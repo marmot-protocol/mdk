@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use marmot_forensics::local_delivery::{DeliveryBatch, ReceiverResult};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
 use crate::{audit_upload::audit_upload_host_is_retired, collector_host_safety, export_config};
@@ -19,13 +20,26 @@ const MAX_BODY_BYTES: usize = 65_535;
 const MAX_WIRE_BYTES: usize = 1024 * 1024;
 
 /// A sender outcome for one prepared range. Only `Complete` may advance its
-/// cursor. `Blocked` needs caller intervention; `Unknown` needs another attempt.
+/// cursor. `Blocked` needs caller intervention; `Retryable` and `Unknown` need
+/// another attempt; `Rejected` is the receiver's final verdict on the batch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuditOtlpSendResult {
     Complete,
-    Partial,
+    /// Throttled (`429`), unavailable (`5xx`), or possibly partly stored
+    /// (`409`): the receiver deduplicates, so the same range is resent.
     Retryable,
-    Blocked,
+    /// The receiver refused the batch's content (`400`, `413`, `422`).
+    /// Resending identical bytes cannot succeed.
+    Rejected {
+        http_status: u16,
+    },
+    /// Delivery cannot proceed until the host changes something: a
+    /// configuration status such as `401`, `403` or `404`, any other
+    /// unexpected status, or an invalid success response. `http_status` is
+    /// `None` when the sender refused the batch before dialing.
+    Blocked {
+        http_status: Option<u16>,
+    },
     Unknown,
 }
 
@@ -37,9 +51,9 @@ impl AuditOtlpSendResult {
     pub fn for_finish(self) -> Option<ReceiverResult> {
         match self {
             Self::Complete => Some(ReceiverResult::Complete),
-            Self::Partial => Some(ReceiverResult::Partial),
             Self::Retryable => Some(ReceiverResult::Retryable),
-            Self::Blocked | Self::Unknown => None,
+            Self::Rejected { .. } => Some(ReceiverResult::Permanent),
+            Self::Blocked { .. } | Self::Unknown => None,
         }
     }
 }
@@ -74,6 +88,20 @@ impl fmt::Debug for AuditOtlpSender {
 impl AuditOtlpSender {
     pub(crate) fn destination(&self) -> &str {
         &self.destination
+    }
+
+    pub(crate) fn fingerprint(&self) -> String {
+        let mut digest = Sha256::new();
+        digest.update(b"marmot.audit-otlp-sender.v1");
+        for part in [
+            self.destination.as_bytes(),
+            self.endpoint.as_bytes(),
+            self.token.as_bytes(),
+        ] {
+            digest.update((part.len() as u64).to_be_bytes());
+            digest.update(part);
+        }
+        hex::encode(digest.finalize())
     }
 
     /// Exact HTTP request-body size for a prepared batch, after JSON escaping.
@@ -153,10 +181,10 @@ impl AuditOtlpSender {
     /// blocked before dialing. No local lease or file handle is held here.
     pub async fn send(&self, batch: DeliveryBatch) -> AuditOtlpSendResult {
         if batch.token.destination() != self.destination.as_str() {
-            return AuditOtlpSendResult::Blocked;
+            return AuditOtlpSendResult::Blocked { http_status: None };
         }
         let Some(body) = encode_batch(batch) else {
-            return AuditOtlpSendResult::Blocked;
+            return AuditOtlpSendResult::Blocked { http_status: None };
         };
         match tokio::time::timeout(self.timeout, self.send_body(body)).await {
             Ok(result) => result,
@@ -186,11 +214,16 @@ impl AuditOtlpSender {
         else {
             return AuditOtlpSendResult::Unknown;
         };
+        let blocked = AuditOtlpSendResult::Blocked {
+            http_status: Some(response.status().as_u16()),
+        };
         match response.status().as_u16() {
-            409 => return AuditOtlpSendResult::Partial,
-            429 | 500..=599 => return AuditOtlpSendResult::Retryable,
+            409 | 429 | 500..=599 => return AuditOtlpSendResult::Retryable,
+            http_status @ (400 | 413 | 422) => {
+                return AuditOtlpSendResult::Rejected { http_status };
+            }
             200 => {}
-            _ => return AuditOtlpSendResult::Blocked,
+            _ => return blocked,
         }
         let valid_success_headers = response.content_length() == Some(2)
             && response.headers().get(reqwest::header::CONTENT_TYPE)
@@ -204,11 +237,11 @@ impl AuditOtlpSender {
                 .headers()
                 .contains_key(reqwest::header::TRANSFER_ENCODING);
         if !valid_success_headers {
-            return AuditOtlpSendResult::Blocked;
+            return blocked;
         }
         match response.bytes().await {
             Ok(body) if body.as_ref() == b"{}" => AuditOtlpSendResult::Complete,
-            Ok(_) => AuditOtlpSendResult::Blocked,
+            Ok(_) => blocked,
             Err(_) => AuditOtlpSendResult::Unknown,
         }
     }

@@ -1,13 +1,15 @@
 //! C mirrors of the forensic audit-log conversions.
 
 use marmot_uniffi::conversions::{
-    AuditLogDeleteResultFfi, AuditLogFileFfi, AuditLogSettingsFfi, AuditLogTrackerConfigV4Ffi,
-    AuditLogTrackerUpdateResultFfi, AuditLogTrackerUpdateResultV5Ffi, AuditLogUploadResultFfi,
-    AuditLogUploadSourceV4Ffi, AuditOtlpConfigV5Ffi, AuditOtlpTrackerResultV5Ffi,
+    AuditDeliveryBacklogV5Ffi, AuditDeliveryFailureKindV5Ffi, AuditDeliveryFailureV5Ffi,
+    AuditDeliveryStatusV5Ffi, AuditLogDeleteResultFfi, AuditLogFileFfi, AuditLogSettingsFfi,
+    AuditLogTrackerConfigV4Ffi, AuditLogTrackerUpdateResultFfi, AuditLogTrackerUpdateResultV5Ffi,
+    AuditLogUploadResultFfi, AuditLogUploadSourceV4Ffi, AuditOtlpConfigV5Ffi,
+    AuditOtlpTrackerResultV5Ffi,
 };
 
 use crate::MarmotStatus;
-use crate::macros::c_mirror;
+use crate::macros::{c_enum, c_mirror};
 use crate::memory::{c_bool, optional_str};
 
 c_mirror! {
@@ -228,6 +230,58 @@ c_mirror! {
     }
 }
 
+c_enum! {
+    /// Why the most recent v5 delivery attempt for an account failed.
+    MarmotAuditDeliveryFailureKindV5 from AuditDeliveryFailureKindV5Ffi {
+        StateOverLimit,
+        TooManyOpenFiles,
+        LocalIo,
+        LocalBlocked,
+        ReceiverBlocked,
+        ReceiverRejected,
+        ReceiverRetryable,
+        NoResponse,
+        Internal,
+    }
+}
+
+c_mirror! {
+    /// The most recent v5 delivery failure; `http_status` is set when the
+    /// receiver answered.
+    MarmotAuditDeliveryFailureV5 from AuditDeliveryFailureV5Ffi {
+        copy kind: MarmotAuditDeliveryFailureKindV5,
+        opt_copy has_http_status/http_status: u16,
+        copy at_ms: u64,
+    }
+}
+
+c_mirror! {
+    /// Undelivered local v5 audit data, as measured at `observed_at_ms`.
+    MarmotAuditDeliveryBacklogV5 from AuditDeliveryBacklogV5Ffi {
+        copy undelivered_bytes: u64,
+        copy undelivered_segments: u64,
+        copy gaps: u64,
+        opt_copy has_oldest_undelivered_at_ms/oldest_undelivered_at_ms: u64,
+        copy observed_at_ms: u64,
+    }
+}
+
+c_mirror! {
+    /// Per-account v5 OTLP audit delivery status.
+    MarmotAuditDeliveryStatusV5 from AuditDeliveryStatusV5Ffi,
+    free marmot_audit_delivery_status_v5_free,
+    list(MarmotAuditDeliveryStatusV5List, marmot_audit_delivery_status_v5_list_free) {
+        str account_ref,
+        copy destination_configured: bool,
+        opt_copy has_last_success_at_ms/last_success_at_ms: u64,
+        opt_rec last_failure: MarmotAuditDeliveryFailureV5,
+        copy consecutive_failures: u64,
+        copy rejected_batches: u64,
+        copy paused: bool,
+        opt_rec backlog: MarmotAuditDeliveryBacklogV5,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -281,6 +335,62 @@ mod tests {
         assert_eq!(returned.source.platform.as_deref(), Some("ios"));
         assert_eq!(returned.source.app_version.as_deref(), Some("test"));
         unsafe { c.free_in_place() };
+        #[cfg(feature = "alloc-audit")]
+        assert_eq!(crate::memory::audit::live_allocations(), start);
+    }
+
+    #[test]
+    fn delivery_status_carries_failure_kind_http_status_and_backlog_then_deep_frees() {
+        let _guard = crate::memory::audit::test_lock();
+        #[cfg(feature = "alloc-audit")]
+        let start = crate::memory::audit::live_allocations();
+        let status = |kind, http_status| AuditDeliveryStatusV5Ffi {
+            account_ref: "alice".into(),
+            destination_configured: true,
+            last_success_at_ms: None,
+            last_failure: Some(AuditDeliveryFailureV5Ffi {
+                kind,
+                http_status,
+                at_ms: 7,
+            }),
+            consecutive_failures: 3,
+            rejected_batches: 0,
+            paused: http_status.is_some(),
+            backlog: Some(AuditDeliveryBacklogV5Ffi {
+                undelivered_bytes: 1024,
+                undelivered_segments: 2,
+                gaps: 1,
+                oldest_undelivered_at_ms: Some(5),
+                observed_at_ms: 6,
+            }),
+        };
+        let mut list = MarmotAuditDeliveryStatusV5List::from(vec![
+            status(AuditDeliveryFailureKindV5Ffi::ReceiverBlocked, Some(401)),
+            status(AuditDeliveryFailureKindV5Ffi::StateOverLimit, None),
+        ]);
+        let rows = unsafe { std::slice::from_raw_parts(list.items, list.len) };
+        let blocked = unsafe { &*rows[0].last_failure };
+        assert!(matches!(
+            blocked.kind,
+            MarmotAuditDeliveryFailureKindV5::ReceiverBlocked
+        ));
+        assert!(blocked.has_http_status);
+        assert_eq!(blocked.http_status, 401);
+        assert!(rows[0].paused);
+        let local = unsafe { &*rows[1].last_failure };
+        assert!(matches!(
+            local.kind,
+            MarmotAuditDeliveryFailureKindV5::StateOverLimit
+        ));
+        assert!(!local.has_http_status);
+        assert!(!rows[1].has_last_success_at_ms);
+        let backlog = unsafe { &*rows[1].backlog };
+        assert_eq!(backlog.undelivered_bytes, 1024);
+        assert_eq!(backlog.undelivered_segments, 2);
+        assert_eq!(backlog.gaps, 1);
+        assert!(backlog.has_oldest_undelivered_at_ms);
+        assert_eq!(backlog.oldest_undelivered_at_ms, 5);
+        unsafe { list.free_in_place() };
         #[cfg(feature = "alloc-audit")]
         assert_eq!(crate::memory::audit::live_allocations(), start);
     }

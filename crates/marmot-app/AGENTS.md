@@ -874,9 +874,14 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
 - The configured audit OTLP/HTTP sender is `marmot-observability`'s `src/audit_otlp_sender.rs`, which hosts name as
   `marmot_app::audit_otlp_sender`. It accepts an owned local-delivery batch,
   checks the prepared destination, preserves each original v5 JSON body inside the restricted OTLP JSON envelope,
-  and maps only complete, partial, and retryable receiver outcomes to local finish actions. Blocked and unknown
-  outcomes retain the prepared range. Runtime tracker/manual triggers and additive native bindings configure it;
-  there is no default v5 destination.
+  and maps only complete, retryable (`409`/`429`/`5xx`) and rejected (`400`/`413`/`422`, finished as permanent)
+  receiver outcomes to local finish actions. Blocked and unknown outcomes retain the prepared range. Runtime
+  tracker/manual triggers and additive native bindings configure it; there is no default v5 destination.
+- Keep per-account v5 delivery status in `runtime/audit_delivery_status.rs`, in its own
+  `audit-otlp-delivery-v5/delivery-status.json` beside (never inside) the cursor, written only under the account's
+  audit export admission. Each tracker pass records its typed outcome there. A receiver block pauses automatic
+  passes for the sender fingerprint it was recorded under; a changed sender or a manual tracker update is the
+  retry. Local failures keep the bounded retry timer. `audit_delivery_status` only reads these files.
 - Keep process-local audit export admission in `src/audit_export_lifecycle.rs`: one active attempt per account, short
   local admission under `storage_lifecycle`, and cancellation on consent, deletion, account removal, destination change,
   or close. Never hold local guards across HTTP or wait for HTTP before releasing the root lease on terminal close.

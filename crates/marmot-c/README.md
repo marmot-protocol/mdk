@@ -737,6 +737,12 @@ Set `enabled` to false to clear the destination. Loopback requires the explicit
 `allow_loopback_dev` flag, while public destinations require HTTPS. v4 files written before
 0.11.0 remain available to drain through the legacy endpoint; v5 bytes never go there.
 
+`marmot_audit_delivery_status_v5` returns a `MarmotAuditDeliveryStatusV5List` with one row per
+account; free it with `marmot_audit_delivery_status_v5_list_free`, which also frees each row's
+nullable `last_failure` and `backlog`. `has_http_status` tells whether the receiver answered. The
+fields and the pause/retry semantics match the
+[shared description](../marmot-uniffi/README.md#audit-v5-recording-and-delivery).
+
 ## Legacy audit v4 upload
 
 Use `MarmotAuditLogTrackerConfigV4` and `marmot_set_audit_log_tracker_config_v4` to supply optional

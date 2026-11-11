@@ -34,9 +34,10 @@ use crate::types::account::{
 };
 use crate::types::agent_stream::MarmotAgentStreamStart;
 use crate::types::audit::{
-    MarmotAuditLogDeleteResult, MarmotAuditLogFileList, MarmotAuditLogSettings,
-    MarmotAuditLogTrackerConfig, MarmotAuditLogTrackerConfigV4, MarmotAuditLogTrackerUpdateResult,
-    MarmotAuditLogTrackerUpdateResultV5, MarmotAuditLogUploadResult, MarmotAuditOtlpConfigV5,
+    MarmotAuditDeliveryStatusV5List, MarmotAuditLogDeleteResult, MarmotAuditLogFileList,
+    MarmotAuditLogSettings, MarmotAuditLogTrackerConfig, MarmotAuditLogTrackerConfigV4,
+    MarmotAuditLogTrackerUpdateResult, MarmotAuditLogTrackerUpdateResultV5,
+    MarmotAuditLogUploadResult, MarmotAuditOtlpConfigV5,
 };
 use crate::types::backups::{
     MarmotBackgroundBackupOutcome, MarmotBackupHistoryAvailabilityList, MarmotBackupRestoreStatus,
@@ -1200,6 +1201,10 @@ c_cmd! {
 
     /// Run the same tracker pass with independent v4/v5 outcomes.
     async fn marmot_post_audit_log_tracker_update_v5() -> rec(MarmotAuditLogTrackerUpdateResultV5) = post_audit_log_tracker_update_v5;
+
+    /// Per-account v5 OTLP audit delivery status (local read; never dials).
+    /// Free with `marmot_audit_delivery_status_v5_list_free`.
+    sync fn marmot_audit_delivery_status_v5() -> rec(MarmotAuditDeliveryStatusV5List) = audit_delivery_status_v5;
 
     /// The account's chat list rows. Free with
     /// `marmot_chat_list_row_list_free`.

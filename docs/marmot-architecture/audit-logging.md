@@ -43,9 +43,22 @@ blocked, and idle account counts separately from v4 whole-file uploads. Existing
 activity triggers use the same 30-second coalescing window, retry delay, and shutdown
 cancellation; they drain bounded v5 batches per account. V5 cursor state lives in
 `audit-otlp-delivery-v5`, so historical v4 cursor state and files are untouched. A complete
-receiver acceptance advances the v5 cursor; retryable, partial, unknown, and blocked outcomes
-retain or block the prepared range according to the local delivery contract. Deleting or
+receiver acceptance advances the v5 cursor. `409` (the receiver may have stored part of the
+batch), `429` and `5xx` are retryable and resend the same range. `400`, `413` and `422` reject
+the batch's content and finish it as a permanent receiver rejection. `401`, `403`, `404`, any
+other status, and an invalid success response are blocked: the range is retained, and automatic
+delivery for that account and destination pauses until the host changes the sender
+configuration or runs a manual tracker update. Unknown outcomes retain the range. Deleting or
 disabling a live audit file fences in-flight acknowledgments.
+
+Each tracker pass persists the account's delivery status in
+`audit-otlp-delivery-v5/delivery-status.json`, separate from the cursor: the last success, the
+last typed failure (state over its size limit, out of file descriptors, other local I/O, a
+blocked local journal, receiver blocked, rejected or retryable with its HTTP status, no
+response), consecutive failed passes, rejected batches, the pause with a one-way fingerprint of
+the sender configuration it applies to, and the last measured backlog. Hosts read it through
+`audit_delivery_status_v5`. The tracker's `warn` log carries the same failure category and HTTP
+status, nothing else.
 
 The old Goggles whole-file endpoint remains a v4-only route. Direct whole-file upload validates
 the exact v4 schema version and rejects v5; the tracker excludes v5 filenames from its v4 pass.
@@ -1443,7 +1456,7 @@ The app can list and upload audit logs, but upload is separate from local record
 
 `MarmotAppRuntime::send_audit_otlp_once` is internal and requires a caller-supplied dedicated sender and one account. It prepares at most one bounded range of original v4 JSONL bodies under the existing exclusive root lease. Local admission covers preparation and, after a response, any durable finish; the HTTP request holds no local file, database, or lifecycle guard. One process-local reservation rejects overlapping attempts for the account. The root lease itself remains held until terminal storage close.
 
-Preparation verifies and owns the source bytes and local generation. Before sending and before finish, the attempt rechecks runtime state, account identity, recording consent, and the sender's stable destination profile without re-reading the source. `LocalAuditDelivery::finish` deliberately acknowledges the owned prepared bytes without reopening their source; external in-place file rewrites are outside this local lifecycle guarantee. Disable/re-enable, file deletion, account removal, destination change, and terminal close reject a pending result. A late response can still represent remote receipt, but cannot advance the old local cursor. Complete `200 {}` finishes locally; `409` durably blocks the range; retryable and unknown outcomes retain it. A blocked receiver verdict has no local finish action. Cancellation retains the prepared range for identical replay, so duplicates remain possible. This seam does not start automatic OTLP delivery, configure a production endpoint, set retention, or claim downstream Loki durability. The existing Goggles manual and tracker uploads keep their own checkpoint and defaults.
+Preparation verifies and owns the source bytes and local generation. Before sending and before finish, the attempt rechecks runtime state, account identity, recording consent, and the sender's stable destination profile without re-reading the source. `LocalAuditDelivery::finish` deliberately acknowledges the owned prepared bytes without reopening their source; external in-place file rewrites are outside this local lifecycle guarantee. Disable/re-enable, file deletion, account removal, destination change, and terminal close reject a pending result. A late response can still represent remote receipt, but cannot advance the old local cursor. Complete `200 {}` finishes locally; `400`, `413` and `422` finish as a permanent rejection; `409`, retryable and unknown outcomes retain the range. A blocked receiver verdict has no local finish action. Cancellation retains the prepared range for identical replay, so duplicates remain possible. This seam does not start automatic OTLP delivery, configure a production endpoint, set retention, or claim downstream Loki durability. The existing Goggles manual and tracker uploads keep their own checkpoint and defaults.
 
 ### Listing
 

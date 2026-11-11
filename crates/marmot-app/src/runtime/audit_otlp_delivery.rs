@@ -2,11 +2,15 @@
 
 use std::sync::{Arc, Mutex as StdMutex};
 
-use marmot_forensics::local_delivery::{DeliveryStep, LocalAuditDelivery, Preparation};
+use marmot_forensics::local_delivery::{
+    DeliveryBacklog, DeliveryStep, LocalAuditDelivery, Preparation,
+};
 
+use crate::audit_export_lifecycle::AuditExportAttempt;
 use crate::{AppError, MarmotApp};
 use marmot_observability::{AuditOtlpSendResult, AuditOtlpSender};
 
+use super::audit_delivery_status::{AuditDeliveryPass, audit_delivery_state_dir, record_pass};
 use super::{MarmotAppRuntime, RuntimeLifecycle, blocking_app_task};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,14 +51,33 @@ pub(crate) async fn send_audit_otlp_once_for_app(
     sender: &AuditOtlpSender,
     configured_sender: Option<&Arc<StdMutex<Option<Arc<AuditOtlpSender>>>>>,
 ) -> Result<AuditOtlpAttemptOutcome, AppError> {
-    let app = app.clone();
-    let lifecycle = lifecycle.clone();
+    attempt_audit_otlp_once(app, lifecycle, account_ref, sender, configured_sender)
+        .await
+        .map(|(outcome, _)| outcome)
+}
+
+enum Reservation {
+    Reserved {
+        attempt: AuditExportAttempt,
+        account_id: String,
+        account_label: String,
+    },
+    Unavailable(AuditOtlpAttemptOutcome),
+}
+
+async fn reserve(
+    app: &MarmotApp,
+    lifecycle: &RuntimeLifecycle,
+    account_ref: &str,
+    sender: &AuditOtlpSender,
+    configured_sender: Option<&Arc<StdMutex<Option<Arc<AuditOtlpSender>>>>>,
+) -> Result<Reservation, AppError> {
     lifecycle.ensure_running()?;
     let account = app.account_home().account(account_ref)?;
     // Open shared storage before nested local admission. Its cached read
     // then cannot recursively acquire storage_lifecycle behind a writer.
     if !app.audit_log_settings()?.enabled {
-        return Ok(AuditOtlpAttemptOutcome::Cancelled);
+        return Ok(Reservation::Unavailable(AuditOtlpAttemptOutcome::Cancelled));
     }
     let directory = blocking_app_task({
         let directory = app.account_dir(&account.label);
@@ -72,7 +95,7 @@ pub(crate) async fn send_audit_otlp_once_for_app(
             .as_deref()
             .is_some_and(|current| std::ptr::eq(current, sender))
         {
-            return Ok(AuditOtlpAttemptOutcome::Cancelled);
+            return Ok(Reservation::Unavailable(AuditOtlpAttemptOutcome::Cancelled));
         }
         app.audit_export_lifecycle.reserve(
             &account.account_id_hex,
@@ -86,12 +109,77 @@ pub(crate) async fn send_audit_otlp_once_for_app(
             &directory,
         )
     };
-    let Some(attempt) = attempt else {
-        return Ok(AuditOtlpAttemptOutcome::Busy);
+    Ok(match attempt {
+        Some(attempt) => Reservation::Reserved {
+            attempt,
+            account_id: account.account_id_hex,
+            account_label: account.label,
+        },
+        None => Reservation::Unavailable(AuditOtlpAttemptOutcome::Busy),
+    })
+}
+
+/// Fold one tracker pass into the account's persisted delivery status under
+/// the same admission as cursor work. A busy or fenced account skips the
+/// write; its own pass records the newer outcome.
+pub(crate) async fn record_audit_delivery_pass(
+    app: &MarmotApp,
+    lifecycle: &RuntimeLifecycle,
+    account_ref: &str,
+    sender: &Arc<AuditOtlpSender>,
+    configured_sender: Option<&Arc<StdMutex<Option<Arc<AuditOtlpSender>>>>>,
+    pass: AuditDeliveryPass,
+) -> Result<(), AppError> {
+    if pass.is_empty() {
+        return Ok(());
+    }
+    let Reservation::Reserved {
+        attempt,
+        account_id,
+        account_label,
+    } = reserve(app, lifecycle, account_ref, sender, configured_sender).await?
+    else {
+        return Ok(());
     };
-    let account_id = account.account_id_hex;
-    let account_label = account.label;
-    let (attempt, preparation) = blocking_app_task({
+    let app = app.clone();
+    let lifecycle = lifecycle.clone();
+    let sender = sender.clone();
+    blocking_app_task(move || {
+        app.with_audit_export_admission(&attempt, || {
+            if !check_live(&app, &lifecycle, &account_id, &account_label)? {
+                return Ok(());
+            }
+            record_pass(
+                &audit_delivery_state_dir(&app, &account_label),
+                &sender,
+                &pass,
+            )
+        })
+        .map(|_| ())
+    })
+    .await
+}
+
+/// One attempt, plus the cursor's backlog as last observed under admission.
+pub(crate) async fn attempt_audit_otlp_once(
+    app: &MarmotApp,
+    lifecycle: &RuntimeLifecycle,
+    account_ref: &str,
+    sender: &AuditOtlpSender,
+    configured_sender: Option<&Arc<StdMutex<Option<Arc<AuditOtlpSender>>>>>,
+) -> Result<(AuditOtlpAttemptOutcome, Option<DeliveryBacklog>), AppError> {
+    let app = app.clone();
+    let lifecycle = lifecycle.clone();
+    let (attempt, account_id, account_label) =
+        match reserve(&app, &lifecycle, account_ref, sender, configured_sender).await? {
+            Reservation::Reserved {
+                attempt,
+                account_id,
+                account_label,
+            } => (attempt, account_id, account_label),
+            Reservation::Unavailable(outcome) => return Ok((outcome, None)),
+        };
+    let (attempt, prepared) = blocking_app_task({
         let app = app.clone();
         let lifecycle = lifecycle.clone();
         let account_id = account_id.clone();
@@ -103,12 +191,11 @@ pub(crate) async fn send_audit_otlp_once_for_app(
                         return Ok(None);
                     }
                     let active = app.audit_delivery_active_path(&account_label)?;
-                    let state_dir = app
-                        .account_dir(&account_label)
-                        .join("audit-otlp-delivery-v5");
+                    let state_dir = audit_delivery_state_dir(&app, &account_label);
                     let mut local =
                         LocalAuditDelivery::open(active, state_dir, attempt.destination())?;
                     let preparation = local.prepare_once()?;
+                    let backlog = local.backlog();
                     if let Preparation::Batch(batch) = &preparation {
                         let source =
                             local
@@ -118,21 +205,21 @@ pub(crate) async fn send_audit_otlp_once_for_app(
                                 })?;
                         app.audit_export_lifecycle.prepared_source(&attempt, source);
                     }
-                    Ok(Some(preparation))
+                    Ok(Some((preparation, backlog)))
                 })?
                 .flatten();
             Ok((attempt, preparation))
         }
     })
     .await?;
-    let Some(preparation) = preparation else {
-        return Ok(AuditOtlpAttemptOutcome::Cancelled);
+    let Some((preparation, backlog)) = prepared else {
+        return Ok((AuditOtlpAttemptOutcome::Cancelled, None));
     };
     let Preparation::Batch(batch) = preparation else {
         let Preparation::Step(step) = preparation else {
             unreachable!()
         };
-        return Ok(AuditOtlpAttemptOutcome::Local(step));
+        return Ok((AuditOtlpAttemptOutcome::Local(step), Some(backlog)));
     };
     let token = batch.token.clone();
 
@@ -154,14 +241,17 @@ pub(crate) async fn send_audit_otlp_once_for_app(
     })
     .await?;
     if !still_live {
-        return Ok(AuditOtlpAttemptOutcome::Cancelled);
+        return Ok((AuditOtlpAttemptOutcome::Cancelled, Some(backlog)));
     }
     let receiver = sender.send(batch).await;
     let Some(action) = receiver.for_finish() else {
-        return Ok(AuditOtlpAttemptOutcome::Sent {
-            receiver,
-            local: None,
-        });
+        return Ok((
+            AuditOtlpAttemptOutcome::Sent {
+                receiver,
+                local: None,
+            },
+            Some(backlog),
+        ));
     };
     let finish_lifecycle = lifecycle.clone();
     let app_for_close = app.clone();
@@ -171,11 +261,10 @@ pub(crate) async fn send_audit_otlp_once_for_app(
                 return Ok(None);
             }
             let active = app.audit_delivery_active_path(&account_label)?;
-            let state_dir = app
-                .account_dir(&account_label)
-                .join("audit-otlp-delivery-v5");
+            let state_dir = audit_delivery_state_dir(&app, &account_label);
             let mut owner = LocalAuditDelivery::open(active, state_dir, attempt.destination())?;
-            Ok(Some(owner.finish(&token, action)?))
+            let step = owner.finish(&token, action)?;
+            Ok(Some((step, owner.backlog())))
         })
     })
     .await;
@@ -193,7 +282,14 @@ pub(crate) async fn send_audit_otlp_once_for_app(
         }
         Err(error) => return Err(error),
     };
-    Ok(AuditOtlpAttemptOutcome::Sent { receiver, local })
+    let (local, backlog) = match local {
+        Some((step, finished)) => (Some(step), finished),
+        None => (None, backlog),
+    };
+    Ok((
+        AuditOtlpAttemptOutcome::Sent { receiver, local },
+        Some(backlog),
+    ))
 }
 
 fn check_live(

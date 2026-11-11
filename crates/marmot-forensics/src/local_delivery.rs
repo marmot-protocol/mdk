@@ -104,6 +104,58 @@ pub struct DeliveryGap {
     pub reason: GapReason,
 }
 
+/// Undelivered local work, as reported by [`LocalAuditDelivery::backlog`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DeliveryBacklog {
+    /// Unacknowledged bytes across present source files.
+    pub undelivered_bytes: u64,
+    /// Present source files with unacknowledged bytes.
+    pub undelivered_segments: u64,
+    /// Recorded delivery gaps.
+    pub gaps: u64,
+    /// Recorder wall time of the oldest undelivered record, when readable.
+    pub oldest_undelivered_wall_time_ms: Option<u64>,
+}
+
+/// Local delivery failures a host can act on differently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalDeliveryFailure {
+    /// The persisted cursor state exceeds its size limit.
+    StateOverLimit,
+    /// The process or system ran out of file descriptors.
+    TooManyOpenFiles,
+    /// Any other local I/O failure.
+    Io,
+}
+
+const STATE_SIZE_LIMIT_MESSAGE: &str = "delivery cursor exceeds size limit";
+
+/// Classify an error returned by [`LocalAuditDelivery`].
+pub fn classify_local_failure(error: &io::Error) -> LocalDeliveryFailure {
+    if error.kind() == io::ErrorKind::InvalidData
+        && error
+            .get_ref()
+            .is_some_and(|inner| inner.to_string() == STATE_SIZE_LIMIT_MESSAGE)
+    {
+        return LocalDeliveryFailure::StateOverLimit;
+    }
+    #[cfg(unix)]
+    let too_many_open_files = matches!(
+        error.raw_os_error(),
+        Some(libc::EMFILE) | Some(libc::ENFILE)
+    );
+    // ERROR_TOO_MANY_OPEN_FILES
+    #[cfg(windows)]
+    let too_many_open_files = error.raw_os_error() == Some(4);
+    #[cfg(not(any(unix, windows)))]
+    let too_many_open_files = false;
+    if too_many_open_files {
+        LocalDeliveryFailure::TooManyOpenFiles
+    } else {
+        LocalDeliveryFailure::Io
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Prepared {
     start: u64,
@@ -227,6 +279,56 @@ impl LocalAuditDelivery {
             .iter()
             .filter_map(|j| j.blocked.as_deref().map(|reason| (j.generation, reason)))
             .collect()
+    }
+
+    /// Undelivered work this cursor still owns, for host status. Read-only:
+    /// it counts the unacknowledged extents of present journals and reads at
+    /// most the first undelivered line of the oldest one. Journals are kept in
+    /// generation order, so the first present journal with an extent is oldest.
+    pub fn backlog(&self) -> DeliveryBacklog {
+        let mut backlog = DeliveryBacklog {
+            gaps: self.state.gaps.len() as u64,
+            ..DeliveryBacklog::default()
+        };
+        let mut oldest = None;
+        for (index, journal) in self.state.journals.iter().enumerate() {
+            if journal.missing || journal.acknowledged >= journal.observed_len {
+                continue;
+            }
+            backlog.undelivered_bytes += journal.observed_len - journal.acknowledged;
+            backlog.undelivered_segments += 1;
+            oldest.get_or_insert(index);
+        }
+        backlog.oldest_undelivered_wall_time_ms =
+            oldest.and_then(|index| self.first_undelivered_wall_time_ms(index));
+        backlog
+    }
+
+    /// The `wall_time_ms` of the journal's first unacknowledged line, or
+    /// `None` when the source moved or that line is not yet a complete record.
+    fn first_undelivered_wall_time_ms(&self, index: usize) -> Option<u64> {
+        // v5 encodes the wall time as a decimal string, v4 as a number.
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum WallTimeMs {
+            Number(u64),
+            Text(String),
+        }
+        #[derive(Deserialize)]
+        struct WallTime {
+            wall_time_ms: WallTimeMs,
+        }
+        let (mut file, len) = self.open_journal(index).ok()?;
+        let start = self.state.journals[index].acknowledged;
+        file.seek(SeekFrom::Start(start)).ok()?;
+        let (line, _, complete, oversized) = read_line(&mut file, start, len).ok()?;
+        if !complete || oversized {
+            return None;
+        }
+        match serde_json::from_slice::<WallTime>(&line).ok()?.wall_time_ms {
+            WallTimeMs::Number(ms) => Some(ms),
+            WallTimeMs::Text(ms) => ms.parse().ok(),
+        }
     }
 
     pub fn prepare_once(&mut self) -> io::Result<Preparation> {
@@ -1855,6 +1957,95 @@ mod tests {
             .err()
             .unwrap();
         assert!(error.to_string().contains("size limit"));
+        assert_eq!(
+            classify_local_failure(&error),
+            LocalDeliveryFailure::StateOverLimit
+        );
+    }
+
+    #[test]
+    fn local_failures_distinguish_descriptor_exhaustion_from_other_io() {
+        #[cfg(unix)]
+        for errno in [libc::EMFILE, libc::ENFILE] {
+            assert_eq!(
+                classify_local_failure(&io::Error::from_raw_os_error(errno)),
+                LocalDeliveryFailure::TooManyOpenFiles
+            );
+        }
+        for error in [
+            io::Error::from(io::ErrorKind::PermissionDenied),
+            invalid("corrupt delivery cursor"),
+        ] {
+            assert_eq!(classify_local_failure(&error), LocalDeliveryFailure::Io);
+        }
+    }
+
+    #[test]
+    fn backlog_reports_undelivered_extent_oldest_record_time_and_gaps() {
+        fn first_wall_time(path: &Path) -> u64 {
+            let bytes = fs::read(path).unwrap();
+            let line = bytes.split(|byte| *byte == b'\n').next().unwrap();
+            serde_json::from_slice::<serde_json::Value>(line).unwrap()["wall_time_ms"]
+                .as_u64()
+                .unwrap()
+        }
+        let (_dir, active, state_dir, recorder) = setup();
+        record(&recorder, "sealed");
+        let stem = active.file_stem().unwrap().to_str().unwrap().to_owned();
+        let sealed = active.with_file_name(format!("{stem}-seg000001.jsonl"));
+        drop(recorder);
+        fs::rename(&active, &sealed).unwrap();
+        let recorder = JsonlRecorder::open(&active, "engine-abc".into()).unwrap();
+        record(&recorder, "active");
+        let sealed_len = fs::metadata(&sealed).unwrap().len();
+        let active_len = fs::metadata(&active).unwrap().len();
+
+        let mut worker = LocalAuditDelivery::open(&active, &state_dir, "receiver-A").unwrap();
+        assert_eq!(
+            worker.backlog(),
+            DeliveryBacklog {
+                undelivered_bytes: sealed_len + active_len,
+                undelivered_segments: 2,
+                gaps: 0,
+                oldest_undelivered_wall_time_ms: Some(first_wall_time(&sealed)),
+            }
+        );
+        let mut sink = FakeReceiver::default();
+        assert_eq!(worker.run_once(&mut sink).unwrap(), DeliveryStep::Accepted);
+        assert_eq!(
+            worker.backlog(),
+            DeliveryBacklog {
+                undelivered_bytes: active_len,
+                undelivered_segments: 1,
+                gaps: 0,
+                oldest_undelivered_wall_time_ms: Some(first_wall_time(&active)),
+            }
+        );
+        drain(&mut worker, &mut sink);
+        assert_eq!(worker.backlog(), DeliveryBacklog::default());
+
+        // An undelivered source that disappears is a gap, not backlog.
+        record(&recorder, "lost");
+        prepared_batch(&mut worker);
+        drop(recorder);
+        let lost = active.with_file_name(format!("{stem}-seg000002.jsonl"));
+        fs::rename(&active, &lost).unwrap();
+        let _recorder = JsonlRecorder::open(&active, "engine-abc".into()).unwrap();
+        fs::remove_file(&lost).unwrap();
+        assert_eq!(
+            worker.prepare_once().unwrap(),
+            Preparation::Step(DeliveryStep::Gap)
+        );
+        // The reopened recorder's first rows are the only backlog left.
+        assert_eq!(
+            worker.backlog(),
+            DeliveryBacklog {
+                undelivered_bytes: fs::metadata(&active).unwrap().len(),
+                undelivered_segments: 1,
+                gaps: 1,
+                oldest_undelivered_wall_time_ms: Some(first_wall_time(&active)),
+            }
+        );
     }
     #[test]
     fn acknowledged_daily_file_expiry_keeps_cursor_bounded_without_replays_or_false_gaps() {

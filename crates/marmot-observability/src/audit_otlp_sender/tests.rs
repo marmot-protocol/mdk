@@ -168,23 +168,24 @@ async fn response_contract_classifies_only_exact_200_as_complete() {
     let (_dir, _active, _state, batch) = prepared();
     for (status, body, expected) in [
         (200, "{}", AuditOtlpSendResult::Complete),
-        (409, "{}", AuditOtlpSendResult::Partial),
+        (409, "{}", AuditOtlpSendResult::Retryable),
         (503, "{}", AuditOtlpSendResult::Retryable),
         (429, "{}", AuditOtlpSendResult::Retryable),
-        (400, "{}", AuditOtlpSendResult::Blocked),
-        (401, "{}", AuditOtlpSendResult::Blocked),
-        (403, "{}", AuditOtlpSendResult::Blocked),
-        (404, "{}", AuditOtlpSendResult::Blocked),
-        (408, "{}", AuditOtlpSendResult::Blocked),
-        (413, "{}", AuditOtlpSendResult::Blocked),
-        (302, "{}", AuditOtlpSendResult::Blocked),
-        (204, "", AuditOtlpSendResult::Blocked),
-        (202, "{}", AuditOtlpSendResult::Blocked),
-        (200, "", AuditOtlpSendResult::Blocked),
-        (200, "[]", AuditOtlpSendResult::Blocked),
-        (200, "{\"partialSuccess\":{}}", AuditOtlpSendResult::Blocked),
-        (200, "{", AuditOtlpSendResult::Blocked),
-        (200, "{} ", AuditOtlpSendResult::Blocked),
+        (400, "{}", rejected(400)),
+        (413, "{}", rejected(413)),
+        (422, "{}", rejected(422)),
+        (401, "{}", blocked(401)),
+        (403, "{}", blocked(403)),
+        (404, "{}", blocked(404)),
+        (408, "{}", blocked(408)),
+        (302, "{}", blocked(302)),
+        (204, "", blocked(204)),
+        (202, "{}", blocked(202)),
+        (200, "", blocked(200)),
+        (200, "[]", blocked(200)),
+        (200, "{\"partialSuccess\":{}}", blocked(200)),
+        (200, "{", blocked(200)),
+        (200, "{} ", blocked(200)),
     ] {
         let (endpoint, task) = service(reply(status, body)).await;
         let sender =
@@ -207,7 +208,7 @@ async fn response_contract_classifies_only_exact_200_as_complete() {
     ] {
         let (endpoint, task) = service(response.to_vec()).await;
         let sender = AuditOtlpSender::for_loopback_dev(TEST_DESTINATION, endpoint, "token").unwrap();
-        assert_eq!(sender.send(batch.clone()).await, AuditOtlpSendResult::Blocked);
+        assert_eq!(sender.send(batch.clone()).await, blocked(200));
         task.await.unwrap();
     }
     let (endpoint, task) = service(reply(503, &"x".repeat(2048))).await;
@@ -218,23 +219,38 @@ async fn response_contract_classifies_only_exact_200_as_complete() {
     );
     task.await.unwrap();
     assert_eq!(AuditOtlpSendResult::Unknown.for_finish(), None);
-    assert_eq!(AuditOtlpSendResult::Blocked.for_finish(), None);
+    assert_eq!(blocked(401).for_finish(), None);
+    assert_eq!(
+        AuditOtlpSendResult::Blocked { http_status: None }.for_finish(),
+        None
+    );
     assert_eq!(
         AuditOtlpSendResult::Complete.for_finish(),
         Some(ReceiverResult::Complete)
     );
-    assert_eq!(
-        AuditOtlpSendResult::Partial.for_finish(),
-        Some(ReceiverResult::Partial)
-    );
+    assert_eq!(rejected(400).for_finish(), Some(ReceiverResult::Permanent));
     assert_eq!(
         AuditOtlpSendResult::Retryable.for_finish(),
         Some(ReceiverResult::Retryable)
     );
 }
 
+fn blocked(status: u16) -> AuditOtlpSendResult {
+    AuditOtlpSendResult::Blocked {
+        http_status: Some(status),
+    }
+}
+
+fn rejected(status: u16) -> AuditOtlpSendResult {
+    AuditOtlpSendResult::Rejected {
+        http_status: status,
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn parsed_409_blocks_even_if_its_diagnostic_body_is_incomplete_or_stalled() {
+/// A 409 means the receiver may have stored part of the batch. It retries the
+/// same range (the receiver deduplicates) instead of blocking the journal.
+async fn parsed_409_retries_even_if_its_diagnostic_body_is_incomplete_or_stalled() {
     crate::collector_host_safety::hand_in_direct_http_builder();
     let (_dir, active, state, batch) = prepared();
     let token = batch.token.clone();
@@ -243,7 +259,7 @@ async fn parsed_409_blocks_even_if_its_diagnostic_body_is_incomplete_or_stalled(
     let sender = AuditOtlpSender::for_loopback_dev(TEST_DESTINATION, endpoint, "token").unwrap();
     assert_eq!(
         sender.send(batch.clone()).await,
-        AuditOtlpSendResult::Partial
+        AuditOtlpSendResult::Retryable
     );
     task.await.unwrap();
 
@@ -280,7 +296,7 @@ async fn parsed_409_blocks_even_if_its_diagnostic_body_is_incomplete_or_stalled(
         result
             .expect("a parsed 409 must not await its withheld body")
             .unwrap(),
-        AuditOtlpSendResult::Partial
+        AuditOtlpSendResult::Retryable
     );
     release.send(()).unwrap();
     task.await.unwrap();
@@ -288,10 +304,14 @@ async fn parsed_409_blocks_even_if_its_diagnostic_body_is_incomplete_or_stalled(
     let mut owner = LocalAuditDelivery::open(&active, &state, TEST_DESTINATION).unwrap();
     assert_eq!(
         owner
-            .finish(&token, AuditOtlpSendResult::Partial.for_finish().unwrap())
+            .finish(&token, AuditOtlpSendResult::Retryable.for_finish().unwrap())
             .unwrap(),
-        DeliveryStep::Blocked
+        DeliveryStep::Retryable
     );
+    match owner.prepare_once().unwrap() {
+        Preparation::Batch(replay) => assert_eq!(replay.token, token),
+        other => panic!("expected the same range again: {other:?}"),
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -310,7 +330,7 @@ async fn mismatched_destination_never_dials_or_advances_the_source_cursor() {
             panic!("a mismatched destination must not connect");
         }
     };
-    assert_eq!(outcome, AuditOtlpSendResult::Blocked);
+    assert_eq!(outcome, AuditOtlpSendResult::Blocked { http_status: None });
     assert_eq!(outcome.for_finish(), None);
     assert!(
         tokio::time::timeout(Duration::from_millis(50), listener.accept())
@@ -437,7 +457,7 @@ async fn authentication_rejection_leaves_the_prepared_range_replayable() {
     let sender =
         AuditOtlpSender::for_loopback_dev(TEST_DESTINATION, endpoint, "old-token").unwrap();
     let outcome = sender.send(batch).await;
-    assert_eq!(outcome, AuditOtlpSendResult::Blocked);
+    assert_eq!(outcome, blocked(401));
     assert_eq!(outcome.for_finish(), None);
     task.await.unwrap();
     let mut owner = LocalAuditDelivery::open(&active, &state, TEST_DESTINATION).unwrap();
@@ -611,7 +631,7 @@ async fn endpoint_and_batch_limits_are_checked_before_network() {
     assert_eq!(boundary_sender.request_body_bytes(&batch), None);
     assert_eq!(
         boundary_sender.send(batch.clone()).await,
-        AuditOtlpSendResult::Blocked
+        AuditOtlpSendResult::Blocked { http_status: None }
     );
     for bodies in [
         vec![],
@@ -628,7 +648,7 @@ async fn endpoint_and_batch_limits_are_checked_before_network() {
         assert_eq!(sender.request_body_bytes(&invalid), None);
         assert_eq!(
             sender.send(invalid.clone()).await,
-            AuditOtlpSendResult::Blocked
+            AuditOtlpSendResult::Blocked { http_status: None }
         );
         assert!(encode_batch(invalid).is_none());
     }
@@ -689,7 +709,10 @@ async fn endpoint_and_batch_limits_are_checked_before_network() {
     boundary.bodies[15] = sized_line(MAX_BODY_BYTES - excess + 1);
     assert_eq!(wire_len(&boundary.bodies), MAX_WIRE_BYTES + 1);
     assert_eq!(sender.request_body_bytes(&boundary), None);
-    assert_eq!(sender.send(boundary).await, AuditOtlpSendResult::Blocked);
+    assert_eq!(
+        sender.send(boundary).await,
+        AuditOtlpSendResult::Blocked { http_status: None }
+    );
 }
 
 /// Run explicitly where the pinned Python receiver dependency is available.
@@ -725,4 +748,24 @@ fn reference_receiver_accepts_exact_sender_wire() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(output.stdout, original);
+}
+
+#[test]
+fn sender_fingerprint_changes_with_destination_endpoint_or_token_only() {
+    let endpoint = "https://collector.example/v1/logs";
+    let fingerprint = |destination: &str, endpoint: &str, token: &str| {
+        crate::wiring::audit_sender_fingerprint(
+            &AuditOtlpSender::new(destination, endpoint, token).unwrap(),
+        )
+    };
+    let base = fingerprint("audit", endpoint, "token-a");
+    assert_eq!(base, fingerprint("audit", endpoint, "token-a"));
+    assert!(!base.contains("token-a") && !base.contains("collector"));
+    for changed in [
+        fingerprint("audit-2", endpoint, "token-a"),
+        fingerprint("audit", "https://other.example/v1/logs", "token-a"),
+        fingerprint("audit", endpoint, "token-b"),
+    ] {
+        assert_ne!(base, changed);
+    }
 }

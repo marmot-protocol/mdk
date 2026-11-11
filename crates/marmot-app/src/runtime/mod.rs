@@ -72,9 +72,10 @@ pub use agent_publisher::{
     AgentPublisher, AgentPublisherOptions, AgentPublisherRecord, AgentPublisherRouting,
 };
 mod account_attention;
+mod audit_delivery_status;
 mod audit_otlp_delivery;
 pub use audit_otlp_delivery::AuditOtlpAttemptOutcome;
-pub(crate) use audit_otlp_delivery::send_audit_otlp_once_for_app;
+pub(crate) use audit_otlp_delivery::{attempt_audit_otlp_once, record_audit_delivery_pass};
 mod audit_tracker;
 pub use account_attention::{
     AccountAttentionEntry, AccountAttentionSnapshot, AccountAttentionState, AccountAttentionTotal,
@@ -3891,11 +3892,22 @@ impl MarmotAppRuntime {
         post_audit_log_tracker_update_for_runtime(
             &self.accounts.app,
             config,
-            sender.as_deref(),
+            sender.as_ref(),
             &self.shared.audit_otlp_sender,
             &self.shared.lifecycle(),
         )
         .await
+    }
+
+    /// Per-account v5 audit OTLP delivery status: the last success, the last
+    /// typed failure, whether automatic delivery is paused for the configured
+    /// destination, and the last measured backlog. Reads small local files
+    /// only; it never dials or touches the delivery cursor. A paused account
+    /// resumes when the host changes the destination configuration or calls
+    /// [`Self::post_audit_log_tracker_update`].
+    pub fn audit_delivery_status(&self) -> Result<Vec<crate::AuditDeliveryStatus>, AppError> {
+        let sender = self.shared.audit_otlp_sender();
+        audit_delivery_status::audit_delivery_status_for_app(&self.accounts.app, sender.as_deref())
     }
 
     /// Test-only per-runtime window override; production keeps the 30-second default.
