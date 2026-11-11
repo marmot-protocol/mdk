@@ -2,10 +2,10 @@
 
 use marmot_uniffi::conversions::{
     AuditDeliveryBacklogV5Ffi, AuditDeliveryFailureKindV5Ffi, AuditDeliveryFailureV5Ffi,
-    AuditDeliveryStatusV5Ffi, AuditLogDeleteResultFfi, AuditLogFileFfi, AuditLogSettingsFfi,
-    AuditLogTrackerConfigV4Ffi, AuditLogTrackerUpdateResultFfi, AuditLogTrackerUpdateResultV5Ffi,
-    AuditLogUploadResultFfi, AuditLogUploadSourceV4Ffi, AuditOtlpConfigV5Ffi,
-    AuditOtlpTrackerResultV5Ffi,
+    AuditDeliveryStatusV5Ffi, AuditLogDeleteResultFfi, AuditLogFileFfi, AuditLogRetentionFfi,
+    AuditLogSettingsFfi, AuditLogTrackerConfigV4Ffi, AuditLogTrackerUpdateResultFfi,
+    AuditLogTrackerUpdateResultV5Ffi, AuditLogUploadResultFfi, AuditLogUploadSourceV4Ffi,
+    AuditOtlpConfigV5Ffi, AuditOtlpTrackerResultV5Ffi,
 };
 
 use crate::MarmotStatus;
@@ -26,6 +26,27 @@ impl MarmotAuditLogSettings {
     pub(crate) fn to_ffi(&self) -> AuditLogSettingsFfi {
         AuditLogSettingsFfi {
             enabled: c_bool(self.enabled),
+        }
+    }
+}
+
+c_mirror! {
+    /// Local audit-log retention policy. Also a borrowed input to
+    /// `marmot_set_audit_log_retention`.
+    MarmotAuditLogRetention from AuditLogRetentionFfi,
+    free marmot_audit_log_retention_free {
+        /// Maximum file age in days, 1 to 30.
+        copy max_age_days: u32,
+        /// Per-account size budget in bytes, at least 16 MiB.
+        copy max_bytes_per_account: u64,
+    }
+}
+
+impl MarmotAuditLogRetention {
+    pub(crate) fn to_ffi(&self) -> AuditLogRetentionFfi {
+        AuditLogRetentionFfi {
+            max_age_days: self.max_age_days,
+            max_bytes_per_account: self.max_bytes_per_account,
         }
     }
 }

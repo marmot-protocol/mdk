@@ -2,101 +2,216 @@
 
 use super::*;
 
-/// The caller excludes every writer of this file and fences this directory's
-/// delivery work. Source bytes never change. The only irreversible operation
-/// (unlink) runs after the closed alias and final observed length are durable.
+/// What an account's delivery cursor shows for one closed source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceDelivery {
+    /// The cursor accepted every byte of this exact file, or it is empty.
+    Delivered,
+    /// The cursor still owes part of this file, or has not adopted it yet.
+    Undelivered,
+    /// No cursor will deliver this file: the account has none, the file
+    /// belongs to another source, or a cursor overflow already recorded its
+    /// loss.
+    Untracked,
+}
+
+/// A read-only snapshot of one account's delivery cursor. It classifies
+/// closed sources from their metadata, without opening them.
+pub struct DeliveryCursorView {
+    state: Option<State>,
+}
+
+impl DeliveryCursorView {
+    /// Load the cursor in `state_dir`, if the account has one.
+    pub fn load(state_dir: &Path) -> io::Result<Self> {
+        let state = match read_cursor(state_dir)? {
+            None => None,
+            Some(bytes) => {
+                let mut state = decode_state(&bytes, "version-1.jsonl")?;
+                // A version 1 cursor did not record its source; its journals'
+                // names show it. One that tracks nothing cannot say which
+                // files it owes, so the budget leaves the account alone.
+                if cursor_version(&bytes)? == 1 {
+                    let journal = state
+                        .journals
+                        .first()
+                        .ok_or_else(|| invalid("version 1 delivery cursor names no source"))?;
+                    state.source = source_family(Path::new(&journal.segment))?.0;
+                }
+                check_header(&state)?;
+                validate_state(&state, &state.source)?;
+                Some(state)
+            }
+        };
+        Ok(Self { state })
+    }
+
+    pub fn source_delivery(&self, path: &Path) -> io::Result<SourceDelivery> {
+        let Some(state) = &self.state else {
+            return Ok(SourceDelivery::Untracked);
+        };
+        let metadata = fs::symlink_metadata(path)?;
+        if !metadata.is_file() {
+            return Err(invalid("source is not a regular file"));
+        }
+        let (active_name, index) = source_family(path)?;
+        if state.source != active_name {
+            return Ok(SourceDelivery::Untracked);
+        }
+        let identity = match metadata_identity(&metadata) {
+            Some(identity) => identity,
+            None => source_identity(path)?,
+        };
+        let modified = modified_ns(&metadata);
+        let matched = find_journal(state, identity);
+        if let Some(journal) = matched.map(|index| &state.journals[index]) {
+            // Without opening the file, only its name and modification time
+            // show the row still describes it rather than a reused inode.
+            let name = path.file_name().and_then(|n| n.to_str());
+            if name != Some(journal.segment.as_str())
+                || journal.modified == 0
+                || journal.modified != modified
+            {
+                return Ok(SourceDelivery::Undelivered);
+            }
+        }
+        Ok(classify(state, matched, index, metadata.len(), modified))
+    }
+}
+
+/// Age expiry. The caller excludes every writer of this file and fences this
+/// directory's delivery work. Source bytes never change. The only
+/// irreversible operation (unlink) runs after the closed alias, its final
+/// observed length and any `ExpiredUndelivered` gap for its unaccepted extent
+/// are durable.
 pub fn expire_closed_source(path: &Path, state_dir: &Path) -> io::Result<bool> {
     expire_with(
         path,
         state_dir,
+        Expiry::Age,
         |target| fs::remove_file(target),
         |delivery| delivery.publish(),
     )
 }
 
+/// Size-budget eviction, under the same exclusion as [`expire_closed_source`].
+/// Removes the file only when the cursor shows nothing left to deliver from
+/// it ([`SourceDelivery::Delivered`] or [`SourceDelivery::Untracked`]);
+/// otherwise returns `Ok(false)` and leaves file and cursor untouched.
+pub fn evict_delivered_source(path: &Path, state_dir: &Path) -> io::Result<bool> {
+    expire_with(
+        path,
+        state_dir,
+        Expiry::Budget,
+        |target| fs::remove_file(target),
+        |delivery| delivery.publish(),
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Expiry {
+    /// Remove whatever is left, recording undelivered data as a gap.
+    Age,
+    /// Remove only what the cursor no longer owes.
+    Budget,
+}
+
 pub(super) fn expire_with(
     path: &Path,
     state_dir: &Path,
+    expiry: Expiry,
     unlink: impl FnOnce(&Path) -> io::Result<()>,
     publish: impl FnOnce(&mut LocalAuditDelivery) -> io::Result<()>,
 ) -> io::Result<bool> {
     let state_path = state_dir.join("local-delivery.json");
-    let state_metadata = match fs::symlink_metadata(state_dir) {
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            return remove_without_cursor(path, unlink);
-        }
-        Ok(meta) if meta.is_dir() => fs::symlink_metadata(&state_path),
-        _ => return Err(invalid("invalid delivery state directory")),
+    let Some(bytes) = read_cursor(state_dir)? else {
+        return remove_without_cursor(path, unlink);
     };
-    match state_metadata {
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            return remove_without_cursor(path, unlink);
-        }
-        Ok(meta) if meta.is_file() => {}
-        _ => return Err(invalid("invalid delivery state file")),
-    }
     let mut source = open_source(path)?;
     let identity = file_identity(&source)?;
-    let len = source.metadata()?.len();
+    let metadata = source.metadata()?;
+    let (len, modified) = (metadata.len(), modified_ns(&metadata));
     let name = path
         .file_name()
         .and_then(|n| n.to_str())
         .ok_or_else(|| invalid("invalid source name"))?;
-    let stem = name
+    let (active_name, segment_index) = source_family(path)?;
+    let stem = active_name
         .strip_suffix(".jsonl")
-        .ok_or_else(|| invalid("invalid source name"))?;
-    let stem = match stem.rsplit_once("-seg") {
-        Some((base, index)) if index.len() >= 6 && index.parse::<u32>().is_ok() => base,
-        _ => stem,
-    };
-    let active_name = format!("{stem}.jsonl");
-    let segment_prefix = format!("{stem}-seg");
-    let state = decode_state(&read_private_file(&state_path)?, &active_name)?;
+        .ok_or_else(|| invalid("invalid source name"))?
+        .to_owned();
     // One directory can retain files from a previous device identity. Its
     // current cursor has no authority over a different source family.
-    if state.source != active_name
-        || !state
-            .journals
-            .iter()
-            .any(|j| j.segment == active_name || j.segment.starts_with(&segment_prefix))
-    {
-        return remove_without_cursor(path, unlink);
-    }
-    check_header(&state)?;
-    validate_state(&state, &active_name)?;
-    let Some(index) = state
-        .journals
-        .iter()
-        .position(|j| !j.missing && (j.device, j.inode) == identity)
-    else {
+    let Some(mut state) = decode_for_family(&bytes, &active_name)? else {
         return remove_without_cursor(path, unlink);
     };
-    let journal = &state.journals[index];
-    // Reused identities or externally changed sources retain the ordinary
-    // conservative missing-source behavior. Never bless those bytes as ACKed,
-    // and never without a stored head to compare against.
-    if journal.fingerprint.is_empty()
-        || len < journal.observed_len
-        || len < journal.fingerprint_len as u64
-        || !fingerprint_matches(
-            &journal.fingerprint,
-            &fingerprint(&mut source, journal.fingerprint_len as usize)?,
-        )
-    {
+    let matched = find_journal(&state, identity);
+    let status = classify(&state, matched, segment_index, len, modified);
+    if status == SourceDelivery::Untracked {
         return remove_without_cursor(path, unlink);
     }
-    // An unchanged sealed alias already has a durable final-length proof.
-    // Ordinary expiry needs no cursor rewrite or extra staging space.
-    if name != active_name && journal.segment == name && journal.observed_len == len {
+    if let Some(index) = matched {
+        let journal = &state.journals[index];
+        // Reused identities or externally changed sources retain the ordinary
+        // conservative missing-source behavior. Never bless those bytes as ACKed,
+        // and never without a stored head to compare against.
+        if journal.fingerprint.is_empty()
+            || len < journal.observed_len
+            || len < journal.fingerprint_len as u64
+            || !fingerprint_matches(
+                &journal.fingerprint,
+                &fingerprint(&mut source, journal.fingerprint_len as usize)?,
+            )
+        {
+            return match expiry {
+                Expiry::Age => remove_without_cursor(path, unlink),
+                Expiry::Budget => Ok(false),
+            };
+        }
+    }
+    let delivered = status == SourceDelivery::Delivered;
+    if !delivered && expiry == Expiry::Budget {
+        return Ok(false);
+    }
+    // An unchanged delivered sealed alias already has a durable final-length
+    // proof, and an empty unadopted file holds nothing. Ordinary expiry needs
+    // no cursor rewrite or extra staging space.
+    let unchanged_alias = matched.is_some_and(|index| {
+        name != active_name
+            && state.journals[index].segment == name
+            && state.journals[index].observed_len == len
+    });
+    if delivered && (unchanged_alias || matched.is_none()) {
         return remove_without_cursor(path, unlink);
     }
+    let renamed = name == active_name;
     let mut original = state.clone();
-    if name == active_name {
-        original.journals[index].segment = active_name.clone();
-    }
+    let index = match matched {
+        Some(index) => {
+            if renamed {
+                original.journals[index].segment = active_name.clone();
+            }
+            index
+        }
+        // Undelivered bytes the cursor has not adopted yet. Adopt them under
+        // a fresh generation so the gap below names them.
+        None => {
+            let fingerprint_len = (len as usize).min(FINGERPRINT_BYTES) as u8;
+            let fingerprint = fingerprint(&mut source, fingerprint_len as usize)?;
+            register_journal(
+                &mut state,
+                name.to_owned(),
+                identity.0,
+                identity.1,
+                fingerprint,
+                fingerprint_len,
+                len,
+            )?;
+            state.journals.len() - 1
+        }
+    };
     let active = path.with_file_name(&active_name);
     let mut target = path.to_owned();
-    let renamed = name == active_name;
     let mut delivery = LocalAuditDelivery {
         active,
         state_path,
@@ -141,11 +256,33 @@ pub(super) fn expire_with(
             .ok_or_else(|| invalid("invalid sealed source"))?
             .to_owned();
         journal.observed_len = len;
+        journal.modified = modified;
         journal.fingerprint_len = len.min(FINGERPRINT_BYTES as u64) as u8;
         journal.fingerprint = fingerprint(&mut source, journal.fingerprint_len as usize)?;
+        if !delivered {
+            // Retention is about to destroy the unaccepted extent: record it
+            // as lost and advance past it, as a skipped record does, so the
+            // absent file later retires without a second, generic gap.
+            let gap = DeliveryGap {
+                generation: journal.generation,
+                segment: journal.segment.clone(),
+                start: journal
+                    .prepared
+                    .as_ref()
+                    .map_or(journal.acknowledged, |p| p.start),
+                end: Some(len),
+                reason: GapReason::ExpiredUndelivered,
+            };
+            journal.acknowledged = len;
+            journal.prepared = None;
+            journal.blocked = None;
+            journal.split_records = None;
+            append_gap(&mut delivery.state, gap);
+        }
         // This publication is the retirement intent: immutable closed source,
-        // exact final byte length, and unchanged ACK/prepared range. Crash at
-        // any later point leaves either that closed file or its absence.
+        // exact final byte length, and the ACK/prepared range or the gap that
+        // replaces it. Crash at any later point leaves either that closed
+        // file or its absence.
         publish(&mut delivery)?;
         match unlink(&target) {
             Ok(()) => Ok(true),
@@ -165,6 +302,117 @@ pub(super) fn expire_with(
         return Err(error);
     }
     result
+}
+
+/// The live journal with this file's identity. Callers confirm it still
+/// describes these bytes: by head fingerprint, or by name and modification
+/// time when they do not open the file.
+fn find_journal(state: &State, identity: (u64, u64)) -> Option<usize> {
+    state
+        .journals
+        .iter()
+        .position(|j| !j.missing && (j.device, j.inode) == identity)
+}
+
+/// What the cursor shows for one source of its own family, given the journal
+/// that tracks it.
+fn classify(
+    state: &State,
+    matched: Option<usize>,
+    segment_index: Option<u32>,
+    len: u64,
+    modified: u64,
+) -> SourceDelivery {
+    match matched.map(|index| &state.journals[index]) {
+        Some(journal) => {
+            if journal.prepared.is_none()
+                && journal.observed_len == len
+                && journal.acknowledged == len
+            {
+                SourceDelivery::Delivered
+            } else {
+                SourceDelivery::Undelivered
+            }
+        }
+        None if len == 0 => SourceDelivery::Delivered,
+        // An overflow gap already covers sealed segments it stopped tracking.
+        None if state
+            .overflow_floor
+            .zip(segment_index)
+            .is_some_and(|(floor, index)| {
+                index <= floor && modified <= state.overflow_floor_modified
+            }) =>
+        {
+            SourceDelivery::Untracked
+        }
+        None => SourceDelivery::Undelivered,
+    }
+}
+
+/// The cursor's bytes, or `None` when the account never configured delivery.
+fn read_cursor(state_dir: &Path) -> io::Result<Option<Vec<u8>>> {
+    match fs::symlink_metadata(state_dir) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Ok(meta) if meta.is_dir() => {}
+        _ => return Err(invalid("invalid delivery state directory")),
+    }
+    let state_path = state_dir.join("local-delivery.json");
+    match fs::symlink_metadata(&state_path) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Ok(meta) if meta.is_file() => read_private_file(&state_path).map(Some),
+        _ => Err(invalid("invalid delivery state file")),
+    }
+}
+
+/// The cursor, if it governs `active_name`'s source family. A version 1
+/// cursor did not record its source, so only its journals' names show it.
+fn decode_for_family(bytes: &[u8], active_name: &str) -> io::Result<Option<State>> {
+    let version = cursor_version(bytes)?;
+    let state = decode_state(bytes, active_name)?;
+    let stem = active_name
+        .strip_suffix(".jsonl")
+        .ok_or_else(|| invalid("invalid source name"))?;
+    let governs = if version == 1 {
+        state
+            .journals
+            .iter()
+            .any(|j| j.segment == active_name || sealed_index(stem, &j.segment).is_some())
+    } else {
+        state.source == active_name
+    };
+    if !governs {
+        return Ok(None);
+    }
+    check_header(&state)?;
+    validate_state(&state, active_name)?;
+    Ok(Some(state))
+}
+
+fn cursor_version(bytes: &[u8]) -> io::Result<u8> {
+    #[derive(Deserialize)]
+    struct Header {
+        version: u8,
+    }
+    Ok(serde_json::from_slice::<Header>(bytes)
+        .map_err(|_| invalid("corrupt delivery cursor"))?
+        .version)
+}
+
+/// The active recorder name a source belongs to, and its segment index.
+fn source_family(path: &Path) -> io::Result<(String, Option<u32>)> {
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| invalid("invalid source name"))?;
+    let stem = name
+        .strip_suffix(".jsonl")
+        .ok_or_else(|| invalid("invalid source name"))?;
+    if let Some((base, _)) = stem.rsplit_once("-seg")
+        && let Some(index) = sealed_index(base, name)
+    {
+        return Ok((format!("{base}.jsonl"), Some(index)));
+    }
+    Ok((name.to_owned(), None))
 }
 
 fn remove_without_cursor(

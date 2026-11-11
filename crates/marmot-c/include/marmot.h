@@ -3760,6 +3760,21 @@ typedef struct MarmotAuditLogSettings {
 } MarmotAuditLogSettings;
 
 /**
+ * Local audit-log retention policy. Also a borrowed input to
+ * `marmot_set_audit_log_retention`.
+ */
+typedef struct MarmotAuditLogRetention {
+  /**
+   * Maximum file age in days, 1 to 30.
+   */
+  uint32_t max_age_days;
+  /**
+   * Per-account size budget in bytes, at least 16 MiB.
+   */
+  uint64_t max_bytes_per_account;
+} MarmotAuditLogRetention;
+
+/**
  * One on-disk audit-log file.
  */
 typedef struct MarmotAuditLogFile {
@@ -10256,6 +10271,19 @@ MarmotStatus marmot_audit_log_settings(const struct MarmotClient *client,
                                        struct MarmotAuditLogSettings **out);
 
 /**
+ * Current local audit-log retention policy. Free with
+ * `marmot_audit_log_retention_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_audit_log_retention(const struct MarmotClient *client,
+                                        struct MarmotAuditLogRetention **out);
+
+/**
  * On-disk audit-log files. Free with
  * `marmot_audit_log_file_list_free`.
  *
@@ -11500,6 +11528,19 @@ MarmotStatus marmot_set_relay_telemetry_runtime_config(const struct MarmotClient
 MarmotStatus marmot_set_audit_log_settings(const struct MarmotClient *client,
                                            const struct MarmotAuditLogSettings *settings,
                                            struct MarmotAuditLogSettings **out);
+
+/**
+ * Replace the local audit-log retention policy. The stored value, clamped to
+ * 1-30 days and at least 16 MiB per account, is returned. Free the result with
+ * `marmot_audit_log_retention_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; `retention` a valid borrowed struct;
+ * `out` valid.
+ */
+MarmotStatus marmot_set_audit_log_retention(const struct MarmotClient *client,
+                                            const struct MarmotAuditLogRetention *retention,
+                                            struct MarmotAuditLogRetention **out);
 
 /**
  * Replace the audit-log tracker endpoint config. Free the result with
@@ -14819,6 +14860,16 @@ void marmot_agent_stream_update_free(struct MarmotAgentStreamUpdate *update);
  * this library.
  */
 void marmot_audit_log_settings_free(struct MarmotAuditLogSettings *ptr);
+
+/**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
+void marmot_audit_log_retention_free(struct MarmotAuditLogRetention *ptr);
 
 /**
  * Free a value of this type returned by this library. NULL

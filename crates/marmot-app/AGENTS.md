@@ -919,9 +919,12 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   and retries like any other rejection.
   Shutdown cancels pending or in-flight automatic work; unacknowledged files remain on disk.
   Tests may shorten the window per runtime via `test-policy-overrides`; paused-clock tests pin the production default.
-  `audit_log/retention.rs` owns the fixed 30-day local forensic retention policy, independently of uploads and consent.
+  `audit_log/retention.rs` owns the local forensic retention policy, independently of uploads and consent: a
+  host-configured maximum age (1-30 days, default 30) and per-account size budget (default 256 MiB, at least 16 MiB),
+  persisted in shared storage. The budget evicts the oldest sealed segments only when no delivery cursor still owes
+  them (mdk#3300); undelivered data leaves only by age, recording an `ExpiredUndelivered` gap, or by explicit clear.
   Sweep metadata on exclusive-root startup and hourly across accounts and failed-wipe remnants, independent of
-  account workers. Use a size-one candidate queue and per-file storage admission. Retire through local delivery before
+  account workers; check budgets on request (recording activity, delivery passes), spaced at least 30 seconds. Use a size-one candidate queue and per-file storage admission. Retire through local delivery before
   unlinking; drain directory-local cursor work, cancel only a prepared attempt owning that inode and block new
   reservations for that directory. Other uploads must remain valid; never globally fence orphan/tombstone cleanup;
   never rewrite rows or unlink the actual live inode. Serialize the weak registry with writer creation and let the

@@ -863,6 +863,30 @@ Persist local forensic audit-log recording settings and return the stored value.
 
 [Source](src/commands/audit.rs#L27)
 
+### `Marmot::audit_log_retention`
+
+**Current.**
+
+```rust
+pub fn audit_log_retention(&self) -> Result<AuditLogRetentionFfi, MarmotKitError>
+```
+
+Read the persisted local audit retention policy: maximum file age in days and per-account size budget in bytes. Defaults to 30 days and 256 MiB.
+
+[Source](src/commands/audit.rs#L40)
+
+### `Marmot::set_audit_log_retention`
+
+**Current.**
+
+```rust
+pub fn set_audit_log_retention( &self, retention: AuditLogRetentionFfi, ) -> Result<AuditLogRetentionFfi, MarmotKitError>
+```
+
+Persist the local audit retention policy and return the stored value, with `max_age_days` clamped to 1-30 and `max_bytes_per_account` to at least 16 MiB. Files past the age are deleted whether or not v5 delivery accepted them; deleting undelivered data records an `ExpiredUndelivered` gap. Above the budget, only the oldest sealed segments that v5 delivery accepted, or that no v5 delivery will send, are deleted. A running app sweeps under the new policy shortly after; explicit delete and clear calls are unaffected.
+
+[Source](src/commands/audit.rs#L48)
+
 ### `Marmot::set_audit_log_tracker_config`
 
 **Current.**
@@ -873,7 +897,7 @@ pub fn set_audit_log_tracker_config( &self, config: AuditLogTrackerConfigV4Ffi, 
 
 Supply non-persisted audit tracker upload metadata: optional Goggles upload URL override, bearer token from the host app, and optional system hardware model, platform, and app version.
 
-[Source](src/commands/audit.rs#L44)
+[Source](src/commands/audit.rs#L64)
 
 ### `Marmot::audit_log_files`
 
@@ -5282,7 +5306,7 @@ pub fn set_audit_otlp_config_v5( &self, mut config: AuditOtlpConfigV5Ffi, ) -> R
 
 Install or remove an in-memory v5 OTLP audit destination. With `enabled: true`, provide a stable destination identity, an HTTPS `/v1/logs` endpoint, and a bearer token; local loopback testing additionally requires `allow_loopback_dev: true`. The returned configuration always omits the token. With `enabled: false`, the runtime clears the sender. This does not enable recording, change the v4 Goggles route, or persist credentials. A configuration change fences in-flight acknowledgments.
 
-[Source](src/commands/audit.rs#L55)
+[Source](src/commands/audit.rs#L75)
 
 </details>
 

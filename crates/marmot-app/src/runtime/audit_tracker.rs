@@ -11,7 +11,7 @@ use tokio::task::JoinHandle;
 use super::audit_delivery_status::{audit_delivery_paused, classify_attempt_error};
 use super::{AttemptStatus, AuditOtlpAttemptOutcome, attempt_audit_otlp_once};
 use super::{RuntimeLifecycle, runtime_shutdown_requested, wait_for_runtime_shutdown};
-use crate::audit_log::{AuditOtlpTrackerResult, AuditUploadAttempt};
+use crate::audit_log::{AuditOtlpTrackerResult, AuditRetentionWorker, AuditUploadAttempt};
 use crate::{
     AppError, AuditDeliveryFailureKind, AuditLogFile, AuditLogTrackerConfig,
     AuditLogTrackerUpdateResult, MarmotApp,
@@ -60,6 +60,7 @@ pub(crate) struct AuditLogTrackerUploader {
     config: Arc<StdMutex<AuditLogTrackerConfig>>,
     otlp_sender: Arc<StdMutex<Option<Arc<AuditOtlpSender>>>>,
     lifecycle: RuntimeLifecycle,
+    retention: AuditRetentionWorker,
     batch_window: AuditBatchWindow,
     worker: Arc<StdMutex<Option<AuditLogTrackerWorker>>>,
 }
@@ -75,12 +76,14 @@ impl AuditLogTrackerUploader {
         config: Arc<StdMutex<AuditLogTrackerConfig>>,
         otlp_sender: Arc<StdMutex<Option<Arc<AuditOtlpSender>>>>,
         lifecycle: RuntimeLifecycle,
+        retention: AuditRetentionWorker,
     ) -> Self {
         Self {
             app,
             config,
             otlp_sender,
             lifecycle,
+            retention,
             batch_window: AuditBatchWindow::default(),
             worker: Arc::new(StdMutex::new(None)),
         }
@@ -107,6 +110,7 @@ impl AuditLogTrackerUploader {
                 self.config.clone(),
                 self.otlp_sender.clone(),
                 self.lifecycle.clone(),
+                self.retention.clone(),
                 receiver,
                 stopping,
                 self.batch_window.clone(),
@@ -158,11 +162,13 @@ impl AuditLogTrackerUploader {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_audit_log_tracker_uploader(
     app: MarmotApp,
     config: Arc<StdMutex<AuditLogTrackerConfig>>,
     otlp_sender: Arc<StdMutex<Option<Arc<AuditOtlpSender>>>>,
     lifecycle: RuntimeLifecycle,
+    retention: AuditRetentionWorker,
     commands: mpsc::Receiver<&'static str>,
     stopping: watch::Receiver<bool>,
     window: AuditBatchWindow,
@@ -179,6 +185,7 @@ async fn run_audit_log_tracker_uploader(
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
         let lifecycle = lifecycle.clone();
+        let retention = retention.clone();
         async move {
             let mut schedule = AuditPassSchedule::default();
             match post_audit_log_tracker_update_with_v5(
@@ -213,6 +220,8 @@ async fn run_audit_log_tracker_uploader(
                     schedule.failed(Duration::ZERO);
                 }
             }
+            // Delivered segments are now evictable under the size budget.
+            retention.request_budget_check();
             schedule
         }
     })
