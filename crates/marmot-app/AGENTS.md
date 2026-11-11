@@ -45,7 +45,11 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   `SetupRecords`, which reads durable records only. Runtime sign-out, wipe and removal also wait for admitted
   foreground generated setup. Wipe takes this fence before its network stages and passes it into local removal,
   rather than taking the foreground transaction again. Local removal takes generated preparation admission only
-  after foreground setup finishes. Setup reaches workers only through the worker-lifecycle surface
+  after foreground setup finishes. Preparation captures the effective context with its chosen identity.
+  Once selected, that identity uses `Continue` even if another attempt clears its journal. A cleared journal may mean
+  successful completion: coalesce from current completion data, never relabel a local snapshot as network-ready.
+  Teardown rechecks the captured public key after its fence wait and rejects a label reused for another identity.
+  Setup reaches workers only through the worker-lifecycle surface
   commented on `AccountManager` in `runtime/mod.rs`, each call keeping its lock state: the worker transaction is a
   tokio `Mutex` and not reentrant. A worker setup takes out of the map is reaped through setup's cancellation
   registry, never `worker_reapers`. Teardown lock order: the background setup fence, the per-account onboarding

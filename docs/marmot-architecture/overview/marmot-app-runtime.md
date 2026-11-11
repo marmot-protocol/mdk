@@ -77,6 +77,15 @@ finishes, so waiting for publication does not block all local preparation.
 A handoff that arrives after removal finds no account to continue. Startup also
 ends quietly when the captured account has been removed or signed out.
 
+Local preparation captures the effective setup context with its selected account.
+A foreground handoff does not reload context after another attempt may have
+cleared it. When another attempt completes the same account, coalescing reads its
+current relay status, profile, readiness and requested confirmed KeyPackage size
+rather than reporting the account as missing.
+
+Teardown rechecks the captured public key after waiting for its fence. If a label
+was reused during that wait, the replacement account is not signed out or removed.
+
 `SharedServices` should hold runtime state shared by every account:
 
 - directory/user cache;

@@ -4848,6 +4848,7 @@ impl MarmotAppRuntime {
                 .setup
                 .fence_generated_teardown(&self.accounts, &account.account_id_hex)
                 .await;
+            self.accounts.resolve_original(&account)?;
             let mut outcome = SignOutOutcome::default();
 
             // Step 1 (KeyPackage hygiene): delete this device's slot before
@@ -4977,6 +4978,7 @@ impl MarmotAppRuntime {
             .setup
             .fence_generated_teardown(&self.accounts, &account.account_id_hex)
             .await;
+        let account = self.accounts.resolve_original(&account)?;
         let mut outcome = WipeOutcome::default();
 
         // From here until the wipe returns, the device group's removal of
@@ -5090,7 +5092,7 @@ impl MarmotAppRuntime {
         // single all-or-nothing step.
         match self
             .accounts
-            .remove_account_fenced(&account.label, &generated_setup_fence)
+            .remove_account_fenced(&account, &generated_setup_fence)
             .await
         {
             Ok(()) => {
@@ -7081,6 +7083,14 @@ impl AccountManager {
         Ok(self.app.account_home().account(account_ref)?)
     }
 
+    fn resolve_original(&self, expected: &AccountSummary) -> Result<AccountSummary, AppError> {
+        let account = self.app.account_home().account(&expected.label)?;
+        if account.account_id_hex != expected.account_id_hex {
+            return Err(AccountHomeError::UnknownAccount(expected.account_id_hex.clone()).into());
+        }
+        Ok(account)
+    }
+
     fn schedule_audit_log_tracker_update(&self, trigger: &'static str) {
         self.shared.schedule_audit_log_tracker_update(trigger);
     }
@@ -7091,21 +7101,25 @@ impl AccountManager {
             .setup
             .fence_generated_teardown(self, &account.account_id_hex)
             .await;
-        self.remove_account_fenced(&account.label, &fence).await
+        self.remove_account_fenced(&account, &fence).await
     }
 
     // Wipe already owns the account's foreground fence before its network
     // stages. Reuse it rather than taking that non-reentrant transaction again.
     async fn remove_account_fenced(
         &self,
-        account_ref: &str,
+        expected: &AccountSummary,
         fence: &onboarding::GeneratedTeardownFence,
     ) -> Result<(), AppError> {
+        // A label may have been reused while foreground setup finished.
+        // Check before purging reports and after taking the worker transaction.
+        self.resolve_original(expected)?;
+
         // Stop and delete the account's moderation reports, and admit none
         // until the removal below has committed (every removal entry point).
         // Fenced before the global lock: the purge may open account storage.
         // Removing the directory deletes the rows even if this purge fails.
-        let (_report_fence, _) = self.fence_moderation_reports(account_ref).await;
+        let (_report_fence, _) = self.fence_moderation_reports(&expected.label).await;
         let _preparation = self.setup.fence_generated_removal(fence).await;
         let lock_wait = self
             .shared
@@ -7115,7 +7129,7 @@ impl AccountManager {
         let _worker_transaction = self.worker_transactions.lock().await;
         lock_wait.finish(TelemetryOutcome::Success);
         self.shared.lifecycle().ensure_running()?;
-        let account = self.app.account_home().account(account_ref)?;
+        let account = self.resolve_original(expected)?;
         for task in self
             .app
             .abort_public_indexer_copies_for_account(&account.account_id_hex)

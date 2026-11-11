@@ -8293,6 +8293,245 @@ struct GeneratedSetupRemovalRun {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_creates_coalesce() {
+    let (_dir, runtime, network, secrets) = generated_setup_fixture();
+    network.block_publish.store(true, Ordering::SeqCst);
+    let first = runtime.create_identity(generated_setup_request());
+    tokio::pin!(first);
+    timeout(Duration::from_secs(30), async {
+        tokio::select! {
+            _ = network.publishing.notified() => {}
+            result = first.as_mut() => panic!("first create returned before its held publication: {result:?}"),
+        }
+    }).await.unwrap();
+    assert_eq!(network.held_publishes.load(Ordering::SeqCst), 1);
+    let original = runtime.accounts.app.account_home().accounts().unwrap();
+    assert_eq!(original.len(), 1);
+
+    let second = runtime.create_identity(generated_setup_request());
+    tokio::pin!(second);
+    assert!(futures::poll!(second.as_mut()).is_pending());
+    assert_eq!(
+        *secrets.written.lock(),
+        vec![original[0].account_id_hex.clone()]
+    );
+    network.block_publish.store(false, Ordering::SeqCst);
+    network.release_publish.notify_waiters();
+    let (first, second) = timeout(Duration::from_secs(30), async {
+        tokio::join!(first, second)
+    })
+    .await
+    .unwrap();
+    let first = first.unwrap();
+    let second = second.unwrap();
+    assert_eq!(first.account, original[0]);
+    assert_eq!(second.account, original[0]);
+    assert_network_setup(&runtime, &network, &first);
+    assert_network_setup(&runtime, &network, &second);
+    assert_eq!(first.relay_lists, second.relay_lists);
+    assert_eq!(first.key_package_bytes, second.key_package_bytes);
+    assert_eq!(
+        runtime.accounts.app.account_home().accounts().unwrap(),
+        original
+    );
+    assert_eq!(*secrets.written.lock(), vec![first.account.account_id_hex]);
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+fn assert_network_setup(
+    runtime: &MarmotAppRuntime,
+    network: &Network,
+    result: &AccountSetupResult,
+) {
+    const NIP65_KIND: u64 = 10002;
+    const INBOX_KIND: u64 = 10050;
+    const KEY_PACKAGE_KIND: u64 = 30443;
+
+    assert_eq!(result.readiness, AccountSetupReadiness::NetworkReady);
+    assert!(result.relay_lists.complete);
+    assert!(result.relay_lists.missing.is_empty());
+    assert_eq!(
+        result.relay_lists.nip65.relays,
+        vec!["wss://default.example"]
+    );
+    assert_eq!(
+        result.relay_lists.inbox.relays,
+        vec!["wss://default.example"]
+    );
+    let bytes = {
+        let accepted = network.events.lock();
+        let relay_list = accepted
+            .iter()
+            .rfind(|event| {
+                event.kind == NIP65_KIND && event.pubkey == result.account.account_id_hex
+            })
+            .expect("network-ready setup must have an accepted relay list");
+        let inbox = accepted
+            .iter()
+            .rfind(|event| {
+                event.kind == INBOX_KIND && event.pubkey == result.account.account_id_hex
+            })
+            .expect("network-ready setup must have an accepted inbox list");
+        assert_eq!(result.relay_lists.nip65.created_at, relay_list.created_at);
+        assert_eq!(result.relay_lists.inbox.created_at, inbox.created_at);
+        let published = accepted
+            .iter()
+            .rfind(|event| {
+                event.kind == KEY_PACKAGE_KIND && event.pubkey == result.account.account_id_hex
+            })
+            .expect("network-ready setup must have an accepted KeyPackage");
+        base64::Engine::decode(
+            &base64::engine::general_purpose::STANDARD,
+            &published.content,
+        )
+        .unwrap()
+    };
+    assert_eq!(result.key_package_bytes, Some(bytes.len()));
+    let lifecycle = runtime
+        .accounts
+        .app
+        .account_storage(&result.account.label)
+        .unwrap()
+        .key_package_lifecycle()
+        .unwrap()
+        .unwrap();
+    assert_eq!(lifecycle.current_key_package.unwrap().bytes(), bytes);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn background_wins_handoff() {
+    let (_dir, runtime, network, secrets) = generated_setup_fixture();
+    let local = runtime
+        .create_generated_account_local_ready(
+            generated_setup_request(),
+            false,
+            None,
+            GeneratedIdentity::ResumeOrCreate,
+        )
+        .await
+        .unwrap();
+    assert_eq!(local.readiness, AccountSetupReadiness::LocalReady);
+    let original = local.account.clone();
+    let context: GeneratedAccountSetupContext = serde_json::from_slice(
+        &runtime
+            .accounts
+            .app
+            .account_home()
+            .account_setup_context(&original.label)
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    runtime.start().await.unwrap();
+    timeout(
+        Duration::from_secs(30),
+        runtime.setup.join_generated_setup_tasks_for_test(),
+    )
+    .await
+    .expect("startup background setup must finish");
+    assert_eq!(
+        runtime
+            .account_setup_readiness(&original.account_id_hex)
+            .unwrap(),
+        AccountSetupReadiness::NetworkReady
+    );
+    let completed = timeout(
+        Duration::from_secs(30),
+        runtime.finish_generated_setup(local, context),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(completed.account, original);
+    assert_network_setup(&runtime, &network, &completed);
+    assert_eq!(
+        runtime.accounts.app.account_home().accounts().unwrap(),
+        vec![original.clone()]
+    );
+    assert_eq!(*secrets.written.lock(), vec![original.account_id_hex]);
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[derive(Clone, Copy, Debug)]
+enum AccountTeardown {
+    Remove,
+    SignOut,
+    Wipe,
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn label_reuse_keeps_replacement() {
+    for teardown in [
+        AccountTeardown::Remove,
+        AccountTeardown::SignOut,
+        AccountTeardown::Wipe,
+    ] {
+        let (_dir, runtime, network, secrets) = generated_setup_fixture();
+        let home = runtime.accounts.app.account_home();
+        let original = home.create_account("reused-label").unwrap();
+        let transaction = runtime
+            .account_setup()
+            .onboarding_transaction(&original.account_id_hex);
+        let gate = transaction.lock().await;
+        let manager = runtime.accounts();
+        let removal = async {
+            match teardown {
+                AccountTeardown::Remove => manager.remove_account(&original.label).await,
+                AccountTeardown::SignOut => runtime
+                    .sign_out(&original.label, SignOutOptions::default())
+                    .await
+                    .map(|_| ()),
+                AccountTeardown::Wipe => {
+                    runtime.sign_out_and_wipe(&original.label).await.map(|_| ())
+                }
+            }
+        };
+        tokio::pin!(removal);
+        assert!(futures::poll!(removal.as_mut()).is_pending());
+        assert!(
+            runtime
+                .setup
+                .generated_setup_fenced_for_test(&original.account_id_hex)
+        );
+        home.remove_account(&original.label).unwrap();
+        let replacement = home.create_account(&original.label).unwrap();
+        assert_ne!(replacement.account_id_hex, original.account_id_hex);
+        drop(gate);
+        let removed = timeout(Duration::from_secs(30), removal).await.unwrap();
+        assert!(
+            matches!(removed,
+            Err(AppError::AccountHome(AccountHomeError::UnknownAccount(id)))
+                if id == original.account_id_hex),
+            "{teardown:?} must reject the removed original"
+        );
+        assert_eq!(home.accounts().unwrap(), vec![replacement.clone()]);
+        assert!(
+            marmot_account::AccountSecretStore::has_secret_for_label(
+                secrets.as_ref(),
+                &replacement.label,
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            home.load_signing_keys(&replacement.label)
+                .unwrap()
+                .public_key()
+                .to_hex(),
+            replacement.account_id_hex
+        );
+        assert_eq!(
+            *secrets.written.lock(),
+            vec![original.account_id_hex, replacement.account_id_hex]
+        );
+        assert!(
+            network.attempts.lock().is_empty(),
+            "{teardown:?} must not publish for the replacement"
+        );
+        runtime.shutdown_and_close().await.unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stale_foreground_stays_gone() {
     for keep_other in [false, true] {
         let (_dir, runtime, network, secrets) = generated_setup_fixture();
@@ -8509,10 +8748,6 @@ async fn foreground_before_withdrawal() {
         }).await.unwrap();
         network.block_publish.store(false, Ordering::SeqCst);
 
-        let transaction = runtime
-            .account_setup()
-            .onboarding_transaction(&original.account_id_hex);
-        let owners = Arc::strong_count(&transaction);
         let teardown = async {
             match removal {
                 GeneratedSetupRemoval::Wipe => runtime
@@ -8526,26 +8761,11 @@ async fn foreground_before_withdrawal() {
             }
         };
         tokio::pin!(teardown);
-        // Drive real teardown until it finishes or queues for the account's
-        // foreground gate. The extra Arc is only a staging signal: the oracle
-        // below is the order of published KeyPackage and slot-deletion events.
-        let completed = timeout(
-            Duration::from_secs(30),
-            std::future::poll_fn(|cx| {
-                if let std::task::Poll::Ready(result) = teardown.as_mut().poll(cx) {
-                    return std::task::Poll::Ready(Some(result));
-                }
-                if Arc::strong_count(&transaction) > owners {
-                    return std::task::Poll::Ready(None);
-                }
-                std::task::Poll::Pending
-            }),
-        )
-        .await
-        .unwrap();
+        assert!(futures::poll!(teardown.as_mut()).is_pending());
         assert!(
-            completed.is_none(),
-            "{removal:?} teardown overtook foreground setup: {completed:?}"
+            runtime
+                .setup
+                .generated_setup_fenced_for_test(&original.account_id_hex)
         );
         assert!(
             !network.events.lock().iter().any(|event| event.kind == 5),
@@ -8558,12 +8778,16 @@ async fn foreground_before_withdrawal() {
             .unwrap()
             .unwrap();
         assert_eq!(finished.readiness, AccountSetupReadiness::NetworkReady);
-        assert!(
-            timeout(Duration::from_secs(30), teardown)
-                .await
-                .unwrap()
-                .unwrap()
-        );
+        let manager = runtime.accounts();
+        let contender = manager.remove_account(&original.account_id_hex);
+        tokio::pin!(contender);
+        timeout(Duration::from_secs(30), async {
+            tokio::select! {
+                biased;
+                result = contender.as_mut() => panic!("competing removal overtook queued {removal:?}: {result:?}"),
+                result = teardown.as_mut() => assert!(result.unwrap()),
+            }
+        }).await.expect("the queued teardown must finish before competing removal");
         let published = network.events.lock().clone();
         let withdrawal = published
             .iter()
@@ -8595,6 +8819,15 @@ async fn foreground_before_withdrawal() {
                 *secrets.written.lock(),
                 vec![original.account_id_hex.clone()]
             );
+        }
+        let removed = timeout(Duration::from_secs(30), contender).await.unwrap();
+        if removal == GeneratedSetupRemoval::Wipe {
+            assert!(matches!(removed,
+                Err(AppError::AccountHome(AccountHomeError::UnknownAccount(id)))
+                    if id == original.account_id_hex));
+        } else {
+            removed.unwrap();
+            assert_setup_stayed_removed(&runtime, &secrets, &original, None);
         }
         runtime.shutdown_and_close().await.unwrap();
     }

@@ -7,6 +7,23 @@ use super::*;
 const GENERATED_SETUP_BACKGROUND_MAX_ATTEMPTS: usize = 3;
 const GENERATED_SETUP_BACKGROUND_RETRY_BASE_DELAY: Duration = Duration::from_millis(100);
 
+#[derive(Clone, Copy)]
+enum GeneratedSetupHandoff {
+    Foreground,
+    Background,
+}
+
+#[derive(Clone, Copy)]
+enum InitialPublication {
+    Requested,
+    Skipped,
+}
+
+enum GeneratedSetupPreparation {
+    Pending(AccountSetupResult, GeneratedAccountSetupContext),
+    Complete(AccountSetupResult),
+}
+
 impl MarmotAppRuntime {
     pub(in crate::runtime) async fn resume_generated_account_setup(&self) -> Result<(), AppError> {
         let Some(account) = self
@@ -103,15 +120,43 @@ impl MarmotAppRuntime {
         initial_profile: Option<UserProfileMetadata>,
         generated: GeneratedIdentity<'_>,
     ) -> Result<AccountSetupResult, AppError> {
+        self.shared.lifecycle().ensure_running()?;
+        let _generated_setup_transaction =
+            self.setup.generated_setup_local_transaction.lock().await;
+        let handoff = if schedule_background {
+            GeneratedSetupHandoff::Background
+        } else {
+            GeneratedSetupHandoff::Foreground
+        };
+        match self
+            .prepare_generated_account(request, handoff, initial_profile, generated)
+            .await?
+        {
+            GeneratedSetupPreparation::Pending(local, context) => {
+                if schedule_background {
+                    self.schedule_generated_account_setup(local.account.clone(), context);
+                }
+                Ok(local)
+            }
+            GeneratedSetupPreparation::Complete(complete) => Ok(complete),
+        }
+    }
+
+    // The caller holds local preparation admission until this returns.
+    // Capture the effective context with its identity, not in a later lookup.
+    async fn prepare_generated_account(
+        &self,
+        request: AccountSetupRequest,
+        handoff: GeneratedSetupHandoff,
+        initial_profile: Option<UserProfileMetadata>,
+        generated: GeneratedIdentity<'_>,
+    ) -> Result<GeneratedSetupPreparation, AppError> {
         let observed = self.shared.observer.product().observed(
             crate::ProductFamily::Account,
             "local_ready",
             crate::ProductUnit::Attempt,
         );
         let work = async move {
-            self.shared.lifecycle().ensure_running()?;
-            let _generated_setup_transaction =
-                self.setup.generated_setup_local_transaction.lock().await;
             self.shared.lifecycle().ensure_running()?;
             validate_account_setup_request(&request, AccountSetupOperation::CreateOrImport)?;
 
@@ -121,11 +166,17 @@ impl MarmotAppRuntime {
                     .app
                     .account_home()
                     .resumable_generated_account_setup()?,
-                GeneratedIdentity::Continue(id) => Some(
-                    self.accounts
-                        .pending_generated_account(id)?
-                        .ok_or_else(|| AccountHomeError::UnknownAccount(id.to_owned()))?,
-                ),
+                GeneratedIdentity::Continue(id) => {
+                    let account = self.accounts.app.account_home().account(id)?;
+                    if account.account_id_hex != id
+                        || account.signed_out
+                        || account.unlinked
+                        || !account.local_signing
+                    {
+                        return Err(AccountHomeError::UnknownAccount(id.to_owned()).into());
+                    }
+                    Some(account)
+                }
             };
             // Persisted relays win on resume so every retry retains the exact
             // locally prepared initial KeyPackage and its publication targets.
@@ -142,6 +193,11 @@ impl MarmotAppRuntime {
                 None => GeneratedAccountSetupContext::from_request(&request),
             };
             let effective_request = context.request();
+            let publication = if effective_request.publish_initial_key_package {
+                InitialPublication::Requested
+            } else {
+                InitialPublication::Skipped
+            };
             let bootstrap = AccountRelayListBootstrap::new(
                 effective_request.default_relays.clone(),
                 effective_request.bootstrap_relays.clone(),
@@ -154,163 +210,198 @@ impl MarmotAppRuntime {
                 .app
                 .validate_account_relay_list_declarations(&bootstrap, None)?;
 
-            let identity_started = Instant::now();
-            let identity_result = self
-                .accounts
-                .create_nostr_account_from_setup(&effective_request, generated);
-            self.shared.observer.performance().record(
-                AppPerformanceOperation::AccountSetupIdentityLocal,
-                identity_started.elapsed(),
-                identity_result.is_ok(),
-            );
-            let (account, _) = identity_result?;
-            if self
-                .accounts
-                .app
-                .account_home()
-                .account_setup_context(&account.label)?
-                .is_none()
-            {
-                self.accounts
-                    .app
-                    .account_home()
-                    .set_account_setup_context(&account.label, &serde_json::to_vec(&context)?)?;
-            }
-            let storage_started = Instant::now();
-            let storage_result = self.accounts.app.account_storage(&account.label);
-            self.shared.observer.performance().record(
-                AppPerformanceOperation::AccountSetupStorageLocal,
-                storage_started.elapsed(),
-                storage_result.is_ok(),
-            );
-            storage_result?;
-            let phase = self
-                .accounts
-                .app
-                .account_home()
-                .account_setup_state(&account.label)?
-                .map(|state| state.phase)
-                .ok_or(AppError::AccountSetupRetryRequired)?;
-
-            let profile_started = Instant::now();
-            let profile_result = (|| {
-                let cached = self
+            // Once selected, keep this exact identity even if publication clears
+            // its journal before local preparation reaches it.
+            let generated = resumable.as_ref().map_or(generated, |account| {
+                GeneratedIdentity::Continue(&account.account_id_hex)
+            });
+            let result = async {
+                let identity_started = Instant::now();
+                let identity_result = self
+                    .accounts
+                    .create_nostr_account_from_setup(&effective_request, generated);
+                self.shared.observer.performance().record(
+                    AppPerformanceOperation::AccountSetupIdentityLocal,
+                    identity_started.elapsed(),
+                    identity_result.is_ok(),
+                );
+                let (account, _) = identity_result?;
+                if self
                     .accounts
                     .app
-                    .directory()
-                    .directory_entry_for_account_id(&account.account_id_hex)?
-                    .and_then(|entry| entry.profile);
-                let (profile, store) = generated_setup_profile(
-                    &account.account_id_hex,
-                    phase,
-                    cached,
-                    initial_profile,
-                    unix_now_seconds(),
+                    .account_home()
+                    .account_setup_context(&account.label)?
+                    .is_none()
+                {
+                    self.accounts.app.account_home().set_account_setup_context(
+                        &account.label,
+                        &serde_json::to_vec(&context)?,
+                    )?;
+                }
+                let storage_started = Instant::now();
+                let storage_result = self.accounts.app.account_storage(&account.label);
+                self.shared.observer.performance().record(
+                    AppPerformanceOperation::AccountSetupStorageLocal,
+                    storage_started.elapsed(),
+                    storage_result.is_ok(),
                 );
-                if store {
-                    self.accounts
+                storage_result?;
+                let phase = self
+                    .accounts
+                    .app
+                    .account_home()
+                    .account_setup_state(&account.label)?
+                    .map(|state| state.phase)
+                    .ok_or(AppError::AccountSetupRetryRequired)?;
+
+                let profile_started = Instant::now();
+                let profile_result = (|| {
+                    let cached = self
+                        .accounts
                         .app
                         .directory()
-                        .remember_directory_profile(&account.account_id_hex, &profile)?;
-                }
-                Ok::<_, AppError>(profile)
-            })();
-            self.shared.observer.performance().record(
-                AppPerformanceOperation::AccountSetupProfileLocal,
-                profile_started.elapsed(),
-                profile_result.is_ok(),
-            );
-            let profile = profile_result?;
+                        .directory_entry_for_account_id(&account.account_id_hex)?
+                        .and_then(|entry| entry.profile);
+                    let (profile, store) = generated_setup_profile(
+                        &account.account_id_hex,
+                        phase,
+                        cached,
+                        initial_profile,
+                        unix_now_seconds(),
+                    );
+                    if store {
+                        self.accounts
+                            .app
+                            .directory()
+                            .remember_directory_profile(&account.account_id_hex, &profile)?;
+                    }
+                    Ok::<_, AppError>(profile)
+                })();
+                self.shared.observer.performance().record(
+                    AppPerformanceOperation::AccountSetupProfileLocal,
+                    profile_started.elapsed(),
+                    profile_result.is_ok(),
+                );
+                let profile = profile_result?;
 
-            let key_package_started = Instant::now();
-            let key_package_result = async {
-                if phase == AccountSetupPhase::LocalStateCreated {
-                    let mut client = self
-                        .accounts
-                        .app
-                        .local_client_with_relay_plane(
+                let key_package_started = Instant::now();
+                let key_package_result = async {
+                    if phase == AccountSetupPhase::LocalStateCreated {
+                        let mut client = self
+                            .accounts
+                            .app
+                            .local_client_with_relay_plane(
+                                &account.label,
+                                self.shared.relay_plane(),
+                                Some(self.shared.lifecycle()),
+                            )
+                            .await?;
+                        let key_package = client
+                            .prepare_initial_key_package(effective_request.default_relays.to_vec())
+                            .await?;
+                        let bytes = key_package.bytes().len();
+                        drop(client);
+                        self.accounts.app.account_home().set_account_setup_phase(
                             &account.label,
-                            self.shared.relay_plane(),
-                            Some(self.shared.lifecycle()),
-                        )
-                        .await?;
-                    let key_package = client
-                        .prepare_initial_key_package(effective_request.default_relays.to_vec())
-                        .await?;
-                    let bytes = key_package.bytes().len();
-                    drop(client);
-                    self.accounts
-                        .app
-                        .account_home()
-                        .set_account_setup_phase(&account.label, AccountSetupPhase::LocalReady)?;
-                    self.accounts.app.presentation_signals.catalog_changed();
-                    Ok(bytes)
-                } else {
-                    let lifecycle = self
-                        .accounts
-                        .app
-                        .account_storage(&account.label)?
-                        .key_package_lifecycle()?
-                        .ok_or(AppError::AccountSetupRetryRequired)?;
-                    lifecycle
-                        .pending_replacement
-                        .as_ref()
-                        .map(|pending| pending.key_package.bytes().len())
-                        .or_else(|| {
-                            lifecycle
-                                .current_key_package
-                                .as_ref()
-                                .map(|key_package| key_package.bytes().len())
-                        })
-                        .ok_or(AppError::AccountSetupRetryRequired)
+                            AccountSetupPhase::LocalReady,
+                        )?;
+                        self.accounts.app.presentation_signals.catalog_changed();
+                        Ok(bytes)
+                    } else {
+                        let lifecycle = self
+                            .accounts
+                            .app
+                            .account_storage(&account.label)?
+                            .key_package_lifecycle()?
+                            .ok_or(AppError::AccountSetupRetryRequired)?;
+                        lifecycle
+                            .pending_replacement
+                            .as_ref()
+                            .map(|pending| pending.key_package.bytes().len())
+                            .or_else(|| {
+                                lifecycle
+                                    .current_key_package
+                                    .as_ref()
+                                    .map(|key_package| key_package.bytes().len())
+                            })
+                            .ok_or(AppError::AccountSetupRetryRequired)
+                    }
                 }
+                .await;
+                self.shared.observer.performance().record(
+                    AppPerformanceOperation::AccountSetupKeyPackageLocal,
+                    key_package_started.elapsed(),
+                    key_package_result.is_ok(),
+                );
+                let key_package_bytes = key_package_result?;
+                if phase == AccountSetupPhase::LocalStateCreated
+                    && matches!(handoff, GeneratedSetupHandoff::Foreground)
+                {
+                    self.accounts
+                        .reset_startup_retry(&account.account_id_hex)
+                        .await;
+                }
+
+                let relay_lists = self
+                    .accounts
+                    .app
+                    .account_relay_list_status(&account.label)?;
+                let readiness = self.account_setup_readiness(&account.label)?;
+                if matches!(handoff, GeneratedSetupHandoff::Background) {
+                    let handoff_started_at = Instant::now();
+                    let handoff_result = if phase == AccountSetupPhase::LocalStateCreated {
+                        self.accounts
+                            .retry_and_reconcile_for_account(&account.account_id_hex)
+                            .await
+                    } else {
+                        self.accounts
+                            .reconcile_for_account(&account.account_id_hex)
+                            .await
+                    };
+                    self.shared.observer.performance().record(
+                        AppPerformanceOperation::AccountSetupLocalReadyHandoff,
+                        handoff_started_at.elapsed(),
+                        handoff_result.is_ok(),
+                    );
+                    handoff_result?;
+                }
+                Ok(AccountSetupResult {
+                    account,
+                    relay_lists,
+                    key_package_bytes: effective_request
+                        .publish_initial_key_package
+                        .then_some(key_package_bytes),
+                    profile: Some(profile),
+                    readiness,
+                })
             }
             .await;
-            self.shared.observer.performance().record(
-                AppPerformanceOperation::AccountSetupKeyPackageLocal,
-                key_package_started.elapsed(),
-                key_package_result.is_ok(),
-            );
-            let key_package_bytes = key_package_result?;
-            if phase == AccountSetupPhase::LocalStateCreated && !schedule_background {
-                self.accounts
-                    .reset_startup_retry(&account.account_id_hex)
-                    .await;
+            let local = match result {
+                Ok(local) => local,
+                Err(
+                    error @ (AppError::AccountHome(
+                        AccountHomeError::UnknownAccount(_)
+                        | AccountHomeError::AccountSetupStateMissing,
+                    )
+                    | AppError::AccountSetupRetryRequired),
+                ) => {
+                    if let Some(account) = resumable.as_ref()
+                        && let Some(complete) =
+                            self.completed_generated_setup(&account.account_id_hex, publication)?
+                    {
+                        return Ok(GeneratedSetupPreparation::Complete(complete));
+                    }
+                    return Err(error);
+                }
+                Err(error) => return Err(error),
+            };
+            if local.readiness == AccountSetupReadiness::NetworkReady
+                && let Some(complete) =
+                    self.completed_generated_setup(&local.account.account_id_hex, publication)?
+            {
+                return Ok(GeneratedSetupPreparation::Complete(complete));
             }
-
-            let relay_lists = self
-                .accounts
-                .app
-                .account_relay_list_status(&account.label)?;
-            let readiness = self.account_setup_readiness(&account.label)?;
-            if schedule_background {
-                let handoff_started_at = Instant::now();
-                let handoff_result = if phase == AccountSetupPhase::LocalStateCreated {
-                    self.accounts
-                        .retry_and_reconcile_for_account(&account.account_id_hex)
-                        .await
-                } else {
-                    self.accounts
-                        .reconcile_for_account(&account.account_id_hex)
-                        .await
-                };
-                self.shared.observer.performance().record(
-                    AppPerformanceOperation::AccountSetupLocalReadyHandoff,
-                    handoff_started_at.elapsed(),
-                    handoff_result.is_ok(),
-                );
-                handoff_result?;
-                self.schedule_generated_account_setup(account.clone(), context);
-            }
-            Ok(AccountSetupResult {
-                account,
-                relay_lists,
-                key_package_bytes: effective_request
-                    .publish_initial_key_package
-                    .then_some(key_package_bytes),
-                profile: Some(profile),
-                readiness,
-            })
+            Ok(GeneratedSetupPreparation::Pending(local, context))
         };
         observed
             .run_async(work, marmot_observability::success_or_failure)
@@ -321,25 +412,24 @@ impl MarmotAppRuntime {
         &self,
         request: AccountSetupRequest,
     ) -> Result<AccountSetupResult, AppError> {
-        let local = self
-            .create_generated_account_local_ready(
+        self.shared.lifecycle().ensure_running()?;
+        let preparation = {
+            let _generated_setup_transaction =
+                self.setup.generated_setup_local_transaction.lock().await;
+            self.prepare_generated_account(
                 request,
-                false,
+                GeneratedSetupHandoff::Foreground,
                 None,
                 GeneratedIdentity::ResumeOrCreate,
             )
-            .await?;
-        let context = self
-            .accounts
-            .app
-            .account_home()
-            .account_setup_context(&local.account.label)?
-            .ok_or(AppError::AccountSetupRetryRequired)
-            .and_then(|bytes| {
-                serde_json::from_slice::<GeneratedAccountSetupContext>(&bytes)
-                    .map_err(AppError::from)
-            })?;
-        self.finish_generated_setup(local, context).await
+            .await?
+        };
+        match preparation {
+            GeneratedSetupPreparation::Pending(local, context) => {
+                self.finish_generated_setup(local, context).await
+            }
+            GeneratedSetupPreparation::Complete(complete) => Ok(complete),
+        }
     }
 
     pub(super) async fn finish_generated_setup(
@@ -351,20 +441,89 @@ impl MarmotAppRuntime {
         let setup = self.account_setup();
         let transaction = setup.onboarding_transaction(&local.account.account_id_hex);
         let _transaction = transaction.lock().await;
+        let request = context.request();
+        let publication = if request.publish_initial_key_package {
+            InitialPublication::Requested
+        } else {
+            InitialPublication::Skipped
+        };
         let result = self
             .accounts
-            .continue_generated_account_setup(&local.account.account_id_hex, context.request())
+            .continue_generated_account_setup(&local.account.account_id_hex, request)
             .await;
+        let result = match result {
+            Ok(mut result) => {
+                if result.profile.is_none() {
+                    result.profile = local.profile;
+                }
+                Ok(result)
+            }
+            Err(
+                error @ (AppError::AccountHome(
+                    AccountHomeError::UnknownAccount(_)
+                    | AccountHomeError::AccountSetupStateMissing,
+                )
+                | AppError::AccountSetupRetryRequired),
+            ) => self
+                .completed_generated_setup(&local.account.account_id_hex, publication)
+                .and_then(|complete| complete.ok_or(error)),
+            Err(error) => Err(error),
+        };
         self.shared.observer.performance().record(
             AppPerformanceOperation::AccountSetupNetworkReady,
             started_at.elapsed(),
             result.is_ok(),
         );
-        let mut result = result?;
-        if result.profile.is_none() {
-            result.profile = local.profile;
+        result
+    }
+
+    fn completed_generated_setup(
+        &self,
+        account_id_hex: &str,
+        publication: InitialPublication,
+    ) -> Result<Option<AccountSetupResult>, AppError> {
+        let home = self.accounts.app.account_home();
+        let account = home.account(account_id_hex)?;
+        if account.account_id_hex != account_id_hex
+            || account.signed_out
+            || account.unlinked
+            || !account.local_signing
+        {
+            return Err(AccountHomeError::UnknownAccount(account_id_hex.to_owned()).into());
         }
-        Ok(result)
+        if home.account_setup_state(&account.label)?.is_some() {
+            return Ok(None);
+        }
+        let readiness = self.account_setup_readiness(&account.label)?;
+        if readiness != AccountSetupReadiness::NetworkReady {
+            return Ok(None);
+        }
+        let relay_lists = self
+            .accounts
+            .app
+            .account_relay_list_status(&account.label)?;
+        let profile = self
+            .accounts
+            .app
+            .directory()
+            .directory_entry_for_account_id(account_id_hex)?
+            .and_then(|entry| entry.profile);
+        let key_package_bytes = if matches!(publication, InitialPublication::Requested) {
+            Some(
+                self.accounts
+                    .confirmed_setup_key_package_bytes(&account.label)?
+                    .ok_or(AppError::AccountSetupRetryRequired)?,
+            )
+        } else {
+            None
+        };
+        Ok(Some(AccountSetupResult {
+            account,
+            relay_lists,
+            key_package_bytes,
+            profile,
+            readiness,
+        }))
     }
 
     /// Publish `account`'s generated setup in the background. The task
