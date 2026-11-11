@@ -774,7 +774,13 @@ async fn every_kind_of_own_commit_tags_a_leaf_that_needs_a_tag() {
         .await
         .unwrap();
     clock.advance_ms(75);
-    laptop.engine.advance_convergence(gid).await.unwrap();
+    // Explicit clock time, through the same drain: the host entry point's
+    // wall-clock slice can expire on a loaded runner before this work lands.
+    laptop
+        .engine
+        .converge_and_drain_queued_outbound_intents(gid, clock.now().monotonic_ms)
+        .await
+        .unwrap();
     let mut publications = laptop.engine.drain_auto_publish();
     assert_eq!(publications.len(), 1);
     laptop

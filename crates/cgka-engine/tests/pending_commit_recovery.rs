@@ -17,8 +17,8 @@
 #![allow(clippy::disallowed_methods)]
 
 use async_trait::async_trait;
-use cgka_engine::EngineBuilder;
 use cgka_engine::feature_registry::FeatureRegistry;
+use cgka_engine::{ConvergenceClock, EngineBuilder};
 use cgka_traits::engine::{CgkaEngine, CreateGroupRequest, GroupEvent, SendIntent, SendResult};
 use cgka_traits::error::PeelerError;
 use cgka_traits::group_context::GroupContextSnapshot;
@@ -452,7 +452,12 @@ async fn reopen_preserves_deferred_selfremove_auto_commit() {
         assert!(matches!(outcome, IngestOutcome::Processed));
         assert!(alice.drain_auto_publish().is_empty());
         clock.advance_ms(75);
-        let advanced = alice.advance_convergence(&group_id).await.unwrap();
+        // Explicit clock time, through the same drain: the host entry point's
+        // wall-clock slice can expire on a loaded runner before this work lands.
+        let advanced = alice
+            .converge_and_drain_queued_outbound_intents(&group_id, clock.now().monotonic_ms)
+            .await
+            .unwrap();
         assert!(advanced.is_empty());
         // Once the delayed auto-commit is staged, bob is projected out of the
         // record (epoch advances to the projected value, bob dropped).

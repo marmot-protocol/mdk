@@ -20,7 +20,7 @@ use cgka_engine::canonicalization::CanonicalizationPolicy;
 use cgka_engine::convergence::ConvergencePolicy;
 use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_engine::message_processor::MAX_QUEUED_OUTBOUND_INTENTS_PER_GROUP;
-use cgka_engine::{EngineBuilder, ManualConvergenceClock};
+use cgka_engine::{ConvergenceClock, EngineBuilder, ManualConvergenceClock};
 use cgka_traits::EngineError;
 use cgka_traits::OutboundFanout;
 use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
@@ -252,7 +252,11 @@ async fn active_rival_rearms_disband_then_terminal_retry_keeps_authenticated_ros
     sibling.join_welcome(welcomes.remove(0)).await.unwrap();
     bob.ingest(msg).await.unwrap();
     clock.advance_ms(1_000);
-    bob.advance_convergence(&gid).await.unwrap();
+    // Explicit clock time, through the same drain: the host entry point's
+    // wall-clock slice can expire on a loaded runner before this work lands.
+    bob.converge_and_drain_queued_outbound_intents(&gid, clock.now().monotonic_ms)
+        .await
+        .unwrap();
     assert_eq!(alice.members(&gid).unwrap().len(), 3);
     let source_epoch = alice.epoch(&gid).unwrap();
     assert_eq!(bob.epoch(&gid).unwrap(), source_epoch);
@@ -289,7 +293,10 @@ async fn active_rival_rearms_disband_then_terminal_retry_keeps_authenticated_ros
     else {
         panic!("disband request")
     };
-    let prepared = alice.advance_convergence(&gid).await.unwrap();
+    let prepared = alice
+        .converge_and_drain_queued_outbound_intents(&gid, clock.now().monotonic_ms)
+        .await
+        .unwrap();
     let (_, pending) = evolution(
         prepared
             .into_iter()
@@ -323,7 +330,10 @@ async fn active_rival_rearms_disband_then_terminal_retry_keeps_authenticated_ros
     let winner_epoch = alice.epoch(&gid).unwrap();
     assert_eq!(winner_epoch, EpochId(source_epoch.0 + 1));
     alice.drain_events();
-    let prepared = alice.advance_convergence(&gid).await.unwrap();
+    let prepared = alice
+        .converge_and_drain_queued_outbound_intents(&gid, clock.now().monotonic_ms)
+        .await
+        .unwrap();
     assert_eq!(prepared.len(), 1);
     let (terminal, pending) = evolution(prepared.into_iter().next().unwrap());
     let candidates = storage.list_disband_candidates(&gid).unwrap();
@@ -356,12 +366,24 @@ async fn active_rival_rearms_disband_then_terminal_retry_keeps_authenticated_ros
     assert!(!storage.list_group_snapshots(&gid).unwrap().is_empty());
     alice.confirm_published(pending).await.unwrap();
     clock.advance_ms(1_000);
-    assert!(alice.advance_convergence(&gid).await.unwrap().is_empty());
+    assert!(
+        alice
+            .converge_and_drain_queued_outbound_intents(&gid, clock.now().monotonic_ms)
+            .await
+            .unwrap()
+            .is_empty()
+    );
     // Confirmation schedules the terminal pass; its first advance opens the
     // mandatory collection window, and the next advance settles that window.
     assert!(storage.disband_tombstone(&gid).unwrap().is_none());
     clock.advance_ms(1_000);
-    assert!(alice.advance_convergence(&gid).await.unwrap().is_empty());
+    assert!(
+        alice
+            .converge_and_drain_queued_outbound_intents(&gid, clock.now().monotonic_ms)
+            .await
+            .unwrap()
+            .is_empty()
+    );
     let tombstone = storage
         .disband_tombstone(&gid)
         .unwrap()

@@ -116,7 +116,12 @@ async fn assert_failed_descriptor_retry(disband: bool) {
         ))
         .unwrap();
     let failed = if disband {
-        alice.advance_convergence(&group_id).await.map(|_| ())
+        // Explicit clock time, through the same drain: the host entry point's
+        // wall-clock slice can expire on a loaded runner before this work lands.
+        alice
+            .converge_and_drain_queued_outbound_intents(&group_id, clock.now().monotonic_ms)
+            .await
+            .map(|_| ())
     } else {
         alice
             .send(SendIntent::SelfUpdate {
@@ -169,7 +174,10 @@ async fn assert_failed_descriptor_retry(disband: bool) {
     assert_eq!(storage.get_group(&group_id).unwrap(), before_group);
     assert_eq!(storage.disband_request(&group_id).unwrap(), request);
     let retry = if disband {
-        let mut prepared = alice.advance_convergence(&group_id).await.unwrap();
+        let mut prepared = alice
+            .converge_and_drain_queued_outbound_intents(&group_id, clock.now().monotonic_ms)
+            .await
+            .unwrap();
         assert_eq!(prepared.len(), 1);
         prepared.remove(0)
     } else {
@@ -196,7 +204,7 @@ async fn assert_failed_descriptor_retry(disband: bool) {
             clock.advance_ms(1_000);
             assert!(
                 alice
-                    .advance_convergence(&group_id)
+                    .converge_and_drain_queued_outbound_intents(&group_id, clock.now().monotonic_ms)
                     .await
                     .unwrap()
                     .is_empty()
