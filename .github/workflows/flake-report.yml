@@ -6,8 +6,8 @@ name: Flaky test leaderboard
 #
 # GITHUB_TOKEN allows 1,000 API requests an hour, shared with every other
 # workflow in the repository, and each merge-queue run costs about 22. A run
-# therefore leaves 600 requests unspent and fetches about 18 new runs; it runs
-# four times a day to keep up with the queue. Run summaries carry over between
+# starts no new fetch once fewer than 600 requests remain, so it fetches about
+# 18 new runs; it runs four times a day to keep up with the queue. Run summaries carry over between
 # runs in the flake-report-cache artifact, so nothing is fetched twice.
 on:
   schedule:
