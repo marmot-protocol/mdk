@@ -8869,6 +8869,87 @@ async fn stale_signed_out_stays_quiet() {
     runtime.shutdown_and_close().await.unwrap();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn signed_out_allows_new_setup() {
+    for unlinked in [false, true] {
+        let (_dir, runtime, network, secrets) = generated_setup_fixture();
+        let original = runtime
+            .create_generated_account_local_ready(
+                generated_setup_request(),
+                false,
+                None,
+                GeneratedIdentity::ResumeOrCreate,
+            )
+            .await
+            .unwrap();
+        runtime
+            .sign_out(&original.account.account_id_hex, SignOutOptions::default())
+            .await
+            .unwrap();
+        let home = runtime.accounts.app.account_home();
+        if unlinked {
+            home.mark_account_unlinked(&original.account.label).unwrap();
+        }
+        let inactive = home.account(&original.account.label).unwrap();
+        let journal = home.account_setup_state(&inactive.label).unwrap().unwrap();
+        let context = home.account_setup_context(&inactive.label).unwrap();
+
+        let foreground = timeout(
+            Duration::from_secs(30),
+            runtime.create_identity(generated_setup_request()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_ne!(foreground.account.account_id_hex, inactive.account_id_hex);
+        assert_network_setup(&runtime, &network, &foreground);
+
+        let local = timeout(
+            Duration::from_secs(30),
+            runtime.create_identity_local_ready(generated_setup_request()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_ne!(local.account.account_id_hex, inactive.account_id_hex);
+        assert_ne!(
+            local.account.account_id_hex,
+            foreground.account.account_id_hex
+        );
+        timeout(
+            Duration::from_secs(30),
+            runtime.setup.join_generated_setup_tasks_for_test(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(home.account(&inactive.label).unwrap(), inactive);
+        assert_eq!(
+            home.account_setup_state(&inactive.label).unwrap(),
+            Some(journal)
+        );
+        assert_eq!(
+            home.account_setup_context(&inactive.label).unwrap(),
+            context
+        );
+        let mut expected = vec![
+            inactive.clone(),
+            foreground.account.clone(),
+            local.account.clone(),
+        ];
+        expected.sort_by(|a, b| a.account_id_hex.cmp(&b.account_id_hex));
+        assert_eq!(home.accounts().unwrap(), expected);
+        assert_eq!(
+            *secrets.written.lock(),
+            vec![
+                inactive.account_id_hex,
+                foreground.account.account_id_hex,
+                local.account.account_id_hex
+            ]
+        );
+        runtime.shutdown_and_close().await.unwrap();
+    }
+}
+
 impl GeneratedSetupRemovalRun {
     /// Whether a KeyPackage was published after the teardown withdrew the
     /// slot (its kind-5 deletion), which must be the last word on it.

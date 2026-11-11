@@ -72,6 +72,8 @@ Neither handoff creates a replacement if that account has been removed.
 Sign-out and wipe fence background setup and wait for admitted foreground
 publication before withdrawing the device's KeyPackage slot. Wipe reuses this
 fence for local removal rather than taking the foreground transaction again.
+This per-account transaction also serializes interactive onboarding steps;
+teardown waits for an admitted step, including its network work.
 Removal takes local preparation admission afterward and holds it until deletion
 finishes, so waiting for publication does not block all local preparation.
 A handoff that arrives after removal finds no account to continue. Startup also
@@ -82,6 +84,7 @@ A foreground handoff does not reload context after another attempt may have
 cleared it. When another attempt completes the same account, coalescing reads its
 current relay status, profile, readiness and requested confirmed KeyPackage size
 rather than reporting the account as missing.
+New setup skips signed-out and unlinked journals, leaving their accounts intact.
 
 Teardown rechecks the captured public key after waiting for its fence. If a label
 was reused during that wait, the replacement account is not signed out or removed.

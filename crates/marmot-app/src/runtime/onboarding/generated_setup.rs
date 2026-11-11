@@ -144,13 +144,13 @@ impl MarmotAppRuntime {
 
     // The caller holds local preparation admission until this returns.
     // Capture the effective context with its identity, not in a later lookup.
-    async fn prepare_generated_account(
-        &self,
+    fn prepare_generated_account<'a>(
+        &'a self,
         request: AccountSetupRequest,
         handoff: GeneratedSetupHandoff,
         initial_profile: Option<UserProfileMetadata>,
-        generated: GeneratedIdentity<'_>,
-    ) -> Result<GeneratedSetupPreparation, AppError> {
+        generated: GeneratedIdentity<'a>,
+    ) -> impl Future<Output = Result<GeneratedSetupPreparation, AppError>> + Send + 'a {
         let observed = self.shared.observer.product().observed(
             crate::ProductFamily::Account,
             "local_ready",
@@ -403,9 +403,7 @@ impl MarmotAppRuntime {
             }
             Ok(GeneratedSetupPreparation::Pending(local, context))
         };
-        observed
-            .run_async(work, marmot_observability::success_or_failure)
-            .await
+        observed.run_async(work, marmot_observability::success_or_failure)
     }
 
     pub(in crate::runtime) async fn create_generated_account_network_ready(

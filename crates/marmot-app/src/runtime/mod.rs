@@ -8318,13 +8318,12 @@ impl AccountManager {
     /// that account's: it fails with `UnknownAccount` once the account is
     /// removed, signed out or set up, instead of resuming or creating another
     /// identity (whitenoise-ios#1302).
-    pub(super) async fn continue_generated_account_setup(
-        &self,
-        account_id_hex: &str,
+    pub(super) fn continue_generated_account_setup<'a>(
+        &'a self,
+        account_id_hex: &'a str,
         request: AccountSetupRequest,
-    ) -> Result<AccountSetupResult, AppError> {
+    ) -> impl Future<Output = Result<AccountSetupResult, AppError>> + Send + 'a {
         self.create_or_import_account_as(request, GeneratedIdentity::Continue(account_id_hex))
-            .await
     }
 
     /// `account_id_hex` while its generated setup is still pending and may
