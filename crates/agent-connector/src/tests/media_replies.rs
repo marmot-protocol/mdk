@@ -116,6 +116,36 @@ fn media_refs(message: &AppMessageRecord) -> Vec<marmot_app::MediaAttachmentRefe
         .collect()
 }
 
+async fn check_media_reply(
+    runtime: &MarmotAppRuntime,
+    account: &str,
+    group: &GroupId,
+    message: &AppMessageRecord,
+    target: &str,
+    expected: &[(&str, &[u8])],
+) {
+    for name in ["e", "q"] {
+        assert_eq!(
+            message
+                .tags
+                .iter()
+                .filter(|tag| tag.first().map(String::as_str) == Some(name))
+                .collect::<Vec<_>>(),
+            vec![&vec![name.to_owned(), target.to_owned()]],
+        );
+    }
+    let media = media_refs(message);
+    assert_eq!(media.len(), expected.len());
+    for (reference, (name, bytes)) in media.into_iter().zip(expected) {
+        assert_eq!(reference.file_name.as_str(), *name);
+        let downloaded = runtime
+            .download_media(account, group, reference)
+            .await
+            .unwrap();
+        assert_eq!(downloaded.plaintext.as_slice(), *bytes);
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn media_replies_reach_recipient() {
     let dir = tempfile::tempdir().unwrap();
@@ -205,6 +235,72 @@ async fn media_replies_reach_recipient() {
         .unwrap();
     connector.start().await.unwrap();
     let listener = bind_connector_socket(&socket).unwrap();
+    let puts = blobs.puts.load(Ordering::SeqCst);
+    let mut worker = tokio::process::Command::new("python3");
+    worker
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../integrations/hermes/tests/marmot/media_reply_smoke.py"
+        ))
+        .args([
+            socket.to_str().unwrap(),
+            &agent.account_id_hex,
+            &group_hex,
+            &target,
+            dir.path().to_str().unwrap(),
+        ])
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .kill_on_drop(true);
+    let serve = async {
+        for _ in 0..6 {
+            connector
+                .serve_once(&listener)
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        Ok::<_, String>(())
+    };
+    let drive = async {
+        let output = worker.output().await.map_err(|error| error.to_string())?;
+        if !output.status.success() {
+            return Err(String::from_utf8_lossy(&output.stderr).into_owned());
+        }
+        Ok(output)
+    };
+    let ((), output) = timeout(CONTROL_RESPONSE_TIMEOUT, async {
+        tokio::try_join!(serve, drive)
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(response["dropped_response"], true);
+    let ids = response["message_ids_hex"].as_array().unwrap();
+    assert_eq!(ids.len(), 5);
+    for (index, id) in ids.iter().enumerate() {
+        let message = received_media(&app, &human.label, id.as_str().unwrap()).await;
+        let first = if index == 4 { 0 } else { index };
+        let name = format!("python-{first}.txt");
+        let bytes = format!("python attachment {first}");
+        let mut expected = vec![(name.as_str(), bytes.as_bytes())];
+        if index == 4 {
+            expected.push(("python-1.txt", b"python attachment 1"));
+        }
+        check_media_reply(
+            &connector.runtime,
+            &human.label,
+            &group,
+            &message,
+            &target,
+            &expected,
+        )
+        .await;
+    }
+    assert_eq!(
+        blobs.puts.load(Ordering::SeqCst),
+        puts + 6,
+        "the lost-response retry must not upload again"
+    );
     let contents = [
         b"first attachment".as_slice(),
         b"second attachment".as_slice(),
@@ -366,18 +462,36 @@ async fn media_replies_reach_recipient() {
         )
         .await
         .unwrap();
+    let references = upload
+        .attachments
+        .into_iter()
+        .map(|item| item.reference)
+        .collect::<Vec<_>>();
+    for invalid in ["not-hex".to_owned(), "ab".to_owned(), format!(" {target}")] {
+        let error = connector
+            .runtime
+            .submit_media_attachments(
+                &agent.label,
+                &group,
+                references.clone(),
+                None,
+                Some(invalid),
+                "invalid-app-target".into(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, AppError::InvalidAppMessagePayload(message) if message.contains("media reply target"))
+        );
+    }
     let accepted = connector
         .runtime
         .submit_media_attachments(
             &agent.label,
             &group,
-            upload
-                .attachments
-                .into_iter()
-                .map(|item| item.reference)
-                .collect(),
+            references,
             None,
-            Some(target.clone()),
+            Some(target.to_uppercase()),
             "standalone-media-reply".into(),
         )
         .await
@@ -393,6 +507,154 @@ async fn media_replies_reach_recipient() {
         .await
         .unwrap();
     assert_eq!(downloaded.plaintext, b"standalone attachment");
+    let durable_request = |message_tags| marmot_app::MediaUploadRequest {
+        attachments: vec![marmot_app::MediaUploadAttachmentRequest {
+            file_name: "durable.txt".into(),
+            media_type: "text/plain".into(),
+            plaintext: b"durable attachment".to_vec(),
+            dim: None,
+            thumbhash: None,
+        }],
+        caption: Some("durable reply".into()),
+        message_tags,
+        send: true,
+        blossom_server: None,
+    };
+    let puts = blobs.puts.load(Ordering::SeqCst);
+    for tags in [
+        vec![vec!["e".into(), "not-hex".into()]],
+        vec![vec!["q".into()]],
+        vec![
+            vec!["e".into(), target.clone()],
+            vec!["q".into(), other.clone()],
+        ],
+    ] {
+        let error = connector
+            .runtime
+            .upload_media_with_client_token(
+                &agent.label,
+                &group,
+                durable_request(tags),
+                "invalid-durable-reply".into(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, AppError::InvalidAppMessagePayload(_)));
+    }
+    assert_eq!(
+        blobs.puts.load(Ordering::SeqCst),
+        puts,
+        "invalid reply metadata must fail before PUT"
+    );
+    let (uploaded, accepted) = connector
+        .runtime
+        .upload_media_with_client_token(
+            &agent.label,
+            &group,
+            durable_request(vec![
+                vec!["e".into(), target.to_uppercase()],
+                vec!["q".into(), target.clone()],
+            ]),
+            "durable-media-reply".into(),
+        )
+        .await
+        .unwrap();
+    let accepted = accepted.unwrap();
+    let message = received_media(&app, &human.label, &accepted.message_id_hex).await;
+    check_media_reply(
+        &connector.runtime,
+        &human.label,
+        &group,
+        &message,
+        &target,
+        &[("durable.txt", b"durable attachment")],
+    )
+    .await;
+    let references = uploaded
+        .attachments
+        .into_iter()
+        .map(|item| item.reference)
+        .collect::<Vec<_>>();
+    let retry = connector
+        .runtime
+        .submit_media_attachments(
+            &agent.label,
+            &group,
+            references.clone(),
+            Some("durable reply".into()),
+            Some(target.to_uppercase()),
+            "durable-media-reply".into(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(retry, accepted);
+    let conflict = connector
+        .runtime
+        .submit_media_attachments(
+            &agent.label,
+            &group,
+            references,
+            Some("durable reply".into()),
+            Some(other.clone()),
+            "durable-media-reply".into(),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(conflict, AppError::InvalidAppMessagePayload(message) if message == "client token is already bound to another submission")
+    );
+
+    let path = dir.path().join("durable-file.txt");
+    std::fs::write(&path, b"file-backed attachment").unwrap();
+    let file_request = |message_tags| marmot_app::MediaFileUploadRequest {
+        attachments: vec![marmot_app::MediaFileUploadAttachmentRequest {
+            source_path: path.to_string_lossy().into_owned(),
+            expected_size: Some(22),
+            file_name: "durable-file.txt".into(),
+            media_type: "text/plain".into(),
+            dim: None,
+            thumbhash: None,
+        }],
+        caption: None,
+        message_tags,
+        send: true,
+        blossom_server: None,
+    };
+    let puts = blobs.puts.load(Ordering::SeqCst);
+    let invalid = connector
+        .runtime
+        .upload_media_files_with_client_token(
+            &agent.label,
+            &group,
+            file_request(vec![vec!["q".into(), "not-hex".into()]]),
+            Arc::new(marmot_app::MediaFileTransferControl::default()),
+            "invalid-file-reply".into(),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(invalid, AppError::InvalidAppMessagePayload(_)));
+    assert_eq!(blobs.puts.load(Ordering::SeqCst), puts);
+    let (_, accepted) = connector
+        .runtime
+        .upload_media_files_with_client_token(
+            &agent.label,
+            &group,
+            file_request(vec![vec!["q".into(), target.to_uppercase()]]),
+            Arc::new(marmot_app::MediaFileTransferControl::default()),
+            "durable-file-reply".into(),
+        )
+        .await
+        .unwrap();
+    let message = received_media(&app, &human.label, &accepted.unwrap().message_id_hex).await;
+    check_media_reply(
+        &connector.runtime,
+        &human.label,
+        &group,
+        &message,
+        &target,
+        &[("durable-file.txt", b"file-backed attachment")],
+    )
+    .await;
     let draft = connector
         .runtime
         .message_draft(&agent.label, &group_hex)
@@ -414,7 +676,7 @@ async fn media_replies_reach_recipient() {
         .collect::<Vec<_>>();
     assert_eq!(
         replies.len(),
-        3,
+        10,
         "matching retries must not publish another album"
     );
     connector.runtime.shutdown_and_close().await.unwrap();

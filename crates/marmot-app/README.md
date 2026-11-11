@@ -438,9 +438,17 @@ event journal.
 with an optional `reply_to_message_id` before its client-token argument. A target
 adds `e` and `q` reply tags to the same kind-9 message as every attachment and the
 optional caption. `None` sends ordinary media. The method validates the target
-without reading, consuming, or changing the composer draft. Tagged upload callers
-can capture the same reply references in `MediaUploadRequest::message_tags`, as
-White Noise Linux does before its upload worker starts.
+as exactly 32 bytes of hexadecimal and persists it in lowercase without reading,
+consuming, or changing the composer draft.
+
+`upload_media_with_client_token` and `upload_media_files_with_client_token`
+capture the reply from their request's `message_tags` when `send` is true, as
+White Noise Linux does before its upload worker starts. Either `e` or `q` may
+name the target; multiple references must agree, ignoring hexadecimal case.
+Reply references with missing, malformed, or conflicting targets fail before
+any PUT. Both wrappers retain the lowercase target through upload and durable
+admission without consulting the composer. With `send` false, their existing
+upload-only behavior is unchanged.
 
 ## Encrypted media endpoints
 

@@ -12,6 +12,39 @@ fn validate_client_token(client_token: &str) -> Result<(), AppError> {
     Ok(())
 }
 
+fn validate_media_reply_target(target: &str) -> Result<(), AppError> {
+    let mut bytes = [0u8; 32];
+    hex::decode_to_slice(target, &mut bytes).map_err(|_| {
+        AppError::InvalidAppMessagePayload(
+            "media reply target must be exactly 32 bytes of hexadecimal".into(),
+        )
+    })
+}
+
+fn capture_media_reply(tags: &[Vec<String>]) -> Result<Option<String>, AppError> {
+    let mut target: Option<&str> = None;
+    for tag in tags {
+        if !matches!(tag.first().map(String::as_str), Some("e" | "q")) {
+            continue;
+        }
+        let candidate = tag.get(1).ok_or_else(|| {
+            AppError::InvalidAppMessagePayload("media reply reference is missing its target".into())
+        })?;
+        validate_media_reply_target(candidate)?;
+        if target.is_some_and(|target| !target.eq_ignore_ascii_case(candidate)) {
+            return Err(AppError::InvalidAppMessagePayload(
+                "media reply references have conflicting targets".into(),
+            ));
+        }
+        target = Some(candidate);
+    }
+    Ok(target.map(|target| {
+        let mut target = target.to_owned();
+        target.make_ascii_lowercase();
+        target
+    }))
+}
+
 impl MarmotAppRuntime {
     /// Upload first, then durably admit the resulting message when `send` is set.
     /// Cancellation does not abandon an upload already handed to this task.
@@ -23,6 +56,11 @@ impl MarmotAppRuntime {
         client_token: String,
     ) -> Result<(MediaUploadResult, Option<crate::LocalSendAcceptance>), AppError> {
         validate_client_token(&client_token)?;
+        let reply_to = if request.send {
+            capture_media_reply(&request.message_tags)?
+        } else {
+            None
+        };
         let runtime = self.clone();
         let account = account.to_owned();
         let group = group.clone();
@@ -32,7 +70,16 @@ impl MarmotAppRuntime {
             let caption = request.caption.clone();
             let upload = runtime.upload_media(&account, &group, request).await?;
             runtime
-                .admit_uploaded_media(&account, &group, upload, send, caption, client_token, None)
+                .admit_uploaded_media(
+                    &account,
+                    &group,
+                    upload,
+                    send,
+                    caption,
+                    reply_to,
+                    client_token,
+                    None,
+                )
                 .await
         })
         .await
@@ -55,6 +102,11 @@ impl MarmotAppRuntime {
     ) -> Result<(MediaUploadResult, Option<crate::LocalSendAcceptance>), AppError> {
         validate_client_token(&client_token)?;
         control.check()?;
+        let reply_to = if request.send {
+            capture_media_reply(&request.message_tags)?
+        } else {
+            None
+        };
         let runtime = self.clone();
         let account = account.to_owned();
         let group = group.clone();
@@ -72,6 +124,7 @@ impl MarmotAppRuntime {
                     upload,
                     send,
                     caption,
+                    reply_to,
                     client_token,
                     Some(control),
                 )
@@ -92,6 +145,7 @@ impl MarmotAppRuntime {
         upload: MediaUploadResult,
         send: bool,
         caption: Option<String>,
+        reply_to: Option<String>,
         client_token: String,
         control: Option<Arc<crate::MediaFileTransferControl>>,
     ) -> Result<(MediaUploadResult, Option<crate::LocalSendAcceptance>), AppError> {
@@ -110,7 +164,7 @@ impl MarmotAppRuntime {
                         .map(|a| a.reference.clone())
                         .collect(),
                     caption,
-                    None,
+                    reply_to,
                     client_token,
                 )
                 .await
@@ -185,9 +239,13 @@ impl MarmotAppRuntime {
         group: &GroupId,
         attachments: Vec<MediaAttachmentReference>,
         caption: Option<String>,
-        reply_to_message_id: Option<String>,
+        mut reply_to_message_id: Option<String>,
         client_token: String,
     ) -> Result<crate::LocalSendAcceptance, AppError> {
+        if let Some(target) = reply_to_message_id.as_mut() {
+            validate_media_reply_target(target)?;
+            target.make_ascii_lowercase();
+        }
         self.submit_local_message(
             account,
             group,
