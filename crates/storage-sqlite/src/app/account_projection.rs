@@ -2081,24 +2081,34 @@ impl SqliteAppStorage {
         account_label: &str,
         account_id_hex: &str,
     ) -> StorageResult<AccountNotificationSettings> {
-        self.ensure_notification_settings(account_label, account_id_hex)?;
-        self.lock()?
-            .query_row_cached(
-                "SELECT account_label, account_id_hex, local_notifications_enabled,
-                        native_push_enabled
-                 FROM notification_settings
-                 WHERE account_label = ?1",
-                params![account_label],
-                |row| {
-                    Ok(AccountNotificationSettings {
-                        account_label: row.get(0)?,
-                        account_id_hex: row.get(1)?,
-                        local_notifications_enabled: row.get::<_, i64>(2)? != 0,
-                        native_push_enabled: row.get::<_, i64>(3)? != 0,
-                    })
-                },
-            )
-            .storage()
+        let conn = self.lock()?;
+        ensure_notice_settings(&conn, account_label, account_id_hex)?;
+        read_notice_settings(&conn, account_label)
+    }
+
+    /// Read committed settings and their matching database revision.
+    /// Initializes defaults when missing. Caller-owned transactions are rejected
+    /// so uncommitted settings cannot enter a notification cache.
+    pub fn notification_policy_snapshot(
+        &self,
+        account_label: &str,
+        account_id_hex: &str,
+    ) -> StorageResult<(AccountNotificationSettings, u64)> {
+        let mut conn = self.lock()?;
+        if !conn.is_autocommit() {
+            return Err(StorageError::Backend(
+                "notification snapshot requires no caller-owned transaction".into(),
+            ));
+        }
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .storage()?;
+        ensure_notice_settings(&tx, account_label, account_id_hex)?;
+        let settings = read_notice_settings(&tx, account_label)?;
+        // COMMIT lets other connections write, so capture the revision first.
+        let revision = self.notification_revision();
+        tx.commit().storage()?;
+        Ok((settings, revision))
     }
 
     pub fn set_local_notifications_enabled(
@@ -3396,20 +3406,50 @@ impl SqliteAppStorage {
         account_label: &str,
         account_id_hex: &str,
     ) -> StorageResult<()> {
-        self.lock()?
-            .execute_cached(
-                "INSERT INTO notification_settings (
-                    account_label, account_id_hex, local_notifications_enabled,
-                    native_push_enabled, updated_at_ms
-                 )
-                 VALUES (?1, ?2, 1, 0, ?3)
-                 ON CONFLICT(account_label) DO UPDATE SET
-                    account_id_hex = excluded.account_id_hex",
-                params![account_label, account_id_hex, unix_now_ms()],
-            )
-            .storage()?;
-        Ok(())
+        let conn = self.lock()?;
+        ensure_notice_settings(&conn, account_label, account_id_hex)
     }
+}
+
+fn ensure_notice_settings(
+    conn: &Connection,
+    account_label: &str,
+    account_id_hex: &str,
+) -> StorageResult<()> {
+    conn.execute_cached(
+        "INSERT INTO notification_settings (
+            account_label, account_id_hex, local_notifications_enabled,
+            native_push_enabled, updated_at_ms
+         )
+         VALUES (?1, ?2, 1, 0, ?3)
+         ON CONFLICT(account_label) DO UPDATE SET
+            account_id_hex = excluded.account_id_hex",
+        params![account_label, account_id_hex, unix_now_ms()],
+    )
+    .storage()?;
+    Ok(())
+}
+
+fn read_notice_settings(
+    conn: &Connection,
+    account_label: &str,
+) -> StorageResult<AccountNotificationSettings> {
+    conn.query_row_cached(
+        "SELECT account_label, account_id_hex, local_notifications_enabled,
+                native_push_enabled
+         FROM notification_settings
+         WHERE account_label = ?1",
+        params![account_label],
+        |row| {
+            Ok(AccountNotificationSettings {
+                account_label: row.get(0)?,
+                account_id_hex: row.get(1)?,
+                local_notifications_enabled: row.get::<_, i64>(2)? != 0,
+                native_push_enabled: row.get::<_, i64>(3)? != 0,
+            })
+        },
+    )
+    .storage()
 }
 
 fn queue_push_registration_removals_with_conn(

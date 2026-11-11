@@ -2301,6 +2301,200 @@ fn app_messages_kinds_filter_restricts_to_listed_kinds() {
 }
 
 #[test]
+fn notice_shared_file_revision() {
+    use std::ffi::OsString;
+    #[cfg(unix)]
+    use std::os::unix::ffi::OsStringExt;
+
+    let root = tempfile::tempdir().unwrap();
+    let key = SqlCipherKey::raw([0x18; 32]);
+    let other = SqliteAccountStorage::open_encrypted(root.path().join("other.sqlite"), &key)
+        .unwrap()
+        .app_storage();
+    other.notification_policy_snapshot("other", "bb").unwrap();
+    let other_revision = other.notification_revision();
+    for name in [
+        OsString::from("account.sqlite"),
+        #[cfg(unix)]
+        OsString::from_vec(b"account-\xff.sqlite".to_vec()),
+    ] {
+        let cached = SqliteAccountStorage::open_encrypted(root.path().join(&name), &key).unwrap();
+        let app = cached.app_storage();
+        app.notification_policy_snapshot("alice", "aa").unwrap();
+        let revision = app.notification_revision();
+        let engine =
+            SqliteAccountStorage::open_encrypted(root.path().join(".").join(&name), &key).unwrap();
+        engine
+            .app_storage()
+            .set_local_notifications_enabled("alice", "aa", false)
+            .unwrap();
+        let (settings, changed) = app.notification_policy_snapshot("alice", "aa").unwrap();
+        assert!(!settings.local_notifications_enabled);
+        assert!(changed > revision);
+        assert_eq!(other.notification_revision(), other_revision);
+    }
+    let memory = SqliteAccountStorage::in_memory().unwrap().app_storage();
+    memory.notification_policy_snapshot("memory", "cc").unwrap();
+    let memory_revision = memory.notification_revision();
+    SqliteAccountStorage::in_memory()
+        .unwrap()
+        .app_storage()
+        .set_local_notifications_enabled("separate", "dd", false)
+        .unwrap();
+    assert_eq!(memory.notification_revision(), memory_revision);
+    assert_eq!(other.notification_revision(), other_revision);
+}
+
+#[test]
+fn notice_snapshot_initializes() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
+    let clone = store.clone().app_storage();
+    let before = app.notification_revision();
+    let (settings, revision) = app.notification_policy_snapshot("alice", "aa").unwrap();
+    assert_eq!(settings.account_label, "alice");
+    assert_eq!(settings.account_id_hex, "aa");
+    assert!(settings.local_notifications_enabled);
+    assert!(!settings.native_push_enabled);
+    assert!(revision > before);
+    assert_eq!(clone.notification_revision(), revision);
+    let (_, warm) = clone.notification_policy_snapshot("alice", "aa").unwrap();
+    assert_eq!(warm, revision);
+
+    app.set_local_notifications_enabled("alice", "aa", false)
+        .unwrap();
+    let (settings, local) = clone.notification_policy_snapshot("alice", "aa").unwrap();
+    assert!(!settings.local_notifications_enabled);
+    assert!(local > revision);
+    app.set_native_push_enabled("alice", "aa", true).unwrap();
+    let (settings, native) = clone.notification_policy_snapshot("alice", "aa").unwrap();
+    assert!(settings.native_push_enabled);
+    assert!(native > local);
+    let (settings, identity) = app.notification_policy_snapshot("alice", "bb").unwrap();
+    assert_eq!(settings.account_id_hex, "bb");
+    assert!(identity > native);
+    assert_eq!(identity, app.notification_revision());
+}
+
+#[test]
+fn notice_snapshot_rollback() {
+    use cgka_traits::storage::StorageProvider;
+
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
+    app.notification_policy_snapshot("alice", "aa").unwrap();
+    let before = app.notification_revision();
+    let failed: StorageResult<()> = store.with_transaction(|_| {
+        app.set_local_notifications_enabled("alice", "aa", false)?;
+        assert!(
+            !app.notification_settings("alice", "aa")?
+                .local_notifications_enabled
+        );
+        assert_fails_with(
+            app.notification_policy_snapshot("alice", "aa"),
+            "notification snapshot requires no caller-owned transaction",
+        );
+        Err(StorageError::Backend(
+            "rollback notification settings".into(),
+        ))
+    });
+    assert_fails_with(failed, "rollback notification settings");
+    let after_rollback = app.notification_revision();
+    assert!(after_rollback > before);
+    let (settings, revision) = app.notification_policy_snapshot("alice", "aa").unwrap();
+    assert!(settings.local_notifications_enabled);
+    assert_eq!(revision, after_rollback);
+
+    store.lock().unwrap().execute_batch("BEGIN").unwrap();
+    assert_fails_with(
+        app.notification_policy_snapshot("new-account", "bb"),
+        "notification snapshot requires no caller-owned transaction",
+    );
+    assert!(!store.lock().unwrap().is_autocommit());
+    store.lock().unwrap().execute_batch("ROLLBACK").unwrap();
+    assert_eq!(app.notification_revision(), revision);
+}
+
+#[test]
+fn notice_revision_quiet_writes() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
+    let mut state = StoredAccountState {
+        label: "alice".into(),
+        groups: vec![group("aa", "Quiet")],
+        ..Default::default()
+    };
+    app.save_account_projection_state(&state, 16, MAX_FUTURE_SKEW_SECS)
+        .unwrap();
+    app.notification_policy_snapshot("alice", "aa").unwrap();
+    let before_mute = app.notification_revision();
+    app.set_chat_muted("aa", Some(5_000)).unwrap();
+    let revision = app.notification_revision();
+    assert!(revision > before_mute);
+    for index in 0..3 {
+        app.notification_settings("alice", "aa").unwrap();
+        app.set_chat_muted("aa", Some(5_000)).unwrap();
+        app.set_local_notifications_enabled("alice", "aa", true)
+            .unwrap();
+        state.seen_events.push(format!("seen-{index}"));
+        app.save_account_projection_state(&state, 16, MAX_FUTURE_SKEW_SECS)
+            .unwrap();
+        app.record_app_event(&app_event(&format!("message-{index}"), "aa", index))
+            .unwrap();
+        assert_eq!(app.notification_revision(), revision);
+    }
+    app.set_chat_muted("aa", None).unwrap();
+    let forever = app.notification_revision();
+    assert!(forever > revision);
+    app.clear_chat_muted("aa").unwrap();
+    assert!(app.notification_revision() > forever);
+    let before_group = app.notification_revision();
+    app.set_group_self_membership("aa", SelfMembership::Removed)
+        .unwrap();
+    assert!(app.notification_revision() > before_group);
+}
+
+#[test]
+fn notice_revision_sql_mutations() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
+    app.save_account_projection_state(
+        &StoredAccountState {
+            label: "alice".into(),
+            groups: vec![group("aa", "Raw mutations")],
+            ..Default::default()
+        },
+        16,
+        MAX_FUTURE_SKEW_SECS,
+    )
+    .unwrap();
+    app.notification_settings("alice", "aa").unwrap();
+    app.set_chat_muted("aa", None).unwrap();
+    for table in [
+        "chat_notification_settings",
+        "notification_settings",
+        "account_groups",
+    ] {
+        let before = app.notification_revision();
+        store
+            .lock()
+            .unwrap()
+            .execute_batch(&format!(
+                "INSERT OR REPLACE INTO {table} SELECT * FROM {table}"
+            ))
+            .unwrap();
+        assert!(app.notification_revision() > before, "REPLACE on {table}");
+        let before = app.notification_revision();
+        store
+            .lock()
+            .unwrap()
+            .execute_batch(&format!("DELETE FROM {table}"))
+            .unwrap();
+        assert!(app.notification_revision() > before, "DELETE on {table}");
+    }
+}
+
+#[test]
 fn notification_settings_default_local_notifications_on() {
     let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
     let account_id_hex = "aa".repeat(32);
@@ -3444,7 +3638,10 @@ fn delete_local_group_data_removes_app_local_rows_without_touching_protocol_stat
         .queue_push_registration_removals(&registration, 11)
         .unwrap();
 
+    let app = store.clone().app_storage();
+    let revision = app.notification_revision();
     assert!(store.delete_local_group_data("aa").unwrap().did_delete());
+    assert!(app.notification_revision() > revision);
     let deletion_frontier = store
         .app_storage()
         .local_group_deletion_frontier("aa")
@@ -4834,11 +5031,14 @@ fn forget_group_local_is_atomic_and_prevents_protocol_resurrection() {
         .unwrap()
         .execute_batch("DROP TRIGGER fail_forget")
         .unwrap();
+    let app = store.clone().app_storage();
+    let revision = app.notification_revision();
     assert!(
         store
             .forget_group_local(&id, cgka_traits::Timestamp(100))
             .unwrap()
     );
+    assert!(app.notification_revision() > revision);
     assert!(
         !store
             .forget_group_local(&id, cgka_traits::Timestamp(100))

@@ -46,7 +46,7 @@ use crate::{
     ReceivedMessage, RuntimeGroupEvent, RuntimeMessageReceived, group_system_event_from_message,
     tag_value,
 };
-use storage_sqlite::TimelineMessageTarget;
+use storage_sqlite::{SqliteAppStorage, TimelineMessageTarget};
 
 pub const MARMOT_APP_EVENT_KIND_PUSH_TOKEN_UPDATE: u64 = 447;
 pub const MARMOT_APP_EVENT_KIND_PUSH_TOKEN_LIST: u64 = 448;
@@ -1597,40 +1597,66 @@ pub(crate) fn is_push_gossip_kind(kind: u64) -> bool {
     )
 }
 
-/// Per-batch memoization of the notification-building lookups that repeat across
-/// the events drained in one `collect_notifications_after_wake` pass (#639):
-/// account notification settings (keyed by account_label), the group record
-/// (keyed by account_label + group_id_hex), and directory-derived users (keyed by
-/// account_id_hex — shared by the receiver and by every sender). Each backing
-/// lookup re-opens the per-account SQLCipher / directory caches and fans across
-/// accounts, so a busy multi-message batch would otherwise re-pay that per
-/// message. `reaction_target` is intentionally NOT cached — it is keyed by a
-/// distinct reacted-to message id per reaction, so there is nothing to reuse.
-///
-/// Cached values are message-agnostic: `user` stores the raw directory result,
-/// and the per-message sender-display-name fallback is applied to the returned
-/// clone by `notification_user_from_message`, never written back into the cache.
+struct CachedNotificationSettings {
+    enabled: bool,
+    connection_serial: u64,
+    revision: u64,
+}
+
+/// Reused notification lookups for a subscription or wake batch. Storage
+/// revisions fence account settings, mutes, and group records. Cached users
+/// exclude per-message sender fallbacks; reaction targets are not cached.
 #[derive(Default)]
 pub(crate) struct NotificationResolver {
-    settings: HashMap<String, NotificationSettings>,
-    chat_muted: HashMap<(String, String), bool>,
+    settings: HashMap<String, CachedNotificationSettings>,
+    chat_muted: HashMap<(String, String), Option<i64>>,
     groups: HashMap<(String, String), Option<AppGroupRecord>>,
     users: HashMap<String, NotificationUser>,
 }
 
 impl NotificationResolver {
-    fn settings(
+    pub(crate) fn invalidate_group(&mut self, group_id: &GroupId) {
+        let group_id_hex = hex::encode(group_id.as_slice());
+        self.groups.retain(|(_, group), _| group != &group_id_hex);
+        self.chat_muted
+            .retain(|(_, group), _| group != &group_id_hex);
+    }
+
+    pub(crate) fn invalidate_users(&mut self) {
+        self.users.clear();
+    }
+
+    fn local_enabled(
         &mut self,
         app: &MarmotApp,
         account_label: &str,
-    ) -> Result<NotificationSettings, AppError> {
+        storage: &SqliteAppStorage,
+    ) -> Result<bool, AppError> {
+        let connection_serial = storage.connection_serial();
         if let Some(settings) = self.settings.get(account_label) {
-            return Ok(settings.clone());
+            if settings.connection_serial == connection_serial
+                && settings.revision == storage.notification_revision()
+            {
+                return Ok(settings.enabled);
+            }
+            self.groups.retain(|(label, _), _| label != account_label);
+            self.chat_muted
+                .retain(|(label, _), _| label != account_label);
         }
-        let settings = app.notification_settings(account_label)?;
-        self.settings
-            .insert(account_label.to_owned(), settings.clone());
-        Ok(settings)
+        let account = app.account_home().account(account_label)?;
+        app.ensure_account_state(&account.label)?;
+        let (settings, revision) =
+            storage.notification_policy_snapshot(&account.label, &account.account_id_hex)?;
+        let enabled = settings.local_notifications_enabled;
+        self.settings.insert(
+            account_label.to_owned(),
+            CachedNotificationSettings {
+                enabled,
+                connection_serial,
+                revision,
+            },
+        );
+        Ok(enabled)
     }
 
     fn group(
@@ -1650,19 +1676,21 @@ impl NotificationResolver {
 
     fn chat_muted(
         &mut self,
-        app: &MarmotApp,
+        storage: &SqliteAppStorage,
         account_label: &str,
         group_id_hex: &str,
     ) -> Result<bool, AppError> {
         let key = (account_label.to_owned(), group_id_hex.to_owned());
-        if let Some(muted) = self.chat_muted.get(&key) {
-            return Ok(*muted);
+        if let Some(until) = self.chat_muted.get(&key) {
+            return Ok(until.is_none_or(|until| until > unix_now_ms()));
         }
-        let muted = app
-            .chat_notification_settings(account_label, group_id_hex)?
-            .muted;
-        self.chat_muted.insert(key, muted);
-        Ok(muted)
+        // The caller already resolved the group. Avoid a second group lookup.
+        if self.groups.get(&key).is_some_and(Option::is_none) {
+            return Err(AppError::UnknownGroup(group_id_hex.to_owned()));
+        }
+        let settings = storage.chat_notification_settings(group_id_hex)?;
+        self.chat_muted.insert(key, settings.muted_until_ms);
+        Ok(settings.muted)
     }
 
     fn user(
@@ -1677,17 +1705,6 @@ impl NotificationResolver {
         self.users.insert(account_id_hex.to_owned(), user.clone());
         Ok(user)
     }
-}
-
-/// Build a notification for a single event with a throwaway resolver. Used by the
-/// live per-event notification stream, where events arrive one at a time and
-/// there is nothing to memoize across.
-pub(crate) fn notification_update_from_event(
-    app: &MarmotApp,
-    event: &MarmotAppEvent,
-) -> Result<Option<NotificationUpdate>, AppError> {
-    let mut resolver = NotificationResolver::default();
-    notification_update_from_event_cached(app, &mut resolver, event)
 }
 
 /// Re-derive candidate notifications from recent stored messages after the
@@ -2011,19 +2028,15 @@ fn notification_update_from_classified_group_state(
     account_id_hex: &str,
     notice: ClassifiedGroupStateNotice<'_>,
 ) -> Result<Option<NotificationUpdate>, AppError> {
-    if app
-        .account_storage(account_label)?
-        .app_storage()
-        .suppress_blocked_notification(
-            notice.actor_account_id_hex.unwrap_or(""),
-            notice.group_id_hex,
-            notice.message_id_hex,
-        )?
-    {
+    let storage = app.account_storage(account_label)?.app_storage();
+    if storage.suppress_blocked_notification(
+        notice.actor_account_id_hex.unwrap_or(""),
+        notice.group_id_hex,
+        notice.message_id_hex,
+    )? {
         return Ok(None);
     }
-    let settings = resolver.settings(app, account_label)?;
-    if !settings.local_notifications_enabled {
+    if !resolver.local_enabled(app, account_label, &storage)? {
         return Err(AppError::NotificationsDisabled);
     }
     let group = match resolver.group(app, account_label, notice.group_id_hex) {
@@ -2031,7 +2044,7 @@ fn notification_update_from_classified_group_state(
         Err(AppError::UnknownGroup(_)) => None,
         Err(err) => return Err(err),
     };
-    let muted = match resolver.chat_muted(app, account_label, notice.group_id_hex) {
+    let muted = match resolver.chat_muted(&storage, account_label, notice.group_id_hex) {
         Ok(muted) => muted,
         Err(AppError::UnknownGroup(_)) => false,
         Err(err) => return Err(err),
@@ -2092,6 +2105,20 @@ fn notification_traffic_for_kind(kind: u64) -> Option<NotificationTrafficClass> 
     }
 }
 
+/// Reject non-notifying events before dispatching storage work.
+pub(crate) fn notification_event_notifies(event: &MarmotAppEvent) -> bool {
+    match event {
+        MarmotAppEvent::MessageReceived(message) => {
+            notification_traffic_for_kind(message.message.kind).is_some()
+        }
+        MarmotAppEvent::GroupJoined { .. } => true,
+        MarmotAppEvent::GroupEvent(event) => {
+            matches!(event.event, GroupEvent::GroupStateChanged { .. })
+        }
+        _ => false,
+    }
+}
+
 /// Resolve one delivered message into a typed notification candidate.
 ///
 /// Durable whole-chat mute filters ordinary traffic after blocked-sender and
@@ -2102,32 +2129,27 @@ fn notification_update_from_message(
     resolver: &mut NotificationResolver,
     event: &RuntimeMessageReceived,
 ) -> Result<Option<NotificationUpdate>, AppError> {
-    let storage = app.account_storage(&event.account_label)?;
-    if storage.app_storage().suppress_blocked_notification(
+    let Some(traffic_class) = notification_traffic_for_kind(event.message.kind) else {
+        return Ok(None);
+    };
+    let storage = app.account_storage(&event.account_label)?.app_storage();
+    if storage.suppress_blocked_notification(
         &event.message.sender,
         &hex::encode(event.message.group_id.as_slice()),
         &event.message.message_id_hex,
     )? {
         return Ok(None);
     }
-    let settings = resolver.settings(app, &event.account_label)?;
-    if !settings.local_notifications_enabled {
+    if !resolver.local_enabled(app, &event.account_label, &storage)? {
         return Err(AppError::NotificationsDisabled);
     }
-    // Only chat messages, reactions, and explicitly classified agent activity
-    // alert. Deletes, edits, stream control events, and group-system rows never
-    // produce notifications (e.g. deleting a message must not push a "Deleted
-    // a message" alert).
-    let Some(traffic_class) = notification_traffic_for_kind(event.message.kind) else {
-        return Ok(None);
-    };
     let group_id_hex = hex::encode(event.message.group_id.as_slice());
     let group = match resolver.group(app, &event.account_label, &group_id_hex) {
         Ok(group) => group,
         Err(AppError::UnknownGroup(_)) => return Ok(None),
         Err(err) => return Err(err),
     };
-    let muted = match resolver.chat_muted(app, &event.account_label, &group_id_hex) {
+    let muted = match resolver.chat_muted(&storage, &event.account_label, &group_id_hex) {
         Ok(muted) => muted,
         Err(AppError::UnknownGroup(_)) => return Ok(None),
         Err(err) => return Err(err),
@@ -2198,8 +2220,8 @@ fn notification_update_from_group_join(
     account_id_hex: &str,
     group_id: &cgka_traits::GroupId,
 ) -> Result<Option<NotificationUpdate>, AppError> {
-    let settings = resolver.settings(app, account_label)?;
-    if !settings.local_notifications_enabled {
+    let storage = app.account_storage(account_label)?.app_storage();
+    if !resolver.local_enabled(app, account_label, &storage)? {
         return Err(AppError::NotificationsDisabled);
     }
     let group_id_hex = hex::encode(group_id.as_slice());
@@ -2209,21 +2231,17 @@ fn notification_update_from_group_join(
         .as_ref()
         .and_then(|group| group.welcomer_account_id_hex.clone())
         .unwrap_or_else(|| account_id_hex.to_owned());
-    if app
-        .account_storage(account_label)?
-        .app_storage()
-        .suppress_blocked_notification(
-            &sender_id,
-            &group_id_hex,
-            &format!(
-                "invite:{}",
-                group
-                    .as_ref()
-                    .and_then(|g| g.via_welcome_message_id_hex.as_deref())
-                    .unwrap_or(&group_id_hex)
-            ),
-        )?
-    {
+    if storage.suppress_blocked_notification(
+        &sender_id,
+        &group_id_hex,
+        &format!(
+            "invite:{}",
+            group
+                .as_ref()
+                .and_then(|g| g.via_welcome_message_id_hex.as_deref())
+                .unwrap_or(&group_id_hex)
+        ),
+    )? {
         return Ok(None);
     }
     let sender = resolver.user(app, &sender_id)?;

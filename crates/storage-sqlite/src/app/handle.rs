@@ -2,6 +2,10 @@
 
 use crate::base::connection::{ConnectionGuard, SharedConnection};
 use cgka_traits::storage::StorageResult;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 
 /// The app side's handle on an account database. It shares the account's
 /// connection, so it opens nothing of its own, closes with the account
@@ -10,9 +14,18 @@ use cgka_traits::storage::StorageResult;
 #[derive(Clone)]
 pub struct SqliteAppStorage {
     pub(crate) connection: SharedConnection,
+    pub(crate) notification_revision: Arc<AtomicU64>,
 }
 
 impl SqliteAppStorage {
+    /// SQL-free, process-local invalidation token for notification policy and
+    /// projected groups. File-backed handles share it by canonical database
+    /// path; in-memory handles are independent. Rollbacks may also advance it.
+    /// Pair it with [`Self::connection_serial`] when caching across opens.
+    pub fn notification_revision(&self) -> u64 {
+        self.notification_revision.load(Ordering::Acquire)
+    }
+
     pub(crate) fn lock(&self) -> StorageResult<ConnectionGuard<'_>> {
         self.connection.lock()
     }

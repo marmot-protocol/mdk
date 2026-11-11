@@ -1853,9 +1853,13 @@ impl MarmotAppRuntime {
         self.shared.lifecycle().ensure_running()?;
         let mut events = self.events.subscribe();
         let app = self.accounts.app.clone();
+        let mut profiles = app.presentation_signals.profile_updates.subscribe();
+        let mut account_resets = app.presentation_signals.account_resets.subscribe();
+        let mut catalog = app.presentation_signals.subscribe_catalog();
         let mut stopping = self.shared.lifecycle().subscribe_shutdown();
         let (updates_tx, updates_rx) = mpsc::channel(APP_RUNTIME_SUBSCRIPTION_BUFFER);
         tokio::spawn(async move {
+            let mut resolver = notifications::NotificationResolver::default();
             let mut seen_notification_keys =
                 MessageSubscriptionSeenIds::with_limit(MESSAGE_SUBSCRIPTION_SEEN_ID_LIMIT);
             let recovery_watermark = notifications::unix_now_seconds();
@@ -1866,12 +1870,42 @@ impl MarmotAppRuntime {
                 };
                 match event {
                     Ok(event) => {
+                        // Coalesce invalidations before resolving this event. A lagged
+                        // signal receiver also has pending entries and clears the cache.
+                        if !account_resets.is_empty() || matches!(catalog.has_changed(), Ok(true)) {
+                            resolver = notifications::NotificationResolver::default();
+                            account_resets = app.presentation_signals.account_resets.subscribe();
+                            catalog.borrow_and_update();
+                        }
+                        if !profiles.is_empty() {
+                            resolver.invalidate_users();
+                            profiles = app.presentation_signals.profile_updates.subscribe();
+                        }
+                        if let Some((_, group_id)) = runtime_group_event_route(&event) {
+                            resolver.invalidate_group(group_id);
+                        }
+                        if !notifications::notification_event_notifies(&event) {
+                            continue;
+                        }
                         let app_for_lookup = app.clone();
-                        match blocking_app_task(move || {
-                            notifications::notification_update_from_event(&app_for_lookup, &event)
+                        #[cfg(test)]
+                        app.notification_dispatches
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let (returned_resolver, result) = match blocking_app_task(move || {
+                            let result = notifications::notification_update_from_event_cached(
+                                &app_for_lookup,
+                                &mut resolver,
+                                &event,
+                            );
+                            Ok((resolver, result))
                         })
                         .await
                         {
+                            Ok(result) => result,
+                            Err(err) => (notifications::NotificationResolver::default(), Err(err)),
+                        };
+                        resolver = returned_resolver;
+                        match result {
                             Ok(Some(update)) => {
                                 if !seen_notification_keys
                                     .should_emit(update.notification_key.clone())
@@ -1894,6 +1928,8 @@ impl MarmotAppRuntime {
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => {
+                        // Lost events may have invalidated any cached value.
+                        resolver = notifications::NotificationResolver::default();
                         let app_for_lookup = app.clone();
                         let recovered = match blocking_app_task(move || {
                             notifications::recover_notification_updates(

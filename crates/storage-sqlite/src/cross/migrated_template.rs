@@ -193,7 +193,7 @@ mod tests {
     }
 
     fn from_template(template: &Path) -> SqliteAccountStorage {
-        SqliteAccountStorage::from_opened(open_with_template(template, options()).unwrap())
+        SqliteAccountStorage::from_opened(open_with_template(template, options()).unwrap()).unwrap()
     }
 
     /// A template in `dir` and a first copy of it.

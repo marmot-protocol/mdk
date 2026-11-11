@@ -11,6 +11,461 @@ use crate::AppMessageProjection;
 use crate::publish_endpoints_from_bootstrap;
 use crate::tests::{ScriptedPushRelayClient, remember_test_member_inbox};
 
+mod live_notifications {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn fixture() -> (tempfile::TempDir, MarmotApp, AccountSummary, GroupId) {
+        let root = tempfile::tempdir().unwrap();
+        let app = MarmotApp::with_relays(root.path(), vec![]);
+        let account = app.account_home().create_account("alice").unwrap();
+        let group = GroupId::new(vec![0xEE; 16]);
+        let mut state = app.load_state("alice").unwrap();
+        state.groups.push(AppGroupRecord::new(
+            hex::encode(group.as_slice()),
+            crate::groups::AppGroupNostrRoutingComponent::new(cgka_traits::NostrRoutingV1 {
+                nostr_group_id: [0xDD; 32],
+                relays: vec!["wss://relay.example".into()],
+            })
+            .unwrap(),
+            "Before".into(),
+            String::new(),
+            crate::AppGroupImageInput::default(),
+            crate::groups::AppGroupAdminPolicyComponent::new(Vec::new()),
+            crate::groups::AppGroupMessageRetentionComponent::disabled(),
+        ));
+        app.save_state(&state).unwrap();
+        (root, app, account, group)
+    }
+
+    fn message(account: &AccountSummary, group: &GroupId, id: u64) -> MarmotAppEvent {
+        MarmotAppEvent::MessageReceived(RuntimeMessageReceived {
+            account_id_hex: account.account_id_hex.clone(),
+            account_label: account.label.clone(),
+            message: ReceivedMessage {
+                authority: None,
+                message_id_hex: format!("{id:064x}"),
+                source_message_id_hex: format!("{id:064x}"),
+                sender: "bb".repeat(32),
+                sender_display_name: Some("Sender".into()),
+                group_id: group.clone(),
+                source_epoch: 1,
+                retention: None,
+                plaintext: format!("Message {id}"),
+                kind: cgka_traits::MARMOT_APP_EVENT_KIND_CHAT,
+                tags: Vec::new(),
+                recorded_at: 1,
+                received_at: 1,
+            },
+        })
+    }
+
+    async fn next(subscription: &mut RuntimeNotificationsSubscription) -> NotificationUpdate {
+        timeout(Duration::from_secs(5), subscription.recv())
+            .await
+            .expect("notification must arrive")
+            .expect("subscription must remain open")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn live_burst_reuses_reads() {
+        static SETTINGS: AtomicUsize = AtomicUsize::new(0);
+        static GROUPS: AtomicUsize = AtomicUsize::new(0);
+        fn trace(event: rusqlite::trace::TraceEvent<'_>) {
+            if let rusqlite::trace::TraceEvent::Stmt(_, sql) = event {
+                if sql.starts_with("SELECT") && sql.contains("FROM notification_settings") {
+                    SETTINGS.fetch_add(1, Ordering::Relaxed);
+                }
+                if sql.starts_with("SELECT") && sql.contains("FROM account_groups") {
+                    GROUPS.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+
+        let (_root, app, account, group) = fixture();
+        let runtime = app.runtime();
+        let mut subscription = runtime.subscribe_notifications().unwrap();
+        let storage = app.account_storage("alice").unwrap();
+        storage
+            .trace_queries_for_test(
+                rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT,
+                Some(trace),
+            )
+            .unwrap();
+        for id in 1..=50 {
+            runtime.events.send(message(&account, &group, id)).unwrap();
+        }
+        for id in 1..=50 {
+            let update = next(&mut subscription).await;
+            assert_eq!(update.message_id_hex, Some(format!("{id:064x}")));
+            assert_eq!(update.preview_text, Some(format!("Message {id}")));
+            assert_eq!(update.group_id_hex, hex::encode(group.as_slice()));
+            assert_eq!(update.group_name.as_deref(), Some("Before"));
+            assert_eq!(update.sender.display_name.as_deref(), Some("Sender"));
+            assert_eq!(update.receiver.account_id_hex, account.account_id_hex);
+            assert!(matches!(
+                update.trigger,
+                crate::NotificationTrigger::NewMessage
+            ));
+        }
+        storage
+            .trace_queries_for_test(rusqlite::trace::TraceEventCodes::empty(), None)
+            .unwrap();
+        assert_eq!(
+            SETTINGS.load(Ordering::Relaxed),
+            1,
+            "one account settings read"
+        );
+        assert_eq!(GROUPS.load(Ordering::Relaxed), 1, "one group outline read");
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn live_settings_and_mutes() {
+        let (_root, app, account, group) = fixture();
+        let barrier = app.account_home().create_account("barrier").unwrap();
+        let mut barrier_state = app.load_state("barrier").unwrap();
+        barrier_state.groups = app.groups("alice").unwrap();
+        app.save_state(&barrier_state).unwrap();
+        let group_hex = hex::encode(group.as_slice());
+        let runtime = app.runtime();
+        let mut subscription = runtime.subscribe_notifications().unwrap();
+
+        runtime.events.send(message(&account, &group, 1)).unwrap();
+        assert_eq!(
+            next(&mut subscription).await.preview_text.as_deref(),
+            Some("Message 1")
+        );
+
+        app.set_local_notifications_enabled("alice", false).unwrap();
+        runtime.events.send(message(&account, &group, 2)).unwrap();
+        runtime.events.send(message(&barrier, &group, 3)).unwrap();
+        let update = next(&mut subscription).await;
+        assert_eq!(update.account_id_hex, barrier.account_id_hex);
+        assert_eq!(update.preview_text.as_deref(), Some("Message 3"));
+
+        app.set_local_notifications_enabled("alice", true).unwrap();
+        runtime.events.send(message(&account, &group, 4)).unwrap();
+        let update = next(&mut subscription).await;
+        assert_eq!(update.account_id_hex, account.account_id_hex);
+        assert_eq!(update.preview_text.as_deref(), Some("Message 4"));
+
+        app.set_chat_muted("alice", &group_hex, None).unwrap();
+        runtime.events.send(message(&account, &group, 5)).unwrap();
+        let mut mention = message(&account, &group, 6);
+        if let MarmotAppEvent::MessageReceived(event) = &mut mention {
+            event.message.tags = vec![vec!["p".into(), account.account_id_hex.clone()]];
+        }
+        runtime.events.send(mention).unwrap();
+        let update = next(&mut subscription).await;
+        assert_eq!(update.preview_text.as_deref(), Some("Message 6"));
+        assert!(update.is_mention);
+
+        app.clear_chat_muted("alice", &group_hex).unwrap();
+        runtime.events.send(message(&account, &group, 7)).unwrap();
+        let update = next(&mut subscription).await;
+        assert_eq!(update.preview_text.as_deref(), Some("Message 7"));
+        assert!(!update.is_mention);
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn live_group_and_profiles() {
+        let (_root, app, account, group) = fixture();
+        let sender = "bb".repeat(32);
+        app.directory()
+            .remember_directory_profile(
+                &sender,
+                &UserProfileMetadata {
+                    name: Some("Before Sender".into()),
+                    created_at: 1,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let runtime = app.runtime();
+        let mut subscription = runtime.subscribe_notifications().unwrap();
+        runtime.events.send(message(&account, &group, 1)).unwrap();
+        let update = next(&mut subscription).await;
+        assert_eq!(update.group_name.as_deref(), Some("Before"));
+        assert_eq!(update.sender.display_name.as_deref(), Some("Before Sender"));
+
+        let mut state = app.load_state("alice").unwrap();
+        state.groups[0].profile = crate::groups::AppGroupProfileComponent::from_bytes(
+            &cgka_traits::encode_component_vectors(&[b"After", b""]),
+        );
+        app.save_state(&state).unwrap();
+        runtime.events.send(message(&account, &group, 2)).unwrap();
+        let update = next(&mut subscription).await;
+        assert_eq!(update.preview_text.as_deref(), Some("Message 2"));
+        assert_eq!(update.group_name.as_deref(), Some("After"));
+        assert_eq!(update.sender.display_name.as_deref(), Some("Before Sender"));
+
+        app.directory()
+            .remember_directory_profile(
+                &sender,
+                &UserProfileMetadata {
+                    name: Some("After Sender".into()),
+                    picture: Some("https://example.test/sender.png".into()),
+                    created_at: 2,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        app.directory()
+            .remember_directory_profile(
+                &account.account_id_hex,
+                &UserProfileMetadata {
+                    name: Some("After Receiver".into()),
+                    created_at: 2,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        runtime.events.send(message(&account, &group, 3)).unwrap();
+        let update = next(&mut subscription).await;
+        assert_eq!(update.preview_text.as_deref(), Some("Message 3"));
+        assert_eq!(update.group_name.as_deref(), Some("After"));
+        assert_eq!(update.sender.display_name.as_deref(), Some("After Sender"));
+        assert_eq!(
+            update.sender.picture_url.as_deref(),
+            Some("https://example.test/sender.png")
+        );
+        assert_eq!(
+            update.receiver.display_name.as_deref(),
+            Some("After Receiver")
+        );
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn live_prefilter_skips_work() {
+        static READS: AtomicUsize = AtomicUsize::new(0);
+        fn trace(event: rusqlite::trace::TraceEvent<'_>) {
+            if let rusqlite::trace::TraceEvent::Stmt(_, sql) = event
+                && (sql.starts_with("SELECT") || sql.starts_with("WITH"))
+            {
+                READS.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let (_root, app, account, group) = fixture();
+        let runtime = app.runtime();
+        let mut subscription = runtime.subscribe_notifications().unwrap();
+        let storage = app.account_storage("alice").unwrap();
+        storage
+            .trace_queries_for_test(
+                rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT,
+                Some(trace),
+            )
+            .unwrap();
+        runtime.events.send(message(&account, &group, 1)).unwrap();
+        assert_eq!(
+            next(&mut subscription).await.preview_text.as_deref(),
+            Some("Message 1")
+        );
+        let before = READS.load(Ordering::Relaxed);
+        runtime.events.send(message(&account, &group, 2)).unwrap();
+        assert_eq!(
+            next(&mut subscription).await.preview_text.as_deref(),
+            Some("Message 2")
+        );
+        let steady_reads = READS.load(Ordering::Relaxed) - before;
+        assert!(
+            steady_reads > 0,
+            "eligible events must reach the real SQLite store"
+        );
+        let before = READS.load(Ordering::Relaxed);
+        let dispatches = app.notification_dispatches.load(Ordering::Relaxed);
+
+        for (id, kind) in [
+            (3, cgka_traits::MARMOT_APP_EVENT_KIND_DELETE),
+            (4, cgka_traits::app_event::MARMOT_APP_EVENT_KIND_EDIT),
+            (5, cgka_traits::MARMOT_APP_EVENT_KIND_AGENT_STREAM_START),
+            (6, cgka_traits::MARMOT_APP_EVENT_KIND_GROUP_SYSTEM),
+            (7, u64::MAX),
+        ] {
+            let mut event = message(&account, &group, id);
+            if let MarmotAppEvent::MessageReceived(event) = &mut event {
+                event.message.kind = kind;
+                event.message.tags = vec![vec!["e".into(), format!("{:064x}", 1)]];
+            }
+            runtime.events.send(event).unwrap();
+        }
+        runtime.events.send(message(&account, &group, 8)).unwrap();
+        let update = next(&mut subscription).await;
+        assert_eq!(update.message_id_hex, Some(format!("{:064x}", 8)));
+        assert_eq!(update.preview_text.as_deref(), Some("Message 8"));
+        assert_eq!(
+            READS.load(Ordering::Relaxed) - before,
+            steady_reads,
+            "rejected kinds must add no SQLite reads before the FIFO sentinel"
+        );
+        assert_eq!(
+            app.notification_dispatches.load(Ordering::Relaxed) - dispatches,
+            1,
+            "only the eligible sentinel may dispatch blocking work"
+        );
+        storage
+            .trace_queries_for_test(rusqlite::trace::TraceEventCodes::empty(), None)
+            .unwrap();
+
+        app.record_account_app_event(
+            "alice",
+            &AppMessageProjection {
+                authority: None,
+                message_id_hex: format!("{:064x}", 9),
+                source_message_id_hex: None,
+                direction: "sent".into(),
+                group_id_hex: hex::encode(group.as_slice()),
+                sender: account.account_id_hex.clone(),
+                plaintext: "My message".into(),
+                kind: cgka_traits::MARMOT_APP_EVENT_KIND_CHAT,
+                tags: Vec::new(),
+                source_epoch: Some(1),
+                retention: None,
+                recorded_at: Some(1),
+                origin_commit_id: None,
+                moderation_grant: false,
+            },
+        )
+        .unwrap();
+        let mut reaction = message(&account, &group, 10);
+        if let MarmotAppEvent::MessageReceived(event) = &mut reaction {
+            event.message.kind = cgka_traits::MARMOT_APP_EVENT_KIND_REACTION;
+            event.message.plaintext = "+".into();
+            event.message.tags = vec![vec!["e".into(), format!("{:064x}", 9)]];
+        }
+        runtime.events.send(reaction).unwrap();
+        let update = next(&mut subscription).await;
+        assert_eq!(update.message_id_hex, Some(format!("{:064x}", 10)));
+        assert_eq!(update.reaction_emoji.as_deref(), Some("+"));
+        assert_eq!(update.reacted_to_preview.as_deref(), Some("My message"));
+        assert!(matches!(
+            update.trigger,
+            crate::NotificationTrigger::NewMessage
+        ));
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn live_missing_group_is_silent() {
+        let (_root, app, account, group) = fixture();
+        let runtime = app.runtime();
+        let mut subscription = runtime.subscribe_notifications().unwrap();
+        let missing = GroupId::new(vec![0xAA; 16]);
+        runtime.events.send(message(&account, &missing, 1)).unwrap();
+        runtime.events.send(message(&account, &group, 2)).unwrap();
+        let update = next(&mut subscription).await;
+        assert_eq!(update.message_id_hex, Some(format!("{:064x}", 2)));
+        assert_eq!(update.group_name.as_deref(), Some("Before"));
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn live_persisted_policy() {
+        let (_root, app, account, group) = fixture();
+        let barrier = app.account_home().create_account("barrier").unwrap();
+        let mut state = app.load_state("barrier").unwrap();
+        state.groups = app.groups("alice").unwrap();
+        app.save_state(&state).unwrap();
+        let runtime = app.runtime();
+        let mut subscription = runtime.subscribe_notifications().unwrap();
+        runtime.events.send(message(&account, &group, 1)).unwrap();
+        assert_eq!(
+            next(&mut subscription).await.group_name.as_deref(),
+            Some("Before")
+        );
+
+        app.account_storage("alice")
+            .unwrap()
+            .app_storage()
+            .set_local_notifications_enabled("alice", &account.account_id_hex, false)
+            .unwrap();
+        runtime.events.send(message(&account, &group, 2)).unwrap();
+        runtime.events.send(message(&barrier, &group, 3)).unwrap();
+        assert_eq!(
+            next(&mut subscription).await.account_id_hex,
+            barrier.account_id_hex
+        );
+
+        app.account_storage("alice")
+            .unwrap()
+            .app_storage()
+            .set_local_notifications_enabled("alice", &account.account_id_hex, true)
+            .unwrap();
+        runtime.events.send(message(&account, &group, 4)).unwrap();
+        let update = next(&mut subscription).await;
+        assert_eq!(update.message_id_hex, Some(format!("{:064x}", 4)));
+        assert_eq!(update.group_name.as_deref(), Some("Before"));
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn live_deleted_group_is_silent() {
+        let (_root, app, account, group) = fixture();
+        let barrier = app.account_home().create_account("barrier").unwrap();
+        let mut state = app.load_state("barrier").unwrap();
+        state.groups = app.groups("alice").unwrap();
+        app.save_state(&state).unwrap();
+        let runtime = app.runtime();
+        let mut subscription = runtime.subscribe_notifications().unwrap();
+        runtime.events.send(message(&account, &group, 1)).unwrap();
+        assert_eq!(
+            next(&mut subscription).await.group_name.as_deref(),
+            Some("Before")
+        );
+
+        assert!(
+            app.delete_group_local_data("alice", &hex::encode(group.as_slice()))
+                .unwrap()
+        );
+        // No GroupStateUpdated has reached this subscription.
+        runtime.events.send(message(&account, &group, 2)).unwrap();
+        runtime.events.send(message(&barrier, &group, 3)).unwrap();
+        let update = next(&mut subscription).await;
+        assert_eq!(update.account_id_hex, barrier.account_id_hex);
+        assert_eq!(update.message_id_hex, Some(format!("{:064x}", 3)));
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resolver_tracks_engine_forget() {
+        let root = tempfile::tempdir().unwrap();
+        let app = MarmotApp::with_relay(root.path(), "wss://relay.example")
+            .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+        let account = app.account_home().create_account("alice").unwrap();
+        let runtime = app.runtime();
+        runtime.reconcile_accounts().await.unwrap();
+        let group = runtime
+            .create_group("alice", "Before", &[], None)
+            .await
+            .unwrap();
+        let mut resolver = crate::notifications::NotificationResolver::default();
+        let warm = crate::notifications::notification_update_from_event_cached(
+            &app,
+            &mut resolver,
+            &message(&account, &group, 1),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(warm.group_name.as_deref(), Some("Before"));
+
+        assert!(runtime.forget_group_local("alice", &group).await.unwrap());
+        // The queued-message resolver has not consumed GroupStateUpdated.
+        assert_eq!(
+            crate::notifications::notification_update_from_event_cached(
+                &app,
+                &mut resolver,
+                &message(&account, &group, 2),
+            )
+            .unwrap(),
+            None
+        );
+        runtime.shutdown().await;
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn worker_lookup_skips_reconcile() {
     let root = tempfile::tempdir().unwrap();

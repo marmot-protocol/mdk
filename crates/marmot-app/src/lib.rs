@@ -559,6 +559,8 @@ pub struct MarmotApp {
     block_list_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     moderation_reports: Arc<moderation_reports::ModerationReportState>,
     pub(crate) block_list_updates: Arc<tokio::sync::watch::Sender<u64>>,
+    #[cfg(test)]
+    notification_dispatches: Arc<std::sync::atomic::AtomicUsize>,
     root: PathBuf,
     /// Present for exclusive-root entry points. Every clone shares this cell,
     /// so the root remains exclusively owned until all database-capable app and
@@ -1733,6 +1735,8 @@ impl MarmotApp {
                 || config.cursor_persistence == CursorPersistence::Frozen,
         );
         Self {
+            #[cfg(test)]
+            notification_dispatches: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             account_home: AccountHome::open(&root),
             root,
             root_runtime_lease: Arc::new(Mutex::new(None)),
@@ -1854,6 +1858,8 @@ impl MarmotApp {
                 || config.cursor_persistence == CursorPersistence::Frozen,
         );
         Self {
+            #[cfg(test)]
+            notification_dispatches: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             root: root.as_ref().to_path_buf(),
             root_runtime_lease: Arc::new(Mutex::new(None)),
             storage_closed: Arc::new(AtomicBool::new(false)),
