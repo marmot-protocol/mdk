@@ -11,6 +11,7 @@ use cgka_traits::{MemberId, MessageId, TransportDeliveryPlane, TransportDelivery
 const RELAY: &str = "wss://a.example";
 const OTHER: &str = "wss://b.example";
 const NOW: u64 = 1_000_000;
+const ADMITTED: StagedRecoverySettlement = StagedRecoverySettlement::Admitted;
 
 fn group(byte: u8) -> TransportReconciliationRoute {
     TransportReconciliationRoute::Group([byte; 32])
@@ -252,7 +253,7 @@ fn only_seen_rows_leave_staging() {
     mark_seen(&app, 1);
     let (one, three) = ([1u8; 32], [3u8; 32]);
     assert_eq!(
-        app.remove_seen_staged_recovery_events(&[&one, &three])
+        app.settle_staged_recovery_events(&[(&one, ADMITTED), (&three, ADMITTED)])
             .unwrap(),
         [true, false]
     );
@@ -264,6 +265,45 @@ fn only_seen_rows_leave_staging() {
         vec![3]
     );
     assert_eq!(app.staged_recovery_total().unwrap().events, 1);
+}
+
+/// A row the engine refused for its group's resources leaves though its
+/// event is not seen, and its second stays covered: fetching it again would
+/// only be refused again.
+#[test]
+fn a_refused_row_leaves_staging_and_stays_covered() {
+    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let app = storage.app_storage();
+    let route = group(1);
+    let base = i64_to_u64(crate::base::codec::unix_now_seconds_i64()).unwrap() - 1_000;
+    let mark = app.recovery_coverage_mark().unwrap();
+    stage(
+        &app,
+        &route,
+        RELAY,
+        &[delivery_at(5, base + 5), delivery_at(6, base + 6)],
+        range(base, base + 10),
+        mark,
+    );
+    let refused = [5u8; 32];
+    assert_eq!(
+        app.settle_staged_recovery_events(&[(&refused, StagedRecoverySettlement::Refused)])
+            .unwrap(),
+        [true]
+    );
+    assert_eq!(
+        staged_ids(
+            &app.staged_recovery_events(std::slice::from_ref(&route), base + 10, 10)
+                .unwrap()
+        ),
+        vec![6]
+    );
+    let relays = [RELAY.to_owned()];
+    assert!(
+        app.recovery_coverage_covers(&route, &relays, base, base + 10)
+            .unwrap()
+    );
+    assert!(!already_seen(&app.lock().unwrap(), &refused).unwrap());
 }
 
 /// A batch's removal is one transaction: a failure part-way through removes
@@ -294,8 +334,11 @@ fn a_failed_removal_leaves_the_whole_batch_staged() {
         ))
         .unwrap();
     let ids = [[1u8; 32], [2u8; 32], [3u8; 32]];
-    let ids = ids.iter().map(<[u8; 32]>::as_slice).collect::<Vec<_>>();
-    assert!(app.remove_seen_staged_recovery_events(&ids).is_err());
+    let ids = ids
+        .iter()
+        .map(|id| (id.as_slice(), ADMITTED))
+        .collect::<Vec<_>>();
+    assert!(app.settle_staged_recovery_events(&ids).is_err());
     assert_eq!(app.staged_recovery_total().unwrap().events, 3);
 
     app.lock()
@@ -303,7 +346,7 @@ fn a_failed_removal_leaves_the_whole_batch_staged() {
         .execute_batch("DROP TRIGGER fail_second")
         .unwrap();
     assert_eq!(
-        app.remove_seen_staged_recovery_events(&ids).unwrap(),
+        app.settle_staged_recovery_events(&ids).unwrap(),
         [true, true, true]
     );
     assert_eq!(app.staged_recovery_total().unwrap().events, 0);

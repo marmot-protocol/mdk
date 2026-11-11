@@ -25,7 +25,14 @@ pub(crate) const RUNNER_COOLDOWN_AFTER_UNREACHABLE: u32 = 3;
 pub(crate) const RUNNER_COOLDOWN_BASE_SECS: u64 = 60;
 pub(crate) const RUNNER_COOLDOWN_CAP_SECS: u64 = 60 * 60;
 /// Quanta per rolling hour before the account breaker pauses the runner.
-pub(crate) const RUNNER_MAX_QUANTA_PER_HOUR: u64 = 720;
+///
+/// A runaway-loop guard, not a pace: a pause is reported as a bug signal.
+/// One account runs one quantum at a time, so this sits near what a second-long
+/// quantum can reach. A first catch-up proves each (route, relay) of every
+/// group a slice at a time, mostly empty slices that fetch nothing, and at 720
+/// an account of about 80 groups paused within minutes of opening and again at
+/// every window roll for hours. The event-byte cap bounds what is fetched.
+pub(crate) const RUNNER_MAX_QUANTA_PER_HOUR: u64 = 7_200;
 /// Fetched event bytes per rolling hour before the account breaker pauses.
 pub(crate) const RUNNER_MAX_EVENT_BYTES_PER_HOUR: u64 = 256 * 1024 * 1024;
 /// One quantum's network deadline.
