@@ -434,6 +434,14 @@ event journal.
   attachment bytes. UniFFI and C expose the same handle. See the
   [live conversation contract](../../docs/marmot-architecture/further-context/conversation-live-window-plan.md).
 
+`MarmotAppRuntime::submit_media_attachments` admits previously uploaded references
+with an optional `reply_to_message_id` before its client-token argument. A target
+adds `e` and `q` reply tags to the same kind-9 message as every attachment and the
+optional caption. `None` sends ordinary media. The method validates the target
+without reading, consuming, or changing the composer draft. Tagged upload callers
+can capture the same reply references in `MediaUploadRequest::message_tags`, as
+White Noise Linux does before its upload worker starts.
+
 ## Encrypted media endpoints
 
 Encrypted media and encrypted group images are uploaded as opaque `application/octet-stream` blobs. A compatible Blossom

@@ -110,6 +110,7 @@ impl MarmotAppRuntime {
                         .map(|a| a.reference.clone())
                         .collect(),
                     caption,
+                    None,
                     client_token,
                 )
                 .await
@@ -174,12 +175,17 @@ impl MarmotAppRuntime {
             .transpose()
     }
 
+    /// Admit uploaded attachments with an optional explicit reply target.
+    /// `None` sends a standalone message; `Some` requires a valid message id
+    /// and adds the shared builder's `e` and `q` tags alongside attachment tags.
+    /// This method never reads, consumes, or changes the composer draft.
     pub async fn submit_media_attachments(
         &self,
         account: &str,
         group: &GroupId,
         attachments: Vec<MediaAttachmentReference>,
         caption: Option<String>,
+        reply_to_message_id: Option<String>,
         client_token: String,
     ) -> Result<crate::LocalSendAcceptance, AppError> {
         self.submit_local_message(
@@ -188,7 +194,7 @@ impl MarmotAppRuntime {
             client_token,
             LocalMessageRequest {
                 content: caption.unwrap_or_default(),
-                reply_to: None,
+                reply_to: reply_to_message_id,
                 attachments,
             },
             None,

@@ -460,6 +460,7 @@ class MarmotAgentControlClient:
         attachments: Iterable[Dict[str, Any]],
         *,
         caption: Optional[str] = None,
+        reply_to_message_id_hex: Optional[str] = None,
         idempotency_key: Optional[str] = None,
         response_timeout: Optional[float] = None,
     ) -> Dict[str, Any]:
@@ -470,6 +471,10 @@ class MarmotAgentControlClient:
             "attachments": list(attachments),
             "caption": str(caption) if caption is not None else None,
         }
+        if reply_to_message_id_hex is not None:
+            payload["reply_to_message_id_hex"] = _normalize_hex(
+                reply_to_message_id_hex, "reply_to_message_id_hex"
+            )
         key = str(idempotency_key or "").strip()
         if key:
             payload["idempotency_key"] = key
