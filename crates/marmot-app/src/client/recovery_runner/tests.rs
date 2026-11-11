@@ -3430,7 +3430,7 @@ fn recovery_runner_policy_holds_the_starting_values() {
             policy.unit.max_attempts_per_hour,
             policy.unit.max_event_bytes_per_hour
         ),
-        (720, 256 * 1024 * 1024)
+        (7_200, 256 * 1024 * 1024)
     );
     assert_eq!(
         (
