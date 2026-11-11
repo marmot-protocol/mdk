@@ -137,8 +137,9 @@ pub(crate) enum Admitted {
     /// stays fetchable.
     NoTrace,
     /// It could not open it and had no room to keep it for later: refused for
-    /// its group's resources. It keeps no trace of it either, so a later
-    /// delivery of the event still reaches it.
+    /// its group's resources after a failed peel. It keeps no trace of it
+    /// either, so a later delivery of the event still reaches it. A
+    /// quarantined group's refusal is `NoTrace`: its gate refuses unopened.
     Refused,
 }
 

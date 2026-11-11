@@ -975,14 +975,14 @@ mod tests {
             ),
             ("E1.max_convergence_reprocessing_passes".to_owned(), 16_u64),
             ("E2.max_deferred_peel_attempts".to_owned(), 32_u64),
-            ("E3.max_peel_deferred_rows_per_group".to_owned(), 2_048_u64),
+            ("E3.max_peel_deferred_rows_per_group".to_owned(), 8_192_u64),
             (
                 "E3.max_peel_deferred_bytes_per_group".to_owned(),
-                16_777_216_u64,
+                67_108_864_u64,
             ),
             (
                 "E3.max_peel_deferred_bytes_per_account".to_owned(),
-                67_108_864_u64,
+                268_435_456_u64,
             ),
             ("E4.max_deferred_rows_per_sweep".to_owned(), 64_u64),
             ("E5.candidate_replay_budget_slack".to_owned(), 4_u64),

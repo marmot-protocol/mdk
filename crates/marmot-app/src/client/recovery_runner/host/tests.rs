@@ -2314,14 +2314,18 @@ async fn the_runner_sweeps_rather_than_parks_what_the_open_seeded() {
     );
 }
 
-/// The host tells admission an event refused for its group's resources from
-/// one the engine kept no trace of for any other reason: admission lets the
-/// first go, and holds its group behind the second.
+/// The host tells admission an event refused for its group's resources after
+/// it could not be opened from one the engine kept no trace of for any other
+/// reason: admission lets the first go, and holds its group behind the
+/// second. A quarantined group's gate refuses before any peel, so its refusal
+/// is the second kind: the event may open once the quarantine lifts.
 #[tokio::test]
 async fn admission_learns_an_event_was_refused_for_its_groups_resources() {
+    use super::super::admission::Admitted;
+
     let dir = tempfile::tempdir().unwrap();
     let at = unix_now_seconds() - HOUR;
-    let (_app, mut client, route) =
+    let (app, mut client, route) =
         crate::tests::group_at_the_undecryptable_retention_cap(&dir, at).await;
     let mut inventory = Vec::new();
     let admitted = super::admit(
@@ -2330,7 +2334,26 @@ async fn admission_learns_an_event_was_refused_for_its_groups_resources() {
         &mut inventory,
     )
     .await;
-    assert_eq!(admitted, Ok(super::super::admission::Admitted::Refused));
+    assert_eq!(admitted, Ok(Admitted::Refused));
+
+    // Two ambiguous apply snapshots quarantine the group at the next open
+    // without touching its stored state or its full backlog.
+    drop(client);
+    let storage = app.account_storage("alice").unwrap();
+    for snapshot in ["openmls-apply-incident-a", "openmls-apply-incident-b"] {
+        storage
+            .create_group_snapshot(&route.group_id, snapshot)
+            .unwrap();
+    }
+    let mut client = crate::tests::client_on_app_relay_plane(&app, "alice").await;
+    assert_eq!(client.quarantined_groups().len(), 1);
+    let admitted = super::admit(
+        &mut client,
+        &route.probe(at, "past-the-cap-quarantined"),
+        &mut inventory,
+    )
+    .await;
+    assert_eq!(admitted, Ok(Admitted::NoTrace));
 }
 
 /// Sleep into the next wall-clock second. The ledger's clock is wall-clock

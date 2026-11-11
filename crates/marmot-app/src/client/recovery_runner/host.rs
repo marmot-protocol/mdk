@@ -343,8 +343,10 @@ impl RunnerHost for AccountRunnerHost {
 
 /// Admit one staged delivery through the account's recovered-ingest path. An
 /// event the account holds, or now persisted, is kept; one the engine refused
-/// for its group's resources is reported so admission lets it go; any other
-/// the engine kept no trace of stays fetchable. A plain
+/// for its group's resources after it could not open it is reported so
+/// admission lets it go; any other the engine kept no trace of stays
+/// fetchable. A quarantined group's refusal is the latter: its gate refuses
+/// before any peel, so the event may open once the quarantine lifts. A plain
 /// message's or a held event's inventory row joins `inventory`, which the
 /// command records once at its end; structural input records its own row at
 /// once, as the native path's turns do (`InventoryWrite::NativeTurn`).
@@ -366,9 +368,9 @@ async fn admit(
             refused_group: None,
         } => Admitted::Kept,
         RecoveredDelivery::Ingested {
-            refused_group: Some(_),
+            refused_group: Some(group),
             ..
-        } => Admitted::Refused,
+        } if !crate::client::group_is_quarantined(&client.runtime, &group) => Admitted::Refused,
         RecoveredDelivery::Ingested { .. } => Admitted::NoTrace,
     })
 }
