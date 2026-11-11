@@ -189,8 +189,10 @@ finish bookkeeping, or expiry of an older attempt record, can hide earlier expos
 does **not** prove that the recipient never received it or that delivery is terminal: keep native retries, pending
 work and confirmed state. The error has no frozen-versus-legacy discriminator; hosts must use this limited Welcome
 meaning. Once the retained legacy record shows a prior attempt, its cause stays Unknown/generic rather than being
-reconstructed. Unknown relay formats and KeyPackage errors carrying only a message remain generic; direct signed
-helpers may also remain generic. An explicit retry can return this error; a confirmed create/invite instead exposes
+reconstructed. Unknown relay formats remain generic, and direct signed helpers may too. A KeyPackage publish
+(`rotate_key_package`, `republish_key_package`, account setup), `block_user`, `unblock_user` and
+`sync_sticker_packs` return this error when every relay refused their event for size; a sticker install or uninstall
+still succeeds and leaves its list for the next sync. An explicit retry can return this error; a confirmed create/invite instead exposes
 the later Welcome failure through its pending query/notice without undoing the Add. No retirement or retry policy
 is added.
 

@@ -825,15 +825,20 @@ impl AppClient {
     /// Publish the pointer a pass built, while this device still writes
     /// under its key, and schedule the next pass. A pass that failed, or
     /// whose pointer no relay accepted, waits longer each time; its run is
-    /// published again by the next pass.
-    pub(crate) async fn finish_backup_pass(&mut self, outcome: BackupPassOutcome) {
+    /// published again by the next pass. Returns the kind it logged for a
+    /// pass that did not settle.
+    pub(crate) async fn finish_backup_pass(
+        &mut self,
+        outcome: BackupPassOutcome,
+    ) -> Option<&'static str> {
         let BackupPassOutcome { key, result } = outcome;
         let settled = match result {
             Ok(report) => self.settle_backup_pass(&key, report).await,
             Err(error) => Err(error),
         };
+        let failure_kind = settled.as_ref().err().map(AppError::privacy_safe_kind);
         let Ok(storage) = self.app.account_storage(&self.state.label) else {
-            return;
+            return failure_kind;
         };
         let storage = storage.app_storage();
         let schedule = match settled {
@@ -859,6 +864,7 @@ impl AppClient {
             }
         };
         let _ = storage.schedule_backup_pass(schedule);
+        failure_kind
     }
 
     /// Publish `report`'s pointer, or decide on a takeover; when the next
@@ -909,7 +915,9 @@ impl AppClient {
 
     /// Sign the pointer with `content`, later than the one it `replaces`
     /// (NIP-01 keeps the newer), and publish it to the account's relays.
-    /// Whether a relay accepted it; the others get it later.
+    /// Whether a relay accepted it; the others get it later. A publish that
+    /// failed is refused, as `EventTooLarge` when every relay refused it for
+    /// size.
     async fn publish_backup_pointer(
         &self,
         key: &[u8],
@@ -939,8 +947,15 @@ impl AppClient {
         let relay_client = self
             .app
             .relay_client_for_account_id(&summary.account_id_hex, signer);
-        let Ok(outcome) = relay_client.publish_event(&endpoints, &event, 1).await else {
-            return Ok(false);
+        let outcome = match relay_client.publish_event(&endpoints, &event, 1).await {
+            Ok(outcome) => outcome,
+            // No host sees a pass: a size refusal by every relay is logged as
+            // one and retried like any refused pointer (mdk#2334).
+            Err(error) => {
+                return Err(AppError::account_publish_failure(&error, || {
+                    backup_error("backup_pointer_refused")
+                }));
+            }
         };
         let accepted = !outcome.accepted.is_empty();
         let mut completion = QuorumCancelledDelivery::new(
@@ -1077,12 +1092,14 @@ impl AppClient {
     }
 
     /// Run every due backup pass in place, as the account worker does off
-    /// it. Test support only.
+    /// it, and return the kind logged for a pass that did not settle. Test
+    /// support only.
     #[cfg(all(test, feature = "test-policy-overrides"))]
-    pub(crate) async fn drive_backup_pass(&mut self) {
-        if let Ok(Some(pass)) = self.prepare_backup_pass() {
-            let outcome = pass.run().await;
-            self.finish_backup_pass(outcome).await;
-        }
+    pub(crate) async fn drive_backup_pass(&mut self) -> Option<&'static str> {
+        let Ok(Some(pass)) = self.prepare_backup_pass() else {
+            return None;
+        };
+        let outcome = pass.run().await;
+        self.finish_backup_pass(outcome).await
     }
 }

@@ -342,7 +342,15 @@ impl MarmotApp {
                         .all(|f| f.kind != TransportEndpointFailureKind::PossiblyExposed);
                 if definite && !retrying_uncertain {
                     storage.clear_block_publication()?;
-                    Err(AppError::BlockListUnavailable)
+                    // Every relay refused it for size: typed (mdk#2334). A
+                    // retry keeps its uncertainty below, since the earlier
+                    // attempt may have reached a relay.
+                    Err(match &other {
+                        Err(error) => AppError::account_publish_failure(error, || {
+                            AppError::BlockListUnavailable
+                        }),
+                        Ok(_) => AppError::BlockListUnavailable,
+                    })
                 } else {
                     Err(AppError::BlockPublicationUncertain)
                 }
