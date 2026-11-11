@@ -2247,7 +2247,7 @@ mod tests {
         acknowledge_all(&mut worker);
         // Version 1 kept ~320 bytes per retained file and wedged at ~3,250.
         assert!(
-            state_len(&state_dir) < 5000 * 96,
+            state_len(&state_dir) < 5000 * 128,
             "{}",
             state_len(&state_dir)
         );
@@ -2262,7 +2262,7 @@ mod tests {
                 .any(|body| body.windows(13).any(|w| w == b"after-history"))
         );
         assert!(worker.gaps().is_empty());
-        assert!(state_len(&state_dir) < 5000 * 96);
+        assert!(state_len(&state_dir) < 5000 * 128);
     }
 
     #[test]
@@ -2306,7 +2306,8 @@ mod tests {
         // Nine backlog segments, then the active file with its new record.
         assert_eq!(sink.batches.len(), 10);
         assert!(worker.gaps().is_empty());
-        assert!(state_len(&state_dir) < MAX_STATE_BYTES / 4);
+        // Windows file ids make each compact row larger than on Unix.
+        assert!(state_len(&state_dir) < MAX_STATE_BYTES / 2);
         let reopened = LocalAuditDelivery::open(&active, &state_dir, "receiver-A").unwrap();
         assert_eq!(reopened.state.version, STATE_VERSION);
     }
