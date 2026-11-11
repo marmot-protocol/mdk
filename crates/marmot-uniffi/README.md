@@ -1829,6 +1829,15 @@ delivered or found nothing left; `consecutive_failures` counts failed attempts s
 record's time as measured at `observed_at_ms`; it is not refreshed while the local cursor cannot
 open or delivery is paused.
 
+Local audit files are kept for at most `max_age_days` (default 30, clamped to 1-30, the
+receiver's acceptance window), delivered or not; deleting undelivered data records an
+`ExpiredUndelivered` gap, counted in `backlog.gaps`, so delivery moves on to later data. Each account also has a size
+budget, `max_bytes_per_account` (default 256 MiB, at least 16 MiB): above it, the oldest sealed
+segments are deleted only once v5 delivery accepted them, or when the account has no v5 delivery.
+Read and change both with `audit_log_retention()` and
+`set_audit_log_retention(AuditLogRetentionFfi)`; the policy is persisted, and the returned record
+is the clamped value stored. The explicit delete and clear calls are unaffected.
+
 ## Legacy audit v4 upload
 
 The v4 whole-file route only drains v4 files written before 0.11.0; keep its configuration until

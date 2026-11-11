@@ -76,6 +76,13 @@ pub struct StoredAuditLogSettings {
     pub enabled: bool,
 }
 
+/// Host-configured local audit retention. The app owns defaults and bounds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StoredAuditLogRetention {
+    pub max_age_days: u32,
+    pub max_bytes_per_account: u64,
+}
+
 /// Installation-local consent receipt. 0 = acceptance required, 1 = declined, 2 = granted.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct StoredUsageDiagnosticsSettings {
@@ -610,6 +617,44 @@ impl SqliteSharedStorage {
                     enabled = excluded.enabled,
                     updated_at_ms = excluded.updated_at_ms",
                     params![bool_i64(settings.enabled), unix_now_ms()],
+                )
+                .storage()?;
+            Ok(())
+        })
+    }
+
+    /// `None` until a host stores a retention policy.
+    pub fn audit_log_retention(&self) -> StorageResult<Option<StoredAuditLogRetention>> {
+        self.lock()?
+            .query_row_cached(
+                "SELECT max_age_days, max_bytes_per_account
+                 FROM audit_log_retention_settings
+                 WHERE id = 1",
+                [],
+                |row| {
+                    Ok(StoredAuditLogRetention {
+                        max_age_days: row.get(0)?,
+                        max_bytes_per_account: row.get::<_, i64>(1)?.try_into().unwrap_or(0),
+                    })
+                },
+            )
+            .optional()
+            .storage()
+    }
+
+    pub fn set_audit_log_retention(&self, retention: StoredAuditLogRetention) -> StorageResult<()> {
+        let max_bytes = i64::try_from(retention.max_bytes_per_account).unwrap_or(i64::MAX);
+        retry_on_busy(|| {
+            self.lock()?
+                .execute_cached(
+                    "INSERT INTO audit_log_retention_settings
+                        (id, max_age_days, max_bytes_per_account, updated_at_ms)
+                     VALUES (1, ?1, ?2, ?3)
+                     ON CONFLICT(id) DO UPDATE SET
+                        max_age_days = excluded.max_age_days,
+                        max_bytes_per_account = excluded.max_bytes_per_account,
+                        updated_at_ms = excluded.updated_at_ms",
+                    params![retention.max_age_days, max_bytes, unix_now_ms()],
                 )
                 .storage()?;
             Ok(())
@@ -1213,7 +1258,7 @@ mod migration_contract_tests {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap();
-        assert_eq!(row, (3, "0003_directory_presentation".into()));
+        assert_eq!(row, (4, "0004_audit_log_retention".into()));
     }
 
     #[test]

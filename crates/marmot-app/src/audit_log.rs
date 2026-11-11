@@ -33,6 +33,10 @@ use marmot_observability::{
 mod legacy_cleanup;
 pub(crate) use legacy_cleanup::cleanup_legacy_audit_logs;
 mod retention;
+pub use retention::{
+    AUDIT_LOG_DEFAULT_MAX_BYTES_PER_ACCOUNT, AUDIT_LOG_MAX_AGE_DAYS,
+    AUDIT_LOG_MIN_MAX_BYTES_PER_ACCOUNT, AuditLogRetention,
+};
 pub(crate) use retention::{AuditRetentionWorker, cleanup_expired_audit_logs};
 
 pub(crate) type AuditRecorderSlot =

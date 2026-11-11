@@ -7,6 +7,11 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ## [Unreleased]
 
+- Add `marmot_audit_log_retention` and `marmot_set_audit_log_retention` for the persisted local audit retention
+  policy (mdk#3300): a maximum age of 1-30 days (default 30) and a per-account size budget of at least 16 MiB
+  (default 256 MiB) that deletes only segments v5 delivery accepted or will never send. `MarmotAuditLogRetention` is a
+  new struct, freed with `marmot_audit_log_retention_free`. Additive; use the matching generated header and library.
+
 - `MarmotAppGroupHydrationQuarantineReason` adds `MARMOT_APP_GROUP_HYDRATION_QUARANTINE_REASON_REWIND_RESTORE_FAILED`
   (mdk#3272), reported by the quarantined-groups read: a read of past group state could not restore the live group.
   Neither a retry nor a re-join clears it, and the next account open restores the live state. A `switch` that covers

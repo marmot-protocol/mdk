@@ -11,7 +11,9 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 mod retention;
-pub use retention::expire_closed_source;
+pub use retention::{
+    DeliveryCursorView, SourceDelivery, evict_delivered_source, expire_closed_source,
+};
 
 const MAX_BATCH_BYTES: usize = 64 * 1024;
 const MAX_LINE_BYTES: usize = 64 * 1024;
@@ -3185,11 +3187,12 @@ mod tests {
     }
 
     #[test]
-    fn retention_preserves_unobserved_and_prepared_unsent_tail_evidence() {
+    fn age_expiry_records_expired_undelivered_gap_and_delivery_continues() {
         for prepare_tail in [false, true] {
             let (_dir, active, state_dir, recorder) = setup();
             let mut worker = LocalAuditDelivery::open(&active, &state_dir, "receiver-A").unwrap();
-            drain(&mut worker, &mut FakeReceiver::default());
+            let mut sink = FakeReceiver::default();
+            drain(&mut worker, &mut sink);
             let acknowledged = worker.state.journals[0].acknowledged;
             record(&recorder, "not-yet-uploaded");
             let final_len = fs::metadata(&active).unwrap().len();
@@ -3206,14 +3209,338 @@ mod tests {
                     )
                     .unwrap()
             );
+            // The loss is recorded before the unlink, so discovery finds
+            // nothing missing afterwards.
             assert_eq!(
                 worker.prepare_once().unwrap(),
-                Preparation::Step(DeliveryStep::Gap)
+                Preparation::Step(DeliveryStep::Idle)
             );
-            assert_eq!(worker.gaps()[0].reason, GapReason::MissingSource);
+            assert_eq!(worker.gaps().len(), 1);
+            assert_eq!(worker.gaps()[0].reason, GapReason::ExpiredUndelivered);
             assert_eq!(worker.gaps()[0].start, acknowledged);
-            assert_eq!(worker.state.journals[0].observed_len, final_len);
+            assert_eq!(worker.gaps()[0].end, Some(final_len));
+            // The delivery status reports the loss, not a backlog it still owes.
+            let backlog = worker.backlog();
+            assert_eq!((backlog.gaps, backlog.undelivered_bytes), (1, 0));
+            let recorder = JsonlRecorder::open(&active, "engine-abc".into()).unwrap();
+            record(&recorder, "after-expiry");
+            let before = sink.batches.len();
+            drain(&mut worker, &mut sink);
+            assert!(
+                sink.batches[before..]
+                    .iter()
+                    .flat_map(|batch| &batch.bodies)
+                    .any(|body| body.windows(12).any(|w| w == b"after-expiry"))
+            );
+            assert_eq!(worker.gaps().len(), 1);
         }
+    }
+
+    #[test]
+    fn age_expiry_of_a_segment_the_cursor_never_adopted_records_its_loss() {
+        let (_dir, active, state_dir, recorder) = setup();
+        let mut worker = LocalAuditDelivery::open(&active, &state_dir, "receiver-A").unwrap();
+        let mut sink = FakeReceiver::default();
+        drain(&mut worker, &mut sink);
+        let sealed = seal_segments(&recorder, &active, 1, 1).remove(0);
+        let len = fs::metadata(&sealed).unwrap().len();
+        assert!(retention::expire_closed_source(&sealed, &state_dir).unwrap());
+        assert!(!sealed.exists());
+        drain(&mut worker, &mut sink);
+        let gaps = worker.gaps();
+        assert_eq!(gaps.len(), 1);
+        assert_eq!(gaps[0].reason, GapReason::ExpiredUndelivered);
+        assert_eq!(
+            gaps[0].segment,
+            sealed.file_name().unwrap().to_str().unwrap()
+        );
+        assert_eq!((gaps[0].start, gaps[0].end), (0, Some(len)));
+    }
+
+    #[test]
+    fn size_budget_evicts_only_what_the_cursor_no_longer_owes() {
+        let (dir, active, state_dir, recorder) = setup();
+        let mut worker = LocalAuditDelivery::open(&active, &state_dir, "receiver-A").unwrap();
+        let delivered = seal_segments(&recorder, &active, 1, 2);
+        let mut sink = FakeReceiver::default();
+        drain(&mut worker, &mut sink);
+        let adopted = seal_segments(&recorder, &active, 3, 1).remove(0);
+        worker.discover().unwrap();
+        let unadopted = seal_segments(&recorder, &active, 4, 1).remove(0);
+        let other = dir.path().join("audit-engine-old-v4-seg000001.jsonl");
+        fs::write(&other, b"previous identity").unwrap();
+
+        let view = DeliveryCursorView::load(&state_dir).unwrap();
+        for (path, expected) in [
+            (&delivered[0], SourceDelivery::Delivered),
+            (&adopted, SourceDelivery::Undelivered),
+            (&unadopted, SourceDelivery::Undelivered),
+            (&other, SourceDelivery::Untracked),
+        ] {
+            assert_eq!(view.source_delivery(path).unwrap(), expected, "{path:?}");
+        }
+        let cursor = fs::read(state_dir.join("local-delivery.json")).unwrap();
+        for owed in [&adopted, &unadopted] {
+            assert!(!retention::evict_delivered_source(owed, &state_dir).unwrap());
+            assert!(owed.exists());
+        }
+        assert_eq!(
+            fs::read(state_dir.join("local-delivery.json")).unwrap(),
+            cursor
+        );
+        for evictable in [&delivered[0], &other] {
+            assert!(retention::evict_delivered_source(evictable, &state_dir).unwrap());
+            assert!(!evictable.exists());
+        }
+        let before = sink.batches.len();
+        drain(&mut worker, &mut sink);
+        assert!(worker.gaps().is_empty());
+        let sent: Vec<_> = sink.batches[before..]
+            .iter()
+            .map(|batch| batch.segment.as_str())
+            .collect();
+        for owed in [&adopted, &unadopted] {
+            assert!(sent.contains(&owed.file_name().unwrap().to_str().unwrap()));
+        }
+    }
+
+    #[test]
+    fn size_budget_reads_a_version_one_cursor_that_was_never_rewritten() {
+        let (_dir, active, state_dir, recorder) = setup();
+        let delivered = seal_segments(&recorder, &active, 1, 1).remove(0);
+        let mut worker = LocalAuditDelivery::open(&active, &state_dir, "receiver-A").unwrap();
+        drain(&mut worker, &mut FakeReceiver::default());
+        let owed = seal_segments(&recorder, &active, 2, 1).remove(0);
+        worker.discover().unwrap();
+        let mut legacy = serde_json::to_value(&worker.state).unwrap();
+        legacy["version"] = 1.into();
+        legacy.as_object_mut().unwrap().remove("source");
+        fs::write(
+            state_dir.join("local-delivery.json"),
+            serde_json::to_vec(&legacy).unwrap(),
+        )
+        .unwrap();
+        let view = DeliveryCursorView::load(&state_dir).unwrap();
+        assert_eq!(
+            view.source_delivery(&delivered).unwrap(),
+            SourceDelivery::Delivered
+        );
+        assert_eq!(
+            view.source_delivery(&owed).unwrap(),
+            SourceDelivery::Undelivered
+        );
+        assert!(!retention::evict_delivered_source(&owed, &state_dir).unwrap());
+        assert!(retention::evict_delivered_source(&delivered, &state_dir).unwrap());
+    }
+
+    #[test]
+    fn a_delivered_row_never_vouches_for_other_bytes_on_its_inode() {
+        let (_dir, active, state_dir, recorder) = setup();
+        let delivered = seal_segments(&recorder, &active, 1, 1).remove(0);
+        let mut worker = LocalAuditDelivery::open(&active, &state_dir, "receiver-A").unwrap();
+        drain(&mut worker, &mut FakeReceiver::default());
+        // Same inode and length, other bytes: what a reused inode looks like
+        // to a cursor that has not run discovery since the deletion.
+        let mut bytes = fs::read(&delivered).unwrap();
+        bytes[0] = b' ';
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&delivered)
+            .unwrap()
+            .write_all(&bytes)
+            .unwrap();
+        for discovered in [false, true] {
+            if discovered {
+                // Discovery sees the changed head and adopts a new generation.
+                worker.discover().unwrap();
+            }
+            let view = DeliveryCursorView::load(&state_dir).unwrap();
+            assert_eq!(
+                view.source_delivery(&delivered).unwrap(),
+                SourceDelivery::Undelivered
+            );
+            assert!(!retention::evict_delivered_source(&delivered, &state_dir).unwrap());
+            assert!(delivered.exists());
+        }
+    }
+
+    #[test]
+    fn age_expiry_of_changed_bytes_on_a_known_inode_records_their_loss() {
+        let (_dir, active, state_dir, recorder) = setup();
+        let sealed = seal_segments(&recorder, &active, 1, 1).remove(0);
+        let mut worker = LocalAuditDelivery::open(&active, &state_dir, "receiver-A").unwrap();
+        let mut sink = FakeReceiver::default();
+        drain(&mut worker, &mut sink);
+        let mut bytes = fs::read(&sealed).unwrap();
+        bytes[0] = b' ';
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&sealed)
+            .unwrap()
+            .write_all(&bytes)
+            .unwrap();
+        assert!(retention::expire_closed_source(&sealed, &state_dir).unwrap());
+        drain(&mut worker, &mut sink);
+        // The delivered generation retires without a gap; the bytes that
+        // replaced it are recorded as expired under their own generation.
+        let gaps = worker.gaps();
+        assert_eq!(gaps.len(), 1);
+        assert_eq!(gaps[0].reason, GapReason::ExpiredUndelivered);
+        assert_eq!((gaps[0].start, gaps[0].end), (0, Some(bytes.len() as u64)));
+    }
+
+    #[test]
+    fn age_expiry_of_an_emptied_known_segment_records_the_loss_before_unlinking() {
+        for fail_unlink in [true, false] {
+            let (_dir, active, state_dir, recorder) = setup();
+            let mut worker = LocalAuditDelivery::open(&active, &state_dir, "receiver-A").unwrap();
+            drain(&mut worker, &mut FakeReceiver::default());
+            let sealed = seal_segments(&recorder, &active, 1, 1).remove(0);
+            worker.discover().unwrap();
+            let cursor = fs::read(state_dir.join("local-delivery.json")).unwrap();
+            fs::OpenOptions::new()
+                .write(true)
+                .open(&sealed)
+                .unwrap()
+                .set_len(0)
+                .unwrap();
+            let result = retention::expire_with(
+                &sealed,
+                &state_dir,
+                retention::Expiry::Age,
+                |target| {
+                    if fail_unlink {
+                        Err(io::Error::from(io::ErrorKind::PermissionDenied))
+                    } else {
+                        fs::remove_file(target)
+                    }
+                },
+                |delivery| delivery.publish(),
+            );
+            if fail_unlink {
+                assert_eq!(result.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+                assert_eq!(
+                    fs::read(state_dir.join("local-delivery.json")).unwrap(),
+                    cursor
+                );
+                continue;
+            }
+            assert!(result.unwrap());
+            // Durable without any discovery: the reopened cursor validates
+            // and names the lost generation.
+            let state = load_state(
+                &state_dir.join("local-delivery.json"),
+                "receiver-A",
+                active.file_name().unwrap().to_str().unwrap(),
+            )
+            .unwrap();
+            assert_eq!(state.gaps.len(), 1);
+            assert_eq!(state.gaps[0].reason, GapReason::MissingSource);
+            assert_eq!(
+                state.gaps[0].segment,
+                sealed.file_name().unwrap().to_str().unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn age_expiry_during_a_split_leaves_a_cursor_that_reopens_and_delivers() {
+        let (_dir, active, state_dir, recorder) = setup();
+        for index in 0..3 {
+            record(&recorder, &format!("split-{index}"));
+        }
+        let mut worker = LocalAuditDelivery::open(&active, &state_dir, "receiver-A").unwrap();
+        let mut sink = FakeReceiver {
+            next: Some(ReceiverResult::Permanent),
+            ..Default::default()
+        };
+        assert_eq!(worker.run_once(&mut sink).unwrap(), DeliveryStep::Split);
+        drop(recorder);
+        assert!(
+            crate::NoopRecorder
+                .expire_file_before(&active, u64::MAX, &mut |p| {
+                    retention::expire_closed_source(p, &state_dir)
+                })
+                .unwrap()
+        );
+        let mut worker = LocalAuditDelivery::open(&active, &state_dir, "receiver-A").unwrap();
+        let recorder = JsonlRecorder::open(&active, "engine-abc".into()).unwrap();
+        record(&recorder, "after-split");
+        let before = sink.batches.len();
+        drain(&mut worker, &mut sink);
+        assert!(
+            sink.batches[before..]
+                .iter()
+                .flat_map(|batch| &batch.bodies)
+                .any(|body| body.windows(11).any(|w| w == b"after-split"))
+        );
+        assert_eq!(worker.gaps().len(), 1);
+        assert_eq!(worker.gaps()[0].reason, GapReason::ExpiredUndelivered);
+    }
+
+    #[test]
+    fn repeated_expiry_while_delivery_is_idle_keeps_the_cursor_bounded() {
+        let (_dir, active, state_dir, recorder) = setup();
+        let mut worker = LocalAuditDelivery::open(&active, &state_dir, "receiver-A").unwrap();
+        drain(&mut worker, &mut FakeReceiver::default());
+        drop(worker);
+        // No discovery runs: only retention touches the cursor.
+        for index in 1..=(MAX_GAPS as u32 + 16) {
+            let sealed = seal_segments(&recorder, &active, index, 1).remove(0);
+            assert!(retention::expire_closed_source(&sealed, &state_dir).unwrap());
+        }
+        let state = load_state(
+            &state_dir.join("local-delivery.json"),
+            "receiver-A",
+            active.file_name().unwrap().to_str().unwrap(),
+        )
+        .unwrap();
+        assert!(
+            state.journals.len() <= MAX_GAPS + 1,
+            "{}",
+            state.journals.len()
+        );
+        assert_eq!(state.gaps.len(), MAX_GAPS);
+        assert_eq!(state.dropped_gaps, 16);
+        // About 110 KiB on Unix; Windows file ids make every row longer.
+        assert!(
+            state_len(&state_dir) < MAX_STATE_BYTES / 4,
+            "{}",
+            state_len(&state_dir)
+        );
+    }
+
+    #[test]
+    fn size_budget_treats_sources_no_cursor_will_deliver_as_untracked() {
+        let (_dir, active, state_dir, recorder) = setup();
+        let segments = seal_segments(&recorder, &active, 1, 2);
+        let view = DeliveryCursorView::load(&state_dir).unwrap();
+        assert_eq!(
+            view.source_delivery(&segments[0]).unwrap(),
+            SourceDelivery::Untracked
+        );
+        assert!(retention::evict_delivered_source(&segments[0], &state_dir).unwrap());
+        assert!(!state_dir.exists());
+        // An overflow gap already gave up on segments at or below its floor.
+        let mut worker = LocalAuditDelivery::open(&active, &state_dir, "receiver-A").unwrap();
+        let source = worker.state.source.clone();
+        worker.state.journals.retain(|j| j.segment == source);
+        let shed = seal_segments(&recorder, &active, 2, 2);
+        worker.state.overflow_floor = Some(2);
+        worker.state.overflow_floor_change_time = change_time_ns(&fs::metadata(&shed[0]).unwrap());
+        worker.publish().unwrap();
+        let view = DeliveryCursorView::load(&state_dir).unwrap();
+        assert_eq!(
+            view.source_delivery(&shed[0]).unwrap(),
+            SourceDelivery::Untracked
+        );
+        assert_eq!(
+            view.source_delivery(&shed[1]).unwrap(),
+            SourceDelivery::Undelivered
+        );
+        assert!(retention::evict_delivered_source(&shed[0], &state_dir).unwrap());
+        assert!(!retention::evict_delivered_source(&shed[1], &state_dir).unwrap());
     }
 
     #[test]
@@ -3251,6 +3578,7 @@ mod tests {
             let result = retention::expire_with(
                 &active,
                 &state_dir,
+                retention::Expiry::Age,
                 |_| Err(io::Error::from(io::ErrorKind::PermissionDenied)),
                 |delivery| {
                     delivery.publish()?;
@@ -3287,6 +3615,49 @@ mod tests {
     }
 
     #[test]
+    fn expired_undelivered_gap_is_compensated_when_publication_or_unlink_fails() {
+        for fail_publication in [false, true] {
+            let (_dir, active, state_dir, recorder) = setup();
+            let mut worker = LocalAuditDelivery::open(&active, &state_dir, "receiver-A").unwrap();
+            let sealed = seal_segments(&recorder, &active, 1, 1).remove(0);
+            worker.discover().unwrap();
+            let state_before = fs::read(state_dir.join("local-delivery.json")).unwrap();
+            let error = retention::expire_with(
+                &sealed,
+                &state_dir,
+                retention::Expiry::Age,
+                |_| Err(io::Error::from(io::ErrorKind::PermissionDenied)),
+                |delivery| {
+                    delivery.publish()?;
+                    if fail_publication {
+                        Err(io::Error::from(io::ErrorKind::TimedOut))
+                    } else {
+                        Ok(())
+                    }
+                },
+            )
+            .unwrap_err();
+            let expected = if fail_publication {
+                io::ErrorKind::TimedOut
+            } else {
+                io::ErrorKind::PermissionDenied
+            };
+            assert_eq!(error.kind(), expected);
+            assert!(sealed.exists());
+            assert_eq!(
+                fs::read(state_dir.join("local-delivery.json")).unwrap(),
+                state_before
+            );
+            assert!(retention::expire_closed_source(&sealed, &state_dir).unwrap());
+            let mut sink = FakeReceiver::default();
+            drain(&mut worker, &mut sink);
+            assert!(!sink.batches.is_empty());
+            let reasons: Vec<_> = worker.gaps().iter().map(|gap| &gap.reason).collect();
+            assert_eq!(reasons, [&GapReason::ExpiredUndelivered]);
+        }
+    }
+
+    #[test]
     fn retention_crash_after_cursor_publication_retries_sealed_inode_without_false_gap() {
         let (_dir, active, state_dir, recorder) = setup();
         let mut worker = LocalAuditDelivery::open(&active, &state_dir, "receiver-A").unwrap();
@@ -3297,6 +3668,7 @@ mod tests {
             let _ = retention::expire_with(
                 &active,
                 &state_dir,
+                retention::Expiry::Age,
                 |_| panic!("simulated process stop before unlink"),
                 |delivery| delivery.publish(),
             );
@@ -3329,6 +3701,7 @@ mod tests {
         let result = retention::expire_with(
             &active,
             &state_dir,
+            retention::Expiry::Age,
             |_| panic!("unlink must not run"),
             |delivery| {
                 delivery.publish()?;

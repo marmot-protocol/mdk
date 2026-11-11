@@ -22,7 +22,9 @@ Shared JSONL forensic audit schema for Marmot incident capture.
   context to the next actual event. Never invoke uncertain-writer recovery or charge failed record attempts from
   maintenance. An empty live file remains open without generating further metadata-only segments.
   Retire a closed source through `local_delivery::expire_closed_source` before unlinking it: publish its immutable alias
-  and final length first, preserve unaccepted-tail evidence, and compensate cursor and filename on errors. Never relax
+  and final length first, record any unaccepted extent as an `ExpiredUndelivered` gap in that same publication, and
+  compensate cursor and filename on errors. Size-budget eviction goes through `evict_delivered_source`, which deletes
+  only what `DeliveryCursorView` would classify as delivered or untracked. Never relax
   generic missing-active detection based on the cursor's previously observed length alone.
   Destructive `rotate()` — which discards the current file — stays a
   separate, explicit operation.
