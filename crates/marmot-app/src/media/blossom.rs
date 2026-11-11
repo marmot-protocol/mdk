@@ -129,6 +129,8 @@ struct MediaOriginSlot {
 struct BlossomHttpTransportInner {
     origins: StdMutex<HashMap<MediaOrigin, MediaOriginSlot>>,
     resolver: DnsResolver,
+    #[cfg(test)]
+    pools_built: std::sync::atomic::AtomicUsize,
 }
 
 /// Per-account HTTP setup shared by compatible Blossom transfers.
@@ -197,6 +199,8 @@ impl BlossomHttpTransport {
             inner: Arc::new(BlossomHttpTransportInner {
                 origins: StdMutex::new(HashMap::new()),
                 resolver,
+                #[cfg(test)]
+                pools_built: std::sync::atomic::AtomicUsize::new(0),
             }),
             allow_loopback_http,
             address_lease,
@@ -342,12 +346,28 @@ impl BlossomHttpTransport {
             }
             MediaHttpKind::Upload => build_pinned_media_upload_client(pin.clone())?,
         };
+        #[cfg(test)]
+        self.inner
+            .pools_built
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         *generation = Some(CachedMediaClient {
             client: client.clone(),
             pin,
             expires_at,
         });
         Ok(client)
+    }
+
+    #[cfg(test)]
+    /// Count the pinned clients, and so connection pools, this transport built.
+    ///
+    /// hyper hands a finished HTTP/1 connection back to its pool from a spawned
+    /// task, so a request sent right after a response can dial a second socket
+    /// through the same pool. Accepted-socket counts cannot prove pool reuse.
+    pub(super) fn pools_built(&self) -> usize {
+        self.inner
+            .pools_built
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Reuse the same safe origin cache through a view that rejects loopback
