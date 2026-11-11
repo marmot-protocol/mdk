@@ -8888,7 +8888,13 @@ impl KeyPackagePublisher for AppKeyPackagePublisher {
         let outcome = NostrKeyPackagePublisher::new(relay_client)
             .publish_prepared_key_package(&nostr_publication, &event)
             .await
-            .map_err(|e| KeyPackagePublishError::exposed(e.to_string()))?;
+            .map_err(|error| {
+                // A size refusal by every relay reaches the caller typed
+                // (mdk#2334); the lifecycle sees the failure as before.
+                KeyPackagePublishError::exposed(error.to_string()).with_event_size_class(
+                    error::publish_size_refusal(&error).map(|cause| cause.size_class),
+                )
+            })?;
         let accepted = outcome
             .accepted
             .into_iter()

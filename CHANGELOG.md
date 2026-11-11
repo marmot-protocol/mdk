@@ -4,11 +4,16 @@
 
 ### Fixed
 
+- Fetch independent directory queries concurrently, so KeyPackage and deletion
+  reads overlap their relay waits while retaining separate event limits (#1813).
 - Reuse notification settings, chat mutes, group records, and directory users
   across live subscription events (#1800). Track settings, mute, and group
   changes at the shared storage boundary, including engine-side forgets across
   connections. Honor timed mute expiry and skip non-notifying kinds before
   storage reads or blocking-task dispatch.
+- Remove a redundant connected-relay restart from the manual relay lifetime test
+  that timed out in the merge queue (#3287). Connected-relay reconnect coverage
+  remains in the socket-watch and SDK tests.
 
 ## 0.15.0 - 2026-11-09
 

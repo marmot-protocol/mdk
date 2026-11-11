@@ -573,6 +573,25 @@ fn engine_event_too_large(
     }
 }
 
+/// The size a failed account publish proves (mdk#2334): every relay refused
+/// the event for size, by its own refusal or over its known limit. The
+/// transport sets that proof only with no acceptance and no unresolved relay
+/// (mdk#2993), so anything else proves nothing. A direct account publish has
+/// no MLS role, so its artifact is `Other`.
+pub(crate) fn publish_size_refusal(error: &TransportAdapterError) -> Option<crate::OversizedEvent> {
+    match error {
+        TransportAdapterError::PublishEndpoints(failure) => {
+            failure
+                .event_size_class
+                .map(|size_class| crate::OversizedEvent {
+                    artifact: crate::OversizedArtifact::Other,
+                    size_class,
+                })
+        }
+        _ => None,
+    }
+}
+
 /// An external signer reports a rejection as text, which every layer passes
 /// through unchanged. So each lower-stack conversion recognises it by that
 /// text, wherever the rejection happened and however it was wrapped.
@@ -625,6 +644,21 @@ impl From<marmot_session::SessionError> for AppError {
 }
 
 impl AppError {
+    /// `EventTooLarge` for a size refusal of an account publish, which only
+    /// [`publish_size_refusal`] proves, and `otherwise` for any other failure.
+    pub(crate) fn account_publish_failure(
+        error: &TransportAdapterError,
+        otherwise: impl FnOnce() -> Self,
+    ) -> Self {
+        match publish_size_refusal(error) {
+            Some(cause) => Self::EventTooLarge {
+                artifact: cause.artifact,
+                size_class: cause.size_class,
+            },
+            None => otherwise(),
+        }
+    }
+
     /// Typed incomplete-repair evidence, including across the worker boundary.
     /// The boolean indicates outstanding delivery loss; neither case is success.
     pub fn full_history_repair_incomplete(
@@ -662,15 +696,18 @@ impl AppError {
                 artifact: *artifact,
                 size_class: *size_class,
             }),
-            Self::Transport(TransportAdapterError::PublishEndpoints(failure))
-            | Self::Account(AccountError::Transport(TransportAdapterError::PublishEndpoints(
-                failure,
-            ))) => failure
-                .event_size_class
-                .map(|size_class| crate::OversizedEvent {
-                    artifact: crate::OversizedArtifact::Other,
-                    size_class,
-                }),
+            Self::Transport(error) | Self::Account(AccountError::Transport(error)) => {
+                publish_size_refusal(error)
+            }
+            // A KeyPackage publish every relay refused for size (mdk#2334).
+            Self::Account(AccountError::KeyPackage(error)) => {
+                error
+                    .event_size_class
+                    .map(|size_class| crate::OversizedEvent {
+                        artifact: crate::OversizedArtifact::Other,
+                        size_class,
+                    })
+            }
             // A founding create refused before it wrote anything (mdk#2334).
             Self::Session(error) | Self::Account(AccountError::Session(error)) => {
                 engine_event_too_large(error.as_engine_error())

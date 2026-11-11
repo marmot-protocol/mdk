@@ -2162,12 +2162,15 @@ async fn configured_recorder_preserves_delivery_source_and_open_health() {
         no_wire.clone(),
         no_wire,
     ];
-    let entries = records
+    // Every delivery's outcome carries its source, a replay's too.
+    let outcomes = records
         .iter()
-        .filter(|record| matches!(record.kind, AuditEventKind::IngestEntry { .. }))
+        .filter(|record| matches!(record.kind, AuditEventKind::IngestOutcome { .. }))
         .map(|record| record.context.as_ref().unwrap().transport.clone().unwrap())
         .collect::<Vec<_>>();
-    assert_eq!(entries, expected);
+    assert_eq!(outcomes, expected);
+    // The duplicate (the third delivery) records only its outcome; the others
+    // open with their wire evidence.
     let wires = records
         .iter()
         .filter_map(|record| match &record.kind {
@@ -2179,7 +2182,9 @@ async fn configured_recorder_preserves_delivery_source_and_open_health() {
         wires,
         expected
             .into_iter()
-            .filter_map(|context| context.wire)
+            .enumerate()
+            .filter(|(index, _)| *index != 2)
+            .filter_map(|(_, context)| context.wire)
             .collect::<Vec<_>>()
     );
 }

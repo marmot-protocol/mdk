@@ -54,6 +54,7 @@ pub mod test_support;
 
 pub use known_limits::{KnownLimitPublishClient, RelayEventLimits};
 use known_limits::{event_json_bytes, join_refusals, refuse_over_known_limits, refused_everywhere};
+use safety::join_unsafe_refusals;
 pub use safety::{RelayEndpointClassification, RelayEndpointPolicy, retired_relay_hosts};
 pub use telemetry::{
     EngineReorgMetrics, RelayRollupEntry, RelayTelemetryRollup, RelayTelemetrySnapshot,
@@ -4378,15 +4379,16 @@ impl TransportAdapter for MarmotRelayPlaneAccountAdapter {
         if request.account_id != self.account_id {
             return Err(TransportAdapterError::AccountNotActive(request.account_id));
         }
-        let request = self
-            .relay_plane
-            .inner
-            .relay_safety
-            .sanitize_publish_request(request)
-            .map_err(TransportAdapterError::Publish)?;
         request.validate_envelope_matches_target()?;
         let event = NostrTransportEvent::from_transport_message(&request.message)
             .map_err(|e| TransportAdapterError::Publish(format!("Nostr payload: {e}")))?;
+        // A relay the host-safety rule refuses is never contacted, so it is a
+        // definite failure before exposure, not an unknown (mdk#3276).
+        let (request, unsafe_refused) = self
+            .relay_plane
+            .inner
+            .relay_safety
+            .admit_publish_request(request, hex::decode(&event.id).ok().map(MessageId::new))?;
         // An event over a relay's known limit is never sent there: the relay
         // would refuse it, or close the socket on the oversized frame, which
         // reads as a possible exposure and resends the event (mdk#2334).
@@ -4396,17 +4398,18 @@ impl TransportAdapter for MarmotRelayPlaneAccountAdapter {
             event_json_bytes(&event),
         )
         .await;
+        // The size proof covers the relays publish can reach, as the size
+        // preflight judges them; the unsafe ones join its failures after.
         if endpoints.is_empty() && !refused.is_empty() {
             // No relay was contacted, so no publish attempt is counted.
-            return Err(refused_everywhere(
-                request.target.endpoints(),
-                refused,
-                &event,
+            return Err(join_unsafe_refusals(
+                refused_everywhere(request.target.endpoints(), refused, &event),
+                unsafe_refused,
             ));
         }
         // Refused endpoints count against the request's threshold in the
         // report; the endpoints still sent to can meet at most their number.
-        let required_acks = if refused.is_empty() {
+        let required_acks = if refused.is_empty() && unsafe_refused.is_empty() {
             request.required_acks
         } else {
             request.required_acks.min(endpoints.len())
@@ -4441,7 +4444,10 @@ impl TransportAdapter for MarmotRelayPlaneAccountAdapter {
         {
             Ok(outcome) => outcome,
             Err(error) => {
-                return Err(join_refusals(error, request.target.endpoints(), refused));
+                return Err(join_unsafe_refusals(
+                    join_refusals(error, request.target.endpoints(), refused),
+                    unsafe_refused,
+                ));
             }
         };
         let local_fanout_endpoints = if !outcome.accepted.is_empty() {
@@ -4469,6 +4475,7 @@ impl TransportAdapter for MarmotRelayPlaneAccountAdapter {
         }
         let mut report = publish_report_from_outcome(outcome, request);
         report.failed.extend(refused);
+        report.failed.extend(unsafe_refused);
         Ok(report)
     }
 

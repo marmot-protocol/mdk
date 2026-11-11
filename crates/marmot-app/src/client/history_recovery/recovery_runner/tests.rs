@@ -976,6 +976,8 @@ struct TestHost {
     admitted: AdmittedLog,
     /// Events the engine keeps no trace of.
     no_trace: Mutex<BTreeSet<Vec<u8>>>,
+    /// Events the engine refuses for their group's resources.
+    refused: Mutex<BTreeSet<Vec<u8>>>,
     /// Events no installed subscription routes yet.
     unrouted: Mutex<BTreeSet<Vec<u8>>>,
     /// Events whose ingest fails locally.
@@ -1061,6 +1063,7 @@ impl TestHost {
             counts: Mutex::default(),
             admitted: admitted.clone(),
             no_trace: Mutex::default(),
+            refused: Mutex::default(),
             unrouted: Mutex::default(),
             failing_ingests: Mutex::default(),
             ingest_seconds: AtomicU64::new(0),
@@ -1254,6 +1257,10 @@ impl RunnerHost for TestHost {
             if self.no_trace.lock().unwrap().contains(&event_id) {
                 outcomes.push(Ok(Admitted::NoTrace));
                 break;
+            }
+            if self.refused.lock().unwrap().contains(&event_id) {
+                outcomes.push(Ok(Admitted::Refused));
+                continue;
             }
             if self.failing_ingests.lock().unwrap().contains(&event_id) {
                 outcomes.push(Err("storage"));
@@ -3427,7 +3434,7 @@ fn recovery_runner_policy_holds_the_starting_values() {
             policy.unit.max_attempts_per_hour,
             policy.unit.max_event_bytes_per_hour
         ),
-        (720, 256 * 1024 * 1024)
+        (7_200, 256 * 1024 * 1024)
     );
     assert_eq!(
         (
@@ -4548,6 +4555,62 @@ async fn recovery_runner_holds_a_group_behind_an_event_the_engine_kept_no_trace_
     first.extend_from_slice(&s[2..]);
     assert_eq!(admitted(), first);
     assert_eq!(account.app.staged_recovery_total().unwrap().events, 0);
+}
+
+/// The engine refuses an event for its group's resources only once it could
+/// not open it under any key the group holds, so nothing newer of its group
+/// can be opened out of order past it. Holding the group behind it would hold
+/// the group's fetches and live frames, and with them the account's cursor,
+/// until the group's deferred input drained, which a group whose epoch does
+/// not move never does. Admission lets it go instead, still covered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovery_runner_lets_go_of_an_event_refused_for_its_groups_resources() {
+    let account = account();
+    let clock = Clock::new();
+    let t0 = clock.now();
+    let route = group(1);
+    let floor = t0 - HOUR;
+    let events = every([1; 32], floor, t0, 10 * 60);
+    account.goal(&route, floor);
+    account.swept(&route, RELAY, &events, floor, t0 - 1);
+    let relay = ModelRelay::new(RELAY, caps(500, true)).build();
+    let host = TestHost::new(
+        &account,
+        &clock,
+        vec![required(&route, &[RELAY])],
+        &[&relay],
+    );
+    host.tails.stand(&route, RELAY, t0);
+    // A live REQ's capture spans the staged hour, so its frames wait on it.
+    host.set_counts(vec![LiveCount {
+        routes: vec![route.clone()],
+        relay: RELAY.to_owned(),
+        since: floor,
+        oldest_seen: Some(t0 - 1),
+    }]);
+    assert_eq!(host.fences().await, vec![(vec![route.clone()], floor)]);
+    host.refused
+        .lock()
+        .unwrap()
+        .insert(events[2].id.to_bytes().to_vec());
+    let (mut runner, _handle) = runner(&host, test_policy());
+    let reached = account.covered_through(&route, RELAY);
+
+    // Every other event goes in, in order, and nothing is held for a retry.
+    assert_eq!(idle(runner.step().await), None);
+    let mut expected = ids(&events);
+    expected.remove(2);
+    assert_eq!(
+        account
+            .admitted()
+            .into_iter()
+            .map(|(_, event_id)| event_id)
+            .collect::<Vec<_>>(),
+        expected
+    );
+    assert_eq!(account.app.staged_recovery_total().unwrap().events, 0);
+    assert_eq!(account.covered_through(&route, RELAY), reached);
+    assert!(host.fences().await.is_empty(), "the live frames go");
 }
 
 // A paused clock, as above.

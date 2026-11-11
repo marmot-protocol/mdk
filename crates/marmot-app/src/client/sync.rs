@@ -5360,7 +5360,16 @@ impl AppClient {
             || pending_acks != 0
             || pending_frontiers != 0
             || created_group_id_hex.is_some();
-        if has_checkpoint_work && !welcome_only_checkpoint {
+        // A committed save of seen inputs alone changed nothing an analyzer
+        // follows. Every ignored relay replay ends in one, so recording it
+        // would add a row per replayed message (mdk#3300). A failed save keeps
+        // its row.
+        let inputs_only_checkpoint = result.is_ok()
+            && changed_groups == 0
+            && pending_acks == 0
+            && pending_frontiers == 0
+            && created_group_id_hex.is_none();
+        if has_checkpoint_work && !welcome_only_checkpoint && !inputs_only_checkpoint {
             self.record_v5_app_checkpoint(super::audit_v5_app_update::CheckpointObservation {
                 message_ref,
                 changed_groups,

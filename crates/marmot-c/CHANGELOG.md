@@ -26,6 +26,13 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   `marmot_deployment_white_noise` sets 2 MiB on White Noise's two relays. Additive; use the matching generated header
   and library.
 
+- `marmot_rotate_key_package`, `marmot_republish_key_package`, account setup's KeyPackage publish,
+  `marmot_block_user`, `marmot_unblock_user` and `marmot_sync_sticker_packs` return `MARMOT_STATUS_EVENT_TOO_LARGE`
+  when every relay refuses their event for size, by its own answer or over its known limit (mdk#2334). Before, they
+  returned `MARMOT_STATUS_RUNTIME`, `MARMOT_STATUS_BLOCK_LIST_UNAVAILABLE` and `MARMOT_STATUS_STICKER_NETWORK`. A
+  block edit retried after an uncertain attempt still returns `MARMOT_STATUS_BLOCK_PUBLICATION_UNCERTAIN`, and a
+  sticker install or uninstall still succeeds, its list owed to the next sync.
+
 - Add `marmot_start_direct_chat` for shared local direct-chat reuse or creation with both accounts as
   founding admins. It returns an owned hex MLS group id, released with `marmot_string_free`; local success does
   not acknowledge Welcome delivery. Generic creation and existing groups' roles remain unchanged. Additive;

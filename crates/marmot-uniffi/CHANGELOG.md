@@ -36,6 +36,14 @@
   Rows include session-local attempt times and available connection-error categories. Additive; aggregate health
   remains unchanged.
 
+### Changed
+
+- `rotate_key_package`, `republish_key_package`, account setup's KeyPackage publish, `block_user`, `unblock_user` and
+  `sync_sticker_packs` fail as `MarmotKitError::EventTooLarge { artifact: Other }` when every relay refuses their
+  event for size, by its own answer or over its known limit (mdk#2334). Before, they failed as `Runtime`,
+  `BlockListUnavailable` and `StickerNetwork`. A block edit retried after an uncertain attempt stays
+  `BlockPublicationUncertain`, and a sticker install or uninstall still succeeds, its list owed to the next sync.
+
 ## 0.15.0 - 2026-11-09
 
 Regenerate Swift/Kotlin bindings with the matching native library. The main

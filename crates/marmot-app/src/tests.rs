@@ -1212,7 +1212,6 @@ impl ScriptedPushRelayClient {
 
     /// Supply the SDK's already-classified endpoint refusal to the real
     /// adapter/session/App owners. Exact-wire parsing remains SDK-owned.
-    #[cfg(feature = "product-analytics-export")]
     pub(crate) fn reject_publishes_of_kind_as_too_large(&self, kind: u64) {
         *self.fail_publish_kind.lock().unwrap() = Some((kind, true));
     }
@@ -1672,24 +1671,31 @@ impl NostrRelayClient for ScriptedPushRelayClient {
                 .expect("typed boundary fixture receives a genuine signed event");
             let class =
                 cgka_traits::EventSizeClass::of_bytes(serde_json::to_vec(event).unwrap().len());
+            let mut failure = cgka_traits::TransportPublishFailure::with_endpoint_failures(
+                "relay rejected event (too-large)",
+                endpoints
+                    .iter()
+                    .cloned()
+                    .map(|endpoint| cgka_traits::TransportEndpointFailure {
+                        endpoint,
+                        reason: "relay rejected event (too-large)".into(),
+                        kind: cgka_traits::TransportEndpointFailureKind::TerminalRejected,
+                        rejection_category: Some(
+                            cgka_traits::TransportEndpointRejectionCategory::TooLarge,
+                        ),
+                        size_class: Some(class),
+                    })
+                    .collect(),
+            )
+            .with_message_id(cgka_traits::MessageId::new(hex::decode(&event.id).unwrap()));
+            // Every relay refused it with nothing accepted: the SDK client's
+            // aggregate size proof.
+            failure.event_size_class = cgka_traits::EventSizeClass::from_rejected_targets(
+                endpoints,
+                &failure.endpoint_failures,
+            );
             return Err(cgka_traits::TransportAdapterError::PublishEndpoints(
-                cgka_traits::TransportPublishFailure::with_endpoint_failures(
-                    "relay rejected event (too-large)",
-                    endpoints
-                        .iter()
-                        .cloned()
-                        .map(|endpoint| cgka_traits::TransportEndpointFailure {
-                            endpoint,
-                            reason: "relay rejected event (too-large)".into(),
-                            kind: cgka_traits::TransportEndpointFailureKind::TerminalRejected,
-                            rejection_category: Some(
-                                cgka_traits::TransportEndpointRejectionCategory::TooLarge,
-                            ),
-                            size_class: Some(class),
-                        })
-                        .collect(),
-                )
-                .with_message_id(cgka_traits::MessageId::new(hex::decode(&event.id).unwrap())),
+                failure,
             ));
         }
         if failure.is_some_and(|(kind, _)| kind == event.kind) {
@@ -20050,7 +20056,7 @@ impl UndecryptableProbeRoute {
 /// Every filling probe is dated `filled_through` so a later probe's effect on
 /// the transport cursor is unambiguous, and each is ingested through the receive
 /// seam because that is the cheapest way to reach the engine 256 times.
-async fn group_at_the_undecryptable_retention_cap(
+pub(crate) async fn group_at_the_undecryptable_retention_cap(
     dir: &tempfile::TempDir,
     filled_through: u64,
 ) -> (MarmotApp, crate::AppClient, UndecryptableProbeRoute) {

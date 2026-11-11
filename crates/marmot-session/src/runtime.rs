@@ -2572,11 +2572,11 @@ where
             let result = self.retry_key_package_fanout().await;
             self.note_key_package_maintenance_attempt(result.is_err());
             self.note_maintenance_duration(started, true, result.is_err());
-            if result.is_err() {
+            if let Err(error) = &result {
                 tracing::warn!(
                     target: TRACE_TARGET,
                     method = "run_due_maintenance",
-                    error_kind = "key_package_fanout_retry",
+                    error_kind = error.key_package_failure_kind("key_package_fanout_retry"),
                     "key package exact-event fanout remains retryable"
                 );
             }
@@ -2614,7 +2614,7 @@ where
                             error_kind = if matches!(error, AccountError::ClockSkewBlocked) {
                                 "clock_skew_blocked"
                             } else {
-                                "key_package_retry"
+                                error.key_package_failure_kind("key_package_retry")
                             },
                             "key package maintenance remains retryable"
                         );

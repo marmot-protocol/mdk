@@ -33,7 +33,8 @@
 //!   lists staged is given back, its seconds owed again on that route, so it
 //!   never holds the account's bound.
 //! - **Stalls.** Nothing is fetched for a group admission cannot drain: one
-//!   held behind a staged event the engine kept no trace of, or every group
+//!   held behind a staged event the engine kept no trace of (other than one
+//!   it refused for resources, which is let go of), or every group
 //!   while admission waits after local failures. Its sweeps and re-checks
 //!   wait until the hold or the wait ends, so the staging bounds hold while
 //!   admission can drain the group.
@@ -51,10 +52,15 @@
 //!   gone.
 //!
 //! Each admission turn ingests at most a few events in one worker command,
-//! so the worker serves commands and live input between bounded batches. An event the
-//! engine keeps no trace of (refused for resources) stays staged, and its
-//! group waits behind it on the local-failure backoff, stalled; other groups
-//! go on.
+//! so the worker serves commands and live input between bounded batches. An
+//! event the engine refused for its group's resources is let go of, still
+//! covered, and its group goes on past it: the engine refuses only what it
+//! could not open under any key the group holds, so nothing newer of the group
+//! is opened out of order past it, and holding the group would hold its
+//! fetches, its live frames and the account's cursor until its deferred input
+//! drained, which a group whose epoch does not move never does. Any other
+//! event the engine keeps no trace of stays staged, and its group waits behind
+//! it on the local-failure backoff, stalled; other groups go on.
 //!
 //! The inbox is admitted as a group of its own, under the same frontier and
 //! bounds. It never fences: no live frames wait on its history.
@@ -68,7 +74,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use cgka_traits::storage::StorageResult;
 use storage_sqlite::{
     RecoveryCoverageRange, RecoveryStagedUsage, RecoveryUnit, RecoveryUnitState,
-    StagedRecoveryEvent, TransportReconciliationRoute,
+    StagedRecoveryEvent, StagedRecoverySettlement, TransportReconciliationRoute,
 };
 
 use super::policy::RecoveryStagingBounds;
@@ -127,9 +133,14 @@ pub(crate) struct LiveFence {
 pub(crate) enum Admitted {
     /// It holds the event, or held it already.
     Kept,
-    /// It kept no trace of it (refused for resources, or for a group it does
-    /// not know), so the event stays fetchable.
+    /// It kept no trace of it (for a group it does not know), so the event
+    /// stays fetchable.
     NoTrace,
+    /// It could not open it and had no room to keep it for later: refused for
+    /// its group's resources after a failed peel. It keeps no trace of it
+    /// either, so a later delivery of the event still reaches it. A
+    /// quarantined group's refusal is `NoTrace`: its gate refuses unopened.
+    Refused,
 }
 
 /// Which group a route belongs to: its MLS group, or the route alone when it
@@ -900,6 +911,7 @@ impl<H: RunnerHost> RecoveryRunner<H> {
             }
             // In order; an event the engine kept no trace of, or a failure,
             // ends the turn, so nothing newer of its group goes ahead of it.
+            // One it refused for resources does not: it is let go of.
             let (keys, deliveries): (Vec<_>, Vec<_>) = batch
                 .events
                 .into_iter()
@@ -915,28 +927,39 @@ impl<H: RunnerHost> RecoveryRunner<H> {
             };
             let mut tried = Vec::with_capacity(outcomes.len());
             let mut failure = None;
+            let mut refused = 0usize;
             for (key, admitted) in keys.into_iter().zip(outcomes) {
-                tried.push(key);
                 match admitted {
-                    Ok(Admitted::Kept) => {}
-                    Ok(Admitted::NoTrace) => break,
+                    Ok(Admitted::Kept) => tried.push((key, StagedRecoverySettlement::Admitted)),
+                    Ok(Admitted::Refused) => {
+                        refused += 1;
+                        tried.push((key, StagedRecoverySettlement::Refused));
+                    }
+                    Ok(Admitted::NoTrace) => {
+                        tried.push((key, StagedRecoverySettlement::Admitted));
+                        break;
+                    }
                     Err(kind) => {
+                        tried.push((key, StagedRecoverySettlement::Admitted));
                         failure = Some(kind);
                         break;
                     }
                 }
             }
-            let event_ids = tried
+            let settled = tried
                 .iter()
-                .map(|(_, event_id)| event_id.clone())
+                .map(|((_, event_id), settlement)| (event_id.clone(), *settlement))
                 .collect::<Vec<_>>();
             // One transaction: a failure lets no row of the batch go, and the
             // next admission settles each again.
             let removed = match self
                 .host
                 .turn(move |turn| {
-                    let event_ids = event_ids.iter().map(Vec::as_slice).collect::<Vec<_>>();
-                    turn.app.remove_seen_staged_recovery_events(&event_ids)
+                    let settled = settled
+                        .iter()
+                        .map(|(event_id, settlement)| (event_id.as_slice(), *settlement))
+                        .collect::<Vec<_>>();
+                    turn.app.settle_staged_recovery_events(&settled)
                 })
                 .await
             {
@@ -956,7 +979,7 @@ impl<H: RunnerHost> RecoveryRunner<H> {
             let mut kept_back = BTreeSet::new();
             let mut moved = BTreeSet::new();
             let mut events = 0usize;
-            for ((group, _), removed) in tried.into_iter().zip(removed) {
+            for (((group, _), _), removed) in tried.into_iter().zip(removed) {
                 if removed {
                     events += 1;
                     moved.insert(group);
@@ -968,6 +991,7 @@ impl<H: RunnerHost> RecoveryRunner<H> {
                 target: TARGET,
                 method = "admit",
                 events = events,
+                refused = refused,
                 groups_admitted = moved.len(),
                 groups_held = kept_back.len(),
             );

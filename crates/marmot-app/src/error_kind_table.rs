@@ -289,6 +289,11 @@ pub fn lower_stack_rows() -> Vec<ErrorKindRow> {
         failure.event_size_class = Some(crate::EventSizeClass::Under64Kib);
         TransportAdapterError::PublishEndpoints(failure)
     };
+    // A KeyPackage publish carries the same proof in its own error (mdk#2334).
+    let key_package_size_refusal = || {
+        marmot_session::KeyPackagePublishError::exposed("publish failed")
+            .with_event_size_class(Some(crate::EventSizeClass::Under64Kib))
+    };
     let expected = HostAnswers {
         marmotkit: "EventTooLarge",
         c_status: "EventTooLarge",
@@ -314,6 +319,14 @@ pub fn lower_stack_rows() -> Vec<ErrorKindRow> {
         (
             "size refusal, account transport wrapper",
             AppError::Account(AccountError::from(size_refusal())),
+        ),
+        (
+            "KeyPackage size refusal, converted account",
+            AppError::from(AccountError::from(key_package_size_refusal())),
+        ),
+        (
+            "KeyPackage size refusal, account wrapper",
+            AppError::Account(AccountError::from(key_package_size_refusal())),
         ),
     ] {
         rows.push(row(name.into(), error, expected));

@@ -1025,9 +1025,13 @@ the second proves it cannot prove it. The sweep ends on an inconclusive second a
 again on the backoff. A broken unit's debt is parked. The group's frames go once each
 holding unit saturates or breaks, or a relay serves the group again. An admission turn ingests at most 16 staged
 events in one worker command, stopping at the first event the engine keeps no trace of, so
-commands and live input go between turns. An event the engine keeps no trace of stays staged,
-and its group waits behind it on the local-failure backoff while other
-groups go on. A relay that holds a group's staging bound (2,048 events or 8 MiB), or any relay
+commands and live input go between turns. An event the engine refused for its group's
+resources is let go of, its second still covered, and its group goes on past it: the engine
+refuses only what it could not open under any key the group holds, so nothing newer is opened
+out of order past it, while a hold would keep the group's fetches, live frames and the account
+cursor waiting on a deferred backlog that a group at a fixed epoch never drains. Any other
+event the engine keeps no trace of stays staged, and its group waits behind it on the
+local-failure backoff while other groups go on. A relay that holds a group's staging bound (2,048 events or 8 MiB), or any relay
 once the account holds 64 MiB, is not eligible while another relay holds that group's frontier.
 A debt unit at the frontier is never held back, so the runner never waits on itself; a
 re-check, which never moves the frontier, waits at the bound like any other. Nothing is fetched

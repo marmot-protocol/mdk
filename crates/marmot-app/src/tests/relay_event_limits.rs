@@ -727,3 +727,184 @@ async fn a_queued_invite_whose_welcome_fits_no_inbox_relay_is_retired_unsent() {
         "neither the commit nor the Welcome was sent"
     );
 }
+
+/// How every relay refuses an account publish for size in the tests below
+/// (mdk#2334). Both give the publish the same proof, and each call that
+/// returns relay errors must surface it as `EventTooLarge`.
+#[derive(Clone, Copy, Debug)]
+enum SizeRefusal {
+    /// MDK refuses it over the relay's known limit, and sends nothing.
+    KnownLimit,
+    /// The relay answers that it is too large.
+    Relay,
+}
+
+impl SizeRefusal {
+    const BOTH: [Self; 2] = [Self::KnownLimit, Self::Relay];
+
+    /// An app on `relays` whose first relay refuses events of `kind` for
+    /// size: over a known limit of `limit` bytes, or by its own answer.
+    fn app(
+        self,
+        dir: &tempfile::TempDir,
+        relay: Arc<ScriptedPushRelayClient>,
+        relays: &[&str],
+        kind: u64,
+        limit: u64,
+    ) -> MarmotApp {
+        let limits = match self {
+            Self::KnownLimit => vec![RelayEventLimit {
+                relay: relays[0].to_owned(),
+                max_event_bytes: limit,
+            }],
+            Self::Relay => {
+                relay.reject_publishes_of_kind_as_too_large(kind);
+                Vec::new()
+            }
+        };
+        MarmotApp::with_relays_and_config(
+            dir.path(),
+            relays.iter().map(|relay| (*relay).to_owned()).collect(),
+            MarmotAppConfig::white_noise()
+                .with_deployment(MarmotDeployment {
+                    relay_event_limits: limits,
+                    ..MarmotDeployment::white_noise()
+                })
+                .with_allow_loopback_relay_endpoints(true)
+                .with_open_ranking_provider(None, Vec::new()),
+        )
+        .with_test_relay_client(relay)
+    }
+}
+
+fn assert_too_large(error: &AppError, refusal: SizeRefusal) {
+    assert!(
+        matches!(
+            error,
+            AppError::EventTooLarge {
+                artifact: OversizedArtifact::Other,
+                size_class: EventSizeClass::Under64Kib,
+            }
+        ),
+        "{refusal:?}: {error:?}"
+    );
+}
+
+fn accepted_kinds(relay: &ScriptedPushRelayClient) -> Vec<u64> {
+    relay
+        .accepted_routes()
+        .into_iter()
+        .map(|(kind, _)| kind)
+        .collect()
+}
+
+/// A KeyPackage publish every relay refuses for size fails as
+/// `EventTooLarge`, not a generic runtime error (mdk#2334). Once the relay
+/// takes it, the same call publishes it: a relay with no known limit is sent
+/// to as before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_key_package_refused_for_size_fails_as_too_large() {
+    for refusal in SizeRefusal::BOTH {
+        let dir = tempfile::tempdir().unwrap();
+        let alice = AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let app = refusal.app(&dir, relay.clone(), &["wss://relay.example"], 30443, 200);
+        // Alice's relay lists are known, so the KeyPackage is all the call
+        // publishes.
+        let mut lists = AccountRelayListStatus::empty();
+        lists.nip65.created_at = 1;
+        lists.nip65.relays = vec!["wss://relay.example".into()];
+        lists.inbox.created_at = 1;
+        lists.inbox.relays = vec!["wss://relay.example".into()];
+        lists.refresh();
+        app.directory()
+            .remember_directory_relay_lists(&alice.account_id_hex, &lists)
+            .unwrap();
+        let mut client = app.client("alice").await.unwrap();
+
+        let error = client.publish_key_package().await.unwrap_err();
+        assert_too_large(&error, refusal);
+        assert!(!accepted_kinds(&relay).contains(&30443));
+
+        if let SizeRefusal::Relay = refusal {
+            relay.allow_all_publish_kinds();
+            client.publish_key_package().await.unwrap();
+            assert!(accepted_kinds(&relay).contains(&30443));
+        }
+    }
+}
+
+/// A block-list edit every relay refuses for size fails as `EventTooLarge`,
+/// not `BlockListUnavailable`, and leaves nothing pending (mdk#2334). Once
+/// the relay takes it, the same edit goes out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_block_list_refused_for_size_fails_as_too_large() {
+    for refusal in SizeRefusal::BOTH {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let mut app = refusal.app(&dir, relay.clone(), &["wss://relay.example"], 10000, 200);
+        app.relay_plane = MarmotRelayPlane::new_with_directory_fetcher_for_test(
+            None,
+            relay.clone(),
+            Arc::new(MemberResolutionDirectoryFetcher::default()),
+            false,
+        );
+        let runtime = app.runtime();
+        let target = Keys::generate().public_key().to_hex();
+
+        let error = runtime.block_user("alice", &target).await.unwrap_err();
+        assert_too_large(&error, refusal);
+        assert!(!runtime.is_user_blocked("alice", &target).unwrap());
+        assert!(
+            app.account_storage("alice")
+                .unwrap()
+                .app_storage()
+                .pending_block_publication()
+                .unwrap()
+                .is_none()
+        );
+
+        if let SizeRefusal::Relay = refusal {
+            relay.allow_all_publish_kinds();
+            runtime.block_user("alice", &target).await.unwrap();
+            assert!(runtime.is_user_blocked("alice", &target).unwrap());
+        }
+    }
+}
+
+/// An installed sticker list every relay refuses for size stays owed: the
+/// uninstall that made it still succeeds, and sync reports the refusal as
+/// `EventTooLarge`, not `StickerRelay` (mdk#2334). Once the relay takes it,
+/// sync publishes it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_sticker_list_refused_for_size_stays_owed_and_sync_reports_it() {
+    // Sticker reads go to a real relay; publishes go to the scripted one.
+    let reads = nostr_relay_builder::MockRelay::run().await.unwrap();
+    let url = reads.url().await.to_string();
+    let pack = format!("30031:{}:pack", Keys::generate().public_key().to_hex());
+    for refusal in SizeRefusal::BOTH {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let app = refusal.app(&dir, relay.clone(), &[url.as_str()], 10031, 200);
+
+        app.uninstall_sticker_pack("alice", &pack).await.unwrap();
+        let error = app.sync_sticker_packs("alice").await.unwrap_err();
+        assert_too_large(&error, refusal);
+        assert!(!accepted_kinds(&relay).contains(&10031));
+
+        if let SizeRefusal::Relay = refusal {
+            relay.allow_all_publish_kinds();
+            let synced = app.sync_sticker_packs("alice").await.unwrap();
+            assert_eq!(synced.pending_operations, 0);
+            assert!(accepted_kinds(&relay).contains(&10031));
+        }
+    }
+}

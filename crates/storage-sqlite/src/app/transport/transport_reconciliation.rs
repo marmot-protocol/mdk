@@ -163,7 +163,7 @@ impl SqliteAppStorage {
     /// seen index holds and no release has journaled, on routes the engine has
     /// not deleted, judged in the same transaction. The seen test is the one
     /// staging applies before it lets a staged copy go
-    /// (`remove_seen_staged_recovery_events`). A writer that records after its
+    /// (`settle_staged_recovery_events`). A writer that records after its
     /// ingests leaves what recording at each ingest would have left once a
     /// release or route deletion in between had cleared it: it never
     /// advertises an event released in between, nor recreates a deleted

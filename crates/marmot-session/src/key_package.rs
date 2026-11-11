@@ -3,7 +3,7 @@
 use async_trait::async_trait;
 use cgka_traits::engine::KeyPackage;
 use cgka_traits::maintenance::SignedPublicationArtifact;
-use cgka_traits::{MemberId, MessageId, Timestamp, TransportEndpoint};
+use cgka_traits::{EventSizeClass, MemberId, MessageId, Timestamp, TransportEndpoint};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KeyPackagePublication {
@@ -60,12 +60,18 @@ pub struct KeyPackagePublishReceipt {
 /// bytes, for example because they were signed by an earlier build under rules
 /// this one no longer accepts. Retrying them cannot succeed, so the runtime
 /// replaces the KeyPackage with a freshly signed one instead (mdk#2628, D8).
+///
+/// `event_size_class` is the transport's proof that every relay refused this
+/// event for size, by its own refusal or over its known limit (mdk#2334). It
+/// changes neither bit: the lifecycle treats the failure as before, and only
+/// the error a caller sees is typed.
 #[derive(Debug, thiserror::Error)]
 #[error("key package publication failed: {message}")]
 pub struct KeyPackagePublishError {
     pub message: String,
     pub externally_exposed: bool,
     pub artifact_unusable: bool,
+    pub event_size_class: Option<EventSizeClass>,
 }
 
 impl KeyPackagePublishError {
@@ -75,6 +81,7 @@ impl KeyPackagePublishError {
             message: message.into(),
             externally_exposed: false,
             artifact_unusable: false,
+            event_size_class: None,
         }
     }
 
@@ -85,6 +92,7 @@ impl KeyPackagePublishError {
             message: message.into(),
             externally_exposed: true,
             artifact_unusable: false,
+            event_size_class: None,
         }
     }
 
@@ -95,7 +103,15 @@ impl KeyPackagePublishError {
             message: message.into(),
             externally_exposed: false,
             artifact_unusable: true,
+            event_size_class: None,
         }
+    }
+
+    /// Every relay refused the event for size, with this coarse size class.
+    #[must_use]
+    pub fn with_event_size_class(mut self, size_class: Option<EventSizeClass>) -> Self {
+        self.event_size_class = size_class;
+        self
     }
 }
 
