@@ -17,14 +17,37 @@ impl MarmotAppRuntime {
         else {
             return Ok(());
         };
-        let Some(bytes) = self
+        let account = match self
+            .accounts
+            .pending_generated_account(&account.account_id_hex)
+        {
+            Ok(Some(account)) => account,
+            Ok(None) | Err(AppError::AccountHome(AccountHomeError::UnknownAccount(_))) => {
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+        let bytes = match self
             .accounts
             .app
             .account_home()
-            .account_setup_context(&account.label)?
-        else {
-            self.report_generated_setup_resume_deferred(&account, "setup_context_missing");
-            return Ok(());
+            .account_setup_context(&account.label)
+        {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => {
+                match self
+                    .accounts
+                    .pending_generated_account(&account.account_id_hex)
+                {
+                    Ok(Some(_)) => self
+                        .report_generated_setup_resume_deferred(&account, "setup_context_missing"),
+                    Ok(None) | Err(AppError::AccountHome(AccountHomeError::UnknownAccount(_))) => {}
+                    Err(error) => return Err(error),
+                }
+                return Ok(());
+            }
+            Err(AccountHomeError::UnknownAccount(_)) => return Ok(()),
+            Err(error) => return Err(error.into()),
         };
         let context = match serde_json::from_slice::<GeneratedAccountSetupContext>(&bytes) {
             Ok(context) => context,
@@ -42,6 +65,12 @@ impl MarmotAppRuntime {
             )
             .await
         {
+            if matches!(
+                error,
+                AppError::AccountHome(AccountHomeError::UnknownAccount(_))
+            ) {
+                return Ok(());
+            }
             self.report_generated_setup_resume_deferred(&account, error.privacy_safe_kind());
         }
         Ok(())
@@ -313,7 +342,7 @@ impl MarmotAppRuntime {
         self.finish_generated_setup(local, context).await
     }
 
-    pub(in crate::runtime) async fn finish_generated_setup(
+    pub(super) async fn finish_generated_setup(
         &self,
         local: AccountSetupResult,
         context: GeneratedAccountSetupContext,

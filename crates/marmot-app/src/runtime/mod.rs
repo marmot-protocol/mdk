@@ -4842,11 +4842,11 @@ impl MarmotAppRuntime {
                 return Err(AccountHomeError::SecretNotFound(account.account_id_hex).into());
             }
 
-            // A pending generated setup stops before anything else, so no
-            // background attempt republishes after the KeyPackage step below.
+            // Stop background setup and finish admitted foreground setup
+            // before withdrawing the KeyPackage slot.
             let _generated_setup_fence = self
                 .setup
-                .fence_generated_setup(&account.account_id_hex)
+                .fence_generated_teardown(&self.accounts, &account.account_id_hex)
                 .await;
             let mut outcome = SignOutOutcome::default();
 
@@ -4971,12 +4971,11 @@ impl MarmotAppRuntime {
             return Err(AccountHomeError::SecretNotFound(account.account_id_hex).into());
         }
 
-        // A pending generated setup stops before any stage, so no background
-        // attempt publishes after stage 2 or outlives the account
-        // (whitenoise-ios#1302).
-        let _generated_setup_fence = self
+        // Finish foreground setup as well as fencing background attempts
+        // before stage 2 withdraws the slot (whitenoise-ios#1302).
+        let generated_setup_fence = self
             .setup
-            .fence_generated_setup(&account.account_id_hex)
+            .fence_generated_teardown(&self.accounts, &account.account_id_hex)
             .await;
         let mut outcome = WipeOutcome::default();
 
@@ -5089,7 +5088,11 @@ impl MarmotAppRuntime {
         // drops in-memory caches, and removes the account directory (MLS DB,
         // media, KeyPackage material, SQL row) plus the secret-store nsec in a
         // single all-or-nothing step.
-        match self.accounts.remove_account(account_ref).await {
+        match self
+            .accounts
+            .remove_account_fenced(&account.account_id_hex, &generated_setup_fence)
+            .await
+        {
             Ok(()) => {
                 outcome.local_cleanup = LocalCleanupReport {
                     completed: true,
@@ -7083,16 +7086,28 @@ impl AccountManager {
     }
 
     pub async fn remove_account(&self, account_ref: &str) -> Result<(), AppError> {
+        let account = self.app.account_home().account(account_ref)?;
+        let fence = self
+            .setup
+            .fence_generated_teardown(self, &account.account_id_hex)
+            .await;
+        self.remove_account_fenced(&account.account_id_hex, &fence)
+            .await
+    }
+
+    // Wipe already owns the account's foreground fence before its network
+    // stages. Reuse it rather than taking that non-reentrant transaction again.
+    async fn remove_account_fenced(
+        &self,
+        account_ref: &str,
+        fence: &onboarding::GeneratedTeardownFence,
+    ) -> Result<(), AppError> {
         // Stop and delete the account's moderation reports, and admit none
         // until the removal below has committed (every removal entry point).
         // Fenced before the global lock: the purge may open account storage.
         // Removing the directory deletes the rows even if this purge fails.
         let (_report_fence, _) = self.fence_moderation_reports(account_ref).await;
-        let account = self.app.account_home().account(account_ref)?;
-        let _generated_setup_fence = self
-            .setup
-            .fence_generated_removal(self, &account.account_id_hex)
-            .await;
+        let _preparation = self.setup.fence_generated_removal(fence).await;
         let lock_wait = self
             .shared
             .observer

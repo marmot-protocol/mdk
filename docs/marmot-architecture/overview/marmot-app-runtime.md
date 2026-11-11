@@ -69,10 +69,13 @@ this contract.
 Generated setup resumed at startup stays bound to the captured account.
 Foreground publication also continues the account returned at local readiness.
 Neither handoff creates a replacement if that account has been removed.
-Account removal holds local preparation admission and the account's foreground
-transaction alongside its background setup fence until deletion finishes.
-An admitted foreground publication therefore completes before removal, while a
-handoff that arrives after removal finds no account to continue.
+Sign-out and wipe fence background setup and wait for admitted foreground
+publication before withdrawing the device's KeyPackage slot. Wipe reuses this
+fence for local removal rather than taking the foreground transaction again.
+Removal takes local preparation admission afterward and holds it until deletion
+finishes, so waiting for publication does not block all local preparation.
+A handoff that arrives after removal finds no account to continue. Startup also
+ends quietly when the captured account has been removed or signed out.
 
 `SharedServices` should hold runtime state shared by every account:
 

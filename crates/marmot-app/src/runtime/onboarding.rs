@@ -35,8 +35,7 @@ pub(super) struct SetupState {
 
 pub(super) use generated_setup_tasks::GeneratedSetupFence;
 
-pub(super) struct GeneratedRemovalFence {
-    _preparation: tokio::sync::OwnedMutexGuard<()>,
+pub(super) struct GeneratedTeardownFence {
     _background: GeneratedSetupFence,
     _foreground: tokio::sync::OwnedMutexGuard<()>,
 }
@@ -101,26 +100,29 @@ impl SetupState {
         self.generated_setup_tasks.fence(account_id).await
     }
 
-    /// Exclude local handoff and foreground completion as well as background
-    /// attempts until account removal returns. Take these before the worker lock.
-    pub(super) async fn fence_generated_removal(
+    /// Stop background setup, then finish admitted foreground setup before
+    /// sign-out withdraws its slot. Do not hold global local admission here.
+    pub(super) async fn fence_generated_teardown(
         &self,
         manager: &AccountManager,
         account_id: &str,
-    ) -> GeneratedRemovalFence {
-        let preparation = self
-            .generated_setup_local_transaction
-            .clone()
-            .lock_owned()
-            .await;
-        let background = self.generated_setup_tasks.fence(account_id).await;
+    ) -> GeneratedTeardownFence {
+        let background = self.fence_generated_setup(account_id).await;
         let transaction = AccountSetup::new(self, manager).onboarding_transaction(account_id);
         let foreground = transaction.lock_owned().await;
-        GeneratedRemovalFence {
-            _preparation: preparation,
+        GeneratedTeardownFence {
             _background: background,
             _foreground: foreground,
         }
+    }
+
+    /// Local deletion excludes preparation only after foreground publication
+    /// has finished, so a network-bound teardown cannot block all setup.
+    pub(super) async fn fence_generated_removal(
+        &self,
+        _teardown: &GeneratedTeardownFence,
+    ) -> tokio::sync::MutexGuard<'_, ()> {
+        self.generated_setup_local_transaction.lock().await
     }
 
     /// Removal hook, called under the worker transaction after the removal

@@ -42,11 +42,16 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   inside synchronous code stops when that code returns) and holds the task; no attempt starts while any fence is
   held. When the last one drops the task checks again, so a cancelled or failed teardown leaves the account
   publishing, and `sign_in_account` schedules a setup its sign-out ended. It checks the worker gate through
-  `SetupRecords`, which reads durable records only. Setup reaches workers only through the worker-lifecycle surface
+  `SetupRecords`, which reads durable records only. Runtime sign-out, wipe and removal also wait for admitted
+  foreground generated setup. Wipe takes this fence before its network stages and passes it into local removal,
+  rather than taking the foreground transaction again. Local removal takes generated preparation admission only
+  after foreground setup finishes. Setup reaches workers only through the worker-lifecycle surface
   commented on `AccountManager` in `runtime/mod.rs`, each call keeping its lock state: the worker transaction is a
   tokio `Mutex` and not reentrant. A worker setup takes out of the map is reaped through setup's cancellation
-  registry, never `worker_reapers`. Lock order: the per-account onboarding transaction, then the worker transaction,
-  then the worker map; the cancellation registry before the per-account state lock.
+  registry, never `worker_reapers`. Teardown lock order: the background setup fence, the per-account onboarding
+  transaction, generated local preparation admission (removal only), the worker transaction, then the worker map.
+  Local preparation never waits for the onboarding transaction. The cancellation registry precedes the per-account
+  state lock.
 - Keep app-client commands and query methods in the `src/client/` module; the crate root should construct clients but
   not absorb their behavior again. The `AppClient` inherent impl is split across the module along these seams: `mod.rs`
   (the `AppClient` struct plus the broadly-shared command/query API — key-package, group lifecycle, message/media/agent
