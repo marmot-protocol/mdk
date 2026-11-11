@@ -36,6 +36,9 @@ drop: storage imports loss by count, so a token's count must cover every drop un
 - Route every relay endpoint through `RelaySafetyPolicy` and build every relay client with `nostr_builder()`;
   `clippy.toml` rejects direct `nostr_sdk` client constructors. See
   `docs/marmot-architecture/overview/dial-safety.md`.
+- Admission sends to each relay under its parsed spelling, but the session matches publish results to its targets
+  by equality. `publish` names every receipt and endpoint failure, in a report or an error, as the request spelled
+  it (`RequestedSpellings`, mdk#3305); keep any new result path inside that renaming.
 - Keep logs privacy-safe: aggregate values only, no account ids, group ids, relay URLs, pubkeys or payloads. The
   tracing target is still `marmot_app::relay_plane`; rename it only in a change of its own.
 - Transport consumers enter `transport_nostr_adapter::dispatch_sdk_replay` with the SDK's ordered reader/connection

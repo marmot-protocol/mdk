@@ -4,7 +4,8 @@ use cgka_traits::app_components::{is_loopback_host, reject_non_public_ip};
 use cgka_traits::{
     MessageId, TransportAccountActivation, TransportAdapterError, TransportEndpoint,
     TransportEndpointFailure, TransportEndpointFailureKind, TransportGroupSync,
-    TransportPublishFailure, TransportPublishRequest, TransportPublishTarget,
+    TransportPublishFailure, TransportPublishReport, TransportPublishRequest,
+    TransportPublishTarget,
 };
 use nostr_sdk::prelude::RelayUrl;
 use serde::{Deserialize, Serialize};
@@ -50,6 +51,45 @@ fn refused_by_safety_rule(endpoint: TransportEndpoint) -> TransportEndpointFailu
         kind: TransportEndpointFailureKind::NotExposed,
         rejection_category: None,
         size_class: None,
+    }
+}
+
+/// The request's own spelling of each publish endpoint admission respelled.
+///
+/// Admission parses every endpoint, so a relay a group or inbox list spells
+/// with an upper-case host or an explicit default port is sent to, and
+/// answers, under its parsed spelling. The caller finds each answer by the
+/// spelling it asked for, so publish reports every one under that spelling
+/// (mdk#3305). Where the request spells one relay several ways, the relay's
+/// one answer goes to the spelling admission keeps, or else to the first, so
+/// a result never counts a relay twice.
+pub(crate) struct RequestedSpellings(Vec<(TransportEndpoint, TransportEndpoint)>);
+
+impl RequestedSpellings {
+    fn restore(&self, endpoint: &mut TransportEndpoint) {
+        if let Some((_, requested)) = self.0.iter().find(|(admitted, _)| admitted == endpoint) {
+            *endpoint = requested.clone();
+        }
+    }
+
+    /// `report`, with every relay named as the request named it.
+    pub(crate) fn restore_report(&self, report: &mut TransportPublishReport) {
+        for receipt in &mut report.accepted {
+            self.restore(&mut receipt.endpoint);
+        }
+        for failure in &mut report.failed {
+            self.restore(&mut failure.endpoint);
+        }
+    }
+
+    /// `error`, with every relay it reports named as the request named it.
+    pub(crate) fn restore_error(&self, mut error: TransportAdapterError) -> TransportAdapterError {
+        if let TransportAdapterError::PublishEndpoints(failure) = &mut error {
+            for failure in &mut failure.endpoint_failures {
+                self.restore(&mut failure.endpoint);
+            }
+        }
+        error
     }
 }
 
@@ -216,6 +256,23 @@ impl RelaySafetyPolicy {
         }
     }
 
+    /// How a publish to `requested` names each relay it sends to, against the
+    /// request's own spelling. See [`RequestedSpellings`].
+    pub(crate) fn requested_spellings(
+        &self,
+        requested: &[TransportEndpoint],
+    ) -> RequestedSpellings {
+        RequestedSpellings(
+            requested
+                .iter()
+                .filter_map(|endpoint| {
+                    let admitted = self.admitted_spelling(endpoint)?;
+                    (!requested.contains(&admitted)).then(|| (admitted, endpoint.clone()))
+                })
+                .collect(),
+        )
+    }
+
     pub(crate) fn sanitize_publish_request(
         &self,
         mut request: TransportPublishRequest,
@@ -323,10 +380,9 @@ impl RelaySafetyPolicy {
         let offered = endpoints.len();
         let mut kept: Vec<TransportEndpoint> = Vec::new();
         for endpoint in endpoints {
-            let Some(relay_url) = self.admitted_relay_url(&endpoint) else {
+            let Some(endpoint) = self.admitted_spelling(&endpoint) else {
                 continue;
             };
-            let endpoint = TransportEndpoint(relay_url.to_string());
             if !kept.contains(&endpoint) {
                 kept.push(endpoint);
             }
@@ -353,6 +409,13 @@ impl RelaySafetyPolicy {
         reject_unsafe_relay_host(&relay_url, self.allow_loopback)
             .is_ok()
             .then_some(relay_url)
+    }
+
+    /// The spelling a discovered endpoint that passes the host-safety rule
+    /// goes on under: its parsed relay URL.
+    fn admitted_spelling(&self, endpoint: &TransportEndpoint) -> Option<TransportEndpoint> {
+        self.admitted_relay_url(endpoint)
+            .map(|relay_url| TransportEndpoint(relay_url.to_string()))
     }
 
     pub fn sanitize_endpoints(
@@ -904,6 +967,51 @@ mod tests {
         assert!(policy.sanitize_endpoints(endpoints(&refs), "test").is_err());
     }
 
+    /// A publish to the fixture's group on `endpoints`.
+    fn group_target(
+        fixture: &crate::test_support::AccountPublishFixture,
+        endpoints: Vec<TransportEndpoint>,
+    ) -> TransportPublishTarget {
+        TransportPublishTarget::Group {
+            group_id: cgka_traits::GroupId::new(vec![0xC3; 32]),
+            transport_group_id: fixture.transport_group_id.clone(),
+            endpoints,
+        }
+    }
+
+    /// A gift-wrapped Welcome.
+    fn welcome() -> cgka_traits::transport::TransportMessage {
+        use nostr_sdk::prelude::{EventBuilder, FinalizeEvent, Keys, Kind, Tag};
+        use transport_nostr_peeler::NostrTransportEvent;
+
+        NostrTransportEvent::from_nostr_event(
+            &EventBuilder::new(Kind::GiftWrap, "sealed welcome")
+                .tags([Tag::public_key(
+                    Keys::parse(&"33".repeat(32)).unwrap().public_key(),
+                )])
+                .finalize(&Keys::parse(&"11".repeat(32)).unwrap())
+                .unwrap(),
+        )
+        .unwrap()
+        .to_transport_message()
+        .unwrap()
+    }
+
+    /// A publish of `welcome` to its recipient's inbox list `endpoints`.
+    fn inbox_target(
+        welcome: &cgka_traits::transport::TransportMessage,
+        endpoints: Vec<TransportEndpoint>,
+    ) -> TransportPublishTarget {
+        let cgka_traits::transport::TransportEnvelope::Welcome { recipient } = &welcome.envelope
+        else {
+            panic!("a gift wrap is a Welcome");
+        };
+        TransportPublishTarget::Inbox {
+            recipient: recipient.clone(),
+            endpoints,
+        }
+    }
+
     /// mdk#3276: publish never contacts a relay the host-safety rule refuses,
     /// so it reports each one as a failure before exposure, under the spelling
     /// the request gave, and sends to the rest. A request the rule lets send
@@ -915,38 +1023,15 @@ mod tests {
         use std::sync::atomic::Ordering;
 
         use cgka_traits::TransportAdapter;
-        use cgka_traits::transport::{TransportEnvelope, TransportMessage};
-        use nostr_sdk::prelude::{EventBuilder, FinalizeEvent, Keys, Kind, Tag};
-        use transport_nostr_peeler::NostrTransportEvent;
 
         use crate::test_support::AccountPublishFixture;
 
         let fixture = AccountPublishFixture::activate().await;
         let safe = fixture.endpoint.clone();
         let refused = endpoints(&["wss://10.0.0.1", "ws://plaintext.example", "not a url"]);
-        let group = |endpoints| TransportPublishTarget::Group {
-            group_id: cgka_traits::GroupId::new(vec![0xC3; 32]),
-            transport_group_id: fixture.transport_group_id.clone(),
-            endpoints,
-        };
-        let welcome: TransportMessage = NostrTransportEvent::from_nostr_event(
-            &EventBuilder::new(Kind::GiftWrap, "sealed welcome")
-                .tags([Tag::public_key(
-                    Keys::parse(&"33".repeat(32)).unwrap().public_key(),
-                )])
-                .finalize(&Keys::parse(&"11".repeat(32)).unwrap())
-                .unwrap(),
-        )
-        .unwrap()
-        .to_transport_message()
-        .unwrap();
-        let TransportEnvelope::Welcome { recipient } = welcome.envelope.clone() else {
-            panic!("a gift wrap is a Welcome");
-        };
-        let inbox = |endpoints| TransportPublishTarget::Inbox {
-            recipient: recipient.clone(),
-            endpoints,
-        };
+        let group = |endpoints| group_target(&fixture, endpoints);
+        let welcome = welcome();
+        let inbox = |endpoints| inbox_target(&welcome, endpoints);
         let with_safe = [refused.clone(), vec![safe.clone()]].concat();
 
         for (message, target, refused, sent_to) in [
@@ -1019,6 +1104,84 @@ mod tests {
                 usize::from(sent_to.is_some()),
                 "only the admitted relay is sent to: {target:?}"
             );
+        }
+    }
+
+    /// mdk#3305: publish names every relay in its result as the request
+    /// spelled it, receipt or failure, in a report or an error. Admission
+    /// sends to each relay under its parsed spelling, and the relay client
+    /// answers under that spelling, but the caller finds each answer by its
+    /// own. A relay a group or inbox list spells with an upper-case host or a
+    /// default port otherwise reads as possibly exposed, whatever it answered,
+    /// and a commit sent only there never resolves.
+    #[tokio::test]
+    async fn publish_reports_each_relay_under_the_spelling_the_request_gave() {
+        use cgka_traits::TransportAdapter;
+
+        use crate::test_support::{AccountPublishFixture, PublishScript};
+
+        let fixture = AccountPublishFixture::activate().await;
+        // Both parse to the fixture's relay, `wss://relay.example`.
+        let relay = TransportEndpoint("wss://Relay.example:443".into());
+        let also_relay = TransportEndpoint("WSS://RELAY.EXAMPLE".into());
+        let other = TransportEndpoint("wss://Other.example".into());
+        let welcome = welcome();
+
+        for (message, target, named) in [
+            // The session's group fanout: one relay per request.
+            (
+                &fixture.message,
+                group_target(&fixture, vec![relay.clone()]),
+                vec![relay.clone()],
+            ),
+            // A Welcome's first request: the recipient's whole inbox list. A
+            // relay it spells twice answers once, under its first spelling...
+            (
+                &welcome,
+                inbox_target(&welcome, vec![relay.clone(), other.clone(), also_relay]),
+                vec![relay.clone(), other.clone()],
+            ),
+            // ...or under the spelling admission gives it, when the list has it.
+            (
+                &welcome,
+                inbox_target(&welcome, vec![relay.clone(), fixture.endpoint.clone()]),
+                vec![fixture.endpoint.clone()],
+            ),
+        ] {
+            for script in [
+                PublishScript::Accept,
+                PublishScript::Refuse,
+                PublishScript::RefuseInError,
+            ] {
+                fixture.client.set_script(script);
+                let result = fixture
+                    .adapter
+                    .publish(TransportPublishRequest {
+                        account_id: fixture.account_id.clone(),
+                        message: message.clone(),
+                        target: target.clone(),
+                        required_acks: 1,
+                    })
+                    .await;
+                let mut answered = match result {
+                    Ok(report) => report
+                        .accepted
+                        .into_iter()
+                        .map(|receipt| receipt.endpoint)
+                        .chain(report.failed.into_iter().map(|failure| failure.endpoint))
+                        .collect::<Vec<_>>(),
+                    Err(TransportAdapterError::PublishEndpoints(failure)) => failure
+                        .endpoint_failures
+                        .into_iter()
+                        .map(|failure| failure.endpoint)
+                        .collect(),
+                    Err(error) => panic!("a whole-call error for {target:?}: {error:?}"),
+                };
+                answered.sort();
+                let mut named = named.clone();
+                named.sort();
+                assert_eq!(answered, named, "{target:?}");
+            }
         }
     }
 }

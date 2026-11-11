@@ -7,6 +7,9 @@
 //!
 //! A group relay the host-safety rule refuses is never contacted, so a send
 //! there has a definite outcome rather than an unknown one (mdk#3276).
+//!
+//! A group relay's answer counts for the relay as the group spells it, even
+//! where parsing spells it another way (mdk#3305).
 
 use super::*;
 
@@ -229,5 +232,54 @@ async fn a_group_whose_relays_all_fail_the_safety_rule_sends_nothing() {
         relay.attempted_routes().len(),
         attempted,
         "nothing was sent"
+    );
+}
+
+/// A group relay spelled differently from its parsed form, with an
+/// upper-case host and an explicit default port: parsing names it
+/// `wss://relay.example`.
+const RESPELLED_GROUP_RELAY: &str = "wss://Relay.example:443";
+
+/// A commit to a group whose only relay it spells differently from parsing
+/// has the relay's own outcome (mdk#3305): a refusal rolls it back and an
+/// acceptance confirms it, rather than reading as possibly exposed and
+/// leaving the commit pending.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_commit_counts_the_answer_of_a_group_relay_spelled_another_way() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), SAFE_RELAY).with_test_relay_client(relay.clone());
+    let mut client = app.client("alice").await.unwrap();
+    let group = client.create_group("respelled route", &[]).await.unwrap();
+    route_group_through(&mut client, &group, &[RESPELLED_GROUP_RELAY]).await;
+    let epoch = client.runtime.epoch_state(&group).unwrap().epoch();
+
+    relay.reject_next_publish();
+    let error = client
+        .update_group_profile(&group, Some("refused"), None)
+        .await
+        .unwrap_err();
+    assert_refused_everywhere(&error);
+    let state = client.runtime.epoch_state(&group).unwrap();
+    assert!(
+        matches!(state, cgka_traits::engine_state::EpochState::Stable { .. }),
+        "the refused commit rolled back: {state:?}"
+    );
+    assert_eq!(state.epoch(), epoch);
+
+    client
+        .update_group_profile(&group, Some("accepted"), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        client.runtime.epoch_state(&group).unwrap().epoch().0,
+        epoch.0 + 1
+    );
+    assert!(
+        !client.runtime.has_pending_outbound_fanouts(&group).unwrap(),
+        "no relay is owed a retry"
     );
 }

@@ -4382,6 +4382,13 @@ impl TransportAdapter for MarmotRelayPlaneAccountAdapter {
         request.validate_envelope_matches_target()?;
         let event = NostrTransportEvent::from_transport_message(&request.message)
             .map_err(|e| TransportAdapterError::Publish(format!("Nostr payload: {e}")))?;
+        // Admission respells each relay it sends to; the result names each
+        // one as the request did, so the caller finds its answer (mdk#3305).
+        let spellings = self
+            .relay_plane
+            .inner
+            .relay_safety
+            .requested_spellings(request.target.endpoints());
         // A relay the host-safety rule refuses is never contacted, so it is a
         // definite failure before exposure, not an unknown (mdk#3276).
         let (request, unsafe_refused) = self
@@ -4403,7 +4410,11 @@ impl TransportAdapter for MarmotRelayPlaneAccountAdapter {
         if endpoints.is_empty() && !refused.is_empty() {
             // No relay was contacted, so no publish attempt is counted.
             return Err(join_unsafe_refusals(
-                refused_everywhere(request.target.endpoints(), refused, &event),
+                spellings.restore_error(refused_everywhere(
+                    request.target.endpoints(),
+                    refused,
+                    &event,
+                )),
                 unsafe_refused,
             ));
         }
@@ -4445,7 +4456,11 @@ impl TransportAdapter for MarmotRelayPlaneAccountAdapter {
             Ok(outcome) => outcome,
             Err(error) => {
                 return Err(join_unsafe_refusals(
-                    join_refusals(error, request.target.endpoints(), refused),
+                    spellings.restore_error(join_refusals(
+                        error,
+                        request.target.endpoints(),
+                        refused,
+                    )),
                     unsafe_refused,
                 ));
             }
@@ -4475,6 +4490,7 @@ impl TransportAdapter for MarmotRelayPlaneAccountAdapter {
         }
         let mut report = publish_report_from_outcome(outcome, request);
         report.failed.extend(refused);
+        spellings.restore_report(&mut report);
         report.failed.extend(unsafe_refused);
         Ok(report)
     }

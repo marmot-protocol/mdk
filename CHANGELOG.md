@@ -4,6 +4,11 @@
 
 ### Fixed
 
+- Report each relay's answer to a publish under the spelling the group or
+  inbox list gave it (#3305). A relay spelled with an upper-case host or an
+  explicit default port read as possibly exposed whatever it answered, so a
+  group whose only relay was spelled that way never confirmed or rolled back a
+  commit.
 - Fetch independent directory queries concurrently, so KeyPackage and deletion
   reads overlap their relay waits while retaining separate event limits (#1813).
 - Reuse notification settings, chat mutes, group records, and directory users
