@@ -232,11 +232,10 @@ jobs:
           python3 scripts/test_ci_workflow_policy.py
           python3 scripts/test_flake_report.py
 
-      - name: Test timing ratchet and flake leaderboard contracts
+      - name: Test timing ratchet
         run: |
           python3 scripts/check_test_timing_ratchet.py
           python3 scripts/test_check_test_timing_ratchet.py
-          python3 scripts/test_flake_report.py
 
   rust-audit:
     name: Rust audit
