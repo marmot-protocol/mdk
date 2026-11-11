@@ -176,10 +176,17 @@ pub(super) fn expire_with(
             before_retirement = Some(state.clone());
             retire_missing(&mut state, index, was_active);
             matched = None;
+        } else if expiry == Expiry::Budget
+            && (journal.change_time == 0 || journal.change_time != change_time)
+        {
+            // The head covers only the first bytes. As the metadata view
+            // does, evict only a file whose inode has not changed since the
+            // cursor last saw it.
+            return Ok(false);
         }
     }
     let status = classify(&state, matched, segment_index, len, change_time);
-    if let Some(original) = before_retirement
+    if let Some(original) = before_retirement.clone()
         && (status == SourceDelivery::Untracked
             || (status == SourceDelivery::Delivered && len == 0))
     {
@@ -224,7 +231,8 @@ pub(super) fn expire_with(
         return remove_without_cursor(path, unlink);
     }
     let renamed = name == active_name;
-    let mut original = state.clone();
+    // Compensation restores the cursor as published, before any retirement.
+    let mut original = before_retirement.unwrap_or_else(|| state.clone());
     let index = match matched {
         Some(index) => {
             if renamed {

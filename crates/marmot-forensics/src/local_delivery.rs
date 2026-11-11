@@ -3391,6 +3391,60 @@ mod tests {
     }
 
     #[test]
+    fn size_budget_never_evicts_a_delivered_segment_rewritten_past_its_head() {
+        let (_dir, active, state_dir, recorder) = setup();
+        let sealed = seal_segments(&recorder, &active, 1, 1).remove(0);
+        let mut worker = LocalAuditDelivery::open(&active, &state_dir, "receiver-A").unwrap();
+        drain(&mut worker, &mut FakeReceiver::default());
+        let mut bytes = fs::read(&sealed).unwrap();
+        assert!(bytes.len() > FINGERPRINT_BYTES + 1);
+        // Same inode, length and head; only bytes past the head differ.
+        let last = bytes.len() - 2;
+        bytes[last] = if bytes[last] == b' ' { b'x' } else { b' ' };
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&sealed)
+            .unwrap()
+            .write_all(&bytes)
+            .unwrap();
+        assert!(!retention::evict_delivered_source(&sealed, &state_dir).unwrap());
+        assert!(sealed.exists());
+    }
+
+    #[test]
+    fn failed_expiry_of_changed_bytes_restores_the_published_cursor() {
+        let (_dir, active, state_dir, recorder) = setup();
+        let mut worker = LocalAuditDelivery::open(&active, &state_dir, "receiver-A").unwrap();
+        let sealed = seal_segments(&recorder, &active, 1, 1).remove(0);
+        worker.discover().unwrap();
+        let cursor = fs::read(state_dir.join("local-delivery.json")).unwrap();
+        let mut bytes = fs::read(&sealed).unwrap();
+        bytes[0] = b' ';
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&sealed)
+            .unwrap()
+            .write_all(&bytes)
+            .unwrap();
+        let error = retention::expire_with(
+            &sealed,
+            &state_dir,
+            retention::Expiry::Age,
+            |_| Err(io::Error::from(io::ErrorKind::PermissionDenied)),
+            |delivery| delivery.publish(),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(sealed.exists());
+        // The old generation is still owed, not retired by the failed attempt.
+        assert_eq!(
+            fs::read(state_dir.join("local-delivery.json")).unwrap(),
+            cursor
+        );
+    }
+
+    #[test]
     fn age_expiry_of_an_emptied_known_segment_records_the_loss_before_unlinking() {
         for fail_unlink in [true, false] {
             let (_dir, active, state_dir, recorder) = setup();
