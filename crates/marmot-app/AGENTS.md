@@ -48,7 +48,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   network work. Wipe takes this fence before its network stages and passes it into local removal,
   rather than taking the foreground transaction again. Local removal takes generated preparation admission only
   after foreground setup finishes. Preparation captures the effective context with its chosen identity.
-  Once selected, that identity uses `Continue` even if another attempt clears its journal. A cleared journal may mean
+  Resolve selection once under local admission: no eligible journal means fresh creation, not another lookup.
+  An existing selection uses `Continue` even if another attempt clears its journal. A cleared journal may mean
   successful completion: coalesce from current completion data, never relabel a local snapshot as network-ready.
   New setup skips signed-out and unlinked journals instead of reviving those accounts or refusing all later creates.
   Teardown rechecks the captured public key after its fence wait and rejects a label reused for another identity.

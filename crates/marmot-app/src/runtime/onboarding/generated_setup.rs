@@ -142,8 +142,8 @@ impl MarmotAppRuntime {
         }
     }
 
-    // The caller holds local preparation admission until this returns.
-    // Capture the effective context with its identity, not in a later lookup.
+    // The caller holds local admission through the returned future.
+    // Resolve and validate its identity and context before async preparation.
     fn prepare_generated_account<'a>(
         &'a self,
         request: AccountSetupRequest,
@@ -156,7 +156,7 @@ impl MarmotAppRuntime {
             "local_ready",
             crate::ProductUnit::Attempt,
         );
-        let work = async move {
+        let selection = (|| {
             self.shared.lifecycle().ensure_running()?;
             validate_account_setup_request(&request, AccountSetupOperation::CreateOrImport)?;
 
@@ -166,6 +166,7 @@ impl MarmotAppRuntime {
                     .app
                     .account_home()
                     .resumable_generated_account_setup()?,
+                GeneratedIdentity::Fresh => None,
                 GeneratedIdentity::Continue(id) => {
                     let account = self.accounts.app.account_home().account(id)?;
                     if account.account_id_hex != id
@@ -193,11 +194,6 @@ impl MarmotAppRuntime {
                 None => GeneratedAccountSetupContext::from_request(&request),
             };
             let effective_request = context.request();
-            let publication = if effective_request.publish_initial_key_package {
-                InitialPublication::Requested
-            } else {
-                InitialPublication::Skipped
-            };
             let bootstrap = AccountRelayListBootstrap::new(
                 effective_request.default_relays.clone(),
                 effective_request.bootstrap_relays.clone(),
@@ -209,12 +205,23 @@ impl MarmotAppRuntime {
             self.accounts
                 .app
                 .validate_account_relay_list_declarations(&bootstrap, None)?;
+            Ok::<_, AppError>((resumable, context, effective_request))
+        })();
+        let work = async move {
+            let (resumable, context, effective_request) = selection?;
+            let publication = if effective_request.publish_initial_key_package {
+                InitialPublication::Requested
+            } else {
+                InitialPublication::Skipped
+            };
 
-            // Once selected, keep this exact identity even if publication clears
-            // its journal before local preparation reaches it.
-            let generated = resumable.as_ref().map_or(generated, |account| {
-                GeneratedIdentity::Continue(&account.account_id_hex)
-            });
+            // A fresh selection stays fresh even if sign-in makes a journal
+            // eligible before creation. Existing selections stay on their ID.
+            let generated = resumable
+                .as_ref()
+                .map_or(GeneratedIdentity::Fresh, |account| {
+                    GeneratedIdentity::Continue(&account.account_id_hex)
+                });
             let result = async {
                 let identity_started = Instant::now();
                 let identity_result = self
@@ -643,5 +650,110 @@ impl MarmotAppRuntime {
         if let Ok(context) = serde_json::from_slice::<GeneratedAccountSetupContext>(&bytes) {
             self.schedule_generated_account_setup(account, context);
         }
+    }
+}
+
+#[cfg(test)]
+mod selection_tests {
+    use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sign_in_keeps_fresh_selection() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = AccountHome::open_with_secret_store(
+            dir.path(),
+            Arc::new(marmot_account::LocalFileSecretStore::new(dir.path())),
+        );
+        let runtime = MarmotAppRuntime::new(MarmotApp::with_relays_and_account_home(
+            dir.path(),
+            vec!["wss://original.example".into()],
+            home,
+        ));
+        let request = |relay: &str| AccountSetupRequest {
+            default_relays: vec![TransportEndpoint(relay.into())],
+            bootstrap_relays: vec![TransportEndpoint(relay.into())],
+            publish_missing_relay_lists: true,
+            publish_initial_key_package: true,
+            ..AccountSetupRequest::default()
+        };
+        let original = runtime
+            .create_generated_account_local_ready(
+                request("wss://original.example"),
+                false,
+                None,
+                GeneratedIdentity::ResumeOrCreate,
+            )
+            .await
+            .unwrap();
+        let home = runtime.accounts.app.account_home();
+        let original_context = home.account_setup_context(&original.account.label).unwrap();
+        let original_storage = runtime
+            .accounts
+            .app
+            .account_storage(&original.account.label)
+            .unwrap();
+        let original_package = original_storage
+            .key_package_lifecycle()
+            .unwrap()
+            .unwrap()
+            .pending_replacement
+            .unwrap()
+            .key_package;
+        home.set_account_signed_out(&original.account.label, true)
+            .unwrap();
+
+        let admission = runtime.setup.generated_setup_local_transaction.lock().await;
+        let preparation = runtime.prepare_generated_account(
+            request("wss://new.example"),
+            GeneratedSetupHandoff::Foreground,
+            None,
+            GeneratedIdentity::ResumeOrCreate,
+        );
+        // Land sign-in's durable transition after selection and before creation.
+        home.set_account_signed_out(&original.account.label, false)
+            .unwrap();
+        let GeneratedSetupPreparation::Pending(local, context) =
+            tokio::time::timeout(Duration::from_secs(30), preparation)
+                .await
+                .unwrap()
+                .unwrap()
+        else {
+            panic!("fresh preparation must not report the old account as complete");
+        };
+        drop(admission);
+
+        assert_ne!(
+            local.account.account_id_hex,
+            original.account.account_id_hex
+        );
+        assert_eq!(context.default_relays, vec!["wss://new.example".to_owned()]);
+        assert_eq!(
+            home.account_setup_context(&local.account.label).unwrap(),
+            Some(serde_json::to_vec(&context).unwrap())
+        );
+        assert_eq!(
+            home.account(&original.account.label).unwrap(),
+            original.account
+        );
+        assert_eq!(
+            home.account_setup_context(&original.account.label).unwrap(),
+            original_context
+        );
+        assert_eq!(
+            original_storage
+                .key_package_lifecycle()
+                .unwrap()
+                .unwrap()
+                .pending_replacement
+                .unwrap()
+                .key_package
+                .bytes(),
+            original_package.bytes()
+        );
+        let mut expected = vec![original.account, local.account];
+        expected.sort_by(|a, b| a.account_id_hex.cmp(&b.account_id_hex));
+        assert_eq!(home.accounts().unwrap(), expected);
+        drop(original_storage);
+        runtime.shutdown_and_close().await.unwrap();
     }
 }

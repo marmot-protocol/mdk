@@ -79,7 +79,8 @@ finishes, so waiting for publication does not block all local preparation.
 A handoff that arrives after removal finds no account to continue. Startup also
 ends quietly when the captured account has been removed or signed out.
 
-Local preparation captures the effective setup context with its selected account.
+Local preparation resolves identity and context once under admission. No eligible
+journal means fresh creation, even if another account signs back in before creation.
 A foreground handoff does not reload context after another attempt may have
 cleared it. When another attempt completes the same account, coalescing reads its
 current relay status, profile, readiness and requested confirmed KeyPackage size

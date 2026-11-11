@@ -1371,9 +1371,10 @@ pub enum AccountSetupReadiness {
 /// may use.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum GeneratedIdentity<'a> {
-    /// A host's create: resume the one pending generated setup, so
-    /// concurrent creates coalesce, or create a new identity.
+    /// Select a resumable setup, or create a new identity.
     ResumeOrCreate,
+    /// Admission selected fresh creation; never scan for resumable setup again.
+    Fresh,
     /// Continue this account's pending setup only; never another identity.
     Continue(&'a str),
 }
@@ -9350,6 +9351,7 @@ impl AccountManager {
                             None => account_home.create_nostr_account_for_setup()?,
                         }
                     }
+                    GeneratedIdentity::Fresh => account_home.create_nostr_account_for_setup()?,
                     GeneratedIdentity::Continue(account_id_hex) => self
                         .pending_generated_account(account_id_hex)?
                         .ok_or_else(|| {
