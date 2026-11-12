@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use cgka_engine::canonicalization::ConvergenceStatus;
 use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_engine::provider::EngineOpenMlsProvider;
-use cgka_engine::{DEFAULT_CIPHERSUITE, Engine, EngineBuilder};
+use cgka_engine::{ConvergenceClock, DEFAULT_CIPHERSUITE, Engine, EngineBuilder};
 use cgka_traits::EngineError;
 use cgka_traits::app_components::GROUP_ADMIN_POLICY_COMPONENT_ID;
 use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MarmotAppEvent};
@@ -5649,7 +5649,12 @@ async fn selfremove_runtime_deadline_survives_encrypted_reopen_and_clears_after_
                 .unwrap(),
             Some(0)
         );
-        alice.advance_convergence(&group_id).await.unwrap();
+        // Explicit clock time, through the same drain: the host entry point's
+        // wall-clock slice can expire on a loaded runner before this work lands.
+        alice
+            .converge_and_drain_queued_outbound_intents(&group_id, clock.now().monotonic_ms)
+            .await
+            .unwrap();
         let mut publications = alice.drain_auto_publish();
         assert_eq!(publications.len(), 1);
         assert_eq!(
@@ -6774,8 +6779,16 @@ async fn historical_legacy_group_enables_lifecycle_after_authentic_leaf_refresh(
     alice.ingest(refresh.clone()).await.unwrap();
     carol.ingest(refresh).await.unwrap();
     clock.advance_ms(1_000);
-    alice.advance_convergence(&gid).await.unwrap();
-    carol.advance_convergence(&gid).await.unwrap();
+    // Explicit clock time, through the same drain: the host entry point's
+    // wall-clock slice can expire on a loaded runner before this work lands.
+    alice
+        .converge_and_drain_queued_outbound_intents(&gid, clock.now().monotonic_ms)
+        .await
+        .unwrap();
+    carol
+        .converge_and_drain_queued_outbound_intents(&gid, clock.now().monotonic_ms)
+        .await
+        .unwrap();
     assert!(alice.disbanding_support_blockers(&gid).unwrap().is_empty());
     let source = alice_storage.get_group(&gid).unwrap();
     let SendResult::GroupEvolution { pending, .. } = alice
@@ -6801,7 +6814,10 @@ async fn historical_legacy_group_enables_lifecycle_after_authentic_leaf_refresh(
     alice.confirm_published(pending).await.unwrap();
     carol.ingest(msg).await.unwrap();
     clock.advance_ms(1_000);
-    carol.advance_convergence(&gid).await.unwrap();
+    carol
+        .converge_and_drain_queued_outbound_intents(&gid, clock.now().monotonic_ms)
+        .await
+        .unwrap();
     for client in [&alice, &carol] {
         assert_eq!(
             client

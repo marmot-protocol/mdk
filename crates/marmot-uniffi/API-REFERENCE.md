@@ -863,6 +863,30 @@ Persist local forensic audit-log recording settings and return the stored value.
 
 [Source](src/commands/audit.rs#L27)
 
+### `Marmot::audit_log_retention`
+
+**Current.**
+
+```rust
+pub fn audit_log_retention(&self) -> Result<AuditLogRetentionFfi, MarmotKitError>
+```
+
+Read the persisted local audit retention policy: maximum file age in days and per-account size budget in bytes. Defaults to 30 days and 256 MiB.
+
+[Source](src/commands/audit.rs#L40)
+
+### `Marmot::set_audit_log_retention`
+
+**Current.**
+
+```rust
+pub fn set_audit_log_retention( &self, retention: AuditLogRetentionFfi, ) -> Result<AuditLogRetentionFfi, MarmotKitError>
+```
+
+Persist the local audit retention policy and return the stored value, with `max_age_days` clamped to 1-30 and `max_bytes_per_account` to at least 16 MiB. Files past the age are deleted whether or not v5 delivery accepted them; deleting undelivered data records an `ExpiredUndelivered` gap. Above the budget, only the oldest sealed segments that v5 delivery accepted, or that no v5 delivery will send, are deleted. A running app sweeps under the new policy shortly after; explicit delete and clear calls are unaffected.
+
+[Source](src/commands/audit.rs#L48)
+
 ### `Marmot::set_audit_log_tracker_config`
 
 **Current.**
@@ -873,7 +897,7 @@ pub fn set_audit_log_tracker_config( &self, config: AuditLogTrackerConfigV4Ffi, 
 
 Supply non-persisted audit tracker upload metadata: optional Goggles upload URL override, bearer token from the host app, and optional system hardware model, platform, and app version.
 
-[Source](src/commands/audit.rs#L44)
+[Source](src/commands/audit.rs#L64)
 
 ### `Marmot::audit_log_files`
 
@@ -885,7 +909,7 @@ pub fn audit_log_files(&self) -> Result<Vec<AuditLogFileFfi>, MarmotKitError>
 
 Local JSONL audit logs available for explicit forensic upload.
 
-[Source](src/commands/audit.rs#L88)
+[Source](src/commands/audit.rs#L124)
 
 ### `Marmot::post_audit_log_file`
 
@@ -897,7 +921,7 @@ pub async fn post_audit_log_file( &self, path: String, endpoint: String, ) -> Re
 
 POST one selected JSONL audit log to a forensic analyzer endpoint.
 
-[Source](src/commands/audit.rs#L98)
+[Source](src/commands/audit.rs#L134)
 
 ### `Marmot::delete_audit_log_file`
 
@@ -909,7 +933,7 @@ pub async fn delete_audit_log_file( &self, path: String, ) -> Result<AuditLogDel
 
 Delete one local JSONL audit log file (e.g. behind a "clear audit log" button).
 
-[Source](src/commands/audit.rs#L118)
+[Source](src/commands/audit.rs#L154)
 
 ### `Marmot::post_audit_log_tracker_update`
 
@@ -921,7 +945,7 @@ pub async fn post_audit_log_tracker_update( &self, ) -> Result<AuditLogTrackerUp
 
 POST all local audit logs to the configured tracker when audit logging is enabled. This is safe for host apps to call unconditionally; disabled or unconfigured states return a structured skip result.
 
-[Source](src/commands/audit.rs#L128)
+[Source](src/commands/audit.rs#L164)
 
 </details>
 
@@ -4395,7 +4419,7 @@ pub fn new_with_configuration( root_path: String, relay_urls: Vec<String>, optio
 
 Open with any combination of runtime options, including the required deployment. The other constructors are wrappers around this entry point and take the deployment as their last argument.
 
-[Source](src/lib.rs#L333)
+[Source](src/lib.rs#L334)
 
 ### `Marmot::new_with_experimental_device_groups`
 
@@ -4405,7 +4429,7 @@ pub fn new_with_experimental_device_groups( root_path: String, relay_urls: Vec<S
 
 Open a controlled development build with device-group capability and explicit runtime intent. The library must enable `dev-device-groups`; otherwise it returns Runtime with `experimental_device_groups_unavailable` before opening the root or acquiring host secret storage. It takes the same `MarmotOptions` and required deployment as `new_with_configuration`, preserving their ordinary meanings and ownership. Ordinary constructors remain disabled even in a capable library. Use this constructor for every foreground/background opener of the experimental root, a notification service extension included: an ordinary constructor does not open an account that holds or is joining a device group and reports Runtime with `experimental_device_groups_required`; see the [shared host test-build guidance](README.md#experimental-device-group-test-builds). Production timing is unchanged. This is not release activation or proof of mobile artifact/device validation.
 
-[Source](src/lib.rs#L348)
+[Source](src/lib.rs#L349)
 
 ### `Marmot::new_with_options`
 
@@ -4417,7 +4441,7 @@ pub fn new_with_options( root_path: String, relay_urls: Vec<String>, relay_polic
 
 Open with an explicit relay policy and optional host-owned key storage. Existing constructors retain their public-only relay policy.
 
-[Source](src/lib.rs#L359)
+[Source](src/lib.rs#L360)
 
 ### `Marmot::new`
 
@@ -4429,7 +4453,7 @@ pub fn new( root_path: String, relay_urls: Vec<String>, deployment: MarmotDeploy
 
 Open the Marmot app at `root_path`, configured with the given default relay URLs and `deployment`. Account secrets (Nostr private keys) are stored in the platform keyring (Keychain on Apple platforms, Android's native keyring on Android) under the deployment's `keychain_service` — not in a plaintext file. Fallible because initializing the platform secret store can fail or another process may own the same root (`MarmotKitError::RuntimeBusy`). Root ownership is nonblocking and remains held until the final `Marmot`/runtime handle is dropped, even after `Marmot::shutdown`. Call `Marmot::start` before subscribing to events.
 
-[Source](src/lib.rs#L388)
+[Source](src/lib.rs#L389)
 
 ### `Marmot::new_with_secret_store`
 
@@ -4441,7 +4465,7 @@ pub fn new_with_secret_store( root_path: String, relay_urls: Vec<String>, secret
 
 Open the Marmot app with host-supplied account-secret storage instead of the platform keychain. Identical to `Marmot::new` except that every read, write, and removal of an account signing key goes through `secret_store`.
 
-[Source](src/lib.rs#L414)
+[Source](src/lib.rs#L415)
 
 ### `Marmot::new_with_cursor_persistence`
 
@@ -4453,7 +4477,7 @@ pub fn new_with_cursor_persistence( root_path: String, relay_urls: Vec<String>, 
 
 Construct with explicit advancing/frozen relay cursor behavior; new_with_configuration composes this with other options.
 
-[Source](src/lib.rs#L445)
+[Source](src/lib.rs#L446)
 
 ### `Marmot::new_with_client_name`
 
@@ -4465,7 +4489,7 @@ pub fn new_with_client_name( root_path: String, relay_urls: Vec<String>, client_
 
 Open with an optional public client label for new KeyPackage publications. Existing constructors remain untagged. Whitespace-only labels, and labels longer than 64 bytes once trimmed, are omitted rather than truncated. Hosts must supply this on every foreground/background runtime construction.
 
-[Source](src/lib.rs#L466)
+[Source](src/lib.rs#L467)
 
 ### `Marmot::start`
 
@@ -4477,7 +4501,7 @@ pub async fn start(&self) -> Result<(), MarmotKitError>
 
 Bring the runtime to local readiness.
 
-[Source](src/lib.rs#L504)
+[Source](src/lib.rs#L505)
 
 ### `Marmot::shutdown`
 
@@ -4489,7 +4513,7 @@ pub async fn shutdown(&self)
 
 Tear the runtime down. Drops all subscriptions; long-lived `EventsSubscription` / `ChatsSubscription` / etc. instances on the host side will see their `next()` return `None` shortly after.
 
-[Source](src/lib.rs#L516)
+[Source](src/lib.rs#L517)
 
 ### `Marmot::shutdown_and_close`
 
@@ -4501,7 +4525,7 @@ pub async fn shutdown_and_close(&self) -> Result<(), MarmotKitError>
 
 Terminally stop work, close storage and release root ownership; reconstruct before further reads/work.
 
-[Source](src/lib.rs#L552)
+[Source](src/lib.rs#L553)
 
 ### `Marmot::storage_is_closed`
 
@@ -4513,7 +4537,7 @@ pub fn storage_is_closed(&self) -> bool
 
 True once `Marmot::shutdown_and_close` has closed the store. A host can check this to confirm it is safe to be suspended, or to notice it is holding a spent handle and needs a fresh one.
 
-[Source](src/lib.rs#L560)
+[Source](src/lib.rs#L561)
 
 ### `Marmot::is_stopping`
 
@@ -4525,7 +4549,7 @@ pub fn is_stopping(&self) -> bool
 
 True once shutdown has started. Host apps can use this to avoid launching more subscriptions or account work while they are moving to the background.
 
-[Source](src/lib.rs#L567)
+[Source](src/lib.rs#L568)
 
 </details>
 
@@ -5254,6 +5278,16 @@ must enforce those separately and bound any untrusted JSON before passing it.
 <details>
 <summary>Audit v5 tracker and configuration</summary>
 
+### `Marmot::audit_delivery_status_v5`
+
+```rust
+pub fn audit_delivery_status_v5( &self, ) -> Result<Vec<AuditDeliveryStatusV5Ffi>, MarmotKitError>
+```
+
+Read each account's persisted v5 OTLP delivery status without dialing or touching the delivery cursor. Use it to show "audit delivery stalled since X: reason": `last_success_at_ms` against `last_failure`, whose `kind` separates local failures (`StateOverLimit`, `TooManyOpenFiles`, `LocalIo`, `LocalBlocked`) from receiver verdicts and whose `http_status` is set when the receiver answered. `paused` is true after `ReceiverBlocked` (for example `401`) for the configured destination; changing the destination, endpoint or token, or calling `post_audit_log_tracker_update_v5`, retries it. `ReceiverRejected` counts rows the receiver refused in `rejected_batches` while delivery continues. `backlog` is the last measured undelivered bytes, segments, gaps and oldest undelivered record time, as of `observed_at_ms`. Accounts that never ran a v5 pass report no failure and no backlog.
+
+[Source](src/commands/audit.rs#L112)
+
 ### `Marmot::post_audit_log_tracker_update_v5`
 
 ```rust
@@ -5262,7 +5296,7 @@ pub async fn post_audit_log_tracker_update_v5( &self, ) -> Result<AuditLogTracke
 
 Run an immediate audit tracker pass and receive separate v4 whole-file and v5 OTLP outcomes. The `v5` field is absent when no dedicated sender is configured; when present, accepted batches, pending accounts, blocked accounts, and idle accounts report the delivery state without treating an empty v4 upload list as success. Recording must be enabled separately. Existing automatic activity triggers use the same v5 sender and retry policy.
 
-[Source](src/commands/audit.rs#L135)
+[Source](src/commands/audit.rs#L171)
 
 ### `Marmot::set_audit_otlp_config_v5`
 
@@ -5272,7 +5306,7 @@ pub fn set_audit_otlp_config_v5( &self, mut config: AuditOtlpConfigV5Ffi, ) -> R
 
 Install or remove an in-memory v5 OTLP audit destination. With `enabled: true`, provide a stable destination identity, an HTTPS `/v1/logs` endpoint, and a bearer token; local loopback testing additionally requires `allow_loopback_dev: true`. The returned configuration always omits the token. With `enabled: false`, the runtime clears the sender. This does not enable recording, change the v4 Goggles route, or persist credentials. A configuration change fences in-flight acknowledgments.
 
-[Source](src/commands/audit.rs#L55)
+[Source](src/commands/audit.rs#L75)
 
 </details>
 
@@ -5733,4 +5767,3 @@ Take the initial list once; subsequent calls return an empty list. An empty firs
 without configured relay entries. This method does not consume a later update or initiate a connection.
 
 [Source](src/subscriptions/relay_liveness.rs#L29)
-

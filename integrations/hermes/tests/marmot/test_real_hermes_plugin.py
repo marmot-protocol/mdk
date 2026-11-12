@@ -125,6 +125,7 @@ async def _exercise_media_routes(adapter_module, platform_config, temp_root: Pat
             attachments,
             *,
             caption=None,
+            reply_to_message_id_hex=None,
             idempotency_key=None,
             response_timeout=None,
         ):

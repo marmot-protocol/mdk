@@ -14,7 +14,7 @@ use marmot_app::{
 use crate::error::ConnectorError;
 use crate::maintenance::agent_maintenance_disposition;
 use crate::media_roots::MediaAllowedRoots;
-use crate::stream_session::SendIdempotencyAcquisition;
+use crate::stream_session::{SendIdempotencyAcquisition, StrictIdempotencyAcquisition};
 use crate::validation::normalize_hex;
 use crate::{
     AgentConnector, MAX_MEDIA_UPLOAD_ATTACHMENT_BYTES, MAX_MEDIA_UPLOAD_ATTACHMENTS,
@@ -114,13 +114,14 @@ pub(crate) fn send_final_fingerprint(
 
 /// Server-derived fingerprint of a media send. Local paths are deliberately
 /// excluded; retries may stage the same bytes under a different private path.
-/// Attachment order, safe metadata, caption, destination, and plaintext bytes
+/// Attachment order, safe metadata, caption, destination, reply target, and plaintext bytes
 /// are all bound so one key cannot return ids for a different album.
 pub(crate) fn send_media_fingerprint(
     account_id_hex: &str,
     group_id_hex: &str,
     caption: Option<&str>,
     attachments: &[MediaUploadAttachmentRequest],
+    reply_to_message_id_hex: Option<&str>,
 ) -> String {
     use sha2::{Digest, Sha256};
 
@@ -136,13 +137,18 @@ pub(crate) fn send_media_fingerprint(
             ])
         })
         .collect::<Vec<_>>();
-    let preimage = serde_json::json!([
-        SEND_MEDIA_FINGERPRINT_VERSION,
-        account_id_hex,
-        group_id_hex,
-        caption,
-        attachments,
+    let mut preimage = Vec::with_capacity(6);
+    preimage.extend([
+        serde_json::json!(SEND_MEDIA_FINGERPRINT_VERSION),
+        serde_json::json!(account_id_hex),
+        serde_json::json!(group_id_hex),
+        serde_json::json!(caption),
+        serde_json::json!(attachments),
     ]);
+    // Preserve persisted plain-send fingerprints across this additive change.
+    if let Some(target) = reply_to_message_id_hex {
+        preimage.push(serde_json::json!(target));
+    }
     let bytes = serde_json::to_vec(&preimage).expect("send_media fingerprint preimage cannot fail");
     hex::encode(Sha256::digest(bytes))
 }
@@ -642,11 +648,21 @@ impl AgentConnector {
         group_id_hex: &str,
         attachments: Vec<AgentControlMediaUpload>,
         caption: Option<String>,
+        reply_to_message_id_hex: Option<String>,
         idempotency_key: Option<String>,
     ) -> Result<AgentControlResponse, ConnectorError> {
         let account = self.local_account_for_account_id(account_id_hex)?;
         let group_id_hex = normalize_hex(group_id_hex)?;
         let group_id = GroupId::new(hex::decode(&group_id_hex)?);
+        let reply_to_message_id_hex = reply_to_message_id_hex
+            .map(|value| {
+                let target = normalize_hex(&value)?;
+                if target.len() != 64 {
+                    return Err(ConnectorError::Hex(hex::FromHexError::InvalidStringLength));
+                }
+                Ok(target)
+            })
+            .transpose()?;
         let upload_attachments = read_media_upload_attachments_with_limits(
             &self.media_allowed_roots,
             attachments,
@@ -663,9 +679,10 @@ impl AgentConnector {
                 &group_id_hex,
                 caption.as_deref(),
                 &upload_attachments,
+                reply_to_message_id_hex.as_deref(),
             );
-            match self.idempotency.acquire(&key, &fingerprint).await? {
-                SendIdempotencyAcquisition::Completed((
+            match self.idempotency.acquire_strict(&key, &fingerprint).await? {
+                StrictIdempotencyAcquisition::Completed((
                     message_ids_hex,
                     maintenance_disposition,
                 )) => {
@@ -674,12 +691,19 @@ impl AgentConnector {
                         maintenance_disposition,
                     });
                 }
-                SendIdempotencyAcquisition::Leader(reservation) => {
+                StrictIdempotencyAcquisition::Leader(reservation) => {
                     Some((key, fingerprint, reservation))
+                }
+                StrictIdempotencyAcquisition::Conflict => {
+                    return Err(ConnectorError::MediaIdempotencyConflict);
                 }
             }
         } else {
             None
+        };
+        let message_tags = match reply_to_message_id_hex {
+            Some(target) => vec![vec!["e".into(), target.clone()], vec!["q".into(), target]],
+            None => Vec::new(),
         };
         let result = self
             .runtime
@@ -687,7 +711,7 @@ impl AgentConnector {
                 &account.label,
                 &group_id,
                 MediaUploadRequest {
-                    message_tags: Vec::new(),
+                    message_tags,
                     attachments: upload_attachments,
                     caption,
                     send: true,

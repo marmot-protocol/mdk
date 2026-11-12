@@ -85,6 +85,34 @@ async fn quarantined_group_does_not_block_account_receives_body(locally_deleted:
         .await
         .unwrap();
     wait_for_joined(&mut events, &bob.account_id_hex, &healthy).await;
+    runtime.shutdown().await;
+
+    // bob's copies have ended their post-join collection, as a relay that
+    // answers history reads lets them. This relay answers none, so bob's
+    // worker would re-activate his subscriptions for the collection while
+    // alice sends, and the swap discards a live copy of her message for the
+    // new REQs to read back from the relay, which serves no stored events
+    // either.
+    let bob_client = app.client("bob").await.unwrap();
+    for group in [&broken, &healthy] {
+        bob_client.runtime.mark_post_join_eose(group).unwrap();
+        let fetch = bob_client
+            .runtime
+            .start_post_join_history_fetch(group)
+            .unwrap()
+            .expect("bob's post-join fetch is owed");
+        bob_client
+            .runtime
+            .finish_post_join_history_fetch(group, &fetch)
+            .unwrap()
+            .expect("the fetch ends");
+    }
+    drop(bob_client);
+
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    let runtime = start_runtime(&app).await;
+    let mut events = runtime.subscribe();
     runtime
         .send_message("alice", &healthy, b"warmup alice".to_vec())
         .await

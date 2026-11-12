@@ -33,6 +33,10 @@ use marmot_observability::{
 mod legacy_cleanup;
 pub(crate) use legacy_cleanup::cleanup_legacy_audit_logs;
 mod retention;
+pub use retention::{
+    AUDIT_LOG_DEFAULT_MAX_BYTES_PER_ACCOUNT, AUDIT_LOG_MAX_AGE_DAYS,
+    AUDIT_LOG_MIN_MAX_BYTES_PER_ACCOUNT, AuditLogRetention,
+};
 pub(crate) use retention::{AuditRetentionWorker, cleanup_expired_audit_logs};
 
 pub(crate) type AuditRecorderSlot =
@@ -84,6 +88,94 @@ pub struct AuditOtlpTrackerResult {
     pub blocked_accounts: u64,
     pub idle_accounts: u64,
     pub skipped_reason: Option<String>,
+}
+
+/// Why the most recent v5 delivery attempt for an account failed.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AuditDeliveryFailureKind {
+    /// The local delivery cursor outgrew its size limit.
+    StateOverLimit,
+    /// The process ran out of file descriptors.
+    TooManyOpenFiles,
+    /// Another local file-system failure.
+    LocalIo,
+    /// A local source journal is blocked, for example by a truncated file.
+    LocalBlocked,
+    /// The receiver refused the configuration (`401`, `403`, `404`), returned
+    /// another unexpected status or an invalid success response, or the
+    /// sender refused the batch before dialing. Automatic delivery pauses
+    /// until the host changes the configuration or retries manually.
+    ReceiverBlocked,
+    /// The receiver rejected a batch's content (`400`, `413`, `422`).
+    /// Delivery continues past it, so these rows are lost to the receiver.
+    ReceiverRejected,
+    /// The receiver was throttled, unavailable, or possibly stored part of
+    /// the batch (`409`, `429`, `5xx`); the same range is retried.
+    ReceiverRetryable,
+    /// No usable response: connection failure, timeout, or a lost reply.
+    NoResponse,
+    /// Any other runtime failure.
+    Internal,
+}
+
+impl AuditDeliveryFailureKind {
+    /// Privacy-safe category for logs.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::StateOverLimit => "state_over_limit",
+            Self::TooManyOpenFiles => "too_many_open_files",
+            Self::LocalIo => "local_io",
+            Self::LocalBlocked => "local_blocked",
+            Self::ReceiverBlocked => "receiver_blocked",
+            Self::ReceiverRejected => "receiver_rejected",
+            Self::ReceiverRetryable => "receiver_retryable",
+            Self::NoResponse => "no_response",
+            Self::Internal => "internal",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AuditDeliveryFailure {
+    pub kind: AuditDeliveryFailureKind,
+    /// The receiver's HTTP status, when it answered.
+    pub http_status: Option<u16>,
+    pub at_ms: u64,
+}
+
+/// Undelivered local v5 audit data, as of `observed_at_ms`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AuditDeliveryBacklog {
+    pub undelivered_bytes: u64,
+    pub undelivered_segments: u64,
+    /// Recorded delivery gaps (data the receiver will never get).
+    pub gaps: u64,
+    /// Recorder wall time of the oldest undelivered record, when readable.
+    pub oldest_undelivered_at_ms: Option<u64>,
+    /// When delivery last measured this backlog. It is not refreshed while
+    /// local delivery cannot open its state or automatic delivery is paused.
+    pub observed_at_ms: u64,
+}
+
+/// Per-account v5 OTLP audit delivery status, persisted across restarts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuditDeliveryStatus {
+    pub account_ref: String,
+    /// Whether the host has configured a v5 audit OTLP destination.
+    pub destination_configured: bool,
+    /// Last delivery attempt that delivered a batch or found nothing left to deliver.
+    pub last_success_at_ms: Option<u64>,
+    pub last_failure: Option<AuditDeliveryFailure>,
+    /// Failed delivery attempts since the last success.
+    pub consecutive_failures: u64,
+    /// Batches the receiver rejected, in total.
+    pub rejected_batches: u64,
+    /// Automatic delivery is paused for the configured destination after a
+    /// [`AuditDeliveryFailureKind::ReceiverBlocked`] failure. A changed
+    /// configuration or a manual tracker update lifts it.
+    pub paused: bool,
+    pub backlog: Option<AuditDeliveryBacklog>,
 }
 
 /// Internal receipt: only a complete snapshot of the enumerated file may be

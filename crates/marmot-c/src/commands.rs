@@ -34,8 +34,9 @@ use crate::types::account::{
 };
 use crate::types::agent_stream::MarmotAgentStreamStart;
 use crate::types::audit::{
-    MarmotAuditLogDeleteResult, MarmotAuditLogFileList, MarmotAuditLogSettings,
-    MarmotAuditLogTrackerConfig, MarmotAuditLogTrackerConfigV4, MarmotAuditLogTrackerUpdateResult,
+    MarmotAuditDeliveryStatusV5List, MarmotAuditLogDeleteResult, MarmotAuditLogFileList,
+    MarmotAuditLogRetention, MarmotAuditLogSettings, MarmotAuditLogTrackerConfig,
+    MarmotAuditLogTrackerConfigV4, MarmotAuditLogTrackerUpdateResult,
     MarmotAuditLogTrackerUpdateResultV5, MarmotAuditLogUploadResult, MarmotAuditOtlpConfigV5,
 };
 use crate::types::backups::{
@@ -1182,6 +1183,10 @@ c_cmd! {
     /// `marmot_audit_log_settings_free`.
     sync fn marmot_audit_log_settings() -> rec(MarmotAuditLogSettings) = audit_log_settings;
 
+    /// Current local audit-log retention policy. Free with
+    /// `marmot_audit_log_retention_free`.
+    sync fn marmot_audit_log_retention() -> rec(MarmotAuditLogRetention) = audit_log_retention;
+
     /// On-disk audit-log files. Free with
     /// `marmot_audit_log_file_list_free`.
     sync fn marmot_audit_log_files() -> rec(MarmotAuditLogFileList) = audit_log_files;
@@ -1200,6 +1205,10 @@ c_cmd! {
 
     /// Run the same tracker pass with independent v4/v5 outcomes.
     async fn marmot_post_audit_log_tracker_update_v5() -> rec(MarmotAuditLogTrackerUpdateResultV5) = post_audit_log_tracker_update_v5;
+
+    /// Per-account v5 OTLP audit delivery status (local read; never dials).
+    /// Free with `marmot_audit_delivery_status_v5_list_free`.
+    sync fn marmot_audit_delivery_status_v5() -> rec(MarmotAuditDeliveryStatusV5List) = audit_delivery_status_v5;
 
     /// The account's chat list rows. Free with
     /// `marmot_chat_list_row_list_free`.
@@ -1744,6 +1753,32 @@ pub unsafe extern "C" fn marmot_set_audit_log_settings(
         unsafe {
             deliver(
                 client.block_on(client.marmot.set_audit_log_settings(settings)),
+                out,
+            )
+        }
+    })
+}
+
+/// Replace the local audit-log retention policy. The stored value, clamped to
+/// 1-30 days and at least 16 MiB per account, is returned. Free the result with
+/// `marmot_audit_log_retention_free`.
+///
+/// # Safety
+/// `client` must be a live handle; `retention` a valid borrowed struct;
+/// `out` valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_set_audit_log_retention(
+    client: *const MarmotClient,
+    retention: *const MarmotAuditLogRetention,
+    out: *mut *mut MarmotAuditLogRetention,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { crate::preflight_out_ptr(out) });
+        let client = try_arg!(unsafe { client_ref(client) });
+        let retention = try_arg!(unsafe { borrowed(retention) });
+        unsafe {
+            deliver(
+                client.marmot.set_audit_log_retention(retention.to_ffi()),
                 out,
             )
         }

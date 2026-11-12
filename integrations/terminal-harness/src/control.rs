@@ -251,6 +251,7 @@ impl ControlClient {
                     group_id_hex: group_ref.to_owned(),
                     attachments,
                     caption,
+                    reply_to_message_id_hex: None,
                     idempotency_key: Some(idempotency_key),
                 },
                 self.response_timeout_at_least(MIN_MEDIA_SEND_RESPONSE_TIMEOUT),
@@ -752,6 +753,7 @@ mod tests {
                     attachments,
                     caption,
                     idempotency_key,
+                    ..
                 } => {
                     assert_eq!(account_id_hex, "account");
                     assert_eq!(group_id_hex, "group");

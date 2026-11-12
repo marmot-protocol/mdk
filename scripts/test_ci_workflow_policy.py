@@ -580,6 +580,32 @@ class OdinArchiveCacheTests(unittest.TestCase):
         self.assertIn("does not match its pinned sha256", result.stderr)
         self.assertEqual((downloads, kept_good, installed), (1, None, False))
 
+    def test_windows_download_tolerates_only_an_offline_revocation_check(self):
+        # SChannel fails a handshake whose revocation server is offline; the
+        # Windows download skips only that check, and the pin still decides.
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            stubs = tmp / "bin"
+            stubs.mkdir()
+            for name, body in {
+                "uname": 'case "$1" in -s) echo MINGW64_NT-10.0 ;; -m) echo x86_64 ;; esac',
+                "sha256sum": "exit 1",
+                "curl": 'printf "%s\\n" "$@" > "$ARGS"; while [ "$1" != --output ]; do shift; done; '
+                        'printf corrupt > "$2"',
+            }.items():
+                (stubs / name).write_text(f"#!/bin/sh\n{body}\n")
+                (stubs / name).chmod(0o755)
+            result = subprocess.run(
+                ["/bin/bash", str(ROOT / "scripts/install-odin.sh"), str(tmp / "odin-install")],
+                env={**os.environ, "PATH": f"{stubs}:{os.environ['PATH']}", "ARGS": str(tmp / "args")},
+                capture_output=True, text=True)
+            arguments = (tmp / "args").read_text().splitlines()
+            self.assertIn("--ssl-revoke-best-effort", arguments)
+            self.assertFalse({"-k", "--insecure", "--ssl-no-revoke"} & set(arguments))
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("does not match its pinned sha256", result.stderr)
+            self.assertFalse((tmp / "odin-install").exists())
+
 
 def semver_key(version: str):
     """Semver 2.0 precedence key for X.Y.Z[-pre] (no build metadata)."""
@@ -833,6 +859,42 @@ class NightlyReleasePolicyTests(unittest.TestCase):
                 with self.subTest(overrides=overrides):
                     result = subprocess.run(command, cwd=root, env={**env, **overrides}, capture_output=True)
                     self.assertNotEqual(result.returncode, 0)
+
+
+class FlakeReportPolicyTests(unittest.TestCase):
+    def test_reads_actions_and_writes_only_issues(self):
+        workflow = (ROOT / ".github/workflows/flake-report.yml").read_text()
+        self.assertIn("permissions:\n  actions: read\n  contents: read\n  issues: write\n\n", workflow)
+        self.assertNotIn("pull_request", workflow)
+        # GITHUB_TOKEN's hourly budget is shared with CI; leave most of it.
+        self.assertIn("--reserve 600", workflow_step("flake-report.yml", "Build the leaderboard"))
+
+    def test_replaces_the_body_of_one_open_leaderboard_issue(self):
+        script = workflow_step("flake-report.yml", "Replace the leaderboard issue body")
+        fake_gh = textwrap.dedent("""\
+            gh() {
+              if [[ "$1 $2" == "issue list" ]]; then
+                while [[ "$1" != --jq ]]; do shift; done
+                jq -r "$2" <<<"$ISSUES"
+                return
+              fi
+              printf '%s\\n' "$*" >>"$LOG"
+            }
+        """)
+        for issues, expected in [
+            ([{"number": 9, "title": "Flaky test leaderboard (old)"}],
+             "issue create --repo o/r --title Flaky test leaderboard --body-file board.md"),
+            ([{"number": 9, "title": "Flaky test leaderboard (old)"}, {"number": 12, "title": "Flaky test leaderboard"}],
+             "issue edit 12 --repo o/r --body-file board.md"),
+        ]:
+            with self.subTest(issues=issues), tempfile.TemporaryDirectory() as tmp:
+                log = Path(tmp) / "gh.log"
+                subprocess.run(
+                    ["bash", "-c", fake_gh + script], check=True, timeout=10,
+                    env={**os.environ, "ISSUES": json.dumps(issues), "LOG": str(log), "REPO": "o/r",
+                         "LEADERBOARD": "board.md"},
+                )
+                self.assertEqual(log.read_text(), expected + "\n")
 
 
 class FakeNightlyGitHub:
@@ -1196,9 +1258,12 @@ class RunnerInfrastructurePolicyTests(unittest.TestCase):
         workflow = (ROOT / ".github/workflows/ci.yml").read_text()
         formal = workflow.split("\n  formal:\n", 1)[1].split("\n  hermes-installer-auth:\n", 1)[0]
         self.assertNotIn("--no-install-recommends graphviz maude", formal)
+        # The proofs need nothing from the Ubuntu archives, so an archive
+        # outage cannot stop the formal job (Canonical DDoS, 2026-11-11).
+        self.assertNotIn("apt-get", formal)
         script = workflow_step("ci.yml", "Install Maude")
         self.assertIn("Maude3.5.1/Maude-3.5.1-linux-x86_64.zip", script)
-        self.assertLess(script.index("sha256sum"), script.index("unzip"))
+        self.assertLess(script.index("sha256sum"), script.index("python3 -m zipfile -e"))
         self.assertIn("maude --version", script)
 
     def test_corrupt_maude_download_cannot_reach_installation(self):
@@ -1212,6 +1277,29 @@ sha256sum() { shasum -a 256 "$@"; }
             self.assertNotEqual(result.returncode, 0)
             self.assertIn(b"checksum", result.stderr)
             self.assertFalse((Path(tmp) / "maude-3.5.1").exists())
+
+    def test_windows_nextest_download_tolerates_only_an_offline_revocation_check(self):
+        # SChannel fails a handshake whose revocation server is offline; the
+        # step skips only that check, and a bad archive still never installs.
+        script = workflow_step("ci.yml", "Install pinned cargo-nextest")
+        with tempfile.TemporaryDirectory() as tmp:
+            result = subprocess.run(["bash", "-c", '''
+cygpath() { printf '%s\\n' "$2"; }
+curl() {
+  printf '%s\\n' "$@" > "$RUNNER_TEMP/curl-args"
+  while [ "$1" != --output ]; do shift; done
+  printf 'corrupt transfer' > "$2"
+}
+sha256sum() { shasum -a 256 "$@"; }
+''' + script], env={**os.environ, "RUNNER_TEMP": tmp, "GITHUB_PATH": tmp + "/path"},
+                capture_output=True)
+            arguments = (Path(tmp) / "curl-args").read_text().splitlines()
+            self.assertIn("--ssl-revoke-best-effort", arguments)
+            self.assertFalse({"-k", "--insecure", "--ssl-no-revoke"} & set(arguments))
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(b"checksum", result.stderr)
+            self.assertFalse((Path(tmp) / "cargo-nextest-0.9.132").exists())
+            self.assertFalse((Path(tmp) / "path").exists())
 
 
 if __name__ == "__main__":

@@ -8,6 +8,7 @@
 
 use super::canonical_membership::{deliver_new, published_key_package};
 use super::*;
+use crate::client::boxed;
 use crate::{ConfirmedDeviceLink, LinkedDevice, LinkedDeviceStatus};
 use cgka_traits::TransportFanoutAttemptState;
 use cgka_traits::app_components::{
@@ -68,7 +69,7 @@ pub(super) struct Devices {
 }
 
 pub(super) async fn phone_and_laptop() -> Devices {
-    phone_and_laptop_on(MarmotDeployment::white_noise()).await
+    boxed(|| phone_and_laptop_on(MarmotDeployment::white_noise())).await
 }
 
 /// [`phone_and_laptop`] under `deployment`.
@@ -90,9 +91,9 @@ pub(super) async fn phone_and_laptop_on(deployment: MarmotDeployment) -> Devices
     for app in [&phone_app, &laptop_app] {
         remember_test_member_inbox(app, &alice_id, "wss://relay.example");
     }
-    let mut phone = phone_app.client("alice").await.unwrap();
+    let mut phone = boxed(|| phone_app.client("alice")).await.unwrap();
     published_key_package(&mut phone, &relay).await;
-    let mut laptop = laptop_app.client("alice").await.unwrap();
+    let mut laptop = boxed(|| laptop_app.client("alice")).await.unwrap();
     let key_package = published_key_package(&mut laptop, &relay).await;
     let link = ConfirmedDeviceLink {
         key_package_event_id_hex: hex::encode(
@@ -1725,27 +1726,25 @@ async fn with_phone_audit_log(devices: Devices) -> Devices {
 
 pub(super) async fn deliver_all(client: &mut AppClient, relay: &ScriptedPushRelayClient) {
     let mut cursor = 0;
-    deliver_new(client, relay, &mut cursor).await;
-    client.sync().await.unwrap();
+    boxed(|| deliver_new(client, relay, &mut cursor)).await;
+    boxed(|| client.sync()).await.unwrap();
 }
 
 /// A phone and laptop in one device group, the laptop joined.
 async fn linked_devices() -> (Devices, GroupId) {
-    let mut devices = phone_and_laptop().await;
+    let mut devices = boxed(phone_and_laptop).await;
     devices
         .laptop
         .dev_record_confirmed_device_link(devices.link.clone())
         .unwrap();
-    let group = devices
-        .phone
-        .dev_create_device_group(devices.link.clone())
+    let group = boxed(|| devices.phone.dev_create_device_group(devices.link.clone()))
         .await
         .unwrap();
     let mut cursor = 0;
-    deliver_new(&mut devices.laptop, &devices.relay, &mut cursor).await;
+    boxed(|| deliver_new(&mut devices.laptop, &devices.relay, &mut cursor)).await;
     // Settling the join names the group to tag from at once (mdk#2628 3.1d).
     assert_eq!(devices.laptop.runtime.device_tag_group(), Some(&group));
-    devices.laptop.sync().await.unwrap();
+    boxed(|| devices.laptop.sync()).await.unwrap();
     assert_eq!(
         trust(&devices.laptop_app, &group),
         Some(DeviceGroupTrust::Linked)
@@ -1754,7 +1753,7 @@ async fn linked_devices() -> (Devices, GroupId) {
     // request it owes at start, so a test's first maintenance pass publishes
     // only what that test is about.
     for client in [&mut devices.phone, &mut devices.laptop] {
-        client.drive_small_state().await;
+        boxed(|| client.drive_small_state()).await;
     }
     (devices, group)
 }
@@ -1765,8 +1764,8 @@ async fn linked_devices() -> (Devices, GroupId) {
 /// Each new KeyPackage is announced before it is published, and both devices
 /// see every roster commit.
 async fn tagging_devices() -> (Devices, GroupId) {
-    let (devices, group) = linked_devices().await;
-    tag_linked_devices(devices, group).await
+    let (devices, group) = boxed(linked_devices).await;
+    boxed(|| tag_linked_devices(devices, group)).await
 }
 
 /// Tag an already linked pair, including chats it established before private
@@ -1774,12 +1773,14 @@ async fn tagging_devices() -> (Devices, GroupId) {
 async fn tag_linked_devices(mut devices: Devices, group: GroupId) -> (Devices, GroupId) {
     let start = devices.relay.published_events.lock().unwrap().len();
     let (mut phone_cursor, mut laptop_cursor) = (start, start);
-    devices.laptop.run_due_maintenance().await.unwrap();
-    deliver_new(&mut devices.phone, &devices.relay, &mut phone_cursor).await;
-    devices.phone.sync().await.unwrap();
-    devices.phone.run_due_maintenance().await.unwrap();
-    deliver_new(&mut devices.laptop, &devices.relay, &mut laptop_cursor).await;
-    devices.laptop.sync().await.unwrap();
+    boxed(|| devices.laptop.run_due_maintenance())
+        .await
+        .unwrap();
+    boxed(|| deliver_new(&mut devices.phone, &devices.relay, &mut phone_cursor)).await;
+    boxed(|| devices.phone.sync()).await.unwrap();
+    boxed(|| devices.phone.run_due_maintenance()).await.unwrap();
+    boxed(|| deliver_new(&mut devices.laptop, &devices.relay, &mut laptop_cursor)).await;
+    boxed(|| devices.laptop.sync()).await.unwrap();
     for device in [&devices.phone, &devices.laptop] {
         for reader in [&devices.phone, &devices.laptop] {
             assert_eq!(announced(reader, &group, device), current_ref(device));

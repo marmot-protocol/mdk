@@ -139,7 +139,13 @@ async fn an_applied_sibling_self_remove_holds_private_adds() {
         .unwrap()
         .unwrap();
     clock.advance_ms(delay);
-    phone.engine.advance_convergence(&gid).await.unwrap();
+    // Explicit clock time, through the same drain: the host entry point's
+    // wall-clock slice can expire on a loaded runner before this work lands.
+    phone
+        .engine
+        .converge_and_drain_queued_outbound_intents(&gid, clock.now().monotonic_ms)
+        .await
+        .unwrap();
     let publications = phone.engine.drain_auto_publish();
     assert_eq!(publications.len(), 1);
     let publication = &publications[0];

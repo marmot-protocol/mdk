@@ -5837,29 +5837,34 @@ fn whitenoise_groups_commands_cover_core_group_workflows() {
 
 #[test]
 fn groups_leave_publishes_self_remove() {
-    let home = tempfile::tempdir().expect("tempdir");
+    // Alice lives in her own home: every runtime starts workers for all local
+    // accounts, so a shared home would let Bob's one-shot leave also host
+    // Alice, whose SelfRemove auto-commit can then resolve the leave before the
+    // pending-request read below.
+    let alice_home = tempfile::tempdir().expect("alice tempdir");
+    let bob_home = tempfile::tempdir().expect("bob tempdir");
     let relay = TestRelay::new();
     let relay_url = relay.url();
 
-    let alice = create_account_with_real_relay(home.path(), relay_url);
-    let bob = create_account_with_real_relay(home.path(), relay_url);
+    let alice = create_account_with_real_relay(alice_home.path(), relay_url);
+    let bob = create_account_with_real_relay(bob_home.path(), relay_url);
     run_json_with_relay(
-        home.path(),
+        bob_home.path(),
         relay_url,
         &["--account", &bob, "keys", "publish"],
     );
 
     let created = run_json_with_relay(
-        home.path(),
+        alice_home.path(),
         relay_url,
         &["--account", &alice, "groups", "create", "departures", &bob],
     );
     let group_id = created["group_id"].as_str().expect("group id");
-    sync_until_joined(home.path(), relay_url, &bob, group_id);
+    sync_until_joined(bob_home.path(), relay_url, &bob, group_id);
     let group_events_before_leave = relay.event_count(445);
 
     let leave = run_json_with_relay(
-        home.path(),
+        bob_home.path(),
         relay_url,
         &["--account", &bob, "groups", "leave", group_id],
     );
@@ -5870,7 +5875,7 @@ fn groups_leave_publishes_self_remove() {
         "leave must add a group event to the selected relay"
     );
     let local = run_json_with_relay(
-        home.path(),
+        bob_home.path(),
         relay_url,
         &["--account", &bob, "chats", "show", group_id],
     );
@@ -5883,10 +5888,10 @@ fn groups_leave_publishes_self_remove() {
 
     // The peer's SelfRemove timer belongs to a live runtime. Keep that runtime
     // alive after the cold local-intent read, through normal daemon scheduling.
-    let socket = home.path().join("dev/wnd.sock");
+    let socket = alice_home.path().join("dev/wnd.sock");
     let daemon = DaemonGuard::start(&socket, |wnd| {
         wnd.arg("--home")
-            .arg(home.path())
+            .arg(alice_home.path())
             .arg("--discovery-relays")
             .arg(relay_url)
             .arg("--default-account-relays")
@@ -5900,7 +5905,7 @@ fn groups_leave_publishes_self_remove() {
     let deadline = Instant::now() + POLL_TIMEOUT;
     loop {
         let members = run_json_with_relay(
-            home.path(),
+            alice_home.path(),
             relay_url,
             &["--account", &alice, "groups", "members", group_id],
         );
@@ -5914,12 +5919,14 @@ fn groups_leave_publishes_self_remove() {
         std::thread::sleep(POLL_INTERVAL);
     }
     stop_owned_test_daemon(daemon);
+    run_json_with_relay(bob_home.path(), relay_url, &["--account", &bob, "sync"]);
     let retained = run_json_with_relay(
-        home.path(),
+        bob_home.path(),
         relay_url,
         &["--account", &bob, "chats", "show", group_id],
     );
     assert_eq!(retained["group"]["self_membership"], "left");
+    assert_eq!(retained["group"]["leave_requested_at_ms"], Value::Null);
 }
 
 #[test]

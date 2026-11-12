@@ -242,6 +242,11 @@ which case it is:
 | Flake | Intermittent, also fails on `origin/master`, or in code your change cannot reach | Leave the test alone. Open or update an issue for it (search the test name first), then enqueue again once |
 | Master is broken | The same failure in master's own CI | Find the open PR fixing it and rebase once it lands. Do not fix it again in your PR |
 
+A flake already on the `just flake-report` leaderboard, or with an open
+`Flaky:` issue, is already tracked: do only what the flake row asks (update
+the open issue, or open one if there is none) and leave the fix to the
+leaderboard's order.
+
 Bring in the person who asked for the change, with the run link and what you
 found, after a second flake ejection or for any case you cannot classify. Never
 skip, weaken, ignore or retry-loop a test to get a change through the queue.

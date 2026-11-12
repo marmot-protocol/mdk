@@ -25,6 +25,10 @@ pub(crate) struct AccountRecoveryOwner {
     /// a repeat pass on it, still inactive, has nothing new to record
     /// (mdk#3238).
     replay_inactive_generation: Option<u64>,
+    /// The adapter's fence ticket at the last synchronization. It moves when
+    /// a live count is admitted, which can be after its generation was
+    /// synchronized (mdk#3333).
+    replay_fence_ticket: Option<transport_nostr_adapter::ReplayFenceTicket>,
 }
 
 /// Wall-clock milliseconds, the precision recovery timestamps are stored at.
@@ -66,6 +70,7 @@ impl AccountRecoveryOwner {
             replay_observed_generation: None,
             replay_complete: false,
             replay_inactive_generation: None,
+            replay_fence_ticket: None,
         }
     }
 
@@ -162,6 +167,14 @@ impl AppClient {
             .recovery_owner
             .replay_observed_generation
             .replace(generation);
+        // A count admitted since the last look may have armed a fence, which
+        // holds its groups' live frames until the runner answers it. Its EOSE
+        // can arrive after the generation was synchronized, so wake the
+        // runner even when the generation needs no new pass (mdk#3333).
+        let ticket = observation.fence_ticket();
+        if self.recovery_owner.replay_fence_ticket.replace(ticket) != Some(ticket) {
+            self.wake_recovery_runner();
+        }
         if self
             .recovery_owner
             .native_replay_synchronized(generation, observation.active())

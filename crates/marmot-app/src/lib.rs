@@ -231,8 +231,11 @@ pub use agent_streams::{
     AgentStreamWatchReport, AgentStreamWatchStart,
 };
 pub use audit_log::{
-    AuditLogDeleteOutcome, AuditLogFile, AuditLogSettings, AuditLogTrackerUpdateResult,
-    AuditLogUploadResult, AuditOtlpTrackerResult,
+    AUDIT_LOG_DEFAULT_MAX_BYTES_PER_ACCOUNT, AUDIT_LOG_MAX_AGE_DAYS,
+    AUDIT_LOG_MIN_MAX_BYTES_PER_ACCOUNT, AuditDeliveryBacklog, AuditDeliveryFailure,
+    AuditDeliveryFailureKind, AuditDeliveryStatus, AuditLogDeleteOutcome, AuditLogFile,
+    AuditLogRetention, AuditLogSettings, AuditLogTrackerUpdateResult, AuditLogUploadResult,
+    AuditOtlpTrackerResult,
 };
 pub use cgka_traits::{
     MARMOT_APP_EVENT_KIND_POLL, MARMOT_APP_EVENT_KIND_POLL_RESPONSE, PollOptionResult,
@@ -1948,12 +1951,12 @@ impl MarmotApp {
         let root = root.as_ref().to_path_buf();
         let lease = MarmotRootRuntimeLease::try_acquire(&root)?;
         audit_log::cleanup_legacy_audit_logs(&root);
-        audit_log::cleanup_expired_audit_logs(&root);
         let app =
             Self::with_relays_and_account_home_and_config(&root, relay_urls, account_home, config);
         *app.root_runtime_lease
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(lease);
+        audit_log::cleanup_expired_audit_logs(&app);
         Ok(app)
     }
 

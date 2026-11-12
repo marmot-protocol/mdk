@@ -99,6 +99,14 @@ pub fn audit_destination(sender: &AuditOtlpSender) -> &str {
     sender.destination()
 }
 
+/// A one-way digest of the sender's destination, endpoint and credential.
+/// `marmot-app` persists it beside a delivery pause so the pause survives a
+/// restart with the same configuration and lifts when the host changes any of
+/// them. It reveals neither the endpoint nor the token.
+pub fn audit_sender_fingerprint(sender: &AuditOtlpSender) -> String {
+    sender.fingerprint()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

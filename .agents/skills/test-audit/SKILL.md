@@ -186,6 +186,29 @@ the tests do.
   passphrase), and never by dropping an open. A whole test can still go when
   a keeper that reopens the same way proves its contract.
 
+## Flakes
+
+Fix flakes in the order `just flake-report` ranks them. It counts failed
+attempts per test across the last week of merge-queue runs, including the
+ones CI's retry hid. Find the root cause; a fix awaits the state the test
+needs and never raises a timeout, adds a retry or loosens an assertion.
+
+Prove the fix with the `just flake-stress` line the leaderboard prints for
+the test. The report prints that line only for the tests it samples (the
+first 20 by default); for a lower-ranked test, rerun with `--samples` up to
+its rank, or read its `stress` field in the `--json` file. It runs the
+filter 40 times with no retries, with the features CI builds that package's
+tests with, and must show 0 failed iterations. When the flake reproduces
+locally, give the failed and total iterations before and after the fix in
+the PR; when it does not, say so. Iterations run one at a time, so to add
+contention widen the filter to the test's binary and raise
+`FLAKE_STRESS_THREADS`; the test groups in `.config/nextest.toml` still cap
+some binaries.
+
+`just test-timing-ratchet` fails when a test file gains a `sleep` or a
+`timeout` of a second or less. After a fix removes some, run it with
+`--update` and commit the lower baseline.
+
 ## Audit evidence
 
 Discovery is read-only, and its candidates are reported before any edit.

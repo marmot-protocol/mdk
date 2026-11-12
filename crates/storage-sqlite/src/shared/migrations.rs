@@ -29,6 +29,14 @@ const MIGRATIONS: &[Migration] = &[
                 .map_err(sqlite_error)
         },
     },
+    Migration {
+        version: 4,
+        name: "0004_audit_log_retention",
+        apply: |tx| {
+            tx.execute_batch(include_str!("v4.sql"))
+                .map_err(sqlite_error)
+        },
+    },
 ];
 
 fn version_2(tx: &Transaction<'_>) -> StorageResult<()> {

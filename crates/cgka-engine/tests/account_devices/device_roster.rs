@@ -1131,7 +1131,13 @@ async fn a_queued_device_entry_replacement_never_lands_on_a_changed_entry() {
     phone.engine.drain_events();
 
     clock.advance_ms(30_000);
-    let drained = phone.engine.advance_convergence(&gid).await.unwrap();
+    // Explicit clock time, through the same drain: the host entry point's
+    // wall-clock slice can expire on a loaded runner before this work lands.
+    let drained = phone
+        .engine
+        .converge_and_drain_queued_outbound_intents(&gid, clock.now().monotonic_ms)
+        .await
+        .unwrap();
     assert!(drained.is_empty(), "{drained:?}");
     assert!(queued_intents(&phone, &gid).is_empty());
     assert!(refused_replacement(&phone.engine.drain_events()));

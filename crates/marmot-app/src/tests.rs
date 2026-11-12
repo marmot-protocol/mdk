@@ -19886,15 +19886,7 @@ async fn assert_failed_cursor_pin(recovery: FailedDeliveryRecovery) {
     let event_id = hex::encode(message.id.as_slice());
     assert_eq!(event_id, relay_event.id);
     let later_cursor = message.timestamp.0 + 10_000;
-    let probe_cursor = |client: &AppClient| {
-        let sealed = client
-            .adapter
-            .seal_transport_cursor(Some(later_cursor), |_| true);
-        client
-            .adapter
-            .unseal_transport_cursor(client.state.last_transport_timestamp);
-        sealed
-    };
+    let probe_cursor = |client: &AppClient| probe_transport_cursor_seal(client, later_cursor);
     if matches!(recovery, FailedDeliveryRecovery::BeforeEngine) {
         bob_client.fail_ingest_of = Some(message.id);
     } else {
@@ -19931,8 +19923,8 @@ async fn assert_failed_cursor_pin(recovery: FailedDeliveryRecovery) {
         relay.replies_handled().await;
         assert!(bob_client.admit_native_turn().await.unwrap());
         assert_eq!(
-            probe_cursor(&bob_client),
-            Some(later_cursor),
+            decided_transport_cursor_seal(&bob_client, later_cursor).await,
+            later_cursor,
             "projection retry must release the pin without another delivery",
         );
         bob_client.take_pending_applied_sync_summary()
@@ -19965,8 +19957,8 @@ async fn assert_failed_cursor_pin(recovery: FailedDeliveryRecovery) {
             "a successful ingest must mark the delivery seen",
         );
         assert_eq!(
-            probe_cursor(&bob_client),
-            Some(later_cursor),
+            decided_transport_cursor_seal(&bob_client, later_cursor).await,
+            later_cursor,
             "successful redelivery must release the original cursor pin",
         );
         bob_client.take_pending_applied_sync_summary()
@@ -20003,6 +19995,37 @@ async fn assert_failed_cursor_pin(recovery: FailedDeliveryRecovery) {
         "the failed delivery's message must be durably projected exactly once",
     );
 }
+
+/// How far a commit could promote `client`'s cursor toward `candidate` right
+/// now, leaving the restart floor where it was.
+#[cfg(feature = "test-policy-overrides")]
+fn probe_transport_cursor_seal(client: &AppClient, candidate: u64) -> Option<u64> {
+    let sealed = client
+        .adapter
+        .seal_transport_cursor(Some(candidate), |_| true);
+    client
+        .adapter
+        .unseal_transport_cursor(client.state.last_transport_timestamp);
+    sealed
+}
+
+/// The cursor a seal decides once it can decide at all. A seal defers with
+/// `None` while replay admission settles or while another plane task holds
+/// the adapter state it will not wait for; neither says whether a pin caps it.
+#[cfg(feature = "test-policy-overrides")]
+async fn decided_transport_cursor_seal(client: &AppClient, candidate: u64) -> u64 {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(sealed) = probe_transport_cursor_seal(client, candidate) {
+                return sealed;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the cursor seal must decide once replay admission settles")
+}
+
 /// The clock a test uses when it drives the epoch-stall detector directly.
 ///
 /// The very same reading production takes, deliberately. These tests arm

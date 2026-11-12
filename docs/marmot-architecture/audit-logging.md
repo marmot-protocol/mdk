@@ -43,9 +43,24 @@ blocked, and idle account counts separately from v4 whole-file uploads. Existing
 activity triggers use the same 30-second coalescing window, retry delay, and shutdown
 cancellation; they drain bounded v5 batches per account. V5 cursor state lives in
 `audit-otlp-delivery-v5`, so historical v4 cursor state and files are untouched. A complete
-receiver acceptance advances the v5 cursor; retryable, partial, unknown, and blocked outcomes
-retain or block the prepared range according to the local delivery contract. Deleting or
+receiver acceptance advances the v5 cursor. `409` (the receiver may have stored part of the
+batch), `429` and `5xx` are retryable and resend the same range. `400`, `413` and `422` reject
+the batch's content and finish it as a permanent receiver rejection. `401`, `403`, `404`, any
+other status, and an invalid success response are blocked: the range is retained, and automatic
+delivery for that account and destination pauses until the host changes the sender
+configuration or runs a manual tracker update. Unknown outcomes retain the range. Deleting or
 disabling a live audit file fences in-flight acknowledgments.
+
+Each tracker attempt persists the account's delivery status, inside its own admission, in
+`audit-otlp-delivery-v5/delivery-status.json`, separate from the cursor: the last success, the
+last typed failure (state over its size limit, out of file descriptors, other local I/O, a
+blocked local journal, receiver blocked, rejected or retryable with its HTTP status, no
+response), consecutive failed passes, rejected batches, the pause with a one-way fingerprint of
+the sender configuration it applies to, and the last measured backlog. Only an attempt that
+delivers lifts a pause. Writes follow attempt order because each one happens before the attempt
+releases its account reservation; routine healthy outcomes rewrite the file at most every 10 s. Hosts read it through
+`audit_delivery_status_v5`. The tracker's `warn` log carries the same failure category and HTTP
+status, nothing else.
 
 The old Goggles whole-file endpoint remains a v4-only route. Direct whole-file upload validates
 the exact v4 schema version and rejects v5; the tracker excludes v5 filenames from its v4 pass.
@@ -1447,7 +1462,7 @@ The app can list and upload audit logs, but upload is separate from local record
 
 `MarmotAppRuntime::send_audit_otlp_once` is internal and requires a caller-supplied dedicated sender and one account. It prepares at most one bounded range of original v4 JSONL bodies under the existing exclusive root lease. Local admission covers preparation and, after a response, any durable finish; the HTTP request holds no local file, database, or lifecycle guard. One process-local reservation rejects overlapping attempts for the account. The root lease itself remains held until terminal storage close.
 
-Preparation verifies and owns the source bytes and local generation. Before sending and before finish, the attempt rechecks runtime state, account identity, recording consent, and the sender's stable destination profile without re-reading the source. `LocalAuditDelivery::finish` deliberately acknowledges the owned prepared bytes without reopening their source; external in-place file rewrites are outside this local lifecycle guarantee. Disable/re-enable, file deletion, account removal, destination change, and terminal close reject a pending result. A late response can still represent remote receipt, but cannot advance the old local cursor. Complete `200 {}` finishes locally; `409` durably blocks the range; retryable and unknown outcomes retain it. A blocked receiver verdict has no local finish action. Cancellation retains the prepared range for identical replay, so duplicates remain possible. This seam does not start automatic OTLP delivery, configure a production endpoint, set retention, or claim downstream Loki durability. The existing Goggles manual and tracker uploads keep their own checkpoint and defaults.
+Preparation verifies and owns the source bytes and local generation. Before sending and before finish, the attempt rechecks runtime state, account identity, recording consent, and the sender's stable destination profile without re-reading the source. `LocalAuditDelivery::finish` deliberately acknowledges the owned prepared bytes without reopening their source; external in-place file rewrites are outside this local lifecycle guarantee. Disable/re-enable, file deletion, account removal, destination change, and terminal close reject a pending result. A late response can still represent remote receipt, but cannot advance the old local cursor. Complete `200 {}` finishes locally; `400`, `413` and `422` finish as a permanent rejection; `409`, retryable and unknown outcomes retain the range. A blocked receiver verdict has no local finish action. Cancellation retains the prepared range for identical replay, so duplicates remain possible. This seam does not start automatic OTLP delivery, configure a production endpoint, set retention, or claim downstream Loki durability. The existing Goggles manual and tracker uploads keep their own checkpoint and defaults.
 
 ### Listing
 
@@ -1492,18 +1507,33 @@ still enumerated by `audit_log_files()` and sort ahead of the active file.
 
 ### Local retention
 
-MDK expires closed forensic files 30 days after their last filesystem write, without a user setting. Recorders seal
+MDK expires closed forensic files a host-configured number of days after their last filesystem write: 30 by
+default, clamped to 1-30 because the v5 receiver accepts records up to 30 days old. Recorders seal
 at 1 MiB or before the first row after a day, whichever comes first, preserving original bytes, inode identity,
-session, sequence and the repeated source header. Daily files therefore keep roughly 30 days of history, with up to
-one extra day plus the hourly sweep delay. Reopening uses the bounded first row to preserve the age boundary across
-short sessions. Header-only prefixes do not roll on their own; their age clock starts with the next actual row.
-A quiet shutdown rolls before its stop row rather than refreshing an old file's retention clock.
-Legacy files are not split or rewritten; they age out 30 days after their last write.
+session, sequence and the repeated source header. Daily files therefore keep roughly the configured age of history,
+with up to one extra day plus the hourly sweep delay. Reopening uses the bounded first row to preserve the age
+boundary across short sessions. Header-only prefixes do not roll on their own; their age clock starts with the next
+actual row. A quiet shutdown rolls before its stop row rather than refreshing an old file's retention clock.
+Legacy files are not split or rewritten; they age out the configured age after their last write.
 
-Exclusive-root startup sweeps account directories and failed-wipe remnants. Scanning uses filenames and metadata;
-expiry consults bounded delivery state (at most 1 MiB) and a bounded source fingerprint when a cursor exists.
+Each account's audit files also have a size budget: 256 MiB by default, at least 16 MiB (mdk#3300). Above it,
+retention deletes that account's oldest sealed segments first, but only those no delivery will ever send again: the
+account's v5 cursor shows them fully accepted, or they are untracked (the account has no v5 cursor, they are v4 or an
+older device identity's files, or a cursor overflow already recorded their loss). A segment with undelivered data is
+never deleted by the budget; only the maximum age or an explicit user clear deletes it. The budget reads metadata and
+one cursor per account (`DeliveryCursorView`), never payloads, and rechecks each file against the cursor under the
+same exclusion as expiry (`evict_delivered_source`). The live active file is never a budget candidate. Hosts set both
+limits with `set_audit_log_retention`, persisted in shared storage.
+
+Exclusive-root startup sweeps account directories and failed-wipe remnants, then each account's budget. Scanning uses
+filenames and metadata; expiry consults bounded delivery state (at most 1 MiB) and a bounded source fingerprint when
+a cursor exists. Startup reads the stored policy only once some file is older than a day or an account exceeds the
+smallest budget; if the policy cannot be read, expiry uses 30 days and the budget waits for a later pass.
 An installation-wide hourly worker also covers signed-out/dormant accounts and remnants created after launch,
-independently of recording consent, upload configuration and upload success. Its metadata scanner has a size-one
+independently of recording consent, upload configuration and upload success. The same worker checks budgets, at
+most every 30 seconds, when recording activity schedules an audit tracker pass and after each automatic delivery pass
+(when delivered segments become evictable): a replay storm can seal several segments a minute. A policy change
+requests a full sweep. Its metadata scanner has a size-one
 path queue and owns no recorder or storage guard. Each unlink is admitted separately; shutdown cancels the walk
 without waiting for payload copying or holding account commands behind a full sweep.
 
@@ -1524,8 +1554,12 @@ No account-file lookup or installation-wide cancellation is needed for orphan di
 Before deleting a tracked source still known as active, retirement seals its filename and durably publishes its closed
 alias and exact final byte length. It preserves ACKs and prepared ranges. A crash leaves a discoverable sealed inode
 or a durably retired alias; publication/unlink errors compensate both cursor and filename, retaining source bytes if
-compensation cannot complete. Acknowledged sources disappear without false gaps; unobserved or prepared unsent tails
-retain genuine missing-source evidence. Generic missing-active detection stays conservative. Delivery drops retired,
+compensation cannot complete. Acknowledged sources disappear without false gaps. When age expiry deletes a source
+with undelivered bytes (an unobserved or prepared unsent tail, or a segment the cursor never adopted), the same
+publication records an `ExpiredUndelivered` gap over the unaccepted extent and advances past it, before the unlink, so
+delivery continues with later data and discovery records no second gap. After the unlink, retention retires that
+journal as discovery would, so a cursor that delivery no longer reads stays bounded. Generic missing-active detection
+stays conservative. Delivery drops retired,
 gap-free acknowledged journals while retaining real gaps and unaccepted extents. Retention never claims expired data
 reached a receiver.
 

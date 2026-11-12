@@ -390,13 +390,16 @@ peel runs. `Engine::retry_deferred_peels` offers those contexts to every retaine
   re-checking the branch rather than the marker. It reads everything before its one durable step, clearing the
   request, and then restores the SelfRemove auto-commit schedules a leaving account dropped without another fallible
   call. `leave_redrive_owed` is the scheduler's level signal, true also while the stored marker disagrees with the
-  branch, and hydration schedules a group with a restored request; the drain runs the step.
+  branch, and hydration schedules a group with a restored request; the drain runs the step. A pass that applies a
+  branch while a request exists schedules the group too: a pass can apply from ingest, where no advance follows to
+  re-drive the leave.
   `prepare_superseded_own_commit` leaves a leaving account's lost pure step-down (`is_pure_self_step_down`) to this
   re-drive and neither re-queues nor reports it; a commit that changed anything else keeps ordinary supersession.
   Pinned by `invite_leave::the_last_admins_leave_is_blocked_until_cancelled`,
   `invite_leave::cancel_refuses_a_leave_that_can_still_finish`,
   `record_write_atomicity::a_blocked_leave_retries_its_marker_and_cancel_after_storage_faults`,
   `invite_leave::a_restored_leave_request_that_owes_a_self_remove_wakes_its_group`,
+  `invite_leave::admin_leave::a_branch_that_blocks_a_leave_schedules_its_redrive`,
   `invite_leave::a_leave_step_down_excludes_an_authentic_stored_peer_proposal` and marmot-app's `rival_branch_leave`
   tests.
 - **The durable `Group::epoch` mirrors the epoch manager, and hydration seeds the epoch manager from it.** Every mirror

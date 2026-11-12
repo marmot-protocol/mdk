@@ -43,13 +43,13 @@ use crate::{
     AgentTextStreamFinishRequest, AppBlobEndpoint, AppCreateGroupOptions, AppDisbandRequest,
     AppError, AppGroupConversationSnapshot, AppGroupMemberRecord, AppGroupMlsState, AppGroupRecord,
     AppGroupRoster, AppMessageQuery, AppMessageRecord, AppProjectionUpdate, AppQuarantinedGroup,
-    AuditLogDeleteOutcome, AuditLogFile, AuditLogSettings, AuditLogTrackerConfig,
-    AuditLogTrackerUpdateResult, AuditLogUploadResult, BackgroundNotificationCollection,
-    BackupSettings, ChatListRow, ChatNotificationSettings, ChatPinState,
-    ExistingDirectConversation, GroupInviteDeclineResult, GroupPushDebugInfo, MAX_SEEN_EVENT_IDS,
-    MarmotApp, MarmotRelayPlane, MarmotServiceEndpoints, MediaAttachmentReference,
-    MediaDownloadResult, MediaUploadRequest, MediaUploadResult, MessageDraft,
-    MessageDraftAttachment, MessageDraftSummary, NotificationCollectionStatus,
+    AuditLogDeleteOutcome, AuditLogFile, AuditLogRetention, AuditLogSettings,
+    AuditLogTrackerConfig, AuditLogTrackerUpdateResult, AuditLogUploadResult,
+    BackgroundNotificationCollection, BackupSettings, ChatListRow, ChatNotificationSettings,
+    ChatPinState, ExistingDirectConversation, GroupInviteDeclineResult, GroupPushDebugInfo,
+    MAX_SEEN_EVENT_IDS, MarmotApp, MarmotRelayPlane, MarmotServiceEndpoints,
+    MediaAttachmentReference, MediaDownloadResult, MediaUploadRequest, MediaUploadResult,
+    MessageDraft, MessageDraftAttachment, MessageDraftSummary, NotificationCollectionStatus,
     NotificationSettings, NotificationUpdate, NotificationWakeSource, PendingWelcomeDelivery,
     PushPlatform, PushRegistration, PushRegistrationShareOutcome, PushRegistrationSyncResult,
     ReceivedMessage, RecoveryWords, RelayTelemetryExportConfig, RelayTelemetryRuntimeConfig,
@@ -72,9 +72,10 @@ pub use agent_publisher::{
     AgentPublisher, AgentPublisherOptions, AgentPublisherRecord, AgentPublisherRouting,
 };
 mod account_attention;
+mod audit_delivery_status;
 mod audit_otlp_delivery;
 pub use audit_otlp_delivery::AuditOtlpAttemptOutcome;
-pub(crate) use audit_otlp_delivery::send_audit_otlp_once_for_app;
+pub(crate) use audit_otlp_delivery::{AttemptStatus, attempt_audit_otlp_once};
 mod audit_tracker;
 pub use account_attention::{
     AccountAttentionEntry, AccountAttentionSnapshot, AccountAttentionState, AccountAttentionTotal,
@@ -574,11 +575,13 @@ impl RuntimeSharedServices {
         let lifecycle = RuntimeLifecycle::new();
         let audit_log_tracker_config = app.audit_log_tracker_config.clone();
         let audit_otlp_sender = Arc::new(StdMutex::new(None));
+        let audit_retention = crate::audit_log::AuditRetentionWorker::new(app.clone());
         let audit_log_tracker_uploader = AuditLogTrackerUploader::new(
             app.clone(),
             audit_log_tracker_config.clone(),
             audit_otlp_sender.clone(),
             lifecycle.clone(),
+            audit_retention.clone(),
         );
         Self {
             recovery_credits: Arc::new(StdMutex::new(
@@ -611,7 +614,7 @@ impl RuntimeSharedServices {
             audit_otlp_sender,
             service_endpoints: app.service_endpoints().clone(),
             audit_log_tracker_uploader: Some(audit_log_tracker_uploader),
-            audit_retention: Some(crate::audit_log::AuditRetentionWorker::new(app.clone())),
+            audit_retention: Some(audit_retention),
             create_group_catch_up_barrier: Arc::new(StdMutex::new(None)),
             #[cfg(any(test, feature = "test-policy-overrides"))]
             next_startup_sync_barrier: Arc::new(StdMutex::new(None)),
@@ -815,6 +818,10 @@ impl RuntimeSharedServices {
                 "skipped forensic audit log tracker update"
             );
             return;
+        }
+        // Recording activity seals segments whether or not anything uploads.
+        if let Some(retention) = &self.audit_retention {
+            retention.request_budget_check();
         }
         let config = self.audit_log_tracker_config();
         if self.audit_otlp_sender().is_some() {
@@ -1371,9 +1378,10 @@ pub enum AccountSetupReadiness {
 /// may use.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum GeneratedIdentity<'a> {
-    /// A host's create: resume the one pending generated setup, so
-    /// concurrent creates coalesce, or create a new identity.
+    /// Select a resumable setup, or create a new identity.
     ResumeOrCreate,
+    /// Admission selected fresh creation; never scan for resumable setup again.
+    Fresh,
     /// Continue this account's pending setup only; never another identity.
     Continue(&'a str),
 }
@@ -3846,6 +3854,23 @@ impl MarmotAppRuntime {
         Ok(stored)
     }
 
+    pub fn audit_log_retention(&self) -> Result<AuditLogRetention, AppError> {
+        self.accounts.app.audit_log_retention()
+    }
+
+    /// Persist the local audit retention policy, clamped to 1-30 days and a
+    /// minimum per-account budget, and sweep under it soon.
+    pub fn set_audit_log_retention(
+        &self,
+        retention: AuditLogRetention,
+    ) -> Result<AuditLogRetention, AppError> {
+        let stored = self.accounts.app.set_audit_log_retention(retention)?;
+        if let Some(worker) = &self.shared.audit_retention {
+            worker.request_sweep();
+        }
+        Ok(stored)
+    }
+
     pub fn audit_log_files(&self) -> Result<Vec<AuditLogFile>, AppError> {
         self.accounts.app.audit_log_files()
     }
@@ -3888,14 +3913,30 @@ impl MarmotAppRuntime {
     ) -> Result<AuditLogTrackerUpdateResult, AppError> {
         let config = self.shared.audit_log_tracker_config();
         let sender = self.shared.audit_otlp_sender();
-        post_audit_log_tracker_update_for_runtime(
+        let result = post_audit_log_tracker_update_for_runtime(
             &self.accounts.app,
             config,
             sender.as_deref(),
             &self.shared.audit_otlp_sender,
             &self.shared.lifecycle(),
         )
-        .await
+        .await;
+        // Delivered segments are now evictable under the size budget.
+        if let Some(retention) = &self.shared.audit_retention {
+            retention.request_budget_check();
+        }
+        result
+    }
+
+    /// Per-account v5 audit OTLP delivery status: the last success, the last
+    /// typed failure, whether automatic delivery is paused for the configured
+    /// destination, and the last measured backlog. Reads small local files
+    /// only; it never dials or touches the delivery cursor. A paused account
+    /// resumes when the host changes the destination configuration or calls
+    /// [`Self::post_audit_log_tracker_update`].
+    pub fn audit_delivery_status(&self) -> Result<Vec<crate::AuditDeliveryStatus>, AppError> {
+        let sender = self.shared.audit_otlp_sender();
+        audit_delivery_status::audit_delivery_status_for_app(&self.accounts.app, sender.as_deref())
     }
 
     /// Test-only per-runtime window override; production keeps the 30-second default.
@@ -4842,12 +4883,13 @@ impl MarmotAppRuntime {
                 return Err(AccountHomeError::SecretNotFound(account.account_id_hex).into());
             }
 
-            // A pending generated setup stops before anything else, so no
-            // background attempt republishes after the KeyPackage step below.
+            // Stop background setup and finish admitted foreground setup
+            // before withdrawing the KeyPackage slot.
             let _generated_setup_fence = self
                 .setup
-                .fence_generated_setup(&account.account_id_hex)
+                .fence_generated_teardown(&self.accounts, &account.account_id_hex)
                 .await;
+            self.accounts.resolve_original(&account)?;
             let mut outcome = SignOutOutcome::default();
 
             // Step 1 (KeyPackage hygiene): delete this device's slot before
@@ -4971,13 +5013,13 @@ impl MarmotAppRuntime {
             return Err(AccountHomeError::SecretNotFound(account.account_id_hex).into());
         }
 
-        // A pending generated setup stops before any stage, so no background
-        // attempt publishes after stage 2 or outlives the account
-        // (whitenoise-ios#1302).
-        let _generated_setup_fence = self
+        // Finish foreground setup as well as fencing background attempts
+        // before stage 2 withdraws the slot (whitenoise-ios#1302).
+        let generated_setup_fence = self
             .setup
-            .fence_generated_setup(&account.account_id_hex)
+            .fence_generated_teardown(&self.accounts, &account.account_id_hex)
             .await;
+        let account = self.accounts.resolve_original(&account)?;
         let mut outcome = WipeOutcome::default();
 
         // From here until the wipe returns, the device group's removal of
@@ -5089,7 +5131,11 @@ impl MarmotAppRuntime {
         // drops in-memory caches, and removes the account directory (MLS DB,
         // media, KeyPackage material, SQL row) plus the secret-store nsec in a
         // single all-or-nothing step.
-        match self.accounts.remove_account(account_ref).await {
+        match self
+            .accounts
+            .remove_account_fenced(&account, &generated_setup_fence)
+            .await
+        {
             Ok(()) => {
                 outcome.local_cleanup = LocalCleanupReport {
                     completed: true,
@@ -6303,8 +6349,13 @@ impl MarmotAppRuntime {
     ) -> Result<AccountSetupResult, AppError> {
         validate_account_setup_request(&request, AccountSetupOperation::CreateIdentityOnly)?;
         request.identity = None;
-        self.create_generated_account_local_ready(request, true, None)
-            .await
+        self.create_generated_account_local_ready(
+            request,
+            true,
+            None,
+            GeneratedIdentity::ResumeOrCreate,
+        )
+        .await
     }
 
     /// Create a generated identity whose first public kind-0 is `profile`.
@@ -6321,8 +6372,13 @@ impl MarmotAppRuntime {
     ) -> Result<AccountSetupResult, AppError> {
         validate_account_setup_request(&request, AccountSetupOperation::CreateIdentityOnly)?;
         request.identity = None;
-        self.create_generated_account_local_ready(request, true, Some(profile))
-            .await
+        self.create_generated_account_local_ready(
+            request,
+            true,
+            Some(profile),
+            GeneratedIdentity::ResumeOrCreate,
+        )
+        .await
     }
 
     pub async fn login(
@@ -7068,17 +7124,44 @@ impl AccountManager {
         Ok(self.app.account_home().account(account_ref)?)
     }
 
+    fn resolve_original(&self, expected: &AccountSummary) -> Result<AccountSummary, AppError> {
+        let account = self.app.account_home().account(&expected.label)?;
+        if account.account_id_hex != expected.account_id_hex {
+            return Err(AccountHomeError::UnknownAccount(expected.account_id_hex.clone()).into());
+        }
+        Ok(account)
+    }
+
     fn schedule_audit_log_tracker_update(&self, trigger: &'static str) {
         self.shared.schedule_audit_log_tracker_update(trigger);
     }
 
     pub async fn remove_account(&self, account_ref: &str) -> Result<(), AppError> {
+        let account = self.app.account_home().account(account_ref)?;
+        let fence = self
+            .setup
+            .fence_generated_teardown(self, &account.account_id_hex)
+            .await;
+        self.remove_account_fenced(&account, &fence).await
+    }
+
+    // Wipe already owns the account's foreground fence before its network
+    // stages. Reuse it rather than taking that non-reentrant transaction again.
+    async fn remove_account_fenced(
+        &self,
+        expected: &AccountSummary,
+        fence: &onboarding::GeneratedTeardownFence,
+    ) -> Result<(), AppError> {
+        // A label may have been reused while foreground setup finished.
+        // Check before purging reports and after taking the worker transaction.
+        self.resolve_original(expected)?;
+
         // Stop and delete the account's moderation reports, and admit none
         // until the removal below has committed (every removal entry point).
         // Fenced before the global lock: the purge may open account storage.
         // Removing the directory deletes the rows even if this purge fails.
-        let (_report_fence, _) = self.fence_moderation_reports(account_ref).await;
-        let _generated_setup_fence = self.fence_generated_setup(account_ref).await?;
+        let (_report_fence, _) = self.fence_moderation_reports(&expected.label).await;
+        let _preparation = self.setup.fence_generated_removal(fence).await;
         let lock_wait = self
             .shared
             .observer
@@ -7087,7 +7170,7 @@ impl AccountManager {
         let _worker_transaction = self.worker_transactions.lock().await;
         lock_wait.finish(TelemetryOutcome::Success);
         self.shared.lifecycle().ensure_running()?;
-        let account = self.app.account_home().account(account_ref)?;
+        let account = self.resolve_original(expected)?;
         for task in self
             .app
             .abort_public_indexer_copies_for_account(&account.account_id_hex)
@@ -8276,13 +8359,12 @@ impl AccountManager {
     /// that account's: it fails with `UnknownAccount` once the account is
     /// removed, signed out or set up, instead of resuming or creating another
     /// identity (whitenoise-ios#1302).
-    pub(super) async fn continue_generated_account_setup(
-        &self,
-        account_id_hex: &str,
+    pub(super) fn continue_generated_account_setup<'a>(
+        &'a self,
+        account_id_hex: &'a str,
         request: AccountSetupRequest,
-    ) -> Result<AccountSetupResult, AppError> {
+    ) -> impl Future<Output = Result<AccountSetupResult, AppError>> + Send + 'a {
         self.create_or_import_account_as(request, GeneratedIdentity::Continue(account_id_hex))
-            .await
     }
 
     /// `account_id_hex` while its generated setup is still pending and may
@@ -9309,6 +9391,7 @@ impl AccountManager {
                             None => account_home.create_nostr_account_for_setup()?,
                         }
                     }
+                    GeneratedIdentity::Fresh => account_home.create_nostr_account_for_setup()?,
                     GeneratedIdentity::Continue(account_id_hex) => self
                         .pending_generated_account(account_id_hex)?
                         .ok_or_else(|| {

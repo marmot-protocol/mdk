@@ -714,8 +714,12 @@ async fn a_reconnect_mid_quantum_gives_the_preempted_attempt_back() {
 /// cannot compare, the inbox never caught up.
 ///
 /// The relay publishes no caps, so a sweep proves a second only when it holds
-/// fewer events than a fuller reply did: each group's message goes out in a
-/// later second than its creating commit.
+/// fewer events than a fuller reply did, and creating a group publishes no
+/// commit on its route: a fetch owing a second that holds one message could
+/// never prove it. The join's activation owes the group's history through
+/// its own second, which can come after the group's creation, so each
+/// group's message goes out in a later second than the one that history
+/// became owed in: it owes no message, and the message arrives live.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn successive_group_joins_lose_nothing_and_catch_up() {
     const GROUPS: u64 = 6;
@@ -752,8 +756,34 @@ async fn successive_group_joins_lose_nothing_and_catch_up() {
             )
             .await
             .unwrap();
-        let created = crate::unix_now_seconds();
-        while crate::unix_now_seconds() <= created {
+        // An account-wide un-cover fails the assertions below; stop waiting.
+        let owed = timeout(Duration::from_secs(20), async {
+            loop {
+                let route = app
+                    .group(&joiner.label, &hex::encode(&group))
+                    .unwrap()
+                    .map(|group| {
+                        TransportReconciliationRoute::Group(
+                            hex::decode(group.nostr_routing.nostr_group_id_hex)
+                                .unwrap()
+                                .try_into()
+                                .unwrap(),
+                        )
+                    });
+                if let Some(route) = route
+                    && storage
+                        .recovery_coverage_lost_since(before)
+                        .unwrap()
+                        .is_none_or(|lost| lost.contains(&route))
+                {
+                    return crate::unix_now_seconds();
+                }
+                sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the joiner's post-join history becomes owed");
+        while crate::unix_now_seconds() <= owed {
             sleep(Duration::from_millis(20)).await;
         }
         runtime

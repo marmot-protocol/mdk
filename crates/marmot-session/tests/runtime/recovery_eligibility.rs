@@ -207,7 +207,7 @@ fn eligibility_runtime(
 async fn recovery_legacy_no_rotation() {
     use cgka_traits::GroupStorage;
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new("recovery profile eligibility key").unwrap();
     let bob_path = dir.path().join("bob.sqlite");
     let mut bob = Device::with_session(

@@ -277,7 +277,7 @@ impl AgentConnector {
                 .acquire_strict(&key, &fingerprint)
                 .await?
             {
-                StrictIdempotencyAcquisition::Completed => return Ok(AgentControlResponse::Ack),
+                StrictIdempotencyAcquisition::Completed(_) => return Ok(AgentControlResponse::Ack),
                 StrictIdempotencyAcquisition::Conflict => {
                     return Err(ConnectorError::StreamPreviewIdempotencyConflict);
                 }

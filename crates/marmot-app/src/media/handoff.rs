@@ -539,6 +539,13 @@ pub(crate) fn wipe_stale(directory: &Path) -> usize {
     removed
 }
 
+/// Holds the lease registry. A copy registers its lease before it writes
+/// anything, so none can finish while the guard lives.
+#[cfg(test)]
+pub(crate) fn hold_lease_registry() -> std::sync::MutexGuard<'static, HashMap<String, PathBuf>> {
+    lock_leases()
+}
+
 /// Live leases of this process whose copies are under `directory`.
 #[cfg(test)]
 pub(crate) fn live_leases_under(directory: &Path) -> usize {

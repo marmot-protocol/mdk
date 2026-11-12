@@ -126,6 +126,7 @@ fn seed_with_epoch(
 
 #[tokio::test]
 async fn historical_attachment_missing_source_epoch_never_fabricates_epoch_zero() {
+    storage_sqlite::relax_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
     let connector = AgentConnector::open(crate::tests::test_config(
         dir.path(),
@@ -148,6 +149,7 @@ async fn historical_attachment_missing_source_epoch_never_fabricates_epoch_zero(
 
 #[tokio::test]
 async fn historical_attachment_missing_key_failure_is_actionable_and_not_retried() {
+    storage_sqlite::relax_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
     let connector = AgentConnector::open(crate::tests::test_config(
         dir.path(),
@@ -207,6 +209,8 @@ async fn historical_attachment_missing_key_failure_is_actionable_and_not_retried
 #[tokio::test]
 async fn historical_attachment_restart_handoff_is_verified_private_and_released() {
     use std::os::unix::fs::PermissionsExt;
+
+    storage_sqlite::relax_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
     let config = crate::tests::test_config(
         dir.path(),
@@ -389,6 +393,7 @@ async fn historical_attachment_restart_handoff_is_verified_private_and_released(
 
 #[tokio::test]
 async fn historical_attachment_scope_and_invalidated_sources_are_unavailable() {
+    storage_sqlite::relax_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
     let connector = AgentConnector::open(crate::tests::test_config(
         dir.path(),
@@ -424,6 +429,7 @@ async fn historical_attachment_scope_and_invalidated_sources_are_unavailable() {
 
 #[tokio::test]
 async fn historical_attachment_deleted_and_expired_sources_are_unavailable() {
+    storage_sqlite::relax_storage_for_test_process();
     for expired in [false, true] {
         let dir = tempfile::tempdir().unwrap();
         let connector = AgentConnector::open(crate::tests::test_config(
@@ -499,6 +505,7 @@ fn tag(bytes: &[u8]) -> Vec<String> {
 
 #[tokio::test]
 async fn historical_attachment_inspection_preserves_slots_and_creates_no_demand() {
+    storage_sqlite::relax_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
     let connector = AgentConnector::open(crate::tests::test_config(
         dir.path(),

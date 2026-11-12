@@ -2,47 +2,90 @@
 
 ## Unreleased
 
+## 0.16.0 - 2026-11-11
+
 ### Breaking changes
 
 - `AppGroupHydrationQuarantineReasonFfi` adds `REWIND_RESTORE_FAILED` (Swift `.rewindRestoreFailed`), reported by the
-  quarantined-groups read (mdk#3272): a read of past group state could not restore the live group. Neither a retry
-  nor a re-join clears it, and the next account open restores the live state. Kotlin `when` and Swift `switch`
-  statements that cover every case must add it. Use the matching native library with regenerated bindings.
+  quarantined-groups read and `GroupEventKindFfi::GroupHydrationQuarantined` (mdk#3272): a read of past group state
+  could not restore the live group. Neither a retry nor a re-join clears it: `retry_hydrate_quarantined_group` returns
+  `false`, `group_recovery_status` omits the group's `rejoin_invitations`, and `confirm_group_rejoin` fails as
+  `MarmotKitError::UnknownGroup` for them. The next account open tries to restore the live state. A group with two
+  interrupted rewinds, which reported `GROUP_RECORD_LOAD_FAILED`, now reports this reason. Kotlin `when` and Swift
+  `switch` statements that cover every case must add it. Use the matching native library with regenerated bindings.
 
-- `GroupEventKindFfi::QueuedIntentRefused` adds `artifact: OversizedArtifactFfi?` and
-  `size_class: EventSizeClassFfi?` (mdk#2334). With `reason` `event_too_large`, a queued send's commit or an invitee's
-  Welcome fits none of its relays' known size limits, or every relay refused it for size: `artifact` names that event
-  and `size_class` its coarse size. Both are `nil` for other reasons. Swift `case` patterns that bind the variant's
-  values positionally add the two fields. Before, a queued commit that every group relay refused for size was re-sent
-  on every drain; it is now dropped and announced once.
+- `GroupEventKindFfi::QueuedIntentRefused` adds `artifact: OversizedArtifactFfi?` and `size_class: EventSizeClassFfi?`
+  (mdk#2334). With `reason` `event_too_large`, a queued send's commit or an invitee's Welcome fits none of its relays'
+  known size limits, or every relay refused it for size: `artifact` names that event and `size_class` its coarse size.
+  Both are `nil` for other reasons. Swift `case .queuedIntentRefused(...)` patterns that bind values positionally, and
+  Kotlin `GroupEventKindFfi.QueuedIntentRefused(...)` constructors and destructuring declarations, add the two fields.
+  Before, a queued commit that every group relay refused for size was re-sent on every drain; it is now dropped and
+  announced once.
 
 ### Added
 
 - `MarmotDeploymentFfi` adds `relay_event_limits: [RelayEventLimitFfi]`, empty by default in Swift and Kotlin: the
   largest event each listed relay accepts, for relays that do not advertise it (mdk#2334). MDK sends no group event,
-  Welcome or account-signed event over a relay's known limit. A send that fits none of its relays reaches none, and a
-  call that returns relay errors then fails as `MarmotKitError::EventTooLarge`. A group create or invite whose
-  Welcome fits none of an invitee's inbox relays fails that way before anything is created or sent.
-  `marmot_deployment_white_noise()` sets 2 MiB on White Noise's two relays. Use the matching native library with
+  Welcome or account-signed event over a relay's known limit. For events over 64 KiB MDK also counts the WebSocket
+  message size a relay's NIP-11 document advertises, with `marmot_deployment_neutral()` too. A send that fits none of
+  its relays reaches none, and a call that returns relay errors then fails as `MarmotKitError::EventTooLarge`. A group
+  create or invite whose Welcome fits none of an invitee's inbox relays fails that way before anything is created or
+  sent. `marmot_deployment_white_noise()` sets 2 MiB on White Noise's two relays. Use the matching native library with
   regenerated bindings.
 
-- `start_direct_conversation(account_ref, peer_account_id)` exposes shared
-  local reuse and creation with both participants as founding admins
-  (mdk#464). Cancellation detaches the wait; retry reuses canonical state.
-  Generic creation and legacy admin roles remain unchanged.
+- `start_direct_conversation(account_ref, peer_account_id) -> String` (Swift
+  `startDirectConversation(accountRef:peerAccountId:)`) reuses this account's direct conversation with a hex or npub
+  peer, or creates an unnamed group with both accounts as founding admins, and returns the MLS group id as hex
+  (mdk#464). Cancelling detaches the wait without cancelling creation, and a retry reuses the canonical group. A
+  self-peer fails as `MarmotKitError::Runtime`. `create_group` and existing roles are unchanged.
 
-- Add `account_relay_liveness`, `subscribe_relay_liveness`, and `reconnect_relay` (mdk#329), with
-  `RelayLivenessFfi`, stable `RelayStatusFfi`, and a closeable `RelayLivenessSubscription`.
-  Rows include session-local attempt times and available connection-error categories. Additive; aggregate health
-  remains unchanged.
+- `account_relay_liveness(account_ref) -> [RelayLivenessFfi]`, `subscribe_relay_liveness(account_ref) ->
+  RelayLivenessSubscription` and `reconnect_relay(account_ref, url) -> RelayLivenessFfi` (mdk#329).
+  `RelayLivenessFfi` has `url`, `status: RelayStatusFfi` (`UNKNOWN`, `CONNECTING`, `CONNECTED`, `OFFLINE`; Swift
+  `.unknown` …), `last_attempt_unix: UInt64?` and `last_error: String?`. `RelayLivenessSubscription.snapshot()`
+  returns the first list once. `next()` returns later complete lists, or `nil` after `cancel()` or runtime shutdown.
+  `cancel()` does not disconnect relays. `reconnect_relay` refuses relays the account has not configured
+  (`MarmotKitError::Runtime`). Additive; aggregate relay health is unchanged.
+
+- `audit_delivery_status_v5()` returns one `AuditDeliveryStatusV5Ffi` per account (mdk#3300): `last_success_at_ms`,
+  `last_failure: AuditDeliveryFailureV5Ffi?` (`kind: AuditDeliveryFailureKindV5Ffi`, `http_status`, `at_ms`),
+  `consecutive_failures`, `rejected_batches`, `paused` and `backlog: AuditDeliveryBacklogV5Ffi?`. It never dials.
+  `ReceiverBlocked` pauses automatic delivery until `set_audit_otlp_config_v5` changes the destination, endpoint or
+  token, or the host calls `post_audit_log_tracker_update_v5()`. Additive; use the matching native library.
+
+- `audit_log_retention()` and `set_audit_log_retention(AuditLogRetentionFfi)` read and persist the local audit
+  retention policy (mdk#3300): `max_age_days` (default 30, clamped to 1-30) and `max_bytes_per_account` (default
+  256 MiB, at least 16 MiB). The setter returns the stored, clamped value. Additive.
+
+- `app_performance_snapshot().runtime_operations` gains 17 `read_queue_*` rows: a host read's wait on its account
+  worker (mdk#3273).
 
 ### Changed
+
+- Local audit files are deleted above a 256 MiB per-account budget by default, oldest delivered or untracked sealed
+  segments first; before, only the 30-day age limit applied (mdk#3300). Raise it with `set_audit_log_retention`.
+  v5 delivery retries `409`, skips a record the receiver rejects with `400`, `413` or `422` after isolating it, and
+  pauses on `401`, `403`, `404` or another unexpected response instead of retrying silently.
 
 - `rotate_key_package`, `republish_key_package`, account setup's KeyPackage publish, `block_user`, `unblock_user` and
   `sync_sticker_packs` fail as `MarmotKitError::EventTooLarge { artifact: Other }` when every relay refuses their
   event for size, by its own answer or over its known limit (mdk#2334). Before, they failed as `Runtime`,
   `BlockListUnavailable` and `StickerNetwork`. A block edit retried after an uncertain attempt stays
   `BlockPublicationUncertain`, and a sticker install or uninstall still succeeds, its list owed to the next sync.
+  Profile, follow-list and relay-list publishes (such as `publish_user_profile` and `publish_relay_lists`) whose event
+  fits none of their relays' known limits also fail as `EventTooLarge { artifact: Other }`, sent nowhere.
+
+### Fixed
+
+- A `decline_group_invite` that timed out with `MarmotKitError::AccountWorkerResponseTimedOut`, or whose task was
+  cancelled, no longer leaves the group later if it was still queued (#3031). An accept sent afterwards keeps the
+  group. A decline the worker had already started still completes, so after a timeout read the group's state before
+  accepting.
+
+- Wiping or removing a generated identity whose setup was still publishing no longer creates a new, unrequested
+  account (whitenoise-ios#1302). `sign_in_account` resumes a generated setup that its sign-out stopped.
+
+- An offline account no longer repeats its full replay synchronization on every idle maintenance tick (#3238).
 
 ## 0.15.0 - 2026-11-09
 

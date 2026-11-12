@@ -1,6 +1,6 @@
 #[tokio::test]
 async fn retained_welcome_retry_cutoff() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new("retained Welcome scheduling key").unwrap();
     let path = dir.path().join("alice.sqlite");
     let mut alice = session(&path, &key, b"welcome-retry-alice");
@@ -203,7 +203,7 @@ async fn retained_welcome_retry_cutoff() {
 #[tokio::test]
 async fn mixed_welcome_retry_cutoff() {
     for welcome_first in [true, false] {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = relaxed_storage_dir().unwrap();
         let key = SqlCipherKey::new("mixed Welcome scheduling key").unwrap();
         let path = dir.path().join("alice.sqlite");
         let mut alice = session(&path, &key, b"mixed-retry-alice");
@@ -3133,7 +3133,7 @@ struct RecoveryPeers {
 async fn recovery_peers(extra_updates: u32) -> RecoveryPeers {
     use cgka_traits::storage::GroupStorage;
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new("live recovery cancellation key").unwrap();
     let bob_path = dir.path().join("bob.sqlite");
     let mut bob_device = Device::open(bob_path.clone(), &key, b"cancel-bob").await;

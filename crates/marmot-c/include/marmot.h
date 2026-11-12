@@ -870,6 +870,21 @@ typedef enum MarmotRelayStatus {
 } MarmotRelayStatus;
 
 /**
+ * Why the most recent v5 delivery attempt for an account failed.
+ */
+typedef enum MarmotAuditDeliveryFailureKindV5 {
+  MARMOT_AUDIT_DELIVERY_FAILURE_KIND_V5_STATE_OVER_LIMIT,
+  MARMOT_AUDIT_DELIVERY_FAILURE_KIND_V5_TOO_MANY_OPEN_FILES,
+  MARMOT_AUDIT_DELIVERY_FAILURE_KIND_V5_LOCAL_IO,
+  MARMOT_AUDIT_DELIVERY_FAILURE_KIND_V5_LOCAL_BLOCKED,
+  MARMOT_AUDIT_DELIVERY_FAILURE_KIND_V5_RECEIVER_BLOCKED,
+  MARMOT_AUDIT_DELIVERY_FAILURE_KIND_V5_RECEIVER_REJECTED,
+  MARMOT_AUDIT_DELIVERY_FAILURE_KIND_V5_RECEIVER_RETRYABLE,
+  MARMOT_AUDIT_DELIVERY_FAILURE_KIND_V5_NO_RESPONSE,
+  MARMOT_AUDIT_DELIVERY_FAILURE_KIND_V5_INTERNAL,
+} MarmotAuditDeliveryFailureKindV5;
+
+/**
  * Storage-verified origin of a kind-1210 row.
  */
 typedef enum MarmotGroupSystemEventProvenance {
@@ -3745,6 +3760,21 @@ typedef struct MarmotAuditLogSettings {
 } MarmotAuditLogSettings;
 
 /**
+ * Local audit-log retention policy. Also a borrowed input to
+ * `marmot_set_audit_log_retention`.
+ */
+typedef struct MarmotAuditLogRetention {
+  /**
+   * Maximum file age in days, 1 to 30.
+   */
+  uint32_t max_age_days;
+  /**
+   * Per-account size budget in bytes, at least 16 MiB.
+   */
+  uint64_t max_bytes_per_account;
+} MarmotAuditLogRetention;
+
+/**
  * One on-disk audit-log file.
  */
 typedef struct MarmotAuditLogFile {
@@ -3819,6 +3849,61 @@ typedef struct MarmotAuditLogTrackerUpdateResultV5 {
   char *v4_skipped_reason;
   struct MarmotAuditOtlpTrackerResultV5 *v5;
 } MarmotAuditLogTrackerUpdateResultV5;
+
+/**
+ * The most recent v5 delivery failure; `http_status` is set when the
+ * receiver answered.
+ */
+typedef struct MarmotAuditDeliveryFailureV5 {
+  enum MarmotAuditDeliveryFailureKindV5 kind;
+  bool has_http_status;
+  /**
+   *Only meaningful when the matching `has_` flag is set.
+   */
+  uint16_t http_status;
+  uint64_t at_ms;
+} MarmotAuditDeliveryFailureV5;
+
+/**
+ * Undelivered local v5 audit data, as measured at `observed_at_ms`.
+ */
+typedef struct MarmotAuditDeliveryBacklogV5 {
+  uint64_t undelivered_bytes;
+  uint64_t undelivered_segments;
+  uint64_t gaps;
+  bool has_oldest_undelivered_at_ms;
+  /**
+   *Only meaningful when the matching `has_` flag is set.
+   */
+  uint64_t oldest_undelivered_at_ms;
+  uint64_t observed_at_ms;
+} MarmotAuditDeliveryBacklogV5;
+
+/**
+ * Per-account v5 OTLP audit delivery status.
+ */
+typedef struct MarmotAuditDeliveryStatusV5 {
+  char *account_ref;
+  bool destination_configured;
+  bool has_last_success_at_ms;
+  /**
+   *Only meaningful when the matching `has_` flag is set.
+   */
+  uint64_t last_success_at_ms;
+  struct MarmotAuditDeliveryFailureV5 *last_failure;
+  uint64_t consecutive_failures;
+  uint64_t rejected_batches;
+  bool paused;
+  struct MarmotAuditDeliveryBacklogV5 *backlog;
+} MarmotAuditDeliveryStatusV5;
+
+/**
+ *Owned list; free the root with its `_free` function only.
+ */
+typedef struct MarmotAuditDeliveryStatusV5List {
+  struct MarmotAuditDeliveryStatusV5 *items;
+  uintptr_t len;
+} MarmotAuditDeliveryStatusV5List;
 
 /**
  * Encrypted Blossom avatar reference for a chat row.
@@ -10186,6 +10271,19 @@ MarmotStatus marmot_audit_log_settings(const struct MarmotClient *client,
                                        struct MarmotAuditLogSettings **out);
 
 /**
+ * Current local audit-log retention policy. Free with
+ * `marmot_audit_log_retention_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_audit_log_retention(const struct MarmotClient *client,
+                                        struct MarmotAuditLogRetention **out);
+
+/**
  * On-disk audit-log files. Free with
  * `marmot_audit_log_file_list_free`.
  *
@@ -10251,6 +10349,19 @@ MarmotStatus marmot_post_audit_log_tracker_update(const struct MarmotClient *cli
  */
 MarmotStatus marmot_post_audit_log_tracker_update_v5(const struct MarmotClient *client,
                                                      struct MarmotAuditLogTrackerUpdateResultV5 **out);
+
+/**
+ * Per-account v5 OTLP audit delivery status (local read; never dials).
+ * Free with `marmot_audit_delivery_status_v5_list_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_audit_delivery_status_v5(const struct MarmotClient *client,
+                                             struct MarmotAuditDeliveryStatusV5List **out);
 
 /**
  * The account's chat list rows. Free with
@@ -11417,6 +11528,19 @@ MarmotStatus marmot_set_relay_telemetry_runtime_config(const struct MarmotClient
 MarmotStatus marmot_set_audit_log_settings(const struct MarmotClient *client,
                                            const struct MarmotAuditLogSettings *settings,
                                            struct MarmotAuditLogSettings **out);
+
+/**
+ * Replace the local audit-log retention policy. The stored value, clamped to
+ * 1-30 days and at least 16 MiB per account, is returned. Free the result with
+ * `marmot_audit_log_retention_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; `retention` a valid borrowed struct;
+ * `out` valid.
+ */
+MarmotStatus marmot_set_audit_log_retention(const struct MarmotClient *client,
+                                            const struct MarmotAuditLogRetention *retention,
+                                            struct MarmotAuditLogRetention **out);
 
 /**
  * Replace the audit-log tracker endpoint config. Free the result with
@@ -14745,6 +14869,16 @@ void marmot_audit_log_settings_free(struct MarmotAuditLogSettings *ptr);
  * The pointer must be NULL or an unfreed pointer returned by
  * this library.
  */
+void marmot_audit_log_retention_free(struct MarmotAuditLogRetention *ptr);
+
+/**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
 void marmot_audit_log_tracker_config_v4_free(struct MarmotAuditLogTrackerConfigV4 *ptr);
 
 /**
@@ -14825,6 +14959,25 @@ void marmot_audit_otlp_config_v5_free(struct MarmotAuditOtlpConfigV5 *ptr);
  * this library.
  */
 void marmot_audit_log_tracker_update_result_v5_free(struct MarmotAuditLogTrackerUpdateResultV5 *ptr);
+
+/**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
+void marmot_audit_delivery_status_v5_free(struct MarmotAuditDeliveryStatusV5 *ptr);
+
+/**
+ * Free a list returned by this library. NULL is a no-op.
+ *
+ * # Safety
+ * `list` must be NULL or an unfreed pointer returned by this
+ * library.
+ */
+void marmot_audit_delivery_status_v5_list_free(struct MarmotAuditDeliveryStatusV5List *list);
 
 /**
  * Free a value of this type returned by this library. NULL

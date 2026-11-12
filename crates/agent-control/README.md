@@ -33,6 +33,21 @@ Invite-policy values serialize on the wire as `deny`, `allowlist`, `any_authenti
 `any_authenticated`. Deserialization also accepts the CLI spellings `any-authenticated-direct` and
 `any-authenticated`.
 
+## Media sends
+
+`send_media` accepts an optional `reply_to_message_id_hex`: the original inner
+message id as 64 hexadecimal characters. Omitted or null targets send ordinary
+media messages. Malformed targets fail with `invalid_hex` before upload.
+
+The captured target applies to the whole ordered attachment batch, with or
+without a caption. The kind-9 message carries `imeta` tags and matching `e` and
+`q` reply references. Sending media never changes the user's composer draft.
+
+A matching `idempotency_key` retry returns the original message ids without
+another upload or publication. Reusing a retained key with different inputs,
+including a different reply target, fails with `media_idempotency_conflict`.
+Existing plain-send fingerprints remain valid across upgrades.
+
 ## Historical attachment recovery
 
 Three additive v2 operations use MDK's native attachment pipeline:

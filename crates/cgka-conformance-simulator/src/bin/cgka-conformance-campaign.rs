@@ -1204,13 +1204,15 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn kills_and_reaps_a_worker_that_exceeds_its_timeout() {
-        let child = Command::new("sh")
-            .args(["-c", "sleep 2"])
+        // Spawn `sleep` itself: behind `sh -c` it is a grandchild that outlives
+        // the killed shell and holds the test's output pipes open.
+        let child = Command::new("sleep")
+            .arg("2")
             .spawn()
             .expect("spawn sleeping child");
         let usage = wait_with_usage(child, Duration::from_millis(10)).expect("reap child");
         assert!(usage.timed_out);
-        assert!(usage.signal.is_some());
+        assert_eq!(usage.signal, Some(libc::SIGKILL));
     }
 
     #[test]

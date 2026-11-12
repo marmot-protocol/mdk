@@ -4991,8 +4991,13 @@ async fn generation_close_failure_keeps_recovered_content_retryable_after_reopen
         .unwrap();
     carol.ingest(commit2).await.unwrap();
     // Model a host consuming the existing wake before driving this quantum.
+    // Drive it at the frozen clock's explicit time: the host entry point's
+    // wall-clock slice can expire on a loaded runner before the sweep
+    // completes and reaches the generation close (mdk#3293).
     carol.drain_pending_convergence_groups();
-    let failed = carol.advance_convergence(&group_id).await;
+    let failed = carol
+        .converge_and_drain_queued_outbound_intents(&group_id, 1_000_000)
+        .await;
     assert!(
         matches!(&failed, Err(cgka_traits::EngineError::Storage(StorageError::Backend(detail)))
             if detail.contains("generation-close-fault")),

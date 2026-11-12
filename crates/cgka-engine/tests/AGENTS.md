@@ -67,8 +67,9 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
 - **File:** `invite_leave/admin_leave.rs`
   - **Owns:** `StepDownAndLeave`: an admin's leave request is durable before anything is published and the re-drive
     stages its step-down, then its SelfRemove; a refused step-down is staged again; the last active admin is refused
-    with nothing recorded; a member's call is a plain Leave. The re-drive across branches stays in `invite_leave.rs`
-    and marmot-app's `rival_branch_leave`.
+    with nothing recorded; a member's call is a plain Leave; a pass that selects a branch blocking the leave schedules
+    its re-drive. The rest of the re-drive across branches stays in `invite_leave.rs` and marmot-app's
+    `rival_branch_leave`.
 
 - **File:** `invite_leave/recovery_batch.rs`
   - **Owns:** Atomic native recovery for two and 32 distinct recipients, exact artifacts and pending references

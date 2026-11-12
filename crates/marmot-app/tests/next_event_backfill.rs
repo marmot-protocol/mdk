@@ -113,6 +113,7 @@ async fn publish_garbage_group_message_at(
 /// its recovery seam (`refresh_recovery_at_seam`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn next_event_returns_when_a_live_delivery_arms_the_epoch_backfill() {
+    storage_sqlite::relax_storage_for_test_process();
     let (_relay, url) = mock_relay().await;
 
     // --- bob: the stalled account whose `next_event` seam we pin ---

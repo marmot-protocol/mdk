@@ -335,6 +335,16 @@ impl<S: StorageProvider> Engine<S> {
         if self.ensure_group_live(group_id).is_err() {
             return Ok(None);
         }
+        // A host advance never converges a removed or disbanded copy, so a
+        // pass opened here could never freeze and would read as due on every
+        // read: a rival left unresolved when the removal was realized must
+        // not keep the copy scheduled.
+        if self
+            .live_group_record(group_id)
+            .is_ok_and(|group| group.is_terminal())
+        {
+            return Ok(None);
+        }
         let tip = self.convergence_tip_epoch(group_id)?;
         let policy = self.convergence_policy_for_group(group_id)?;
         let now = self.convergence_now();
@@ -2621,8 +2631,13 @@ impl<S: StorageProvider> Engine<S> {
                 // The selected branch advanced without consuming our
                 // SelfRemove. The proposal is epoch-bound, but the durable
                 // leave request is not; keep the send gate so the async
-                // convergence wrapper can publish a fresh proposal.
+                // convergence wrapper can publish a fresh proposal. A pass
+                // can also apply from ingest, where no wrapper runs, so
+                // schedule the group: the branch may have undone the
+                // step-down or blocked the leave, and only the re-drive in
+                // the next advance stages or records either.
                 self.leaving_groups.insert(group_id.clone());
+                self.schedule_pending_convergence_group(group_id);
             } else if self.leaving_groups.contains(group_id) {
                 // Compatibility cleanup for a pre-durable in-memory gate.
                 self.leaving_groups.remove(group_id);

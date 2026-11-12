@@ -451,6 +451,7 @@ async fn post_audit_log_file_posts_jsonl_body() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn v5_recorder_file_cannot_be_sent_to_legacy_whole_file_endpoint() {
+    storage_sqlite::relax_storage_for_test_process();
     let tmp = tempfile::tempdir().unwrap();
     let home = AccountHome::open(tmp.path());
     home.create_account("alice").unwrap();
@@ -522,6 +523,7 @@ async fn post_audit_log_file_rejects_oversized_files_before_upload() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn audit_log_setting_enables_jsonl_recorder_for_opened_accounts() {
+    storage_sqlite::relax_storage_for_test_process();
     let tmp = tempfile::tempdir().unwrap();
     let home = AccountHome::open(tmp.path());
     let account = home.create_account("alice").unwrap();
@@ -547,6 +549,7 @@ async fn audit_log_setting_enables_jsonl_recorder_for_opened_accounts() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn deferred_runtime_open_records_the_stored_group_baseline() {
+    storage_sqlite::relax_storage_for_test_process();
     let tmp = tempfile::tempdir().unwrap();
     let account = AccountHome::open(tmp.path())
         .create_account("alice")
@@ -624,6 +627,7 @@ async fn deferred_runtime_open_records_the_stored_group_baseline() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn opened_baseline_inventory_exposes_the_64_group_cap() {
+    storage_sqlite::relax_storage_for_test_process();
     let tmp = tempfile::tempdir().unwrap();
     let account = AccountHome::open(tmp.path())
         .create_account("alice")
@@ -666,6 +670,7 @@ async fn opened_baseline_inventory_exposes_the_64_group_cap() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn local_group_action_writes_human_action_context() {
+    storage_sqlite::relax_storage_for_test_process();
     let tmp = tempfile::tempdir().unwrap();
     let home = AccountHome::open(tmp.path());
     let account = home.create_account("alice").unwrap();
@@ -722,6 +727,7 @@ async fn local_group_action_writes_human_action_context() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn local_message_send_tags_engine_rows_with_human_action() {
+    storage_sqlite::relax_storage_for_test_process();
     let tmp = tempfile::tempdir().unwrap();
     let home = AccountHome::open(tmp.path());
     let account = home.create_account("alice").unwrap();
@@ -860,9 +866,13 @@ impl CaptureSink {
                         // while its request is still deliberately in flight, which
                         // the coalescing test's contract cannot tolerate.
                         requests.lock().unwrap().push(request);
+                        // Leave the in-flight count before answering, for the
+                        // same reason: a client that sends its next request
+                        // only after this answer must not be counted as
+                        // overlapping this one while the socket closes.
+                        in_flight.lock().unwrap().0 -= 1;
                         write_http_response(&mut stream, status).await;
                         let _ = stream.shutdown().await;
-                        in_flight.lock().unwrap().0 -= 1;
                         finished.notify_one();
                     });
                 }
@@ -1897,6 +1907,7 @@ async fn wait_for_audit_file_quiesce(path: &str) -> String {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn enabled_recorder_emits_local_member_ref_before_any_group_mutation() {
+    storage_sqlite::relax_storage_for_test_process();
     let tmp = tempfile::tempdir().unwrap();
     let home = AccountHome::open(tmp.path());
     let account = home.create_account("alice").unwrap();
@@ -1927,6 +1938,7 @@ fn assert_source_linkage(actual: &Value, expected: &Value) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reopen_and_toggle_restore_source_row_without_group_mutation() {
+    storage_sqlite::relax_storage_for_test_process();
     let tmp = tempfile::tempdir().unwrap();
     let home = AccountHome::open(tmp.path());
     let account = home.create_account("alice").unwrap();
@@ -2033,6 +2045,7 @@ async fn reopen_and_toggle_restore_source_row_without_group_mutation() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn live_delete_rotates_and_replays_source_context() {
+    storage_sqlite::relax_storage_for_test_process();
     let tmp = tempfile::tempdir().unwrap();
     let home = AccountHome::open(tmp.path());
     let account = home.create_account("alice").unwrap();

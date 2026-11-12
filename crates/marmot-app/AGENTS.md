@@ -32,6 +32,7 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   debug tokio worker stack in the CLI daemon test; spawned tasks capture the owned pair and borrow it inside), and
   generated setup's procedures stay `MarmotAppRuntime` methods in that module tree. Hosts reach onboarding through
   `MarmotAppRuntime::account_setup()`; `AccountManager` exposes no onboarding methods.
+  Helpers that only return another future return it directly: extra async wrappers hit the simulator's layout-depth limit.
   `AccountManager` holds one `SetupState` for four hooks only, each where it is called: reconcile (worker transaction
   held; it never takes it again), the teardown fence (removal and sign-out, before the worker transaction), removal
   (under the transaction, after the removal commit point) and shutdown's two phases (before the invite catch-up drain;
@@ -42,11 +43,23 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   inside synchronous code stops when that code returns) and holds the task; no attempt starts while any fence is
   held. When the last one drops the task checks again, so a cancelled or failed teardown leaves the account
   publishing, and `sign_in_account` schedules a setup its sign-out ended. It checks the worker gate through
-  `SetupRecords`, which reads durable records only. Setup reaches workers only through the worker-lifecycle surface
+  `SetupRecords`, which reads durable records only. Runtime sign-out, wipe and removal also wait for admitted
+  foreground generated setup and interactive onboarding steps sharing the per-account transaction, including their
+  network work. Wipe takes this fence before its network stages and passes it into local removal,
+  rather than taking the foreground transaction again. Local removal takes generated preparation admission only
+  after foreground setup finishes. Preparation captures the effective context with its chosen identity.
+  Resolve selection once under local admission: no eligible journal means fresh creation, not another lookup.
+  An existing selection uses `Continue` even if another attempt clears its journal. A cleared journal may mean
+  successful completion: coalesce from current completion data, never relabel a local snapshot as network-ready.
+  New setup skips signed-out and unlinked journals instead of reviving those accounts or refusing all later creates.
+  Teardown rechecks the captured public key after its fence wait and rejects a label reused for another identity.
+  Setup reaches workers only through the worker-lifecycle surface
   commented on `AccountManager` in `runtime/mod.rs`, each call keeping its lock state: the worker transaction is a
   tokio `Mutex` and not reentrant. A worker setup takes out of the map is reaped through setup's cancellation
-  registry, never `worker_reapers`. Lock order: the per-account onboarding transaction, then the worker transaction,
-  then the worker map; the cancellation registry before the per-account state lock.
+  registry, never `worker_reapers`. Teardown lock order: the background setup fence, the per-account onboarding
+  transaction, generated local preparation admission (removal only), the worker transaction, then the worker map.
+  Local preparation never waits for the onboarding transaction. The cancellation registry precedes the per-account
+  state lock.
 - Keep app-client commands and query methods in the `src/client/` module; the crate root should construct clients but
   not absorb their behavior again. The `AppClient` inherent impl is split across the module along these seams: `mod.rs`
   (the `AppClient` struct plus the broadly-shared command/query API — key-package, group lifecycle, message/media/agent
@@ -878,9 +891,15 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
 - The configured audit OTLP/HTTP sender is `marmot-observability`'s `src/audit_otlp_sender.rs`, which hosts name as
   `marmot_app::audit_otlp_sender`. It accepts an owned local-delivery batch,
   checks the prepared destination, preserves each original v5 JSON body inside the restricted OTLP JSON envelope,
-  and maps only complete, partial, and retryable receiver outcomes to local finish actions. Blocked and unknown
-  outcomes retain the prepared range. Runtime tracker/manual triggers and additive native bindings configure it;
-  there is no default v5 destination.
+  and maps only complete, retryable (`409`/`429`/`5xx`) and rejected (`400`/`413`/`422`, finished as permanent)
+  receiver outcomes to local finish actions. Blocked and unknown outcomes retain the prepared range. Runtime
+  tracker/manual triggers and additive native bindings configure it; there is no default v5 destination.
+- Keep per-account v5 delivery status in `runtime/audit_delivery_status.rs`, in its own
+  `audit-otlp-delivery-v5/delivery-status.json` beside (never inside) the cursor. Each tracker attempt records its
+  typed outcome there inside its own audit export admission, before its reservation drops, so status writes follow
+  attempt order; never record from a separate reservation. Routine healthy outcomes rewrite it at most every 10 s. A receiver block pauses automatic
+  passes for the sender fingerprint it was recorded under; a changed sender or a manual tracker update is the
+  retry. Local failures keep the bounded retry timer. `audit_delivery_status` only reads these files.
 - Keep process-local audit export admission in `src/audit_export_lifecycle.rs`: one active attempt per account, short
   local admission under `storage_lifecycle`, and cancellation on consent, deletion, account removal, destination change,
   or close. Never hold local guards across HTTP or wait for HTTP before releasing the root lease on terminal close.
@@ -913,9 +932,12 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   and retries like any other rejection.
   Shutdown cancels pending or in-flight automatic work; unacknowledged files remain on disk.
   Tests may shorten the window per runtime via `test-policy-overrides`; paused-clock tests pin the production default.
-  `audit_log/retention.rs` owns the fixed 30-day local forensic retention policy, independently of uploads and consent.
+  `audit_log/retention.rs` owns the local forensic retention policy, independently of uploads and consent: a
+  host-configured maximum age (1-30 days, default 30) and per-account size budget (default 256 MiB, at least 16 MiB),
+  persisted in shared storage. The budget evicts the oldest sealed segments only when no delivery cursor still owes
+  them (mdk#3300); undelivered data leaves only by age, recording an `ExpiredUndelivered` gap, or by explicit clear.
   Sweep metadata on exclusive-root startup and hourly across accounts and failed-wipe remnants, independent of
-  account workers. Use a size-one candidate queue and per-file storage admission. Retire through local delivery before
+  account workers; check budgets on request (recording activity, delivery passes), spaced at least 30 seconds. Use a size-one candidate queue and per-file storage admission. Retire through local delivery before
   unlinking; drain directory-local cursor work, cancel only a prepared attempt owning that inode and block new
   reservations for that directory. Other uploads must remain valid; never globally fence orphan/tombstone cleanup;
   never rewrite rows or unlink the actual live inode. Serialize the weak registry with writer creation and let the

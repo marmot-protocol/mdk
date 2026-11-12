@@ -10,6 +10,7 @@ use nostr_relay_builder::MockRelay;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn explicit_catch_up_syncs_when_group_read_snapshot_fails() {
+    storage_sqlite::relax_storage_for_test_process();
     let relay = MockRelay::run().await.unwrap();
     let relay_url = relay.url().await.to_string();
     let dir = tempfile::tempdir().unwrap();
