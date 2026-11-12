@@ -312,6 +312,13 @@ class LeaderboardTests(unittest.TestCase):
         self.assertEqual((data["tests"], data["runs"]["cached"]), ([], 0))
         self.assertIn("could not be fetched and are left out", markdown)
 
+    def test_a_rerun_attempt_in_progress_leaves_out_the_cached_attempt(self):
+        self.main(FakeGitHub([run(1, 1)], {1: [(1, "ci-runner-cli-e2e-0-1", artifact_zip(report(FLAKY)))]}))
+        second = FakeGitHub([run(1, 1, status="in_progress", attempt=2)], {})
+        _, _, data = self.main(second)
+        self.assertEqual((data["tests"], data["runs"]["cached"], data["runs"]["in_progress"]), ([], 0, 1))
+        self.assertEqual(second.downloads, [])
+
     def test_another_job_selection_does_not_reuse_cached_summaries(self):
         artifacts = {1: [(1, "ci-runner-cli-e2e-0-1", artifact_zip(report(FLAKY))),
                          (2, "ci-runner-relay-runtime-0-1", artifact_zip(report(PASS)))]}

@@ -194,11 +194,14 @@ ones CI's retry hid. Find the root cause; a fix awaits the state the test
 needs and never raises a timeout, adds a retry or loosens an assertion.
 
 Prove the fix with the `just flake-stress` line the leaderboard prints for
-the test. It runs the filter 40 times with no retries, with the features CI
-builds that package's tests with, and must show 0 failed iterations. When the
-flake reproduces locally, give the failed and total iterations before and
-after the fix in the PR; when it does not, say so. Iterations run one at a
-time, so to add contention widen the filter to the test's binary and raise
+the test. The report prints that line only for the tests it samples (the
+first 20 by default); for a lower-ranked test, rerun with `--samples` up to
+its rank, or read its `stress` field in the `--json` file. It runs the
+filter 40 times with no retries, with the features CI builds that package's
+tests with, and must show 0 failed iterations. When the flake reproduces
+locally, give the failed and total iterations before and after the fix in
+the PR; when it does not, say so. Iterations run one at a time, so to add
+contention widen the filter to the test's binary and raise
 `FLAKE_STRESS_THREADS`; the test groups in `.config/nextest.toml` still cap
 some binaries.
 
