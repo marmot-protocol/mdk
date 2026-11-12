@@ -40,6 +40,6 @@ zeroize = { workspace = true, optional = true }
 
 [dev-dependencies]
 marmot-pairing.workspace = true
-nostr-memory = { git = "https://github.com/erskingardner/rust-nostr", rev = "a8efab6d23846d044746def3dc2766fd1a7e227c" }
+nostr-memory = { git = "https://github.com/erskingardner/rust-nostr", rev = "e93cc06b5624f06c21ecd8111a124176eb0c7589" }
 nostr-relay-builder.workspace = true
 tokio = { workspace = true, features = ["net", "test-util"] }

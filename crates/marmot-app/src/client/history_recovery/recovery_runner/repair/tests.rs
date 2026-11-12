@@ -85,13 +85,27 @@ async fn client(
 ) {
     let relay = LocalRelay::new(RelayBuilder::default().query_policy(sweeps.clone()));
     relay.run().await.unwrap();
+    let (dir, client, storage, route) = client_on(relay.url().await.to_string()).await;
+    (dir, relay, client, storage, route)
+}
+
+/// One account with one group on the relay at `relay_url`, its client opened
+/// directly.
+async fn client_on(
+    relay_url: String,
+) -> (
+    tempfile::TempDir,
+    AppClient,
+    SqliteAppStorage,
+    TransportReconciliationRoute,
+) {
     let dir = tempfile::tempdir().unwrap();
     crate::AccountHome::open(dir.path())
         .create_account("alice")
         .unwrap();
     let app = crate::MarmotApp::with_relay_and_config(
         dir.path(),
-        relay.url().await.to_string(),
+        relay_url,
         crate::MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
     );
     // The quiet group's own empty live REQ would prove the history these
@@ -106,7 +120,56 @@ async fn client(
         .unwrap()
         .route;
     let storage = app.account_storage("alice").unwrap().app_storage();
-    (dir, relay, client, storage, route)
+    (dir, client, storage, route)
+}
+
+/// A TCP forwarder to a relay whose `close` takes the relay away for
+/// certain. `LocalRelay::shutdown` stops only the connection handlers idle
+/// when it fires: one busy with a client message misses it and keeps serving
+/// that connection.
+struct RelaySockets {
+    url: String,
+    stop: tokio::sync::oneshot::Sender<()>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl RelaySockets {
+    async fn forward(relay: &LocalRelay) -> Self {
+        let upstream = relay.url().await.to_string();
+        let upstream = upstream
+            .strip_prefix("ws://")
+            .unwrap()
+            .trim_end_matches('/')
+            .to_owned();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let (stop, mut stopped) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let mut sockets = tokio::task::JoinSet::new();
+            loop {
+                tokio::select! {
+                    _ = &mut stopped => break,
+                    accepted = listener.accept() => {
+                        let (mut incoming, _) = accepted.unwrap();
+                        let upstream = upstream.clone();
+                        sockets.spawn(async move {
+                            let mut outgoing = tokio::net::TcpStream::connect(upstream).await.unwrap();
+                            let _ = tokio::io::copy_bidirectional(&mut incoming, &mut outgoing).await;
+                        });
+                    }
+                }
+            }
+            sockets.shutdown().await;
+        });
+        Self { url, stop, task }
+    }
+
+    /// Close every forwarded socket and the listener: nothing answers at
+    /// `url` once this returns.
+    async fn close(self) {
+        let _ = self.stop.send(());
+        self.task.await.unwrap();
+    }
 }
 
 fn reason(result: Result<crate::SyncSummary, crate::ClassifiedSyncFailure>) -> Reason {
@@ -409,8 +472,11 @@ fn unadmitted(route: &TransportReconciliationRoute, at: u64) -> cgka_traits::Tra
 /// the relay unreachable, and the next serves nothing while it cools down.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_repair_the_runner_cannot_serve_is_coverage_unproven() {
-    let (_dir, relay, mut client, _, _) = client(&Sweeps::default()).await;
-    relay.shutdown();
+    let relay = LocalRelay::new(RelayBuilder::default());
+    relay.run().await.unwrap();
+    let sockets = RelaySockets::forward(&relay).await;
+    let (_dir, mut client, _, _) = client_on(sockets.url.clone()).await;
+    sockets.close().await;
     let result = tokio::time::timeout(
         Duration::from_secs(60),
         client.repair_full_history_cancellable(&|| false, None),
