@@ -4369,11 +4369,23 @@ impl NostrSdkRelayClient {
     /// queue. It exits on pool shutdown or receiver loss; a supervisor must
     /// retain the loss watch and start a replacement after a gap.
     pub fn spawn_notification_forwarder(&self, adapter: NostrTransportAdapter) -> JoinHandle<()> {
+        // A full queue is receiver loss, so it holds as much as the receiver
+        // it drains. A catch-up replays far more than a few hundred copies; a
+        // smaller queue turns a dispatch stall that receiver would absorb into
+        // loss, as the relay plane's did (mdk#2066).
+        self.spawn_notification_forwarder_with_queue(adapter, SDK_NOTIFICATION_CAPACITY)
+    }
+
+    /// [`Self::spawn_notification_forwarder`] with a `queue`-slot event queue.
+    fn spawn_notification_forwarder_with_queue(
+        &self,
+        adapter: NostrTransportAdapter,
+        queue: usize,
+    ) -> JoinHandle<()> {
         let mut notifications = self.notifications();
         let loss = self.clone();
         tokio::spawn(async move {
-            const EVENT_QUEUE_CAPACITY: usize = 256;
-            let (sender, mut event_rx) = mpsc::channel(EVENT_QUEUE_CAPACITY);
+            let (sender, mut event_rx) = mpsc::channel(queue);
             let pending = Arc::new(AtomicU64::new(0));
             let worker_pending = pending.clone();
             let classifier = loss.clone();
@@ -10400,7 +10412,8 @@ mod tests {
         let sdk = NostrSdkRelayClient::new(Client::default());
         let adapter = NostrTransportAdapter::new(Arc::new(sdk.clone()));
         let mut loss = sdk.notification_loss().unwrap();
-        let forwarder = sdk.spawn_notification_forwarder(adapter.clone());
+        const QUEUE: usize = 16;
+        let forwarder = sdk.spawn_notification_forwarder_with_queue(adapter.clone(), QUEUE);
         adapter
             .activate_account(crate::TransportAccountActivation {
                 account_id: account,
@@ -10410,14 +10423,10 @@ mod tests {
             })
             .await
             .unwrap();
-        // Reserve every adapter delivery slot. The forwarder's event worker
-        // blocks, while its loss-aware SDK reader must keep running.
-        let held_delivery_slots = adapter
-            .delivery_tx
-            .reserve_many(crate::DELIVERY_BUFFER)
-            .await
-            .unwrap();
-        for index in 0..400 {
+        // Hold the adapter state every dispatch takes. The forwarder's event
+        // worker blocks, while its loss-aware SDK reader must keep running.
+        let held_state = adapter.state.write().await;
+        for index in 0..4 * QUEUE {
             let event = EventBuilder::new(Kind::GiftWrap, format!("blocked-{index}"))
                 .tag(Tag::public_key(keys.public_key()))
                 .finalize(&keys)
@@ -10439,7 +10448,7 @@ mod tests {
         .await
         .expect("loss watch advances while event delivery is blocked");
         assert!(loss.borrow().as_ref().unwrap().cumulative_skipped > 0);
-        drop(held_delivery_slots);
+        drop(held_state);
         timeout(Duration::from_secs(5), forwarder)
             .await
             .expect("lossy forwarder exits after recording its gap")
