@@ -157,6 +157,12 @@ async fn inbox_dismissal_survives_open() {
             now - HOUR,
         )
         .unwrap();
+    // A periodic recheck could replace retirement with new coverage evidence.
+    assert!(
+        storage
+            .record_recovery_recheck(&route, &endpoint, 0, 0, true, now)
+            .unwrap()
+    );
 
     let mut client = crate::tests::client_on_app_relay_plane(&app, "alice").await;
     let notices = client.history_notices().unwrap();
@@ -165,7 +171,20 @@ async fn inbox_dismissal_survives_open() {
     assert_eq!(notices[0].group_id_hex, None);
     let dismissed = notices[0].notice_id.clone();
     assert!(client.dismiss_history_notice(&dismissed).unwrap());
+    assert!(
+        !storage
+            .recovery_unit_debt(&route, &endpoint, floor - 1)
+            .unwrap()
+            .is_empty(),
+        "the pass must owe history outside the dismissed span"
+    );
     client.run_recovery_runner_pass().await.unwrap();
+    assert!(
+        storage
+            .recovery_unit_debt(&route, &endpoint, floor - 1)
+            .unwrap()
+            .is_empty()
+    );
     assert!(client.history_notices().unwrap().is_empty());
     let spans = storage.recovery_unit_spans(&route, &endpoint).unwrap();
     assert!(spans.iter().any(|span| {
@@ -192,13 +211,14 @@ async fn inbox_dismissal_survives_open() {
 
     // New loss, unlike opening the same ledger again, reopens acknowledged history.
     let loss_floor = floor + HOUR;
+    let loss_at = unix_now_seconds();
     storage
         .record_account_recovery_loss_routed(
             "alice",
             RecoveryLossCause::Queue,
             41,
             1,
-            unix_now_seconds(),
+            loss_at,
             Some(loss_floor),
             Some(&[(route.clone(), loss_floor)]),
         )
@@ -223,13 +243,46 @@ async fn inbox_dismissal_survives_open() {
             now,
         )
         .unwrap();
+    assert!(
+        storage
+            .recovery_unit_spans(&route, &endpoint)
+            .unwrap()
+            .iter()
+            .any(|span| {
+                span.retired.is_none()
+                    && span.range.since_seconds == loss_floor
+                    && span.range.until_seconds == now
+            })
+    );
     let fresh = client.history_notices().unwrap();
     assert_eq!(fresh.len(), 1);
     assert_eq!(fresh[0].cause, crate::HistoryNoticeCause::UnprovenHistory);
     assert_eq!(fresh[0].group_id_hex, None);
     assert_ne!(fresh[0].notice_id, dismissed);
     assert!(client.dismiss_history_notice(&fresh[0].notice_id).unwrap());
+    let acknowledged = storage.recovery_unit_spans(&route, &endpoint).unwrap();
+    storage
+        .record_account_recovery_loss_routed(
+            "alice",
+            RecoveryLossCause::Queue,
+            41,
+            1,
+            loss_at,
+            Some(loss_floor),
+            Some(&[(route.clone(), loss_floor)]),
+        )
+        .unwrap();
     client.synchronize_recovery_loss(&storage).unwrap();
+    assert_eq!(
+        storage.recovery_unit_spans(&route, &endpoint).unwrap(),
+        acknowledged
+    );
+    assert!(
+        storage
+            .recovery_unit_debt(&route, &endpoint, now)
+            .unwrap()
+            .is_empty()
+    );
     assert!(client.history_notices().unwrap().is_empty());
 
     drop(client);

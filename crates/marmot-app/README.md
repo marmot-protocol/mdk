@@ -882,9 +882,9 @@ re-arms them.
 
 `dismiss_history_notice(account_ref, notice_id)` runs on the account worker. After the user accepts that the history may
 be incomplete, it durably retires exactly the shown occurrence, never as coverage or a recovery success. A ledger notice
-retires its shown parked spans and clears its route's remainder. Ordinary recovery and account reopen preserve those
-retirements. Loss import, not dismissal, releases the delivery-loss fence; unchanged loss evidence is not imported again.
-It returns false for a stale id. A malformed id is `AppError::Hex`.
+retires its shown parked spans and clears its route's remainder. Ordinary recovery and account reopen do not undo that
+dismissal. A qualified proof can replace retirement with coverage. Loss import, not dismissal, releases the delivery-loss
+fence; unchanged loss evidence is not imported again. It returns false for a stale id. A malformed id is `AppError::Hex`.
 
 History outside the dismissed spans remains owed. Without a healthy live tail, advancing time can add unproved seconds.
 A relay refusing those seconds can raise a fresh `UnprovenHistory` notice without reopening any dismissed second.
