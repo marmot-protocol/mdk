@@ -242,11 +242,17 @@ def _render_env_lines(
 
 
 def _write_env_atomically(env_path: Path, lines: list[str]) -> None:
-    env_path.parent.mkdir(parents=True, exist_ok=True)
     text = "\n".join(lines)
     if text and not text.endswith("\n"):
         text += "\n"
-    fd, tmp_name = tempfile.mkstemp(prefix=".env.", suffix=".tmp", dir=env_path.parent)
+    _write_text_atomically(env_path, text)
+
+
+def _write_text_atomically(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f"{path.name}.", suffix=".tmp", dir=path.parent
+    )
     tmp_path = Path(tmp_name)
     owns_fd = True
     try:
@@ -267,7 +273,7 @@ def _write_env_atomically(env_path: Path, lines: list[str]) -> None:
                 os.close(fd)
                 owns_fd = False
             raise
-        os.replace(tmp_path, env_path)
+        os.replace(tmp_path, path)
     except Exception:
         if owns_fd:
             os.close(fd)
@@ -387,7 +393,6 @@ def commit_env_and_config_transaction(
 
     wrote_env = False
     wrote_config = False
-    config_tmp_path: Path | None = None
     config_backup_path: Path | None = None
     try:
         if env_path is not None and env_lines is not None:
@@ -397,20 +402,16 @@ def commit_env_and_config_transaction(
             config_path.parent.mkdir(parents=True, exist_ok=True)
             if config_backup:
                 config_backup_path = _create_backup(config_path)
-            config_tmp_path = config_path.with_suffix(config_path.suffix + ".tmp")
-            config_tmp_path.write_text(config_text, encoding="utf-8")
-            os.replace(config_tmp_path, config_path)
+            _write_text_atomically(config_path, config_text)
             wrote_config = True
     except Exception:
         if wrote_env and env_path is not None:
             _restore_path_bytes(env_path, env_backup, env_backup_mode)
         if wrote_config and config_path is not None:
             _restore_path_bytes(config_path, config_backup_bytes, config_backup_mode)
-        for cleanup_path in (config_tmp_path, config_backup_path):
-            if cleanup_path is None:
-                continue
+        if config_backup_path is not None:
             try:
-                cleanup_path.unlink(missing_ok=True)
+                config_backup_path.unlink(missing_ok=True)
             except OSError:
                 pass
         raise
