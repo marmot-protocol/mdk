@@ -4,6 +4,17 @@
 //! counts as owed, so the job still runs.
 use super::AppClient;
 
+/// What [`AppClient::epoch_gap_hold_ends`] found across the live groups.
+pub(crate) struct EpochGapHolds {
+    /// Each group whose due self-update the epoch-gap hold holds, and when
+    /// that hold ends.
+    pub(crate) held: Vec<(cgka_traits::GroupId, cgka_traits::Timestamp)>,
+    /// A group is unrecoverable.
+    pub(crate) unrecoverable: bool,
+    /// A group could not be read now.
+    pub(crate) group_unread: bool,
+}
+
 impl AppClient {
     /// Whether the content-report backfill has batches left for the opened
     /// database. Memory only once it has finished.
@@ -111,5 +122,93 @@ impl AppClient {
             .account_storage(&self.state.label)
             .and_then(|storage| Ok(storage.app_storage().next_local_submission()?))
             .map_or(true, |next| next.is_some())
+    }
+}
+
+impl AppClient {
+    /// When session maintenance (`run_due_maintenance`) next has work
+    /// (mdk#3265): the session's own deadlines, each held self-update at
+    /// the end of its epoch-gap hold, private KeyPackage expiries, and the
+    /// app's retries, which with no stored time are owed every 15 s while
+    /// they last. It reads every live group, so the worker runs it once per
+    /// wake. A failed read counts as owed with no stored time: maintenance
+    /// retries 15 s after its last run, never back to back.
+    pub(crate) fn maintenance_due(&self) -> marmot_session::MaintenanceDue {
+        self.try_maintenance_due()
+            .unwrap_or(marmot_session::MaintenanceDue {
+                at: None,
+                retry_while_owed: true,
+            })
+    }
+
+    /// Each live group whose due self-update the epoch-gap hold holds now,
+    /// with the second that hold ends: 24 h after the gap opened (mdk#2258).
+    /// Also whether a group is unrecoverable, and whether a group could not
+    /// be read now, such as one not yet hydrated, which leaves the others'
+    /// due times standing and counts as owed.
+    pub(crate) fn epoch_gap_hold_ends(&self) -> Result<EpochGapHolds, super::AppError> {
+        let now_ms = super::recovery::wall_now_ms()?;
+        let mut held = Vec::new();
+        let mut unrecoverable = false;
+        let mut group_unread = false;
+        for group_id in self.runtime.live_group_ids()? {
+            unrecoverable |= matches!(
+                self.runtime.epoch_state(&group_id),
+                Some(cgka_traits::EpochState::Unrecoverable { .. })
+            );
+            let Ok(record) = self.runtime.group_record(&group_id) else {
+                group_unread = true;
+                continue;
+            };
+            if let Some(since) = self.epoch_gap_open_since(&group_id, record.epoch)?
+                && super::self_update_waits_for_epoch_gap(since, now_ms)
+            {
+                let until_ms = since.saturating_add(super::EPOCH_GAP_SELF_UPDATE_HOLD_MS);
+                held.push((group_id, cgka_traits::Timestamp(until_ms.div_ceil(1_000))));
+            }
+        }
+        Ok(EpochGapHolds {
+            held,
+            unrecoverable,
+            group_unread,
+        })
+    }
+
+    fn try_maintenance_due(&self) -> Result<marmot_session::MaintenanceDue, super::AppError> {
+        let EpochGapHolds {
+            held,
+            unrecoverable,
+            group_unread,
+        } = self.epoch_gap_hold_ends()?;
+        let mut due = self.runtime.maintenance_due(&held)?;
+        let mut at = |at: u64| {
+            due.at = Some(due.at.map_or(cgka_traits::Timestamp(at), |earliest| {
+                earliest.min(cgka_traits::Timestamp(at))
+            }));
+        };
+        if let Some(expiry) = self.runtime.private_key_packages_next_expiry()? {
+            at(expiry);
+        }
+        let storage = self.app.account_storage(&self.state.label)?.app_storage();
+        if let Some(expiry) = storage.received_private_key_packages_next_expiry()? {
+            at(expiry);
+        }
+        let mut reinvite_owed = false;
+        for record in self.runtime.pending_reinvites()? {
+            match record.reinvite.as_ref() {
+                Some(retry) => at(retry.next_attempt_at_ms.div_ceil(1_000)),
+                None => reinvite_owed = true,
+            }
+        }
+        // Device groups are unreleased: their passes keep the 15 s check.
+        if unrecoverable
+            || group_unread
+            || reinvite_owed
+            || self.runtime.has_rejoin_offers()?
+            || self.app.device_groups_enabled()
+        {
+            due.retry_while_owed = true;
+        }
+        Ok(due)
     }
 }

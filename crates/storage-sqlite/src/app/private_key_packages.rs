@@ -132,6 +132,20 @@ impl SqliteAppStorage {
         Ok(taken == 1)
     }
 
+    /// When the earliest handed-over KeyPackage expires, so maintenance can
+    /// wake to discard it (mdk#3265). `None` with none held.
+    pub fn received_private_key_packages_next_expiry(&self) -> StorageResult<Option<u64>> {
+        let conn = self.lock()?;
+        let earliest: Option<i64> = conn
+            .query_row_cached(
+                "SELECT MIN(not_after) FROM private_key_packages_received",
+                [],
+                |row| row.get(0),
+            )
+            .storage()?;
+        Ok(earliest.map(|at| u64::try_from(at).unwrap_or(0)))
+    }
+
     /// Discard every handed-over KeyPackage that expired by `now`. Returns
     /// how many went. With none expired it only reads (mdk#2923).
     pub fn delete_expired_received_private_key_packages(&self, now: u64) -> StorageResult<usize> {

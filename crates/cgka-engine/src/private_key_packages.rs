@@ -640,6 +640,16 @@ impl<S: StorageProvider> Engine<S> {
         })
     }
 
+    /// When the earliest issued private KeyPackage expires, so maintenance
+    /// can wake to discard it (mdk#3265). `None` with none issued.
+    pub fn private_key_packages_next_expiry(&self) -> Result<Option<u64>, EngineError> {
+        Ok(private_storage(&self.storage)?
+            .list_issued_private_key_packages()?
+            .iter()
+            .map(|record| record.not_after)
+            .min())
+    }
+
     /// Delete private KeyPackages with their keys: those expired at `now`,
     /// and with `recipient`, every one issued to that sibling. Returns how
     /// many went. With none to discard it reads only and opens no writer

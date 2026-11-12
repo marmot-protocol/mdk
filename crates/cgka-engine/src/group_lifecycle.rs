@@ -1227,6 +1227,16 @@ impl<S: StorageProvider> Engine<S> {
         Ok(candidates)
     }
 
+    /// Whether any stored Welcome is a rejoin offer, which maintenance retries
+    /// while it lasts (mdk#3265).
+    pub fn has_rejoin_offers(&self) -> Result<bool, EngineError> {
+        Ok(self
+            .storage
+            .list_welcomes()?
+            .iter()
+            .any(|candidate| candidate.rejoin.is_some()))
+    }
+
     /// Retry owned offers once trusted removal (or Unrecoverable repair) makes
     /// ordinary joining legal. Hosts call this on their maintenance seam, so
     /// recovery does not depend on another relay copy passing app deduplication.

@@ -3907,18 +3907,18 @@ async fn a_ready_worker_completes_one_span_per_startup_stage() {
     runtime.shutdown().await;
 }
 
-/// The maintenance phases every completed tick passes through, in tick order
-/// (mdk#2923). The key-package catch-up runs only when one is due.
-const MAINTENANCE_TICK_PHASES: [RuntimeOp; 4] = [
-    RuntimeOp::WorkerMaintenanceDue,
+/// The phases every completed session maintenance run passes through, in
+/// order, inside its `worker_maintenance_due` span (mdk#2923). Since mdk#3265
+/// it runs on the worker's schedule, not inside a tick.
+const SESSION_MAINTENANCE_PHASES: [RuntimeOp; 3] = [
     RuntimeOp::WorkerMaintenanceAppPasses,
     RuntimeOp::WorkerMaintenanceSession,
     RuntimeOp::WorkerMaintenanceEffects,
 ];
 
-/// A worker's first maintenance tick, which fires on entry, records one span
-/// per phase inside its `worker_maintenance` span, and the passes it sets off
-/// record their own.
+/// A worker's first session maintenance run, which it makes as it opens,
+/// records one span per phase inside its `worker_maintenance_due` span, and
+/// the passes the worker runs as it opens record their own.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_maintenance_tick_records_one_span_per_phase() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -3930,15 +3930,15 @@ async fn a_maintenance_tick_records_one_span_per_phase() {
     runtime.accounts().reconcile().await.expect("alice starts");
 
     timeout(ACCOUNT_OPEN_TEST_DEADLINE, async {
-        while startup_stage_snapshot(&runtime, RuntimeOp::WorkerMaintenance).completed == 0 {
+        while startup_stage_snapshot(&runtime, RuntimeOp::WorkerMaintenanceDue).completed == 0 {
             tokio::task::yield_now().await;
         }
     })
     .await
-    .expect("the first maintenance tick completes");
+    .expect("the first session maintenance run completes");
 
-    let ticks = startup_stage_snapshot(&runtime, RuntimeOp::WorkerMaintenance);
-    for operation in MAINTENANCE_TICK_PHASES {
+    let ticks = startup_stage_snapshot(&runtime, RuntimeOp::WorkerMaintenanceDue);
+    for operation in SESSION_MAINTENANCE_PHASES {
         let phase = startup_stage_snapshot(&runtime, operation);
         assert_eq!(
             (phase.successes, phase.completed, phase.in_flight),
@@ -3947,8 +3947,8 @@ async fn a_maintenance_tick_records_one_span_per_phase() {
             operation.as_str()
         );
     }
-    // The passes the tick sets due run on later loop turns, and its
-    // housekeeping batch on the blocking pool, so wait for each to complete.
+    // The passes run on later loop turns, and the housekeeping batch on the
+    // blocking pool, so wait for each to complete.
     for operation in [
         RuntimeOp::WorkerPresentationPass,
         RuntimeOp::WorkerAvatarPass,
@@ -4122,6 +4122,100 @@ async fn the_worker_samples_push_timing_only_while_owed() {
     assert_eq!(missed(), 1, "the watchdog found owed push timing");
     advance_held_clock(Duration::ZERO).await;
     assert!(push_runs() > before_missed, "and ran the Push job");
+    runtime.shutdown().await;
+}
+
+/// An account whose KeyPackage cannot publish (no relays) owes session
+/// maintenance work with no stored time. It retries 15 s after its last
+/// run by the worker's clock, as the tick did, never back to back on each
+/// re-read of its due time (mdk#3265).
+#[tokio::test(flavor = "current_thread")]
+async fn owed_session_maintenance_retries_15_s_apart_not_back_to_back() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let app = MarmotApp::with_relays(dir.path(), vec![]);
+    app.account_home()
+        .create_account("alice")
+        .expect("create alice");
+    let runtime = MarmotAppRuntime::new(app.clone());
+    runtime.accounts().reconcile().await.expect("alice starts");
+    let count = |operation| startup_stage_snapshot(&runtime, operation).completed;
+    timeout(ACCOUNT_OPEN_TEST_DEADLINE, async {
+        while count(RuntimeOp::WorkerMaintenanceDue) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the first session maintenance run completes");
+    let runs = count(RuntimeOp::WorkerMaintenanceDue);
+    // Ten seconds in one-second steps: past the re-read spacing each time,
+    // short of the 15 s retry.
+    for _ in 0..10 {
+        advance_held_clock(Duration::from_secs(1)).await;
+    }
+    assert_eq!(
+        count(RuntimeOp::WorkerMaintenanceDue),
+        runs,
+        "no run within 10 s"
+    );
+    advance_held_clock(Duration::from_secs(6)).await;
+    timeout(ACCOUNT_OPEN_TEST_DEADLINE, async {
+        while count(RuntimeOp::WorkerMaintenanceDue) == runs {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the owed work retries after 15 s");
+    runtime.shutdown().await;
+}
+
+/// The worker re-reads when session maintenance next has work after a run
+/// and after a command that can change state, and not after a read
+/// (mdk#3265).
+#[tokio::test(flavor = "current_thread")]
+async fn session_maintenance_rereads_its_due_time_after_changes_only() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let app = MarmotApp::with_relays(dir.path(), vec![]);
+    app.account_home()
+        .create_account("alice")
+        .expect("create alice");
+    let runtime = MarmotAppRuntime::new(app.clone());
+    runtime.accounts().reconcile().await.expect("alice starts");
+    let count = |operation| startup_stage_snapshot(&runtime, operation).completed;
+    let reads = || count(RuntimeOp::WorkerMaintenanceNextDue);
+    timeout(ACCOUNT_OPEN_TEST_DEADLINE, async {
+        while count(RuntimeOp::WorkerMaintenanceDue) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the first session maintenance run completes");
+    // The first read planned the run; the run is followed by another, once
+    // the read spacing has passed.
+    let planned = reads();
+    advance_held_clock(Duration::from_secs(2)).await;
+    assert!(reads() > planned, "a run is followed by a re-read");
+    // All within one tick, so the watchdog's own read does not count.
+    let settled = reads();
+    advance_held_clock(Duration::from_secs(2)).await;
+    assert_eq!(reads(), settled, "nothing changed");
+
+    runtime
+        .key_package_maintenance_status("alice")
+        .await
+        .expect("status reads");
+    let policy = runtime
+        .periodic_maintenance_policy("alice")
+        .await
+        .expect("policy reads");
+    advance_held_clock(Duration::from_secs(2)).await;
+    assert_eq!(reads(), settled, "a read changes nothing");
+
+    runtime
+        .set_periodic_maintenance_policy("alice", policy)
+        .await
+        .expect("policy writes");
+    advance_held_clock(Duration::from_secs(2)).await;
+    assert!(reads() > settled, "a state change is followed by a re-read");
     runtime.shutdown().await;
 }
 
@@ -4411,15 +4505,18 @@ async fn idle_ticks_run_nothing(app: MarmotApp) -> IdleTicks {
         // whatever is in flight.
         settle((attachment, presentation)).await;
     };
-    // The first tick fires on entry and starts the startup housekeeping:
-    // let it, its passes and the blocking work they spawn all finish.
+    // The first tick fires on entry, and the worker runs every scheduled job
+    // once as it opens, session maintenance included (mdk#3265): let them,
+    // their passes and the blocking work they spawn all finish.
     timeout(ACCOUNT_OPEN_TEST_DEADLINE, async {
-        while count(RuntimeOp::WorkerMaintenance) == 0 {
+        while count(RuntimeOp::WorkerMaintenance) == 0
+            || count(RuntimeOp::WorkerMaintenanceDue) == 0
+        {
             tokio::task::yield_now().await;
         }
     })
     .await
-    .expect("the first maintenance tick completes");
+    .expect("the first maintenance tick and session maintenance complete");
     settle((1, 1)).await;
     const COUNTED: [RuntimeOp; 15] = [
         RuntimeOp::WorkerMaintenance,
@@ -4442,8 +4539,9 @@ async fn idle_ticks_run_nothing(app: MarmotApp) -> IdleTicks {
     // Settle ticks until four in a row run no pass and no housekeeping:
     // startup work can still be finishing. The attachment pass polls while
     // its startup sweep or promotion runs, and those finish in real time, so
-    // under load the last poll can come a tick after them; each attachment
-    // pass also wakes housekeeping.
+    // under load the last poll can come a tick after them; session
+    // maintenance's first run wakes the passes too (mdk#3265); and each
+    // attachment pass wakes housekeeping.
     let activity = || (passes(), count(RuntimeOp::WorkerMaintenanceCompaction));
     let mut quiet = 0;
     for _ in 0..20 {
@@ -4456,7 +4554,10 @@ async fn idle_ticks_run_nothing(app: MarmotApp) -> IdleTicks {
     }
     assert_eq!(quiet, 4, "startup passes settle");
     let before = snapshot();
-    // Every job the tick used to run, and every watchdog counter.
+    // Every job the tick used to run, and every watchdog counter. Session
+    // maintenance is checked on its own below: this account has no relays,
+    // so it owes a KeyPackage it cannot publish (mdk#3265).
+    let maintenance_before = count(RuntimeOp::WorkerMaintenanceDue);
     let moved: Vec<RuntimeOp> = [
         RuntimeOp::WorkerMaintenanceContentBackfill,
         RuntimeOp::WorkerMaintenanceLegacyPromotion,
@@ -4520,6 +4621,12 @@ async fn idle_ticks_run_nothing(app: MarmotApp) -> IdleTicks {
         missed_from_start,
         Vec::<(&str, u64)>::new(),
         "no missed wake from the first tick"
+    );
+    // Owed work with no stored time retries once per 15 s, as the tick did,
+    // never back to back (mdk#3265).
+    assert!(
+        count(RuntimeOp::WorkerMaintenanceDue) - maintenance_before <= 3,
+        "session maintenance retries at most once per 15 s"
     );
     assert_eq!(delta(2), 0, "nothing owed spawns no housekeeping batch");
     assert_eq!(

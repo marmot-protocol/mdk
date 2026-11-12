@@ -24924,6 +24924,64 @@ fn assert_group_catching_up<T: std::fmt::Debug>(
 /// past its local epoch. Any commit it authors from there forks the group, so
 /// every group change is refused and the maintenance self-update waits, unless
 /// the user accepts the fork risk for that epoch.
+/// mdk#3265: the app's half of when session maintenance is due. An open
+/// epoch gap holds the group's self-update until 24 h after the gap opened,
+/// and a handed-over KeyPackage's expiry makes maintenance due then.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_app_due_read_holds_epoch_gaps_and_wakes_for_expiries() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    let mut client = app.client("alice").await.unwrap();
+    let group_id = client
+        .create_group("behind", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("no members to resolve");
+    let epoch = client.runtime.group_record(&group_id).unwrap().epoch;
+    let storage = app.account_storage("alice").unwrap().app_storage();
+    assert!(client.epoch_gap_hold_ends().unwrap().held.is_empty());
+
+    storage
+        .arm_epoch_backfill_intents(&[storage_sqlite::StoredEpochBackfillIntent {
+            group_id_hex: hex::encode(group_id.as_slice()),
+            stalled_epoch: epoch.0,
+        }])
+        .unwrap();
+    let _ = client.refresh_pending_recovery().await;
+    let since = storage
+        .epoch_gap_recovery_open_since(group_id.as_slice(), epoch.0)
+        .unwrap()
+        .expect("the gap is open");
+    let held = client.epoch_gap_hold_ends().unwrap().held;
+    assert_eq!(
+        held,
+        vec![(
+            group_id.clone(),
+            cgka_traits::Timestamp((since + 24 * 60 * 60 * 1_000).div_ceil(1_000))
+        )]
+    );
+
+    let now = crate::unix_now_seconds();
+    storage
+        .insert_received_private_key_packages(&[storage_sqlite::ReceivedPrivateKeyPackage {
+            key_package_ref_hex: "ab".repeat(32),
+            issuer_slot_hex: "cd".repeat(32),
+            not_before: now,
+            not_after: now + 120,
+            key_package: vec![1],
+            received_at: now,
+        }])
+        .unwrap();
+    let due = client.maintenance_due();
+    assert!(due.at.is_some_and(|at| at.0 <= now + 120), "{due:?}");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn group_changes_refuse_while_epoch_gap_recovery_holds_the_group() {
     let dir = tempfile::tempdir().unwrap();

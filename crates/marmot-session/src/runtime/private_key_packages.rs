@@ -167,6 +167,12 @@ where
         Ok(self.session.uncount_outdated_private_key_packages()?)
     }
 
+    /// When the earliest issued private KeyPackage expires, so maintenance
+    /// can wake to discard it (mdk#3265).
+    pub fn private_key_packages_next_expiry(&self) -> AccountResult<Option<u64>> {
+        Ok(self.session.private_key_packages_next_expiry()?)
+    }
+
     /// Delete private KeyPackages with their keys: those expired at `now`,
     /// and with `recipient`, every one issued to that sibling (3.6 removes a
     /// sibling through this). Returns how many went.

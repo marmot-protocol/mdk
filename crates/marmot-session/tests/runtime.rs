@@ -4000,6 +4000,17 @@ async fn undelivered_commit_is_reported_and_holds_the_next_self_update_for_an_ho
         held.last_failure_code.as_deref(),
         Some("commit_delivery_hold")
     );
+    // mdk#3265: the held rotation waits for the hold, which ends an hour
+    // after the first acknowledgement, not every 15 s. The group's
+    // 10-minute component recheck comes first here, so the due time is
+    // later than now but no later than the hold's end.
+    let due = runtime.maintenance_due(&[]).unwrap();
+    assert!(!due.retry_while_owed, "{due:?}");
+    assert!(
+        due.at
+            .is_some_and(|at| at.0 > 100_000 && at.0 <= 100_000 + 60 * 60),
+        "{due:?}"
+    );
     assert!(
         adapter
             .publishes()
@@ -7038,6 +7049,16 @@ async fn held_group_defers_a_due_self_update_until_the_hold_lifts() {
         Some("epoch_gap_hold")
     );
     assert_eq!(runtime.session().epoch(&group_id).unwrap(), source_epoch);
+    // mdk#3265: held, the rotation is due exactly when its hold ends, a
+    // minute from now and before anything else here, not every 15 s;
+    // unheld, it retries every 15 s like any send failure.
+    let hold_ends = cgka_traits::Timestamp(100_060);
+    let due = runtime
+        .maintenance_due(&[(group_id.clone(), hold_ends)])
+        .unwrap();
+    assert_eq!(due.at, Some(hold_ends), "{due:?}");
+    assert!(!due.retry_while_owed, "{due:?}");
+    assert!(runtime.maintenance_due(&[]).unwrap().retry_while_owed);
 
     let effects = runtime.run_due_maintenance().await.unwrap();
     assert!(
@@ -7728,4 +7749,97 @@ async fn periodic_fault_keeps_effects() {
             vec![complete]
         );
     }
+}
+
+/// mdk#3265: an offline account with KeyPackage relays retries a failed
+/// publication at its stored backoff, 30 s after the first attempt and 60 s
+/// after the second, not every 15 s.
+#[tokio::test]
+async fn an_offline_key_package_publication_is_due_at_its_backoff() {
+    let dir = relaxed_storage_dir().unwrap();
+    let key = SqlCipherKey::new("marmot kp offline backoff key").unwrap();
+    let policy = StaticTransportRouting::new(vec![TransportEndpoint("wss://inbox.example".into())])
+        .key_package_endpoints(vec![TransportEndpoint("wss://keys.example".into())]);
+    let wall = Arc::new(TestWallClock::new(100_000));
+    let mut runtime = AccountDeviceRuntime::new(
+        session(dir.path().join("alice.sqlite"), &key, b"alice"),
+        RecordingAdapter::default(),
+        policy,
+        ExposedThenFailsKeyPackages::default(),
+    )
+    .with_maintenance_sources(
+        wall.clone(),
+        Arc::new(TestMonotonicClock::default()),
+        Arc::new(TestRandom::new(0)),
+    );
+    runtime
+        .publish_fresh_key_package()
+        .await
+        .expect_err("no relay acknowledges the KeyPackage");
+    let due = runtime.maintenance_due(&[]).unwrap();
+    assert_eq!(due.at, Some(cgka_traits::Timestamp(100_030)), "{due:?}");
+    assert!(!due.retry_while_owed, "{due:?}");
+
+    wall.set(100_030);
+    runtime.run_due_maintenance().await.unwrap();
+    let due = runtime.maintenance_due(&[]).unwrap();
+    assert_eq!(due.at, Some(cgka_traits::Timestamp(100_090)), "{due:?}");
+    assert!(!due.retry_while_owed, "{due:?}");
+}
+
+/// mdk#3265: work owed with no stored time is reported as owed, never as due
+/// now, which the worker would read as new work on every re-read. A fresh
+/// account owes its first KeyPackage; paused maintenance prepares none, so
+/// it owes nothing.
+#[tokio::test]
+async fn owed_work_has_no_due_time_and_a_pause_owes_no_new_key_package() {
+    let dir = relaxed_storage_dir().unwrap();
+    let key = SqlCipherKey::new("marmot owed without time key").unwrap();
+    let mut runtime = AccountDeviceRuntime::new(
+        session(dir.path().join("alice.sqlite"), &key, b"alice"),
+        RecordingAdapter::default(),
+        StaticTransportRouting::new(vec![]),
+        RecordingKeyPackages::default(),
+    );
+    let due = runtime.maintenance_due(&[]).unwrap();
+    assert_eq!(due.at, None, "{due:?}");
+    assert!(due.retry_while_owed, "{due:?}");
+
+    runtime.pause_maintenance();
+    let due = runtime.maintenance_due(&[]).unwrap();
+    assert_eq!(due.at, None, "{due:?}");
+    assert!(!due.retry_while_owed, "{due:?}");
+}
+
+/// mdk#3265: a published KeyPackage one relay refused is due again at that
+/// relay's stored backoff, 30 s after the attempt, not every 15 s.
+#[tokio::test]
+async fn a_published_key_package_with_a_refused_relay_is_due_at_its_backoff() {
+    let dir = relaxed_storage_dir().unwrap();
+    let key = SqlCipherKey::new("marmot kp partial backoff key").unwrap();
+    let policy = StaticTransportRouting::new(vec![TransportEndpoint("wss://inbox.example".into())])
+        .key_package_endpoints(vec![
+            TransportEndpoint("wss://keys-a.example".into()),
+            TransportEndpoint("wss://keys-b.example".into()),
+        ]);
+    let wall = Arc::new(TestWallClock::new(100_000));
+    let mut runtime = AccountDeviceRuntime::new(
+        session(dir.path().join("alice.sqlite"), &key, b"alice"),
+        RecordingAdapter::default(),
+        policy,
+        PartialFanoutKeyPackages::default(),
+    )
+    .with_maintenance_sources(
+        wall.clone(),
+        Arc::new(TestMonotonicClock::default()),
+        Arc::new(TestRandom::new(0)),
+    );
+    runtime
+        .publish_fresh_key_package()
+        .await
+        .expect("one relay acknowledges it");
+    assert!(runtime.key_package_has_pending_fanout().unwrap());
+    let due = runtime.maintenance_due(&[]).unwrap();
+    assert_eq!(due.at, Some(cgka_traits::Timestamp(100_030)), "{due:?}");
+    assert!(!due.retry_while_owed, "{due:?}");
 }

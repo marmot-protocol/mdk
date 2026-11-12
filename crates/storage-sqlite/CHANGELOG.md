@@ -49,6 +49,8 @@
 - Batch timeline withdrawals and branch-selection revivals attribute each changed row's trigger to an event that
   affected it, rather than the first event in the batch. Every cause participates: conflicting or unmatched causes
   use the generic reprojection trigger, including simultaneous reaction and reply-preview changes (mdk#2843).
+- `SqliteAppStorage::received_private_key_packages_next_expiry` returns when the earliest handed-over private
+  KeyPackage expires (mdk#3265).
 
 ### Changed
 
