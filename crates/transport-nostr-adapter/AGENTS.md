@@ -184,8 +184,9 @@ for reconnect/backoff and relay status mechanics.
   new coverage drops (replaced again, deactivated, shut down), the replaced coverage's floor is charged
   (`settle_replayed`). Settle only once a stream's final phase is set: a connection restart puts a source back to
   waiting for the same range, so it keeps the debt. Never discharge on EOSE or silence alone; a copy parked in
-  `ready_history` with no claiming source is still charged at once. Only frames for groups its
-  REQs no longer route, or past the buffer bounds, become replay loss at once. A fence holds only what is still in the replay
+  `ready_history` with no claiming source is still charged at once. Frames for groups its REQs
+  no longer route, history copies whose group is still routed but that no fresh REQ asks for again (a different
+  relay, or a later `since`), and frames past the buffer bounds become replay loss at once. A fence holds only what is still in the replay
   buffer: never call back a frame already handed off (a queued or borrowed native batch, a draining hand-off); it goes
   on as late input, as at expiry, and the range stays owed. A hand-off that rejoins the buffer keeps its placement pin
   until its next hand-off; while a fence holds it there, that pin is exempt (`held_pins`), but a pin on a copy still out
