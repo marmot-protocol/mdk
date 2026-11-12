@@ -1462,6 +1462,76 @@ mod tests {
         app.close().unwrap();
     }
 
+    /// A connection registered after a check listed the others was not held:
+    /// its commit can reach the check's `data_version` read before its
+    /// release applies it. The check waits for a later read, which sees the
+    /// commit applied and moves no group for it.
+    #[test]
+    fn a_check_waits_out_a_connection_registered_after_it_listed_them() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("group-writes.sqlite");
+        let engine = open_file(&path);
+        let untouched = GroupId::new(vec![17; 16]);
+        // Opened and migrated now, registered only inside the check.
+        let opened = crate::base::connection::finish_account_open(
+            rusqlite::Connection::open(&path).unwrap(),
+            crate::SqliteStorageOptions::default(),
+            None,
+        )
+        .unwrap();
+        engine.write_count();
+        let before = generation(&engine, &untouched);
+
+        let (start, started) = std::sync::mpsc::channel::<()>();
+        let (committed, has_committed) = std::sync::mpsc::channel::<()>();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let late = std::thread::spawn(move || {
+            started.recv().unwrap();
+            let late = SqliteAccountStorage::from_opened(opened).unwrap();
+            let guard = late.lock().unwrap();
+            guard
+                .execute(
+                    "INSERT INTO device_groups (group_id_hex, trust, key_package_ref_hex, recorded_at)
+                     VALUES ('ff', 'untrusted', NULL, 0)",
+                    [],
+                )
+                .unwrap();
+            committed.send(()).unwrap();
+            released.recv().unwrap();
+            drop(guard);
+            late
+        });
+        // SQLite calls the progress handler at the jump into `PRAGMA
+        // data_version`'s read transaction: after the check listed the
+        // connections, before it reads the value.
+        let mut window = Some((start, has_committed));
+        engine
+            .lock()
+            .unwrap()
+            .progress_handler(
+                1,
+                Some(move || {
+                    if let Some((start, has_committed)) = window.take() {
+                        start.send(()).unwrap();
+                        has_committed.recv().unwrap();
+                    }
+                    false
+                }),
+            )
+            .unwrap();
+        engine.write_count();
+        engine
+            .lock()
+            .unwrap()
+            .progress_handler(1, None::<fn() -> bool>)
+            .unwrap();
+        release.send(()).unwrap();
+        let _late = late.join().unwrap();
+
+        engine.write_count();
+        assert_eq!(generation(&engine, &untouched).committed, before.committed);
+    }
+
     /// A test that declares its own writer gets the production answer (every
     /// group moves) and no panic, even when a counted commit lands in the
     /// same window and would explain the move.

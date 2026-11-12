@@ -132,9 +132,15 @@ fn moves_data_version_without_a_commit(sql: &str) -> bool {
     compact == "wal_checkpoint"
         || compact.contains("wal_checkpoint(truncate)")
         || compact.contains("wal_checkpoint=truncate")
-        || sql
-            .split(';')
-            .any(|statement| statement.split_whitespace().next() == Some("vacuum"))
+        || sql.split(';').any(|statement| {
+            // The first keyword ends at any non-identifier character: SQLite
+            // takes `VACUUM"main"` and `VACUUM[main]` without a space.
+            let statement = statement.trim_start();
+            let keyword = statement
+                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .map_or(statement, |end| &statement[..end]);
+            keyword == "vacuum"
+        })
 }
 
 /// `sql` with each `--` and `/* */` comment outside a quoted string replaced
@@ -185,6 +191,9 @@ fn the_truncate_and_vacuum_gate_matches_every_spelling() {
         "/* one-time */ VACUUM",
         "-- one-time\nvacuum",
         "VACUUM\tINTO 'copy.sqlite'",
+        "VACUUM\"main\"",
+        "VACUUM`main`",
+        "VACUUM[main]",
     ] {
         assert!(moves_data_version_without_a_commit(moves), "{moves}");
     }
@@ -195,6 +204,7 @@ fn the_truncate_and_vacuum_gate_matches_every_spelling() {
         "PRAGMA auto_vacuum=INCREMENTAL",
         "SELECT '-- VACUUM' FROM t",
         "SELECT 1 /* VACUUM */",
+        "SELECT vacuumed FROM t",
     ] {
         assert!(!moves_data_version_without_a_commit(stays), "{stays}");
     }
