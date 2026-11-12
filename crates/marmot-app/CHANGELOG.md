@@ -131,6 +131,13 @@
   fails or is cancelled leaves the setup to resume. `sign_in_account` resumes a generated setup that its sign-out
   stopped.
 
+### Fixed
+
+- `NotificationUpdate.is_dm` follows the chat-list conversation kind for
+  messages, group-state notices, and invitations, including pending DM
+  Welcomes. Named chats and unknown roster projections remain non-DM
+  (mdk#2773).
+
 ## 0.15.0 - 2026-11-09
 
 Multi-device accounts in groups, automatic rejoin, recovery-owned account history, typed chat-list queries, advanced

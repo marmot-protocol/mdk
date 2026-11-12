@@ -310,6 +310,8 @@ pub struct NotificationUpdate {
     pub account_id_hex: String,
     pub group_id_hex: String,
     pub group_name: Option<String>,
+    /// Matches the chat-list Direct classification: an empty name and two
+    /// member accounts. Missing or unhydrated group metadata is not a DM.
     pub is_dm: bool,
     /// True when this notification's receiving account is mentioned by a NIP-27
     /// pubkey-reference (`p`) tag or an inline nostr pubkey entity (a bare
@@ -2076,7 +2078,7 @@ fn notification_update_from_classified_group_state(
         account_id_hex: account_id_hex.to_owned(),
         group_id_hex: notice.group_id_hex.to_owned(),
         group_name: group_name(group.as_ref()),
-        is_dm: false,
+        is_dm: group_is_dm(group.as_ref()),
         is_mention: false,
         message_id_hex: Some(notice.message_id_hex.to_owned()),
         sender,
@@ -2199,7 +2201,7 @@ fn notification_update_from_message(
         account_id_hex: event.account_id_hex.clone(),
         group_id_hex,
         group_name: group_name(group.as_ref()),
-        is_dm: false,
+        is_dm: group_is_dm(group.as_ref()),
         is_mention,
         message_id_hex: Some(event.message.message_id_hex.clone()),
         sender,
@@ -2258,7 +2260,7 @@ fn notification_update_from_group_join(
         account_id_hex: account_id_hex.to_owned(),
         group_id_hex,
         group_name: group_name(group.as_ref()),
-        is_dm: false,
+        is_dm: group_is_dm(group.as_ref()),
         is_mention: false,
         message_id_hex: None,
         sender,
@@ -2270,6 +2272,13 @@ fn notification_update_from_group_join(
         timestamp_ms: unix_now_ms(),
         is_from_self: sender_id == account_id_hex,
     }))
+}
+
+fn group_is_dm(group: Option<&AppGroupRecord>) -> bool {
+    group.is_some_and(|group| {
+        storage_sqlite::conversation_kind(&group.profile.name, group.member_count)
+            == crate::ChatConversationKind::Direct
+    })
 }
 
 fn group_name(group: Option<&AppGroupRecord>) -> Option<String> {
