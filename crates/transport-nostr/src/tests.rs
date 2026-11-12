@@ -4160,6 +4160,100 @@ async fn seal_imports_replay_loss() {
     plane.shutdown().await;
 }
 
+/// The ciphertext a replaced activation discarded before its EOSE is owed,
+/// not lost, while the replacement's REQ asks for it again. Once the
+/// replacement replays it and the account admits it, nothing is lost and the
+/// seal reaches the candidate.
+#[tokio::test]
+async fn seal_passes_a_discard_its_replacement_replays() {
+    let relay = Arc::new(RecordingRelayClient::default());
+    let plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
+    let account = MemberId::new(vec![0xA1; 32]);
+    let adapter = plane.account_adapter(account.clone(), relay.clone());
+    adapter.open_transport_cursor(Some(OPENED_CURSOR));
+    // The test routes the replayed delivery itself, as the router would.
+    let router = plane.inner.transport.router.lock().await.take().unwrap();
+    router.abort();
+    let _ = router.await;
+    let endpoint = TransportEndpoint("wss://relay.example".into());
+    let transport_group_id = vec![0xD3; 32];
+    let activation = TransportAccountActivation {
+        account_id: account.clone(),
+        inbox_endpoints: vec![endpoint.clone()],
+        group_subscriptions: vec![TransportGroupSubscription {
+            group_id: GroupId::new(vec![0xC3; 32]),
+            transport_group_id: transport_group_id.clone(),
+            endpoints: vec![endpoint.clone()],
+            retained_since: None,
+        }],
+        since: Some(Timestamp(OPENED_CURSOR - 1_000)),
+    };
+    adapter.activate_account(activation.clone()).await.unwrap();
+    let group_batch = |subscription: &NostrSubscription| {
+        matches!(subscription, NostrSubscription::GroupBatch { .. })
+    };
+    let event = group_event("replayed-after-discard", &transport_group_id);
+    plane
+        .handle_relay_event_for_test(NostrRelayEvent {
+            endpoint: endpoint.clone(),
+            subscription_id: Some(issued_id(&relay, group_batch)),
+            event: event.clone(),
+        })
+        .await
+        .unwrap();
+    let first_issued = relay.subscriptions.lock().unwrap().len();
+    adapter.activate_account(activation).await.unwrap();
+    let replacement = relay.subscriptions.lock().unwrap()[first_issued..].to_vec();
+    let fresh = replacement
+        .iter()
+        .find(|subscription| group_batch(subscription))
+        .expect("the replacement asks for the group again")
+        .subscription_id();
+    assert_eq!(
+        adapter.seal_transport_cursor(Some(OPENED_CURSOR + 2_000), |_| true),
+        None,
+        "the owed copy holds the seal"
+    );
+    plane
+        .handle_relay_event_for_test(NostrRelayEvent {
+            endpoint: endpoint.clone(),
+            subscription_id: Some(fresh),
+            event,
+        })
+        .await
+        .unwrap();
+    for subscription in replacement {
+        relay
+            .send_eose(&endpoint, subscription.subscription_id())
+            .await;
+    }
+    let transport = &plane.inner.transport;
+    let delivery = timeout(Duration::from_secs(5), transport.adapter.receive())
+        .await
+        .expect("the replacement releases the replayed copy")
+        .unwrap()
+        .unwrap();
+    let id = delivery.message.id.clone();
+    route_account_delivery(transport, delivery);
+    transport.adapter.ack_replay_delivery(&account, &id).await;
+    let Some(AccountDeliveryReceive::Delivery(delivery)) = adapter.try_receive_account_delivery()
+    else {
+        panic!("the replayed copy reaches the account once");
+    };
+    adapter.release_account_delivery(&delivery.message.id);
+    assert_eq!(
+        adapter.seal_transport_cursor(Some(OPENED_CURSOR + 2_000), |_| true),
+        Some(OPENED_CURSOR + 2_000)
+    );
+    assert!(adapter.pending_delivery_overflow().is_none());
+    assert_eq!(
+        adapter.notification_losses_for_test(),
+        0,
+        "nothing was lost"
+    );
+    plane.shutdown().await;
+}
+
 /// Notify permits coalesce, but the adapter retains loss for every account.
 /// A router that starts after both losses must drain both without a cursor
 /// seal, so idle accounts still persist their recovery obligation.

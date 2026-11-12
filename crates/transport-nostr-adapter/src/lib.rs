@@ -3413,6 +3413,9 @@ struct AccountReplayCoverage {
     fence_ticket: u64,
     /// The ticket of the last owner plan applied: an older plan is stale.
     fence_plan_ticket: u64,
+    /// History copies a replaced coverage dropped because this one's REQs
+    /// ask for them again, owed until they come (see `replay_fence`).
+    replayed: HashMap<[u8; 32], replay_fence::ReplayedCopy>,
 }
 
 impl Drop for AccountReplayCoverage {
@@ -3432,6 +3435,10 @@ impl Drop for AccountReplayCoverage {
         self.retain_native_scope();
         if discarded {
             self.record_loss(self.retained_since.unwrap_or(0));
+        }
+        // A copy still owed never came again.
+        if let Some(floor) = self.replayed_floor() {
+            self.record_loss(floor);
         }
     }
 }
@@ -3898,6 +3905,7 @@ impl AccountReplayCoverage {
 
     fn admission_pending(&self) -> bool {
         self.flushing
+            || !self.replayed.is_empty()
             || self.buffered_items != self.fence_held_items()
             || self.native_held().0 != 0
             || self.unplaced_pending()
@@ -4225,6 +4233,7 @@ impl AccountReplayCoverage {
         if self.drop_claims(group_id, claims) || force {
             self.record_loss(since);
         }
+        self.settle_replayed();
         self.wake_replay();
     }
 
@@ -4335,6 +4344,21 @@ impl AccountReplayCoverage {
     }
 
     fn stage_delivery(
+        &mut self,
+        delivery: TransportDelivery,
+        relay: Option<RelayIndex>,
+        input: ReplayInput,
+        delivery_tx: &mpsc::Sender<TransportDelivery>,
+    ) -> Result<(), TransportAdapterError> {
+        let id = <[u8; 32]>::try_from(delivery.message.id.as_slice()).ok();
+        let staged = self.stage_input(delivery, relay, input, delivery_tx);
+        if let Some(id) = id {
+            self.discharge_replayed(&id);
+        }
+        staged
+    }
+
+    fn stage_input(
         &mut self,
         delivery: TransportDelivery,
         relay: Option<RelayIndex>,
@@ -4696,6 +4720,7 @@ impl AccountReplayCoverage {
         self.groups.retain(|_, group| {
             !group.routes.is_empty() || !group.events.is_empty() || group.placements != 0
         });
+        self.settle_replayed();
         if native {
             self.change_sources();
         } else {
@@ -4822,6 +4847,7 @@ impl AccountReplayCoverage {
         self.releasing_bytes = 0;
         self.inbox_placements = 0;
         self.flushing = false;
+        self.settle_replayed();
         self.wake_replay();
     }
 
@@ -4940,6 +4966,7 @@ impl AccountReplayCoverage {
             ReplayStart::Connection => RelayReplay::Awaiting,
             ReplayStart::Gap => RelayReplay::Incomplete,
         };
+        self.settle_replayed();
         self.wake_replay();
         Some(())
     }
@@ -5106,6 +5133,8 @@ impl AccountReplayCoverage {
                 stream.phase = ReplayAdmission::Complete;
             }
         }
+        // A copy owed here that this reply did not bring is lost.
+        self.settle_replayed();
         if let Some(endpoint) = self
             .endpoint_deadlines
             .get_mut(id)
@@ -5810,11 +5839,16 @@ impl AdapterState {
     ) {
         // Buffered live frames have no other copy: they move to the new
         // coverage, those a fence holds still held, rather than being lost
-        // with the old one.
-        let carried = self
+        // with the old one. A history copy a fresh REQ asks for again is
+        // owed by the new coverage instead, lost only if it does not come.
+        let fresh = self.fresh_replay_starts(subscriptions);
+        let (carried, replayed) = self
             .account_replay_coverage
             .get_mut(account_id)
-            .map(AccountReplayCoverage::take_carried_live)
+            .map(|replaced| {
+                let carried = replaced.take_carried_live();
+                (carried, replaced.take_replayed_history(&fresh))
+            })
             .unwrap_or_default();
         let mut coverage = AccountReplayCoverage::new(
             account_id.clone(),
@@ -5831,7 +5865,52 @@ impl AdapterState {
         if let Some(coverage) = self.account_replay_coverage.get_mut(account_id) {
             coverage.admit_retained();
             coverage.restore_carried_live(carried);
+            coverage.owe_replayed_history(replayed);
         }
+    }
+
+    /// Each group route and relay the REQs replay history on, with the REQ's
+    /// `since`, as their staged streams will have them.
+    fn fresh_replay_starts(
+        &mut self,
+        subscriptions: &[NostrSubscription],
+    ) -> Vec<replay_fence::FreshReplay> {
+        let mut starts = Vec::new();
+        for subscription in subscriptions {
+            let since =
+                ReplayWindow::for_subscription(subscription).map_or(0, |window| window.since);
+            let routes = match subscription {
+                NostrSubscription::Group {
+                    group_id,
+                    transport_group_id,
+                    ..
+                }
+                | NostrSubscription::GroupMaintenance {
+                    group_id,
+                    transport_group_id,
+                    ..
+                } => vec![(group_id, transport_group_id.as_slice())],
+                NostrSubscription::GroupBatch { routes, .. } => routes
+                    .iter()
+                    .map(|route| (&route.group_id, route.transport_group_id.as_slice()))
+                    .collect(),
+                NostrSubscription::AccountInbox { .. } => Vec::new(),
+            };
+            for endpoint in subscription.endpoints() {
+                let relay = self.relay_index.index_for(endpoint);
+                for (group, route) in &routes {
+                    if let Ok(route) = <[u8; 32]>::try_from(*route) {
+                        starts.push(replay_fence::FreshReplay {
+                            group: (*group).clone(),
+                            route,
+                            relay,
+                            since,
+                        });
+                    }
+                }
+            }
+        }
+        starts
     }
 
     fn stage_subscription_starts(&mut self, subscriptions: &[NostrSubscription], now_ms: u64) {
