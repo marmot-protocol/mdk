@@ -54,6 +54,26 @@ impl Default for PushAnnounceTiming {
     }
 }
 
+/// What a test sets for an account whose client the account worker owns, so
+/// it cannot set the client's own fields: the push fetch clock's time and
+/// whether the device can fetch.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TestPushOverride {
+    pub(crate) now_ms: i64,
+    pub(crate) can_fetch: bool,
+}
+
+#[cfg(test)]
+pub(crate) static TEST_PUSH_OVERRIDES: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, TestPushOverride>>,
+> = std::sync::LazyLock::new(Default::default);
+
+#[cfg(test)]
+fn test_push_override(label: &str) -> Option<TestPushOverride> {
+    TEST_PUSH_OVERRIDES.lock().unwrap().get(label).copied()
+}
+
 /// The most one look at the fetch clock counts. The worker looks every 15
 /// seconds, so a longer gap is time the process did not run, such as a
 /// suspended host.
@@ -108,14 +128,23 @@ impl PushFetchClock {
         self.counted_to_ms = now_ms;
         if step <= PUSH_FETCH_MAX_STEP_MS {
             self.watched_ms = self.watched_ms.saturating_add(step);
+        } else {
+            // The process did not run: what the catch-up placed must be
+            // watched again before it counts as settled (mdk#2923).
+            self.watched_ms = 0;
         }
         step.min(PUSH_FETCH_MAX_STEP_MS)
     }
 
     /// Whether this client has watched the device able to fetch for at least
-    /// `settle` in the current stretch.
-    pub(super) fn settled(&self, settle: Duration) -> bool {
-        self.fetching && self.watched_ms >= millis(settle)
+    /// `settle` in the current stretch, as of `now_ms`. A last look more than
+    /// one step old says nothing about now: an idle worker stops looking, and
+    /// the device may have lost its relays or been suspended since
+    /// (mdk#2923).
+    pub(super) fn settled(&self, settle: Duration, now_ms: i64) -> bool {
+        self.fetching
+            && self.watched_ms >= millis(settle)
+            && now_ms.saturating_sub(self.counted_to_ms) <= PUSH_FETCH_MAX_STEP_MS
     }
 }
 
@@ -235,9 +264,10 @@ impl AppClient {
             return PushShareForm::Plain;
         };
         if self.announce_left_in_outbox(group_id, state.as_ref())
-            || !self
-                .push_fetch_clock
-                .settled(self.push_announce_timing.catch_up_settle)
+            || !self.push_fetch_clock.settled(
+                self.push_announce_timing.catch_up_settle,
+                self.push_now_ms(),
+            )
         {
             return PushShareForm::Plain;
         }
@@ -331,30 +361,38 @@ impl AppClient {
         }
     }
 
+    /// The time the push fetch clock reads: the wall clock, or a test's.
+    pub(super) fn push_now_ms(&self) -> i64 {
+        #[cfg(test)]
+        if let Some(now_ms) = self
+            .test_push_now_ms
+            .or_else(|| test_push_override(&self.state.label).map(|over| over.now_ms))
+        {
+            return now_ms;
+        }
+        notifications::unix_now_ms()
+    }
+
     /// Whether this device can fetch its groups' messages now: a relay is
     /// connected, and this client's catch-up has run. That is every endpoint
     /// of its live subscriptions finishing its current reply, or, once the
     /// catch-up timeout has passed since the client opened, any subscription
     /// served by one: a subscription whose relays never answer cannot hold
     /// back every announce in the account.
-    /// The time the push fetch clock reads: the wall clock, or a test's.
-    fn push_now_ms(&self) -> i64 {
-        #[cfg(test)]
-        if let Some(now_ms) = self.test_push_now_ms {
-            return now_ms;
-        }
-        notifications::unix_now_ms()
-    }
-
     async fn push_device_can_fetch(&self) -> bool {
         #[cfg(test)]
-        if let Some(can_fetch) = self.test_push_device_can_fetch {
+        if let Some(can_fetch) = self
+            .test_push_device_can_fetch
+            .or_else(|| test_push_override(&self.state.label).map(|over| over.can_fetch))
+        {
             return can_fetch;
         }
         let input = self.adapter.account_subscription_input().await;
         let caught_up = input.complete
             || (input.any
-                && notifications::unix_now_ms().saturating_sub(self.push_fetch_clock.opened_at_ms)
+                && self
+                    .push_now_ms()
+                    .saturating_sub(self.push_fetch_clock.opened_at_ms)
                     >= millis(self.push_announce_timing.catch_up_timeout));
         caught_up && self.relay_plane.relay_health().await.connected > 0
     }
@@ -435,10 +473,10 @@ impl AppClient {
     /// client's catch-up brought.
     fn owed_push_announces(&self) -> Result<BTreeMap<String, Option<i64>>, AppError> {
         let mut owed = BTreeMap::new();
-        if !self
-            .push_fetch_clock
-            .settled(self.push_announce_timing.catch_up_settle)
-        {
+        if !self.push_fetch_clock.settled(
+            self.push_announce_timing.catch_up_settle,
+            self.push_now_ms(),
+        ) {
             return Ok(owed);
         }
         for state in self
@@ -798,16 +836,16 @@ mod tests {
         let settle = Duration::from_secs(10);
         let mut clock = PushFetchClock::new(0);
         assert_eq!(clock.advance(false, 1_000), 0);
-        assert!(!clock.settled(Duration::ZERO));
+        assert!(!clock.settled(Duration::ZERO, 1_000));
         assert_eq!(clock.advance(true, 2_000), 0, "a stretch begins");
-        assert!(clock.settled(Duration::ZERO));
+        assert!(clock.settled(Duration::ZERO, 2_000));
         assert_eq!(clock.advance(true, 7_000), 5_000);
         assert_eq!(clock.advance(true, 7_000), 0);
-        assert!(!clock.settled(settle));
+        assert!(!clock.settled(settle, 7_000));
         assert_eq!(clock.advance(true, 12_000), 5_000);
-        assert!(clock.settled(settle));
+        assert!(clock.settled(settle, 12_000));
         assert_eq!(clock.advance(false, 13_000), 0, "the stretch ends");
-        assert!(!clock.settled(Duration::ZERO));
+        assert!(!clock.settled(Duration::ZERO, 13_000));
         assert_eq!(
             clock.advance(true, 100_000),
             0,
@@ -818,10 +856,25 @@ mod tests {
             PUSH_FETCH_MAX_STEP_MS,
             "a suspended process counts one step"
         );
-        assert!(!clock.settled(settle), "and nothing toward the settle");
+        assert!(
+            !clock.settled(settle, 100_000 + 3_600_000),
+            "and nothing toward the settle"
+        );
         assert_eq!(clock.advance(true, 3_706_000), 6_000);
-        assert!(!clock.settled(settle));
+        assert!(!clock.settled(settle, 3_706_000));
         assert_eq!(clock.advance(true, 3_710_000), 4_000);
-        assert!(clock.settled(settle));
+        assert!(clock.settled(settle, 3_710_000));
+        assert!(
+            !clock.settled(settle, 3_710_000 + PUSH_FETCH_MAX_STEP_MS + 1),
+            "a last look more than a step old says nothing about now"
+        );
+        assert_eq!(
+            clock.advance(true, 3_710_000 + 3_600_000),
+            PUSH_FETCH_MAX_STEP_MS
+        );
+        assert!(
+            !clock.settled(settle, 3_710_000 + 3_600_000),
+            "a look after a suspend starts the watch again"
+        );
     }
 }

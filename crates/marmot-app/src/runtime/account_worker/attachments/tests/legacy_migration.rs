@@ -312,3 +312,19 @@ async fn the_worker_compacts_only_when_the_maintenance_task_flags_it() {
     assert!(admission.compaction_attempted);
     test_free_space::clear(dir.path());
 }
+
+/// The housekeeping job's schedule and the watchdog read one answer: owed on
+/// a fresh worker, and nothing at all with cursors frozen, where the batch
+/// never runs, so a frozen worker's watchdog counts no miss on every tick
+/// (mdk#2923 step B).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn housekeeping_owes_nothing_where_its_batch_cannot_run() {
+    let (_dir, mut client, _storage, _reference) = offline_fixture().await;
+    let admission = Admission::default();
+    assert!(housekeeping_owed_now(&client, &admission));
+    assert!(next_housekeeping_at(&client, &admission).is_some());
+
+    client.app.config.cursor_persistence = crate::CursorPersistence::Frozen;
+    assert!(!housekeeping_owed_now(&client, &admission));
+    assert_eq!(next_housekeeping_at(&client, &admission), None);
+}

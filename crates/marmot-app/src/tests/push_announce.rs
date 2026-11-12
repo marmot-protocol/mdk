@@ -539,6 +539,61 @@ async fn an_idle_token_change_goes_out_plain_and_its_announce_follows() {
     );
 }
 
+/// A device whose fetch clock settled, then sat idle while the worker
+/// stopped looking: `cut` its fetching or not, and move the clock an hour
+/// on. Its clock was settled at the last look.
+async fn settle_then_idle_for_an_hour(fx: &mut Fixture, cut: bool) {
+    let group = fx.group.clone();
+    finish_post_join_fetch(&fx.bob, &group);
+    let start = crate::notifications::unix_now_ms();
+    fx.bob.client.test_push_now_ms = Some(start);
+    fx.bob.can_fetch().await;
+    end_join_windows(&mut fx.bob);
+    assert!(!retry(&mut fx.bob).await);
+    fx.bob.client.push_announce_timing.catch_up_settle =
+        PushAnnounceTiming::default().catch_up_settle;
+    fx.bob.client.test_push_now_ms = Some(start + 15_000);
+    fx.bob.client.advance_push_join_windows().await;
+    assert!(
+        !fx.bob.client.push_timing_owed(),
+        "the worker stops looking"
+    );
+    if cut {
+        fx.bob.client.test_push_device_can_fetch = Some(false);
+    }
+    fx.bob.client.test_push_now_ms = Some(start + 15_000 + 3_600_000);
+}
+
+/// A token change an hour after the clock last settled goes out plain, not
+/// as an announce: the last look says nothing about now, and here the
+/// device has since lost its relays (mdk#2923).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_token_change_after_idle_and_lost_relays_goes_out_plain() {
+    let mut fx = Fixture::new().await;
+    settle_then_idle_for_an_hour(&mut fx, true).await;
+    fx.bob.register("bob-token-2", &fx.server);
+    let from = gossip_sent(&fx.bob);
+    assert_eq!(fx.bob.share().await.succeeded_groups, 1);
+    let shared = sent_updates(&fx.bob, from);
+    assert_eq!(shared.len(), 1);
+    assert_eq!(have(&shared[0]), None, "a plain self-update");
+}
+
+/// The same after a suspend that left fetching on: the hour the process did
+/// not run counts nothing, so the change goes out plain and the catch-up is
+/// watched again before an announce (mdk#2923).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_token_change_after_a_suspend_goes_out_plain() {
+    let mut fx = Fixture::new().await;
+    settle_then_idle_for_an_hour(&mut fx, false).await;
+    fx.bob.register("bob-token-2", &fx.server);
+    let from = gossip_sent(&fx.bob);
+    assert_eq!(fx.bob.share().await.succeeded_groups, 1);
+    let shared = sent_updates(&fx.bob, from);
+    assert_eq!(shared.len(), 1);
+    assert_eq!(have(&shared[0]), None, "a plain self-update");
+}
+
 /// The periodic announce goes out with the first group message sent once the
 /// interval has passed, even one left in the group's outbox, and never on its
 /// own.

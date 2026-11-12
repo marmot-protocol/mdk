@@ -121,6 +121,8 @@ use push::notification_trigger_for_intent;
 #[cfg(all(test, feature = "test-policy-overrides"))]
 pub(crate) use push::{AcceptedPushAnnounce, PushAnnounceTiming};
 #[cfg(test)]
+pub(crate) use push::{TEST_PUSH_OVERRIDES, TestPushOverride};
+#[cfg(test)]
 pub(crate) use sync::epoch_stall_now_ms;
 pub(crate) use sync::{
     CommittedSyncProgress, ConvergenceScheduleState, EpochBackfillRunOutcome, RetainedSendWake,
