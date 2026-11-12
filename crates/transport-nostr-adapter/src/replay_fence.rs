@@ -666,7 +666,8 @@ impl AccountReplayCoverage {
     }
 
     /// Whether this coverage has the copy `id`: buffered, with native
-    /// ingress, or handed off. Its own accounting then covers it.
+    /// ingress (retained input not yet admitted included), or handed off.
+    /// Its own accounting then covers it.
     fn holds_copy(&self, id: &[u8; 32]) -> bool {
         self.groups
             .values()
@@ -674,6 +675,10 @@ impl AccountReplayCoverage {
             || self.unplaced.contains_key(id)
             || self.released.contains(id)
             || self.native_ids.contains_key(id)
+            || self
+                .ingress
+                .as_ref()
+                .is_some_and(|ingress| ingress.retains(id))
     }
 
     /// The owed copy `id` was just staged here: once this coverage has it,
