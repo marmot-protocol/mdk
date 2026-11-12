@@ -381,12 +381,14 @@ def collect(args: argparse.Namespace, since: dt.datetime, github: GitHub | None)
         collection.listed = len(runs)
         artifact_name = re.compile(
             r"ci-runner-(?:" + "|".join(re.escape(job) for job in args.jobs) + r")-\d+-\d+")
-        pending = []
+        pending, rerunning = [], 0
         for run in runs:
             if run.get("status") != "completed":
                 # A rerun in progress leaves out its older cached attempt too.
                 collection.in_progress += 1
-                missing.add(run["id"])
+                if cache.load(run["id"]) is not None:
+                    rerunning += 1
+                    missing.add(run["id"])
                 continue
             cached = cache.load(run["id"])
             if cached is None or cached.get("run_attempt", 1) < run.get("run_attempt", 1):
@@ -419,6 +421,9 @@ def collect(args: argparse.Namespace, since: dt.datetime, github: GitHub | None)
         if failed:
             collection.notes.append(f"{failed} runs could not be fetched and are left out; "
                                     "a rerun tries them again.")
+        if rerunning:
+            collection.notes.append(f"{rerunning} runs are being rerun, so their earlier attempts are left out "
+                                    "until the rerun finishes.")
     collection.summaries = [summary for summary in cache.all()
                             if parse_time(summary["created_at"]) >= since and summary["run_id"] not in missing]
     return collection
