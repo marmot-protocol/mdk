@@ -916,10 +916,16 @@ async fn a_burst_of_quiet_joins_costs_recovery_linear_in_the_joins() {
         .recovery_account_usage(crate::unix_now_seconds())
         .unwrap()
         .attempts;
-    // About one per join (12 when measured), with slack. A sliver per
-    // restarted route cost about GROUPS * GROUPS / 2 (68 and 76 measured).
+    // Each join costs its group's post-join collection and one inbox
+    // comparison: the join restarts the inbox REQ, and the seconds the old
+    // one vouched for stay owed until the new one's EOSE is placed, which
+    // the runner does not wait for. The account's open and its KeyPackage
+    // publication restart the inbox REQ too, so each costs one more when it
+    // falls in a second the first join's restart does not (24 measured
+    // unloaded, 25 under load). A sliver per restarted route cost about
+    // GROUPS * GROUPS / 2 (57, 68 and 76 measured).
     assert!(
-        attempts <= 2 * GROUPS,
+        attempts <= 2 * GROUPS + 2,
         "{attempts} attempts for {GROUPS} quiet joins"
     );
     timeout(SETTLE, runtime.shutdown_and_close())
