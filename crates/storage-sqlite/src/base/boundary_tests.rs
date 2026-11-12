@@ -98,9 +98,14 @@ fn storage_boundary_matches_the_allow_list() {
 ///
 /// A lint, not the boundary. It catches the spellings our source would
 /// plausibly use, with a clearer message than a failing test. The runtime
-/// check is the enforcement: an unnoted truncate or `VACUUM` panics the next
-/// count read on another counted connection under test. Spellings our
-/// source doesn't use, and SQL assembled at run time, are out of its scope.
+/// check behind `write_count` is the enforcement. Under test, an unnoted
+/// truncate or `VACUUM` panics a later `write_count` on another counted
+/// connection whose check concludes with no counted commit and no hookless
+/// note since that connection's last concluded check. It goes unreported
+/// when no such read follows, or when a counted commit or a noted rollback,
+/// truncate, `VACUUM` or close lands in the same window: one `data_version`
+/// move can't be split between them. Spellings our source doesn't use, and
+/// SQL assembled at run time, are out of its scope.
 #[test]
 fn only_the_connection_truncates_or_vacuums() {
     let mut found: BTreeMap<String, Vec<String>> = BTreeMap::new();
