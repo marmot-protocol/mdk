@@ -197,7 +197,9 @@ async fn a_failed_account_read_recovers_without_a_write() {
 /// database's total write count holds, which every write to the file moves
 /// through any connection: here bundles change through the app's own
 /// connection, not the engine. The version carries the list's lifetime bound,
-/// and a read that skipped a bundle that does not decode is never reused.
+/// and a read that skipped a bundle that does not decode is never reused. The
+/// oracle checks a settled reuse by the list's inputs, without reading the
+/// list afresh.
 #[tokio::test]
 async fn the_owned_key_package_list_is_reused_only_until_the_file_is_written() {
     let dir = tempfile::tempdir().unwrap();
@@ -224,6 +226,7 @@ async fn the_owned_key_package_list_is_reused_only_until_the_file_is_written() {
 
     client.publish_read_state();
     assert!(client.read_state_reused_key_packages());
+    assert!(!client.read_state_read_key_packages_afresh());
 
     let storage = app.account_storage("alice").unwrap().app_storage();
     storage

@@ -627,20 +627,31 @@ async fn accept_group_invite_retrying_busy(
     // announced here, and one joined before it lets the attempt find the
     // group.
     let mut events = runtime.subscribe();
+    let mut waited_for_join = false;
     timeout(Duration::from_secs(5), async {
         loop {
             match runtime.accept_group_invite(account_ref, group_id).await {
                 // The Welcome has not been joined yet. Each refused attempt
                 // costs the worker a turn, so wait for the join instead of
                 // polling.
-                Err(AppError::UnknownGroup(_)) => {
-                    wait_for_group_joined(&mut events, account_ref, group_id).await
+                Err(AppError::UnknownGroup(_)) if !waited_for_join => {
+                    wait_for_group_joined(&mut events, account_ref, group_id).await;
+                    waited_for_join = true;
                 }
-                // A startup or catch-up sync holds the live client and
+                // Still unknown after the join was announced, or after the
+                // receiver lagged or closed: a projection save that failed
+                // after the Welcome's ingest announces the join, and the
+                // worker's retry saves the group later without announcing
+                // it again. That retry is a worker command, so polling does
+                // not hold it off.
+                //
+                // Or a startup or catch-up sync holds the live client and
                 // refused before starting the mutation. The runtime emits
-                // nothing when that sync lets go, so retry; these refusals
-                // answer without a worker turn.
-                Err(AppError::AccountWorkerBusy) => sleep(Duration::from_millis(10)).await,
+                // nothing when that sync lets go; these refusals answer
+                // without a worker turn.
+                Err(AppError::UnknownGroup(_) | AppError::AccountWorkerBusy) => {
+                    sleep(Duration::from_millis(10)).await
+                }
                 result => return result,
             }
         }
@@ -650,7 +661,7 @@ async fn accept_group_invite_retrying_busy(
 }
 
 /// Wait until `account_ref` joins `group_id`, or until a lagged or closed
-/// receiver can no longer tell: the caller then tries again.
+/// receiver can no longer tell: the caller then polls.
 async fn wait_for_group_joined(
     events: &mut tokio::sync::broadcast::Receiver<MarmotAppEvent>,
     account_ref: &str,

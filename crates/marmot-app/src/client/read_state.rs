@@ -512,6 +512,10 @@ pub(crate) struct ReadStatePublisher {
     /// oracle's check of the list while it is reused.
     #[cfg(any(test, feature = "test-support"))]
     key_package_inputs: Option<oracle::KeyPackageInputs>,
+    /// Whether the oracle read the owned KeyPackage list afresh after the
+    /// last publish.
+    #[cfg(any(test, feature = "test-support"))]
+    key_packages_read_afresh: bool,
 }
 
 impl ReadStatePublisher {
@@ -543,6 +547,8 @@ impl ReadStatePublisher {
             key_packages_reused: false,
             #[cfg(any(test, feature = "test-support"))]
             key_package_inputs: None,
+            #[cfg(any(test, feature = "test-support"))]
+            key_packages_read_afresh: false,
         }
     }
 
@@ -868,20 +874,26 @@ impl AppClient {
         // read, unless its raw inputs are the ones read before its build and
         // the clock has reached none of their lifetime bounds.
         #[cfg(any(test, feature = "test-support"))]
-        if _changed {
-            oracle::check(
-                self,
-                &publisher.current(),
-                publisher.uploads_in_flight().as_ref(),
-                publisher.storage_open_at_publish,
-            );
-        } else if publisher.key_packages_reused {
-            oracle::check_reused_key_packages(
-                self,
-                &publisher.current(),
-                publisher.storage_open_at_publish,
-                publisher.key_package_inputs.as_ref(),
-            );
+        {
+            let read_afresh = if _changed {
+                oracle::check(
+                    self,
+                    &publisher.current(),
+                    publisher.uploads_in_flight().as_ref(),
+                    publisher.storage_open_at_publish,
+                );
+                true
+            } else if publisher.key_packages_reused {
+                oracle::check_reused_key_packages(
+                    self,
+                    &publisher.current(),
+                    publisher.storage_open_at_publish,
+                    publisher.key_package_inputs.as_ref(),
+                )
+            } else {
+                false
+            };
+            publisher.key_packages_read_afresh = read_afresh;
         }
     }
 
@@ -903,6 +915,17 @@ impl AppClient {
             self.read_state = Some(slot);
             self.publish_read_state();
         }
+    }
+
+    /// Whether the oracle read the owned KeyPackage list afresh after this
+    /// client's last publish.
+    #[cfg(test)]
+    pub(crate) fn read_state_read_key_packages_afresh(&self) -> bool {
+        self.read_state.as_ref().is_some_and(|slot| {
+            slot.lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .key_packages_read_afresh
+        })
     }
 
     /// Whether this client's last publish reused the owned KeyPackage list.
@@ -1018,23 +1041,24 @@ pub(crate) mod oracle {
     /// now, are `built_from`, the ones read before its build, and the clock
     /// has reached none of their lifetime bounds since: a fresh read would
     /// then decide every bundle as the build did. A failed read, or no
-    /// inputs, checks in full.
+    /// inputs, checks in full. Returns whether it read the list afresh.
     pub(crate) fn check_reused_key_packages(
         client: &AppClient,
         state: &ReadState,
         storage_open_at_publish: bool,
         built_from: Option<&KeyPackageInputs>,
-    ) {
+    ) -> bool {
         if let Some(built_from) = built_from
             && KeyPackageInputs::read(client).is_ok_and(|now| built_from.holds_at(&now))
         {
-            return;
+            return false;
         }
         let window = Window {
             storage_open_at_publish,
             storage_closed: &client.app.storage_closed,
         };
         key_packages(client, state, window);
+        true
     }
 
     /// What the owned KeyPackage list is a function of, read raw: the stored
