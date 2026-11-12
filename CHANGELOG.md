@@ -18,8 +18,18 @@
   bound, and the read skipped no undecodable bundle and saw no disagreement
   (mdk#3273).
 
+### Security
+
+- Keep Hermes inbound attachment staging private from creation: use a `0700`
+  directory and exclusively created `0600` files instead of copying source
+  permissions and tightening them afterward. Tighten existing staging
+  directories before copying new attachments (#2477).
+
 ### Fixed
 
+- Write Hermes `config.yaml`, its backup, and temporary files with mode `0600`
+  during gateway configuration, regardless of the process umask. Existing
+  group and other access is removed (#2481).
 - Preserve explicit reply targets on standalone app and Hermes media sends,
   including durable uploads and ordered batches with or without captions.
   Validate and normalize reply ids before upload or admission, keep composer

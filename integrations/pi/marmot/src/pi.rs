@@ -1190,6 +1190,21 @@ printf '{{"type":"message_end","message":{{"role":"assistant","content":[{{"type
             .success()
     }
 
+    /// Whether fake Pi's process group is gone within a few seconds. The
+    /// runner reaps only the group leader after its SIGKILL; the leader's
+    /// `sleep` child dies and is reaped by the host on its own schedule.
+    #[cfg(unix)]
+    async fn process_group_exits(pid: &str) -> bool {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while process_group_alive(pid) {
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        true
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn timeout_kills_pi_after_it_consumed_the_batch_and_leaves_cleanup_to_the_lease() {
@@ -1218,7 +1233,10 @@ printf '{{"type":"message_end","message":{{"role":"assistant","content":[{{"type
         assert!(matches!(failure.error, HarnessError::BackendTimedOut));
         assert_eq!(failure.observed_session.as_deref(), Some("pi-hang"));
         let pid = fs::read_to_string(&pid_file).unwrap();
-        assert!(!process_group_alive(pid.trim()));
+        assert!(
+            process_group_exits(pid.trim()).await,
+            "fake Pi survived the timeout"
+        );
         assert!(
             attachments
                 .iter()
@@ -1269,14 +1287,10 @@ printf '{{"type":"message_end","message":{{"role":"assistant","content":[{{"type
 
         run.abort();
         assert!(run.await.unwrap_err().is_cancelled());
-        let stopped = std::time::Instant::now();
-        while process_group_alive(pid.trim()) {
-            assert!(
-                stopped.elapsed() < Duration::from_secs(5),
-                "fake Pi survived cancellation"
-            );
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        assert!(
+            process_group_exits(pid.trim()).await,
+            "fake Pi survived cancellation"
+        );
         assert!(attachments[0].path.exists());
         let batch_path = batch.path().to_path_buf();
         drop(batch);

@@ -147,13 +147,26 @@ async fn held_native_restores_cursor() {
     fixture.receiver = client_on_app_relay_plane(&app, "receiver").await;
     fixture.receiver.prepare_transport().await.unwrap();
     lease_native(&mut fixture.receiver, &fixture.group, vec![event.clone()]).await;
-    fixture.receiver.admit_native_turn().await.unwrap();
-    assert!(
-        app.load_state("receiver")
-            .unwrap()
-            .last_transport_timestamp
-            .is_some_and(|cursor| cursor >= event.event.created_at)
-    );
+    // A turn defers the save it owes while the reopened plane's replay
+    // admission settles, or while another plane task holds the state the
+    // cursor seal reads without waiting. The intent survives the deferral, so
+    // later turns save it without another delivery.
+    timeout(Duration::from_secs(10), async {
+        loop {
+            fixture.receiver.admit_native_turn().await.unwrap();
+            if app
+                .load_state("receiver")
+                .unwrap()
+                .last_transport_timestamp
+                .is_some_and(|cursor| cursor >= event.event.created_at)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the redelivered duplicate restores the cursor save");
     assert_eq!(visible_messages(&fixture.receiver, &fixture.group).len(), 1);
     assert!(
         fixture
