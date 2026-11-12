@@ -2631,8 +2631,13 @@ impl<S: StorageProvider> Engine<S> {
                 // The selected branch advanced without consuming our
                 // SelfRemove. The proposal is epoch-bound, but the durable
                 // leave request is not; keep the send gate so the async
-                // convergence wrapper can publish a fresh proposal.
+                // convergence wrapper can publish a fresh proposal. A pass
+                // can also apply from ingest, where no wrapper runs, so
+                // schedule the group: the branch may have undone the
+                // step-down or blocked the leave, and only the re-drive in
+                // the next advance stages or records either.
                 self.leaving_groups.insert(group_id.clone());
+                self.schedule_pending_convergence_group(group_id);
             } else if self.leaving_groups.contains(group_id) {
                 // Compatibility cleanup for a pre-durable in-memory gate.
                 self.leaving_groups.remove(group_id);
