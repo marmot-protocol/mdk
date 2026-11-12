@@ -6,7 +6,9 @@ use super::canonical_membership::deliver_new;
 #[cfg(feature = "test-policy-overrides")]
 use super::push_token_reshare::Device;
 use super::*;
-use crate::client::read_state::oracle::{KeyPackageInputs, LifetimeBound};
+use crate::client::read_state::oracle::{
+    KeyPackageInputs, LifetimeBound, check_reused_key_packages,
+};
 use crate::client::read_state::{GroupAnswers, ReadState, UploadsInFlight};
 use tokio::sync::watch;
 
@@ -298,7 +300,8 @@ async fn a_bundle_not_valid_yet_bounds_the_list_it_stays_out_of() {
 /// at or after that reading and short of the first lifetime bound after it:
 /// the soonest `not_after` of a stored bundle, or `not_before` of one not
 /// valid yet, decoded without OpenMLS. A stored row whose lifetime it cannot
-/// find never lets it skip.
+/// find never lets it skip, and a check with no recorded inputs, or with
+/// inputs that no longer hold, reads the list afresh.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_oracle_rereads_a_reused_key_package_list_once_an_input_or_the_clock_moves() {
     let dir = tempfile::tempdir().unwrap();
@@ -319,6 +322,15 @@ async fn the_oracle_rereads_a_reused_key_package_list_once_an_input_or_the_clock
         built_from.first_bound(),
         LifetimeBound::At(Timestamp(not_after))
     );
+    client.start_read_state(UploadsInFlight::default());
+    let state = client.subscribe_read_state().unwrap().borrow().clone();
+    assert!(!check_reused_key_packages(
+        &client,
+        &state,
+        true,
+        Some(&built_from)
+    ));
+    assert!(check_reused_key_packages(&client, &state, true, None));
     let mut now = KeyPackageInputs::read(&client).unwrap();
     assert!(built_from.holds_at(&now));
     now.taken_at = Timestamp(not_after);
@@ -330,6 +342,12 @@ async fn the_oracle_rereads_a_reused_key_package_list_once_an_input_or_the_clock
     store_own_bundle_valid_from(&app, &published[0], not_before);
     let with_new_bundle = KeyPackageInputs::read(&client).unwrap();
     assert!(!built_from.holds_at(&with_new_bundle));
+    assert!(check_reused_key_packages(
+        &client,
+        &state,
+        true,
+        Some(&built_from)
+    ));
     assert_eq!(
         with_new_bundle.first_bound(),
         LifetimeBound::At(Timestamp(not_before))
