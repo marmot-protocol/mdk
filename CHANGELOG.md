@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Security
+
+- Keep Hermes inbound attachment staging private from creation: use a `0700`
+  directory and exclusively created `0600` files instead of copying source
+  permissions and tightening them afterward. Tighten existing staging
+  directories before copying new attachments (#2477).
+
 ### Fixed
 
 - Write Hermes `config.yaml`, its backup, and temporary files with mode `0600`

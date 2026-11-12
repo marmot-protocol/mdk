@@ -3925,11 +3925,23 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         return media_urls, media_types
 
     def _stage_inbound_media_file(self, source_path: Path, *, file_name: str) -> Path:
-        self._inbound_media_dir.mkdir(parents=True, exist_ok=True)
+        self._inbound_media_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         safe_name = Path(str(file_name or "attachment")).name or "attachment"
         dest = self._inbound_media_dir / f"{uuid.uuid4().hex}-{safe_name}"
-        shutil.copy2(source_path, dest)
-        dest.chmod(0o600)
+        directory_fd = os.open(self._inbound_media_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            # Tighten existing directories before creating attachment names.
+            os.fchmod(directory_fd, 0o700)
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+            destination_fd = os.open(dest.name, flags, 0o600, dir_fd=directory_fd)
+            try:
+                with os.fdopen(destination_fd, "wb") as destination, source_path.open("rb") as source:
+                    shutil.copyfileobj(source, destination)
+            except BaseException:
+                os.unlink(dest.name, dir_fd=directory_fd)
+                raise
+        finally:
+            os.close(directory_fd)
         return dest
 
     def _debounce_key(self, event: Dict[str, Any]) -> str:
