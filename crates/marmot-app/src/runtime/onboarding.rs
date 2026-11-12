@@ -106,8 +106,8 @@ impl SetupState {
         account_id: &str,
     ) -> GeneratedTeardownFence {
         let background = self.fence_generated_setup(account_id).await;
-        let transaction = AccountSetup::new(self, manager).onboarding_transaction(account_id);
-        let foreground = transaction.lock_owned().await;
+        let transaction = manager.app.onboarding_transaction(account_id);
+        let foreground = manager.lock_nip46_removal(transaction, account_id).await;
         GeneratedTeardownFence {
             _background: background,
             _foreground: foreground,

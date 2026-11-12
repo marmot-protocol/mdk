@@ -8471,6 +8471,7 @@ async fn label_reuse_keeps_replacement() {
         let original = home.create_account("reused-label").unwrap();
         let transaction = runtime
             .account_setup()
+            .app()
             .onboarding_transaction(&original.account_id_hex);
         let gate = transaction.lock().await;
         let manager = runtime.accounts();

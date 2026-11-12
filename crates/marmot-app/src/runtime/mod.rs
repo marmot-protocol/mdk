@@ -7189,9 +7189,9 @@ impl AccountManager {
     async fn lock_nip46_removal(
         &self,
         gate: Arc<Mutex<()>>,
-        account: &AccountSummary,
+        account_id: &str,
     ) -> tokio::sync::OwnedMutexGuard<()> {
-        let user = PublicKey::from_hex(&account.account_id_hex).ok();
+        let user = PublicKey::from_hex(account_id).ok();
         let acquisition = gate.lock_owned();
         tokio::pin!(acquisition);
         let ready = {
@@ -7200,7 +7200,7 @@ impl AccountManager {
                 .nip46_adoptions
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            // Queue before releasing admission: later adoptions must wait behind removal.
+            // Queue before releasing admission: later adoptions must wait behind teardown.
             let ready = futures::FutureExt::now_or_never(acquisition.as_mut());
             for adoption in &adoptions.active {
                 if Some(adoption.user) == user {

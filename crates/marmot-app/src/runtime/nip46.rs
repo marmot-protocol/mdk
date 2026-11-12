@@ -214,7 +214,10 @@ impl MarmotAppRuntime {
             .accounts
             .app
             .onboarding_transaction(&account.account_id_hex);
-        let _transaction = self.accounts.lock_nip46_removal(gate, &account).await;
+        let _transaction = self
+            .accounts
+            .lock_nip46_removal(gate, &account.account_id_hex)
+            .await;
         self.shared.lifecycle().ensure_running()?;
         let account = self.accounts.resolve(&account.account_id_hex)?;
         let account_id = account.account_id_hex.clone();

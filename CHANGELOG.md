@@ -51,6 +51,8 @@
   Explicit pairing can repair metadata-only interrupted credential writes.
   Local removal reports account disappearance after cancellation instead of a vault failure.
   Account deletion serializes session resume through credential erasure and removal.
+  Sign-out and wipe wait for foreground setup and keep signer resume behind
+  their existing account fence through credential removal.
   Unsupported relay negotiation accepts `method not found` without hiding other errors.
 
 ## 0.16.0 - 2026-11-11
