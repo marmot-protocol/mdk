@@ -133,6 +133,17 @@ const CREATE_GROUP_LOOKUP_CONCURRENCY: usize = 8;
 /// from suppressing rotation.
 const EPOCH_GAP_SELF_UPDATE_HOLD_MS: u64 = 24 * 60 * 60 * 1_000;
 
+/// The future `start` builds, boxed in this plain function. `Box::pin` called
+/// in an async body still builds the future in that body's poll frame, and
+/// every poll of the body then carries it. Maintenance, and the device-group
+/// test fixtures that drive it, await each step through this so their poll
+/// frames hold only boxes: unboxed, maintenance's phases alone took over half
+/// a MiB of a debug test thread's stack at once (mdk#2412).
+#[inline(never)]
+pub(crate) fn boxed<F: Future>(start: impl FnOnce() -> F) -> std::pin::Pin<Box<F>> {
+    Box::pin(start())
+}
+
 fn self_update_waits_for_epoch_gap(open_since_ms: u64, now_ms: u64) -> bool {
     now_ms.saturating_sub(open_since_ms) < EPOCH_GAP_SELF_UPDATE_HOLD_MS
 }
@@ -1589,13 +1600,13 @@ impl AppClient {
         );
         let app_passes =
             self.maintenance_step(crate::RuntimePerformanceOperation::WorkerMaintenanceAppPasses);
-        self.drive_sign_ins().await;
-        self.drive_small_state().await;
+        boxed(|| self.drive_sign_ins()).await;
+        boxed(|| self.drive_small_state()).await;
         self.drive_invitation_decisions().await;
-        self.drive_backup_takeover().await;
-        self.drive_device_removals().await;
-        self.device_rename_upkeep().await;
-        self.drive_history_deliveries().await;
+        boxed(|| self.drive_backup_takeover()).await;
+        boxed(|| self.drive_device_removals()).await;
+        boxed(|| self.device_rename_upkeep()).await;
+        boxed(|| self.drive_history_deliveries()).await;
         let prepared = self.epoch_gap_held_groups().and_then(|held| {
             self.sync_key_package_announcement_group()?;
             self.sync_device_tag_group()?;
@@ -1613,28 +1624,29 @@ impl AppClient {
                 return Err(error);
             }
         };
-        self.join_stashed_sibling_welcomes().await;
-        self.send_owed_sibling_welcomes(&held).await;
+        boxed(|| self.join_stashed_sibling_welcomes()).await;
+        boxed(|| self.send_owed_sibling_welcomes(&held)).await;
         let mut private_stock = private_key_packages::PrivateKeyPackageSelection::default();
-        let sibling_add_attempts = self
-            .add_linked_devices_to_chats(&held, &mut private_stock)
-            .await;
-        self.fill_sibling_chat_gaps(
-            &held,
-            linked_device_chats::LINK_CHAT_ADDS_PER_PASS.saturating_sub(sibling_add_attempts),
-            &mut private_stock,
-        )
+        let sibling_add_attempts =
+            boxed(|| self.add_linked_devices_to_chats(&held, &mut private_stock)).await;
+        boxed(|| {
+            self.fill_sibling_chat_gaps(
+                &held,
+                linked_device_chats::LINK_CHAT_ADDS_PER_PASS.saturating_sub(sibling_add_attempts),
+                &mut private_stock,
+            )
+        })
         .await;
-        self.sibling_key_package_upkeep(&held).await;
+        boxed(|| self.sibling_key_package_upkeep(&held)).await;
         // One second for both, so a heartbeat sent on the pass that restarts
         // the inactivity clock counts as sent since the restart.
         let device_pass_at = crate::unix_now_seconds();
-        self.device_heartbeat_upkeep(&held, device_pass_at).await;
-        self.device_inactivity_upkeep(&held, device_pass_at).await;
+        boxed(|| self.device_heartbeat_upkeep(&held, device_pass_at)).await;
+        boxed(|| self.device_inactivity_upkeep(&held, device_pass_at)).await;
         finish_maintenance_step(app_passes, marmot_observability::Outcome::Success);
         let session =
             self.maintenance_step(crate::RuntimePerformanceOperation::WorkerMaintenanceSession);
-        let effects = self.runtime.run_due_maintenance_holding(&held).await;
+        let effects = boxed(|| self.runtime.run_due_maintenance_holding(&held)).await;
         finish_maintenance_step(
             session,
             if effects.is_ok() {
@@ -1757,7 +1769,7 @@ impl AppClient {
             );
         }
         let effects = effects?;
-        self.finish_maintenance_effects(&effects).await
+        boxed(|| self.finish_maintenance_effects(&effects)).await
     }
 
     /// Preserve committed maintenance effects before best-effort invite recovery.
