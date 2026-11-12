@@ -261,15 +261,26 @@ class AgentControlClientTests(unittest.IsolatedAsyncioTestCase):
         self.tempdir = _unix_tempdir("wn-agent.sock", prefix="ac")
         self.socket_path = str(Path(self.tempdir.name) / "wn-agent.sock")
         self.server = None
+        self.handler_tasks = set()
 
     async def asyncTearDown(self):
         if self.server is not None:
             self.server.close()
+            # Since Python 3.12, wait_closed() also waits for every accepted
+            # connection. A handler still parked on an event its test never
+            # set (because the test failed first) would hold its connection
+            # open forever, so cancel it; cancelling closes the transport.
+            for task in self.handler_tasks:
+                task.cancel()
             await self.server.wait_closed()
         self.tempdir.cleanup()
 
     async def start_server(self, handler):
-        self.server = await asyncio.start_unix_server(handler, path=self.socket_path)
+        async def tracked_handler(reader, writer):
+            self.handler_tasks.add(asyncio.current_task())
+            await handler(reader, writer)
+
+        self.server = await asyncio.start_unix_server(tracked_handler, path=self.socket_path)
 
     async def test_bounded_read_propagates_cancel_that_arrives_with_its_frame(self):
         # A subscription read that swallowed teardown's cancel would keep the
@@ -1094,8 +1105,11 @@ class AgentControlClientTests(unittest.IsolatedAsyncioTestCase):
             ack_seen.set()
 
         events = client.inbound_events(account_id_hex="11" * 32, on_ack=on_ack)
+        # The server ends the stream only after on_ack runs, so the bound only
+        # catches an on_ack deferred to the first event; a stalled loop must not
+        # trip it.
         with self.assertRaises(StopAsyncIteration):
-            await asyncio.wait_for(anext(events), timeout=1.0)
+            await asyncio.wait_for(anext(events), timeout=HANG_TIMEOUT_S)
         self.assertEqual(acknowledged, [True])
 
     async def test_inbound_subscription_waits_without_request_timeout_after_ack(self):
