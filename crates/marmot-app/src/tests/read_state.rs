@@ -9,7 +9,7 @@ use super::*;
 use crate::client::read_state::oracle::{
     KeyPackageInputs, LifetimeBound, check_reused_key_packages,
 };
-use crate::client::read_state::{GroupAnswers, ReadState, UploadsInFlight};
+use crate::client::read_state::{GroupAnswers, ReadState, ReadStatePublisher, UploadsInFlight};
 use tokio::sync::watch;
 
 fn entry(state: &watch::Receiver<Arc<ReadState>>, group: &GroupId) -> (u64, Arc<GroupAnswers>) {
@@ -300,8 +300,8 @@ async fn a_bundle_not_valid_yet_bounds_the_list_it_stays_out_of() {
 /// at or after that reading and short of the first lifetime bound after it:
 /// the soonest `not_after` of a stored bundle, or `not_before` of one not
 /// valid yet, decoded without OpenMLS. A stored row whose lifetime it cannot
-/// find never lets it skip, and a check with no recorded inputs, or with
-/// inputs that no longer hold, reads the list afresh.
+/// find never lets it skip, and a check with no recorded inputs, with inputs
+/// that no longer hold, or whose input read fails, reads the list afresh.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_oracle_rereads_a_reused_key_package_list_once_an_input_or_the_clock_moves() {
     let dir = tempfile::tempdir().unwrap();
@@ -313,6 +313,19 @@ async fn the_oracle_rereads_a_reused_key_package_list_once_an_input_or_the_clock
     let mut client = app.client("alice").await.unwrap();
     client.publish_key_package().await.unwrap();
     let published = client.durably_owned_key_packages().unwrap();
+    // A read state before any build lists no KeyPackage, so a fresh read
+    // differs from it: a check of it panics exactly when it reads the list
+    // afresh.
+    let stale = ReadStatePublisher::new(UploadsInFlight::default()).current();
+    assert!(
+        stale
+            .account
+            .durably_owned_key_packages
+            .as_ref()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(!published.is_empty());
     let not_after = cgka_engine::key_package::key_package_metadata(&published[0])
         .unwrap()
         .not_after;
@@ -322,15 +335,11 @@ async fn the_oracle_rereads_a_reused_key_package_list_once_an_input_or_the_clock
         built_from.first_bound(),
         LifetimeBound::At(Timestamp(not_after))
     );
-    client.start_read_state(UploadsInFlight::default());
-    let state = client.subscribe_read_state().unwrap().borrow().clone();
-    assert!(!check_reused_key_packages(
-        &client,
-        &state,
-        true,
-        Some(&built_from)
-    ));
-    assert!(check_reused_key_packages(&client, &state, true, None));
+    assert_eq!(
+        check_reused_list(&client, &stale, true, Some(&built_from)),
+        Some(false)
+    );
+    assert_eq!(check_reused_list(&client, &stale, true, None), None);
     let mut now = KeyPackageInputs::read(&client).unwrap();
     assert!(built_from.holds_at(&now));
     now.taken_at = Timestamp(not_after);
@@ -342,12 +351,10 @@ async fn the_oracle_rereads_a_reused_key_package_list_once_an_input_or_the_clock
     store_own_bundle_valid_from(&app, &published[0], not_before);
     let with_new_bundle = KeyPackageInputs::read(&client).unwrap();
     assert!(!built_from.holds_at(&with_new_bundle));
-    assert!(check_reused_key_packages(
-        &client,
-        &state,
-        true,
-        Some(&built_from)
-    ));
+    assert_eq!(
+        check_reused_list(&client, &stale, true, Some(&built_from)),
+        None
+    );
     assert_eq!(
         with_new_bundle.first_bound(),
         LifetimeBound::At(Timestamp(not_before))
@@ -364,6 +371,46 @@ async fn the_oracle_rereads_a_reused_key_package_list_once_an_input_or_the_clock
     let undecodable = KeyPackageInputs::read(&client).unwrap();
     assert_eq!(undecodable.first_bound(), LifetimeBound::Unknown);
     assert!(!undecodable.holds_at(&KeyPackageInputs::read(&client).unwrap()));
+
+    // With storage closed the input read fails, and the fresh read's
+    // `Closed` against a published list is a mismatch when storage was
+    // already closed at the publish.
+    app.close_storage().unwrap();
+    assert!(KeyPackageInputs::read(&client).is_err());
+    assert_eq!(
+        check_reused_list(&client, &stale, false, Some(&undecodable)),
+        None
+    );
+}
+
+/// The oracle's check of a reused owned KeyPackage list against `state`:
+/// whether it read the list afresh, or `None` when that fresh read differed
+/// from `state` and the oracle panicked.
+fn check_reused_list(
+    client: &AppClient,
+    state: &ReadState,
+    storage_open_at_publish: bool,
+    built_from: Option<&KeyPackageInputs>,
+) -> Option<bool> {
+    let checked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        check_reused_key_packages(client, state, storage_open_at_publish, built_from)
+    }));
+    match checked {
+        Ok(read_afresh) => Some(read_afresh),
+        Err(panic) => {
+            let message = panic
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .unwrap_or_default();
+            assert!(
+                message.starts_with(
+                    "read state differs from the live read for durably owned key packages"
+                ),
+                "unexpected panic: {message}"
+            );
+            None
+        }
+    }
 }
 
 /// Stores a copy of alice's `template`, signed with her own key, that is

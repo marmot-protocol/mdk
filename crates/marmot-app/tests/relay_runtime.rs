@@ -635,7 +635,10 @@ async fn accept_group_invite_retrying_busy(
                 // keep it from receiving the Welcome. `GroupJoined` is no such
                 // signal: a projection save that fails after the Welcome's
                 // ingest announces the join before the row exists, and its
-                // retry saves the row without announcing it again.
+                // retry saves the row without announcing it again. A probe
+                // that finds the row starts a group-state watch, dropped
+                // here, which reads off the worker and ends at the row's
+                // next change or at shutdown.
                 row_missing = matches!(
                     runtime
                         .subscribe_group_state(account_ref, &group_id_hex)
