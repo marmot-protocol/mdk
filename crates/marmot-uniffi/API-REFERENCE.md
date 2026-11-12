@@ -42,6 +42,23 @@ Descriptions and API-selection recommendations still require source-aware human 
 they are not verified by the mechanical gate. Counts are reported by the tool rather than
 hard-coded in these pages.
 
+## Swift cancellation adapters
+
+The published `MarmotKit.swift` includes these Swift-only methods from
+[`CancellableSubscriptions.swift`](swift-support/CancellableSubscriptions.swift).
+Each has the same result and native errors as its object's `next()`, but forwards Swift task cancellation
+to the native future and throws `CancellationError`. Cancellation does not close the subscription.
+These are not new Rust exports or Kotlin methods. See
+[subscription ownership](README.md#screen-snapshots-paging-and-ownership) for concurrent receive and cancellation races.
+
+| Subscription | Swift signature |
+| --- | --- |
+| `PresentedChatListSubscription` | `func nextCancellable() async throws -> PresentedChatListUpdateFfi?` |
+| `ChatListWindowSubscription` | `func nextCancellable() async throws -> ChatListWindowSnapshotFfi?` |
+| `AccountAttentionSubscription` | `func nextCancellable() async throws -> AccountAttentionSnapshotFfi?` |
+| `ConversationWindowSubscription` | `func nextCancellable() async throws -> ConversationWindowSnapshotFfi?` |
+| `BlockListSubscription` | `func nextCancellable() async throws -> BlockListSnapshotFfi?` |
+
 ## Methods by source module
 
 Each expandable section lists every export in that module. Search this page for the exact

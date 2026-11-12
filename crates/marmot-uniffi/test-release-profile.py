@@ -657,6 +657,7 @@ class ReleaseProfileTests(unittest.TestCase):
         crate = workspace / "crates/marmot-uniffi"
         privacy = crate / "apple-privacy"
         shutil.copytree(HERE / "apple-privacy", privacy)
+        shutil.copytree(HERE / "swift-support", crate / "swift-support")
         (crate / "marmotkit-release-profile.env").write_text(
             "export CARGO_PROFILE_RELEASE_LTO=false\n"
             "export CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16\n"
