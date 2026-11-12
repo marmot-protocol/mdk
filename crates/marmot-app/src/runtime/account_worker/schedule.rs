@@ -162,6 +162,12 @@ impl Schedule {
             .min()
     }
 
+    /// Whether an event woke `job` and it has not run since.
+    #[cfg(test)]
+    pub(super) fn woken(&self, job: Job) -> bool {
+        self.get(job).woken
+    }
+
     /// Whether `job` has a wake or a deadline pending.
     pub(super) fn pending(&self, job: Job) -> bool {
         let state = self.get(job);

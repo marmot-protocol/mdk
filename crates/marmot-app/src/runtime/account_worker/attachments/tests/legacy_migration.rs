@@ -131,7 +131,7 @@ async fn a_rolled_back_compaction_is_tried_again_later() {
         !storage.app_storage().database_space().unwrap().incremental,
         "not before its spacing has passed"
     );
-    let past = std::time::Instant::now() - Duration::from_secs(1);
+    let past = tokio::time::Instant::now() - Duration::from_secs(1);
     admission.compaction_retry_at = Some(past);
     admission.latches.recheck_due = Some(past);
     maintenance_tick(&client, &shared, &mut admission).await;
@@ -182,7 +182,7 @@ async fn the_tick_that_finishes_the_migration_flags_the_compaction() {
         admission
             .latches
             .recheck_due
-            .is_some_and(|due| due > std::time::Instant::now()),
+            .is_some_and(|due| due > tokio::time::Instant::now()),
         "the hourly recheck is not due on the next tick"
     );
 
@@ -205,7 +205,7 @@ fn compaction_rollbacks_are_spaced_1_min_then_10_min() {
         admission
             .compaction_retry_at
             .unwrap()
-            .duration_since(std::time::Instant::now())
+            .duration_since(tokio::time::Instant::now())
     };
     admission.record_compaction(CompactionAttempt::RolledBack);
     assert!((Duration::from_secs(59)..=Duration::from_secs(60)).contains(&waits(&admission)));
