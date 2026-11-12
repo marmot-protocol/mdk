@@ -752,6 +752,7 @@ impl AccountReplayCoverage {
                     });
                 }
             }
+            self.discharge_replayed(&id);
         }
     }
 
@@ -1802,6 +1803,63 @@ mod tests {
                 .is_empty(),
             "retained spill was not lost"
         );
+    }
+
+    /// A history copy a replaced coverage owes its fresh REQ is no longer
+    /// owed once native ingress hands it back as retained input: the fresh
+    /// REQ ending without a copy of its own charges nothing.
+    #[tokio::test]
+    async fn a_retained_copy_settles_what_a_replacement_owes() {
+        let mut state = AdapterState::default();
+        let shared = Arc::new(ReplayIngressState::default());
+        let (mut coverage, id) = coverage(&state, shared.clone());
+        let (tx, _rx) = mpsc::channel(1);
+        coverage.record_stored_event(&id, RelayIndex(0), 30);
+        coverage
+            .stage_delivery(
+                delivery(30, &id),
+                Some(RelayIndex(0)),
+                ReplayInput::History,
+                &tx,
+            )
+            .unwrap();
+        let account = MemberId::new(vec![0xA1; 32]);
+        state
+            .replay_ingresses
+            .insert(account.clone(), shared.clone());
+        state
+            .account_replay_coverage
+            .insert(account.clone(), coverage);
+        assert_eq!(
+            state
+                .relay_index
+                .index_for(&TransportEndpoint("wss://native.example".into())),
+            RelayIndex(0)
+        );
+        let fresh = NostrSubscription::Group {
+            account_id: account.clone(),
+            group_id: GroupId::new(vec![0; 16]),
+            transport_group_id: vec![0; 32],
+            endpoints: vec![TransportEndpoint("wss://native.example".into())],
+            since: None,
+            attempt: SubscriptionAttempt::INITIAL.next(),
+        };
+        state.record_account_replay_start(&account, std::slice::from_ref(&fresh));
+        let pending = |state: &AdapterState| {
+            state
+                .replay_losses
+                .pending
+                .lock()
+                .unwrap()
+                .get(&account)
+                .copied()
+        };
+        assert_eq!(pending(&state), None, "owed, not lost");
+        shared.retain(delivery(30, &id));
+        let coverage = state.account_replay_coverage.get_mut(&account).unwrap();
+        coverage.admit_retained();
+        coverage.record_eose(&fresh.subscription_id(), RelayIndex(0));
+        assert_eq!(pending(&state), None);
     }
 
     /// An executor failure records the issued floor as loss for the remote

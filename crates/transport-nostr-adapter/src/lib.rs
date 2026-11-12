@@ -4233,7 +4233,6 @@ impl AccountReplayCoverage {
         if self.drop_claims(group_id, claims) || force {
             self.record_loss(since);
         }
-        self.settle_replayed();
         self.wake_replay();
     }
 
@@ -4355,6 +4354,7 @@ impl AccountReplayCoverage {
         if let Some(id) = id {
             self.discharge_replayed(&id);
         }
+        self.settle_replayed();
         staged
     }
 
@@ -5222,6 +5222,7 @@ impl AccountReplayCoverage {
         for (group_id, owner) in owners {
             self.abandon_stream(&group_id, &owner, ReplayAbandon::Interrupted);
         }
+        self.settle_replayed();
         if self.maintenance.contains(id) {
             self.wake_replay();
         } else {
@@ -5265,6 +5266,7 @@ impl AccountReplayCoverage {
                 endpoint.deadline = None;
             }
         }
+        self.settle_replayed();
     }
 }
 

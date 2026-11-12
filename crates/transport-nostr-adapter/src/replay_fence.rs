@@ -36,12 +36,13 @@
 //!   move to the new coverage, held from the same point until the owner's
 //!   next plan answers; a plan older than the last one applied still answers
 //!   nothing. Only a frame whose group the new REQs no longer route, or that
-//!   the buffer has no room for, is lost. A history copy a fresh REQ asks for
-//!   again, on the same route and relay from no later, is owed instead: the
-//!   new coverage keeps the seal shut until the copy comes again, and charges
-//!   the replaced coverage's floor as loss if every source it is owed on
-//!   stops replaying first (its EOSE, a cut reply, abandonment or
-//!   retirement, its waiting allowance) or the new coverage drops.
+//!   the buffer has no room for, is lost. A history copy a source claims that
+//!   a fresh REQ asks for again, on the same route and relay from no later,
+//!   is owed instead: the new coverage keeps the seal shut until the copy
+//!   comes again, and charges the replaced coverage's floor as loss if every
+//!   source it is owed on stops replaying first (its EOSE, a cut reply,
+//!   abandonment or retirement, its waiting allowance) or the new coverage
+//!   drops. A reconnect that asks for the same range again keeps the debt.
 //! - **One group.** A fence holds its own group's frames only. They count
 //!   neither in the account's pending admission nor against other groups'
 //!   placement, so other groups' live boundaries, tails and ingest go on. A
@@ -694,6 +695,17 @@ impl AccountReplayCoverage {
         if self.replayed.is_empty() {
             return;
         }
+        // A copy that reached this coverage another way (retained native
+        // input) is no longer owed.
+        let held = self
+            .replayed
+            .keys()
+            .filter(|id| self.holds_copy(id))
+            .copied()
+            .collect::<Vec<_>>();
+        for id in held {
+            self.replayed.remove(&id);
+        }
         let groups = &self.groups;
         let mut lost = None::<u64>;
         self.replayed.retain(|_, copy| {
@@ -1270,6 +1282,39 @@ mod tests {
                 "case {end}"
             );
         }
+    }
+
+    /// A connection boundary that restarts the fresh REQ after it counted a
+    /// stored event abandons that serial, but the restarted serial asks for
+    /// the same range again: the copy stays owed, with nothing charged, and
+    /// comes on the new connection.
+    #[tokio::test]
+    async fn an_owed_copy_stays_owed_across_a_reconnect() {
+        let (tx, _rx) = mpsc::channel(8);
+        let (mut state, fresh) = replaying_history_when_replaced(RelayIndex(1), SINCE, &tx);
+        let coverage = state.account_replay_coverage.get_mut(&account()).unwrap();
+        coverage.record_stored_event(&fresh, RelayIndex(1), 120);
+        coverage.restart_relay(
+            RelayIndex(1),
+            ReplayRestart::Connection,
+            ReplayOrigin::Changed,
+            None,
+            None,
+        );
+        assert_eq!(pending_loss(&state.replay_losses), None);
+        let coverage = state.account_replay_coverage.get_mut(&account()).unwrap();
+        assert!(coverage.admission_pending(), "still owed");
+        coverage.record_stored_event(&fresh, RelayIndex(1), 150);
+        coverage
+            .stage_delivery(
+                delivery(0, 150, 1, &fresh, 1),
+                Some(RelayIndex(1)),
+                ReplayInput::History,
+                &tx,
+            )
+            .unwrap();
+        coverage.record_eose(&fresh, RelayIndex(1));
+        assert_eq!(pending_loss(&state.replay_losses), None);
     }
 
     /// A fresh REQ whose reply a relay may have cut (a full page) settles

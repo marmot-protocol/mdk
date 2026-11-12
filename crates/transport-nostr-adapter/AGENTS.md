@@ -176,12 +176,15 @@ for reconnect/backoff and relay status mechanics.
   last applied is ignored, and a fence nothing holds ends at once. A fresh activation (`record_account_replay_start`)
   moves the buffered live frames native ingress does not own into the new coverage: those fences hold stay held from
   the same point under the old plan ticket, and those still waiting for admission wait there. A buffered history copy
-  a fresh REQ asks for again (same group route and relay, `since` no later than the copy) is not dropped as loss but
-  owed by the new coverage (`take_replayed_history`, `owe_replayed_history`): an owed copy keeps `admission_pending`
-  true, so no cursor seal passes it, until the copy enters the new coverage (`discharge_replayed`). Once no source it
-  is owed on still waits for its history (its EOSE or full reply without the copy, a refusal, abandonment, retirement,
-  an expired waiting allowance) or the new coverage drops (replaced again, deactivated, shut down), the replaced
-  coverage's floor is charged (`settle_replayed`); never discharge on EOSE or silence alone. Only frames for groups its
+  a source still claims, which a fresh REQ asks for again (same group route and relay, `since` no later than the
+  copy), is not dropped as loss but owed by the new coverage (`take_replayed_history`, `owe_replayed_history`): an
+  owed copy keeps `admission_pending` true, so no cursor seal passes it, until the copy enters the new coverage
+  (staged, or retained native input; `discharge_replayed`). Once no source it is owed on still waits for its history
+  (its EOSE or full reply without the copy, a refusal, abandonment, retirement, an expired waiting allowance) or the
+  new coverage drops (replaced again, deactivated, shut down), the replaced coverage's floor is charged
+  (`settle_replayed`). Settle only once a stream's final phase is set: a connection restart puts a source back to
+  waiting for the same range, so it keeps the debt. Never discharge on EOSE or silence alone; a copy parked in
+  `ready_history` with no claiming source is still charged at once. Only frames for groups its
   REQs no longer route, or past the buffer bounds, become replay loss at once. A fence holds only what is still in the replay
   buffer: never call back a frame already handed off (a queued or borrowed native batch, a draining hand-off); it goes
   on as late input, as at expiry, and the range stays owed. A hand-off that rejoins the buffer keeps its placement pin
