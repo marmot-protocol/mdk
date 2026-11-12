@@ -641,8 +641,8 @@ async fn attachment_worker_exit_cancels_transfer_and_releases_global_capacity() 
     );
     // The cancelled task drops its completion sender and its permits as it
     // ends, in no promised order, so wait for the capacity to come back
-    // before counting it.
-    tokio::time::timeout(Duration::from_secs(1), async {
+    // before counting it. The bound only catches a hang.
+    tokio::time::timeout(Duration::from_secs(10), async {
         let _global = shared.attachment_transfer.acquire().await.unwrap();
         let _http = permits.acquire_many(4).await.unwrap();
     })
