@@ -115,6 +115,17 @@ class CountWaitsTests(unittest.TestCase):
                 tokio::time::sleep(Duration::from_secs(60)).await;
             }
         """), {"sleep": 1})
+        # A `pause()` inside a branch pauses nothing after that branch.
+        self.assertEqual(waits("crates/a/tests/branch.rs", """\
+            #[tokio::test]
+            async fn paused_in_a_branch() {
+                if paused {
+                    tokio::time::pause();
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        """), {"sleep": 1})
         # The innermost `use` decides what a bare `sleep` is.
         self.assertEqual(waits("crates/a/tests/scoped.rs", """            use std::thread::sleep;
 
@@ -178,6 +189,12 @@ class CountWaitsTests(unittest.TestCase):
         self.assertEqual(waits("crates/a/src/lib.rs", nested), {"sleep": 1})
         not_test = production.replace("#[cfg(test)]", "#[cfg(all(not(test), unix))]").replace("#[tokio::test]", "")
         self.assertEqual(waits("crates/a/src/lib.rs", not_test), {})
+        self.assertEqual(waits("crates/a/src/lib.rs", """\
+            pub mod test_support {
+                pub fn settle() { std::thread::sleep(Duration::from_millis(5)); }
+            }
+            fn production() { std::thread::sleep(Duration::from_millis(5)); }
+        """), {"sleep": 1})
         for path in ["crates/a/tests/x.rs", "crates/a/src/tests.rs", "crates/a/src/worker_tests.rs",
                      "crates/a/src/runtime/tests/x.rs", "crates/a/src/test_support.rs",
                      "crates/a/src/test_support/relay.rs"]:

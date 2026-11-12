@@ -717,3 +717,54 @@ async fn a_released_second_stays_owed_under_the_tail() {
         "the inbox does not carry it"
     );
 }
+
+/// A count that fences a group after the owner already synchronized its
+/// generation still wakes the runner. The owner can authorize a new
+/// generation before its EOSE arrives; the EOSE then arms the group's fence
+/// in that same generation, and only the runner's answer lets the group's
+/// live frames go. Without the wake an otherwise idle account held them for
+/// good (mdk#3333).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fence_armed_after_its_generation_synchronized_wakes_the_runner() {
+    let mut fixture = fixture().await;
+    let group = group_route(&fixture);
+    fixture.relay.hold_replies(Some(crate::tests::every_reply));
+    fixture.client.prepare_transport().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            fixture.client.synchronize_native_replay().await.unwrap();
+            let generation = fixture.client.adapter.replay_admission().await.generation();
+            if fixture
+                .client
+                .recovery_owner
+                .native_replay_authorizes(generation)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the owner authorizes the new generation before its EOSE");
+    let generation = fixture.client.adapter.replay_admission().await.generation();
+    let mut wake = fixture.client.routing.recovery_runner_wake().subscribe();
+    wake.borrow_and_update();
+
+    fixture.relay.answer_held_replies().await;
+    let read = fixture.client.recovery_runner_live_counts().await;
+    assert_eq!(
+        read.held.iter().collect::<Vec<_>>(),
+        [&group],
+        "the late EOSE fences the group"
+    );
+    assert_eq!(
+        fixture.client.adapter.replay_admission().await.generation(),
+        generation,
+        "in the generation the owner already synchronized"
+    );
+    fixture.client.synchronize_native_replay().await.unwrap();
+    assert!(
+        wake.has_changed().unwrap(),
+        "the runner is woken to answer the fence"
+    );
+}

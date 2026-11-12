@@ -25,6 +25,11 @@
   Validate and normalize reply ids before upload or admission, keep composer
   drafts unchanged, and reject idempotency keys reused for different reply
   targets (#859).
+- Update the pinned Nostr SDK fork so a manual relay reconnect dials at once
+  (#3269). A connect issued right after a disconnect could find the relay
+  marked disconnected by the old connection's teardown and wait out the 5 s
+  retry interval, so a reconnect could miss its 5 s bound and fail with a
+  reconnect observation timeout.
 - Fail `durably_owned_key_packages` with the storage error when proving a
   stored bundle fails to read (I/O, busy, closed), instead of returning a
   partial list that reports this device's own KeyPackages as not owned.
