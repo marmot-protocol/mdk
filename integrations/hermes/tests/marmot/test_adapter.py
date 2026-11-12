@@ -6085,6 +6085,65 @@ class MediaSupportTests(unittest.IsolatedAsyncioTestCase):
         self.adapter_module = load_adapter_module()
         self.config_cls = sys.modules["gateway.config"].PlatformConfig
 
+    def test_inbound_stays_private(self):
+        for mask in (0o000, 0o022):
+            for existing in (False, True):
+                with self.subTest(umask=mask, existing=existing), tempfile.TemporaryDirectory() as tmpdir:
+                    source = Path(tmpdir) / "download.png"
+                    source.write_bytes(b"private attachment")
+                    source.chmod(0o644)
+                    adapter = self.adapter_module.MarmotPlatformAdapter(
+                        self.config_cls(extra={"home": tmpdir}), client=object(),
+                    )
+                    staging = adapter._inbound_media_dir
+                    if existing:
+                        staging.mkdir(parents=True)
+                        staging.chmod(0o755)
+                    observations = []
+                    copy = self.adapter_module.shutil.copyfileobj
+
+                    def observe_copy(src, dst):
+                        observations.append((
+                            staging.stat().st_mode & 0o777,
+                            os.fstat(dst.fileno()).st_mode & 0o777,
+                        ))
+                        copy(src, dst)
+
+                    previous = os.umask(mask)
+                    try:
+                        with unittest.mock.patch.object(
+                            self.adapter_module.shutil, "copyfileobj", side_effect=observe_copy,
+                        ):
+                            dest = adapter._stage_inbound_media_file(source, file_name="inbound.png")
+                    finally:
+                        os.umask(previous)
+                    self.assertEqual(staging.stat().st_mode & 0o777, 0o700)
+                    self.assertEqual(dest.stat().st_mode & 0o777, 0o600)
+                    self.assertEqual(observations, [(0o700, 0o600)])
+                    self.assertEqual(dest.read_bytes(), b"private attachment")
+
+    def test_inbound_never_overwrites(self):
+        for symlink in (False, True):
+            with self.subTest(symlink=symlink), tempfile.TemporaryDirectory() as tmpdir:
+                source = Path(tmpdir) / "download.png"
+                source.write_bytes(b"private attachment")
+                adapter = self.adapter_module.MarmotPlatformAdapter(
+                    self.config_cls(extra={"home": tmpdir}), client=object(),
+                )
+                adapter._inbound_media_dir.mkdir(parents=True)
+                dest = adapter._inbound_media_dir / "fixed-inbound.png"
+                if symlink:
+                    dest.symlink_to(source)
+                else:
+                    dest.write_bytes(b"existing attachment")
+                with unittest.mock.patch.object(
+                    self.adapter_module.uuid, "uuid4", return_value=types.SimpleNamespace(hex="fixed"),
+                ), self.assertRaises(FileExistsError):
+                    adapter._stage_inbound_media_file(source, file_name="inbound.png")
+                self.assertEqual(source.read_bytes(), b"private attachment")
+                if not symlink:
+                    self.assertEqual(dest.read_bytes(), b"existing attachment")
+
     async def test_inbound_media_download_populates_ordered_message_event(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             first_source = Path(tmpdir) / "inbound.png"
