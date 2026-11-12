@@ -4583,7 +4583,9 @@ fn raw_update_path_commit(
         account_identity_proof_component, account_identity_proof_extension,
     };
     use openmls::extensions::{AppDataDictionaryExtension, Extension, ExtensionType, Extensions};
-    use openmls::prelude::{BasicCredential, Capabilities, CredentialWithKey, LeafNodeParameters};
+    use openmls::prelude::{
+        BasicCredential, Capabilities, CredentialType, CredentialWithKey, LeafNodeParameters,
+    };
     let crypto = RustCrypto::default();
     let provider =
         EngineOpenMlsProvider::<SqliteAccountStorage>::new(&crypto, storage.mls_storage());
@@ -4653,7 +4655,7 @@ fn raw_update_path_commit(
             Some(&[DEFAULT_CIPHERSUITE]),
             Some(&extension_types),
             Some(leaf.capabilities().proposals()),
-            None,
+            Some(&[CredentialType::Basic]),
         ))
         .build();
     let (commit, _, _) = group

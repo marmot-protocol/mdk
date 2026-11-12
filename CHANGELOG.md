@@ -8,6 +8,12 @@
   directory and exclusively created `0600` files instead of copying source
   permissions and tightening them afterward. Tighten existing staging
   directories before copying new attachments (#2477).
+- Move OpenMLS from the `erskingardner/openmls` fork to upstream `main`, which
+  carries the fixes released in OpenMLS 0.9.1 and 0.9.2. A Welcome, GroupInfo,
+  Proposal or Commit with deeply nested extensions could abort the process
+  (GHSA-gc79-23g3-8g52), and a rejected private message could advance its
+  sender's ratchet and block that sender's later messages (GHSA-p276-g3f3-wwgh).
+  Stored groups load unchanged, and members on either build interoperate.
 
 ### Fixed
 
