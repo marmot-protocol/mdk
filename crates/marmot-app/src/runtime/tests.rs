@@ -4200,11 +4200,22 @@ async fn idle_ticks_take_no_writer_and_spawn_no_housekeeping() {
         RuntimeOp::WatchdogMissedWakePresentationPass,
     ];
     let snapshot = || COUNTED.map(count);
-    // Settle two more ticks, which may still finish startup work: a pass
-    // that ran while the ownership sweep was still in flight polls once
-    // more 15 s later.
-    tick().await;
-    tick().await;
+    // Settle ticks until four in a row run no pass and no housekeeping:
+    // startup work can still be finishing. The attachment pass polls while
+    // its startup sweep or promotion runs, and those finish in real time, so
+    // under load the last poll can come a tick after them; each attachment
+    // pass also wakes housekeeping.
+    let activity = || (passes(), count(RuntimeOp::WorkerMaintenanceCompaction));
+    let mut quiet = 0;
+    for _ in 0..20 {
+        let before = activity();
+        tick().await;
+        quiet = if activity() == before { quiet + 1 } else { 0 };
+        if quiet == 4 {
+            break;
+        }
+    }
+    assert_eq!(quiet, 4, "startup passes settle");
     let before = snapshot();
     // Every job the tick used to run, and every watchdog counter.
     let moved: Vec<RuntimeOp> = [
@@ -4223,6 +4234,20 @@ async fn idle_ticks_take_no_writer_and_spawn_no_housekeeping() {
             .filter(|operation| operation.as_str().starts_with("watchdog_missed_wake_")),
     )
     .collect();
+    let account_id_hex = app
+        .account_home()
+        .account("alice")
+        .expect("alice")
+        .account_id_hex;
+    let housekeeping_runs = || {
+        account_worker::HOUSEKEEPING_RUNS
+            .lock()
+            .unwrap()
+            .get(&account_id_hex)
+            .cloned()
+            .unwrap_or_default()
+    };
+    let runs_before = housekeeping_runs().len();
     let moved_before: Vec<u64> = moved.iter().map(|operation| count(*operation)).collect();
     for _ in 0..3 {
         tick().await;
@@ -4238,7 +4263,9 @@ async fn idle_ticks_take_no_writer_and_spawn_no_housekeeping() {
     assert_eq!(
         moved_ran,
         Vec::<(&str, u64)>::new(),
-        "an idle tick runs none of the jobs it used to, and misses no wake"
+        "an idle tick runs none of the jobs it used to, and misses no wake; \
+         housekeeping runs in the window (trigger, held and real times): {:#?}",
+        &housekeeping_runs()[runs_before..]
     );
     assert_eq!(delta(0), 3, "three idle ticks ran");
     assert_eq!(

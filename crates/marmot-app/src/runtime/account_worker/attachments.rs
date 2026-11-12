@@ -78,14 +78,14 @@ pub(super) struct Admission {
     /// in-memory copy every tick.
     compaction_rollbacks: u32,
     /// A rolled-back compaction is not attempted again before this.
-    compaction_retry_at: Option<std::time::Instant>,
+    compaction_retry_at: Option<TokioInstant>,
     /// This worker settled the WAL truncate an earlier process may have left
     /// owed (recorded nowhere): set only once a maintenance pass tried it,
     /// so a pass that failed before that leaves it for the next one.
     startup_wal_settled: Arc<std::sync::atomic::AtomicBool>,
     /// When the "Keep media" sweep (mdk#2314 step 10) next runs: `None` at
     /// worker start, then hourly.
-    keep_media_due: Option<std::time::Instant>,
+    keep_media_due: Option<TokioInstant>,
     /// A sweep stopped at its time budget with attachments still past the
     /// window, or failed: the next tick runs it again.
     keep_media_more: Arc<std::sync::atomic::AtomicBool>,
@@ -112,7 +112,7 @@ pub(super) struct HousekeepingLatches {
     /// When deferred housekeeping (reclaim, an owed WAL truncate, a
     /// compaction not yet worthwhile, too large or too tight) is checked
     /// again. `None` means now.
-    recheck_due: Option<std::time::Instant>,
+    recheck_due: Option<TokioInstant>,
     /// The deletion count the last housekeeping batch saw: a deletion frees
     /// pages, so reclaim checks again.
     batch_cleanup_seen: Option<i64>,
@@ -129,7 +129,7 @@ pub(super) struct HousekeepingLatches {
     /// When the owed rescan runs: one housekeeping recheck after the
     /// failure, so a failure that persists costs one pass per recheck, not
     /// one per tick.
-    sweep_rescan_due: Option<std::time::Instant>,
+    sweep_rescan_due: Option<TokioInstant>,
 }
 
 impl HousekeepingLatches {
@@ -182,7 +182,7 @@ fn spawn_media_sweep(
     // A failed batch owes a rescan from the start on the next recheck.
     let mut rescan_now = false;
     if latches.sweep_rescan.load(Ordering::Acquire) {
-        let now = std::time::Instant::now();
+        let now = TokioInstant::now();
         match latches.sweep_rescan_due {
             None => latches.sweep_rescan_due = Some(now + HOUSEKEEPING_RECHECK_INTERVAL),
             Some(due) if now >= due => rescan_now = true,
@@ -338,7 +338,7 @@ pub(super) fn spawn_legacy_migration(
     };
     let app_storage = storage.app_storage();
     admission.latches.bind(&app_storage);
-    let now = std::time::Instant::now();
+    let now = TokioInstant::now();
     let sweep_keep_media = admission.keep_media_more.load(Ordering::Acquire)
         || admission.keep_media_due.is_none_or(|due| now >= due);
     let latches = &mut admission.latches;
@@ -511,7 +511,7 @@ pub(super) async fn compact_if_due(
         || admission.compaction_attempted
         || admission
             .compaction_retry_at
-            .is_some_and(|at| std::time::Instant::now() < at)
+            .is_some_and(|at| TokioInstant::now() < at)
         || !admission
             .compaction_due
             .load(std::sync::atomic::Ordering::Acquire)
@@ -574,7 +574,7 @@ impl Admission {
                     .get(self.compaction_rollbacks as usize - 1)
                     .filter(|_| !self.compaction_attempted)
                 {
-                    let at = std::time::Instant::now() + *spacing;
+                    let at = TokioInstant::now() + *spacing;
                     self.compaction_retry_at = Some(at);
                     self.latches.recheck_due =
                         Some(self.latches.recheck_due.map_or(at, |due| due.min(at)));
@@ -806,7 +806,7 @@ struct PassWork {
     next_at: Option<u64>,
     polling: bool,
     pending_now: bool,
-    rescan_at: Option<std::time::Instant>,
+    rescan_at: Option<TokioInstant>,
 }
 
 /// When the attachment pass should next run on its own, after a run that
@@ -829,7 +829,7 @@ pub(super) fn next_pass_at(client: &AppClient, admission: &Admission) -> TokioIn
     [
         timed,
         work.polling.then_some(retry),
-        work.rescan_at.map(TokioInstant::from_std),
+        work.rescan_at,
         Some(now + HOUSEKEEPING_RECHECK_INTERVAL),
     ]
     .into_iter()
@@ -844,9 +844,7 @@ pub(super) fn pass_owed_now(client: &AppClient, admission: &Admission) -> bool {
     work.pending_now
         || work.polling
         || work.next_at.is_some_and(|at| at <= work.now)
-        || work
-            .rescan_at
-            .is_some_and(|at| at <= std::time::Instant::now())
+        || work.rescan_at.is_some_and(|at| at <= TokioInstant::now())
 }
 
 /// What the housekeeping job (the compaction and the housekeeping batch)
@@ -855,15 +853,12 @@ pub(super) fn pass_owed_now(client: &AppClient, admission: &Admission) -> bool {
 /// look in 15 s, as the tick gave it; `at` for the earliest in-memory
 /// deadline (the keep-media sweep, the hourly recheck, a compaction retry).
 /// Deadlines not yet set (a fresh worker) are due now.
-fn housekeeping_work(
-    client: &AppClient,
-    admission: &Admission,
-) -> (bool, Option<std::time::Instant>) {
+fn housekeeping_work(client: &AppClient, admission: &Admission) -> (bool, Option<TokioInstant>) {
     use std::sync::atomic::Ordering;
     if client.app.config.cursor_persistence == crate::CursorPersistence::Frozen {
         return (false, None);
     }
-    let now = std::time::Instant::now();
+    let now = TokioInstant::now();
     let latches = &admission.latches;
     let compaction_flagged =
         !admission.compaction_attempted && admission.compaction_due.load(Ordering::Acquire);
@@ -887,6 +882,48 @@ fn housekeeping_work(
     (poll, at)
 }
 
+/// Why the housekeeping job is due, for a test's failure message: which
+/// poll flag holds, and the real-clock deadlines relative to now.
+#[cfg(test)]
+pub(super) fn housekeeping_reason(client: &AppClient, admission: &Admission) -> String {
+    use std::sync::atomic::Ordering;
+    let now = TokioInstant::now();
+    let until = |at: Option<TokioInstant>| {
+        at.map(|at| {
+            if at <= now {
+                format!("-{:?}", now - at)
+            } else {
+                format!("+{:?}", at - now)
+            }
+        })
+    };
+    let latches = &admission.latches;
+    format!(
+        "migration_running={} keep_media_more={} legacy_bodies_owed={} \
+         database_avatars_owed={} startup_wal_owed={} compaction_flagged={} \
+         keep_media_due={:?} recheck_due={:?} compaction_retry={:?} \
+         cleanup_epoch_changed={}",
+        admission
+            .legacy_migration
+            .as_ref()
+            .is_some_and(|task| !task.is_finished()),
+        admission.keep_media_more.load(Ordering::Acquire),
+        !HousekeepingLatches::done(&latches.legacy_bodies_done),
+        !HousekeepingLatches::done(&latches.database_avatars_done),
+        !admission.startup_wal_settled.load(Ordering::Acquire),
+        !admission.compaction_attempted && admission.compaction_due.load(Ordering::Acquire),
+        until(admission.keep_media_due),
+        until(latches.recheck_due),
+        until(admission.compaction_retry_at),
+        client
+            .app
+            .account_storage(&client.state.label)
+            .map_or(true, |storage| {
+                storage.app_storage().media_cleanup_epoch().ok() != latches.batch_cleanup_seen
+            }),
+    )
+}
+
 /// When the housekeeping job should next run on its own.
 pub(super) fn next_housekeeping_at(
     client: &AppClient,
@@ -897,10 +934,7 @@ pub(super) fn next_housekeeping_at(
     let retry = now + super::schedule::RETRY_WHILE_OWED;
     [
         poll.then_some(retry),
-        at.map(|at| {
-            let at = TokioInstant::from_std(at);
-            if at <= now { retry } else { at }
-        }),
+        at.map(|at| if at <= now { retry } else { at }),
     ]
     .into_iter()
     .flatten()
@@ -912,7 +946,7 @@ pub(super) fn next_housekeeping_at(
 /// (one read of a TEMP counter).
 pub(super) fn housekeeping_owed_now(client: &AppClient, admission: &Admission) -> bool {
     let (poll, at) = housekeeping_work(client, admission);
-    poll || at.is_some_and(|at| at <= std::time::Instant::now())
+    poll || at.is_some_and(|at| at <= TokioInstant::now())
         || client
             .app
             .account_storage(&client.state.label)

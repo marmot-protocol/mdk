@@ -1781,6 +1781,8 @@ async fn run_app_runtime_account_worker(
     // Recovery and post-join work run on their own wakes and deadlines;
     // the tick only checks that none was missed (mdk#2923 step B).
     let mut schedule = schedule::Schedule::opened();
+    #[cfg(test)]
+    let started = (TokioInstant::now(), std::time::Instant::now());
     let mut maintenance_paused = client.runtime.maintenance_is_paused();
     let mut avatar_resumed = false;
     let mut avatar_identities = super::avatar::IdentityAvatarMaintenance::default();
@@ -3013,6 +3015,21 @@ async fn run_app_runtime_account_worker(
                     );
                 }
                 if schedule.due(schedule::Job::Housekeeping, now) {
+                    #[cfg(test)]
+                    record_housekeeping_run(
+                        &account_id_hex,
+                        format!(
+                            "held +{:?} real +{:?} trigger={} {}",
+                            TokioInstant::now() - started.0,
+                            started.1.elapsed(),
+                            if schedule.woken(schedule::Job::Housekeeping) {
+                                "wake"
+                            } else {
+                                "deadline"
+                            },
+                            attachments::housekeeping_reason(&client, &attachment_admission),
+                        ),
+                    );
                     let step = telemetry.observe(RuntimeOp::WorkerMaintenanceCompaction);
                     attachments::compact_if_due(&client, &shared, &mut attachment_admission).await;
                     step.finish(TelemetryOutcome::Success);
@@ -7929,6 +7946,24 @@ const CONVERGENCE_RETRY_MAX_DELAY: Duration = Duration::from_secs(60);
 /// After this many unsettled re-arms, fall back to error-style backoff so a
 /// never-settling input cannot keep the worker waking every ~1.1s indefinitely.
 const CONVERGENCE_UNSETTLED_MAX_REARMS: u32 = 10;
+
+/// Why each housekeeping run started, per account, for the idle test's
+/// failure message: the trigger, and the held and real times since the
+/// worker opened.
+#[cfg(test)]
+pub(crate) static HOUSEKEEPING_RUNS: std::sync::LazyLock<
+    Mutex<std::collections::HashMap<String, Vec<String>>>,
+> = std::sync::LazyLock::new(Default::default);
+
+#[cfg(test)]
+fn record_housekeeping_run(account_id_hex: &str, run: String) {
+    HOUSEKEEPING_RUNS
+        .lock()
+        .unwrap()
+        .entry(account_id_hex.to_owned())
+        .or_default()
+        .push(run);
+}
 
 #[cfg(test)]
 pub(crate) static HELD_SCHEDULED_CONVERGENCE_ACCOUNTS: std::sync::LazyLock<Mutex<HashSet<String>>> =
