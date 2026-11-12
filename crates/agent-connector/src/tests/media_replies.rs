@@ -87,10 +87,16 @@ async fn blob_server() -> BlobServer {
     BlobServer { url, puts, task }
 }
 
-async fn received_media(app: &MarmotApp, label: &str, message_id: &str) -> AppMessageRecord {
+async fn received_media(
+    connector: &AgentConnector,
+    label: &str,
+    message_id: &str,
+) -> AppMessageRecord {
+    let mut events = connector.runtime.subscribe();
     timeout(Duration::from_secs(30), async {
         loop {
-            if let Some(message) = app
+            if let Some(message) = connector
+                .app
                 .messages(label)
                 .unwrap()
                 .into_iter()
@@ -98,7 +104,7 @@ async fn received_media(app: &MarmotApp, label: &str, message_id: &str) -> AppMe
             {
                 return message;
             }
-            sleep(Duration::from_millis(10)).await;
+            events.recv().await.unwrap();
         }
     })
     .await
@@ -278,7 +284,7 @@ async fn media_replies_reach_recipient() {
     let ids = response["message_ids_hex"].as_array().unwrap();
     assert_eq!(ids.len(), 5);
     for (index, id) in ids.iter().enumerate() {
-        let message = received_media(&app, &human.label, id.as_str().unwrap()).await;
+        let message = received_media(&connector, &human.label, id.as_str().unwrap()).await;
         let first = if index == 4 { 0 } else { index };
         let name = format!("python-{first}.txt");
         let bytes = format!("python attachment {first}");
@@ -348,7 +354,7 @@ async fn media_replies_reach_recipient() {
             panic!("media send failed: {response:?}");
         };
         assert_eq!(message_ids_hex.len(), 1);
-        let message = received_media(&app, &human.label, &message_ids_hex[0]).await;
+        let message = received_media(&connector, &human.label, &message_ids_hex[0]).await;
         assert_eq!(message.plaintext, caption.unwrap_or_default());
         for name in ["e", "q"] {
             assert_eq!(
@@ -421,7 +427,7 @@ async fn media_replies_reach_recipient() {
         else {
             panic!("plain send failed: {response:?}");
         };
-        let message = received_media(&app, &human.label, &message_ids_hex[0]).await;
+        let message = received_media(&connector, &human.label, &message_ids_hex[0]).await;
         assert_eq!(reply_target_from_tags(&message.tags), None);
         assert_eq!(media_refs(&message).len(), 2);
     }
@@ -496,7 +502,7 @@ async fn media_replies_reach_recipient() {
         )
         .await
         .unwrap();
-    let standalone = received_media(&app, &human.label, &accepted.message_id_hex).await;
+    let standalone = received_media(&connector, &human.label, &accepted.message_id_hex).await;
     assert_eq!(
         reply_target_from_tags(&standalone.tags).as_deref(),
         Some(target.as_str())
@@ -560,7 +566,7 @@ async fn media_replies_reach_recipient() {
         .await
         .unwrap();
     let accepted = accepted.unwrap();
-    let message = received_media(&app, &human.label, &accepted.message_id_hex).await;
+    let message = received_media(&connector, &human.label, &accepted.message_id_hex).await;
     check_media_reply(
         &connector.runtime,
         &human.label,
@@ -645,7 +651,7 @@ async fn media_replies_reach_recipient() {
         )
         .await
         .unwrap();
-    let message = received_media(&app, &human.label, &accepted.unwrap().message_id_hex).await;
+    let message = received_media(&connector, &human.label, &accepted.unwrap().message_id_hex).await;
     check_media_reply(
         &connector.runtime,
         &human.label,
