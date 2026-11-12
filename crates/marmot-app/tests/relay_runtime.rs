@@ -623,18 +623,54 @@ async fn accept_group_invite_retrying_busy(
     account_ref: &str,
     group_id: &GroupId,
 ) -> Result<marmot_app::AppGroupRecord, AppError> {
+    // Subscribe before the first attempt: a Welcome joined after it is
+    // announced here, and one joined before it lets the attempt find the
+    // group.
+    let mut events = runtime.subscribe();
     timeout(Duration::from_secs(5), async {
         loop {
             match runtime.accept_group_invite(account_ref, group_id).await {
-                Err(AppError::AccountWorkerBusy | AppError::UnknownGroup(_)) => {
-                    sleep(Duration::from_millis(10)).await
+                // The Welcome has not been joined yet. Each refused attempt
+                // costs the worker a turn, so wait for the join instead of
+                // polling.
+                Err(AppError::UnknownGroup(_)) => {
+                    wait_for_group_joined(&mut events, account_ref, group_id).await
                 }
+                // A startup or catch-up sync holds the live client and
+                // refused before starting the mutation. The runtime emits
+                // nothing when that sync lets go, so retry; these refusals
+                // answer without a worker turn.
+                Err(AppError::AccountWorkerBusy) => sleep(Duration::from_millis(10)).await,
                 result => return result,
             }
         }
     })
     .await
     .map_err(|_| AppError::AccountWorkerResponseTimedOut)?
+}
+
+/// Wait until `account_ref` joins `group_id`, or until a lagged or closed
+/// receiver can no longer tell: the caller then tries again.
+async fn wait_for_group_joined(
+    events: &mut tokio::sync::broadcast::Receiver<MarmotAppEvent>,
+    account_ref: &str,
+    group_id: &GroupId,
+) {
+    loop {
+        match events.recv().await {
+            Ok(MarmotAppEvent::GroupJoined {
+                account_id_hex,
+                account_label,
+                group_id: joined,
+            }) if &joined == group_id
+                && (account_id_hex == account_ref || account_label == account_ref) =>
+            {
+                return;
+            }
+            Ok(_) => {}
+            Err(_) => return,
+        }
+    }
 }
 
 async fn wait_for_account_network_ready(runtime: &MarmotAppRuntime, account_ref: &str) {
