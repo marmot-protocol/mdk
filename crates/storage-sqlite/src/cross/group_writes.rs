@@ -1503,7 +1503,9 @@ mod tests {
         });
         // SQLite calls the progress handler at the jump into `PRAGMA
         // data_version`'s read transaction: after the check listed the
-        // connections, before it reads the value.
+        // connections, before it reads the value. The bundled SQLCipher
+        // compiles the pragma as `Init` -> `Goto` -> `Noop` -> `Transaction`
+        // -> `ReadCookie`, and the handler runs at the `Goto`.
         let mut window = Some((start, has_committed));
         engine
             .lock()

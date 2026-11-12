@@ -92,10 +92,15 @@ fn storage_boundary_matches_the_allow_list() {
 
 /// Every WAL truncate and `VACUUM` in production code runs through
 /// `ConnectionGuard::checkpoint_truncate`, `ConnectionGuard::vacuum` or a
-/// close, which note it for the group write counts first (mdk#3273): SQLite
-/// moves every other connection's `PRAGMA data_version` for one without a
-/// commit hook, and an unnoted one reads as a writer no trigger saw. Reads
-/// string literals, so it misses SQL assembled at run time.
+/// close, which note it for the group write counts (mdk#3273): SQLite moves
+/// every other connection's `PRAGMA data_version` for one without a commit
+/// hook, and an unnoted one reads as a writer no trigger saw.
+///
+/// A lint, not the boundary. It catches the spellings our source would
+/// plausibly use, with a clearer message than a failing test. The runtime
+/// check is the enforcement: an unnoted truncate or `VACUUM` panics the next
+/// count read on another counted connection under test. Spellings our
+/// source doesn't use, and SQL assembled at run time, are out of its scope.
 #[test]
 fn only_the_connection_truncates_or_vacuums() {
     let mut found: BTreeMap<String, Vec<String>> = BTreeMap::new();
@@ -125,9 +130,11 @@ fn only_the_connection_truncates_or_vacuums() {
 /// as an argument or after `=`, quoted or not.
 fn moves_data_version_without_a_commit(sql: &str) -> bool {
     let sql = without_comments(sql).to_ascii_lowercase();
+    // SQLite's tokenizer also takes a UTF-8 byte-order mark for whitespace.
+    let space = |c: char| c.is_whitespace() || c == '\u{feff}';
     let compact: String = sql
         .chars()
-        .filter(|c| !c.is_whitespace() && !matches!(c, '\'' | '"' | '`' | '[' | ']'))
+        .filter(|&c| !space(c) && !matches!(c, '\'' | '"' | '`' | '[' | ']'))
         .collect();
     compact == "wal_checkpoint"
         || compact.contains("wal_checkpoint(truncate)")
@@ -135,7 +142,7 @@ fn moves_data_version_without_a_commit(sql: &str) -> bool {
         || sql.split(';').any(|statement| {
             // The first keyword ends at any non-identifier character: SQLite
             // takes `VACUUM"main"` and `VACUUM[main]` without a space.
-            let statement = statement.trim_start();
+            let statement = statement.trim_start_matches(space);
             let keyword = statement
                 .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
                 .map_or(statement, |end| &statement[..end]);
@@ -194,6 +201,8 @@ fn the_truncate_and_vacuum_gate_matches_every_spelling() {
         "VACUUM\"main\"",
         "VACUUM`main`",
         "VACUUM[main]",
+        "\u{feff}VACUUM",
+        "PRAGMA wal_checkpoint(\u{feff}TRUNCATE)",
     ] {
         assert!(moves_data_version_without_a_commit(moves), "{moves}");
     }
