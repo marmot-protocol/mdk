@@ -1885,8 +1885,8 @@ impl MarmotAppRuntime {
                     self.shared.relay_telemetry_runtime_config(),
                     self.shared.service_endpoints(),
                 );
-            self.resume_generated_account_setup().await?;
             self.restore_nip46_sessions().await?;
+            self.resume_generated_account_setup().await?;
             self.reconcile_accounts().await?;
             self.shared.lifecycle().mark_running();
             Ok(config)
@@ -6888,6 +6888,22 @@ async fn catch_up_account_commands_with_retry(
     }
 }
 
+impl MarmotApp {
+    fn onboarding_transaction(&self, id: &str) -> Arc<Mutex<()>> {
+        let mut locks = self
+            .onboarding_transactions
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = locks.get(id).and_then(std::sync::Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(Mutex::new(()));
+        locks.insert(id.to_owned(), Arc::downgrade(&lock));
+        lock
+    }
+}
+
 // Account setup reaches the workers only through this surface. The worker
 // transaction is a tokio `Mutex` and not reentrant, so every call keeps the lock
 // state it had when onboarding lived on this type, and each says which it is:
@@ -7571,7 +7587,7 @@ impl AccountManager {
     /// Explicitly re-activate a reversibly signed-out local account.
     pub async fn sign_in_account(&self, account_ref: &str) -> Result<ManagedAccount, AppError> {
         let account = self.resolve(account_ref)?;
-        let gate = self.onboarding_transaction(&account.account_id_hex);
+        let gate = self.app.onboarding_transaction(&account.account_id_hex);
         let _transaction = gate.lock().await;
         let observed = self.shared.observer.product().observed(
             crate::ProductFamily::Account,
@@ -8776,7 +8792,7 @@ impl AccountManager {
                     } => Some((session.clone(), *generation)),
                     ExternalSetupSigner::Host(_) => None,
                 };
-                let gate = self.onboarding_transaction(&account_id_hex);
+                let gate = self.app.onboarding_transaction(&account_id_hex);
                 let _transaction =
                     crate::Nip46Session::during_adoption(native_adoption.as_ref(), async {
                         Ok(gate.lock().await)

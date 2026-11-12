@@ -149,6 +149,7 @@ impl MarmotAppRuntime {
     ) -> Result<(), AppError> {
         let gate = self
             .accounts
+            .app
             .onboarding_transaction(&account.account_id_hex);
         let observer = (session.clone(), generation);
         let _transaction =
@@ -197,6 +198,7 @@ impl MarmotAppRuntime {
         let account = self.accounts.resolve(account_ref)?;
         let gate = self
             .accounts
+            .app
             .onboarding_transaction(&account.account_id_hex);
         let _transaction = gate.lock().await;
         self.load_nip46_session(&account)
@@ -210,6 +212,7 @@ impl MarmotAppRuntime {
         let account = self.accounts.resolve(account_ref)?;
         let gate = self
             .accounts
+            .app
             .onboarding_transaction(&account.account_id_hex);
         let _transaction = self.accounts.lock_nip46_removal(gate, &account).await;
         self.shared.lifecycle().ensure_running()?;
@@ -279,6 +282,7 @@ impl MarmotAppRuntime {
         for account in self.accounts.app.account_home().accounts()? {
             let gate = self
                 .accounts
+                .app
                 .onboarding_transaction(&account.account_id_hex);
             let _transaction = gate.lock().await;
             if let Err(error) = self.load_nip46_session(&account).await {
