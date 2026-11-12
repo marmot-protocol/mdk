@@ -25,7 +25,7 @@ async fn hydrated_recovery_fixture(
     use openmls_basic_credential::SignatureKeyPair;
     use openmls_traits::signatures::Signer as _;
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new("hydrated welcome ownership key").unwrap();
     let build = |name: &[u8], storage: SqliteAccountStorage| {
         EngineBuilder::new(storage)

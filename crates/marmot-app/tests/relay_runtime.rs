@@ -1767,6 +1767,7 @@ async fn import_with_stalled_discovery_endpoint_completes_within_the_advisory_ca
 async fn app_runtime_private_key_import_recovers_orphaned_keychain_credential() {
     use nostr::prelude::ToBech32;
 
+    storage_sqlite::relax_storage_for_test_process();
     install_mock_keyring();
     let dir = tempfile::tempdir().unwrap();
     let (_relay, url) = mock_relay().await;
@@ -1846,6 +1847,7 @@ async fn app_runtime_private_key_import_recovers_orphaned_keychain_credential() 
 async fn failed_key_package_setup_retries_same_nsec_after_restart() {
     use nostr::prelude::ToBech32;
 
+    storage_sqlite::relax_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
     let rejecting = Arc::new(AtomicBool::new(true));
     let relay = LocalRelay::new(
@@ -1937,6 +1939,7 @@ async fn failed_key_package_setup_retries_same_nsec_after_restart() {
 async fn failed_reactivation_key_package_publish_restores_signed_out_retry() {
     use nostr::prelude::ToBech32;
 
+    storage_sqlite::relax_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
     let rejecting = Arc::new(AtomicBool::new(false));
     let relay = LocalRelay::new(
@@ -1999,6 +2002,7 @@ async fn failed_reactivation_key_package_publish_restores_signed_out_retry() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn failed_external_signer_reactivation_restores_signed_out_retry() {
+    storage_sqlite::relax_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
     let rejecting = Arc::new(AtomicBool::new(false));
     let relay = LocalRelay::new(
@@ -2069,6 +2073,7 @@ async fn failed_external_signer_reactivation_restores_signed_out_retry() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn failed_generated_identity_setup_resumes_same_identity_after_restart() {
+    storage_sqlite::relax_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
     let rejecting = Arc::new(AtomicBool::new(true));
     let relay = LocalRelay::new(
@@ -2122,6 +2127,7 @@ async fn failed_generated_identity_setup_resumes_same_identity_after_restart() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn failed_external_signer_setup_resumes_after_restart() {
+    storage_sqlite::relax_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
     let rejecting = Arc::new(AtomicBool::new(true));
     let relay = LocalRelay::new(
@@ -2270,6 +2276,7 @@ async fn cancelled_key_package_setup_resumes_exact_pending_attempt_after_restart
 async fn app_runtime_private_key_setup_rollback_preserves_only_recovered_keychain_secret() {
     use nostr::prelude::ToBech32;
 
+    storage_sqlite::relax_storage_for_test_process();
     install_mock_keyring();
     let dir = tempfile::tempdir().unwrap();
     let (_relay, url) = mock_relay().await;
@@ -3020,6 +3027,7 @@ async fn app_runtime_can_rotate_key_package_on_request() {
 async fn account_key_packages_reports_durable_ownership_merges_relay_echo_and_survives_restart() {
     use nostr::prelude::ToBech32;
 
+    storage_sqlite::relax_storage_for_test_process();
     let first_dir = tempfile::tempdir().unwrap();
     let second_dir = tempfile::tempdir().unwrap();
     let (relay, url) = mock_relay().await;
@@ -3145,6 +3153,7 @@ async fn account_key_packages_reports_durable_ownership_merges_relay_echo_and_su
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[cfg(feature = "test-policy-overrides")]
 async fn local_account_key_packages_are_readable_while_startup_is_held() {
+    storage_sqlite::relax_storage_for_test_process();
     async fn read_while_startup_is_held(
         runtime: &MarmotAppRuntime,
         account_id: &str,
@@ -4154,6 +4163,7 @@ async fn app_runtime_delete_group_local_removes_projection_without_publishing_le
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[cfg(feature = "test-policy-overrides")]
 async fn app_runtime_serves_member_reads_during_scheduled_convergence() {
+    storage_sqlite::relax_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
     let (_relay, url) = mock_relay().await;
     let app = MarmotApp::with_relay_and_config(
@@ -7532,6 +7542,7 @@ async fn app_runtime_chat_and_group_state_subscriptions_stream_projection_update
 #[cfg(feature = "test-policy-overrides")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn group_state_subscription_observes_rename_applied_during_interleaved_send() {
+    storage_sqlite::relax_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
     let (_relay, url) = mock_relay().await;
     let app = MarmotApp::with_relay_and_config(
@@ -7635,6 +7646,7 @@ async fn group_state_subscription_observes_rename_applied_during_interleaved_sen
 #[cfg(feature = "test-policy-overrides")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn group_state_subscription_observes_rename_applied_during_failed_send() {
+    storage_sqlite::relax_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
     let reject_armed = Arc::new(AtomicBool::new(false));
     // Publish the enforced cap, like the interleaved-send sibling's relay. A
@@ -7995,6 +8007,7 @@ fn row_title(app: &MarmotApp, label: &str, group_id_hex: &str) -> Option<String>
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[cfg(feature = "test-policy-overrides")]
 async fn accepted_disband_finishes_for_both_members_without_followup_commands() {
+    storage_sqlite::relax_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
     let (_relay, url) = mock_relay().await;
     let app = MarmotApp::with_relay_and_config(
@@ -9919,6 +9932,7 @@ async fn encrypted_media_endpoint_updates_are_full_replacement_and_admin_only() 
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_neutral_deployment_creates_text_only_groups_and_refuses_group_images() {
+    storage_sqlite::relax_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());
     home.create_account("alice").unwrap();
@@ -10393,6 +10407,7 @@ async fn relay_list_empty_fetch_keeps_cached_lists() {
 async fn import_ignores_retired_published_routes_without_rewriting_relay_lists() {
     use nostr::prelude::ToBech32;
 
+    storage_sqlite::relax_storage_for_test_process();
     let publisher_dir = tempfile::tempdir().unwrap();
     let publisher_home = AccountHome::open(publisher_dir.path());
     let keys = Keys::generate();
@@ -10458,6 +10473,7 @@ async fn import_ignores_retired_published_routes_without_rewriting_relay_lists()
 // pins `login_external_signer`, not only the shared routing helpers exercised
 // by the nsec-import regression above.
 async fn external_signer_login_ignores_retired_routes_without_rewriting_relay_lists() {
+    storage_sqlite::relax_storage_for_test_process();
     let publisher_dir = tempfile::tempdir().unwrap();
     let publisher_home = AccountHome::open(publisher_dir.path());
     let keys = Keys::generate();
@@ -10764,6 +10780,7 @@ async fn nip30_emoji_media_and_reaction_reach_peer() {
         AttachmentTransferState, MediaAttachmentOutcome,
     };
 
+    storage_sqlite::relax_storage_for_test_process();
     async fn acquire(
         runtime: &MarmotAppRuntime,
         account: &str,
@@ -11558,6 +11575,7 @@ async fn account_storage_records_received_messages() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn account_publishes_route_to_own_nip65_not_bootstrap() {
+    storage_sqlite::relax_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
     let (_home, home_url) = mock_relay().await;
     let (_other, other_url) = mock_relay().await;
@@ -11646,6 +11664,7 @@ async fn assert_published_relay_lists(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn generated_account_declares_separate_inbox_relays() {
+    storage_sqlite::relax_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
     let (_relay, url) = mock_relay().await;
     let (_inbox_relay, inbox_url) = mock_relay().await;
@@ -11681,6 +11700,8 @@ async fn generated_account_declares_separate_inbox_relays() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn imported_account_publishes_missing_lists_with_separate_inbox_relays() {
     use nostr::prelude::ToBech32;
+
+    storage_sqlite::relax_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
     let (_relay, url) = mock_relay().await;
     let (_inbox_relay, inbox_url) = mock_relay().await;
@@ -11721,6 +11742,7 @@ async fn imported_account_publishes_missing_lists_with_separate_inbox_relays() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn account_owned_profile_publish_uses_the_selected_accounts_relay_configuration() {
+    storage_sqlite::relax_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
     let (_alice_relay, alice_relay_url) = mock_relay().await;
     let (_bob_relay, bob_relay_url) = mock_relay().await;
@@ -12293,6 +12315,7 @@ fn slot_of(event: &nostr::prelude::Event) -> Option<String> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn signing_out_one_device_deletes_only_its_own_key_package_slot() {
+    storage_sqlite::relax_storage_for_test_process();
     // mdk#1697: each device of an account publishes into its own slot, and
     // signing one out deletes that slot and nothing else
     // (`foundation/key-packages.md`, "Stopping publication").
@@ -13699,6 +13722,7 @@ async fn create_group_detailed_returns_durable_emitted_chat_list_row() {
 #[cfg(feature = "test-policy-overrides")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn create_group_post_canonical_projection_crash_recovers_visibility_and_welcome() {
+    storage_sqlite::relax_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
     let rejecting = Arc::new(AtomicBool::new(false));
     let relay = LocalRelay::new(
@@ -15255,6 +15279,7 @@ impl WritePolicy for CountUncertainSetupRelayListPublications {
 async fn assert_required_discovery_failure_does_not_publish_defaults(external_signer: bool) {
     use nostr::prelude::ToBech32;
 
+    storage_sqlite::relax_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
     let publications = Arc::new(AtomicUsize::new(0));
     let bootstrap = LocalRelay::new(RelayBuilder::default().write_policy(
@@ -15339,6 +15364,7 @@ async fn outbox_acceptance_external_signer_required_discovery_failure_does_not_p
 async fn partial_outbox_failure_does_not_publish_defaults(external_signer: bool) {
     use nostr::prelude::ToBech32;
 
+    storage_sqlite::relax_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
     let publications = Arc::new(AtomicUsize::new(0));
     let discovery = LocalRelay::new(RelayBuilder::default().write_policy(
@@ -15443,6 +15469,7 @@ async fn outbox_acceptance_external_signer_partial_outbox_failure_does_not_publi
 async fn newer_discovery_inbox_survives_older_outbox(external_signer: bool, empty_outbox: bool) {
     use nostr::prelude::ToBech32;
 
+    storage_sqlite::relax_storage_for_test_process();
     let publisher_dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(publisher_dir.path());
     let keys = Keys::generate();
@@ -15657,6 +15684,7 @@ async fn outbox_acceptance_external_signer_preserves_explicit_empty_metadata() {
 async fn outbox_acceptance_closed_multi_author_queries_fall_back_per_member() {
     use nostr::prelude::ToBech32;
 
+    storage_sqlite::relax_storage_for_test_process();
     let discovery_policy = RejectMultiAuthorQueries::default();
     let discovery = LocalRelay::new(RelayBuilder::default().query_policy(discovery_policy.clone()));
     discovery.run().await.unwrap();
@@ -16169,6 +16197,8 @@ async fn onboarding_access_restricted_query_is_not_a_missing_record() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn onboarding_key_package_rejection_retains_identity_until_confirmed_retry() {
     use nostr::prelude::ToBech32;
+
+    storage_sqlite::relax_storage_for_test_process();
     let directory = tempfile::tempdir().unwrap();
     let rejecting = Arc::new(AtomicBool::new(true));
     let relay = LocalRelay::new(
@@ -16541,6 +16571,8 @@ impl nostr_relay_builder::prelude::QueryPolicy for OnboardingKeyPackageQueriesRe
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn onboarding_single_device_unknown_discovery_still_offers_explicit_continue() {
     use nostr::prelude::ToBech32;
+
+    storage_sqlite::relax_storage_for_test_process();
     let directory = tempfile::tempdir().unwrap();
     let relay = LocalRelay::new(
         RelayBuilder::default().query_policy(OnboardingKeyPackageQueriesRestricted),
@@ -17806,6 +17838,8 @@ async fn live_report_indicator_uses_existing_timeline_subscription() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn offline_member_recovers_dismissal_label_after_admin_demotion() {
     use marmot_app::ReportReason;
+
+    storage_sqlite::relax_storage_for_test_process();
     let (_relay, url) = mock_relay().await;
     let dirs = [
         tempfile::tempdir().unwrap(),

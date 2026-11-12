@@ -866,7 +866,7 @@ async fn rejoin_commit_cooldown() {
 #[tokio::test]
 async fn rejoin_two_admin_accounts() {
     use cgka_traits::storage::GroupStorage;
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new("two admin rejoin key").unwrap();
     let bob_path = dir.path().join("bob.sqlite");
     let carol_path = dir.path().join("carol.sqlite");
