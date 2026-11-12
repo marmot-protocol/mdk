@@ -7,8 +7,8 @@ if [[ $# -gt 1 || "${1:-swift}" != swift ]]; then
   exit 2
 fi
 command -v swiftc >/dev/null
-cargo build -p marmot-uniffi --features cli --locked
-smoke_target="$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')/debug"
+cargo build -p marmot-uniffi --features cli --locked --release
+smoke_target="$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')/release"
 case "$(uname -s)" in
   Darwin) smoke_library="$smoke_target/libmarmot_uniffi.dylib" ;;
   Linux) smoke_library="$smoke_target/libmarmot_uniffi.so" ;;

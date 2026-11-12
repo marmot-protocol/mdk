@@ -1894,7 +1894,8 @@ so it exposes the same `Marmot` object, subscription objects, records, enums, an
 Direct `uniffi-bindgen` output does not include the Swift cancellation adapters. Use the packaged
 `MarmotKit.swift`, or concatenate the generated Swift and the matching support source into one file.
 Run `bash crates/marmot-uniffi/subscription-cancellation-smoke.sh` to exercise Swift cancellation against
-real native subscription futures. It requires `swiftc` and the native build prerequisites above.
+real native subscription futures. It builds the native library with `--release`, matching the Apple artifacts,
+and requires `swiftc` and the native build prerequisites above.
 
 No generated Swift or Kotlin files are committed here; the output directories are ignored because generated bindings
 and packaged native libraries are derived artifacts. Regenerate them from this crate before vendoring into an app
