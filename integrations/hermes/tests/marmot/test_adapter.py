@@ -509,13 +509,30 @@ class AgentControlClientTests(unittest.IsolatedAsyncioTestCase):
         client = self.adapter.MarmotAgentControlClient(self.socket_path)
         attachment = [{"path": "/tmp/a.png", "media_type": "image/png", "file_name": "a.png"}]
 
-        await client.send_media("11" * 32, "22" * 32, attachment, idempotency_key="media-key-1")
-        await client.send_media("11" * 32, "22" * 32, attachment, idempotency_key="  ")
+        await client.send_media(
+            "11" * 32, "22" * 32, attachment,
+            idempotency_key="media-key-1", reply_to_message_id_hex="AA" * 32,
+        )
+        await client.send_media(
+            "11" * 32, "22" * 32, attachment,
+            idempotency_key="  ", reply_to_message_id_hex=None,
+        )
         await client.send_media("11" * 32, "22" * 32, attachment)
 
         self.assertEqual(requests[0]["idempotency_key"], "media-key-1")
         self.assertNotIn("idempotency_key", requests[1])
         self.assertNotIn("idempotency_key", requests[2])
+        self.assertEqual(requests[0]["reply_to_message_id_hex"], "aa" * 32)
+        self.assertNotIn("reply_to_message_id_hex", requests[1])
+        self.assertNotIn("reply_to_message_id_hex", requests[2])
+        for target in ("", " ", "not-hex", "ab", "ab" * 33):
+            with self.subTest(target=target):
+                with self.assertRaises(self.adapter.AgentControlError) as raised:
+                    await client.send_media(
+                        "11" * 32, "22" * 32, attachment,
+                        reply_to_message_id_hex=target,
+                    )
+                self.assertEqual(raised.exception.code, "invalid_hex")
 
     async def test_send_media_waits_for_terminal_response_beyond_generic_timeout(self):
         publishes = 0
@@ -6145,6 +6162,7 @@ class MediaSupportTests(unittest.IsolatedAsyncioTestCase):
                     attachments,
                     *,
                     caption=None,
+                    reply_to_message_id_hex=None,
                     idempotency_key=None,
                     response_timeout=None,
                 ):
@@ -6218,6 +6236,7 @@ class MediaSupportTests(unittest.IsolatedAsyncioTestCase):
                     attachments,
                     *,
                     caption=None,
+                    reply_to_message_id_hex=None,
                     idempotency_key=None,
                     response_timeout=None,
                 ):
@@ -6777,8 +6796,10 @@ class MediaSupportTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(list(adapter._outbound_media_dir.iterdir()), [])
 
-    async def test_multiple_images_reply_metadata_remains_blocked(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
+    async def test_media_rejects_malformed_reply_before_staging(self):
+        with tempfile.TemporaryDirectory() as tmpdir, unittest.mock.patch.dict(
+            os.environ, {"MARMOT_HOME": tmpdir, "MARMOT_OUTBOUND_MEDIA_DIR": ""}
+        ):
             root = Path(tmpdir)
             image = root / "reply.png"
             image.write_bytes(b"reply")
@@ -6786,17 +6807,39 @@ class MediaSupportTests(unittest.IsolatedAsyncioTestCase):
                 self.config_cls(
                     extra={
                         "account_id_hex": "11" * 32,
+                        "home": str(root),
                         "media_local_roots": [str(root)],
                     }
                 ),
                 client=object(),
             )
-            with self.assertRaisesRegex(self.adapter_module.AgentControlError, "reply threading"):
-                await adapter.send_multiple_images(
-                    "22" * 32,
-                    [(image.as_uri(), "caption")],
-                    metadata={"reply_to_message_id_hex": "33" * 32},
-                )
+            for target in ("", " ", "not-hex", "ab", "ab" * 33):
+                for method in (
+                    adapter.send_image_file,
+                    adapter.send_document,
+                    adapter.send_video,
+                    adapter.send_voice,
+                ):
+                    for kwargs in (
+                        {"reply_to": target},
+                        {"metadata": {"reply_to_message_id_hex": target}},
+                    ):
+                        with self.subTest(target=target, method=method.__name__, kwargs=kwargs):
+                            result = await method("22" * 32, str(image), **kwargs)
+                            self.assertFalse(result.success)
+                            self.assertIn("reply_to_message_id_hex must", result.error)
+                for key in (
+                    "reply_to_message_id_hex", "reply_to_message_id", "reply_to", "parent_message_id_hex",
+                ):
+                    with self.subTest(target=target, key=key):
+                        with self.assertRaisesRegex(
+                            self.adapter_module.AgentControlError, "reply_to_message_id_hex must"
+                        ):
+                            await adapter.send_multiple_images(
+                                "22" * 32, [(image.as_uri(), "caption")], metadata={key: target},
+                            )
+            self.assertFalse((root / "dev" / "outbound-media").exists())
+            self.assertEqual(image.read_bytes(), b"reply")
 
     async def test_standalone_media_files_use_one_batch_send(self):
         class FakeAdapter:
@@ -6876,27 +6919,6 @@ class MediaSupportTests(unittest.IsolatedAsyncioTestCase):
             result = await adapter.send_image_file("22" * 32, str(outside), caption="look")
             self.assertFalse(result.success)
             self.assertIn("allowed local roots", result.error or "")
-
-    async def test_outbound_media_reply_to_is_rejected(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            media_dir = Path(tmpdir) / "dev" / "inbound-media"
-            media_dir.mkdir(parents=True)
-            image_path = media_dir / "out.png"
-            image_path.write_bytes(b"png")
-
-            adapter = self.adapter_module.MarmotPlatformAdapter(
-                self.config_cls(extra={"account_id_hex": "11" * 32, "home": tmpdir}),
-                client=unittest.mock.AsyncMock(),
-            )
-            result = await adapter.send_image_file(
-                "22" * 32,
-                str(image_path),
-                caption="look",
-                reply_to="33" * 32,
-            )
-            self.assertFalse(result.success)
-            self.assertIn("reply threading", result.error or "")
-
 
 class DeleteMessageTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):

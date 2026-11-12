@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Fixed
+
+- Preserve explicit reply targets on standalone app and Hermes media sends,
+  including durable uploads and ordered batches with or without captions.
+  Validate and normalize reply ids before upload or admission, keep composer
+  drafts unchanged, and reject idempotency keys reused for different reply
+  targets (#859).
+
 ## 0.16.0 - 2026-11-11
 
 ### Fixed

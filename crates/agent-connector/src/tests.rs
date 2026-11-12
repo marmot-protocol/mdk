@@ -1,5 +1,7 @@
 //! White-box tests for the connector exercising private/`pub(crate)` internals across modules.
 
+mod media_replies;
+
 use agent_control::{
     AGENT_CONTROL_STREAM_STATUS_STARTED, AgentControlAccountSelection, AgentControlEnvelope,
     AgentControlEvent, AgentControlInvitePolicy, AgentControlProfileLookupStatus,
@@ -4578,7 +4580,7 @@ async fn preview_receipts_do_not_evict_durable_receipts_or_persist_on_restart() 
                 preview.record(key, fingerprint, Vec::new());
                 reservation.complete(Vec::new(), AgentControlSendMaintenanceDisposition::Ready);
             }
-            crate::stream_session::StrictIdempotencyAcquisition::Completed => {
+            crate::stream_session::StrictIdempotencyAcquisition::Completed(_) => {
                 panic!("fresh preview key unexpectedly replayed")
             }
             crate::stream_session::StrictIdempotencyAcquisition::Conflict => {
@@ -4626,7 +4628,7 @@ async fn preview_receipts_do_not_evict_durable_receipts_or_persist_on_restart() 
         .unwrap()
     {
         crate::stream_session::StrictIdempotencyAcquisition::Leader(_) => {}
-        crate::stream_session::StrictIdempotencyAcquisition::Completed => {
+        crate::stream_session::StrictIdempotencyAcquisition::Completed(_) => {
             panic!("preview receipt must not survive restart")
         }
         crate::stream_session::StrictIdempotencyAcquisition::Conflict => {
@@ -6730,10 +6732,16 @@ fn send_media_fingerprint_is_content_bound() {
         dim: None,
         thumbhash: None,
     };
-    let first = send_media_fingerprint("aa", "bb", Some("caption"), &[attachment(b"same bytes")]);
+    let first = send_media_fingerprint(
+        "aa",
+        "bb",
+        Some("caption"),
+        &[attachment(b"same bytes")],
+        None,
+    );
     assert_eq!(
-        first,
-        send_media_fingerprint("aa", "bb", Some("caption"), &[attachment(b"same bytes")],)
+        first, "9a0352dc88b6b8244b4ebd1863b2ddc73773eeb43adbcef368a4e1f0902a1d5e",
+        "persisted plain-send retries must retain their pre-reply fingerprint"
     );
     assert_ne!(
         first,
@@ -6742,17 +6750,19 @@ fn send_media_fingerprint_is_content_bound() {
             "bb",
             Some("caption"),
             &[attachment(b"different bytes")],
+            None,
         )
     );
     assert_ne!(
         first,
-        send_media_fingerprint("aa", "bb", None, &[attachment(b"same bytes")])
+        send_media_fingerprint("aa", "bb", None, &[attachment(b"same bytes")], None)
     );
     let ordered = send_media_fingerprint(
         "aa",
         "bb",
         Some("caption"),
         &[attachment(b"one"), attachment(b"two")],
+        None,
     );
     assert_ne!(
         ordered,
@@ -6761,13 +6771,39 @@ fn send_media_fingerprint_is_content_bound() {
             "bb",
             Some("caption"),
             &[attachment(b"two"), attachment(b"one")],
+            None,
         ),
         "attachment order must change the fingerprint"
     );
     assert_ne!(
         first,
-        send_media_fingerprint("aa", "cc", Some("caption"), &[attachment(b"same bytes")]),
+        send_media_fingerprint(
+            "aa",
+            "cc",
+            Some("caption"),
+            &[attachment(b"same bytes")],
+            None
+        ),
         "destination group must change the fingerprint"
+    );
+    let reply = send_media_fingerprint(
+        "aa",
+        "bb",
+        Some("caption"),
+        &[attachment(b"same bytes")],
+        Some("cc"),
+    );
+    assert_ne!(first, reply, "adding a reply must change the fingerprint");
+    assert_ne!(
+        reply,
+        send_media_fingerprint(
+            "aa",
+            "bb",
+            Some("caption"),
+            &[attachment(b"same bytes")],
+            Some("dd")
+        ),
+        "a different reply target must change the fingerprint"
     );
 }
 

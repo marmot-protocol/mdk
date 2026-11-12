@@ -319,7 +319,7 @@ pub(crate) fn build_inner_event(
     build_inner_event_with_media_reply(intent, sender_pubkey_hex, created_at, None)
 }
 
-/// The draft-only media reply context keeps the public Media intent compatible.
+/// The optional media reply context keeps the public Media intent compatible.
 /// Tags and validation still belong to this single event builder.
 pub(crate) fn build_inner_event_with_media_reply(
     intent: &AppMessageIntent,

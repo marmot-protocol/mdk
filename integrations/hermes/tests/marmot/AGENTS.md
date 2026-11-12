@@ -12,6 +12,8 @@ Keep test-only fixtures outside the plugin source directory so Hermes's standard
   `HERMES_APPROVAL_CONTRACT=1` and the pinned Hermes source on `PYTHONPATH` (see the plugin README).
 - `test_adapter.py` asserts on the plugin README's source-install section; keep the phrase
   "Install through Hermes's standard plugin flow" before `## Release Install` with its fence intact.
+- `media_reply_smoke.py` - Python worker for the connector's real socket/media receiver test; drives all five
+  production media methods through a lost-response retry. Not discovered by `unittest`.
 - `test_dev_scripts.sh` - dev-script, installer, `hermes-agent.lock` drift, and systemd-service checks.
 - `e2e_deterministic.py`, `e2e_connector.py`, `real_hermes_persisted_config.py` - driven by
   `scripts/hermes_marmot_*.sh` through `just hermes-dev-e2e-deterministic`, `just hermes-dev-e2e-connector`, and

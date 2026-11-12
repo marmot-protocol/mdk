@@ -805,9 +805,16 @@ minus authentication overhead). It validates every source before staging or
 uploading any of them, applies the first non-empty caption once, and removes all
 staged copies on success, error, timeout, or cancellation. Retryable control-
 plane failures reuse one idempotency key; `wn-agent` binds that key to the
-destination, caption, ordered attachment metadata, and plaintext hashes before
+destination, reply target, caption, ordered attachment metadata, and plaintext hashes before
 uploading, then returns the original durable message ids on a matching retry.
-Reply-targeted media sends remain unsupported and fail before upload.
+Image, document, video, and voice sends accept `reply_to`, the original inner
+message id. Multi-image sends accept `reply_to_message_id_hex` in their metadata.
+The caption and all ordered attachments arrive on one reply message. The adapter
+captures the target before staging and retains it across retries. An omitted or
+null target sends an ordinary media message. Targets must contain 32 bytes of
+hexadecimal; malformed or wrong-sized targets fail before staging. The Python
+control client's `send_media` exposes
+the same target as the optional `reply_to_message_id_hex` keyword.
 
 Large encrypted-media blobs retain the existing wire format, but every receiver
 must run an MDK version with the matching 512 MiB receive bound; older receivers
