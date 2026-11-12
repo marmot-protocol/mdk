@@ -25,6 +25,36 @@
   retry interval, so a reconnect could miss its 5 s bound and fail with a
   reconnect observation timeout.
 
+### Added
+
+- Share NIP-46 remote signer sessions across Rust, UniFFI, and C, with
+  account-secret-store persistence, startup restoration, versioned permission
+  approval, relay-ready pairing offers, and request-scoped cancellation (#828).
+  Sign-out and wipe erase communication keys; host NIP-55 callbacks and local
+  signing accounts keep their existing APIs.
+  Freeing a C handle preserves the runtime-owned signer. Logout detaches the
+  revoked signer after credential erasure; storage failures retain stopped,
+  retryable cleanup ownership. Setup rollback restores prior callbacks and
+  grant records while initial-provisioning retries retain their paired credentials.
+  Native login/register adoption is runtime-owned across all bindings: caller drop
+  stops waiting without cancelling admitted work. Pairing is a separate bounded,
+  caller-cancellable connect call; login requires an already-verified Ready session
+  and rejects other states without connecting or creating an account. Unbound pairing
+  never mutates an account. Explicit session cancel/disconnect/logout interrupts
+  adoption, and shutdown interrupts and settles owned work before returning.
+  Adoption keeps its admission generation through binding, network waits, and
+  rollback. Reconnect cannot revive retired work; rollback cannot cancel a newer generation.
+  Completed accounts rebind without reopening setup; failed Native adoption restores
+  prior local callbacks, records, and activation without retracting published
+  KeyPackages. Legacy host login behavior and explicit sign-out cleanup are unchanged.
+  Post-commit journal cleanup failures do not revoke a ready account.
+  Explicit pairing can repair metadata-only interrupted credential writes.
+  Local removal reports account disappearance after cancellation instead of a vault failure.
+  Account deletion serializes session resume through credential erasure and removal.
+  Sign-out and wipe wait for foreground setup and keep signer resume behind
+  their existing account fence through credential removal.
+  Unsupported relay negotiation accepts `method not found` without hiding other errors.
+
 ## 0.16.0 - 2026-11-11
 
 ### Fixed

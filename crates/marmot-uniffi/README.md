@@ -16,6 +16,7 @@ Read the documentation at the tag matching your binaries; `master` can describe 
   [exclusive root ownership](#exclusive-root-ownership), [threading model](#threading-model),
   [service endpoint defaults](#service-endpoint-defaults)
 - Accounts and identity: [interactive account onboarding](#interactive-account-onboarding),
+  [NIP-46 accounts](#nip-46-accounts),
   [identity references and profiles](#identity-references-and-profiles),
   [KeyPackage inventory](#keypackage-inventory), [KeyPackage selection](#keypackage-selection),
   [invitation lookup outcomes](#invitation-lookup-outcomes),
@@ -490,6 +491,82 @@ Public profile-image uploads use the deployment's `profileImageEndpoint`
 (`https://blossom.primal.net` in White Noise's), or an explicit Blossom server
 passed to `uploadProfileImage`. With neither, the upload fails. Peers' avatars
 always load from the URL in their own profile.
+
+## NIP-46 accounts
+
+`Marmot.nip46New` returns a `Nip46SessionFfi` shared by Swift, Kotlin, and the C
+ABI. MDK owns its transport, request correlation, identity checks, and
+account-scoped credential storage. It does not retain a host signer callback.
+Local-key accounts and separate remote signers can run in the same runtime.
+
+1. Create an offline session with a bunker link in `uri`, or `relays` and an
+   optional `name` for client-initiated pairing.
+2. Call `reviewPermissions`, display its version and grants, and pass the exact
+   snapshot to `approvePermissions` only after user consent. New sessions and
+   imported exports require this review, including old unversioned descriptors.
+   Do not approve an expanded permission set automatically. `uri` and `connect`
+   refuse unapproved sessions.
+3. For client-initiated pairing, await `pairingOffer` before showing its
+   credential-bearing URI as a QR code or copy action. It installs the relay
+   listener and enters `Listening`; the offline `uri` accessor alone does not.
+   Never log either URI. Await `connect` to verify the user's account identity
+   (bunker links can connect directly), then call `nip46Login`
+   with messaging and bootstrap relays. Login requires an already-verified `Ready`
+   session; otherwise it rejects without connecting, discovering relays, or creating
+   an account. Login persists the verified communication
+   key through the configured secret store and nonsecret metadata in the account
+   home. `nip46Register` attaches a restored descriptor to an existing account.
+4. On restart, call the ordinary runtime `start`; MDK restores account sessions
+   before starting their workers. Restoration reads local credentials; a missing
+   account-identity proof can still require bounded remote signing.
+   Use `nip46Resume` to obtain the restored handle, not a host-managed signer
+   callback or exported client secret. Resume retains the persisted grant snapshot;
+   a changed required set needs another explicit review.
+
+`status` returns `Nip46StatusFfi`: typed state, optional `Nip46ErrorFfi`, auth URL,
+request ID, and generation. It contains no keys, pairing URI, or request payload.
+Read status locally. Async `connect` and `ping` use the independently driven
+transport; cancelling a pending foreign call cancels its scoped request.
+Permission persistence and bounded `logout` run on blocking workers and complete
+even when the foreign caller cancels the call. An `Approval` state is an intermediate auth challenge,
+not successful completion. Review its URL before opening it; `completeAuth` takes
+the matching request ID and acknowledges only that challenge. The RPC still waits
+for the signer's final response.
+
+`cancelRequest` affects one matching request; stale IDs return `RequestNotFound`.
+`disconnect` interrupts transport work and allows explicit reconnection in a new
+generation. `cancel` permanently cancels that session. Neither removes stored
+credentials. `export` remains an optional encrypted-vault backup containing secret
+communication credentials; never put it in logs or ordinary preferences.
+`nip46Remove` detaches the session and removes its account-scoped credentials;
+ordinary account sign-out/wipe applies its own lifecycle cleanup. `logout` attempts
+a bounded remote courtesy request and erases this session's local communication
+key even when the signer is unavailable. It detaches the revoked signer so fresh
+pairing can be registered after local erasure succeeds. A vault deletion error
+leaves signing stopped; retry `logout` or `nip46Remove` after the vault recovers.
+It does not replace MDK account sign-out.
+
+Once Native `nip46Login` or `nip46Register` adoption is admitted, cancelling the
+foreign call only stops waiting. Runtime-owned adoption continues without rollback
+on caller cancellation. Pairing is a separate bounded, caller-cancellable `connect`
+call and makes no account changes while unbound. Cancel and discard abandoned pairing
+UI; call adoption explicitly only after verification succeeds. Account sign-out does
+not cancel unrelated unbound sessions.
+Use session `cancel`, `disconnect`, or `logout` to interrupt adoption explicitly.
+An explicit reconnect cannot resume adoption retired by an earlier disconnect.
+Rollback does not reset newer-generation transport state or cancel its pending requests.
+Shutdown interrupts and settles owned adoption before returning.
+
+Failed completed-account Native rebinds restore the prior local callback, grant
+record, and activation state while preserving setup readiness. Already-published
+KeyPackages are not retracted. Account sign-out cleanup remains explicit. This
+does not make legacy host-callback/NIP-55 failed login transactional.
+An unavailable signer can still stop the account's worker.
+
+Local-key and arbitrary host callback APIs are unchanged. For C ownership and
+blocking-call rules, see [NIP-46 accounts in the C guide](../marmot-c/README.md#nip-46-accounts).
+The [shared session contract](../../docs/external-signer-accounts.md#nip-46-sessions)
+lists the required permission kinds and storage/recovery behavior.
 
 ## Interactive account onboarding
 

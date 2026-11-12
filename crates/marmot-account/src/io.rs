@@ -39,6 +39,22 @@ pub(crate) fn read_private_json<T: for<'de> Deserialize<'de>>(
 /// steady-state reads free of inode metadata writes. `after_open` lets tests
 /// replace the file inside that window.
 fn read_tightened_private_file(path: &Path, after_open: impl FnOnce()) -> io::Result<Vec<u8>> {
+    read_private_file_bounded(path, u64::MAX, after_open)
+}
+
+pub(crate) fn read_private_json_bounded<T: for<'de> Deserialize<'de>>(
+    path: &Path,
+    max_bytes: u64,
+) -> AccountHomeResult<T> {
+    let bytes = read_private_file_bounded(path, max_bytes, || {})?;
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
+fn read_private_file_bounded(
+    path: &Path,
+    max_bytes: u64,
+    after_open: impl FnOnce(),
+) -> io::Result<Vec<u8>> {
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -46,7 +62,7 @@ fn read_tightened_private_file(path: &Path, after_open: impl FnOnce()) -> io::Re
         use std::os::unix::fs::OpenOptionsExt;
         options.custom_flags(libc::O_NOFOLLOW);
     }
-    let mut file = options.open(path)?;
+    let file = options.open(path)?;
     after_open();
     #[cfg(unix)]
     {
@@ -64,7 +80,14 @@ fn read_tightened_private_file(path: &Path, after_open: impl FnOnce()) -> io::Re
         }
     }
     let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)?;
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "private record exceeds size limit",
+        ));
+    }
     Ok(bytes)
 }
 

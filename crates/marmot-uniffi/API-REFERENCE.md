@@ -4436,7 +4436,7 @@ pub fn new_with_configuration( root_path: String, relay_urls: Vec<String>, optio
 
 Open with any combination of runtime options, including the required deployment. The other constructors are wrappers around this entry point and take the deployment as their last argument.
 
-[Source](src/lib.rs#L334)
+[Source](src/lib.rs#L338)
 
 ### `Marmot::new_with_experimental_device_groups`
 
@@ -4446,7 +4446,7 @@ pub fn new_with_experimental_device_groups( root_path: String, relay_urls: Vec<S
 
 Open a controlled development build with device-group capability and explicit runtime intent. The library must enable `dev-device-groups`; otherwise it returns Runtime with `experimental_device_groups_unavailable` before opening the root or acquiring host secret storage. It takes the same `MarmotOptions` and required deployment as `new_with_configuration`, preserving their ordinary meanings and ownership. Ordinary constructors remain disabled even in a capable library. Use this constructor for every foreground/background opener of the experimental root, a notification service extension included: an ordinary constructor does not open an account that holds or is joining a device group and reports Runtime with `experimental_device_groups_required`; see the [shared host test-build guidance](README.md#experimental-device-group-test-builds). Production timing is unchanged. This is not release activation or proof of mobile artifact/device validation.
 
-[Source](src/lib.rs#L349)
+[Source](src/lib.rs#L353)
 
 ### `Marmot::new_with_options`
 
@@ -4458,7 +4458,7 @@ pub fn new_with_options( root_path: String, relay_urls: Vec<String>, relay_polic
 
 Open with an explicit relay policy and optional host-owned key storage. Existing constructors retain their public-only relay policy.
 
-[Source](src/lib.rs#L360)
+[Source](src/lib.rs#L364)
 
 ### `Marmot::new`
 
@@ -4470,7 +4470,7 @@ pub fn new( root_path: String, relay_urls: Vec<String>, deployment: MarmotDeploy
 
 Open the Marmot app at `root_path`, configured with the given default relay URLs and `deployment`. Account secrets (Nostr private keys) are stored in the platform keyring (Keychain on Apple platforms, Android's native keyring on Android) under the deployment's `keychain_service` — not in a plaintext file. Fallible because initializing the platform secret store can fail or another process may own the same root (`MarmotKitError::RuntimeBusy`). Root ownership is nonblocking and remains held until the final `Marmot`/runtime handle is dropped, even after `Marmot::shutdown`. Call `Marmot::start` before subscribing to events.
 
-[Source](src/lib.rs#L389)
+[Source](src/lib.rs#L393)
 
 ### `Marmot::new_with_secret_store`
 
@@ -4482,7 +4482,7 @@ pub fn new_with_secret_store( root_path: String, relay_urls: Vec<String>, secret
 
 Open the Marmot app with host-supplied account-secret storage instead of the platform keychain. Identical to `Marmot::new` except that every read, write, and removal of an account signing key goes through `secret_store`.
 
-[Source](src/lib.rs#L415)
+[Source](src/lib.rs#L419)
 
 ### `Marmot::new_with_cursor_persistence`
 
@@ -4494,7 +4494,7 @@ pub fn new_with_cursor_persistence( root_path: String, relay_urls: Vec<String>, 
 
 Construct with explicit advancing/frozen relay cursor behavior; new_with_configuration composes this with other options.
 
-[Source](src/lib.rs#L446)
+[Source](src/lib.rs#L450)
 
 ### `Marmot::new_with_client_name`
 
@@ -4506,7 +4506,7 @@ pub fn new_with_client_name( root_path: String, relay_urls: Vec<String>, client_
 
 Open with an optional public client label for new KeyPackage publications. Existing constructors remain untagged. Whitespace-only labels, and labels longer than 64 bytes once trimmed, are omitted rather than truncated. Hosts must supply this on every foreground/background runtime construction.
 
-[Source](src/lib.rs#L467)
+[Source](src/lib.rs#L471)
 
 ### `Marmot::start`
 
@@ -4518,7 +4518,7 @@ pub async fn start(&self) -> Result<(), MarmotKitError>
 
 Bring the runtime to local readiness.
 
-[Source](src/lib.rs#L505)
+[Source](src/lib.rs#L509)
 
 ### `Marmot::shutdown`
 
@@ -4530,7 +4530,7 @@ pub async fn shutdown(&self)
 
 Tear the runtime down. Drops all subscriptions; long-lived `EventsSubscription` / `ChatsSubscription` / etc. instances on the host side will see their `next()` return `None` shortly after.
 
-[Source](src/lib.rs#L517)
+[Source](src/lib.rs#L521)
 
 ### `Marmot::shutdown_and_close`
 
@@ -4542,7 +4542,7 @@ pub async fn shutdown_and_close(&self) -> Result<(), MarmotKitError>
 
 Terminally stop work, close storage and release root ownership; reconstruct before further reads/work.
 
-[Source](src/lib.rs#L553)
+[Source](src/lib.rs#L557)
 
 ### `Marmot::storage_is_closed`
 
@@ -4554,7 +4554,7 @@ pub fn storage_is_closed(&self) -> bool
 
 True once `Marmot::shutdown_and_close` has closed the store. A host can check this to confirm it is safe to be suspended, or to notice it is holding a spent handle and needs a fresh one.
 
-[Source](src/lib.rs#L561)
+[Source](src/lib.rs#L565)
 
 ### `Marmot::is_stopping`
 
@@ -4566,7 +4566,7 @@ pub fn is_stopping(&self) -> bool
 
 True once shutdown has started. Host apps can use this to avoid launching more subscriptions or account work while they are moving to the background.
 
-[Source](src/lib.rs#L568)
+[Source](src/lib.rs#L572)
 
 </details>
 
@@ -5784,3 +5784,218 @@ Take the initial list once; subsequent calls return an empty list. An empty firs
 without configured relay entries. This method does not consume a later update or initiate a connection.
 
 [Source](src/subscriptions/relay_liveness.rs#L29)
+
+<details>
+<summary>nip46.rs</summary>
+
+### `Marmot::nip46_new`
+
+```rust
+pub fn nip46_new(&self, config_json: String) -> Result<Arc<Nip46SessionFfi>, MarmotKitError>
+```
+
+Create an offline MDK-owned session from a bunker URI, pairing config, or secret export. Review and approve permissions before URI access or connection. Imports do not silently approve grants. No host signer callback is retained; the handle belongs to its creating Marmot object.
+
+[Source](src/nip46.rs#L254) · [Session lifecycle](README.md#nip-46-accounts)
+
+### `Marmot::nip46_login`
+
+```rust
+pub async fn nip46_login( &self, session: Arc<Nip46SessionFfi>, default_relays: Vec<String>, bootstrap_relays: Vec<String>, inbox_relays: Vec<String>, ) -> Result<AccountSummaryFfi, MarmotKitError>
+```
+
+Create or reopen the external account using the verified shared signer and persist its communication credentials through MDK's configured secret store. Requires a successful explicit `connect` and an already-verified `Ready` session; other states are rejected without connecting, discovering relays, or creating an account. Messaging relay-list discovery and default publication follow external-signer login. Empty inbox relays reuse defaults. A session from another Marmot object returns `ExternalSignerMismatch` before network work.
+
+Once Native adoption is admitted, caller cancellation only stops waiting; runtime-owned work continues. Pairing is a separate bounded, caller-cancellable `connect` call and makes no account changes while unbound. Explicit session cancel, disconnect, or logout interrupts adoption; shutdown interrupts and settles owned work before returning.
+
+Adoption retains its admission generation through binding and network waits. A later explicit reconnect cannot resume adoption retired by disconnect.
+
+Rollback does not reset newer-generation transport state or cancel its pending requests.
+
+Before commit, a failed Native handoff restores the previous local callback and grant record without deleting pre-existing credentials. Completed accounts rebind without reopening setup and restore prior activation on failure. Already-published KeyPackages are not retracted. New and incomplete accounts retain pairing for possibly exposed publication retries. Post-commit journal cleanup errors do not revoke a network-ready account. Account sign-out cleanup remains explicit; legacy host login behavior is unchanged.
+
+[Source](src/nip46.rs#L264) · [Session lifecycle](README.md#nip-46-accounts)
+
+### `Marmot::nip46_register`
+
+```rust
+pub async fn nip46_register( &self, account_ref: String, session: Arc<Nip46SessionFfi>, ) -> Result<(), MarmotKitError>
+```
+
+Attach a verified imported session to an existing account, persist credentials, and activate the worker. A different attached session must be removed before replacement. A foreign-owner handle returns `ExternalSignerMismatch`. Ordinary cold startup restores MDK-owned sessions without this import path.
+
+Admitted adoption outlives caller cancellation and is interrupted and settled by shutdown, as with `nip46_login`. If no prior callback exists, a verified pairing remains attached for recovery when worker startup fails.
+
+[Source](src/nip46.rs#L293) · [Session lifecycle](README.md#nip-46-accounts)
+
+### `Marmot::nip46_resume`
+
+```rust
+pub async fn nip46_resume( &self, account_ref: String, ) -> Result<Arc<Nip46SessionFfi>, MarmotKitError>
+```
+
+Obtain the account's shared session from MDK-owned credentials, without a host descriptor or signer callback. Persisted approval is retained unchanged; changed required grants need explicit review. Startup restores local credentials before workers; a missing account-identity proof can require bounded remote signing.
+
+[Source](src/nip46.rs#L306) · [Session lifecycle](README.md#nip-46-accounts)
+
+### `Marmot::nip46_remove`
+
+```rust
+pub async fn nip46_remove(&self, account_ref: String) -> Result<(), MarmotKitError>
+```
+
+Detach the account's shared session and remove its persisted communication credentials. This does not replace account sign-out or data wiping.
+
+[Source](src/nip46.rs#L315) · [Session lifecycle](README.md#nip-46-accounts)
+
+### `Nip46SessionFfi::permissions`
+
+```rust
+pub fn permissions(&self) -> Nip46PermissionsFfi
+```
+
+Read the currently required version and grants without recording review, approving access, or doing network work.
+
+[Source](src/nip46.rs#L158)
+
+### `Nip46SessionFfi::review_permissions`
+
+```rust
+pub fn review_permissions(&self) -> Nip46PermissionsFfi
+```
+
+Record the exact required snapshot for user review. Review does not approve; display its version and grants before calling approval.
+
+[Source](src/nip46.rs#L163)
+
+### `Nip46SessionFfi::approve_permissions`
+
+```rust
+pub async fn approve_permissions( &self, version: u32, grants: Vec<String>, ) -> Result<(), Nip46ErrorFfi>
+```
+
+Approve only the previously reviewed version and exact grant set after user consent. Missing review or changed grants return `PermissionApprovalRequired`. An imported descriptor, including one exported with approval metadata, does not grant access by itself. Bound account credential persistence runs on a blocking worker and finishes even if the foreign caller cancels its wait.
+
+[Source](src/nip46.rs#L169)
+
+### `Nip46SessionFfi::connect`
+
+```rust
+pub async fn connect(&self) -> Result<String, Nip46ErrorFfi>
+```
+
+Pair or reconnect, verify the pinned account public key, and adopt policy-checked signer relay changes. Returns user hex; messaging relays are unchanged. Requires permission approval. The independently driven native transport does not block the host or Tokio async workers. Cancelling a pending foreign call cancels its scoped request.
+
+[Source](src/nip46.rs#L183)
+
+### `Nip46SessionFfi::pairing_offer`
+
+```rust
+pub async fn pairing_offer(&self) -> Result<String, Nip46ErrorFfi>
+```
+
+Install the client-pairing listener and await relay subscription acknowledgements before returning the credential-bearing URI. Display that URI only after this call succeeds, then await connect while the pairing UI remains visible. Requires explicit permission approval and an unpaired client-initiated session. Cancellation retires the offer; obtain and display a fresh one before retrying.
+
+[Source](src/nip46.rs#L188)
+
+### `Nip46SessionFfi::uri`
+
+```rust
+pub fn uri(&self) -> Result<String, Nip46ErrorFfi>
+```
+
+Return the credential-bearing pairing URI locally after permission approval. This accessor does not install a listener; use `pairing_offer` before displaying a client-initiated QR code. Never log or persist either URI as ordinary settings.
+
+[Source](src/nip46.rs#L193)
+
+### `Nip46SessionFfi::export`
+
+```rust
+pub fn export(&self) -> Result<String, Nip46ErrorFfi>
+```
+
+Export secret communication credentials and pinned identities as compatibility JSON for an optional encrypted-vault backup. MDK-owned resume does not require this export. Logged-out credentials cannot be exported.
+
+[Source](src/nip46.rs#L198)
+
+### `Nip46SessionFfi::status`
+
+```rust
+pub fn status(&self) -> Nip46StatusFfi
+```
+
+Read local typed state, optional privacy-safe error, auth URL, request ID, and generation. No keys, pairing URI, or signer request payload is included. `Approval` is an intermediate challenge, not successful RPC completion.
+
+[Source](src/nip46.rs#L203)
+
+### `Nip46SessionFfi::state_json`
+
+```rust
+pub fn state_json(&self) -> Result<String, Nip46ErrorFfi>
+```
+
+Read the compatibility JSON status used by C. Existing state/detail/auth-url fields are retained with request, generation, and typed-error metadata. No network work.
+
+[Source](src/nip46.rs#L208)
+
+### `Nip46SessionFfi::ping`
+
+```rust
+pub async fn ping(&self) -> Result<(), Nip46ErrorFfi>
+```
+
+Check the remote signer through the independently driven shared transport. Failures retain the typed session reason. Cancelling a pending foreign call cancels its scoped request without terminally cancelling the session.
+
+[Source](src/nip46.rs#L213)
+
+### `Nip46SessionFfi::disconnect`
+
+```rust
+pub fn disconnect(&self)
+```
+
+Interrupt transport work and advance its generation while permitting explicit reconnection. Does not remove persisted credentials.
+
+[Source](src/nip46.rs#L218)
+
+### `Nip46SessionFfi::cancel_request`
+
+```rust
+pub fn cancel_request(&self, request_id: String) -> Result<(), Nip46ErrorFfi>
+```
+
+Cancel one matching pending request without cancelling the session. Stale IDs return `RequestNotFound`; other sessions are unaffected.
+
+[Source](src/nip46.rs#L223)
+
+### `Nip46SessionFfi::complete_auth`
+
+```rust
+pub fn complete_auth(&self, request_id: String) -> Result<(), Nip46ErrorFfi>
+```
+
+Acknowledge a matching auth challenge after reviewing its URL. The pending RPC still needs its final remote response. Stale IDs return `RequestNotFound`.
+
+[Source](src/nip46.rs#L228)
+
+### `Nip46SessionFfi::cancel`
+
+```rust
+pub fn cancel(&self)
+```
+
+Permanently cancel this session and interrupt pending work, including synchronous identity-proof callbacks. Does not remove persisted credentials or revoke an optional saved export.
+
+[Source](src/nip46.rs#L233)
+
+### `Nip46SessionFfi::logout`
+
+```rust
+pub async fn logout(&self) -> Result<(), Nip46ErrorFfi>
+```
+
+Attempt bounded remote courtesy logout and erase the session's communication credentials even when no acknowledgement arrives or the foreign caller cancels its wait. Successful local erasure detaches the revoked signer so a fresh pairing can be registered in the same process. A vault deletion error stops signing but retains cleanup ownership; retry logout or account-level removal after the vault recovers. This does not sign out the MDK account; account sign-out already leaves attached handles logged out.
+
+[Source](src/nip46.rs#L241)
+
+</details>

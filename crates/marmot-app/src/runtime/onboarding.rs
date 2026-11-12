@@ -22,7 +22,6 @@ mod single_device;
 #[derive(Clone)]
 pub(super) struct SetupState {
     generated_setup_local_transaction: Arc<Mutex<()>>,
-    onboarding_transactions: Arc<StdMutex<HashMap<String, std::sync::Weak<Mutex<()>>>>>,
     onboarding_state: Arc<StdMutex<HashMap<String, std::sync::Weak<StdMutex<()>>>>>,
     onboarding_updates: Arc<StdMutex<HashMap<String, watch::Sender<OnboardingSnapshot>>>>,
     onboarding_cancellations: Arc<StdMutex<OnboardingCancellationTasks>>,
@@ -64,7 +63,6 @@ impl SetupState {
     pub(super) fn new() -> Self {
         Self {
             generated_setup_local_transaction: Arc::new(Mutex::new(())),
-            onboarding_transactions: Arc::new(StdMutex::new(HashMap::new())),
             onboarding_state: Arc::new(StdMutex::new(HashMap::new())),
             onboarding_updates: Arc::new(StdMutex::new(HashMap::new())),
             onboarding_cancellations: Arc::new(StdMutex::new(OnboardingCancellationTasks {
@@ -108,8 +106,8 @@ impl SetupState {
         account_id: &str,
     ) -> GeneratedTeardownFence {
         let background = self.fence_generated_setup(account_id).await;
-        let transaction = AccountSetup::new(self, manager).onboarding_transaction(account_id);
-        let foreground = transaction.lock_owned().await;
+        let transaction = manager.app.onboarding_transaction(account_id);
+        let foreground = manager.lock_nip46_removal(transaction, account_id).await;
         GeneratedTeardownFence {
             _background: background,
             _foreground: foreground,
@@ -1218,20 +1216,6 @@ impl<'a> SetupRecords<'a> {
 }
 
 impl AccountSetup<'_> {
-    fn onboarding_transaction(&self, id: &str) -> Arc<Mutex<()>> {
-        let mut locks = self
-            .state
-            .onboarding_transactions
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        locks.retain(|_, lock| lock.strong_count() > 0);
-        if let Some(lock) = locks.get(id).and_then(std::sync::Weak::upgrade) {
-            return lock;
-        }
-        let lock = Arc::new(Mutex::new(()));
-        locks.insert(id.to_owned(), Arc::downgrade(&lock));
-        lock
-    }
     fn require_captured_attempt(
         &self,
         checkpoint: &OnboardingCheckpoint,
@@ -1762,7 +1746,7 @@ impl AccountSetup<'_> {
         self.shared().lifecycle().ensure_running()?;
         self.validate_onboarding_options(&options)?;
         let id = AccountHome::account_id_for_secret(&nsec)?;
-        let transaction = self.onboarding_transaction(&id);
+        let transaction = self.app().onboarding_transaction(&id);
         let _transaction = transaction.lock().await;
         let _workers = self.manager.lock_worker_transaction().await;
         let snapshot = match self.app().account_home().account(&id) {
@@ -1813,7 +1797,7 @@ impl AccountSetup<'_> {
         {
             return Err(AppError::ExternalSignerMismatch);
         }
-        let transaction = self.onboarding_transaction(&id);
+        let transaction = self.app().onboarding_transaction(&id);
         let _transaction = transaction.lock().await;
         let _workers = self.manager.lock_worker_transaction().await;
         // Existing identities must be gated before promotion can clear their
@@ -1865,7 +1849,7 @@ impl AccountSetup<'_> {
     /// future is safe: the next call retries its last checkpointed operation.
     pub async fn run_onboarding(&self, account_ref: &str) -> Result<OnboardingSnapshot, AppError> {
         let (account_id, attempt) = self.records().peek_onboarding_attempt(account_ref)?;
-        let transaction = self.onboarding_transaction(&account_id);
+        let transaction = self.app().onboarding_transaction(&account_id);
         let _transaction = transaction.lock().await;
         let mut c = self
             .records()
@@ -2064,7 +2048,7 @@ impl AccountSetup<'_> {
         step: OnboardingStep,
     ) -> Result<OnboardingSnapshot, AppError> {
         let (account_id, attempt) = self.records().peek_onboarding_attempt(account_ref)?;
-        let transaction = self.onboarding_transaction(&account_id);
+        let transaction = self.app().onboarding_transaction(&account_id);
         let _transaction = transaction.lock().await;
         let mut c = self
             .records()
@@ -2106,7 +2090,7 @@ impl AccountSetup<'_> {
         discovery_relays: Vec<String>,
     ) -> Result<OnboardingSnapshot, AppError> {
         let (account_id, attempt) = self.records().peek_onboarding_attempt(account_ref)?;
-        let transaction = self.onboarding_transaction(&account_id);
+        let transaction = self.app().onboarding_transaction(&account_id);
         let _transaction = transaction.lock().await;
         let mut c = self
             .records()
@@ -2144,7 +2128,7 @@ impl AccountSetup<'_> {
         step: OnboardingStep,
     ) -> Result<OnboardingSnapshot, AppError> {
         let (account_id, attempt) = self.records().peek_onboarding_attempt(account_ref)?;
-        let transaction = self.onboarding_transaction(&account_id);
+        let transaction = self.app().onboarding_transaction(&account_id);
         let _transaction = transaction.lock().await;
         let mut c = self
             .records()
@@ -2651,7 +2635,7 @@ impl AccountSetup<'_> {
         selection: Option<(Vec<String>, Vec<String>)>,
     ) -> Result<OnboardingSnapshot, AppError> {
         let (account_id, attempt) = self.records().peek_onboarding_attempt(account_ref)?;
-        let transaction = self.onboarding_transaction(&account_id);
+        let transaction = self.app().onboarding_transaction(&account_id);
         let _transaction = transaction.lock().await;
         let mut c = self
             .records()
@@ -2825,7 +2809,7 @@ impl AccountSetup<'_> {
         follows: Option<Vec<String>>,
     ) -> Result<OnboardingSnapshot, AppError> {
         let (account_id, attempt) = self.records().peek_onboarding_attempt(account_ref)?;
-        let transaction = self.onboarding_transaction(&account_id);
+        let transaction = self.app().onboarding_transaction(&account_id);
         let _transaction = transaction.lock().await;
         let mut c = self
             .records()
@@ -2867,7 +2851,7 @@ impl AccountSetup<'_> {
         account_ref: &str,
     ) -> Result<OnboardingSnapshot, AppError> {
         let (account_id, attempt) = self.records().peek_onboarding_attempt(account_ref)?;
-        let transaction = self.onboarding_transaction(&account_id);
+        let transaction = self.app().onboarding_transaction(&account_id);
         let _transaction = transaction.lock().await;
         let mut c = self
             .records()
@@ -2918,7 +2902,7 @@ impl AccountSetup<'_> {
         recovery_epoch: Option<&str>,
     ) -> Result<OnboardingSnapshot, AppError> {
         let (account_id, attempt) = self.records().peek_onboarding_attempt(account_ref)?;
-        let transaction = self.onboarding_transaction(&account_id);
+        let transaction = self.app().onboarding_transaction(&account_id);
         let _transaction = transaction.lock().await;
         let mut c = self
             .records()

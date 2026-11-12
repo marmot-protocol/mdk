@@ -1,6 +1,7 @@
 package dev.ipf.marmotkit
 
 import java.nio.file.Files
+import kotlinx.coroutines.runBlocking
 
 private class OptionsStore : SecretStore {
     override fun hasSecretForLabel(label: String): Boolean = label == "probe"
@@ -10,7 +11,7 @@ private class OptionsStore : SecretStore {
     override fun removeSecret(label: String, accountIdHex: String) {}
 }
 
-fun main(args: Array<String>) {
+fun main(args: Array<String>) = runBlocking {
     val findings = listOf(
         OnboardingFindingFfi(OnboardingIssueFfi.TIMED_OUT, "wss://example.com",
             OnboardingFindingContextFfi.RECORD_DISCOVERY, OnboardingCheckPurposeFfi.RECORD_LOOKUP,
@@ -50,6 +51,26 @@ fun main(args: Array<String>) {
     try {
         Marmot.newWithConfiguration(root.path, listOf("ws://127.0.0.1:1"), copy).use { kit ->
             check(kit.listAccounts().isEmpty())
+            kit.nip46New("{\"relays\":[\"ws://127.0.0.1:1\"],\"name\":\"Kotlin permissions\"}").use { session ->
+                check(session.status().state == Nip46StateFfi.PERMISSION_APPROVAL)
+                try {
+                    session.uri()
+                    error("unapproved session exposed a pairing URI")
+                } catch (error: Nip46ErrorFfi.PermissionApprovalRequired) {
+                }
+                val reviewed = session.reviewPermissions()
+                session.approvePermissions(reviewed.version, reviewed.grants)
+                check(session.uri().startsWith("nostrconnect://"))
+                try {
+                    session.cancelRequest("stale")
+                    error("stale request cancellation succeeded")
+                } catch (error: Nip46ErrorFfi.RequestNotFound) {
+                }
+                session.disconnect()
+                check(session.status().state == Nip46StateFfi.DISCONNECTED)
+                session.cancel()
+                check(session.status().state == Nip46StateFfi.CANCELLED)
+            }
             val experimentalRoot = root.resolve("experimental")
             if (args.contains("--dev-device-groups")) {
                 Marmot.newWithExperimentalDeviceGroups(experimentalRoot.path,

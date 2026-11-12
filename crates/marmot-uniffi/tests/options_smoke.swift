@@ -10,7 +10,7 @@ private final class OptionsStore: SecretStore, @unchecked Sendable {
 
 @main
 struct OptionsSmoke {
-    static func main() throws {
+    static func main() async throws {
         let findings = [
             OnboardingFindingFfi(issue: .timedOut, endpoint: "wss://example.com",
                 context: .recordDiscovery, purpose: .recordLookup, outcome: .unknown,
@@ -51,6 +51,26 @@ struct OptionsSmoke {
         )
         let accounts = try kit.listAccounts()
         precondition(accounts.isEmpty)
+        let session = try kit.nip46New(configJson: "{\"relays\":[\"ws://127.0.0.1:1\"],\"name\":\"Swift permissions\"}")
+        precondition(session.status().state == .permissionApproval)
+        do {
+            _ = try session.uri()
+            preconditionFailure("unapproved session exposed a pairing URI")
+        } catch Nip46ErrorFfi.PermissionApprovalRequired {
+        }
+        let reviewed = session.reviewPermissions()
+        try await session.approvePermissions(version: reviewed.version, grants: reviewed.grants)
+        let pairingUri = try session.uri()
+        precondition(pairingUri.hasPrefix("nostrconnect://"))
+        do {
+            try session.cancelRequest(requestId: "stale")
+            preconditionFailure("stale request cancellation succeeded")
+        } catch Nip46ErrorFfi.RequestNotFound {
+        }
+        session.disconnect()
+        precondition(session.status().state == .disconnected)
+        session.cancel()
+        precondition(session.status().state == .cancelled)
         let experimentalRoot = root.appendingPathComponent("experimental")
         if CommandLine.arguments.contains("--dev-device-groups") {
             let experimental = try Marmot.newWithExperimentalDeviceGroups(

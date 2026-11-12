@@ -7,6 +7,36 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ## [Unreleased]
 
+### Changed
+
+- NIP-46 handles wrap MDK's shared session transport instead of a C-only signer.
+  Existing C signatures and status numbers are unchanged. New permission review
+  and approval calls are required before pairing or connection, including imports
+  of old unversioned descriptors. Add relay-ready pairing offers, ping, reconnectable disconnect, request-scoped
+  cancellation, auth-challenge completion, MDK-owned resume, and credential removal.
+  `marmot_nip46_status` returns typed state/error metadata and owned optional
+  strings; release the record with `marmot_nip46_status_free`. Cancellation and
+  rejection remain distinct in the typed error vocabulary even when their legacy
+  `MarmotStatus` is the same.
+  Login/register persist account-scoped credentials through the configured secret
+  store; client startup restores them before workers. State/export JSON retains
+  its existing fields and adds versioned permission and typed status metadata.
+  `marmot_nip46_free` releases only its C handle, preserving the runtime-owned
+  account signer and other handles. Explicit `marmot_nip46_cancel` remains
+  terminal for the shared session. Join handle borrowers before freeing.
+  Admitted Native login/register adoption survives waiter drop. Pairing is a separate
+  bounded, caller-cancellable connect call; login requires an already-verified Ready
+  session and rejects other states without connecting or creating an account.
+  Unbound pairing never mutates an account. Explicit cancel/disconnect/logout
+  interrupts adoption; shutdown interrupts and settles owned work before returning.
+  Failed completed-account Native rebind restores prior local callbacks, records,
+  and activation without retracting published KeyPackages. Sign-out cleanup stays
+  explicit; legacy host login behavior is unchanged.
+  Setup rollback restores prior signer ownership and grants; publication retries
+  retain paired credentials across restart. Vault deletion failures leave a
+  stopped signer with retryable cleanup ownership.
+  Optional host exports remain secret and require encrypted storage.
+
 ## [0.16.0] - 2026-11-11
 
 ### Breaking changes

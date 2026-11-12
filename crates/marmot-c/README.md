@@ -501,9 +501,10 @@ Free the returned page with `marmot_timeline_page_free`; the library does not fr
 ## NIP-46 accounts
 
 Keep one `MarmotNip46Session` per remote-signer account. Local-key accounts use
-their normal login path in the same client. The session pins three separate keys:
-the client communication key, the remote signer's communication key, and the
-user's account key. Only the last identifies the MDK account.
+their normal login path in the same client. C handles wrap the same MDK-owned
+session used by Swift and Kotlin, without retained host signer callbacks. See the
+[shared session contract](../marmot-uniffi/README.md#nip-46-accounts) for identity,
+permission, status, and credential ownership.
 
 NIP-46 sessions use the shared [SOCKS5 routing policy](../marmot-app/README.md#socks5-routing).
 Invalid `WN_SOCKS5_*` configuration makes `marmot_nip46_new` fail with
@@ -512,42 +513,84 @@ clearing or correcting the environment afterward does not unblock it.
 
 1. Create an offline handle with `marmot_nip46_new`. Configuration accepts a bunker
    link in `uri`, or a `relays` array with an optional `name` for client pairing.
-   For pairing, get the credential-bearing link with `marmot_nip46_uri` and show
-   its QR code or let the user copy it.
-2. Run `marmot_nip46_connect` on a background worker. It verifies `get_public_key`
+2. Call `marmot_nip46_review_grants`; display its JSON `version` and `grants`.
+   After user consent, pass the exact version and borrowed grant array to
+   `marmot_nip46_approve_grants`. Imports, including unversioned descriptors,
+   need explicit approval too. Review does not approve. For client-initiated
+   pairing, await `marmot_nip46_pairing_offer` on a background worker before
+   displaying its credential-bearing URI. It waits for relay subscription
+   acknowledgements; `marmot_nip46_uri` alone does not install the listener.
+3. Run `marmot_nip46_connect` on a background worker while the pairing UI is
+   visible. Bunker links can connect directly. It verifies `get_public_key`
    and adopts policy-checked `switch_relays` results for this signer transport
    only. Messaging relays are unchanged. An unsupported-method error leaves the
    previous signer relays in place; other errors fail connection.
-3. Call `marmot_nip46_login` off the UI thread to create or reopen the external
-   account. It signs real MLS identity proofs and KeyPackages through the signer.
+4. After `marmot_nip46_connect` succeeds, call `marmot_nip46_login` off the UI
+   thread to create or reopen the external account. Login requires an already-verified
+   `Ready` session; otherwise it rejects without connecting, discovering relays, or
+   creating an account. It signs real MLS identity proofs and KeyPackages through the signer.
    Supply default messaging relays for lists the account has not published. Set
    `inbox_relays` separately, or pass `NULL, 0` to use the defaults for both lists. Login
    publishes those defaults only for lists that discovery confirms absent. An
    incomplete directory read fails login with a retryable error instead of
    overwriting lists it could not see. Signed lists, including explicit-empty
    declarations, are kept.
-4. Store `marmot_nip46_export` only in the host's encrypted vault. It contains the
-   client secret, pinned user and signer keys, and current relay set, but not the
-   consumed bunker/pairing secret. External database keys also use the configured
-   secret store, under reserved `.external-sqlcipher/<account label>` credentials.
-5. On restart, create handles from these exports before `marmot_client_start`.
-   Do not register them yet. Start local accounts, then independently connect and
-   call `marmot_nip46_register` for each remote account on background workers.
-   Registration activates its worker and may request a fresh identity proof.
+5. MDK persists verified signer credentials through the configured secret store.
+   On restart, call `marmot_client_start`, then `marmot_nip46_resume` to obtain an
+   account handle. Local startup restores credentials before activating workers;
+   a missing account-identity proof can require bounded remote signing.
+   No descriptor or host callback is needed.
+   `marmot_nip46_export` remains an optional encrypted-vault backup. To import one,
+   use new/review/approve/connect/register. Remove an existing owned session with
+   `marmot_nip46_remove` before attaching a different one to the same account.
 
-Poll `marmot_nip46_state` for JSON fields `state`, `detail`, and `auth_url`. States
-are `connecting`, `ready`, `approval`, `unavailable`, `cancelled`, and `logged_out`.
+Poll `marmot_nip46_state` for compatibility JSON fields `state`, `detail`, and
+`auth_url`, plus typed `last_error`, `request_id`, and `generation`. Existing state
+strings remain; `permission_approval`, `listening`, `disconnected`, and `reconnecting` describe
+additional lifecycle states.
+`marmot_nip46_status` returns a typed `MarmotNip46Status` with the full
+`MarmotNip46State`/`MarmotNip46Error` vocabulary. Only read `last_error` when
+`has_last_error` is true; auth URL and request ID strings are nullable. Release the
+whole record with `marmot_nip46_status_free`, never its embedded strings separately.
 An approval URL is an intermediate response, not failure or completion. Show
 pending work until the final response; let the user review the URL before opening
-it. RPC requests have a 90-second budget; MDK account setup can time out sooner.
+it. Pass its matching request ID to `marmot_nip46_complete_auth`; this acknowledges
+the challenge but does not complete the RPC. `marmot_nip46_cancel_request` cancels
+only the named pending request. Stale IDs return `MARMOT_STATUS_INVALID_ARGUMENT`.
+RPC requests have a 90-second budget; MDK account setup can time out sooner.
 
-`marmot_nip46_cancel` interrupts pending work without invalidating a saved export.
-For lock, reload, or shutdown, cancel, join every borrower, then free sessions
-before their creating client. Free disconnects without remote logout. For signout,
-complete MDK signout first, remove the vault export, then call
-`marmot_nip46_logout`. Its five-second courtesy request clears local client keys
-even when the signer does not acknowledge it. Do not free a handle while calls
-are in flight. Returned strings use `marmot_string_free`.
+Login/register adoption follows the shared runtime-owned contract: once admitted,
+loss of the waiter does not cancel adoption. Pairing is a separate bounded,
+caller-cancellable connect call and makes no account changes while unbound. Cancel
+and discard abandoned pairing UI; call adoption explicitly only after verification
+succeeds. Account signout does not cancel unrelated unbound sessions. Use explicit session cancellation, disconnect, or logout
+to interrupt; client shutdown interrupts and settles owned adoption before returning.
+An explicit reconnect cannot resume adoption retired by an earlier disconnect.
+Rollback does not reset newer-generation transport state or cancel its pending requests.
+This does not permit freeing a handle during an active C call.
+
+`marmot_nip46_ping` checks the remote signer; `marmot_nip46_disconnect` interrupts
+transport work but permits explicit reconnection. `marmot_nip46_cancel` permanently
+interrupts the shared session, including its account signer and other handles,
+without removing its persisted credentials or saved export.
+`marmot_nip46_free` releases only the C handle. Attached sessions remain owned by
+MDK, so freeing a login or resumed handle does not stop account signing or other
+handles. An unbound session stops when its final owner drops. Join every borrower
+before freeing a handle, and free all handles before their creating client.
+MDK account signout removes its owned signer credentials and leaves attached
+handles logged out; remove any optional host vault export too.
+`marmot_nip46_logout` is direct session revocation, not account signout. Its
+five-second courtesy request clears local client keys even without acknowledgement.
+If vault deletion fails, signing remains stopped and cleanup can be retried with
+logout or `marmot_nip46_remove` after the vault recovers.
+After account signout it reports an already logged-out session rather than sending
+another remote request. Do not free a handle while calls are in flight. Returned
+strings use `marmot_string_free`.
+
+New-account publication retries retain pairing credentials across restart;
+a post-commit journal cleanup error does not revoke the ready account.
+Completed-account rebinds do not reopen setup, including when adoption fails.
+An unavailable signer can still stop the account's worker.
 
 The loopback example exercises the C ABI with real NIP-44 websocket traffic,
 distinct user/bunker/client keys, mixed accounts, approvals and logout:
