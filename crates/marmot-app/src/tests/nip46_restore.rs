@@ -543,12 +543,13 @@ async fn run_nip46_drop(settlement: DropSettlement) {
     let mut sign_in = Box::pin(runtime.sign_in_account(&id));
     let mut early_sign_in = None;
     let sign_in_waited = if sign_in_requested {
-        match tokio::time::timeout(Duration::from_millis(100), &mut sign_in).await {
-            Ok(result) => {
+        // Sign-in reaches the account gate before its first suspension.
+        match futures::poll!(sign_in.as_mut()) {
+            std::task::Poll::Ready(result) => {
                 early_sign_in = Some(result);
                 false
             }
-            Err(_) => true,
+            std::task::Poll::Pending => true,
         }
     } else {
         false
