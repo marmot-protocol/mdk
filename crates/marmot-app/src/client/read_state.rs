@@ -614,7 +614,9 @@ impl ReadStatePublisher {
                     // shows up as a change.
                     #[cfg(any(test, feature = "test-support"))]
                     {
-                        self.key_package_inputs = oracle::KeyPackageInputs::read(client).ok();
+                        self.key_package_inputs = oracle::enabled()
+                            .then(|| oracle::KeyPackageInputs::read(client).ok())
+                            .flatten();
                     }
                     let (answer, validity) = owned_key_packages(client, write_count);
                     (answer, validity, false)
@@ -874,8 +876,9 @@ impl AppClient {
         // read, unless its raw inputs are the ones read before its build and
         // the clock has reached none of their lifetime bounds.
         #[cfg(any(test, feature = "test-support"))]
-        {
+        if oracle::enabled() {
             let read_afresh = if _changed {
+                oracle::note_check();
                 oracle::check(
                     self,
                     &publisher.current(),
@@ -884,6 +887,7 @@ impl AppClient {
                 );
                 true
             } else if publisher.key_packages_reused {
+                oracle::note_check();
                 oracle::check_reused_key_packages(
                     self,
                     &publisher.current(),
@@ -962,6 +966,41 @@ pub(crate) mod oracle {
     use cgka_traits::storage::StoredKeyPackageBundle;
 
     use super::*;
+
+    /// Publishes the oracle checked in this process.
+    static CHECKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    /// Whether this process runs the oracle: only marmot-app's own tests do.
+    /// Its unit tests always do. Its integration tests do because Cargo and
+    /// nextest start each test process with `CARGO_PKG_NAME` set to the
+    /// test's package, archived runs included. A downstream crate's tests
+    /// link this crate with `test-support` too (a dev-dependency turns it on,
+    /// and workspace feature unification turns it on for every crate built
+    /// with it), so the feature alone cannot scope the oracle. Their
+    /// processes carry their own package's name and run without it, as does
+    /// a test binary started directly, with no runner to name its package.
+    pub(crate) fn enabled() -> bool {
+        #[cfg(test)]
+        {
+            true
+        }
+        #[cfg(not(test))]
+        {
+            static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *ENABLED.get_or_init(|| {
+                std::env::var_os("CARGO_PKG_NAME")
+                    .is_some_and(|package| package == env!("CARGO_PKG_NAME"))
+            })
+        }
+    }
+
+    pub(crate) fn note_check() {
+        CHECKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn checks() -> u64 {
+        CHECKS.load(std::sync::atomic::Ordering::Relaxed)
+    }
 
     /// Whether `error` is a closed-storage error, at any depth.
     fn closed(error: &AppError) -> bool {

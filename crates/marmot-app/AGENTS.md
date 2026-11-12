@@ -1163,10 +1163,12 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   the read fully succeeded, with no bundle skipped as undecodable and no lifetime check that disagrees with that
   reading. `ReadState::valid_until` is the earliest window end;
   a change of it alone publishes a version. A new input of a reused answer must be in its validity or move one of
-  its counts (a new table needs a `storage-sqlite` `cross/group_writes.rs` trigger). Under test, every publish
-  that changed something, and every reused KeyPackage list, is checked against today's live reads
+  its counts (a new table needs a `storage-sqlite` `cross/group_writes.rs` trigger). In this crate's own tests,
+  every publish that changed something, and every reused KeyPackage list, is checked against today's live reads
   (`read_state::oracle`); the only pair let through unequal is one where a terminal storage close landed between
-  the publish and the check and one side is that close's `Closed` error.
+  the publish and the check and one side is that close's `Closed` error. The oracle runs in this crate's unit tests
+  and, through the runner's `CARGO_PKG_NAME`, its integration tests; downstream crates' tests link `test-support`
+  too (feature unification) and run without it (`oracle::enabled`). Keep its proof in this crate's suites.
 
 ## Code map (modules not covered above)
 

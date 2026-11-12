@@ -1716,6 +1716,35 @@ fn sqlite_file_requires_key_for_test(path: &Path) -> bool {
         .is_err()
 }
 
+/// The account read-state oracle runs in marmot-app's integration tests,
+/// which link this crate without `cfg(test)`: their runner names the package.
+/// `marmot-uniffi`'s `read_state_oracle_stays_off_in_downstream_tests` is the
+/// other half (mdk#3273).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn read_state_oracle_runs_in_marmot_app_integration_tests() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, url) = mock_app(&dir).await;
+    let runtime = MarmotAppRuntime::new(app);
+    let account = create_network_ready_identity(
+        &runtime,
+        AccountSetupRequest {
+            default_relays: vec![endpoint(&url)],
+            bootstrap_relays: vec![endpoint(&url)],
+            ..AccountSetupRequest::default()
+        },
+    )
+    .await
+    .account
+    .account_id_hex;
+    // A worker command publishes the read state before it replies.
+    runtime
+        .key_package_maintenance_status(&account)
+        .await
+        .unwrap();
+    assert!(marmot_app::read_state_oracle_checks() > 0);
+    runtime.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn import_with_stalled_discovery_endpoint_completes_within_the_advisory_cap() {
     let dir = tempfile::tempdir().unwrap();

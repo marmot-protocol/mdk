@@ -1600,6 +1600,42 @@ mod tests {
 
     use super::*;
 
+    /// marmot-app's account read-state oracle stays off in a downstream
+    /// crate's tests, though this crate links marmot-app with `test-support`
+    /// (mdk#3273). marmot-app's
+    /// `read_state_oracle_runs_in_marmot_app_integration_tests` is the other
+    /// half.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn read_state_oracle_stays_off_in_downstream_tests() {
+        let relay = MockRelay::run().await.unwrap();
+        let url = relay.url().await.to_string();
+        let root = tempfile::tempdir().unwrap();
+        let app = MarmotApp::with_relay_and_config(
+            root.path(),
+            url.clone(),
+            marmot_app::MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
+        );
+        let kit = Marmot {
+            runtime: app.runtime(),
+            app,
+        };
+        let endpoint = TransportEndpoint(url);
+        let account = kit
+            .runtime
+            .create_identity(AccountSetupRequest {
+                default_relays: vec![endpoint.clone()],
+                bootstrap_relays: vec![endpoint],
+                ..AccountSetupRequest::default()
+            })
+            .await
+            .unwrap()
+            .account
+            .account_id_hex;
+        // A worker command publishes the read state before it replies.
+        kit.key_package_maintenance_status(account).await.unwrap();
+        assert_eq!(marmot_app::read_state_oracle_checks(), 0);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn app_component_and_key_package_status_ffi_roundtrip() {
         let relay = MockRelay::run().await.unwrap();
