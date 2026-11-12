@@ -4,6 +4,9 @@
 
 ### Fixed
 
+- Write Hermes `config.yaml`, its backup, and temporary files with mode `0600`
+  during gateway configuration, regardless of the process umask. Existing
+  group and other access is removed (#2481).
 - Preserve explicit reply targets on standalone app and Hermes media sends,
   including durable uploads and ordered batches with or without captions.
   Validate and normalize reply ids before upload or admission, keep composer
