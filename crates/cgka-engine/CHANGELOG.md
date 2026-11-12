@@ -32,6 +32,10 @@
   for deciding whether a delivery is worth hydrating the group for (mdk#2332). It is empty for a live, quarantined or
   unknown group.
 
+- `Engine::private_key_packages_next_expiry` returns when the earliest issued private KeyPackage expires, and
+  `Engine::has_rejoin_offers` whether any stored Welcome is a rejoin offer, so maintenance can wake for them
+  (mdk#3265).
+
 ### Changed
 
 - A newly signed account identity proof and a replay-rotation obligation are dated by the engine's wall clock

@@ -48,6 +48,9 @@
   `prepared_group_image_upload` reads its record, from one statement and without reading the image, ciphertext or
   secret (mdk#3273).
 
+- `SqliteAppStorage::received_private_key_packages_next_expiry` returns when the earliest handed-over private
+  KeyPackage expires (mdk#3265).
+
 ### Changed
 
 - New reads for the account worker's job deadlines (mdk#2923): `device_pairing_state_exists`,

@@ -1,12 +1,14 @@
 //! The account worker's own deadlines (mdk#2923 step B). Every job the
-//! maintenance tick used to run, other than session maintenance, runs when
-//! an event wakes it or a deadline comes, not on every maintenance tick. Recovery and post-join re-arm at [`RETRY_WHILE_OWED`], the tick's
+//! maintenance tick used to run, session maintenance included (mdk#3265),
+//! runs when an event wakes it or a deadline comes, not on every maintenance
+//! tick. Recovery and post-join re-arm at [`RETRY_WHILE_OWED`], the tick's
 //! old cadence, while they still have work, and with none they rest until a
 //! wake. A pass arms the deadline its data gives (see [`Schedule::arm`]).
 //!
-//! The 15 s tick stays only as a watchdog until PR C removes it: a job that
-//! has work due with no wake pending and no deadline within 15 s is a missed
-//! wake. The watchdog counts it, logs once per job per worker ownership, and
+//! The 15 s tick stays only as a watchdog until a later PR removes it: a job
+//! that has work due with no wake pending and no deadline within 15 s is a
+//! missed wake, and so is session maintenance found due before its planned
+//! run. The watchdog counts it, logs once per job per worker ownership, and
 //! wakes the job for the worker's next turn, so a missed wake costs at most
 //! one tick, as before.
 use std::time::Duration;
@@ -57,10 +59,15 @@ pub(super) enum Job {
     Push,
     /// History uploads, fetches, backup passes and restores.
     HistoryDispatch,
+    /// Session maintenance (`run_due_maintenance`), at the earliest time its
+    /// data gives (mdk#3265).
+    SessionMaintenance,
+    /// The relay-config update's retry after the account was not active.
+    RelayConfig,
 }
 
 impl Job {
-    pub(super) const ALL: [Self; 13] = [
+    pub(super) const ALL: [Self; 15] = [
         Self::Recovery,
         Self::PostJoin,
         Self::AttachmentPass,
@@ -74,6 +81,8 @@ impl Job {
         Self::KeyPackageCatchUp,
         Self::Push,
         Self::HistoryDispatch,
+        Self::SessionMaintenance,
+        Self::RelayConfig,
     ];
 
     pub(super) const fn as_str(self) -> &'static str {
@@ -91,6 +100,8 @@ impl Job {
             Self::KeyPackageCatchUp => "key_package_catch_up",
             Self::Push => "push",
             Self::HistoryDispatch => "history_dispatch",
+            Self::SessionMaintenance => "session_maintenance",
+            Self::RelayConfig => "relay_config",
         }
     }
 
@@ -226,6 +237,28 @@ impl Schedule {
         state.woken
             || state.deadline.is_some_and(|deadline| deadline <= now)
             || state.wall.is_some_and(|wall| wall <= now_wall)
+    }
+
+    /// Move `job`'s deadline to `at`, by the worker's clock, and its wall
+    /// time to `wall`, keeping a pending wake. Session maintenance re-reads
+    /// its due time after other work, which must not cancel a wake already
+    /// set (mdk#3265).
+    pub(super) fn reschedule(&mut self, job: Job, at: Option<Instant>, wall: Option<u64>) {
+        let state = self.state(job);
+        state.deadline = at;
+        state.wall = wall;
+    }
+
+    /// The watchdog's count for a job whose plan comes from its data:
+    /// `late` is the caller's finding that work came due which the plan
+    /// does not reach. A pending wake runs it anyway, so that is no miss.
+    /// Returns as [`Self::missed`] does.
+    pub(super) fn late(&mut self, job: Job, late: bool) -> Option<bool> {
+        let state = self.state(job);
+        if !late || state.woken {
+            return None;
+        }
+        Some(!std::mem::replace(&mut state.missed_logged, true))
     }
 
     /// The watchdog's check: `job` has work (`owed`), yet no wake is
@@ -391,5 +424,22 @@ mod tests {
             schedule.missed(Job::AvatarPass, true, now, WALL),
             Some(true)
         );
+    }
+
+    /// A late finding counts once per worker with a log on the first; a
+    /// pending wake runs the job anyway, so it is no miss, and a re-read
+    /// keeps that wake.
+    #[test]
+    fn a_late_finding_counts_unless_a_wake_is_pending() {
+        let now = Instant::now();
+        let job = Job::SessionMaintenance;
+        let mut schedule = Schedule::opened();
+        assert_eq!(schedule.late(job, true), None, "woken");
+        schedule.reschedule(job, None, Some(WALL + 600));
+        assert!(schedule.due(job, now, WALL), "a re-read keeps the wake");
+        schedule.arm(job, Some(now + Duration::from_secs(600)));
+        assert_eq!(schedule.late(job, false), None, "nothing late");
+        assert_eq!(schedule.late(job, true), Some(true), "first miss logs");
+        assert_eq!(schedule.late(job, true), Some(false));
     }
 }
