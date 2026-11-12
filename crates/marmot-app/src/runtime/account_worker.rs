@@ -1973,7 +1973,7 @@ async fn run_app_runtime_account_worker(
             );
         }
         let ready_command = ready_command_index(&pending, &media_http);
-        let scheduled_at = schedule.next_at(TokioInstant::now());
+        let scheduled_at = schedule.next_at(TokioInstant::now(), crate::unix_now_seconds());
         #[cfg(test)]
         tests::secondary_retry_scheduler_tests::record_turn(
             &account_id_hex,
@@ -2849,7 +2849,14 @@ async fn run_app_runtime_account_worker(
                         "avatar maintenance failed; retrying in 15 s");
                 }
                 if !avatar_due {
-                    schedule.arm(schedule::Job::AvatarPass, avatar_pass_next_at(&client, failed));
+                    let (retry, wall) = avatar_pass_next_at(&client, failed);
+                    schedule.arm_timed(
+                        schedule::Job::AvatarPass,
+                        retry,
+                        wall,
+                        crate::unix_now_seconds(),
+                        TokioInstant::now(),
+                    );
                 }
             }
             _ = local_submission_wakeups.changed() => { local_submission_due = true; }
@@ -2915,14 +2922,17 @@ async fn run_app_runtime_account_worker(
                 // A pass may have deleted media rows, which frees pages.
                 schedule.wake(schedule::Job::Housekeeping);
                 if !attachment_due {
-                    let next = attachments::next_pass_at(&client, &attachment_admission);
-                    schedule.arm(
+                    let (next, wall) = attachments::next_pass_at(&client, &attachment_admission);
+                    schedule.arm_timed(
                         schedule::Job::AttachmentPass,
                         Some(if failed {
                             next.min(TokioInstant::now() + schedule::RETRY_WHILE_OWED)
                         } else {
                             next
                         }),
+                        wall,
+                        crate::unix_now_seconds(),
+                        TokioInstant::now(),
                     );
                 }
             }
@@ -2938,17 +2948,18 @@ async fn run_app_runtime_account_worker(
                 // them still count as waiting behind maintenance.
                 let _unit = unit.enter(WorkerUnit::Maintenance);
                 let now = TokioInstant::now();
+                let now_wall = crate::unix_now_seconds();
                 let context = EpochBackfillReportContext {
                     events: &events,
                     account_id_hex: &account_id_hex,
                     account_label: &account_label,
                     shared: &shared,
                 };
-                if schedule.due(schedule::Job::Recovery, now) {
+                if schedule.due(schedule::Job::Recovery, now, now_wall) {
                     let owed = run_scheduled_recovery(&mut client, context).await;
                     schedule.ran(schedule::Job::Recovery, owed, TokioInstant::now());
                 }
-                if schedule.due(schedule::Job::PostJoin, now) {
+                if schedule.due(schedule::Job::PostJoin, now, now_wall) {
                     let owed = run_scheduled_post_join(&mut client, context).await;
                     client.post_join_advanced = false;
                     schedule.ran(schedule::Job::PostJoin, owed, TokioInstant::now());
@@ -2961,7 +2972,7 @@ async fn run_app_runtime_account_worker(
                     (schedule::Job::PresentationPass, &mut presentation_due),
                     (schedule::Job::LocalSubmission, &mut local_submission_due),
                 ] {
-                    if schedule.due(job, now) {
+                    if schedule.due(job, now, now_wall) {
                         schedule.arm(job, None);
                         *due = true;
                     }
@@ -2969,7 +2980,7 @@ async fn run_app_runtime_account_worker(
                 // The jobs the maintenance tick used to run, in its order.
                 let telemetry = shared.observer.performance().clone();
                 let retry = || Some(TokioInstant::now() + schedule::RETRY_WHILE_OWED);
-                if schedule.due(schedule::Job::ContentBackfill, now) {
+                if schedule.due(schedule::Job::ContentBackfill, now, now_wall) {
                     let step = telemetry.observe(RuntimeOp::WorkerMaintenanceContentBackfill);
                     let backfill = client.backfill_content_reports();
                     step.finish_app(&backfill);
@@ -2985,7 +2996,7 @@ async fn run_app_runtime_account_worker(
                     };
                     schedule.arm(schedule::Job::ContentBackfill, next);
                 }
-                if schedule.due(schedule::Job::LegacyPromotion, now) {
+                if schedule.due(schedule::Job::LegacyPromotion, now, now_wall) {
                     let step = telemetry.observe(RuntimeOp::WorkerMaintenanceLegacyPromotion);
                     let outcome =
                         run_legacy_message_promotion_batch(&client, &mut legacy_message_promotion);
@@ -3002,7 +3013,7 @@ async fn run_app_runtime_account_worker(
                     };
                     schedule.arm(schedule::Job::LegacyPromotion, next);
                 }
-                if schedule.due(schedule::Job::DevicePairing, now) {
+                if schedule.due(schedule::Job::DevicePairing, now, now_wall) {
                     // Pairing timers, KeyPackage retries and link settlement.
                     client.drive_device_pairing().await;
                     if client.device_unlinked() {
@@ -3014,7 +3025,7 @@ async fn run_app_runtime_account_worker(
                         if client.device_pairing_owed() { retry() } else { None },
                     );
                 }
-                if schedule.due(schedule::Job::Housekeeping, now) {
+                if schedule.due(schedule::Job::Housekeeping, now, now_wall) {
                     #[cfg(test)]
                     record_housekeeping_run(
                         &account_id_hex,
@@ -3039,7 +3050,7 @@ async fn run_app_runtime_account_worker(
                         attachments::next_housekeeping_at(&client, &attachment_admission),
                     );
                 }
-                if schedule.due(schedule::Job::KeyPackageCatchUp, now) {
+                if schedule.due(schedule::Job::KeyPackageCatchUp, now, now_wall) {
                     if client.key_package_maintenance_requires_catch_up() {
                         run_key_package_catch_up(
                             &mut client,
@@ -3054,18 +3065,19 @@ async fn run_app_runtime_account_worker(
                             continue 'worker;
                         }
                     }
-                    let next = if client.key_package_maintenance_requires_catch_up() {
-                        retry()
+                    if client.key_package_maintenance_requires_catch_up() {
+                        schedule.arm(schedule::Job::KeyPackageCatchUp, retry());
                     } else {
-                        let now = crate::unix_now_seconds();
-                        client
-                            .key_package_catch_up_next_at()
-                            .filter(|at| *at > now)
-                            .map(scheduled_instant)
-                    };
-                    schedule.arm(schedule::Job::KeyPackageCatchUp, next);
+                        let now_wall = crate::unix_now_seconds();
+                        schedule.arm_wall(
+                            schedule::Job::KeyPackageCatchUp,
+                            client.key_package_catch_up_next_at().filter(|at| *at > now_wall),
+                            now_wall,
+                            TokioInstant::now(),
+                        );
+                    }
                 }
-                if schedule.due(schedule::Job::Push, now) {
+                if schedule.due(schedule::Job::Push, now, now_wall) {
                     // A join window ends once T has been counted since its
                     // join completed, which only sampling fetch time shows.
                     // Repair asks wait for the same clock, and replies for
@@ -3081,13 +3093,15 @@ async fn run_app_runtime_account_worker(
                         if client.push_timing_owed() { retry() } else { None },
                     );
                 }
-                if schedule.due(schedule::Job::HistoryDispatch, now) {
+                if schedule.due(schedule::Job::HistoryDispatch, now, now_wall) {
                     let step = telemetry.observe(RuntimeOp::WorkerMaintenanceHistoryDispatch);
                     dispatch_history_blobs(&mut client, &media_http);
                     step.finish(TelemetryOutcome::Success);
-                    schedule.arm(
+                    schedule.arm_wall(
                         schedule::Job::HistoryDispatch,
-                        client.history_dispatch_next_at().map(scheduled_instant),
+                        client.history_dispatch_next_at(),
+                        crate::unix_now_seconds(),
+                        TokioInstant::now(),
                     );
                 }
             }
@@ -3110,37 +3124,20 @@ async fn run_app_runtime_account_worker(
                 let telemetry = shared.observer.performance().clone();
                 // The watchdog: a job with work but no wake or deadline
                 // pending was missed. Count it; it runs on the next turn.
-                for job in schedule::Job::ALL {
-                    let owed = match job {
-                        schedule::Job::Recovery => client.recovery_owed(),
-                        schedule::Job::PostJoin => client.post_join_owed(),
-                        // A pass or submission already set due is not missed.
-                        schedule::Job::AttachmentPass => !attachment_due
-                            && attachments::pass_owed_now(&client, &attachment_admission),
-                        schedule::Job::AvatarPass => !avatar_due && avatar_pass_owed_now(&client),
-                        schedule::Job::PresentationPass => {
-                            !presentation_due && presentation_pass_owed_now(&client)
-                        }
-                        schedule::Job::LocalSubmission => {
-                            !local_submission_due && client.local_submission_pending()
-                        }
-                        schedule::Job::ContentBackfill => client.content_report_backfill_owed(),
-                        schedule::Job::LegacyPromotion => {
-                            legacy_message_promotion.status == LegacyMessagePromotionStatus::Pending
-                        }
-                        schedule::Job::DevicePairing => client.device_pairing_owed(),
-                        schedule::Job::Housekeeping => {
-                            attachments::housekeeping_owed_now(&client, &attachment_admission)
-                        }
-                        schedule::Job::KeyPackageCatchUp => {
-                            client.key_package_maintenance_requires_catch_up()
-                        }
-                        schedule::Job::Push => client.push_timing_owed(),
-                        schedule::Job::HistoryDispatch => client
-                            .history_dispatch_next_at()
-                            .is_some_and(|at| at <= crate::unix_now_seconds()),
+                let owed_jobs = {
+                    let flags = WatchdogFlags {
+                        attachment_due,
+                        avatar_due,
+                        presentation_due,
+                        local_submission_due,
+                        legacy_promotion_pending: legacy_message_promotion.status
+                            == LegacyMessagePromotionStatus::Pending,
+                        admission: &attachment_admission,
                     };
-                    let Some(first) = schedule.missed(job, owed, TokioInstant::now()) else {
+                    schedule::Job::ALL.map(|job| job_owed_now(job, &client, &flags))
+                };
+                for (job, owed) in schedule::Job::ALL.into_iter().zip(owed_jobs) {
+                    let Some(first) = schedule.missed(job, owed, TokioInstant::now(), crate::unix_now_seconds()) else {
                         continue;
                     };
                     telemetry.record_runtime(
@@ -3260,30 +3257,25 @@ async fn run_scheduled_post_join(
     failed || client.post_join_owed()
 }
 
-/// When the avatar pass next runs on its own: at the earliest acquisition
-/// `due`, in 15 s for one already due that waits for a free slot, after a
-/// failure, or while the bootstrap still has rows; otherwise only on a wake
-/// (mdk#2923 step B).
-fn avatar_pass_next_at(client: &AppClient, failed: bool) -> Option<TokioInstant> {
+/// When the avatar pass next runs on its own: by the worker's clock, in 15 s
+/// after a failure or while the bootstrap still has rows; by wall time, at
+/// the earliest acquisition `due`, which the schedule turns into 15 s for one
+/// already due that waits for a free slot; otherwise only on a wake (mdk#2923
+/// step B).
+fn avatar_pass_next_at(client: &AppClient, failed: bool) -> (Option<TokioInstant>, Option<u64>) {
     let retry = TokioInstant::now() + schedule::RETRY_WHILE_OWED;
     let Ok((due, bootstrap)) = client
         .app
         .account_storage(&client.state.label)
         .and_then(|storage| Ok(storage.app_storage().avatar_work_schedule()?))
     else {
-        return Some(retry);
+        return (Some(retry), None);
     };
     if failed || bootstrap {
-        return Some(retry);
+        return (Some(retry), None);
     }
-    let now = crate::unix_now_seconds();
-    due.map(|at| {
-        if at <= now {
-            retry
-        } else {
-            TokioInstant::now() + Duration::from_secs(at - now)
-        }
-    })
+    // A wall-clock `due`; the schedule runs one already past in 15 s.
+    (None, due)
 }
 
 /// The watchdog's read: whether the avatar pass has work due now.
@@ -3420,15 +3412,44 @@ async fn run_key_package_catch_up(
     }
 }
 
-/// The schedule's instant for unix second `at`: then, or in 15 s for a time
-/// already past, so work due but not taken waits for its retry, not a busy
-/// loop.
-fn scheduled_instant(at: u64) -> TokioInstant {
-    let now = crate::unix_now_seconds();
-    if at <= now {
-        TokioInstant::now() + schedule::RETRY_WHILE_OWED
-    } else {
-        TokioInstant::now() + Duration::from_secs(at - now)
+/// What the watchdog's owed read needs besides the client: the due flags
+/// the worker keeps for its passes and local submissions, legacy
+/// promotion's state, and the attachment admission.
+struct WatchdogFlags<'a> {
+    attachment_due: bool,
+    avatar_due: bool,
+    presentation_due: bool,
+    local_submission_due: bool,
+    legacy_promotion_pending: bool,
+    admission: &'a attachments::Admission,
+}
+
+/// The watchdog's read of whether `job` has work due now (mdk#2923 step B).
+/// A pass or submission already set due is not owed: it runs on the next
+/// turn anyway.
+fn job_owed_now(job: schedule::Job, client: &AppClient, flags: &WatchdogFlags<'_>) -> bool {
+    match job {
+        schedule::Job::Recovery => client.recovery_owed(),
+        schedule::Job::PostJoin => client.post_join_owed(),
+        schedule::Job::AttachmentPass => {
+            !flags.attachment_due && attachments::pass_owed_now(client, flags.admission)
+        }
+        schedule::Job::AvatarPass => !flags.avatar_due && avatar_pass_owed_now(client),
+        schedule::Job::PresentationPass => {
+            !flags.presentation_due && presentation_pass_owed_now(client)
+        }
+        schedule::Job::LocalSubmission => {
+            !flags.local_submission_due && client.local_submission_pending()
+        }
+        schedule::Job::ContentBackfill => client.content_report_backfill_owed(),
+        schedule::Job::LegacyPromotion => flags.legacy_promotion_pending,
+        schedule::Job::DevicePairing => client.device_pairing_owed(),
+        schedule::Job::Housekeeping => attachments::housekeeping_owed_now(client, flags.admission),
+        schedule::Job::KeyPackageCatchUp => client.key_package_maintenance_requires_catch_up(),
+        schedule::Job::Push => client.push_timing_owed(),
+        schedule::Job::HistoryDispatch => client
+            .history_dispatch_next_at()
+            .is_some_and(|at| at <= crate::unix_now_seconds()),
     }
 }
 
@@ -10947,6 +10968,44 @@ mod tests {
                 .is_some()
         );
         assert!(!client.has_due_push_announce());
+    }
+
+    /// The watchdog reads push timing as owed while an announce is owed,
+    /// which the tick needs for timing that appears without a worker turn
+    /// (mdk#2923 step B).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_watchdog_reads_owed_push_timing() {
+        let dir = tempfile::tempdir().unwrap();
+        let account = AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let app =
+            MarmotApp::with_relay(dir.path(), "wss://relay.example").with_test_relay_client(relay);
+        let mut client = app.client(&account.label).await.unwrap();
+        let group = client
+            .create_group("push watchdog", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("no members to resolve");
+        let admission = attachments::Admission::default();
+        let flags = WatchdogFlags {
+            attachment_due: false,
+            avatar_due: false,
+            presentation_due: false,
+            local_submission_due: false,
+            legacy_promotion_pending: false,
+            admission: &admission,
+        };
+        assert!(!job_owed_now(schedule::Job::Push, &client, &flags));
+        app.record_group_push_announce_owed(
+            &account.label,
+            &hex::encode(group.as_slice()),
+            crate::notifications::unix_now_ms(),
+        )
+        .unwrap();
+        assert!(job_owed_now(schedule::Job::Push, &client, &flags));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

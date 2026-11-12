@@ -345,9 +345,10 @@ impl AppClient {
     /// back: an ask to decide once this device has processed what it was
     /// catching up on, or a reply whose slots have passed.
     pub(crate) fn has_due_push_repair(&self) -> bool {
-        let settled = self
-            .push_fetch_clock
-            .settled(self.push_announce_timing.catch_up_settle);
+        let settled = self.push_fetch_clock.settled(
+            self.push_announce_timing.catch_up_settle,
+            self.push_now_ms(),
+        );
         let now_ms = notifications::unix_now_ms();
         self.push_repairs.asks.iter().any(|((group_id, _), ask)| {
             let due = match &ask.reply {
@@ -373,10 +374,10 @@ impl AppClient {
         if self.push_repairs.asks.is_empty() {
             return false;
         }
-        if self
-            .push_fetch_clock
-            .settled(self.push_announce_timing.catch_up_settle)
-        {
+        if self.push_fetch_clock.settled(
+            self.push_announce_timing.catch_up_settle,
+            self.push_now_ms(),
+        ) {
             self.decide_push_repairs();
         }
         let now_ms = notifications::unix_now_ms();

@@ -3966,6 +3966,140 @@ async fn a_maintenance_tick_records_one_span_per_phase() {
     runtime.shutdown().await;
 }
 
+/// Step the test's held clock by `by`, then let the worker run.
+async fn advance_held_clock(by: Duration) {
+    tokio::time::pause();
+    tokio::time::advance(by).await;
+    tokio::time::resume();
+    for _ in 0..200 {
+        tokio::task::yield_now().await;
+    }
+}
+
+/// On an idle account the account worker samples the push fetch clock only
+/// while push timing is owed (mdk#2923 step B). A token change on an
+/// unsettled clock goes out at once as a plain self-update and owes an
+/// announce; that wakes the worker's Push job, which re-arms every 15 s
+/// while it is owed, and the announce follows within 30 s, with no missed
+/// wake and no busy loop. The watchdog's own check is
+/// `the_watchdog_reads_owed_push_timing`.
+#[tokio::test(flavor = "current_thread")]
+async fn the_worker_samples_push_timing_only_while_owed() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let account = AccountHome::open(dir.path())
+        .create_account("alice")
+        .expect("create alice");
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    let group = {
+        let mut client = app.client(&account.label).await.expect("client");
+        client
+            .create_group("push timing", &[])
+            .await
+            .expect("group")
+            .operation
+            .expect("no members to resolve")
+    };
+    let group_hex = hex::encode(group.as_slice());
+    let mut push_now_ms = crate::notifications::unix_now_ms();
+    let set_push_clock = |now_ms: i64| {
+        crate::client::TEST_PUSH_OVERRIDES.lock().unwrap().insert(
+            account.label.clone(),
+            crate::client::TestPushOverride {
+                now_ms,
+                can_fetch: true,
+            },
+        );
+    };
+    set_push_clock(push_now_ms);
+    let runtime = MarmotAppRuntime::new(app.clone());
+    runtime.accounts().reconcile().await.expect("alice starts");
+    let count = |operation| startup_stage_snapshot(&runtime, operation).completed;
+    let push_runs = || startup_stage_snapshot(&runtime, RuntimeOp::WorkerMaintenancePush).started;
+    let missed = || count(RuntimeOp::WatchdogMissedWakePush);
+    timeout(ACCOUNT_OPEN_TEST_DEADLINE, async {
+        while count(RuntimeOp::WorkerMaintenance) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the worker opens");
+    // Fifteen seconds of the worker's time and the push clock together.
+    let step = async |push_now_ms: &mut i64| {
+        *push_now_ms += 15_000;
+        set_push_clock(*push_now_ms);
+        advance_held_clock(Duration::from_secs(15)).await;
+    };
+    let gossip = || {
+        app.group_push_gossip_state(&account.label, &group_hex)
+            .expect("gossip state")
+    };
+
+    // Until the Push job rests: two steps with no run.
+    let mut quiet = 0;
+    for _ in 0..10 {
+        let before = push_runs();
+        step(&mut push_now_ms).await;
+        quiet = if push_runs() == before { quiet + 1 } else { 0 };
+        if quiet == 2 {
+            break;
+        }
+    }
+    assert_eq!(quiet, 2, "the Push job rests with nothing owed");
+    let rested = push_runs();
+    app.set_native_push_enabled(&account.label, true)
+        .expect("native push");
+    runtime
+        .upsert_push_registration(
+            &account.label,
+            crate::PushPlatform::Fcm,
+            "alice-token",
+            &nostr::prelude::Keys::generate().public_key().to_hex(),
+            None,
+        )
+        .await
+        .expect("registration");
+    let outcome = runtime
+        .share_push_registration(&account.label)
+        .await
+        .expect("share");
+    advance_held_clock(Duration::ZERO).await;
+    assert!(
+        gossip().is_some_and(|state| state.announce_owed_at_ms.is_some()),
+        "the token went out plain and owes an announce: {outcome:?} {:?}",
+        gossip()
+    );
+    assert_eq!(
+        push_runs() - rested,
+        1,
+        "the token change woke the Push job once"
+    );
+    let mut samples = 0;
+    while gossip().is_some_and(|state| state.announce_owed_at_ms.is_some()) && samples < 4 {
+        step(&mut push_now_ms).await;
+        samples += 1;
+    }
+    assert!(
+        gossip().is_some_and(
+            |state| state.announce_owed_at_ms.is_none() && state.last_announced_at_ms.is_some()
+        ),
+        "the owed announce went out"
+    );
+    assert!(samples <= 2, "within 30 s, took {samples} samples");
+    assert!(
+        push_runs() - rested <= 1 + samples,
+        "the Push job runs once per 15 s sample, not in a loop: {}",
+        push_runs() - rested
+    );
+    assert_eq!(missed(), 0, "the worker woke its Push job itself");
+    runtime.shutdown().await;
+    crate::client::TEST_PUSH_OVERRIDES
+        .lock()
+        .unwrap()
+        .remove(&account.label);
+}
+
 /// Another account's activity runs none of this account's passes; its own
 /// does (mdk#2923).
 #[tokio::test(flavor = "current_thread")]
@@ -4268,6 +4402,19 @@ async fn idle_ticks_take_no_writer_and_spawn_no_housekeeping() {
         &housekeeping_runs()[runs_before..]
     );
     assert_eq!(delta(0), 3, "three idle ticks ran");
+    // From the first tick on, warm-up included: no job missed a wake.
+    let missed_from_start: Vec<(&str, u64)> = RuntimeOp::ALL
+        .iter()
+        .copied()
+        .filter(|operation| operation.as_str().starts_with("watchdog_missed_wake_"))
+        .map(|operation| (operation.as_str(), count(operation)))
+        .filter(|(_, missed)| *missed > 0)
+        .collect();
+    assert_eq!(
+        missed_from_start,
+        Vec::<(&str, u64)>::new(),
+        "no missed wake from the first tick"
+    );
     assert_eq!(
         delta(1),
         0,

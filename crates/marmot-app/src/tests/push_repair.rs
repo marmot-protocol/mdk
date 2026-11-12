@@ -480,6 +480,65 @@ async fn a_device_catching_up_decides_after_its_backlog_body() {
     assert!(!first.client.has_due_push_repair());
 }
 
+/// A suspend gap restarts the watch: a member whose clock had settled, then
+/// whose process did not run for an hour, decides a repair ask only once it
+/// has watched the device able to fetch for the settle time again
+/// (mdk#2923).
+#[test]
+fn a_repair_decision_waits_for_a_fresh_watch_after_a_suspend() {
+    run_composed_app_runtime_test(
+        "push-repair-after-suspend",
+        a_repair_decision_waits_for_a_fresh_watch_after_a_suspend_body,
+    );
+}
+
+async fn a_repair_decision_waits_for_a_fresh_watch_after_a_suspend_body() {
+    let mut fx = four_members().await;
+    let relay = fx.relay.clone();
+    let group = fx.group.clone();
+    let requested = send_447(&mut fx.dave, &group, request()).await;
+    let order = ranked(
+        &[&fx.alice, &fx.bob, &fx.carol, &fx.dave],
+        &group,
+        &requested,
+        fx.dave.leaf(&group).1,
+    );
+    let mut ranks = by_rank(
+        vec![&mut fx.alice, &mut fx.bob, &mut fx.carol],
+        &group,
+        &order,
+    );
+    let first = &mut ranks[0];
+
+    // Settled: watched for the settle time at the test's clock.
+    let start = crate::notifications::unix_now_ms();
+    first.client.test_push_now_ms = Some(start);
+    first.client.advance_push_join_windows().await;
+    first.client.push_announce_timing.catch_up_settle =
+        crate::client::PushAnnounceTiming::default().catch_up_settle;
+    first.client.test_push_now_ms = Some(start + 15_000);
+    first.client.advance_push_join_windows().await;
+
+    // An hour the process did not run, with fetching still on.
+    let woke = start + 15_000 + 3_600_000;
+    first.client.test_push_now_ms = Some(woke);
+    first.client.advance_push_join_windows().await;
+    let from = gossip_sent(first);
+    first.receive(&relay).await;
+    assert!(
+        !first.client.has_due_push_repair(),
+        "the catch-up is watched again first"
+    );
+    assert!(!repair(first).await);
+    assert!(replies(first, from).is_empty());
+
+    first.client.test_push_now_ms = Some(woke + 15_000);
+    first.client.advance_push_join_windows().await;
+    assert!(first.client.has_due_push_repair());
+    assert!(!repair(first).await);
+    assert!(!replies(first, from).is_empty(), "then it replies");
+}
+
 /// A member answers each announcer's leaf at most once in 24 hours, however
 /// many announces or requests that leaf sends.
 #[test]

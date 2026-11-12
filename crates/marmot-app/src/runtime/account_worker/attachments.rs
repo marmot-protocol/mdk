@@ -815,19 +815,14 @@ struct PassWork {
 /// for the completion that frees one, or 15 s; polled work also runs every
 /// 15 s, as the tick ran it; and the pass runs at least hourly, for what only
 /// it notices, such as another connection's commits for the media sweep.
-pub(super) fn next_pass_at(client: &AppClient, admission: &Admission) -> TokioInstant {
+pub(super) fn next_pass_at(
+    client: &AppClient,
+    admission: &Admission,
+) -> (TokioInstant, Option<u64>) {
     let work = pass_work(client, admission);
     let now = TokioInstant::now();
     let retry = now + super::schedule::RETRY_WHILE_OWED;
-    let timed = work.next_at.map(|at| {
-        if at <= work.now {
-            retry
-        } else {
-            now + Duration::from_secs(at - work.now)
-        }
-    });
-    [
-        timed,
+    let by_clock = [
         work.polling.then_some(retry),
         work.rescan_at,
         Some(now + HOUSEKEEPING_RECHECK_INTERVAL),
@@ -835,7 +830,18 @@ pub(super) fn next_pass_at(client: &AppClient, admission: &Admission) -> TokioIn
     .into_iter()
     .flatten()
     .min()
-    .unwrap_or(retry)
+    .unwrap_or(retry);
+    // A timed row's second is wall time on the scheduler's clock, which
+    // tests may pin; carry its distance from now onto the wall clock the
+    // schedule reads. The schedule turns one already due into a 15 s retry.
+    let wall = work.next_at.map(|at| {
+        if at <= work.now {
+            0
+        } else {
+            crate::unix_now_seconds().saturating_add(at - work.now)
+        }
+    });
+    (by_clock, wall)
 }
 
 /// The watchdog's read: whether the attachment pass has work due now.
@@ -848,16 +854,26 @@ pub(super) fn pass_owed_now(client: &AppClient, admission: &Admission) -> bool {
 }
 
 /// What the housekeeping job (the compaction and the housekeeping batch)
-/// owes (mdk#2923 step B): `poll` while a migration, the startup truncate,
-/// keep-media `more`, a flagged compaction or a running batch needs the next
-/// look in 15 s, as the tick gave it; `at` for the earliest in-memory
-/// deadline (the keep-media sweep, the hourly recheck, a compaction retry).
-/// Deadlines not yet set (a fresh worker) are due now.
-fn housekeeping_work(client: &AppClient, admission: &Admission) -> (bool, Option<TokioInstant>) {
+/// owes (mdk#2923 step B), which both its schedule and the watchdog read:
+/// `poll` while a migration, the startup truncate, keep-media `more`, a
+/// flagged compaction or a running batch needs the next look in 15 s, as the
+/// tick gave it; `at` for the earliest deadline (the keep-media sweep, the
+/// hourly recheck, a compaction retry), due now when not yet set (a fresh
+/// worker); and `cleanup_changed` when this connection deleted media rows
+/// since the last batch. `None` when the batch cannot run: cursors frozen,
+/// or the account's storage unreadable.
+struct HousekeepingWork {
+    poll: bool,
+    at: Option<TokioInstant>,
+    cleanup_changed: bool,
+}
+
+fn housekeeping_work(client: &AppClient, admission: &Admission) -> Option<HousekeepingWork> {
     use std::sync::atomic::Ordering;
     if client.app.config.cursor_persistence == crate::CursorPersistence::Frozen {
-        return (false, None);
+        return None;
     }
+    let storage = client.app.account_storage(&client.state.label).ok()?;
     let now = TokioInstant::now();
     let latches = &admission.latches;
     let compaction_flagged =
@@ -879,11 +895,18 @@ fn housekeeping_work(client: &AppClient, admission: &Admission) -> (bool, Option
     .into_iter()
     .flatten()
     .min();
-    (poll, at)
+    // A failed read counts as a change, as the batch counts it.
+    let cleanup_changed =
+        storage.app_storage().media_cleanup_epoch().ok() != latches.batch_cleanup_seen;
+    Some(HousekeepingWork {
+        poll,
+        at,
+        cleanup_changed,
+    })
 }
 
 /// Why the housekeeping job is due, for a test's failure message: which
-/// poll flag holds, and the real-clock deadlines relative to now.
+/// poll flag holds, and its deadlines relative to now on the worker's clock.
 #[cfg(test)]
 pub(super) fn housekeeping_reason(client: &AppClient, admission: &Admission) -> String {
     use std::sync::atomic::Ordering;
@@ -924,36 +947,30 @@ pub(super) fn housekeeping_reason(client: &AppClient, admission: &Admission) -> 
     )
 }
 
-/// When the housekeeping job should next run on its own.
+/// When the housekeeping job should next run on its own: in 15 s while it
+/// polls or a deletion waits for a batch, else at its earliest deadline.
 pub(super) fn next_housekeeping_at(
     client: &AppClient,
     admission: &Admission,
 ) -> Option<TokioInstant> {
-    let (poll, at) = housekeeping_work(client, admission);
+    let work = housekeeping_work(client, admission)?;
     let now = TokioInstant::now();
     let retry = now + super::schedule::RETRY_WHILE_OWED;
     [
-        poll.then_some(retry),
-        at.map(|at| if at <= now { retry } else { at }),
+        (work.poll || work.cleanup_changed).then_some(retry),
+        work.at.map(|at| if at <= now { retry } else { at }),
     ]
     .into_iter()
     .flatten()
     .min()
 }
 
-/// The watchdog's read: whether the housekeeping job has work due now,
-/// including a media-row deletion on this connection since the last batch
-/// (one read of a TEMP counter).
+/// The watchdog's read, from the same [`housekeeping_work`] its schedule
+/// reads: whether the housekeeping job has work due now.
 pub(super) fn housekeeping_owed_now(client: &AppClient, admission: &Admission) -> bool {
-    let (poll, at) = housekeeping_work(client, admission);
-    poll || at.is_some_and(|at| at <= TokioInstant::now())
-        || client
-            .app
-            .account_storage(&client.state.label)
-            .map_or(true, |storage| {
-                storage.app_storage().media_cleanup_epoch().ok()
-                    != admission.latches.batch_cleanup_seen
-            })
+    housekeeping_work(client, admission).is_some_and(|work| {
+        work.poll || work.cleanup_changed || work.at.is_some_and(|at| at <= TokioInstant::now())
+    })
 }
 
 /// The scheduler's clock. Tests may pin it per account directory to cross
