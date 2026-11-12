@@ -170,9 +170,11 @@ pub(crate) enum HooklessMove {
     /// The rollback of a transaction a dropped connection left open, which
     /// fires no rollback hook (rusqlite removes hooks before closing). If the
     /// transaction spilled into a fully checkpointed WAL, it reset the WAL
-    /// header. Noted once the last handle is gone, so a check another
-    /// connection runs at that moment can miss it; only a failed `ROLLBACK`
-    /// leaves a transaction open for a drop.
+    /// header. Noted once the last handle is gone, before the connection is
+    /// marked released: until then its registration stays alive
+    /// ([`WeakSharedConnection::is_alive`]), and a check another connection
+    /// runs waits for a later read. Only a failed `ROLLBACK` leaves a
+    /// transaction open for a drop.
     Rollback,
 }
 
@@ -523,21 +525,39 @@ impl SharedConnection {
 
     /// A reference that does not keep the connection open.
     pub(crate) fn downgrade(&self) -> WeakSharedConnection {
-        WeakSharedConnection(Arc::downgrade(&self.inner))
+        WeakSharedConnection {
+            inner: Arc::downgrade(&self.inner),
+            released: Arc::clone(&self.inner.connection.released),
+        }
     }
 }
 
 /// A [`SharedConnection`] that does not keep it open.
 #[derive(Clone)]
-pub(crate) struct WeakSharedConnection(std::sync::Weak<SharedConnectionInner>);
+pub(crate) struct WeakSharedConnection {
+    inner: std::sync::Weak<SharedConnectionInner>,
+    released: Arc<ConnectionRelease>,
+}
 
 impl WeakSharedConnection {
+    /// `None` once the last handle is gone, even while its drop is still
+    /// closing the connection (see [`Self::is_alive`]).
     pub(crate) fn upgrade(&self) -> Option<SharedConnection> {
-        self.0.upgrade().map(|inner| SharedConnection { inner })
+        self.inner.upgrade().map(|inner| SharedConnection { inner })
     }
 
+    /// The connection is still open: true until a close, or the drop of its
+    /// last handle, has closed it. A drop runs its [`HooklessMove`] note
+    /// first, so a connection that is no longer alive has nothing left to
+    /// note.
     pub(crate) fn is_alive(&self) -> bool {
-        self.0.strong_count() > 0
+        !self.released.is_marked()
+    }
+
+    /// Some handle still holds the connection.
+    #[cfg(test)]
+    pub(crate) fn has_handles(&self) -> bool {
+        self.inner.strong_count() > 0
     }
 }
 
@@ -1708,7 +1728,9 @@ impl Drop for CloseableConnection {
             (hooks.hookless_move)(HooklessMove::Rollback);
         }
         // Close before marking, so a closer that is waiting returns only once
-        // the database file is closed.
+        // the database file is closed, and a registration
+        // ([`WeakSharedConnection::is_alive`]) reads as gone only after the
+        // note above.
         drop(connection);
         self.released.mark();
     }

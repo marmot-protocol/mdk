@@ -179,8 +179,12 @@ struct Counts {
     /// [`expect_uncounted_writes_for_test`]).
     #[cfg(any(test, feature = "test-support"))]
     path: Option<PathBuf>,
-    /// This process's counted connections to the file.
+    /// This process's counted connections to the file, each until it is
+    /// closed.
     connections: Vec<WeakSharedConnection>,
+    /// Connections ever registered: a check that saw fewer did not hold the
+    /// newer ones.
+    registered: u64,
 }
 
 impl Counts {
@@ -272,6 +276,7 @@ impl GroupWriteCounter {
             let mut counts = counter.lock();
             counts.connections.retain(WeakSharedConnection::is_alive);
             counts.connections.push(connection.downgrade());
+            counts.registered += 1;
         }
         counter
     }
@@ -324,9 +329,11 @@ impl GroupWriteCounter {
     /// connection's count. For an idle connection that window can be long.
     ///
     /// The check holds every other counted connection to the file, so none is
-    /// partway through a commit its release has not applied yet; when one is
-    /// busy (a closing one included, until its close has taken it), or inside
-    /// a transaction, it waits for a later read. A commit counts once SQLite
+    /// partway through a commit its release has not applied yet. It waits for
+    /// a later read when one is busy (a closing one included, until its close
+    /// has taken it), inside a transaction, or dropped but not yet closed (its
+    /// drop notes a rollback first), and when one registered after the check
+    /// listed them, since that one was not held. A commit counts once SQLite
     /// calls the commit hook, even if the commit then fails: that can explain
     /// a move that did not happen, never flag one that did.
     fn check_unexplained_commits(&self, connection: &SharedConnection) {
@@ -341,13 +348,22 @@ impl GroupWriteCounter {
             #[cfg(not(any(test, feature = "test-support")))]
             return;
         }
-        let others: Vec<SharedConnection> = self
-            .lock()
-            .connections
-            .iter()
-            .filter_map(WeakSharedConnection::upgrade)
-            .filter(|other| !other.same_as(connection))
-            .collect();
+        let (registered, connections) = {
+            let counts = self.lock();
+            (counts.registered, counts.connections.clone())
+        };
+        let mut others = Vec::with_capacity(connections.len());
+        for other in &connections {
+            match other.upgrade() {
+                Some(other) if other.same_as(connection) => {}
+                Some(other) => others.push(other),
+                // Its last handle is gone, but its drop has not closed it:
+                // the rollback that drop notes may already have moved the
+                // value.
+                None if other.is_alive() => return,
+                None => {}
+            }
+        }
         let mut held = Vec::with_capacity(others.len());
         for other in &others {
             match other.try_lock_idle() {
@@ -365,6 +381,11 @@ impl GroupWriteCounter {
         let reported = {
             let mut pending = lock(&self.connection.pending);
             let mut counts = self.lock();
+            if counts.registered != registered {
+                // Not held: a connection opened since may have committed
+                // without its release applying the commit yet.
+                return;
+            }
             #[cfg(any(test, feature = "test-support"))]
             let declared = has_uncounted_writer(counts.path.as_deref());
             #[cfg(not(any(test, feature = "test-support")))]
@@ -1282,9 +1303,6 @@ mod tests {
     /// A truncate run around the helper is reported.
     #[test]
     fn a_counted_connections_move_without_a_commit_is_not_reported() {
-        const SPILL: &str = "INSERT INTO spill SELECT randomblob(4000)
-             FROM (WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 100)
-                   SELECT i FROM n)";
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("group-writes.sqlite");
         let engine = open_file(&path);
@@ -1314,8 +1332,6 @@ mod tests {
         moves_every_group("a vacuum", &|| {
             app.app_storage().make_non_incremental_for_test().unwrap();
         });
-        // A spill starts the WAL over when every frame in it is checkpointed.
-        const CHECKPOINTED: &str = "INSERT INTO spill VALUES (x'00'); PRAGMA wal_checkpoint;";
         execute(&app, CHECKPOINTED);
         moves_every_group("a rollback", &|| {
             execute(&app, &format!("BEGIN; {SPILL}; ROLLBACK;"));
@@ -1337,6 +1353,50 @@ mod tests {
         assert!(around.is_err());
 
         moves_every_group("a close", &|| app.close().unwrap());
+    }
+
+    /// Writes more pages than a `cache_size = 10` connection keeps, so the
+    /// transaction spills into the WAL before it commits.
+    const SPILL: &str = "INSERT INTO spill SELECT randomblob(4000)
+         FROM (WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 100)
+               SELECT i FROM n)";
+    /// A spill starts the WAL over when every frame in it is checkpointed.
+    const CHECKPOINTED: &str = "INSERT INTO spill VALUES (x'00'); PRAGMA wal_checkpoint;";
+
+    /// A connection dropped with a spilled transaction open notes the
+    /// rollback only after its last handle is gone. A check on another
+    /// connection in that gap waits for a later read rather than taking the
+    /// move for an uncounted writer's, and the next read sees the note.
+    #[test]
+    fn a_check_waits_out_a_drop_that_has_not_noted_its_rollback() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("group-writes.sqlite");
+        let engine = open_file(&path);
+        let dropped = open_file(&path);
+        let group = GroupId::new(vec![16; 16]);
+        execute(
+            &dropped,
+            &format!("CREATE TABLE spill (bytes BLOB); PRAGMA cache_size = 10; {CHECKPOINTED}"),
+        );
+        engine.write_count();
+        let before = generation(&engine, &group);
+        execute(&dropped, &format!("BEGIN; {SPILL};"));
+
+        // Holding the dropped connection's pending notes stops its drop at
+        // the rollback note, after its last handle is gone.
+        let registration = dropped.connection.downgrade();
+        let counter = dropped.group_writes.clone();
+        let noting = super::lock(&counter.connection.pending);
+        let dropping = std::thread::spawn(move || drop(dropped));
+        while registration.has_handles() {
+            std::thread::yield_now();
+        }
+        engine.write_count();
+        drop(noting);
+        dropping.join().unwrap();
+
+        engine.write_count();
+        assert!(generation(&engine, &group).committed > before.committed);
     }
 
     /// A guard taken before a close began can still commit through the
