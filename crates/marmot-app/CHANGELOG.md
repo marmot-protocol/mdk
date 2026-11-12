@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Fixed
+
+- `NotificationUpdate.is_dm` follows the chat-list conversation kind for
+  messages, group-state notices, and invitations, including pending DM
+  Welcomes. Named chats and unknown roster projections remain non-DM
+  (mdk#2773).
+
 ## 0.16.0 - 2026-11-11
 
 ### Breaking changes
@@ -130,13 +137,6 @@
   attempt in flight before their first stage, so nothing publishes after the KeyPackage withdrawal. A teardown that
   fails or is cancelled leaves the setup to resume. `sign_in_account` resumes a generated setup that its sign-out
   stopped.
-
-### Fixed
-
-- `NotificationUpdate.is_dm` follows the chat-list conversation kind for
-  messages, group-state notices, and invitations, including pending DM
-  Welcomes. Named chats and unknown roster projections remain non-DM
-  (mdk#2773).
 
 ## 0.15.0 - 2026-11-09
 

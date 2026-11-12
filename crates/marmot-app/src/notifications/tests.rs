@@ -2026,24 +2026,13 @@ fn notification_dm_projection() {
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
     let account = app.account_home().create_account("alice").unwrap();
     let local = &account.account_id_hex;
-    let actor = "bb".repeat(32);
-    let message = received_chat("hello", vec![]);
+    let actor = Keys::generate().public_key().to_hex();
+    let mut message = received_chat("hello", vec![]);
+    message.sender = actor.clone();
+    app.set_local_notifications_enabled("alice", true).unwrap();
+    let mut state = app.load_state("alice").unwrap();
     let group_id = message.group_id.clone();
     let group_id_hex = hex::encode(group_id.as_slice());
-    let mut group = AppGroupRecord::new(
-        group_id_hex.clone(),
-        crate::AppGroupNostrRoutingComponent::new(
-            cgka_traits::NostrRoutingV1::new([0xEE; 32], vec!["wss://relay.example".to_owned()])
-                .unwrap(),
-        )
-        .unwrap(),
-        String::new(),
-        String::new(),
-        crate::AppGroupImageInput::default(),
-        crate::AppGroupAdminPolicyComponent::new(Vec::new()),
-        crate::AppGroupMessageRetentionComponent::disabled(),
-    );
-    group.welcomer_account_id_hex = Some(actor.clone());
     let events = [
         MarmotAppEvent::MessageReceived(RuntimeMessageReceived {
             account_id_hex: local.clone(),
@@ -2076,27 +2065,35 @@ fn notification_dm_projection() {
         (Some(""), None, false, false),
         (None, None, false, false),
     ] {
-        group.profile.name = name.unwrap_or_default().to_owned();
+        let mut group = AppGroupRecord::new(
+            group_id_hex.clone(),
+            crate::AppGroupNostrRoutingComponent::new(
+                cgka_traits::NostrRoutingV1::new(
+                    [0xEE; 32],
+                    vec!["wss://relay.example".to_owned()],
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+            name.unwrap_or_default().to_owned(),
+            String::new(),
+            crate::AppGroupImageInput::default(),
+            crate::AppGroupAdminPolicyComponent::new(Vec::new()),
+            crate::AppGroupMessageRetentionComponent::disabled(),
+        );
+        group.welcomer_account_id_hex = Some(actor.clone());
         group.member_count = members;
         group.pending_confirmation = pending;
+        state.groups = name.map(|_| group).into_iter().collect();
+        app.save_state(&state).unwrap();
         let mut resolver = NotificationResolver::default();
-        seed_group_state_resolver(
-            &mut resolver,
-            "alice",
-            local,
-            &group_id_hex,
-            Some(&actor),
-            true,
-            false,
-        );
-        resolver.groups.insert(
-            ("alice".to_owned(), group_id_hex.clone()),
-            name.map(|_| group.clone()),
-        );
         for event in &events {
-            let update = notification_update_from_event_cached(&app, &mut resolver, event)
-                .unwrap()
-                .expect("eligible notification");
+            let update = notification_update_from_event_cached(&app, &mut resolver, event).unwrap();
+            if name.is_none() && matches!(event, MarmotAppEvent::MessageReceived(_)) {
+                assert_eq!(update, None, "messages from unknown groups are suppressed");
+                continue;
+            }
+            let update = update.expect("eligible notification");
             assert_eq!(
                 update.is_dm, expected,
                 "{name:?} {members:?} {pending} {event:?}"
