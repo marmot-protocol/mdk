@@ -873,6 +873,7 @@ class ConfigureGatewayTransactionTests(unittest.TestCase):
     def test_config_is_private(self):
         real_replace = os.replace
         config_text = "model: gpt-4o\napi_key: test-config-secret\n"
+        original = b"model: old\r\napi_key: original-secret\r\n"
         for mask in (0o022, 0o000):
             for initial_mode in (None, 0o600, 0o644):
                 with (
@@ -881,13 +882,18 @@ class ConfigureGatewayTransactionTests(unittest.TestCase):
                 ):
                     config_path = Path(tempdir) / "config.yaml"
                     if initial_mode is not None:
-                        config_path.write_text("model: old\n", encoding="utf-8")
+                        config_path.write_bytes(original)
                         config_path.chmod(initial_mode)
 
                     def check_replace(src, dst):
                         self.assertEqual(Path(src).stat().st_mode & 0o777, 0o600)
                         self.assertEqual(
-                            Path(src).read_text(encoding="utf-8"), config_text
+                            Path(src).read_bytes(),
+                            (
+                                config_text.encode("utf-8")
+                                if dst == config_path
+                                else original
+                            ),
                         )
                         return real_replace(src, dst)
 
@@ -899,7 +905,6 @@ class ConfigureGatewayTransactionTests(unittest.TestCase):
                                 env_lines=None,
                                 config_path=config_path,
                                 config_text=config_text,
-                                config_backup=False,
                             )
                     finally:
                         os.umask(previous_mask)
@@ -908,6 +913,11 @@ class ConfigureGatewayTransactionTests(unittest.TestCase):
                     self.assertEqual(
                         config_path.read_text(encoding="utf-8"), config_text
                     )
+                    backups = list(config_path.parent.glob("config.yaml.*.bak"))
+                    self.assertEqual(len(backups), 0 if initial_mode is None else 1)
+                    for backup in backups:
+                        self.assertEqual(backup.stat().st_mode & 0o777, 0o600)
+                        self.assertEqual(backup.read_bytes(), original)
 
     def test_env_dry_run_requires_configure_env_and_writes_nothing(self):
         with tempfile.TemporaryDirectory() as tempdir:

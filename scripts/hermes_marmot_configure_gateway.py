@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 import os
 import re
-import shutil
 import stat
 import sys
 import tempfile
@@ -245,10 +244,10 @@ def _write_env_atomically(env_path: Path, lines: list[str]) -> None:
     text = "\n".join(lines)
     if text and not text.endswith("\n"):
         text += "\n"
-    _write_text_atomically(env_path, text)
+    _write_bytes_atomically(env_path, text.encode("utf-8"))
 
 
-def _write_text_atomically(path: Path, text: str) -> None:
+def _write_bytes_atomically(path: Path, data: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(
         prefix=f"{path.name}.", suffix=".tmp", dir=path.parent
@@ -263,9 +262,9 @@ def _write_text_atomically(path: Path, text: str) -> None:
             owns_fd = False
             raise
         try:
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            with os.fdopen(fd, "wb") as handle:
                 owns_fd = False
-                handle.write(text)
+                handle.write(data)
                 handle.flush()
                 os.fsync(handle.fileno())
         except Exception:
@@ -402,7 +401,7 @@ def commit_env_and_config_transaction(
             config_path.parent.mkdir(parents=True, exist_ok=True)
             if config_backup:
                 config_backup_path = _create_backup(config_path)
-            _write_text_atomically(config_path, config_text)
+            _write_bytes_atomically(config_path, config_text.encode("utf-8"))
             wrote_config = True
     except Exception:
         if wrote_env and env_path is not None:
@@ -614,7 +613,7 @@ def _create_backup(config_path: Path) -> Path | None:
         return None
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     backup_path = config_path.with_name(f"{config_path.name}.{stamp}.{os.getpid()}.bak")
-    shutil.copy2(config_path, backup_path)
+    _write_bytes_atomically(backup_path, config_path.read_bytes())
     return backup_path
 
 
