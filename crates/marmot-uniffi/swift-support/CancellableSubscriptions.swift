@@ -98,6 +98,7 @@ private func cancellableProjectionNext<Value>(
       var reader = try cancellableSubscriptionReader(status.errorBuf)
       let error = try FfiConverterTypeMarmotKitError.read(from: &reader)
       guard !hasRemaining(reader) else { throw UniffiInternalError.incompleteData }
+      try Task.checkCancellation()
       throw error
     case 2:
       let message: String

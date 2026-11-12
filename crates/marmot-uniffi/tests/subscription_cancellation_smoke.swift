@@ -77,6 +77,29 @@ private func expectPrecancelled(_ next: @escaping @Sendable () async throws -> V
   }.value
 }
 
+private final class NativeReadyPoll {
+  let continuation: CheckedContinuation<Int8, Never>
+  init(_ continuation: CheckedContinuation<Int8, Never>) { self.continuation = continuation }
+}
+
+private func awaitNativeReady(_ handle: UInt64) async {
+  while true {
+    let result: Int8 = await withCheckedContinuation { continuation in
+      let retained = Unmanaged.passRetained(NativeReadyPoll(continuation))
+      ffi_marmot_uniffi_rust_future_poll_rust_buffer(
+        handle,
+        { raw, result in
+          Unmanaged<NativeReadyPoll>.fromOpaque(UnsafeRawPointer(bitPattern: UInt(raw))!)
+            .takeRetainedValue().continuation.resume(returning: result)
+        },
+        UInt64(UInt(bitPattern: retained.toOpaque()))
+      )
+    }
+    if result == 0 { return }
+    precondition(result == 1, "invalid native poll result")
+  }
+}
+
 private enum NativeCancelCallback {
   case cancelled
   case cancelledOrWoken
@@ -331,6 +354,27 @@ private struct SubscriptionCancellationSmoke {
       preconditionFailure("wrong generation did not propagate a typed native error")
     } catch MarmotKitError.ConversationWindowWrongGeneration {
     }
+
+    try await Task.detached {
+      let readyError = uniffi_marmot_uniffi_fn_method_conversationwindowsubscription_page(
+        conversation.uniffiClonePointer(),
+        FfiConverterTypeConversationWindowRevisionFfi_lower(invalidRevision),
+        FfiConverterTypeConversationPageDirectionFfi_lower(.older), 1, 0
+      )
+      await awaitNativeReady(readyError)
+      withUnsafeCurrentTask { $0!.cancel() }
+      do {
+        let _: ConversationWindowSnapshotFfi? = try await cancellableProjectionNext(
+          readyError,
+          read: { _ in
+            preconditionFailure("cancelled ready error decoded a successful payload")
+          })
+        preconditionFailure("cancelled ready error returned normally")
+      } catch is CancellationError {
+      } catch MarmotKitError.ConversationWindowWrongGeneration {
+        preconditionFailure("completed native error took priority over task cancellation")
+      }
+    }.value
 
     await conversation.cancel()
     let closedConversation = try await conversation.nextCancellable()

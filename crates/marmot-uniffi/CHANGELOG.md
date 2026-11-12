@@ -29,6 +29,8 @@
   `MarmotKit.swift` (mdk#2760). MDK owns their native-pending cancellation
   integration checks. Remove the host's handwritten adapter when adopting
   the combined Swift asset to avoid duplicate method definitions.
+  Task cancellation takes priority over completed native typed errors;
+  active tasks retain those errors.
 
 - `MarmotDeploymentFfi` adds `relay_event_limits: [RelayEventLimitFfi]`, empty by default in Swift and Kotlin: the
   largest event each listed relay accepts, for relays that do not advertise it (mdk#2334). MDK sends no group event,
