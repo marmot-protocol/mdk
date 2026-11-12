@@ -25,7 +25,10 @@
 //!
 //! Writers the triggers do not see (another process, a raw connection) are
 //! caught by `PRAGMA data_version`: reading the write count checks it, and a
-//! move no counted commit explains moves every group, or panics under test.
+//! move no counted commit explains moves every group, and is reported (a
+//! warning, a panic under test) unless one of this process's counted
+//! connections made a move SQLite makes without a commit: a WAL truncate, a
+//! `VACUUM`, a rollback (see [`GroupWriteCounter::check_unexplained_commits`]).
 //!
 //! Two scopes: `committed` moves on the group record and its commit-derived
 //! OpenMLS rows; `state` moves on those and every other input. Application
@@ -35,7 +38,9 @@
 
 use crate::SqliteResultExt;
 use crate::base::codec::message_state_to_i64;
-use crate::base::connection::{SharedConnection, WeakSharedConnection};
+use crate::base::connection::{
+    ConnectionHooks, HooklessMove, SharedConnection, WeakSharedConnection,
+};
 use crate::protocol::openmls_storage::ratchet_labels;
 use cgka_traits::message::MessageState;
 use cgka_traits::storage::{GroupWriteGeneration, StorageResult};
@@ -159,6 +164,13 @@ struct Counts {
     /// file, as applied: what explains a move of another connection's
     /// `PRAGMA data_version`.
     commits: u64,
+    /// Changes of the file that move other connections' `PRAGMA
+    /// data_version` without a commit hook, made through any of this
+    /// process's counted connections: WAL truncates and `VACUUM`s
+    /// ([`HooklessMove`]), and rollbacks, which reset the WAL header too when
+    /// the transaction had spilled pages into a WAL that was fully
+    /// checkpointed. Each is applied when made, with its connection held.
+    hookless: u64,
     /// Writes this counter could not attribute to one group: they move every
     /// group.
     unattributed: GroupWriteGeneration,
@@ -203,9 +215,20 @@ struct Pending {
     applied_changes: u64,
     /// This connection's commits that have joined the file's count.
     own_commits: u64,
-    /// The connection's `PRAGMA data_version` at its last check, and the
-    /// commits other connections had applied then.
-    checked: Option<(i64, u64)>,
+    /// This connection's part of [`Counts::hookless`].
+    own_hookless: u64,
+    /// The connection's last check.
+    checked: Option<Checked>,
+}
+
+/// What one check of a connection's `PRAGMA data_version` saw.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Checked {
+    data_version: i64,
+    /// Commits other connections had applied then.
+    commits: u64,
+    /// [`Counts::hookless`] moves other connections had made then.
+    hookless: u64,
 }
 
 /// The counts for one database file, shared by every handle this process
@@ -278,9 +301,27 @@ impl GroupWriteCounter {
     /// The safety net under the triggers: SQLite moves a connection's
     /// `PRAGMA data_version` when any other connection, in this process or
     /// another, commits to the file. A move that no commit by another of this
-    /// process's counted connections explains was made by a writer the
-    /// triggers did not see, so every group's count and the write count move.
-    /// Under test that panics instead: every writer must be counted.
+    /// process's counted connections explains may have been made by a writer
+    /// the triggers did not see, so every group's count and the write count
+    /// move.
+    ///
+    /// SQLite also moves it without a commit hook: a WAL truncate (its own
+    /// checkpoints, a close's), a `VACUUM`, and the rollback of a transaction
+    /// that spilled into a fully checkpointed WAL. Every other path that
+    /// moves it fires the commit hook, needs no other connection open (the
+    /// last close, a journal-mode change), writes no file a counted
+    /// connection has open (a SQLCipher rekey, a backup), or follows an I/O
+    /// fault.
+    /// When another counted connection made such a move since the last
+    /// check, the move is not reported: nothing is logged and nothing panics.
+    /// Every group still moves, so an uncounted commit in the same window
+    /// costs a rebuild, never a stale answer. Without one, the move is
+    /// reported, and under test it panics: every writer must be counted.
+    ///
+    /// The cost: under test, an uncounted commit is not flagged when another
+    /// counted connection truncated the WAL, vacuumed or rolled back a
+    /// transaction (read-only ones included) between two reads of this
+    /// connection's count. For an idle connection that window can be long.
     ///
     /// The check holds every other counted connection to the file, so none is
     /// partway through a commit its release has not applied yet; when one is
@@ -321,31 +362,41 @@ impl GroupWriteCounter {
         else {
             return;
         };
-        let (unexplained, declared) = {
+        let reported = {
             let mut pending = lock(&self.connection.pending);
             let mut counts = self.lock();
             #[cfg(any(test, feature = "test-support"))]
             let declared = has_uncounted_writer(counts.path.as_deref());
             #[cfg(not(any(test, feature = "test-support")))]
             let declared = false;
-            let by_others = counts.commits.saturating_sub(pending.own_commits);
-            // A declared writer's commit may land beside a counted one, which
-            // would explain the move: any move counts for such a file.
-            let unexplained = matches!(
-                pending.checked,
-                Some((version, commits))
-                    if version != data_version && (declared || commits == by_others)
-            );
+            let now = Checked {
+                data_version,
+                commits: counts.commits.saturating_sub(pending.own_commits),
+                hookless: counts.hookless.saturating_sub(pending.own_hookless),
+            };
+            let (unexplained, reported) = match pending.checked {
+                Some(last) if last.data_version != data_version => {
+                    // A declared writer's commit may land beside a counted
+                    // one, which would explain the move: any move counts for
+                    // such a file.
+                    let unexplained = declared || last.commits == now.commits;
+                    (
+                        unexplained,
+                        unexplained && !declared && last.hookless == now.hookless,
+                    )
+                }
+                _ => (false, false),
+            };
             if unexplained {
                 counts.note(None, COMMITTED);
                 counts.writes += 1;
             }
-            pending.checked = Some((data_version, by_others));
-            (unexplained, declared)
+            pending.checked = Some(now);
+            reported
         };
         drop(held);
         drop(own);
-        if unexplained && !declared {
+        if reported {
             tracing::warn!(
                 target: "storage_sqlite::group_writes",
                 method = "check_unexplained_commits",
@@ -378,6 +429,22 @@ impl GroupWriteCounter {
         pending.own_commits += commits;
         for (group, scope) in pending.notes.drain(..) {
             counts.note(group, scope);
+        }
+    }
+
+    /// Apply a [`Counts::hookless`] move this connection is about to make,
+    /// or made in a rollback, with the connection held: no check of another
+    /// connection can run until it is released, so none sees the move
+    /// before this. A `VACUUM` also moves every group, since it may renumber
+    /// rows without a trigger seeing them.
+    fn note_hookless_move(&self, vacuum: bool) {
+        let mut pending = lock(&self.connection.pending);
+        let mut counts = self.lock();
+        counts.hookless += 1;
+        pending.own_hookless += 1;
+        if vacuum {
+            counts.note(None, COMMITTED);
+            counts.writes += 1;
         }
     }
 
@@ -440,10 +507,21 @@ pub(crate) fn install(connection: &SharedConnection) -> StorageResult<GroupWrite
             false
         }))
         .storage()?;
+        // SQLite cannot say whether the transaction spilled, or whether it
+        // wrote at all, so every rollback counts.
+        let rolled_back = counter.clone();
+        conn.rollback_hook(Some(move || rolled_back.note_hookless_move(false)))
+            .storage()?;
         counter
     };
     let applied = counter.clone();
-    connection.set_release_hook(Box::new(move |conn| applied.apply(conn)))?;
+    let moved = counter.clone();
+    connection.set_hooks(ConnectionHooks {
+        release: Box::new(move |conn| applied.apply(conn)),
+        hookless_move: Box::new(move |change| {
+            moved.note_hookless_move(change == HooklessMove::Vacuum);
+        }),
+    })?;
     Ok(counter)
 }
 
@@ -1160,8 +1238,8 @@ mod tests {
     }
 
     /// The safety net: a commit no counted connection made moves every
-    /// group, and under test it panics. Commits through counted connections,
-    /// a VACUUM among them, and another counted open explain themselves.
+    /// group, and under test it panics. Commits through counted connections
+    /// and another counted open explain themselves.
     #[test]
     fn only_an_uncounted_commit_trips_the_data_version_net() {
         let directory = tempfile::tempdir().unwrap();
@@ -1173,7 +1251,6 @@ mod tests {
 
         write_device_group(&app, &group);
         execute(&app, "BEGIN; DELETE FROM device_groups; COMMIT;");
-        execute(&app, "VACUUM;");
         let reopened = open_file(&path);
         engine.write_count();
         drop(reopened);
@@ -1194,6 +1271,72 @@ mod tests {
         assert!(tripped.is_err());
         assert!(generation(&engine, &group).committed > before.0.committed);
         assert!(engine.group_writes.lock().writes > before.1);
+    }
+
+    /// SQLite moves another connection's `PRAGMA data_version` without a
+    /// commit hook for a WAL truncate (a maintenance pass's, a close's), a
+    /// `VACUUM`, and a rollback, in a write or at a drop, whose spill reset a
+    /// fully checkpointed WAL. Made through a counted connection, none is an
+    /// uncounted writer: the other connection's next count read does not
+    /// panic, and every group still moves, as a rebuild costs nothing stale.
+    /// A truncate run around the helper is reported.
+    #[test]
+    fn a_counted_connections_move_without_a_commit_is_not_reported() {
+        const SPILL: &str = "INSERT INTO spill SELECT randomblob(4000)
+             FROM (WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 100)
+                   SELECT i FROM n)";
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("group-writes.sqlite");
+        let engine = open_file(&path);
+        let app = open_file(&path);
+        let group = GroupId::new(vec![15; 16]);
+        execute(
+            &app,
+            "CREATE TABLE spill (bytes BLOB); PRAGMA cache_size = 10;",
+        );
+        let moves_every_group = |change: &str, make: &dyn Fn()| {
+            engine.write_count();
+            let before = generation(&engine, &group);
+            make();
+            let read = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                engine.write_count();
+            }));
+            assert!(read.is_ok(), "{change} was reported");
+            assert!(
+                generation(&engine, &group).committed > before.committed,
+                "{change} moved no group"
+            );
+        };
+
+        moves_every_group("a truncate", &|| {
+            assert!(app.app_storage().truncate_wal().unwrap());
+        });
+        moves_every_group("a vacuum", &|| {
+            app.app_storage().make_non_incremental_for_test().unwrap();
+        });
+        // A spill starts the WAL over when every frame in it is checkpointed.
+        const CHECKPOINTED: &str = "INSERT INTO spill VALUES (x'00'); PRAGMA wal_checkpoint;";
+        execute(&app, CHECKPOINTED);
+        moves_every_group("a rollback", &|| {
+            execute(&app, &format!("BEGIN; {SPILL}; ROLLBACK;"));
+        });
+        // Opened first: an open's own commits would explain the move.
+        let dropped = open_file(&path);
+        execute(&dropped, &format!("PRAGMA cache_size = 10; {CHECKPOINTED}"));
+        let dropped = std::cell::Cell::new(Some(dropped));
+        moves_every_group("a drop", &|| {
+            let dropped = dropped.take().unwrap();
+            execute(&dropped, &format!("BEGIN; {SPILL};"));
+        });
+
+        engine.write_count();
+        execute(&app, "PRAGMA wal_checkpoint(TRUNCATE)");
+        let around = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            engine.write_count();
+        }));
+        assert!(around.is_err());
+
+        moves_every_group("a close", &|| app.close().unwrap());
     }
 
     /// A guard taken before a close began can still commit through the

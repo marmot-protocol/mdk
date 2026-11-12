@@ -90,6 +90,53 @@ fn storage_boundary_matches_the_allow_list() {
     panic!("{message}");
 }
 
+/// Every WAL truncate and `VACUUM` in production code runs through
+/// `ConnectionGuard::checkpoint_truncate`, `ConnectionGuard::vacuum` or a
+/// close, which note it for the group write counts first (mdk#3273): SQLite
+/// moves every other connection's `PRAGMA data_version` for one without a
+/// commit hook, and an unnoted one reads as a writer no trigger saw. Reads
+/// string literals, so it misses SQL assembled at run time.
+#[test]
+fn only_the_connection_truncates_or_vacuums() {
+    let mut found: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for file in production_files() {
+        for literal in scan(&file.ast).literals {
+            if moves_data_version_without_a_commit(&literal) {
+                found.entry(file.rel.clone()).or_default().push(literal);
+            }
+        }
+    }
+    let mut helpers = found.remove("base/connection.rs").unwrap_or_default();
+    helpers.sort();
+    assert_eq!(
+        helpers,
+        ["PRAGMA wal_checkpoint(TRUNCATE)", "VACUUM"],
+        "base/connection.rs truncates or vacuums outside its two helpers"
+    );
+    assert!(
+        found.is_empty(),
+        "truncate the WAL with `ConnectionGuard::checkpoint_truncate` and vacuum with \
+         `ConnectionGuard::vacuum`: {found:#?}"
+    );
+}
+
+/// SQL that truncates the WAL or vacuums, or a pragma call that could.
+fn moves_data_version_without_a_commit(sql: &str) -> bool {
+    let compact: String = sql
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect::<String>()
+        .to_ascii_lowercase();
+    compact == "wal_checkpoint"
+        || compact.contains("wal_checkpoint(truncate)")
+        || sql.split(';').any(|statement| {
+            let statement = statement.trim().to_ascii_lowercase();
+            statement == "vacuum"
+                || statement.starts_with("vacuum ")
+                || statement.starts_with("vacuum\n")
+        })
+}
+
 /// One production source file and the side its folder puts it on.
 struct SourceFile {
     rel: String,
