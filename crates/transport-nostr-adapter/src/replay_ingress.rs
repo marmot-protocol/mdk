@@ -1817,11 +1817,12 @@ mod tests {
 
     /// A history copy a replaced coverage owes its fresh REQ is no longer
     /// owed once native ingress hands it back as retained input, admitted or
-    /// still waiting for admission: the fresh REQ ending without a copy of
-    /// its own charges nothing.
+    /// still waiting for admission: neither the fresh REQ ending without a
+    /// copy of its own nor its coverage being replaced in turn charges
+    /// anything.
     #[tokio::test]
     async fn a_retained_copy_settles_what_a_replacement_owes() {
-        for admitted in [true, false] {
+        for (admitted, replaced) in [(true, false), (false, false), (false, true)] {
             let mut state = AdapterState::default();
             let shared = Arc::new(ReplayIngressState::default());
             let (mut coverage, id) = coverage(&state, shared.clone());
@@ -1848,7 +1849,7 @@ mod tests {
                     .index_for(&TransportEndpoint("wss://native.example".into())),
                 RelayIndex(0)
             );
-            let fresh = NostrSubscription::Group {
+            let mut fresh = NostrSubscription::Group {
                 account_id: account.clone(),
                 group_id: GroupId::new(vec![0; 16]),
                 transport_group_id: vec![0; 32],
@@ -1872,8 +1873,20 @@ mod tests {
             if admitted {
                 coverage.admit_retained();
             }
-            coverage.record_eose(&fresh.subscription_id(), RelayIndex(0));
-            assert_eq!(pending(&state), None, "admitted: {admitted}");
+            if replaced {
+                let NostrSubscription::Group { attempt, .. } = &mut fresh else {
+                    unreachable!("a group REQ");
+                };
+                *attempt = attempt.next();
+                state.record_account_replay_start(&account, std::slice::from_ref(&fresh));
+            } else {
+                coverage.record_eose(&fresh.subscription_id(), RelayIndex(0));
+            }
+            assert_eq!(
+                pending(&state),
+                None,
+                "admitted: {admitted}, replaced: {replaced}"
+            );
         }
     }
 

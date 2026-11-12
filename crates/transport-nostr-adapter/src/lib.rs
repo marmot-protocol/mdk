@@ -5084,6 +5084,9 @@ impl AccountReplayCoverage {
             {
                 *replay = RelayReplay::Incomplete;
             }
+            // A copy owed here that this reply did not bring is lost, though
+            // its peers still wait.
+            self.settle_replayed();
             return;
         }
         let Some(replay) = self.replay_mut(id, relay) else {
