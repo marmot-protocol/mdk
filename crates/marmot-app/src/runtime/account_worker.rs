@@ -3835,7 +3835,7 @@ fn run_legacy_message_promotion_batch(
 }
 
 /// One promotion batch through `promote`: a failed batch is a failure,
-/// whether it retries next tick or halts the sweep, and a sweep that is
+/// whether it retries 15 s later or halts the sweep, and a sweep that is
 /// complete or halted has nothing to do.
 fn run_legacy_message_promotion_batch_with(
     schedule: &mut LegacyMessagePromotionSchedule,
