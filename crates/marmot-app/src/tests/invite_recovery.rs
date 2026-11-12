@@ -1367,8 +1367,8 @@ pub(super) fn package_expiring_at(
     };
     use openmls::extensions::{AppDataDictionary, AppDataDictionaryExtension, Extension};
     use openmls::prelude::{
-        BasicCredential, Capabilities, Ciphersuite, CredentialWithKey, ExtensionType, Extensions,
-        KeyPackage as MlsKeyPackage, Lifetime, MlsMessageOut,
+        BasicCredential, Capabilities, Ciphersuite, CredentialType, CredentialWithKey,
+        ExtensionType, Extensions, KeyPackage as MlsKeyPackage, Lifetime, MlsMessageOut,
     };
     use openmls_basic_credential::SignatureKeyPair;
     use tls_codec::Serialize;
@@ -1410,7 +1410,7 @@ pub(super) fn package_expiring_at(
             Some(&[ciphersuite]),
             Some(&[ExtensionType::AppDataDictionary]),
             Some(&[openmls::prelude::ProposalType::AppDataUpdate]),
-            None,
+            Some(&[CredentialType::Basic]),
         ))
         .leaf_node_extensions(Extensions::single(proof).unwrap())
         .key_package_lifetime(Lifetime::init(now.saturating_sub(3600), expires));

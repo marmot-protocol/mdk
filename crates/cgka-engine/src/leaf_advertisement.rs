@@ -204,7 +204,7 @@ mod tests {
     };
     use crate::engine::DEFAULT_CIPHERSUITE;
     use openmls::extensions::{AppDataDictionary, ExtensionType, UnknownExtension};
-    use openmls::prelude::{Capabilities, KeyPackage};
+    use openmls::prelude::{Capabilities, CredentialType, KeyPackage};
 
     #[test]
     fn refresh_unions_support_and_preserves_every_other_leaf_byte() {
@@ -242,7 +242,7 @@ mod tests {
                         ExtensionType::AppDataDictionary,
                     ]),
                     None,
-                    None,
+                    Some(&[CredentialType::Basic]),
                 ))
                 .leaf_node_extensions(Extensions::from_vec(extensions).unwrap())
                 .build(
