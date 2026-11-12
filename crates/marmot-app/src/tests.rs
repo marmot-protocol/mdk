@@ -21426,27 +21426,38 @@ async fn retained_send_recovers_after_reconnect(host_wake: bool) {
     let failed_event_id = relay.attempted_event_ids()[attempts_before].clone();
 
     relay.allow_publishes();
+    let mut events = runtime.subscribe();
     runtime
         .shared_services()
         .relay_plane()
         .simulate_notification_consumer_exit_for_test();
-    let backoff_deadline = std::time::Instant::now() + Duration::from_secs(15);
-    loop {
-        match runtime.unhydrated_group_count_for_test("sender").await {
-            Err(AppError::TransportClosed) => break,
-            // The worker takes a ready command before its receive, and each
-            // probe ends with publishing A (checked against live reads under
-            // test). On two threads, a probe sent back to back would be
-            // waiting at every turn, and the receive that observes the exit
-            // would never run.
-            Ok(_) => tokio::time::sleep(Duration::from_millis(10)).await,
-            Err(error) => panic!("unexpected reconnect probe error: {error:?}"),
+    // Wait for the failed receive before probing: the worker takes a ready
+    // command before its receive, so probes sent back to back would keep
+    // the receive that observes the exit from running.
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            match events.recv().await {
+                Ok(MarmotAppEvent::AccountError(error))
+                    if error.message.starts_with("runtime receive failed") =>
+                {
+                    break;
+                }
+                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    panic!("runtime events closed before the failed receive")
+                }
+            }
         }
-        assert!(
-            std::time::Instant::now() < backoff_deadline,
-            "account worker did not enter reconnect backoff"
-        );
-    }
+    })
+    .await
+    .expect("the consumer exit must fail the worker's receive");
+    assert!(
+        matches!(
+            runtime.unhydrated_group_count_for_test("sender").await,
+            Err(AppError::TransportClosed)
+        ),
+        "account worker did not enter reconnect backoff"
+    );
 
     if host_wake {
         runtime
