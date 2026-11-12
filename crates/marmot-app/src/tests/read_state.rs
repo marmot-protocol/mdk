@@ -6,6 +6,7 @@ use super::canonical_membership::deliver_new;
 #[cfg(feature = "test-policy-overrides")]
 use super::push_token_reshare::Device;
 use super::*;
+use crate::client::read_state::oracle::{KeyPackageInputs, LifetimeBound};
 use crate::client::read_state::{GroupAnswers, ReadState, UploadsInFlight};
 use tokio::sync::watch;
 
@@ -287,6 +288,61 @@ async fn a_bundle_not_valid_yet_bounds_the_list_it_stays_out_of() {
     );
     assert_eq!(state.valid_until, Some(Timestamp(not_before)));
     assert!(state.version > version);
+}
+
+/// The oracle skips its fresh read of a reused KeyPackage list only while
+/// the list's raw inputs are the ones read before its build and the clock is
+/// at or after that reading and short of the first lifetime bound after it:
+/// the soonest `not_after` of a stored bundle, or `not_before` of one not
+/// valid yet, decoded without OpenMLS. A stored row whose lifetime it cannot
+/// find never lets it skip.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_oracle_rereads_a_reused_key_package_list_once_an_input_or_the_clock_moves() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+    let mut client = app.client("alice").await.unwrap();
+    client.publish_key_package().await.unwrap();
+    let published = client.durably_owned_key_packages().unwrap();
+    let not_after = cgka_engine::key_package::key_package_metadata(&published[0])
+        .unwrap()
+        .not_after;
+
+    let built_from = KeyPackageInputs::read(&client).unwrap();
+    assert_eq!(
+        built_from.first_bound(),
+        LifetimeBound::At(Timestamp(not_after))
+    );
+    let mut now = KeyPackageInputs::read(&client).unwrap();
+    assert!(built_from.holds_at(&now));
+    now.taken_at = Timestamp(not_after);
+    assert!(!built_from.holds_at(&now));
+    now.taken_at = Timestamp(built_from.taken_at.0 - 1);
+    assert!(!built_from.holds_at(&now));
+
+    let not_before = crate::unix_now_seconds() + 3_600;
+    store_own_bundle_valid_from(&app, &published[0], not_before);
+    let with_new_bundle = KeyPackageInputs::read(&client).unwrap();
+    assert!(!built_from.holds_at(&with_new_bundle));
+    assert_eq!(
+        with_new_bundle.first_bound(),
+        LifetimeBound::At(Timestamp(not_before))
+    );
+
+    app.account_storage("alice")
+        .unwrap()
+        .app_storage()
+        .execute_batch_for_test(
+            "INSERT INTO openmls_values (provider_version, label, storage_key, value)
+             VALUES (1, CAST('KeyPackage' AS BLOB), x'00ff', x'00')",
+        )
+        .unwrap();
+    let undecodable = KeyPackageInputs::read(&client).unwrap();
+    assert_eq!(undecodable.first_bound(), LifetimeBound::Unknown);
+    assert!(!undecodable.holds_at(&KeyPackageInputs::read(&client).unwrap()));
 }
 
 /// Stores a copy of alice's `template`, signed with her own key, that is

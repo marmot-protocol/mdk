@@ -508,6 +508,10 @@ pub(crate) struct ReadStatePublisher {
     /// oracle then checks even when nothing changed.
     #[cfg(any(test, feature = "test-support"))]
     key_packages_reused: bool,
+    /// The owned KeyPackage list's raw inputs, read before its build: the
+    /// oracle's check of the list while it is reused.
+    #[cfg(any(test, feature = "test-support"))]
+    key_package_inputs: Option<oracle::KeyPackageInputs>,
 }
 
 impl ReadStatePublisher {
@@ -537,6 +541,8 @@ impl ReadStatePublisher {
             storage_open_at_publish: true,
             #[cfg(any(test, feature = "test-support"))]
             key_packages_reused: false,
+            #[cfg(any(test, feature = "test-support"))]
+            key_package_inputs: None,
         }
     }
 
@@ -544,6 +550,10 @@ impl ReadStatePublisher {
     fn forget_inputs(&mut self) {
         self.key_packages = None;
         self.entries.clear();
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            self.key_package_inputs = None;
+        }
     }
 
     #[cfg_attr(not(test), allow(dead_code))] // Moved reads subscribe (mdk#3273 PR 3).
@@ -593,6 +603,13 @@ impl ReadStatePublisher {
                     (answer, validity, true)
                 }
                 _ => {
+                    // The oracle's copy of the inputs, read before the
+                    // build's own reads: a write landing during the build
+                    // shows up as a change.
+                    #[cfg(any(test, feature = "test-support"))]
+                    {
+                        self.key_package_inputs = oracle::KeyPackageInputs::read(client).ok();
+                    }
                     let (answer, validity) = owned_key_packages(client, write_count);
                     (answer, validity, false)
                 }
@@ -847,8 +864,9 @@ impl AppClient {
         // ones and found every group entry's validity holding, so it skips
         // the full check: the oracle's live reads hydrate on demand, and a
         // worker answering a tight poll would spend its time here. A reused
-        // KeyPackage list is still checked against a fresh read at every
-        // publish.
+        // KeyPackage list is still checked at every publish: against a fresh
+        // read, unless its raw inputs are the ones read before its build and
+        // the clock has reached none of their lifetime bounds.
         #[cfg(any(test, feature = "test-support"))]
         if _changed {
             oracle::check(
@@ -858,10 +876,11 @@ impl AppClient {
                 publisher.storage_open_at_publish,
             );
         } else if publisher.key_packages_reused {
-            oracle::check_key_packages(
+            oracle::check_reused_key_packages(
                 self,
                 &publisher.current(),
                 publisher.storage_open_at_publish,
+                publisher.key_package_inputs.as_ref(),
             );
         }
     }
@@ -912,6 +931,13 @@ impl AppClient {
 /// group that is not hydrated, the oracle runs without on-demand hydration.
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) mod oracle {
+    use std::cell::OnceCell;
+    use std::collections::BTreeSet;
+
+    use cgka_traits::StorageError;
+    use cgka_traits::group::ProtocolProfile;
+    use cgka_traits::storage::StoredKeyPackageBundle;
+
     use super::*;
 
     /// Whether `error` is a closed-storage error, at any depth.
@@ -986,18 +1012,148 @@ pub(crate) mod oracle {
         same(window, "durably owned key packages", &published, &live);
     }
 
-    /// The owned KeyPackage list alone: a publish that reused it and changed
-    /// nothing else.
-    pub(crate) fn check_key_packages(
+    /// A reused owned KeyPackage list, at a publish that changed nothing
+    /// else. The full check reads the list afresh, which re-validates every
+    /// stored bundle. It is skipped only when the list's raw inputs, read
+    /// now, are `built_from`, the ones read before its build, and the clock
+    /// has reached none of their lifetime bounds since: a fresh read would
+    /// then decide every bundle as the build did. A failed read, or no
+    /// inputs, checks in full.
+    pub(crate) fn check_reused_key_packages(
         client: &AppClient,
         state: &ReadState,
         storage_open_at_publish: bool,
+        built_from: Option<&KeyPackageInputs>,
     ) {
+        if let Some(built_from) = built_from
+            && KeyPackageInputs::read(client).is_ok_and(|now| built_from.holds_at(&now))
+        {
+            return;
+        }
         let window = Window {
             storage_open_at_publish,
             storage_closed: &client.app.storage_closed,
         };
         key_packages(client, state, window);
+    }
+
+    /// What the owned KeyPackage list is a function of, read raw: the stored
+    /// bundle rows, which the build's by-reference lookups read too; the refs
+    /// of the private KeyPackages issued to siblings, which it leaves out;
+    /// and the protocol profile. With the system-clock reading taken before
+    /// them.
+    pub(crate) struct KeyPackageInputs {
+        pub(crate) taken_at: Timestamp,
+        rows: Vec<StoredKeyPackageBundle>,
+        private_refs: BTreeSet<Vec<u8>>,
+        profile: ProtocolProfile,
+        /// [`Self::first_bound`], decoded at its first use.
+        first_bound: OnceCell<LifetimeBound>,
+    }
+
+    /// The first lifetime bound after an input reading.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum LifetimeBound {
+        At(Timestamp),
+        /// No stored bundle has a bound ahead.
+        Never,
+        /// A stored row's lifetime could not be found, so no clock reading
+        /// is known to decide as this one did.
+        Unknown,
+    }
+
+    impl KeyPackageInputs {
+        pub(crate) fn read(client: &AppClient) -> Result<Self, StorageError> {
+            use cgka_traits::storage::{KeyPackageBundleStorage as _, StorageProvider as _};
+
+            let taken_at = system_clock_now();
+            let storage = &client.engine_storage;
+            let private_refs = match storage.private_key_package_storage() {
+                Some(private) => private
+                    .list_issued_private_key_packages()?
+                    .into_iter()
+                    .map(|record| record.key_package_ref)
+                    .collect(),
+                None => BTreeSet::new(),
+            };
+            Ok(Self {
+                taken_at,
+                rows: storage.stored_key_package_bundles()?,
+                private_refs,
+                profile: client.runtime.new_protocol_profile(),
+                first_bound: OnceCell::new(),
+            })
+        }
+
+        /// Whether a list built from these inputs is what a full read at
+        /// `now` would give: the same inputs, and the clock at or after this
+        /// reading and short of the first lifetime bound after it, so every
+        /// stored bundle's lifetime decides as it did here.
+        pub(crate) fn holds_at(&self, now: &Self) -> bool {
+            now.rows == self.rows
+                && now.private_refs == self.private_refs
+                && now.profile == self.profile
+                && now.taken_at >= self.taken_at
+                && match self.first_bound() {
+                    LifetimeBound::At(bound) => now.taken_at < bound,
+                    LifetimeBound::Never => true,
+                    LifetimeBound::Unknown => false,
+                }
+        }
+
+        /// The soonest `not_before` or `not_after` after this reading of any
+        /// stored bundle, read from the serialized rows without OpenMLS or
+        /// the engine's rule: a bound of a bundle the list leaves out for
+        /// another reason counts too.
+        pub(crate) fn first_bound(&self) -> LifetimeBound {
+            *self.first_bound.get_or_init(|| {
+                let mut first: Option<u64> = None;
+                for row in &self.rows {
+                    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&row.value) else {
+                        return LifetimeBound::Unknown;
+                    };
+                    let mut found = false;
+                    lifetimes(&value, &mut |not_before, not_after| {
+                        found = true;
+                        for bound in [not_before, not_after] {
+                            if bound > self.taken_at.0 {
+                                first = Some(first.map_or(bound, |first| first.min(bound)));
+                            }
+                        }
+                    });
+                    if !found {
+                        return LifetimeBound::Unknown;
+                    }
+                }
+                first.map_or(LifetimeBound::Never, |bound| {
+                    LifetimeBound::At(Timestamp(bound))
+                })
+            })
+        }
+    }
+
+    /// Call `found` with every object in `value` that has integer
+    /// `not_before` and `not_after` fields, as an OpenMLS `Lifetime` does.
+    fn lifetimes(value: &serde_json::Value, found: &mut dyn FnMut(u64, u64)) {
+        match value {
+            serde_json::Value::Object(fields) => {
+                if let (Some(not_before), Some(not_after)) = (
+                    fields.get("not_before").and_then(serde_json::Value::as_u64),
+                    fields.get("not_after").and_then(serde_json::Value::as_u64),
+                ) {
+                    found(not_before, not_after);
+                }
+                for field in fields.values() {
+                    lifetimes(field, found);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    lifetimes(item, found);
+                }
+            }
+            _ => {}
+        }
     }
 
     pub(crate) fn check(
