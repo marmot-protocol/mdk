@@ -4296,7 +4296,15 @@ async fn replay_loss_wakes_accounts() {
             })
             .await
             .unwrap();
+        let first_issued = relay.subscriptions.lock().unwrap().len();
         adapter.activate_account(activation).await.unwrap();
+        // The replacement's REQs end without the discarded copy: lost.
+        let replacement = relay.subscriptions.lock().unwrap()[first_issued..].to_vec();
+        for subscription in replacement {
+            relay
+                .send_eose(&endpoint, subscription.subscription_id())
+                .await;
+        }
         assert!(adapter.pending_delivery_overflow().is_none());
     }
     plane.spawn_router();
