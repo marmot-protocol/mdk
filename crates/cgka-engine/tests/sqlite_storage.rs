@@ -443,10 +443,14 @@ async fn safe_exports_keep_their_source_and_puncturing_across_reopen() {
                 group
                     .safe_export_secret_from_pending(&crypto, storage.mls_storage(), component)
                     .unwrap()
+                    .as_slice()
+                    .to_vec()
             } else {
                 group
                     .safe_export_secret(&crypto, storage.mls_storage(), component)
                     .unwrap()
+                    .as_slice()
+                    .to_vec()
             });
             Err::<(), EngineError>(EngineError::Other(
                 "restore independent exporter oracle".into(),

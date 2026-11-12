@@ -20,6 +20,7 @@ mod key_package_selection;
 mod message_journeys;
 #[cfg(feature = "test-policy-overrides")]
 mod multi_device_members;
+mod nip46_restore;
 #[cfg(feature = "product-analytics-export")]
 mod observed_operations;
 mod offline_queued_sends;

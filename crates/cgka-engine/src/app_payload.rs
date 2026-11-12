@@ -92,9 +92,9 @@ pub(crate) fn encrypted_media_exporter_secret(
             crate::group_lifecycle::ENCRYPTED_MEDIA_EXPORTER_CONTEXT,
             32,
         )
-        .map_err(|error| {
-            EngineError::Backend(format!("encrypted media export_secret: {error:?}"))
-        })?;
+        .map_err(|error| EngineError::Backend(format!("encrypted media export_secret: {error:?}")))?
+        .as_slice()
+        .to_vec();
     Ok(Some(cgka_traits::SecretBytes::new(secret)))
 }
 

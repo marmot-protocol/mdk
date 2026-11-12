@@ -224,7 +224,9 @@ not a newer suffix from another tag of that group. Healthy peer claims and indep
 `take_replay_status` transfers retained loss to the consumer's existing recovery fence and holds a read guard
 through its synchronous cursor seal. Drop the status before awaiting again. `replay_loss_notified` wakes the
 router without consuming evidence. Loss survives replacement until imported. Buffered and releasing ciphertext
-holds the cursor, but a dead relay alone does not: all-relay EOSE is a separate certificate. The router calls
+holds the cursor, but a dead relay alone does not: all-relay EOSE is a separate certificate. A history copy a
+replacement's REQ asks for again is owed instead of lost, and holds the cursor the same way, until the replacement
+delivers it; if the replacement stops replaying that range first, or is itself replaced, the original loss is charged. The router calls
 `ack_replay_delivery` only after installing its queue/spill pin or recording loss, closing the
 adapter-to-router gap. The account owner persists limited native admission only after pending bytes and
 nondurable spill handoffs are clear, including every native batch ACK. A source whose range is already

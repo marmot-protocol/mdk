@@ -4724,12 +4724,16 @@ impl<S: StorageProvider> Engine<S> {
         {
             let secret = mls_group
                 .safe_export_secret_from_pending(crypto, storage, component_id)
-                .map_err(|e| EngineError::Backend(format!("staged safe_export_secret: {e:?}")))?;
+                .map_err(|e| EngineError::Backend(format!("staged safe_export_secret: {e:?}")))?
+                .as_slice()
+                .to_vec();
             Ok((epoch, cgka_traits::SecretBytes::new(secret)))
         } else {
             let secret = mls_group
                 .safe_export_secret(crypto, storage, component_id)
-                .map_err(|e| EngineError::Backend(format!("safe_export_secret: {e:?}")))?;
+                .map_err(|e| EngineError::Backend(format!("safe_export_secret: {e:?}")))?
+                .as_slice()
+                .to_vec();
             Ok((
                 EpochId(mls_group.epoch().as_u64()),
                 cgka_traits::SecretBytes::new(secret),
@@ -4933,7 +4937,9 @@ impl<S: StorageProvider + 'static> CgkaEngine for Engine<S> {
                     crate::group_lifecycle::EXPORTER_CONTEXT,
                     32,
                 )
-                .map_err(|e| EngineError::Backend(format!("staged export_secret: {e:?}")))?;
+                .map_err(|e| EngineError::Backend(format!("staged export_secret: {e:?}")))?
+                .as_slice()
+                .to_vec();
             let media_secret = staged
                 .export_secret(
                     crypto,
@@ -4943,7 +4949,9 @@ impl<S: StorageProvider + 'static> CgkaEngine for Engine<S> {
                 )
                 .map_err(|e| {
                     EngineError::Backend(format!("staged encrypted media export_secret: {e:?}"))
-                })?;
+                })?
+                .as_slice()
+                .to_vec();
             let stream_secret = staged
                 .export_secret(
                     crypto,
@@ -4953,7 +4961,9 @@ impl<S: StorageProvider + 'static> CgkaEngine for Engine<S> {
                 )
                 .map_err(|e| {
                     EngineError::Backend(format!("staged agent text stream export_secret: {e:?}"))
-                })?;
+                })?
+                .as_slice()
+                .to_vec();
             (
                 staged.group_context().epoch().as_u64(),
                 group_secret,
@@ -4968,7 +4978,9 @@ impl<S: StorageProvider + 'static> CgkaEngine for Engine<S> {
                     crate::group_lifecycle::EXPORTER_CONTEXT,
                     32,
                 )
-                .map_err(|e| EngineError::Backend(format!("export_secret: {e:?}")))?;
+                .map_err(|e| EngineError::Backend(format!("export_secret: {e:?}")))?
+                .as_slice()
+                .to_vec();
             let media_secret = mls_group
                 .export_secret(
                     crypto,
@@ -4976,9 +4988,9 @@ impl<S: StorageProvider + 'static> CgkaEngine for Engine<S> {
                     crate::group_lifecycle::ENCRYPTED_MEDIA_EXPORTER_CONTEXT,
                     32,
                 )
-                .map_err(|e| {
-                    EngineError::Backend(format!("encrypted media export_secret: {e:?}"))
-                })?;
+                .map_err(|e| EngineError::Backend(format!("encrypted media export_secret: {e:?}")))?
+                .as_slice()
+                .to_vec();
             let stream_secret = mls_group
                 .export_secret(
                     crypto,
@@ -4988,7 +5000,9 @@ impl<S: StorageProvider + 'static> CgkaEngine for Engine<S> {
                 )
                 .map_err(|e| {
                     EngineError::Backend(format!("agent text stream export_secret: {e:?}"))
-                })?;
+                })?
+                .as_slice()
+                .to_vec();
             (
                 mls_group.epoch().as_u64(),
                 group_secret,

@@ -15,7 +15,7 @@ use cgka_traits::{GroupId, TransportEndpoint};
 use marmot_app::MaintenanceTiming;
 use marmot_app::{
     AccountSetupRequest, AppError, AppMessageQuery, MarmotApp, MarmotAppConfig, MarmotAppEvent,
-    MarmotAppRuntime,
+    MarmotAppRuntime, Nip46Error,
 };
 use nostr_relay_builder::LocalRelay;
 use serde::{Deserialize, Serialize};
@@ -3041,6 +3041,22 @@ fn app_error(error: AppError) -> SubjectError {
         );
     }
     let category = match error {
+        AppError::Nip46(ref error) => match error {
+            Nip46Error::Invalid => SubjectFailureCategory::Protocol,
+            Nip46Error::ProxyConfig | Nip46Error::Storage => SubjectFailureCategory::Environment,
+            Nip46Error::Unavailable
+            | Nip46Error::RelayPublish
+            | Nip46Error::Timeout
+            | Nip46Error::Busy
+            | Nip46Error::Disconnected => SubjectFailureCategory::Resource,
+            Nip46Error::Rejected
+            | Nip46Error::Mismatch
+            | Nip46Error::Cancelled
+            | Nip46Error::LoggedOut
+            | Nip46Error::Unsupported
+            | Nip46Error::PermissionApprovalRequired
+            | Nip46Error::RequestNotFound => SubjectFailureCategory::ExpectedRefusal,
+        },
         AppError::UserBlocked
         | AppError::MessageDraftRevisionConflict
         | AppError::AttachmentModeRequired

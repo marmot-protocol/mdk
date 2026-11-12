@@ -46,7 +46,7 @@ use openmls::extensions::{
     AppDataDictionary, AppDataDictionaryExtension, Extension, LastResortExtension,
 };
 use openmls::prelude::{
-    BasicCredential, Capabilities, CredentialWithKey, ExtensionType, Extensions,
+    BasicCredential, Capabilities, CredentialType, CredentialWithKey, ExtensionType, Extensions,
     KeyPackage as MlsKeyPackage, Lifetime, MlsMessageBodyIn, MlsMessageIn, MlsMessageOut,
     ProtocolVersion,
 };
@@ -72,7 +72,13 @@ fn key_package_with_raw_identity(identity: &[u8]) -> cgka_traits::engine::KeyPac
         signature_key: signer.public().into(),
     };
     let bundle = MlsKeyPackage::builder()
-        .leaf_node_capabilities(Capabilities::default())
+        .leaf_node_capabilities(Capabilities::new(
+            None,
+            Some(&[ciphersuite]),
+            None,
+            None,
+            Some(&[CredentialType::Basic]),
+        ))
         .build(ciphersuite, &provider, &signer, credential_with_key)
         .unwrap();
     let mls_msg: MlsMessageOut = bundle.key_package().clone().into();
@@ -109,7 +115,7 @@ fn key_package_with_mismatched_account_identity_proof(
                 ACCOUNT_IDENTITY_PROOF_EXTENSION_TYPE,
             )]),
             None,
-            None,
+            Some(&[CredentialType::Basic]),
         ))
         .leaf_node_extensions(Extensions::single(proof_extension).unwrap())
         .build(ciphersuite, &provider, &signer, credential_with_key)
@@ -150,7 +156,7 @@ fn key_package_with_account_identity_proof_and_lifetime(
                 ExtensionType::AppDataDictionary,
             ]),
             None,
-            None,
+            Some(&[CredentialType::Basic]),
         ))
         .leaf_node_extensions(Extensions::single(proof_extension).unwrap())
         .key_package_lifetime(lifetime)
@@ -188,7 +194,7 @@ fn key_package_with_account_identity_proof_for_ciphersuite(
                 ACCOUNT_IDENTITY_PROOF_EXTENSION_TYPE,
             )]),
             None,
-            None,
+            Some(&[CredentialType::Basic]),
         ))
         .leaf_node_extensions(Extensions::single(proof_extension).unwrap())
         .build(ciphersuite, &provider, &signer, credential_with_key)
@@ -240,7 +246,7 @@ fn mixed_profile_key_package(identity_seed: &[u8]) -> cgka_traits::engine::KeyPa
                 ExtensionType::AppDataDictionary,
             ]),
             None,
-            None,
+            Some(&[CredentialType::Basic]),
         ))
         .leaf_node_extensions(Extensions::from_vec(vec![legacy, current]).unwrap())
         .build(ciphersuite, &provider, &signer, credential_with_key)
@@ -322,7 +328,7 @@ fn current_profile_key_package_with_fault(
             Some(&[ciphersuite]),
             Some(&[ExtensionType::AppDataDictionary]),
             None,
-            None,
+            Some(&[CredentialType::Basic]),
         ))
         .leaf_node_extensions(Extensions::single(extension).unwrap())
         .build(ciphersuite, &provider, &signer, credential_with_key)
@@ -365,7 +371,7 @@ fn key_package_with_malformed_last_resort_component(
                 ExtensionType::AppDataDictionary,
             ]),
             None,
-            None,
+            Some(&[CredentialType::Basic]),
         ))
         .leaf_node_extensions(Extensions::single(proof_extension).unwrap())
         .key_package_extensions(Extensions::single(key_package_extension).unwrap())
@@ -402,7 +408,7 @@ fn legacy_last_resort_key_package(identity_seed: &[u8]) -> cgka_traits::engine::
                 ExtensionType::LastResort,
             ]),
             None,
-            None,
+            Some(&[CredentialType::Basic]),
         ))
         .leaf_node_extensions(Extensions::single(proof_extension).unwrap())
         .key_package_extensions(
@@ -3436,7 +3442,7 @@ fn key_package_with_advertised_capabilities(
             Some(&[ciphersuite]),
             Some(&extension_types),
             Some(&proposals),
-            None,
+            Some(&[CredentialType::Basic]),
         ))
         .leaf_node_extensions(Extensions::from_vec(extensions).unwrap())
         .build(ciphersuite, &provider, &signer, credential)
@@ -4847,14 +4853,15 @@ async fn group_context_exports_the_staged_source_then_confirmation_or_rollback()
         assert_eq!(context.transport_group_id().as_deref(), Some(route));
         for (label, exporter_context) in DOMAINS {
             let expected = if pending {
-                group.pending_commit().unwrap().export_secret(
-                    &crypto,
-                    "marmot",
-                    exporter_context,
-                    32,
-                )
+                group
+                    .pending_commit()
+                    .unwrap()
+                    .export_secret(&crypto, "marmot", exporter_context, 32)
+                    .map(|s| s.as_slice().to_vec())
             } else {
-                group.export_secret(&crypto, "marmot", exporter_context, 32)
+                group
+                    .export_secret(&crypto, "marmot", exporter_context, 32)
+                    .map(|s| s.as_slice().to_vec())
             }
             .unwrap();
             let actual = context

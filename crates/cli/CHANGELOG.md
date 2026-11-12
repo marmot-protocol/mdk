@@ -9,7 +9,7 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
-## [0.16.0] - 2026-11-11
+## [0.16.0] - 2026-11-12
 
 ### Added
 

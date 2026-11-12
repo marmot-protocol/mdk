@@ -1,7 +1,7 @@
 ---
 title: "Current State — Implementations & Spec"
 created: 2026-04-19
-updated: 2026-11-08
+updated: 2026-11-10
 tags: [marmot, overview, current-state, implementations]
 status: overview
 ---
@@ -18,6 +18,13 @@ status: overview
 > explicit group evolution.
 
 # Current State — Implementations & Spec
+
+NIP-46 sessions live in `marmot-app` and are exposed through UniFFI and C.
+Pairing supports both directions, explicit versioned permission approval, and
+independent per-account transports. Communication keys use the account secret
+store; startup restores sessions before workers, and sign-out erases those keys.
+See [external signer accounts](../../external-signer-accounts.md#nip-46-sessions).
+Released host artifacts and client adoption are separate from source support.
 
 App account-history recovery uses one coverage-ledger runner (#2660) for startup, receive, maintenance,
 convergence and explicit repair. Before subscriptions activate, it converts retained recovery obligations and
