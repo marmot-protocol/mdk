@@ -384,7 +384,9 @@ def collect(args: argparse.Namespace, since: dt.datetime, github: GitHub | None)
         pending = []
         for run in runs:
             if run.get("status") != "completed":
+                # A rerun in progress leaves out its older cached attempt too.
                 collection.in_progress += 1
+                missing.add(run["id"])
                 continue
             cached = cache.load(run["id"])
             if cached is None or cached.get("run_attempt", 1) < run.get("run_attempt", 1):

@@ -19,8 +19,8 @@ Test-only code is any file under a `tests/` directory, named `tests.rs` or
 `*_tests.rs`, or in a `test_support` module, plus every `#[cfg(test)]` inline
 module, `#[test]` or `#[tokio::test]` function, and `#[cfg(test)]` function
 elsewhere. Waits inside a `#[tokio::test(start_paused = true)]`
-function, or a function that calls `time::pause()`, run on paused time and do
-not count.
+function, or after `time::pause()` in the block that calls it, run on paused
+time and do not count.
 
 This is a textual scan, not a Rust parser. Unusual constructs can hide a wait
 from it, for example a sleep reached through a `use ... as` alias or a macro,
@@ -62,8 +62,10 @@ TEST_PATH = re.compile(r"(?:^|/)(?:tests|test_support)/|(?:^|/)(?:tests|test_sup
 # whose predicate requires `test` (see `cfg_requires_test`).
 TEST_FN_ATTR = re.compile(r"#\s*\[\s*(?:test|tokio\s*::\s*test(?:\s*\([^\]]*\))?)\s*\]")
 CFG_ATTR = re.compile(r"#\s*\[\s*cfg\s*\(")
-# A loose screen on raw source for any of those attributes.
-MAYBE_TEST_ATTR = re.compile(r"#\s*\[\s*(?:test\b|tokio\s*::\s*test|cfg\s*\([^\]]*\btest\b)")
+# A loose screen on raw source for any of those attributes, or an inline
+# `test_support` module.
+MAYBE_TEST_CODE = re.compile(
+    r"#\s*\[\s*(?:test\b|tokio\s*::\s*test|cfg\s*\([^\]]*\btest\b)|\bmod\s+test_support\s*\{")
 # What follows a test attribute: more attributes, then a `mod` (inline or
 # declared) or anything else.
 ITEM_AFTER_ATTR = re.compile(r"\s*(?:#\s*\[[^\]]*\]\s*)*(?:pub(?:\([^)]*\))?\s+)?mod\s+(\w+)\s*([{;])")
@@ -134,7 +136,9 @@ def paused_ranges(code: str, pairs: dict[int, int]) -> list[tuple[int, int]]:
     """Spans where the Tokio clock is paused.
 
     A `start_paused` test is paused throughout; after `time::pause()` the
-    clock stays paused until `time::resume()` or the end of that function.
+    clock stays paused until `time::resume()` or the end of the innermost
+    block holding the call, so a `pause()` inside an `if` exempts nothing
+    after that branch.
     """
     ranges = []
     for attr in PAUSED_ATTR.finditer(code):
@@ -144,12 +148,12 @@ def paused_ranges(code: str, pairs: dict[int, int]) -> list[tuple[int, int]]:
             resume = RESUME_CALL.search(code, function.end(), end)
             ranges.append((function.start(), resume.start() if resume else end))
     for call in PAUSE_CALL.finditer(code):
-        # The innermost function whose body holds the call.
-        ends = [pairs[function.end() - 1] for function in FN_OPEN.finditer(code, 0, call.start())
-                if pairs[function.end() - 1] > call.start()]
+        # The innermost block holding the call.
+        ends = [end for start, end in pairs.items() if start < call.start() < end]
         if ends:
-            resume = RESUME_CALL.search(code, call.end(), ends[-1])
-            ranges.append((call.start(), resume.start() if resume else ends[-1]))
+            block_end = min(ends)
+            resume = RESUME_CALL.search(code, call.end(), block_end)
+            ranges.append((call.start(), resume.start() if resume else block_end))
     return ranges
 
 
@@ -221,7 +225,9 @@ def test_attributes(code: str) -> list[tuple[int, int]]:
 
 def test_items(code: str, pairs: dict[int, int]) -> tuple[list[tuple[int, int]], list[int]]:
     """Ranges of test functions and inline test modules, and offsets of test-only `mod x;`."""
-    ranges, declarations = [], []
+    ranges = [(module.start(), pairs[module.end() - 1]) for module in INLINE_MOD.finditer(code)
+              if module.group(1) == "test_support"]
+    declarations = []
     for start, end in test_attributes(code):
         block = BLOCK_AFTER_ATTR.match(code, end)
         if block:
@@ -261,7 +267,7 @@ def count_waits(path: str, source: str, test_only: bool = False) -> dict[str, in
     # Cheap textual screens first: most files cannot contain a counted wait.
     if "sleep" not in source and "timeout" not in source:
         return {}
-    if not (test_only or TEST_PATH.search(path) or MAYBE_TEST_ATTR.search(source)):
+    if not (test_only or TEST_PATH.search(path) or MAYBE_TEST_CODE.search(source)):
         return {}
     code = strip_comments_and_strings(source)
     if not (SLEEP.search(code) or TIMEOUT.search(code)):
@@ -300,7 +306,7 @@ def child_modules(path: str, source: str, test_only: bool) -> set[str]:
     sits in a test-only file or inline test module. Its file is
     `<dir>/<name>.rs` or `<dir>/<name>/mod.rs`, or its `#[path]`.
     """
-    if not ((test_only or TEST_PATH.search(path) or MAYBE_TEST_ATTR.search(source)) and MOD_DECL.search(source)):
+    if not ((test_only or TEST_PATH.search(path) or MAYBE_TEST_CODE.search(source)) and MOD_DECL.search(source)):
         return set()
     code = strip_comments_and_strings(source)
     pairs = brace_pairs(code)
