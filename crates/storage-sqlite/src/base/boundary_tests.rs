@@ -120,21 +120,84 @@ fn only_the_connection_truncates_or_vacuums() {
     );
 }
 
-/// SQL that truncates the WAL or vacuums, or a pragma call that could.
+/// SQL that truncates the WAL or vacuums, or a pragma call that could. SQLite
+/// takes the checkpoint mode by name only (`wal_checkpoint(3)` is PASSIVE),
+/// as an argument or after `=`, quoted or not.
 fn moves_data_version_without_a_commit(sql: &str) -> bool {
+    let sql = without_comments(sql).to_ascii_lowercase();
     let compact: String = sql
         .chars()
-        .filter(|c| !c.is_whitespace())
-        .collect::<String>()
-        .to_ascii_lowercase();
+        .filter(|c| !c.is_whitespace() && !matches!(c, '\'' | '"' | '`' | '[' | ']'))
+        .collect();
     compact == "wal_checkpoint"
         || compact.contains("wal_checkpoint(truncate)")
-        || sql.split(';').any(|statement| {
-            let statement = statement.trim().to_ascii_lowercase();
-            statement == "vacuum"
-                || statement.starts_with("vacuum ")
-                || statement.starts_with("vacuum\n")
-        })
+        || compact.contains("wal_checkpoint=truncate")
+        || sql
+            .split(';')
+            .any(|statement| statement.split_whitespace().next() == Some("vacuum"))
+}
+
+/// `sql` with each `--` and `/* */` comment outside a quoted string replaced
+/// by a space.
+fn without_comments(sql: &str) -> String {
+    let mut out = String::with_capacity(sql.len());
+    let mut chars = sql.chars().peekable();
+    while let Some(c) = chars.next() {
+        match (c, chars.peek()) {
+            ('\'' | '"', _) => {
+                out.push(c);
+                for quoted in chars.by_ref() {
+                    out.push(quoted);
+                    if quoted == c {
+                        break;
+                    }
+                }
+            }
+            ('-', Some('-')) => {
+                chars.by_ref().find(|&skipped| skipped == '\n');
+                out.push(' ');
+            }
+            ('/', Some('*')) => {
+                chars.next();
+                let mut previous = ' ';
+                chars.by_ref().find(|&skipped| {
+                    let end = previous == '*' && skipped == '/';
+                    previous = skipped;
+                    end
+                });
+                out.push(' ');
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+#[test]
+fn the_truncate_and_vacuum_gate_matches_every_spelling() {
+    for moves in [
+        "wal_checkpoint",
+        "PRAGMA wal_checkpoint(TRUNCATE)",
+        "PRAGMA main.wal_checkpoint( 'truncate' )",
+        "PRAGMA wal_checkpoint = \"TRUNCATE\"",
+        "VACUUM",
+        "PRAGMA auto_vacuum=NONE; VACUUM main",
+        "/* one-time */ VACUUM",
+        "-- one-time\nvacuum",
+        "VACUUM\tINTO 'copy.sqlite'",
+    ] {
+        assert!(moves_data_version_without_a_commit(moves), "{moves}");
+    }
+    for stays in [
+        "PRAGMA wal_checkpoint(PASSIVE)",
+        "PRAGMA wal_checkpoint(3)",
+        "PRAGMA incremental_vacuum(64)",
+        "PRAGMA auto_vacuum=INCREMENTAL",
+        "SELECT '-- VACUUM' FROM t",
+        "SELECT 1 /* VACUUM */",
+    ] {
+        assert!(!moves_data_version_without_a_commit(stays), "{stays}");
+    }
 }
 
 /// One production source file and the side its folder puts it on.

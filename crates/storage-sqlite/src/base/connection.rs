@@ -153,19 +153,23 @@ pub struct ConnectionGuard<'a> {
 pub(crate) struct ConnectionHooks {
     /// Each time a guard releases the connection.
     pub(crate) release: Box<dyn Fn(&rusqlite::Connection) + Send + Sync>,
-    /// Just before the connection makes a [`HooklessMove`].
+    /// For each [`HooklessMove`] the connection makes, before any check on
+    /// another connection can see it: just before a truncate, just after a
+    /// `VACUUM` (with the guard still held), and in a drop before the
+    /// connection is marked released.
     pub(crate) hookless_move: Box<dyn Fn(HooklessMove) + Send + Sync>,
 }
 
 /// A change of the database file that moves every other connection's
 /// `PRAGMA data_version` without SQLite calling the commit hook. Only this
-/// module makes one, and it notes each first ([`ConnectionHooks::hookless_move`]).
+/// module makes one, and it notes each ([`ConnectionHooks::hookless_move`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum HooklessMove {
     /// A `wal_checkpoint(TRUNCATE)`: it rewrites the WAL header even when the
     /// WAL is empty, changing no row. A close runs one too.
     WalTruncate,
     /// A `VACUUM`: it commits its copy of the database below the commit hook.
+    /// Noted after the copy (see [`ConnectionGuard::vacuum`]).
     Vacuum,
     /// The rollback of a transaction a dropped connection left open, which
     /// fires no rollback hook (rusqlite removes hooks before closing). If the
@@ -196,9 +200,15 @@ impl ConnectionGuard<'_> {
     }
 
     /// `VACUUM`. The one way this crate vacuums.
+    ///
+    /// Noted once it returns, failed or not: the note moves every group, and
+    /// a reader that sampled the moved count while the copy was still running
+    /// would cache rows the copy then renumbers. The guard is still held, so
+    /// no check on another connection concludes in between.
     pub(crate) fn vacuum(&self) -> rusqlite::Result<()> {
+        let vacuumed = self.execute_batch("VACUUM");
         self.note(HooklessMove::Vacuum);
-        self.execute_batch("VACUUM")
+        vacuumed
     }
 
     fn note(&self, change: HooklessMove) {

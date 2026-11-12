@@ -453,11 +453,13 @@ impl GroupWriteCounter {
         }
     }
 
-    /// Apply a [`Counts::hookless`] move this connection is about to make,
-    /// or made in a rollback, with the connection held: no check of another
-    /// connection can run until it is released, so none sees the move
-    /// before this. A `VACUUM` also moves every group, since it may renumber
-    /// rows without a trigger seeing them.
+    /// Apply a [`Counts::hookless`] move of this connection while a check on
+    /// another connection would still wait for a later read: with the
+    /// connection held (a truncate, a `VACUUM`, a rollback, a close), or in
+    /// a drop before the connection is marked released. A `VACUUM` also
+    /// moves every group, since it may renumber rows without a trigger
+    /// seeing them; it is noted after the copy, so a count that moved is
+    /// never read beside rows the copy had yet to renumber.
     fn note_hookless_move(&self, vacuum: bool) {
         let mut pending = lock(&self.connection.pending);
         let mut counts = self.lock();
@@ -892,6 +894,7 @@ mod tests {
     use crate::protocol::openmls_storage::{mls_group_key, ratchet_labels};
     use cgka_traits::storage::{GroupWriteGeneration, StorageProvider};
     use cgka_traits::types::GroupId;
+    use std::sync::{Arc, Mutex};
 
     fn generation(storage: &SqliteAccountStorage, group: &GroupId) -> GroupWriteGeneration {
         storage.group_write_generation(group).unwrap()
@@ -1312,10 +1315,12 @@ mod tests {
             &app,
             "CREATE TABLE spill (bytes BLOB); PRAGMA cache_size = 10;",
         );
+        // Measured from after the change: the other connection's read moves
+        // every group only if it saw the move.
         let moves_every_group = |change: &str, make: &dyn Fn()| {
             engine.write_count();
-            let before = generation(&engine, &group);
             make();
+            let before = generation(&engine, &group);
             let read = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 engine.write_count();
             }));
@@ -1329,8 +1334,36 @@ mod tests {
         moves_every_group("a truncate", &|| {
             assert!(app.app_storage().truncate_wal().unwrap());
         });
+        // A `VACUUM` may renumber rows, so it moves every group itself, but
+        // only once the copy is done: a count read while it runs is the old
+        // one, so nothing read then is cached under the new count.
         moves_every_group("a vacuum", &|| {
+            let before = generation(&app, &group);
+            let during = Arc::new(Mutex::new(Vec::new()));
+            let (sampled, counter, sampled_group) =
+                (Arc::clone(&during), app.group_writes.clone(), group.clone());
+            app.lock()
+                .unwrap()
+                .progress_handler(
+                    1,
+                    Some(move || {
+                        sampled
+                            .lock()
+                            .unwrap()
+                            .push(counter.generation(&sampled_group));
+                        false
+                    }),
+                )
+                .unwrap();
             app.app_storage().make_non_incremental_for_test().unwrap();
+            app.lock()
+                .unwrap()
+                .progress_handler(1, None::<fn() -> bool>)
+                .unwrap();
+            let during = during.lock().unwrap();
+            assert!(!during.is_empty());
+            assert!(during.iter().all(|seen| *seen == before));
+            assert!(generation(&app, &group).committed > before.committed);
         });
         execute(&app, CHECKPOINTED);
         moves_every_group("a rollback", &|| {
