@@ -36,6 +36,7 @@ from .agent_control import (
     SEND_MEDIA_COMPLETION_TIMEOUT_S,
     _DEFAULT_READ_TIMEOUT,
     _normalize_hex,
+    _normalize_media_reply,
     _normalize_stream_capability,
     bounded_wait,
 )
@@ -2589,12 +2590,6 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         caption: Optional[str] = None,
         reply_to: Optional[str] = None,
     ) -> SendResult:
-        if reply_to:
-            return SendResult(
-                success=False,
-                error="Marmot media sends do not support reply threading yet",
-            )
-
         requested = list(attachments)
         if not requested:
             return SendResult(success=False, error="Marmot media send requires at least one attachment")
@@ -2608,6 +2603,11 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         staged_paths: list[Path] = []
         pinned_roots: list[tuple[Path, int]] = []
         try:
+            reply_target = (
+                _normalize_media_reply(reply_to)
+                if reply_to is not None
+                else None
+            )
             total_preflight_bytes = 0
             try:
                 pinned_roots = pin_allowed_media_roots(self._allowed_media_roots)
@@ -2688,6 +2688,7 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
                             normalized_chat_id,
                             wire_attachments,
                             caption=caption,
+                            reply_to_message_id_hex=reply_target,
                             idempotency_key=idempotency_key,
                             response_timeout=remaining,
                         ),
@@ -2833,25 +2834,11 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             if str(alt_text or "").strip():
                 captions.append(str(alt_text))
 
-        metadata = metadata or {}
-        reply_to = next(
-            (
-                str(metadata[key])
-                for key in (
-                    "reply_to_message_id_hex",
-                    "reply_to_message_id",
-                    "reply_to",
-                    "parent_message_id_hex",
-                )
-                if metadata.get(key)
-            ),
-            None,
-        )
         result = await self._send_media_batch(
             chat_id,
             attachments,
             caption=captions[0] if captions else None,
-            reply_to=reply_to,
+            reply_to=_outbound_reply_target(None, metadata),
         )
         if not result.success:
             raise AgentControlError(
@@ -2875,7 +2862,7 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             media_type=media_type,
             file_name=path.name,
             caption=caption,
-            reply_to=reply_to,
+            reply_to=_outbound_reply_target(reply_to, metadata),
         )
 
     async def send_document(
@@ -2894,7 +2881,7 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             media_type=media_type,
             file_name=path.name,
             caption=caption,
-            reply_to=reply_to,
+            reply_to=_outbound_reply_target(reply_to, metadata),
         )
 
     async def send_video(
@@ -2913,7 +2900,7 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             media_type=media_type,
             file_name=path.name,
             caption=caption,
-            reply_to=reply_to,
+            reply_to=_outbound_reply_target(reply_to, metadata),
         )
 
     async def send_voice(
@@ -2930,7 +2917,7 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             media_type=media_type,
             file_name=path.name,
             caption=kwargs.get("caption"),
-            reply_to=kwargs.get("reply_to"),
+            reply_to=_outbound_reply_target(kwargs.get("reply_to"), kwargs.get("metadata")),
         )
 
     async def delete_message(self, chat_id: str, message_id: str) -> bool:
@@ -5246,6 +5233,23 @@ def _optional_hex(value: Any, field: str = "hex") -> Optional[str]:
     if value is None or str(value).strip() == "":
         return None
     return _normalize_hex(value, field)
+
+
+def _outbound_reply_target(reply_to: Optional[str], metadata: Optional[Dict[str, Any]]) -> Optional[str]:
+    if reply_to is not None:
+        return reply_to
+    for key in (
+        "reply_to_message_id_hex",
+        "reply_to_message_id",
+        "reply_to",
+        "parent_message_id_hex",
+    ):
+        value = _metadata_dict_value(metadata, key)
+        if value is not None:
+            if isinstance(value, dict):
+                value = value.get("message_id_hex", "")
+            return str(value)
+    return None
 
 
 def _metadata_dict_value(metadata: Optional[Dict[str, Any]], key: str) -> Any:

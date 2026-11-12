@@ -2584,7 +2584,7 @@ where
         }
         let recovered = self.session.drain();
         if !recovered.is_empty() {
-            let recovered = self.publish_session_effects(recovered).await?;
+            let recovered = boxed(|| self.publish_session_effects(recovered)).await?;
             output.absorb_account_effects(recovered);
         }
         let now = self.wall_clock.now();
@@ -2597,13 +2597,13 @@ where
         // A device sets its tag signature key before it stages a KeyPackage,
         // so the KeyPackage is built tagged (mdk#2628 3.1d). Until the merged
         // roster carries the key, nothing is staged, announced or published.
-        let tag_key = self.set_device_tag_key_for_maintenance(held).await;
+        let tag_key = boxed(|| self.set_device_tag_key_for_maintenance(held)).await;
         output.absorb_account_effects(tag_key);
         let tag_key_settled = self.device_tag_key_settled()?;
         // While a device group is set, its roster names a KeyPackage before
         // it reaches the slot (mdk#2628 3.4), so announce first.
         if tag_key_settled {
-            let announced = self.announce_key_package_for_maintenance(held).await?;
+            let announced = boxed(|| self.announce_key_package_for_maintenance(held)).await?;
             output.absorb_account_effects(announced);
         }
         // Fanout of an already-acknowledged exact event is publication
@@ -2664,10 +2664,10 @@ where
             }
         }
         self.retry_confirmed_transport_fanouts(&mut output).await?;
-        self.deliver_watched_welcomes(&mut output).await?;
+        boxed(|| self.deliver_watched_welcomes(&mut output)).await?;
         // Roster housekeeping waits behind the KeyPackage steps' commits
         // (mdk#2628 3.1d).
-        let expired = self.drop_expired_removed_slots_for_maintenance(held).await;
+        let expired = boxed(|| self.drop_expired_removed_slots_for_maintenance(held)).await;
         output.absorb_account_effects(expired);
 
         // Old groups have no enrollment row and are intentionally excluded.
@@ -2954,10 +2954,11 @@ where
                                 .unwrap_or_else(|e| e.into_inner())
                                 .self_update_attempts += 1;
                             let started = self.monotonic_clock.elapsed();
-                            let resumed = self
-                                .resume_outbound_fanouts_for_group(Some(&obligation.group_id))
-                                .await
-                                .map(|(effects, _blocked_groups)| effects);
+                            let resumed = boxed(|| {
+                                self.resume_outbound_fanouts_for_group(Some(&obligation.group_id))
+                            })
+                            .await
+                            .map(|(effects, _blocked_groups)| effects);
                             let confirmed = resumed.as_ref().is_ok_and(|effects| {
                                 effects
                                     .pending
@@ -3016,7 +3017,7 @@ where
                                 .unwrap_or_else(|e| e.into_inner())
                                 .self_update_attempts += 1;
                             let started = self.monotonic_clock.elapsed();
-                            let retried = self.publish_session_effects(retry).await;
+                            let retried = boxed(|| self.publish_session_effects(retry)).await;
                             self.note_maintenance_duration(
                                 started,
                                 false,
@@ -3111,11 +3112,12 @@ where
                 .unwrap_or_else(|e| e.into_inner())
                 .self_update_attempts += 1;
             let started = self.monotonic_clock.elapsed();
-            let sent = self
-                .send(SendIntent::SelfUpdate {
+            let sent = boxed(|| {
+                self.send(SendIntent::SelfUpdate {
                     group_id: group_id.clone(),
                 })
-                .await;
+            })
+            .await;
             self.note_maintenance_duration(
                 started,
                 false,
@@ -7535,6 +7537,15 @@ pub struct PublishFailure {
 }
 
 pub use cgka_traits::OversizedArtifact;
+
+/// The future `start` builds, boxed in this plain function, as
+/// [`refuse_too_large`] boxes its own. Maintenance awaits each phase through
+/// it: unboxed, every phase's future sat in the maintenance poll frame at once,
+/// over a third of a MiB of a debug test thread's stack (mdk#2412).
+#[inline(never)]
+fn boxed<F: Future>(start: impl FnOnce() -> F) -> Pin<Box<F>> {
+    Box::pin(start())
+}
 
 /// [`AccountDeviceSession::publish_refused_as_too_large`] for `oversized`,
 /// boxed in this plain function. `Box::pin` called in an async body still

@@ -755,6 +755,7 @@ impl AgentConnector {
                 group_id_hex,
                 attachments,
                 caption,
+                reply_to_message_id_hex,
                 idempotency_key,
             } => {
                 self.send_media_response(
@@ -762,6 +763,7 @@ impl AgentConnector {
                     &group_id_hex,
                     attachments,
                     caption,
+                    reply_to_message_id_hex,
                     idempotency_key,
                 )
                 .await

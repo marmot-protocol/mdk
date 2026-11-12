@@ -500,7 +500,11 @@ fn loss_and_repair_reach_before_a_rejoined_copy() {
     let below = (lowest, rejoined.floor - 1);
     assert_eq!(rejoined.owed(), [(RELAY, below), (OTHER, below)], "loss");
 
+    // A fresh copy reads the clock again, so its window can start a second
+    // later than the first one's.
     let rejoined = Rejoined::new();
+    let lowest = rejoined.goal - 3_000;
+    let below = (lowest, rejoined.floor - 1);
     rejoined
         .app
         .widen_recovery_coverage_goals(rejoined.routes(), lowest, CopyFloorReason::Repair)

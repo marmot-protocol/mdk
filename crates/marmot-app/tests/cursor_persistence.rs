@@ -184,6 +184,7 @@ fn frozen_wake_collection_ingests_without_moving_the_durable_cursor() {
 }
 
 async fn frozen_wake_collection_body() {
+    storage_sqlite::relax_storage_for_test_process();
     // A truthful cap lets the frozen boot's runner prove the offline gap; a
     // relay with an unreadable information document holds it instead.
     let (_relay, url) = limited_relay::mock_relay().await;

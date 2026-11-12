@@ -32,6 +32,7 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   debug tokio worker stack in the CLI daemon test; spawned tasks capture the owned pair and borrow it inside), and
   generated setup's procedures stay `MarmotAppRuntime` methods in that module tree. Hosts reach onboarding through
   `MarmotAppRuntime::account_setup()`; `AccountManager` exposes no onboarding methods.
+  Helpers that only return another future return it directly: extra async wrappers hit the simulator's layout-depth limit.
   `AccountManager` holds one `SetupState` for four hooks only, each where it is called: reconcile (worker transaction
   held; it never takes it again), the teardown fence (removal and sign-out, before the worker transaction), removal
   (under the transaction, after the removal commit point) and shutdown's two phases (before the invite catch-up drain;
@@ -42,11 +43,23 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   inside synchronous code stops when that code returns) and holds the task; no attempt starts while any fence is
   held. When the last one drops the task checks again, so a cancelled or failed teardown leaves the account
   publishing, and `sign_in_account` schedules a setup its sign-out ended. It checks the worker gate through
-  `SetupRecords`, which reads durable records only. Setup reaches workers only through the worker-lifecycle surface
+  `SetupRecords`, which reads durable records only. Runtime sign-out, wipe and removal also wait for admitted
+  foreground generated setup and interactive onboarding steps sharing the per-account transaction, including their
+  network work. Wipe takes this fence before its network stages and passes it into local removal,
+  rather than taking the foreground transaction again. Local removal takes generated preparation admission only
+  after foreground setup finishes. Preparation captures the effective context with its chosen identity.
+  Resolve selection once under local admission: no eligible journal means fresh creation, not another lookup.
+  An existing selection uses `Continue` even if another attempt clears its journal. A cleared journal may mean
+  successful completion: coalesce from current completion data, never relabel a local snapshot as network-ready.
+  New setup skips signed-out and unlinked journals instead of reviving those accounts or refusing all later creates.
+  Teardown rechecks the captured public key after its fence wait and rejects a label reused for another identity.
+  Setup reaches workers only through the worker-lifecycle surface
   commented on `AccountManager` in `runtime/mod.rs`, each call keeping its lock state: the worker transaction is a
   tokio `Mutex` and not reentrant. A worker setup takes out of the map is reaped through setup's cancellation
-  registry, never `worker_reapers`. Lock order: the per-account onboarding transaction, then the worker transaction,
-  then the worker map; the cancellation registry before the per-account state lock.
+  registry, never `worker_reapers`. Teardown lock order: the background setup fence, the per-account onboarding
+  transaction, generated local preparation admission (removal only), the worker transaction, then the worker map.
+  Local preparation never waits for the onboarding transaction. The cancellation registry precedes the per-account
+  state lock.
 - Keep app-client commands and query methods in the `src/client/` module; the crate root should construct clients but
   not absorb their behavior again. The `AppClient` inherent impl is split across the module along these seams: `mod.rs`
   (the `AppClient` struct plus the broadly-shared command/query API — key-package, group lifecycle, message/media/agent

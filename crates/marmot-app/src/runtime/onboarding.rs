@@ -35,6 +35,11 @@ pub(super) struct SetupState {
 
 pub(super) use generated_setup_tasks::GeneratedSetupFence;
 
+pub(super) struct GeneratedTeardownFence {
+    _background: GeneratedSetupFence,
+    _foreground: tokio::sync::OwnedMutexGuard<()>,
+}
+
 /// Account setup: interactive onboarding, its recovery and its sign-in
 /// notices, reached through `MarmotAppRuntime::account_setup`.
 ///
@@ -93,6 +98,31 @@ impl SetupState {
     /// account is still pending (`generated_setup_tasks`).
     pub(super) async fn fence_generated_setup(&self, account_id: &str) -> GeneratedSetupFence {
         self.generated_setup_tasks.fence(account_id).await
+    }
+
+    /// Stop background setup, then finish admitted foreground setup before
+    /// sign-out withdraws its slot. Do not hold global local admission here.
+    pub(super) async fn fence_generated_teardown(
+        &self,
+        manager: &AccountManager,
+        account_id: &str,
+    ) -> GeneratedTeardownFence {
+        let background = self.fence_generated_setup(account_id).await;
+        let transaction = AccountSetup::new(self, manager).onboarding_transaction(account_id);
+        let foreground = transaction.lock_owned().await;
+        GeneratedTeardownFence {
+            _background: background,
+            _foreground: foreground,
+        }
+    }
+
+    /// Local deletion excludes preparation only after foreground publication
+    /// has finished, so a network-bound teardown cannot block all setup.
+    pub(super) async fn fence_generated_removal(
+        &self,
+        _teardown: &GeneratedTeardownFence,
+    ) -> tokio::sync::MutexGuard<'_, ()> {
+        self.generated_setup_local_transaction.lock().await
     }
 
     /// Removal hook, called under the worker transaction after the removal

@@ -12,6 +12,9 @@ fi
 destination="$1"
 version=dev-2026-10
 expected_commit=84bc3fc
+# Windows SChannel fails the handshake when a revocation server is offline;
+# skip only that unmakeable check there. The pinned sha256 still decides.
+revocation=""
 case "$(uname -s):$(uname -m)" in
   Linux:x86_64)
     platform=linux-amd64
@@ -32,6 +35,7 @@ case "$(uname -s):$(uname -m)" in
     platform=windows-amd64
     asset_id=615725640
     sha256=b6b2e426a8b6f147b74ec7e18bef8df27cf40fe16193159df7ca09a0cc0c2011
+    revocation=--ssl-revoke-best-effort
     ;;
   *)
     echo "error: no pinned Odin binary for host $(uname -s)/$(uname -m)" >&2
@@ -52,7 +56,7 @@ archive="$work/$asset"
 download() {
   curl --proto '=https' --tlsv1.2 --fail --location --silent --show-error \
     --connect-timeout 15 --max-time 600 --speed-limit 1024 --speed-time 30 \
-    --retry 4 --retry-all-errors --retry-max-time 120 \
+    --retry 4 --retry-all-errors --retry-max-time 120 ${revocation:+"$revocation"} \
     --output "$archive" "$@"
 }
 # Verify the archive before extracting or executing any upstream content.

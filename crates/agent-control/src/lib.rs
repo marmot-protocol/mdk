@@ -600,6 +600,9 @@ pub enum AgentControlRequest {
         group_id_hex: String,
         attachments: Vec<AgentControlMediaUpload>,
         caption: Option<String>,
+        /// Original inner message id for the whole attachment batch.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reply_to_message_id_hex: Option<String>,
         /// Optional client-supplied dedup key. Matching retries return the
         /// original durable message ids without re-uploading or re-publishing.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1872,6 +1875,7 @@ mod tests {
             group_id_hex: "cc".repeat(32),
             attachments: vec![upload()],
             caption: Some("look".to_owned()),
+            reply_to_message_id_hex: None,
             idempotency_key: None,
         };
         let value = serde_json::to_value(&without).unwrap();
@@ -1882,6 +1886,7 @@ mod tests {
             group_id_hex: "cc".repeat(32),
             attachments: vec![upload()],
             caption: Some("look".to_owned()),
+            reply_to_message_id_hex: Some("dd".repeat(32)),
             idempotency_key: Some("media-key-1".to_owned()),
         };
         let value = serde_json::to_value(&with).unwrap();
@@ -2469,6 +2474,7 @@ mod tests {
                         thumbhash: None,
                     }],
                     caption: Some("look".to_owned()),
+                    reply_to_message_id_hex: None,
                     idempotency_key: None,
                 },
                 "send_media",

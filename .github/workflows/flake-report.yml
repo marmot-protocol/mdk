@@ -1,0 +1,100 @@
+name: Flaky test leaderboard
+
+# Ranks the tests that failed an attempt in the last week of merge-queue runs
+# (scripts/flake_report.py) and replaces the body of the one open
+# "Flaky test leaderboard" issue with it.
+#
+# GITHUB_TOKEN allows 1,000 API requests an hour, shared with every other
+# workflow in the repository, and each merge-queue run costs about 22. A run
+# starts no new fetch once fewer than 600 requests remain, so it fetches about
+# 18 new runs; it runs four times a day to keep up with the queue. Run summaries carry over between
+# runs in the flake-report-cache artifact, so nothing is fetched twice.
+on:
+  schedule:
+    - cron: "23 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: read
+  issues: write
+
+concurrency:
+  group: flake-report
+  cancel-in-progress: false
+
+jobs:
+  report:
+    name: Update the flaky test leaderboard
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Restore cached run summaries
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          CACHE_DIR: ${{ runner.temp }}/flake-report-cache
+        run: |
+          set -euo pipefail
+          # The fullest summaries kept by a recent run, so one run that started
+          # empty (and kept only what its budget fetched) cannot shadow an
+          # older, fuller cache. Without any, the report starts empty and
+          # fills the cache over a few runs.
+          best=0
+          for run in $(gh run list --repo "$REPO" --workflow flake-report.yml --limit 10 \
+            --json databaseId,status --jq ".[] | select(.status == \"completed\" and .databaseId != $RUN_ID) | .databaseId"); do
+            candidate="$RUNNER_TEMP/candidate-$run"
+            gh run download "$run" --repo "$REPO" --name flake-report-cache --dir "$candidate" || continue
+            count="$(find "$candidate" -name 'run-*.json.gz' | wc -l)"
+            if (( count > best )); then
+              rm -rf "$CACHE_DIR"
+              mv "$candidate" "$CACHE_DIR"
+              best="$count"
+            fi
+          done
+          echo "Restored $best run summaries."
+
+      - name: Build the leaderboard
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          CACHE_DIR: ${{ runner.temp }}/flake-report-cache
+          LEADERBOARD: ${{ runner.temp }}/leaderboard.md
+        run: |
+          python3 scripts/flake_report.py --repo "$REPO" --cache-dir "$CACHE_DIR" --prune \
+            --reserve 600 --max-chars 60000 --output "$LEADERBOARD"
+          cat "$LEADERBOARD" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep run summaries for the next run
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: flake-report-cache
+          path: ${{ runner.temp }}/flake-report-cache
+          retention-days: 8
+          if-no-files-found: ignore
+
+      - name: Replace the leaderboard issue body
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          LEADERBOARD: ${{ runner.temp }}/leaderboard.md
+        run: |
+          set -euo pipefail
+          title="Flaky test leaderboard"
+          # The issues list, not search: search can miss an issue created
+          # moments ago and lead to a second copy.
+          existing="$(gh issue list --repo "$REPO" --state open --limit 1000 --json number,title \
+            --jq "map(select(.title == \"$title\")) | min_by(.number) | .number // empty")"
+          if [[ -n "$existing" ]]; then
+            gh issue edit "$existing" --repo "$REPO" --body-file "$LEADERBOARD"
+          else
+            gh issue create --repo "$REPO" --title "$title" --body-file "$LEADERBOARD"
+          fi

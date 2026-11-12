@@ -2126,6 +2126,10 @@ async fn settled_activation_uses_diff() {
             since: Some(Timestamp(100)),
         };
         adapter.activate_account(activation.clone()).await.unwrap();
+        // The relay connected as the REQ went out; the plane restarts the
+        // REQ's count when it hears that, so it must hear it before the
+        // relay's events, as it would on the wire.
+        relay.messages.handled().await;
         let issued = relay.subscriptions.lock().unwrap().clone();
         for subscription in issued {
             if full_reply {

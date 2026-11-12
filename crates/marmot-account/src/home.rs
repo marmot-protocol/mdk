@@ -294,7 +294,7 @@ impl AccountHome {
         Ok(account)
     }
 
-    /// Recover the one generated setup that did not yet remove its journal.
+    /// Recover an active generated setup that did not yet remove its journal.
     pub fn resumable_generated_account_setup(&self) -> AccountHomeResult<Option<AccountSummary>> {
         let _guard = self
             .mutation_lock
@@ -327,7 +327,12 @@ impl AccountHome {
             if account.label != account.account_id_hex {
                 return Err(AccountHomeError::AccountIdMismatch);
             }
-            if !self.account_record_path(&label).exists() {
+            if self.account_record_path(&label).exists() {
+                let recorded = self.account(&label)?;
+                if recorded.signed_out || recorded.unlinked {
+                    continue;
+                }
+            } else {
                 let has_secret = self.secret_store.has_secret_for_label(&label)?
                     || self
                         .secret_store

@@ -318,21 +318,30 @@ async fn private_key_packages_keep_their_keys_and_stay_out_of_the_inventory() {
     assert_eq!(queued.iter().filter(|queued| **queued).count(), 1);
 
     // Nothing has expired a second before `not_after`; everything has at it.
-    let not_after = issued[0].not_after;
-    assert_eq!(
-        phone
-            .engine
-            .discard_private_key_packages(not_after - 1, None)
-            .unwrap(),
-        0
-    );
-    assert_eq!(
-        phone
-            .engine
-            .discard_private_key_packages(not_after, None)
-            .unwrap(),
-        3
-    );
+    // OpenMLS stamps each lifetime from real time, so a batch that crosses a
+    // second boundary carries two `not_after` values: check each boundary.
+    let mut boundaries: Vec<_> = issued.iter().map(|record| record.not_after).collect();
+    boundaries.sort_unstable();
+    boundaries.dedup();
+    for not_after in boundaries {
+        assert_eq!(
+            phone
+                .engine
+                .discard_private_key_packages(not_after - 1, None)
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            phone
+                .engine
+                .discard_private_key_packages(not_after, None)
+                .unwrap(),
+            issued
+                .iter()
+                .filter(|record| record.not_after == not_after)
+                .count()
+        );
+    }
     assert!(
         phone
             .engine

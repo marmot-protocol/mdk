@@ -598,7 +598,15 @@ impl AppClient {
                         ConvergenceScheduleState::Idle
                     });
                 }
-                if self.runtime.has_pending_convergence_inputs(group_id)? {
+                // A removed or disbanded copy never converges again, so a rival
+                // its removal left unresolved stays pending for good; waking
+                // the copy for it would do nothing.
+                if self.runtime.has_pending_convergence_inputs(group_id)?
+                    && !self
+                        .runtime
+                        .group_record(group_id)
+                        .is_ok_and(|group| group.is_terminal())
+                {
                     Ok(ConvergenceScheduleState::PendingUnopenable)
                 } else if self.runtime.has_queued_outbound_intents(group_id)?
                     && !self

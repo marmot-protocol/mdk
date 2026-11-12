@@ -2021,7 +2021,7 @@ fn blob_reference_for_servers(body: &[u8], servers: &[String]) -> MediaAttachmen
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn renewed_lease_keeps_pool() {
-    let (server_url, accepted, server) = spawn_keep_alive_http_server(b"hello", 2).await;
+    let (server_url, _accepted, server) = spawn_keep_alive_http_server(b"hello", 2).await;
     let transport = BlossomHttpTransport::for_test(true, Duration::ZERO, Duration::from_secs(1));
     let url = format!("{server_url}/{}.bin", valid_hash());
     for _ in 0..2 {
@@ -2033,12 +2033,12 @@ async fn renewed_lease_keeps_pool() {
         );
     }
     server.await.unwrap();
-    assert_eq!(accepted.load(Ordering::SeqCst), 1);
+    assert_eq!(transport.pools_built(), 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn uploads_reuse_renewed_pool() {
-    let (url, accepted, server) = spawn_keep_alive_http_server(b"{}", 2).await;
+    let (url, _accepted, server) = spawn_keep_alive_http_server(b"{}", 2).await;
     let transport = BlossomHttpTransport::for_test(true, Duration::ZERO, Duration::from_secs(1));
     for _ in 0..2 {
         upload_blossom_blob(
@@ -2052,12 +2052,12 @@ async fn uploads_reuse_renewed_pool() {
         .unwrap();
     }
     server.await.unwrap();
-    assert_eq!(accepted.load(Ordering::SeqCst), 1);
+    assert_eq!(transport.pools_built(), 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn repeated_same_origin_downloads_reuse_one_vetted_connection() {
-    let (server_url, accepted, server) = spawn_keep_alive_http_server(b"hello", 2).await;
+async fn repeated_same_origin_downloads_reuse_one_vetted_pool() {
+    let (server_url, _accepted, server) = spawn_keep_alive_http_server(b"hello", 2).await;
     let transport =
         BlossomHttpTransport::for_test(true, Duration::from_secs(60), Duration::from_secs(1));
     let url = format!("{server_url}/{}.bin", valid_hash());
@@ -2077,9 +2077,9 @@ async fn repeated_same_origin_downloads_reuse_one_vetted_connection() {
     server.await.unwrap();
 
     assert_eq!(
-        accepted.load(Ordering::SeqCst),
+        transport.pools_built(),
         1,
-        "compatible same-origin downloads should reuse the vetted connection"
+        "compatible same-origin downloads should reuse the vetted pool"
     );
 }
 

@@ -209,3 +209,67 @@ async fn step_down_and_leave_refuses_the_last_admin_and_is_a_leave_for_a_member(
         Some(epoch)
     );
 }
+
+/// bob steps down on a longer branch from the epoch alice's step-down
+/// left. A pass outside the async convergence wrapper selects his branch,
+/// which undoes alice's step-down and leaves her the last admin. Applying
+/// it schedules the group, so the next advance re-drives her leave and
+/// records it as blocked; nothing else would wake the group without
+/// unrelated traffic.
+#[tokio::test]
+async fn a_branch_that_blocks_a_leave_schedules_its_redrive() {
+    let (mut alice, alice_storage, mut bob, gid) =
+        two_admins(b"rival-redrive-alice", b"rival-redrive-bob").await;
+    step_down_and_leave(&mut alice, &gid).await;
+    alice.advance_convergence(&gid).await.unwrap();
+    let step_down = alice.drain_auto_publish().remove(0);
+    alice.confirm_published(step_down.pending).await.unwrap();
+    alice.advance_convergence(&gid).await.unwrap();
+    assert_eq!(alice.drain_auto_proposals().len(), 1, "the SelfRemove");
+    assert!(!is_admin(&alice, &gid));
+
+    let alice_admin = alice.self_id().as_slice().to_vec();
+    let mut rival = Vec::new();
+    for intent in [
+        SendIntent::SelfUpdate {
+            group_id: gid.clone(),
+        },
+        SendIntent::UpdateAppComponents {
+            group_id: gid.clone(),
+            updates: vec![cgka_traits::app_components::AppComponentData {
+                component_id: GROUP_ADMIN_POLICY_COMPONENT_ID,
+                data: encode_admin_policy_for_test(std::slice::from_ref(&alice_admin)),
+            }],
+        },
+    ] {
+        let SendResult::GroupEvolution { msg, pending, .. } = bob.send(intent).await.unwrap()
+        else {
+            panic!("bob's commit")
+        };
+        bob.confirm_published(pending).await.unwrap();
+        rival.push(msg);
+    }
+    for msg in rival {
+        alice.ingest(msg).await.unwrap();
+    }
+    // Only the pass below may schedule the group.
+    alice.drain_pending_convergence_groups();
+    converge_buffered_commit(&mut alice, &gid);
+    assert_eq!(alice.epoch(&gid).unwrap(), bob.epoch(&gid).unwrap());
+    assert!(is_admin(&alice, &gid), "bob's branch undid the step-down");
+    assert!(alice.leave_redrive_owed(&gid).unwrap());
+    assert!(
+        alice.drain_pending_convergence_groups().contains(&gid),
+        "the selected branch wakes the leave"
+    );
+
+    alice.advance_convergence(&gid).await.unwrap();
+    assert!(alice.drain_auto_publish().is_empty(), "no step-down");
+    assert_eq!(
+        alice_storage
+            .leave_request(&gid)
+            .unwrap()
+            .and_then(|request| request.blocked),
+        Some(LeaveBlockReason::LastActiveAdmin)
+    );
+}

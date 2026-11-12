@@ -1,7 +1,7 @@
 ---
 title: "Marmot App Runtime Shape"
 created: 2026-05-19
-updated: 2026-10-17
+updated: 2026-11-11
 tags: [marmot, overview, app-runtime, daemon, tui]
 status: implemented-first-slice
 ---
@@ -65,6 +65,30 @@ Host apps should render the locally persisted chat list when `start()` returns,
 show relay progress separately, and apply projection updates as network data
 arrives. No durable account, device, or startup identifier is introduced by
 this contract.
+
+Generated setup resumed at startup stays bound to the captured account.
+Foreground publication also continues the account returned at local readiness.
+Neither handoff creates a replacement if that account has been removed.
+Sign-out and wipe fence background setup and wait for admitted foreground
+publication before withdrawing the device's KeyPackage slot. Wipe reuses this
+fence for local removal rather than taking the foreground transaction again.
+This per-account transaction also serializes interactive onboarding steps;
+teardown waits for an admitted step, including its network work.
+Removal takes local preparation admission afterward and holds it until deletion
+finishes, so waiting for publication does not block all local preparation.
+A handoff that arrives after removal finds no account to continue. Startup also
+ends quietly when the captured account has been removed or signed out.
+
+Local preparation resolves identity and context once under admission. No eligible
+journal means fresh creation, even if another account signs back in before creation.
+A foreground handoff does not reload context after another attempt may have
+cleared it. When another attempt completes the same account, coalescing reads its
+current relay status, profile, readiness and requested confirmed KeyPackage size
+rather than reporting the account as missing.
+New setup skips signed-out and unlinked journals, leaving their accounts intact.
+
+Teardown rechecks the captured public key after waiting for its fence. If a label
+was reused during that wait, the replacement account is not signed out or removed.
 
 `SharedServices` should hold runtime state shared by every account:
 

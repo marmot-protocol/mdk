@@ -32,7 +32,9 @@ use cgka_engine::commit_class::{CommitAuthorityError, CommitClass, authorize_sta
 use cgka_engine::convergence::BranchSelectionTrace;
 use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_engine::provider::EngineOpenMlsProvider;
-use cgka_engine::{DEFAULT_CIPHERSUITE, Engine, EngineBuilder, ManualConvergenceClock};
+use cgka_engine::{
+    ConvergenceClock, DEFAULT_CIPHERSUITE, Engine, EngineBuilder, ManualConvergenceClock,
+};
 use cgka_traits::EngineError;
 use cgka_traits::app_components::{
     ACCOUNT_DEVICES_COMPONENT_ID, ACCOUNT_IDENTITY_PROOF_COMPONENT_ID, APP_COMPONENTS_COMPONENT_ID,
@@ -2391,10 +2393,12 @@ async fn the_stamp_and_replay_give_every_class_the_same_priority() {
     let leave = route_to_group(&msg, &gid);
     m.alice.engine.ingest(leave.clone()).await.unwrap();
     clock.advance_ms(75);
+    // Explicit clock time, through the same drain: the host entry point's
+    // wall-clock slice can expire on a loaded runner before this work lands.
     assert!(
         m.alice
             .engine
-            .advance_convergence(&gid)
+            .converge_and_drain_queued_outbound_intents(&gid, clock.now().monotonic_ms)
             .await
             .unwrap()
             .is_empty()

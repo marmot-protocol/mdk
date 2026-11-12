@@ -69,8 +69,8 @@ struct SendIdempotencyGate {
 /// A retry that reuses the same key AND matches the recorded fingerprint returns
 /// the cached ids without re-sending, so a retry after a post-write timeout cannot
 /// double-post an unrecallable encrypted message. A reused key whose fingerprint
-/// differs (a different request body under the same key) is treated as a cache
-/// miss, so it can never return ids belonging to an unrelated send. Keys are
+/// differs is a cache miss through `acquire`, or a conflict through
+/// `acquire_strict` (media sends). Neither returns ids for an unrelated send. Keys are
 /// evicted oldest-first once the capacity is reached and the eviction is mirrored
 /// to disk.
 ///
@@ -93,7 +93,7 @@ pub(crate) enum SendIdempotencyAcquisition {
 }
 
 pub(crate) enum StrictIdempotencyAcquisition {
-    Completed,
+    Completed(SendIdempotencyResult),
     Leader(SendIdempotencyLeader),
     Conflict,
 }
@@ -253,7 +253,7 @@ impl SendIdempotencyStore {
     }
 
     /// Acquire an idempotency reservation whose key is permanently bound to
-    /// its first fingerprint. This is used by preview mutations; legacy durable
+    /// its first fingerprint. Used by media sends and preview mutations; legacy
     /// send/finalize callers retain the historical cache-miss semantics of
     /// [`Self::acquire`].
     pub(crate) async fn acquire_strict(
@@ -263,9 +263,12 @@ impl SendIdempotencyStore {
     ) -> Result<StrictIdempotencyAcquisition, ConnectorError> {
         {
             let inner = crate::lock_recover(&self.inner);
-            if let Some((recorded, _, _)) = inner.seen.get(key) {
+            if let Some((recorded, ids, disposition)) = inner.seen.get(key) {
                 return if constant_time_eq(recorded.as_bytes(), fingerprint.as_bytes()) {
-                    Ok(StrictIdempotencyAcquisition::Completed)
+                    Ok(StrictIdempotencyAcquisition::Completed((
+                        ids.clone(),
+                        *disposition,
+                    )))
                 } else {
                     Ok(StrictIdempotencyAcquisition::Conflict)
                 };
@@ -306,16 +309,19 @@ impl SendIdempotencyStore {
 
         {
             let inner = crate::lock_recover(&self.inner);
-            if let Some((recorded, _, _)) = inner.seen.get(key) {
+            if let Some((recorded, ids, disposition)) = inner.seen.get(key) {
                 return if constant_time_eq(recorded.as_bytes(), fingerprint.as_bytes()) {
-                    Ok(StrictIdempotencyAcquisition::Completed)
+                    Ok(StrictIdempotencyAcquisition::Completed((
+                        ids.clone(),
+                        *disposition,
+                    )))
                 } else {
                     Ok(StrictIdempotencyAcquisition::Conflict)
                 };
             }
         }
-        if crate::lock_recover(&gate.completed).is_some() {
-            return Ok(StrictIdempotencyAcquisition::Completed);
+        if let Some(result) = crate::lock_recover(&gate.completed).clone() {
+            return Ok(StrictIdempotencyAcquisition::Completed(result));
         }
         Ok(StrictIdempotencyAcquisition::Leader(
             SendIdempotencyLeader {

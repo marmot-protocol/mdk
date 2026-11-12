@@ -260,11 +260,14 @@ async fn socks5_pins_dns_fail_closed() {
                         if route == "directory" {
                             loop {
                                 let message = socket.next().await.unwrap().unwrap();
-                                let Some(text) = message.to_text().ok() else {
+                                // Nostr messages are text frames. The client pings
+                                // as it connects, which can be before its REQ.
+                                let tokio_tungstenite::tungstenite::Message::Text(text) = message
+                                else {
                                     continue;
                                 };
                                 let request: serde_json::Value =
-                                    serde_json::from_str(text).unwrap();
+                                    serde_json::from_str(text.as_str()).unwrap();
                                 if request[0] != "REQ" {
                                     continue;
                                 }
