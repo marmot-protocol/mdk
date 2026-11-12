@@ -234,6 +234,30 @@ async fn overdue_secondary_groups_service_durable_send(deferred_count: usize) {
         )
         .await
         .unwrap();
+    let (respond, direct_response) = oneshot::channel();
+    commands
+        .try_send(AccountWorkerCommand::SendMessage {
+            enqueued_at: Instant::now(),
+            queued: None,
+            group_id: groups[0].clone(),
+            payload: b"direct and durable overlap".to_vec(),
+            respond,
+        })
+        .unwrap();
+    // Fence the direct command into the deferred FIFO before releasing the
+    // pass, so both foreground signals are ready at its secondary retry.
+    let (respond, response) = ReadReply::unobserved();
+    commands
+        .try_send(AccountWorkerCommand::Members {
+            group_id: groups[0].clone(),
+            respond,
+        })
+        .unwrap();
+    timeout(Duration::from_secs(5), response)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
     let admission_gate = runtime
         .shared_services()
         .local_submission_gate(&account.account_id_hex);
@@ -296,6 +320,12 @@ async fn overdue_secondary_groups_service_durable_send(deferred_count: usize) {
     relay.indexer_publish_release.notify_waiters();
     runtime.shutdown_and_close().await.unwrap();
     observed.expect("overdue confirmed secondary groups must service the durable send while their ACKs remain held");
+    let direct = direct_response.await.unwrap().unwrap();
+    assert_eq!(
+        direct.accept_disposition,
+        cgka_traits::SendAcceptDisposition::Published
+    );
+    assert_eq!(direct.published, 1);
     for response in predecessors {
         response.await.unwrap().unwrap();
     }

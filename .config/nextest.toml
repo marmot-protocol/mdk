@@ -42,6 +42,8 @@ app-runtime-journeys = { max-threads = 2 }
 session-chaos = { max-threads = 2 }
 # Real-SDK epoch-gap history cases include the production 30-second retry.
 bounded-sdk-history = { max-threads = 1 }
+# Publication-progress and fairness cases wait for the real 30-second retry.
+publication-progress = { max-threads = 4 }
 # These two adapter cases verify signatures and delivery at the real 32k
 # replay bound. Paused time removes waiting, but their CPU work exceeds 30s.
 adapter-replay-bounds = { max-threads = 1 }
@@ -56,6 +58,10 @@ test-group = 'engine-recovery'
 [[profile.default.overrides]]
 filter = 'package(marmot-app) & test(runtime::account_worker::tests::selective_history_tests::late_commit)'
 test-group = 'bounded-sdk-history'
+
+[[profile.default.overrides]]
+filter = 'package(marmot-app) & (test(tests::publication_progress::) | test(runtime::account_worker::tests::secondary_retry_scheduler_tests::))'
+test-group = 'publication-progress'
 
 [[profile.default.overrides]]
 filter = 'package(transport-nostr-adapter) & binary(inbound_routing) & (test(=live_suffix_reuses_budget) | test(=oversized_replay_is_withheld))'
