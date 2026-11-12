@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.16.0 - 2026-11-12
+
 ### Security
 
 - Keep Hermes inbound attachment staging private from creation: use a `0700`
@@ -17,6 +19,36 @@
 
 ### Fixed
 
+- Keep a chat receiving new messages after its account's live subscriptions
+  are rebuilt (#3333). A relay's end-of-stored-events reply that arrived after
+  the account had accepted the new subscriptions held the group's live
+  messages until the recovery runner answered it, but only a new subscription
+  generation woke the runner. The chat stopped receiving messages until
+  unrelated activity woke recovery, and on an idle account nothing did.
+- Joining a group while stored history is still replaying no longer records
+  account-wide history loss and a needless re-sync (#3342). History that the
+  new subscription asks for again is now owed to it, and loss is recorded only
+  if that history does not arrive.
+- Re-drive a pending leave that a rival branch blocked (#3345). When a
+  convergence pass applied a branch that undid a leaving admin's step-down, or
+  left the account the chat's last admin, the leave was neither staged again
+  nor reported blocked until unrelated traffic arrived, so sign-out could wait
+  out its full 30 s leave deadline.
+- Stop waking the account worker every 10 ms for a chat the account was
+  removed from (#3330). When two members committed the same removal from one
+  epoch, the leftover rival kept the removed chat scheduled for convergence for
+  the life of the process, wasting CPU and battery.
+- A delayed generated-account setup handoff at startup or in the foreground no
+  longer creates a replacement account after the original is wiped or removed
+  (#3290). The handoff is bound to the original account and stops if it is
+  gone; sign-out and wipe wait for foreground setup before withdrawing its
+  KeyPackage, and a new create leaves signed-out and unlinked accounts alone.
+- Forward Swift task cancellation to MDK's cancellable subscription receives
+  (#2760). MarmotKit's Swift asset now ships `nextCancellable()` for presented
+  chat lists, chat-list windows, account attention, conversation windows and
+  block lists; UniFFI's generated `next()` keeps waiting after its Swift task
+  is cancelled. Remove a host-owned copy of these adapters when taking the new
+  asset, or Swift rejects the duplicate methods.
 - Write Hermes `config.yaml`, its backup, and temporary files with mode `0600`
   during gateway configuration, regardless of the process umask. Existing
   group and other access is removed (#2481).
@@ -30,45 +62,6 @@
   marked disconnected by the old connection's teardown and wait out the 5 s
   retry interval, so a reconnect could miss its 5 s bound and fail with a
   reconnect observation timeout.
-
-### Added
-
-- Share NIP-46 remote signer sessions across Rust, UniFFI, and C, with
-  account-secret-store persistence, startup restoration, versioned permission
-  approval, relay-ready pairing offers, and request-scoped cancellation (#828).
-  Sign-out and wipe erase communication keys; host NIP-55 callbacks and local
-  signing accounts keep their existing APIs.
-  Freeing a C handle preserves the runtime-owned signer. Logout detaches the
-  revoked signer after credential erasure; storage failures retain stopped,
-  retryable cleanup ownership. Setup rollback restores prior callbacks and
-  grant records while initial-provisioning retries retain their paired credentials.
-  Native login/register adoption is runtime-owned across all bindings: caller drop
-  stops waiting without cancelling admitted work. Pairing is a separate bounded,
-  caller-cancellable connect call; login requires an already-verified Ready session
-  and rejects other states without connecting or creating an account. Unbound pairing
-  never mutates an account. Explicit session cancel/disconnect/logout interrupts
-  adoption, and shutdown interrupts and settles owned work before returning.
-  Adoption keeps its admission generation through binding, network waits, and
-  rollback. Reconnect cannot revive retired work; rollback cannot cancel a newer generation.
-  Completed accounts rebind without reopening setup; failed Native adoption restores
-  prior local callbacks, records, and activation without retracting published
-  KeyPackages. Legacy host login behavior and explicit sign-out cleanup are unchanged.
-  Post-commit journal cleanup failures do not revoke a ready account.
-  Explicit pairing can repair metadata-only interrupted credential writes.
-  Local removal reports account disappearance after cancellation instead of a vault failure.
-  Account deletion serializes session resume through credential erasure and removal.
-  Sign-out and wipe wait for foreground setup and keep signer resume behind
-  their existing account fence through credential removal.
-  Unsupported relay negotiation accepts `method not found` without hiding other errors.
-
-## 0.16.0 - 2026-11-11
-
-### Fixed
-
-- Run the malformed kind-445 drain test against a relay that publishes its
-  filter limit, so a cold boot's catch-up proves the offline gap at once. Its
-  information-less relay held the message behind the unknown-cap sweep, which
-  on a loaded runner outlasted the test's wait.
 - Resume v5 audit delivery of a file a receiver's `409` blocked under 0.15.0
   (#3300). 0.15.0 blocked such a file for good as partial acceptance; loading
   the cursor now clears that block as it does a 0.15.0 rejection, including a
@@ -151,6 +144,36 @@
 - Stop resending an account event that is over a relay's advertised message
   limit (mdk#2334). Such a relay closed the socket, which read as a possible
   exposure, and the event was resent three times; it is no longer sent there.
+
+### Added
+
+- Share NIP-46 remote signer sessions across Rust, UniFFI, and C, with
+  account-secret-store persistence, startup restoration, versioned permission
+  approval, relay-ready pairing offers, and request-scoped cancellation (#828).
+  Sign-out and wipe erase communication keys; host NIP-55 callbacks and local
+  signing accounts keep their existing APIs.
+  Freeing a C handle preserves the runtime-owned signer. Logout detaches the
+  revoked signer after credential erasure; storage failures retain stopped,
+  retryable cleanup ownership. Setup rollback restores prior callbacks and
+  grant records while initial-provisioning retries retain their paired credentials.
+  Native login/register adoption is runtime-owned across all bindings: caller drop
+  stops waiting without cancelling admitted work. Pairing is a separate bounded,
+  caller-cancellable connect call; login requires an already-verified Ready session
+  and rejects other states without connecting or creating an account. Unbound pairing
+  never mutates an account. Explicit session cancel/disconnect/logout interrupts
+  adoption, and shutdown interrupts and settles owned work before returning.
+  Adoption keeps its admission generation through binding, network waits, and
+  rollback. Reconnect cannot revive retired work; rollback cannot cancel a newer generation.
+  Completed accounts rebind without reopening setup; failed Native adoption restores
+  prior local callbacks, records, and activation without retracting published
+  KeyPackages. Legacy host login behavior and explicit sign-out cleanup are unchanged.
+  Post-commit journal cleanup failures do not revoke a ready account.
+  Explicit pairing can repair metadata-only interrupted credential writes.
+  Local removal reports account disappearance after cancellation instead of a vault failure.
+  Account deletion serializes session resume through credential erasure and removal.
+  Sign-out and wipe wait for foreground setup and keep signer resume behind
+  their existing account fence through credential removal.
+  Unsupported relay negotiation accepts `method not found` without hiding other errors.
 
 ## 0.15.0 - 2026-11-09
 

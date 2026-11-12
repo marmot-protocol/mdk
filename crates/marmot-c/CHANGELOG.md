@@ -7,7 +7,9 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ## [Unreleased]
 
-### Changed
+## [0.16.0] - 2026-11-12
+
+### Breaking changes
 
 - NIP-46 handles wrap MDK's shared session transport instead of a C-only signer.
   Existing C signatures and status numbers are unchanged. New permission review
@@ -36,10 +38,6 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   retain paired credentials across restart. Vault deletion failures leave a
   stopped signer with retryable cleanup ownership.
   Optional host exports remain secret and require encrypted storage.
-
-## [0.16.0] - 2026-11-11
-
-### Breaking changes
 
 - `MarmotAppGroupHydrationQuarantineReason` adds `MARMOT_APP_GROUP_HYDRATION_QUARANTINE_REASON_REWIND_RESTORE_FAILED`
   (mdk#3272), reported by the quarantined-groups read and the `MARMOT_GROUP_EVENT_KIND_GROUP_HYDRATION_QUARANTINED`

@@ -2,27 +2,7 @@
 
 ## Unreleased
 
-### Added
-
-- Add `Nip46SessionFfi`, typed permission/status/state/error records, and Marmot
-  creation/login/register/resume/removal methods for Swift and Kotlin. MDK owns the
-  transport and account-scoped credentials; no host signer callback is retained.
-  New and imported sessions require explicit review and approval of the exact
-  permission snapshot. Runtime startup restores persisted sessions before workers.
-  Session operations include relay-ready pairing offers, ping, reconnectable disconnect, scoped cancellation,
-  auth-challenge completion, export, terminal cancellation, and bounded logout.
-  `MarmotKitError::Nip46` retains the typed session reason; exhaustive switches
-  need the new case. Local-key and arbitrary host callback APIs are unchanged.
-  Native login/register adoption remains runtime-owned after caller cancellation;
-  only the wait ends. Pairing is a separate bounded, caller-cancellable connect call.
-  Login requires an already-verified Ready session and rejects other states without
-  connecting or creating an account. Unbound pairing never mutates an account.
-  Explicit session cancel/disconnect/logout interrupts adoption; shutdown interrupts
-  and settles owned work before returning. Failed completed-account Native rebind
-  restores prior local callbacks, records, and activation, not published KeyPackages.
-  Ordinary sign-out cleanup remains explicit; legacy host login is unchanged.
-
-## 0.16.0 - 2026-11-11
+## 0.16.0 - 2026-11-12
 
 ### Breaking changes
 
@@ -42,7 +22,28 @@
   Before, a queued commit that every group relay refused for size was re-sent on every drain; it is now dropped and
   announced once.
 
+- `MarmotKitError` adds `Nip46 { reason: Nip46ErrorFfi }` (mdk#828), which carries a NIP-46 session failure's typed
+  reason. Kotlin `when` and Swift `switch` statements that cover every case must add it.
+
 ### Added
+
+- Add `Nip46SessionFfi`, typed permission/status/state/error records, and Marmot
+  creation/login/register/resume/removal methods for Swift and Kotlin. MDK owns the
+  transport and account-scoped credentials; no host signer callback is retained.
+  New and imported sessions require explicit review and approval of the exact
+  permission snapshot. Runtime startup restores persisted sessions before workers.
+  Session operations include relay-ready pairing offers, ping, reconnectable disconnect, scoped cancellation,
+  auth-challenge completion, export, terminal cancellation, and bounded logout.
+  `MarmotKitError::Nip46` retains the typed session reason; exhaustive switches
+  need the new case. Local-key and arbitrary host callback APIs are unchanged.
+  Native login/register adoption remains runtime-owned after caller cancellation;
+  only the wait ends. Pairing is a separate bounded, caller-cancellable connect call.
+  Login requires an already-verified Ready session and rejects other states without
+  connecting or creating an account. Unbound pairing never mutates an account.
+  Explicit session cancel/disconnect/logout interrupts adoption; shutdown interrupts
+  and settles owned work before returning. Failed completed-account Native rebind
+  restores prior local callbacks, records, and activation, not published KeyPackages.
+  Ordinary sign-out cleanup remains explicit; legacy host login is unchanged.
 
 - Ship Swift `nextCancellable()` adapters for presented chat lists, chat-list
   windows, account attention, conversation windows, and block lists inside
