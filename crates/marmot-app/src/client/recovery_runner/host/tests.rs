@@ -121,6 +121,175 @@ fn passes(client: &AppClient) -> u32 {
     }
 }
 
+/// Dismissal survives recovery and a file-backed account reopen (mdk#3308).
+/// A refusal after fresh loss in that interval must still raise a new notice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inbox_dismissal_survives_open() {
+    use storage_sqlite::{CopyFloorReason, RecoveryLossCause, RecoverySpanRetirement};
+
+    let relay = MockRelay::run().await.unwrap();
+    let url = relay.url().await.to_string();
+    let endpoint = transport_nostr::canonical_relay(&url);
+    let dir = tempfile::tempdir().unwrap();
+    crate::AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let config = crate::MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true);
+    let app = crate::MarmotApp::with_relay_and_config(dir.path(), &url, config.clone())
+        .with_unvouched_relay_replies_for_test();
+    let now = unix_now_seconds();
+    let route = TransportReconciliationRoute::Inbox;
+    let floor = now - DAY;
+    let storage = app.account_storage("alice").unwrap().app_storage();
+    storage
+        .widen_recovery_coverage_goals(std::slice::from_ref(&route), floor, CopyFloorReason::Clamp)
+        .unwrap();
+    // A prior refusal parked history; empty live replies must not prove it away.
+    storage
+        .begin_recovery_unit_attempt(&route, &endpoint, None, now - HOUR)
+        .unwrap();
+    storage
+        .settle_recovery_unit(
+            &route,
+            &endpoint,
+            RecoveryUnitOutcome::Refused,
+            &RecoveryRunnerPolicy::default().unit,
+            now - HOUR,
+        )
+        .unwrap();
+    // A periodic recheck could replace retirement with new coverage evidence.
+    assert!(
+        storage
+            .record_recovery_recheck(&route, &endpoint, 0, 0, true, now)
+            .unwrap()
+    );
+
+    let mut client = crate::tests::client_on_app_relay_plane(&app, "alice").await;
+    let notices = client.history_notices().unwrap();
+    assert_eq!(notices.len(), 1);
+    assert_eq!(notices[0].cause, crate::HistoryNoticeCause::UnprovenHistory);
+    assert_eq!(notices[0].group_id_hex, None);
+    let dismissed = notices[0].notice_id.clone();
+    assert!(client.dismiss_history_notice(&dismissed).unwrap());
+    assert!(
+        !storage
+            .recovery_unit_debt(&route, &endpoint, floor - 1)
+            .unwrap()
+            .is_empty(),
+        "the pass must owe history outside the dismissed span"
+    );
+    client.run_recovery_runner_pass().await.unwrap();
+    assert!(
+        storage
+            .recovery_unit_debt(&route, &endpoint, floor - 1)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(client.history_notices().unwrap().is_empty());
+    let spans = storage.recovery_unit_spans(&route, &endpoint).unwrap();
+    assert!(spans.iter().any(|span| {
+        span.range.since_seconds == floor && span.retired == Some(RecoverySpanRetirement::Dismissed)
+    }));
+
+    drop(client);
+    app.relay_plane.shutdown().await;
+    app.close_storage().unwrap();
+    drop(storage);
+    drop(app);
+
+    let app = crate::MarmotApp::with_relay_and_config(dir.path(), &url, config)
+        .with_unvouched_relay_replies_for_test();
+    let mut client = crate::tests::client_on_app_relay_plane(&app, "alice").await;
+    client.run_recovery_runner_pass().await.unwrap();
+    let storage = app.account_storage("alice").unwrap().app_storage();
+    assert!(client.history_notices().unwrap().is_empty());
+    assert_eq!(
+        storage.recovery_unit_spans(&route, &endpoint).unwrap(),
+        spans
+    );
+    assert!(!client.dismiss_history_notice(&dismissed).unwrap());
+
+    // New loss, unlike opening the same ledger again, reopens acknowledged history.
+    let loss_floor = floor + HOUR;
+    let loss_at = unix_now_seconds();
+    storage
+        .record_account_recovery_loss_routed(
+            "alice",
+            RecoveryLossCause::Queue,
+            41,
+            1,
+            loss_at,
+            Some(loss_floor),
+            Some(&[(route.clone(), loss_floor)]),
+        )
+        .unwrap();
+    client.synchronize_recovery_loss(&storage).unwrap();
+    let now = unix_now_seconds();
+    assert_eq!(
+        storage.recovery_unit_debt(&route, &endpoint, now).unwrap()[0].since_seconds,
+        loss_floor,
+        "fresh loss reopens the acknowledged interval"
+    );
+    // Settle another refusal, now for the history the new loss reopened.
+    storage
+        .begin_recovery_unit_attempt(&route, &endpoint, None, now)
+        .unwrap();
+    storage
+        .settle_recovery_unit(
+            &route,
+            &endpoint,
+            RecoveryUnitOutcome::Refused,
+            &RecoveryRunnerPolicy::default().unit,
+            now,
+        )
+        .unwrap();
+    assert!(
+        storage
+            .recovery_unit_spans(&route, &endpoint)
+            .unwrap()
+            .iter()
+            .any(|span| {
+                span.retired.is_none()
+                    && span.range.since_seconds == loss_floor
+                    && span.range.until_seconds == now
+            })
+    );
+    let fresh = client.history_notices().unwrap();
+    assert_eq!(fresh.len(), 1);
+    assert_eq!(fresh[0].cause, crate::HistoryNoticeCause::UnprovenHistory);
+    assert_eq!(fresh[0].group_id_hex, None);
+    assert_ne!(fresh[0].notice_id, dismissed);
+    assert!(client.dismiss_history_notice(&fresh[0].notice_id).unwrap());
+    let acknowledged = storage.recovery_unit_spans(&route, &endpoint).unwrap();
+    storage
+        .record_account_recovery_loss_routed(
+            "alice",
+            RecoveryLossCause::Queue,
+            41,
+            1,
+            loss_at,
+            Some(loss_floor),
+            Some(&[(route.clone(), loss_floor)]),
+        )
+        .unwrap();
+    client.synchronize_recovery_loss(&storage).unwrap();
+    assert_eq!(
+        storage.recovery_unit_spans(&route, &endpoint).unwrap(),
+        acknowledged
+    );
+    assert!(
+        storage
+            .recovery_unit_debt(&route, &endpoint, now)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(client.history_notices().unwrap().is_empty());
+
+    drop(client);
+    app.relay_plane.shutdown().await;
+    app.close_storage().unwrap();
+}
+
 /// A subscriber to the account's runner wake, with what it has seen marked.
 fn wake(client: &AppClient) -> watch::Receiver<u64> {
     let mut wake = client.routing.recovery_runner_wake().subscribe();
