@@ -1844,7 +1844,12 @@ async fn run_app_runtime_account_worker(
         {
             schedule.wake(schedule::Job::HistoryDispatch);
         }
-        if !schedule.pending(schedule::Job::Push) && client.push_timing_owed() {
+        // Tests turn this wake off to show the watchdog finds owed timing.
+        #[cfg(test)]
+        let push_turn_wake = client.test_push_turn_wake();
+        #[cfg(not(test))]
+        let push_turn_wake = true;
+        if push_turn_wake && !schedule.pending(schedule::Job::Push) && client.push_timing_owed() {
             schedule.wake(schedule::Job::Push);
         }
         if !schedule.pending(schedule::Job::DevicePairing) && client.device_pairing_owed() {

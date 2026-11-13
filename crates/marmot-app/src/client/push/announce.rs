@@ -55,23 +55,73 @@ impl Default for PushAnnounceTiming {
 }
 
 /// What a test sets for an account whose client the account worker owns, so
-/// it cannot set the client's own fields: the push fetch clock's time and
-/// whether the device can fetch.
+/// it cannot set the client's own fields: the push fetch clock's time,
+/// whether the device can fetch, and whether the worker wakes its Push job
+/// on its own turn, which a test of the watchdog turns off.
 #[cfg(test)]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct TestPushOverride {
     pub(crate) now_ms: i64,
     pub(crate) can_fetch: bool,
+    pub(crate) turn_wake: bool,
+}
+
+/// Overrides by account data directory, so tests in one process that reuse
+/// an account label never read each other's.
+#[cfg(test)]
+static TEST_PUSH_OVERRIDES: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, TestPushOverride>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// Holds a test's override for one account directory and removes it when
+/// dropped, a failed test included.
+#[cfg(test)]
+pub(crate) struct TestPushOverrideGuard {
+    dir: std::path::PathBuf,
 }
 
 #[cfg(test)]
-pub(crate) static TEST_PUSH_OVERRIDES: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashMap<String, TestPushOverride>>,
-> = std::sync::LazyLock::new(Default::default);
+impl TestPushOverrideGuard {
+    pub(crate) fn set(dir: std::path::PathBuf, over: TestPushOverride) -> Self {
+        TEST_PUSH_OVERRIDES
+            .lock()
+            .unwrap()
+            .insert(dir.clone(), over);
+        Self { dir }
+    }
+
+    pub(crate) fn update(&self, change: impl FnOnce(&mut TestPushOverride)) {
+        if let Some(over) = TEST_PUSH_OVERRIDES.lock().unwrap().get_mut(&self.dir) {
+            change(over);
+        }
+    }
+}
 
 #[cfg(test)]
-fn test_push_override(label: &str) -> Option<TestPushOverride> {
-    TEST_PUSH_OVERRIDES.lock().unwrap().get(label).copied()
+impl Drop for TestPushOverrideGuard {
+    fn drop(&mut self) {
+        TEST_PUSH_OVERRIDES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.dir);
+    }
+}
+
+#[cfg(test)]
+impl AppClient {
+    fn test_push_override(&self) -> Option<TestPushOverride> {
+        TEST_PUSH_OVERRIDES
+            .lock()
+            .unwrap()
+            .get(&self.app.account_dir(&self.state.label))
+            .copied()
+    }
+
+    /// Whether the worker wakes its Push job on its own turn; a test of the
+    /// watchdog turns it off.
+    pub(crate) fn test_push_turn_wake(&self) -> bool {
+        self.test_push_override().is_none_or(|over| over.turn_wake)
+    }
 }
 
 /// The most one look at the fetch clock counts. The worker looks every 15
@@ -144,7 +194,7 @@ impl PushFetchClock {
     pub(super) fn settled(&self, settle: Duration, now_ms: i64) -> bool {
         self.fetching
             && self.watched_ms >= millis(settle)
-            && now_ms.saturating_sub(self.counted_to_ms) <= PUSH_FETCH_MAX_STEP_MS
+            && now_ms.saturating_sub(self.counted_to_ms) < PUSH_FETCH_MAX_STEP_MS
     }
 }
 
@@ -366,7 +416,7 @@ impl AppClient {
         #[cfg(test)]
         if let Some(now_ms) = self
             .test_push_now_ms
-            .or_else(|| test_push_override(&self.state.label).map(|over| over.now_ms))
+            .or_else(|| self.test_push_override().map(|over| over.now_ms))
         {
             return now_ms;
         }
@@ -383,7 +433,7 @@ impl AppClient {
         #[cfg(test)]
         if let Some(can_fetch) = self
             .test_push_device_can_fetch
-            .or_else(|| test_push_override(&self.state.label).map(|over| over.can_fetch))
+            .or_else(|| self.test_push_override().map(|over| over.can_fetch))
         {
             return can_fetch;
         }
@@ -864,9 +914,10 @@ mod tests {
         assert!(!clock.settled(settle, 3_706_000));
         assert_eq!(clock.advance(true, 3_710_000), 4_000);
         assert!(clock.settled(settle, 3_710_000));
+        assert!(clock.settled(settle, 3_710_000 + PUSH_FETCH_MAX_STEP_MS - 1));
         assert!(
-            !clock.settled(settle, 3_710_000 + PUSH_FETCH_MAX_STEP_MS + 1),
-            "a last look more than a step old says nothing about now"
+            !clock.settled(settle, 3_710_000 + PUSH_FETCH_MAX_STEP_MS),
+            "a last look a full step old says nothing about now"
         );
         assert_eq!(
             clock.advance(true, 3_710_000 + 3_600_000),

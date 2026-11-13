@@ -577,6 +577,32 @@ async fn a_token_change_after_idle_and_lost_relays_goes_out_plain() {
     let shared = sent_updates(&fx.bob, from);
     assert_eq!(shared.len(), 1);
     assert_eq!(have(&shared[0]), None, "a plain self-update");
+
+    // Once the relays return, the announce follows and settles the debt.
+    fx.bob.client.test_push_device_can_fetch = Some(true);
+    announce_follows(&mut fx, from).await;
+}
+
+/// The plain self-update's announce, after a token change on a clock that
+/// was not settled: the Push job samples until it goes out, then the group
+/// owes nothing.
+async fn announce_follows(fx: &mut Fixture, from: usize) {
+    let group_hex = fx.group_hex();
+    assert!(fx.bob.client.push_timing_owed(), "the announce is owed");
+    let samples = run_push_job_while_owed(&mut fx.bob, 8).await;
+    let sent = sent_updates(&fx.bob, from);
+    assert_eq!(
+        sent.len(),
+        2,
+        "the announce followed after {samples} samples"
+    );
+    assert_eq!(have(&sent[1]), Some(held(&fx.bob, &group_hex)));
+    assert_eq!(
+        gossip_state(&fx.bob, &group_hex).announce_owed_at_ms,
+        None,
+        "and settled the debt"
+    );
+    assert!(!fx.bob.client.push_timing_owed(), "the worker rests again");
 }
 
 /// The same after a suspend that left fetching on: the hour the process did
@@ -592,6 +618,16 @@ async fn a_token_change_after_a_suspend_goes_out_plain() {
     let shared = sent_updates(&fx.bob, from);
     assert_eq!(shared.len(), 1);
     assert_eq!(have(&shared[0]), None, "a plain self-update");
+
+    // The first look after the gap starts the watch, so no announce yet.
+    fx.bob.client.advance_push_join_windows().await;
+    retry(&mut fx.bob).await;
+    assert_eq!(
+        sent_updates(&fx.bob, from).len(),
+        1,
+        "no announce on the first look after the gap"
+    );
+    announce_follows(&mut fx, from).await;
 }
 
 /// The periodic announce goes out with the first group message sent once the

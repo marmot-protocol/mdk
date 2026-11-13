@@ -3981,8 +3981,8 @@ async fn advance_held_clock(by: Duration) {
 /// unsettled clock goes out at once as a plain self-update and owes an
 /// announce; that wakes the worker's Push job, which re-arms every 15 s
 /// while it is owed, and the announce follows within 30 s, with no missed
-/// wake and no busy loop. The watchdog's own check is
-/// `the_watchdog_reads_owed_push_timing`.
+/// wake and no busy loop. Owed timing that appears with no worker turn to
+/// see it is the watchdog's to find, which runs the job.
 #[tokio::test(flavor = "current_thread")]
 async fn the_worker_samples_push_timing_only_while_owed() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -4003,16 +4003,15 @@ async fn the_worker_samples_push_timing_only_while_owed() {
     };
     let group_hex = hex::encode(group.as_slice());
     let mut push_now_ms = crate::notifications::unix_now_ms();
-    let set_push_clock = |now_ms: i64| {
-        crate::client::TEST_PUSH_OVERRIDES.lock().unwrap().insert(
-            account.label.clone(),
-            crate::client::TestPushOverride {
-                now_ms,
-                can_fetch: true,
-            },
-        );
-    };
-    set_push_clock(push_now_ms);
+    let push_override = crate::client::TestPushOverrideGuard::set(
+        app.account_dir(&account.label),
+        crate::client::TestPushOverride {
+            now_ms: push_now_ms,
+            can_fetch: true,
+            turn_wake: true,
+        },
+    );
+    let set_push_clock = |now_ms: i64| push_override.update(|over| over.now_ms = now_ms);
     let runtime = MarmotAppRuntime::new(app.clone());
     runtime.accounts().reconcile().await.expect("alice starts");
     let count = |operation| startup_stage_snapshot(&runtime, operation).completed;
@@ -4036,17 +4035,28 @@ async fn the_worker_samples_push_timing_only_while_owed() {
             .expect("gossip state")
     };
 
-    // Until the Push job rests: two steps with no run.
-    let mut quiet = 0;
-    for _ in 0..10 {
-        let before = push_runs();
-        step(&mut push_now_ms).await;
-        quiet = if push_runs() == before { quiet + 1 } else { 0 };
-        if quiet == 2 {
-            break;
+    // Steps until the Push job has not run for `need` steps in a row. A
+    // deadline it still holds is at most 15 s ahead, so it fires within one.
+    let rest = async |push_now_ms: &mut i64, need: usize| {
+        let mut quiet = 0;
+        for _ in 0..10 {
+            let before = push_runs();
+            step(push_now_ms).await;
+            quiet = if push_runs() == before { quiet + 1 } else { 0 };
+            if quiet == need {
+                break;
+            }
         }
-    }
-    assert_eq!(quiet, 2, "the Push job rests with nothing owed");
+        quiet
+    };
+
+    // Three quiet steps, so its last look is more than one 30 s step old and
+    // says nothing about now.
+    assert_eq!(
+        rest(&mut push_now_ms, 3).await,
+        3,
+        "the Push job rests with nothing owed"
+    );
     let rested = push_runs();
     app.set_native_push_enabled(&account.label, true)
         .expect("native push");
@@ -4093,11 +4103,26 @@ async fn the_worker_samples_push_timing_only_while_owed() {
         push_runs() - rested
     );
     assert_eq!(missed(), 0, "the worker woke its Push job itself");
+
+    // Owed timing that appears with no worker turn to see it: the tick's
+    // watchdog counts the miss and runs the Push job. The run that sent the
+    // announce may have re-armed its 15 s retry, which would run the job
+    // before the watchdog looks, so first let that fire. With the worker's
+    // own per-turn wake off, only the watchdog can then find the debt.
+    assert_eq!(
+        rest(&mut push_now_ms, 2).await,
+        2,
+        "the Push job holds no deadline"
+    );
+    push_override.update(|over| over.turn_wake = false);
+    let before_missed = push_runs();
+    app.record_group_push_announce_owed(&account.label, &group_hex, push_now_ms)
+        .expect("owed");
+    step(&mut push_now_ms).await;
+    assert_eq!(missed(), 1, "the watchdog found owed push timing");
+    advance_held_clock(Duration::ZERO).await;
+    assert!(push_runs() > before_missed, "and ran the Push job");
     runtime.shutdown().await;
-    crate::client::TEST_PUSH_OVERRIDES
-        .lock()
-        .unwrap()
-        .remove(&account.label);
 }
 
 /// Another account's activity runs none of this account's passes; its own
