@@ -1056,11 +1056,16 @@ impl SqliteAppStorage {
             rebuild_message_timeline_for_group_tx(&conn, group_id_hex)?;
             let messages =
                 timeline_records_by_ids_tx(&conn, group_id_hex, affected_message_ids.clone())?;
-            let mut changes = timeline_changes_for_invalidation(
-                |_| Some((message_id_hex, kind, tags.as_slice())),
-                &before,
-                &messages,
-            );
+            let event = InvalidationEvents {
+                primary: InvalidationEvent {
+                    message_id_hex,
+                    kind,
+                    tags: &tags,
+                },
+                others: Vec::new(),
+            };
+            let mut changes =
+                timeline_changes_for_invalidation(|_| Some(&event), &before, &messages);
             // Only the revived row's own delivery state changed. Rows it merely
             // affects (a reply preview, say) keep the trigger their own content
             // warrants — the same split `finalize_app_event_source_retention`
@@ -1145,19 +1150,22 @@ impl SqliteAppStorage {
             // rows so we can diff before/after for the change set.
             let mut invalidation_events = BTreeMap::new();
             for (row_group_id_hex, message_id_hex, kind, tags) in &rows {
-                for id in affected_timeline_message_ids_for_parts_tx(
+                let ids = affected_timeline_message_ids_for_parts_tx(
                     &conn,
                     row_group_id_hex,
                     message_id_hex,
                     *kind,
                     tags,
-                )? {
-                    invalidation_events.entry(id).or_insert((
-                        message_id_hex.as_str(),
-                        *kind,
-                        tags.as_slice(),
-                    ));
-                }
+                )?;
+                add_invalidation_event(
+                    &mut invalidation_events,
+                    ids,
+                    InvalidationEvent {
+                        message_id_hex,
+                        kind: *kind,
+                        tags,
+                    },
+                );
             }
             let mut affected_message_ids =
                 invalidation_events.keys().cloned().collect::<BTreeSet<_>>();
@@ -1177,7 +1185,7 @@ impl SqliteAppStorage {
             let mut messages =
                 timeline_records_by_ids_tx(&conn, &group_id_hex, affected_message_ids.clone())?;
             let changes = timeline_changes_for_invalidation(
-                |row| invalidation_events.get(&row.message_id_hex).copied(),
+                |row| invalidation_events.get(&row.message_id_hex),
                 &before,
                 &messages,
             );
@@ -1290,19 +1298,22 @@ impl SqliteAppStorage {
                 .collect::<StorageResult<Vec<_>>>()?;
             let mut invalidation_events = BTreeMap::new();
             for (row_group_id_hex, message_id_hex, kind, tags) in &rows {
-                for id in affected_timeline_message_ids_for_parts_tx(
+                let ids = affected_timeline_message_ids_for_parts_tx(
                     &conn,
                     row_group_id_hex,
                     message_id_hex,
                     *kind,
                     tags,
-                )? {
-                    invalidation_events.entry(id).or_insert((
-                        message_id_hex.as_str(),
-                        *kind,
-                        tags.as_slice(),
-                    ));
-                }
+                )?;
+                add_invalidation_event(
+                    &mut invalidation_events,
+                    ids,
+                    InvalidationEvent {
+                        message_id_hex,
+                        kind: *kind,
+                        tags,
+                    },
+                );
             }
             let mut affected_message_ids =
                 invalidation_events.keys().cloned().collect::<BTreeSet<_>>();
@@ -1324,7 +1335,7 @@ impl SqliteAppStorage {
             let mut messages =
                 timeline_records_by_ids_tx(&conn, &group_id_hex, affected_message_ids.clone())?;
             let changes = timeline_changes_for_invalidation(
-                |row| invalidation_events.get(&row.message_id_hex).copied(),
+                |row| invalidation_events.get(&row.message_id_hex),
                 &before,
                 &messages,
             );
@@ -1479,19 +1490,22 @@ impl SqliteAppStorage {
                 .collect::<StorageResult<Vec<_>>>()?;
             let mut invalidation_events = BTreeMap::new();
             for (message_id_hex, kind, tags) in &rows {
-                for id in affected_timeline_message_ids_for_parts_tx(
+                let ids = affected_timeline_message_ids_for_parts_tx(
                     &conn,
                     group_id_hex,
                     message_id_hex,
                     *kind,
                     tags,
-                )? {
-                    invalidation_events.entry(id).or_insert((
-                        message_id_hex.as_str(),
-                        *kind,
-                        tags.as_slice(),
-                    ));
-                }
+                )?;
+                add_invalidation_event(
+                    &mut invalidation_events,
+                    ids,
+                    InvalidationEvent {
+                        message_id_hex,
+                        kind: *kind,
+                        tags,
+                    },
+                );
             }
             let mut affected_message_ids =
                 invalidation_events.keys().cloned().collect::<BTreeSet<_>>();
@@ -1514,7 +1528,7 @@ impl SqliteAppStorage {
             let mut messages =
                 timeline_records_by_ids_tx(&conn, group_id_hex, affected_message_ids.clone())?;
             let changes = timeline_changes_for_invalidation(
-                |row| invalidation_events.get(&row.message_id_hex).copied(),
+                |row| invalidation_events.get(&row.message_id_hex),
                 &before,
                 &messages,
             );
@@ -1588,11 +1602,15 @@ impl SqliteAppStorage {
             rebuild_message_timeline_for_group_tx(&conn, &group_id_hex)?;
             let mut messages =
                 timeline_records_by_ids_tx(&conn, &group_id_hex, affected_message_ids.clone())?;
-            let changes = timeline_changes_for_invalidation(
-                |_| Some((message_id_hex.as_str(), kind, tags.as_slice())),
-                &before,
-                &messages,
-            );
+            let event = InvalidationEvents {
+                primary: InvalidationEvent {
+                    message_id_hex: &message_id_hex,
+                    kind,
+                    tags: &tags,
+                },
+                others: Vec::new(),
+            };
+            let changes = timeline_changes_for_invalidation(|_| Some(&event), &before, &messages);
             if tags_damaged {
                 retain_changed_messages(&mut messages, &changes);
             }
@@ -3473,8 +3491,74 @@ fn timeline_trigger_for_recorded_event_row(
     timeline_trigger_for_event_row(event_message_id_hex, kind, tags, row)
 }
 
+#[derive(Clone, Copy)]
+struct InvalidationEvent<'a> {
+    message_id_hex: &'a str,
+    kind: u64,
+    tags: &'a [Vec<String>],
+}
+
+impl InvalidationEvent<'_> {
+    fn names_row(&self, row_id: &str) -> bool {
+        self.message_id_hex == row_id
+            || tag_values(self.tags, EVENT_REF_TAG).any(|target| target == row_id)
+    }
+}
+
+struct InvalidationEvents<'a> {
+    primary: InvalidationEvent<'a>,
+    others: Vec<InvalidationEvent<'a>>,
+}
+
+impl InvalidationEvents<'_> {
+    fn trigger(&self, row: &TimelineMessageRecord) -> TimelineUpdateTrigger {
+        let trigger_for = |event: &InvalidationEvent<'_>| {
+            timeline_trigger_for_invalidation_row(event.message_id_hex, event.kind, event.tags, row)
+        };
+        let trigger = trigger_for(&self.primary);
+        if self
+            .others
+            .iter()
+            .any(|event| trigger_for(event) != trigger)
+        {
+            return TimelineUpdateTrigger::MessageEditedOrReprojected;
+        }
+        trigger
+    }
+}
+
+fn add_invalidation_event<'a>(
+    events: &mut BTreeMap<String, InvalidationEvents<'a>>,
+    ids: BTreeSet<String>,
+    event: InvalidationEvent<'a>,
+) {
+    // Direct changes outrank dependent previews. Retain equal-priority causes
+    // so conflicting triggers become a generic reprojection, not a row-order tie.
+    for id in ids {
+        match events.entry(id) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(InvalidationEvents {
+                    primary: event,
+                    others: Vec::new(),
+                });
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                let direct = event.names_row(entry.key());
+                let previous_direct = entry.get().primary.names_row(entry.key());
+                if direct && !previous_direct {
+                    let causes = entry.get_mut();
+                    causes.primary = event;
+                    causes.others.clear();
+                } else if direct == previous_direct {
+                    entry.get_mut().others.push(event);
+                }
+            }
+        }
+    }
+}
+
 fn timeline_changes_for_invalidation<'a>(
-    event_for_row: impl Fn(&TimelineMessageRecord) -> Option<(&'a str, u64, &'a [Vec<String>])>,
+    event_for_row: impl Fn(&TimelineMessageRecord) -> Option<&'a InvalidationEvents<'a>>,
     before: &[TimelineMessageRecord],
     messages: &[TimelineMessageRecord],
 ) -> Vec<TimelineMessageChange> {
@@ -3493,7 +3577,7 @@ fn timeline_changes_for_invalidation<'a>(
         .map(|message| TimelineMessageChange::Upsert {
             trigger: event_for_row(&message).map_or(
                 TimelineUpdateTrigger::MessageEditedOrReprojected,
-                |(id, kind, tags)| timeline_trigger_for_invalidation_row(id, kind, tags, &message),
+                |events| events.trigger(&message),
             ),
             message: Box::new(message),
         })
@@ -3504,7 +3588,9 @@ fn timeline_changes_for_invalidation<'a>(
         .map(|message| message.message_id_hex.clone())
         .collect();
     mark_recipient_confirmation_changes(&mut changes, &confirmed_before, |row| {
-        event_for_row(row).map_or(("", &[][..]), |(id, _, tags)| (id, tags))
+        event_for_row(row).map_or(("", &[][..]), |events| {
+            (events.primary.message_id_hex, events.primary.tags)
+        })
     });
     changes.extend(
         before
