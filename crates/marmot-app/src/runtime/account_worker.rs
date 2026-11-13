@@ -2741,8 +2741,8 @@ async fn run_app_runtime_account_worker(
                     }
                 };
             }
-            _ = attachment_admission.ready(), if attachment_admission.is_waiting() => {
-                attachment_due = true;
+            more = attachment_admission.ready(), if attachment_admission.is_waiting() => {
+                attachment_due |= more;
             }
             _ = tokio::task::yield_now(), if attachment_due => {
                 if lifecycle.is_stopping() { continue 'worker; }
