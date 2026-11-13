@@ -60,6 +60,13 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   transaction, generated local preparation admission (removal only), the worker transaction, then the worker map.
   Local preparation never waits for the onboarding transaction. The cancellation registry precedes the per-account
   state lock.
+- Write an account's groups through its worker whenever it signs on one (`AccountManager::signs_on_worker`: an active
+  local signer, or a signed-in external signer whose signer is registered). The worker keeps the account's state in
+  memory and saves each dirty group's whole record, so a storage write beside it is undone at its next save and leaves
+  its reads stale (mdk#178, mdk#3318). A worker that cannot start or answer fails the call; never fall back to a
+  direct write. Archive, forget and delete write storage directly only for an account that signs on no worker, through
+  `write_without_worker`, which holds the worker transaction so no worker starts during the write, and reaps any
+  worker still retiring first.
 - Keep app-client commands and query methods in the `src/client/` module; the crate root should construct clients but
   not absorb their behavior again. The `AppClient` inherent impl is split across the module along these seams: `mod.rs`
   (the `AppClient` struct plus the broadly-shared command/query API — key-package, group lifecycle, message/media/agent

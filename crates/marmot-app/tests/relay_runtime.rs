@@ -6890,8 +6890,8 @@ async fn app_runtime_archive_survives_subsequent_inbound_delivery() {
 // fall back to a direct `MarmotApp::set_group_archived` write when the account
 // worker is unavailable (e.g. a startup/reconcile failure). The direct write
 // can race a freshly spawned worker holding the pre-archive snapshot and revert
-// the flag again. Only non-local-signing accounts (which can never own a
-// worker) are allowed the direct-write path. Here we make the worker
+// the flag again. Only an account that signs on no worker is allowed the
+// direct-write path (mdk#3318). Here we make the worker
 // unavailable by stopping the runtime and assert the toggle surfaces the error
 // instead of silently persisting through the bypass.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -7130,6 +7130,74 @@ async fn external_signer_forget_and_delete_go_through_the_accounts_worker() {
         );
     }
 
+    runtime.shutdown().await;
+}
+
+/// mdk#3318: an account that signs on no worker, here a signed-out external
+/// signer, archives, forgets and deletes its chats in storage directly, and
+/// the worker it signs back in with starts from those writes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn signed_out_account_archives_forgets_and_deletes_without_a_worker() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, url) = mock_app(&dir).await;
+    let runtime = MarmotAppRuntime::new(app);
+    let account = login_external_signer_with_worker(&runtime, &url).await;
+    let account_id = account.account.account_id_hex;
+    let mut groups = Vec::new();
+    for name in ["archived", "forgotten", "deleted"] {
+        groups.push(
+            runtime
+                .create_group(&account_id, name, &[], None)
+                .await
+                .unwrap()
+                .operation
+                .expect("a group with no other members"),
+        );
+    }
+    let [archived, forgotten, deleted] = groups.try_into().unwrap();
+    runtime
+        .sign_out(&account_id, SignOutOptions::default())
+        .await
+        .unwrap();
+
+    let record = runtime
+        .set_group_archived(&account_id, &hex::encode(archived.as_slice()), true)
+        .await
+        .unwrap();
+    assert!(record.archived);
+    assert!(
+        runtime
+            .forget_group_local(&account_id, &forgotten)
+            .await
+            .unwrap()
+    );
+    assert!(
+        runtime
+            .delete_group_local(&account_id, &deleted)
+            .await
+            .unwrap()
+    );
+
+    assert!(runtime.sign_in_account(&account_id).await.unwrap().running);
+    assert!(
+        runtime
+            .group_conversation_snapshot(&account_id, &archived)
+            .await
+            .unwrap()
+            .group
+            .archived
+    );
+    for removed in [forgotten, deleted] {
+        let snapshot = runtime
+            .group_conversation_snapshot(&account_id, &removed)
+            .await
+            .map(|_| ());
+        assert!(
+            matches!(&snapshot, Err(AppError::UnknownGroup(id))
+                if *id == hex::encode(removed.as_slice())),
+            "the new worker must start without the removed group: {snapshot:?}"
+        );
+    }
     runtime.shutdown().await;
 }
 
