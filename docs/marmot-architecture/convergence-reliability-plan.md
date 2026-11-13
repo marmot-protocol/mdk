@@ -1254,10 +1254,10 @@ Simulator failures write portable and optional sensitive replay capsules; proces
 failures can be added to the same private versioned corpus. The index retains seeds, adapters, build matrices,
 recurrence, minimum diagnosis time, reduction candidates, and digest-pinned promoted-vector provenance without
 copying raw error text.
-[MDK #1140](https://github.com/marmot-protocol/mdk/pull/1140) now also fails closed when a manifest-less or corrupt
-NDJSON stream is presented to incident replay, preventing an incomplete stream remnant from being silently adopted as
-an empty healthy document. This hardens corpus admission; it does not constitute execution of an incident-derived
-corpus in the scheduled lanes.
+[MDK #1140](https://github.com/marmot-protocol/mdk/pull/1140) also made incident replay fail closed on a manifest-less
+or corrupt NDJSON stream instead of silently adopting an incomplete stream remnant as an empty healthy document. That
+check was removed with the `incident-replay` crate on 2026-11-13; it never constituted execution of an
+incident-derived corpus in the scheduled lanes.
 The reducer now treats paired transport, partition, lifecycle, and storage actions as dependency units before removing
 independent noise. Non-layer-specific failures receive a canonical Scenario IR candidate for the next smaller adapter;
 the semantic identity must reproduce there before concluding that the larger layer is uninvolved. Promotion remains
@@ -1306,7 +1306,7 @@ operation must be reachable through the shared model, and reviewed execution lan
 operations and cross-operation interactions actually occurred.
 
 - [ ] Inventory every generated product action, its legality preconditions and state transition, and identify duplicate
-  implementations across `family.rs`, `stateful_generator.rs`, incident synthesis, and adapter-specific producers.
+  implementations across `family.rs`, `stateful_generator.rs`, and adapter-specific producers.
 - [ ] Extract one shared legality-aware product model covering membership, administrator authority, profile state,
   application traffic, connectivity, restart, retained-history synchronization, and future canonical IR operations.
 - [ ] Define workload profiles declaratively in terms of action weights, required motifs, compatible subjects,
