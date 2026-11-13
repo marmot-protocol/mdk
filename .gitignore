@@ -16,7 +16,6 @@ reviews/
 
 # Local forensic inputs and sensitive/exact replay artifacts.
 /incident-exports/
-/incident-replay-output/
 *-sensitive-replay-capsule.v1.json
 
 # Local Docker relay state.

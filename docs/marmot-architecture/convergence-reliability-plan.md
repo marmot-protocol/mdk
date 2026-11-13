@@ -1,7 +1,7 @@
 ---
 title: "Convergence Reliability And Simulation Plan"
 created: 2026-07-30
-updated: 2026-11-08
+updated: 2026-11-13
 tags: [marmot, cgka, convergence, simulation, verification, reliability]
 status: working-plan
 ---
@@ -765,12 +765,15 @@ eligibility change cannot masquerade as a scheduler result.
 
 ### 3.3 Incident replay
 
+The `incident-replay` crate described here was removed on 2026-11-13 with the retired audit service whose exports it
+read. The vectors it produced remain under `crates/cgka-conformance-simulator/vectors/incidents/`.
+
 - [x] Preserve normalized archetype synthesis for incomplete forensic evidence.
 - [x] Add producer-attested normalized-history IR import when evidence is sufficient.
 - [x] Carry evidence confidence and unavailable fields into the scenario artifact.
 - [x] Keep sensitive exports and generated exact capsules out of version control.
 
-`IncidentScenarioArtifactV1` makes replay fidelity and trust boundaries explicit. Existing Goggles audit exports
+`IncidentScenarioArtifactV1` makes replay fidelity and trust boundaries explicit. Existing legacy audit-service exports
 continue through the proven fork/convergence archetype synthesizers and are labeled
 `outcome_equivalent_archetype` with derived confidence; the artifact names unavailable action history, participant
 delivery order, transport bytes, and MLS state. Normalized import is `producer_attested_normalized_history`: it checks

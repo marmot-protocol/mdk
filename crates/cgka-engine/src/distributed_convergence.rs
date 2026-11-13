@@ -1957,7 +1957,7 @@ impl<S: StorageProvider> Engine<S> {
         // durable queue.
         self.schedule_drain_for_retained_outbound_intents(group_id);
         // The reported epoch is the device's pre-apply tip, never the row's.
-        // A commit row carries the epoch it forks from, and `incident-replay`
+        // A commit row carries the epoch it forks from, and audit analysis
         // reads `MessageStateChanged.epoch` as where the engine was — a rival's
         // source epoch there reads as a rollback.
         for (disposition, previous_state) in disposition_transitions {
@@ -2363,8 +2363,8 @@ impl<S: StorageProvider> Engine<S> {
         completed_pass.retry = None;
         // The disposition writes are part of the atomic convergence apply.
         // Snapshot their prior values first, then emit forensic transitions
-        // only after that transaction commits so Goggles never observes a
-        // state change that rolled back.
+        // only after that transaction commits so the audit receiver never
+        // observes a state change that rolled back.
         let disposition_transitions = if self.recorder.is_enabled() {
             openmls_canonicalization_dispositions(&result)
                 .map_err(ConvergencePassFailure::at(

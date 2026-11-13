@@ -1293,8 +1293,8 @@ fn rotate_failure_keeps_recording_to_original_file() {
 /// uses ($ref, properties, additionalProperties:false, items, and oneOf
 /// discriminated by a `type` const). It does not validate value patterns; its
 /// job is to prove every key we serialize is a key the schema allows — i.e. that
-/// mdk never emits a field that Goggles' `additionalProperties: false`
-/// would reject.
+/// mdk never emits a field that a strict receiver's
+/// `additionalProperties: false` would reject.
 fn resolve_ref<'a>(
     schema: &'a serde_json::Value,
     defs: &'a serde_json::Value,

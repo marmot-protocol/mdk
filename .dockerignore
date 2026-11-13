@@ -16,5 +16,4 @@ dev/data
 /campaign-local/
 /campaign-output/
 /incident-exports/
-/incident-replay-output/
 *-sensitive-replay-capsule.v1.json

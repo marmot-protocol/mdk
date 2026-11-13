@@ -20,9 +20,9 @@ use transport_nostr::retired_relay_hosts;
 use crate::{collector_host_safety, export_config};
 
 const AUDIT_LOG_CONTENT_TYPE: &str = "application/x-ndjson";
-// The whole-file Goggles endpoint accepts the historical v4 contract only.
+// The legacy whole-file tracker endpoint accepts the historical v4 contract only.
 // New v5 records use the separately configured, explicit OTLP delivery path.
-const GOGGLES_UPLOAD_SCHEMA_VERSION: &str = "marmot-forensics-audit/v4";
+const V4_UPLOAD_SCHEMA_VERSION: &str = "marmot-forensics-audit/v4";
 pub const AUDIT_LOG_UPLOAD_MAX_BYTES: u64 = 64 * 1024 * 1024;
 const AUDIT_LOG_UPLOAD_TIMEOUT: Duration = Duration::from_secs(60);
 pub(crate) static AUDIT_UPLOAD_SCHEMA: LazyLock<jsonschema::Validator> = LazyLock::new(|| {
@@ -140,7 +140,7 @@ impl AuditUploadSnapshot {
             // before serde_json::Value could collapse duplicate object keys.
             let event = serde_json::from_slice::<marmot_forensics::AuditEvent>(line)
                 .map_err(|_| invalid_audit_upload())?;
-            if event.schema_version != GOGGLES_UPLOAD_SCHEMA_VERSION {
+            if event.schema_version != V4_UPLOAD_SCHEMA_VERSION {
                 return Err(invalid_audit_upload());
             }
             let value: serde_json::Value =

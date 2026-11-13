@@ -10,7 +10,6 @@ members = [
     "crates/storage-sqlite",
     "crates/cgka-conformance-simulator",
     "crates/convergence-campaign-runner",
-    "crates/incident-replay",
     "crates/transport-nostr-peeler",
     "crates/transport-nostr-adapter",
     "crates/transport-nostr",

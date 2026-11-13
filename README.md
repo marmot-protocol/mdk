@@ -171,7 +171,6 @@ still land on the same epoch and group state. The engine — not relay order or 
 | | [`integrations/`](integrations/README.md) | Per-runtime plugins and terminal harnesses |
 | Verification | [`cgka-conformance-simulator`](crates/cgka-conformance-simulator/README.md) | Multi-client scenarios, vectors, chaos, property tests |
 | | [`convergence-campaign-runner`](crates/convergence-campaign-runner/README.md) | Distributed container/VM campaigns |
-| | [`incident-replay`](crates/incident-replay/README.md) | Triages forensic exports of real incidents into verdicts and simulator vectors |
 | | [`formal/tamarin`](formal/tamarin/README.md) | Tamarin models for convergence and lifecycle |
 | | [`formal/pairing`](formal/pairing/README.md) | Symbolic pairing authentication and Welcome binding |
 
