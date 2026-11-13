@@ -223,7 +223,9 @@ struct CompareStage<'a, H> {
     covered: bool,
     newly_covered_seconds: u64,
     late: u64,
-    /// Events newly staged, for the audit.
+    /// Events the relay returned, staged or not, and those newly staged, for
+    /// the audit.
+    fetched_events: u64,
     staged_events: u64,
     /// Bytes charged to staged batches.
     staged_bytes: u64,
@@ -247,6 +249,7 @@ impl<H: RunnerHost> CompareSink for CompareStage<'_, H> {
             fetched_bytes
         };
         let found = !events.is_empty();
+        self.fetched_events = self.fetched_events.saturating_add(events.len() as u64);
         let Some(deliveries) = route_events(self.host, &self.plan.key.relay, events).await else {
             // Nothing was written: settlement charges these bytes instead.
             self.unstaged_bytes = self.unstaged_bytes.saturating_add(fetched_bytes);
@@ -275,18 +278,24 @@ impl<H: RunnerHost> CompareSink for CompareStage<'_, H> {
                 SinkStop::Local
             }
             // The transaction committed, bytes and events included.
-            Some(Ok(None)) => {
+            Some(Ok(Staged {
+                newly: None,
+                events,
+            })) => {
                 self.staged_bytes = self.staged_bytes.saturating_add(fetched_bytes);
+                self.staged_events = self.staged_events.saturating_add(events);
                 SinkStop::StaleMark
             }
-            Some(Ok(Some(staged))) => {
+            Some(Ok(Staged {
+                newly: Some(newly),
+                events,
+            })) => {
                 self.staged_bytes = self.staged_bytes.saturating_add(fetched_bytes);
-                self.newly_covered_seconds =
-                    self.newly_covered_seconds.saturating_add(staged.newly);
+                self.newly_covered_seconds = self.newly_covered_seconds.saturating_add(newly);
                 if self.covered {
-                    self.late = self.late.saturating_add(staged.events);
+                    self.late = self.late.saturating_add(events);
                 }
-                self.staged_events = self.staged_events.saturating_add(staged.events);
+                self.staged_events = self.staged_events.saturating_add(events);
                 return Ok(());
             }
         };
@@ -301,15 +310,16 @@ impl<H: RunnerHost> CompareSink for CompareStage<'_, H> {
 
 /// What staging one batch did.
 struct Staged {
-    /// Seconds it newly covered on the unit's (route, relay).
-    newly: u64,
+    /// Seconds it newly covered on the unit's (route, relay); `None` when the
+    /// mark was too old to record the coverage.
+    newly: Option<u64>,
     /// Events newly staged.
     events: u64,
 }
 
 /// Stage one batch: its events, and `covered` through `mark` when the window
-/// was certified. `None` when the mark is too old to record the coverage; the
-/// events stay staged.
+/// was certified. The events stay staged even when the mark is too old to
+/// record the coverage.
 fn stage(
     turn: &WorkerTurn<'_>,
     key: &UnitKey,
@@ -318,7 +328,7 @@ fn stage(
     covered: Option<RecoveryCoverageRange>,
     proof: RecoveryCoverageProof,
     mark: RecoveryCoverageMark,
-) -> StorageResult<Option<Staged>> {
+) -> StorageResult<Staged> {
     let before = covered
         .map(|range| uncovered_seconds(turn.app, key, range))
         .transpose()?;
@@ -335,19 +345,22 @@ fn stage(
         turn.now,
     )?;
     let (Some(range), Some(before)) = (covered, before) else {
-        return Ok(Some(Staged {
-            newly: 0,
+        return Ok(Staged {
+            newly: Some(0),
             events: staged.staged as u64,
-        }));
+        });
     };
     if !staged.covered {
-        return Ok(None);
+        return Ok(Staged {
+            newly: None,
+            events: staged.staged as u64,
+        });
     }
     let after = uncovered_seconds(turn.app, key, range)?;
-    Ok(Some(Staged {
-        newly: before.saturating_sub(after),
+    Ok(Staged {
+        newly: Some(before.saturating_sub(after)),
         events: staged.staged as u64,
-    }))
+    })
 }
 
 /// Run the quantum: each planned range in turn, until one does not finish,
@@ -395,6 +408,7 @@ pub(super) async fn run<H: RunnerHost>(
         covered: false,
         newly_covered_seconds: 0,
         late: 0,
+        fetched_events: 0,
         staged_events: 0,
         staged_bytes: 0,
         unstaged_bytes: 0,
@@ -427,7 +441,6 @@ pub(super) async fn run<H: RunnerHost>(
         .await;
         report.requests = report.requests.saturating_add(compared.stats.requests);
         report.answers = report.answers.saturating_add(compared.stats.answers);
-        report.events_fetched = report.events_fetched.saturating_add(compared.stats.events);
         report.rate_limited = compared.rate_limited;
         sink.unstaged_bytes = sink
             .unstaged_bytes
@@ -459,6 +472,7 @@ pub(super) async fn run<H: RunnerHost>(
         }
     }
     report.newly_covered_seconds = sink.newly_covered_seconds;
+    report.events_fetched = sink.fetched_events;
     report.events_staged = sink.staged_events;
     report.stop = sink.stop;
     facts.late = sink.late;

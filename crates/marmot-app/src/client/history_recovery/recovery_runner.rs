@@ -66,7 +66,7 @@ mod tests;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -543,6 +543,9 @@ impl RecoveryRunnerHandle {
     }
 }
 
+/// An audit row and the MLS group it is about, if any.
+type AuditRow = (Option<Vec<u8>>, AuditEventKind);
+
 /// One account's runner.
 pub(crate) struct RecoveryRunner<H> {
     host: Arc<H>,
@@ -568,8 +571,9 @@ pub(crate) struct RecoveryRunner<H> {
     /// Begins abandoned as raced, coalesced per route for the audit.
     races: audit::Races,
     /// Raced rows whose window closed, for the next survey turn to write: no
-    /// turn is awaited only to write a row.
-    unwritten_races: Vec<(Option<Vec<u8>>, AuditEventKind)>,
+    /// turn is awaited only to write a row. The survey drains them inside its
+    /// turn, so a turn whose preparation fails leaves them for the retry.
+    unwritten_races: Arc<Mutex<Vec<AuditRow>>>,
     /// The routes the last survey found suspended, for the audit; `None`
     /// before the first.
     suspended: Option<BTreeSet<TransportReconciliationRoute>>,
@@ -613,7 +617,7 @@ impl<H: RunnerHost> RecoveryRunner<H> {
             reported_pause: None,
             open: OpenAttempts::default(),
             races: audit::Races::default(),
-            unwritten_races: Vec::new(),
+            unwritten_races: Arc::default(),
             suspended: None,
         };
         let handle = RecoveryRunnerHandle {
@@ -755,9 +759,11 @@ impl<H: RunnerHost> RecoveryRunner<H> {
         };
         let policy = self.policy;
         let suspended = self.suspended.clone();
-        let races = std::mem::take(&mut self.unwritten_races);
+        let races = Arc::clone(&self.unwritten_races);
         let (mut survey, epoch_gap_due) = match self
             .debt_turn(pass, move |turn| {
+                let races =
+                    std::mem::take(&mut *races.lock().unwrap_or_else(PoisonError::into_inner));
                 for (group, row) in races {
                     (turn.audit)(group.as_deref(), row);
                 }
@@ -1171,7 +1177,10 @@ impl<H: RunnerHost> RecoveryRunner<H> {
     fn raced(&mut self, candidate: &Candidate) -> Step {
         let route = &candidate.key.route;
         if let Some(row) = self.races.raced(route, self.host.now_seconds()) {
-            self.unwritten_races.push((candidate.group_id.clone(), row));
+            self.unwritten_races
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push((candidate.group_id.clone(), row));
         }
         Step::Raced
     }

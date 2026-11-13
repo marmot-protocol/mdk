@@ -483,7 +483,8 @@ async fn recovery_runner_never_marks_a_best_effort_fetch_as_a_probe() {
 }
 
 /// A begin that races and so closes its route's window leaves the coalesced
-/// row for the next survey turn: the raced step awaits no turn to write it.
+/// row for the next survey turn: the raced step awaits no turn to write it,
+/// and a survey that fails before its turn runs leaves it queued.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn recovery_runner_writes_a_closed_race_window_in_its_next_survey() {
     let account = account();
@@ -520,6 +521,11 @@ async fn recovery_runner_writes_a_closed_race_window_in_its_next_survey() {
         host.take_audited().is_empty(),
         "the raced step writes nothing itself"
     );
+    // A survey whose turn fails before its closure keeps the row queued. The
+    // step's admission turn comes first.
+    host.fail_debt_preparations(1, 1);
+    idle(runner.step().await);
+    assert!(host.take_audited().is_empty());
     runner.step().await;
     let rows = host
         .take_audited()
@@ -541,6 +547,60 @@ async fn recovery_runner_writes_a_closed_race_window_in_its_next_survey() {
             )] if *group == GROUP_ID.to_vec()
                 && *obligation_id == tag
                 && *window_secs >= RECOVERY_RUNNER_RACED_WINDOW_SECS
+        ),
+        "{rows:?}"
+    );
+}
+
+/// A slice staged after its coverage mark went stale still commits its
+/// events: coverage is not recorded, but the fetch row counts what it kept.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovery_runner_counts_events_staged_under_a_stale_mark() {
+    let account = account();
+    let clock = Clock::new();
+    let t0 = clock.now();
+    let route = group(1);
+    let floor = t0 - HOUR;
+    let events = every([1; 32], floor, t0, 10 * 60);
+    let total = events.len() as u64;
+    let relay = ModelRelay::new(RELAY, caps(500, true))
+        .with_events(events)
+        .build();
+    let host = TestHost::new(&account, &clock, vec![grouped(&route, &[RELAY])], &[&relay]);
+    account.goal(&route, floor);
+    host.tails.stand(&route, RELAY, t0);
+    let (mut runner, _handle) = runner(&host, test_policy());
+
+    relay.gate.hold_from(0);
+    let (outcome, ()) = tokio::join!(async { ran(runner.step().await).outcome }, async {
+        wait_until("a held request", WAIT, || relay.gate.waiting() == 1).await;
+        // Other routes' un-covers, each its own generation, push the log past
+        // its row bound, so it no longer reaches the quantum's mark.
+        let others = (0..5_000u32)
+            .map(|n| group(2 + u8::try_from(n % 200).unwrap()))
+            .collect::<Vec<_>>();
+        for chunk in others.chunks(64) {
+            account
+                .app
+                .uncover_recovery_coverage(chunk, 10, storage_sqlite::CopyFloorReason::Loss)
+                .unwrap();
+        }
+        relay.gate.open();
+    });
+    assert_eq!(outcome, Outcome::Unanswered, "a stale mark proves nothing");
+    let rows = fetched(&host);
+    assert!(
+        matches!(
+            rows.as_slice(),
+            [(
+                _,
+                AuditEventKind::RecoveryRunnerFetched {
+                    newly_covered_secs: 0,
+                    events_fetched,
+                    events_staged,
+                    ..
+                }
+            )] if *events_fetched == total && *events_staged == total
         ),
         "{rows:?}"
     );

@@ -215,6 +215,8 @@ struct StageSink<'a, H> {
     plan: &'a SweepPlan,
     meter: &'a Meter,
     newly_covered_seconds: u64,
+    /// Events the relay returned, staged or not, for the audit.
+    fetched_events: u64,
     staged_events: u64,
     stop: Option<SinkStop>,
 }
@@ -231,6 +233,7 @@ impl<H: RunnerHost> SweepSink for StageSink<'_, H> {
         } else {
             self.meter.bytes.swap(0, Ordering::Relaxed)
         };
+        self.fetched_events = self.fetched_events.saturating_add(events.len() as u64);
         let Some(deliveries) = route_events(self.host, &self.plan.key.relay, events).await else {
             // Nothing was written: settlement charges these bytes instead.
             self.meter.bytes.fetch_add(fetched_bytes, Ordering::Relaxed);
@@ -253,9 +256,12 @@ impl<H: RunnerHost> SweepSink for StageSink<'_, H> {
                 super::log_failure("stage", error);
                 SinkStop::Local
             }
-            // The transaction committed, bytes included.
-            Some(Ok(None)) => SinkStop::StaleMark,
-            Some(Ok(Some((newly, staged)))) => {
+            // The transaction committed, bytes and events included.
+            Some(Ok((None, staged))) => {
+                self.staged_events = self.staged_events.saturating_add(staged);
+                SinkStop::StaleMark
+            }
+            Some(Ok((Some(newly), staged))) => {
                 self.newly_covered_seconds = self.newly_covered_seconds.saturating_add(newly);
                 self.staged_events = self.staged_events.saturating_add(staged);
                 return Ok(());
@@ -271,8 +277,8 @@ impl<H: RunnerHost> SweepSink for StageSink<'_, H> {
 }
 
 /// Stage one proven slice and return the seconds it newly covered on its
-/// (route, relay) and the events it newly staged, or `None` when the mark is
-/// too old to record it.
+/// (route, relay), `None` when the mark is too old to record the coverage,
+/// and the events it newly staged, which stay staged either way.
 fn stage(
     turn: &WorkerTurn<'_>,
     key: &UnitKey,
@@ -280,7 +286,7 @@ fn stage(
     fetched_bytes: u64,
     range: RecoveryCoverageRange,
     mark: RecoveryCoverageMark,
-) -> StorageResult<Option<(u64, u64)>> {
+) -> StorageResult<(Option<u64>, u64)> {
     let before = uncovered_seconds(turn.app, key, range)?;
     let staged = turn.app.stage_recovery_slice(
         &RecoveryStagedSlice {
@@ -294,11 +300,12 @@ fn stage(
         },
         turn.now,
     )?;
+    let events = staged.staged as u64;
     if !staged.covered {
-        return Ok(None);
+        return Ok((None, events));
     }
     let after = uncovered_seconds(turn.app, key, range)?;
-    Ok(Some((before.saturating_sub(after), staged.staged as u64)))
+    Ok((Some(before.saturating_sub(after)), events))
 }
 
 /// Seconds of `range` the ledger does not cover on the unit's relay.
@@ -371,6 +378,7 @@ pub(super) async fn run<H: RunnerHost>(
         plan,
         meter: &meter,
         newly_covered_seconds: 0,
+        fetched_events: 0,
         staged_events: 0,
         stop: None,
     };
@@ -395,7 +403,6 @@ pub(super) async fn run<H: RunnerHost>(
         .await;
         report.requests = report.requests.saturating_add(swept.stats.requests);
         report.answers = report.answers.saturating_add(swept.stats.answers);
-        report.events_fetched = report.events_fetched.saturating_add(swept.stats.events);
         for slice in &swept.covered {
             report.proved_seconds = report
                 .proved_seconds
@@ -417,6 +424,7 @@ pub(super) async fn run<H: RunnerHost>(
         .bytes
         .fetch_add(relay.relay.take_fetched_bytes(), Ordering::Relaxed);
     report.newly_covered_seconds = sink.newly_covered_seconds;
+    report.events_fetched = sink.fetched_events;
     report.events_staged = sink.staged_events;
     report.stop = sink.stop;
     report.rate_limited = meter.rate_limited.into_inner();

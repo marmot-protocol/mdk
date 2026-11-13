@@ -1004,6 +1004,9 @@ struct TestHost {
     caps_unknown: AtomicBool,
     /// Worker turns still to fail, against `closed`.
     failing_turns: AtomicUsize,
+    /// Debt turns to let through, then debt turns whose preparation fails
+    /// against `closed` before their closure runs.
+    failing_preparations: Mutex<(usize, usize)>,
     closed: OnceLock<Account>,
     /// The relay pool's connection generations, by relay.
     connections: watch::Sender<BTreeMap<String, u64>>,
@@ -1082,6 +1085,7 @@ impl TestHost {
             caps_latency: Mutex::new(Duration::ZERO),
             caps_unknown: AtomicBool::new(false),
             failing_turns: AtomicUsize::new(0),
+            failing_preparations: Mutex::default(),
             closed: OnceLock::new(),
             connections: watch::channel(BTreeMap::new()).0,
             audited: Mutex::default(),
@@ -1149,6 +1153,18 @@ impl TestHost {
         });
         self.failing_turns.store(turns, Ordering::SeqCst);
     }
+
+    /// After `skip` debt turns, the next `turns` fail in their preparation,
+    /// as the account host's does when a write before the turn's closure
+    /// fails.
+    fn fail_debt_preparations(&self, skip: usize, turns: usize) {
+        self.closed.get_or_init(|| {
+            let closed = account();
+            closed._storage.close().unwrap();
+            closed
+        });
+        *self.failing_preparations.lock().unwrap() = (skip, turns);
+    }
 }
 
 #[async_trait]
@@ -1183,7 +1199,26 @@ impl RunnerHost for TestHost {
         T: Send + 'static,
     {
         let now = self.clock.now();
-        if let Err(error) = self.app.arm_due_recovery_probes(now) {
+        let failing = {
+            let mut failing = self.failing_preparations.lock().unwrap();
+            match &mut *failing {
+                (0, 0) => false,
+                (0, turns) => {
+                    *turns -= 1;
+                    true
+                }
+                (skip, _) => {
+                    *skip -= 1;
+                    false
+                }
+            }
+        };
+        let app = if failing {
+            &self.closed.get().expect("a closed database").app
+        } else {
+            &self.app
+        };
+        if let Err(error) = app.arm_due_recovery_probes(now) {
             return Some(Err(error));
         }
         let tails: Box<dyn LiveTailRead> = match &self.client {
