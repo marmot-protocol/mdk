@@ -475,6 +475,8 @@ pub enum TimelineUpdateTrigger {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum TimelineRemoveReason {
     Invalidated,
+    /// The user removed an own send that reached no one: discarded it, or
+    /// deleted it while it was failed.
     Cleared,
     Pruned,
     NoLongerMatchesQuery,
@@ -541,6 +543,9 @@ struct TimelineRow {
     deleted_by_message_id_hex: Option<String>,
     invalidation_status: Option<String>,
     recipient_confirmed: bool,
+    /// A deletion cleared another account's reaction from the row. The
+    /// reaction still proves that account received the row.
+    deleted_peer_reaction: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -762,6 +767,8 @@ impl SqliteAppStorage {
             affected_message_ids.extend(existing_affected_message_ids.iter().cloned());
             let confirmed_before =
                 recipient_confirmed_ids_tx(&conn, &event.group_id_hex, &affected_message_ids)?;
+            let materialized_before =
+                materialized_timeline_ids_tx(&conn, &event.group_id_hex, &affected_message_ids)?;
             conn.execute_cached(
                 "INSERT INTO app_events (
                     group_id_hex, message_id_hex, source_message_id_hex, source_epoch, direction, sender,
@@ -892,6 +899,16 @@ impl SqliteAppStorage {
                 &confirmed_before,
                 &event.message_id_hex,
                 &event.tags,
+            );
+            // A row can leave the timeline here: deleting a failed send drops it.
+            changes.extend(
+                materialized_before
+                    .into_iter()
+                    .filter(|id| !messages.iter().any(|message| &message.message_id_hex == id))
+                    .map(|message_id_hex| TimelineMessageChange::Remove {
+                        message_id_hex,
+                        reason: TimelineRemoveReason::Cleared,
+                    }),
             );
             Ok(TimelineProjectionUpdate {
                 group_id_hex: event.group_id_hex.clone(),
@@ -1765,6 +1782,7 @@ pub(crate) fn rebuild_message_timeline_for_group_tx(
         let receipt_kept = kept_receipts.contains(&row.message_id_hex);
         settle_recipient_confirmed_send(row, receipt_kept);
     }
+    rows.retain(|row| !is_deleted_failed_send(row));
     tx.execute_cached(
         "DELETE FROM message_timeline WHERE group_id_hex = ?1",
         params![group_id_hex],
@@ -1845,6 +1863,81 @@ pub(crate) fn secure_prune_expired_app_events_tx(
         local_account_id_hex,
         mention_classifier,
     )
+}
+
+/// Prune body for [`crate::SqliteAppStorage::discard_failed_send`]: drop one
+/// own send that reached no one, as retention drops an expired message, and
+/// report the rows that changed. `Ok(None)` when the row is not such a send
+/// (delivered, still pending, a peer confirmed it, or gone), and nothing is
+/// touched. The caller sets `secure_delete` as for the retention prunes.
+pub(crate) fn discard_failed_send_tx(
+    tx: &Connection,
+    group_id_hex: &str,
+    message_id_hex: &str,
+    local_account_id_hex: &str,
+    mention_classifier: &crate::app::chat_list::MentionClassifier<'_>,
+) -> StorageResult<Option<(SecurePruneAppEventsResult, TimelineProjectionUpdate)>> {
+    // The timeline row carries the verdict a host shows: a peer's reaction
+    // clears `local_publish_failed` there while `app_events` keeps it.
+    let event = tx
+        .query_row_cached(
+            "SELECT source.message_id_hex, source.kind, source.source_epoch, source.tags_json
+             FROM message_timeline AS timeline
+             JOIN app_events AS source
+               ON source.group_id_hex = timeline.group_id_hex
+              AND source.message_id_hex = timeline.message_id_hex
+             WHERE timeline.group_id_hex = ?1
+               AND timeline.message_id_hex = ?2
+               AND timeline.direction = 'sent'
+               AND timeline.source_message_id_hex IS NULL
+               AND timeline.invalidation_status = ?3",
+            params![group_id_hex, message_id_hex, LOCAL_PUBLISH_FAILED_REASON],
+            pruned_app_event_from_row,
+        )
+        .optional()
+        .storage()?;
+    let Some(event) = event else {
+        return Ok(None);
+    };
+    // Unlike a retention prune, discard reports a live update, so loaded
+    // replies quoting the send learn their preview changed.
+    let mut affected_message_ids = affected_timeline_message_ids_for_parts_tx(
+        tx,
+        group_id_hex,
+        &event.message_id_hex,
+        event.kind,
+        &event.tags,
+    )?;
+    affected_message_ids.insert(event.message_id_hex.clone());
+    let before = timeline_records_by_ids_tx(tx, group_id_hex, affected_message_ids.clone())?;
+    let outcome = secure_prune_selected_app_events_tx(
+        tx,
+        group_id_hex,
+        vec![event.clone()],
+        local_account_id_hex,
+        mention_classifier,
+    )?;
+    let messages = timeline_records_by_ids_tx(tx, group_id_hex, affected_message_ids)?;
+    let mut changes = timeline_changes_for_invalidation(
+        &event.message_id_hex,
+        event.kind,
+        &event.tags,
+        &before,
+        &messages,
+    );
+    for change in &mut changes {
+        if let TimelineMessageChange::Remove { reason, .. } = change {
+            *reason = TimelineRemoveReason::Cleared;
+        }
+    }
+    Ok(Some((
+        outcome,
+        TimelineProjectionUpdate {
+            group_id_hex: group_id_hex.to_owned(),
+            messages,
+            changes,
+        },
+    )))
 }
 
 fn secure_prune_selected_app_events_tx(
@@ -2345,7 +2438,23 @@ fn project_single_message_timeline_tx(
     apply_targeted_modifiers_tx(tx, &mut row)?;
     let receipt_kept = recipient_receipt_kept_tx(tx, group_id_hex, message_id_hex)?;
     settle_recipient_confirmed_send(&mut row, receipt_kept);
+    if is_deleted_failed_send(&row) {
+        return Ok(None);
+    }
     Ok(Some((row, stream_start)))
+}
+
+/// An own send that reached no one and that the user then deleted. It has no
+/// timeline row: nobody else holds the message, so a "deleted" placeholder
+/// would stand for nothing, and its failed state would offer to retry a
+/// message the user removed. The source row stays, like every invalidated
+/// record. A send a peer reacted to ([`settle_recipient_confirmed_send`]) is
+/// delivered and keeps its placeholder.
+fn is_deleted_failed_send(row: &TimelineRow) -> bool {
+    row.deleted
+        && row.direction == "sent"
+        && row.source_message_id_hex.is_none()
+        && row.invalidation_status.as_deref() == Some(LOCAL_PUBLISH_FAILED_REASON)
 }
 
 /// Mirror a REACTION/DELETE/EDIT event's `EVENT_REF_TAG` ("e") targets into the
@@ -2493,6 +2602,7 @@ fn apply_message_removals_tx(tx: &Connection, row: &mut TimelineRow) -> StorageR
         row.edit = None;
         row.media = None;
         row.agent_text_stream = None;
+        row.deleted_peer_reaction |= peer_reacted(row);
         row.reactions = TimelineReactionSummary::default();
     }
     Ok(())
@@ -4216,6 +4326,7 @@ fn project_group_events(
             row.edit = None;
             row.media = None;
             row.agent_text_stream = None;
+            row.deleted_peer_reaction |= peer_reacted(row);
             row.reactions = TimelineReactionSummary::default();
         }
     }
@@ -4257,6 +4368,29 @@ fn failed_unaccepted_send_tx(
 /// The rows among `message_ids` whose projection is recipient-confirmed, read
 /// before a write so [`mark_recipient_confirmation_changes`] can tell which
 /// rows the write confirmed or unconfirmed.
+/// The ids among `message_ids` that have a timeline row.
+fn materialized_timeline_ids_tx(
+    conn: &Connection,
+    group_id_hex: &str,
+    message_ids: &BTreeSet<String>,
+) -> StorageResult<BTreeSet<String>> {
+    let mut stmt = conn
+        .prepare_cached(
+            "SELECT 1 FROM message_timeline WHERE group_id_hex = ?1 AND message_id_hex = ?2",
+        )
+        .storage()?;
+    let mut present = BTreeSet::new();
+    for message_id_hex in message_ids {
+        if stmt
+            .exists(params![group_id_hex, message_id_hex])
+            .storage()?
+        {
+            present.insert(message_id_hex.clone());
+        }
+    }
+    Ok(present)
+}
+
 fn recipient_confirmed_ids_tx(
     conn: &Connection,
     group_id_hex: &str,
@@ -4345,25 +4479,30 @@ fn mark_recipient_confirmation_changes(
 /// Only a failed send with no relay acceptance settles: a pending send keeps
 /// its pending state until its own publish settles, and a row a relay accepted
 /// keeps whatever verdict it has. Runs after modifiers apply, so a reaction its
-/// sender deleted, an invalidated reaction and a deleted send never count.
+/// sender deleted and an invalidated reaction never count. A deletion clears
+/// the row's reactions but keeps whether a peer's was among them: a reaction
+/// proves receipt whenever it arrived, so a deleted send it names is delivered.
 /// Convergence withdrawals (`LosingBranch` and the rest) stay as they are: a
 /// peer reacting does not make non-canonical history canonical. A receipt
 /// retention kept after pruning the reaction (`receipt_kept`) counts as the
 /// reaction did.
 fn settle_recipient_confirmed_send(row: &mut TimelineRow, receipt_kept: bool) {
     let failed_unaccepted_send = row.direction == "sent"
-        && !row.deleted
         && row.source_message_id_hex.is_none()
         && row.invalidation_status.as_deref() == Some(LOCAL_PUBLISH_FAILED_REASON);
-    let peer_reacted = row
-        .reactions
-        .user_reactions
-        .iter()
-        .any(|reaction| reaction.sender != row.sender);
-    if failed_unaccepted_send && (peer_reacted || receipt_kept) {
+    let confirmed = peer_reacted(row) || row.deleted_peer_reaction || receipt_kept;
+    if failed_unaccepted_send && confirmed {
         row.invalidation_status = None;
         row.recipient_confirmed = true;
     }
+}
+
+/// Whether another account's reaction is on the row.
+fn peer_reacted(row: &TimelineRow) -> bool {
+    row.reactions
+        .user_reactions
+        .iter()
+        .any(|reaction| reaction.sender != row.sender)
 }
 
 /// Whether retention kept this send's receipt after pruning the peer reaction
@@ -4469,6 +4608,7 @@ fn timeline_row_from_chat(event: &RawAppEvent) -> TimelineRow {
         deleted_by_message_id_hex: None,
         invalidation_status: None,
         recipient_confirmed: false,
+        deleted_peer_reaction: false,
     }
 }
 
@@ -4495,6 +4635,7 @@ fn timeline_row_from_app_event(event: &RawAppEvent) -> TimelineRow {
         deleted_by_message_id_hex: None,
         invalidation_status: None,
         recipient_confirmed: false,
+        deleted_peer_reaction: false,
     }
 }
 
@@ -4532,6 +4673,7 @@ fn timeline_row_from_stream_start(event: &RawAppEvent) -> TimelineRow {
         deleted_by_message_id_hex: None,
         invalidation_status: None,
         recipient_confirmed: false,
+        deleted_peer_reaction: false,
     }
 }
 

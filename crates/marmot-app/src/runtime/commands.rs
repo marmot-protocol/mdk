@@ -14,7 +14,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use super::account_worker::GroupCreationRequest;
 use super::{
-    AccountManager, AccountWorkerCommand, ReadClass, account_worker_response,
+    AccountManager, AccountWorkerCommand, Emit, ReadClass, Unpublished, account_worker_response,
     group_contributes_co_members, local_account_worker_response,
     long_account_worker_catch_up_response, long_account_worker_response,
     publish_app_runtime_group_state_updated,
@@ -1073,6 +1073,7 @@ impl AccountManager {
                 .forget_group_local(group_id, cgka_traits::Timestamp(crate::unix_now_seconds()))?;
             if changed {
                 publish_app_runtime_group_state_updated(
+                    Emit::Unpublished(Unpublished::NoClient),
                     &self.events,
                     &account.account_id_hex,
                     &account.label,
@@ -1108,6 +1109,7 @@ impl AccountManager {
                 .delete_group_local_data(&account.label, &group_id_hex)?;
             if deleted {
                 publish_app_runtime_group_state_updated(
+                    Emit::Unpublished(Unpublished::NoClient),
                     &self.events,
                     &account.account_id_hex,
                     &account.label,
@@ -2553,6 +2555,25 @@ impl AccountManager {
         command
             .send(AccountWorkerCommand::SecureDeleteExpiredPlaintext {
                 group_id: group_id.clone(),
+                respond,
+            })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        account_worker_response(response).await
+    }
+
+    pub(crate) async fn discard_failed_send(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+        message_id_hex: &str,
+    ) -> Result<crate::DiscardFailedSendResult, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::DiscardFailedSend {
+                group_id: group_id.clone(),
+                message_id_hex: message_id_hex.to_owned(),
                 respond,
             })
             .await

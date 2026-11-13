@@ -3097,6 +3097,46 @@ async fn freshly_generated_key_package_is_durably_owned_before_publication() {
     );
 }
 
+/// The owned list says how long it holds while nothing writes (mdk#3273): a
+/// fresh KeyPackage leaves it at its `not_after`, judged at one clock reading
+/// the list holds from, and a stored bundle that does not decode is
+/// reported, so a caller keeping the list reads it again.
+#[tokio::test]
+async fn the_owned_key_package_list_reports_how_long_it_holds() {
+    let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
+    let mut engine = build_profile_client_on_storage(
+        b"owned-validity",
+        storage.clone(),
+        ProtocolProfile::Current,
+    );
+    let generated = engine.fresh_key_package().await.unwrap();
+    let not_after = cgka_engine::key_package::key_package_metadata(&generated)
+        .unwrap()
+        .not_after;
+    let before = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    let owned = engine.durably_owned_key_packages_with_validity().unwrap();
+    assert_eq!(owned.key_packages, vec![generated.clone()]);
+    assert_eq!(owned.changes_at, Some(cgka_traits::Timestamp(not_after)));
+    assert!(owned.checked_at.0 >= before);
+    assert!(!owned.skipped_undecodable);
+    assert!(!owned.clock_moved);
+
+    storage
+        .app_storage()
+        .execute_batch_for_test(
+            "INSERT INTO openmls_values (provider_version, label, storage_key, value)
+             VALUES (1, CAST('KeyPackage' AS BLOB), x'00ff', x'00')",
+        )
+        .unwrap();
+    let owned = engine.durably_owned_key_packages_with_validity().unwrap();
+    assert_eq!(owned.key_packages, vec![generated]);
+    assert!(owned.skipped_undecodable);
+}
+
 #[tokio::test]
 async fn strict_cutover_retires_all_legacy_key_package_bundles_idempotently() {
     let storage = SqliteAccountStorage::in_memory_for_test().unwrap();

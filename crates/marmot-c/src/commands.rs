@@ -87,7 +87,8 @@ use crate::types::media::{
     MarmotMediaUploadRequest, MarmotMediaUploadResult,
 };
 use crate::types::message::{
-    MarmotAppMessageRecordList, MarmotRetentionSweepReport, MarmotSecureDeleteExpiredResult,
+    MarmotAppMessageRecordList, MarmotDiscardFailedSendResult, MarmotRetentionSweepReport,
+    MarmotSecureDeleteExpiredResult,
 };
 use crate::types::notification::{
     MarmotBackgroundNotificationCollection, MarmotNotificationSettings,
@@ -1127,6 +1128,12 @@ c_cmd! {
     /// `MARMOT_STATUS_INVALID_EDIT_TARGET` unless the target is an available
     /// chat message this account sent. Free with `marmot_send_summary_free`.
     async fn marmot_edit_message(account_ref: str, group_id_hex: str, target_message_id: str, content: str) -> rec(MarmotSendSummary) = edit_message;
+
+    /// Remove a failed own send from this device without publishing
+    /// anything; use it instead of `marmot_delete_message` for a row whose
+    /// invalidation status is `local_publish_failed`. Free with
+    /// `marmot_discard_failed_send_result_free`.
+    async fn marmot_discard_failed_send(account_ref: str, group_id_hex: str, message_id_hex: str) -> rec(MarmotDiscardFailedSendResult) = discard_failed_send;
 
     /// Securely delete this group's expired disappearing messages now.
     /// Free with `marmot_secure_delete_expired_result_free`.

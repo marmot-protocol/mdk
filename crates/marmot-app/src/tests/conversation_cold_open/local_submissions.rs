@@ -873,6 +873,7 @@ async fn completion_write_failure_does_not_stall_later_submissions() {
         .app
         .sqlcipher_key("alice", &keys, &path, SqlcipherDatabaseKind::Session)
         .unwrap();
+    storage_sqlite::expect_uncounted_writes_for_test(&path);
     let connection = rusqlite::Connection::open(path).unwrap();
     storage_sqlite::open_hardened_sqlcipher(
         &connection,

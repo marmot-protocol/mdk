@@ -88,6 +88,22 @@ impl SqliteOpenMlsStorage {
     }
 }
 
+/// The label of a stored KeyPackage bundle, one of the rows the owned
+/// KeyPackage list reads (mdk#3273).
+pub(crate) fn key_package_label() -> &'static [u8] {
+    labels::KEY_PACKAGE_LABEL.as_bytes()
+}
+
+/// Labels of the per-message ratchet: rows an application message or a
+/// secret export advances without changing the group's commit-derived state
+/// (mdk#3273).
+pub(crate) fn ratchet_labels() -> [&'static [u8]; 2] {
+    [
+        labels::MESSAGE_SECRETS_LABEL.as_bytes(),
+        labels::APPLICATION_EXPORT_TREE_LABEL.as_bytes(),
+    ]
+}
+
 pub(crate) fn mls_group_key(group_id: &MarmotGroupId) -> StorageResult<Vec<u8>> {
     let mls_group_id = openmls::group::GroupId::from_slice(group_id.as_slice());
     SqliteOpenMlsStorage::group_key(&mls_group_id)
