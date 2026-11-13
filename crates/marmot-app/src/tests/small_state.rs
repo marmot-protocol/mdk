@@ -193,6 +193,7 @@ async fn siblings_archives_are_saved_together_or_not_at_all() {
     let key = app
         .sqlcipher_key("alice", &keys, &path, crate::SqlcipherDatabaseKind::Session)
         .unwrap();
+    storage_sqlite::expect_uncounted_writes_for_test(&path);
     let connection = rusqlite::Connection::open(path).unwrap();
     storage_sqlite::open_hardened_sqlcipher(
         &connection,

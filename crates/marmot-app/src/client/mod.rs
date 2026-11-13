@@ -31,7 +31,9 @@ use marmot_session::{
 };
 use rand::RngCore;
 use rand::rngs::OsRng;
-use storage_sqlite::{PreparedGroupImageUploadRecord, PreparedGroupImageUploadState};
+use storage_sqlite::{
+    PreparedGroupImageUploadRecord, PreparedGroupImageUploadState, PreparedGroupImageUploadStatus,
+};
 use transport_nostr_peeler::MarmotNostrSigner;
 use zeroize::Zeroizing;
 
@@ -101,6 +103,7 @@ pub(crate) mod linked_device_chats;
 mod private_key_packages;
 mod projection;
 mod push;
+pub(crate) mod read_state;
 mod receipts;
 pub(crate) mod recovery;
 mod recovery_coverage;
@@ -690,19 +693,19 @@ where
 }
 
 fn prepared_group_image_status(
-    record: &PreparedGroupImageUploadRecord,
+    status: &PreparedGroupImageUploadStatus,
 ) -> AppPreparedGroupImageUpload {
     AppPreparedGroupImageUpload {
-        upload_id: record.upload_id.clone(),
-        state: match record.state {
+        upload_id: status.upload_id.clone(),
+        state: match status.state {
             PreparedGroupImageUploadState::Staged => AppPreparedGroupImageUploadState::Staged,
             PreparedGroupImageUploadState::Uploaded => AppPreparedGroupImageUploadState::Uploaded,
             PreparedGroupImageUploadState::Failed => AppPreparedGroupImageUploadState::Failed,
             PreparedGroupImageUploadState::Consumed => AppPreparedGroupImageUploadState::Consumed,
         },
-        attempt_count: record.attempt_count,
-        last_error_kind: record.last_error_kind.clone(),
-        group_id_hex: record.group_id_hex.clone(),
+        attempt_count: status.attempt_count,
+        last_error_kind: status.last_error_kind.clone(),
+        group_id_hex: status.group_id_hex.clone(),
     }
 }
 
@@ -774,6 +777,9 @@ pub struct AppClient {
     pub(crate) conversation_captures: Vec<std::sync::Weak<crate::runtime::SendCapture>>,
     pub(crate) runtime_telemetry: Option<PerformanceRecorder>,
     pub(crate) send_telemetry: Option<PerformanceRecorder>,
+    /// Publishes A, the account's read state (mdk#3273), on the account
+    /// worker; `None` on a directly owned client.
+    pub(crate) read_state: Option<Box<read_state::ReadStateSlot>>,
     pub(crate) app: MarmotApp,
     pub(crate) runtime: AppRuntime,
     /// This client's own clone of the engine's connection, for storage-only
@@ -1502,6 +1508,14 @@ impl AppClient {
         Ok(self.runtime.durably_owned_key_packages()?)
     }
 
+    /// [`Self::durably_owned_key_packages`] with how long the list holds while
+    /// nothing writes (mdk#3273).
+    pub(crate) fn durably_owned_key_packages_with_validity(
+        &self,
+    ) -> Result<marmot_session::OwnedKeyPackages, AppError> {
+        Ok(self.runtime.durably_owned_key_packages_with_validity()?)
+    }
+
     pub fn schedule_manual_self_update(&mut self, group_id: &GroupId) -> Result<String, AppError> {
         self.ensure_group(group_id)?;
         Ok(hex::encode(
@@ -1910,7 +1924,7 @@ impl AppClient {
             .account_storage(&self.state.label)?
             .app_storage()
             .stage_prepared_group_image_upload(&record)?;
-        Ok(prepared_group_image_status(&record))
+        Ok(prepared_group_image_status(&record.status()))
     }
 
     pub(crate) fn prepared_initial_group_image_status(
@@ -1925,7 +1939,7 @@ impl AppClient {
             .ok_or_else(|| {
                 AppError::InvalidEncryptedMedia("prepared group image upload was not found".into())
             })?;
-        Ok(prepared_group_image_status(&record))
+        Ok(prepared_group_image_status(&record.status()))
     }
 
     pub(crate) fn prepared_initial_group_images(
@@ -1935,7 +1949,7 @@ impl AppClient {
             .app
             .account_storage(&self.state.label)?
             .app_storage()
-            .list_prepared_group_image_uploads()?
+            .list_prepared_group_image_upload_statuses()?
             .iter()
             .map(prepared_group_image_status)
             .collect())
@@ -1960,7 +1974,7 @@ impl AppClient {
             PreparedGroupImageUploadState::Uploaded | PreparedGroupImageUploadState::Consumed
         ) {
             return Ok(PreparedGroupImageUploadStart::Complete(
-                prepared_group_image_status(&record),
+                prepared_group_image_status(&record.status()),
             ));
         }
         let input =
@@ -2008,7 +2022,7 @@ impl AppClient {
             .ok_or_else(|| {
                 AppError::InvalidEncryptedMedia("prepared group image upload was not found".into())
             })?;
-        Ok(prepared_group_image_status(&record))
+        Ok(prepared_group_image_status(&record.status()))
     }
 
     pub(crate) fn reusable_direct_group(
@@ -2992,6 +3006,9 @@ impl AppClient {
         &self,
         telemetry: Option<&marmot_observability::PerformanceRecorder>,
     ) -> Result<GroupReadSnapshot, AppError> {
+        // The snapshot answers reads while a long unit holds the client, so
+        // it must not lead A: publish what the snapshot is about to describe.
+        self.publish_read_state();
         if cfg!(feature = "test-policy-overrides")
             && self.app.config.dev_force_group_read_snapshot_failure
         {
@@ -6705,18 +6722,34 @@ impl AppClient {
         group_id: &GroupId,
     ) -> Result<Option<crate::GroupCommitDelivery>, AppError> {
         self.ensure_group(group_id)?;
-        Ok(self
-            .runtime
-            .undelivered_commit(group_id)?
-            .map(|undelivered| crate::GroupCommitDelivery {
-                owed_relay_urls: undelivered
-                    .owed_endpoints
-                    .into_iter()
-                    .map(|endpoint| endpoint.0)
-                    .collect(),
-                relay_count: u32::try_from(undelivered.endpoint_count).unwrap_or(u32::MAX),
-                since: undelivered.since.0,
-            }))
+        Ok(self.group_commit_delivery_until(group_id, None)?.0)
+    }
+
+    /// [`Self::group_commit_delivery`] past its mirror gate, and the
+    /// wall-clock window its answer holds in without a write. `rows`, when
+    /// given, stands in for the account-wide loads.
+    fn group_commit_delivery_until(
+        &self,
+        group_id: &GroupId,
+        rows: Option<&marmot_session::GroupMaintenanceRows>,
+    ) -> Result<
+        (
+            Option<crate::GroupCommitDelivery>,
+            marmot_session::WallClockWindow,
+        ),
+        AppError,
+    > {
+        let (undelivered, window) = self.runtime.undelivered_commit_until_in(group_id, rows)?;
+        let delivery = undelivered.map(|undelivered| crate::GroupCommitDelivery {
+            owed_relay_urls: undelivered
+                .owed_endpoints
+                .into_iter()
+                .map(|endpoint| endpoint.0)
+                .collect(),
+            relay_count: u32::try_from(undelivered.endpoint_count).unwrap_or(u32::MAX),
+            since: undelivered.since.0,
+        });
+        Ok((delivery, window))
     }
 
     /// When unresolved epoch-gap recovery first covered this group's `epoch`.

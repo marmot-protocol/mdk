@@ -1147,6 +1147,30 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   re-exports and its `_for_test` hooks, which `marmot-observability`'s `test-support` feature (enabled here as a
   dev-dependency only) builds.
 
+- Publish the account read state A (`src/client/read_state.rs`, mdk#3273) before anything leaves the account
+  worker. Reply through `reply` or `respond_diagnosed` and send host events through `emit` with
+  `Emit::Quiescent`; both publish first. An exit that cannot publish names why: `Emit::Unpublished`,
+  `answer_off_quiescent` or `send_from_snapshot`; capturing a group-read snapshot publishes A first.
+  `read_state_tests::every_reply_and_event_leaves_the_worker_through_a_named_exit` fails on a new raw send.
+  Every account answer is rebuilt at every publish except the owned-KeyPackage list. That list and each group
+  entry are reused only while the typed validity built with them holds, and reuse checks nothing else. A group
+  entry (`EntryValidity`) holds while its change generation, mirror record and maintenance pause are unchanged,
+  the clock is inside its commit-delivery window (from the reading that answer was computed at to its next
+  deadline), and no answer failed on something other than a fact about the group (`settled_failure`) nor did the
+  device-group check that hides it fail. The KeyPackage list (`KeyPackagesValidity`) holds while the file's
+  KeyPackage write count (`key_package_write_count`: stored bundles and issued private KeyPackages only, so a send
+  keeps it) and the engine's protocol profile are the ones read before the build, the system clock is inside the
+  window from the one reading its lifetimes are judged at to its next lifetime bound (a listed `not_after` or a
+  pending bundle's `not_before`), and the read fully succeeded, with no bundle skipped as undecodable and no lifetime
+  check that disagrees with that reading. `ReadState::valid_until` is the earliest window end;
+  a change of it alone publishes a version. A new input of a reused answer must be in its validity or move one of
+  its counts (a new table needs a `storage-sqlite` `cross/group_writes.rs` trigger). In this crate's own tests,
+  every publish that changed something, and every reused KeyPackage list, is checked against today's live reads
+  (`read_state::oracle`); the only pair let through unequal is one where a terminal storage close landed between
+  the publish and the check and one side is that close's `Closed` error. The oracle runs in this crate's unit tests
+  and, through the runner's `CARGO_PKG_NAME`, its integration tests; downstream crates' tests link `test-support`
+  too (feature unification) and run without it (`oracle::enabled`). Keep its proof in this crate's suites.
+
 ## Code map (modules not covered above)
 
 - Crate root `src/`: `config.rs` (`MarmotAppConfig`, collector endpoints, attachment acquisition policy),
@@ -1189,7 +1213,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   `local_submissions.rs`,
   `agent_publisher.rs` (host-driven agent publishing), `attachment_controls.rs`, `attachment_permission.rs`
   (runtime-only network approval; never restore it from disk).
-- `src/client/`: `recovery.rs` (native replay ingress and the recovery seams), `recovery_coverage.rs` (the
+- `src/client/`: `read_state.rs` (A, the account's published read state: its publisher and the test oracle,
+  mdk#3273), `recovery.rs` (native replay ingress and the recovery seams), `recovery_coverage.rs` (the
   coverage-ledger recorder, mdk#2660), `recovery_runner.rs` (the per-account recovery
   runner, mdk#2660; `recovery_runner/host.rs` seats it on the worker or
   a direct client; `recovery_runner/post_join.rs` gives each joined copy a bounded collection on the same runner,

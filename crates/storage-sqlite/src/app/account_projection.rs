@@ -1,4 +1,4 @@
-use crate::base::connection::CachedSql;
+use crate::base::connection::{CachedSql, ConnectionGuard};
 use crate::{
     SQLITE_BIND_PARAMETER_CHUNK, SqliteAppStorage, SqliteResultExt,
     base::connection::retry_on_busy, bool_i64, i64_to_u64, i64_to_usize, u64_to_i64, unix_now_ms,
@@ -3844,13 +3844,9 @@ where
     })
 }
 
-fn checkpoint_wal_truncate_after_secure_delete(conn: &Connection) -> StorageResult<()> {
+fn checkpoint_wal_truncate_after_secure_delete(conn: &ConnectionGuard<'_>) -> StorageResult<()> {
     retry_on_busy(|| {
-        let (busy, _log_frames, _checkpointed_frames): (i64, i64, i64) = conn
-            .query_row_cached("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-            })
-            .storage()?;
+        let (busy, _log_frames, _checkpointed_frames) = conn.checkpoint_truncate().storage()?;
         if busy == 0 {
             Ok(())
         } else {

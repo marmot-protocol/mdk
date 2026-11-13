@@ -230,7 +230,12 @@ impl<T> SqliteResultExt<T> for rusqlite::Result<T> {
 /// stays in one spot and never has to be re-derived by string-parsing
 /// "database is locked".
 pub(crate) fn map_sqlite_error(error: rusqlite::Error) -> StorageError {
-    if is_busy_error(&error) {
+    sqlite_storage_error(&error)
+}
+
+/// [`map_sqlite_error`] for an error the caller keeps.
+pub(crate) fn sqlite_storage_error(error: &rusqlite::Error) -> StorageError {
+    if is_busy_error(error) {
         StorageError::Busy(error.to_string())
     } else {
         match error.sqlite_error_code() {

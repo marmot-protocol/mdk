@@ -301,6 +301,28 @@ pub(crate) fn app_component_data_of_group(
     app_component_bytes(mls_group, component_id).map(ToOwned::to_owned)
 }
 
+/// Every application-owned component entry `mls_group`'s GroupContext holds,
+/// in id order: what [`app_component_data_of_group`] answers for each id at or
+/// above [`cgka_traits::app_components::APP_OWNED_APP_COMPONENT_ID_START`].
+pub(crate) fn app_owned_component_entries_of_group(
+    mls_group: &MlsGroup,
+) -> Vec<(AppComponentId, Vec<u8>)> {
+    mls_group
+        .extensions()
+        .app_data_dictionary()
+        .map(|extension| {
+            extension
+                .dictionary()
+                .entries()
+                .filter(|entry| {
+                    entry.id() >= cgka_traits::app_components::APP_OWNED_APP_COMPONENT_ID_START
+                })
+                .map(|entry| (entry.id(), entry.data().to_vec()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// The device roster `mls_group` holds. `None` when it holds none or it
 /// cannot be read.
 pub(crate) fn device_roster_of_group(mls_group: &MlsGroup) -> Option<DeviceRosterV1> {

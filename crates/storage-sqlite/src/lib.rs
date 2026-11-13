@@ -169,7 +169,7 @@ pub use app::transport::prepared_group_image_upload::{
     ACTIVE_PREPARED_GROUP_IMAGE_UPLOAD_TTL_SECONDS,
     CONSUMED_PREPARED_GROUP_IMAGE_UPLOAD_TTL_SECONDS, MAX_ACTIVE_PREPARED_GROUP_IMAGE_UPLOADS,
     MAX_CONSUMED_PREPARED_GROUP_IMAGE_UPLOADS, PreparedGroupImageUploadRecord,
-    PreparedGroupImageUploadState,
+    PreparedGroupImageUploadState, PreparedGroupImageUploadStatus,
 };
 pub use app::transport::transport_reconciliation::{
     TRANSPORT_RECONCILIATION_MAX_ITEMS_PER_ROUTE, TRANSPORT_RECONCILIATION_RETENTION_SECS,
@@ -182,6 +182,8 @@ pub use base::connection::{
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use base::connection::{SnapshotFault, relax_storage_for_test_process};
+#[cfg(any(test, feature = "test-support"))]
+pub use cross::group_writes::expect_uncounted_writes_for_test;
 pub use cross::outbound::MessageDraftCommitObserver;
 pub use protocol::handle::SqliteAccountStorage;
 #[allow(deprecated)]
