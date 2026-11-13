@@ -1317,6 +1317,78 @@ fn rerecording_an_origin_commit_invalidated_row_keeps_its_tombstone() {
 }
 
 #[test]
+fn batch_withdrawal_triggers() {
+    for path in ["origin", "revival", "terminal"] {
+        for targets in [["a", "b"], ["b", "a"]] {
+            let app = SqliteAccountStorage::in_memory().unwrap().app_storage();
+            for (id, at) in [("a", 10), ("b", 11)] {
+                app.record_app_event(&chat(id, "alice", at, id)).unwrap();
+                app.record_app_event(&reply(&format!("reply-{id}"), "bob", id, at + 10, "quote"))
+                    .unwrap();
+            }
+            for (id, target, at) in [("first", targets[0], 12), ("second", targets[1], 13)] {
+                let mut event = delete(id, "alice", target, at);
+                event.origin_commit_id = Some("commit".to_owned());
+                if path == "terminal" {
+                    event.direction = "sent".to_owned();
+                    event.source_message_id_hex = None;
+                }
+                app.record_app_event(&event).unwrap();
+            }
+            if path == "revival" {
+                app.invalidate_app_events_by_origin_commit(
+                    "commit",
+                    BRANCH_SELECTION_WITHDRAWAL_REASON,
+                )
+                .unwrap();
+            }
+            let update = match path {
+                "origin" => app.invalidate_app_events_by_origin_commit("commit", "LosingBranch"),
+                "revival" => app.clear_branch_selection_withdrawal_by_origin_commit("commit"),
+                "terminal" => app.invalidate_pending_sent_app_events_for_group(
+                    &"11".repeat(32),
+                    LOCAL_PUBLISH_FAILED_REASON,
+                ),
+                _ => unreachable!(),
+            }
+            .unwrap()
+            .unwrap();
+            let mut changes = update
+                .changes
+                .iter()
+                .map(|change| match change {
+                    TimelineMessageChange::Upsert { message, trigger } => (
+                        message.message_id_hex.as_str(),
+                        message.deleted,
+                        trigger.clone(),
+                    ),
+                    TimelineMessageChange::Remove { .. } => panic!("{path}: unexpected removal"),
+                })
+                .collect::<Vec<_>>();
+            changes.sort_by_key(|(id, ..)| *id);
+            assert_eq!(
+                changes,
+                [
+                    (
+                        "a",
+                        path == "revival",
+                        TimelineUpdateTrigger::MessageEditedOrReprojected
+                    ),
+                    (
+                        "b",
+                        path == "revival",
+                        TimelineUpdateTrigger::MessageEditedOrReprojected
+                    ),
+                    ("reply-a", false, TimelineUpdateTrigger::ReplyPreviewChanged),
+                    ("reply-b", false, TimelineUpdateTrigger::ReplyPreviewChanged),
+                ],
+                "{path}, {targets:?}"
+            );
+        }
+    }
+}
+
+#[test]
 fn revalidating_an_origin_commit_revives_only_branch_selection_withdrawals() {
     // A convergence pass parks a losing commit and the app tombstones every
     // kind-1210 row it synthesized. A later pass holding deeper evidence

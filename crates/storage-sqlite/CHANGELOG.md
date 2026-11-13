@@ -33,6 +33,12 @@
   passed a probe, so its debt includes its park again; `pending_recovery_probes()` lists the broken units still
   waiting for one.
 
+### Fixed
+
+- Batch timeline withdrawals and branch-selection revivals attribute each changed row's trigger to an event that
+  affected it, rather than the first event in the batch. Unmatched changes use the generic reprojection trigger
+  (mdk#2843).
+
 ## 0.16.0 - 2026-11-12
 
 ### Breaking changes
