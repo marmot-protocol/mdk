@@ -15,10 +15,8 @@ use cgka_traits::group::ProtocolProfile;
 use cgka_traits::message::{MessageRecord, MessageState, StoredMessagePayload};
 use cgka_traits::storage::{StorageError, StorageProvider};
 use cgka_traits::types::{EpochId, GroupId};
-use openmls::group::MlsGroup;
 use openmls::prelude::ProtocolVersion;
 use openmls::treesync::Node;
-use openmls_rust_crypto::RustCrypto;
 use openmls_traits::storage::{CURRENT_VERSION, StorageProvider as OpenMlsStorageProvider};
 use openmls_traits::types::VerifiableCiphersuite;
 use serde::{Deserialize, Serialize};
@@ -316,18 +314,19 @@ pub struct ConformanceStructuralProgressSnapshot {
     pub terminal_unrecoverable: bool,
 }
 
-// The conformance snapshot reports stored state as it is (see clippy.toml).
+// The conformance snapshot reports the stored record as it is (see
+// clippy.toml). Its OpenMLS state loads through the engine's gate, so a group
+// whose rewind restore failed never reports its anchor's epoch.
 #[allow(clippy::disallowed_methods)]
 pub(crate) fn capture_group_snapshot<S: StorageProvider>(
-    storage: &S,
-    crypto: &RustCrypto,
+    engine: &crate::Engine<S>,
     group_id: &GroupId,
     epoch_state: &EpochState,
 ) -> Result<ConformanceGroupSnapshot, EngineError> {
+    let storage = &engine.storage;
+    let crypto = &engine.crypto;
     let mls_group_id = openmls::group::GroupId::from_slice(group_id.as_slice());
-    let mls_group = MlsGroup::load(storage.mls_storage(), &mls_group_id)
-        .map_err(|error| EngineError::Backend(format!("load conformance group: {error:?}")))?
-        .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;
+    let mls_group = engine.load_mls_group(group_id)?;
     let group_context: openmls::group::GroupContext = <S::Mls as OpenMlsStorageProvider<
         CURRENT_VERSION,
     >>::group_context(

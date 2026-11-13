@@ -89,13 +89,62 @@ impl MlsGroupCache {
 }
 
 impl<S: StorageProvider> Engine<S> {
+    /// The OpenMLS state of `group_id`, read through `mls` (the engine's
+    /// store, or the one a transaction hands its closure), for an engine path
+    /// that acts on it. `None` for a group with no OpenMLS state.
+    ///
+    /// Refused with `UnknownGroup` while the group's committing rewind window
+    /// has failed to restore (mdk#3272): until the next open its OpenMLS
+    /// state is a retained anchor's, not live state. Only that quarantine
+    /// reason is refused. Every other one keeps genuine local state, which
+    /// its repair (a hydration retry, a re-join) reads, and the data-path
+    /// gates refuse those groups where they must (mdk#3280). `clippy.toml`
+    /// bans `MlsGroup::load` in this crate, and each raw load allows the lint
+    /// with the reason it may skip this check.
+    pub(crate) fn load_mls_group_in(
+        &self,
+        mls: &S::Mls,
+        group_id: &GroupId,
+    ) -> Result<Option<MlsGroup>, EngineError> {
+        self.refuse_failed_rewind_restore(group_id)?;
+        // The gated load itself (see clippy.toml).
+        #[allow(clippy::disallowed_methods)]
+        let group = MlsGroup::load(
+            mls,
+            &openmls::group::GroupId::from_slice(group_id.as_slice()),
+        )
+        .map_err(|error| EngineError::Backend(format!("load group: {error:?}")))?;
+        Ok(group)
+    }
+
+    /// [`Self::load_mls_group_in`] through the engine's store, refusing a
+    /// group with no OpenMLS state as `UnknownGroup`.
+    pub(crate) fn load_mls_group(&self, group_id: &GroupId) -> Result<MlsGroup, EngineError> {
+        self.load_mls_group_in(self.storage.mls_storage(), group_id)?
+            .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))
+    }
+
+    /// `UnknownGroup` while `group_id`'s rewind restore has failed, whether
+    /// or not the engine has moved it into quarantine yet.
+    fn refuse_failed_rewind_restore(&self, group_id: &GroupId) -> Result<(), EngineError> {
+        if self.rewinds.failed(group_id)
+            || self.quarantined_groups.get(group_id)
+                == Some(&cgka_traits::engine::GroupHydrationQuarantineReason::RewindRestoreFailed)
+        {
+            return Err(EngineError::UnknownGroup(group_id.clone()));
+        }
+        Ok(())
+    }
+
     /// The group's `MlsGroup`: the cached object when nothing has written to
-    /// the OpenMLS store since it was stored, otherwise a fresh load. `None`
-    /// for an unknown group.
+    /// the OpenMLS store since it was stored, otherwise a fresh load through
+    /// [`Self::load_mls_group_in`]. `None` for an unknown group.
     pub(crate) fn take_mls_group(
         &self,
         group_id: &GroupId,
     ) -> Result<Option<MlsGroup>, EngineError> {
+        // A cached object is as much the group's state as a load.
+        self.refuse_failed_rewind_restore(group_id)?;
         // Sampled before the load so a write that lands during the load still
         // invalidates the object on return.
         let generation = self.storage.mls_write_generation();
@@ -117,16 +166,7 @@ impl<S: StorageProvider> Engine<S> {
                 return Ok(Some(cached.group));
             }
         }
-        let provider = crate::provider::EngineOpenMlsProvider::<S>::new(
-            &self.crypto,
-            self.storage.mls_storage(),
-        );
-        let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
-        MlsGroup::load(
-            <crate::provider::EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(&provider),
-            &mls_gid,
-        )
-        .map_err(|e| EngineError::Backend(format!("load: {e:?}")))
+        self.load_mls_group_in(self.storage.mls_storage(), group_id)
     }
 
     /// Store `group` after an operation that wrote through it and succeeded.
@@ -174,6 +214,8 @@ impl<S: StorageProvider> Engine<S> {
 }
 
 #[cfg(test)]
+// Tests load OpenMLS state directly to write through it (see clippy.toml).
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use cgka_traits::engine::{CgkaEngine, CreateGroupRequest, SendResult};
     use cgka_traits::error::EngineError;

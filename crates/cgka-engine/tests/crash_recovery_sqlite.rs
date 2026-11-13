@@ -7,7 +7,7 @@
 //! tests stop it at fixed debug-only crash points, then reopen and hydrate the
 //! database without running child destructors.
 
-// Tests read stored records directly (see the crate clippy.toml).
+// Tests read stored records and OpenMLS state directly (see the crate clippy.toml).
 #![allow(clippy::disallowed_methods)]
 
 use std::collections::BTreeSet;

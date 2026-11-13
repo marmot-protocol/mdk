@@ -5,7 +5,15 @@
 # quarantined group's raw record (open-time recovery and hydration, forget,
 # routing and retention of its input, code inside an already gated pass or
 # window) allows this lint at the site and says why.
+#
+# Engine paths load a group's OpenMLS state only through
+# `Engine::load_mls_group_in` (and `load_mls_group` / `take_mls_group` above
+# it), which refuses a group whose rewind restore failed: until the next open
+# its OpenMLS state is that anchor's too (mdk#3280). A load that may skip the
+# check (hydration, a cleanup of state its own operation made, code inside a
+# rewind window or an already gated pass) allows this lint and says why.
 disallowed-methods = [
     { path = "cgka_traits::storage::GroupStorage::get_group", reason = "read through Engine::live_group_record or Engine::stored_group_record, which refuse a quarantined group" },
     { path = "cgka_traits::storage::GroupStorage::list_group_records", reason = "a listing includes quarantined groups; filter them or read through Engine::live_group_record" },
+    { path = "openmls::group::MlsGroup::load", reason = "load through Engine::load_mls_group_in, which refuses a group whose rewind restore failed" },
 ]

@@ -2454,6 +2454,8 @@ fn capture_candidate_tip_context<S: StorageProvider>(
     let crypto = RustCrypto::default();
     let provider = EngineOpenMlsProvider::<S>::new(&crypto, storage.mls_storage());
     let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
+    // Reads the candidate tip this rewind window just replayed (see clippy.toml).
+    #[allow(clippy::disallowed_methods)]
     let Some(mls_group) = MlsGroup::load(
         <EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(&provider),
         &mls_gid,
@@ -3377,7 +3379,7 @@ fn replay_messages_for_canonicalization_result<S: StorageProvider>(
         .collect())
 }
 
-// Replay inside the pass or a rewind window writes the state it replayed (see clippy.toml).
+// Replay inside the pass or a rewind window reads and writes the record and OpenMLS state it replayed (see clippy.toml).
 #[allow(clippy::disallowed_methods)]
 fn update_group_record_from_replay<S: StorageProvider>(
     storage: &S,
@@ -3850,7 +3852,7 @@ fn project_pending_canonicalization_messages(
 /// Authenticate messages against successive source trees for probe or canonical apply.
 /// `retain_replayed_anchors` enables durable apply and per-commit presentation deltas;
 /// probes omit both while still validating the complete candidate branch.
-// Replays inside a rewind window, where the rewound record is the state being replayed (see clippy.toml).
+// Replays inside a rewind window, where the rewound record and OpenMLS state are the state being replayed (see clippy.toml).
 #[allow(clippy::disallowed_methods)]
 fn process_openmls_messages_inner<S: StorageProvider>(
     storage: &S,
@@ -4739,6 +4741,8 @@ fn read_retained_anchor_group<S: StorageProvider, T>(
     }
     let provider = EngineOpenMlsProvider::<S>::new(crypto, storage.mls_storage());
     let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
+    // Loads the retained anchor this contained window rewound to, on purpose (see clippy.toml).
+    #[allow(clippy::disallowed_methods)]
     let historical_group = MlsGroup::load(provider.storage(), &mls_gid)
         .map_err(|error| EngineError::Backend(format!("load retained anchor: {error:?}")))?
         .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;

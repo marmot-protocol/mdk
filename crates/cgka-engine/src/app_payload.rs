@@ -169,6 +169,8 @@ pub(crate) fn historical_source<S: cgka_traits::StorageProvider>(
             }
             let provider =
                 crate::provider::EngineOpenMlsProvider::<S>::new(crypto, storage.mls_storage());
+            // Loads the retained snapshot this contained window rewound to, on purpose (see clippy.toml).
+            #[allow(clippy::disallowed_methods)]
             let group = MlsGroup::load(
                 provider.storage(),
                 &openmls::group::GroupId::from_slice(request.group_id.as_slice()),

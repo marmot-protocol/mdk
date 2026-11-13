@@ -1,4 +1,4 @@
-// Tests read stored records directly (see the crate clippy.toml).
+// Tests read stored records and OpenMLS state directly (see the crate clippy.toml).
 #![allow(clippy::disallowed_methods)]
 
 use async_trait::async_trait;

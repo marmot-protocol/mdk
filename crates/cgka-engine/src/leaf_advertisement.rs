@@ -24,7 +24,6 @@ use std::collections::BTreeSet;
 
 use crate::device_tag::OwnDeviceTag;
 use crate::engine::Engine;
-use crate::provider::EngineOpenMlsProvider;
 use cgka_traits::app_components::{
     APP_COMPONENTS_COMPONENT_ID, AppComponentId, AppComponentSet, DEVICE_TAG_COMPONENT_ID,
     encode_components_list,
@@ -36,7 +35,6 @@ use openmls::extensions::{AppDataDictionaryExtension, Extension, Extensions};
 use openmls::group::MlsGroup;
 use openmls::messages::proposals::Proposal;
 use openmls::prelude::{LeafNode, LeafNodeParameters};
-use openmls_traits::OpenMlsProvider as _;
 
 /// Replacement extensions for this device's own leaf when it advertises fewer
 /// component ids than the device supports or `device_tag` is a tag it needs,
@@ -95,11 +93,7 @@ pub(crate) fn own_leaf_refresh_extensions(
 impl<S: StorageProvider> Engine<S> {
     fn load_live_mls_group(&self, group_id: &GroupId) -> Result<MlsGroup, EngineError> {
         self.ensure_group_live(group_id)?;
-        let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
-        let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
-        MlsGroup::load(provider.storage(), &mls_gid)
-            .map_err(|error| EngineError::Backend(format!("load: {error:?}")))?
-            .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))
+        self.load_mls_group(group_id)
     }
 
     /// Component ids this device supports that its own leaf in `group_id` does

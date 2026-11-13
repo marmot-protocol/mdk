@@ -32,7 +32,6 @@
 use std::collections::BTreeMap;
 
 use crate::engine::Engine;
-use crate::provider::EngineOpenMlsProvider;
 use cgka_traits::MemberId;
 use cgka_traits::app_components::{
     ACCOUNT_DEVICES_COMPONENT_ID, APP_COMPONENTS_COMPONENT_ID, AppComponentData,
@@ -45,7 +44,6 @@ use cgka_traits::storage::StorageProvider;
 use cgka_traits::types::GroupId;
 use openmls::group::MlsGroup;
 use openmls::prelude::BasicCredential;
-use openmls_traits::OpenMlsProvider as _;
 
 /// Why `self_id` cannot activate account-devices in `group` now, or `None`
 /// when it can.
@@ -141,11 +139,7 @@ impl<S: StorageProvider> Engine<S> {
         &mut self,
         group_id: GroupId,
     ) -> Result<SendResult, EngineError> {
-        let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
-        let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
-        let mls_group = MlsGroup::load(provider.storage(), &mls_gid)
-            .map_err(|error| EngineError::Backend(format!("load: {error:?}")))?
-            .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;
+        let mls_group = self.load_mls_group(&group_id)?;
         if let Some(reason) =
             account_devices_activation_refusal(&mls_group, self.identity.self_id())?
         {

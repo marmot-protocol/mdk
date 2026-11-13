@@ -22,7 +22,6 @@ use cgka_traits::storage::{
 };
 use cgka_traits::transport::EncryptedPayload;
 use cgka_traits::types::{EpochId, GroupId};
-use openmls::group::MlsGroup;
 use openmls::messages::proposals::{AppDataUpdateProposal, Proposal};
 use openmls::prelude::BasicCredential;
 use openmls_traits::OpenMlsProvider as _;
@@ -35,11 +34,7 @@ impl<S: StorageProvider> Engine<S> {
         &mut self,
         group_id: GroupId,
     ) -> Result<SendResult, EngineError> {
-        let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
-        let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
-        let mls_group = MlsGroup::load(provider.storage(), &mls_gid)
-            .map_err(|error| EngineError::Backend(format!("load: {error:?}")))?
-            .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;
+        let mls_group = self.load_mls_group(&group_id)?;
         crate::app_components::require_admin(&mls_group, &group_id, self.identity.self_id())?;
 
         let mut required = crate::app_components::required_app_components_of_group(&mls_group)?;
@@ -98,11 +93,7 @@ impl<S: StorageProvider> Engine<S> {
             return Ok(SendResult::DisbandRequested { request });
         }
 
-        let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
-        let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
-        let mls_group = MlsGroup::load(provider.storage(), &mls_gid)
-            .map_err(|error| EngineError::Backend(format!("load: {error:?}")))?
-            .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;
+        let mls_group = self.load_mls_group(&group_id)?;
         let required = crate::app_components::required_app_components_of_group(&mls_group)?;
         if !required.contains(GROUP_LIFECYCLE_COMPONENT_ID)
             || crate::app_components::lifecycle_of_group(&mls_group)?
@@ -209,11 +200,7 @@ impl<S: StorageProvider> Engine<S> {
         if self.storage.disband_tombstone(group_id)?.is_some() {
             return Ok(Vec::new());
         }
-        let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
-        let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
-        let mls_group = MlsGroup::load(provider.storage(), &mls_gid)
-            .map_err(|error| EngineError::Backend(format!("load: {error:?}")))?
-            .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;
+        let mls_group = self.load_mls_group(group_id)?;
         crate::app_components::lifecycle_support_blockers(&mls_group)
     }
 
@@ -267,10 +254,7 @@ impl<S: StorageProvider> Engine<S> {
         }
 
         let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
-        let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
-        let Some(mut mls_group) = MlsGroup::load(provider.storage(), &mls_gid)
-            .map_err(|error| EngineError::Backend(format!("load: {error:?}")))?
-        else {
+        let Some(mut mls_group) = self.load_mls_group_in(provider.storage(), group_id)? else {
             self.fail_disband_request(request, DisbandFailureReason::NoLongerMember)?;
             return Ok(None);
         };
@@ -426,10 +410,7 @@ impl<S: StorageProvider> Engine<S> {
         }
 
         let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
-        let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
-        let Some(mut mls_group) = MlsGroup::load(provider.storage(), &mls_gid)
-            .map_err(|error| EngineError::Backend(format!("load: {error:?}")))?
-        else {
+        let Some(mut mls_group) = self.load_mls_group_in(provider.storage(), group_id)? else {
             if self.storage.disband_tombstone(group_id)?.is_some() {
                 return Ok(true);
             }

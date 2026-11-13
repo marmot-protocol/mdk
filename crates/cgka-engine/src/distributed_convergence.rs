@@ -2426,14 +2426,12 @@ impl<S: StorageProvider> Engine<S> {
                 // Membership cleanup belongs to canonical apply: a failed queue or
                 // leave-request write must roll back MLS and the completed pass too.
                 let membership_effects = if let Some(before) = previous_membership.as_ref() {
-                    let group = openmls::group::MlsGroup::load(
-                        storage.mls_storage(),
-                        &openmls::group::GroupId::from_slice(group_id.as_slice()),
-                    )
-                    .map_err(|error| OpenMlsProjectionError::Storage(format!("{error:?}")))?
-                    .ok_or_else(|| {
-                        OpenMlsProjectionError::Replay("selected group missing".into())
-                    })?;
+                    let group = self
+                        .load_mls_group_in(storage.mls_storage(), group_id)
+                        .map_err(|error| OpenMlsProjectionError::Storage(format!("{error:?}")))?
+                        .ok_or_else(|| {
+                            OpenMlsProjectionError::Replay("selected group missing".into())
+                        })?;
                     // Disband owns its terminal cleanup and must not announce an
                     // intermediate local restoration from its replayed source tree.
                     if crate::app_components::lifecycle_of_group(&group)

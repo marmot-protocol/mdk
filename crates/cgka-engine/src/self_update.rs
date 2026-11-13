@@ -24,7 +24,6 @@ use cgka_traits::maintenance::{
 use cgka_traits::storage::StorageProvider;
 use cgka_traits::transport::EncryptedPayload;
 use cgka_traits::types::{EpochId, GroupId, MessageId};
-use openmls::group::MlsGroup;
 use openmls_traits::OpenMlsProvider as _;
 use sha2::{Digest, Sha256};
 use tls_codec::Serialize as _;
@@ -84,10 +83,7 @@ impl<S: StorageProvider> Engine<S> {
         }
 
         let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
-        let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
-        let mut mls_group = MlsGroup::load(provider.storage(), &mls_gid)
-            .map_err(|e| EngineError::Backend(format!("load: {e:?}")))?
-            .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;
+        let mut mls_group = self.load_mls_group(&group_id)?;
         let source_epoch = EpochId(mls_group.epoch().as_u64());
         let own_leaf_before = mls_group
             .own_leaf_node()

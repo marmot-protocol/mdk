@@ -294,3 +294,66 @@ async fn a_failed_rewind_restore_quarantines_its_group_for_the_session() {
         intents
     );
 }
+
+// A failed restore leaves a retained anchor's OpenMLS state in the store until
+// the next open, so no engine path may load it (mdk#3280). Every other
+// quarantine keeps genuine local state, which its repair reads.
+#[tokio::test]
+async fn openmls_loads_refuse_only_a_failed_rewind_restore() {
+    let (mut alice, _) = client(b"alice-mls-load-gate");
+    let (group, created) = alice
+        .create_group(CreateGroupRequest {
+            name: "mls load gate".into(),
+            description: String::new(),
+            members: vec![],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![alice.self_id()],
+        })
+        .await
+        .unwrap();
+    let SendResult::GroupCreated { pending, .. } = created else {
+        panic!("expected GroupCreated");
+    };
+    alice.confirm_published(pending).await.unwrap();
+    // A read through the cache leaves the object cached; a fresh load skips it.
+    let loads = |alice: &Engine<SqliteAccountStorage>| {
+        (
+            alice.with_mls_group(&group, |mls_group| Ok(mls_group.epoch().as_u64())),
+            alice
+                .load_mls_group(&group)
+                .map(|mls_group| mls_group.epoch().as_u64()),
+        )
+    };
+    let refused = |alice: &Engine<SqliteAccountStorage>, when: &str| {
+        let (cached, fresh) = loads(alice);
+        assert!(
+            matches!(&cached, Err(EngineError::UnknownGroup(id)) if *id == group),
+            "the cached read must refuse the group {when}, got {cached:?}"
+        );
+        assert!(
+            matches!(&fresh, Err(EngineError::UnknownGroup(id)) if *id == group),
+            "a fresh load must refuse the group {when}, got {fresh:?}"
+        );
+    };
+    assert!(matches!(loads(&alice), (Ok(_), Ok(_))));
+
+    // Another reason keeps loading: a hydration retry or a re-join reads it.
+    alice.enter_hydration_quarantine(
+        &group,
+        GroupHydrationQuarantineReason::MemberValidationFailed,
+    );
+    assert!(matches!(loads(&alice), (Ok(_), Ok(_))));
+    let cached_at = alice.storage.mls_write_generation();
+    assert!(alice.leave_hydration_quarantine(&group));
+
+    // A failed restore is refused from the moment the guard records it, and
+    // after the engine moves it into quarantine. The object the last read
+    // cached is still current here, so the cached read must refuse before
+    // its lookup.
+    alice.rewinds.fail_for_test(&group);
+    assert_eq!(alice.storage.mls_write_generation(), cached_at);
+    refused(&alice, "before the move");
+    alice.quarantine_failed_rewinds();
+    refused(&alice, "after the move");
+}

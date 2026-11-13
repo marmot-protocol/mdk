@@ -1,5 +1,8 @@
 //! Ingest tests for stale classifications and application-message round trips.
 
+// Tests load OpenMLS state directly (see the crate clippy.toml).
+#![allow(clippy::disallowed_methods)]
+
 use async_trait::async_trait;
 use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_engine::{Engine, EngineBuilder};

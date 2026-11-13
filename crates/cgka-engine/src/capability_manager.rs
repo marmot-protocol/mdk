@@ -234,21 +234,7 @@ impl<S: StorageProvider> Engine<S> {
         let required_cap = req.requires;
 
         // Load the MLS group to read live RequiredCapabilities.
-        let provider = crate::provider::EngineOpenMlsProvider::<S>::new(
-            &self.crypto,
-            self.storage.mls_storage(),
-        );
-        let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
-        let mls_group = match MlsGroup::load(
-            <crate::provider::EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(
-                &provider,
-            ),
-            &mls_gid,
-        ) {
-            Ok(Some(g)) => g,
-            Ok(None) => return Err(EngineError::UnknownGroup(group_id.clone())),
-            Err(e) => return Err(EngineError::Backend(format!("load: {e:?}"))),
-        };
+        let mls_group = self.load_mls_group(group_id)?;
 
         // If the capability is in the group's RequiredCapabilities, MLS
         // guarantees every current member supports it. Available.
@@ -274,21 +260,7 @@ impl<S: StorageProvider> Engine<S> {
         &self,
         group_id: &GroupId,
     ) -> Result<GroupCapabilities, EngineError> {
-        let provider = crate::provider::EngineOpenMlsProvider::<S>::new(
-            &self.crypto,
-            self.storage.mls_storage(),
-        );
-        let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
-        let mls_group = match MlsGroup::load(
-            <crate::provider::EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(
-                &provider,
-            ),
-            &mls_gid,
-        ) {
-            Ok(Some(g)) => g,
-            Ok(None) => return Err(EngineError::UnknownGroup(group_id.clone())),
-            Err(e) => return Err(EngineError::Backend(format!("load: {e:?}"))),
-        };
+        let mls_group = self.load_mls_group(group_id)?;
         let already_required = required_capabilities_from_group(&mls_group);
         let leaves = leaf_capabilities_of_group(&mls_group)?;
 

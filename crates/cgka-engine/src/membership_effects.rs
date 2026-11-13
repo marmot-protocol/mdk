@@ -167,11 +167,7 @@ impl<S: StorageProvider> Engine<S> {
         // Reading another leaf's tag does not require this observer's own
         // entry to have announced its tag key. Reuse the same trusted live
         // roster, but preserve real load/storage errors for transaction retry.
-        let Some(device_group) = MlsGroup::load(
-            self.storage.mls_storage(),
-            &openmls::group::GroupId::from_slice(trusted.as_slice()),
-        )
-        .map_err(|error| EngineError::Backend(format!("load device group: {error:?}")))?
+        let Some(device_group) = self.load_mls_group_in(self.storage.mls_storage(), trusted)?
         else {
             return Ok(None);
         };

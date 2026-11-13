@@ -77,7 +77,7 @@ Each module's top-level rustdoc is the source of truth; this is an index.
 | `app_payload.rs` | `validate_app_payload_for_sender`: `MarmotAppEvent` sender validation; the `EpochPin` digest (`epoch_pin`, `staged_epoch_pin`) a pinned app message is checked against |
 | `group_context_view.rs` | `GroupContext` snapshot view; `exporter_secret(label, length)` returns `None` rather than truncating |
 | `snapshot_guard.rs` | `SnapshotRollbackGuard`, whose two constructors classify every rewind window (`contained`: inside a group savepoint; `rewind`: committing, outside any transaction), `Rewinds`, the guard-to-engine handoff of groups whose committing restore failed, and `RewindSite`, the closed set of guard sites that `openmls_projection::recover_interrupted_rewind_guard` classifies at open |
-| `mls_group_cache.rs` | Loaded `MlsGroup`s reused only while the backend's OpenMLS write generation is unchanged |
+| `mls_group_cache.rs` | `load_mls_group_in`, the one gated OpenMLS load (refuses a group whose rewind restore failed, mdk#3280); loaded `MlsGroup`s reused only while the backend's OpenMLS write generation is unchanged |
 | `bounded_id_set.rs` | Capacity-bounded FIFO caches (`seen_message_ids`, `sent_message_ids`); durable `MessageRecord` store stays authoritative |
 | `wire_format.rs` | `PURE_PLAINTEXT_WIRE_FORMAT_POLICY` + `WIRE_FORMAT_POLICY_REVIEW_REQUIRED` grep marker |
 | `canonicalization.rs` | Executable post-peeling canonicalization-contract model |
@@ -302,7 +302,11 @@ peel runs. `Engine::retry_deferred_peels` offers those contexts to every retaine
   `Engine::stored_group_record`, which refuse a quarantined group with `UnknownGroup`: `clippy.toml` bans
   `GroupStorage::get_group` and `list_group_records` in this crate, and each raw read (open-time recovery and
   hydration, forget, routing, retention and byte accounting of a quarantined group's input, code inside an already
-  gated window, diagnostics) allows the lint with its reason. `check_group_live` is the gate's public form: the session
+  gated window, diagnostics) allows the lint with its reason. OpenMLS state loads only through
+  `Engine::load_mls_group_in` (`load_mls_group` and the cached `take_mls_group` sit on it), which refuses
+  `RewindRestoreFailed` alone, since every other reason's repair reads the group's genuine local state; `clippy.toml`
+  bans `MlsGroup::load`, and each raw load (hydration, the cleanup of state its own create or send made, code inside
+  a rewind window or the pass) allows the lint with its reason (mdk#3280). `check_group_live` is the gate's public form: the session
   calls it before every group-scoped account record it keeps on its own storage handle, so only the engine decides
   liveness (mdk#2602). Quarantine clears only through `retry_hydrate_quarantined_group` or an authenticated re-join
   Welcome, both of which schedule retained input for replay, except `RewindRestoreFailed`, which only the next open
@@ -318,9 +322,9 @@ peel runs. `Engine::retry_deferred_peels` offers those contexts to every retaine
   that quarantine's event, side-effect discard and byte discharge: after the pass and the sweep's enumeration, at
   ingest and sweep entry, and in `ensure_hydrated`, retry, `drain_events` and `drain_auto_publish`. The reason is
   sticky: retry answers `false`, `leave_hydration_quarantine` refuses, and a re-join Welcome is refused non-terminally;
-  `pending_group_rejoins_for` omits the group's stored offers and `confirm_group_rejoin` refuses them with
-  `UnknownGroup` before loading MLS state, since its consent token would be the anchor's (OpenMLS loads are not gated
-  yet: mdk#3280). The next open restores the kept snapshot. No committing window opens while any guard snapshot of the group survives,
+  every OpenMLS load refuses it (`Engine::load_mls_group_in`, above), so `pending_group_rejoins_for` omits the
+  group's stored offers and `confirm_group_rejoin` refuses them with `UnknownGroup`, since a consent token would be
+  the anchor's (mdk#3280). The next open restores the kept snapshot. No committing window opens while any guard snapshot of the group survives,
   so open-time recovery never meets two outermost snapshots.
 - **Engine construction restores every interrupted rewind before anything reads group state** (mdk#3272).
   `EngineBuilder::build` lists guard snapshots in all groups with one `list_snapshots_with_prefixes` read and runs
@@ -644,6 +648,7 @@ From the 2026-05-09 engine audit and follow-ups. Grep the rule when touching the
 | Replay swallows only `ProcessMessageError::ValidationError` for application messages, and, on a candidate path only, a pending proposal's parent-dependent authentication failure (`is_parent_dependent_process_message_error`: `UnknownMember`, `InvalidMembershipTag`): the proposal was sealed under another branch's state, so it is that branch's evidence and never fails the path's commits (mdk#3226). A proposal the path authenticates stays live evidence (#963), a classified rejection stays `RejectedProposal`, and the selected apply fails on any proposal error; `LibraryError` and structural failures propagate | replay tests; `src/openmls_projection/tests/candidate_replay.rs::a_proposal_sealed_on_a_rival_branch_does_not_fail_this_path`, `marmot-app` `tests::canonical_membership::rival_branch_leave` |
 | `auto_committer::decide_with_reason` refuses to auto-commit a SelfRemove whose leaver credential is not 32 bytes | MIP-03 guard tests |
 | `SnapshotRollbackGuard` restores and releases on `commit` and on `Drop`; a committing window whose restore fails after its rewind keeps its snapshot and quarantines the group (`RewindRestoreFailed`) until the next open, while a contained window's failed restore undoes the window (mdk#3272) | `src/snapshot_guard.rs::tests`, `tests/hydration_quarantine/rewind_restore_fault.rs`, `src/engine/rewind_gate_tests.rs` |
+| An OpenMLS load, fresh or cached, refuses a group whose rewind restore failed, from the guard's record of the failure on, and loads a group in any other quarantine (mdk#3280) | `src/engine/rewind_gate_tests.rs::openmls_loads_refuse_only_a_failed_rewind_restore`, `tests/hydration_quarantine/rewind_restore_fault.rs::a_failed_restore_hides_a_rejoin_offer_until_the_next_open` |
 | `current_audit_context` is set only through `OperationAuditScope`, which clears it on every exit, so a send or group creation dropped mid-await lends its context to no later row | `tests/audit_log.rs::dropping_a_suspended_send_leaves_no_operation_context_behind`, `::dropping_a_suspended_group_creation_leaves_no_operation_context_behind` |
 | The engine only records into the recorder it was built with; it exposes no audit-sink methods (record, rotate, finish, swap). Owners hold a clone of the session's `SharedRecorder`, so engine and app rows share one sequence | `marmot-app` `tests::audit_ownership::app_rows_and_engine_rows_share_one_sequence_and_group_ref`, `::finishing_the_audit_log_closes_it_for_every_clone` |
 | Every rewind onto a retained anchor (probes and the reorg apply) uses `rollback_group_state_keeping_live_records`, never `rollback_group_to_snapshot` plus a re-put: a legacy full anchor must not drop a pending application event or restore a removed row or queued intent, and on SQLite the rewind must not read or write the ledger (mdk#2330) | `tests/record_write_atomicity.rs::reorg_onto_a_legacy_full_anchor_keeps_live_records`, `::a_failed_generic_rewind_keeps_pending_app_output`, `storage-sqlite` `snapshots::tests::rewind_keeping_live_records_does_not_grow_with_history` |
