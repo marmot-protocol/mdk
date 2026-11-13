@@ -177,7 +177,7 @@ When audit logging is enabled for an account session, `MarmotApp::open_account()
 
 | Value | How it is produced | Where it appears |
 | --- | --- | --- |
-| `audit-device-id` | Random 16 bytes, hex encoded, generated once per account directory and stored in `<account_dir>/audit-device-id`. | Input to `engine_id` and included as `source.device_id` in the recorder source row. |
+| `audit-device-id` | Random 16 bytes, hex encoded, generated once per account directory and stored in `<account_dir>/audit-device-id`. | Input to `engine_id`. The v5 recorder source row carries it hashed as `device_ref`; historical v4 rows carry it as `source.device_id`. |
 | `account_ref` | First 16 bytes of `SHA-256("marmot-audit-account-ref/v1" + account_id)`, hex encoded. | Top-level JSONL `account_ref`. |
 | `local_member_ref` | First 16 bytes of `SHA-256("marmot-audit-member-ref/v1" + account_id)`, hex encoded. Same domain and width as `group_state_changed` actor/subject member refs. | Optional `kind.source.local_member_ref` on `source_context` rows (also permitted on `context.source`). |
 | `engine_id` | First 16 bytes of `SHA-256("marmot-audit-engine-id/v2" + account_id + device_id_hex)`, hex encoded. | Top-level JSONL `engine_id` and the file name. |
@@ -1615,7 +1615,7 @@ filename convention, so empty, corrupt, or partially written files are removed t
 It also deletes `audit-upload-checkpoint.json` and its `.tmp` staging sibling: bookkeeping the removed v4 whole-file
 upload kept per account, naming files already sent and holding no evidence.
 
-V4/future filenames, names outside those reserved forms, temporary files, databases, the device ID, and
+V4/future filenames, names outside those reserved forms, other temporary files, databases, the device ID, and
 `audit-key-reveal.jsonl` are preserved. A custom file that uses a reserved legacy name is also deleted. Symlinks
 are skipped at every scan level; a symlinked or non-directory container is reported as a cleanup failure.
 Nested directories are not traversed, and files outside the leased root are not scanned. Cleanup is idempotent;
@@ -1636,7 +1636,7 @@ can reintroduce legacy files later. Removing the scan requires an explicit chang
 | `app_version` | Optional host app version. |
 
 Fields are trimmed and a blank field becomes absent. At recorder open the app writes a `source_context` JSONL row
-with stable `device_id`, the host-supplied platform, app version and optional hardware model, and an optional
+with the stable hashed `device_ref`, the host-supplied platform, app version and optional hardware model, and an optional
 `local_member_ref` derived from the already-available account `MemberId`. Set the source before opening accounts;
 already-open recorders keep the source they started with. Hardware model must be an OS-provided model identifier,
 not a hostname, serial number, or user-assigned name; omit it when unavailable.
