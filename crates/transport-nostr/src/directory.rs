@@ -186,6 +186,8 @@ pub trait DirectoryRelayFetcher: Send + Sync {
         request: DirectoryFetchRequest,
     ) -> Result<Vec<DirectoryRelayEventRecord>, String>;
 
+    /// Per-relay failures produce incomplete outcomes. Return an error for
+    /// invalid requests or failures of the fetch resource itself.
     async fn fetch_directory_events_with_completion(
         &self,
         request: DirectoryFetchRequest,
@@ -1089,7 +1091,7 @@ impl DirectoryRelayFetcher for NostrSdkDirectoryRelayFetcher {
                         .complete_endpoints
                         .extend(endpoint.complete_endpoints);
                 }
-                Err(_) => outcome.complete = false,
+                Err(_) => return Err("directory relay fetch task failed".to_owned()),
             }
         }
         if relay_urls.is_empty() {

@@ -17,7 +17,7 @@ use cgka_engine::key_package::key_package_metadata;
 use cgka_traits::TransportEndpoint;
 use cgka_traits::engine::KeyPackage;
 use cgka_traits::group::ProtocolProfile;
-use futures::{StreamExt, stream};
+use futures::{StreamExt, TryStreamExt, stream};
 use nostr_sdk::prelude::PublicKey;
 use transport_nostr_adapter::{KIND_MARMOT_INBOX_RELAY_LIST, KIND_NIP65_RELAY_LIST};
 
@@ -497,14 +497,15 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
         )
         .await
         {
-            Ok(RelayListResolution { completed, errors }) => {
+            Ok(resolution) => {
+                let RelayListResolution { completed, errors } = resolution?;
                 for (index, error) in errors {
                     outcomes[index] = Some(Err(error));
                 }
                 let key_package_unresolved = (0..targets.len())
                     .filter(|index| outcomes[*index].is_none())
                     .collect::<Vec<_>>();
-                let finished = tokio::time::timeout_at(
+                let finished = match tokio::time::timeout_at(
                     deadline,
                     self.resolve_missing_key_packages(
                         &targets,
@@ -515,7 +516,13 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                     ),
                 )
                 .await
-                .is_ok();
+                {
+                    Ok(result) => {
+                        result?;
+                        true
+                    }
+                    Err(_) => false,
+                };
                 (completed, true, finished)
             }
             Err(_) => (HashSet::new(), false, false),
@@ -729,7 +736,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
         &self,
         targets: &mut [MemberTarget],
         groups: Vec<(Vec<TransportEndpoint>, Vec<usize>)>,
-    ) -> HashSet<usize> {
+    ) -> Result<HashSet<usize>, DirectoryError> {
         let specs = groups
             .into_iter()
             .flat_map(|(endpoints, indices)| {
@@ -760,20 +767,20 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                         )
                     })
                     .collect();
-                let result = directory
+                let outcome = directory
                     .relay_plane
                     .fetch_directory_events_with_completion(endpoints.clone(), queries)
-                    .await;
-                let outcome = result.unwrap_or_default();
+                    .await
+                    .map_err(DirectoryError::RelayDirectory)?;
                 if members.len() == 1 || outcome.complete {
-                    return members
+                    return Ok(members
                         .into_iter()
                         .map(|(index, _)| (index, endpoints.clone(), outcome.clone()))
-                        .collect::<Vec<_>>();
+                        .collect::<Vec<_>>());
                 }
                 // CLOSED and other incomplete outcomes need the same fallback
-                // as transport errors. Retain positive batch records even when
-                // the single-author retry also fails.
+                // as a rejected batch. Retain positive records when the
+                // single-author retry is also incomplete.
                 stream::iter(members.into_iter().map(|(index, account_id)| {
                     let directory = directory.clone();
                     let endpoints = endpoints.clone();
@@ -798,9 +805,9 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                             .relay_plane
                             .fetch_directory_events_with_completion(endpoints.clone(), queries)
                             .await
-                            .unwrap_or_default();
+                            .map_err(DirectoryError::RelayDirectory)?;
                         records.extend(retry.records);
-                        (
+                        Ok::<_, DirectoryError>((
                             index,
                             endpoints,
                             DirectoryFetchOutcome {
@@ -808,18 +815,18 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                                 complete: retry.complete,
                                 complete_endpoints: retry.complete_endpoints,
                             },
-                        )
+                        ))
                     }
                 }))
-                .buffered(MEMBER_RESOLUTION_FALLBACK_CONCURRENCY)
-                .collect::<Vec<_>>()
+                .buffer_unordered(MEMBER_RESOLUTION_FALLBACK_CONCURRENCY)
+                .try_collect::<Vec<_>>()
                 .await
             }
         });
         let results = stream::iter(work)
-            .buffered(MEMBER_RESOLUTION_RELAY_CONCURRENCY)
-            .collect::<Vec<_>>()
-            .await;
+            .buffer_unordered(MEMBER_RESOLUTION_RELAY_CONCURRENCY)
+            .try_collect::<Vec<_>>()
+            .await?;
         let mut completed = HashSet::new();
         for (index, endpoints, outcome) in results.into_iter().flatten() {
             let account_id = targets[index].account_id_hex.clone();
@@ -845,25 +852,25 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                 completed.insert(index);
             }
         }
-        completed
+        Ok(completed)
     }
 
     async fn resolve_missing_relay_lists(
         &self,
         targets: &mut [MemberTarget],
         unresolved: &[usize],
-    ) -> RelayListResolution {
+    ) -> Result<RelayListResolution, DirectoryError> {
         let needs_discovery = unresolved.to_vec();
         if needs_discovery.is_empty() {
-            return RelayListResolution::default();
+            return Ok(RelayListResolution::default());
         }
         let endpoints = self.directory_source_relays(&[]);
         if endpoints.is_empty() {
-            return RelayListResolution::default();
+            return Ok(RelayListResolution::default());
         }
         let completed_discovery = self
             .resolve_relay_list_hop(targets, vec![(endpoints.clone(), needs_discovery.clone())])
-            .await;
+            .await?;
         let incomplete_discovery = needs_discovery
             .iter()
             .copied()
@@ -903,7 +910,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
             .collect::<HashSet<_>>();
         let completed_outbox = self
             .resolve_relay_list_hop(targets, by_outboxes.into_iter().collect())
-            .await;
+            .await?;
         let completed = completed_discovery
             .iter()
             .copied()
@@ -938,7 +945,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                 (index, DirectoryError::DirectoryLookupIncomplete(account))
             })
             .collect();
-        RelayListResolution { completed, errors }
+        Ok(RelayListResolution { completed, errors })
     }
 
     async fn resolve_missing_key_packages(
@@ -948,7 +955,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
         outcomes: &mut [Option<Result<Vec<KeyPackage>, DirectoryError>>],
         purpose: MemberResolutionPurpose,
         requirements: Option<&cgka_engine::key_package::KeyPackageRequirements>,
-    ) {
+    ) -> Result<(), DirectoryError> {
         let defaults = self.directory_source_relays(&[]);
         let mut by_endpoints = BTreeMap::<Vec<TransportEndpoint>, Vec<usize>>::new();
         for index in unresolved.iter().copied() {
@@ -1001,11 +1008,10 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                 async move {
                     let result = directory
                         .relay_plane
-                        .fetch_directory_events(endpoints, queries)
+                        .fetch_directory_events_with_completion(endpoints, queries)
                         .await
-                        .map_err(|error| {
-                            DirectoryError::RelayDirectory(format!("fetch key packages: {error}"))
-                        });
+                        .map(|outcome| outcome.records)
+                        .map_err(DirectoryError::RelayDirectory);
                     (indices, result)
                 }
             });
@@ -1017,10 +1023,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
         let mut fallback = Vec::new();
         let mut fallback_records = BTreeMap::new();
         while let Some((indices, result)) = batches.next().await {
-            let Ok(records) = result else {
-                fallback.extend(indices);
-                continue;
-            };
+            let records = result?;
             let multiple_authors = indices.len() > 1;
             let mut records_by_author = BTreeMap::<_, Vec<_>>::new();
             for record in records {
@@ -1110,14 +1113,12 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                     async move {
                         let queries = key_package_queries(vec![target.account_id_hex.clone()]);
                         let result = async {
-                            let (mut records, complete) = match directory
+                            let fetched = directory
                                 .relay_plane
                                 .fetch_directory_events_with_completion(endpoints.clone(), queries)
                                 .await
-                            {
-                                Ok(outcome) => (outcome.records, outcome.complete),
-                                Err(_) => (Vec::new(), false),
-                            };
+                                .map_err(DirectoryError::RelayDirectory)?;
+                            let mut records = fetched.records;
                             // This supplementary lookup must not discard a
                             // valid package observed in this call's batch.
                             // Never load a previously cached package here.
@@ -1128,7 +1129,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                                         account: &target.account_id_hex,
                                         searched: &endpoints,
                                         observed: records,
-                                        primary_complete: complete,
+                                        primary_complete: fetched.complete,
                                         discovery: &directory.directory_source_relays(&[]),
                                         requirements,
                                         cached_target: None,
@@ -1158,6 +1159,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                 self.accept_fetched_key_packages(purpose, selected, &targets[index].relay_lists)
             }));
         }
+        Ok(())
     }
 }
 
@@ -1176,9 +1178,9 @@ fn recipient_resolution_status(error: &DirectoryError) -> Option<MemberResolutio
         } => Some(Status::ObsoleteKeyPackage),
         DirectoryError::InvalidKeyPackageEvent(_) => Some(Status::InvalidKeyPackage),
         DirectoryError::MissingMemberInboxRoute(_) => Some(Status::MissingInboxRoute),
-        DirectoryError::DirectoryLookupIncomplete(_)
-        | DirectoryError::RelayDirectory(_)
-        | DirectoryError::MissingRelayLists(_) => Some(Status::Incomplete),
+        DirectoryError::DirectoryLookupIncomplete(_) | DirectoryError::MissingRelayLists(_) => {
+            Some(Status::Incomplete)
+        }
         DirectoryError::KeyPackageRequirements(
             EngineError::MissingRequiredCapabilities { .. }
             | EngineError::InvalidKeyPackageCapabilities { .. },

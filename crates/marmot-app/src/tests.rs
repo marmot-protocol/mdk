@@ -707,7 +707,6 @@ pub(crate) struct MemberResolutionDirectoryFetcher {
     reject_multi_author: std::sync::atomic::AtomicBool,
     key_packages_only_in_single_author: std::sync::Mutex<std::collections::HashSet<String>>,
     key_packages_only_in_multi_author: std::sync::Mutex<std::collections::HashSet<String>>,
-    reject_multi_author_incomplete: std::sync::atomic::AtomicBool,
     pub(super) failing_single_author: std::sync::Mutex<Option<String>>,
     stalled_endpoint: std::sync::Mutex<Option<String>>,
     incomplete_endpoint: std::sync::Mutex<Option<String>>,
@@ -912,14 +911,6 @@ impl transport_nostr::DirectoryRelayFetcher for MemberResolutionDirectoryFetcher
         &self,
         request: transport_nostr::DirectoryFetchRequest,
     ) -> Result<transport_nostr::DirectoryFetchOutcome, String> {
-        if self
-            .reject_multi_author_incomplete
-            .load(std::sync::atomic::Ordering::SeqCst)
-            && request.queries.iter().any(|query| query.authors.len() > 1)
-        {
-            self.requests.lock().unwrap().push(request);
-            return Ok(transport_nostr::DirectoryFetchOutcome::default());
-        }
         let incomplete_kind = *self.incomplete_query_kind.lock().unwrap();
         let complete = !self
             .incomplete_endpoint
@@ -939,7 +930,15 @@ impl transport_nostr::DirectoryRelayFetcher for MemberResolutionDirectoryFetcher
             });
         let queries = request.queries.clone();
         let endpoints = request.endpoints.clone();
-        let mut records = self.fetch_directory_events(request).await?;
+        let mut records = match self.fetch_directory_events(request).await {
+            Ok(records) => records,
+            Err(error) if self.fail_all.load(std::sync::atomic::Ordering::SeqCst) => {
+                return Err(error);
+            }
+            // Relay rejection and failed routes are incomplete reads; only
+            // the explicit resource-failure knob fails the fetch operation.
+            Err(_) => return Ok(transport_nostr::DirectoryFetchOutcome::default()),
+        };
         records.sort_by(|a, b| {
             b.event
                 .created_at
@@ -8086,7 +8085,7 @@ async fn cached_retired_inbox_with_failed_refresh_remains_retryable() {
         .await
         .expect_err("a failed refresh cannot use a retired-only cached inbox");
     assert!(
-        matches!(error, DirectoryError::DirectoryLookupIncomplete(ref id) if *id == account_id),
+        matches!(error, DirectoryError::RelayDirectory(_)),
         "{error:?}"
     );
 
@@ -8764,6 +8763,13 @@ async fn partial_invite_route_retry() {
             .iter()
             .any(|query| query.kind == KIND_MARMOT_KEY_PACKAGE)
     }));
+    let before_fault = client.group_mls_state(&group).unwrap();
+    fetcher.fail_all_fetches();
+    client
+        .invite_members(&group, &[accounts[0].account_id_hex.as_str()])
+        .await
+        .expect_err("a directory resource failure is not a recipient no-op");
+    assert_eq!(client.group_mls_state(&group).unwrap(), before_fault);
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn direct_requires_ready_peer() {
@@ -9371,40 +9377,6 @@ async fn member_key_package_set_falls_back_when_multi_author_queries_are_rejecte
             .count(),
         6,
         "discovery, outbox, and KeyPackage batches must each fall back per member"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn member_key_package_set_falls_back_when_multi_author_queries_are_incomplete() {
-    let (_directory, app, accounts, fetcher) = member_resolution_fixture(2, false).await;
-    fetcher
-        .reject_multi_author_incomplete
-        .store(true, std::sync::atomic::Ordering::SeqCst);
-    let members = accounts
-        .iter()
-        .map(|account| account.account_id_hex.as_str())
-        .collect::<Vec<_>>();
-
-    let summary = app
-        .directory()
-        .prewarm_group_member_key_packages(&members)
-        .await
-        .expect("CLOSED-shaped incomplete batches must retry per author");
-
-    assert_eq!(summary.network_resolved_members, 2);
-    let requests = fetcher.requests.lock().unwrap();
-    assert!(
-        requests
-            .iter()
-            .any(|request| request.queries.iter().any(|query| query.authors.len() == 2))
-    );
-    assert_eq!(
-        requests
-            .iter()
-            .filter(|request| request.queries.iter().all(|query| query.authors.len() == 1))
-            .count(),
-        4,
-        "both relay-list hops retry each member; successful prewarm needs no preference refetch"
     );
 }
 

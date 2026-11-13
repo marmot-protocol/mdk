@@ -13,6 +13,9 @@
 
 ### Fixed
 
+- Create and invite abort on directory fetch-resource failures instead of
+  reporting recipients as `Incomplete` in a successful result (#1813).
+  Incomplete relay reads still use per-member recovery.
 - `NotificationUpdate.is_dm` follows the chat-list conversation kind for
   messages, group-state notices, and invitations, including pending DM
   Welcomes. Named chats and unknown roster projections remain non-DM
