@@ -766,27 +766,29 @@ eligibility change cannot masquerade as a scheduler result.
 ### 3.3 Incident replay
 
 The `incident-replay` crate described here was removed on 2026-11-13 with the retired audit service whose exports it
-read. The vectors it produced remain under `crates/cgka-conformance-simulator/vectors/incidents/`.
+read. This repository no longer synthesizes vectors from audit exports. The vectors it produced remain under
+`crates/cgka-conformance-simulator/vectors/incidents/`, and `canonical_vector_fixtures_match_generated_traces` still
+runs them. The rest of this section records what the crate did.
 
 - [x] Preserve normalized archetype synthesis for incomplete forensic evidence.
 - [x] Add producer-attested normalized-history IR import when evidence is sufficient.
 - [x] Carry evidence confidence and unavailable fields into the scenario artifact.
 - [x] Keep sensitive exports and generated exact capsules out of version control.
 
-`IncidentScenarioArtifactV1` makes replay fidelity and trust boundaries explicit. Existing legacy audit-service exports
-continue through the proven fork/convergence archetype synthesizers and are labeled
-`outcome_equivalent_archetype` with derived confidence; the artifact names unavailable action history, participant
-delivery order, transport bytes, and MLS state. Normalized import is `producer_attested_normalized_history`: it checks
-coverage and bounds of the producer's step-to-source mapping, validates the Scenario IR, and requires the declared
-outcomes to reproduce, but it does not independently prove semantic correspondence between arbitrary source events
-and declared actions. Imported free-form labels and application payloads remain
-`confidential_unredacted_scenario`, and the artifact records `unverified` until simulator reproduction changes it to
-`reproduced`. Raw MLS bytes plus an engine checkpoint remain a separate opt-in sensitive local failure capsule.
+`IncidentScenarioArtifactV1` made replay fidelity and trust boundaries explicit. Audit-service exports went through
+the proven fork/convergence archetype synthesizers and were labeled
+`outcome_equivalent_archetype` with derived confidence; the artifact named unavailable action history, participant
+delivery order, transport bytes, and MLS state. Normalized import was `producer_attested_normalized_history`: it
+checked coverage and bounds of the producer's step-to-source mapping, validated the Scenario IR, and required the
+declared outcomes to reproduce, but it did not independently prove semantic correspondence between arbitrary source
+events and declared actions. Imported free-form labels and application payloads were
+`confidential_unredacted_scenario`, and the artifact recorded `unverified` until simulator reproduction changed it to
+`reproduced`. Raw MLS bytes plus an engine checkpoint were a separate opt-in sensitive local failure capsule.
 
-The CLI writes the vector and evidence envelope owner-only and never copies the source export or checkpoint. These
-files are not shareable without separate redaction and review. Real
-exports belong under ignored `incident-exports/`; local generated output belongs under `target/` or ignored
-`incident-replay-output/`; sensitive replay-capsule filenames are ignored repository-wide.
+The CLI wrote the vector and evidence envelope owner-only and never copied the source export or checkpoint. Those
+files are not shareable without separate redaction and review. The repository still ignores `incident-exports/`,
+`incident-replay-output/` and sensitive replay-capsule filenames, so leftover local output stays out of git and Docker
+build contexts.
 
 ### Milestone 3 Exit Gate
 
@@ -799,9 +801,9 @@ Offline retained-history catch-up, mixed application/commit traffic, and the sel
 small default regression and a separately ignored sustained campaign. Replay-probe exhaustion fails closed while
 retaining the frozen durable inputs, then succeeds after the test-only ceiling is removed; opaque transport limits use
 the separately tested resource-refused/redelivery repair contract. Report measurement tests pin the first failing
-action and resource-category limiting cause. Incident tests cover both a reproducing producer-attested history and the
-ordinary legacy-export archetype whose evidence envelope explicitly names why exact action and byte replay are
-unavailable.
+action and resource-category limiting cause. Incident tests covered both a reproducing producer-attested history and
+the ordinary legacy-export archetype whose evidence envelope explicitly named why exact action and byte replay are
+unavailable; they were removed with the `incident-replay` crate.
 
 Milestone 3 also closes a production amplification loophole: application-bearing candidate re-materialization now
 draws from the same finite per-pass replay budget as the preceding candidate search instead of creating an unlimited
