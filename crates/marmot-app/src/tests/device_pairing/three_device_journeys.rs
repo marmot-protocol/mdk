@@ -148,7 +148,9 @@ fn three_linked_devices_converge_after_competing_edits_and_a_durable_reopen() {
         let chat = bob
             .create_group("Three linked copies", &[&alice])
             .await
-            .unwrap();
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         for device in [&mut phone, &mut tablet, &mut laptop] {
             device.step(&relay).await;
             assert!(

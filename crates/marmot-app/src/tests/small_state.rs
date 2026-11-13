@@ -33,7 +33,9 @@ async fn chat_with_bob(
     let chat = phone
         .create_group("Bob and Alice", &[&bob_id])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     (bob_dir, chat)
 }
 
@@ -177,7 +179,13 @@ async fn siblings_archives_are_saved_together_or_not_at_all() {
     let mut devices = phone_and_laptop().await;
     let (_bob_dir, chat) =
         chat_with_bob(&devices.phone_app, &mut devices.phone, &devices.relay).await;
-    let notes = devices.phone.create_group("Notes", &[]).await.unwrap();
+    let notes = devices
+        .phone
+        .create_group("Notes", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     link(&mut devices).await;
     let app = devices.phone_app.clone();
     let path = app.account_storage_path("alice");

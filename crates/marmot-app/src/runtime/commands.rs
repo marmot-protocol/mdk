@@ -182,7 +182,7 @@ impl AccountManager {
         name: &str,
         members: &[String],
         description: Option<String>,
-    ) -> Result<GroupId, AppError> {
+    ) -> Result<crate::GroupMemberResult<GroupId>, AppError> {
         self.create_group_with_options(
             account_ref,
             name,
@@ -229,7 +229,7 @@ impl AccountManager {
         name: &str,
         members: &[String],
         description: Option<String>,
-    ) -> Result<CreatedGroup, AppError> {
+    ) -> Result<crate::GroupMemberResult<CreatedGroup>, AppError> {
         self.create_group_with_options_detailed(
             account_ref,
             name,
@@ -249,7 +249,7 @@ impl AccountManager {
         members: &[String],
         description: Option<String>,
         initial_image: Option<crate::AppInitialGroupImage>,
-    ) -> Result<GroupId, AppError> {
+    ) -> Result<crate::GroupMemberResult<GroupId>, AppError> {
         self.create_group_with_options(
             account_ref,
             name,
@@ -279,7 +279,7 @@ impl AccountManager {
             .send(AccountWorkerCommand::CreateGroup {
                 queued_at: Instant::now(),
                 request: GroupCreationRequest::Direct {
-                    peer_account_id_hex,
+                    peer_account_id_hex: peer_account_id_hex.clone(),
                 },
                 options: AppCreateGroupOptions::default(),
                 respond,
@@ -287,6 +287,9 @@ impl AccountManager {
             .await
             .map_err(|_| AppError::TransportClosed)?;
         let created = long_account_worker_response(response).await?;
+        let created = created
+            .operation
+            .ok_or_else(|| AppError::DirectoryLookupIncomplete(peer_account_id_hex))?;
         self.spawn_create_catch_up(command);
         self.schedule_audit_log_tracker_update("start_direct_conversation");
         Ok(created.group_id)
@@ -298,7 +301,7 @@ impl AccountManager {
         name: &str,
         members: &[String],
         options: AppCreateGroupOptions,
-    ) -> Result<GroupId, AppError> {
+    ) -> Result<crate::GroupMemberResult<GroupId>, AppError> {
         let started_at = Instant::now();
         let result = async {
             let command = self.worker_commands(account_ref).await?;
@@ -317,7 +320,9 @@ impl AccountManager {
                 .await
                 .map_err(|_| AppError::TransportClosed)?;
             let created = long_account_worker_response(response).await?;
-            self.spawn_create_catch_up(command);
+            if created.operation.is_some() {
+                self.spawn_create_catch_up(command);
+            }
             Ok::<_, AppError>(created)
         }
         .await;
@@ -326,9 +331,14 @@ impl AccountManager {
             started_at.elapsed(),
             result.is_ok(),
         );
-        let group_id = result?.group_id;
-        self.schedule_audit_log_tracker_update("create_group");
-        Ok(group_id)
+        let created = result?;
+        if created.operation.is_some() {
+            self.schedule_audit_log_tracker_update("create_group");
+        }
+        Ok(crate::GroupMemberResult {
+            operation: created.operation.map(|created| created.group_id),
+            member_outcomes: created.member_outcomes,
+        })
     }
 
     pub async fn stage_prepared_group_image(
@@ -421,7 +431,7 @@ impl AccountManager {
         members: &[String],
         description: Option<String>,
         upload_id: String,
-    ) -> Result<GroupId, AppError> {
+    ) -> Result<crate::GroupMemberResult<GroupId>, AppError> {
         let started_at = Instant::now();
         let result = async {
             let command = self.worker_commands(account_ref).await?;
@@ -445,7 +455,10 @@ impl AccountManager {
             long_account_worker_response(response).await
         }
         .await;
-        let result = result.map(|created| created.group_id);
+        let result = result.map(|created| crate::GroupMemberResult {
+            operation: created.operation.map(|created| created.group_id),
+            member_outcomes: created.member_outcomes,
+        });
         self.shared.observer.performance().record(
             AppPerformanceOperation::GroupCreateTotalCallerLatency,
             started_at.elapsed(),
@@ -461,7 +474,7 @@ impl AccountManager {
         members: &[String],
         description: Option<String>,
         initial_image: Option<crate::AppInitialGroupImage>,
-    ) -> Result<CreatedGroup, AppError> {
+    ) -> Result<crate::GroupMemberResult<CreatedGroup>, AppError> {
         self.create_group_with_options_detailed(
             account_ref,
             name,
@@ -481,12 +494,20 @@ impl AccountManager {
         name: &str,
         members: &[String],
         options: AppCreateGroupOptions,
-    ) -> Result<CreatedGroup, AppError> {
+    ) -> Result<crate::GroupMemberResult<CreatedGroup>, AppError> {
         let started_at = Instant::now();
         let result = self
             .create_group_with_options_outcome(account_ref, name, members, options)
             .await
-            .and_then(CanonicalCreatedGroup::into_detailed);
+            .and_then(|created| {
+                Ok(crate::GroupMemberResult {
+                    operation: created
+                        .operation
+                        .map(CanonicalCreatedGroup::into_detailed)
+                        .transpose()?,
+                    member_outcomes: created.member_outcomes,
+                })
+            });
         self.shared.observer.performance().record(
             AppPerformanceOperation::GroupCreateTotalCallerLatency,
             started_at.elapsed(),
@@ -501,7 +522,7 @@ impl AccountManager {
         name: &str,
         members: &[String],
         options: AppCreateGroupOptions,
-    ) -> Result<CanonicalCreatedGroup, AppError> {
+    ) -> Result<crate::GroupMemberResult<CanonicalCreatedGroup>, AppError> {
         let command = self.worker_commands(account_ref).await?;
         let (respond, response) = oneshot::channel();
         command
@@ -518,7 +539,10 @@ impl AccountManager {
             .await
             .map_err(|_| AppError::TransportClosed)?;
         let result = long_account_worker_response(response).await;
-        if result.is_ok() {
+        if result
+            .as_ref()
+            .is_ok_and(|created| created.operation.is_some())
+        {
             self.spawn_create_catch_up(command);
             self.schedule_audit_log_tracker_update("create_group");
         }
@@ -901,9 +925,15 @@ impl AccountManager {
         account_ref: &str,
         group_id: &GroupId,
         members: &[String],
-    ) -> Result<SendSummary, AppError> {
-        self.invite_members_with_initial_admins(account_ref, group_id, members, &[])
-            .await
+    ) -> Result<crate::GroupMemberResult<SendSummary>, AppError> {
+        self.invite_members_with_initial_admins(
+            account_ref,
+            group_id,
+            members,
+            &[],
+            crate::MemberResolutionPolicy::Partial,
+        )
+        .await
     }
 
     pub async fn invite_members_with_initial_admins(
@@ -912,7 +942,8 @@ impl AccountManager {
         group_id: &GroupId,
         members: &[String],
         initial_admins: &[String],
-    ) -> Result<SendSummary, AppError> {
+        member_resolution: crate::MemberResolutionPolicy,
+    ) -> Result<crate::GroupMemberResult<SendSummary>, AppError> {
         let started_at = Instant::now();
         let result = async {
             let command = self.worker_commands(account_ref).await?;
@@ -922,14 +953,16 @@ impl AccountManager {
                     group_id: group_id.clone(),
                     members: members.to_vec(),
                     initial_admins: initial_admins.to_vec(),
+                    member_resolution,
                     respond,
                 })
                 .await
                 .map_err(|_| AppError::TransportClosed)?;
             let summary = account_worker_response(response).await?;
-            self.spawn_invite_catch_up(command);
-
-            self.schedule_audit_log_tracker_update("invite_members");
+            if summary.operation.is_some() {
+                self.spawn_invite_catch_up(command);
+                self.schedule_audit_log_tracker_update("invite_members");
+            }
             Ok(summary)
         }
         .await;

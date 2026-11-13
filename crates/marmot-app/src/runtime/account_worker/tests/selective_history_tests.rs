@@ -267,7 +267,9 @@ async fn late_commit_recovery(publish_after_cover: bool) {
             },
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     tokio::time::timeout(Duration::from_secs(20), async {
         loop {
             runtime.catch_up_accounts().await.unwrap();

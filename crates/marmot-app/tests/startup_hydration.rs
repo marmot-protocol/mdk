@@ -85,7 +85,9 @@ async fn sustained_traffic_body() {
                 client
                     .create_group(&format!("flooded group {group}"), &[donor_id.as_str()])
                     .await
-                    .unwrap(),
+                    .unwrap()
+                    .operation
+                    .expect("eligible fixture members"),
             );
         }
     }
@@ -180,7 +182,9 @@ async fn held_hydration_body() {
                 client
                     .create_group(&format!("held group {group}"), &[donor_id.as_str()])
                     .await
-                    .unwrap(),
+                    .unwrap()
+                    .operation
+                    .expect("eligible fixture members"),
             );
         }
     }
@@ -393,7 +397,12 @@ async fn held_direct_conversation_index_body() {
     {
         let app_fixture = open_store(&dir, &url, None);
         let mut client = app_fixture.client(BENCH_ACCOUNT).await.unwrap();
-        group_id = client.create_group("", &[donor_id.as_str()]).await.unwrap();
+        group_id = client
+            .create_group("", &[donor_id.as_str()])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
     }
     let group_id_hex = hex::encode(group_id.as_slice());
 

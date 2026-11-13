@@ -52,7 +52,9 @@ impl AdminSignOut {
                 },
             )
             .await
-            .unwrap();
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         let mut bob_cursor = 0;
         deliver_new(&mut bob, &relay, &mut bob_cursor).await;
         bob.accept_group_invite(&chat).unwrap();

@@ -67,7 +67,13 @@ async fn lone_writer(blossom: &LocalBlossom) -> (Devices, GroupId, Words) {
     })
     .await;
     let words = confirm_words(&mut devices.phone).await;
-    let chat = devices.phone.create_group("team", &[]).await.unwrap();
+    let chat = devices
+        .phone
+        .create_group("team", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     send_text(&mut devices.phone, &chat, "before the backup").await;
     (devices, chat, words)
 }

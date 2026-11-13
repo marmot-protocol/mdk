@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Breaking changes
+
+- Account migration 0202 adds `member_outcomes_json` to prepared group-image
+  uploads, retaining the original partial member-resolution report across
+  consumed-upload retries (#1813). Account schema advances from 201 to 202;
+  older binaries refuse the upgraded database. Downgrade is unsupported.
+- `PreparedGroupImageUploadRecord` carries the optional report, written through
+  `SqliteAppStorage::save_prepared_image_members` before canonical creation.
+
 ## 0.16.0 - 2026-11-12
 
 ### Breaking changes

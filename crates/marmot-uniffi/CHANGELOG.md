@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Breaking changes
+
+- Group creation and invitation methods return concrete partial-member result
+  records. Creation's `groupIdHex` or `created`, and invitation's `summary`, are
+  optional. Inspect ordered `memberOutcomes` for unavailable accounts, including
+  when an operation succeeded. Detailed invites return `GroupInviteResultFfi`;
+  other detailed mutations keep `GroupMutationResultFfi`. Regenerate Swift and
+  Kotlin bindings with the matching native library.
+
 ## 0.16.0 - 2026-11-12
 
 ### Breaking changes

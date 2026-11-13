@@ -192,7 +192,9 @@ async fn backup_restore_imports_only_current_memberships_and_catalog_survives_a_
         .phone
         .create_group("not joined yet", &[])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let unknown_message = send_text(&mut devices.phone, &unknown, "history for later").await;
     devices
         .phone_app
@@ -249,7 +251,9 @@ async fn backup_restore_imports_only_current_memberships_and_catalog_survives_a_
         .laptop
         .create_group("not in the archive", &[])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let published = devices.relay.published_event_ids();
     drop(devices.laptop);
     let plane = MarmotRelayPlane::new(None, devices.relay.clone());
@@ -461,7 +465,9 @@ async fn losing_own_leaf_before_fetch_or_before_apply_prevents_backup_history() 
         .phone
         .create_group("second current chat", &[])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     send_text(&mut devices.phone, &two, "old second message").await;
     let messages = HashMap::from([
         (one.clone(), first_message(&devices.phone, &one)),
@@ -558,7 +564,9 @@ async fn manual_backup_restore_cancels_and_closes_while_a_blob_is_held() {
         .phone
         .create_group("second chat", &[])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     send_text(&mut devices.phone, &two, "second history").await;
     write_backup(&mut devices.phone).await;
     let entries = pointer(&devices.relay, &words.public);
@@ -625,7 +633,9 @@ async fn manual_backup_restore_cancels_and_closes_while_a_blob_is_held() {
         .laptop
         .create_group("media capacity", &[])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let uploaded = devices
         .laptop
         .upload_media(
@@ -841,7 +851,13 @@ async fn a_partial_backup_restore_keeps_its_prefix_and_retries_older_unique_hist
     .await;
     add_laptop(&mut devices, &older_chat).await;
     assert!(devices.phone.forget_group_local(&older_chat).await.unwrap());
-    let newer_chat = devices.phone.create_group("newer chat", &[]).await.unwrap();
+    let newer_chat = devices
+        .phone
+        .create_group("newer chat", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let newer_event = send_text(&mut devices.phone, &newer_chat, "newer available history").await;
     due_now(&devices.phone);
     write_backup(&mut devices.phone).await;

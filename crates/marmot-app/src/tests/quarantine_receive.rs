@@ -78,12 +78,16 @@ async fn quarantined_group_does_not_block_account_receives_body(locally_deleted:
     let broken = runtime
         .create_group("alice", "quarantined", bob_members, None)
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     wait_for_joined(&mut events, &bob.account_id_hex, &broken).await;
     let healthy = runtime
         .create_group("alice", "healthy", bob_members, None)
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     wait_for_joined(&mut events, &bob.account_id_hex, &healthy).await;
     runtime.shutdown().await;
 

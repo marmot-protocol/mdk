@@ -9,6 +9,13 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+### Changed
+
+- Group creation and invites keep eligible members when another requested member has no usable fresh KeyPackage or inbox route.
+  JSON includes `member_outcomes` with each canonical account's status and selected device count. A selected member is not proof of delivery.
+  Creation returns `group_id: null` when no requested member is eligible. Invites return `summary: null` and nullable publication fields when no mutation occurs.
+  Text output reports resolution outcomes rather than claiming all requested members were invited.
+
 ## [0.16.0] - 2026-11-12
 
 ### Added

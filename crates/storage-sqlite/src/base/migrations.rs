@@ -381,6 +381,8 @@ mod migration_0180_removal_validation;
 mod migration_0200_chat_list_search_text;
 #[path = "migrations/0201_device_inactivity_clock.rs"]
 mod migration_0201_device_inactivity_clock;
+#[path = "migrations/0202_prepared_group_member_outcomes.rs"]
+mod migration_0202_prepared_group_member_outcomes;
 
 const MIGRATIONS: &[Migration] = &[
     Migration {
@@ -1441,6 +1443,12 @@ const MIGRATIONS: &[Migration] = &[
         name: "0201_device_inactivity_clock",
         suspend_foreign_keys: &[],
         apply: migration_0201_device_inactivity_clock::apply,
+    },
+    Migration {
+        version: 202,
+        name: "0202_prepared_group_member_outcomes",
+        suspend_foreign_keys: &[],
+        apply: migration_0202_prepared_group_member_outcomes::apply,
     },
 ];
 

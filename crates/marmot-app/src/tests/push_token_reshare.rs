@@ -235,7 +235,9 @@ impl Fixture {
             .client
             .create_group("push re-share", &[&bob.account_id_hex])
             .await
-            .unwrap();
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         bob.join(&relay, &group).await;
         // The creator's catch-up has run by the time it shares.
         alice.can_fetch().await;
@@ -282,7 +284,9 @@ async fn member_added_after_token_shares_learns_every_existing_token() {
         .client
         .invite_members(&group, &[fx.carol.account_id_hex.as_str()])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     // The completed revision is queued again, not treated as already done.
     assert_eq!(fx.alice.pending_shares(), vec![fx.group_hex()]);
     fx.bob.receive(&relay).await;
@@ -345,12 +349,16 @@ async fn offline_member_shares_once_after_catching_up_past_every_add() {
         .client
         .invite_members(&group, &[fx.carol.account_id_hex.as_str()])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     fx.alice
         .client
         .invite_members(&group, &[fx.dave.account_id_hex.as_str()])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     assert_eq!(fx.alice.pending_shares(), vec![fx.group_hex()]);
     assert_eq!(fx.alice.share().await.succeeded_groups, 1);
     fx.carol.join(&relay, &group).await;
@@ -398,7 +406,9 @@ async fn failed_share_queue_after_own_add_is_retried() {
         .client
         .invite_members(&group, &[fx.carol.account_id_hex.as_str()])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     assert!(fx.alice.pending_shares().is_empty());
     // The add also owes the group a push snapshot, which is pending work.
     assert!(fx.alice.client.take_queued_push_registration_share());
@@ -459,7 +469,9 @@ async fn upgrade_repair_reaches_members_who_joined_before_the_fix() {
         .client
         .invite_members(&group, &[carol.account_id_hex.as_str()])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     bob.receive(&relay).await;
     // Model a pre-fix device: the add queued no share.
     for device in [&alice, &bob] {
@@ -576,7 +588,9 @@ async fn sibling_devices_reshare_their_own_records() {
         .client
         .invite_members(&group, &[fx.carol.account_id_hex.as_str()])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     fx.bob.receive(&relay).await;
     tablet.receive(&relay).await;
     fx.carol.join(&relay, &group).await;

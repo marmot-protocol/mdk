@@ -33,7 +33,9 @@ pub use crate::relay_fault_proxy::{
     ConnectionTrafficV1, HistoryRequestV1, LiveGroupReplyV1, PRODUCTION_RELAY_INFORMATION,
     RelayDeliveryPath, RelayEventDeliveryV1, RelayTrafficV1,
 };
-pub(crate) use process_backend::{HistoryRepairOutcome, history_repair_outcome};
+pub(crate) use process_backend::{
+    HistoryRepairOutcome, history_repair_outcome, require_member_operation,
+};
 use process_backend::{ParticipantApp, ParticipantRuntime};
 use process_relay::{ProxyBackend, RelayBackend};
 pub use process_server::run as run_app_process_stdio;
@@ -3173,6 +3175,7 @@ fn app_error(error: AppError) -> SubjectError {
         | AppError::Io(_)
         | AppError::Sqlite(_)
         | AppError::CreatedGroupProjectionUnavailable(_)
+        | AppError::CreatedGroupMemberReportUnavailable(_)
         | AppError::SqlcipherKeyDerivation(_)
         | AppError::BlockListUnavailable
         | AppError::BlockPublicationUncertain

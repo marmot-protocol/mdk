@@ -71,6 +71,40 @@ mod tests {
         assert!(cache.get(&newest).is_none());
         assert!(!cache.order.contains(&newest));
     }
+
+    #[test]
+    fn partial_errors_keep_internal() {
+        use cgka_traits::error::EngineError;
+
+        assert_eq!(
+            recipient_resolution_status(&DirectoryError::TransportClosed),
+            None
+        );
+        let incompatible =
+            DirectoryError::KeyPackageRequirements(EngineError::InvalidKeyPackageCapabilities {
+                member: cgka_traits::MemberId::new(vec![1; 32]),
+            });
+        assert_eq!(
+            recipient_resolution_status(&incompatible),
+            Some(MemberResolutionStatus::IncompatibleKeyPackage)
+        );
+        for error in [
+            EngineError::Backend("key package provider failed".into()),
+            EngineError::Other("unexpected admission failure".into()),
+        ] {
+            assert_eq!(
+                recipient_resolution_status(&DirectoryError::KeyPackageRequirements(error)),
+                None
+            );
+        }
+        assert_eq!(
+            recipient_resolution_status(&DirectoryError::MissingKeyPackage {
+                account: "01".repeat(32),
+                reason: MissingKeyPackageReason::ObsoleteOnly,
+            }),
+            Some(MemberResolutionStatus::ObsoleteKeyPackage)
+        );
+    }
 }
 
 #[derive(Default)]
@@ -140,6 +174,36 @@ pub enum MemberResolutionPurpose {
     Prewarm,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemberResolutionStatus {
+    /// Fresh, compatible devices and a safe inbox route are available.
+    /// This does not mean the account joined or received a Welcome.
+    Selected,
+    MissingKeyPackage,
+    ObsoleteKeyPackage,
+    InvalidKeyPackage,
+    IncompatibleKeyPackage,
+    MissingInboxRoute,
+    Incomplete,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MemberResolutionOutcome {
+    pub account_id_hex: String,
+    pub status: MemberResolutionStatus,
+    /// Number of eligible devices, zero for every unavailable status.
+    pub selected_device_count: u32,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemberResolutionPolicy {
+    Atomic,
+    #[default]
+    Partial,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MemberKeyPackagePrewarmSummary {
     /// Number of member references supplied by the host.
@@ -189,6 +253,8 @@ pub struct ResolvedMemberKeyPackages {
     /// order. An account with several devices contributes several.
     pub key_packages: Vec<KeyPackage>,
     pub stats: MemberKeyPackageResolutionStats,
+    /// One result per canonical account, in first-input order.
+    pub member_outcomes: Vec<MemberResolutionOutcome>,
 }
 
 impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
@@ -219,13 +285,19 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
             .key_packages)
     }
 
+    /// Resolve fresh packages against the operation's admission requirements.
+    /// Partial resolution keeps eligible accounts and reports recipient-local
+    /// failures, including when no account is eligible. Invalid requests and
+    /// resource, storage or internal failures still fail the whole operation.
+    /// Atomic resolution returns the first unresolved account's error instead.
     pub async fn resolve_compatible_member_key_packages(
         &self,
         member_refs: Vec<String>,
         requirements: &cgka_engine::key_package::KeyPackageRequirements,
         purpose: MemberResolutionPurpose,
+        policy: MemberResolutionPolicy,
     ) -> Result<ResolvedMemberKeyPackages, DirectoryError> {
-        self.resolve_member_key_packages_for_purpose(member_refs, purpose, Some(requirements))
+        self.resolve_members_with_policy(member_refs, purpose, Some(requirements), policy)
             .await
     }
 
@@ -277,12 +349,34 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
         purpose: MemberResolutionPurpose,
         requirements: Option<&cgka_engine::key_package::KeyPackageRequirements>,
     ) -> Result<ResolvedMemberKeyPackages, DirectoryError> {
+        self.resolve_members_with_policy(
+            member_refs,
+            purpose,
+            requirements,
+            MemberResolutionPolicy::Atomic,
+        )
+        .await
+    }
+
+    async fn resolve_members_with_policy(
+        &self,
+        member_refs: Vec<String>,
+        purpose: MemberResolutionPurpose,
+        requirements: Option<&cgka_engine::key_package::KeyPackageRequirements>,
+        policy: MemberResolutionPolicy,
+    ) -> Result<ResolvedMemberKeyPackages, DirectoryError> {
         let observation =
             self.resources
                 .begin(ObservedFamily::KeyPackage, "lookup", ObservedUnit::Action);
         let deadline = tokio::time::Instant::now() + MEMBER_RESOLUTION_DEADLINE;
         let result = self
-            .resolve_member_key_packages_inner(&member_refs, purpose, requirements, deadline)
+            .resolve_member_key_packages_inner(
+                &member_refs,
+                purpose,
+                requirements,
+                deadline,
+                policy,
+            )
             .await;
         if let Some(observation) = observation {
             observation.finish(match &result {
@@ -304,6 +398,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
         purpose: MemberResolutionPurpose,
         requirements: Option<&cgka_engine::key_package::KeyPackageRequirements>,
         deadline: tokio::time::Instant,
+        policy: MemberResolutionPolicy,
     ) -> Result<ResolvedMemberKeyPackages, DirectoryError> {
         let directory_observation = self
             .resources
@@ -315,10 +410,18 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
             .map(DirectoryObservation::counts_only);
         let mut seen = HashSet::new();
         let mut targets = Vec::new();
+        let local_accounts = if member_refs.is_empty() {
+            HashMap::new()
+        } else {
+            self.resources
+                .local_accounts()?
+                .into_iter()
+                .map(|account| (account.label, account.account_id_hex))
+                .collect::<HashMap<_, _>>()
+        };
         for member_ref in member_refs {
-            let local = self.resources.account_id_for_label(member_ref).ok();
-            let account_id_hex = match local {
-                Some(account_id_hex) => account_id_hex,
+            let account_id_hex = match local_accounts.get(member_ref) {
+                Some(account_id_hex) => account_id_hex.clone(),
                 None => PublicKey::parse(member_ref)
                     .map_err(|_| DirectoryError::InvalidPublicKey)?
                     .to_hex(),
@@ -474,17 +577,26 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
             }
         }
 
-        let mut key_packages = Vec::with_capacity(targets.len());
-        for (index, outcome) in outcomes.into_iter().enumerate() {
-            match outcome.unwrap_or_else(|| {
-                Err(DirectoryError::MissingKeyPackage {
-                    account: targets[index].account_id_hex.clone(),
-                    reason: MissingKeyPackageReason::NotFound,
+        let unique_members = targets.len();
+        let mut key_packages = Vec::with_capacity(unique_members);
+        let mut member_outcomes = Vec::with_capacity(unique_members);
+        for (target, outcome) in targets.into_iter().zip(outcomes) {
+            let outcome = outcome
+                .unwrap_or_else(|| {
+                    Err(DirectoryError::MissingKeyPackage {
+                        account: target.account_id_hex.clone(),
+                        reason: MissingKeyPackageReason::NotFound,
+                    })
                 })
-            }) {
-                Ok(key_package) => {
+                .and_then(|packages| {
+                    if packages.is_empty() {
+                        return Err(DirectoryError::MissingKeyPackage {
+                            account: target.account_id_hex.clone(),
+                            reason: MissingKeyPackageReason::NotFound,
+                        });
+                    }
                     let safe_inbox = self.relay_plane.retain_safe_discovered_endpoints(
-                        targets[index]
+                        target
                             .relay_lists
                             .inbox
                             .relays
@@ -496,19 +608,40 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                     );
                     if safe_inbox.is_empty() {
                         return Err(DirectoryError::MissingMemberInboxRoute(
-                            targets[index].account_id_hex.clone(),
+                            target.account_id_hex.clone(),
                         ));
                     }
-                    key_packages.extend(key_package);
+                    Ok(packages)
+                });
+            let (status, selected_device_count) = match outcome {
+                Ok(packages) => {
+                    let device_count = packages.len() as u32;
+                    key_packages.extend(packages);
+                    (MemberResolutionStatus::Selected, device_count)
                 }
-                Err(error) => return Err(error),
-            }
+                Err(error) => {
+                    let status = match policy {
+                        MemberResolutionPolicy::Atomic => return Err(error),
+                        MemberResolutionPolicy::Partial => recipient_resolution_status(&error),
+                    };
+                    let Some(status) = status else {
+                        return Err(error);
+                    };
+                    (status, 0)
+                }
+            };
+            member_outcomes.push(MemberResolutionOutcome {
+                account_id_hex: target.account_id_hex,
+                status,
+                selected_device_count,
+            });
         }
         Ok(ResolvedMemberKeyPackages {
             key_packages,
+            member_outcomes,
             stats: MemberKeyPackageResolutionStats {
                 requested_members: member_refs.len(),
-                unique_members: targets.len(),
+                unique_members,
             },
         })
     }
@@ -1025,6 +1158,42 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                 self.accept_fetched_key_packages(purpose, selected, &targets[index].relay_lists)
             }));
         }
+    }
+}
+
+fn recipient_resolution_status(error: &DirectoryError) -> Option<MemberResolutionStatus> {
+    use MemberResolutionStatus as Status;
+    use cgka_traits::error::EngineError;
+
+    match error {
+        DirectoryError::MissingKeyPackage {
+            reason: MissingKeyPackageReason::NotFound,
+            ..
+        } => Some(Status::MissingKeyPackage),
+        DirectoryError::MissingKeyPackage {
+            reason: MissingKeyPackageReason::ObsoleteOnly,
+            ..
+        } => Some(Status::ObsoleteKeyPackage),
+        DirectoryError::InvalidKeyPackageEvent(_) => Some(Status::InvalidKeyPackage),
+        DirectoryError::MissingMemberInboxRoute(_) => Some(Status::MissingInboxRoute),
+        DirectoryError::DirectoryLookupIncomplete(_)
+        | DirectoryError::RelayDirectory(_)
+        | DirectoryError::MissingRelayLists(_) => Some(Status::Incomplete),
+        DirectoryError::KeyPackageRequirements(
+            EngineError::MissingRequiredCapabilities { .. }
+            | EngineError::InvalidKeyPackageCapabilities { .. },
+        ) => Some(Status::IncompatibleKeyPackage),
+        DirectoryError::KeyPackageRequirements(
+            EngineError::InvalidKeyPackageLifetime { .. }
+            | EngineError::InvalidAccountIdentityProof(_)
+            | EngineError::Serialize(_),
+        ) => Some(Status::InvalidKeyPackage),
+        DirectoryError::KeyPackageRequirements(EngineError::Other(message))
+            if message == "KeyPackage does not match target group profile or ciphersuite" =>
+        {
+            Some(Status::IncompatibleKeyPackage)
+        }
+        _ => None,
     }
 }
 

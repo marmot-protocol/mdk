@@ -29,7 +29,12 @@ async fn open_suspension_root() -> (SuspensionRoot, GroupId) {
     .unwrap()
     .with_test_relay_client(relay.clone());
     let mut setup_client = app.client(LABEL).await.unwrap();
-    let group_id = setup_client.create_group("suspension", &[]).await.unwrap();
+    let group_id = setup_client
+        .create_group("suspension", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     drop(setup_client);
 
     let session_path = app.account_storage_path(LABEL);

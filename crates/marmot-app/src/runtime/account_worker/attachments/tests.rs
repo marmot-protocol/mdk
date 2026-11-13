@@ -819,7 +819,12 @@ fn attachment_explicit_retry_derives_an_uncached_source_epoch_key() {
         .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
         let mut client = app.client("alice").await.unwrap();
         let storage = app.account_storage("alice").unwrap();
-        let group_id = client.create_group("retry media", &[]).await.unwrap();
+        let group_id = client
+            .create_group("retry media", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         let group_hex = hex::encode(group_id.as_slice());
         // Group creation caches its founding epoch; the source epoch is the
         // next one, and the group has left it by the time the row exists.

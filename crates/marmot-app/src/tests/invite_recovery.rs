@@ -800,14 +800,23 @@ async fn invite_recovery_group_preflight_keeps_failed_roster_unchanged_and_allow
     let group = client
         .create_group("Recovery preflight", &[])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let before = client.group_mls_state(&group).unwrap();
-    assert!(matches!(
-        client
-            .invite_members(&group, &[&member.account_id_hex])
-            .await,
-        Err(AppError::MissingKeyPackage { .. })
-    ));
+    let result = client
+        .invite_members(&group, &[&member.account_id_hex])
+        .await
+        .unwrap();
+    assert_eq!(result.operation, None);
+    assert_eq!(
+        result.member_outcomes,
+        vec![MemberResolutionOutcome {
+            account_id_hex: member.account_id_hex.clone(),
+            status: MemberResolutionStatus::MissingKeyPackage,
+            selected_device_count: 0,
+        }]
+    );
     let after = client.group_mls_state(&group).unwrap();
     assert_eq!(after.member_count, before.member_count);
     assert_eq!(after.epoch, before.epoch);
@@ -821,7 +830,9 @@ async fn invite_recovery_group_preflight_keeps_failed_roster_unchanged_and_allow
     client
         .invite_members(&group, &[&member.account_id_hex])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     assert_eq!(client.group_mls_state(&group).unwrap().member_count, 2);
 }
 
@@ -854,7 +865,9 @@ async fn invite_recovery_runtime_ready_account_group_creation_uses_discovery_onl
             AppCreateGroupOptions::default(),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let roster = runtime.group_members("creator", &group).await.unwrap();
     assert_eq!(roster.len(), 2);
     assert!(
@@ -1118,7 +1131,9 @@ async fn invite_recovery_preserves_incompatible_errors_for_empty_and_failed_supp
     let group = client
         .create_group("Compatibility diagnostics", &[])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let requirements = client
         .runtime
         .session()
@@ -1154,6 +1169,7 @@ async fn invite_recovery_preserves_incompatible_errors_for_empty_and_failed_supp
                 vec![account.account_id_hex.clone()],
                 &requirements,
                 nostr_directory::MemberResolutionPurpose::CommitFresh,
+                nostr_directory::MemberResolutionPolicy::Atomic,
             )
             .await;
         assert!(matches!(

@@ -272,7 +272,9 @@ fn host_scenario(relay_url: String) -> HostOutcome {
         vec![bob_id.clone()],
         None,
     ))
-    .expect("create group after both identities and runtimes are ready");
+    .expect("create group after both identities and runtimes are ready")
+    .group_id_hex
+    .expect("selected members create a group");
     loop {
         match block_on(bob_events.__ffi_next()).expect("bob events open") {
             MarmotEventFfi::GroupJoined { group_id_hex, .. } if group_id_hex == group => break,
@@ -293,7 +295,9 @@ fn host_scenario(relay_url: String) -> HostOutcome {
     block_on(carol.__ffi_start()).expect("start carol");
     let carol_group =
         block_on(carol.__ffi_create_group(carol_id.clone(), "notes".into(), Vec::new(), None))
-            .expect("carol group");
+            .expect("carol group")
+            .group_id_hex
+            .expect("selected members create a group");
     let bob_received = std::thread::Builder::new()
         .name("host-events".into())
         .spawn(move || {

@@ -134,7 +134,9 @@ mod tests {
         for name in groups {
             kit.create_group(account.clone(), (*name).into(), vec![], None)
                 .await
-                .unwrap();
+                .unwrap()
+                .group_id_hex
+                .expect("selected members create a group");
         }
         (relay, dir, kit, account)
     }

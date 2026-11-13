@@ -10,6 +10,26 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::sync::{Arc, Mutex};
 
+pub(crate) fn require_member_operation<T>(
+    result: marmot_app::GroupMemberResult<T>,
+) -> Result<T, AppError> {
+    if result
+        .member_outcomes
+        .iter()
+        .any(|outcome| outcome.status != marmot_app::MemberResolutionStatus::Selected)
+    {
+        return Err(AppError::Io(std::io::Error::other(format!(
+            "scenario member resolution incomplete: {:?}",
+            result.member_outcomes
+        ))));
+    }
+    result.operation.ok_or_else(|| {
+        AppError::Io(std::io::Error::other(
+            "scenario member operation unavailable",
+        ))
+    })
+}
+
 #[derive(Clone)]
 pub(super) enum ParticipantApp {
     Local(Box<MarmotApp>),
@@ -250,7 +270,9 @@ impl ParticipantRuntime {
         description: Option<String>,
     ) -> Result<GroupId, AppError> {
         match self {
-            Self::Local(r) => r.create_group(account, name, members, description).await,
+            Self::Local(r) => {
+                require_member_operation(r.create_group(account, name, members, description).await?)
+            }
             Self::Remote(p) => p
                 .call_async("create_group", json!([account, name, members, description]))
                 .await
@@ -367,6 +389,7 @@ impl ParticipantRuntime {
             Self::Local(r) => r
                 .invite_members(account, group, members)
                 .await
+                .and_then(require_member_operation)
                 .map(Into::into),
             Self::Remote(p) => p
                 .call_async("invite_members", json!([account, group, members]))
@@ -654,10 +677,10 @@ impl ParticipantServer {
                     Vec<String>,
                     Option<String>,
                 ) = args(arguments)?;
-                value(
+                value(require_member_operation(
                     r.create_group(&account, &name, &members, description)
                         .await?,
-                )
+                )?)
             }
             "group_members" => {
                 let (account, group): (String, GroupId) = args(arguments)?;
@@ -708,9 +731,9 @@ impl ParticipantServer {
             }
             "invite_members" => {
                 let (account, group, members): (String, GroupId, Vec<String>) = args(arguments)?;
-                value(SendReceipt::from(
+                value(SendReceipt::from(require_member_operation(
                     r.invite_members(&account, &group, &members).await?,
-                ))
+                )?))
             }
             "remove_members" => {
                 let (account, group, members): (String, GroupId, Vec<String>) = args(arguments)?;

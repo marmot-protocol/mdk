@@ -1,7 +1,7 @@
 ---
 title: "Marmot App Runtime Shape"
 created: 2026-05-19
-updated: 2026-11-11
+updated: 2026-11-12
 tags: [marmot, overview, app-runtime, daemon, tui]
 status: implemented-first-slice
 ---
@@ -232,6 +232,12 @@ Latency-sensitive hosts should use the explicit prepared-artifact sequence:
    Blossom transfer. A consumed id is idempotent and returns its original
    canonical group, including recovery after a crash before the consumed
    marker was written.
+
+The create response includes ordered per-account member-resolution outcomes. The prepared upload retains that exact
+report before engine creation, so a consumed-id retry returns the original decisions rather than repeating discovery.
+Changing the retry's roster does not change the committed operation or its report. For legacy consumed artifacts without
+a retained report, `CreatedGroupMemberReportUnavailable` identifies the existing group. A later roster and the retry's
+input cannot reconstruct the original ordered decisions. Refresh the existing group instead of creating a duplicate.
 
 The states `staged`, `uploading`, `uploaded`, `failed`, and `consumed` are
 returned through Rust and UniFFI. `uploading` is worker-local; after a restart,

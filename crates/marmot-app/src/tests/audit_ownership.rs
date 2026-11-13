@@ -55,7 +55,12 @@ async fn audited_alice(relay: &str) -> (tempfile::TempDir, MarmotApp) {
 async fn app_rows_and_engine_rows_share_one_sequence_and_group_ref() {
     let (_dir, app) = audited_alice("wss://audit-one-sequence.example").await;
     let mut client = app.client("alice").await.unwrap();
-    let group_id = client.create_group("one sequence", &[]).await.unwrap();
+    let group_id = client
+        .create_group("one sequence", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     client.record_epoch_stall_backfill_escalated(&group_id, 7, 3);
     client.send(&group_id, b"after the app row").await.unwrap();
     drop(client);
@@ -100,7 +105,12 @@ async fn app_rows_and_engine_rows_share_one_sequence_and_group_ref() {
 async fn finishing_the_audit_log_closes_it_for_every_clone() {
     let (_dir, app) = audited_alice("wss://audit-finish.example").await;
     let mut client = app.client("alice").await.unwrap();
-    let group_id = client.create_group("finish", &[]).await.unwrap();
+    let group_id = client
+        .create_group("finish", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     // Stands in for a clone that outlives shutdown. The runtime, the session
     // and the engine hold theirs inside the client.
     let surviving = client.audit.clone();
@@ -158,7 +168,12 @@ async fn finishing_the_audit_log_closes_it_for_every_clone() {
 async fn real_session_and_live_toggle_register_the_writer_for_retention() {
     let (_dir, app) = audited_alice("wss://audit-retention.example").await;
     let mut client = app.client("alice").await.unwrap();
-    let group = client.create_group("retention", &[]).await.unwrap();
+    let group = client
+        .create_group("retention", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let path = client.audit.audit_log_path().unwrap();
     let age = || {
         std::fs::File::options()

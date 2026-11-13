@@ -285,7 +285,12 @@ mod tests {
             let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
                 .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
             let mut client = app.client("alice").await.unwrap();
-            let group = client.create_group("Drafts", &[]).await.unwrap();
+            let group = client
+                .create_group("Drafts", &[])
+                .await
+                .unwrap()
+                .operation
+                .expect("eligible fixture members");
             let id = hex::encode(group.as_slice());
             let runtime = MarmotAppRuntime::new(app.clone());
             let mut sub = runtime
@@ -355,7 +360,12 @@ mod tests {
         let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
             .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
         let mut client = app.client("alice").await.unwrap();
-        let group = client.create_group("Muted", &[]).await.unwrap();
+        let group = client
+            .create_group("Muted", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         let id = hex::encode(group.as_slice());
         let runtime = MarmotAppRuntime::new(app.clone());
         runtime.set_chat_muted("alice", &id, None).unwrap();
@@ -397,7 +407,12 @@ mod tests {
         let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
             .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
         let mut client = app.client("alice").await.unwrap();
-        client.create_group("Pending", &[]).await.unwrap();
+        client
+            .create_group("Pending", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         app.ensure_chat_list_projection(&account).unwrap();
         let storage = app.account_storage("alice").unwrap();
         let app = storage.app_storage();
@@ -447,7 +462,12 @@ mod tests {
         let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
             .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
         let mut client = app.client("alice").await.unwrap();
-        let group = client.create_group("Before", &[]).await.unwrap();
+        let group = client
+            .create_group("Before", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         let id = hex::encode(group.as_slice());
         let runtime = MarmotAppRuntime::new(app.clone());
         // Neither legacy list reads nor a subscription have warmed the projection.
@@ -487,7 +507,12 @@ mod tests {
         let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
             .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
         let mut client = app.client("alice").await.unwrap();
-        let group = client.create_group("Initial name", &[]).await.unwrap();
+        let group = client
+            .create_group("Initial name", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         let id = hex::encode(group.as_slice());
         let runtime = MarmotAppRuntime::new(app.clone());
         let mut sub = runtime
@@ -569,7 +594,12 @@ mod tests {
         let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
             .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
         let mut client = app.client("alice").await.unwrap();
-        let group = client.create_group("Before", &[]).await.unwrap();
+        let group = client
+            .create_group("Before", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         let id = hex::encode(group.as_slice());
         let runtime = MarmotAppRuntime::new(app.clone());
         let mut sub = runtime

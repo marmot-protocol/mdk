@@ -361,7 +361,9 @@ async fn sdk_account_worker_reopens_after_notification_consumer_exit() {
             },
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     runtime.group_members(&alice.label, &group).await.unwrap();
 
     runtime
@@ -429,7 +431,9 @@ async fn sdk_account_worker_keeps_serving_through_notification_lag() {
             },
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     runtime.group_members(&alice.label, &group).await.unwrap();
     let plane = runtime.shared_services().relay_plane().clone();
     let sdk = plane.sdk_relay_client_for_test().unwrap();
@@ -514,7 +518,9 @@ async fn notification_lag_with_a_legacy_retained_route_stays_bounded() {
                 },
             )
             .await
-            .unwrap();
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         drop(client);
         let storage = app.account_storage(&alice.label).unwrap().app_storage();
         let mut stored = storage

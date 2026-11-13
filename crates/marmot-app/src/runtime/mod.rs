@@ -2121,8 +2121,10 @@ impl MarmotAppRuntime {
             .await
     }
 
-    /// Create a locally canonical group. A successful return does not imply
-    /// every invitation Welcome was delivered; subscribe for
+    /// Create a locally canonical group from eligible accounts. A nonempty
+    /// request with no eligible accounts returns no operation; an empty roster
+    /// creates a creator-only group. Member outcomes report selection, not
+    /// Welcome delivery; subscribe for
     /// [`MarmotAppEvent::WelcomeDeliveryPending`] or query
     /// [`Self::pending_welcome_deliveries`] before presenting invite success.
     pub async fn create_group(
@@ -2131,7 +2133,7 @@ impl MarmotAppRuntime {
         name: &str,
         members: &[String],
         description: Option<String>,
-    ) -> Result<GroupId, AppError> {
+    ) -> Result<crate::GroupMemberResult<GroupId>, AppError> {
         self.accounts
             .create_group(account_ref, name, members, description)
             .await
@@ -2147,15 +2149,15 @@ impl MarmotAppRuntime {
             .await
     }
 
-    /// Create a locally canonical group and return the exact durable
-    /// chat-list row available at the response boundary.
+    /// Return member selection and, when created, the exact durable chat-list
+    /// row available at the response boundary.
     pub async fn create_group_detailed(
         &self,
         account_ref: &str,
         name: &str,
         members: &[String],
         description: Option<String>,
-    ) -> Result<crate::CreatedGroup, AppError> {
+    ) -> Result<crate::GroupMemberResult<crate::CreatedGroup>, AppError> {
         self.accounts
             .create_group_detailed(account_ref, name, members, description)
             .await
@@ -2168,7 +2170,7 @@ impl MarmotAppRuntime {
         members: &[String],
         description: Option<String>,
         initial_image: Option<crate::AppInitialGroupImage>,
-    ) -> Result<GroupId, AppError> {
+    ) -> Result<crate::GroupMemberResult<GroupId>, AppError> {
         self.accounts
             .create_group_with_initial_image(account_ref, name, members, description, initial_image)
             .await
@@ -2180,7 +2182,7 @@ impl MarmotAppRuntime {
         name: &str,
         members: &[String],
         options: AppCreateGroupOptions,
-    ) -> Result<GroupId, AppError> {
+    ) -> Result<crate::GroupMemberResult<GroupId>, AppError> {
         self.accounts
             .create_group_with_options(account_ref, name, members, options)
             .await
@@ -2256,7 +2258,7 @@ impl MarmotAppRuntime {
         members: &[String],
         description: Option<String>,
         upload_id: String,
-    ) -> Result<GroupId, AppError> {
+    ) -> Result<crate::GroupMemberResult<GroupId>, AppError> {
         self.accounts
             .create_group_with_prepared_initial_image(
                 account_ref,
@@ -2275,7 +2277,7 @@ impl MarmotAppRuntime {
         members: &[String],
         description: Option<String>,
         initial_image: Option<crate::AppInitialGroupImage>,
-    ) -> Result<crate::CreatedGroup, AppError> {
+    ) -> Result<crate::GroupMemberResult<crate::CreatedGroup>, AppError> {
         self.accounts
             .create_group_with_initial_image_detailed(
                 account_ref,
@@ -2293,7 +2295,7 @@ impl MarmotAppRuntime {
         name: &str,
         members: &[String],
         options: AppCreateGroupOptions,
-    ) -> Result<crate::CreatedGroup, AppError> {
+    ) -> Result<crate::GroupMemberResult<crate::CreatedGroup>, AppError> {
         self.accounts
             .create_group_with_options_detailed(account_ref, name, members, options)
             .await
@@ -2538,9 +2540,15 @@ impl MarmotAppRuntime {
         account_ref: &str,
         group_id: &GroupId,
         members: &[String],
-    ) -> Result<SendSummary, AppError> {
-        self.invite_members_with_initial_admins(account_ref, group_id, members, &[])
-            .await
+    ) -> Result<crate::GroupMemberResult<SendSummary>, AppError> {
+        self.invite_members_with_initial_admins(
+            account_ref,
+            group_id,
+            members,
+            &[],
+            crate::MemberResolutionPolicy::Partial,
+        )
+        .await
     }
 
     pub async fn invite_members_with_initial_admins(
@@ -2549,9 +2557,16 @@ impl MarmotAppRuntime {
         group_id: &GroupId,
         members: &[String],
         initial_admins: &[String],
-    ) -> Result<SendSummary, AppError> {
+        member_resolution: crate::MemberResolutionPolicy,
+    ) -> Result<crate::GroupMemberResult<SendSummary>, AppError> {
         self.accounts
-            .invite_members_with_initial_admins(account_ref, group_id, members, initial_admins)
+            .invite_members_with_initial_admins(
+                account_ref,
+                group_id,
+                members,
+                initial_admins,
+                member_resolution,
+            )
             .await
     }
 

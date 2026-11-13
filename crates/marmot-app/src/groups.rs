@@ -112,6 +112,7 @@ impl std::fmt::Debug for AppInitialGroupImage {
 /// requirement.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AppCreateGroupOptions {
+    pub member_resolution: nostr_directory::MemberResolutionPolicy,
     /// Initial group routing relays. Omitted uses the app configuration.
     pub relays: Option<Vec<String>>,
     pub description: String,

@@ -110,6 +110,25 @@ screen API exists. The method reference marks explicit alternatives individually
 
 ### Start a direct chat
 
+Group creation returns `GroupCreationResultFfi` with an optional `groupIdHex`;
+detailed creation returns `DetailedGroupCreationResultFfi` with an optional `created` row.
+Invites return `InviteMembersResultFfi` with an optional `summary`. Detailed invites
+return `GroupInviteResultFfi`, whose `invite` contains that result alongside refreshed
+details and management state. Other detailed mutations keep `GroupMutationResultFfi`.
+
+Inspect `memberOutcomes` even when an operation is present. Each canonical account
+appears once, in request order. `selected` means its fresh KeyPackages were eligible,
+not that the recipient joined or received a Welcome. `selectedDeviceCount` counts
+devices, not accounts. Unavailable accounts do not prevent eligible accounts from
+being included. With no eligible requested members, the operation is absent and no
+group mutation occurs. An empty creation roster still creates a creator-only group.
+`startDirectConversation` requires its peer and never reports a creator-only success.
+
+`CreatedGroupMemberReportUnavailable` identifies a legacy prepared-image upload that
+already created a group but lacks its original member report. Use the error's
+`groupIdHex` to open the existing group. Do not create a replacement group or present
+current directory results as the original creation outcome.
+
 Use `startDirectConversation` with a hex or npub peer identity. MDK serializes lookup and creation on the account worker.
 It reuses the deterministic local direct-conversation selection, or creates an unnamed group with both accounts as admins
 in the founding state and Welcome. Reuse preserves existing roles and sends no admin-policy update.

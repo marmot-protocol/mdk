@@ -362,6 +362,19 @@ The creator remains an admin. Omitting this option preserves creator-only admin 
 deduplicates the requested roster and fetches current KeyPackages in bounded multi-author relay batches before building
 the MLS add.
 
+Create and invite return `GroupMemberResult<T>`: an optional operation result and ordered `member_outcomes`, one per
+canonical account. Each selected account reports its device count; selection does not imply Welcome delivery or joining.
+Unavailable accounts carry typed package, inbox-route, or incomplete-lookup outcomes and are omitted from the one MLS
+operation. If a nonempty roster has no eligible account, `operation` is `None` and no group or commit is created.
+An explicitly empty create still creates a creator-only group.
+
+Invalid input, self-inclusion, invalid admin intent, and authorization failures remain whole-operation errors.
+Storage failures propagate instead of being classified as unavailable recipients. Initial admins must belong to the
+requested roster, but only selected accounts receive their requested role.
+`AppCreateGroupOptions::member_resolution` defaults to `Partial`; `Atomic` rejects the entire roster on its first
+recipient failure. `invite_members_with_initial_admins` takes the same policy explicitly. `start_direct_conversation`
+and stable agent-control v2 creation/invitation use atomic resolution, preserving their existing failure behavior.
+
 - Cached packages are useful for discovery, but cannot authorize an invitation or substitute for a failed relay lookup.
   This also applies to another account on the same installation: its local package record is not an invitation
   shortcut, and its published package must be reachable on relays. Relay freshness is not proof that the recipient still

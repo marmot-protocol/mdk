@@ -169,6 +169,8 @@ pub enum AppError {
     /// retrying creation and producing a duplicate group.
     #[error("group was created but its local chat projection is unavailable")]
     CreatedGroupProjectionUnavailable(String),
+    #[error("group was created but its original member report is unavailable")]
+    CreatedGroupMemberReportUnavailable(String),
     #[error("invalid group membership page: {0}")]
     InvalidGroupMembershipPage(String),
     /// The once-per-open peer-index backfill has not finished. Retry after
@@ -745,6 +747,9 @@ impl AppError {
             Self::UnknownGroup(_) => "unknown_group",
             Self::GroupInviteNotPending => "group_invite_not_pending",
             Self::CreatedGroupProjectionUnavailable(_) => "created_group_projection_unavailable",
+            Self::CreatedGroupMemberReportUnavailable(_) => {
+                "created_group_member_report_unavailable"
+            }
             Self::InvalidGroupMembershipPage(_) => "invalid_group_membership_page",
             Self::ChatPresentationNotReady => "chat_presentation_not_ready",
             Self::InvalidChatListQuery(_) => "invalid_chat_list_query",

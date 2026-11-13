@@ -1039,22 +1039,16 @@ impl TuiApp {
         args.extend(all_members.iter().cloned());
         let result = self.client.run_json(Some(&account_id), &args)?;
         let group_id = value_string(&result, "group_id");
-        let member_count = all_members.len();
         self.refresh_chats_with_feedback(FeedbackPermission::Silent)?;
         if let Some(group_id) = group_id.as_deref() {
             self.select_chat_by_group_id(group_id, FeedbackPermission::Silent)?;
         }
+        let outcomes = member_status(result.get("member_outcomes").unwrap_or(&Value::Null));
         self.set_status(
             group_id
                 .as_deref()
-                .map(|group_id| {
-                    format!(
-                        "created chat {} with {} member(s)",
-                        shorten(group_id, 18),
-                        member_count
-                    )
-                })
-                .unwrap_or_else(|| format!("created chat with {member_count} member(s)")),
+                .map(|group_id| format!("created chat {}; {}", shorten(group_id, 18), outcomes))
+                .unwrap_or_else(|| format!("chat not created; {outcomes}")),
         );
         Ok(())
     }

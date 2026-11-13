@@ -82,7 +82,7 @@ impl AgentConnector {
         let account_id_hex = crate::validation::normalize_hex(account_id_hex)?;
         let account = self.local_account_for_account_id(&account_id_hex)?;
         crate::validation::validate_group_create(&name, &members, description.as_deref())?;
-        let group_id = self
+        let result = self
             .runtime
             .create_group_with_options(
                 &account.label,
@@ -92,10 +92,14 @@ impl AgentConnector {
                     description: description.unwrap_or_default(),
                     relays,
                     initial_admins: admins,
+                    member_resolution: marmot_app::MemberResolutionPolicy::Atomic,
                     ..Default::default()
                 },
             )
             .await?;
+        let group_id = result
+            .operation
+            .ok_or(ConnectorError::MemberResolutionFailed)?;
         let group_id_hex = hex::encode(group_id.as_slice());
         // Provenance is activation metadata only; it never changes sender authorization.
         // Preserve the canonical create result on persistence failure so clients
@@ -204,8 +208,16 @@ impl AgentConnector {
             let admins: &[String] = if change.promote { &members } else { &[] };
             Some(
                 self.runtime
-                    .invite_members_with_initial_admins(&account.label, &group_id, &members, admins)
-                    .await?,
+                    .invite_members_with_initial_admins(
+                        &account.label,
+                        &group_id,
+                        &members,
+                        admins,
+                        marmot_app::MemberResolutionPolicy::Atomic,
+                    )
+                    .await?
+                    .operation
+                    .ok_or(ConnectorError::MemberResolutionFailed)?,
             )
         } else if change.promote && is_member && !is_admin {
             Some(

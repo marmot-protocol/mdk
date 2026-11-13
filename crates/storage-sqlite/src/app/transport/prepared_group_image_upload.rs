@@ -56,6 +56,7 @@ pub struct PreparedGroupImageUploadRecord {
     pub encrypted_blob: Option<Vec<u8>>,
     pub upload_secret: Option<Vec<u8>>,
     pub group_id_hex: Option<String>,
+    pub member_outcomes_json: Option<String>,
     pub attempt_count: u32,
     pub last_error_kind: Option<String>,
     pub recorded_at: u64,
@@ -91,6 +92,7 @@ impl SqliteAppStorage {
             || record.upload_id.is_empty()
             || record.component_data.is_empty()
             || record.group_id_hex.is_some()
+            || record.member_outcomes_json.is_some()
             || !matches!(&record.encrypted_blob, Some(blob) if !blob.is_empty())
             || !matches!(&record.upload_secret, Some(secret) if secret.len() == 32)
             || record.attempt_count != 0
@@ -171,7 +173,7 @@ impl SqliteAppStorage {
         let conn = self.lock()?;
         conn.query_row_cached(
             "SELECT upload_id, state, component_data, encrypted_blob, upload_secret,
-                    group_id_hex, attempt_count, last_error_kind, recorded_at, updated_at
+                    group_id_hex, attempt_count, last_error_kind, recorded_at, updated_at, member_outcomes_json
              FROM app_prepared_group_image_upload
              WHERE upload_id = ?1",
             params![upload_id],
@@ -190,7 +192,7 @@ impl SqliteAppStorage {
         let mut statement = conn
             .prepare_cached(
                 "SELECT upload_id, state, component_data, encrypted_blob, upload_secret,
-                        group_id_hex, attempt_count, last_error_kind, recorded_at, updated_at
+                        group_id_hex, attempt_count, last_error_kind, recorded_at, updated_at, member_outcomes_json
                  FROM app_prepared_group_image_upload
                  ORDER BY recorded_at, upload_id",
             )
@@ -246,6 +248,27 @@ impl SqliteAppStorage {
         Ok(())
     }
 
+    pub fn save_prepared_image_members(
+        &self,
+        upload_id: &str,
+        member_outcomes_json: &str,
+    ) -> StorageResult<()> {
+        let changed = self
+            .lock()?
+            .execute_cached(
+                "UPDATE app_prepared_group_image_upload SET member_outcomes_json = ?2
+         WHERE upload_id = ?1 AND state = 'uploaded'",
+                params![upload_id, member_outcomes_json],
+            )
+            .storage()?;
+        if changed == 0 {
+            return Err(StorageError::Backend(
+                "prepared group image upload is not ready for member resolution".into(),
+            ));
+        }
+        Ok(())
+    }
+
     pub fn consume_prepared_group_image_upload(
         &self,
         upload_id: &str,
@@ -268,7 +291,7 @@ impl SqliteAppStorage {
             let raw = tx
                 .query_row_cached(
                     "SELECT upload_id, state, component_data, encrypted_blob, upload_secret,
-                            group_id_hex, attempt_count, last_error_kind, recorded_at, updated_at
+                            group_id_hex, attempt_count, last_error_kind, recorded_at, updated_at, member_outcomes_json
                      FROM app_prepared_group_image_upload WHERE upload_id = ?1",
                     params![upload_id],
                     prepared_group_image_upload_from_row,
@@ -316,6 +339,7 @@ type RawPreparedGroupImageUpload = (
     Option<String>,
     i64,
     i64,
+    Option<String>,
 );
 
 fn prepared_group_image_upload_from_row(
@@ -332,6 +356,7 @@ fn prepared_group_image_upload_from_row(
         row.get(7)?,
         row.get(8)?,
         row.get(9)?,
+        row.get(10)?,
     ))
 }
 
@@ -345,6 +370,7 @@ fn try_from_raw_record(
         encrypted_blob: raw.3,
         upload_secret: raw.4,
         group_id_hex: raw.5,
+        member_outcomes_json: raw.10,
         attempt_count: u32::try_from(raw.6).map_err(|_| {
             StorageError::Serialization("invalid group image upload attempt count".into())
         })?,
@@ -366,6 +392,7 @@ mod tests {
             encrypted_blob: Some(vec![4, 5, 6]),
             upload_secret: Some(vec![7; 32]),
             group_id_hex: None,
+            member_outcomes_json: None,
             attempt_count: 0,
             last_error_kind: None,
             recorded_at: 10,
@@ -415,6 +442,12 @@ mod tests {
             .app_storage()
             .mark_prepared_group_image_upload_uploaded("upload-1", 12)
             .unwrap();
+        let report =
+            r#"[1,[{"account_id_hex":"account","status":"selected","selected_device_count":2}]]"#;
+        store
+            .app_storage()
+            .save_prepared_image_members("upload-1", report)
+            .unwrap();
         store
             .app_storage()
             .consume_prepared_group_image_upload("upload-1", "abcd", 13)
@@ -426,6 +459,20 @@ mod tests {
             .unwrap();
         assert_eq!(consumed.state, PreparedGroupImageUploadState::Consumed);
         assert_eq!(consumed.group_id_hex.as_deref(), Some("abcd"));
+        assert_eq!(consumed.member_outcomes_json.as_deref(), Some(report));
+        assert!(
+            matches!(store.app_storage().save_prepared_image_members("upload-1", "[]"), Err(StorageError::Backend(message)) if message == "prepared group image upload is not ready for member resolution")
+        );
+        assert_eq!(
+            store
+                .app_storage()
+                .prepared_group_image_upload("upload-1")
+                .unwrap()
+                .unwrap()
+                .member_outcomes_json
+                .as_deref(),
+            Some(report)
+        );
         assert!(consumed.component_data.is_empty());
         assert!(consumed.encrypted_blob.is_none());
         assert!(consumed.upload_secret.is_none());

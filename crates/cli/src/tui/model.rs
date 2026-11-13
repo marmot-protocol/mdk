@@ -4401,7 +4401,26 @@ pub(crate) fn move_index(current: usize, len: usize, delta: isize) -> usize {
     (current as isize + delta).clamp(0, max) as usize
 }
 
+pub(crate) fn member_status(outcomes: &Value) -> String {
+    let Some(rows) = outcomes.as_array() else {
+        return "member outcomes unavailable".to_owned();
+    };
+    let selected = rows
+        .iter()
+        .filter(|row| row.get("status").and_then(Value::as_str) == Some("selected"))
+        .count();
+    let unavailable = rows.len() - selected;
+    format!("{selected} selected, {unavailable} unavailable; member outcomes: {outcomes}")
+}
+
 pub(crate) fn publish_status(action: &str, result: &Value) -> String {
+    if let Some(outcomes) = result.get("member_outcomes") {
+        return format!(
+            "{}; published={}",
+            member_status(outcomes),
+            result.get("published").unwrap_or(&Value::Null)
+        );
+    }
     let published = result
         .get("published")
         .and_then(Value::as_u64)

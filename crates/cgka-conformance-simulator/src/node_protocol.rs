@@ -462,6 +462,7 @@ impl NodeServer {
                     .runtime
                     .create_group(&state.account_id, &name, &member_accounts, None)
                     .await
+                    .and_then(crate::app_runtime::require_member_operation)
                     .map_err(app_node_error)?;
                 state.groups.insert(group.clone(), group_id.clone());
                 state.active_group = Some(group);
@@ -481,6 +482,7 @@ impl NodeServer {
                     .runtime
                     .invite_members(&state.account_id, &group_id, &member_accounts)
                     .await
+                    .and_then(crate::app_runtime::require_member_operation)
                     .map_err(app_node_error)?;
                 Ok(ack_from_summary(action_id, summary, None))
             }

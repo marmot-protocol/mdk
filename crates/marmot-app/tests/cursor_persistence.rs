@@ -221,7 +221,9 @@ async fn frozen_wake_collection_body() {
     let group_id = alice_client
         .create_group("cursor persistence", &[bob_id.as_str()])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     wait_for_event(&mut events_boot1, "boot 1 group join", |event| {
         matches!(
             event,

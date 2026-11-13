@@ -129,7 +129,7 @@ fn publisher_finishes_and_cancels() {
             0,
             &mut account,
         ));
-        let mut group = ptr::null_mut();
+        let mut creation = ptr::null_mut();
         check(marmot_create_group(
             client,
             (*account).account_id_hex,
@@ -137,8 +137,9 @@ fn publisher_finishes_and_cancels() {
             ptr::null(),
             0,
             ptr::null(),
-            &mut group,
+            &mut creation,
         ));
+        let group = (*creation).group_id_hex;
         let mut options = MarmotPublisherOptions {
             candidate: candidate.as_ptr(),
             server_cert_der: ptr::null(),
@@ -328,7 +329,7 @@ fn publisher_finishes_and_cancels() {
         assert_eq!((*summary).message_ids_len, 1);
         marmot_send_summary_free(summary);
         marmot_agent_publisher_free(publisher);
-        marmot_string_free(group);
+        marmot_c::types::group::marmot_group_creation_free(creation);
         marmot_account_summary_free(account);
         check(marmot_client_shutdown(client));
         marmot_client_free(client);

@@ -128,7 +128,9 @@ async fn overdue_secondary_groups_service_durable_send(deferred_count: usize) {
                     },
                 )
                 .await
-                .unwrap(),
+                .unwrap()
+                .operation
+                .expect("eligible fixture members"),
         );
     }
     relay

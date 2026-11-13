@@ -62,11 +62,12 @@ use crate::types::emoji_set::{
 use crate::types::group::{
     MarmotAccountDevicesActivation, MarmotAppBlobEndpoint, MarmotAppGroupMemberIdsList,
     MarmotAppGroupMemberRecordList, MarmotAppGroupMlsState, MarmotAppGroupRecord,
-    MarmotAppQuarantinedGroupList, MarmotCreateGroupOptions, MarmotCreatedGroup,
+    MarmotAppQuarantinedGroupList, MarmotCreateGroupOptions, MarmotDetailedGroupCreationResult,
     MarmotDisbandRequest, MarmotGroupAppComponent, MarmotGroupCommitDelivery,
-    MarmotGroupConversationSnapshot, MarmotGroupDetails, MarmotGroupInviteDeclineResult,
-    MarmotGroupManagementState, MarmotGroupMutationResult, MarmotGroupRecoveryStatus,
-    MarmotGroupRoster, MarmotInitialGroupImage, MarmotMemberKeyPackagePrewarmSummary,
+    MarmotGroupConversationSnapshot, MarmotGroupCreationResult, MarmotGroupDetails,
+    MarmotGroupInviteDeclineResult, MarmotGroupInviteResult, MarmotGroupManagementState,
+    MarmotGroupMutationResult, MarmotGroupRecoveryStatus, MarmotGroupRoster,
+    MarmotInitialGroupImage, MarmotInviteMembersResult, MarmotMemberKeyPackagePrewarmSummary,
     MarmotMemberRef, MarmotPendingWelcomeDeliveryList, MarmotPreparedGroupImageUpload,
     MarmotPreparedGroupImageUploadList,
 };
@@ -291,7 +292,7 @@ pub(crate) unsafe fn deliver_bytes(
 ///     /// docs (become the C header docs)
 ///     async fn marmot_create_group(
 ///         account_ref: str, name: str, member_refs: str_arr, description: opt_str,
-///     ) -> string = create_group;
+///     ) -> rec(MarmotGroupCreationResult) = create_group;
 /// }
 /// ```
 ///
@@ -702,9 +703,9 @@ c_cmd! {
     async fn marmot_start_direct_chat(account_ref: str, peer_account_id: str) -> string = start_direct_conversation;
 
     /// Create a new MLS group with `name` and the given members
-    /// (referenced by `npub` or hex account id). Writes the new group id
-    /// as a hex string; free it with `marmot_string_free`.
-    async fn marmot_create_group(account_ref: str, name: str, member_refs/member_refs_len: str_arr, description: opt_str) -> string = create_group;
+    /// (referenced by `npub` or hex account id). Writes a partial member result with an optional group id
+    /// encoded as hex; free it with `marmot_group_creation_free`.
+    async fn marmot_create_group(account_ref: str, name: str, member_refs/member_refs_len: str_arr, description: opt_str) -> rec(MarmotGroupCreationResult) = create_group;
 
     /// Normalize a member reference (hex, `npub`, `nostr:npub...`,
     /// `nprofile`, `nostr:nprofile...`, and `marmot://profile/...`).
@@ -728,8 +729,8 @@ c_cmd! {
     async fn marmot_group_management_state(account_ref: str, group_id_hex: str) -> rec(MarmotGroupManagementState) = group_management_state;
 
     /// Invite members (by `npub` or hex account id) into the group.
-    /// Requires admin. Free with `marmot_send_summary_free`.
-    async fn marmot_invite_members(account_ref: str, group_id_hex: str, member_refs/member_refs_len: str_arr) -> rec(MarmotSendSummary) = invite_members;
+    /// Requires admin. Free with `marmot_invite_members_free`.
+    async fn marmot_invite_members(account_ref: str, group_id_hex: str, member_refs/member_refs_len: str_arr) -> rec(MarmotInviteMembersResult) = invite_members;
 
     /// Remove members from the group. Requires admin; preflight rejects
     /// self-removal and removing the last admin. Free with
@@ -1047,8 +1048,8 @@ c_cmd! {
 
     /// `marmot_invite_members` plus refreshed details and management
     /// state in one round trip. Free with
-    /// `marmot_group_mutation_result_free`.
-    async fn marmot_invite_members_detailed(account_ref: str, group_id_hex: str, member_refs/member_refs_len: str_arr) -> rec(MarmotGroupMutationResult) = invite_members_detailed;
+    /// `marmot_group_invite_free`.
+    async fn marmot_invite_members_detailed(account_ref: str, group_id_hex: str, member_refs/member_refs_len: str_arr) -> rec(MarmotGroupInviteResult) = invite_members_detailed;
 
     /// `marmot_remove_members` plus refreshed details and management
     /// state. Free with `marmot_group_mutation_result_free`.
@@ -1367,13 +1368,13 @@ c_cmd! {
     async fn marmot_acknowledge_disband_failure(account_ref: str, group_id_hex: str) -> scalar(bool) = acknowledge_disband_failure;
 
     /// `marmot_invite_members` where some invitees join as admins. Free
-    /// with `marmot_send_summary_free`.
-    async fn marmot_invite_members_with_initial_admins(account_ref: str, group_id_hex: str, member_refs/member_refs_len: str_arr, initial_admin_refs/initial_admin_refs_len: str_arr) -> rec(MarmotSendSummary) = invite_members_with_initial_admins;
+    /// with `marmot_invite_members_free`.
+    async fn marmot_invite_members_with_initial_admins(account_ref: str, group_id_hex: str, member_refs/member_refs_len: str_arr, initial_admin_refs/initial_admin_refs_len: str_arr) -> rec(MarmotInviteMembersResult) = invite_members_with_initial_admins;
 
     /// `marmot_invite_members_with_initial_admins` plus refreshed details
     /// and management state in one round trip. Free with
-    /// `marmot_group_mutation_result_free`.
-    async fn marmot_invite_members_detailed_with_initial_admins(account_ref: str, group_id_hex: str, member_refs/member_refs_len: str_arr, initial_admin_refs/initial_admin_refs_len: str_arr) -> rec(MarmotGroupMutationResult) = invite_members_detailed_with_initial_admins;
+    /// `marmot_group_invite_free`.
+    async fn marmot_invite_members_detailed_with_initial_admins(account_ref: str, group_id_hex: str, member_refs/member_refs_len: str_arr, initial_admin_refs/initial_admin_refs_len: str_arr) -> rec(MarmotGroupInviteResult) = invite_members_detailed_with_initial_admins;
 
     /// Queue an MLS self-update commit for the group. Writes the
     /// scheduled job id; free it with `marmot_string_free`.
@@ -1438,8 +1439,8 @@ c_cmd! {
     async fn marmot_prewarm_group_member_key_packages(account_ref: str, member_refs/member_refs_len: str_arr) -> rec(MarmotMemberKeyPackagePrewarmSummary) = prewarm_group_member_key_packages;
 
     /// `marmot_create_group` plus the new chat-list row in one round
-    /// trip. Free with `marmot_created_group_free`.
-    async fn marmot_create_group_detailed(account_ref: str, name: str, member_refs/member_refs_len: str_arr, description: opt_str) -> rec(MarmotCreatedGroup) = create_group_detailed;
+    /// trip. Free with `marmot_detailed_creation_free`.
+    async fn marmot_create_group_detailed(account_ref: str, name: str, member_refs/member_refs_len: str_arr, description: opt_str) -> rec(MarmotDetailedGroupCreationResult) = create_group_detailed;
 
     /// Member and admin ids for several groups in one read. Free with
     /// `marmot_app_group_member_ids_list_free`.
@@ -1467,9 +1468,9 @@ c_cmd! {
     async fn marmot_prepared_group_images(account_ref: str) -> rec(MarmotPreparedGroupImageUploadList) = prepared_group_images;
 
     /// Create a group whose avatar is an already-staged prepared image.
-    /// Writes the new group id as a hex string; free it with
-    /// `marmot_string_free`.
-    async fn marmot_create_group_with_prepared_initial_image(account_ref: str, name: str, member_refs/member_refs_len: str_arr, description: opt_str, upload_id: str) -> string = create_group_with_prepared_initial_image;
+    /// Writes a partial member result with an optional group id encoded as hex; free it with
+    /// `marmot_group_creation_free`.
+    async fn marmot_create_group_with_prepared_initial_image(account_ref: str, name: str, member_refs/member_refs_len: str_arr, description: opt_str, upload_id: str) -> rec(MarmotGroupCreationResult) = create_group_with_prepared_initial_image;
 
     /// One group's maintenance state. Free with
     /// `marmot_group_maintenance_status_free`.
@@ -2629,7 +2630,7 @@ pub unsafe extern "C" fn marmot_save_message_draft(
 
 /// Create a group with the options struct: description, an optional
 /// initial avatar, and disappearing-message retention. Writes the new
-/// group id as a hex string; free it with `marmot_string_free`.
+/// partial member result; free it with `marmot_group_creation_free`.
 ///
 /// # Safety
 /// `client` must be a live handle; strings valid; the member array must
@@ -2643,7 +2644,7 @@ pub unsafe extern "C" fn marmot_create_group_with_options(
     member_refs: *const *const c_char,
     member_refs_len: usize,
     options: *const MarmotCreateGroupOptions,
-    out: *mut *mut c_char,
+    out: *mut *mut MarmotGroupCreationResult,
 ) -> MarmotStatus {
     ffi_guard(|| {
         try_arg!(unsafe { crate::preflight_out_ptr(out) });
@@ -2654,7 +2655,7 @@ pub unsafe extern "C" fn marmot_create_group_with_options(
         let options = try_arg!(unsafe { borrowed(options) });
         let options = try_arg!(unsafe { options.to_ffi() });
         unsafe {
-            deliver_string(
+            deliver(
                 client.block_on(client.marmot.create_group_with_options(
                     account_ref,
                     name,
@@ -2668,7 +2669,7 @@ pub unsafe extern "C" fn marmot_create_group_with_options(
 }
 
 /// `marmot_create_group_with_options` plus the new chat-list row in one
-/// round trip. Free with `marmot_created_group_free`.
+/// round trip. Free with `marmot_detailed_creation_free`.
 ///
 /// # Safety
 /// Same as `marmot_create_group_with_options`.
@@ -2680,7 +2681,7 @@ pub unsafe extern "C" fn marmot_create_group_with_options_detailed(
     member_refs: *const *const c_char,
     member_refs_len: usize,
     options: *const MarmotCreateGroupOptions,
-    out: *mut *mut MarmotCreatedGroup,
+    out: *mut *mut MarmotDetailedGroupCreationResult,
 ) -> MarmotStatus {
     ffi_guard(|| {
         try_arg!(unsafe { crate::preflight_out_ptr(out) });
@@ -2705,8 +2706,8 @@ pub unsafe extern "C" fn marmot_create_group_with_options_detailed(
 }
 
 /// Create a group with an inline initial avatar. `initial_image` may be
-/// NULL for no image. Writes the new group id as a hex string; free it
-/// with `marmot_string_free`.
+/// NULL for no image. Writes a partial member result; free it
+/// with `marmot_group_creation_free`.
 ///
 /// # Safety
 /// `client` must be a live handle; strings valid (`description`
@@ -2722,7 +2723,7 @@ pub unsafe extern "C" fn marmot_create_group_with_initial_image(
     member_refs_len: usize,
     description: *const c_char,
     initial_image: *const MarmotInitialGroupImage,
-    out: *mut *mut c_char,
+    out: *mut *mut MarmotGroupCreationResult,
 ) -> MarmotStatus {
     ffi_guard(|| {
         try_arg!(unsafe { crate::preflight_out_ptr(out) });
@@ -2733,7 +2734,7 @@ pub unsafe extern "C" fn marmot_create_group_with_initial_image(
         let description = try_arg!(unsafe { crate::memory::optional_str(description) });
         let initial_image = try_arg!(unsafe { optional_initial_image(initial_image) });
         unsafe {
-            deliver_string(
+            deliver(
                 client.block_on(client.marmot.create_group_with_initial_image(
                     account_ref,
                     name,
@@ -2748,7 +2749,7 @@ pub unsafe extern "C" fn marmot_create_group_with_initial_image(
 }
 
 /// `marmot_create_group_with_initial_image` plus the new chat-list row
-/// in one round trip. Free with `marmot_created_group_free`.
+/// in one round trip. Free with `marmot_detailed_creation_free`.
 ///
 /// # Safety
 /// Same as `marmot_create_group_with_initial_image`.
@@ -2761,7 +2762,7 @@ pub unsafe extern "C" fn marmot_create_group_with_initial_image_detailed(
     member_refs_len: usize,
     description: *const c_char,
     initial_image: *const MarmotInitialGroupImage,
-    out: *mut *mut MarmotCreatedGroup,
+    out: *mut *mut MarmotDetailedGroupCreationResult,
 ) -> MarmotStatus {
     ffi_guard(|| {
         try_arg!(unsafe { crate::preflight_out_ptr(out) });
