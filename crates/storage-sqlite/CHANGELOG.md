@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Added
+
+- `SqliteAppStorage::sticker_pack_relays` and `set_sticker_pack_relays` retain sticker-pack relay hints independently
+  of NIP-01 replacement metadata (mdk#3283). Account migration 0202 adds `relays_json`, defaulting existing packs to
+  an empty list. Pack replacement preserves retained hints.
+
 ## 0.16.0 - 2026-11-12
 
 ### Breaking changes

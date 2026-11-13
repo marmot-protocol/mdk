@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Added
+
+- `MarmotApp::sticker_pack_share_link(account_ref, coordinate)` builds a
+  canonical Sonar viewer link offline with up to eight retained relay
+  candidates. New fetch candidates displace older hints; retention and
+  sharing apply the current relay safety policy. Packs without usable
+  hints use account relays. Hints that exceed the parser's link size limit
+  are omitted (mdk#3283).
+
 ### Fixed
 
 - `NotificationUpdate.is_dm` follows the chat-list conversation kind for
