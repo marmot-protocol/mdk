@@ -6,9 +6,10 @@
 
 - `MarmotApp::sticker_pack_share_link(account_ref, coordinate)` builds a
   canonical Sonar viewer link offline with up to eight retained relay
-  candidates. Fetches retain those candidates per pack; older cached packs
-  use account relays until refreshed. Hints that exceed the parser's link
-  size limit are omitted (mdk#3283).
+  candidates. New fetch candidates displace older hints; retention and
+  sharing apply the current relay safety policy. Packs without usable
+  hints use account relays. Hints that exceed the parser's link size limit
+  are omitted (mdk#3283).
 
 ### Fixed
 
