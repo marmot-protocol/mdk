@@ -21,6 +21,12 @@ pub(crate) trait LiveTailRead: Send + Sync {
     /// The last second the ledger must prove on `relay` for `route` at `now`:
     /// the second before a standing tail starts there, else `now`.
     fn owed_until(&self, route: &TransportReconciliationRoute, relay: &str, now: u64) -> u64;
+
+    /// Whether `route`'s joined copy is still collecting its post-join
+    /// history, for the audit.
+    fn collecting(&self, _route: &TransportReconciliationRoute) -> bool {
+        false
+    }
 }
 
 impl LiveTailRead for LiveTails {
@@ -69,5 +75,9 @@ impl LiveTailRead for PostJoinTails {
             .copied()
             .unwrap_or_else(|| self.live.owed_until(route, relay, now))
             .min(now)
+    }
+
+    fn collecting(&self, route: &TransportReconciliationRoute) -> bool {
+        self.collecting.contains_key(route)
     }
 }

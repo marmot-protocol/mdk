@@ -47,6 +47,13 @@ impl AppClient {
         self.audit.record(record);
     }
 
+    /// Record one recovery-runner row (`WorkerTurn::audit`): about the MLS
+    /// group given, or account-scoped.
+    pub(crate) fn record_runner_audit(&self, group: Option<&[u8]>, kind: AuditEventKind) {
+        let group = group.map(|group| GroupId::new(group.to_vec()));
+        self.record_audit_event(group.as_ref(), None, kind);
+    }
+
     /// Drain only current-operation events into the installed recorder. They
     /// get the same source/session/sequence as engine audit rows.
     pub(crate) fn flush_live_v5_events(&mut self) {

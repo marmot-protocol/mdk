@@ -40,10 +40,12 @@ mod refusal;
 mod shared;
 pub use recovery::{
     EoseRepairReceiver, EoseRepairTrigger, RECOVERY_AUDIT_MAX_ENDPOINTS,
-    RECOVERY_AUDIT_MAX_OBLIGATIONS, RecoveryAttemptScope, RecoveryGoalBound, RecoveryNeedChange,
-    RecoveryNextAttempt, RecoveryObligationCause, RecoveryObligationVerdict, RecoveryPassOutcome,
-    RecoveryRelayFailure, RecoveryRelayOutcome, RecoveryRunnerCap, RecoveryScopeProgress,
-    TransportCursorTrigger,
+    RECOVERY_AUDIT_MAX_OBLIGATIONS, RECOVERY_RUNNER_RACED_WINDOW_SECS, RecoveryAttemptScope,
+    RecoveryGoalBound, RecoveryNeedChange, RecoveryNextAttempt, RecoveryObligationCause,
+    RecoveryObligationVerdict, RecoveryPassOutcome, RecoveryRelayFailure, RecoveryRelayOutcome,
+    RecoveryRunnerBreak, RecoveryRunnerCap, RecoveryRunnerChange, RecoveryRunnerFetch,
+    RecoveryRunnerFetchEnd, RecoveryRunnerOutcome, RecoveryRunnerPurpose, RecoveryRunnerRoute,
+    RecoveryScopeProgress, TransportCursorTrigger,
 };
 pub use refusal::{
     SUBSCRIPTION_REFUSAL_AUDIT_MAX_ENTRIES, SubscriptionRefusalCategory, SubscriptionRefusalEntry,
@@ -1464,6 +1466,86 @@ pub enum AuditEventKind {
         pauses: u64,
         late_findings: u64,
     },
+    /// One fetch the recovery runner settled: a debt or re-check quantum on
+    /// one (route, relay) unit. Recorded in the quantum's settle turn, once
+    /// per quantum that began, never per survey. A group route's row carries
+    /// the group's `group_ref`; the inbox's is account-scoped.
+    ///
+    /// `obligation_id` is the route's one-way ledger tag (hex), the one its
+    /// `unproven_history` notice carries, so v5's `obligation_ref` joins the
+    /// two; `retained_route` marks a group's retained prior route. `relay_url`
+    /// is the unit's relay (v5 `endpoint_ref`). `owed_since_secs` and
+    /// `owed_until_secs` bound the `ranges` the begin turn planned, which owe
+    /// `owed_secs` seconds after the live tail. `raced` counts the route's
+    /// begins abandoned as raced since its previous runner row
+    /// ([`Self::RecoveryRunnerRaced`]). `late_findings` counts events a
+    /// re-check found inside history already covered. v5 only.
+    RecoveryRunnerFetched {
+        route_kind: RecoveryRunnerRoute,
+        obligation_id: String,
+        retained_route: bool,
+        relay_url: String,
+        best_effort: bool,
+        fetch: RecoveryRunnerFetch,
+        purpose: RecoveryRunnerPurpose,
+        probe: bool,
+        ranges: u64,
+        owed_secs: u64,
+        owed_since_secs: u64,
+        owed_until_secs: u64,
+        outcome: RecoveryRunnerOutcome,
+        end: RecoveryRunnerFetchEnd,
+        duration_ms: u64,
+        requests: u64,
+        answers: u64,
+        newly_covered_secs: u64,
+        proved_secs: u64,
+        events_fetched: u64,
+        events_staged: u64,
+        late_findings: u64,
+        raced: u64,
+    },
+    /// Begins the recovery runner abandoned on one route because the unit it
+    /// picked no longer owed anything, or was no longer eligible, once it
+    /// began (nothing charged). Coalesced per route: a row at most once per
+    /// [`RECOVERY_RUNNER_RACED_WINDOW_SECS`], written by the race that ends a
+    /// window, and counts not written so go on the route's next
+    /// [`Self::RecoveryRunnerFetched`] row instead. `window_secs` is how long
+    /// the counted races took. Group-scoped like the fetch rows. v5 only.
+    RecoveryRunnerRaced {
+        route_kind: RecoveryRunnerRoute,
+        obligation_id: String,
+        raced: u64,
+        window_secs: u64,
+    },
+    /// A recovery-runner unit or route changed state: it broke, a probe
+    /// failed, it re-armed, a route was suspended or resumed, a relay's
+    /// units retired as gone or reopened, or the retention prune parked or
+    /// widened a route's remainder. Transition-driven, never per survey.
+    /// Route-level changes carry the route's `route_kind` and ledger tag
+    /// (`obligation_id`, as on [`Self::RecoveryRunnerFetched`]) and the
+    /// group's `group_ref`; aggregate changes (`caps_rearmed`,
+    /// `repair_rearmed`, `reopened`) count `units` and are account-scoped.
+    /// v5 only.
+    RecoveryRunnerChanged {
+        change: RecoveryRunnerChange,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        route_kind: Option<RecoveryRunnerRoute>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        obligation_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        relay_url: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        break_reason: Option<RecoveryRunnerBreak>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        park_revision: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        units: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        remainder_since_secs: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        remainder_until_secs: Option<u64>,
+    },
 }
 
 impl AuditEventKind {
@@ -1527,6 +1609,9 @@ impl AuditEventKind {
             AuditEventKind::SubscriptionEoseRepaired { .. } => "subscription_eose_repaired",
             AuditEventKind::SubscriptionRefused { .. } => "subscription_refused",
             AuditEventKind::RecoveryRunnerPaused { .. } => "recovery_runner_paused",
+            AuditEventKind::RecoveryRunnerFetched { .. } => "recovery_runner_fetched",
+            AuditEventKind::RecoveryRunnerRaced { .. } => "recovery_runner_raced",
+            AuditEventKind::RecoveryRunnerChanged { .. } => "recovery_runner_changed",
         }
     }
 
@@ -1574,6 +1659,9 @@ impl AuditEventKind {
                 | AuditEventKind::SubscriptionEoseRepaired { .. }
                 | AuditEventKind::SubscriptionRefused { .. }
                 | AuditEventKind::RecoveryRunnerPaused { .. }
+                | AuditEventKind::RecoveryRunnerFetched { .. }
+                | AuditEventKind::RecoveryRunnerRaced { .. }
+                | AuditEventKind::RecoveryRunnerChanged { .. }
         )
     }
 }

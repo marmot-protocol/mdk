@@ -26,6 +26,18 @@
   sharing apply the current relay safety policy. Packs without usable
   hints use account relays. Hints that exceed the parser's link size limit
   are omitted (mdk#3283).
+- The v5 forensic audit log records what the recovery runner does for each group (mdk#2660 phase 4), so an exported
+  log shows whether a group keeps trying to catch up, what it thinks it owes, and whether it stopped trying.
+  `recovery_runner_fetched` is one row per fetch the runner settles: the group, route and relay (hashed), sweep or
+  NIP-77 comparison, its purpose (debt, held capture, epoch-gap visit, post-join collection, repair, re-check), the
+  owed window and seconds, the outcome and how the relay call ended, its duration, and what it covered, fetched and
+  staged. `recovery_runner_raced` coalesces begins that found nothing owed to at most one row per route per minute,
+  and `recovery_runner_changed` records each unit break, failed probe and re-arm, a route suspended or resumed,
+  relays retired as gone or reopened, and each remainder the retention floor parks or widens. marmot-forensics adds
+  the three v5-only `AuditEventKind` variants, their closed vocabularies (`RecoveryRunnerRoute`,
+  `RecoveryRunnerFetch`, `RecoveryRunnerPurpose`, `RecoveryRunnerOutcome`, `RecoveryRunnerFetchEnd`,
+  `RecoveryRunnerChange`, `RecoveryRunnerBreak`), `RECOVERY_RUNNER_RACED_WINDOW_SECS`, and their v5 schema and
+  validation. Surveys write no rows, and the runner's behavior is unchanged.
 
 ### Changed
 

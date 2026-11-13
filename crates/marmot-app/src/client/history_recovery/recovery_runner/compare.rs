@@ -223,6 +223,8 @@ struct CompareStage<'a, H> {
     covered: bool,
     newly_covered_seconds: u64,
     late: u64,
+    /// Events newly staged, for the audit.
+    staged_events: u64,
     /// Bytes charged to staged batches.
     staged_bytes: u64,
     /// Bytes of batches that never reached storage, for settlement.
@@ -284,6 +286,7 @@ impl<H: RunnerHost> CompareSink for CompareStage<'_, H> {
                 if self.covered {
                     self.late = self.late.saturating_add(staged.events);
                 }
+                self.staged_events = self.staged_events.saturating_add(staged.events);
                 return Ok(());
             }
         };
@@ -365,6 +368,8 @@ pub(super) async fn run<H: RunnerHost>(
         newly_covered_seconds: 0,
         proved_seconds: 0,
         proved_events: 0,
+        events_fetched: 0,
+        events_staged: 0,
         delta: 0,
         observed_cap: None,
         stop: None,
@@ -390,6 +395,7 @@ pub(super) async fn run<H: RunnerHost>(
         covered: false,
         newly_covered_seconds: 0,
         late: 0,
+        staged_events: 0,
         staged_bytes: 0,
         unstaged_bytes: 0,
         stop: None,
@@ -421,6 +427,7 @@ pub(super) async fn run<H: RunnerHost>(
         .await;
         report.requests = report.requests.saturating_add(compared.stats.requests);
         report.answers = report.answers.saturating_add(compared.stats.answers);
+        report.events_fetched = report.events_fetched.saturating_add(compared.stats.events);
         report.rate_limited = compared.rate_limited;
         sink.unstaged_bytes = sink
             .unstaged_bytes
@@ -452,6 +459,7 @@ pub(super) async fn run<H: RunnerHost>(
         }
     }
     report.newly_covered_seconds = sink.newly_covered_seconds;
+    report.events_staged = sink.staged_events;
     report.stop = sink.stop;
     facts.late = sink.late;
     if !plan.best_effort {

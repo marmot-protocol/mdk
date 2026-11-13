@@ -662,6 +662,98 @@ fn validate_operational(kind: &crate::audit::AuditEventKind) -> Result<(), Contr
         AuditEventKind::RecoveryRunnerPaused { pauses, .. } => {
             require(*pauses > 0, "a pause row counts its own pause")
         }
+        AuditEventKind::RecoveryRunnerFetched {
+            route_kind,
+            best_effort,
+            fetch,
+            purpose,
+            probe,
+            ranges,
+            owed_secs,
+            owed_since_secs,
+            owed_until_secs,
+            ..
+        } => {
+            use crate::audit::{RecoveryRunnerFetch, RecoveryRunnerPurpose, RecoveryRunnerRoute};
+            require(
+                *ranges > 0 && owed_since_secs <= owed_until_secs,
+                "a runner fetch plans at least one range in an ordered window",
+            )?;
+            require(
+                *owed_secs > 0 && *owed_secs <= owed_until_secs - owed_since_secs + 1,
+                "a runner fetch owes at least a second and no more than its window",
+            )?;
+            require(
+                !(*probe && *best_effort),
+                "a best-effort relay keeps no retry state to probe",
+            )?;
+            require(
+                *purpose != RecoveryRunnerPurpose::Recheck
+                    || (*fetch == RecoveryRunnerFetch::Compare && !*best_effort),
+                "a re-check compares on a required relay",
+            )?;
+            require(
+                *route_kind != RecoveryRunnerRoute::Inbox || *fetch == RecoveryRunnerFetch::Compare,
+                "the inbox is only ever compared",
+            )
+        }
+        AuditEventKind::RecoveryRunnerRaced { raced, .. } => {
+            require(*raced > 0, "a raced row counts at least one race")
+        }
+        AuditEventKind::RecoveryRunnerChanged {
+            change,
+            route_kind,
+            obligation_id,
+            relay_url,
+            break_reason,
+            park_revision,
+            units,
+            remainder_since_secs,
+            remainder_until_secs,
+        } => {
+            use crate::audit::RecoveryRunnerChange as C;
+            let route = route_kind.is_some() && obligation_id.is_some();
+            let unrouted = route_kind.is_none() && obligation_id.is_none();
+            let parked = matches!(change, C::Broken | C::ProbeFailed);
+            let remainder = matches!(change, C::RemainderParked | C::RemainderWidened);
+            let counted = matches!(
+                change,
+                C::CapsRearmed | C::RepairRearmed | C::RetiredGone | C::Reopened
+            );
+            require(
+                match change {
+                    C::Broken | C::ProbeFailed | C::Rearmed => route && relay_url.is_some(),
+                    C::CapsRearmed => unrouted && relay_url.is_some(),
+                    C::RepairRearmed | C::Reopened => unrouted && relay_url.is_none(),
+                    C::RetiredGone
+                    | C::Suspended
+                    | C::Resumed
+                    | C::RemainderParked
+                    | C::RemainderWidened => route && relay_url.is_none(),
+                },
+                "a runner change names exactly the route and relay its change is about",
+            )?;
+            require(
+                break_reason.is_some() == parked,
+                "only a broken or re-parked unit carries a break reason",
+            )?;
+            require(
+                park_revision.is_some() == (parked || remainder),
+                "only a park carries its revision",
+            )?;
+            require(
+                units.is_some() == counted && units.is_none_or(|units| units > 0),
+                "only an aggregate change counts its units, at least one",
+            )?;
+            require(
+                match (remainder_since_secs, remainder_until_secs) {
+                    (Some(since), Some(until)) => remainder && since <= until,
+                    (None, None) => !remainder,
+                    _ => false,
+                },
+                "only a remainder change carries its ordered range",
+            )
+        }
         _ => Ok(()),
     }
 }

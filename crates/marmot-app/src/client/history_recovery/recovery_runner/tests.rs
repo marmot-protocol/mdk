@@ -45,6 +45,7 @@ use crate::runtime::account_worker::recovery_credits::{
     self, RecoveryCreditPool, available_credits, hold_all_credits_for_test,
 };
 
+mod audit_rows;
 mod comparison;
 mod epoch_gap;
 mod inbox;
@@ -1006,8 +1007,8 @@ struct TestHost {
     closed: OnceLock<Account>,
     /// The relay pool's connection generations, by relay.
     connections: watch::Sender<BTreeMap<String, u64>>,
-    /// Audit rows the runner's worker turns recorded.
-    audited: Mutex<Vec<AuditEventKind>>,
+    /// Audit rows the runner's turns recorded, each with its group.
+    audited: Mutex<Vec<(Option<Vec<u8>>, AuditEventKind)>>,
     /// What the last survey found catching up.
     catching_up: Mutex<Option<BTreeSet<UnitKey>>>,
 }
@@ -1126,6 +1127,18 @@ impl TestHost {
         });
     }
 
+    fn record_audit(&self, group: Option<&[u8]>, kind: AuditEventKind) {
+        self.audited
+            .lock()
+            .unwrap()
+            .push((group.map(<[u8]>::to_vec), kind));
+    }
+
+    /// The audit rows recorded so far, each with its group, taken.
+    fn take_audited(&self) -> Vec<(Option<Vec<u8>>, AuditEventKind)> {
+        std::mem::take(&mut *self.audited.lock().unwrap())
+    }
+
     /// The next `turns` worker turns (not debt turns) run on a closed
     /// database, so every storage call in them fails.
     fn fail_next_turns(&self, turns: usize) {
@@ -1156,7 +1169,7 @@ impl RunnerHost for TestHost {
         } else {
             &self.app
         };
-        let audit = |kind| self.audited.lock().unwrap().push(kind);
+        let audit = |group: Option<&[u8]>, kind| self.record_audit(group, kind);
         Some(turn(&WorkerTurn {
             app,
             now: self.clock.now(),
@@ -1179,6 +1192,7 @@ impl RunnerHost for TestHost {
         };
         let routes = self.routes.lock().unwrap().clone();
         let counts = self.counts.lock().unwrap().clone();
+        let audit = |group: Option<&[u8]>, kind| self.record_audit(group, kind);
         let answer = turn(&DebtTurn {
             app: &self.app,
             routes: &routes,
@@ -1186,6 +1200,8 @@ impl RunnerHost for TestHost {
             tails: &*tails,
             live_counts: &counts,
             inbox: INBOX_KEY,
+            audit: &audit,
+            audits: true,
         });
         self.debt_turns.fetch_add(1, Ordering::SeqCst);
         self.clock
@@ -2264,7 +2280,12 @@ async fn recovery_runner_pauses_the_account_at_its_hourly_cap() {
     assert_eq!(relay.requests(), requests);
     // Once per pause: the next step while paused records nothing more.
     assert_eq!(idle(runner.step().await), Some(until));
-    let audited = std::mem::take(&mut *host.audited.lock().unwrap());
+    let audited = host
+        .take_audited()
+        .into_iter()
+        .map(|(_, kind)| kind)
+        .filter(|kind| matches!(kind, AuditEventKind::RecoveryRunnerPaused { .. }))
+        .collect::<Vec<_>>();
     let [
         AuditEventKind::RecoveryRunnerPaused {
             cap,
@@ -2804,6 +2825,7 @@ fn recovery_runner_sizes_a_route_last_seen_empty_by_its_span() {
     let (quiet, busy) = (group(1), group(2));
     let candidate = |route: &Route, owed_seconds: u64| select::Candidate {
         key: unit_key(route, RELAY),
+        group_id: None,
         best_effort: false,
         owed_seconds,
         position: 0,
@@ -2824,6 +2846,8 @@ fn recovery_runner_sizes_a_route_last_seen_empty_by_its_span() {
         newly_covered_seconds: HOUR,
         proved_seconds: HOUR,
         proved_events: 0,
+        events_fetched: 0,
+        events_staged: 0,
         delta: HOUR,
         observed_cap: None,
         stop: None,

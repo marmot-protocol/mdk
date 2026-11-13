@@ -2,8 +2,11 @@
 //! (`recovery_need_changed`, `recovery_attempt_started`,
 //! `recovery_attempt_finished`, `recovery_obligation_reassessed`) and the
 //! transport-cursor row (`transport_cursor_advanced`) and historical wire-reissue row
-//! (`subscription_eose_repaired`), and the recovery runner's account breaker
-//! row (`recovery_runner_paused`). These kinds exist only in audit v5; a v4
+//! (`subscription_eose_repaired`), and the recovery runner's rows: its account
+//! breaker (`recovery_runner_paused`), each quantum it settles
+//! (`recovery_runner_fetched`), the begins it abandons
+//! (`recovery_runner_raced`) and its unit and route state changes
+//! (`recovery_runner_changed`). These kinds exist only in audit v5; a v4
 //! recorder drops them (see `AuditEventKind::is_v5_only`).
 //!
 //! Each enum mirrors a name the recovery code already uses, so a reader can
@@ -17,6 +20,10 @@ pub const RECOVERY_AUDIT_MAX_OBLIGATIONS: usize = 16;
 /// Largest number of endpoint references one row carries. Matches the v5
 /// endpoint list bound; a longer list sets `endpoints_truncated`.
 pub const RECOVERY_AUDIT_MAX_ENDPOINTS: usize = 16;
+
+/// Shortest span one `recovery_runner_raced` row coalesces on a route: a
+/// route writes at most one such row per this many seconds.
+pub const RECOVERY_RUNNER_RACED_WINDOW_SECS: u64 = 60;
 
 /// Why an obligation exists: `storage_sqlite::RecoveryCause`, one to one,
 /// plus [`Self::UnprovenHistory`] for a coverage-ledger route's notice.
@@ -287,6 +294,158 @@ pub enum RecoveryRunnerCap {
     Attempts,
     EventBytes,
     Both,
+}
+
+/// The kind of route a recovery-runner row is about:
+/// `storage_sqlite::TransportReconciliationRoute`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryRunnerRoute {
+    /// The account's gift-wrap inbox. Its rows are account-scoped.
+    Inbox,
+    /// A group's current or retained route. Its rows carry the group's
+    /// `group_ref`.
+    Group,
+}
+
+/// How one recovery-runner quantum fetched: the runner's `SweepPlan::compare`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryRunnerFetch {
+    /// Sliced `REQ`s over the owed ranges (`quantum::run`).
+    Sweep,
+    /// A NIP-77 comparison of the owed ranges, fetching the difference by id
+    /// (`compare::run`).
+    Compare,
+}
+
+/// What a recovery-runner quantum was for, most specific first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryRunnerPurpose {
+    /// A re-check over history already covered or retired (`recheck`).
+    Recheck,
+    /// A step of an explicit full-history repair (`repair`).
+    Repair,
+    /// A joined copy's post-join collection (`post_join`).
+    PostJoinCollection,
+    /// A return visit an unresolved epoch gap authorized (`epoch_gap`).
+    EpochGapVisit,
+    /// Debt of a group whose live frames a capture fence holds (the runner's
+    /// held class).
+    Fenced,
+    /// Any other ledger debt: loss, cold start, a widened goal, the
+    /// standing window.
+    Debt,
+}
+
+/// One quantum's outcome: `storage_sqlite::RecoveryUnitOutcome`, one to one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryRunnerOutcome {
+    /// Newly covered seconds on the unit's own (route, relay).
+    Advanced,
+    /// The planned ranges were already covered.
+    NothingOwed,
+    /// The relay answered and nothing was newly covered.
+    NoProgress,
+    /// The relay could not be reached or timed out.
+    Unreachable,
+    /// The relay kept rate-limiting.
+    RateLimited,
+    /// The relay refused: auth required, restricted, blocked or unsupported.
+    Refused,
+    /// The runner preempted the call: shutdown, a pass's end, a stale mark.
+    Unanswered,
+    /// Staging or the ledger write failed.
+    LocalFailure,
+}
+
+/// How a quantum's last relay call ended: the adapter's `SweepEnd` for a
+/// sweep and `CompareEnd` for a comparison, by their labels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryRunnerFetchEnd {
+    /// Every planned range finished.
+    Finished,
+    /// The quantum's deadline cut it.
+    Deadline,
+    /// Shutdown or a pass's end preempted it, or a comparison the relay
+    /// would not run is swept instead.
+    Cancelled,
+    /// A comparison fetched as much as its quantum may.
+    BudgetSpent,
+    /// The relay named an id in a comparison and did not return it.
+    Withheld,
+    /// A sweep met a second its relay cannot prove under its caps.
+    SaturatedSecond,
+    /// A comparison met a second whose relay set reached the limit.
+    SaturatedWindow,
+    /// A sweep met a second whose answer was inconclusive.
+    InconclusiveSecond,
+    /// The relay kept answering `rate-limited:`.
+    RateLimited,
+    /// The relay refused with `CLOSED`.
+    Refused,
+    /// The relay does not speak NIP-77.
+    Unsupported,
+    /// The relay did not answer before the request's deadline.
+    TimedOut,
+    /// The relay's connection dropped or never came up.
+    Disconnected,
+    /// Staging refused what was fetched.
+    SinkFailed,
+    /// The sweep's cursor store failed.
+    StoreFailed,
+}
+
+/// A recovery-runner state change worth a row: a unit breaking, parking or
+/// re-arming, a route suspended, a retention prune parking debt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryRunnerChange {
+    /// An active or retired unit broke: its remaining debt is parked behind
+    /// the "history may be incomplete" notice and it is not retried until
+    /// new evidence re-arms it.
+    Broken,
+    /// A broken unit's one probe (earned by new loss over its park) made no
+    /// progress or was refused: the unit stays parked under the same park.
+    ProbeFailed,
+    /// A broken unit is active again: a quantum (often its probe) made
+    /// progress or found nothing owed.
+    Rearmed,
+    /// A relay's recorded NIP-11 caps changed and re-armed its broken units
+    /// planned with other caps (`record_recovery_relay_caps`).
+    CapsRearmed,
+    /// An explicit repair re-armed every broken and retired unit
+    /// (`rearm_all_recovery_units`).
+    RepairRearmed,
+    /// A route no longer carries some relays, or ended: their units' debt
+    /// and parks retired as route gone (`retire_gone_recovery_units`).
+    RetiredGone,
+    /// Relays the routes carry again owe their whole goal again
+    /// (`reopen_returned_recovery_units`).
+    Reopened,
+    /// The route's group copy is Unrecoverable: its units are no longer
+    /// scheduled, charged, broken or noticed while its debt accrues.
+    Suspended,
+    /// A suspended route is scheduled again.
+    Resumed,
+    /// The retention floor overtook debt no relay had proved yet: the route
+    /// gained a parked remainder (`prune_recovery_coverage`).
+    RemainderParked,
+    /// A later prune widened the route's parked remainder.
+    RemainderWidened,
+}
+
+/// Why a unit broke: `storage_sqlite::RecoveryUnitBreak`, one to one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryRunnerBreak {
+    /// It answered without progress until its budget ran out.
+    NoProgress,
+    /// The relay refused the request.
+    Refused,
 }
 
 #[cfg(test)]
@@ -795,5 +954,259 @@ mod tests {
             ]),
             defined("Operational_recoveryRelayFailure")
         );
+        assert_eq!(
+            names(&[RecoveryRunnerRoute::Inbox, RecoveryRunnerRoute::Group]),
+            defined("Operational_recoveryRunnerRoute")
+        );
+        assert_eq!(
+            names(&[RecoveryRunnerFetch::Sweep, RecoveryRunnerFetch::Compare]),
+            defined("Operational_recoveryRunnerFetch")
+        );
+        use RecoveryRunnerPurpose as RP;
+        assert_eq!(
+            names(&[
+                RP::Recheck,
+                RP::Repair,
+                RP::PostJoinCollection,
+                RP::EpochGapVisit,
+                RP::Fenced,
+                RP::Debt
+            ]),
+            defined("Operational_recoveryRunnerPurpose")
+        );
+        use RecoveryRunnerOutcome as RO;
+        assert_eq!(
+            names(&[
+                RO::Advanced,
+                RO::NothingOwed,
+                RO::NoProgress,
+                RO::Unreachable,
+                RO::RateLimited,
+                RO::Refused,
+                RO::Unanswered,
+                RO::LocalFailure
+            ]),
+            defined("Operational_recoveryRunnerOutcome")
+        );
+        use RecoveryRunnerFetchEnd as E;
+        assert_eq!(
+            names(&[
+                E::Finished,
+                E::Deadline,
+                E::Cancelled,
+                E::BudgetSpent,
+                E::Withheld,
+                E::SaturatedSecond,
+                E::SaturatedWindow,
+                E::InconclusiveSecond,
+                E::RateLimited,
+                E::Refused,
+                E::Unsupported,
+                E::TimedOut,
+                E::Disconnected,
+                E::SinkFailed,
+                E::StoreFailed
+            ]),
+            defined("Operational_recoveryRunnerFetchEnd")
+        );
+        use RecoveryRunnerChange as RC;
+        assert_eq!(
+            names(&[
+                RC::Broken,
+                RC::ProbeFailed,
+                RC::Rearmed,
+                RC::CapsRearmed,
+                RC::RepairRearmed,
+                RC::RetiredGone,
+                RC::Reopened,
+                RC::Suspended,
+                RC::Resumed,
+                RC::RemainderParked,
+                RC::RemainderWidened
+            ]),
+            defined("Operational_recoveryRunnerChange")
+        );
+        assert_eq!(
+            names(&[
+                RecoveryRunnerBreak::NoProgress,
+                RecoveryRunnerBreak::Refused
+            ]),
+            defined("Operational_recoveryRunnerBreak")
+        );
+    }
+
+    fn fetched() -> AuditEventKind {
+        AuditEventKind::RecoveryRunnerFetched {
+            route_kind: RecoveryRunnerRoute::Group,
+            obligation_id: "0c".repeat(16),
+            retained_route: false,
+            relay_url: "wss://relay.secret.example".into(),
+            best_effort: false,
+            fetch: RecoveryRunnerFetch::Sweep,
+            purpose: RecoveryRunnerPurpose::Debt,
+            probe: false,
+            ranges: 1,
+            owed_secs: 60,
+            owed_since_secs: 1_000,
+            owed_until_secs: 1_059,
+            outcome: RecoveryRunnerOutcome::NoProgress,
+            end: RecoveryRunnerFetchEnd::TimedOut,
+            duration_ms: 10_000,
+            requests: 1,
+            answers: 0,
+            newly_covered_secs: 0,
+            proved_secs: 0,
+            events_fetched: 0,
+            events_staged: 0,
+            late_findings: 0,
+            raced: 3,
+        }
+    }
+
+    fn changed(change: RecoveryRunnerChange) -> AuditEventKind {
+        AuditEventKind::RecoveryRunnerChanged {
+            change,
+            route_kind: Some(RecoveryRunnerRoute::Group),
+            obligation_id: Some("0c".repeat(16)),
+            relay_url: Some("wss://relay.secret.example".into()),
+            break_reason: Some(RecoveryRunnerBreak::Refused),
+            park_revision: Some(2),
+            units: None,
+            remainder_since_secs: None,
+            remainder_until_secs: None,
+        }
+    }
+
+    /// Each runner kind writes a schema-valid, strictly decodable v5 row that
+    /// hashes its relay and route tag, and the route tag joins the route's
+    /// `unproven_history` notice.
+    #[test]
+    fn recovery_runner_rows_hash_their_route_and_relay_and_join_the_notice() {
+        let raced = AuditEventKind::RecoveryRunnerRaced {
+            route_kind: RecoveryRunnerRoute::Group,
+            obligation_id: "0c".repeat(16),
+            raced: 4,
+            window_secs: 75,
+        };
+        let notice = AuditEventKind::RecoveryNeedChanged {
+            cause: RecoveryObligationCause::UnprovenHistory,
+            change: RecoveryNeedChange::NoticeShown,
+            obligation_id: "0c".repeat(16),
+            obligation_revision: 2,
+            bound: None,
+            floor_secs: None,
+            charged: None,
+        };
+        let (_dir, lines) = v5_lines(vec![
+            fetched(),
+            raced,
+            changed(RecoveryRunnerChange::Broken),
+            notice,
+        ]);
+        assert_eq!(lines.len(), 4);
+        let schema: serde_json::Value = serde_json::from_str(v5::JSON_SCHEMA).unwrap();
+        let validator = jsonschema::validator_for(&schema).unwrap();
+        let mut refs = std::collections::BTreeSet::new();
+        for line in &lines {
+            let value: serde_json::Value = serde_json::from_str(line).unwrap();
+            assert!(validator.is_valid(&value), "{line}");
+            v5::Record::from_json(line.as_bytes()).unwrap();
+            assert!(!line.contains("wss://"), "relay URLs never reach v5");
+            assert!(!line.contains(&"0c".repeat(16)), "route tags are hashed");
+            assert!(!value["group_ref"].is_null(), "group rows name the group");
+            refs.insert(
+                value["event"]["obligation_ref"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned(),
+            );
+        }
+        assert_eq!(refs.len(), 1, "every row joins the route's notice");
+        let fetched: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
+        assert_eq!(fetched["event"]["end"], "timed_out");
+        assert_eq!(fetched["event"]["endpoint_ref"].as_str().unwrap().len(), 64);
+    }
+
+    #[test]
+    fn strict_writer_refuses_inconsistent_recovery_runner_rows() {
+        let mut inverted = fetched();
+        if let AuditEventKind::RecoveryRunnerFetched {
+            owed_since_secs, ..
+        } = &mut inverted
+        {
+            *owed_since_secs = 2_000;
+        }
+        let mut overowed = fetched();
+        if let AuditEventKind::RecoveryRunnerFetched { owed_secs, .. } = &mut overowed {
+            *owed_secs = 61;
+        }
+        let mut swept_inbox = fetched();
+        if let AuditEventKind::RecoveryRunnerFetched { route_kind, .. } = &mut swept_inbox {
+            *route_kind = RecoveryRunnerRoute::Inbox;
+        }
+        let mut swept_recheck = fetched();
+        if let AuditEventKind::RecoveryRunnerFetched { purpose, .. } = &mut swept_recheck {
+            *purpose = RecoveryRunnerPurpose::Recheck;
+        }
+        let mut best_effort_probe = fetched();
+        if let AuditEventKind::RecoveryRunnerFetched {
+            probe, best_effort, ..
+        } = &mut best_effort_probe
+        {
+            (*probe, *best_effort) = (true, true);
+        }
+        let empty_race = AuditEventKind::RecoveryRunnerRaced {
+            route_kind: RecoveryRunnerRoute::Inbox,
+            obligation_id: "0c".repeat(16),
+            raced: 0,
+            window_secs: 0,
+        };
+        // A re-arm carries no break reason or park; a suspension names no
+        // relay; a remainder needs its range; an aggregate counts its units.
+        let rearmed_with_reason = changed(RecoveryRunnerChange::Rearmed);
+        let mut suspended_on_relay = changed(RecoveryRunnerChange::Suspended);
+        if let AuditEventKind::RecoveryRunnerChanged {
+            break_reason,
+            park_revision,
+            ..
+        } = &mut suspended_on_relay
+        {
+            (*break_reason, *park_revision) = (None, None);
+        }
+        let mut remainder_without_range = changed(RecoveryRunnerChange::RemainderParked);
+        if let AuditEventKind::RecoveryRunnerChanged {
+            relay_url,
+            break_reason,
+            ..
+        } = &mut remainder_without_range
+        {
+            (*relay_url, *break_reason) = (None, None);
+        }
+        let uncounted_repair = AuditEventKind::RecoveryRunnerChanged {
+            change: RecoveryRunnerChange::RepairRearmed,
+            route_kind: None,
+            obligation_id: None,
+            relay_url: None,
+            break_reason: None,
+            park_revision: None,
+            units: None,
+            remainder_since_secs: None,
+            remainder_until_secs: None,
+        };
+        let (_dir, lines) = v5_lines(vec![
+            fetched(),
+            changed(RecoveryRunnerChange::ProbeFailed),
+            inverted,
+            overowed,
+            swept_inbox,
+            swept_recheck,
+            best_effort_probe,
+            empty_race,
+            rearmed_with_reason,
+            suspended_on_relay,
+            remainder_without_range,
+            uncounted_repair,
+        ]);
+        assert_eq!(lines.len(), 2, "only the consistent rows are written");
     }
 }

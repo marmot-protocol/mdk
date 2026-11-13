@@ -1486,14 +1486,17 @@ async fn a_runner_turn_records_into_the_accounts_audit() {
     let host = runner.host.clone();
     let recorded = tokio::spawn(async move {
         host.turn(|turn| {
-            (turn.audit)(marmot_forensics::AuditEventKind::RecoveryRunnerPaused {
-                cap: marmot_forensics::RecoveryRunnerCap::Attempts,
-                attempts: 120,
-                event_bytes: 4096,
-                paused_for_secs: 1_800,
-                pauses: 1,
-                late_findings: 0,
-            });
+            (turn.audit)(
+                None,
+                marmot_forensics::AuditEventKind::RecoveryRunnerPaused {
+                    cap: marmot_forensics::RecoveryRunnerCap::Attempts,
+                    attempts: 120,
+                    event_bytes: 4096,
+                    paused_for_secs: 1_800,
+                    pauses: 1,
+                    late_findings: 0,
+                },
+            );
         })
         .await
     });
@@ -1508,6 +1511,56 @@ async fn a_runner_turn_records_into_the_accounts_audit() {
         (&"attempts".into(), &120.into(), &1_800.into())
     );
     assert!(rows[0]["group_ref"].is_null());
+}
+
+/// The debt turn's retention prune records the remainder it parks into the
+/// account's own v5 recorder, once: a later prune under the same floor
+/// changes nothing and writes nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_retention_prune_records_the_remainder_it_parks() {
+    let relay = MockRelay::run().await.unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    crate::AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = crate::MarmotApp::with_relay_and_config(
+        dir.path(),
+        relay.url().await.to_string(),
+        crate::MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
+    );
+    app.set_audit_log_settings(crate::AuditLogSettings { enabled: true })
+        .unwrap();
+    let mut client = app.client("alice").await.unwrap();
+    let ledger = app.account_storage("alice").unwrap().app_storage();
+    // Two hours on, the retention floor has overtaken history the open owed
+    // the inbox and nothing proved.
+    let later = unix_now_seconds() + 2 * 60 * 60;
+    client.runner_pruned_floor = None;
+    client.runner_prune_clock = later;
+    client.prune_runner_retention(&ledger, later).unwrap();
+    client.runner_pruned_floor = None;
+    client.prune_runner_retention(&ledger, later).unwrap();
+
+    let rows = recorded_v5_rows(&app, "recovery_runner_changed");
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    let event = &rows[0]["event"];
+    assert_eq!(event["change"], "remainder_parked");
+    assert_eq!(event["route_kind"], "inbox");
+    assert!(
+        rows[0]["group_ref"].is_null(),
+        "the inbox is account-scoped"
+    );
+    let remainder = ledger.recovery_coverage_remainders().unwrap();
+    let [remainder] = remainder.as_slice() else {
+        panic!("one parked remainder");
+    };
+    assert_eq!(
+        (&event["remainder_until_secs"], &event["park_revision"]),
+        (
+            &remainder.range.until_seconds.into(),
+            &remainder.revision.into()
+        )
+    );
 }
 
 /// A deadline the stop has already passed.
