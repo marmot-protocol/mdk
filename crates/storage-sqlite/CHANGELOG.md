@@ -36,8 +36,8 @@
 ### Fixed
 
 - Batch timeline withdrawals and branch-selection revivals attribute each changed row's trigger to an event that
-  affected it, rather than the first event in the batch. Direct targets take precedence over dependent previews,
-  and conflicting or unmatched causes use the generic reprojection trigger (mdk#2843).
+  affected it, rather than the first event in the batch. Every cause participates: conflicting or unmatched causes
+  use the generic reprojection trigger, including simultaneous reaction and reply-preview changes (mdk#2843).
 
 ## 0.16.0 - 2026-11-12
 

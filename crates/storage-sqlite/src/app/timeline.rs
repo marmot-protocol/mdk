@@ -897,7 +897,8 @@ impl SqliteAppStorage {
             mark_recipient_confirmation_changes(
                 &mut changes,
                 &confirmed_before,
-                |_| (&event.message_id_hex, event.tags.as_slice()),
+                |row| row.message_id_hex == event.message_id_hex
+                    || tag_values(&event.tags, EVENT_REF_TAG).any(|target| target == row.message_id_hex),
             );
             // A row can leave the timeline here: deleting a failed send drops it.
             changes.extend(
@@ -3511,6 +3512,10 @@ struct InvalidationEvents<'a> {
 }
 
 impl InvalidationEvents<'_> {
+    fn names_row(&self, row_id: &str) -> bool {
+        self.primary.names_row(row_id) || self.others.iter().any(|event| event.names_row(row_id))
+    }
+
     fn trigger(&self, row: &TimelineMessageRecord) -> TimelineUpdateTrigger {
         let trigger_for = |event: &InvalidationEvent<'_>| {
             timeline_trigger_for_invalidation_row(event.message_id_hex, event.kind, event.tags, row)
@@ -3532,8 +3537,8 @@ fn add_invalidation_event<'a>(
     ids: BTreeSet<String>,
     event: InvalidationEvent<'a>,
 ) {
-    // Direct changes outrank dependent previews. Retain equal-priority causes
-    // so conflicting triggers become a generic reprojection, not a row-order tie.
+    // One row may change in several ways. Keep every cause so a narrow trigger
+    // cannot hide another change to its content, reactions, or quoted preview.
     for id in ids {
         match events.entry(id) {
             std::collections::btree_map::Entry::Vacant(entry) => {
@@ -3543,15 +3548,7 @@ fn add_invalidation_event<'a>(
                 });
             }
             std::collections::btree_map::Entry::Occupied(mut entry) => {
-                let direct = event.names_row(entry.key());
-                let previous_direct = entry.get().primary.names_row(entry.key());
-                if direct && !previous_direct {
-                    let causes = entry.get_mut();
-                    causes.primary = event;
-                    causes.others.clear();
-                } else if direct == previous_direct {
-                    entry.get_mut().others.push(event);
-                }
+                entry.get_mut().others.push(event);
             }
         }
     }
@@ -3588,9 +3585,7 @@ fn timeline_changes_for_invalidation<'a>(
         .map(|message| message.message_id_hex.clone())
         .collect();
     mark_recipient_confirmation_changes(&mut changes, &confirmed_before, |row| {
-        event_for_row(row).map_or(("", &[][..]), |events| {
-            (events.primary.message_id_hex, events.primary.tags)
-        })
+        event_for_row(row).is_some_and(|events| events.names_row(&row.message_id_hex))
     });
     changes.extend(
         before
@@ -4492,13 +4487,13 @@ fn recipient_confirmed_ids_tx(
 /// host that redraws send state on
 /// [`TimelineUpdateTrigger::DeliveryOrSendStateChanged`] must hear that the
 /// row is now delivered, or no longer confirmed, and replies quoting it are
-/// reported as [`TimelineUpdateTrigger::ReplyPreviewChanged`]. A reply the
-/// event itself names (`event_message_id_hex` or an `e` target) changed in
-/// its own right — a deletion, say — and keeps the trigger that says so.
-fn mark_recipient_confirmation_changes<'a>(
+/// reported as [`TimelineUpdateTrigger::ReplyPreviewChanged`]. A reply directly
+/// named by any event in the batch changed in its own right and keeps that
+/// trigger rather than being reduced to a preview update.
+fn mark_recipient_confirmation_changes(
     changes: &mut [TimelineMessageChange],
     confirmed_before: &BTreeSet<String>,
-    event_for_row: impl Fn(&TimelineMessageRecord) -> (&'a str, &'a [Vec<String>]),
+    names_row: impl Fn(&TimelineMessageRecord) -> bool,
 ) {
     let flipped = changes
         .iter()
@@ -4519,15 +4514,13 @@ fn mark_recipient_confirmation_changes<'a>(
         let TimelineMessageChange::Upsert { trigger, message } = change else {
             continue;
         };
-        let (event_message_id_hex, tags) = event_for_row(message);
         if flipped.contains(&message.message_id_hex) {
             *trigger = TimelineUpdateTrigger::DeliveryOrSendStateChanged;
         } else if message
             .reply_to_message_id_hex
             .as_ref()
             .is_some_and(|target| flipped.contains(target))
-            && message.message_id_hex != event_message_id_hex
-            && !tag_values(tags, EVENT_REF_TAG).any(|target| target == message.message_id_hex)
+            && !names_row(message)
         {
             // Its quote of the send changed delivery, not the reply itself.
             *trigger = TimelineUpdateTrigger::ReplyPreviewChanged;

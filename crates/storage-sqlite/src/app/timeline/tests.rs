@@ -1417,11 +1417,33 @@ fn batch_overlap_triggers() {
                     "parent",
                     Some(ids[0]),
                 ),
+                (
+                    reaction(ids[0], "alice", "quoted", 12, "-"),
+                    delete(ids[1], "alice", "parent", 13),
+                    "quoted",
+                    None,
+                ),
+                (
+                    delete(ids[0], "alice", "live-edit", 12),
+                    reaction(ids[1], "alice", "parent", 13, "-"),
+                    "parent",
+                    None,
+                ),
+                (
+                    edit(ids[0], "alice", "parent", 12, "edited"),
+                    reaction(ids[1], "alice", "quoted", 13, "-"),
+                    "quoted",
+                    None,
+                ),
             ] {
                 let app = SqliteAccountStorage::in_memory().unwrap().app_storage();
                 app.record_app_event(&chat("parent", "alice", 10, "original"))
                     .unwrap();
                 app.record_app_event(&reaction("reaction", "alice", "parent", 11, "+"))
+                    .unwrap();
+                app.record_app_event(&edit("live-edit", "alice", "parent", 11, "live edit"))
+                    .unwrap();
+                app.record_app_event(&reply("quoted", "alice", "parent", 11, "quote"))
                     .unwrap();
                 let events = if ids[0] < ids[1] {
                     [first, second]
