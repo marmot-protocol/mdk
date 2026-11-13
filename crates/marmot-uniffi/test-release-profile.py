@@ -696,8 +696,7 @@ class ReleaseProfileTests(unittest.TestCase):
             "with log.open('a', encoding='utf-8') as handle:\n"
             "    handle.write(json.dumps(entry) + '\\n')\n"
             "args = sys.argv[1:]\n"
-            f"workspace = Path({str(workspace)!r})\n"
-            "target_dir = workspace / 'target'\n"
+            "target_dir = Path(os.environ['CARGO_TARGET_DIR'])\n"
             "if args and args[0] == 'build':\n"
             "    triple = args[args.index('--target') + 1] if '--target' in args else None\n"
             "    if triple:\n"
@@ -718,6 +717,7 @@ class ReleaseProfileTests(unittest.TestCase):
         env = os.environ.copy()
         env["HOME"] = str(self.root / f"home-{script}")
         env["PATH"] = f"{bin_dir}:{env['PATH']}"
+        env["CARGO_TARGET_DIR"] = str(self.root / f"target-{script}")
         env["MARMOTKIT_WORKSPACE_DIR"] = str(workspace)
         env["MARMOTKIT_CRATE_DIR"] = str(crate)
         env["OTLP_EXPORT"] = "1"
