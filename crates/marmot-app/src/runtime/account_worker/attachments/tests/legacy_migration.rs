@@ -328,3 +328,46 @@ async fn housekeeping_owes_nothing_where_its_batch_cannot_run() {
     assert!(!housekeeping_owed_now(&client, &admission));
     assert_eq!(next_housekeeping_at(&client, &admission), None);
 }
+
+/// A media row deleted outside the attachment pass, here an abandoned
+/// upload, wakes no job. The housekeeping schedule still owes reclaim a look
+/// within 15 s, not at its hourly recheck.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_media_deletion_outside_the_pass_brings_housekeeping_back_within_15_s() {
+    use crate::runtime::account_worker::schedule::RETRY_WHILE_OWED;
+    use media_store::MediaCatalog as _;
+    use std::sync::atomic::Ordering;
+    let (_dir, client, storage, _reference) = offline_fixture().await;
+    let mut admission = Admission::default();
+    let latches = &mut admission.latches;
+    latches.legacy_bodies_done.store(true, Ordering::Release);
+    latches.database_avatars_done.store(true, Ordering::Release);
+    admission.startup_wal_settled.store(true, Ordering::Release);
+    let later = TokioInstant::now() + Duration::from_secs(3600);
+    admission.keep_media_due = Some(later);
+    admission.latches.recheck_due = Some(later);
+    admission.latches.batch_cleanup_seen =
+        Some(storage.app_storage().media_cleanup_epoch().unwrap());
+    assert!(!housekeeping_owed_now(&client, &admission), "settled");
+    assert_eq!(next_housekeeping_at(&client, &admission), Some(later));
+
+    let catalog = storage_sqlite::SqliteMediaCatalog::new(storage.app_storage());
+    let id = media_store::FileId([9; 16]);
+    catalog
+        .insert_pending(&media_store::NewFile {
+            id,
+            key: media_store::FileKey::from_bytes([1; 32]),
+            category: Category::Retained,
+            byte_len: 1,
+            digest: [2; 32],
+            created_at: 1,
+        })
+        .unwrap();
+    assert!(catalog.abandon_pending(id).unwrap());
+    assert!(housekeeping_owed_now(&client, &admission), "reclaim owed");
+    let at = next_housekeeping_at(&client, &admission).expect("scheduled");
+    assert!(
+        at <= TokioInstant::now() + RETRY_WHILE_OWED,
+        "a look within 15 s"
+    );
+}
