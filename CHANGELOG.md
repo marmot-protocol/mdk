@@ -16,10 +16,17 @@
 - Archive, forget and delete an external-signer account's chat through its
   running account worker, as for a local-signing account (#3318). These wrote
   storage directly while the worker kept its own copy of the account: its next
-  save of the chat, for example for an inbound message, unarchived it again,
-  and after a forget or delete it kept answering for the removed group. An
-  account that runs no worker still writes storage directly, now with worker
-  starts held off until the write is done.
+  save of the chat's record, for example after another member renamed the
+  chat, unarchived it again, and after a forget or delete it kept answering for
+  the removed group. An account that runs no worker still writes storage
+  directly, now with worker starts held off until the write is done.
+
+### Added
+
+- Discard a failed own send locally with `discard_failed_send` (Rust, UniFFI,
+  C) instead of publishing a group delete for a message nobody received. A
+  failed send the user deletes now leaves the timeline instead of staying as a
+  "deleted" row that still reports failure.
 
 ## 0.16.0 - 2026-11-12
 

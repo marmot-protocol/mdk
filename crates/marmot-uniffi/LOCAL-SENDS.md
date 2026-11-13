@@ -31,6 +31,23 @@ old delivery summary. Pair regenerated Swift/Kotlin bindings with matching nativ
 binaries. C hosts also need the matching regenerated header: the timeline record
 layout now includes a nullable `client_token`.
 
+## Failed sends
+
+A row whose `invalidation_status` is `local_publish_failed` reached no one. To
+remove it, call `discard_failed_send(account_ref, group_id_hex, message_id_hex)`,
+not `delete_message`: discard publishes nothing and securely drops the row, its
+edits and its media references. Act on the returned outcome:
+
+- `Discarded`: the row leaves through an ordinary timeline update with reason
+  `Cleared`. Purge `media_ciphertext_sha256` from any decrypted-media cache.
+- `StillSending`: the group has a send the engine may still publish, and this
+  message could be among them. Keep the row and offer the action again later.
+- `NotFailedSend`: the row is not a failed own send any more (delivered,
+  pending, confirmed by a peer's reaction, or gone).
+
+A failed send deleted with `delete_message` also leaves the timeline, with the
+same `Cleared` reason, and the group receives the delete.
+
 ## Identity and retry contract
 
 - Tokens contain 1–128 UTF-8 bytes and are scoped to one account-device and group.

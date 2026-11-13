@@ -4,6 +4,10 @@
 
 ### Added
 
+- `MarmotAppRuntime::discard_failed_send(account_ref, group_id, message_id_hex)`
+  securely drops a failed own send from this device without publishing. It
+  returns `StillSending` while the group has a send the engine may still
+  publish, and `NotFailedSend` for any row that is not a failed own send.
 - `MarmotApp::sticker_pack_share_link(account_ref, coordinate)` builds a
   canonical Sonar viewer link offline with up to eight retained relay
   candidates. New fetch candidates displace older hints; retention and

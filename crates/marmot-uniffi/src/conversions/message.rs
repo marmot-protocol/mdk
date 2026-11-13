@@ -1,9 +1,9 @@
 //! Message-record and message-subscription-update FFI conversions.
 
 use marmot_app::{
-    AppMessageRecord, ReceivedMessage, RetentionSweepGroupOutcome, RetentionSweepReport,
-    RetentionSweepStatus, RuntimeMessageReceived, RuntimeMessageUpdate, SecureDeleteExpiredResult,
-    sticker_ref_from_tags,
+    AppMessageRecord, DiscardFailedSendOutcome, DiscardFailedSendResult, ReceivedMessage,
+    RetentionSweepGroupOutcome, RetentionSweepReport, RetentionSweepStatus, RuntimeMessageReceived,
+    RuntimeMessageUpdate, SecureDeleteExpiredResult, sticker_ref_from_tags,
 };
 
 use super::common::{MessageTagFfi, markdown_content_tokens, message_tags_ffi};
@@ -70,6 +70,49 @@ impl From<SecureDeleteExpiredResult> for SecureDeleteExpiredResultFfi {
         Self {
             pruned_messages: value.pruned_messages,
             secrets_deleted: value.secrets_deleted,
+            media_ciphertext_sha256: value.media_ciphertext_sha256,
+            erasure_pending: value.erasure_pending,
+        }
+    }
+}
+
+/// What `discard_failed_send` did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum DiscardFailedSendOutcomeFfi {
+    /// The send is gone from this device. Nothing was published.
+    Discarded,
+    /// The group has a send the engine may still publish, and this message
+    /// could be among them. Nothing changed; try again later.
+    StillSending,
+    /// No failed own send has this id. Nothing changed.
+    NotFailedSend,
+}
+
+impl From<DiscardFailedSendOutcome> for DiscardFailedSendOutcomeFfi {
+    fn from(value: DiscardFailedSendOutcome) -> Self {
+        match value {
+            DiscardFailedSendOutcome::Discarded => Self::Discarded,
+            DiscardFailedSendOutcome::StillSending => Self::StillSending,
+            DiscardFailedSendOutcome::NotFailedSend => Self::NotFailedSend,
+        }
+    }
+}
+
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct DiscardFailedSendResultFfi {
+    pub outcome: DiscardFailedSendOutcomeFfi,
+    /// Ciphertext hashes of the discarded send's encrypted media, for purging
+    /// a decrypted-media cache. Empty unless the send was discarded.
+    pub media_ciphertext_sha256: Vec<String>,
+    /// True when the send was discarded but secure WAL truncation remains
+    /// pending. The next secure delete in this group retries it.
+    pub erasure_pending: bool,
+}
+
+impl From<DiscardFailedSendResult> for DiscardFailedSendResultFfi {
+    fn from(value: DiscardFailedSendResult) -> Self {
+        Self {
+            outcome: value.outcome.into(),
             media_ciphertext_sha256: value.media_ciphertext_sha256,
             erasure_pending: value.erasure_pending,
         }
