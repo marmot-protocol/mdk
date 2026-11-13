@@ -11,6 +11,11 @@
   other detailed mutations keep `GroupMutationResultFfi`. Regenerate Swift and
   Kotlin bindings with the matching native library.
 
+### Fixed
+
+- Isolate Apple release-profile mock build outputs from inherited
+  `CARGO_TARGET_DIR` values (mdk#2906).
+
 ## 0.16.0 - 2026-11-12
 
 ### Breaking changes
