@@ -3882,7 +3882,7 @@ Reads one cached pack without network I/O. Returns none when the coordinate is a
 pub fn sticker_pack_share_link( &self, account_ref: String, coordinate: String, ) -> Result<String, MarmotKitError>
 ```
 
-Builds `https://sonarprivacy.xyz/stickers?a=...` from a valid pack coordinate without network I/O. Call off the UI thread because it reads local storage. Includes up to eight normalized, unique relay candidates retained by pack fetches, or current account relays when no retained hints pass the current relay safety policy. New fetch candidates displace older hints. Hints are candidates, not confirmed event locations; oversized hints are omitted to keep links within the parser's 2048-character limit. An uncached coordinate can be shared. Invalid coordinates return `InvalidSticker`.
+Builds `https://sonarprivacy.xyz/stickers?a=...` from a valid pack coordinate without network I/O. Call off the UI thread because it reads local storage. Includes up to eight normalized, unique relay candidates retained by pack fetches, or current account relays when none remain usable. Both sources pass the current relay safety policy. New fetch candidates displace older hints. Hints are candidates, not confirmed event locations; oversized hints are omitted to keep links within the parser's 2048-character limit. An uncached coordinate can be shared. Invalid coordinates return `InvalidSticker`.
 
 [Source](src/commands/sticker.rs#L43)
 
