@@ -265,8 +265,7 @@ fn audit_events(path: &std::path::Path) -> Vec<marmot_forensics::AuditEvent> {
 
 /// The epoch the forensic trail reports for a message's transition into
 /// `new_state`, which is where the engine was when it handled the message —
-/// never the message's own claimed epoch. See `incident-replay`'s
-/// `MessageStateChanged` doc.
+/// never the message's own claimed epoch.
 fn reported_epoch_for_state(
     events: &[marmot_forensics::AuditEvent],
     msg_id: &MessageId,
@@ -1200,7 +1199,7 @@ async fn stale_commit_outside_rewind_horizon_is_not_treated_as_recoverable_fork(
 
     // The row a beyond-horizon commit leaves behind carries the commit's own
     // source epoch, but the forensic trail must keep reporting where this
-    // engine was: `incident-replay` folds `MessageStateChanged.epoch` into an
+    // engine was: audit analysis folds `MessageStateChanged.epoch` into an
     // engine's current position and reads a drop below its high-water mark as a
     // rollback. Routine relay redelivery takes exactly this path.
     drop(alice);
@@ -1221,7 +1220,7 @@ async fn stale_commit_outside_rewind_horizon_is_not_treated_as_recoverable_fork(
 /// unclassified `Retryable` arm of the direct-path error match. The row that
 /// arm transitions carries the commit's source epoch; the audit row for the
 /// transition must keep reporting the device's own epoch, because
-/// `incident-replay` folds `MessageStateChanged.epoch` into the engine's
+/// audit analysis folds `MessageStateChanged.epoch` into the engine's
 /// position and reads a drop as a rollback.
 #[tokio::test]
 async fn commit_refused_by_the_incoming_wire_format_policy_reports_the_device_epoch() {
@@ -3012,7 +3011,7 @@ async fn restarted_committer_without_source_anchor_halts_through_convergence() {
         )),
         "the durable halt must leave an audit row naming the missing material"
     );
-    // The forensic epoch is not the row epoch. `incident-replay` reads
+    // The forensic epoch is not the row epoch. Audit analysis reads
     // `MessageStateChanged.epoch` as "the engine handled a message while at
     // `epoch`" and folds the newest timed one into that engine's current
     // position, calling a drop below its own high-water mark a rollback. So the
@@ -3050,7 +3049,7 @@ async fn restarted_committer_without_source_anchor_halts_through_convergence() {
 #[tokio::test]
 async fn canonicalization_transition_reports_the_device_tip_not_the_rival_source_epoch() {
     // A rival's row carries the epoch it forks FROM, so reading that column
-    // back into `MessageStateChanged.epoch` tells `incident-replay` the engine
+    // back into `MessageStateChanged.epoch` tells audit analysis the engine
     // was BELOW where it actually is and turns every adjudicated fork into a
     // reported rollback. The pass's dispositions must report the device's
     // pre-apply tip, the same decoupling the persist site makes.

@@ -45,9 +45,13 @@ Shared JSONL forensic audit schema for Marmot incident capture.
   refusal row in `src/audit/refusal.rs`); a v4 recorder drops them, and the frozen v4 schema and its catalog tests
   exclude them. A new string field on an operational kind needs an explicit `protect` classification in
   `src/v5/operational.rs` (category, diagnostic reference, or hash), or v5 refuses to write the row. The v5
-  local-delivery path sends original validated bodies; v4 files and the v4-only whole-file Goggles contract remain
-  separate. Rust validation remains authoritative for rules JSON Schema cannot express. Coordinate
-  any v5 wire changes with the strict receiver before deployment.
+  local-delivery path sends original validated bodies; v4 files and the legacy v4-only whole-file upload contract
+  remain separate. Rust validation remains authoritative for rules JSON Schema cannot express.
+- The White Noise audit receiver (in `internet-privacy/whitenoise-data`) pins this crate's v5 schema bytes and ports
+  `src/v5/validation.rs`; it rejects a whole batch on any record it cannot validate, and the sender then skips those
+  records. Any v5 change to a kind, field (even optional), enum value or relational rule needs a whitenoise-data
+  repin and receiver deployment before clients that emit it ship. See
+  [Downstream: whitenoise-data](../../docs/marmot-architecture/audit-logging.md#downstream-whitenoise-data).
 - The v4 schema (`schema/audit-log-event.v4.schema.json`) is frozen: new fields go to v5 only, and
   `AuditEventKind::without_v5_only_fields` strips any a v4 recorder cannot express (`publish_outcome.event_age_secs`).
   Keep the frozen schema and the Rust kind catalog in lockstep. Two tests enforce
@@ -57,8 +61,9 @@ Shared JSONL forensic audit schema for Marmot incident capture.
   serialized JSON against the schema's `additionalProperties: false` branches, so it is what catches an added *field*
   the schema does not list. A new field therefore needs a `sample_audit_event_kinds` entry that populates it (the v5
   catalog test checks it there), or nothing checks it. Coordinate even optional additions with strict downstream
-  consumers such as Goggles before shipping producers: its `additionalProperties: false` validation rejected whole v4
-  uploads containing `local_member_ref` until its schema was synchronized, and its v5 validation is just as strict. Bump `AUDIT_LOG_SCHEMA_VERSION` and add a new versioned schema
+  consumers before shipping producers: the retired v4 receiver's `additionalProperties: false` validation rejected
+  whole uploads containing `local_member_ref` until its schema was synchronized, and the White Noise audit receiver's
+  v5 validation is just as strict. Bump `AUDIT_LOG_SCHEMA_VERSION` and add a new versioned schema
   file when changing required fields; analyzers reject unknown versions. An additive optional field needs no bump, but note in its doc comment
   that absence is then ambiguous between "old row" and "value known absent".
 

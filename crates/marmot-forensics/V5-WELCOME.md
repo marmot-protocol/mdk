@@ -11,7 +11,7 @@ configure with the UniFFI/C `set_audit_otlp_config_v5` and drive with
 `post_audit_log_tracker_update_v5`.
 
 `AUDIT_LOG_SCHEMA_VERSION` still names the frozen v4 contract. Historical v4
-files stay readable, and the whole-file Goggles upload accepts only v4. See
+files stay readable, and the legacy whole-file upload accepts only v4. See
 [audit-logging.md](../../docs/marmot-architecture/audit-logging.md#v5-recording-and-delivery)
 for recording and delivery.
 
@@ -153,4 +153,5 @@ cargo test -p transport-nostr-adapter --lib audit_v5_endpoint_vectors_match_owne
 
 A contract fixture cannot establish real Welcome coverage or claim v5 bandwidth;
 the [app Welcome tests](../marmot-app/tests/audit-v5-welcome-probe.md) exercise
-the emitted evidence. v5 is never uploaded to the strict v4 Goggles receiver.
+the emitted evidence. v5 is never sent through the legacy v4 whole-file upload; the v5 OTLP sender
+delivers it to the host-configured receiver, such as the White Noise audit receiver.

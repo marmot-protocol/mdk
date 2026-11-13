@@ -52,6 +52,10 @@ pub(super) struct Admission {
     upload_promotion:
         Option<tokio::task::JoinHandle<(Option<storage_sqlite::AttachmentUploadOwner>, bool)>>,
     upload_cursor: Option<storage_sqlite::AttachmentUploadOwner>,
+    /// A pass skipped the batch in `upload_promotion`. That pass may have
+    /// come for an owner the batch's read missed, so the batch's completion
+    /// runs one more pass even when it was idle (mdk#3378).
+    upload_skipped: bool,
     /// The legacy body migration batch running on the blocking pool, if any.
     legacy_migration: Option<tokio::task::JoinHandle<()>>,
     /// The one-time database compaction ran under this worker; it is not
@@ -237,7 +241,8 @@ fn spawn_media_sweep(
 /// Starts one page of outgoing upload promotion on the blocking pool unless
 /// one is still running. Each run resumes after the last, so uploads that
 /// cannot promote yet never starve the rest; a promotion wakes attachment
-/// observers with a state change and requests another worker pass on completion.
+/// observers with a state change. A batch requests another worker pass on
+/// completion when it promoted, left a page, or a pass skipped it.
 fn spawn_upload_promotion(
     admission: &mut Admission,
     storage: SqliteAccountStorage,
@@ -245,8 +250,10 @@ fn spawn_upload_promotion(
     updates: AttachmentUpdates,
     telemetry: &marmot_observability::PerformanceRecorder,
 ) {
-    // Consume even a finished batch through ready(), preserving its wakeup.
+    // Consume even a finished batch through ready(), preserving its wakeup,
+    // and owe the skipped pass a follow-up.
     if admission.upload_promotion.is_some() {
+        admission.upload_skipped = true;
         return;
     }
     // Only a file-backed upload promotes. With none, and no page in
@@ -571,7 +578,9 @@ impl Admission {
                 self.upload_promotion = None;
                 let (next, more) = result.unwrap_or_default();
                 self.upload_cursor = next;
-                more
+                // Clear the skip even when `more` already wakes the worker.
+                let skipped = std::mem::take(&mut self.upload_skipped);
+                more || skipped
             }
             else => false,
         }

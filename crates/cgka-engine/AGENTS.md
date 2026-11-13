@@ -505,7 +505,7 @@ peel runs. `Engine::retry_deferred_peels` offers those contexts to every retaine
   against live state (`WrongEpoch`, failed apply, rollback). The stamp is a stored-input shape, not a verdict. Forensics
   is decoupled on purpose: the persist's audit row and every direct-path error arm that writes the row keep reporting
   `current_epoch` (via `update_stored_message_state_reported_at`), and the pass's disposition transitions report the
-  device's pre-apply tip, because `incident-replay` reads `MessageStateChanged.epoch` as where the engine was. Tests
+  device's pre-apply tip, because audit analysis reads `MessageStateChanged.epoch` as where the engine was. Tests
   in `tests/fork_detection.rs`: `restarted_committer_without_source_anchor_halts_through_convergence`,
   `stale_commit_outside_rewind_horizon_is_not_treated_as_recoverable_fork`,
   `canonicalization_transition_reports_the_device_tip_not_the_rival_source_epoch`,

@@ -74,7 +74,7 @@ pub struct AuditLogUploadResult {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AuditLogTrackerUpdateResult {
     pub enabled: bool,
-    /// Historical whole-file v4 uploads to the Goggles endpoint.
+    /// Historical whole-file v4 uploads to the legacy tracker endpoint.
     pub uploaded: Vec<AuditLogUploadResult>,
     pub skipped_reason: Option<String>,
     /// v5 OTLP delivery, present when a dedicated sender was configured.

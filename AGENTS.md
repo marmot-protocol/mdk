@@ -44,13 +44,13 @@ before adding behavior or bindings.
 | Shared terminal-harness runtime | `integrations/terminal-harness/AGENTS.md` |
 | Claude Code / Codex / OpenCode / Pi / Goose harnesses | `integrations/{claude,codex,opencode,pi,goose}/marmot/AGENTS.md` |
 | Forensic audit schema | `crates/marmot-forensics/AGENTS.md` |
+| Production audit pipeline (White Noise audit receiver and reader in `internet-privacy/whitenoise-data`), investigating a group from audit records | `docs/marmot-architecture/audit-logging.md#downstream-whitenoise-data`; query with the `whitenoise-reader` skill |
 | App runtime UniFFI bindings | `crates/marmot-uniffi/AGENTS.md` |
 | UniFFI async-export runtime macro | `crates/marmot-uniffi-macros/AGENTS.md` |
 | App runtime C ABI bindings | `crates/marmot-c/AGENTS.md` |
 | CLI / daemon / TUI surface | `crates/cli/AGENTS.md` |
 | Multi-client harness / vectors | `crates/cgka-conformance-simulator/AGENTS.md` (`src/`, `tests/`, `vectors/` have their own) |
 | Container/VM convergence campaigns | `crates/convergence-campaign-runner/AGENTS.md` |
-| Goggles incident replay adapter | `crates/incident-replay/AGENTS.md` |
 | Architecture docs | `docs/AGENTS.md` and `docs/marmot-architecture/AGENTS.md` |
 | Formal model | `formal/tamarin/AGENTS.md` |
 | Formal verification method, proof coverage, and model-to-code correspondence | `.agents/skills/formal-verification/SKILL.md` |

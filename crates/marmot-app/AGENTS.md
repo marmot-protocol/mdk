@@ -904,7 +904,7 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   local admission under `storage_lifecycle`, and cancellation on consent, deletion, account removal, destination change,
   or close. Never hold local guards across HTTP or wait for HTTP before releasing the root lease on terminal close.
 - Record new opt-in sessions into distinct v5 files and deliver strictly validated v5 JSONL through OTLP. Historical
-  v4 files retain their separate v4-only Goggles whole-file path. Never migrate or send v1-v3
+  v4 files retain their separate legacy v4-only whole-file upload path. Never migrate or send v1-v3
   or key-reveal files. Reject removed/unknown fields and duplicate keys before HTTP; cache ineligible file verdicts
   by size and mtime without retry cooldowns. On exclusive-root startup, `audit_log/legacy_cleanup.rs` deletes
   reserved v1-v3 filenames and their segments from `accounts/` and failed-wipe `.wipe-tombstones/` remnants
