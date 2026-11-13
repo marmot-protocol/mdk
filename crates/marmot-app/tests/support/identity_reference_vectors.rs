@@ -319,15 +319,20 @@ pub fn cases() -> Vec<IdentityReferenceCase> {
             "damaged_nprofile_checksum",
             damaged_checksum(NO_RELAY_NPROFILE),
         ),
-        rejected("wrong_hrp_note_shaped", WRONG_HRP_NOTE),
-        rejected("note_event_hrp", NOTE_EVENT_HRP).with_previews_target(PREVIEW_EVENT_2222),
-        rejected("nevent_event_hrp", NEVENT_EVENT_HRP).with_previews_target(PREVIEW_EVENT_2222),
+        rejected("wrong_hrp_note_shaped", WRONG_HRP_NOTE).with_md_hrp("note"),
+        rejected("note_event_hrp", NOTE_EVENT_HRP)
+            .with_md_hrp("note")
+            .with_previews_target(PREVIEW_EVENT_2222),
+        rejected("nevent_event_hrp", NEVENT_EVENT_HRP)
+            .with_md_hrp("nevent")
+            .with_previews_target(PREVIEW_EVENT_2222),
         rejected("naddr_event_hrp", NADDR_EVENT_HRP)
+            .with_md_hrp("naddr")
             .with_previews_target(PREVIEW_COORDINATE_KIND0),
         rejected("nsec_synthetic", NSEC_SYNTHETIC_REJECTION),
         // Event and address references: the identity parsers never resolve
         // these (the nprofile fallback is the only accepted bech32 family);
-        // the markdown recognizer renders only the `nostr:`-wrapped forms,
+        // markdown also recognizes checksum-valid bare event references,
         // and the preview parser supports the coordinate kinds it names.
         rejected("nostr_note_event_hrp", format!("nostr:{NOTE_EVENT_HRP}"))
             .with_md_hrp("note")
@@ -339,13 +344,16 @@ pub fn cases() -> Vec<IdentityReferenceCase> {
             .with_md_hrp("naddr")
             .with_previews_target(PREVIEW_COORDINATE_KIND0),
         rejected("naddr_kind30023", NADDR_KIND30023_ENTRY)
+            .with_md_hrp("naddr")
             .with_previews_target(PREVIEW_COORDINATE_KIND30023_ENTRY),
         rejected("naddr_kind10002", NADDR_KIND10002)
+            .with_md_hrp("naddr")
             .with_previews_target(PREVIEW_COORDINATE_KIND10002),
-        rejected("naddr_kind1", NADDR_KIND1),
-        rejected("naddr_kind0_with_d", NADDR_KIND0_WITH_D),
-        rejected("naddr_kind41", NADDR_KIND41),
+        rejected("naddr_kind1", NADDR_KIND1).with_md_hrp("naddr"),
+        rejected("naddr_kind0_with_d", NADDR_KIND0_WITH_D).with_md_hrp("naddr"),
+        rejected("naddr_kind41", NADDR_KIND41).with_md_hrp("naddr"),
         rejected("nevent_with_relay_hint", NEVENT_RELAY_HINT_EVENT_HRP)
+            .with_md_hrp("nevent")
             .with_previews_target(PREVIEW_EVENT_2222),
         // Markdown-only surface: `@` mentions accept the Npub HRP only.
         rejected("at_npub", format!("@{NPUB}")).with_md_hrp("npub"),

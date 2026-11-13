@@ -164,6 +164,65 @@ BECH32_DATA_WORDS := [4]u64{0x03fd000000000000, 0x07ff7dfa00000000, 0, 0}
 helpers_bech_data :: proc(b: u8) -> bool {
 	return BECH32_DATA_WORDS[b >> 6] & (u64(1) << (b & 63)) != 0
 }
+
+@(rodata)
+BECH32_VALUES := [128]u8 {
+	'q' = 0,
+	'p' = 1,
+	'z' = 2,
+	'r' = 3,
+	'y' = 4,
+	'9' = 5,
+	'x' = 6,
+	'8' = 7,
+	'g' = 8,
+	'f' = 9,
+	'2' = 10,
+	't' = 11,
+	'v' = 12,
+	'd' = 13,
+	'w' = 14,
+	'0' = 15,
+	's' = 16,
+	'3' = 17,
+	'j' = 18,
+	'n' = 19,
+	'5' = 20,
+	'4' = 21,
+	'k' = 22,
+	'h' = 23,
+	'c' = 24,
+	'e' = 25,
+	'6' = 26,
+	'm' = 27,
+	'u' = 28,
+	'a' = 29,
+	'7' = 30,
+	'l' = 31,
+}
+
+bech32_polymod :: proc(check: u32, value: u8) -> u32 {
+	generators :: [5]u32{0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3}
+	top := check >> 25
+	result := ((check & 0x1ffffff) << 5) ~ u32(value)
+	for generator, i in generators {
+		if top & (u32(1) << u32(i)) != 0 {result ~= generator}
+	}
+	return result
+}
+
+// BIP-173 checksum over a token whose lowercase NIP-19 shape was already checked.
+bech32_checksum_ok :: proc(token: string) -> bool {
+	separator := 0
+	for token[separator] != '1' {separator += 1}
+	check := u32(1)
+	for b in transmute([]u8)token[:separator] {check = bech32_polymod(check, b >> 5)}
+	check = bech32_polymod(check, 0)
+	for b in transmute([]u8)token[:separator] {check = bech32_polymod(check, b & 31)}
+	for b in transmute([]u8)token[separator + 1:] {check = bech32_polymod(check, BECH32_VALUES[b])}
+	return check == 1
+}
+
 helpers_boundary :: proc(b: u8) -> bool {return !helpers_alnum(b) && b != '_' && b != '/'}
 left_boundary_ok :: proc(s: string, i: int) -> bool {return i == 0 || helpers_boundary(s[i - 1])}
 classify_bech32 :: proc(s: string, i: int) -> (NostrHrp, int, bool) {

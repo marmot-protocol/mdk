@@ -190,7 +190,10 @@ inline_literal_end :: proc(s: string, from: int) -> int {
 		if c == 'n' {
 			if !left_boundary_ok(s, i) ||
 			   (!text_has_prefix(s[i:len(s)], "nostr:") &&
-					   !text_has_prefix(s[i:len(s)], "npub1")) {
+					   !text_has_prefix(s[i:len(s)], "npub1") &&
+					   !text_has_prefix(s[i:len(s)], "note1") &&
+					   !text_has_prefix(s[i:len(s)], "nevent1") &&
+					   !text_has_prefix(s[i:len(s)], "naddr1")) {
 				continue
 			}
 		}
@@ -633,7 +636,12 @@ inline_nostr :: proc(s: string, i: int) -> (Inline, int, bool) {
 		if (i > 0 && s[i - 1] == '@') || (i >= 6 && s[i - 6:i] == "nostr:") {return {}, i, false}
 	}
 	hrp, end, ok := classify_bech32(s, start)
-	if !ok || (!uri && hrp != .Npub) {return {}, i, false}
+	if !ok {return {}, i, false}
+	if !uri && hrp != .Npub {
+		if s[i] == '@' || (hrp != .Note && hrp != .Nevent && hrp != .Naddr) {return {}, i, false}
+		if !bech32_checksum_ok(s[start:end]) {return {}, i, false}
+		tag = .NostrUri
+	}
 	return Inline{tag = tag, text = s[start:end], hrp = hrp}, end, true
 }
 

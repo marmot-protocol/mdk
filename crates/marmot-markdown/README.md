@@ -11,8 +11,9 @@ Block parsing and inline tokenization remain separate passes; destination classi
 
 - Parses CommonMark plus GFM-style tables and strikethrough, math, and a bounded `<details>` extension into `Block` /
   `Inline` nodes.
-- Recognizes Nostr entities inline: bare `@npub1…` handles (`Inline::NostrMention`) and explicit `nostr:<hrp>1…`
-  references (`Inline::NostrUri`), and classifies private-key destinations as sensitive.
+- Recognizes `npub1…` handles with or without `@` (`Inline::NostrMention`), explicit `nostr:<hrp>1…` references,
+  and checksum-valid bare `note1…`, `nevent1…`, and `naddr1…` references (`Inline::NostrUri`). Other recognition
+  remains shape-only. Private-key destinations are classified as sensitive.
 - Parses local-time timestamps into `Inline::Timestamp` with Unix seconds and a typed display style.
 - Does not parse general HTML. Tag-like sequences stay literal text; only autolinks, timestamps and the `<details>` extension get
   structured treatment.

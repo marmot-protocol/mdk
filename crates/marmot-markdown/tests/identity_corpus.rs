@@ -3,9 +3,9 @@
 // The corpus (crates/marmot-app/tests/support/identity_reference_vectors.rs)
 // records, per row, the HRP the markdown recognizer is expected to produce
 // (`md_hrp`, None when the reference produces no nostr entity). This test
-// pins that baseline: the markdown recognizer is shape-only, so rows like
-// `damaged_npub_checksum` are recognized even though resolution rejects
-// them, while bare event/address literals produce no entity at all.
+// pins that baseline: bare event/address references require a valid checksum,
+// while npub mentions and nostr: URIs remain shape-only. For example,
+// `damaged_npub_checksum` is recognized even though resolution rejects it.
 
 include!(concat!(
     env!("CARGO_MANIFEST_DIR"),
