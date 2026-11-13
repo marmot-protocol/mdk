@@ -11,7 +11,7 @@ struct Scheduler {
 }
 
 impl Scheduler {
-    fn new(results: Vec<Option<Duration>>) -> Self {
+    fn new(results: Vec<bool>) -> Self {
         let (triggers, commands) = mpsc::channel(1);
         let (stop, stopping) = watch::channel(false);
         let (started, starts) = mpsc::unbounded_channel();
@@ -25,9 +25,7 @@ impl Scheduler {
                 started.send(Instant::now()).unwrap();
                 async move {
                     gate.notified().await;
-                    AuditPassSchedule {
-                        retry_after: result,
-                    }
+                    AuditPassSchedule { retry: result }
                 }
             })
             .await;
@@ -64,7 +62,7 @@ impl Scheduler {
 
 #[tokio::test(start_paused = true)]
 async fn activity_batches_without_extending_the_first_deadline() {
-    let mut s = Scheduler::new(vec![None]);
+    let mut s = Scheduler::new(vec![false]);
     let start = Instant::now();
     s.trigger().await;
     for _ in 0..29 {
@@ -82,7 +80,7 @@ async fn activity_batches_without_extending_the_first_deadline() {
 
 #[tokio::test(start_paused = true)]
 async fn activity_during_upload_has_one_delayed_follow_up_and_no_overlap() {
-    let mut s = Scheduler::new(vec![None, None]);
+    let mut s = Scheduler::new(vec![false, false]);
     s.trigger().await;
     s.advance(30).await;
     s.starts.try_recv().unwrap();
@@ -104,16 +102,7 @@ async fn activity_during_upload_has_one_delayed_follow_up_and_no_overlap() {
 
 #[tokio::test(start_paused = true)]
 async fn retries_back_off_without_new_activity_and_reset_after_success() {
-    let mut s = Scheduler::new(vec![
-        Some(Duration::ZERO),
-        Some(Duration::ZERO),
-        Some(Duration::ZERO),
-        Some(Duration::ZERO),
-        Some(Duration::ZERO),
-        None,
-        Some(Duration::ZERO),
-        None,
-    ]);
+    let mut s = Scheduler::new(vec![true, true, true, true, true, false, true, false]);
     s.trigger().await;
     s.advance(30).await;
     s.starts.try_recv().unwrap();
@@ -137,22 +126,19 @@ async fn retries_back_off_without_new_activity_and_reset_after_success() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn server_delay_survives_continuous_activity() {
-    let mut s = Scheduler::new(vec![Some(Duration::from_secs(300)), None]);
+async fn retry_cooldown_survives_continuous_activity() {
+    let mut s = Scheduler::new(vec![true, false]);
     s.trigger().await;
     s.advance(30).await;
     let first = s.starts.try_recv().unwrap();
     s.finish().await;
-    for _ in 0..9 {
-        s.advance(30).await;
+    for _ in 0..5 {
+        s.advance(10).await;
         s.trigger().await;
     }
     assert!(s.starts.try_recv().is_err());
-    s.advance(30).await;
-    assert_eq!(
-        s.starts.try_recv().unwrap() - first,
-        Duration::from_secs(300)
-    );
+    s.advance(10).await;
+    assert_eq!(s.starts.try_recv().unwrap() - first, AUDIT_RETRY_INITIAL);
     s.shutdown().await;
 }
 
@@ -163,7 +149,7 @@ async fn shutdown_cancels_pending_and_in_flight_passes() {
     let start = Instant::now();
     s.shutdown().await;
     assert_eq!(Instant::now(), start);
-    let mut s = Scheduler::new(vec![None]);
+    let mut s = Scheduler::new(vec![false]);
     s.trigger().await;
     s.advance(30).await;
     s.starts.try_recv().unwrap();
@@ -172,75 +158,12 @@ async fn shutdown_cancels_pending_and_in_flight_passes() {
     assert_eq!(Instant::now(), start);
 }
 
-/// Real HTTP path: endpoint-wide failures stop automatic passes, but the manual
-/// API remains immediate and continues through the retained files.
-/// Answers every request with `status` and reports each one on the returned
-/// channel. The response carries `Retry-After` only when one is given.
-async fn status_server(
-    status: u16,
-    retry_after: Option<&'static str>,
-) -> (JoinHandle<()>, String, mpsc::UnboundedReceiver<()>) {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let endpoint = format!("http://{}/ingest", listener.local_addr().unwrap());
-    let (requests, observed) = mpsc::unbounded_channel();
-    let retry_after =
-        retry_after.map_or(String::new(), |value| format!("Retry-After: {value}\r\n"));
-    let server = tokio::spawn(async move {
-        loop {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let mut bytes = Vec::new();
-            let mut buf = [0; 2048];
-            loop {
-                let n = stream.read(&mut buf).await.unwrap();
-                assert!(n > 0);
-                bytes.extend_from_slice(&buf[..n]);
-                if let Some(end) = bytes.windows(4).position(|x| x == b"\r\n\r\n")
-                    && bytes.len() >= end + 4 + 3
-                {
-                    break;
-                }
-            }
-            requests.send(()).unwrap();
-            let response = format!(
-                "HTTP/1.1 {status} Test\r\n{retry_after}Content-Length: 0\r\nConnection: close\r\n\r\n"
-            );
-            stream.write_all(response.as_bytes()).await.unwrap();
-        }
-    });
-    (server, endpoint, observed)
-}
-
-fn two_file_audit_app(root: &std::path::Path) -> MarmotApp {
-    let home = marmot_account::AccountHome::open(root);
-    home.create_account("alice").unwrap();
-    for name in ["audit-a.jsonl", "audit-b.jsonl"] {
-        std::fs::write(home.account_dir("alice").join(name),
-            b"{\"schema_version\":\"marmot-forensics-audit/v4\",\"seq\":0,\"wall_time_ms\":0,\"engine_id\":\"test\",\"kind\":{\"type\":\"recorder_started\",\"recorder\":\"test\"}}\n"
-        ).unwrap();
-    }
-    let app = MarmotApp::with_relay(root, "wss://relay.example");
-    app.set_audit_log_settings(crate::AuditLogSettings { enabled: true })
-        .unwrap();
-    app
-}
-
-fn tracker_config(endpoint: String) -> AuditLogTrackerConfig {
-    AuditLogTrackerConfig {
-        endpoint: Some(endpoint),
-        authorization_bearer_token: Some("test-token".into()),
-        ..Default::default()
-    }
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn v5_catalog_failure_retains_completed_v4_result_and_requests_retry() {
+async fn v5_catalog_failure_is_reported_as_skipped_and_requests_retry() {
     let tmp = tempfile::tempdir().unwrap();
     let app = MarmotApp::with_relay(tmp.path(), "wss://relay.example");
     app.set_audit_log_settings(crate::AuditLogSettings { enabled: true })
         .unwrap();
-    // V4 exits with its own missing-endpoint result before enumerating the
-    // account catalog. V5 must report the catalog failure independently.
     std::fs::write(tmp.path().join("accounts"), b"not a directory").unwrap();
     let sender = AuditOtlpSender::for_loopback_dev(
         "audit-v5-test",
@@ -249,9 +172,8 @@ async fn v5_catalog_failure_retains_completed_v4_result_and_requests_retry() {
     )
     .unwrap();
     let mut schedule = AuditPassSchedule::default();
-    let result = post_audit_log_tracker_update_with_v5(
+    let result = post_audit_log_tracker_update(
         &app,
-        AuditLogTrackerConfig::default(),
         Some(&sender),
         None,
         &RuntimeLifecycle::new(),
@@ -260,86 +182,12 @@ async fn v5_catalog_failure_retains_completed_v4_result_and_requests_retry() {
     )
     .await
     .unwrap();
-    assert_eq!(
-        result.skipped_reason.as_deref(),
-        Some("audit log tracker endpoint missing")
-    );
+    assert!(result.enabled);
     assert_eq!(
         result.v5.unwrap().skipped_reason.as_deref(),
         Some("v5 delivery pass failed")
     );
-    assert_eq!(schedule.retry_after, Some(Duration::ZERO));
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn automatic_pass_stops_on_auth_rate_limit_and_server_failure() {
-    // 400 and 413 are the file-specific controls: with Retry-After present,
-    // both are ordinary rejections, so the pass continues and the cooldown
-    // applies. The bare-413 latch is pinned separately below.
-    for status in [401, 403, 429, 503, 400, 413] {
-        let tmp = tempfile::tempdir().unwrap();
-        let app = two_file_audit_app(tmp.path());
-        let (server, endpoint, mut observed) = status_server(status, Some("120")).await;
-        let config = tracker_config(endpoint);
-        let mut schedule = AuditPassSchedule::default();
-        post_audit_log_tracker_update(&app, config.clone(), true, &mut schedule)
-            .await
-            .unwrap();
-        let count = if matches!(status, 400 | 413) { 2 } else { 1 };
-        for _ in 0..count {
-            observed.try_recv().unwrap();
-        }
-        assert!(observed.try_recv().is_err());
-        assert_eq!(
-            schedule.retry_after,
-            Some(Duration::from_secs(if matches!(status, 401 | 403) {
-                300
-            } else {
-                120
-            }))
-        );
-        post_audit_log_tracker_update_for_app(&app, config)
-            .await
-            .unwrap();
-        for _ in 0..2 {
-            observed.try_recv().unwrap();
-        }
-        assert!(observed.try_recv().is_err());
-        server.abort();
-    }
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn bare_413_latches_the_file_while_any_retry_after_keeps_it_retryable() {
-    // "\u{e9}" is obs-text: hyper accepts it, but `HeaderValue::to_str` does
-    // not, so the header must count as present even without a readable value.
-    for (retry_after, latched) in [(None, true), (Some("soon"), false), (Some("\u{e9}"), false)] {
-        let tmp = tempfile::tempdir().unwrap();
-        let app = two_file_audit_app(tmp.path());
-        let (server, endpoint, mut observed) = status_server(413, retry_after).await;
-        let config = tracker_config(endpoint);
-        let mut schedule = AuditPassSchedule::default();
-        post_audit_log_tracker_update(&app, config.clone(), true, &mut schedule)
-            .await
-            .unwrap();
-        // A refusal never blocks the file behind it.
-        for _ in 0..2 {
-            observed.try_recv().unwrap();
-        }
-        assert!(observed.try_recv().is_err());
-        assert_eq!(
-            schedule.retry_after.is_none(),
-            latched,
-            "only a bare 413 leaves the retry timer unarmed"
-        );
-
-        post_audit_log_tracker_update_for_app(&app, config)
-            .await
-            .unwrap();
-        let re_posted = std::iter::from_fn(|| observed.try_recv().ok()).count();
-        assert_eq!(re_posted, if latched { 0 } else { 2 });
-        server.abort();
-    }
+    assert!(schedule.retry);
 }
 
 #[test]
@@ -349,88 +197,6 @@ fn batch_window_override_is_local_to_one_uploader() {
     *first.override_duration.lock().unwrap() = Some(Duration::ZERO);
     assert_eq!(first.clone().duration(), Duration::ZERO);
     assert_eq!(second.duration(), Duration::from_secs(30));
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn redirected_tracker_upload_is_not_checkpointed_until_direct_success() {
-    let tmp = tempfile::tempdir().unwrap();
-    let home = marmot_account::AccountHome::open(tmp.path());
-    home.create_account("alice").unwrap();
-    std::fs::write(
-        home.account_dir("alice").join("audit-a.jsonl"),
-        b"{\"schema_version\":\"marmot-forensics-audit/v4\",\"seq\":0,\"wall_time_ms\":0,\"engine_id\":\"test\",\"kind\":{\"type\":\"recorder_started\",\"recorder\":\"test\"}}\n",
-    )
-    .unwrap();
-    let app = MarmotApp::with_relay(tmp.path(), "wss://relay.example");
-    app.set_audit_log_settings(crate::AuditLogSettings { enabled: true })
-        .unwrap();
-    let first = app.audit_log_files().unwrap().remove(0);
-
-    let source = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let sink = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let location = format!("http://{}/stolen", sink.local_addr().unwrap());
-    let redirect_endpoint = format!("http://{}/ingest", source.local_addr().unwrap());
-    let redirect_server = tokio::spawn(async move {
-        use tokio::io::AsyncWriteExt;
-        let (mut stream, _) = source.accept().await.unwrap();
-        let mut bytes = Vec::new();
-        let mut buf = [0; 2048];
-        loop {
-            let n = tokio::io::AsyncReadExt::read(&mut stream, &mut buf)
-                .await
-                .unwrap();
-            assert!(n > 0);
-            bytes.extend_from_slice(&buf[..n]);
-            if bytes.windows(4).any(|window| window == b"\r\n\r\n") {
-                break;
-            }
-        }
-        stream
-            .write_all(
-                format!(
-                    "HTTP/1.1 307 Temporary Redirect\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                )
-                .as_bytes(),
-            )
-            .await
-            .unwrap();
-    });
-    let (sink_tx, mut sink_rx) = tokio::sync::oneshot::channel();
-    let sink_server = tokio::spawn(async move {
-        if sink.accept().await.is_ok() {
-            let _ = sink_tx.send(());
-        }
-    });
-
-    let redirected = post_audit_log_tracker_update_for_app(&app, tracker_config(redirect_endpoint))
-        .await
-        .unwrap();
-    assert!(redirected.uploaded.is_empty());
-    assert!(
-        app.audit_upload_checkpoint("alice")
-            .acknowledged(&first)
-            .is_none()
-    );
-    assert!(
-        tokio::time::timeout(std::time::Duration::from_millis(150), &mut sink_rx)
-            .await
-            .is_err(),
-        "redirect sink received a tracker upload"
-    );
-    sink_server.abort();
-    redirect_server.await.unwrap();
-
-    let (server, endpoint, mut observed) = status_server(204, None).await;
-    let uploaded = post_audit_log_tracker_update_for_app(&app, tracker_config(endpoint))
-        .await
-        .unwrap();
-    assert_eq!(uploaded.uploaded.len(), 1);
-    assert!(observed.try_recv().is_ok());
-    assert_eq!(
-        app.audit_upload_checkpoint("alice").acknowledged(&first),
-        Some(marmot_observability::AuditUploadOutcome::Uploaded)
-    );
-    server.abort();
 }
 
 #[tokio::test(start_paused = true)]
@@ -444,11 +210,7 @@ async fn batches_preserve_first_trigger_and_label_automatic_retries() {
         AuditBatchWindow::default(),
         move |trigger| {
             seen.send(trigger).unwrap();
-            async {
-                AuditPassSchedule {
-                    retry_after: Some(Duration::ZERO),
-                }
-            }
+            async { AuditPassSchedule { retry: true } }
         },
     ));
     triggers.send("send_message").await.unwrap();
@@ -557,9 +319,8 @@ async fn automatic_v5_pass(
 ) -> (AuditOtlpTrackerResult, AuditPassSchedule) {
     let sender = runtime.shared.audit_otlp_sender();
     let mut schedule = AuditPassSchedule::default();
-    let result = post_audit_log_tracker_update_with_v5(
+    let result = post_audit_log_tracker_update(
         app,
-        AuditLogTrackerConfig::default(),
         sender.as_deref(),
         Some(&runtime.shared.audit_otlp_sender),
         &runtime.shared.lifecycle(),
@@ -591,10 +352,7 @@ async fn receiver_block_pauses_automatic_delivery_until_manual_retry_or_config_c
     let (result, schedule) = automatic_v5_pass(&app, &runtime).await;
     assert_eq!(requests.try_recv().unwrap(), 401);
     assert_eq!(result.blocked_accounts, 1);
-    assert_eq!(
-        schedule.retry_after, None,
-        "a block does not arm the retry timer"
-    );
+    assert!(!schedule.retry, "a block does not arm the retry timer");
     let status = alice_status(&runtime);
     assert!(status.destination_configured);
     assert!(status.paused);
@@ -723,7 +481,7 @@ async fn delivery_status_distinguishes_receiver_rejection_from_local_state_limit
     let (result, schedule) = automatic_v5_pass(&app, &runtime).await;
     assert!(requests.try_recv().is_err());
     assert_eq!(result.blocked_accounts, 1);
-    assert_eq!(schedule.retry_after, Some(Duration::ZERO));
+    assert!(schedule.retry);
     let status = alice_status(&runtime);
     assert!(!status.paused, "local failures keep retrying");
     assert_eq!(status.rejected_batches, rejected);

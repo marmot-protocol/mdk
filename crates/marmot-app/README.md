@@ -1012,7 +1012,7 @@ See [moderation reports](../../docs/marmot-architecture/moderation-reports.md) f
 ## Audit v5 Welcome evidence
 
 Opt-in audit recording writes v5 files (see [`marmot-forensics`](../marmot-forensics/README.md)); historical v4 files
-keep their separate legacy whole-file upload path. With audit logging enabled, the app records v5 Welcome evidence from
+stay local until retention expires them. With audit logging enabled, the app records v5 Welcome evidence from
 real founding, publication, receipt, peel, join and checkpoint boundaries. The
 [Welcome probe notes](tests/audit-v5-welcome-probe.md) describe those boundaries and the unit tests that exercise them:
 

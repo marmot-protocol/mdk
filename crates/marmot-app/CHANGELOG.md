@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Breaking changes
+
+- Remove the legacy v4 whole-file audit upload, whose only receiver (the
+  retired Goggles service) no longer exists. `post_audit_log_file`,
+  `AuditLogUploadResult`, `AuditLogTrackerConfig`,
+  `MarmotServiceEndpoints::audit_log_tracker_endpoint` and the upload
+  checkpoint are removed. Set recorder source metadata with
+  `MarmotAppRuntime::set_audit_log_source(AuditLogSource)`.
+  `post_audit_log_tracker_update` now runs only the v5 OTLP pass, and
+  `AuditLogTrackerUpdateResult` keeps only `enabled` and `v5`. Startup cleanup
+  deletes the orphaned `audit-upload-checkpoint.json`.
+
 ### Added
 
 - `MarmotAppRuntime::discard_failed_send(account_ref, group_id, message_id_hex)`

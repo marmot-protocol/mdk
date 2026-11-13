@@ -4,6 +4,15 @@
 
 ### Breaking changes
 
+- Remove the legacy v4 whole-file audit upload. Its only receiver, the
+  retired Goggles service, no longer exists; v5 OTLP delivery is now the only
+  remote audit path. The manual file upload, the v4 tracker pass, the default
+  tracker endpoint (`MARMOT_AUDIT_LOG_TRACKER_ENDPOINT`) and the upload
+  checkpoint are gone, and startup cleanup deletes the orphaned
+  `audit-upload-checkpoint.json`. The tracker config setter is replaced by a
+  source-only `set_audit_log_source` across Rust, UniFFI and C, and the v5
+  tracker result drops its v4 fields. Local v4 files stay listable and
+  deletable until retention expires them.
 - Return optional create/invite operation results with ordered per-account
   resolution outcomes across Rust, C, UniFFI, and CLI (#1813). Available accounts
   proceed in one MLS operation; unavailable accounts are reported individually.

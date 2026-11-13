@@ -24,15 +24,15 @@ The code that ships diagnostics off the device (step 6 of the 2026-10 architectu
   through `marmot-app`'s re-exports, so those types gain no new `pub` method. A recording method goes on a view
   (`ProductRecorder`, `PerformanceRecorder`, `ProductOperation`); starting workers, consent receipts, silencing, the
   telemetry origin, the exporters' runtime config and the audit destination go on `wiring`.
-- **No files.** Production code creates and opens no files. `marmot-app` keeps every audit, checkpoint and id file on
-  `fs-private` and hands the uploader the open file or the checkpoint record. `clippy.toml` bans std and tokio file
-  creation and opening; only a test that writes a temporary file allows the lint.
+- **No files.** Production code creates and opens no files. `marmot-app` keeps every audit and id file on
+  `fs-private`; the audit OTLP sender gets an owned batch. `clippy.toml` bans std and tokio file creation and opening;
+  only a test that writes a temporary file allows the lint.
 - **Every collector client goes through `collector_host_safety`.** It validates every resolved address, pins it,
   disables redirects and system proxies, takes TLS trust from the configured URL, and applies the connect and request
   timeouts; loopback is allowed only for an exact loopback test endpoint. It builds clients through the process-wide
   `http_builder` `marmot-app` hands in (`hand_in_http_builder`, the process SOCKS5 policy); until then it builds none,
   so nothing dials. `clippy.toml` bans direct reqwest constructors: allow the lint only where a fresh builder goes
-  straight into the helper, or in a test fixture. The audit upload and the audit OTLP sender also reject retired hosts
+  straight into the helper, or in a test fixture. The audit OTLP sender also rejects retired hosts (`host_is_retired`)
   before the helper; product analytics and relay telemetry have no denylist (adding one is its own change). See
   `docs/marmot-architecture/overview/dial-safety.md`.
 - **Privacy-safe logs only:** explicit `target` and `method` fields and aggregate values
@@ -50,8 +50,7 @@ The code that ships diagnostics off the device (step 6 of the 2026-10 architectu
 | `src/app_telemetry.rs`, `src/app_telemetry/` | The app-performance recorder and its snapshots; runtime operation observations in `app_telemetry/runtime.rs`. |
 | `src/relay_telemetry_export.rs` | The relay-telemetry exporter: the privacy mapping (`build_export_batch`) and opt-in gate in the default build, OTLP encoding and push behind `otlp-export`. |
 | `src/audit_otlp_sender.rs` | The configured audit OTLP/HTTP sender. |
-| `src/audit_upload.rs` | The v4 audit upload's HTTP half: snapshot capture, the checkpoint record, endpoint validation, the request, the response handling and `AuditUploadError`. |
-| `src/collector_host_safety.rs` | The collector dial-safety helper and the injected HTTP builder slot. |
+| `src/collector_host_safety.rs` | The collector dial-safety helper, the retired-host check and the injected HTTP builder slot. |
 | `src/export_config.rs` | The exporters' resolved config and the collector endpoint parsers. |
 
 ## Rules

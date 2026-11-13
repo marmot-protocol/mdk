@@ -1,10 +1,9 @@
 //! The exporters' resolved configuration (#2627): the relay-telemetry export
-//! config with its resource and runtime config, the audit upload source, and
-//! the structural gates every collector endpoint passes.
+//! config with its resource and runtime config, and the structural gates every
+//! collector endpoint passes.
 //!
 //! `marmot-app` keeps the settings that resolve against its service endpoints
-//! (`RelayTelemetrySettings`, `AuditLogTrackerConfig`) and builds these values
-//! from them.
+//! (`RelayTelemetrySettings`) and builds these values from them.
 
 use std::time::Duration;
 
@@ -47,14 +46,6 @@ impl std::fmt::Debug for RelayTelemetryRuntimeConfig {
             .field("resource", &self.resource)
             .finish()
     }
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct AuditLogUploadSource {
-    /// System model identifier; never a user-assigned device name, hostname, or serial number.
-    pub hardware_model: Option<String>,
-    pub platform: Option<String>,
-    pub app_version: Option<String>,
 }
 
 impl RelayTelemetryResource {

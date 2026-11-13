@@ -1,6 +1,6 @@
 //! Active opt-in v5 forensic record contract. New app audit sessions record
 //! typed lifecycle, app, Welcome and operational events here; historical v4 files remain
-//! readable and their whole-file upload contract stays separate.
+//! readable but are never delivered.
 mod operational;
 mod primitives;
 mod strict_json;

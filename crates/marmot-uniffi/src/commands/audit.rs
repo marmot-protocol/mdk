@@ -1,10 +1,10 @@
-//! Forensic audit-log settings, listing, upload, and tracker commands.
+//! Forensic audit-log settings, source metadata, listing, deletion, and v5
+//! delivery commands.
 
 use crate::Marmot;
 use crate::conversions::{
     AuditDeliveryStatusV5Ffi, AuditLogDeleteResultFfi, AuditLogFileFfi, AuditLogRetentionFfi,
-    AuditLogSettingsFfi, AuditLogTrackerConfigV4Ffi, AuditLogTrackerUpdateResultFfi,
-    AuditLogTrackerUpdateResultV5Ffi, AuditLogUploadResultFfi, AuditOtlpConfigV5Ffi,
+    AuditLogSettingsFfi, AuditLogSourceFfi, AuditLogTrackerUpdateResultV5Ffi, AuditOtlpConfigV5Ffi,
 };
 use crate::errors::MarmotKitError;
 use marmot_app::audit_otlp_sender::AuditOtlpSender;
@@ -55,19 +55,15 @@ impl Marmot {
             .into())
     }
 
-    /// Supply non-persisted audit tracker upload metadata: optional legacy v4
-    /// whole-file upload URL override, bearer token from the host app, and optional system
-    /// hardware model, platform, and app version.
-    ///
-    /// The returned config confirms what was stored but never echoes the
-    /// bearer token back across FFI: secrets flow in, not out.
-    pub fn set_audit_log_tracker_config(
+    /// Supply the non-persisted source metadata (system hardware model,
+    /// platform, app version) recorded in each audit recorder opened after
+    /// this call, and return the stored, trimmed value. Call it at startup,
+    /// before account sessions open; running recorders keep their source.
+    pub fn set_audit_log_source(
         &self,
-        config: AuditLogTrackerConfigV4Ffi,
-    ) -> Result<AuditLogTrackerConfigV4Ffi, MarmotKitError> {
-        Ok(AuditLogTrackerConfigV4Ffi::redacted(
-            self.runtime.set_audit_log_tracker_config(config.into())?,
-        ))
+        source: AuditLogSourceFfi,
+    ) -> Result<AuditLogSourceFfi, MarmotKitError> {
+        Ok(self.runtime.set_audit_log_source(source.into())?.into())
     }
 
     /// Configure the v5 audit OTLP destination in memory. The token is
@@ -120,7 +116,8 @@ impl Marmot {
             .collect())
     }
 
-    /// Local JSONL audit logs available for explicit forensic upload.
+    /// Local JSONL audit log files, including historical v4 files until
+    /// retention expires them.
     pub fn audit_log_files(&self) -> Result<Vec<AuditLogFileFfi>, MarmotKitError> {
         Ok(self
             .runtime
@@ -128,19 +125,6 @@ impl Marmot {
             .into_iter()
             .map(Into::into)
             .collect())
-    }
-
-    /// POST one selected JSONL audit log to a forensic analyzer endpoint.
-    pub async fn post_audit_log_file(
-        &self,
-        path: String,
-        endpoint: String,
-    ) -> Result<AuditLogUploadResultFfi, MarmotKitError> {
-        Ok(self
-            .runtime
-            .post_audit_log_file(&path, &endpoint)
-            .await?
-            .into())
     }
 
     /// Delete one local JSONL audit log file (e.g. behind a "clear audit log"
@@ -158,16 +142,10 @@ impl Marmot {
         Ok(self.runtime.delete_audit_log_file(&path).await?.into())
     }
 
-    /// POST all local audit logs to the configured tracker when audit logging is
-    /// enabled. This is safe for host apps to call unconditionally; disabled or
-    /// unconfigured states return a structured skip result.
-    pub async fn post_audit_log_tracker_update(
-        &self,
-    ) -> Result<AuditLogTrackerUpdateResultFfi, MarmotKitError> {
-        Ok(self.runtime.post_audit_log_tracker_update().await?.into())
-    }
-
-    /// Run the same manual tracker pass with separate v4 and v5 results.
+    /// Run one manual v5 OTLP delivery pass now. Safe to call
+    /// unconditionally: `enabled` reports the audit switch and `v5` is `None`
+    /// when no destination is configured. Also retries accounts whose
+    /// automatic delivery is paused.
     pub async fn post_audit_log_tracker_update_v5(
         &self,
     ) -> Result<AuditLogTrackerUpdateResultV5Ffi, MarmotKitError> {
