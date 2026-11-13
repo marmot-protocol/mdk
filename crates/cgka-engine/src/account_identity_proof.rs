@@ -738,6 +738,7 @@ fn read_exact<'a>(cursor: &mut &'a [u8], len: usize, field: &str) -> Result<&'a 
 mod tests {
     use super::*;
     use nostr::prelude::FinalizeEvent;
+    use openmls::prelude::CredentialType;
 
     struct FixedSigner([u8; 64]);
 
@@ -950,7 +951,7 @@ mod tests {
                     Some(&[suite]),
                     Some(&[account_identity_proof_capability()]),
                     None,
-                    None,
+                    Some(&[CredentialType::Basic]),
                 ))
                 .leaf_node_extensions(
                     Extensions::single(Extension::Unknown(

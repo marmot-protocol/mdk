@@ -478,7 +478,7 @@ jobs:
   # Pull requests run this only with the `ci:apple` or `ci:full` label; merge
   # groups always run it, so it gates merging.
   ios-account-clippy:
-    name: iOS account keychain clippy
+    name: iOS keychain and Swift cancellation
     needs: changes
     if: >-
       needs.changes.outputs.run_ios == 'true'
@@ -491,6 +491,9 @@ jobs:
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           persist-credentials: false
+
+      - name: Install pinned Odin
+        uses: ./.github/actions/setup-odin
 
       - name: Install Rust toolchain
         shell: bash
@@ -513,6 +516,9 @@ jobs:
       # before the runtime moved there.
       - name: Check iOS account keychain code
         run: cargo clippy -p marmot-account -p marmot-session --target aarch64-apple-ios --locked -- -D warnings
+
+      - name: Verify Swift subscription cancellation against native futures
+        run: bash crates/marmot-uniffi/subscription-cancellation-smoke.sh
 
   # The broader integration matrix explicitly enables test-policy-overrides.
   # This focused default-feature job proves ordinary debug/release consumers

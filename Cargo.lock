@@ -66,7 +66,7 @@ dependencies = [
 
 [[package]]
 name = "agent-connector"
-version = "0.16.0"
+version = "0.17.0-dev"
 dependencies = [
  "agent-control",
  "agent-stream-compose",
@@ -96,7 +96,7 @@ dependencies = [
 
 [[package]]
 name = "agent-control"
-version = "0.16.0"
+version = "0.17.0-dev"
 dependencies = [
  "serde",
  "serde_json",
@@ -106,7 +106,7 @@ dependencies = [
 
 [[package]]
 name = "agent-stream-compose"
-version = "0.16.0"
+version = "0.17.0-dev"
 dependencies = [
  "cgka-traits",
  "hex",
@@ -946,7 +946,7 @@ checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
 
 [[package]]
 name = "cgka-conformance-simulator"
-version = "0.16.0"
+version = "0.17.0-dev"
 dependencies = [
  "async-trait",
  "cgka-engine",
@@ -985,7 +985,7 @@ dependencies = [
 
 [[package]]
 name = "cgka-engine"
-version = "0.16.0"
+version = "0.17.0-dev"
 dependencies = [
  "async-trait",
  "cgka-traits",
@@ -1018,7 +1018,7 @@ dependencies = [
 
 [[package]]
 name = "cgka-traits"
-version = "0.16.0"
+version = "0.17.0-dev"
 dependencies = [
  "async-trait",
  "criterion",
@@ -1274,7 +1274,7 @@ checksum = "a6ef517f0926dd24a1582492c791b6a4818a4d94e789a334894aa15b0d12f55c"
 
 [[package]]
 name = "convergence-campaign-runner"
-version = "0.16.0"
+version = "0.17.0-dev"
 dependencies = [
  "async-trait",
  "cgka-conformance-simulator",
@@ -2089,7 +2089,7 @@ dependencies = [
 
 [[package]]
 name = "fs-private"
-version = "0.16.0"
+version = "0.17.0-dev"
 dependencies = [
  "libc",
  "tempfile",
@@ -2588,7 +2588,6 @@ dependencies = [
  "hkdf 0.13.0",
  "hpke-rs-crypto",
  "k256",
- "ml-kem",
  "p256",
  "p384",
  "rand 0.10.1",
@@ -2596,7 +2595,6 @@ dependencies = [
  "rand_core 0.10.1",
  "sha2 0.11.0",
  "subtle",
- "x-wing",
  "x25519-dalek",
 ]
 
@@ -2651,7 +2649,6 @@ version = "0.4.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "818356c5132c1fede50f837ca96afbe78ff42413047f4abb886217845e1b6c8c"
 dependencies = [
- "ctutils",
  "subtle",
  "typenum",
  "zeroize",
@@ -2895,7 +2892,7 @@ dependencies = [
 
 [[package]]
 name = "incident-replay"
-version = "0.16.0"
+version = "0.17.0-dev"
 dependencies = [
  "cgka-conformance-simulator",
  "fs-private",
@@ -3162,26 +3159,6 @@ dependencies = [
  "hashbrown 0.16.1",
  "portable-atomic",
  "thiserror 2.0.18",
-]
-
-[[package]]
-name = "keccak"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9e24a010dd405bd7ed803e5253182815b41bf2e6a80cc3bfc066658e03a198aa"
-dependencies = [
- "cfg-if",
- "cpufeatures 0.3.0",
-]
-
-[[package]]
-name = "kem"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "01737161ba802849cfd486b5bd209d38ba4943494c249a8126005170c7621edd"
-dependencies = [
- "crypto-common 0.2.2",
- "rand_core 0.10.1",
 ]
 
 [[package]]
@@ -3558,7 +3535,7 @@ dependencies = [
 
 [[package]]
 name = "marmot-account"
-version = "0.16.0"
+version = "0.17.0-dev"
 dependencies = [
  "android-native-keyring-store",
  "apple-native-keyring-store",
@@ -3580,7 +3557,7 @@ dependencies = [
 
 [[package]]
 name = "marmot-app"
-version = "0.16.0"
+version = "0.17.0-dev"
 dependencies = [
  "agent-stream-compose",
  "async-trait",
@@ -3647,7 +3624,7 @@ dependencies = [
 
 [[package]]
 name = "marmot-c"
-version = "0.16.0"
+version = "0.17.0-dev"
 dependencies = [
  "futures",
  "keyring-core",
@@ -3668,7 +3645,7 @@ dependencies = [
 
 [[package]]
 name = "marmot-forensics"
-version = "0.16.0"
+version = "0.17.0-dev"
 dependencies = [
  "fs-private",
  "hex",
@@ -3683,7 +3660,7 @@ dependencies = [
 
 [[package]]
 name = "marmot-markdown"
-version = "0.16.0"
+version = "0.17.0-dev"
 dependencies = [
  "marmot-markdown-ast",
  "serde_json",
@@ -3691,14 +3668,14 @@ dependencies = [
 
 [[package]]
 name = "marmot-markdown-ast"
-version = "0.16.0"
+version = "0.17.0-dev"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "marmot-observability"
-version = "0.16.0"
+version = "0.17.0-dev"
 dependencies = [
  "cgka-traits",
  "chrono",
@@ -3728,7 +3705,7 @@ dependencies = [
 
 [[package]]
 name = "marmot-pairing"
-version = "0.16.0"
+version = "0.17.0-dev"
 dependencies = [
  "cgka-traits",
  "hex",
@@ -3746,7 +3723,7 @@ dependencies = [
 
 [[package]]
 name = "marmot-session"
-version = "0.16.0"
+version = "0.17.0-dev"
 dependencies = [
  "async-trait",
  "base64",
@@ -3778,7 +3755,7 @@ dependencies = [
 
 [[package]]
 name = "marmot-terminal-harness"
-version = "0.16.0"
+version = "0.17.0-dev"
 dependencies = [
  "agent-control",
  "async-trait",
@@ -3798,7 +3775,7 @@ dependencies = [
 
 [[package]]
 name = "marmot-uniffi"
-version = "0.16.0"
+version = "0.17.0-dev"
 dependencies = [
  "cgka-traits",
  "futures",
@@ -3825,7 +3802,7 @@ dependencies = [
 
 [[package]]
 name = "marmot-uniffi-macros"
-version = "0.16.0"
+version = "0.17.0-dev"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -3842,8 +3819,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "maybe-async"
+version = "0.2.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "746873a384ad60adc5db74471dfaba74bd278afbdcfd81db93fafcdfc8b5ca0c"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
 name = "media-store"
-version = "0.16.0"
+version = "0.17.0-dev"
 dependencies = [
  "flate2",
  "fs-private",
@@ -3912,46 +3900,6 @@ dependencies = [
  "log",
  "wasi",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "ml-dsa"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "add6b9d92e496f16f4526d68ff29da1483aba4b119baeab8bed3b9e3544a6f3d"
-dependencies = [
- "const-oid",
- "crypto-common 0.2.2",
- "ctutils",
- "hybrid-array",
- "module-lattice",
- "pkcs8",
- "shake",
- "signature",
-]
-
-[[package]]
-name = "ml-kem"
-version = "0.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5e15f3e5b957493873e396a66914e83e616b6afe335cdef7efe5c6e1216aba66"
-dependencies = [
- "hybrid-array",
- "kem",
- "module-lattice",
- "rand_core 0.10.1",
- "sha3 0.11.0",
-]
-
-[[package]]
-name = "module-lattice"
-version = "0.2.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0c61b87c9683ab7cb1c6871d261ad5479b6b10ceb52c4352aaca3b5d35a8febe"
-dependencies = [
- "ctutils",
- "hybrid-array",
- "num-traits",
 ]
 
 [[package]]
@@ -4077,7 +4025,7 @@ dependencies = [
 
 [[package]]
 name = "nostr-directory"
-version = "0.16.0"
+version = "0.17.0-dev"
 dependencies = [
  "base64",
  "cgka-engine",
@@ -4319,8 +4267,8 @@ checksum = "4f933a4265d5cdad61d19bbdfc972ea5726d56cd8d3d57b8f2d3c365dd42bee9"
 
 [[package]]
 name = "openmls"
-version = "0.8.1"
-source = "git+https://github.com/erskingardner/openmls.git?rev=94f57b829d95840fc5b415b7a86f547f5c1f65ba#94f57b829d95840fc5b415b7a86f547f5c1f65ba"
+version = "0.9.0"
+source = "git+https://github.com/openmls/openmls.git?rev=6100df3fb1d8c3eeab53e349fcbd621f98c44fe2#6100df3fb1d8c3eeab53e349fcbd621f98c44fe2"
 dependencies = [
  "getrandom 0.4.3",
  "log",
@@ -4337,12 +4285,11 @@ dependencies = [
 
 [[package]]
 name = "openmls_basic_credential"
-version = "0.5.0"
-source = "git+https://github.com/erskingardner/openmls.git?rev=94f57b829d95840fc5b415b7a86f547f5c1f65ba#94f57b829d95840fc5b415b7a86f547f5c1f65ba"
+version = "0.6.0"
+source = "git+https://github.com/openmls/openmls.git?rev=6100df3fb1d8c3eeab53e349fcbd621f98c44fe2#6100df3fb1d8c3eeab53e349fcbd621f98c44fe2"
 dependencies = [
  "ed25519-dalek",
  "getrandom 0.4.3",
- "ml-dsa",
  "openmls_traits",
  "p256",
  "p384",
@@ -4354,8 +4301,8 @@ dependencies = [
 
 [[package]]
 name = "openmls_memory_storage"
-version = "0.5.0"
-source = "git+https://github.com/erskingardner/openmls.git?rev=94f57b829d95840fc5b415b7a86f547f5c1f65ba#94f57b829d95840fc5b415b7a86f547f5c1f65ba"
+version = "0.6.0"
+source = "git+https://github.com/openmls/openmls.git?rev=6100df3fb1d8c3eeab53e349fcbd621f98c44fe2#6100df3fb1d8c3eeab53e349fcbd621f98c44fe2"
 dependencies = [
  "log",
  "openmls_traits",
@@ -4366,8 +4313,8 @@ dependencies = [
 
 [[package]]
 name = "openmls_rust_crypto"
-version = "0.5.1"
-source = "git+https://github.com/erskingardner/openmls.git?rev=94f57b829d95840fc5b415b7a86f547f5c1f65ba#94f57b829d95840fc5b415b7a86f547f5c1f65ba"
+version = "0.6.0"
+source = "git+https://github.com/openmls/openmls.git?rev=6100df3fb1d8c3eeab53e349fcbd621f98c44fe2#6100df3fb1d8c3eeab53e349fcbd621f98c44fe2"
 dependencies = [
  "aes-gcm",
  "chacha20poly1305 0.11.0",
@@ -4378,7 +4325,6 @@ dependencies = [
  "hpke-rs",
  "hpke-rs-crypto",
  "hpke-rs-rust-crypto",
- "ml-dsa",
  "openmls_memory_storage",
  "openmls_traits",
  "p256",
@@ -4393,19 +4339,20 @@ dependencies = [
 [[package]]
 name = "openmls_serialization_helpers"
 version = "0.1.0"
-source = "git+https://github.com/erskingardner/openmls.git?rev=94f57b829d95840fc5b415b7a86f547f5c1f65ba#94f57b829d95840fc5b415b7a86f547f5c1f65ba"
+source = "git+https://github.com/openmls/openmls.git?rev=6100df3fb1d8c3eeab53e349fcbd621f98c44fe2#6100df3fb1d8c3eeab53e349fcbd621f98c44fe2"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.117",
+ "syn 3.0.6",
  "thiserror 2.0.18",
 ]
 
 [[package]]
 name = "openmls_traits"
-version = "0.5.0"
-source = "git+https://github.com/erskingardner/openmls.git?rev=94f57b829d95840fc5b415b7a86f547f5c1f65ba#94f57b829d95840fc5b415b7a86f547f5c1f65ba"
+version = "0.6.0"
+source = "git+https://github.com/openmls/openmls.git?rev=6100df3fb1d8c3eeab53e349fcbd621f98c44fe2#6100df3fb1d8c3eeab53e349fcbd621f98c44fe2"
 dependencies = [
+ "maybe-async",
  "serde",
  "tls_codec",
 ]
@@ -6014,38 +5961,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "sha3"
-version = "0.11.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "be176f1a57ce4e3d31c1a166222d9768de5954f811601fb7ca06fc8203905ce1"
-dependencies = [
- "digest 0.11.3",
- "keccak",
-]
-
-[[package]]
-name = "sha3"
-version = "0.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bc9bad02c26382724b2d2692c6f179285e4b54eeecd7968f52a50059c3c11759"
-dependencies = [
- "digest 0.11.3",
- "keccak",
- "sponge-cursor",
-]
-
-[[package]]
-name = "shake"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "09057cb2149ad4cbd2da1e26b351f9a4c354219421229c69c3063e6f61947c4a"
-dependencies = [
- "digest 0.11.3",
- "keccak",
- "sponge-cursor",
-]
-
-[[package]]
 name = "sharded-slab"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6178,12 +6093,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "sponge-cursor"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3a0219bd7d979d58245a4f41f695e1ac9f8befdffadd7f61f1bae9e39abc6620"
-
-[[package]]
 name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6217,7 +6126,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "storage-sqlite"
-version = "0.16.0"
+version = "0.17.0-dev"
 dependencies = [
  "cgka-traits",
  "fs-private",
@@ -6847,7 +6756,7 @@ dependencies = [
 
 [[package]]
 name = "transport-nostr"
-version = "0.16.0"
+version = "0.17.0-dev"
 dependencies = [
  "async-trait",
  "cgka-traits",
@@ -6869,7 +6778,7 @@ dependencies = [
 
 [[package]]
 name = "transport-nostr-adapter"
-version = "0.16.0"
+version = "0.17.0-dev"
 dependencies = [
  "async-trait",
  "async-wsocket 0.17.0",
@@ -6897,7 +6806,7 @@ dependencies = [
 
 [[package]]
 name = "transport-nostr-peeler"
-version = "0.16.0"
+version = "0.17.0-dev"
 dependencies = [
  "async-trait",
  "base64",
@@ -6917,7 +6826,7 @@ dependencies = [
 
 [[package]]
 name = "transport-quic-broker"
-version = "0.16.0"
+version = "0.17.0-dev"
 dependencies = [
  "cgka-traits",
  "clap",
@@ -6935,7 +6844,7 @@ dependencies = [
 
 [[package]]
 name = "transport-quic-stream"
-version = "0.16.0"
+version = "0.17.0-dev"
 dependencies = [
  "cgka-traits",
  "chacha20poly1305 0.10.1",
@@ -7907,7 +7816,7 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 
 [[package]]
 name = "wn-claude"
-version = "0.16.0"
+version = "0.17.0-dev"
 dependencies = [
  "async-trait",
  "clap",
@@ -7922,7 +7831,7 @@ dependencies = [
 
 [[package]]
 name = "wn-cli"
-version = "0.16.0"
+version = "0.17.0-dev"
 dependencies = [
  "agent-stream-compose",
  "cgka-traits",
@@ -7955,7 +7864,7 @@ dependencies = [
 
 [[package]]
 name = "wn-codex"
-version = "0.16.0"
+version = "0.17.0-dev"
 dependencies = [
  "async-trait",
  "clap",
@@ -7969,7 +7878,7 @@ dependencies = [
 
 [[package]]
 name = "wn-goose"
-version = "0.16.0"
+version = "0.17.0-dev"
 dependencies = [
  "async-trait",
  "clap",
@@ -7985,7 +7894,7 @@ dependencies = [
 
 [[package]]
 name = "wn-opencode"
-version = "0.16.0"
+version = "0.17.0-dev"
 dependencies = [
  "async-trait",
  "clap",
@@ -8000,7 +7909,7 @@ dependencies = [
 
 [[package]]
 name = "wn-pi"
-version = "0.16.0"
+version = "0.17.0-dev"
 dependencies = [
  "async-trait",
  "clap",
@@ -8038,19 +7947,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "05f360fc0b24296329c78fda852a1e9ae82de9cf7b27dae4b7f62f118f77b9ed"
 dependencies = [
  "tap",
-]
-
-[[package]]
-name = "x-wing"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b51507b887016c3925c84591108dadb8c099f776eb04fec6a60ae3519fee856f"
-dependencies = [
- "kem",
- "ml-kem",
- "sha3 0.12.0",
- "shake",
- "x25519-dalek",
 ]
 
 [[package]]

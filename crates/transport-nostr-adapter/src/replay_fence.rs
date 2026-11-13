@@ -36,7 +36,13 @@
 //!   move to the new coverage, held from the same point until the owner's
 //!   next plan answers; a plan older than the last one applied still answers
 //!   nothing. Only a frame whose group the new REQs no longer route, or that
-//!   the buffer has no room for, is lost.
+//!   the buffer has no room for, is lost. A history copy a source claims that
+//!   a fresh REQ asks for again, on the same route and relay from no later,
+//!   is owed instead: the new coverage keeps the seal shut until the copy
+//!   comes again, and charges the replaced coverage's floor as loss if every
+//!   source it is owed on stops replaying first (its EOSE, a cut reply,
+//!   abandonment or retirement, its waiting allowance) or the new coverage
+//!   drops. A reconnect that asks for the same range again keeps the debt.
 //! - **One group.** A fence holds its own group's frames only. They count
 //!   neither in the account's pending admission nor against other groups'
 //!   placement, so other groups' live boundaries, tails and ingest go on. A
@@ -550,6 +556,202 @@ impl AccountReplayCoverage {
     }
 }
 
+/// One group route a fresh activation's REQ replays history on, on one relay,
+/// from its `since` ([`AdapterState::fresh_replay_starts`]).
+pub(super) struct FreshReplay {
+    pub(super) group: GroupId,
+    pub(super) route: [u8; 32],
+    pub(super) relay: RelayIndex,
+    pub(super) since: u64,
+}
+
+/// A history copy a replaced coverage dropped because a fresh REQ asks for it
+/// again: the coverage replacing it owes the copy until it comes again.
+pub(super) struct ReplayedCopy {
+    /// Each group, route and relay a fresh REQ asks it again on.
+    sources: Vec<(GroupId, [u8; 32], RelayIndex)>,
+    created_at: u64,
+    /// The replaced coverage's loss floor, charged if the copy does not come
+    /// again.
+    floor: u64,
+}
+
+impl AccountReplayCoverage {
+    /// Take the history copies the fresh REQs (`fresh`) ask for again, for
+    /// the coverage replacing this one to owe ([`Self::owe_replayed_history`]):
+    /// a copy only streams claim, one of them on a group route and relay a
+    /// fresh REQ asks again from no later than the copy was sent. Call it
+    /// after [`Self::take_carried_live`]; what neither moves nor is owed stays
+    /// for the drop to charge as loss.
+    pub(super) fn take_replayed_history(
+        &mut self,
+        fresh: &[FreshReplay],
+    ) -> HashMap<[u8; 32], ReplayedCopy> {
+        let floor = self.retained_since.unwrap_or(0);
+        let mut replayed = HashMap::<[u8; 32], ReplayedCopy>::new();
+        let native_ids = &self.native_ids;
+        for (group_id, group) in &mut self.groups {
+            let copies = group
+                .events
+                .iter()
+                .filter(|(id, event)| {
+                    !event.retained && !native_ids.contains_key(*id) && !group.live.contains(*id)
+                })
+                .filter_map(|(id, event)| {
+                    let created_at = event.delivery.message.timestamp.0;
+                    let sources = group
+                        .streams
+                        .iter()
+                        .filter(|(owner, stream)| {
+                            stream.claims.contains(id)
+                                && fresh.iter().any(|start| {
+                                    start.group == *group_id
+                                        && start.route == owner.route
+                                        && start.relay == owner.relay
+                                        && start.since <= created_at
+                                })
+                        })
+                        .map(|(owner, _)| (group_id.clone(), owner.route, owner.relay))
+                        .collect::<Vec<_>>();
+                    (!sources.is_empty()).then_some((*id, sources, created_at))
+                })
+                .collect::<Vec<_>>();
+            for (id, sources, created_at) in copies {
+                let event = group.events.remove(&id).expect("replayed copy is buffered");
+                for stream in group.streams.values_mut() {
+                    stream.claims.remove(&id);
+                }
+                group.ready_history.remove(&id);
+                self.buffered_items -= 1;
+                self.buffered_bytes -= event.delivery.message.payload.len();
+                replayed
+                    .entry(id)
+                    .and_modify(|copy| copy.sources.extend(sources.iter().cloned()))
+                    .or_insert(ReplayedCopy {
+                        sources,
+                        created_at,
+                        floor,
+                    });
+            }
+        }
+        replayed
+    }
+
+    /// Owe the history copies a replaced coverage dropped because the REQs
+    /// this one tracks ask for them again ([`Self::take_replayed_history`]).
+    /// A copy that comes again into this coverage is no longer owed
+    /// ([`Self::discharge_replayed`]); one whose every source here stops
+    /// replaying first is charged from the replaced coverage's floor
+    /// ([`Self::settle_replayed`]), as is one still owed when this coverage
+    /// drops.
+    pub(super) fn owe_replayed_history(&mut self, replayed: HashMap<[u8; 32], ReplayedCopy>) {
+        for (id, copy) in replayed {
+            if self.holds_copy(&id) {
+                continue;
+            }
+            match self.replayed.entry(id) {
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    let owed = entry.get_mut();
+                    owed.sources.extend(copy.sources);
+                    owed.floor = owed.floor.min(copy.floor);
+                }
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(copy);
+                }
+            }
+        }
+        self.settle_replayed();
+    }
+
+    /// Whether this coverage has the copy `id`: buffered, with native
+    /// ingress (retained input not yet admitted included), or handed off.
+    /// Its own accounting then covers it.
+    fn holds_copy(&self, id: &[u8; 32]) -> bool {
+        self.groups
+            .values()
+            .any(|group| group.events.contains_key(id))
+            || self.unplaced.contains_key(id)
+            || self.released.contains(id)
+            || self.native_ids.contains_key(id)
+            || self
+                .ingress
+                .as_ref()
+                .is_some_and(|ingress| ingress.retains(id))
+    }
+
+    /// The owed copy `id` was just staged here: once this coverage has it,
+    /// it is no longer owed.
+    pub(super) fn discharge_replayed(&mut self, id: &[u8; 32]) {
+        if self.replayed.contains_key(id) && self.holds_copy(id) {
+            self.replayed.remove(id);
+            self.wake_replay();
+        }
+    }
+
+    /// Charge each owed copy that nothing here can replay any more: no source
+    /// it was owed on still waits for its stored history from no later than
+    /// the copy. A source that reached its EOSE, or a reply the relay may
+    /// have cut, without the copy, one abandoned or retired, and one whose
+    /// waiting allowance ran out all end the debt as loss from the replaced
+    /// coverage's floor.
+    pub(super) fn settle_replayed(&mut self) {
+        if self.replayed.is_empty() {
+            return;
+        }
+        self.forget_held_replayed();
+        let groups = &self.groups;
+        let stored = &self.stored;
+        let mut lost = None::<u64>;
+        self.replayed.retain(|_, copy| {
+            let waiting = copy.sources.iter().any(|(group_id, route, relay)| {
+                groups.get(group_id).is_some_and(|group| {
+                    group.streams.iter().any(|(owner, stream)| {
+                        owner.route == *route
+                            && owner.relay == *relay
+                            && stream.phase == ReplayAdmission::Waiting
+                            && stream.since <= copy.created_at
+                            // A reply past its EOSE sends no more stored
+                            // history, whatever its peers still wait for.
+                            && !stored
+                                .get(owner.request.as_ref())
+                                .and_then(|relays| relays.get(relay))
+                                .is_some_and(|stored| stored.ended)
+                    })
+                })
+            });
+            if !waiting {
+                lost = Some(lost.map_or(copy.floor, |floor| floor.min(copy.floor)));
+            }
+            waiting
+        });
+        if let Some(floor) = lost {
+            self.record_loss(floor);
+            self.wake_replay();
+        }
+    }
+
+    /// Forget each owed copy that reached this coverage another way
+    /// (retained native input, admitted or still waiting for admission).
+    fn forget_held_replayed(&mut self) {
+        let held = self
+            .replayed
+            .keys()
+            .filter(|id| self.holds_copy(id))
+            .copied()
+            .collect::<Vec<_>>();
+        for id in held {
+            self.replayed.remove(&id);
+        }
+    }
+
+    /// The loss floor of the copies still owed and not held, if any: what a
+    /// dropped coverage charges.
+    pub(super) fn replayed_floor(&mut self) -> Option<u64> {
+        self.forget_held_replayed();
+        self.replayed.values().map(|copy| copy.floor).min()
+    }
+}
+
 /// End a fence that holds nothing any more: no unanswered count, no owner
 /// point.
 fn end_idle(group: &mut GroupReplay) {
@@ -953,6 +1155,292 @@ mod tests {
     #[tokio::test]
     async fn a_fresh_activation_loses_what_it_no_longer_routes() {
         let state = replace(held_live(&[1]), &[0]);
+        assert_eq!(
+            pending_loss(&state.replay_losses),
+            Some(NostrNotificationLossFloor::Since(SINCE))
+        );
+    }
+
+    /// An account whose REQ on `relay` was still replaying a stored copy of
+    /// group 0 at 150 when a fresh activation replaced its coverage with a
+    /// REQ for group 0 on relay 1 from `fresh_since`. Returns the state and
+    /// the fresh REQ's id.
+    fn replaying_history_when_replaced(
+        relay: RelayIndex,
+        fresh_since: u64,
+        tx: &mpsc::Sender<TransportDelivery>,
+    ) -> (AdapterState, String) {
+        let mut state = replaying_history(relay, tx, |_, _| {});
+        let fresh = reactivate(&mut state, fresh_since, 1, &[0]);
+        (state, fresh)
+    }
+
+    /// An account whose REQ on `relay` replayed a stored copy of group 0 at
+    /// 150, then ran `then` on its coverage and REQ id, before any fresh
+    /// activation.
+    fn replaying_history(
+        relay: RelayIndex,
+        tx: &mpsc::Sender<TransportDelivery>,
+        then: impl FnOnce(&mut AccountReplayCoverage, &str),
+    ) -> AdapterState {
+        let (mut coverage, id, losses) = fenced_coverage(true);
+        coverage.record_stored_event(&id, relay, 150);
+        coverage
+            .stage_delivery(
+                delivery(0, 150, 1, &id, 1),
+                Some(relay),
+                ReplayInput::History,
+                tx,
+            )
+            .unwrap();
+        then(&mut coverage, &id);
+        let mut state = AdapterState {
+            replay_losses: losses,
+            source_clock: coverage.changes.clock.clone(),
+            ..AdapterState::default()
+        };
+        state.replay_fencing.insert(account());
+        state.account_replay_coverage.insert(account(), coverage);
+        // The replaced REQ went out with the fresh REQs' relay as relay 1.
+        state
+            .relay_index
+            .index_for(&TransportEndpoint("wss://b.example".to_owned()));
+        let a = TransportEndpoint("wss://a.example".to_owned());
+        assert_eq!(state.relay_index.index_for(&a), RelayIndex(1));
+        state
+    }
+
+    /// Replace the account's coverage with one REQ for `groups` on relay 1
+    /// from `since`, at the `n`th attempt after the initial one.
+    fn reactivate(state: &mut AdapterState, since: u64, n: usize, groups: &[u8]) -> String {
+        let fresh_routes = groups
+            .iter()
+            .map(|&group| {
+                let mut fresh_route = route(group);
+                if let NostrSubscription::Group { since: at, .. } = &mut fresh_route {
+                    *at = Some(Timestamp(since));
+                }
+                fresh_route
+            })
+            .collect::<Vec<_>>();
+        let attempt = (0..n).fold(SubscriptionAttempt::INITIAL, |attempt, _| attempt.next());
+        let batch = pack_group_batches(&account(), &fresh_routes, attempt, 0).remove(0);
+        state.record_account_replay_start(&account(), std::slice::from_ref(&batch));
+        batch.subscription_id()
+    }
+
+    /// A history copy its REQ was still replaying when a fresh activation
+    /// replaced the coverage is owed, not lost, when a fresh REQ asks for it
+    /// again on the same route and relay from no later: the account's
+    /// admission stays pending on it. The fresh REQ delivering it before its
+    /// EOSE settles the debt with no loss, and once it is placed nothing
+    /// pends. A copy from a relay the fresh REQs leave out, or older than
+    /// their `since`, is lost from the replaced coverage's floor at once.
+    #[tokio::test]
+    async fn a_fresh_activation_owes_history_its_reqs_ask_for_again() {
+        let lost = Some(NostrNotificationLossFloor::Since(SINCE));
+        for (relay, fresh_since, lost) in [
+            (RelayIndex(1), SINCE, None),
+            (RelayIndex(2), SINCE, lost),
+            (RelayIndex(1), 200, lost),
+        ] {
+            let (tx, mut rx) = mpsc::channel(8);
+            let (mut state, fresh) = replaying_history_when_replaced(relay, fresh_since, &tx);
+            assert!(sent(&mut rx).is_empty(), "its REQ had no EOSE");
+            assert_eq!(pending_loss(&state.replay_losses), lost);
+            if lost.is_some() {
+                continue;
+            }
+            let coverage = state.account_replay_coverage.get_mut(&account()).unwrap();
+            coverage.record_stored_event(&fresh, RelayIndex(1), 150);
+            coverage
+                .stage_delivery(
+                    delivery(0, 150, 1, &fresh, 1),
+                    Some(RelayIndex(1)),
+                    ReplayInput::History,
+                    &tx,
+                )
+                .unwrap();
+            coverage.record_eose(&fresh, RelayIndex(1));
+            coverage.apply_fence_plan(&plan(coverage, &[]));
+            let placed = coverage.take_ready_deliveries();
+            for delivery in &placed {
+                coverage.ack_placement(&delivery.message.id);
+            }
+            let mut out = placed
+                .iter()
+                .map(|delivery| delivery.message.timestamp.0)
+                .collect::<Vec<_>>();
+            out.extend(sent(&mut rx).into_iter().map(|(_, at)| at));
+            assert_eq!(out, vec![150], "the fresh REQ replays it once");
+            assert_eq!(pending_loss(&state.replay_losses), None);
+            let coverage = &state.account_replay_coverage[&account()];
+            assert!(!coverage.admission_pending(), "nothing is owed");
+        }
+    }
+
+    /// An owed copy is lost, from the replaced coverage's floor, once nothing
+    /// that owes it can still replay it: the fresh coverage is replaced in
+    /// turn, its REQ is refused on the relay, or its waiting allowance runs
+    /// out, each before the copy comes again. Until then nothing is charged.
+    #[tokio::test(start_paused = true)]
+    async fn an_owed_copy_is_lost_when_its_reqs_stop_before_it_comes() {
+        for end in 0..3 {
+            let (tx, _rx) = mpsc::channel(8);
+            let (mut state, fresh) = replaying_history_when_replaced(RelayIndex(1), SINCE, &tx);
+            assert_eq!(pending_loss(&state.replay_losses), None);
+            match end {
+                0 => {
+                    reactivate(&mut state, SINCE, 2, &[0]);
+                }
+                1 => state
+                    .account_replay_coverage
+                    .get_mut(&account())
+                    .unwrap()
+                    .record_refusal(
+                        &fresh,
+                        RelayIndex(1),
+                        SubscriptionRefusalDisposition::Dropped,
+                    ),
+                _ => {
+                    tokio::time::advance(REPLAY_WAIT_LIMIT).await;
+                    state
+                        .account_replay_coverage
+                        .get_mut(&account())
+                        .unwrap()
+                        .expire_replay(tokio::time::Instant::now());
+                }
+            }
+            assert_eq!(
+                pending_loss(&state.replay_losses),
+                Some(NostrNotificationLossFloor::Since(SINCE)),
+                "case {end}"
+            );
+        }
+    }
+
+    /// A connection boundary that restarts the fresh REQ after it counted a
+    /// stored event abandons that serial, but the restarted serial asks for
+    /// the same range again: the copy stays owed, with nothing charged, and
+    /// comes on the new connection.
+    #[tokio::test]
+    async fn an_owed_copy_stays_owed_across_a_reconnect() {
+        let (tx, _rx) = mpsc::channel(8);
+        let (mut state, fresh) = replaying_history_when_replaced(RelayIndex(1), SINCE, &tx);
+        let coverage = state.account_replay_coverage.get_mut(&account()).unwrap();
+        coverage.record_stored_event(&fresh, RelayIndex(1), 120);
+        coverage.restart_relay(
+            RelayIndex(1),
+            ReplayRestart::Connection,
+            ReplayOrigin::Changed,
+            None,
+            None,
+        );
+        assert_eq!(pending_loss(&state.replay_losses), None);
+        let coverage = state.account_replay_coverage.get_mut(&account()).unwrap();
+        assert!(coverage.admission_pending(), "still owed");
+        coverage.record_stored_event(&fresh, RelayIndex(1), 150);
+        coverage
+            .stage_delivery(
+                delivery(0, 150, 1, &fresh, 1),
+                Some(RelayIndex(1)),
+                ReplayInput::History,
+                &tx,
+            )
+            .unwrap();
+        coverage.record_eose(&fresh, RelayIndex(1));
+        assert_eq!(pending_loss(&state.replay_losses), None);
+    }
+
+    /// A fresh REQ whose reply a relay may have cut (a full page) settles
+    /// the debt like any EOSE: the owed copy it did not bring is lost.
+    #[tokio::test]
+    async fn an_owed_copy_a_full_reply_leaves_out_is_lost() {
+        let (tx, _rx) = mpsc::channel(8);
+        let (mut state, fresh) = replaying_history_when_replaced(RelayIndex(1), SINCE, &tx);
+        let coverage = state.account_replay_coverage.get_mut(&account()).unwrap();
+        for at in 0..RELAY_REPLAY_PAGE_LIMIT {
+            coverage.record_stored_event(&fresh, RelayIndex(1), 200 + at as u64);
+        }
+        assert_eq!(pending_loss(&state.replay_losses), None);
+        let coverage = state.account_replay_coverage.get_mut(&account()).unwrap();
+        coverage.record_eose(&fresh, RelayIndex(1));
+        assert_eq!(
+            coverage.subscriptions[&fresh][&RelayIndex(1)],
+            RelayReplay::Delegated
+        );
+        assert_eq!(
+            pending_loss(&state.replay_losses),
+            Some(NostrNotificationLossFloor::Since(SINCE))
+        );
+    }
+
+    /// A copy its source parked for release when its connection restarted,
+    /// then claimed again on the restarted reply, is owed like any claimed
+    /// copy when a fresh REQ asks for it again: nothing is charged until that
+    /// REQ ends without it.
+    #[tokio::test]
+    async fn a_parked_copy_claimed_again_is_owed() {
+        let (tx, _rx) = mpsc::channel(8);
+        let mut state = replaying_history(RelayIndex(1), &tx, |coverage, id| {
+            coverage.record_eose(id, RelayIndex(1));
+            coverage.apply_fence_plan(&plan(coverage, &[]));
+            coverage.restart_relay(
+                RelayIndex(1),
+                ReplayRestart::Connection,
+                ReplayOrigin::Changed,
+                None,
+                None,
+            );
+            coverage.record_stored_event(id, RelayIndex(1), 150);
+            coverage
+                .stage_delivery(
+                    delivery(0, 150, 1, id, 1),
+                    Some(RelayIndex(1)),
+                    ReplayInput::History,
+                    &tx,
+                )
+                .unwrap();
+        });
+        assert_eq!(pending_loss(&state.replay_losses), None);
+        let fresh = reactivate(&mut state, SINCE, 1, &[0]);
+        assert_eq!(pending_loss(&state.replay_losses), None, "owed, not lost");
+        state
+            .account_replay_coverage
+            .get_mut(&account())
+            .unwrap()
+            .record_eose(&fresh, RelayIndex(1));
+        assert_eq!(
+            pending_loss(&state.replay_losses),
+            Some(NostrNotificationLossFloor::Since(SINCE))
+        );
+    }
+
+    /// A fresh REQ's EOSE on a relay without an owed copy charges it at once,
+    /// even when another group of that REQ lost history there, which leaves
+    /// the REQ's streams on that relay waiting for their allowance.
+    #[tokio::test]
+    async fn an_owed_copy_is_lost_at_an_eose_beside_lost_history() {
+        let (tx, _rx) = mpsc::channel(8);
+        let mut state = replaying_history(RelayIndex(1), &tx, |_, _| {});
+        let fresh = reactivate(&mut state, 120, 1, &[0, 1]);
+        let coverage = state.account_replay_coverage.get_mut(&account()).unwrap();
+        // Group 1's stored copy has no room: its history is lost from 120.
+        coverage.record_stored_event(&fresh, RelayIndex(1), 130);
+        coverage
+            .stage_delivery(
+                delivery(1, 130, 2, &fresh, REPLAY_BUFFER_MAX_BYTES + 1),
+                Some(RelayIndex(1)),
+                ReplayInput::History,
+                &tx,
+            )
+            .unwrap();
+        assert_eq!(
+            pending_loss(&state.replay_losses),
+            Some(NostrNotificationLossFloor::Since(120))
+        );
+        let coverage = state.account_replay_coverage.get_mut(&account()).unwrap();
+        coverage.record_eose(&fresh, RelayIndex(1));
         assert_eq!(
             pending_loss(&state.replay_losses),
             Some(NostrNotificationLossFloor::Since(SINCE))

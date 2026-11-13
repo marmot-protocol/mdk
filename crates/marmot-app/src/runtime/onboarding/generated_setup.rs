@@ -444,7 +444,9 @@ impl MarmotAppRuntime {
     ) -> Result<AccountSetupResult, AppError> {
         let started_at = Instant::now();
         let setup = self.account_setup();
-        let transaction = setup.onboarding_transaction(&local.account.account_id_hex);
+        let transaction = setup
+            .app()
+            .onboarding_transaction(&local.account.account_id_hex);
         let _transaction = transaction.lock().await;
         let request = context.request();
         let publication = if request.publish_initial_key_package {

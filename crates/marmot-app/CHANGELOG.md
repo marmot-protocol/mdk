@@ -9,7 +9,7 @@
   Welcomes. Named chats and unknown roster projections remain non-DM
   (mdk#2773).
 
-## 0.16.0 - 2026-11-11
+## 0.16.0 - 2026-11-12
 
 ### Breaking changes
 
@@ -80,6 +80,16 @@
   (mdk#3300). `Retryable` becomes `Retryable { http_status: u16 }` and `Blocked` becomes
   `Blocked { http_status: Option<u16> }`. marmot-forensics `DeliveryStep` adds `Split`, and `GapReason` adds
   `ReceiverRejected`, `ExpiredUndelivered` and `CursorOverflow`. Exhaustive matches add them.
+
+- `AppError` adds `Nip46(Nip46Error)` (mdk#828), the typed failure of the runtime-owned NIP-46 sessions that
+  `nip46_new`, `nip46_login`, `nip46_register`, `nip46_resume` and `nip46_remove` manage. Exhaustive matches must add
+  it.
+
+- `MarmotAppRuntime::submit_media_attachments` takes `reply_to_message_id: Option<String>` before its client token
+  (mdk#859). Pass `None` for an ordinary media message. A target must be 32 bytes of hexadecimal and is stored in
+  lowercase; the composer draft is not read or changed. `upload_media_with_client_token` and
+  `upload_media_files_with_client_token` now keep the reply target from a sending request's `e` or `q` tags, and
+  reply references with a missing, malformed or conflicting target fail before any upload.
 
 ### Added
 

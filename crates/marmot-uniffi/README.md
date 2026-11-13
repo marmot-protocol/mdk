@@ -16,6 +16,7 @@ Read the documentation at the tag matching your binaries; `master` can describe 
   [exclusive root ownership](#exclusive-root-ownership), [threading model](#threading-model),
   [service endpoint defaults](#service-endpoint-defaults)
 - Accounts and identity: [interactive account onboarding](#interactive-account-onboarding),
+  [NIP-46 accounts](#nip-46-accounts),
   [identity references and profiles](#identity-references-and-profiles),
   [KeyPackage inventory](#keypackage-inventory), [KeyPackage selection](#keypackage-selection),
   [invitation lookup outcomes](#invitation-lookup-outcomes),
@@ -210,6 +211,13 @@ runtime-scoped objects after reconstruction. Swift uses ARC; Kotlin hosts close 
 UniFFI handles after cancelling/joining consumers. C hosts use only the matching deep-free and
 never free handles during concurrent use. Returned plaintext and copies made by host decoders
 remain the host's responsibility, including removal of downstream copies after local deletion.
+
+For Swift observation tasks, use `nextCancellable()` on presented chat lists, chat-list windows,
+account attention, conversation windows, and block lists. Cancelling the task cancels its native
+wait and throws `CancellationError`; it does not close the subscription. Keep one receive active
+per subscription, and cancel and await the old task before starting another. Cancellation racing
+with a completed receive can discard that returned update. See the
+[Swift adapter signatures](API-REFERENCE.md#swift-cancellation-adapters).
 
 ### Localization, privacy and diagnostics
 Native startup investigation can explicitly call `set_startup_diagnostics_enabled(true)` before the first account query, then read `startup_diagnostics_snapshot()` while a call remains unfinished. The snapshot uses independent bounded memory and fixed phases, including key lookup, database-open waiting and migration numbers; it contains no paths, account identifiers or error text. Keep normal builds disabled, bound host serialization separately, and revoke capture with `false` when it is no longer needed. Neither method changes upload consent or database state. See the [API reference](API-REFERENCE.md).
@@ -439,7 +447,8 @@ MarmotKit runs MDK on a Tokio runtime it owns, not on the threads that call it.
   `Dispatchers.Main` does not run MDK work on the UI thread. Cancelling a Kotlin coroutine frees
   the call, which aborts the task at its next suspension point; `shutdownAndClose()` and
   `signOutAndWipe()` keep running regardless. Generated Swift waits for the call to finish even when its `Task` is
-  cancelled.
+  cancelled. The five Swift `nextCancellable()` subscription adapters explicitly forward cancellation
+  to the native future; ordinary generated `next()` methods keep their UniFFI behavior.
 - **Subscription receives** (`next()`, `nextUpdate()`) are the exception: they wait on the calling
   thread, with the runtime entered, because a receive that ran ahead on the runtime could consume
   an update that a cancelled caller never collects. They only wait and convert; the work that
@@ -482,6 +491,82 @@ Public profile-image uploads use the deployment's `profileImageEndpoint`
 (`https://blossom.primal.net` in White Noise's), or an explicit Blossom server
 passed to `uploadProfileImage`. With neither, the upload fails. Peers' avatars
 always load from the URL in their own profile.
+
+## NIP-46 accounts
+
+`Marmot.nip46New` returns a `Nip46SessionFfi` shared by Swift, Kotlin, and the C
+ABI. MDK owns its transport, request correlation, identity checks, and
+account-scoped credential storage. It does not retain a host signer callback.
+Local-key accounts and separate remote signers can run in the same runtime.
+
+1. Create an offline session with a bunker link in `uri`, or `relays` and an
+   optional `name` for client-initiated pairing.
+2. Call `reviewPermissions`, display its version and grants, and pass the exact
+   snapshot to `approvePermissions` only after user consent. New sessions and
+   imported exports require this review, including old unversioned descriptors.
+   Do not approve an expanded permission set automatically. `uri` and `connect`
+   refuse unapproved sessions.
+3. For client-initiated pairing, await `pairingOffer` before showing its
+   credential-bearing URI as a QR code or copy action. It installs the relay
+   listener and enters `Listening`; the offline `uri` accessor alone does not.
+   Never log either URI. Await `connect` to verify the user's account identity
+   (bunker links can connect directly), then call `nip46Login`
+   with messaging and bootstrap relays. Login requires an already-verified `Ready`
+   session; otherwise it rejects without connecting, discovering relays, or creating
+   an account. Login persists the verified communication
+   key through the configured secret store and nonsecret metadata in the account
+   home. `nip46Register` attaches a restored descriptor to an existing account.
+4. On restart, call the ordinary runtime `start`; MDK restores account sessions
+   before starting their workers. Restoration reads local credentials; a missing
+   account-identity proof can still require bounded remote signing.
+   Use `nip46Resume` to obtain the restored handle, not a host-managed signer
+   callback or exported client secret. Resume retains the persisted grant snapshot;
+   a changed required set needs another explicit review.
+
+`status` returns `Nip46StatusFfi`: typed state, optional `Nip46ErrorFfi`, auth URL,
+request ID, and generation. It contains no keys, pairing URI, or request payload.
+Read status locally. Async `connect` and `ping` use the independently driven
+transport; cancelling a pending foreign call cancels its scoped request.
+Permission persistence and bounded `logout` run on blocking workers and complete
+even when the foreign caller cancels the call. An `Approval` state is an intermediate auth challenge,
+not successful completion. Review its URL before opening it; `completeAuth` takes
+the matching request ID and acknowledges only that challenge. The RPC still waits
+for the signer's final response.
+
+`cancelRequest` affects one matching request; stale IDs return `RequestNotFound`.
+`disconnect` interrupts transport work and allows explicit reconnection in a new
+generation. `cancel` permanently cancels that session. Neither removes stored
+credentials. `export` remains an optional encrypted-vault backup containing secret
+communication credentials; never put it in logs or ordinary preferences.
+`nip46Remove` detaches the session and removes its account-scoped credentials;
+ordinary account sign-out/wipe applies its own lifecycle cleanup. `logout` attempts
+a bounded remote courtesy request and erases this session's local communication
+key even when the signer is unavailable. It detaches the revoked signer so fresh
+pairing can be registered after local erasure succeeds. A vault deletion error
+leaves signing stopped; retry `logout` or `nip46Remove` after the vault recovers.
+It does not replace MDK account sign-out.
+
+Once Native `nip46Login` or `nip46Register` adoption is admitted, cancelling the
+foreign call only stops waiting. Runtime-owned adoption continues without rollback
+on caller cancellation. Pairing is a separate bounded, caller-cancellable `connect`
+call and makes no account changes while unbound. Cancel and discard abandoned pairing
+UI; call adoption explicitly only after verification succeeds. Account sign-out does
+not cancel unrelated unbound sessions.
+Use session `cancel`, `disconnect`, or `logout` to interrupt adoption explicitly.
+An explicit reconnect cannot resume adoption retired by an earlier disconnect.
+Rollback does not reset newer-generation transport state or cancel its pending requests.
+Shutdown interrupts and settles owned adoption before returning.
+
+Failed completed-account Native rebinds restore the prior local callback, grant
+record, and activation state while preserving setup readiness. Already-published
+KeyPackages are not retracted. Account sign-out cleanup remains explicit. This
+does not make legacy host-callback/NIP-55 failed login transactional.
+An unavailable signer can still stop the account's worker.
+
+Local-key and arbitrary host callback APIs are unchanged. For C ownership and
+blocking-call rules, see [NIP-46 accounts in the C guide](../marmot-c/README.md#nip-46-accounts).
+The [shared session contract](../../docs/external-signer-accounts.md#nip-46-sessions)
+lists the required permission kinds and storage/recovery behavior.
 
 ## Interactive account onboarding
 
@@ -1862,8 +1947,9 @@ These regenerate host bindings and execute DTO round trips; platform package bui
 
 ## Building local bindings
 
-The Rust API in `src/` is the source of truth for both generated Swift and generated Kotlin. Platform scripts only
-package that shared surface:
+The Rust API in `src/` is the source of truth for generated Swift and Kotlin. Apple packaging adds
+[`swift-support/CancellableSubscriptions.swift`](swift-support/CancellableSubscriptions.swift) to the generated
+source in `MarmotKit.swift`; Kotlin needs no matching adapter.
 
 - `./crates/marmot-uniffi/xcframework.sh` builds `output/MarmotKit.xcframework` plus `output/MarmotKit.swift` and
   `output/PrivacyInfo.xcprivacy` for iOS.
@@ -1881,6 +1967,12 @@ Odin. Install it with `bash scripts/install-odin.sh <dir>` and set `ODIN` to the
 The generated Swift file is platform-independent: `output/MarmotKit.swift` and `output/macos/MarmotKit.swift` are the
 same UniFFI surface, and releases publish it once. The Kotlin binding is generated from the same host library metadata,
 so it exposes the same `Marmot` object, subscription objects, records, enums, and error variants.
+
+Direct `uniffi-bindgen` output does not include the Swift cancellation adapters. Use the packaged
+`MarmotKit.swift`, or concatenate the generated Swift and the matching support source into one file.
+Run `bash crates/marmot-uniffi/subscription-cancellation-smoke.sh` to exercise Swift cancellation against
+real native subscription futures. It builds the native library with `--release`, matching the Apple artifacts,
+and requires `swiftc` and the native build prerequisites above.
 
 No generated Swift or Kotlin files are committed here; the output directories are ignored because generated bindings
 and packaged native libraries are derived artifacts. Regenerate them from this crate before vendoring into an app

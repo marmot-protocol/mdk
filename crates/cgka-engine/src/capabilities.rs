@@ -13,7 +13,7 @@ use cgka_traits::capabilities::{
 use cgka_traits::error::EngineError;
 use cgka_traits::group::ProtocolProfile;
 use openmls::extensions::RequiredCapabilitiesExtension;
-use openmls::prelude::{Capabilities, ExtensionType, ProposalType};
+use openmls::prelude::{Capabilities, CredentialType, ExtensionType, ProposalType};
 use openmls_traits::types::Ciphersuite;
 
 // RFC 9420 section 7.2. These types are implicitly supported, never advertised.
@@ -62,7 +62,7 @@ pub(crate) fn leaf_capabilities(
         Some(&[ciphersuite]),
         Some(&ext_types),
         Some(&proposal_types),
-        None,
+        Some(&[CredentialType::Basic]),
     )
 }
 

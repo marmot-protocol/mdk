@@ -299,7 +299,7 @@ impl AccountSetup<'_> {
         step: OnboardingStep,
     ) -> Result<OnboardingSnapshot, AppError> {
         let (account_id, attempt) = self.records().peek_onboarding_attempt(account_ref)?;
-        let transaction = self.onboarding_transaction(&account_id);
+        let transaction = self.app().onboarding_transaction(&account_id);
         let _transaction = transaction.lock().await;
         let mut c = self
             .records()

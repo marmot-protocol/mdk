@@ -14,6 +14,7 @@ See [dev device linking](../cli/README.md#device-linking-dev-builds).
 ## Contents
 
 - [Runtime overview](#runtime-overview)
+- [Remote signer accounts](#remote-signer-accounts)
 - [SOCKS5 routing](#socks5-routing)
 - [Local storage](#local-storage)
 - [Account bootstrap and KeyPackages](#account-bootstrap-and-keypackages)
@@ -119,6 +120,28 @@ For where the code lives (`src/runtime/`, `src/client/`, `src/media/`, and so on
 and the diagnostics exporters are the [`marmot-observability`](../marmot-observability) crate) see
 [`AGENTS.md`](AGENTS.md).
 
+## Remote signer accounts
+
+The runtime owns NIP-46 sessions for `bunker://` and client-initiated
+`nostrconnect://` pairing. Each account has an independent transport and
+communication key. Permission approval precedes connection, and stored sessions
+restore before account workers without host signer callbacks. Sign-out and wipe
+erase the communication key; terminal storage close preserves it for restart.
+Native login/register adoption is runtime-owned once admitted: dropping its future
+stops waiting, not adoption. First await successful session `connect`; `nip46_login`
+accepts only an already-verified `Ready` session and never silently connects.
+Pairing is separately caller-owned and cancellable, with no account mutation while unbound.
+Reconnect never resumes an adoption retired by an earlier disconnect.
+Rollback still cleans its binding without cancelling a newer generation.
+Account deletion excludes session resume until credential erasure and removal finish;
+a queued resume reports the removed account, leaving a fresh pairing free to log in.
+Explicit session cancellation, disconnect, or logout interrupts adoption; shutdown
+interrupts and settles owned adoption before returning. Failed completed-account
+rebind restores prior local signer state and activation, but does not retract
+already-published KeyPackages. Host callback/NIP-55 login behavior is unchanged.
+See [external signer accounts](../../docs/external-signer-accounts.md#nip-46-sessions)
+for pairing, permission versions, recovery, cancellation, and credential storage.
+
 ## SOCKS5 routing
 
 Set the process environment before the first network-policy use (including runtime or NIP-46 client construction):
@@ -137,7 +160,7 @@ including invalid configuration. Later environment changes, including clearing t
 or unblock an invalid policy. Restart the process to apply a different configuration.
 
 The policy covers relay publishing, account receive/history pools, directory relay clients (including completion-aware
-reads), C NIP-46 signer sessions, and the shared HTTP clients for media, Open Ranking, and collectors (including audit
+reads), shared NIP-46 signer sessions, and the shared HTTP clients for media, Open Ranking, and collectors (including audit
 uploads). Completion-aware reads retain pre-admission wire-event counts under the proxy transport. Relay hostnames are
 resolved by the proxy. HTTP clients still resolve and validate destinations locally, then send the pinned IP through
 SOCKS5 while retaining the original HTTP Host header and TLS identity. The proxy is an explicitly trusted egress.

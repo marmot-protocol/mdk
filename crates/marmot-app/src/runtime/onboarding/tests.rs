@@ -8471,6 +8471,7 @@ async fn label_reuse_keeps_replacement() {
         let original = home.create_account("reused-label").unwrap();
         let transaction = runtime
             .account_setup()
+            .app()
             .onboarding_transaction(&original.account_id_hex);
         let gate = transaction.lock().await;
         let manager = runtime.accounts();
@@ -8973,10 +8974,10 @@ impl GeneratedSetupRemovalRun {
 }
 
 /// Create a generated identity at local readiness against relays that never
-/// acknowledge, and hold the account's first publication (the worker's
-/// initial KeyPackage), which the background setup attempt queues behind.
-/// Apply `removal` while that attempt is pending, release the publication,
-/// and let the background task run every attempt it has left.
+/// acknowledge, and hold the account's first publications: its relay-list
+/// bootstrap and its initial KeyPackage, which go out independently. Apply
+/// `removal` while they are pending, release them, and let the background
+/// task run every attempt it has left.
 async fn remove_generated_identity_while_publishing(
     removal: GeneratedSetupRemoval,
 ) -> GeneratedSetupRemovalRun {
@@ -8994,10 +8995,23 @@ async fn remove_generated_identity_while_publishing(
     assert_eq!(created.readiness, AccountSetupReadiness::LocalReady);
     let id = created.account.account_id_hex.clone();
 
-    timeout(Duration::from_secs(30), network.publishing.notified())
-        .await
-        .expect("generated setup publishes in the background");
-    assert_eq!(network.held_publishes.load(Ordering::SeqCst), 1);
+    // Wait for both holds: a release must reach every held publication, and
+    // one that is still on its way when the release fires would miss it.
+    timeout(Duration::from_secs(30), async {
+        while network.held_publishes.load(Ordering::SeqCst) < 2 {
+            network.publishing.notified().await;
+        }
+    })
+    .await
+    .expect("generated setup publishes in the background");
+    let mut held = network
+        .attempts
+        .lock()
+        .iter()
+        .map(|event| event.kind)
+        .collect::<Vec<_>>();
+    held.sort_unstable();
+    assert_eq!(held, [10002, 30443]);
     // Later publishes, the removal's own included, answer at once.
     network.block_publish.store(false, Ordering::SeqCst);
 

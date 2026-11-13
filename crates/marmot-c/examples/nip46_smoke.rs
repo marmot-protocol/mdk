@@ -14,7 +14,11 @@ use futures::StreamExt;
 use marmot_c::commands::*;
 use marmot_c::nip46::*;
 use marmot_c::secret_store::{MarmotSecretStore, MarmotSecretStoreStatus};
+use marmot_c::subscriptions::*;
 use marmot_c::types::account::*;
+use marmot_c::types::chat_list::marmot_chat_list_row_free;
+use marmot_c::types::group::marmot_app_group_record_free;
+use marmot_c::types::message::marmot_app_message_record_list_free;
 use marmot_c::*;
 use nostr::nips::{nip04, nip44};
 use nostr::prelude::*;
@@ -237,7 +241,62 @@ impl Session {
             unsafe { marmot_nip46_new(client.0, config.as_ptr(), &mut session) },
             "nip46_new",
         );
-        Self(session)
+        let session = Self(session);
+        let mut uri = ptr::dangling_mut();
+        assert_eq!(
+            unsafe { marmot_nip46_uri(session.0, &mut uri) },
+            MarmotStatus::ExternalSignerRejected
+        );
+        assert!(
+            uri.is_null(),
+            "imported descriptors must not silently approve permissions"
+        );
+        session.approve();
+        session
+    }
+    fn approve(&self) {
+        let mut out = ptr::null_mut();
+        check(
+            unsafe { marmot_nip46_review_grants(self.0, &mut out) },
+            "nip46_review_permissions",
+        );
+        let reviewed: Value = serde_json::from_str(&take_string(out)).expect("permission JSON");
+        let grants = reviewed["grants"]
+            .as_array()
+            .expect("permission grants")
+            .iter()
+            .map(|grant| c(grant.as_str().unwrap()))
+            .collect::<Vec<_>>();
+        let pointers = grants
+            .iter()
+            .map(|grant| grant.as_ptr())
+            .collect::<Vec<_>>();
+        check(
+            unsafe {
+                marmot_nip46_approve_grants(
+                    self.0,
+                    reviewed["version"].as_u64().unwrap() as u32,
+                    pointers.as_ptr(),
+                    pointers.len(),
+                )
+            },
+            "nip46_approve_permissions",
+        );
+    }
+    fn resume(client: Handle, account: &str) -> Self {
+        let account = c(account);
+        let mut session = ptr::null_mut();
+        check(
+            unsafe { marmot_nip46_resume(client.0, account.as_ptr(), &mut session) },
+            "nip46_resume",
+        );
+        let session = Self(session);
+        assert_ne!(
+            session.state()["state"],
+            "permission_approval",
+            "MDK-owned credentials retain their reviewed grant snapshot"
+        );
+        session
     }
     fn connect(&self) -> String {
         let mut out = ptr::null_mut();
@@ -245,11 +304,6 @@ impl Session {
             unsafe { marmot_nip46_connect(self.0, &mut out) },
             "nip46_connect",
         );
-        take_string(out)
-    }
-    fn uri(&self) -> String {
-        let mut out = ptr::null_mut();
-        check(unsafe { marmot_nip46_uri(self.0, &mut out) }, "nip46_uri");
         take_string(out)
     }
     fn export(&self) -> Value {
@@ -721,6 +775,180 @@ fn sign_out(client: Handle, account: &str) {
     unsafe { marmot_sign_out_outcome_free(out) };
 }
 
+fn assert_ready(client: Handle, account: &str) {
+    let account = c(account);
+    let mut readiness = MarmotAccountSetupReadiness::Initializing;
+    check(
+        unsafe { marmot_account_setup_readiness(client.0, account.as_ptr(), &mut readiness) },
+        "account setup readiness",
+    );
+    assert_eq!(readiness, MarmotAccountSetupReadiness::NetworkReady);
+}
+
+struct ChatChanges(*mut MarmotChatListSubscription);
+impl ChatChanges {
+    fn new(client: Handle, account: &str) -> Self {
+        let account = c(account);
+        let mut changes = ptr::null_mut();
+        check(
+            unsafe { marmot_subscribe_chat_list(client.0, account.as_ptr(), 0, &mut changes) },
+            "subscribe chat changes",
+        );
+        Self(changes)
+    }
+
+    fn next(&self, deadline: std::time::Instant) -> (String, bool) {
+        let remaining = deadline
+            .checked_duration_since(std::time::Instant::now())
+            .expect("chat change deadline exceeded");
+        let timeout = remaining.as_millis().clamp(1, u128::from(u32::MAX)) as u32;
+        let mut row = ptr::null_mut();
+        check(
+            unsafe { marmot_chat_list_subscription_next(self.0, timeout, &mut row) },
+            "next chat change",
+        );
+        assert!(!row.is_null());
+        let changed = unsafe { (input((*row).group_id_hex), (*row).pending_confirmation) };
+        unsafe { marmot_chat_list_row_free(row) };
+        changed
+    }
+}
+impl Drop for ChatChanges {
+    fn drop(&mut self) {
+        unsafe { marmot_chat_list_subscription_free(self.0) };
+    }
+}
+
+fn welcome_and_message(client: Handle, local: &str, remote: &str, fixture: &Fixture) -> Result<()> {
+    let invitations = ChatChanges::new(client, remote);
+    let delivered = ChatChanges::new(client, local);
+    let decryptions_before = fixture
+        .controls
+        .evidence
+        .lock()
+        .unwrap()
+        .requests
+        .iter()
+        .filter(|(_, method)| method == "nip44_decrypt")
+        .count();
+    let local_c = c(local);
+    let remote_c = c(remote);
+    let members = [remote_c.as_ptr()];
+    let name = c("NIP-46 shared signer welcome");
+    let mut group = ptr::null_mut();
+    check(
+        unsafe {
+            marmot_create_group(
+                client.0,
+                local_c.as_ptr(),
+                name.as_ptr(),
+                members.as_ptr(),
+                members.len(),
+                ptr::null(),
+                &mut group,
+            )
+        },
+        "create group inviting remote signer",
+    );
+    let group = take_string(group);
+    let deadline = std::time::Instant::now() + WAIT;
+    loop {
+        let (changed, pending) = invitations.next(deadline);
+        if changed == group {
+            assert!(pending, "remote account did not receive a pending Welcome");
+            break;
+        }
+    }
+    let group_c = c(&group);
+    let mut accepted = ptr::null_mut();
+    check(
+        unsafe {
+            marmot_accept_group_invite(client.0, remote_c.as_ptr(), group_c.as_ptr(), &mut accepted)
+        },
+        "remote account accepts decrypted Welcome",
+    );
+    let record = unsafe { &*accepted };
+    assert_eq!(unsafe { input(record.group_id_hex) }, group);
+    assert!(!record.pending_confirmation);
+    assert!(!record.via_welcome_message_id_hex.is_null());
+    assert!(!record.welcomer_account_id_hex.is_null());
+    assert_eq!(
+        PublicKey::parse(&unsafe { input(record.welcomer_account_id_hex) })?,
+        PublicKey::parse(local)?
+    );
+    unsafe { marmot_app_group_record_free(accepted) };
+    let decryptions_after = fixture
+        .controls
+        .evidence
+        .lock()
+        .unwrap()
+        .requests
+        .iter()
+        .filter(|(_, method)| method == "nip44_decrypt")
+        .count();
+    assert!(
+        decryptions_after > decryptions_before,
+        "Welcome did not use the remote account's NIP-44 decrypt signer path"
+    );
+    let plaintext = "remote shared-session MLS roundtrip";
+    let remote_key = PublicKey::parse(remote)?;
+    let text = c(plaintext);
+    let mut sent = ptr::null_mut();
+    check(
+        unsafe {
+            marmot_send_text(
+                client.0,
+                remote_c.as_ptr(),
+                group_c.as_ptr(),
+                text.as_ptr(),
+                &mut sent,
+            )
+        },
+        "remote account sends MLS message",
+    );
+    unsafe { marmot_send_summary_free(sent) };
+    let deadline = std::time::Instant::now() + WAIT;
+    loop {
+        let mut output = ptr::null_mut();
+        check(
+            unsafe {
+                marmot_messages(
+                    client.0,
+                    local_c.as_ptr(),
+                    group_c.as_ptr(),
+                    0,
+                    0,
+                    ptr::null(),
+                    0,
+                    &mut output,
+                )
+            },
+            "local recipient reads actual messages",
+        );
+        let list = unsafe { &*output };
+        let messages = if list.len == 0 {
+            &[][..]
+        } else {
+            unsafe { std::slice::from_raw_parts(list.items, list.len) }
+        };
+        let received = messages.iter().any(|message| {
+            message.kind == 9
+                && unsafe { input(message.plaintext) } == plaintext
+                && PublicKey::parse(&unsafe { input(message.sender) }).ok() == Some(remote_key)
+                && unsafe { input(message.group_id_hex) } == group
+        });
+        unsafe { marmot_app_message_record_list_free(output) };
+        if received {
+            break;
+        }
+        delivered.next(deadline);
+    }
+    println!(
+        "PASS remote signer decrypts a real Welcome and sends MLS plaintext to the local recipient"
+    );
+    Ok(())
+}
+
 fn assert_accounts(
     client: Handle,
     local: &str,
@@ -748,6 +976,7 @@ fn assert_accounts(
         assert_eq!(account.local_signing, local_signing);
         assert_eq!(account.external_signing, !local_signing);
         assert_eq!(account.signed_out, signed_out);
+        assert_eq!(account.running, !signed_out);
     }
     unsafe { marmot_account_summary_list_free(out) };
 }
@@ -834,7 +1063,12 @@ fn main() -> Result<()> {
         client,
         &json!({"relays":[relay_url],"name":"White Noise Linux smoke"}),
     );
-    let pairing_uri = session_b.uri();
+    let mut pairing_uri = ptr::null_mut();
+    check(
+        unsafe { marmot_nip46_pairing_offer(session_b.0, &mut pairing_uri) },
+        "listen before exposing pairing offer",
+    );
+    let pairing_uri = take_string(pairing_uri);
     assert!(pairing_uri.starts_with("nostrconnect://"));
     let parsed = url::Url::parse(&pairing_uri)?;
     let pairing_client =
@@ -907,12 +1141,17 @@ fn main() -> Result<()> {
     let account_a = session_a.login(client, &relay_url, fixture_a.user.public_key());
     let account_b = session_b.login(client, &relay_url, fixture_b.user.public_key());
     assert_accounts(client, &local_id, &account_a, &account_b, false);
+    check(
+        unsafe { marmot_client_start(client.0) },
+        "start mixed-account receive workers",
+    );
+    welcome_and_message(client, &local_id, &account_a, &fixture_a)?;
     {
         let secrets = SECRETS.lock().expect("host store mutex");
         assert_eq!(
             secrets.len(),
-            3,
-            "local identity and two external database secrets belong in the host store"
+            5,
+            "local identity, two external database secrets, and two NIP-46 credentials belong in the host store"
         );
         assert_eq!(
             secrets
@@ -940,6 +1179,13 @@ fn main() -> Result<()> {
                 "remote account key entered local store"
             );
         }
+        let signer_credentials = secrets
+            .iter()
+            .filter(|(label, _, _)| label.starts_with(".nip46-client/"))
+            .collect::<Vec<_>>();
+        assert_eq!(signer_credentials.len(), 2);
+        assert_ne!(signer_credentials[0].1, signer_credentials[1].1);
+        assert_ne!(signer_credentials[0].2, signer_credentials[1].2);
     }
     fn check_database_secrets(path: &std::path::Path) -> Result<()> {
         for entry in std::fs::read_dir(path)? {
@@ -1056,18 +1302,41 @@ fn main() -> Result<()> {
         })?;
         // Delivery to the native actor can follow the fixture's successful relay acknowledgement.
         let deadline = std::time::Instant::now() + WAIT;
-        loop {
+        let request_id = loop {
             let state = session_a.state();
             if state["state"] == "approval" {
                 assert_eq!(state["auth_url"], AUTH_URL);
-                break;
+                break c(state["request_id"]
+                    .as_str()
+                    .expect("auth challenge request ID"));
             }
             assert!(
                 std::time::Instant::now() < deadline,
                 "auth_url intermediate was not surfaced"
             );
             std::thread::sleep(Duration::from_millis(10));
-        }
+        };
+        let stale = c("stale-request");
+        assert_eq!(
+            unsafe { marmot_nip46_complete_auth(session_a.0, stale.as_ptr()) },
+            MarmotStatus::InvalidArgument
+        );
+        let mut typed = ptr::null_mut();
+        check(
+            unsafe { marmot_nip46_status(session_a.0, &mut typed) },
+            "typed auth status",
+        );
+        assert_eq!(unsafe { &*typed }.state, MarmotNip46State::Approval);
+        assert_eq!(unsafe { input((*typed).auth_url) }, AUTH_URL);
+        assert_eq!(
+            unsafe { input((*typed).request_id) },
+            request_id.to_str().unwrap()
+        );
+        unsafe { marmot_nip46_status_free(typed) };
+        check(
+            unsafe { marmot_nip46_complete_auth(session_a.0, request_id.as_ptr()) },
+            "matching auth completion",
+        );
         check(
             client.profile(&account_b, "other-session-during-approval"),
             "other account while approval pending",
@@ -1082,9 +1351,78 @@ fn main() -> Result<()> {
             "approval final result",
         );
         assert_eq!(session_a.state()["state"], "ready");
+        assert_eq!(
+            unsafe { marmot_nip46_complete_auth(session_a.0, request_id.as_ptr()) },
+            MarmotStatus::InvalidArgument
+        );
         Ok(())
     })?;
     println!("PASS auth_url remains intermediate; local and second remote account stay usable");
+
+    fixture_a.controls.approval.store(true, Ordering::SeqCst);
+    std::thread::scope(|scope| -> Result<()> {
+        let waiting = scope.spawn(|| client.profile(&account_a, "scoped-cancellation"));
+        runtime.block_on(async {
+            tokio::time::timeout(WAIT, fixture_a.controls.approval_sent.notified()).await
+        })?;
+        let deadline = std::time::Instant::now() + WAIT;
+        let request_id = loop {
+            let state = session_a.state();
+            if state["state"] == "approval" {
+                break c(state["request_id"].as_str().expect("pending request ID"));
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "pending request was not surfaced"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        check(
+            unsafe { marmot_nip46_cancel_request(session_a.0, request_id.as_ptr()) },
+            "scoped request cancellation",
+        );
+        let cancelled = waiting.join().expect("scoped cancellation worker");
+        fixture_a.controls.finish_approval.notify_one();
+        assert_ne!(
+            cancelled,
+            MarmotStatus::Ok,
+            "cancelled profile publication must not succeed"
+        );
+        let mut typed = ptr::null_mut();
+        check(
+            unsafe { marmot_nip46_status(session_a.0, &mut typed) },
+            "typed request cancellation status",
+        );
+        assert_eq!(unsafe { &*typed }.state, MarmotNip46State::Unavailable);
+        assert!(unsafe { &*typed }.has_last_error);
+        assert_eq!(unsafe { &*typed }.last_error, MarmotNip46Error::Cancelled);
+        assert!(unsafe { &*typed }.auth_url.is_null() && unsafe { &*typed }.request_id.is_null());
+        unsafe { marmot_nip46_status_free(typed) };
+        assert_eq!(
+            unsafe { marmot_nip46_cancel_request(session_a.0, request_id.as_ptr()) },
+            MarmotStatus::InvalidArgument
+        );
+        check(
+            client.profile(&account_a, "after-scoped-cancellation"),
+            "same session after scoped cancellation",
+        );
+        check(
+            client.profile(&account_b, "other-after-scoped-cancellation"),
+            "other session after scoped cancellation",
+        );
+        Ok(())
+    })?;
+    check(
+        unsafe { marmot_nip46_disconnect(session_a.0) },
+        "temporary disconnect",
+    );
+    assert_eq!(session_a.state()["state"], "disconnected");
+    assert_eq!(session_a.connect(), account_a);
+    check(
+        unsafe { marmot_nip46_ping(session_a.0) },
+        "ping after reconnect",
+    );
+    println!("PASS scoped auth, request cancellation and reconnect preserve the shared signer");
 
     fixture_a.controls.wrong_event.store(true, Ordering::SeqCst);
     assert_ne!(
@@ -1106,8 +1444,6 @@ fn main() -> Result<()> {
     drop(owner);
     let owner = ClientOwner(Handle::open(&root, &relay_url));
     let client = owner.0;
-    let pending_a = Session::new(client, &export_a);
-    let session_b = Session::new(client, &export_b);
     fixture_a.controls.offline.store(true, Ordering::SeqCst);
     let started = std::time::Instant::now();
     check(
@@ -1118,18 +1454,71 @@ fn main() -> Result<()> {
         started.elapsed() < WAIT,
         "offline signer blocked local startup"
     );
+    assert_accounts(client, &local_id, &account_a, &account_b, false);
+    let session_b = Session::resume(client, &account_b);
     check(
         client.profile(&local_id, "local-after-cold-restart"),
         "local after cold restart",
     );
     assert_eq!(session_b.connect(), account_b);
-    session_b.register(client, &account_b);
+    check(
+        unsafe { marmot_nip46_ping(session_b.0) },
+        "resumed signer ping",
+    );
     check(
         client.profile(&account_b, "remote-after-cold-restart"),
         "other remote after cold restart",
     );
     fixture_a.controls.offline.store(false, Ordering::SeqCst);
-    drop(pending_a);
+    let resumed_a = Session::resume(client, &account_a);
+    check(
+        unsafe { marmot_nip46_disconnect(resumed_a.0) },
+        "interrupt outstanding offline RPC before explicit reconnect",
+    );
+    assert_eq!(resumed_a.connect(), account_a);
+    check(
+        client.profile(&account_a, "mdk-owned-cold-resume"),
+        "MDK-owned cold resumed account",
+    );
+    drop(resumed_a);
+    let account_a_c = c(&account_a);
+    check(
+        unsafe { marmot_nip46_remove(client.0, account_a_c.as_ptr()) },
+        "remove before legacy descriptor restore",
+    );
+    assert_ready(client, &account_a);
+    let failed_rebind = Session::new(client, &export_a);
+    assert_eq!(failed_rebind.connect(), account_a);
+    let mut refused_rebind = ptr::dangling_mut();
+    assert_eq!(
+        unsafe {
+            marmot_nip46_login(
+                client.0,
+                failed_rebind.0,
+                ptr::null(),
+                0,
+                ptr::null(),
+                0,
+                ptr::null(),
+                0,
+                &mut refused_rebind,
+            )
+        },
+        MarmotStatus::Runtime,
+        "missing messaging relays must refuse completed-account rebind"
+    );
+    assert!(refused_rebind.is_null());
+    assert_ready(client, &account_a);
+    check(
+        client.profile(&local_id, "local-after-failed-rebind"),
+        "local after failed completed-account rebind",
+    );
+    check(
+        client.profile(&account_b, "remote-after-failed-rebind"),
+        "other remote after failed completed-account rebind",
+    );
+    drop(failed_rebind);
+    println!("PASS failed completed-account rebind preserves readiness and independent accounts");
     println!(
         "PASS cold restart reopens encrypted account databases; offline signer does not block local/other remote accounts"
     );
@@ -1148,6 +1537,7 @@ fn main() -> Result<()> {
     assert_eq!(session_a.connect(), account_a);
     session_a.register(client, &account_a);
     client.keypackage(&account_a);
+    assert_ready(client, &account_a);
     let secrets = fixture_a
         .controls
         .evidence
@@ -1182,14 +1572,23 @@ fn main() -> Result<()> {
         "local after cancellation",
     );
     drop(session_a);
+    check(
+        unsafe { marmot_nip46_remove(client.0, account_a_c.as_ptr()) },
+        "remove cancelled session before descriptor replacement",
+    );
     let session_a = Session::new(client, &export_a);
     assert_eq!(session_a.connect(), account_a);
     session_a.register(client, &account_a);
-    sign_out(client, &account_a);
+    let courtesy_uri = format!(
+        "bunker://{}?relay={}",
+        fixture_a.bunker.public_key(),
+        replacement_url.replace(':', "%3A").replace('/', "%2F")
+    );
+    let courtesy = Session::new(client, &json!({"uri":courtesy_uri}));
     // No acknowledgement: local credentials must still be revoked, bounded by native timeout.
     fixture_a.controls.offline.store(true, Ordering::SeqCst);
     let started = std::time::Instant::now();
-    let courtesy_status = unsafe { marmot_nip46_logout(session_a.0) };
+    let courtesy_status = unsafe { marmot_nip46_logout(courtesy.0) };
     assert!(
         started.elapsed() < Duration::from_secs(10),
         "logout must be bounded without remote acknowledgement"
@@ -1199,7 +1598,15 @@ fn main() -> Result<()> {
         MarmotStatus::Timeout,
         "offline signer cannot acknowledge logout"
     );
+    assert_eq!(courtesy.state()["state"], "logged_out");
+    drop(courtesy);
+    fixture_a.controls.offline.store(false, Ordering::SeqCst);
+    sign_out(client, &account_a);
     assert_eq!(session_a.state()["state"], "logged_out");
+    assert_eq!(
+        unsafe { marmot_nip46_logout(session_a.0) },
+        MarmotStatus::ExternalSignerUnavailable
+    );
     let mut rejected = ptr::null_mut();
     assert_ne!(
         unsafe { marmot_nip46_export(session_a.0, &mut rejected) },
@@ -1218,6 +1625,104 @@ fn main() -> Result<()> {
     assert_accounts(client, &local_id, &account_a, &account_b, true);
     println!(
         "PASS one-session cancel and unacknowledged logout preserve local/other remote accounts"
+    );
+
+    let retry = Session::new(client, &export_a);
+    assert_eq!(retry.connect(), account_a);
+    let mut refused = ptr::dangling_mut();
+    assert_ne!(
+        unsafe {
+            marmot_nip46_login(
+                client.0,
+                retry.0,
+                ptr::null(),
+                0,
+                ptr::null(),
+                0,
+                ptr::null(),
+                0,
+                &mut refused,
+            )
+        },
+        MarmotStatus::Ok,
+        "missing messaging relays must refuse reactivation"
+    );
+    assert!(refused.is_null());
+    assert_eq!(retry.state()["state"], "disconnected");
+    assert_eq!(
+        SECRETS
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(label, _, _)| label.starts_with(".nip46-client/"))
+            .count(),
+        1,
+        "failed reactivation retained account A's communication credential"
+    );
+    assert_accounts(client, &local_id, &account_a, &account_b, true);
+    assert_ready(client, &account_a);
+    assert_eq!(retry.connect(), account_a);
+    assert_eq!(
+        retry.login(client, &relay_url, fixture_a.user.public_key()),
+        account_a
+    );
+    check(
+        client.profile(&account_a, "after-reactivation-retry"),
+        "same pairing after failed reactivation",
+    );
+    check(
+        unsafe { marmot_nip46_logout(retry.0) },
+        "logout attached signer",
+    );
+    let mut absent = ptr::dangling_mut();
+    assert_eq!(
+        unsafe { marmot_nip46_resume(client.0, account_a_c.as_ptr(), &mut absent) },
+        MarmotStatus::ExternalSignerUnavailable
+    );
+    assert!(absent.is_null());
+
+    let replacement_a = Session::new(
+        client,
+        &json!({"relays":[replacement_url],"name":"Replacement pairing"}),
+    );
+    let mut offer = ptr::null_mut();
+    check(
+        unsafe { marmot_nip46_pairing_offer(replacement_a.0, &mut offer) },
+        "replacement pairing offer",
+    );
+    let offer = take_string(offer);
+    let offer = url::Url::parse(&offer)?;
+    let pairing_client = PublicKey::from_hex(offer.host_str().ok_or("pairing client key")?)?;
+    let secret = offer
+        .query_pairs()
+        .find(|(key, _)| key == "secret")
+        .ok_or("pairing secret")?
+        .1
+        .into_owned();
+    runtime.block_on(fixture_a.pairing.send(Pairing {
+        client: pairing_client,
+        secret,
+        author: fixture_a.bunker.clone(),
+    }))?;
+    assert_eq!(replacement_a.connect(), account_a);
+    assert_eq!(
+        replacement_a.login(client, &relay_url, fixture_a.user.public_key()),
+        account_a
+    );
+    assert_eq!(
+        unsafe { marmot_nip46_logout(session_a.0) },
+        MarmotStatus::ExternalSignerUnavailable
+    );
+    check(
+        client.profile(&account_a, "after-same-process-repair"),
+        "fresh signer after attached logout and stale-handle logout",
+    );
+    client.keypackage(&account_a);
+    sign_out(client, &account_a);
+    drop(replacement_a);
+    drop(retry);
+    println!(
+        "PASS failed reactivation rolls back its binding; attached logout permits immediate fresh pairing"
     );
 
     drop(session_a);

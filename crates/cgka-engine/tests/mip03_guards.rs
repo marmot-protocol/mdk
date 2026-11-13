@@ -34,8 +34,8 @@ use openmls::group::MlsGroup;
 use openmls::messages::external_proposals::JoinProposal;
 use openmls::messages::proposals::{AppDataUpdateOperation, PreSharedKeyProposal, Proposal};
 use openmls::prelude::{
-    BasicCredential, CredentialWithKey, LeafNodeParameters, MlsMessageBodyIn, MlsMessageIn,
-    MlsMessageOut, ProcessedMessageContent,
+    BasicCredential, Capabilities, CredentialType, CredentialWithKey, LeafNodeParameters,
+    MlsMessageBodyIn, MlsMessageIn, MlsMessageOut, ProcessedMessageContent,
 };
 use openmls::schedule::PreSharedKeyId;
 use openmls_basic_credential::SignatureKeyPair;
@@ -548,7 +548,13 @@ fn external_join_proposal_with_signature(
         signature_key: key_package_signer.public().into(),
     };
     let key_package = openmls::key_packages::KeyPackage::builder()
-        .leaf_node_capabilities(openmls::prelude::Capabilities::default())
+        .leaf_node_capabilities(Capabilities::new(
+            None,
+            Some(&[DEFAULT_CIPHERSUITE]),
+            None,
+            None,
+            Some(&[CredentialType::Basic]),
+        ))
         .build(
             DEFAULT_CIPHERSUITE,
             &OpenMlsRustCrypto::default(),

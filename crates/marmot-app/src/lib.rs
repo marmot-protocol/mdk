@@ -129,8 +129,10 @@ pub use moderation_reports::{
     ModerationReportOrigin, ModerationReportOutcome, ModerationReportRetrySummary,
     ModerationReportStatus,
 };
+mod nip46;
 mod nostr_secret;
 mod nostr_verification;
+pub use nip46::{Nip46Error, Nip46Permissions, Nip46Session, Nip46State, Nip46Status};
 mod notifications;
 #[cfg(test)]
 mod observability_tests;
@@ -558,6 +560,26 @@ fn media_close_key(label: &str) -> String {
 }
 
 #[derive(Clone)]
+struct Nip46Adoption {
+    owner: std::sync::Weak<()>,
+    user: nostr::prelude::PublicKey,
+    session: Nip46Session,
+    completed: tokio::sync::watch::Receiver<bool>,
+}
+
+impl Nip46Adoption {
+    fn finished(&self) -> bool {
+        *self.completed.borrow() || self.completed.has_changed().is_err()
+    }
+}
+
+#[derive(Default)]
+struct Nip46Adoptions {
+    closed: bool,
+    active: Vec<Nip46Adoption>,
+}
+
+#[derive(Clone)]
 pub struct MarmotApp {
     block_list_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     moderation_reports: Arc<moderation_reports::ModerationReportState>,
@@ -573,6 +595,8 @@ pub struct MarmotApp {
     /// it counts against the same App Group suspension rule as the databases
     /// (see [`Self::close_storage`]).
     root_runtime_lease: Arc<Mutex<Option<MarmotRootRuntimeLease>>>,
+    /// Account setup and signer handoff share one guard across runtime handles.
+    onboarding_transactions: Arc<Mutex<HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>>,
     /// Latched as soon as [`Self::close_storage`] starts. Every database
     /// accessor checks it so a late call cannot silently reopen a database
     /// while terminal close is in progress or after it completes.
@@ -673,6 +697,9 @@ pub struct MarmotApp {
     product_analytics: marmot_observability::ProductRecorder,
     startup_diagnostics: startup_diagnostics::NativeStartupDiagnostics,
     external_signers: Arc<Mutex<HashMap<String, RegisteredExternalSigner>>>,
+    nip46_owner: Arc<()>,
+    nip46_sessions: Arc<Mutex<HashMap<String, Nip46Session>>>,
+    nip46_adoptions: Arc<Mutex<Nip46Adoptions>>,
     public_indexer_copy_tasks: Arc<Mutex<PublicIndexerCopyTasks>>,
     /// In-memory view of the persisted per-kind authoring floors; see
     /// `sign_replaceable_identity_event`.
@@ -1743,6 +1770,7 @@ impl MarmotApp {
             account_home: AccountHome::open(&root),
             root,
             root_runtime_lease: Arc::new(Mutex::new(None)),
+            onboarding_transactions: Arc::default(),
             storage_closed: Arc::new(AtomicBool::new(false)),
             storage_close_completed: Arc::new(AtomicBool::new(false)),
             storage_lifecycle: Arc::new(RwLock::new(())),
@@ -1803,6 +1831,9 @@ impl MarmotApp {
             product_analytics,
             startup_diagnostics: Default::default(),
             external_signers: Arc::new(Mutex::new(HashMap::new())),
+            nip46_owner: Arc::new(()),
+            nip46_sessions: Arc::default(),
+            nip46_adoptions: Arc::default(),
             public_indexer_copy_tasks: Arc::new(Mutex::new(PublicIndexerCopyTasks::default())),
             replaceable_identity_created_at: Arc::new(Mutex::new(HashMap::new())),
             sticker_mutation_locks: Arc::new(Mutex::new(HashMap::new())),
@@ -1865,6 +1896,7 @@ impl MarmotApp {
             notification_dispatches: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             root: root.as_ref().to_path_buf(),
             root_runtime_lease: Arc::new(Mutex::new(None)),
+            onboarding_transactions: Arc::default(),
             storage_closed: Arc::new(AtomicBool::new(false)),
             storage_close_completed: Arc::new(AtomicBool::new(false)),
             storage_lifecycle: Arc::new(RwLock::new(())),
@@ -1926,6 +1958,9 @@ impl MarmotApp {
             product_analytics,
             startup_diagnostics: Default::default(),
             external_signers: Arc::new(Mutex::new(HashMap::new())),
+            nip46_owner: Arc::new(()),
+            nip46_sessions: Arc::default(),
+            nip46_adoptions: Arc::default(),
             public_indexer_copy_tasks: Arc::new(Mutex::new(PublicIndexerCopyTasks::default())),
             replaceable_identity_created_at: Arc::new(Mutex::new(HashMap::new())),
             sticker_mutation_locks: Arc::new(Mutex::new(HashMap::new())),
@@ -6876,8 +6911,8 @@ impl MarmotApp {
     /// a running account engine (see [`SqliteAccountStorage::close`] for what
     /// that does to in-flight transactions).
     /// [`MarmotAppRuntime::shutdown_and_close`] is the sequenced entry point
-    /// host apps should use; it stops admitting runtime work before calling
-    /// this and drains the workers afterwards.
+    /// host apps should use; it stops admission and settles NIP-46 adoption
+    /// before calling this, then drains workers afterwards.
     ///
     /// **Terminal.** [`Self::storage_is_closed`] latches, and every database
     /// accessor then fails with
@@ -6918,6 +6953,10 @@ impl MarmotApp {
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         self.storage_closed.store(true, Ordering::Release);
+        self.nip46_adoptions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .closed = true;
         let _ = self.abort_all_public_indexer_copies();
         self.stop_emoji_set_installs();
         self.presentation_signals.catalog_changed();
@@ -8090,20 +8129,30 @@ impl MarmotApp {
         if public_key.to_hex() != account.account_id_hex {
             return Err(AppError::ExternalSignerMismatch);
         }
+        self.pin_external_signer(&account.account_id_hex, public_key, signer);
+        Ok(())
+    }
+
+    fn pin_external_signer(
+        &self,
+        account_id: &str,
+        public_key: nostr::prelude::PublicKey,
+        signer: Arc<dyn ExternalAccountSigner>,
+    ) -> Option<Arc<dyn ExternalAccountSigner>> {
         let mut signers = self
             .external_signers
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        match signers.entry(account.account_id_hex.clone()) {
+        let previous = match signers.entry(account_id.to_owned()) {
             std::collections::hash_map::Entry::Occupied(entry) => entry.get().replace(signer),
             std::collections::hash_map::Entry::Vacant(entry) => {
                 entry.insert(RegisteredExternalSigner::new(public_key, signer));
+                None
             }
-        }
+        };
         drop(signers);
-        self.relay_plane
-            .evict_account_publish_client(&account.account_id_hex);
-        Ok(())
+        self.relay_plane.evict_account_publish_client(account_id);
+        previous
     }
 
     fn account_signer_for_summary(
@@ -8121,6 +8170,7 @@ impl MarmotApp {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .get(&account.account_id_hex)
+                .filter(|signer| signer.has_signer())
                 .map(RegisteredExternalSigner::account_signer)
                 .ok_or_else(|| {
                     AppError::ExternalSignerUnavailable(account.account_id_hex.clone())
@@ -8146,7 +8196,8 @@ impl MarmotApp {
         self.external_signers
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .contains_key(account_id_hex)
+            .get(account_id_hex)
+            .is_some_and(RegisteredExternalSigner::has_signer)
     }
 
     fn account_home(&self) -> AccountHome {

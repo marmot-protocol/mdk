@@ -89,6 +89,7 @@ IOS_WORKSPACE_CRATES = {
     "marmot-account",
     "marmot-forensics",
     "marmot-session",
+    "marmot-uniffi",
     "storage-sqlite",
     "traits",
 }

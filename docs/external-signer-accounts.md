@@ -1,26 +1,24 @@
 # External Signer Accounts
 
-MDK supports account records whose Nostr private key is owned by a host-provided
-external signer instead of MDK's local secret store. This is intended for client
-integrations such as Android Amber / NIP-55, iOS secure signer integrations, and
-desktop signer bridges.
+MDK supports external-signing accounts through host callbacks such as Amber/NIP-55
+or an MDK-owned NIP-46 remote session. The user's Nostr secret stays with the signer.
 
 External signer accounts are sign-capable accounts. They are different from
-public/tracked accounts: MDK can publish, decrypt, receive welcomes, and run the
-account worker only after the client registers a signer callback for the account.
+public/tracked accounts: MDK can publish, decrypt, receive welcomes, and run their
+workers through a registered callback or a restored remote session.
 
 ## Account Model
 
 `AccountSummary` exposes two signing flags:
 
 - `local_signing`: MDK has a local Nostr secret for the account.
-- `external_signing`: MDK has no local Nostr secret and must call a client
-  signer callback.
+- `external_signing`: MDK has no local Nostr secret and uses an external signer.
 
 Public/tracked accounts have both flags set to `false`.
 
-An external account stores only public account metadata plus device-local
-database unlock material. A random SQLCipher key goes through the configured
+An external account stores public account metadata and device-local database
+unlock material. NIP-46 accounts also retain the communication credentials
+described below, not the user's signing secret. A random SQLCipher key goes through the configured
 `SecretStore` under the reserved `.external-sqlcipher/<account label>` credential,
 with a SHA-256 identifier derived from that label. It is not the user's Nostr
 private key and does not change the account's signing flags. Its storage protection
@@ -40,14 +38,14 @@ credential and `.salt` sidecars for recovery or downgrade. See the
 
 ## Client Flow
 
-For a new external signer account, clients call `loginExternalSigner` with:
+For a new host-callback account, clients call `loginExternalSigner` with:
 
 - the account public key as hex or npub
 - an `ExternalAccountSignerFfi` callback implementation
 - default relays
 - bootstrap relays
 
-For an existing external signer account after app/process restart, clients must
+For an existing host-callback account after app/process restart, clients must
 call `registerExternalSigner` before expecting the account to publish, decrypt,
 receive welcomes, or start its worker. MDK lists the account before the callback
 is registered, but runtime work remains paused until registration succeeds.
@@ -60,15 +58,146 @@ each external account independently so an unavailable signer does not hold up
 other accounts. Replacing a callback updates the existing per-account signer slot;
 SDK clients and workers keep the same pinned identity.
 
-The C binding provides a concrete NIP-46 adapter through `marmot_nip46_*` session
-functions. It accepts bunker links or client-initiated pairing, uses signed
-kind-24133 events with NIP-44 v2 transport, and pins the user key separately from
-the bunker and client communication keys. See the
-[C session lifecycle](../crates/marmot-c/README.md#nip-46-accounts).
-
 If a reversibly signed-out external account logs in again through
 `loginExternalSigner`, MDK clears the signed-out marker after setup succeeds and
 then reconciles the runtime worker.
+
+## NIP-46 sessions
+
+`MarmotAppRuntime::nip46_new` prepares an offline session from a `bunker://` URI
+or a relay list for client-initiated pairing. Review `review_permissions`, obtain
+user consent, and approve that exact version and grant list. Imported credential
+exports also need approval; their JSON cannot grant permissions by itself.
+
+For client-initiated pairing, await `pairing_offer` before displaying its
+`nostrconnect://` URI. The call waits for relay subscription acknowledgements so
+an ephemeral signer response can arrive before `connect` starts. Display the URI
+only after that call succeeds, then await `connect` concurrently with the pairing
+UI. The offline `uri` accessor alone does not install a listener. An interrupted
+unpaired offer gets a fresh secret; display the replacement offer, not the old QR.
+Only relays with acknowledged listeners appear in the returned offer; an offline
+configured relay does not prevent pairing through a ready relay.
+Later offers retry the configured endpoints rather than permanently dropping them.
+
+For a bunker URI, call `connect` directly. Both paths verify `get_public_key`
+and pin the user key separately from the remote signer and communication keys.
+Await successful `connect` before calling `nip46_login`. Login requires an already-verified
+`Ready` session and rejects other states without connecting, discovering relays, or
+creating an account. `nip46_login` binds that verified user and persists its session
+before account setup asks for signatures. `nip46_register` attaches an imported
+session to an existing account. Only one communication key can own an account,
+and a bound communication key cannot be imported into another session.
+A completed external account rebinds without opening a setup journal, including
+when reactivating after sign-out. Failed adoption preserves its setup readiness
+and restores the prior local callback, grant record, and activation state, or the
+previously empty slot. Already-published KeyPackages are not retracted.
+Only credentials created by that attempt are removed; already-attached sessions
+remain bound. Completed setup does not imply that a signer or worker is available.
+
+Native login and registration adoption runs in runtime-owned work across Rust,
+UniFFI, and C. Once admitted, dropping the caller's future stops waiting but does
+not cancel adoption or trigger rollback. Pairing is a separate caller-owned, bounded,
+cancellable `connect` call. An unbound pairing never mutates an account. Hosts must
+cancel and discard abandoned pairing UI and make a new explicit adoption call only
+after verification succeeds. Account sign-out does not cancel unrelated unbound
+sessions. Explicit session `cancel`, `disconnect`, or `logout`
+interrupts adoption's network waits; local binding and persistence settle before
+the owned work ends. Adoption keeps the session generation captured at admission
+through gate waits, binding, and network work. A disconnect between phases still
+retires it; a later explicit reconnect cannot resume that older adoption.
+Rollback still removes or restores its credential record and restores the prior
+callback. It does not reset transport state or cancel requests belonging to a
+newer generation.
+Shutdown interrupts and settles owned adoption before it
+closes storage. Local removal, sign-out, and wipe interrupt earlier admitted
+adoption for that account. Explicit reactivation waits for adoption to settle,
+so an older rollback cannot undo the later sign-in. Caller drop does not replace
+explicit account sign-out cleanup.
+These guarantees do not change legacy host-callback/NIP-55 login behavior or
+make failed host login transactional.
+
+New, promoted, and incomplete accounts follow initial provisioning. Possibly
+exposed publication retains its pairing for restart retry when no prior callback
+is restored. Journal cleanup errors do not revoke a network-ready account.
+Cancelling early provisioning can roll back the new account. Local removal then
+returns `UnknownAccount`, not a credential-store failure.
+Account setup transactions share the app's signer-registry scope across runtime handles.
+Account deletion holds that same transaction through credential erasure and removal.
+Concurrent session resume waits, then reports the removed account instead of retaining
+a session that blocks a fresh pairing's login.
+
+MDK stores the communication secret through `AccountSecretStore` under
+`.nip46-client/<account label>`, with a separate SHA-256-derived credential id.
+The private `.nip46-session.json` contains public keys, relays, a client name,
+and the approved permission snapshot, never the secret or one-use bunker token.
+The communication key, SQLCipher credential, and user's signing key are distinct.
+A crash before the first secret-store write can leave metadata without a key.
+Restoration reports the missing key; explicit approved pairing can repair that
+state after a credential load confirms absence. An unavailable or malformed key
+does not permit repair. An existing key is never overwritten.
+
+Runtime startup restores each stored session before reconciling account workers.
+Restoration is local; later signer work reconnects with a 90-second request
+deadline and a queue capped at 32 operations. Stored valid account-identity proofs
+remain reusable offline. A missing proof can require remote signing. Corrupt or
+unavailable session material leaves the account intact and reports a recoverable
+error. `nip46_resume` returns the account's session without a host callback or
+exported descriptor, and can rebuild a terminally cancelled actor from storage.
+
+Permission version 1 covers these MDK capabilities:
+
+| Capability | Requested grants |
+| --- | --- |
+| Account-identity and push-owner proofs | `sign_event:450`, `sign_event:451` |
+| KeyPackages and deletion | `sign_event:30443`, `sign_event:5` |
+| NIP-59 seals and relay authentication | `sign_event:13`, `sign_event:22242` |
+| Relay lists | `sign_event:10002`, `sign_event:10050` |
+| Profiles, follows, and mute lists | `sign_event:0`, `sign_event:3`, `sign_event:10000` |
+| Blossom authorization and backup pointers | `sign_event:24242`, `sign_event:30078` |
+| Welcome and encrypted account data | `nip44_encrypt`, `nip44_decrypt` |
+
+NIP-04 and unrestricted `sign_event` are not requested. A restored snapshot that
+differs from the required set blocks RPCs until reviewed and approved again;
+startup never broadens it. Client approval is not signer authorization: the signer
+can still reject any request or ask for authentication.
+
+Status exposes typed state and error codes, a session generation, and the active
+request id. `auth_url` is an intermediate challenge for that request. Open it in
+the host UI; `complete_auth` acknowledges the matching challenge but cannot finish
+the RPC. Only a correlated final response from the pinned signer can do that.
+Never log status snapshots containing authentication URLs, pairing URIs, exports,
+or request payloads.
+
+Request-scoped cancellation, including dropping an async signer RPC wait, retires
+that request without cancelling another account. This differs from dropping an
+admitted Native login or registration wait, which leaves adoption running.
+`disconnect` interrupts the
+current generation and permits explicit reconnect. `cancel` is terminal for that
+actor. `connect` does not preempt another RPC; use `disconnect` before reconnecting
+when an old offline request is still pending. Delayed responses cannot revive a
+cancelled generation. `logout` attempts a five-second
+courtesy request and erases local communication credentials regardless of the
+remote result. Account sign-out, session removal, and wipe erase the key without
+requiring the signer; encrypted history and its database credential remain on
+reversible sign-out. `shutdown_and_close` cancels actors but preserves stored
+sessions. Delete any host-owned credential backups on logout too.
+If vault deletion fails, signing stays stopped and cleanup ownership remains
+retryable. Retry local erasure or `nip46_remove` after the vault recovers; pending
+removal cannot restore or authorize a signer.
+
+Generic host-callback/NIP-55 sign-out does not query the NIP-46 credential
+namespace when no session record exists; generic account wipe follows the same rule.
+Explicit NIP-46 removal also revokes an orphaned communication key if its metadata
+was lost, retaining a removal intent when vault deletion fails.
+
+Every signer relay passes the shared retired-relay and endpoint policy and uses
+the configured process proxy. It retains the documented
+[Nostr SDK DNS-resolution residual](marmot-architecture/overview/dial-safety.md#accepted-residual).
+An unsupported `switch_relays` response, including `method not found`, keeps the
+current signer relays. Rejection, malformed responses, and transport failures still
+fail connection.
+See the [UniFFI lifecycle](../crates/marmot-uniffi/README.md#nip-46-accounts) and
+[C ownership rules](../crates/marmot-c/README.md#nip-46-accounts).
 
 ## Amber-Compatible Account-Identity Proof
 
