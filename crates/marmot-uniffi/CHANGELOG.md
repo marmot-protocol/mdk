@@ -32,6 +32,12 @@
 - `sticker_pack_share_link(account_ref, coordinate)` builds a canonical Sonar pack link locally with retained
   relay hints, falling back to current account outbox candidates for packs without hints (mdk#3283).
 
+### Changed
+
+- `HistoryNoticeCauseFfi::UnprovenHistory` is no longer emitted (mdk#3308): the recovery runner retries a relay that
+  could not prove a route's history quietly, and a notice needs evidence that messages are missing. The variant stays;
+  keep exhaustive switches.
+
 ### Fixed
 
 - Isolate Apple release-profile mock build outputs from inherited

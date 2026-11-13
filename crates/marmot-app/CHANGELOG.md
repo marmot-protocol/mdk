@@ -27,6 +27,20 @@
   hints use account relays. Hints that exceed the parser's link size limit
   are omitted (mdk#3283).
 
+### Changed
+
+- The coverage ledger no longer raises "history may be incomplete" notices (mdk#3308). Users see a notice only when
+  MDK has evidence that messages are missing (an epoch gap the runner's visits exhausted, a maintenance or known-event
+  park an upgrade kept) or after a rejoin. `HistoryNoticeCause::UnprovenHistory` stays in the enum for compatibility
+  but is no longer emitted; keep exhaustive matches. Notices shown for it before the upgrade leave the list, and
+  `dismiss_history_notice` with one of their ids returns `false` and changes nothing. No `recovery_need_changed`
+  audit row carries `unproven_history` any more.
+- A broken recovery unit (a relay that refused the runner or could not prove a route's history) now probes quietly
+  on a timer instead of waiting for the user to dismiss its notice: an hour after it breaks, then on an interval that
+  doubles to a day. A probe goes through the runner's ordinary scheduling, budgets, relay cooldowns and account
+  breaker, raises no notice and never shows as catching up. Units broken before the upgrade have a probe time in the
+  past, so each probes once right after the upgrade.
+
 ### Fixed
 
 - Outgoing attachment promotion resumes when a running batch finishes after
@@ -41,6 +55,13 @@
   reporting recipients as `Incomplete` in a successful result (#1813).
   Incomplete relay reads still use per-member recovery. Over-budget published
   member routes stay account-local and do not renew prewarm readiness.
+- An inbox relay that refuses NIP-77 comparison (`auth-required` or no NIP-77 support) no longer brings back a
+  "history may be incomplete" notice about a second after every dismissal and on every app open (mdk#3308). The inbox
+  owes history up to the current second on such a relay, so each quantum after a dismissal was refused again and
+  parked under a new revision.
+- History the 30-day retention window passed before the runner proved it (a route's parked remainder) no longer
+  raises a notice. After the upgrade to the coverage ledger, nearly every chat showed "history may be incomplete" for
+  this alone, and busy groups flashed the notice about once a second as live input moved their live edge.
 
 ## 0.16.0 - 2026-11-12
 

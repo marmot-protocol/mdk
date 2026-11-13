@@ -44,6 +44,12 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 - `marmot_sticker_pack_share_link` synchronously builds a canonical Sonar pack link with local relay hints
   (mdk#3283). Inputs are borrowed; free the returned owned string with `marmot_string_free`.
 
+### Changed
+
+- `MARMOT_HISTORY_NOTICE_CAUSE_UNPROVEN_HISTORY` is no longer emitted (mdk#3308): the recovery runner retries a relay
+  that could not prove a route's history quietly, and a notice needs evidence that messages are missing. The value
+  stays; keep exhaustive switches.
+
 ## [0.16.0] - 2026-11-12
 
 ### Breaking changes

@@ -1049,11 +1049,12 @@ Shared conventions:
 
 #### `recovery_need_changed`
 
-Recovery need changed for one obligation, or for one coverage-ledger route's notice (`unproven_history`).
+Recovery need changed for one obligation. Earlier releases also recorded one coverage-ledger route's notice
+(`unproven_history`); since mdk#3308 the ledger raises no notice, so this row no longer carries that cause.
 
 | Field | Meaning |
 | --- | --- |
-| `cause` | `queue_loss`, `notification_loss`, `epoch_gap`, `maintenance`, `explicit_history`, `known_event`, `incremental_history`, or `subscription_replay` (the code's `RecoveryCause`), or `unproven_history`: a route the recovery runner parked or could not prove, which has no obligation (mdk#2660, unproduced until the runner owns history). |
+| `cause` | `queue_loss`, `notification_loss`, `epoch_gap`, `maintenance`, `explicit_history`, `known_event`, `incremental_history`, or `subscription_replay` (the code's `RecoveryCause`), or `unproven_history`: a route the recovery runner parked or could not prove, which has no obligation (mdk#2660). No longer produced for notices since mdk#3308; kept for older logs. |
 | `change` | `recorded` (new debt), `joined` (charged to pending work), `resumed` (new evidence reopened a parked or retired obligation), `notice_shown` (it parked; its "history may be incomplete" notice is now shown), `notice_dismissed` (the user retired it), `closed` (a parked obligation completed with qualified coverage), or `closed_below_window` (an explicit full-history request closed because its whole retained window was certified and what remains lies below it; neither coverage nor a dismissal). |
 | `obligation_ref` | Hashed obligation id; for `unproven_history`, the hashed route tag, never the route. |
 | `obligation_revision` | Revision the change left; for `unproven_history`, the route's park revision. |

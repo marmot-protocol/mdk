@@ -1791,9 +1791,11 @@ analytics. C callers: see the [C guide](../marmot-c/README.md#history-may-be-inc
 history is still being fetched (`catching_up_group_ids_hex`), whether the inbox's is
 (`inbox_catching_up`), and every notice as `history_notices` lists them. Show the first two
 as "catching up" and re-read on `MarmotEventFfi::RecoveryStatusChanged`. The recovery
-runner supplies those fields. Current epoch-gap exhaustion emits `EpochGap`; coverage-ledger
-parks emit `HistoryNoticeCauseFfi::UnprovenHistory` without attributing the original reason
-history was owed. Other cause labels preserve compatibility; keep exhaustive switches.
+runner supplies those fields. Current epoch-gap exhaustion emits `EpochGap`. Other cause
+labels preserve compatibility; keep exhaustive switches. `HistoryNoticeCauseFfi::UnprovenHistory`
+is no longer emitted: the recovery runner retries a route whose relays could not prove its
+history quietly, on a growing interval, and raises a notice only for evidence that messages
+are missing.
 
 When a Welcome installs a new copy of a group in place of this device's old one (an automatic
 rejoin after the old copy could not be repaired, a reentry after a trusted removal, or a fork

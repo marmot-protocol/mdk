@@ -17,6 +17,12 @@ pub(crate) const RUNNER_BACKOFF_CAP_SECS: u64 = 60 * 60;
 /// unsuccessful visit cap for an epoch gap. The first five delays total about
 /// 15 minutes.
 pub(crate) const RUNNER_BREAK_AFTER_NO_PROGRESS: u32 = 6;
+/// How long a newly broken unit waits before its first timed probe; each
+/// failed probe doubles the wait up to the cap (mdk#3308). A probe is quiet:
+/// it raises no notice, and goes through the ordinary scheduling, budgets and
+/// relay cooldowns.
+pub(crate) const RUNNER_PROBE_BASE_SECS: u64 = 60 * 60;
+pub(crate) const RUNNER_PROBE_CAP_SECS: u64 = 24 * 60 * 60;
 /// How long a unit whose relay was unreachable waits before its next attempt.
 pub(crate) const RUNNER_UNREACHABLE_RETRY_SECS: u64 = 30;
 /// Unreachable results in a row before the relay cools down.
@@ -110,6 +116,8 @@ impl Default for RecoveryRunnerPolicy {
                 max_attempts_per_hour: RUNNER_MAX_QUANTA_PER_HOUR,
                 max_event_bytes_per_hour: RUNNER_MAX_EVENT_BYTES_PER_HOUR,
                 recheck_after_cooldown_seconds: RUNNER_RECHECK_AFTER_COOLDOWN_SECS,
+                probe_base_seconds: RUNNER_PROBE_BASE_SECS,
+                probe_cap_seconds: RUNNER_PROBE_CAP_SECS,
             },
             quantum: RUNNER_QUANTUM,
             request_timeout: RUNNER_REQUEST_TIMEOUT,

@@ -1,10 +1,6 @@
-//! Ledger-parked routes as notices, and the account's recovery status
-//! (mdk#2660 phase 4): a parked group
-//! route is a notice in that group's status, an inbox park only in the
-//! account's list, a remainder only once nothing on its route catches up,
-//! and dismissal retires the park, each shown and dismissed notice audited.
-//! A suspended (Unrecoverable) group's routes give none, nor does a park on
-//! a relay a route carries only as best effort.
+//! What the coverage ledger parks raises no notice (mdk#3308), and the
+//! account's recovery status reads what the runner catches up (mdk#2660
+//! phase 4).
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -16,9 +12,9 @@ use storage_sqlite::{
 };
 
 use crate::client::recovery_runner::{RecoveryRunnerPolicy, UnitKey};
-use crate::history_notices::{decode_notice_id, encode_notice_id, ledger_route_tag};
+use crate::history_notices::{encode_notice_id, ledger_route_tag};
 use crate::tests::{ScriptedPushRelayClient, client_on_app_relay_plane};
-use crate::{AccountRecoveryStatus, AppClient, HistoryNoticeCause, MarmotApp};
+use crate::{AccountRecoveryStatus, AppClient, MarmotApp};
 
 const RELAY: &str = "wss://relay.example";
 const DAY: u64 = 24 * 60 * 60;
@@ -132,391 +128,16 @@ fn catching_up(client: &AppClient, units: &[&TransportReconciliationRoute]) {
         .send_replace(Some(units));
 }
 
+/// Neither a broken unit's park, on a group route or the inbox, nor a
+/// remainder the retention floor overtook is evidence that messages are
+/// missing, so none raises a notice, a notice change or a `notice_shown`
+/// row, however caught up the runner is. A ledger notice id an earlier
+/// release showed dismisses nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_parked_group_route_is_a_notice_in_its_groups_status_until_dismissed() {
-    let dir = tempfile::tempdir().unwrap();
-    let (mut client, app, group, route) = fixture(&dir).await;
-    assert!(client.history_notices().unwrap().is_empty());
-    client.take_history_notice_changes();
-    park(&app, &route);
-
-    let notices = client.history_notices().unwrap();
-    assert_eq!(notices.len(), 1);
-    let notice = notices[0].clone();
-    assert_eq!(notice.cause, HistoryNoticeCause::UnprovenHistory);
-    assert_eq!(notice.group_id_hex, Some(hex::encode(group.as_slice())));
-    assert!(notice.parked_at_ms.is_some());
-    assert_eq!(notice.notice_id.len(), 48);
-    let ticket = decode_notice_id(&notice.notice_id).unwrap();
-    assert_eq!(ticket.id, ledger_route_tag(&route), "the id names no route");
-    let status = client.group_recovery_status(&group).unwrap();
-    assert!(status.history_may_be_incomplete);
-    assert_eq!(status.history_notice_ids, vec![notice.notice_id.clone()]);
-    assert_eq!(
-        client.take_history_notice_changes(),
-        Some(vec![group.clone()])
-    );
-    assert_eq!(client.take_history_notice_changes(), None);
-
-    // A stale revision retires nothing.
-    let stale = encode_notice_id(RecoveryDemandTicket {
-        revision: ticket.revision + 1,
-        ..ticket
-    });
-    assert!(!client.dismiss_history_notice(&stale).unwrap());
-    assert_eq!(client.history_notices().unwrap(), vec![notice.clone()]);
-
-    assert!(client.dismiss_history_notice(&notice.notice_id).unwrap());
-    assert!(client.history_notices().unwrap().is_empty());
-    assert!(
-        client
-            .group_recovery_status(&group)
-            .unwrap()
-            .history_notice_ids
-            .is_empty()
-    );
-    assert_eq!(
-        app.recovery_unit(&route, RELAY).unwrap().unwrap().state,
-        RecoveryUnitState::Retired
-    );
-    assert_eq!(
-        client.take_history_notice_changes(),
-        Some(vec![group.clone()])
-    );
-    assert!(
-        !client.dismiss_history_notice(&notice.notice_id).unwrap(),
-        "a dismissed park is stale"
-    );
-
-    // A re-arm and a later park are a new occurrence with a new id.
-    app.rearm_all_recovery_units().unwrap();
-    park(&app, &route);
-    let again = client.history_notices().unwrap();
-    assert_eq!(again.len(), 1);
-    assert_ne!(again[0].notice_id, notice.notice_id);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_inbox_park_is_a_notice_in_the_account_list_only() {
-    let dir = tempfile::tempdir().unwrap();
-    let (mut client, app, group, _) = fixture(&dir).await;
-    client.take_history_notice_changes();
-    park(&app, &TransportReconciliationRoute::Inbox);
-
-    let notices = client.history_notices().unwrap();
-    assert_eq!(notices.len(), 1);
-    assert_eq!(notices[0].cause, HistoryNoticeCause::UnprovenHistory);
-    assert_eq!(notices[0].group_id_hex, None);
-    assert!(
-        client
-            .group_recovery_status(&group)
-            .unwrap()
-            .history_notice_ids
-            .is_empty()
-    );
-    assert_eq!(client.take_history_notice_changes(), Some(Vec::new()));
-    assert!(
-        client
-            .dismiss_history_notice(&notices[0].notice_id)
-            .unwrap()
-    );
-    assert!(client.history_notices().unwrap().is_empty());
-}
-
-/// A shown ledger notice records one `notice_shown` row per occurrence, and
-/// its dismissal one `notice_dismissed` row under the same reference; a
-/// stale dismissal and a withdrawn notice record nothing more.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn ledger_notices_are_audited_when_shown_and_dismissed() {
+async fn ledger_parks_and_remainders_raise_no_notice() {
     let dir = tempfile::tempdir().unwrap();
     let (app, mut client, storage, group, route) = audited_fixture(&dir).await;
     client.take_history_notice_changes();
-    park(&storage, &route);
-    park(&storage, &TransportReconciliationRoute::Inbox);
-    client.take_history_notice_changes();
-    client.take_history_notice_changes();
-
-    let shown = need_changed(&app, "notice_shown");
-    assert_eq!(shown.len(), 2, "each notice is shown once, not per seam");
-    let notices = client.history_notices().unwrap();
-    let group_notice = notices
-        .iter()
-        .find(|notice| notice.group_id_hex.is_some())
-        .unwrap();
-    let group_ticket = decode_notice_id(&group_notice.notice_id).unwrap();
-    let group_row = shown
-        .iter()
-        .find(|row| !row["group_ref"].is_null())
-        .expect("the group route's notice names its group");
-    let inbox_row = shown
-        .iter()
-        .find(|row| row["group_ref"].is_null())
-        .expect("the inbox's notice is account-scoped");
-    for row in [group_row, inbox_row] {
-        assert_eq!(row["event"]["cause"], "unproven_history");
-        assert!(row["event"]["charged"].is_null());
-        assert!(row["event"]["bound"].is_null());
-    }
-    assert_ne!(
-        group_row["event"]["obligation_ref"],
-        inbox_row["event"]["obligation_ref"]
-    );
-    assert_eq!(
-        group_row["event"]["obligation_revision"],
-        group_ticket.revision
-    );
-
-    let stale = encode_notice_id(RecoveryDemandTicket {
-        revision: group_ticket.revision + 1,
-        ..group_ticket
-    });
-    assert!(!client.dismiss_history_notice(&stale).unwrap());
-    assert!(need_changed(&app, "notice_dismissed").is_empty());
-
-    assert!(
-        client
-            .dismiss_history_notice(&group_notice.notice_id)
-            .unwrap()
-    );
-    let dismissed = need_changed(&app, "notice_dismissed");
-    assert_eq!(dismissed.len(), 1);
-    assert_eq!(dismissed[0]["event"]["cause"], "unproven_history");
-    assert_eq!(
-        dismissed[0]["event"]["obligation_ref"],
-        group_row["event"]["obligation_ref"]
-    );
-    assert_eq!(dismissed[0]["group_ref"], group_row["group_ref"]);
-    assert_eq!(
-        client.take_history_notice_changes(),
-        Some(vec![group.clone()])
-    );
-    assert!(
-        need_changed(&app, "closed").is_empty(),
-        "a dismissal is not coverage"
-    );
-    assert_eq!(need_changed(&app, "notice_shown").len(), 2);
-}
-
-/// A remainder the retention floor overtook is a notice only once the runner
-/// has surveyed and catches up nothing on its route: before that, more of
-/// the route's window may still be coming.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_remainder_is_a_notice_once_nothing_on_its_route_catches_up() {
-    let dir = tempfile::tempdir().unwrap();
-    let (mut client, app, group, route) = fixture(&dir).await;
-    let now = crate::unix_now_seconds();
-    app.widen_recovery_coverage_goals(
-        std::slice::from_ref(&route),
-        now - 2 * DAY,
-        storage_sqlite::CopyFloorReason::Clamp,
-    )
-    .unwrap();
-    app.prune_recovery_coverage(now - DAY, &[(route.clone(), vec![RELAY.to_owned()])])
-        .unwrap();
-    assert_eq!(app.recovery_coverage_remainders().unwrap().len(), 1);
-
-    assert!(client.history_notices().unwrap().is_empty(), "not surveyed");
-    catching_up(&client, &[&route]);
-    assert!(client.history_notices().unwrap().is_empty(), "catching up");
-    catching_up(&client, &[&TransportReconciliationRoute::Inbox]);
-    let notices = client.history_notices().unwrap();
-    assert_eq!(notices.len(), 1);
-    assert_eq!(notices[0].group_id_hex, Some(hex::encode(group.as_slice())));
-    assert_eq!(
-        client
-            .group_recovery_status(&group)
-            .unwrap()
-            .history_notice_ids,
-        vec![notices[0].notice_id.clone()]
-    );
-
-    assert!(
-        client
-            .dismiss_history_notice(&notices[0].notice_id)
-            .unwrap()
-    );
-    assert!(app.recovery_coverage_remainders().unwrap().is_empty());
-    assert!(client.history_notices().unwrap().is_empty());
-}
-
-/// A suspended (Unrecoverable) group's park and remainder are no notices:
-/// its recovery waits for the group's repair. Once the copy is repaired they
-/// show again.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_suspended_groups_park_and_remainder_are_no_notices() {
-    use cgka_traits::storage::GroupStorage;
-    let dir = tempfile::tempdir().unwrap();
-    let (mut client, app, group, route) = fixture(&dir).await;
-    let storage = client.app.account_storage("alice").unwrap();
-    let suspend = |unrecoverable: bool| {
-        let mut record = storage.get_group(&group).unwrap();
-        record.unrecoverable = unrecoverable;
-        storage.put_group(&record).unwrap();
-    };
-    let shown = |client: &AppClient| {
-        let notices = client.history_notices().unwrap();
-        assert_eq!(
-            client
-                .group_recovery_status(&group)
-                .unwrap()
-                .history_notice_ids,
-            notices
-                .iter()
-                .map(|notice| notice.notice_id.clone())
-                .collect::<Vec<_>>()
-        );
-        notices
-    };
-
-    park(&app, &route);
-    assert_eq!(shown(&client).len(), 1);
-    suspend(true);
-    assert!(shown(&client).is_empty(), "a suspended park");
-    suspend(false);
-    let parked = shown(&client);
-    assert_eq!(parked.len(), 1);
-    assert!(client.dismiss_history_notice(&parked[0].notice_id).unwrap());
-
-    let now = crate::unix_now_seconds();
-    app.widen_recovery_coverage_goals(
-        std::slice::from_ref(&route),
-        now - 2 * DAY,
-        storage_sqlite::CopyFloorReason::Clamp,
-    )
-    .unwrap();
-    app.prune_recovery_coverage(now - DAY, &[(route.clone(), vec![RELAY.to_owned()])])
-        .unwrap();
-    catching_up(&client, &[]);
-    assert_eq!(shown(&client).len(), 1);
-    suspend(true);
-    assert!(shown(&client).is_empty(), "a suspended remainder");
-    suspend(false);
-    assert_eq!(shown(&client).len(), 1);
-}
-
-/// A broken unit on a relay the route carries only as best effort owes
-/// nothing, so it raises no notice; one on the relay the route requires
-/// does, and that notice is the route's. Its dismissal leaves the hidden
-/// park, which shows as a fresh notice once its relay is required again.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_park_on_a_relay_the_route_carries_only_as_best_effort_is_no_notice() {
-    const OPERATED: &str = "wss://operated.example";
-    const BEST_EFFORT: &str = "wss://best-effort.example";
-    let dir = tempfile::tempdir().unwrap();
-    crate::AccountHome::open(dir.path())
-        .create_account("alice")
-        .unwrap();
-    let app = MarmotApp::with_relays_and_config(
-        dir.path(),
-        vec![RELAY.into()],
-        crate::MarmotAppConfig::white_noise()
-            .with_open_ranking_provider(None, Vec::new())
-            .with_recovery_operated_relays(vec![OPERATED.into()]),
-    )
-    .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
-    let mut client = client_on_app_relay_plane(&app, "alice").await;
-    let group = client
-        .create_group_with_options(
-            "best effort",
-            &[],
-            crate::AppCreateGroupOptions {
-                relays: Some(vec![OPERATED.into(), BEST_EFFORT.into()]),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap()
-        .operation
-        .expect("eligible fixture members");
-    let route = client
-        .recovery_runner_routes()
-        .into_iter()
-        .find(|route| route.group_id.as_deref() == Some(group.as_slice()))
-        .unwrap();
-    assert_eq!(route.required, vec![OPERATED.to_owned()]);
-    assert_eq!(route.best_effort, vec![BEST_EFFORT.to_owned()]);
-    let storage = app.account_storage("alice").unwrap().app_storage();
-
-    park_on(&storage, &route.route, BEST_EFFORT);
-    assert!(client.history_notices().unwrap().is_empty());
-    park_on(&storage, &route.route, OPERATED);
-    let notices = client.history_notices().unwrap();
-    assert_eq!(notices.len(), 1);
-    assert_eq!(notices[0].group_id_hex, Some(hex::encode(group.as_slice())));
-
-    // Dismissal retires what the notice showed, and only that.
-    assert!(
-        client
-            .dismiss_history_notice(&notices[0].notice_id)
-            .unwrap()
-    );
-    assert!(client.history_notices().unwrap().is_empty());
-    let parked = storage.parked_recovery_routes().unwrap();
-    assert_eq!(parked.len(), 1);
-    assert_eq!(parked[0].relays, vec![BEST_EFFORT.to_owned()]);
-
-    // Once the route drops its operated relay, the one it keeps is required,
-    // and the park left behind shows as a fresh notice.
-    for entry in &mut client.routing.write().group_routes {
-        if entry.group_id.as_slice() == group.as_slice() {
-            entry.endpoints.retain(|endpoint| endpoint.0 != OPERATED);
-        }
-    }
-    let route = client
-        .recovery_runner_routes()
-        .into_iter()
-        .find(|route| route.group_id.as_deref() == Some(group.as_slice()))
-        .unwrap();
-    assert_eq!(route.required, vec![BEST_EFFORT.to_owned()]);
-    let fresh = client.history_notices().unwrap();
-    assert_eq!(fresh.len(), 1);
-    assert_ne!(fresh[0].notice_id, notices[0].notice_id);
-    assert!(client.dismiss_history_notice(&fresh[0].notice_id).unwrap());
-    assert!(client.history_notices().unwrap().is_empty());
-    assert!(storage.parked_recovery_routes().unwrap().is_empty());
-}
-
-/// A newer park on a relay the route carries only as best effort is outside
-/// what a notice shows: it moves no notice's revision, so the remainder's
-/// notice keeps its id and stays dismissable, and dismissing it leaves that
-/// park as it is.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_hidden_park_moves_no_notice_revision_and_is_never_dismissed() {
-    const OPERATED: &str = "wss://operated.example";
-    const BEST_EFFORT: &str = "wss://best-effort.example";
-    let dir = tempfile::tempdir().unwrap();
-    crate::AccountHome::open(dir.path())
-        .create_account("alice")
-        .unwrap();
-    let app = MarmotApp::with_relays_and_config(
-        dir.path(),
-        vec![RELAY.into()],
-        crate::MarmotAppConfig::white_noise()
-            .with_open_ranking_provider(None, Vec::new())
-            .with_recovery_operated_relays(vec![OPERATED.into()]),
-    )
-    .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
-    let mut client = client_on_app_relay_plane(&app, "alice").await;
-    let group = client
-        .create_group_with_options(
-            "best effort",
-            &[],
-            crate::AppCreateGroupOptions {
-                relays: Some(vec![OPERATED.into(), BEST_EFFORT.into()]),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap()
-        .operation
-        .expect("eligible fixture members");
-    let route = client
-        .recovery_runner_routes()
-        .into_iter()
-        .find(|route| route.group_id.as_deref() == Some(group.as_slice()))
-        .unwrap()
-        .route;
-    let storage = app.account_storage("alice").unwrap().app_storage();
     let now = crate::unix_now_seconds();
     storage
         .widen_recovery_coverage_goals(
@@ -526,28 +147,33 @@ async fn a_hidden_park_moves_no_notice_revision_and_is_never_dismissed() {
         )
         .unwrap();
     storage
-        .prune_recovery_coverage(now - DAY, &[(route.clone(), vec![OPERATED.to_owned()])])
+        .prune_recovery_coverage(now - DAY, &[(route.clone(), vec![RELAY.to_owned()])])
         .unwrap();
-    catching_up(&client, &[]);
-    let notices = client.history_notices().unwrap();
-    assert_eq!(notices.len(), 1, "the remainder's notice");
+    assert_eq!(storage.recovery_coverage_remainders().unwrap().len(), 1);
+    park(&storage, &route);
+    park(&storage, &TransportReconciliationRoute::Inbox);
+    for surveyed in [&[][..], &[&route][..]] {
+        catching_up(&client, surveyed);
+        assert!(client.history_notices().unwrap().is_empty());
+        let status = client.group_recovery_status(&group).unwrap();
+        assert!(!status.history_may_be_incomplete && status.history_notice_ids.is_empty());
+        assert!(client.account_recovery_status().unwrap().notices.is_empty());
+    }
+    assert_eq!(client.take_history_notice_changes(), None);
+    assert!(need_changed(&app, "notice_shown").is_empty());
 
-    park_on(&storage, &route, BEST_EFFORT);
-    assert_eq!(
-        client.history_notices().unwrap(),
-        notices,
-        "the hidden park moves nothing"
-    );
-    assert!(
-        client
-            .dismiss_history_notice(&notices[0].notice_id)
-            .unwrap()
-    );
-    assert!(client.history_notices().unwrap().is_empty());
-    assert!(storage.recovery_coverage_remainders().unwrap().is_empty());
-    let parked = storage.parked_recovery_routes().unwrap();
-    assert_eq!(parked.len(), 1);
-    assert_eq!(parked[0].relays, vec![BEST_EFFORT.to_owned()]);
+    let revision = storage.parked_recovery_routes().unwrap()[0].revision;
+    let old = encode_notice_id(RecoveryDemandTicket {
+        id: ledger_route_tag(&route),
+        revision,
+    });
+    assert!(!client.dismiss_history_notice(&old).unwrap());
+    assert!(matches!(
+        storage.recovery_unit(&route, RELAY).unwrap().unwrap().state,
+        RecoveryUnitState::Broken(_)
+    ));
+    assert_eq!(storage.recovery_coverage_remainders().unwrap().len(), 1);
+    assert!(need_changed(&app, "notice_dismissed").is_empty());
 }
 
 /// The status reports the groups and inbox the runner's last survey found
@@ -556,7 +182,7 @@ async fn a_hidden_park_moves_no_notice_revision_and_is_never_dismissed() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_status_reports_what_the_runner_catches_up() {
     let dir = tempfile::tempdir().unwrap();
-    let (mut client, app, group, route) = fixture(&dir).await;
+    let (mut client, _, group, route) = fixture(&dir).await;
     assert_eq!(
         client.account_recovery_status().unwrap(),
         AccountRecoveryStatus::default(),
@@ -584,12 +210,7 @@ async fn the_status_reports_what_the_runner_catches_up() {
         "announced once"
     );
 
-    // A notice is a status change too.
-    park(&app, &TransportReconciliationRoute::Inbox);
-    let status = client.account_recovery_status().unwrap();
-    assert_eq!(status.notices, client.history_notices().unwrap());
-    assert_eq!(status.notices.len(), 1);
-    assert!(client.take_history_notice_changes().is_some());
+    // A notice change is a status change too.
     assert!(client.take_recovery_status_changed(true));
 
     catching_up(&client, &[]);
@@ -598,11 +219,12 @@ async fn the_status_reports_what_the_runner_catches_up() {
 }
 
 /// A conversion that changed the notices is announced once, then
-/// acknowledged: the account's parked loss becomes its routes' parks.
+/// acknowledged: the account's parked loss, a notice, becomes its routes'
+/// parks, which raise none.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_conversion_that_changed_the_notices_is_announced_once() {
     let dir = tempfile::tempdir().unwrap();
-    let (mut client, app, group, route) = fixture(&dir).await;
+    let (mut client, app, _, route) = fixture(&dir).await;
     client.take_history_notice_changes();
     park(&app, &route);
     // The old owner's parked account-wide queue loss, imported evidence and
@@ -622,8 +244,8 @@ async fn a_conversion_that_changed_the_notices_is_announced_once() {
     .unwrap();
     assert_eq!(
         client.take_history_notice_changes(),
-        Some(vec![group.clone()]),
-        "the route's park names its group; the old owner's account-wide loss names none"
+        Some(Vec::new()),
+        "the old owner's account-wide loss names no group"
     );
 
     // The old owner's parked loss above is what a build from before the
@@ -646,22 +268,15 @@ async fn a_conversion_that_changed_the_notices_is_announced_once() {
     let mut client = client_on_app_relay_plane(&owner, "alice").await;
     assert!(!app.recovery_conversion_pending().unwrap());
     assert!(app.recovery_conversion_notices_changed().unwrap());
-    let notices = client.history_notices().unwrap();
+    assert!(client.history_notices().unwrap().is_empty());
     assert!(
-        notices
+        app.parked_recovery_routes()
+            .unwrap()
             .iter()
-            .all(|notice| notice.cause == HistoryNoticeCause::UnprovenHistory)
-    );
-    assert!(
-        notices
-            .iter()
-            .any(|notice| notice.group_id_hex == Some(hex::encode(group.as_slice())))
+            .any(|parked| parked.route == route)
     );
 
-    assert_eq!(
-        client.take_history_notice_changes(),
-        Some(vec![group.clone()])
-    );
+    assert_eq!(client.take_history_notice_changes(), Some(Vec::new()));
     assert!(!app.recovery_conversion_notices_changed().unwrap());
     assert_eq!(client.take_history_notice_changes(), None);
 }

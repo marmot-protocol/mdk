@@ -910,8 +910,11 @@ account-wide ones (loss, incremental and explicit history) appear only in the li
 `MarmotAppRuntime::account_recovery_status(account_ref)` reads the account's recovery as one `AccountRecoveryStatus`:
 the groups whose history is still being fetched, whether the inbox's is, and every notice as `history_notices` lists
 them. Re-read it on `MarmotAppEvent::RecoveryStatusChanged`; the recovery runner supplies the catching-up fields.
-Current epoch-gap exhaustion emits `EpochGap`; coverage-ledger parks emit `HistoryNoticeCause::UnprovenHistory`
-without attributing the original reason history was owed. Other cause labels preserve compatibility.
+Current epoch-gap exhaustion emits `EpochGap`. Other cause labels preserve compatibility; keep exhaustive matches.
+`HistoryNoticeCause::UnprovenHistory` is no longer emitted: what the coverage ledger parks (a relay that refused or
+could not prove a route's history, or history the retention window passed before anything proved it) is no evidence
+that messages are missing, so it raises no notice. The recovery runner probes a broken relay quietly, an hour after it
+breaks and then on an interval doubling to a day.
 
 A rejoin emits one `HistoryNoticeCause::BeforeRejoin` per new copy of the group. A replacement Welcome (the copy's
 install epoch moved and its join epoch was reset) makes the recovery runner retire what the group's routes owed or

@@ -469,6 +469,8 @@ fn staging_trims_the_units_parked_spans() {
         max_attempts_per_hour: 720,
         max_event_bytes_per_hour: 256 << 20,
         recheck_after_cooldown_seconds: 3_600,
+        probe_base_seconds: 3_600,
+        probe_cap_seconds: 86_400,
     };
     app.widen_recovery_coverage_goals(
         std::slice::from_ref(&route),

@@ -708,8 +708,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   Never add a row per scheduler evaluation, per live ingest, or on the router path; the router only counts
   placements. Rows are best effort: an audit-only read that fails skips the row, never the recovery step. The
   account owner's native input goal uses cause `subscription_replay` in those existing rows, without loss
-  charges or history certificates. Ledger notices record `notice_shown` and
-  `notice_dismissed` with cause `unproven_history`, the route tag as the obligation id. `subscription_eose_repaired` remains historical decoding only. The publication seam drains the
+  charges or history certificates. The coverage ledger raises no notice (mdk#3308), so no `notice_shown` or
+  `notice_dismissed` row carries `unproven_history` any more. `subscription_eose_repaired` remains historical decoding only. The publication seam drains the
   adapter's queued subscription refusals (`take_subscription_refusals`) into one `subscription_refused` row. Scenario
   tests live in
   `src/client/audit_recovery/scenario_tests.rs`.
@@ -864,12 +864,15 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   judged: no covered window without a non-suspended route, each with a required relay. A verdict waits for a re-check
   only where `recheck::owed`, the survey's own predicate, owes one. Each survey publishes the required units still catching up
   (`RunnerHost::surveyed`) into `AppTransportRouting`'s catching-up watch: the only source of the account recovery
-  status, the worker's `RecoveryStatusChanged` cue, and the condition for a remainder's notice. Ledger notices
-  (`HistoryNoticeCause::UnprovenHistory`, ids from `ledger_route_tag` and the park revision) skip a suspended group's
-  routes (`RunnerRoute::suspended`) and a broken unit on a relay its route no longer requires. A notice's revision and
-  its dismissal (`dismiss_recovery_route_park_on`) cover exactly what it shows.
+  status and the worker's `RecoveryStatusChanged` cue. A broken unit, probing or not, is never catching up. The
+  coverage ledger raises no notice: neither a broken unit's park nor a route's remainder is evidence that messages
+  are missing (decided with Jeff, 2026-11-13; mdk#3308). Keep `HistoryNoticeCause::UnprovenHistory` for
+  compatibility, never emitted. A broken unit probes quietly instead: every debt turn first arms the probes whose
+  time passed (`arm_due_recovery_probes`, in each host's `debt_turn`), a failed probe re-parks under the same
+  revision on a doubling interval (`RUNNER_PROBE_BASE_SECS` to `RUNNER_PROBE_CAP_SECS`), and the survey's
+  `probe_due` wakes an idle runner for the next one. `ledger_route_tag` stays for the runner's audit rows.
   An Unrecoverable group's routes are suspended (`RunnerRoute.unrecoverable`, read from the engine's group record
-  each debt turn): never scheduled, charged, broken or noticed, left out of admission so what they staged is given
+  each debt turn): never scheduled, charged, broken or probed, left out of admission so what they staged is given
   back as an unlisted route's is. A
   retained route's ceiling (`retained_route_goal_until`) caps every debt and re-check read through
   `DebtTurn::owed_until`/`checked_until`; never store it. Route-gone retirement runs only in the runner's debt turn
@@ -990,9 +993,9 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   window. Repair tests live in `src/client/recovery_runner/repair/tests.rs`. See the README for the
   automatic-recovery and send-fairness limits.
 - A dismissed "history may be incomplete" notice is the one user-authorized ending for parked recovery debt
-  besides qualified completion, and never counts as coverage or a recovery success. A ledger notice retires its
-  route's parked spans (`dismiss_recovery_route_park_on`); a parked epoch-gap obligation retires through
-  `retire_parked_recovery_obligation`, its own outcome. Loss is ledger debt, so no dismissal releases the
+  besides qualified completion, and never counts as coverage or a recovery success. A parked epoch-gap obligation
+  retires through `retire_parked_recovery_obligation`, its own outcome; a dismissal of a ledger notice id an earlier
+  release showed returns `false` and retires nothing. Loss is ledger debt, so no dismissal releases the
   delivery-loss fence: the loss import does. Notice ids are opaque and must not be logged.
 - Keep an account's delivery route open when its relay notification consumer lags: charge the lag as notification
   loss with the REQ floors its SDK context reported at the lag (per route when known; record them through
