@@ -8,7 +8,7 @@ bash crates/marmot-uniffi/native-host-smoke.sh
 
 Run from the repository root on macOS or Linux with the repository's Rust toolchain, Swift with SwiftPM/XCTest, and the native build dependencies described in [building local bindings](README.md#building-local-bindings). This is a source-checkout test, not an XCFramework or Android release-artifact validator.
 
-The existing `ios-account-clippy` job in [CI](../../.github/workflows/ci.yml) runs this XCTest on macOS alongside the Swift subscription-cancellation smoke.
+The `marmotkit-native-host` job in [CI](../../.github/workflows/ci.yml) runs this XCTest on macOS, beside the job that runs the Swift subscription-cancellation smoke.
 
 The script builds the debug native library, binding generator, and relay example with `--features cli`, without test-policy timing overrides. It generates Swift from that library and stages a temporary SwiftPM package: `MarmotKit` contains `marmot_uniffi.swift`, the `marmot_uniffiFFI` system-library target contains the generated header and module map renamed to `module.modulemap`, and the test target imports `MarmotKit` and XCTest. Native link flags and the library search environment point at the matching debug library. Generated files stay out of the checkout.
 

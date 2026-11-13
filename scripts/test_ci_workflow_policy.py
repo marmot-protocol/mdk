@@ -320,6 +320,17 @@ class MergeGatePolicyTests(unittest.TestCase):
                                              "NEEDS": json.dumps(needs)})
                 self.assertEqual(result.returncode == 0, expected)
 
+    def test_required_ci_needs_every_gating_job(self):
+        # Required CI is the only required check, so a job missing from its
+        # needs can fail without blocking a merge.
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text()
+        jobs = set(re.findall(r"(?m)^  ([a-z0-9-]+):\n", workflow.split("\njobs:\n", 1)[1]))
+        required = workflow.split("\n  required-ci:\n", 1)[1].split("\n    runs-on:", 1)[0]
+        needs = re.findall(r"(?m)^      - ([a-z0-9-]+)$", required)
+        # The layout experiment runs only on request; the watcher must never fail a run.
+        self.assertEqual(sorted(needs),
+                         sorted(jobs - {"archive-layout-experiment", "merge-group-fail-fast", "required-ci"}))
+
     def test_full_runs_use_nextest_profiles_without_a_default_filter(self):
         # The merge queue is the only gate that runs every test to the end, so a
         # profile filter would silently drop coverage from master.

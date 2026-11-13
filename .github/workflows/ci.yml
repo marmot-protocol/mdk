@@ -475,8 +475,8 @@ jobs:
           retention-days: 7
           if-no-files-found: warn
 
-  # Pull requests run this only with the `ci:apple` or `ci:full` label; merge
-  # groups always run it, so it gates merging.
+  # Pull requests run this and marmotkit-native-host only with the `ci:apple`
+  # or `ci:full` label; merge groups always run them, so they gate merging.
   ios-account-clippy:
     name: iOS keychain and Swift cancellation
     needs: changes
@@ -484,7 +484,11 @@ jobs:
       needs.changes.outputs.run_ios == 'true'
       && (needs.changes.outputs.ci_mode != 'precheck' || needs.changes.outputs.apple_opt_in == 'true')
     runs-on: macos-latest
-    timeout-minutes: 30
+    # The cancellation smoke builds the shipped release profile (thin LTO, one
+    # codegen unit), which grows with marmot-app. Queue runs took 16-27
+    # minutes in November 2026, and pending marmot-app code adds about 3; this
+    # keeps half of that 30 again in reserve for a slow runner.
+    timeout-minutes: 45
 
     steps:
       - name: Check out repository
@@ -519,6 +523,39 @@ jobs:
 
       - name: Verify Swift subscription cancellation against native futures
         run: bash crates/marmot-uniffi/subscription-cancellation-smoke.sh
+
+  # The native-host smoke builds a debug library with dev-dependency features,
+  # so it shares no Cargo artifacts with the release build above. Its own job
+  # runs beside that one instead of after it. It restores no Rust cache: the
+  # cache budget is full, and this job finishes well before its sibling.
+  marmotkit-native-host:
+    name: MarmotKit native host lifecycle
+    needs: changes
+    if: >-
+      needs.changes.outputs.run_ios == 'true'
+      && (needs.changes.outputs.ci_mode != 'precheck' || needs.changes.outputs.apple_opt_in == 'true')
+    runs-on: macos-latest
+    # The smoke took 6-9 minutes as a step of ios-account-clippy.
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install pinned Odin
+        uses: ./.github/actions/setup-odin
+
+      - name: Install Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          toolchain="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
+          rustup toolchain install "$toolchain" --profile minimal
+          rustup default "$toolchain"
+          rustc --version
+          cargo --version
 
       - name: Verify native MarmotKit host lifecycle
         run: bash crates/marmot-uniffi/native-host-smoke.sh
@@ -1746,6 +1783,7 @@ jobs:
       - rust-clippy
       - c-smoke
       - ios-account-clippy
+      - marmotkit-native-host
       - convergence-policy-pin
       - rust-test-build
       - rust-test
