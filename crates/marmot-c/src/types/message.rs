@@ -71,6 +71,9 @@ c_mirror! {
         copy outcome: MarmotDiscardFailedSendOutcome,
         /// Ciphertext hashes of the discarded send's encrypted media.
         str_vec media_ciphertext_sha256/media_ciphertext_sha256_len,
+        /// True when secure WAL truncation remains pending; the next secure
+        /// delete in this group retries it.
+        copy erasure_pending: bool,
     }
 }
 

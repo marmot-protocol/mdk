@@ -1899,7 +1899,9 @@ pub(crate) fn discard_failed_send_tx(
     let Some(event) = event else {
         return Ok(None);
     };
-    let mut affected_message_ids = affected_timeline_message_ids_for_pruned_event_tx(
+    // Unlike a retention prune, discard reports a live update, so loaded
+    // replies quoting the send learn their preview changed.
+    let mut affected_message_ids = affected_timeline_message_ids_for_parts_tx(
         tx,
         group_id_hex,
         &event.message_id_hex,

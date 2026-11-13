@@ -3719,6 +3719,11 @@ typedef struct MarmotDiscardFailedSendResult {
    */
   char **media_ciphertext_sha256;
   uintptr_t media_ciphertext_sha256_len;
+  /**
+   * True when secure WAL truncation remains pending; the next secure
+   * delete in this group retries it.
+   */
+  bool erasure_pending;
 } MarmotDiscardFailedSendResult;
 
 /**

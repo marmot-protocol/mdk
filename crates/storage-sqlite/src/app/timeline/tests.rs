@@ -5102,7 +5102,7 @@ fn migration_backfill_matches_the_live_projection() {
 fn deleted_failed_send_migration_matches_the_live_projection() {
     let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
     let group = "11".repeat(32);
-    for id in ["quiet", "seen", "retracted", "kept"] {
+    for id in ["quiet", "seen", "retracted", "kept", "second"] {
         store.record_app_event(&own_send(id, 1)).unwrap();
         store
             .invalidate_app_event_by_message_id(&group, id, LOCAL_PUBLISH_FAILED_REASON)
@@ -5113,6 +5113,13 @@ fn deleted_failed_send_migration_matches_the_live_projection() {
             .record_app_event(&reaction(&format!("r_{target}"), "peer", target, 2, "+"))
             .unwrap();
     }
+    // A reaction applies to its first `e` tag only: naming "second" after
+    // another message confirms nothing.
+    let mut elsewhere = reaction("r_second", "peer", "elsewhere", 2, "+");
+    elsewhere
+        .tags
+        .push(vec![EVENT_REF_TAG.to_owned(), "second".to_owned()]);
+    store.record_app_event(&elsewhere).unwrap();
     store
         .record_app_event(&delete("d_reaction", "peer", "r_retracted", 3))
         .unwrap();
@@ -5124,7 +5131,7 @@ fn deleted_failed_send_migration_matches_the_live_projection() {
             [&group],
         )
         .unwrap();
-    for id in ["quiet", "seen", "retracted", "kept"] {
+    for id in ["quiet", "seen", "retracted", "kept", "second"] {
         store
             .record_app_event(&delete(&format!("d_{id}"), "me", id, 4))
             .unwrap();
@@ -5143,13 +5150,14 @@ fn deleted_failed_send_migration_matches_the_live_projection() {
     {
         // The pre-0204 shape: every deleted failed send has a row, unsettled.
         let conn = store.lock().unwrap();
-        for id in ["quiet", "retracted"] {
+        for id in ["quiet", "retracted", "second"] {
             conn.execute(
                 "INSERT INTO message_timeline (
                     group_id_hex, message_id_hex, source_message_id_hex, direction, sender,
                     plaintext, kind, tags_json, timeline_at, received_at, reactions_json,
                     deleted, invalidation_status
-                 ) VALUES (?1, ?2, NULL, 'sent', 'me', '', 9, '[]', 1, 1, '[]', 1, ?3)",
+                 ) SELECT ?1, ?2, NULL, 'sent', 'me', '', 9, '[]', 1, 1, reactions_json, 1, ?3
+                   FROM message_timeline WHERE group_id_hex = ?1 AND message_id_hex = 'kept'",
                 rusqlite::params![group, id, LOCAL_PUBLISH_FAILED_REASON],
             )
             .unwrap();
@@ -5436,4 +5444,50 @@ fn discard_drops_only_a_failed_send() {
             .unwrap()
     );
     assert!(discard("failed").is_none());
+}
+
+/// Discarding a send updates the loaded replies that quote it in the same
+/// projection update.
+#[test]
+fn discarding_a_send_updates_the_replies_that_quote_it() {
+    let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
+    let group = "11".repeat(32);
+    store.record_app_event(&own_send("mine", 1)).unwrap();
+    store
+        .invalidate_app_event_by_message_id(&group, "mine", LOCAL_PUBLISH_FAILED_REASON)
+        .unwrap();
+    store
+        .record_app_event(&StoredAppEvent {
+            direction: "sent".to_owned(),
+            ..reply("answer", "me", "mine", 2, "also")
+        })
+        .unwrap();
+    assert!(
+        store
+            .timeline_message(&group, "answer")
+            .unwrap()
+            .unwrap()
+            .reply_preview
+            .is_some()
+    );
+
+    let (_, update) = store
+        .discard_failed_send(&group, "mine", "me", &no_mentions)
+        .unwrap()
+        .expect("a failed send is discarded");
+    assert!(removed_as_cleared(&update, "mine"), "{:?}", update.changes);
+    assert_eq!(
+        trigger_for(&update, "answer"),
+        Some(TimelineUpdateTrigger::ReplyPreviewChanged)
+    );
+    let answer = update
+        .messages
+        .iter()
+        .find(|message| message.message_id_hex == "answer")
+        .expect("the quoting reply is in the update");
+    assert_eq!(
+        Some(answer),
+        store.timeline_message(&group, "answer").unwrap().as_ref(),
+        "the update carries the reply as it now reads"
+    );
 }

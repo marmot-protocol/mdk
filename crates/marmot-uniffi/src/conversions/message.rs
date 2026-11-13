@@ -104,6 +104,9 @@ pub struct DiscardFailedSendResultFfi {
     /// Ciphertext hashes of the discarded send's encrypted media, for purging
     /// a decrypted-media cache. Empty unless the send was discarded.
     pub media_ciphertext_sha256: Vec<String>,
+    /// True when the send was discarded but secure WAL truncation remains
+    /// pending. The next secure delete in this group retries it.
+    pub erasure_pending: bool,
 }
 
 impl From<DiscardFailedSendResult> for DiscardFailedSendResultFfi {
@@ -111,6 +114,7 @@ impl From<DiscardFailedSendResult> for DiscardFailedSendResultFfi {
         Self {
             outcome: value.outcome.into(),
             media_ciphertext_sha256: value.media_ciphertext_sha256,
+            erasure_pending: value.erasure_pending,
         }
     }
 }

@@ -5613,9 +5613,10 @@ impl AppClient {
     where
         F: FnMut(crate::AppProjectionUpdate),
     {
-        let result = |outcome, media_ciphertext_sha256| crate::DiscardFailedSendResult {
+        let unchanged = |outcome| crate::DiscardFailedSendResult {
             outcome,
-            media_ciphertext_sha256,
+            media_ciphertext_sha256: Vec::new(),
+            erasure_pending: false,
         };
         let group_id_hex = hex::encode(group_id.as_slice());
         let failed = self
@@ -5630,10 +5631,7 @@ impl AppClient {
                         == Some(crate::LOCAL_PUBLISH_FAILED_REASON)
             });
         if !failed {
-            return Ok(result(
-                crate::DiscardFailedSendOutcome::NotFailedSend,
-                Vec::new(),
-            ));
+            return Ok(unchanged(crate::DiscardFailedSendOutcome::NotFailedSend));
         }
         // A failed verdict is not always final: an intent the engine still
         // queues, or a fanout it still retries, can publish the message later
@@ -5642,24 +5640,22 @@ impl AppClient {
         if self.runtime.has_queued_outbound_intents(group_id)?
             || self.runtime.has_pending_outbound_fanouts(group_id)?
         {
-            return Ok(result(
-                crate::DiscardFailedSendOutcome::StillSending,
-                Vec::new(),
-            ));
+            return Ok(unchanged(crate::DiscardFailedSendOutcome::StillSending));
         }
         Ok(
             match self
                 .app
                 .discard_failed_send(&self.state.label, &group_id_hex, message_id_hex)?
             {
-                Some((media_ciphertext_sha256, update)) => {
+                Some((pruned, update)) => {
                     on_projection(update);
-                    result(
-                        crate::DiscardFailedSendOutcome::Discarded,
-                        media_ciphertext_sha256,
-                    )
+                    crate::DiscardFailedSendResult {
+                        outcome: crate::DiscardFailedSendOutcome::Discarded,
+                        media_ciphertext_sha256: pruned.media_ciphertext_sha256,
+                        erasure_pending: pruned.erasure_pending,
+                    }
                 }
-                None => result(crate::DiscardFailedSendOutcome::NotFailedSend, Vec::new()),
+                None => unchanged(crate::DiscardFailedSendOutcome::NotFailedSend),
             },
         )
     }

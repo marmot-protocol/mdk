@@ -8,8 +8,8 @@
 //! keeps its placeholder.
 //!
 //! - Deleted failed sends with a live peer reaction (not invalidated, not
-//!   retracted by its sender) or a kept receipt are settled as 0173 settles
-//!   undeleted ones.
+//!   retracted by its sender, first `e` tag on the send) or a kept receipt
+//!   are settled as 0173 settles undeleted ones.
 //! - The remaining deleted failed sends lose their timeline rows. `app_events`
 //!   keeps the source rows. The attachment and unread triggers follow the
 //!   delete, and the chat list notices the changed preview and rebuilds on open.
@@ -50,6 +50,20 @@ pub(super) fn settle_and_drop_deleted_failed_sends(tx: &rusqlite::Connection) ->
                      AND edge.kind = 7
                      AND reaction.invalidated = 0
                      AND reaction.sender != t.sender
+                     -- A reaction applies to its first `e` tag only; edges
+                     -- record every one.
+                     AND (
+                         SELECT json_extract(tag.value, '$[1]')
+                         FROM json_each(
+                             CASE WHEN json_valid(reaction.tags_json)
+                                   AND json_type(reaction.tags_json) = 'array'
+                                  THEN reaction.tags_json ELSE '[]' END
+                         ) AS tag
+                         WHERE tag.type = 'array'
+                           AND json_extract(tag.value, '$[0]') = 'e'
+                         ORDER BY CAST(tag.key AS INTEGER)
+                         LIMIT 1
+                     ) = t.message_id_hex
                      AND NOT EXISTS (
                          SELECT 1
                          FROM message_modifier_edges AS retraction

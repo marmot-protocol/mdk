@@ -1290,6 +1290,9 @@ pub struct DiscardFailedSendResult {
     /// Ciphertext hashes of the discarded send's encrypted media, for purging
     /// a host's decrypted-media cache. Empty unless the send was discarded.
     pub media_ciphertext_sha256: Vec<String>,
+    /// True when the send was discarded but secure WAL truncation remains
+    /// pending. The next secure delete in this group retries it.
+    pub erasure_pending: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -7781,7 +7784,7 @@ impl MarmotApp {
         label: &str,
         group_id_hex: &str,
         message_id_hex: &str,
-    ) -> Result<Option<(Vec<String>, AppProjectionUpdate)>, AppError> {
+    ) -> Result<Option<(SecurePruneAppEventsResult, AppProjectionUpdate)>, AppError> {
         let account = self.account_home().account(label)?;
         let classifier = Self::chat_list_mention_classifier(&account.account_id_hex);
         let discarded = self
@@ -7795,10 +7798,7 @@ impl MarmotApp {
             )?;
         discarded
             .map(|(outcome, update)| {
-                Ok((
-                    outcome.media_ciphertext_sha256,
-                    self.app_projection_update(&account.label, update)?,
-                ))
+                Ok((outcome, self.app_projection_update(&account.label, update)?))
             })
             .transpose()
     }
