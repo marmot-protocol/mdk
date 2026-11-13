@@ -18,6 +18,8 @@
 //! read as the sweep end that settles alike ([`verdict`]), so the outcome
 //! table stays `quantum::classify` alone.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use async_trait::async_trait;
 use cgka_traits::TransportDelivery;
 use cgka_traits::storage::StorageResult;
@@ -29,7 +31,8 @@ use storage_sqlite::{
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use transport_nostr_adapter::compare::{
-    CompareEnd, ComparePolicy, CompareRequest, CompareSink, LocalItem, run_comparison,
+    CompareEnd, ComparePolicy, CompareRelay, CompareReply, CompareRequest, CompareSink, IdsReply,
+    LocalItem, run_comparison,
 };
 use transport_nostr_adapter::sweep::{
     ClosedReason, RelayCaps, SweepEnd, SweepRange, SweepRoute, SweepSinkError, UnreachableKind,
@@ -215,6 +218,47 @@ fn verdict(end: CompareEnd, first_unproven: u64, sweeps_otherwise: bool) -> Swee
     }
 }
 
+/// The unit's relay, counting the events in every fetch it answers, for the
+/// audit: those the comparison then drops as not asked for count too.
+struct Counted<'a> {
+    relay: &'a dyn CompareRelay,
+    events: AtomicU64,
+}
+
+#[async_trait]
+impl CompareRelay for Counted<'_> {
+    fn caps(&self) -> RelayCaps {
+        self.relay.caps()
+    }
+
+    async fn compare(
+        &self,
+        route: SweepRoute,
+        window: SweepRange,
+        local: &[LocalItem],
+        limit: usize,
+    ) -> CompareReply {
+        self.relay.compare(route, window, local, limit).await
+    }
+
+    async fn fetch_ids(&self, route: SweepRoute, window: SweepRange, ids: &[EventId]) -> IdsReply {
+        let reply = self.relay.fetch_ids(route, window, ids).await;
+        if let IdsReply::Answered(events) = &reply {
+            self.events
+                .fetch_add(events.len() as u64, Ordering::Relaxed);
+        }
+        reply
+    }
+
+    fn take_fetched_bytes(&self) -> u64 {
+        self.relay.take_fetched_bytes()
+    }
+
+    fn interrupt(&self) -> bool {
+        self.relay.interrupt()
+    }
+}
+
 /// Stages each batch the comparison hands over in its own worker turn.
 struct CompareStage<'a, H> {
     host: &'a H,
@@ -223,9 +267,7 @@ struct CompareStage<'a, H> {
     covered: bool,
     newly_covered_seconds: u64,
     late: u64,
-    /// Events the relay returned, staged or not, and those newly staged, for
-    /// the audit.
-    fetched_events: u64,
+    /// Events newly staged, for the audit.
     staged_events: u64,
     /// Bytes charged to staged batches.
     staged_bytes: u64,
@@ -249,7 +291,6 @@ impl<H: RunnerHost> CompareSink for CompareStage<'_, H> {
             fetched_bytes
         };
         let found = !events.is_empty();
-        self.fetched_events = self.fetched_events.saturating_add(events.len() as u64);
         let Some(deliveries) = route_events(self.host, &self.plan.key.relay, events).await else {
             // Nothing was written: settlement charges these bytes instead.
             self.unstaged_bytes = self.unstaged_bytes.saturating_add(fetched_bytes);
@@ -397,6 +438,10 @@ pub(super) async fn run<H: RunnerHost>(
         report.end = SweepEnd::Unreachable(UnreachableKind::Disconnected);
         return (report, facts);
     };
+    let relay = Counted {
+        relay: &*relay,
+        events: AtomicU64::new(0),
+    };
     let route = plan.route;
     let sweeps_otherwise = plan.sweeps_otherwise();
     let limits = policy.compare();
@@ -408,7 +453,6 @@ pub(super) async fn run<H: RunnerHost>(
         covered: false,
         newly_covered_seconds: 0,
         late: 0,
-        fetched_events: 0,
         staged_events: 0,
         staged_bytes: 0,
         unstaged_bytes: 0,
@@ -434,7 +478,7 @@ pub(super) async fn run<H: RunnerHost>(
                     ..limits
                 },
             },
-            &*relay,
+            &relay,
             &mut sink,
             cancel,
         )
@@ -472,7 +516,7 @@ pub(super) async fn run<H: RunnerHost>(
         }
     }
     report.newly_covered_seconds = sink.newly_covered_seconds;
-    report.events_fetched = sink.fetched_events;
+    report.events_fetched = relay.events.into_inner();
     report.events_staged = sink.staged_events;
     report.stop = sink.stop;
     facts.late = sink.late;

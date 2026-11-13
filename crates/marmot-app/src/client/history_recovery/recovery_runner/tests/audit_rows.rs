@@ -320,6 +320,49 @@ async fn recovery_runner_audits_a_route_suspended_and_resumed() {
     );
 }
 
+/// A survey turn that fails after its closure wrote a suspension row, as
+/// when the host's fence read fails, writes it once: the next survey finds
+/// the route already recorded as suspended.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovery_runner_writes_a_suspension_once_when_its_survey_turn_fails() {
+    let account = account();
+    let clock = Clock::new();
+    let t0 = clock.now();
+    let route = group(1);
+    let relay = ModelRelay::new(RELAY, caps(500, false)).build();
+    let host = TestHost::new(
+        &account,
+        &clock,
+        vec![RunnerRoute {
+            unrecoverable: true,
+            ..grouped(&route, &[RELAY])
+        }],
+        &[&relay],
+    );
+    account.goal(&route, t0 - HOUR);
+    host.tails.stand(&route, RELAY, t0);
+    let (mut runner, _handle) = runner(&host, test_policy());
+
+    // The step's admission turn comes first; its survey turn fails.
+    host.fail_fence_read(1);
+    idle(runner.step().await);
+    assert_eq!(host.debt_turns(), 2);
+    clock.advance(DAY);
+    idle(runner.step().await);
+    let changes = host
+        .take_audited()
+        .into_iter()
+        .filter_map(|(group, kind)| match kind {
+            AuditEventKind::RecoveryRunnerChanged { change, .. } => Some((group, change)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        changes,
+        [(Some(GROUP_ID.to_vec()), RecoveryRunnerChange::Suspended)]
+    );
+}
+
 /// Raced begins are counted per route and written at most once per window;
 /// a route's next fetch row takes what its open window holds.
 #[test]
@@ -601,6 +644,47 @@ async fn recovery_runner_counts_events_staged_under_a_stale_mark() {
                     ..
                 }
             )] if *events_fetched == total && *events_staged == total
+        ),
+        "{rows:?}"
+    );
+}
+
+/// A capped answer the sweep asks again in halves, down to a second the
+/// relay cannot prove, still counts every event it returned, though none
+/// was staged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovery_runner_counts_events_in_answers_it_never_staged() {
+    let account = account();
+    let clock = Clock::new();
+    let t0 = clock.now();
+    let route = group(1);
+    let floor = t0 - HOUR;
+    let relay = stalling_relay([1; 32], floor).build();
+    let host = TestHost::new(&account, &clock, vec![grouped(&route, &[RELAY])], &[&relay]);
+    account.goal(&route, floor);
+    host.tails.stand(&route, RELAY, t0);
+    let (mut runner, _handle) = runner(&host, test_policy());
+
+    assert_eq!(ran(runner.step().await).outcome, Outcome::NoProgress);
+    // Every request over the stalled second came back capped at two events.
+    let returned = 2 * relay
+        .queries()
+        .iter()
+        .filter(|query| query.since <= floor && floor <= query.until)
+        .count() as u64;
+    assert!(returned > 0);
+    let rows = fetched(&host);
+    assert!(
+        matches!(
+            rows.as_slice(),
+            [(
+                _,
+                AuditEventKind::RecoveryRunnerFetched {
+                    events_fetched,
+                    events_staged: 0,
+                    ..
+                }
+            )] if *events_fetched == returned
         ),
         "{rows:?}"
     );

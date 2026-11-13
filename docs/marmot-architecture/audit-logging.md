@@ -1352,7 +1352,7 @@ One debt or re-check quantum on one (route, relay) unit, written in its settle t
 | `requests` / `answers` | Requests sent and answers the relay gave. |
 | `newly_covered_secs` | Seconds this quantum newly covered on the unit's own relay: the runner's measure of progress. |
 | `proved_secs` | Seconds in the slices or windows it proved, newly or not. |
-| `events_fetched` | Events the relay returned. |
+| `events_fetched` | Events in the relay answers the runner read (answered slices, proved seconds, fetches by id), whether or not they were then staged; a capped answer the sweep asks again in halves counts too. A second the relay cannot prove hands over no events, so what it read there shows only in the account's charged bytes. |
 | `events_staged` | Of those, events newly staged for admission (not already held or staged). Admission into the engine is the ingest rows'. |
 | `late_findings` | Events a re-check found inside history already covered. Zero for debt. |
 | `raced` | Begins on this route abandoned as raced since its previous runner row (see `recovery_runner_raced`). |

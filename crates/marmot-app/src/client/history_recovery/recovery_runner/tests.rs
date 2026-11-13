@@ -1007,6 +1007,9 @@ struct TestHost {
     /// Debt turns to let through, then debt turns whose preparation fails
     /// against `closed` before their closure runs.
     failing_preparations: Mutex<(usize, usize)>,
+    /// Debt turns to let through, then one that fails after its closure
+    /// succeeds.
+    failing_fence: Mutex<Option<usize>>,
     closed: OnceLock<Account>,
     /// The relay pool's connection generations, by relay.
     connections: watch::Sender<BTreeMap<String, u64>>,
@@ -1086,6 +1089,7 @@ impl TestHost {
             caps_unknown: AtomicBool::new(false),
             failing_turns: AtomicUsize::new(0),
             failing_preparations: Mutex::default(),
+            failing_fence: Mutex::default(),
             closed: OnceLock::new(),
             connections: watch::channel(BTreeMap::new()).0,
             audited: Mutex::default(),
@@ -1165,6 +1169,17 @@ impl TestHost {
         });
         *self.failing_preparations.lock().unwrap() = (skip, turns);
     }
+
+    /// After `skip` debt turns, the next fails after its closure succeeds,
+    /// as the account host's does when its fence read fails.
+    fn fail_fence_read(&self, skip: usize) {
+        self.closed.get_or_init(|| {
+            let closed = account();
+            closed._storage.close().unwrap();
+            closed
+        });
+        *self.failing_fence.lock().unwrap() = Some(skip);
+    }
 }
 
 #[async_trait]
@@ -1238,6 +1253,26 @@ impl RunnerHost for TestHost {
             audit: &audit,
             audits: true,
         });
+        let fence_fails = {
+            let mut failing = self.failing_fence.lock().unwrap();
+            match &mut *failing {
+                Some(0) => failing.take().is_some(),
+                Some(skip) => {
+                    *skip -= 1;
+                    false
+                }
+                None => false,
+            }
+        };
+        let answer = match answer {
+            Ok(_) if fence_fails => {
+                let closed = &self.closed.get().expect("a closed database").app;
+                Err(closed
+                    .arm_due_recovery_probes(now)
+                    .expect_err("a closed database fails"))
+            }
+            answer => answer,
+        };
         self.debt_turns.fetch_add(1, Ordering::SeqCst);
         self.clock
             .advance(self.debt_turn_seconds.load(Ordering::SeqCst));

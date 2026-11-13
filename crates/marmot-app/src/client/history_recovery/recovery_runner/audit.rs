@@ -385,14 +385,15 @@ pub(crate) fn remainders_changed(
     }
 }
 
-/// Record the routes whose suspension changed since `before`: each newly
-/// suspended route, and each route still current that is no longer. Returns
-/// the suspended routes now. Before the first survey `before` is `None`, so
-/// a process records every route it finds suspended once.
+/// Record the routes whose suspension changed since `last`: each newly
+/// suspended route, and each route still current that is no longer; then
+/// make `last` the suspended routes now. Before the first survey `last` is
+/// `None`, so a process records every route it finds suspended once.
 pub(super) fn suspensions(
     turn: &DebtTurn<'_>,
-    before: Option<&BTreeSet<TransportReconciliationRoute>>,
-) -> BTreeSet<TransportReconciliationRoute> {
+    last: &mut Option<BTreeSet<TransportReconciliationRoute>>,
+) {
+    let before = last.as_ref();
     let mut now = BTreeSet::new();
     for route in turn.routes {
         let was = before.is_some_and(|before| before.contains(&route.route));
@@ -411,7 +412,7 @@ pub(super) fn suspensions(
             now.insert(route.route.clone());
         }
     }
-    now
+    *last = Some(now);
 }
 
 /// Begins abandoned as raced, coalesced per route: a race counts into its

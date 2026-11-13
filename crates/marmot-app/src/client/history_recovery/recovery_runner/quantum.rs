@@ -94,8 +94,11 @@ pub(super) struct QuantumReport {
     /// Seconds and events in the slices it proved: the route's rate.
     pub(super) proved_seconds: u64,
     pub(super) proved_events: u64,
-    /// Events the relay returned, and those of them newly staged (not seen
-    /// or staged before), for the audit.
+    /// Events in the relay's answers the runner read (answered slices,
+    /// proved seconds, fetched ids), whatever became of them; and those of
+    /// them newly staged (not seen or staged before). For the audit. A second
+    /// the relay could not prove hands over no events, so its reads count
+    /// only in the bytes charged.
     pub(super) events_fetched: u64,
     pub(super) events_staged: u64,
     /// The slice width and observed cap it ended with.
@@ -137,6 +140,9 @@ impl SweepCursorStore for PlannedCursor {
 struct Meter {
     /// Event bytes read that no staged slice has charged yet.
     bytes: AtomicU64,
+    /// Events in the answers read, for the audit: a capped answer the sweep
+    /// asks again in halves counts too.
+    events: AtomicU64,
     /// The last reply was a `rate-limited:` CLOSED.
     rate_limited: AtomicBool,
     /// The sweep cut the request in flight: what it returns is no answer.
@@ -155,6 +161,9 @@ impl Metered<'_> {
     fn read(&self, kept: &[Event], rate_limited: bool) {
         let bytes = self.relay.take_fetched_bytes().max(event_bytes(kept));
         self.meter.bytes.fetch_add(bytes, Ordering::Relaxed);
+        self.meter
+            .events
+            .fetch_add(kept.len() as u64, Ordering::Relaxed);
         if !self.meter.interrupted.load(Ordering::Relaxed) {
             self.meter
                 .rate_limited
@@ -215,8 +224,6 @@ struct StageSink<'a, H> {
     plan: &'a SweepPlan,
     meter: &'a Meter,
     newly_covered_seconds: u64,
-    /// Events the relay returned, staged or not, for the audit.
-    fetched_events: u64,
     staged_events: u64,
     stop: Option<SinkStop>,
 }
@@ -233,7 +240,6 @@ impl<H: RunnerHost> SweepSink for StageSink<'_, H> {
         } else {
             self.meter.bytes.swap(0, Ordering::Relaxed)
         };
-        self.fetched_events = self.fetched_events.saturating_add(events.len() as u64);
         let Some(deliveries) = route_events(self.host, &self.plan.key.relay, events).await else {
             // Nothing was written: settlement charges these bytes instead.
             self.meter.bytes.fetch_add(fetched_bytes, Ordering::Relaxed);
@@ -378,7 +384,6 @@ pub(super) async fn run<H: RunnerHost>(
         plan,
         meter: &meter,
         newly_covered_seconds: 0,
-        fetched_events: 0,
         staged_events: 0,
         stop: None,
     };
@@ -424,7 +429,7 @@ pub(super) async fn run<H: RunnerHost>(
         .bytes
         .fetch_add(relay.relay.take_fetched_bytes(), Ordering::Relaxed);
     report.newly_covered_seconds = sink.newly_covered_seconds;
-    report.events_fetched = sink.fetched_events;
+    report.events_fetched = meter.events.load(Ordering::Relaxed);
     report.events_staged = sink.staged_events;
     report.stop = sink.stop;
     report.rate_limited = meter.rate_limited.into_inner();

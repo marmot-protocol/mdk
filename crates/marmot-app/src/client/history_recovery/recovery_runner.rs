@@ -188,7 +188,10 @@ pub(crate) struct DebtTurn<'a> {
     pub(crate) tails: &'a dyn LiveTailRead,
     /// The open live REQs' counts, for the fence.
     pub(crate) live_counts: &'a [LiveCount],
-    /// As [`WorkerTurn::audit`].
+    /// As [`WorkerTurn::audit`]. The host may still fail the turn after its
+    /// closure returns (its fence read), and the runner then runs it again,
+    /// so a row is written where what it records is committed or stored,
+    /// never left for the runner to store once the turn answers.
     pub(crate) audit: audit::AuditHook<'a>,
     /// Whether the recorder keeps v5 rows, so a fetch's row is worth the
     /// reads that describe it.
@@ -575,8 +578,10 @@ pub(crate) struct RecoveryRunner<H> {
     /// turn, so a turn whose preparation fails leaves them for the retry.
     unwritten_races: Arc<Mutex<Vec<AuditRow>>>,
     /// The routes the last survey found suspended, for the audit; `None`
-    /// before the first.
-    suspended: Option<BTreeSet<TransportReconciliationRoute>>,
+    /// before the first. The survey updates it inside its turn, where it
+    /// writes the rows for the change, so a turn that fails after them
+    /// writes none of them again.
+    suspended: Arc<Mutex<Option<BTreeSet<TransportReconciliationRoute>>>>,
 }
 
 impl<H: RunnerHost> RecoveryRunner<H> {
@@ -618,7 +623,7 @@ impl<H: RunnerHost> RecoveryRunner<H> {
             open: OpenAttempts::default(),
             races: audit::Races::default(),
             unwritten_races: Arc::default(),
-            suspended: None,
+            suspended: Arc::default(),
         };
         let handle = RecoveryRunnerHandle {
             wake,
@@ -758,26 +763,31 @@ impl<H: RunnerHost> RecoveryRunner<H> {
             Err(step) => return step,
         };
         let policy = self.policy;
-        let suspended = self.suspended.clone();
+        let suspended = Arc::clone(&self.suspended);
         let races = Arc::clone(&self.unwritten_races);
         let (mut survey, epoch_gap_due) = match self
             .debt_turn(pass, move |turn| {
+                // Each row is written where what it records is: whatever
+                // fails later in the turn, none of them is written again.
                 let races =
                     std::mem::take(&mut *races.lock().unwrap_or_else(PoisonError::into_inner));
                 for (group, row) in races {
                     (turn.audit)(group.as_deref(), row);
                 }
+                audit::suspensions(
+                    turn,
+                    &mut suspended.lock().unwrap_or_else(PoisonError::into_inner),
+                );
                 let due = epoch_gap::advance(turn, &policy, &stalled)?.next_due;
                 let survey = select::survey(turn, &policy, &stalled)?;
-                Ok((survey, due, audit::suspensions(turn, suspended.as_ref())))
+                Ok((survey, due))
             })
             .await
         {
             None => return Step::Stopped,
-            Some(Ok((survey, due, suspended))) => {
+            Some(Ok(surveyed)) => {
                 self.survey_failures = 0;
-                self.suspended = Some(suspended);
-                (survey, due)
+                surveyed
             }
             Some(Err(error)) => {
                 self.survey_failures = self.survey_failures.saturating_add(1);
