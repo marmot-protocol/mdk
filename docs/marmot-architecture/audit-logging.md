@@ -1342,7 +1342,7 @@ One debt or re-check quantum on one (route, relay) unit, written in its settle t
 | `best_effort` | The relay is best effort for the route: one uncharged attempt per new debt. |
 | `fetch` | `sweep` (sliced `REQ`s) or `compare` (NIP-77, fetching the difference by id). |
 | `purpose` | Most specific first: `recheck` (late input on covered history), `repair` (explicit full-history repair), `post_join_collection` (a joined copy's history), `epoch_gap_visit` (a return visit an unresolved epoch gap authorized), `fenced` (debt of a group whose live frames a capture fence holds), `debt` (anything else: loss, cold start, a widened goal). |
-| `probe` | The quantum is a broken unit's one probe, earned by new loss over its park. |
+| `probe` | The quantum is a broken unit's probe: timed, or earned by new loss over its park. |
 | `ranges` | Owed ranges the begin turn planned. |
 | `owed_secs` | Seconds those ranges hold: what the unit owed after its live tail as the quantum began (for a re-check, what it still checks). |
 | `owed_since_secs` / `owed_until_secs` | The first and last planned second: the debt window. |
@@ -1383,14 +1383,14 @@ A unit or route changed state. Transition-driven: each appears once per change.
 | `repair_rearmed` | An explicit repair re-armed every broken and retired unit. | `units` |
 | `retired_gone` | A route no longer carries some relays, or ended: their units' debt and parks retired as route gone. | route, `units` |
 | `reopened` | Relays the routes carry again owe their whole goal again. | `units` |
-| `suspended` | The route's group copy is Unrecoverable: its units are no longer scheduled, charged, broken or noticed while its debt accrues. Each process records every suspended route it finds once. | route |
+| `suspended` | The route's group copy is Unrecoverable: its units are no longer scheduled, charged or broken while its debt accrues. Each process records every suspended route it finds once. | route |
 | `resumed` | A suspended route is scheduled again. | route |
-| `remainder_parked` | The retention floor overtook debt nothing had proved yet: the route gained a parked remainder, which only a dismissal clears. | route, `park_revision`, `remainder_since_secs`, `remainder_until_secs` |
+| `remainder_parked` | The retention floor overtook debt nothing had proved yet: the route gained a parked remainder, which only a rejoin or the route ending clears. | route, `park_revision`, `remainder_since_secs`, `remainder_until_secs` |
 | `remainder_widened` | A later prune widened the route's remainder. | as `remainder_parked` |
 
 "Route" is `route_kind` with `obligation_ref`; `units` counts the units changed and is at least one. The account-wide
-pause stays [`recovery_runner_paused`](#recovery_runner_paused-v5-only); the notice's own shown and dismissed rows stay
-`recovery_need_changed`.
+pause stays [`recovery_runner_paused`](#recovery_runner_paused-v5-only); notice rows stay `recovery_need_changed`, and
+the coverage ledger no longer raises any.
 
 ### `auto_commit_decision`
 

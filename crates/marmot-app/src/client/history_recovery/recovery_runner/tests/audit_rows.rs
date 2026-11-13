@@ -144,8 +144,9 @@ async fn recovery_runner_audits_a_fetch_its_relay_never_answered() {
 }
 
 /// A unit that answers without progress until its budget runs out writes
-/// its six quanta and one break, with the park its notice shows. The broken
-/// unit then waits silently.
+/// its six quanta and one break, with its park's revision. The broken unit
+/// then writes nothing until its timed probe, which writes one probe fetch
+/// and one failed probe under the same park.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn recovery_runner_audits_a_unit_breaking_and_parking() {
     let account = account();
@@ -225,11 +226,49 @@ async fn recovery_runner_audits_a_unit_breaking_and_parking() {
         )]
     );
 
-    clock.advance(DAY);
-    assert_eq!(idle(runner.step().await), None);
+    let probe_at = idle(runner.step().await).expect("a broken unit waits for its timed probe");
     assert!(
         host.take_audited().is_empty(),
-        "a parked unit writes nothing"
+        "a parked unit writes nothing until its probe is due"
+    );
+
+    clock.advance_to(probe_at);
+    assert_eq!(ran(runner.step().await).outcome, Outcome::NoProgress);
+    let rows = host.take_audited();
+    let probes = rows
+        .iter()
+        .filter(|(_, kind)| {
+            matches!(
+                kind,
+                AuditEventKind::RecoveryRunnerFetched {
+                    probe: true,
+                    outcome: RecoveryRunnerOutcome::NoProgress,
+                    ..
+                }
+            )
+        })
+        .count();
+    assert_eq!(probes, 1, "the due probe is one fetch row");
+    let changes = rows
+        .iter()
+        .filter_map(|(_, kind)| match kind {
+            AuditEventKind::RecoveryRunnerChanged {
+                change,
+                break_reason,
+                park_revision,
+                ..
+            } => Some((*change, *break_reason, *park_revision)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        changes,
+        [(
+            RecoveryRunnerChange::ProbeFailed,
+            Some(RecoveryRunnerBreak::NoProgress),
+            Some(park.revision),
+        )],
+        "a failed probe stays under the same park"
     );
 }
 

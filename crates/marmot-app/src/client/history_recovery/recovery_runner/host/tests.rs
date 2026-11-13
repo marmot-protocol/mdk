@@ -1515,17 +1515,20 @@ async fn a_runner_turn_records_into_the_accounts_audit() {
 
 /// The debt turn's retention prune records the remainder it parks into the
 /// account's own v5 recorder, once: a later prune under the same floor
-/// changes nothing and writes nothing.
+/// changes nothing and writes nothing. The inbox relay never answers, so no
+/// live subscription covers the window before the prune does.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_retention_prune_records_the_remainder_it_parks() {
-    let relay = MockRelay::run().await.unwrap();
+    let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let relay_url = format!("ws://{}", silent.local_addr().unwrap());
+    drop(silent);
     let dir = tempfile::tempdir().unwrap();
     crate::AccountHome::open(dir.path())
         .create_account("alice")
         .unwrap();
     let app = crate::MarmotApp::with_relay_and_config(
         dir.path(),
-        relay.url().await.to_string(),
+        relay_url,
         crate::MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
     );
     app.set_audit_log_settings(crate::AuditLogSettings { enabled: true })

@@ -404,12 +404,12 @@ pub enum RecoveryRunnerFetchEnd {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RecoveryRunnerChange {
-    /// An active or retired unit broke: its remaining debt is parked behind
-    /// the "history may be incomplete" notice and it is not retried until
-    /// new evidence re-arms it.
+    /// An active or retired unit broke: its remaining debt is parked, and it
+    /// is retried only by its timed probe or when new evidence re-arms it.
     Broken,
-    /// A broken unit's one probe (earned by new loss over its park) made no
-    /// progress or was refused: the unit stays parked under the same park.
+    /// A broken unit's probe (timed, or earned by new loss over its park)
+    /// made no progress or was refused: the unit stays parked under the same
+    /// park and waits longer for its next timed probe.
     ProbeFailed,
     /// A broken unit is active again: a quantum (often its probe) made
     /// progress or found nothing owed.
@@ -1078,8 +1078,8 @@ mod tests {
     }
 
     /// Each runner kind writes a schema-valid, strictly decodable v5 row that
-    /// hashes its relay and route tag, and the route tag joins the route's
-    /// `unproven_history` notice.
+    /// hashes its relay and route tag, and the route tag joins the
+    /// `unproven_history` notice row an older producer wrote for the route.
     #[test]
     fn recovery_runner_rows_hash_their_route_and_relay_and_join_the_notice() {
         let raced = AuditEventKind::RecoveryRunnerRaced {

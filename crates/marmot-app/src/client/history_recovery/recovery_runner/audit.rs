@@ -4,8 +4,8 @@
 //! Rows are written through the turn's audit hook ([`super::WorkerTurn`],
 //! [`super::DebtTurn`]), never awaited, and the recorder drops them unless it
 //! records v5. They carry the group (hashed to `group_ref`), the route's
-//! one-way ledger tag (hashed to `obligation_ref`, the reference
-//! `unproven_history` notice rows carried), the relay (hashed to `endpoint_ref`),
+//! one-way ledger tag (hashed to `obligation_ref`, the reference older
+//! producers' `unproven_history` notice rows carried), the relay (hashed to `endpoint_ref`),
 //! closed enums and counts. Volume follows real work: one row per quantum
 //! that began, one per unit or route transition, and abandoned begins
 //! coalesced per route ([`Races`]). Surveys and catching-up flips write none.
@@ -40,8 +40,8 @@ pub(super) fn route_kind(route: &TransportReconciliationRoute) -> RecoveryRunner
     }
 }
 
-/// The route's one-way ledger tag, as `unproven_history` notice rows carried
-/// it.
+/// The route's one-way ledger tag, as older producers' `unproven_history`
+/// notice rows carried it.
 pub(super) fn route_tag(route: &TransportReconciliationRoute) -> String {
     hex::encode(ledger_route_tag(route))
 }
@@ -259,7 +259,7 @@ fn visiting_epoch_gap(app: &SqliteAppStorage, route: &RunnerRoute) -> bool {
     })
 }
 
-/// Whether the unit, as the begin turn read it, holds its one probe.
+/// Whether the unit, as the begin turn read it, holds a probe.
 pub(super) fn probing(unit: Option<&RecoveryUnit>) -> bool {
     unit.is_some_and(|unit| matches!(unit.state, RecoveryUnitState::Broken(_)) && unit.probe)
 }

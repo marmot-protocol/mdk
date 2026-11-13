@@ -1471,9 +1471,9 @@ pub enum AuditEventKind {
     /// per quantum that began, never per survey. A group route's row carries
     /// the group's `group_ref`; the inbox's is account-scoped.
     ///
-    /// `obligation_id` is the route's one-way ledger tag (hex), the one its
-    /// `unproven_history` notice carries, so v5's `obligation_ref` joins the
-    /// two; `retained_route` marks a group's retained prior route. `relay_url`
+    /// `obligation_id` is the route's one-way ledger tag (hex), the one an
+    /// older producer's `unproven_history` notice carried, so v5's
+    /// `obligation_ref` joins them; `retained_route` marks a group's retained prior route. `relay_url`
     /// is the unit's relay (v5 `endpoint_ref`). `owed_since_secs` and
     /// `owed_until_secs` bound the `ranges` the begin turn planned, which owe
     /// `owed_secs` seconds after the live tail. `raced` counts the route's
