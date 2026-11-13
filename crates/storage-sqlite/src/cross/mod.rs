@@ -4,6 +4,7 @@
 //! The crossings still to move are listed in `allow-list.txt`; see `README.md`.
 
 pub(crate) mod authority;
+pub(crate) mod group_writes;
 pub(crate) mod groups;
 pub(crate) mod handles;
 pub(crate) mod media_cleanup;

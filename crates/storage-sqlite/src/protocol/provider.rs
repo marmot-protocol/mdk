@@ -4,7 +4,8 @@ use crate::base::connection::CachedSql;
 use crate::protocol::openmls_storage::SqliteOpenMlsStorage;
 use crate::{SqliteAccountStorage, SqliteResultExt};
 use cgka_traits::storage::{
-    KeyPackageBundleStorage, StorageError, StorageProvider, StorageResult, StoredKeyPackageBundle,
+    KeyPackageBundleStorage, MlsStorageError, StorageError, StorageProvider, StorageResult,
+    StoredKeyPackageBundle,
 };
 use cgka_traits::types::Backend;
 
@@ -13,6 +14,10 @@ impl StorageProvider for SqliteAccountStorage {
 
     fn mls_storage(&self) -> &Self::Mls {
         &self.openmls
+    }
+
+    fn mls_storage_failure(&self, error: &MlsStorageError<Self>) -> Option<StorageError> {
+        error.storage_failure()
     }
 
     fn pending_ref_high_water(&self) -> StorageResult<u64> {
@@ -37,6 +42,14 @@ impl StorageProvider for SqliteAccountStorage {
             .ok()?;
         let own = self.connection.openmls_write_generation() & 0xffff_ffff;
         Some(((data_version as u64) << 32) | own)
+    }
+
+    fn group_write_generation(
+        &self,
+        group_id: &cgka_traits::types::GroupId,
+    ) -> Option<cgka_traits::storage::GroupWriteGeneration> {
+        // A closed store answers nothing, so nothing cached from it holds.
+        (!self.connection.is_closed()).then(|| self.group_writes.generation(group_id))
     }
 
     fn with_read_snapshot<T, E, F>(&self, f: F) -> Result<T, E>

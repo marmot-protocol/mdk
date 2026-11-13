@@ -6,7 +6,7 @@ use std::path::Path;
 #[cfg(any(target_os = "android", test))]
 use std::sync::Once;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::thread::ThreadId;
 use std::time::Duration;
 use zeroize::Zeroizing;
@@ -144,6 +144,84 @@ fn sqlite_error_kind(error: &rusqlite::Error) -> &'static str {
 /// lifetime.
 pub struct ConnectionGuard<'a> {
     guard: MutexGuard<'a, Option<rusqlite::Connection>>,
+    hooks: &'a OnceLock<ConnectionHooks>,
+}
+
+/// What a connection runs on the side of its work; see
+/// [`CloseableConnection::set_hooks`]. Each runs with the connection still
+/// held and must not lock it.
+pub(crate) struct ConnectionHooks {
+    /// Each time a guard releases the connection.
+    pub(crate) release: Box<dyn Fn(&rusqlite::Connection) + Send + Sync>,
+    /// For each [`HooklessMove`] the connection makes, before any check on
+    /// another connection can see it: just before a truncate, just after a
+    /// `VACUUM` (with the guard still held), and in a drop before the
+    /// connection is marked released.
+    pub(crate) hookless_move: Box<dyn Fn(HooklessMove) + Send + Sync>,
+}
+
+/// A change of the database file that moves every other connection's
+/// `PRAGMA data_version` without SQLite calling the commit hook. Only this
+/// module makes one, and it notes each ([`ConnectionHooks::hookless_move`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HooklessMove {
+    /// A `wal_checkpoint(TRUNCATE)`: it rewrites the WAL header even when the
+    /// WAL is empty, changing no row. A close runs one too.
+    WalTruncate,
+    /// A `VACUUM`: it commits its copy of the database below the commit hook.
+    /// Noted after the copy (see [`ConnectionGuard::vacuum`]).
+    Vacuum,
+    /// The rollback of a transaction a dropped connection left open, which
+    /// fires no rollback hook (rusqlite removes hooks before closing). If the
+    /// transaction spilled into a fully checkpointed WAL, it reset the WAL
+    /// header. Noted once the last handle is gone, before the connection is
+    /// marked released: until then its registration stays alive
+    /// ([`WeakSharedConnection::is_alive`]), and a check another connection
+    /// runs waits for a later read. Only a failed `ROLLBACK` leaves a
+    /// transaction open for a drop.
+    Rollback,
+}
+
+impl Drop for ConnectionGuard<'_> {
+    fn drop(&mut self) {
+        if let (Some(hooks), Some(connection)) = (self.hooks.get(), self.guard.as_ref()) {
+            (hooks.release)(connection);
+        }
+    }
+}
+
+impl ConnectionGuard<'_> {
+    /// `PRAGMA wal_checkpoint(TRUNCATE)`, and its row: (busy, frames in the
+    /// WAL, frames checkpointed). The one way this crate truncates the WAL
+    /// outside a close (`only_the_connection_truncates_or_vacuums`).
+    pub(crate) fn checkpoint_truncate(&self) -> rusqlite::Result<(i64, i64, i64)> {
+        self.note(HooklessMove::WalTruncate);
+        checkpoint_truncate(self)
+    }
+
+    /// `VACUUM`. The one way this crate vacuums.
+    ///
+    /// Noted once it returns, failed or not: the note moves every group, and
+    /// a reader that sampled the moved count while the copy was still running
+    /// would cache rows the copy then renumbers. The guard is still held, so
+    /// no check on another connection concludes in between.
+    pub(crate) fn vacuum(&self) -> rusqlite::Result<()> {
+        let vacuumed = self.execute_batch("VACUUM");
+        self.note(HooklessMove::Vacuum);
+        vacuumed
+    }
+
+    fn note(&self, change: HooklessMove) {
+        if let Some(hooks) = self.hooks.get() {
+            (hooks.hookless_move)(change);
+        }
+    }
+}
+
+fn checkpoint_truncate(connection: &rusqlite::Connection) -> rusqlite::Result<(i64, i64, i64)> {
+    connection.query_row_cached("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+    })
 }
 
 impl Deref for ConnectionGuard<'_> {
@@ -181,7 +259,6 @@ impl DerefMut for ConnectionGuard<'_> {
 /// the [`SqliteAccountStorage`] aggregate (the app's shared cache and directory
 /// caches), so the checkpoint-then-close ordering and the closed-state contract
 /// live in one place.
-#[derive(Debug)]
 pub struct CloseableConnection {
     slot: Mutex<Option<rusqlite::Connection>>,
     /// Published before [`Self::close`] waits for the connection mutex. New
@@ -196,6 +273,16 @@ pub struct CloseableConnection {
     /// Detail carried by the [`StorageError::Closed`] this connection raises,
     /// naming which database is closed.
     closed_detail: &'static str,
+    hooks: OnceLock<ConnectionHooks>,
+}
+
+impl fmt::Debug for CloseableConnection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CloseableConnection")
+            .field("closed", &self.closed)
+            .field("closed_detail", &self.closed_detail)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Default)]
@@ -244,7 +331,42 @@ impl CloseableConnection {
             closed: AtomicBool::new(false),
             released: Arc::default(),
             closed_detail,
+            hooks: OnceLock::new(),
         }
+    }
+
+    /// Run `hooks.release` with the connection still held each time a guard
+    /// on it is released, on the releasing thread, and `hooks.hookless_move`
+    /// before each [`HooklessMove`] it makes, its close's checkpoint
+    /// included. Set once; a second set is refused. The hooks must not lock
+    /// this connection.
+    pub(crate) fn set_hooks(&self, hooks: ConnectionHooks) -> StorageResult<()> {
+        self.hooks
+            .set(hooks)
+            .map_err(|_| StorageError::Backend("connection hooks already set".into()))
+    }
+
+    /// Borrow the connection if no thread holds it right now, without
+    /// waiting: `Ok(None)` when one does. Unlike [`Self::lock`] it also
+    /// borrows a connection whose close has begun but not taken it yet: a
+    /// guard taken before the close began may still be committing through
+    /// it, so a caller that must see every commit's release waits for that
+    /// guard instead of skipping the connection. Fails with
+    /// [`StorageError::Closed`] once the close has taken the connection,
+    /// which it does only after every guard on it was released.
+    pub(crate) fn try_lock_until_taken(&self) -> StorageResult<Option<ConnectionGuard<'_>>> {
+        let guard = match self.slot.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+        };
+        if guard.is_none() {
+            return Err(StorageError::Closed(self.closed_detail.to_string()));
+        }
+        Ok(Some(ConnectionGuard {
+            guard,
+            hooks: &self.hooks,
+        }))
     }
 
     /// Borrow the connection, or fail with [`StorageError::Closed`] if it has
@@ -263,7 +385,10 @@ impl CloseableConnection {
         if self.is_closed() || guard.is_none() {
             return Err(StorageError::Closed(self.closed_detail.to_string()));
         }
-        Ok(ConnectionGuard { guard })
+        Ok(ConnectionGuard {
+            guard,
+            hooks: &self.hooks,
+        })
     }
 
     /// Whether [`Self::close`] has started. Nonblocking.
@@ -297,7 +422,7 @@ impl CloseableConnection {
         let Some(connection) = slot.take() else {
             return Ok(());
         };
-        let result = Self::close_taken(connection);
+        let result = Self::close_taken(connection, self.hooks.get());
         self.released.mark();
         result
     }
@@ -311,12 +436,20 @@ impl CloseableConnection {
         self.closed.store(true, Ordering::Release);
     }
 
-    fn close_taken(connection: rusqlite::Connection) -> StorageResult<()> {
+    fn close_taken(
+        connection: rusqlite::Connection,
+        hooks: Option<&ConnectionHooks>,
+    ) -> StorageResult<()> {
         // TRUNCATE folds the WAL back into the main database and resets the
         // file to zero length, so the next open starts from a clean sidecar
-        // rather than replaying this session's log. It is a no-op error on
-        // rollback-journal databases, which is why the failure is not fatal.
-        if let Err(error) = connection.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);") {
+        // rather than replaying this session's log. A failure is not fatal.
+        // Noted first: it moves every other connection's `data_version`, and
+        // so may the rollback of a transaction the close finds open, which
+        // fires no rollback hook (rusqlite removes hooks before closing).
+        if let Some(hooks) = hooks {
+            (hooks.hookless_move)(HooklessMove::WalTruncate);
+        }
+        if let Err(error) = checkpoint_truncate(&connection) {
             tracing::debug!(
                 target: "storage_sqlite::base::connection",
                 method = "close",
@@ -385,6 +518,56 @@ impl SharedConnection {
     /// See [`SharedConnectionInner::serial`].
     pub(crate) fn serial(&self) -> u64 {
         self.inner.serial
+    }
+
+    /// See [`CloseableConnection::set_hooks`].
+    pub(crate) fn set_hooks(&self, hooks: ConnectionHooks) -> StorageResult<()> {
+        self.inner.connection.set_hooks(hooks)
+    }
+
+    /// [`CloseableConnection::try_lock_until_taken`]: the connection if no
+    /// thread holds it right now, even while it is closing. Unlike
+    /// [`Self::lock`] it ignores the transaction slot, so a transaction
+    /// another thread owns may be open on what it returns.
+    pub(crate) fn try_lock_idle(&self) -> StorageResult<Option<ConnectionGuard<'_>>> {
+        self.inner.connection.try_lock_until_taken()
+    }
+
+    /// A reference that does not keep the connection open.
+    pub(crate) fn downgrade(&self) -> WeakSharedConnection {
+        WeakSharedConnection {
+            inner: Arc::downgrade(&self.inner),
+            released: Arc::clone(&self.inner.connection.released),
+        }
+    }
+}
+
+/// A [`SharedConnection`] that does not keep it open.
+#[derive(Clone)]
+pub(crate) struct WeakSharedConnection {
+    inner: std::sync::Weak<SharedConnectionInner>,
+    released: Arc<ConnectionRelease>,
+}
+
+impl WeakSharedConnection {
+    /// `None` once the last handle is gone, even while its drop is still
+    /// closing the connection (see [`Self::is_alive`]).
+    pub(crate) fn upgrade(&self) -> Option<SharedConnection> {
+        self.inner.upgrade().map(|inner| SharedConnection { inner })
+    }
+
+    /// The connection is still open: true until a close, or the drop of its
+    /// last handle, has closed it. A drop runs its [`HooklessMove`] note
+    /// first, so a connection that is no longer alive has nothing left to
+    /// note.
+    pub(crate) fn is_alive(&self) -> bool {
+        !self.released.is_marked()
+    }
+
+    /// Some handle still holds the connection.
+    #[cfg(test)]
+    pub(crate) fn has_handles(&self) -> bool {
+        self.inner.strong_count() > 0
     }
 }
 
@@ -1544,14 +1727,21 @@ impl CloseableConnection {
 
 impl Drop for CloseableConnection {
     fn drop(&mut self) {
+        let connection = self
+            .slot
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let (Some(hooks), Some(connection)) = (self.hooks.get(), connection.as_ref())
+            && !connection.is_autocommit()
+        {
+            (hooks.hookless_move)(HooklessMove::Rollback);
+        }
         // Close before marking, so a closer that is waiting returns only once
-        // the database file is closed.
-        drop(
-            self.slot
-                .get_mut()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .take(),
-        );
+        // the database file is closed, and a registration
+        // ([`WeakSharedConnection::is_alive`]) reads as gone only after the
+        // note above.
+        drop(connection);
         self.released.mark();
     }
 }

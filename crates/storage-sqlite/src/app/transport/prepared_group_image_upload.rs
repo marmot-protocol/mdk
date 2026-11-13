@@ -83,6 +83,49 @@ impl fmt::Debug for PreparedGroupImageUploadRecord {
     }
 }
 
+impl PreparedGroupImageUploadRecord {
+    /// The record's status fields.
+    pub fn status(&self) -> PreparedGroupImageUploadStatus {
+        PreparedGroupImageUploadStatus {
+            upload_id: self.upload_id.clone(),
+            state: self.state,
+            group_id_hex: self.group_id_hex.clone(),
+            attempt_count: self.attempt_count,
+            last_error_kind: self.last_error_kind.clone(),
+            recorded_at: self.recorded_at,
+            updated_at: self.updated_at,
+        }
+    }
+}
+
+/// A prepared upload's status fields: the record without its image
+/// component, ciphertext and upload secret, so a status read loads none of
+/// them.
+#[derive(Clone, PartialEq, Eq)]
+pub struct PreparedGroupImageUploadStatus {
+    pub upload_id: String,
+    pub state: PreparedGroupImageUploadState,
+    pub group_id_hex: Option<String>,
+    pub attempt_count: u32,
+    pub last_error_kind: Option<String>,
+    pub recorded_at: u64,
+    pub updated_at: u64,
+}
+
+impl fmt::Debug for PreparedGroupImageUploadStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PreparedGroupImageUploadStatus")
+            .field("upload_id", &self.upload_id)
+            .field("state", &self.state)
+            .field("has_group_id", &self.group_id_hex.is_some())
+            .field("attempt_count", &self.attempt_count)
+            .field("last_error_kind", &self.last_error_kind)
+            .field("recorded_at", &self.recorded_at)
+            .field("updated_at", &self.updated_at)
+            .finish()
+    }
+}
+
 impl SqliteAppStorage {
     pub fn stage_prepared_group_image_upload(
         &self,
@@ -185,24 +228,50 @@ impl SqliteAppStorage {
         .transpose()
     }
 
-    pub fn list_prepared_group_image_uploads(
+    /// Every prepared upload's status, oldest first. It reads no image
+    /// component, ciphertext or upload secret.
+    pub fn list_prepared_group_image_upload_statuses(
         &self,
-    ) -> StorageResult<Vec<PreparedGroupImageUploadRecord>> {
+    ) -> StorageResult<Vec<PreparedGroupImageUploadStatus>> {
         let conn = self.lock()?;
         let mut statement = conn
             .prepare_cached(
-                "SELECT upload_id, state, component_data, encrypted_blob, upload_secret,
-                        group_id_hex, attempt_count, last_error_kind, recorded_at, updated_at, member_outcomes_json
+                "SELECT upload_id, state, group_id_hex, attempt_count, last_error_kind,
+                        recorded_at, updated_at
                  FROM app_prepared_group_image_upload
                  ORDER BY recorded_at, upload_id",
             )
             .storage()?;
         let rows = statement
-            .query_map([], prepared_group_image_upload_from_row)
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, i64>(6)?,
+                ))
+            })
             .storage()?
             .collect::<Result<Vec<_>, _>>()
             .storage()?;
-        rows.into_iter().map(try_from_raw_record).collect()
+        rows.into_iter()
+            .map(
+                |(upload_id, state, group_id_hex, attempts, last_error_kind, recorded, updated)| {
+                    Ok(PreparedGroupImageUploadStatus {
+                        upload_id,
+                        state: PreparedGroupImageUploadState::from_storage(&state)?,
+                        group_id_hex,
+                        attempt_count: attempt_count_from_storage(attempts)?,
+                        last_error_kind,
+                        recorded_at: i64_to_u64(recorded)?,
+                        updated_at: i64_to_u64(updated)?,
+                    })
+                },
+            )
+            .collect()
     }
 
     pub fn mark_prepared_group_image_upload_uploaded(
@@ -360,6 +429,11 @@ fn prepared_group_image_upload_from_row(
     ))
 }
 
+fn attempt_count_from_storage(value: i64) -> StorageResult<u32> {
+    u32::try_from(value)
+        .map_err(|_| StorageError::Serialization("invalid group image upload attempt count".into()))
+}
+
 fn try_from_raw_record(
     raw: RawPreparedGroupImageUpload,
 ) -> StorageResult<PreparedGroupImageUploadRecord> {
@@ -371,9 +445,7 @@ fn try_from_raw_record(
         upload_secret: raw.4,
         group_id_hex: raw.5,
         member_outcomes_json: raw.10,
-        attempt_count: u32::try_from(raw.6).map_err(|_| {
-            StorageError::Serialization("invalid group image upload attempt count".into())
-        })?,
+        attempt_count: attempt_count_from_storage(raw.6)?,
         last_error_kind: raw.7,
         recorded_at: i64_to_u64(raw.8)?,
         updated_at: i64_to_u64(raw.9)?,
@@ -576,7 +648,7 @@ mod tests {
         assert_eq!(
             store
                 .app_storage()
-                .list_prepared_group_image_uploads()
+                .list_prepared_group_image_upload_statuses()
                 .unwrap()
                 .len(),
             1
@@ -611,7 +683,7 @@ mod tests {
         }
         let rows = store
             .app_storage()
-            .list_prepared_group_image_uploads()
+            .list_prepared_group_image_upload_statuses()
             .unwrap();
         assert_eq!(rows.len(), MAX_CONSUMED_PREPARED_GROUP_IMAGE_UPLOADS);
         assert!(rows.iter().all(|row| row.upload_id != "upload-0000"));
@@ -704,6 +776,31 @@ mod tests {
                 other => panic!("{name}: expected a refusal, got {other:?}"),
             }
         }
-        assert!(app.list_prepared_group_image_uploads().unwrap().is_empty());
+        assert!(
+            app.list_prepared_group_image_upload_statuses()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// The status list answers each upload's status fields as its record
+    /// holds them, oldest first, without the image, ciphertext or secret.
+    #[test]
+    fn the_status_list_answers_each_records_status_oldest_first() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let app = store.app_storage();
+        app.stage_prepared_group_image_upload(&staged_record_with("upload-b".into(), 20))
+            .unwrap();
+        app.stage_prepared_group_image_upload(&staged_record_with("upload-a".into(), 10))
+            .unwrap();
+        app.mark_prepared_group_image_upload_failed("upload-b", "blob_store", 21)
+            .unwrap();
+        let records = ["upload-a", "upload-b"]
+            .map(|upload_id| app.prepared_group_image_upload(upload_id).unwrap().unwrap());
+        assert_eq!(records[1].last_error_kind.as_deref(), Some("blob_store"));
+        assert_eq!(
+            app.list_prepared_group_image_upload_statuses().unwrap(),
+            records.map(|record| record.status()).to_vec()
+        );
     }
 }

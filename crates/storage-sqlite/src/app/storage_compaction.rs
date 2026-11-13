@@ -21,6 +21,7 @@
 use cgka_traits::storage::{StorageError, StorageResult};
 use rusqlite::Connection;
 
+use crate::base::connection::ConnectionGuard;
 use crate::{SqliteAppStorage, SqliteResultExt};
 
 /// `PRAGMA auto_vacuum` value for incremental mode.
@@ -110,8 +111,9 @@ impl SqliteAppStorage {
     /// step 6 have: no auto-vacuum. Test support only.
     #[cfg(any(test, feature = "test-support"))]
     pub fn make_non_incremental_for_test(&self) -> StorageResult<()> {
-        self.lock()?
-            .execute_batch("PRAGMA auto_vacuum=NONE; VACUUM;")
+        let conn = self.lock()?;
+        conn.execute_batch("PRAGMA auto_vacuum=NONE;")
+            .and_then(|()| conn.vacuum())
             .storage()
     }
 
@@ -144,7 +146,8 @@ impl SqliteAppStorage {
         conn.progress_handler(CLOSE_POLL_OPS, Some(closing))
             .storage()?;
         let vacuumed = conn
-            .execute_batch("PRAGMA auto_vacuum=INCREMENTAL; VACUUM;")
+            .execute_batch("PRAGMA auto_vacuum=INCREMENTAL;")
+            .and_then(|()| conn.vacuum())
             .storage();
         conn.progress_handler(CLOSE_POLL_OPS, None::<fn() -> bool>)
             .storage()?;
@@ -199,7 +202,7 @@ impl SqliteAppStorage {
     /// [`truncate_wal_in`] on the locked connection, recording the result
     /// before the lock is released.
     /// A failed attempt leaves the truncate owed, as a blocked one does.
-    fn truncate_wal_locked(&self, conn: &Connection) -> StorageResult<bool> {
+    fn truncate_wal_locked(&self, conn: &ConnectionGuard<'_>) -> StorageResult<bool> {
         let truncated = truncate_wal_in(conn);
         self.connection
             .record_wal_truncate(matches!(truncated, Ok(true)));
@@ -235,15 +238,14 @@ impl SqliteAppStorage {
 /// `wal_checkpoint(TRUNCATE)` without waiting on the busy handler: a reader
 /// holding an older snapshot on another connection makes it report busy
 /// (its first column), not fail. `true` when it truncated.
-fn truncate_wal_in(conn: &Connection) -> StorageResult<bool> {
+fn truncate_wal_in(conn: &ConnectionGuard<'_>) -> StorageResult<bool> {
     let wait: i64 = conn
         .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
         .storage()?;
     conn.busy_timeout(std::time::Duration::ZERO).storage()?;
     let checkpoint = conn
-        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
-            row.get::<_, i64>(0)
-        })
+        .checkpoint_truncate()
+        .map(|(busy, _, _)| busy)
         .storage();
     let restored = conn
         .busy_timeout(std::time::Duration::from_millis(

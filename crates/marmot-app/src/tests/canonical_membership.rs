@@ -788,6 +788,7 @@ async fn sibling_selfremove_through_author_command(profile_command: bool) {
         let key = sibling_app
             .sqlcipher_key("bob", &keys, &path, SqlcipherDatabaseKind::Session)
             .unwrap();
+        storage_sqlite::expect_uncounted_writes_for_test(&path);
         let connection = rusqlite::Connection::open(path).unwrap();
         storage_sqlite::open_hardened_sqlcipher(
             &connection,
@@ -850,6 +851,7 @@ async fn sibling_selfremove_through_author_command(profile_command: bool) {
     let key = reopened
         .sqlcipher_key("bob", &keys, &path, SqlcipherDatabaseKind::Session)
         .unwrap();
+    storage_sqlite::expect_uncounted_writes_for_test(&path);
     let connection = rusqlite::Connection::open(path).unwrap();
     storage_sqlite::open_hardened_sqlcipher(
         &connection,
@@ -1278,6 +1280,7 @@ async fn partial_native_projection_retries_without_republishing() {
         let key = app
             .sqlcipher_key("alice", &keys, &path, SqlcipherDatabaseKind::Session)
             .unwrap();
+        storage_sqlite::expect_uncounted_writes_for_test(&path);
         let connection = rusqlite::Connection::open(path).unwrap();
         storage_sqlite::open_hardened_sqlcipher(
             &connection,
@@ -1511,6 +1514,7 @@ async fn committed_activity_tail_retries_after_storage_failure() {
     let key = app
         .sqlcipher_key("alice", &keys, &path, SqlcipherDatabaseKind::Session)
         .unwrap();
+    storage_sqlite::expect_uncounted_writes_for_test(&path);
     let connection = rusqlite::Connection::open(path).unwrap();
     storage_sqlite::open_hardened_sqlcipher(
         &connection,
@@ -1631,6 +1635,7 @@ async fn failed_push_sweep_does_not_block_other_groups_or_routes() {
     let key = app
         .sqlcipher_key("alice", &keys, &path, SqlcipherDatabaseKind::Session)
         .unwrap();
+    storage_sqlite::expect_uncounted_writes_for_test(&path);
     let connection = rusqlite::Connection::open(path).unwrap();
     storage_sqlite::open_hardened_sqlcipher(
         &connection,
@@ -1725,6 +1730,7 @@ async fn assert_managed_worker_retains_activity(late_checkpoint: bool) {
     let key = app
         .sqlcipher_key("alice", &keys, &path, crate::SqlcipherDatabaseKind::Session)
         .unwrap();
+    storage_sqlite::expect_uncounted_writes_for_test(&path);
     let connection = rusqlite::Connection::open(path).unwrap();
     storage_sqlite::open_hardened_sqlcipher(
         &connection,

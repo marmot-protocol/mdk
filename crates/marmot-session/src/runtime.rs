@@ -891,6 +891,26 @@ where
         Ok(self.session.app_components(group_id, component_ids)?)
     }
 
+    /// Every application-owned component the group holds, in id order: what
+    /// [`Self::app_component`] answers for each app-owned id, from one load
+    /// (mdk#3273).
+    pub fn app_owned_components(
+        &self,
+        group_id: &GroupId,
+    ) -> AccountResult<Vec<(AppComponentId, Vec<u8>)>> {
+        Ok(self.session.app_owned_components(group_id)?)
+    }
+
+    /// Where each group's published answers stand, in order (mdk#3273). The
+    /// account-wide maintenance pause, which [`Self::maintenance_status`]
+    /// projects, is not in it: read [`Self::maintenance_is_paused`].
+    pub fn group_change_generations<'a>(
+        &self,
+        group_ids: impl IntoIterator<Item = &'a GroupId>,
+    ) -> Vec<cgka_engine::change_generation::GroupChangeGeneration> {
+        self.session.group_change_generations(group_ids)
+    }
+
     pub fn safe_export_secret(
         &mut self,
         group_id: &GroupId,
@@ -1815,6 +1835,14 @@ where
         Ok(self.session.durably_owned_key_packages()?)
     }
 
+    /// [`Self::durably_owned_key_packages`] with how long the list holds while
+    /// nothing writes (mdk#3273).
+    pub fn durably_owned_key_packages_with_validity(
+        &self,
+    ) -> AccountResult<cgka_engine::key_package::OwnedKeyPackages> {
+        Ok(self.session.durably_owned_key_packages_with_validity()?)
+    }
+
     /// Whether account activation owes a generator-policy upgrade. A pending
     /// replacement owns the work until ACK; its revision prevents regenerating
     /// on every retry while the acknowledged current revision is still old.
@@ -2193,6 +2221,16 @@ where
     }
 
     pub fn maintenance_status(&self, group_id: &GroupId) -> AccountResult<GroupMaintenanceStatus> {
+        self.maintenance_status_in(group_id, None)
+    }
+
+    /// [`Self::maintenance_status`], taking the account-wide rows from
+    /// `rows` when given instead of loading them for this one group.
+    pub fn maintenance_status_in(
+        &self,
+        group_id: &GroupId,
+        rows: Option<&GroupMaintenanceRows>,
+    ) -> AccountResult<GroupMaintenanceStatus> {
         let mut obligations = self.session.maintenance_obligations_for_group(group_id)?;
         if self.maintenance_paused {
             // Pause is intentionally process-local. Project it in status
@@ -2211,12 +2249,15 @@ where
             state: self.session.group_maintenance(group_id)?,
             obligations,
             evolutions: self.session.group_evolutions_for_group(group_id)?,
-            fanouts: self
-                .session
-                .transport_fanouts()?
-                .into_iter()
-                .filter(|fanout| fanout.group_id.as_ref() == Some(group_id))
-                .collect(),
+            fanouts: match rows {
+                Some(rows) => rows.fanouts(group_id).to_vec(),
+                None => self
+                    .session
+                    .transport_fanouts()?
+                    .into_iter()
+                    .filter(|fanout| fanout.group_id.as_ref() == Some(group_id))
+                    .collect(),
+            },
             paused: self.maintenance_paused,
         })
     }
@@ -3953,7 +3994,34 @@ where
         &self,
         group_id: &GroupId,
     ) -> AccountResult<Option<UndeliveredCommit>> {
+        Ok(self.undelivered_commit_until(group_id)?.0)
+    }
+
+    /// The wall-clock time this runtime's time-dependent answers, such as
+    /// [`Self::undelivered_commit_until`], are computed against.
+    pub fn wall_clock_now(&self) -> Timestamp {
+        self.wall_clock.now()
+    }
+
+    /// [`Self::undelivered_commit`], and the wall-clock window its answer
+    /// holds in without a write (mdk#3273): from the clock reading it was
+    /// computed at until a legacy self-update fanout's bound passes.
+    pub fn undelivered_commit_until(
+        &self,
+        group_id: &GroupId,
+    ) -> AccountResult<(Option<UndeliveredCommit>, WallClockWindow)> {
+        self.undelivered_commit_until_in(group_id, None)
+    }
+
+    /// [`Self::undelivered_commit_until`], taking the account-wide rows from
+    /// `rows` when given instead of loading them for this one group.
+    pub fn undelivered_commit_until_in(
+        &self,
+        group_id: &GroupId,
+        rows: Option<&GroupMaintenanceRows>,
+    ) -> AccountResult<(Option<UndeliveredCommit>, WallClockWindow)> {
         let mut oldest: Option<UndeliveredCommit> = None;
+        let mut changes_at: Option<Timestamp> = None;
         let mut consider = |commit: UndeliveredCommit| {
             if oldest
                 .as_ref()
@@ -4004,23 +4072,29 @@ where
         }
         // Self-updates staged before the frozen-fanout migration.
         let now = self.wall_clock.now();
-        // The ungated list: the group-scoped lookup fails for a stored group
+        // The ungated lists: the group-scoped lookup fails for a stored group
         // the engine has not hydrated yet, which has nothing owed to report.
-        let confirmed_evolutions = self
-            .session
-            .group_evolutions()?
-            .into_iter()
-            .filter(|evolution| {
-                &evolution.group_id == group_id && evolution.phase == GroupEvolutionPhase::Confirmed
-            })
-            .map(|evolution| evolution.id)
-            .collect::<HashSet<_>>();
-        for fanout in self.session.transport_fanouts()? {
+        let loaded;
+        let rows = match rows {
+            Some(rows) => rows,
+            None => {
+                loaded = self.group_maintenance_rows()?;
+                &loaded
+            }
+        };
+        let none_confirmed = HashSet::new();
+        let confirmed_evolutions = rows
+            .confirmed_evolutions
+            .get(group_id)
+            .unwrap_or(&none_confirmed);
+        for fanout in rows.fanouts(group_id) {
             let Some(evolution_id) = fanout.evolution_id.as_ref() else {
                 continue;
             };
-            if fanout.group_id.as_ref() != Some(group_id)
-                || fanout.bounded_until.is_some_and(|until| until <= now)
+            if let Some(until) = fanout.bounded_until.filter(|until| *until > now) {
+                changes_at = Some(changes_at.map_or(until, |earliest| earliest.min(until)));
+            }
+            if fanout.bounded_until.is_some_and(|until| until <= now)
                 || !(fanout.evolution_confirmed || confirmed_evolutions.contains(evolution_id))
                 || self.commit_withdrawn(&fanout.id)?
             {
@@ -4054,7 +4128,40 @@ where
                 });
             }
         }
-        Ok(oldest)
+        Ok((
+            oldest,
+            WallClockWindow {
+                from: now,
+                until: changes_at,
+            },
+        ))
+    }
+
+    /// The account-wide rows [`Self::maintenance_status_in`] and
+    /// [`Self::undelivered_commit_until_in`] filter by group, loaded once: a
+    /// caller answering for many groups scans the account once rather than
+    /// once per group (mdk#3273).
+    pub fn group_maintenance_rows(&self) -> AccountResult<GroupMaintenanceRows> {
+        let mut rows = GroupMaintenanceRows::default();
+        let mut names_an_evolution = false;
+        for fanout in self.session.transport_fanouts()? {
+            names_an_evolution |= fanout.evolution_id.is_some();
+            if let Some(group_id) = fanout.group_id.clone() {
+                rows.fanouts.entry(group_id).or_default().push(fanout);
+            }
+        }
+        // Only a fanout naming an evolution consults the confirmed ones.
+        if names_an_evolution {
+            for evolution in self.session.group_evolutions()? {
+                if evolution.phase == GroupEvolutionPhase::Confirmed {
+                    rows.confirmed_evolutions
+                        .entry(evolution.group_id)
+                        .or_default()
+                        .insert(evolution.id);
+                }
+            }
+        }
+        Ok(rows)
     }
 
     /// Whether convergence withdrew this own commit from the selected branch:
@@ -7362,6 +7469,48 @@ pub struct AccountIngestEffects {
     /// Carried verbatim from the session's ingest effects.
     pub left_object_unpersisted: bool,
     pub effects: AccountDeviceEffects,
+}
+
+/// The account's transport fanouts and confirmed group evolutions, by group.
+/// See [`AccountDeviceRuntime::group_maintenance_rows`].
+#[derive(Debug, Default)]
+pub struct GroupMaintenanceRows {
+    /// Each group's fanouts, in storage order.
+    fanouts: HashMap<GroupId, Vec<DurableTransportFanout>>,
+    confirmed_evolutions: HashMap<GroupId, HashSet<cgka_traits::MessageId>>,
+}
+
+impl GroupMaintenanceRows {
+    fn fanouts(&self, group_id: &GroupId) -> &[DurableTransportFanout] {
+        self.fanouts.get(group_id).map_or(&[], Vec::as_slice)
+    }
+}
+
+/// The wall-clock span over which a time-dependent answer holds without a
+/// write (mdk#3273): from the clock reading it was computed at, until the
+/// first later bound that changes it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WallClockWindow {
+    /// The clock reading the answer was computed at. A clock moved back
+    /// before it can bring an expired bound back into force.
+    pub from: Timestamp,
+    /// When a bound passes and the answer can change; `None` when only a
+    /// write can change it.
+    pub until: Option<Timestamp>,
+}
+
+impl WallClockWindow {
+    /// The window of an answer that depends on no clock reading.
+    pub const ALWAYS: Self = Self {
+        from: Timestamp(0),
+        until: None,
+    };
+
+    /// Whether an answer computed in this window still holds at `now`.
+    #[must_use]
+    pub fn contains(&self, now: Timestamp) -> bool {
+        self.from <= now && self.until.is_none_or(|until| now < until)
+    }
 }
 
 /// A confirmed commit that some of its group relays have not accepted yet

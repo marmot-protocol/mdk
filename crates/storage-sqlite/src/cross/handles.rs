@@ -14,7 +14,9 @@ use std::sync::{
 static NOTIFICATION_REVISIONS: LazyLock<Mutex<HashMap<PathBuf, Weak<AtomicU64>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-fn database_revision(conn: &Connection) -> StorageResult<Arc<AtomicU64>> {
+/// The canonical path of `conn`'s main database, which every connection to
+/// that file in this process shares; `None` for an in-memory database.
+pub(crate) fn database_file(conn: &Connection) -> StorageResult<Option<PathBuf>> {
     let path = match conn.path() {
         Some(path) => Cow::Borrowed(Path::new(path)),
         None => {
@@ -40,11 +42,17 @@ fn database_revision(conn: &Connection) -> StorageResult<Arc<AtomicU64>> {
         }
     };
     if path.as_os_str().is_empty() {
-        return Ok(Arc::new(AtomicU64::new(0)));
+        return Ok(None);
     }
-    let path = path.canonicalize().map_err(|error| {
-        StorageError::Backend(format!("notification database identity: {error}"))
-    })?;
+    path.canonicalize()
+        .map(Some)
+        .map_err(|error| StorageError::Backend(format!("database identity: {error}")))
+}
+
+fn database_revision(conn: &Connection) -> StorageResult<Arc<AtomicU64>> {
+    let Some(path) = database_file(conn)? else {
+        return Ok(Arc::new(AtomicU64::new(0)));
+    };
     let mut revisions = NOTIFICATION_REVISIONS
         .lock()
         .unwrap_or_else(|error| error.into_inner());

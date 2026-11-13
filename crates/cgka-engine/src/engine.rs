@@ -4372,6 +4372,22 @@ impl<S: StorageProvider> Engine<S> {
         self.with_mls_group(group_id, f)
     }
 
+    /// Every application-owned component the group's GroupContext holds, in
+    /// id order, behind the same liveness gate as
+    /// [`CgkaEngine::app_component`]: one load answers what that read
+    /// answers for every app-owned id, so a published read state can hold
+    /// them all (mdk#3273).
+    pub fn app_owned_components(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<Vec<(AppComponentId, Vec<u8>)>, EngineError> {
+        self.with_live_mls_group(group_id, |mls_group| {
+            Ok(crate::app_components::app_owned_component_entries_of_group(
+                mls_group,
+            ))
+        })
+    }
+
     /// Which roster slot the leaf at `leaf_index` belongs to, read from its
     /// device tag against `roster`, the device group's current roster
     /// (device-tag-v1.md, "Reading tags").

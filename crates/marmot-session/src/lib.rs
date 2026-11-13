@@ -16,6 +16,12 @@ mod runtime;
 mod session;
 mod time;
 
+/// Where a group's published answers stand (mdk#3273); see
+/// [`AccountDeviceRuntime::group_change_generations`].
+pub use cgka_engine::change_generation::{ChangeStamp, GroupChangeGeneration};
+/// The owned KeyPackages with how long the list holds (mdk#3273); see
+/// [`AccountDeviceRuntime::durably_owned_key_packages_with_validity`].
+pub use cgka_engine::key_package::OwnedKeyPackages;
 pub use error::{AccountError, AccountResult};
 pub use key_package::{
     KeyPackageEventDeletion, KeyPackagePublication, KeyPackagePublishError,
@@ -27,12 +33,12 @@ pub use routing::{StaticTransportRouting, TransportRoutingError, TransportRoutin
 pub use runtime::{
     AccountDeviceEffects, AccountDeviceRuntime, AccountIngestEffects, AccountIngestPhase,
     CompletedWelcomePublishTask, DeviceRosterEdit, DeviceRosterEditBlocked, DeviceSelfReport,
-    FailedApplicationMessage, ForeignSlotOutcome, ForeignSlotPublication, GroupRejoinStatus,
-    MaintenanceActivity, MaintenanceAttemptDuration, MaintenanceTiming, OversizedArtifact,
-    OversizedEvent, PendingResolution, PreparedSessionCommit, PreparedSessionSend,
-    PreparedWelcomePublishTask, PublishFailure, PublishedApplicationMessage, UndeliveredCommit,
-    UnresolvedApplicationMessage, UnresolvedPublish, UnresolvedPublishReason,
-    WelcomeDeliveryFailure,
+    FailedApplicationMessage, ForeignSlotOutcome, ForeignSlotPublication, GroupMaintenanceRows,
+    GroupRejoinStatus, MaintenanceActivity, MaintenanceAttemptDuration, MaintenanceTiming,
+    OversizedArtifact, OversizedEvent, PendingResolution, PreparedSessionCommit,
+    PreparedSessionSend, PreparedWelcomePublishTask, PublishFailure, PublishedApplicationMessage,
+    UndeliveredCommit, UnresolvedApplicationMessage, UnresolvedPublish, UnresolvedPublishReason,
+    WallClockWindow, WelcomeDeliveryFailure,
 };
 pub use session::{
     CreateGroupEffects, GroupAuthorityView, HydrationProgress, PublishWork, QueuedIntentRef,
