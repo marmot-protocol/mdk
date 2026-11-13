@@ -274,8 +274,9 @@ fn context() -> (MediaHttpContext, mpsc::UnboundedReceiver<MediaHttpDone>) {
     )
 }
 
-#[test]
-fn promotion_resumes_after_skip() {
+/// Build a two-worker runtime with one blocking thread, so blocking tasks run
+/// one at a time in the order they were spawned.
+fn one_blocking_thread_runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .thread_stack_size(8 * 1024 * 1024)
@@ -283,128 +284,215 @@ fn promotion_resumes_after_skip() {
         .enable_all()
         .build()
         .unwrap()
-        .block_on(async {
-            let (_dir, client, storage, reference) = offline_fixture().await;
-            let app = storage.app_storage();
-            let media = client.app.account_media_store("alice", &storage).unwrap();
-            let body = b"retained worker bytes";
-            let mut tokens = Vec::new();
-            // One unbound upload keeps the final empty pass reachable.
-            for _ in 0..2 {
-                let token = app
-                    .reserve_attachment_upload(GROUP, 3, crate::unix_now_seconds())
-                    .unwrap()
-                    .unwrap();
-                crate::media::outgoing::stage_body(
-                    &media,
-                    &app.attachment_upload_stage(&token),
-                    &mut body.as_slice(),
-                    body.len() as u64,
-                    &|| false,
-                )
-                .unwrap();
-                tokens.push(token);
-            }
-            let tag = reference.imeta_tag();
-            app.bind_attachment_uploads(
-                &tokens[..1],
-                &[(
-                    serde_json::to_value(&tag).unwrap(),
-                    crate::media::media_hash_from_reference(&reference).unwrap(),
-                )],
-            )
-            .unwrap();
-            let staged = app.attachment_upload_file(&tokens[0]).unwrap().unwrap();
-            // Expired sources fill the first page without promoting a body.
-            // Only the next page can publish the final source.
-            for index in 0..=crate::media::outgoing::UPLOAD_PROMOTION_BATCH {
-                let message = format!("{index:064x}");
-                let retention = (index < crate::media::outgoing::UPLOAD_PROMOTION_BATCH)
-                    .then(|| crate::AppMessageRetentionDecision::new(10, 1));
-                app.record_app_event_with_retention(
-                    &StoredAppEvent {
-                        group_id_hex: GROUP.into(),
-                        message_id_hex: message.clone(),
-                        source_message_id_hex: Some(message.clone()),
-                        source_epoch: Some(3),
-                        direction: "sent".into(),
-                        sender: "33".repeat(32),
-                        plaintext: String::new(),
-                        kind: 9,
-                        tags: vec![tag.clone()],
-                        recorded_at: 10,
-                        received_at: 10,
-                        origin_commit_id: None,
-                        moderation_grant: false,
-                    },
-                    retention,
-                )
-                .unwrap();
-                app.protect_attachment_uploads(GROUP, &message, std::slice::from_ref(&tag))
-                    .unwrap();
-            }
-            let shared = RuntimeSharedServices::default();
-            let mut admission = Admission::default();
-            let (release, held) = std::sync::mpsc::channel();
-            let blocker = tokio::task::spawn_blocking(move || {
-                held.recv().unwrap();
-            });
-            let spawn = |admission: &mut Admission| {
-                spawn_upload_promotion(
-                    admission,
-                    storage.clone(),
-                    media.clone(),
-                    shared.attachment_updates.clone(),
-                    shared.observer.performance(),
-                )
-            };
-            spawn(&mut admission);
-            // The only blocking thread is held, so this pass must skip the batch.
-            spawn(&mut admission);
-            assert!(!admission.upload_promotion.as_ref().unwrap().is_finished());
-            release.send(()).unwrap();
-            blocker.await.unwrap();
-            tokio::time::timeout(Duration::from_secs(10), async {
-                for (index, expected) in [true, true, false].into_iter().enumerate() {
-                    assert!(
-                        admission.is_waiting(),
-                        "promotion completion was not observed"
-                    );
-                    let more = admission.ready().await;
-                    assert_eq!(more, expected);
-                    if index == 0 {
-                        assert_eq!(
-                            media.file_state(&staged).unwrap(),
-                            Some(media_store::FileState::Staged)
-                        );
-                    }
-                    if more {
-                        spawn(&mut admission);
-                    }
-                }
-            })
-            .await
-            .unwrap();
-            assert!(
-                !admission.is_waiting(),
-                "an idle batch must stop rescheduling"
-            );
-            let message = format!("{:064x}", crate::media::outgoing::UPLOAD_PROMOTION_BATCH);
-            let status = app
-                .attachment_transfer_status(
-                    GROUP,
-                    &message,
-                    &message,
-                    0,
-                    crate::unix_now_seconds(),
-                    true,
-                )
-                .unwrap();
-            assert_eq!(
-                status.map(|status| status.state),
-                Some(storage_sqlite::AttachmentTransferState::Ready)
-            );
+}
+
+/// Reserve an outgoing upload in [`GROUP`] and stage its body as a media file.
+fn stage_upload(app: &SqliteAppStorage, media: &AccountMediaStore) -> Vec<u8> {
+    let body = b"retained worker bytes";
+    let token = app
+        .reserve_attachment_upload(GROUP, 3, crate::unix_now_seconds())
+        .unwrap()
+        .unwrap();
+    crate::media::outgoing::stage_body(
+        media,
+        &app.attachment_upload_stage(&token),
+        &mut body.as_slice(),
+        body.len() as u64,
+        &|| false,
+    )
+    .unwrap();
+    token
+}
+
+/// Bind `token` to the fixture's attachment `reference`.
+fn bind_upload(app: &SqliteAppStorage, token: &[u8], reference: &crate::MediaAttachmentReference) {
+    app.bind_attachment_uploads(
+        &[token.to_vec()],
+        &[(
+            serde_json::to_value(reference.imeta_tag()).unwrap(),
+            crate::media::media_hash_from_reference(reference).unwrap(),
+        )],
+    )
+    .unwrap();
+}
+
+/// Record a sent message in [`GROUP`] carrying `tag`, and protect the upload
+/// it names, which makes that upload a promotion owner.
+fn record_sent(
+    app: &SqliteAppStorage,
+    message: &str,
+    tag: &[String],
+    retention: Option<crate::AppMessageRetentionDecision>,
+) {
+    app.record_app_event_with_retention(
+        &StoredAppEvent {
+            group_id_hex: GROUP.into(),
+            message_id_hex: message.into(),
+            source_message_id_hex: Some(message.into()),
+            source_epoch: Some(3),
+            direction: "sent".into(),
+            sender: "33".repeat(32),
+            plaintext: String::new(),
+            kind: 9,
+            tags: vec![tag.to_vec()],
+            recorded_at: 10,
+            received_at: 10,
+            origin_commit_id: None,
+            moderation_grant: false,
+        },
+        retention,
+    )
+    .unwrap();
+    app.protect_attachment_uploads(GROUP, message, &[tag.to_vec()])
+        .unwrap();
+}
+
+/// Assert the sent `message`'s first slot is Ready.
+fn assert_sent_slot_ready(app: &SqliteAppStorage, message: &str) {
+    let status = app
+        .attachment_transfer_status(GROUP, message, message, 0, crate::unix_now_seconds(), true)
+        .unwrap();
+    assert_eq!(
+        status.map(|status| status.state),
+        Some(storage_sqlite::AttachmentTransferState::Ready)
+    );
+}
+
+#[test]
+fn promotion_resumes_after_skip() {
+    one_blocking_thread_runtime().block_on(async {
+        let (_dir, client, storage, reference) = offline_fixture().await;
+        let app = storage.app_storage();
+        let media = client.app.account_media_store("alice", &storage).unwrap();
+        let token = stage_upload(&app, &media);
+        // One unbound upload keeps the final empty pass reachable.
+        stage_upload(&app, &media);
+        let tag = reference.imeta_tag();
+        bind_upload(&app, &token, &reference);
+        let staged = app.attachment_upload_file(&token).unwrap().unwrap();
+        // Expired sources fill the first page without promoting a body.
+        // Only the next page can publish the final source.
+        for index in 0..=crate::media::outgoing::UPLOAD_PROMOTION_BATCH {
+            let retention = (index < crate::media::outgoing::UPLOAD_PROMOTION_BATCH)
+                .then(|| crate::AppMessageRetentionDecision::new(10, 1));
+            record_sent(&app, &format!("{index:064x}"), &tag, retention);
+        }
+        let shared = RuntimeSharedServices::default();
+        let mut admission = Admission::default();
+        let (release, held) = std::sync::mpsc::channel();
+        let blocker = tokio::task::spawn_blocking(move || {
+            held.recv().unwrap();
         });
+        let spawn = |admission: &mut Admission| {
+            spawn_upload_promotion(
+                admission,
+                storage.clone(),
+                media.clone(),
+                shared.attachment_updates.clone(),
+                shared.observer.performance(),
+            )
+        };
+        spawn(&mut admission);
+        // The only blocking thread is held, so this pass must skip the batch.
+        spawn(&mut admission);
+        assert!(!admission.upload_promotion.as_ref().unwrap().is_finished());
+        release.send(()).unwrap();
+        blocker.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            for (index, expected) in [true, true, false].into_iter().enumerate() {
+                assert!(
+                    admission.is_waiting(),
+                    "promotion completion was not observed"
+                );
+                let more = admission.ready().await;
+                assert_eq!(more, expected);
+                if index == 0 {
+                    assert_eq!(
+                        media.file_state(&staged).unwrap(),
+                        Some(media_store::FileState::Staged)
+                    );
+                }
+                if more {
+                    spawn(&mut admission);
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            !admission.is_waiting(),
+            "an idle batch must stop rescheduling"
+        );
+        assert_sent_slot_ready(
+            &app,
+            &format!("{:064x}", crate::media::outgoing::UPLOAD_PROMOTION_BATCH),
+        );
+    });
+}
+
+/// A pass that skips a batch whose owner read came before a new owner gets a
+/// follow-up pass, even when that batch promoted nothing and left no page
+/// (mdk#3378). The follow-up ends once a batch no pass skipped finds nothing.
+#[test]
+fn promotion_skipped_while_its_batch_ends_idle_runs_a_follow_up_pass() {
+    one_blocking_thread_runtime().block_on(async {
+        let (_dir, client, storage, reference) = offline_fixture().await;
+        let app = storage.app_storage();
+        let media = client.app.account_media_store("alice", &storage).unwrap();
+        let token = stage_upload(&app, &media);
+        // One unbound upload keeps the final empty pass reachable.
+        stage_upload(&app, &media);
+        bind_upload(&app, &token, &reference);
+        let staged = app.attachment_upload_file(&token).unwrap().unwrap();
+        let shared = RuntimeSharedServices::default();
+        let mut admission = Admission::default();
+        let spawn = |admission: &mut Admission| {
+            spawn_upload_promotion(
+                admission,
+                storage.clone(),
+                media.clone(),
+                shared.attachment_updates.clone(),
+                shared.observer.performance(),
+            )
+        };
+        // No message is sent yet, so this batch reads no owner.
+        spawn(&mut admission);
+        // The only blocking thread runs tasks in order: once this one ran,
+        // the batch has read its owners and finished.
+        tokio::task::spawn_blocking(|| ()).await.unwrap();
+        assert!(admission.upload_promotion.as_ref().unwrap().is_finished());
+        // The send makes the upload an owner. Its pass finds the batch not
+        // yet consumed by the worker, so it skips it.
+        let message = "44".repeat(32);
+        record_sent(&app, &message, &reference.imeta_tag(), None);
+        spawn(&mut admission);
+        assert_eq!(
+            media.file_state(&staged).unwrap(),
+            Some(media_store::FileState::Staged)
+        );
+        tokio::time::timeout(Duration::from_secs(10), async {
+            // The idle batch still owes the skipped pass; the follow-up
+            // promotes; the next batch, skipped by no pass, finds nothing.
+            for (index, expected) in [true, true, false].into_iter().enumerate() {
+                assert!(
+                    admission.is_waiting(),
+                    "promotion completion was not observed"
+                );
+                let more = admission.ready().await;
+                assert_eq!(more, expected, "worker wakeup after batch {index}");
+                if more {
+                    spawn(&mut admission);
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            !admission.is_waiting(),
+            "a follow-up that finds nothing must stop rescheduling"
+        );
+        assert_sent_slot_ready(&app, &message);
+    });
 }
 
 /// Count loopback response bytes once, then prove the retained asset survives a client restart.
