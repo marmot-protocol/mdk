@@ -5,6 +5,10 @@ Start with the [integration guide](README.md#integration-guide-and-api-reference
 for API selection, lifecycle, localization and ownership. For the 0.14.0 changes, read
 [0.13.0 → 0.14.0](../../docs/integration/0.14.0.md).
 
+The [native-host test recipe](NATIVE-HOST-TESTS.md) exercises generated Swift against a local MockRelay
+with an injected thread-safe `SecretStore`, bounded delivery assertions, and same-root reopening.
+It also gives the corresponding Android configuration and callback signatures.
+
 This inventories runtime/object methods, free functions and host callback methods. `AttachmentHistoryCursor`,
 `AccountAttachmentCursor`, `ChatStorageCursor`, `RetainedAttachmentsCursor` and `ChatListDraftVersionFfi` are opaque
 objects with no exported methods. Generated disposal/concurrency helpers are platform scaffolding, not additional

@@ -8772,6 +8772,92 @@ async fn partial_invite_route_retry() {
     assert_eq!(client.group_mls_state(&group).unwrap(), before_fault);
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn oversized_member_is_partial() {
+    for kind in [KIND_NIP65_RELAY_LIST, KIND_MARMOT_INBOX_RELAY_LIST] {
+        let (_directory, app, accounts, fetcher) = member_resolution_fixture(2, false).await;
+        let tag = if kind == KIND_NIP65_RELAY_LIST {
+            "r"
+        } else {
+            "relay"
+        };
+        for event in fetcher.events.lock().unwrap().iter_mut() {
+            if event.kind == kind && event.pubkey == accounts[1].account_id_hex {
+                event.tags = (0..17)
+                    .map(|index| vec![tag.into(), format!("wss://outbox-{index}.example")])
+                    .collect();
+            }
+        }
+        app.directory()
+            .prewarm_group_member_key_packages(&[accounts[1].account_id_hex.as_str()])
+            .await
+            .expect_err("an inadmissible route is not ready for prewarm reuse");
+        let creator = app
+            .account_home()
+            .create_account("route-cap-creator")
+            .unwrap();
+        let mut client = app.client(&creator.label).await.unwrap();
+        let result = client
+            .create_group(
+                "partial route cap",
+                &[&accounts[0].account_id_hex, &accounts[1].account_id_hex],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result.member_outcomes,
+            vec![
+                MemberResolutionOutcome {
+                    account_id_hex: accounts[0].account_id_hex.clone(),
+                    status: MemberResolutionStatus::Selected,
+                    selected_device_count: 1,
+                },
+                MemberResolutionOutcome {
+                    account_id_hex: accounts[1].account_id_hex.clone(),
+                    status: MemberResolutionStatus::Incomplete,
+                    selected_device_count: 0,
+                },
+            ]
+        );
+        let group = result.operation.unwrap();
+        let mut roster = client
+            .members(&group)
+            .unwrap()
+            .into_iter()
+            .map(|member| member.member_id_hex)
+            .collect::<Vec<_>>();
+        let mut expected = vec![creator.account_id_hex, accounts[0].account_id_hex.clone()];
+        roster.sort();
+        expected.sort();
+        assert_eq!(roster, expected);
+        for event in fetcher.events.lock().unwrap().iter_mut() {
+            if event.kind == kind && event.pubkey == accounts[1].account_id_hex {
+                event.tags = vec![vec![tag.into(), "wss://shared.example".into()]];
+                event.created_at += 1;
+            }
+        }
+        let retry = client
+            .invite_members(&group, &[accounts[1].account_id_hex.as_str()])
+            .await
+            .unwrap();
+        assert!(retry.operation.is_some());
+        assert_eq!(
+            retry.member_outcomes[0].status,
+            MemberResolutionStatus::Selected
+        );
+        expected.push(accounts[1].account_id_hex.clone());
+        expected.sort();
+        let mut roster = client
+            .members(&group)
+            .unwrap()
+            .into_iter()
+            .map(|member| member.member_id_hex)
+            .collect::<Vec<_>>();
+        roster.sort();
+        assert_eq!(roster, expected);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn direct_requires_ready_peer() {
     let (_dir, app, accounts, fetcher) = member_resolution_fixture(1, false).await;
     let creator = app.account_home().create_account("direct-creator").unwrap();

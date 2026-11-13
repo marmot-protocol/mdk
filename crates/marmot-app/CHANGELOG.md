@@ -13,13 +13,17 @@
 
 ### Fixed
 
-- Create and invite abort on directory fetch-resource failures instead of
-  reporting recipients as `Incomplete` in a successful result (#1813).
-  Incomplete relay reads still use per-member recovery.
+- Outgoing attachment promotion resumes when a running batch finishes after
+  an attachment pass skipped it. Productive batches and unfinished pages
+  trigger another pass without waiting for the maintenance tick (mdk#3366).
 - `NotificationUpdate.is_dm` follows the chat-list conversation kind for
   messages, group-state notices, and invitations, including pending DM
   Welcomes. Named chats and unknown roster projections remain non-DM
   (mdk#2773).
+- Create and invite abort on directory fetch-resource failures instead of
+  reporting recipients as `Incomplete` in a successful result (#1813).
+  Incomplete relay reads still use per-member recovery. Over-budget published
+  member routes stay account-local and do not renew prewarm readiness.
 
 ## 0.16.0 - 2026-11-12
 

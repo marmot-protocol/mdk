@@ -57,6 +57,7 @@ This is the current integration entry point for Swift/iOS, Swift/macOS and Kotli
 | [Release integration index](../../docs/integration/README.md) | Per-release upgrade guides: required changes, changed defaults, optional adoption, examples and acceptance checks. Read every intervening guide when skipping versions. |
 | [Changelog](CHANGELOG.md) | Binding-level changes per release, including unreleased work on `master`. |
 | [Distribution](DISTRIBUTION.md) | Exact artifact layout, platform setup, checksums, Apple resources and source/binary pairing. |
+| [Native-host tests](NATIVE-HOST-TESTS.md) | Runnable Swift XCTest with a local MockRelay, injected test-only secret storage, delivery assertions, and same-root reopening; corresponding Android configuration. |
 | [Chat lists](../../docs/marmot-architecture/further-context/chat-projections-native.md) | Bounded list windows, account attention, navigation and sequence handling. |
 | [Chat-list rows](CHAT-LIST-ROWS.md) | Selected previews, per-message expiry handling, live draft updates and row-action availability. |
 | [Conversation windows](CONVERSATION-WINDOW.md) | Initial unread/latest positioning, live snapshots, paging, drafts and cancellation. |
@@ -382,6 +383,10 @@ configuration changes.
 Native construction/default checks: `./crates/marmot-uniffi/options-smoke.sh swift`
 and `MDK_KOTLIN_CLASSPATH=<JNA:Android:annotations:coroutines jars>
 ./crates/marmot-uniffi/options-smoke.sh kotlin`.
+
+For a generated Swift end-to-end test without platform-keychain credentials or public relays, run
+`bash crates/marmot-uniffi/native-host-smoke.sh`. See the [native-host recipe](NATIVE-HOST-TESTS.md)
+and its checked [XCTest source](tests/native_host_smoke.swift).
 
 ### Deployment
 

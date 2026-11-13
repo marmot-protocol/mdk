@@ -547,6 +547,41 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                 observation.directory_sample(outcome, "network", 1);
             }
         }
+        for (target, outcome) in targets.iter().zip(&mut outcomes) {
+            let Some(result) = outcome.take() else {
+                continue;
+            };
+            *outcome = Some(result.and_then(|packages| {
+                if packages.is_empty() {
+                    return Err(DirectoryError::MissingKeyPackage {
+                        account: target.account_id_hex.clone(),
+                        reason: MissingKeyPackageReason::NotFound,
+                    });
+                }
+                let safe_inbox = self.relay_plane.retain_safe_discovered_endpoints(
+                    target
+                        .relay_lists
+                        .inbox
+                        .relays
+                        .iter()
+                        .cloned()
+                        .map(TransportEndpoint)
+                        .collect(),
+                    "member invite inbox readiness",
+                );
+                if safe_inbox.is_empty() {
+                    return Err(DirectoryError::MissingMemberInboxRoute(
+                        target.account_id_hex.clone(),
+                    ));
+                }
+                self.relay_plane
+                    .sanitize_relay_endpoints(safe_inbox, "member invite inbox admission")
+                    .map_err(|_| {
+                        DirectoryError::DirectoryLookupIncomplete(target.account_id_hex.clone())
+                    })?;
+                Ok(packages)
+            }));
+        }
         match purpose {
             // A cancelled relay-list stage may hold a discovery-only snapshot.
             MemberResolutionPurpose::Commit | MemberResolutionPurpose::CommitFresh
@@ -588,38 +623,12 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
         let mut key_packages = Vec::with_capacity(unique_members);
         let mut member_outcomes = Vec::with_capacity(unique_members);
         for (target, outcome) in targets.into_iter().zip(outcomes) {
-            let outcome = outcome
-                .unwrap_or_else(|| {
-                    Err(DirectoryError::MissingKeyPackage {
-                        account: target.account_id_hex.clone(),
-                        reason: MissingKeyPackageReason::NotFound,
-                    })
+            let outcome = outcome.unwrap_or_else(|| {
+                Err(DirectoryError::MissingKeyPackage {
+                    account: target.account_id_hex.clone(),
+                    reason: MissingKeyPackageReason::NotFound,
                 })
-                .and_then(|packages| {
-                    if packages.is_empty() {
-                        return Err(DirectoryError::MissingKeyPackage {
-                            account: target.account_id_hex.clone(),
-                            reason: MissingKeyPackageReason::NotFound,
-                        });
-                    }
-                    let safe_inbox = self.relay_plane.retain_safe_discovered_endpoints(
-                        target
-                            .relay_lists
-                            .inbox
-                            .relays
-                            .iter()
-                            .cloned()
-                            .map(TransportEndpoint)
-                            .collect(),
-                        "member invite inbox readiness",
-                    );
-                    if safe_inbox.is_empty() {
-                        return Err(DirectoryError::MissingMemberInboxRoute(
-                            target.account_id_hex.clone(),
-                        ));
-                    }
-                    Ok(packages)
-                });
+            });
             let (status, selected_device_count) = match outcome {
                 Ok(packages) => {
                     let device_count = packages.len() as u32;
@@ -908,9 +917,23 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
             .flatten()
             .copied()
             .collect::<HashSet<_>>();
-        let completed_outbox = self
-            .resolve_relay_list_hop(targets, by_outboxes.into_iter().collect())
-            .await?;
+        let mut invalid_outboxes = HashSet::new();
+        let outbox_groups = by_outboxes
+            .into_iter()
+            .filter_map(|(endpoints, indices)| {
+                match self
+                    .relay_plane
+                    .sanitize_relay_endpoints(endpoints, "member inbox outbox admission")
+                {
+                    Ok(endpoints) => Some((endpoints, indices)),
+                    Err(_) => {
+                        invalid_outboxes.extend(indices);
+                        None
+                    }
+                }
+            })
+            .collect();
+        let completed_outbox = self.resolve_relay_list_hop(targets, outbox_groups).await?;
         let completed = completed_discovery
             .iter()
             .copied()
@@ -919,6 +942,9 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
         let errors = needs_discovery
             .into_iter()
             .filter(|index| {
+                if invalid_outboxes.contains(index) {
+                    return true;
+                }
                 let has_inbox = !self
                     .relay_plane
                     .retain_safe_discovered_endpoints(
@@ -959,7 +985,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
         let defaults = self.directory_source_relays(&[]);
         let mut by_endpoints = BTreeMap::<Vec<TransportEndpoint>, Vec<usize>>::new();
         for index in unresolved.iter().copied() {
-            let mut endpoints = self.relay_plane.retain_safe_discovered_endpoints(
+            let endpoints = self.relay_plane.retain_safe_discovered_endpoints(
                 targets[index]
                     .relay_lists
                     .nip65
@@ -970,6 +996,18 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                     .collect(),
                 "member KeyPackage batch fetch",
             );
+            let mut endpoints = match self
+                .relay_plane
+                .sanitize_relay_endpoints(endpoints, "member KeyPackage route admission")
+            {
+                Ok(endpoints) => endpoints,
+                Err(_) => {
+                    outcomes[index] = Some(Err(DirectoryError::DirectoryLookupIncomplete(
+                        targets[index].account_id_hex.clone(),
+                    )));
+                    continue;
+                }
+            };
             if endpoints.is_empty() {
                 endpoints.clone_from(&defaults);
             }

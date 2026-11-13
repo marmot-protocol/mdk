@@ -49,8 +49,9 @@ pub(super) struct Admission {
     media_sweep: Option<tokio::task::JoinHandle<()>>,
     /// The outgoing upload promotion pass running on the blocking pool, if
     /// any, and where the next one resumes.
-    upload_promotion: Option<tokio::task::JoinHandle<()>>,
-    upload_cursor: Arc<std::sync::Mutex<Option<storage_sqlite::AttachmentUploadOwner>>>,
+    upload_promotion:
+        Option<tokio::task::JoinHandle<(Option<storage_sqlite::AttachmentUploadOwner>, bool)>>,
+    upload_cursor: Option<storage_sqlite::AttachmentUploadOwner>,
     /// The legacy body migration batch running on the blocking pool, if any.
     legacy_migration: Option<tokio::task::JoinHandle<()>>,
     /// The one-time database compaction ran under this worker; it is not
@@ -236,7 +237,7 @@ fn spawn_media_sweep(
 /// Starts one page of outgoing upload promotion on the blocking pool unless
 /// one is still running. Each run resumes after the last, so uploads that
 /// cannot promote yet never starve the rest; a promotion wakes attachment
-/// observers with a state change.
+/// observers with a state change and requests another worker pass on completion.
 fn spawn_upload_promotion(
     admission: &mut Admission,
     storage: SqliteAccountStorage,
@@ -244,31 +245,21 @@ fn spawn_upload_promotion(
     updates: AttachmentUpdates,
     telemetry: &marmot_observability::PerformanceRecorder,
 ) {
-    if admission
-        .upload_promotion
-        .as_ref()
-        .is_some_and(|task| !task.is_finished())
-    {
+    // Consume even a finished batch through ready(), preserving its wakeup.
+    if admission.upload_promotion.is_some() {
         return;
     }
     // Only a file-backed upload promotes. With none, and no page in
     // progress, there is nothing to page (mdk#2923). A failed read still
     // runs the pass.
-    let paging = admission
-        .upload_cursor
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .is_some();
-    if !paging && matches!(storage.app_storage().has_file_backed_uploads(), Ok(false)) {
+    if admission.upload_cursor.is_none()
+        && matches!(storage.app_storage().has_file_backed_uploads(), Ok(false))
+    {
         return;
     }
-    let cursor = admission.upload_cursor.clone();
+    let after = admission.upload_cursor.take();
     let batch = telemetry.observe(RuntimeOp::WorkerUploadPromotion);
     admission.upload_promotion = Some(tokio::task::spawn_blocking(move || {
-        let after = cursor
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take();
         match crate::media::outgoing::promote_uploads(
             &storage.app_storage(),
             &media,
@@ -276,18 +267,18 @@ fn spawn_upload_promotion(
             crate::media::outgoing::UPLOAD_PROMOTION_BATCH,
         ) {
             Ok((next, promoted)) => {
-                *cursor
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = next;
+                let more = next.is_some() || promoted;
                 if promoted {
                     updates.state_changed();
                 }
                 batch.finish(TelemetryOutcome::Success);
+                (next, more)
             }
             Err(_) => {
                 tracing::warn!(target: "marmot_app::runtime", method = "outgoing_upload_promotion",
                     "outgoing upload promotion deferred");
                 batch.finish(TelemetryOutcome::Failure);
+                (None, false)
             }
         }
     }));
@@ -567,12 +558,22 @@ impl Admission {
     }
 
     pub(super) fn is_waiting(&self) -> bool {
-        self.waiting.is_some()
+        self.waiting.is_some() || self.upload_promotion.is_some()
     }
-    pub(super) async fn ready(&mut self) {
-        if let Some(waiting) = self.waiting.as_mut() {
-            self.permit = waiting.await.ok();
-            self.waiting = None;
+    pub(super) async fn ready(&mut self) -> bool {
+        tokio::select! {
+            permit = async { self.waiting.as_mut().unwrap().await }, if self.waiting.is_some() => {
+                self.permit = permit.ok();
+                self.waiting = None;
+                true
+            }
+            result = async { self.upload_promotion.as_mut().unwrap().await }, if self.upload_promotion.is_some() => {
+                self.upload_promotion = None;
+                let (next, more) = result.unwrap_or_default();
+                self.upload_cursor = next;
+                more
+            }
+            else => false,
         }
     }
 }
