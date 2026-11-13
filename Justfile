@@ -418,9 +418,6 @@ app-stack-campaign out *args:
 app-stack-campaign-contract:
     python3 -m unittest discover -s scripts/tests -p 'test_app_stack_campaign.py'
 
-audit-otlp-receiver-contract:
-    uv run --with 'jsonschema==4.25.1' python -m unittest discover -s scripts/audit-otlp-receiver -p 'test_receiver.py' -v
-
 # Prove that the generic nightly lane restores exactly the generated batches
 # intentionally removed from the PR smoke lane.
 simulator-filter-contract:
@@ -725,6 +722,6 @@ release-profile-gate:
 # passes, and the release pin proof. Run it once for shared build-input or
 # workflow changes; ordinary pushes use the scoped checks in AGENTS.md.
 # GitHub CI invokes the static gates directly and runs the full test matrix.
-fast-ci: fmt-check naming-gate tracing-audit c-parity-gate binding-docs-gate binding-build-gate convergence-ledger-gate campaign-toolchain-gate app-stack-campaign-contract audit-otlp-receiver-contract agent-install-docs-gate install-example-sha256-gate cargo-audit-policy-gate ci-path-classifier-gate flake-report-contract test-timing-ratchet apple-privacy-gate release-profile-gate clippy test-convergence-policy-pin
+fast-ci: fmt-check naming-gate tracing-audit c-parity-gate binding-docs-gate binding-build-gate convergence-ledger-gate campaign-toolchain-gate app-stack-campaign-contract agent-install-docs-gate install-example-sha256-gate cargo-audit-policy-gate ci-path-classifier-gate flake-report-contract test-timing-ratchet apple-privacy-gate release-profile-gate clippy test-convergence-policy-pin
 
-ci: fmt-check naming-gate tracing-audit c-parity-gate binding-docs-gate binding-build-gate convergence-ledger-gate campaign-toolchain-gate app-stack-campaign-contract audit-otlp-receiver-contract agent-install-docs-gate install-example-sha256-gate cargo-audit-policy-gate ci-path-classifier-gate flake-report-contract test-timing-ratchet apple-privacy-gate release-profile-gate clippy test-convergence-policy-pin test
+ci: fmt-check naming-gate tracing-audit c-parity-gate binding-docs-gate binding-build-gate convergence-ledger-gate campaign-toolchain-gate app-stack-campaign-contract agent-install-docs-gate install-example-sha256-gate cargo-audit-policy-gate ci-path-classifier-gate flake-report-contract test-timing-ratchet apple-privacy-gate release-profile-gate clippy test-convergence-policy-pin test

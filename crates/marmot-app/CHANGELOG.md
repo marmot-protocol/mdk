@@ -14,8 +14,9 @@
 ### Fixed
 
 - Outgoing attachment promotion resumes when a running batch finishes after
-  an attachment pass skipped it. Productive batches and unfinished pages
-  trigger another pass without waiting for the maintenance tick (mdk#3366).
+  an attachment pass skipped it. Productive batches, unfinished pages and
+  skipped batches that promoted nothing trigger another pass without waiting
+  for the maintenance tick (mdk#3366, mdk#3378).
 - `NotificationUpdate.is_dm` follows the chat-list conversation kind for
   messages, group-state notices, and invitations, including pending DM
   Welcomes. Named chats and unknown roster projections remain non-DM

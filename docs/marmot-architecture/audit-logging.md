@@ -1,7 +1,7 @@
 ---
 title: "Forensic Audit Logging Inventory"
 created: 2026-06-10
-updated: 2026-11-07
+updated: 2026-11-13
 tags: [marmot, architecture, audit, forensics, jsonl, privacy]
 status: current
 ---
@@ -62,17 +62,48 @@ releases its account reservation; routine healthy outcomes rewrite the file at m
 `audit_delivery_status_v5`. The tracker's `warn` log carries the same failure category and HTTP
 status, nothing else.
 
-The old Goggles whole-file endpoint remains a v4-only route. Direct whole-file upload validates
+The legacy v4 whole-file tracker endpoint remains a v4-only route. Direct whole-file upload validates
 the exact v4 schema version and rejects v5; the tracker excludes v5 filenames from its v4 pass.
 The v5 sender preserves each original JSONL body inside one OTLP log record, stripping only its
 terminal newline. It validates and pins collector addresses before connection and never stores
 the bearer token on disk.
 
 **Host adoption requirement:** enabling audit on this build creates v5 files, not new v4 files.
-Hosts that previously relied only on the Goggles tracker must configure a compatible v5 OTLP
+Hosts that previously relied only on the v4 whole-file tracker must configure a compatible v5 OTLP
 receiver and destination before relying on remote audit delivery. Until then, new evidence stays
 local and the v5 tracker reports it as pending or unconfigured; explicit v4 whole-file upload of a
 v5 file is rejected. Deploy the compatible receiver before activating v5 delivery in a host.
+
+## Downstream: whitenoise-data
+
+The receiving end of White Noise's v5 audit pipeline is
+[`internet-privacy/whitenoise-data`](https://github.com/internet-privacy/whitenoise-data), a private,
+team-internal repository. It builds two separate Odin programs that share only source code and Loki as their store:
+
+| Program | Role |
+| --- | --- |
+| **White Noise audit receiver** (`audit-receiver`) | The write side. Accepts MDK's restricted OTLP/HTTP JSON `/v1/logs` profile (the envelope the v5 sender above produces), validates the whole batch against a pinned copy of [`audit-log-event.v5.schema.json`](../../crates/marmot-forensics/schema/audit-log-event.v5.schema.json) plus ports of the relational rules in `marmot-forensics` `src/v5/validation.rs`, and pushes the original bodies to Loki. It accepts v5 only. |
+| **White Noise audit reader** (`audit-reader`) | The read side. A read-only HTTP API that answers investigation questions about one group (`history`, `convergence`, `welcome`, `recovery`, `workload`) and returns original records, citing the exact records and queries behind every finding. An absent record is never proof that something did not happen. |
+
+These replace Goggles, the earlier Django audit service, which is retired. Do not describe either
+program, or any current audit consumer, as Goggles. The legacy v4 whole-file tracker path and its
+`X-Goggles-*` header names below are Goggles' old wire contract, which MDK still speaks.
+
+**Investigating a group.** Agents query the reader through the `whitenoise-reader` skill, which
+whitenoise-data ships in `docs/reader/skill/`. Install it into your agent's skills directory as
+`whitenoise-reader`, and ask the repository's maintainer for a reader token. The reader's
+`GET /v1/contract` endpoint lists what each record kind can and cannot prove; the repository's `CONTRACT.md` explains how
+the reader interprets each kind. Reader output is sensitive: never put group ids, refs, source refs,
+record ids, record bodies or tokens into MDK issues, PRs, commits, fixtures or logs.
+
+**Changing the v5 wire contract.** The receiver checks the vendored schema's SHA-256 at startup and
+rejects a whole batch if any record has an unknown kind, field or enum value, or breaks a ported
+relational rule. MDK's sender then bisects the batch and skips the rejected records, so they never reach
+storage. Any v5 change that adds or alters a kind, a field (even an optional one), an enum value or a
+`validation.rs` rule therefore needs a whitenoise-data repin, following its `docs/receiver/DESIGN.md`
+procedure, and a receiver deployment before clients that emit it ship. The reader also needs updating
+before investigations can interpret the new data. Name the MDK commit the repin should target in the
+MDK PR.
 
 ## Historical v4 status
 
@@ -707,11 +738,12 @@ Metadata notes:
   state-machine breadcrumb that lets analyzers reconstruct the client's group state without replaying engine internals.
 - `new_state = "unrecoverable"` is a terminal halt: convergence and ingest stay blocked for that group until a verified
   repair path clears the marker, and `reason = "hydrate_unrecoverable_group"` means the halt was durable and survived a
-  process restart. `crates/incident-replay` treats these rows as one of its two halt surfaces (the other being
-  `convergence_run_state` with `phase = "unrecoverable"`) and quarantines the export naming the affected engines —
-  unless a later `new_state = "stable"` row with `reason = "join_welcome_repair"` (the one legal exit, emitted by
+  process restart. Analyzers should treat these rows as one of two halt surfaces (the other being
+  `convergence_run_state` with `phase = "unrecoverable"`) for the engine that wrote them — unless a later
+  `new_state = "stable"` row with `reason = "join_welcome_repair"` (the one legal exit, emitted by
   `repair_to_stable`) shows the verified repair completed for that `(engine_id, group_ref)`.
-  Goggles derives its error-severity `epoch_state_transition` projection row from exactly this state.
+  The White Noise audit reader reports each source's last engine state from these rows, and its `convergence`
+  answer flags sources whose last state is `recovering`, `merging` or `unrecoverable`.
 - `reason = "hydrate_removed_group"` marks the session open (`seeded` from the cheap pass, then `stable` or
   `pending_publish` from the per-group promotion, whichever that copy's recovered lifecycle calls for) of a local copy
   this device was *removed* from. A copy that is removed *and* halted takes `hydrate_unrecoverable_group` instead:
@@ -890,8 +922,8 @@ Metadata notes:
 
 - This event has `group_ref`.
 - `phase = "unrecoverable"` is terminal: the convergence pass halted and the group stays blocked until a verified repair
-  path clears the marker. `crates/incident-replay` treats it as one of its two halt surfaces (the other being
-  `epoch_state_changed` with `new_state = "unrecoverable"`) and quarantines the export naming the affected engines.
+  path clears the marker. Analyzers should treat it as one of two halt surfaces (the other being
+  `epoch_state_changed` with `new_state = "unrecoverable"`) for the engine that wrote it.
 - `current_tip_epoch` is the engine's own materialized tip, so analyzers may fold it into a per-engine epoch high-water
   mark the same way they fold `convergence_decision.current_tip_epoch`. Real exports carry roughly twice as many
   run-state rows as decisions, making this the denser of the two signals.
@@ -1462,7 +1494,7 @@ The app can list and upload audit logs, but upload is separate from local record
 
 `MarmotAppRuntime::send_audit_otlp_once` is internal and requires a caller-supplied dedicated sender and one account. It prepares at most one bounded range of original v4 JSONL bodies under the existing exclusive root lease. Local admission covers preparation and, after a response, any durable finish; the HTTP request holds no local file, database, or lifecycle guard. One process-local reservation rejects overlapping attempts for the account. The root lease itself remains held until terminal storage close.
 
-Preparation verifies and owns the source bytes and local generation. Before sending and before finish, the attempt rechecks runtime state, account identity, recording consent, and the sender's stable destination profile without re-reading the source. `LocalAuditDelivery::finish` deliberately acknowledges the owned prepared bytes without reopening their source; external in-place file rewrites are outside this local lifecycle guarantee. Disable/re-enable, file deletion, account removal, destination change, and terminal close reject a pending result. A late response can still represent remote receipt, but cannot advance the old local cursor. Complete `200 {}` finishes locally; `400`, `413` and `422` finish as a permanent rejection; `409`, retryable and unknown outcomes retain the range. A blocked receiver verdict has no local finish action. Cancellation retains the prepared range for identical replay, so duplicates remain possible. This seam does not start automatic OTLP delivery, configure a production endpoint, set retention, or claim downstream Loki durability. The existing Goggles manual and tracker uploads keep their own checkpoint and defaults.
+Preparation verifies and owns the source bytes and local generation. Before sending and before finish, the attempt rechecks runtime state, account identity, recording consent, and the sender's stable destination profile without re-reading the source. `LocalAuditDelivery::finish` deliberately acknowledges the owned prepared bytes without reopening their source; external in-place file rewrites are outside this local lifecycle guarantee. Disable/re-enable, file deletion, account removal, destination change, and terminal close reject a pending result. A late response can still represent remote receipt, but cannot advance the old local cursor. Complete `200 {}` finishes locally; `400`, `413` and `422` finish as a permanent rejection; `409`, retryable and unknown outcomes retain the range. A blocked receiver verdict has no local finish action. Cancellation retains the prepared range for identical replay, so duplicates remain possible. This seam does not start automatic OTLP delivery, configure a production endpoint, set retention, or claim downstream Loki durability. The legacy v4 whole-file manual and tracker uploads keep their own checkpoint and defaults.
 
 ### Listing
 
@@ -1594,7 +1626,7 @@ Each upload attempt is a separate chokepoint: resolve once, validate every DNS a
 
 A 3xx response is `AuditUploadAttempt::Rejected` with its numeric status. The client never follows `Location`, so a separate redirect target receives no body or source/auth headers. Failed or refused uploads are not checkpointed.
 
-Optional source headers:
+Optional source headers (the header names are the retired Goggles service's wire contract):
 
 - `X-Goggles-Hardware-Model`
 - `X-Goggles-Platform`
@@ -1624,7 +1656,7 @@ The validator has HTTP/file reference resolution disabled and compiles only the 
 
 No v1-v3 migration or sanitization is performed. Historical schemas remain committed for offline interpretation.
 New app recording writes v5 only; this gate remains to drain v4 files written before v5 recording, and the v4
-schema is frozen. Rejected bodies must not be stored as quarantined artifacts by Goggles.
+schema is frozen. A receiver must not store rejected bodies as quarantined artifacts.
 
 ### Legacy local cleanup
 
@@ -1689,13 +1721,14 @@ for the same producer/session or leave identity unknown. Joining `local_member_r
 `group_state_changed.subject_member_ref` is a diagnostic correlation, not a membership interval or
 removed-versus-stale classification. External consumers must adopt the optional field before using that join.
 
-Goggles validates v5 rows strictly (`additionalProperties: false`), as it did v4: adding even an optional field to an
-existing v5 kind is a consumer compatibility change. Under v4, the `local_member_ref` addition caused whole-upload
-rejection until Goggles synchronized its schema. Coordinate future v5 field/kind changes with consumer schema
-releases and validate representative producer JSONL against the consumer's v5 schema before distributing clients.
+The White Noise audit receiver validates v5 rows strictly (`additionalProperties: false`), as the retired v4
+receiver did: adding even an optional field to an existing v5 kind is a consumer compatibility change. Under v4, the
+`local_member_ref` addition caused whole-upload rejection until the receiver synchronized its schema. Repin
+whitenoise-data for future v5 field/kind changes (see [Downstream: whitenoise-data](#downstream-whitenoise-data)) and
+validate representative producer JSONL against the receiver's pinned v5 schema before distributing clients.
 The v4 schema is frozen; a field it cannot express is dropped by a v4 recorder. This segmentation fix adds
 no fields or schema version; source metadata stays in the validated JSONL body, never upload headers or user-assigned
-account/device names. Goggles can correlate retained metadata by engine/account/recorder-session identity, but cannot
+account/device names. A consumer can correlate retained metadata by engine/account/recorder-session identity, but cannot
 recover startup evidence that was never uploaded or has expired.
 
 Compiled/default endpoint source:
@@ -1750,8 +1783,8 @@ it, plus whether that was an accepted upload, a file above the request ceiling, 
   instead of failing on every trigger. It never blocks the files behind it.
 - There is no app-level escape hatch for a file above the ceiling. `post_audit_log_file` enforces the same limit before
   it opens a request body, so an oversized legacy audit file is not transferable through any app API: it stays on disk
-  for local handling until its records expire through local retention. Goggles must reject legacy schemas even through
-  other upload paths. Segment rotation keeps newly produced files below the ceiling, so this is an upgrade-path condition.
+  for local handling until its records expire through local retention. A receiver must reject legacy schemas even
+  through other upload paths. Segment rotation keeps newly produced files below the ceiling, so this is an upgrade-path condition.
 - The sidecar is bounded by the account's *live* audit files, not by its upload history: entries for files that are gone
   are pruned each run. Local retention removes expired segments; each tracker run stats every enumerated file and
   rewrites the whole sidecar. Both costs are linear in file count and small next to the HTTP request each run makes.
@@ -1818,7 +1851,7 @@ let server-side tooling collate multiple devices into group-level analytics.
 | Did a notification gap or incomplete native replay require recovery? | Current sessions use owner rows with `notification_loss` or `subscription_replay`; limited native admission is not a history certificate or loss acknowledgment. `subscription_eose_repaired` describes historical repair passes only. |
 | Did a relay refuse this account's inbox or group subscriptions, and why? | `subscription_refused`: per relay and route kind, the refusal category, whether the relay client kept or dropped the REQ, and how often. |
 | Did the recovery runner hit the account's hourly cap? | `recovery_runner_paused`: the cap, the hour's usage, how long the pause lasts, and process totals of pauses and late findings. |
-| Can a dashboard correlate the same member across client files? | `group_state_changed.actor_member_ref` and `subject_member_ref` are stable 16-byte hashes of member identity bytes. A producing engine's optional `source_context.local_member_ref` uses that same member-ref domain so a removal/leave subject can be joined to the producer. Absence is not a removal. This is not a membership interval or Goggles classification. |
+| Can a dashboard correlate the same member across client files? | `group_state_changed.actor_member_ref` and `subject_member_ref` are stable 16-byte hashes of member identity bytes. A producing engine's optional `source_context.local_member_ref` uses that same member-ref domain so a removal/leave subject can be joined to the producer. Absence is not a removal. This is not a membership interval or a receiver-side classification. |
 
 Intentional non-goals / limits:
 

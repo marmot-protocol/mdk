@@ -55,8 +55,8 @@ impl Marmot {
             .into())
     }
 
-    /// Supply non-persisted audit tracker upload metadata: optional Goggles
-    /// upload URL override, bearer token from the host app, and optional system
+    /// Supply non-persisted audit tracker upload metadata: optional legacy v4
+    /// whole-file upload URL override, bearer token from the host app, and optional system
     /// hardware model, platform, and app version.
     ///
     /// The returned config confirms what was stored but never echoes the

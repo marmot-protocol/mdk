@@ -3,8 +3,7 @@ use marmot_forensics::audit::{
     AuditEventKind, AuditRecord, ForensicRecorder, JsonlRecorder, default_jsonl_path,
 };
 use marmot_forensics::local_delivery::{DeliveryStep, LocalAuditDelivery, Preparation};
-use std::io::Write as _;
-use std::process::{Command, Stdio};
+use std::process::Command;
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -710,41 +709,6 @@ async fn endpoint_and_batch_limits_are_checked_before_network() {
         sender.send(boundary).await,
         AuditOtlpSendResult::Blocked { http_status: None }
     );
-}
-
-/// Run explicitly where the pinned Python receiver dependency is available.
-/// It feeds this sender's actual wire bytes into #1997's reference validator.
-/// `cargo test -p marmot-observability --locked --lib audit_otlp_sender::tests::reference_receiver_accepts_exact_sender_wire -- --exact --ignored`
-#[test]
-#[ignore = "requires uv and the #1997 Python reference receiver"]
-fn reference_receiver_accepts_exact_sender_wire() {
-    let (_dir, _active, _state, batch) = prepared();
-    let original = batch.bodies.concat();
-    let wire = encode_batch(batch).unwrap();
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let mut child = Command::new("uv")
-        .current_dir(root)
-        .args([
-            "run",
-            "--with",
-            "jsonschema==4.25.1",
-            "python",
-            "-c",
-            "import sys; sys.path.insert(0, 'scripts/audit-otlp-receiver'); from receiver import validate_batch; rows = validate_batch(sys.stdin.buffer.read()); sys.stdout.buffer.write(b''.join(body.encode('utf-8') + b'\\n' for body, _ in rows))",
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    child.stdin.take().unwrap().write_all(&wire).unwrap();
-    let output = child.wait_with_output().unwrap();
-    assert!(
-        output.status.success(),
-        "reference receiver rejected sender wire: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert_eq!(output.stdout, original);
 }
 
 #[test]

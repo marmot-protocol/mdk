@@ -1,7 +1,7 @@
 ---
 title: "Convergence Reliability And Simulation Plan"
 created: 2026-07-30
-updated: 2026-11-08
+updated: 2026-11-13
 tags: [marmot, cgka, convergence, simulation, verification, reliability]
 status: working-plan
 ---
@@ -765,25 +765,30 @@ eligibility change cannot masquerade as a scheduler result.
 
 ### 3.3 Incident replay
 
+The `incident-replay` crate described here was removed on 2026-11-13 with the retired audit service whose exports it
+read. This repository no longer synthesizes vectors from audit exports. The vectors it produced remain under
+`crates/cgka-conformance-simulator/vectors/incidents/`, and `canonical_vector_fixtures_match_generated_traces` still
+runs them. The rest of this section records what the crate did.
+
 - [x] Preserve normalized archetype synthesis for incomplete forensic evidence.
 - [x] Add producer-attested normalized-history IR import when evidence is sufficient.
 - [x] Carry evidence confidence and unavailable fields into the scenario artifact.
 - [x] Keep sensitive exports and generated exact capsules out of version control.
 
-`IncidentScenarioArtifactV1` makes replay fidelity and trust boundaries explicit. Existing Goggles audit exports
-continue through the proven fork/convergence archetype synthesizers and are labeled
-`outcome_equivalent_archetype` with derived confidence; the artifact names unavailable action history, participant
-delivery order, transport bytes, and MLS state. Normalized import is `producer_attested_normalized_history`: it checks
-coverage and bounds of the producer's step-to-source mapping, validates the Scenario IR, and requires the declared
-outcomes to reproduce, but it does not independently prove semantic correspondence between arbitrary source events
-and declared actions. Imported free-form labels and application payloads remain
-`confidential_unredacted_scenario`, and the artifact records `unverified` until simulator reproduction changes it to
-`reproduced`. Raw MLS bytes plus an engine checkpoint remain a separate opt-in sensitive local failure capsule.
+`IncidentScenarioArtifactV1` made replay fidelity and trust boundaries explicit. Audit-service exports went through
+the proven fork/convergence archetype synthesizers and were labeled
+`outcome_equivalent_archetype` with derived confidence; the artifact named unavailable action history, participant
+delivery order, transport bytes, and MLS state. Normalized import was `producer_attested_normalized_history`: it
+checked coverage and bounds of the producer's step-to-source mapping, validated the Scenario IR, and required the
+declared outcomes to reproduce, but it did not independently prove semantic correspondence between arbitrary source
+events and declared actions. Imported free-form labels and application payloads were
+`confidential_unredacted_scenario`, and the artifact recorded `unverified` until simulator reproduction changed it to
+`reproduced`. Raw MLS bytes plus an engine checkpoint were a separate opt-in sensitive local failure capsule.
 
-The CLI writes the vector and evidence envelope owner-only and never copies the source export or checkpoint. These
-files are not shareable without separate redaction and review. Real
-exports belong under ignored `incident-exports/`; local generated output belongs under `target/` or ignored
-`incident-replay-output/`; sensitive replay-capsule filenames are ignored repository-wide.
+The CLI wrote the vector and evidence envelope owner-only and never copied the source export or checkpoint. Those
+files are not shareable without separate redaction and review. The repository still ignores `incident-exports/`,
+`incident-replay-output/` and sensitive replay-capsule filenames, so leftover local output stays out of git and Docker
+build contexts.
 
 ### Milestone 3 Exit Gate
 
@@ -796,9 +801,9 @@ Offline retained-history catch-up, mixed application/commit traffic, and the sel
 small default regression and a separately ignored sustained campaign. Replay-probe exhaustion fails closed while
 retaining the frozen durable inputs, then succeeds after the test-only ceiling is removed; opaque transport limits use
 the separately tested resource-refused/redelivery repair contract. Report measurement tests pin the first failing
-action and resource-category limiting cause. Incident tests cover both a reproducing producer-attested history and the
-ordinary legacy-export archetype whose evidence envelope explicitly names why exact action and byte replay are
-unavailable.
+action and resource-category limiting cause. Incident tests covered both a reproducing producer-attested history and
+the ordinary legacy-export archetype whose evidence envelope explicitly named why exact action and byte replay are
+unavailable; they were removed with the `incident-replay` crate.
 
 Milestone 3 also closes a production amplification loophole: application-bearing candidate re-materialization now
 draws from the same finite per-pass replay budget as the preceding candidate search instead of creating an unlimited
@@ -1249,10 +1254,10 @@ Simulator failures write portable and optional sensitive replay capsules; proces
 failures can be added to the same private versioned corpus. The index retains seeds, adapters, build matrices,
 recurrence, minimum diagnosis time, reduction candidates, and digest-pinned promoted-vector provenance without
 copying raw error text.
-[MDK #1140](https://github.com/marmot-protocol/mdk/pull/1140) now also fails closed when a manifest-less or corrupt
-NDJSON stream is presented to incident replay, preventing an incomplete stream remnant from being silently adopted as
-an empty healthy document. This hardens corpus admission; it does not constitute execution of an incident-derived
-corpus in the scheduled lanes.
+[MDK #1140](https://github.com/marmot-protocol/mdk/pull/1140) also made incident replay fail closed on a manifest-less
+or corrupt NDJSON stream instead of silently adopting an incomplete stream remnant as an empty healthy document. That
+check was removed with the `incident-replay` crate on 2026-11-13; it never constituted execution of an
+incident-derived corpus in the scheduled lanes.
 The reducer now treats paired transport, partition, lifecycle, and storage actions as dependency units before removing
 independent noise. Non-layer-specific failures receive a canonical Scenario IR candidate for the next smaller adapter;
 the semantic identity must reproduce there before concluding that the larger layer is uninvolved. Promotion remains
@@ -1301,7 +1306,7 @@ operation must be reachable through the shared model, and reviewed execution lan
 operations and cross-operation interactions actually occurred.
 
 - [ ] Inventory every generated product action, its legality preconditions and state transition, and identify duplicate
-  implementations across `family.rs`, `stateful_generator.rs`, incident synthesis, and adapter-specific producers.
+  implementations across `family.rs`, `stateful_generator.rs`, and adapter-specific producers.
 - [ ] Extract one shared legality-aware product model covering membership, administrator authority, profile state,
   application traffic, connectivity, restart, retained-history synchronization, and future canonical IR operations.
 - [ ] Define workload profiles declaratively in terms of action weights, required motifs, compatible subjects,
