@@ -11,14 +11,14 @@ use cgka_traits::GroupId;
 use crate::Marmot;
 use crate::conversions::{
     AccountDevicesActivationFfi, AppBlobEndpointFfi, AppGroupMemberIdsFfi, AppGroupMemberRecordFfi,
-    AppGroupMlsStateFfi, AppGroupRecordFfi, AppQuarantinedGroupFfi, CreatedGroupFfi,
+    AppGroupMlsStateFfi, AppGroupRecordFfi, AppQuarantinedGroupFfi, DetailedGroupCreationResultFfi,
     DisbandRequestFfi, GroupAppComponentFfi, GroupCommitDeliveryFfi, GroupConversationSnapshotFfi,
-    GroupDetailsFfi, GroupInviteDeclineResultFfi, GroupMaintenanceStatusFfi,
-    GroupManagementStateFfi, GroupMemberActionStateFfi, GroupMutationResultFfi, GroupRosterFfi,
-    KeyPackageMaintenanceStatusFfi, MaintenanceRunSummaryFfi, MemberRefFfi,
-    PeriodicMaintenancePolicyFfi, SendSummaryFfi, group_conversation_snapshot_ffi,
-    group_details_from_conversation_snapshot_ffi, group_id_from_hex, group_management_state_ffi,
-    group_roster_ffi, normalize_member_ref_ffi,
+    GroupCreationResultFfi, GroupDetailsFfi, GroupInviteDeclineResultFfi, GroupInviteResultFfi,
+    GroupMaintenanceStatusFfi, GroupManagementStateFfi, GroupMemberActionStateFfi,
+    GroupMutationResultFfi, GroupRosterFfi, InviteMembersResultFfi, KeyPackageMaintenanceStatusFfi,
+    MaintenanceRunSummaryFfi, MemberRefFfi, PeriodicMaintenancePolicyFfi, SendSummaryFfi,
+    group_conversation_snapshot_ffi, group_details_from_conversation_snapshot_ffi,
+    group_id_from_hex, group_management_state_ffi, group_roster_ffi, normalize_member_ref_ffi,
 };
 use crate::errors::MarmotKitError;
 
@@ -431,9 +431,10 @@ impl Marmot {
     }
 
     /// Create a new MLS group with `name` and the given members. Members are
-    /// referenced by `npub` or hex account id. Returns the locally canonical
-    /// group id as hex; this confirms local canonicalization, not Welcome
-    /// delivery. `WelcomeDeliveryPending` is a delivery-failure signal, not an
+    /// referenced by `npub` or hex account id. Returns ordered member outcomes
+    /// and an optional canonical group id. A nonempty roster with no eligible
+    /// account creates nothing; an empty roster creates a creator-only group.
+    /// Selection is not Welcome delivery. `WelcomeDeliveryPending` is a delivery-failure signal, not an
     /// acknowledgement. Hosts should subscribe before creation and/or query
     /// `pending_welcome_deliveries` afterward before presenting invitation
     /// success.
@@ -443,12 +444,12 @@ impl Marmot {
         name: String,
         member_refs: Vec<String>,
         description: Option<String>,
-    ) -> Result<String, MarmotKitError> {
+    ) -> Result<GroupCreationResultFfi, MarmotKitError> {
         let group_id = self
             .runtime
             .create_group(&account_ref, &name, &member_refs, description)
             .await?;
-        Ok(hex::encode(group_id.as_slice()))
+        Ok(group_id.into())
     }
 
     /// Create a group with forward-compatible founding options. A nonzero
@@ -460,23 +461,23 @@ impl Marmot {
         name: String,
         member_refs: Vec<String>,
         options: CreateGroupOptionsFfi,
-    ) -> Result<String, MarmotKitError> {
+    ) -> Result<GroupCreationResultFfi, MarmotKitError> {
         let group_id = self
             .runtime
             .create_group_with_options(&account_ref, &name, &member_refs, options.into())
             .await?;
-        Ok(hex::encode(group_id.as_slice()))
+        Ok(group_id.into())
     }
 
-    /// Create a group and return the exact durable chat-list row available to
-    /// subscriptions and queries at the response boundary.
+    /// Return member outcomes and, when created, the exact durable chat-list
+    /// row available to subscriptions and queries at the response boundary.
     pub async fn create_group_detailed(
         &self,
         account_ref: String,
         name: String,
         member_refs: Vec<String>,
         description: Option<String>,
-    ) -> Result<CreatedGroupFfi, MarmotKitError> {
+    ) -> Result<DetailedGroupCreationResultFfi, MarmotKitError> {
         Ok(self
             .runtime
             .create_group_detailed(&account_ref, &name, &member_refs, description)
@@ -484,15 +485,15 @@ impl Marmot {
             .into())
     }
 
-    /// Create a group with forward-compatible founding options and return the
-    /// exact durable chat-list row available at the response boundary.
+    /// Return member outcomes and the optional canonical group with its exact
+    /// durable chat-list row, using the supplied founding options.
     pub async fn create_group_with_options_detailed(
         &self,
         account_ref: String,
         name: String,
         member_refs: Vec<String>,
         options: CreateGroupOptionsFfi,
-    ) -> Result<CreatedGroupFfi, MarmotKitError> {
+    ) -> Result<DetailedGroupCreationResultFfi, MarmotKitError> {
         Ok(self
             .runtime
             .create_group_with_options_detailed(&account_ref, &name, &member_refs, options.into())
@@ -510,7 +511,7 @@ impl Marmot {
         member_refs: Vec<String>,
         description: Option<String>,
         initial_image: Option<InitialGroupImageFfi>,
-    ) -> Result<String, MarmotKitError> {
+    ) -> Result<GroupCreationResultFfi, MarmotKitError> {
         let initial_image = initial_image.map(Into::into);
         let group_id = self
             .runtime
@@ -522,7 +523,7 @@ impl Marmot {
                 initial_image,
             )
             .await?;
-        Ok(hex::encode(group_id.as_slice()))
+        Ok(group_id.into())
     }
 
     /// Validate and durably encrypt a founding image without performing any
@@ -586,7 +587,9 @@ impl Marmot {
     /// Fast founding-image create path. `upload_id` must already be uploaded;
     /// the image component is present in epoch-zero metadata and no Blossom
     /// request occurs on this call. Reusing a consumed id returns its original
-    /// canonical group rather than creating a duplicate.
+    /// canonical group and retained member report rather than creating a duplicate.
+    /// `CreatedGroupMemberReportUnavailable` identifies a canonical group whose
+    /// original report was not retained; use that group instead of recreating it.
     pub async fn create_group_with_prepared_initial_image(
         &self,
         account_ref: String,
@@ -594,7 +597,7 @@ impl Marmot {
         member_refs: Vec<String>,
         description: Option<String>,
         upload_id: String,
-    ) -> Result<String, MarmotKitError> {
+    ) -> Result<GroupCreationResultFfi, MarmotKitError> {
         let group_id = self
             .runtime
             .create_group_with_prepared_initial_image(
@@ -605,7 +608,7 @@ impl Marmot {
                 upload_id,
             )
             .await?;
-        Ok(hex::encode(group_id.as_slice()))
+        Ok(group_id.into())
     }
 
     pub async fn create_group_with_initial_image_detailed(
@@ -615,7 +618,7 @@ impl Marmot {
         member_refs: Vec<String>,
         description: Option<String>,
         initial_image: Option<InitialGroupImageFfi>,
-    ) -> Result<CreatedGroupFfi, MarmotKitError> {
+    ) -> Result<DetailedGroupCreationResultFfi, MarmotKitError> {
         let initial_image = initial_image.map(Into::into);
         Ok(self
             .runtime
@@ -818,26 +821,31 @@ impl Marmot {
             .await?)
     }
 
-    /// Invite `member_refs` into an existing group.
+    /// Invite eligible accounts from `member_refs` and report each account's
+    /// resolution outcome. A nonempty request with no eligible account creates
+    /// no operation or Commit. Empty requests and native membership-edit
+    /// refusals remain errors.
     pub async fn invite_members(
         &self,
         account_ref: String,
         group_id_hex: String,
         member_refs: Vec<String>,
-    ) -> Result<SendSummaryFfi, MarmotKitError> {
+    ) -> Result<InviteMembersResultFfi, MarmotKitError> {
         self.invite_members_with_initial_admins(account_ref, group_id_hex, member_refs, Vec::new())
             .await
     }
 
     /// Invite `member_refs` and grant admin to `initial_admin_refs` in the
-    /// same invite commit. Each initial admin must be one of the invitees.
+    /// same invite commit. Each initial admin must be requested as an invitee;
+    /// only selected accounts receive the grant. Inspect ordered member outcomes
+    /// even when the optional operation is present.
     pub async fn invite_members_with_initial_admins(
         &self,
         account_ref: String,
         group_id_hex: String,
         member_refs: Vec<String>,
         initial_admin_refs: Vec<String>,
-    ) -> Result<SendSummaryFfi, MarmotKitError> {
+    ) -> Result<InviteMembersResultFfi, MarmotKitError> {
         let group_id = group_id_from_hex(&group_id_hex)?;
         let group_id_hex = hex::encode(group_id.as_slice());
         let state =
@@ -850,6 +858,7 @@ impl Marmot {
                 &group_id,
                 &member_refs,
                 &initial_admin_refs,
+                marmot_app::MemberResolutionPolicy::Partial,
             )
             .await?;
         Ok(summary.into())
@@ -1321,7 +1330,7 @@ impl Marmot {
         account_ref: String,
         group_id_hex: String,
         member_refs: Vec<String>,
-    ) -> Result<GroupMutationResultFfi, MarmotKitError> {
+    ) -> Result<GroupInviteResultFfi, MarmotKitError> {
         self.invite_members_detailed_with_initial_admins(
             account_ref,
             group_id_hex,
@@ -1339,7 +1348,7 @@ impl Marmot {
         group_id_hex: String,
         member_refs: Vec<String>,
         initial_admin_refs: Vec<String>,
-    ) -> Result<GroupMutationResultFfi, MarmotKitError> {
+    ) -> Result<GroupInviteResultFfi, MarmotKitError> {
         let group_id = group_id_from_hex(&group_id_hex)?;
         let group_id_hex = hex::encode(group_id.as_slice());
         let state =
@@ -1352,10 +1361,21 @@ impl Marmot {
                 &group_id,
                 &member_refs,
                 &initial_admin_refs,
+                marmot_app::MemberResolutionPolicy::Partial,
             )
             .await?;
-        group_mutation_result_for(self, &account_ref, &group_id, &group_id_hex, summary.into())
-            .await
+        let details = group_details_for(self, &account_ref, &group_id).await?;
+        let account = self.runtime.accounts().resolve(&account_ref)?;
+        let management_state = group_management_state_ffi(
+            &account.account_id_hex,
+            &details,
+            self.app.admin_leave_steps_down(),
+        );
+        Ok(GroupInviteResultFfi {
+            invite: summary.into(),
+            details,
+            management_state,
+        })
     }
 
     pub async fn remove_members_detailed(
@@ -1796,7 +1816,9 @@ mod tests {
             let generic = kit
                 .create_group(account.clone(), name.into(), vec![peer.clone()], None)
                 .await
-                .unwrap();
+                .unwrap()
+                .group_id_hex
+                .expect("selected members create a group");
             let details = kit.group_details(account.clone(), generic).await.unwrap();
             assert_eq!(details.group.admins, vec![account.clone()]);
         }
@@ -1804,7 +1826,9 @@ mod tests {
         let group = kit
             .create_group(account.clone(), "components".into(), vec![], None)
             .await
-            .unwrap();
+            .unwrap()
+            .group_id_hex
+            .expect("selected members create a group");
         assert!(
             kit.group_app_component(account.clone(), group.clone(), 0xf301)
                 .await
@@ -1881,7 +1905,9 @@ mod tests {
                 None,
             )
             .await
-            .expect("create group");
+            .expect("create group")
+            .group_id_hex
+            .expect("selected members create a group");
 
         let details = kit
             .group_details(account_ref.clone(), group_id_hex.clone())

@@ -227,7 +227,9 @@ async fn offline_plaintext_replay(senders: usize, per_sender: usize, offline: Du
     let group = runtimes[0]
         .create_group(&accounts[0], "offline replay", &accounts[1..], None)
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     for index in 1..=senders {
         accept_group_invite_retrying_busy(&runtimes[index], &accounts[index], &group)
             .await

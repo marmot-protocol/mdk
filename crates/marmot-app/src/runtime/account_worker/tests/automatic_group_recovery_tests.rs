@@ -72,7 +72,9 @@ async fn app_retry_rearms_halted_job() {
     let group = alice_client
         .create_group("parked repair", &["bob"])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     bob_client.sync().await.unwrap();
     bob_client.accept_group_invite(&group).unwrap();
     drop(bob_client);
@@ -183,7 +185,9 @@ async fn auto_rejoin_keeps_history() {
     let group = alice_setup
         .create_group("automatic repair", &["bob", "carol"])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     bob_setup.sync().await.unwrap();
     carol_setup.sync().await.unwrap();
     bob_setup.accept_group_invite(&group).unwrap();

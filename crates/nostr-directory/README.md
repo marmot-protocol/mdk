@@ -31,5 +31,13 @@ adoption and reconciliation) and `DirectoryObserver` (usage analytics), then bui
 `DirectoryConfig` and a shared `DirectoryState`. `marmot-app` does this in `src/directory_resources.rs` and hands the
 service out as `MarmotApp::directory()`.
 
+`resolve_compatible_member_key_packages` takes a `MemberResolutionPolicy`. `Partial` returns fresh packages for eligible
+accounts with ordered per-account `member_outcomes`, including typed failures for unavailable accounts. An empty package
+set is a report, not permission to create a group without its requested members. `Atomic` returns the first recipient
+failure instead. Invalid references, storage failures and fetch-resource errors remain global errors under both
+policies. Incomplete relay reads can fall back per account; an error from the completion fetch aborts the lookup.
+Over-budget published member routes remain account-local and do not renew prewarm readiness.
+`resolve_member_key_packages` and composition prewarm retain their atomic readiness contract.
+
 The crate's API is what its root re-exports, plus the `config` and `error` modules. The `test-support` feature adds
 the hooks `marmot-app`'s directory tests use; production builds never enable it.

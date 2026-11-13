@@ -130,7 +130,12 @@ async fn message_journey_crash_child() {
     let app =
         MarmotApp::with_relay(&root, "wss://journey.example").with_test_relay_client(relay.clone());
     let mut client = app.client("sender").await.unwrap();
-    let group = client.create_group("journey", &[]).await.unwrap();
+    let group = client
+        .create_group("journey", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     fs_private::write_private(&root.join("group"), group.as_slice()).unwrap();
     relay.armed.store(true, Ordering::SeqCst);
     let mut updates = 0;
@@ -258,7 +263,12 @@ async fn message_journey_queue_cancel() {
     let app = MarmotApp::with_relay(root.path(), "wss://journey.example")
         .with_test_relay_client(relay.clone());
     let mut client = app.client("sender").await.unwrap();
-    let group = client.create_group("journey", &[]).await.unwrap();
+    let group = client
+        .create_group("journey", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     drop(client);
     let runtime = app.runtime();
     runtime.reconcile_accounts().await.unwrap();

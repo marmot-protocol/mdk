@@ -394,7 +394,9 @@ async fn native_error_keeps_fairness() {
         .sender
         .create_group("independent native backlog", &[&receiver_id])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     fixture.receiver.sync().await.unwrap();
     let (mut healthy_events, healthy_expected) =
         encrypted_texts(&mut fixture.sender, &healthy_group).await;
@@ -679,7 +681,9 @@ async fn runner_owned_history_releases_post_join_maintenance() {
     let group = sender
         .create_group("runner post-join history", &[&recipient.account_id_hex])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     sender
         .send(&group, b"history before the join")
         .await

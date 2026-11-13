@@ -8,7 +8,12 @@ async fn prepared_cache_keeps_snapshot_metadata_fresh_and_prunes_paged_rows() {
         .unwrap();
     let app = app::MarmotApp::with_relay(dir.path(), relay.url().await.as_str());
     let mut client = app.client("alice").await.unwrap();
-    let group = client.create_group("conversion cache", &[]).await.unwrap();
+    let group = client
+        .create_group("conversion cache", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("selected members create a group");
     for i in 0..3 {
         client
             .send(&group, format!("**message {i}**").as_bytes())

@@ -335,6 +335,11 @@ enum MarmotStatus
    * epoch, or a leave that can still finish. Show the leave's progress.
    */
   MARMOT_STATUS_LEAVE_NOT_BLOCKED = 129,
+  /**
+   * A legacy prepared-image create already committed, but its original
+   * member report is unavailable. Use the existing group; do not recreate it.
+   */
+  MARMOT_STATUS_CREATED_GROUP_MEMBER_REPORT_UNAVAILABLE = 130,
 };
 #ifndef __cplusplus
 #if __STDC_VERSION__ >= 202311L
@@ -553,6 +558,16 @@ typedef enum MarmotMissingRelayListKind {
    */
   MARMOT_MISSING_RELAY_LIST_KIND_INBOX,
 } MarmotMissingRelayListKind;
+
+typedef enum MarmotMemberResolutionStatus {
+  MARMOT_MEMBER_RESOLUTION_STATUS_SELECTED,
+  MARMOT_MEMBER_RESOLUTION_STATUS_MISSING_KEY_PACKAGE,
+  MARMOT_MEMBER_RESOLUTION_STATUS_OBSOLETE_KEY_PACKAGE,
+  MARMOT_MEMBER_RESOLUTION_STATUS_INVALID_KEY_PACKAGE,
+  MARMOT_MEMBER_RESOLUTION_STATUS_INCOMPATIBLE_KEY_PACKAGE,
+  MARMOT_MEMBER_RESOLUTION_STATUS_MISSING_INBOX_ROUTE,
+  MARMOT_MEMBER_RESOLUTION_STATUS_INCOMPLETE,
+} MarmotMemberResolutionStatus;
 
 /**
  * Marmot protocol profile the group runs.
@@ -2783,6 +2798,18 @@ typedef struct MarmotAccountRelayLists {
   struct MarmotRelayList inbox;
 } MarmotAccountRelayLists;
 
+typedef struct MarmotMemberResolutionOutcome {
+  char *account_id_hex;
+  enum MarmotMemberResolutionStatus status;
+  uint32_t selected_device_count;
+} MarmotMemberResolutionOutcome;
+
+typedef struct MarmotGroupCreationResult {
+  char *group_id_hex;
+  struct MarmotMemberResolutionOutcome *member_outcomes;
+  uintptr_t member_outcomes_len;
+} MarmotGroupCreationResult;
+
 /**
  * A normalized member reference (hex / npub / nostr: / marmot:// input).
  */
@@ -3075,6 +3102,12 @@ typedef struct MarmotSendSummary {
   enum MarmotSendAcceptDisposition accept_disposition;
   enum MarmotSendMaintenanceDisposition maintenance_disposition;
 } MarmotSendSummary;
+
+typedef struct MarmotInviteMembersResult {
+  struct MarmotSendSummary *summary;
+  struct MarmotMemberResolutionOutcome *member_outcomes;
+  uintptr_t member_outcomes_len;
+} MarmotInviteMembersResult;
 
 /**
  * Opaque application-owned group state. Empty data is distinct from absence.
@@ -3607,6 +3640,12 @@ typedef struct MarmotGroupInviteDeclineResult {
   struct MarmotAppGroupRecord group;
   struct MarmotSendSummary summary;
 } MarmotGroupInviteDeclineResult;
+
+typedef struct MarmotGroupInviteResult {
+  struct MarmotInviteMembersResult invite;
+  struct MarmotGroupDetails details;
+  struct MarmotGroupManagementState management_state;
+} MarmotGroupInviteResult;
 
 /**
  * A group mutation's publish summary plus refreshed details and
@@ -4873,14 +4912,19 @@ typedef struct MarmotMemberKeyPackagePrewarmSummary {
 } MarmotMemberKeyPackagePrewarmSummary;
 
 /**
- * A newly created group plus its chat-list row, so a caller can
- * render the conversation without a follow-up read. Free with
- * `marmot_created_group_free`.
+ * Created-group payload owned by MarmotDetailedGroupCreationResult.
+ * Its fields are released by the parent's deep-free.
  */
 typedef struct MarmotCreatedGroup {
   char *group_id_hex;
   struct MarmotChatListRow chat_list_row;
 } MarmotCreatedGroup;
+
+typedef struct MarmotDetailedGroupCreationResult {
+  struct MarmotCreatedGroup *created;
+  struct MarmotMemberResolutionOutcome *member_outcomes;
+  uintptr_t member_outcomes_len;
+} MarmotDetailedGroupCreationResult;
 
 /**
  * Member and admin ids for one group in a batch page.
@@ -8727,8 +8771,8 @@ MarmotStatus marmot_start_direct_chat(const struct MarmotClient *client,
 
 /**
  * Create a new MLS group with `name` and the given members
- * (referenced by `npub` or hex account id). Writes the new group id
- * as a hex string; free it with `marmot_string_free`.
+ * (referenced by `npub` or hex account id). Writes a partial member result with an optional group id
+ * encoded as hex; free it with `marmot_group_creation_free`.
  *
  * # Safety
  * `client` must be a live handle; string arguments must be valid
@@ -8742,7 +8786,7 @@ MarmotStatus marmot_create_group(const struct MarmotClient *client,
                                  const char *const *member_refs,
                                  uintptr_t member_refs_len,
                                  const char *description,
-                                 char **out);
+                                 struct MarmotGroupCreationResult **out);
 
 /**
  * Normalize a member reference (hex, `npub`, `nostr:npub...`,
@@ -8810,7 +8854,7 @@ MarmotStatus marmot_group_management_state(const struct MarmotClient *client,
 
 /**
  * Invite members (by `npub` or hex account id) into the group.
- * Requires admin. Free with `marmot_send_summary_free`.
+ * Requires admin. Free with `marmot_invite_members_free`.
  *
  * # Safety
  * `client` must be a live handle; string arguments must be valid
@@ -8823,7 +8867,7 @@ MarmotStatus marmot_invite_members(const struct MarmotClient *client,
                                    const char *group_id_hex,
                                    const char *const *member_refs,
                                    uintptr_t member_refs_len,
-                                   struct MarmotSendSummary **out);
+                                   struct MarmotInviteMembersResult **out);
 
 /**
  * Remove members from the group. Requires admin; preflight rejects
@@ -9794,7 +9838,7 @@ MarmotStatus marmot_self_demote_admin(const struct MarmotClient *client,
 /**
  * `marmot_invite_members` plus refreshed details and management
  * state in one round trip. Free with
- * `marmot_group_mutation_result_free`.
+ * `marmot_group_invite_free`.
  *
  * # Safety
  * `client` must be a live handle; string arguments must be valid
@@ -9807,7 +9851,7 @@ MarmotStatus marmot_invite_members_detailed(const struct MarmotClient *client,
                                             const char *group_id_hex,
                                             const char *const *member_refs,
                                             uintptr_t member_refs_len,
-                                            struct MarmotGroupMutationResult **out);
+                                            struct MarmotGroupInviteResult **out);
 
 /**
  * `marmot_remove_members` plus refreshed details and management
@@ -10998,7 +11042,7 @@ MarmotStatus marmot_acknowledge_disband_failure(const struct MarmotClient *clien
 
 /**
  * `marmot_invite_members` where some invitees join as admins. Free
- * with `marmot_send_summary_free`.
+ * with `marmot_invite_members_free`.
  *
  * # Safety
  * `client` must be a live handle; string arguments must be valid
@@ -11013,12 +11057,12 @@ MarmotStatus marmot_invite_members_with_initial_admins(const struct MarmotClient
                                                        uintptr_t member_refs_len,
                                                        const char *const *initial_admin_refs,
                                                        uintptr_t initial_admin_refs_len,
-                                                       struct MarmotSendSummary **out);
+                                                       struct MarmotInviteMembersResult **out);
 
 /**
  * `marmot_invite_members_with_initial_admins` plus refreshed details
  * and management state in one round trip. Free with
- * `marmot_group_mutation_result_free`.
+ * `marmot_group_invite_free`.
  *
  * # Safety
  * `client` must be a live handle; string arguments must be valid
@@ -11033,7 +11077,7 @@ MarmotStatus marmot_invite_members_detailed_with_initial_admins(const struct Mar
                                                                 uintptr_t member_refs_len,
                                                                 const char *const *initial_admin_refs,
                                                                 uintptr_t initial_admin_refs_len,
-                                                                struct MarmotGroupMutationResult **out);
+                                                                struct MarmotGroupInviteResult **out);
 
 /**
  * Queue an MLS self-update commit for the group. Writes the
@@ -11249,7 +11293,7 @@ MarmotStatus marmot_prewarm_group_member_key_packages(const struct MarmotClient 
 
 /**
  * `marmot_create_group` plus the new chat-list row in one round
- * trip. Free with `marmot_created_group_free`.
+ * trip. Free with `marmot_detailed_creation_free`.
  *
  * # Safety
  * `client` must be a live handle; string arguments must be valid
@@ -11263,7 +11307,7 @@ MarmotStatus marmot_create_group_detailed(const struct MarmotClient *client,
                                           const char *const *member_refs,
                                           uintptr_t member_refs_len,
                                           const char *description,
-                                          struct MarmotCreatedGroup **out);
+                                          struct MarmotDetailedGroupCreationResult **out);
 
 /**
  * Member and admin ids for several groups in one read. Free with
@@ -11358,8 +11402,8 @@ MarmotStatus marmot_prepared_group_images(const struct MarmotClient *client,
 
 /**
  * Create a group whose avatar is an already-staged prepared image.
- * Writes the new group id as a hex string; free it with
- * `marmot_string_free`.
+ * Writes a partial member result with an optional group id encoded as hex; free it with
+ * `marmot_group_creation_free`.
  *
  * # Safety
  * `client` must be a live handle; string arguments must be valid
@@ -11374,7 +11418,7 @@ MarmotStatus marmot_create_group_with_prepared_initial_image(const struct Marmot
                                                              uintptr_t member_refs_len,
                                                              const char *description,
                                                              const char *upload_id,
-                                                             char **out);
+                                                             struct MarmotGroupCreationResult **out);
 
 /**
  * One group's maintenance state. Free with
@@ -11984,7 +12028,7 @@ MarmotStatus marmot_save_message_draft(const struct MarmotClient *client,
 /**
  * Create a group with the options struct: description, an optional
  * initial avatar, and disappearing-message retention. Writes the new
- * group id as a hex string; free it with `marmot_string_free`.
+ * partial member result; free it with `marmot_group_creation_free`.
  *
  * # Safety
  * `client` must be a live handle; strings valid; the member array must
@@ -11997,11 +12041,11 @@ MarmotStatus marmot_create_group_with_options(const struct MarmotClient *client,
                                               const char *const *member_refs,
                                               uintptr_t member_refs_len,
                                               const struct MarmotCreateGroupOptions *options,
-                                              char **out);
+                                              struct MarmotGroupCreationResult **out);
 
 /**
  * `marmot_create_group_with_options` plus the new chat-list row in one
- * round trip. Free with `marmot_created_group_free`.
+ * round trip. Free with `marmot_detailed_creation_free`.
  *
  * # Safety
  * Same as `marmot_create_group_with_options`.
@@ -12012,12 +12056,12 @@ MarmotStatus marmot_create_group_with_options_detailed(const struct MarmotClient
                                                        const char *const *member_refs,
                                                        uintptr_t member_refs_len,
                                                        const struct MarmotCreateGroupOptions *options,
-                                                       struct MarmotCreatedGroup **out);
+                                                       struct MarmotDetailedGroupCreationResult **out);
 
 /**
  * Create a group with an inline initial avatar. `initial_image` may be
- * NULL for no image. Writes the new group id as a hex string; free it
- * with `marmot_string_free`.
+ * NULL for no image. Writes a partial member result; free it
+ * with `marmot_group_creation_free`.
  *
  * # Safety
  * `client` must be a live handle; strings valid (`description`
@@ -12032,11 +12076,11 @@ MarmotStatus marmot_create_group_with_initial_image(const struct MarmotClient *c
                                                     uintptr_t member_refs_len,
                                                     const char *description,
                                                     const struct MarmotInitialGroupImage *initial_image,
-                                                    char **out);
+                                                    struct MarmotGroupCreationResult **out);
 
 /**
  * `marmot_create_group_with_initial_image` plus the new chat-list row
- * in one round trip. Free with `marmot_created_group_free`.
+ * in one round trip. Free with `marmot_detailed_creation_free`.
  *
  * # Safety
  * Same as `marmot_create_group_with_initial_image`.
@@ -12048,7 +12092,7 @@ MarmotStatus marmot_create_group_with_initial_image_detailed(const struct Marmot
                                                              uintptr_t member_refs_len,
                                                              const char *description,
                                                              const struct MarmotInitialGroupImage *initial_image,
-                                                             struct MarmotCreatedGroup **out);
+                                                             struct MarmotDetailedGroupCreationResult **out);
 
 /**
  * Encrypt and stage a group image without attaching it to a group yet,
@@ -15443,6 +15487,46 @@ void marmot_installed_custom_emoji_asset_free(struct MarmotInstalledCustomEmojiA
 void marmot_event_free(struct MarmotEvent *event);
 
 /**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
+void marmot_group_creation_free(struct MarmotGroupCreationResult *ptr);
+
+/**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
+void marmot_detailed_creation_free(struct MarmotDetailedGroupCreationResult *ptr);
+
+/**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
+void marmot_invite_members_free(struct MarmotInviteMembersResult *ptr);
+
+/**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
+void marmot_group_invite_free(struct MarmotGroupInviteResult *ptr);
+
+/**
  * Free a list returned by this library. NULL is a no-op.
  *
  * # Safety
@@ -15586,16 +15670,6 @@ void marmot_app_quarantined_group_list_free(struct MarmotAppQuarantinedGroupList
  * this library.
  */
 void marmot_member_key_package_prewarm_summary_free(struct MarmotMemberKeyPackagePrewarmSummary *ptr);
-
-/**
- * Free a value of this type returned by this library. NULL
- * is a no-op.
- *
- * # Safety
- * The pointer must be NULL or an unfreed pointer returned by
- * this library.
- */
-void marmot_created_group_free(struct MarmotCreatedGroup *ptr);
 
 /**
  * Free a value of this type returned by this library. NULL

@@ -6,7 +6,9 @@ async fn queued_messages(app: &MarmotApp) -> (AppClient, cgka_traits::GroupId, V
     let group = client
         .create_group("publication progress", &[])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let sender = hex::encode(client.runtime.session().self_id().as_slice());
     let mut ids = Vec::new();
     for content in ["first queued message", "second queued message"] {
@@ -520,6 +522,8 @@ async fn queued_publication_cancel_finalizer_keeps_progress_before_revival() {
         )
         .await
         .unwrap()
+        .operation
+        .expect("eligible fixture members")
         .group_id;
     // Leave a real uninstalled group route for the finalizer's route refresh.
     client
@@ -763,7 +767,9 @@ async fn send_during_secondary_retry(foreground: ForegroundSend) {
             },
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     drop(client);
     // A recent announce keeps the creator's first send from owing a push
     // announce, so the indexer's next publish is the text's retry.

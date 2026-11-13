@@ -46,7 +46,12 @@ mod tests {
         let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
             .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
         let mut client = app.client("alice").await.unwrap();
-        let group = client.create_group("Original", &[]).await.unwrap();
+        let group = client
+            .create_group("Original", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         let id = hex::encode(group.as_slice());
         let storage = app.account_storage("alice").unwrap().app_storage();
         app.chat_list_row("alice", &id).unwrap().unwrap();

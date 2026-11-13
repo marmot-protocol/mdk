@@ -65,6 +65,8 @@ use crate::{
 use marmot_observability::AppPerformanceOperation;
 use marmot_observability::PerformanceRecorder;
 
+const PREPARED_MEMBER_REPORT_VERSION: u8 = 1;
+
 mod audit;
 mod audit_recovery;
 mod audit_v5_app_update;
@@ -1898,6 +1900,7 @@ impl AppClient {
             encrypted_blob: Some(prepared.encrypted_blob),
             upload_secret: Some(prepared.upload_secret.to_vec()),
             group_id_hex: None,
+            member_outcomes_json: None,
             attempt_count: 0,
             last_error_kind: None,
             recorded_at: now,
@@ -2146,7 +2149,7 @@ impl AppClient {
 
     /// Create a locally canonical group and attempt each founding Welcome.
     ///
-    /// `Ok(group_id)` reports group creation, not blanket invitation success.
+    /// `operation` reports group creation; `member_outcomes` reports selection.
     /// Any Welcome that misses its acknowledgement policy is reported through
     /// `WelcomeDeliveryPending` and remains listed by
     /// [`Self::pending_welcome_deliveries`] for explicit re-delivery.
@@ -2155,7 +2158,7 @@ impl AppClient {
         &mut self,
         name: &str,
         member_refs: &[&str],
-    ) -> Result<GroupId, AppError> {
+    ) -> Result<crate::GroupMemberResult<GroupId>, AppError> {
         self.create_group_with_options(name, member_refs, AppCreateGroupOptions::default())
             .await
     }
@@ -2166,7 +2169,7 @@ impl AppClient {
         name: &str,
         member_refs: &[&str],
         initial_image: Option<AppInitialGroupImage>,
-    ) -> Result<GroupId, AppError> {
+    ) -> Result<crate::GroupMemberResult<GroupId>, AppError> {
         self.create_group_with_options(
             name,
             member_refs,
@@ -2184,13 +2187,18 @@ impl AppClient {
         name: &str,
         member_refs: &[&str],
         options: AppCreateGroupOptions,
-    ) -> Result<GroupId, AppError> {
+    ) -> Result<crate::GroupMemberResult<GroupId>, AppError> {
         let created = self
             .create_group_with_options_and_optional_telemetry(name, member_refs, options, None)
             .await?;
         // The chat stands either way: an undelivered Welcome stays owed.
-        let _ = self.drive_unpublished_welcome_delivery(None).await;
-        Ok(created.group_id)
+        if created.operation.is_some() {
+            let _ = self.drive_unpublished_welcome_delivery(None).await;
+        }
+        Ok(crate::GroupMemberResult {
+            operation: created.operation.map(|created| created.group_id),
+            member_outcomes: created.member_outcomes,
+        })
     }
 
     pub(crate) async fn create_group_with_options_and_telemetry(
@@ -2199,7 +2207,7 @@ impl AppClient {
         member_refs: &[&str],
         options: AppCreateGroupOptions,
         telemetry: &PerformanceRecorder,
-    ) -> Result<CanonicalCreatedGroup, AppError> {
+    ) -> Result<crate::GroupMemberResult<CanonicalCreatedGroup>, AppError> {
         self.create_group_with_options_and_optional_telemetry(
             name,
             member_refs,
@@ -2216,7 +2224,7 @@ impl AppClient {
         options: AppCreateGroupOptions,
         upload_id: &str,
         telemetry: &PerformanceRecorder,
-    ) -> Result<CanonicalCreatedGroup, AppError> {
+    ) -> Result<crate::GroupMemberResult<CanonicalCreatedGroup>, AppError> {
         let storage = self.app.account_storage(&self.state.label)?.app_storage();
         let record = storage
             .prepared_group_image_upload(upload_id)?
@@ -2224,12 +2232,17 @@ impl AppClient {
                 AppError::InvalidEncryptedMedia("prepared group image upload was not found".into())
             })?;
         if record.state == PreparedGroupImageUploadState::Consumed {
-            let group_id_hex = record.group_id_hex.ok_or_else(|| {
+            let group_id_hex = record.group_id_hex.as_ref().ok_or_else(|| {
                 AppError::InvalidEncryptedMedia("consumed group image artifact has no group".into())
             })?;
-            return Ok(CanonicalCreatedGroup {
-                group_id: GroupId::new(hex::decode(group_id_hex)?),
-                chat_list_row: None,
+            let group_id = GroupId::new(hex::decode(group_id_hex)?);
+            let member_outcomes = Self::prepared_member_outcomes(&record, &group_id)?;
+            return Ok(crate::GroupMemberResult {
+                operation: Some(CanonicalCreatedGroup {
+                    group_id,
+                    chat_list_row: None,
+                }),
+                member_outcomes,
             });
         }
         if record.state != PreparedGroupImageUploadState::Uploaded {
@@ -2263,9 +2276,13 @@ impl AppClient {
                 &group_id_hex,
                 unix_now_seconds(),
             )?;
-            return Ok(CanonicalCreatedGroup {
-                group_id,
-                chat_list_row: None,
+            let member_outcomes = Self::prepared_member_outcomes(&record, &group_id)?;
+            return Ok(crate::GroupMemberResult {
+                operation: Some(CanonicalCreatedGroup {
+                    group_id,
+                    chat_list_row: None,
+                }),
+                member_outcomes,
             });
         }
 
@@ -2288,13 +2305,29 @@ impl AppClient {
         .await
     }
 
+    fn prepared_member_outcomes(
+        record: &PreparedGroupImageUploadRecord,
+        group_id: &GroupId,
+    ) -> Result<Vec<crate::MemberResolutionOutcome>, AppError> {
+        let unavailable =
+            || AppError::CreatedGroupMemberReportUnavailable(hex::encode(group_id.as_slice()));
+        let report = record
+            .member_outcomes_json
+            .as_deref()
+            .ok_or_else(unavailable)?;
+        match serde_json::from_str::<(u8, Vec<crate::MemberResolutionOutcome>)>(report) {
+            Ok((PREPARED_MEMBER_REPORT_VERSION, outcomes)) => Ok(outcomes),
+            _ => Err(unavailable()),
+        }
+    }
+
     async fn create_group_with_options_and_optional_telemetry(
         &mut self,
         name: &str,
         member_refs: &[&str],
         options: AppCreateGroupOptions,
         telemetry: Option<&PerformanceRecorder>,
-    ) -> Result<CanonicalCreatedGroup, AppError> {
+    ) -> Result<crate::GroupMemberResult<CanonicalCreatedGroup>, AppError> {
         let mut options = options;
         let initial_image = options.initial_image.take();
         self.create_group_with_initial_source_and_optional_telemetry(
@@ -2319,8 +2352,9 @@ impl AppClient {
         options: AppCreateGroupOptions,
         initial_image: Option<InitialGroupImageSource>,
         telemetry: Option<&PerformanceRecorder>,
-    ) -> Result<CanonicalCreatedGroup, AppError> {
+    ) -> Result<crate::GroupMemberResult<CanonicalCreatedGroup>, AppError> {
         let AppCreateGroupOptions {
+            member_resolution,
             description,
             initial_admins,
             disappearing_message_secs,
@@ -2328,6 +2362,15 @@ impl AppClient {
             ..
         } = options;
         validate_group_profile(name, &description)?;
+        let creator = self.app.account_home().account(&self.state.label)?;
+        let requested_members = member_refs
+            .iter()
+            .map(|member| self.app.member_id(member))
+            .collect::<Result<HashSet<_>, _>>()?;
+        let creator_id = self.app.member_id(&self.state.label)?;
+        if requested_members.contains(&creator_id) {
+            return Err(AppError::GroupCreateIncludesCreator);
+        }
         if name.trim().is_empty()
             && member_refs.len() == 1
             && let Ok(member) = crate::ids::account_id_hex_from_ref(member_refs[0])
@@ -2371,19 +2414,12 @@ impl AppClient {
                 .map(|admin| self.app.member_id(admin))
                 .collect::<Result<Vec<_>, _>>()?,
         };
-        if !request.initial_admins.is_empty() {
-            let mut founding_members = member_refs
-                .iter()
-                .map(|member| self.app.member_id(member))
-                .collect::<Result<HashSet<_>, _>>()?;
-            founding_members.insert(self.app.member_id(&self.state.label)?);
-            if request
-                .initial_admins
-                .iter()
-                .any(|admin| !founding_members.contains(admin))
-            {
-                return Err(AppError::GroupCreateAdminNotMember);
-            }
+        if request
+            .initial_admins
+            .iter()
+            .any(|admin| admin != &creator_id && !requested_members.contains(admin))
+        {
+            return Err(AppError::GroupCreateAdminNotMember);
         }
         let requirements = self
             .runtime
@@ -2400,6 +2436,7 @@ impl AppClient {
                     .collect(),
                 &requirements,
                 nostr_directory::MemberResolutionPurpose::Commit,
+                member_resolution,
             )
             .await;
         let key_package_elapsed = key_package_started_at.elapsed();
@@ -2418,11 +2455,25 @@ impl AppClient {
                 true,
             );
         }
+        let member_outcomes = resolved.member_outcomes;
         let members = resolved.key_packages;
-        // Resolution still validates every requested package and inbox route.
-        // Reject an explicit creator before MLS mutation instead of surfacing
-        // OpenMLS's opaque DuplicateSignatureKey error from add_members.
-        let creator = self.app.account_home().account(&self.state.label)?;
+        if !member_refs.is_empty() && members.is_empty() {
+            return Ok(crate::GroupMemberResult {
+                operation: None,
+                member_outcomes,
+            });
+        }
+        if !request.initial_admins.is_empty() {
+            let selected_accounts = member_outcomes
+                .iter()
+                .filter(|outcome| outcome.status == crate::MemberResolutionStatus::Selected)
+                .map(|outcome| outcome.account_id_hex.as_str())
+                .collect::<HashSet<_>>();
+            request.initial_admins.retain(|admin| {
+                admin == &creator_id
+                    || selected_accounts.contains(hex::encode(admin.as_slice()).as_str())
+            });
+        }
         let mut founding_selections = Vec::with_capacity(members.len());
         for member in &members {
             let metadata = marmot_session::key_package_metadata(member)
@@ -2550,10 +2601,24 @@ impl AppClient {
             "create_group",
             changed_fields,
             touched_components,
-            Some(resolved.stats.unique_members as u64),
+            Some(
+                member_outcomes
+                    .iter()
+                    .filter(|outcome| outcome.status == crate::MemberResolutionStatus::Selected)
+                    .count() as u64,
+            ),
         );
 
         request.members = members;
+        if let Some(upload_id) = prepared_upload_id.as_deref() {
+            self.app
+                .account_storage(&self.state.label)?
+                .app_storage()
+                .save_prepared_image_members(
+                    upload_id,
+                    &serde_json::to_string(&(PREPARED_MEMBER_REPORT_VERSION, &member_outcomes))?,
+                )?;
+        }
         let siblings = self.founding_sibling_key_packages(
             &request,
             &optional_app_components,
@@ -2699,9 +2764,12 @@ impl AppClient {
             // unrelated chats may still be awaiting deferred hydration.
             self.send_owed_sibling_welcomes(&[]).await;
         }
-        Ok(CanonicalCreatedGroup {
-            group_id,
-            chat_list_row: local_projection.ok(),
+        Ok(crate::GroupMemberResult {
+            operation: Some(CanonicalCreatedGroup {
+                group_id,
+                chat_list_row: local_projection.ok(),
+            }),
+            member_outcomes,
         })
     }
 
@@ -3040,14 +3108,22 @@ impl AppClient {
         &mut self,
         group_id: &GroupId,
         member_refs: &[&str],
-    ) -> Result<SendSummary, AppError> {
+    ) -> Result<crate::GroupMemberResult<SendSummary>, AppError> {
         let summary = self
-            .invite_members_with_optional_telemetry(group_id, member_refs, &[], None)
+            .invite_members_with_optional_telemetry(
+                group_id,
+                member_refs,
+                &[],
+                crate::MemberResolutionPolicy::Partial,
+                None,
+            )
             .await?;
         // As the account worker does: only a published commit has Welcomes
         // to send now (mdk#2726). The invite stands either way: an
         // undelivered Welcome stays owed.
-        if summary.accept_disposition == cgka_traits::SendAcceptDisposition::Published {
+        if summary.operation.as_ref().is_some_and(|operation| {
+            operation.accept_disposition == cgka_traits::SendAcceptDisposition::Published
+        }) {
             let _ = self.drive_unpublished_welcome_delivery(None).await;
         }
         Ok(summary)
@@ -3058,12 +3134,14 @@ impl AppClient {
         group_id: &GroupId,
         member_refs: &[&str],
         initial_admin_refs: &[&str],
+        member_resolution: crate::MemberResolutionPolicy,
         telemetry: &PerformanceRecorder,
-    ) -> Result<SendSummary, AppError> {
+    ) -> Result<crate::GroupMemberResult<SendSummary>, AppError> {
         self.invite_members_with_optional_telemetry(
             group_id,
             member_refs,
             initial_admin_refs,
+            member_resolution,
             Some(telemetry),
         )
         .await
@@ -3074,10 +3152,48 @@ impl AppClient {
         group_id: &GroupId,
         member_refs: &[&str],
         initial_admin_refs: &[&str],
+        member_resolution: crate::MemberResolutionPolicy,
         telemetry: Option<&PerformanceRecorder>,
-    ) -> Result<SendSummary, AppError> {
+    ) -> Result<crate::GroupMemberResult<SendSummary>, AppError> {
         self.ensure_group(group_id)?;
         self.ensure_group_change_admitted(group_id)?;
+
+        let requested_members = member_refs
+            .iter()
+            .map(|member| self.app.member_id(member))
+            .collect::<Result<HashSet<_>, _>>()?;
+        let inviter = self.app.member_id(&self.state.label)?;
+        if requested_members.contains(&inviter) {
+            return Err(AppError::GroupInviteIncludesInviter);
+        }
+        let mut initial_admins = initial_admin_refs
+            .iter()
+            .map(|admin| self.app.member_id(admin))
+            .collect::<Result<Vec<_>, _>>()?;
+        if !initial_admins.is_empty() {
+            let current_members = self.runtime.members(group_id)?;
+            if initial_admins.iter().any(|admin| {
+                !requested_members.contains(admin)
+                    || current_members.iter().any(|member| &member.id == admin)
+            }) {
+                return Err(marmot_session::SessionError::from(EngineError::Other(
+                    "initial admin must be among the invited members".into(),
+                ))
+                .into());
+            }
+        }
+        let authority = self
+            .runtime
+            .group_authority_view()
+            .with_group_authority_snapshot(group_id, |_, authority| Ok::<_, AppError>(authority))?;
+        if !authority.facts.is_admin {
+            return Err(
+                marmot_session::SessionError::from(EngineError::NotGroupAdmin {
+                    group_id: group_id.clone(),
+                })
+                .into(),
+            );
+        }
 
         let key_package_started_at = Instant::now();
         let requirements = self
@@ -3094,6 +3210,7 @@ impl AppClient {
                     .collect(),
                 &requirements,
                 nostr_directory::MemberResolutionPurpose::Commit,
+                member_resolution,
             )
             .await;
         record_app_performance(
@@ -3104,24 +3221,23 @@ impl AppClient {
         );
         let nostr_directory::ResolvedMemberKeyPackages {
             key_packages,
-            stats,
+            member_outcomes,
+            ..
         } = key_packages?;
-        // A device never adds its own account's other devices from published
-        // KeyPackages (mdk#2628 D14). Refuse the inviter's account, under any
-        // alias, before anything is staged or published. Receivers still
-        // accept an admin's own-account Add; this is a sender rule.
-        let inviter = self.app.account_home().account(&self.state.label)?;
-        for package in &key_packages {
-            let metadata = marmot_session::key_package_metadata(package)
-                .map_err(|error| AppError::InvalidKeyPackageEvent(error.to_string()))?;
-            if metadata.credential_identity_hex == inviter.account_id_hex {
-                return Err(AppError::GroupInviteIncludesInviter);
-            }
+        if !member_refs.is_empty() && key_packages.is_empty() {
+            return Ok(crate::GroupMemberResult {
+                operation: None,
+                member_outcomes,
+            });
         }
-
-        let mut initial_admins = Vec::with_capacity(initial_admin_refs.len());
-        for admin in initial_admin_refs {
-            initial_admins.push(self.app.member_id(admin)?);
+        if !initial_admins.is_empty() {
+            let selected_accounts = member_outcomes
+                .iter()
+                .filter(|outcome| outcome.status == crate::MemberResolutionStatus::Selected)
+                .map(|outcome| outcome.account_id_hex.as_str())
+                .collect::<HashSet<_>>();
+            initial_admins
+                .retain(|admin| selected_accounts.contains(hex::encode(admin.as_slice()).as_str()));
         }
 
         let routing_refresh_started_at = Instant::now();
@@ -3136,7 +3252,7 @@ impl AppClient {
 
         let mut affected_fields = vec!["members"];
         let mut affected_components = Vec::new();
-        if !initial_admin_refs.is_empty() {
+        if !initial_admins.is_empty() {
             affected_fields.push("admins");
             affected_components.push(GROUP_ADMIN_POLICY_COMPONENT_ID);
         }
@@ -3145,7 +3261,12 @@ impl AppClient {
             "invite_members",
             affected_fields,
             affected_components,
-            Some(stats.unique_members as u64),
+            Some(
+                member_outcomes
+                    .iter()
+                    .filter(|outcome| outcome.status == crate::MemberResolutionStatus::Selected)
+                    .count() as u64,
+            ),
         );
 
         let pre_send_sync_started_at = Instant::now();
@@ -3217,7 +3338,10 @@ impl AppClient {
                     engine_publish_started_at.elapsed(),
                     queued.is_ok(),
                 );
-                return queued.map(|effects| send_summary_from_effects(&effects));
+                return queued.map(|effects| crate::GroupMemberResult {
+                    operation: Some(send_summary_from_effects(&effects)),
+                    member_outcomes,
+                });
             }
             // The commit or a Welcome fit none of its relays' known limits,
             // so the runtime rolled it back with nothing sent (mdk#2334).
@@ -3357,7 +3481,10 @@ impl AppClient {
             true,
         );
 
-        Ok(summary)
+        Ok(crate::GroupMemberResult {
+            operation: Some(summary),
+            member_outcomes,
+        })
     }
 
     pub async fn remove_members(
@@ -8072,7 +8199,12 @@ mod self_membership_backfill_tests {
         let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
             .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
         let mut client = app.client("alice").await.unwrap();
-        let group_id = client.create_group("pending group", &[]).await.unwrap();
+        let group_id = client
+            .create_group("pending group", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         let group_id_hex = hex::encode(group_id.as_slice());
         let storage = app.account_storage("alice").unwrap();
         storage
@@ -8129,9 +8261,24 @@ mod self_membership_backfill_tests {
         let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
             .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
         let mut client = app.client("alice").await.unwrap();
-        let removed = client.create_group("removed device", &[]).await.unwrap();
-        let removed_account = client.create_group("removed account", &[]).await.unwrap();
-        let live = client.create_group("live device", &[]).await.unwrap();
+        let removed = client
+            .create_group("removed device", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
+        let removed_account = client
+            .create_group("removed account", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
+        let live = client
+            .create_group("live device", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         let storage = app.account_storage("alice").unwrap();
         storage
             .app_storage()
@@ -8180,7 +8327,12 @@ mod self_membership_backfill_tests {
         let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
             .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
         let mut client = app.client("alice").await.unwrap();
-        let group_id = client.create_group("large group", &[]).await.unwrap();
+        let group_id = client
+            .create_group("large group", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         let group_id_hex = hex::encode(group_id.as_slice());
         let storage = app.account_storage("alice").unwrap();
         let mut incomplete = storage.get_group(&group_id).unwrap();

@@ -59,13 +59,20 @@ async fn key_packages_and_leaves_advertise_account_devices() {
     bob.sync().await.unwrap();
 
     let mut alice = app.client("alice").await.unwrap();
-    let group = alice.create_group("team", &[]).await.unwrap();
+    let group = alice
+        .create_group("team", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     assert!(own_leaf_advertises_everything(&alice, &group));
     assert!(requires_account_devices(&alice, &group));
     alice
         .invite_members(&group, &[bob_id.as_str()])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let mut cursor = 0;
     deliver_new(&mut bob, &relay, &mut cursor).await;
     bob.sync().await.unwrap();
@@ -110,13 +117,17 @@ async fn key_packages_without_account_devices_found_and_join_a_group() {
     let group = client
         .create_group("team", &[accounts[0].account_id_hex.as_str()])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     assert!(own_leaf_advertises_everything(&client, &group));
     assert!(!requires_account_devices(&client, &group));
     client
         .invite_members(&group, &[accounts[1].account_id_hex.as_str()])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     assert_eq!(client.group_mls_state(&group).unwrap().member_count, 3);
     assert!(!requires_account_devices(&client, &group));
 }
@@ -151,7 +162,12 @@ async fn an_admin_turns_account_devices_on_once_the_group_is_eligible() {
         .unwrap();
     let mut client = app.client(&creator.label).await.unwrap();
     let member = accounts[0].account_id_hex.as_str();
-    let group = client.create_group("team", &[member]).await.unwrap();
+    let group = client
+        .create_group("team", &[member])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     assert!(!requires_account_devices(&client, &group));
 
     assert_eq!(

@@ -215,7 +215,9 @@ async fn file_backed_sends_retain_bounded_bodies_and_publish_once() {
         let group = client
             .create_group("generated file retention", &[])
             .await
-            .unwrap();
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         let group_hex = hex::encode(group.as_slice());
         drop(client);
         let connection = fault_connection(&app);
@@ -361,7 +363,12 @@ async fn cancelled_file_upload_is_refused_without_upload_or_admission() {
     )
     .with_test_relay_client(Arc::new(crate::tests::ScriptedPushRelayClient::default()));
     let mut client = app.client("alice").await.unwrap();
-    let group = client.create_group("generated cancel", &[]).await.unwrap();
+    let group = client
+        .create_group("generated cancel", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     drop(client);
     let (url, puts, server) = upload_endpoint().await;
     let source_dir = tempfile::tempdir().unwrap();
@@ -430,7 +437,9 @@ async fn cancelled_finish_frees_staging() {
     let group = client
         .create_group("cancelled completion", &[])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let connection = fault_connection(&app);
     let bytes = b"completed upload";
     let (reference, _) = crate::media::tests::attachment_worker_fixture(bytes);
@@ -499,7 +508,9 @@ async fn outgoing_sends_ignore_the_budget_and_refuse_what_they_cannot_stage() {
             let group = client
                 .create_group("generated retention pressure", &[])
                 .await
-                .unwrap();
+                .unwrap()
+                .operation
+                .expect("eligible fixture members");
             let group_hex = hex::encode(group.as_slice());
             let storage = app.account_storage("alice").unwrap().app_storage();
             let connection = fault_connection(&app);
@@ -709,7 +720,9 @@ async fn staging_does_not_hold_an_account_transaction() {
     let group = client
         .create_group("generated slow staging", &[])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let storage = app.account_storage("alice").unwrap();
     let staging = crate::media::outgoing::SendStaging::open(&app, "alice", &group, 3).unwrap();
     let (entered, waiting) = std::sync::mpsc::channel();
@@ -776,7 +789,9 @@ async fn a_send_dropped_during_staging_releases_its_upload() {
     let group = client
         .create_group("generated dropped staging", &[])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let connection = fault_connection(&app);
     let source_dir = tempfile::tempdir().unwrap();
     let path = source_dir.path().join("generated.bin");
@@ -850,7 +865,9 @@ async fn a_completed_upload_dropped_before_admission_is_released() {
     let group = client
         .create_group("generated dropped completion", &[])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let connection = fault_connection(&app);
     let (url, puts, server) = upload_endpoint().await;
     let request = crate::MediaUploadRequest {
@@ -903,7 +920,9 @@ async fn an_undelivered_upload_only_result_is_released() {
     let group = client
         .create_group("undelivered upload", &[])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let connection = fault_connection(&app);
     let bytes = b"completed upload";
     let (reference, _) = crate::media::tests::attachment_worker_fixture(bytes);

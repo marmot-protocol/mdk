@@ -873,7 +873,12 @@ async fn failed_single_author_refetch_preserves_only_usable_current_batch_packag
         let (_dir, app, accounts, fetcher) = member_resolution_fixture(2, false).await;
         app.account_home().create_account("inviter").unwrap();
         let mut inviter = client_on_app_relay_plane(&app, "inviter").await;
-        let group = inviter.create_group("refetch failures", &[]).await.unwrap();
+        let group = inviter
+            .create_group("refetch failures", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         let requirements = inviter
             .runtime
             .session()
@@ -949,6 +954,7 @@ async fn failed_single_author_refetch_preserves_only_usable_current_batch_packag
                 refs.iter().map(|member| (*member).to_owned()).collect(),
                 &requirements,
                 nostr_directory::MemberResolutionPurpose::Commit,
+                nostr_directory::MemberResolutionPolicy::Atomic,
             )
             .await;
         assert!(fetcher.requests.lock().unwrap().iter().any(|request| {
@@ -1094,9 +1100,16 @@ async fn incompatible_slot_is_skipped_for_create_and_invite() {
     let group = alice
         .create_group("compatible creation", &[bob.account_id_hex.as_str()])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     assert_eq!(alice.members(&group).unwrap().len(), 2);
-    let empty = alice.create_group("compatible invite", &[]).await.unwrap();
+    let empty = alice
+        .create_group("compatible invite", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let requirements = alice
         .runtime
         .session()
@@ -1108,6 +1121,7 @@ async fn incompatible_slot_is_skipped_for_create_and_invite() {
             vec![bob.account_id_hex.clone()],
             &requirements,
             nostr_directory::MemberResolutionPurpose::CommitFresh,
+            nostr_directory::MemberResolutionPolicy::Atomic,
         )
         .await
         .unwrap();
@@ -1125,24 +1139,35 @@ async fn incompatible_slot_is_skipped_for_create_and_invite() {
     alice
         .invite_members(&empty, &[bob.account_id_hex.as_str()])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     assert_eq!(alice.members(&empty).unwrap().len(), 2);
     // No compatible candidate means no group mutation, even with a newer
     // incompatible slot present.
     let no_fallback = alice
         .create_group("no compatible candidate", &[])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     fetcher
         .events
         .lock()
         .unwrap()
         .retain(|event| event.id != fallback.id);
-    assert!(
-        alice
-            .invite_members(&no_fallback, &[bob.account_id_hex.as_str()])
-            .await
-            .is_err()
+    let result = alice
+        .invite_members(&no_fallback, &[bob.account_id_hex.as_str()])
+        .await
+        .unwrap();
+    assert_eq!(result.operation, None);
+    assert_eq!(
+        result.member_outcomes,
+        vec![MemberResolutionOutcome {
+            account_id_hex: bob.account_id_hex.clone(),
+            status: MemberResolutionStatus::IncompatibleKeyPackage,
+            selected_device_count: 0,
+        }]
     );
     assert_eq!(alice.members(&no_fallback).unwrap().len(), 1);
 }

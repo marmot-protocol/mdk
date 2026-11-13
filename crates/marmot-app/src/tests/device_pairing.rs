@@ -326,7 +326,9 @@ async fn a_completed_link_can_disappear_from_the_approvers_selected_roster() {
         .client
         .create_group("Keep my chat", &[])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let message = crate::tests::device_group::history_delivery::send_text(
         &mut laptop.client,
         &chat,

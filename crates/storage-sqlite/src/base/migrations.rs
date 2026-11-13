@@ -383,6 +383,8 @@ mod migration_0200_chat_list_search_text;
 mod migration_0201_device_inactivity_clock;
 #[path = "migrations/0202_sticker_pack_relays.rs"]
 mod migration_0202_sticker_pack_relays;
+#[path = "migrations/0203_prepared_group_member_outcomes.rs"]
+mod migration_0203_prepared_group_member_outcomes;
 
 const MIGRATIONS: &[Migration] = &[
     Migration {
@@ -1449,6 +1451,12 @@ const MIGRATIONS: &[Migration] = &[
         name: "0202_sticker_pack_relays",
         suspend_foreign_keys: &[],
         apply: migration_0202_sticker_pack_relays::apply,
+    },
+    Migration {
+        version: 203,
+        name: "0203_prepared_group_member_outcomes",
+        suspend_foreign_keys: &[],
+        apply: migration_0203_prepared_group_member_outcomes::apply,
     },
 ];
 

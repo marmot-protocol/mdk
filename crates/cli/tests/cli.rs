@@ -7785,7 +7785,7 @@ fn group_create_fetches_missing_key_package_for_pubkey_members() {
 }
 
 #[test]
-fn missing_key_package_errors_include_repair_guidance() {
+fn unavailable_create_is_noop() {
     let alice_home = tempfile::tempdir().expect("alice tempdir");
     let bob_home = tempfile::tempdir().expect("bob tempdir");
     let relay = TestRelay::new();
@@ -7809,22 +7809,27 @@ fn missing_key_package_errors_include_repair_guidance() {
     assert_eq!(deleted["deleted"], true);
 
     let alice = create_account_with_real_relay(alice_home.path(), relay_url);
-    let error = run_json_error_with_relay(
+    let result = run_json_with_relay(
         alice_home.path(),
         relay_url,
         &["--account", &alice, "group", "create", "general", &bob],
     );
 
-    assert_eq!(error["code"], "missing_key_package");
-    assert_eq!(error["account_id"], bob);
+    assert!(result["group_id"].is_null());
     assert_eq!(
-        error["repair"]["local"],
-        format!("wn --account {bob} keys publish")
+        result["member_outcomes"],
+        serde_json::json!([{
+            "account_id_hex": bob,
+            "status": "missing_key_package",
+            "selected_device_count": 0
+        }])
     );
-    assert_eq!(
-        error["repair"]["remote"],
-        "wn keys fetch <npub-or-hex> --bootstrap-relays <relay-url>"
+    let chats = run_json_with_relay(
+        alice_home.path(),
+        relay_url,
+        &["--account", &alice, "chats", "list"],
     );
+    assert_eq!(chats["chats"], serde_json::json!([]));
 }
 
 #[test]
@@ -7926,12 +7931,36 @@ fn local_group_message_workflow_runs_through_the_dm_contract() {
         .to_owned();
     let bob = create_account(home.path());
     run_json(home.path(), &["--account", &bob, "keys", "publish"]);
+    let unpublished_home = tempfile::tempdir().expect("unpublished peer tempdir");
+    let unavailable = marmot_account::AccountHome::open(unpublished_home.path())
+        .create_account("unpublished")
+        .unwrap()
+        .account_id_hex;
 
     let created_group = run_json(
         home.path(),
-        &["--account", &alice, "group", "create", "general", &bob],
+        &[
+            "--account",
+            &alice,
+            "group",
+            "create",
+            "general",
+            &bob,
+            &unavailable,
+        ],
     );
     let group_id = created_group["group_id"].as_str().expect("group id");
+    assert_eq!(
+        created_group["member_outcomes"],
+        serde_json::json!([
+            {"account_id_hex": bob, "status": "selected", "selected_device_count": 1},
+            {"account_id_hex": unavailable, "status": "missing_key_package", "selected_device_count": 0}
+        ])
+    );
+    assert_eq!(
+        member_accounts(&created_group),
+        sorted_accounts([alice.as_str(), bob.as_str()])
+    );
 
     let bob_join = sync_until_joined(home.path(), test_relay_url(), &bob, group_id);
     assert_eq!(bob_join["joined_groups"][0], group_id);

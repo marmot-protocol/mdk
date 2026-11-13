@@ -6533,7 +6533,12 @@ mod runtime_group_subscription_refresh_tests {
             let app = MarmotApp::with_relay(dir.path(), "wss://old.example")
                 .with_test_relay_client(relay.clone());
             let mut client = app.client("alice").await.unwrap();
-            let group_id = client.create_group("retained routing", &[]).await.unwrap();
+            let group_id = client
+                .create_group("retained routing", &[])
+                .await
+                .unwrap()
+                .operation
+                .expect("eligible fixture members");
             let routes_before = client.routing.snapshot().group_routes;
             let subscriptions_before = relay.subscription_count();
             let next_route =
@@ -6619,8 +6624,18 @@ mod runtime_group_subscription_refresh_tests {
         let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
             .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
         let mut client = app.client("alice").await.unwrap();
-        let forgotten = client.create_group("forgotten", &[]).await.unwrap();
-        let kept = client.create_group("kept", &[]).await.unwrap();
+        let forgotten = client
+            .create_group("forgotten", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
+        let kept = client
+            .create_group("kept", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         let kept_hex = hex::encode(kept.as_slice());
         let connection = projection_fault_connection(&app);
         connection.execute_batch(&format!("CREATE TRIGGER fail_kept_removal BEFORE UPDATE OF self_membership ON account_groups
@@ -6749,6 +6764,8 @@ mod runtime_group_subscription_refresh_tests {
                     )
                     .await
                     .unwrap()
+                    .operation
+                    .expect("eligible fixture members")
                     .group_id;
                 // Leave the second route pending so this observer must install it.
                 client
@@ -6759,7 +6776,9 @@ mod runtime_group_subscription_refresh_tests {
                         &telemetry,
                     )
                     .await
-                    .unwrap();
+                    .unwrap()
+                    .operation
+                    .expect("eligible fixture members");
                 let group_hex = hex::encode(group.as_slice());
                 for (id, retention) in [
                     ("published-before-tail", None),
@@ -6906,8 +6925,18 @@ mod runtime_group_subscription_refresh_tests {
             MarmotApp::with_relay(dir.path(), "wss://relay.example").with_test_relay_client(relay);
         let mut client = app.client("alice").await.unwrap();
         client.prepare_transport().await.unwrap();
-        let group = client.create_group("rejoined", &[]).await.unwrap();
-        let blocked = client.create_group("blocked", &[]).await.unwrap();
+        let group = client
+            .create_group("rejoined", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
+        let blocked = client
+            .create_group("blocked", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         let group_hex = hex::encode(group.as_slice());
         let blocked_hex = hex::encode(blocked.as_slice());
         let path = app.account_storage_path("alice");
@@ -7040,7 +7069,9 @@ mod runtime_group_subscription_refresh_tests {
                 &telemetry,
             )
             .await
-            .unwrap();
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
 
         relay.fail_next_subscribe();
         let mut summary = SyncSummary::default();
@@ -7083,7 +7114,9 @@ mod runtime_group_subscription_refresh_tests {
                 &PerformanceRecorder::default(),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         assert!(client.recovery_runner_due());
 
         client.fail_next_runner_preparation = true;
@@ -7143,7 +7176,9 @@ mod runtime_group_subscription_refresh_tests {
                     &telemetry,
                 )
                 .await
-                .unwrap();
+                .unwrap()
+                .operation
+                .expect("eligible fixture members");
             client
                 .create_group_with_options_and_telemetry(
                     "pending install",
@@ -7152,7 +7187,9 @@ mod runtime_group_subscription_refresh_tests {
                     &telemetry,
                 )
                 .await
-                .unwrap();
+                .unwrap()
+                .operation
+                .expect("eligible fixture members");
             let group = created.group_id;
             let group_hex = hex::encode(group.as_slice());
             // Explicit projection fixture: force the post-canonical observer's
@@ -7288,7 +7325,9 @@ mod runtime_group_subscription_refresh_tests {
                 &telemetry,
             )
             .await
-            .unwrap();
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         client
             .create_group_with_options_and_telemetry(
                 "drained retry bystander",
@@ -7297,7 +7336,9 @@ mod runtime_group_subscription_refresh_tests {
                 &telemetry,
             )
             .await
-            .unwrap();
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
 
         let effects = marmot_session::AccountDeviceEffects {
             events: vec![cgka_traits::engine::GroupEvent::GroupStateChanged {
@@ -7502,7 +7543,12 @@ mod tests {
         let app = MarmotApp::with_relay(dir.path(), "wss://reaction-projection.example")
             .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
         let mut client = app.client("alice").await.unwrap();
-        let group = client.create_group("reaction key", &[]).await.unwrap();
+        let group = client
+            .create_group("reaction key", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         let (source, secret) = client.encrypted_media_secret(&group).unwrap();
         let carried = cgka_traits::EncryptedMediaSecret::new(secret);
         let reference = crate::MediaAttachmentReference {
@@ -7626,7 +7672,12 @@ mod tests {
         )
         .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
         let mut client = client_on_app_relay_plane(&app, "alice").await;
-        let group = client.create_group("evidence policy", &[]).await.unwrap();
+        let group = client
+            .create_group("evidence policy", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         let epoch = client.runtime.group_record(&group).unwrap().epoch.0;
         let storage = app.account_storage("alice").unwrap().app_storage();
         let fork = IngestOutcome::TransportDeferred {
@@ -7685,7 +7736,12 @@ mod tests {
         )
         .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
         let mut client = client_on_app_relay_plane(&app, "alice").await;
-        let group = client.create_group("refused", &[]).await.unwrap();
+        let group = client
+            .create_group("refused", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         let storage = app.account_storage("alice").unwrap().app_storage();
         let refused = IngestOutcome::ResourceRefused {
             group_id: group.clone(),
@@ -7771,7 +7827,12 @@ mod tests {
         let app = MarmotApp::with_relay(dir.path(), "wss://batch-projection.example")
             .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
         let mut client = app.client("alice").await.unwrap();
-        let group_id = client.create_group("batch projection", &[]).await.unwrap();
+        let group_id = client
+            .create_group("batch projection", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         let mut effects = marmot_session::AccountDeviceEffects::default();
         let mut sources = HashMap::new();
         for index in 0..3 {
@@ -7965,7 +8026,12 @@ mod tests {
             let app = MarmotApp::with_relay(dir.path(), "wss://backfill.example")
                 .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
             let mut client = app.client("alice").await.unwrap();
-            let group = client.create_group("seen tail", &[]).await.unwrap();
+            let group = client
+                .create_group("seen tail", &[])
+                .await
+                .unwrap()
+                .operation
+                .expect("eligible fixture members");
             let storage = app.account_storage("alice").unwrap();
             let ids = (0..5)
                 .map(|i| MessageId::new(vec![i; 32]))
@@ -8015,16 +8081,30 @@ mod tests {
         )
         .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
         let mut client = client_on_app_relay_plane(&app, "alice").await;
-        let first = client.create_group("first demand", &[]).await.unwrap();
-        let second = client.create_group("second demand", &[]).await.unwrap();
+        let first = client
+            .create_group("first demand", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
+        let second = client
+            .create_group("second demand", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         let buffered = client
             .create_group("failed persistence", &[])
             .await
-            .unwrap();
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         let added = client
             .create_group("new durable demand", &[])
             .await
-            .unwrap();
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         let storage = app.account_storage("alice").unwrap().app_storage();
         let intent =
             |group: &cgka_traits::GroupId, epoch| storage_sqlite::StoredEpochBackfillIntent {
@@ -8083,7 +8163,12 @@ mod tests {
         let app = MarmotApp::with_relay(dir.path(), "wss://backfill.example")
             .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
         let mut client = app.client("alice").await.unwrap();
-        let group = client.create_group("reload failure", &[]).await.unwrap();
+        let group = client
+            .create_group("reload failure", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         let storage = app.account_storage("alice").unwrap();
         let raw = MessageRecord {
             id: MessageId::new(vec![0xfd; 32]),
@@ -8165,9 +8250,24 @@ mod tests {
         let app = MarmotApp::with_relay(dir.path(), "wss://backfill.example")
             .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
         let mut client = app.client("alice").await.unwrap();
-        let live = client.create_group("still a member", &[]).await.unwrap();
-        let removed = client.create_group("removed device", &[]).await.unwrap();
-        let disbanded = client.create_group("disbanded group", &[]).await.unwrap();
+        let live = client
+            .create_group("still a member", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
+        let removed = client
+            .create_group("removed device", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
+        let disbanded = client
+            .create_group("disbanded group", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         let storage = app.account_storage("alice").unwrap().app_storage();
 
         let mut armed = armed_backfill(&live, 4);
@@ -8204,9 +8304,24 @@ mod tests {
         let app = MarmotApp::with_relay(dir.path(), "wss://backfill.example")
             .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
         let mut client = app.client("alice").await.unwrap();
-        let live = client.create_group("still a member", &[]).await.unwrap();
-        let departed = client.create_group("departed", &[]).await.unwrap();
-        let queued_departed = client.create_group("queued departed", &[]).await.unwrap();
+        let live = client
+            .create_group("still a member", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
+        let departed = client
+            .create_group("departed", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
+        let queued_departed = client
+            .create_group("queued departed", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         let storage = app.account_storage("alice").unwrap().app_storage();
         let epoch = client.group_mls_state(&live).unwrap().epoch;
 
@@ -8256,7 +8371,12 @@ mod tests {
         let app = MarmotApp::with_relay(dir.path(), "wss://backfill.example")
             .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
         let mut client = app.client("alice").await.unwrap();
-        let departed = client.create_group("departed", &[]).await.unwrap();
+        let departed = client
+            .create_group("departed", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         let storage = app.account_storage("alice").unwrap();
         let epoch = client.group_mls_state(&departed).unwrap().epoch;
         client
@@ -8301,7 +8421,12 @@ mod tests {
         let app = MarmotApp::with_relay(dir.path(), "wss://backfill.example")
             .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
         let mut client = app.client("alice").await.unwrap();
-        let departed = client.create_group("departed", &[]).await.unwrap();
+        let departed = client
+            .create_group("departed", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         let storage = app.account_storage("alice").unwrap().app_storage();
 
         client
@@ -8343,7 +8468,12 @@ mod tests {
         let app = MarmotApp::with_relay(dir.path(), "wss://backfill.example")
             .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
         let mut client = app.client("alice").await.unwrap();
-        let departed = client.create_group("departed", &[]).await.unwrap();
+        let departed = client
+            .create_group("departed", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         let storage = app.account_storage("alice").unwrap().app_storage();
         let epoch = client.group_mls_state(&departed).unwrap().epoch;
 
@@ -8457,7 +8587,12 @@ mod tests {
         let app = MarmotApp::with_relay(dir.path(), "wss://backfill.example")
             .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
         let mut client = app.client("alice").await.unwrap();
-        let departed = client.create_group("departed", &[]).await.unwrap();
+        let departed = client
+            .create_group("departed", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         let storage = app.account_storage("alice").unwrap().app_storage();
         let epoch = client.group_mls_state(&departed).unwrap().epoch;
 

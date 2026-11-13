@@ -1,5 +1,6 @@
 //! `group` and `groups` command namespace handlers and group output helpers.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -213,30 +214,51 @@ async fn group_command_once(
             // not an invitee is a caller mistake to reject before publishing
             // rather than a follow-up promotion to emulate.
             let initial_admins = initial_admin_ids(&members, &admins)?;
-            let summary = runtime
+            let result = runtime
                 .invite_members_with_initial_admins(
                     &account.label,
                     &group_id,
                     &members,
                     &initial_admins,
+                    marmot_app::MemberResolutionPolicy::Partial,
                 )
                 .await?;
+            let summary = result.operation.as_ref();
+            let selected_admins = if initial_admins.is_empty() {
+                Vec::new()
+            } else {
+                let selected_accounts = result
+                    .member_outcomes
+                    .iter()
+                    .filter(|outcome| {
+                        outcome.status == marmot_app::MemberResolutionStatus::Selected
+                    })
+                    .map(|outcome| outcome.account_id_hex.as_str())
+                    .collect::<HashSet<_>>();
+                initial_admins
+                    .iter()
+                    .filter(|admin| selected_accounts.contains(admin.as_str()))
+                    .collect::<Vec<_>>()
+            };
             Ok(CommandOutput {
                 plain: format!(
-                    "invited {} member(s) admins={} published={}",
-                    members.len(),
-                    initial_admins.len(),
-                    summary.published
+                    "invite operation={} published={}; member outcomes: {}",
+                    summary.is_some(),
+                    summary.map(|summary| summary.published).unwrap_or(0),
+                    serde_json::to_string(&result.member_outcomes)?
                 ),
                 json: json!({
                     "account_id": account.account_id_hex,
                     "npub": npub_for_account_id(&account.account_id_hex)?,
                     "group_id": hex::encode(group_id.as_slice()),
                     "members": members,
-                    "initial_admins": initial_admins,
-                    "published": summary.published,
-                    "message_ids": summary.message_ids,
-                    "maintenance_disposition": summary.maintenance_disposition,
+                    "initial_admins": selected_admins,
+                    "requested_initial_admins": initial_admins,
+                    "published": summary.map(|summary| summary.published),
+                    "message_ids": summary.map(|summary| &summary.message_ids),
+                    "maintenance_disposition": summary.map(|summary| &summary.maintenance_disposition),
+                    "summary": summary,
+                    "member_outcomes": result.member_outcomes,
                 }),
             })
         }
@@ -1381,16 +1403,35 @@ async fn created_group_output(
     app: &MarmotApp,
     runtime: &MarmotAppRuntime,
     account: &marmot_account::AccountSummary,
-    group_id: &GroupId,
+    result: &marmot_app::GroupMemberResult<GroupId>,
 ) -> Result<CommandOutput, WnError> {
+    let Some(group_id) = result.operation.as_ref() else {
+        return Ok(CommandOutput {
+            plain: format!(
+                "group not created; unavailable members: {}",
+                serde_json::to_string(&result.member_outcomes)?
+            ),
+            json: json!({
+                "account_id": account.account_id_hex,
+                "npub": npub_for_account_id(&account.account_id_hex)?,
+                "group_id": null,
+                "member_outcomes": result.member_outcomes,
+            }),
+        });
+    };
     let group_id_hex = hex::encode(group_id.as_slice());
     let group = app
         .group(&account.label, &group_id_hex)?
         .ok_or_else(|| AppError::UnknownGroup(group_id_hex.clone()))?;
     let members = runtime.group_members(&account.label, group_id).await?;
+    let mut json = created_group_json(&account.account_id_hex, group, members)?;
+    json["member_outcomes"] = serde_json::to_value(&result.member_outcomes)?;
     Ok(CommandOutput {
-        plain: format!("created group {group_id_hex}"),
-        json: created_group_json(&account.account_id_hex, group, members)?,
+        plain: format!(
+            "created group {group_id_hex}; member outcomes: {}",
+            serde_json::to_string(&result.member_outcomes)?
+        ),
+        json,
     })
 }
 
@@ -1930,7 +1971,9 @@ mod tests {
         let group = alice
             .create_group("invite still in flight", &[])
             .await
-            .unwrap();
+            .unwrap()
+            .operation
+            .expect("creator-only group created");
         let bob = bob_app.runtime();
         bob.start().await.unwrap();
         // This real worker read drains startup before the acceptance request.
@@ -1964,7 +2007,12 @@ mod tests {
         })
         .await;
 
-        let sent = alice.invite_members(&group, &[&bob_id]).await.unwrap();
+        let sent = alice
+            .invite_members(&group, &[&bob_id])
+            .await
+            .unwrap()
+            .operation
+            .expect("available member invited");
         assert!(sent.published > 0);
         let accepted = tokio::time::timeout(Duration::from_secs(15), acceptance).await;
         bob.shutdown().await;

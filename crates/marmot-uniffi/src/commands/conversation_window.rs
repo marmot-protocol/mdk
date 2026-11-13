@@ -159,7 +159,9 @@ mod tests {
         let group = kit
             .create_group(account.clone(), "native window".into(), vec![], None)
             .await
-            .unwrap();
+            .unwrap()
+            .group_id_hex
+            .expect("selected members create a group");
         assert_eq!(hex::decode(&group).unwrap().len(), 16);
         for i in 0..6 {
             kit.send_text(

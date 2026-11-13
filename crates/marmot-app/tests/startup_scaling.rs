@@ -151,7 +151,9 @@ async fn run_case(groups: usize, roster: usize, messages_per_group: usize) -> Be
             let group_id = client
                 .create_group(&format!("bench group {group}"), &member_refs)
                 .await
-                .unwrap();
+                .unwrap()
+                .operation
+                .expect("eligible fixture members");
             for message in 0..messages_per_group {
                 client
                     .send(

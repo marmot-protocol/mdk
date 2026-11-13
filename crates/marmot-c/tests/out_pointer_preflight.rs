@@ -239,8 +239,8 @@ impl ClientFixture {
             },
             MarmotStatus::Ok
         );
-        let owned = unsafe { std::ffi::CStr::from_ptr(group) }.to_owned();
-        unsafe { marmot_c::marmot_string_free(group) };
+        let owned = unsafe { std::ffi::CStr::from_ptr((*group).group_id_hex) }.to_owned();
+        unsafe { marmot_c::types::group::marmot_group_creation_free(group) };
         owned
     }
     fn archive(&self, group: &std::ffi::CStr, archived: bool) {

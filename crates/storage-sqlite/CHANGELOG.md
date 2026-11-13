@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Breaking changes
+
+- Account migration 0203 adds `member_outcomes_json` to prepared group-image
+  uploads, retaining the original partial member-resolution report across
+  consumed-upload retries (#1813). Account schema advances from 202 to 203;
+  older binaries refuse the upgraded database. Downgrade is unsupported.
+- `PreparedGroupImageUploadRecord` carries the optional report, written through
+  `SqliteAppStorage::save_prepared_image_members` before canonical creation.
+
 ### Added
 
 - `SqliteAppStorage::sticker_pack_relays` and `set_sticker_pack_relays` retain sticker-pack relay hints independently

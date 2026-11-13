@@ -104,7 +104,9 @@ impl OfflineQueue {
         let group_id = setup_client
             .create_group("offline queue", &[])
             .await
-            .unwrap();
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         drop(setup_client);
         let runtime = MarmotAppRuntime::new(app.clone());
         runtime.reconcile_accounts().await.unwrap();
@@ -526,7 +528,12 @@ async fn retry_cutoff_skips_a_send_that_only_owes_secondary_replication() {
     )
     .with_test_relay_client(relay.clone());
     let mut client = app.client("sender").await.unwrap();
-    let group_id = client.create_group("cutoff", &[]).await.unwrap();
+    let group_id = client
+        .create_group("cutoff", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
 
     relay.make_endpoints_unavailable(&["wss://relay-b.example"]);
     client.send(&group_id, b"met quorum").await.unwrap();

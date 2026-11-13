@@ -633,7 +633,12 @@ async fn an_interrupted_creation_settles_on_restart() {
     assert!(!phone.take_linked_devices_changed());
 
     // The engine holds a chat under the id: the chat stays a chat.
-    let chat = phone.create_group("chat", &[]).await.unwrap();
+    let chat = phone
+        .create_group("chat", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     assert!(storage.insert_device_group(&creating(&chat)).unwrap());
     phone.reconcile_hydrated_account_state().unwrap();
     assert_eq!(trust(&phone_app, &chat), None);
@@ -794,7 +799,12 @@ async fn a_link_never_names_a_chat() {
         mut laptop,
         link,
     } = phone_and_laptop().await;
-    let chat = phone.create_group("chat", &[]).await.unwrap();
+    let chat = phone
+        .create_group("chat", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let before = relay.published_events.lock().unwrap().len();
     let result = phone
         .dev_create_device_group(ConfirmedDeviceLink {
@@ -813,7 +823,12 @@ async fn a_link_never_names_a_chat() {
     assert_eq!(trust(&phone_app, &chat), None);
     assert!(phone.state_group_record(&chat).is_some());
 
-    let laptop_chat = laptop.create_group("chat", &[]).await.unwrap();
+    let laptop_chat = laptop
+        .create_group("chat", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let result = laptop.dev_record_confirmed_device_link(ConfirmedDeviceLink {
         device_group_id: laptop_chat.clone(),
         ..link
@@ -871,7 +886,12 @@ async fn a_chat_welcome_under_a_waiting_link_is_refused() {
     let bob_app = device_group_app_at(&bob_dir, relay.clone());
     remember_test_member_inbox(&bob_app, &alice_id, "wss://relay.example");
     let mut bob = bob_app.client("bob").await.unwrap();
-    let chat = bob.create_group("chat", &[&alice_id]).await.unwrap();
+    let chat = bob
+        .create_group("chat", &[&alice_id])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let link = ConfirmedDeviceLink {
         device_group_id: chat.clone(),
         ..link
@@ -977,7 +997,12 @@ async fn the_host_never_learns_of_the_device_group() {
         ..
     } = phone_and_laptop().await;
     let group = phone.dev_create_device_group(link).await.unwrap();
-    let chat = phone.create_group("chat", &[]).await.unwrap();
+    let chat = phone
+        .create_group("chat", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let chat_hex = hex::encode(chat.as_slice());
 
     phone.pending_epoch_stall_escalations.clear();
@@ -1533,7 +1558,9 @@ async fn an_unreadable_roster_never_names_the_group_and_a_terminal_one_lists_not
     let chat = phone
         .create_group("chat during deferred quarantine", &[])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     assert_eq!(phone.runtime.members(&chat).unwrap().len(), 1);
     assert_eq!(
         phone.runtime.group_record(&chat).unwrap().epoch,
@@ -1545,7 +1572,9 @@ async fn an_unreadable_roster_never_names_the_group_and_a_terminal_one_lists_not
     let chat = phone
         .create_group("chat during eager quarantine", &[])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     assert_eq!(phone.runtime.members(&chat).unwrap().len(), 1);
 
     let mut removed = stored();
@@ -1805,7 +1834,9 @@ async fn tagging_devices_with_chats<const N: usize>() -> (Devices, GroupId, [Gro
                 .laptop
                 .create_group("existing chat", &[])
                 .await
-                .unwrap(),
+                .unwrap()
+                .operation
+                .expect("eligible fixture members"),
         );
     }
     let (devices, group) = tag_linked_devices(devices, group).await;

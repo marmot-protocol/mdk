@@ -58,7 +58,9 @@ async fn members_share_real_activity_targets_and_reactions_after_reopen() {
     let group = alice_client
         .create_group("original", &[&bob_id])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     tokio::time::timeout(Duration::from_secs(15), async {
         loop {
             if matches!(events.recv().await.unwrap(), MarmotAppEvent::GroupJoined { group_id, .. } if group_id == group) {

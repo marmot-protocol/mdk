@@ -198,7 +198,9 @@ mod tests {
         let group = client
             .create_group("command cancellation", &[])
             .await
-            .unwrap();
+            .unwrap()
+            .operation
+            .expect("selected members create a group");
         drop(client);
         let runtime = app.runtime();
         let inner = runtime

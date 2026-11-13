@@ -45,7 +45,9 @@ async fn crypto_fixture() -> CryptoFixture {
     let group = sender
         .create_group("mixed ingress plaintext", &[&recipient.account_id_hex])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     assert!(
         receiver
             .sync()

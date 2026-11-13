@@ -1076,7 +1076,12 @@ async fn a_superseded_roster_update_tells_the_host_sign_ins_changed() {
     let laptop_key_package = published_key_package(&mut laptop, relay).await;
     let link = link_for(&laptop_key_package, 0x5a, &phone);
     let group = phone.dev_create_device_group(link).await.unwrap();
-    let chat = phone.create_group("chat", &[]).await.unwrap();
+    let chat = phone
+        .create_group("chat", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
 
     let superseded = |group_id: &GroupId| {
         let mut effects = marmot_session::AccountDeviceEffects::default();
@@ -1207,7 +1212,11 @@ async fn a_welcome_naming_another_key_package_brings_the_check_forward() {
     // The phone's own deliveries first: it joins each group before the
     // laptop's delivery of the same Welcome arrives.
     for name in ["one", "two", "three"] {
-        bob.create_group(name, &[&account.alice_id]).await.unwrap();
+        bob.create_group(name, &[&account.alice_id])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
     }
     let burst = welcomes_ordered(&account, &mut cursor, &phones, true).await;
     let delivered = deliver_events(&mut phone, &burst).await;
@@ -1222,7 +1231,11 @@ async fn a_welcome_naming_another_key_package_brings_the_check_forward() {
     // A burst right after a check, the laptop's deliveries first, waits its
     // minute, then makes one check and leaves none pending.
     for name in ["four", "five", "six"] {
-        bob.create_group(name, &[&account.alice_id]).await.unwrap();
+        bob.create_group(name, &[&account.alice_id])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
     }
     let burst = welcomes_ordered(&account, &mut cursor, &phones, false).await;
     let delivered = deliver_events(&mut phone, &burst).await;

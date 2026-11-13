@@ -439,12 +439,19 @@ Each entry embeds the existing `MarmotAccountKeyPackage` record plus `MarmotAcco
 
 ## Invitation lookup outcomes
 
-Creating or inviting reports the first unusable recipient, in request order.
-`MARMOT_STATUS_MISSING_KEY_PACKAGE` means the lookup completed and found nothing
+`MARMOT_STATUS_OK` from creation or invitation does not mean every account was
+selected. Inspect `member_outcomes` (`invite.member_outcomes` for detailed
+invitations) using the
+[shared lookup and result contract](../marmot-uniffi/README.md#invitation-lookup-outcomes).
+Optional C operation fields (`group_id_hex`, `created`, or `summary`) are NULL when
+no operation occurred. Free the whole result even when its operation is absent.
+
+`marmot_start_direct_chat` still requires its peer. It and explicit directory
+lookups can return `MARMOT_STATUS_MISSING_KEY_PACKAGE` when the lookup found nothing
 invitable; the detail ends in `[obsolete_only]` when the recipient must update their
 app. `MARMOT_STATUS_DIRECTORY_LOOKUP_INCOMPLETE` means the lookup ran out of time or
-relay coverage and nothing is known to be missing; offer retry. Directory KeyPackage
-and relay-list lookups report the same status.
+relay coverage and nothing is known to be missing; offer retry. Authorization and
+other global failures still return error statuses, not partial recipient outcomes.
 
 ## Undelivered Welcomes
 

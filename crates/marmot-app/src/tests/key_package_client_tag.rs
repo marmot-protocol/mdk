@@ -261,7 +261,9 @@ async fn only_key_package_events_carry_the_client_tag() {
     let group = alice
         .create_group("client tags", &[&bob_account.account_id_hex])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     alice.send(&group, b"hello").await.unwrap();
     let bootstrap =
         || AccountRelayListBootstrap::new(vec![TransportEndpoint(RELAY.into())], vec![]);

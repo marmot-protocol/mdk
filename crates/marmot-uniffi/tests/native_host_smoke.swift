@@ -104,9 +104,10 @@ final class NativeHostSmoke: XCTestCase {
       try self.networkReady(bob, account: bobId.label)
     }
     print("Native host smoke: deliver and accept Welcome")
-    let group = try await alice.createGroup(
+    let creation = try await alice.createGroup(
       accountRef: aliceId.label, name: "Native host smoke", memberRefs: [bobId.accountIdHex],
       description: nil)
+    let group = try XCTUnwrap(creation.groupIdHex)
     try await waitUntil("Bob Welcome delivery") {
       try bob.chatList(accountRef: bobId.label, includeArchived: false)
         .contains { $0.groupIdHex == group }

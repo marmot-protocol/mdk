@@ -7,8 +7,18 @@ async fn group_fixture() -> (tempfile::TempDir, MarmotApp, GroupId, GroupId) {
         .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
     app.account_home().create_account("alice").unwrap();
     let mut client = app.client("alice").await.unwrap();
-    let group_id = client.create_group("target", &[]).await.unwrap();
-    let other_id = client.create_group("other", &[]).await.unwrap();
+    let group_id = client
+        .create_group("target", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
+    let other_id = client
+        .create_group("other", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     drop(client);
     let id_hex = hex::encode(group_id.as_slice());
     let mut state = app.load_state("alice").unwrap();

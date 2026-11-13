@@ -137,7 +137,9 @@ async fn next_event_returns_when_a_live_delivery_arms_the_epoch_backfill() {
     let group_id = alice_client
         .create_group("epoch-gap backfill next_event seam", &[bob_id.as_str()])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let group_id_hex = hex::encode(group_id.as_slice());
 
     // bob joins by draining the welcome; poll `sync` until the group is live so
