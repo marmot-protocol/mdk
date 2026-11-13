@@ -255,7 +255,7 @@
         "witness weight retained across a post-delivery fork reorg",
         "delivered app payloads not re-delivered on reorg"
       ],
-      "next": "Use as the witness-decided convergence contract; source of the convergence incident vector's witness path."
+      "next": "Use as the witness-decided convergence contract."
     },
     {
       "id": "drop-queued/v1",
