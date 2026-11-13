@@ -81,6 +81,9 @@ operations! {
     ReadQueueBehindSend => "read_queue_behind_send",
     ReadQueueBehindInviteOrCreate => "read_queue_behind_invite_or_create",
     ReadQueueBehindMaintenance => "read_queue_behind_maintenance",
+    // One per version of the account's published read state (mdk#3273): the
+    // worker building and swapping it in at a quiescent point.
+    ReadStatePublish => "read_state_publish",
     LifecycleLockWait => "lifecycle_lock_wait",
     AccountStartup => "account_startup",
     AccountStartupRetrySuppressed => "account_startup_retry_suppressed",

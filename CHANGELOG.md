@@ -11,6 +11,35 @@
   Prepared-image retries retain the original report across restart. Stable
   agent-control v2 creation and invitation remain atomic.
 
+### Added
+
+- Discard a failed own send locally with `discard_failed_send` (Rust, UniFFI,
+  C) instead of publishing a group delete for a message nobody received. A
+  failed send the user deletes now leaves the timeline instead of staying as a
+  "deleted" row that still reports failure.
+- Record `read_state_publish` runtime telemetry: the count and duration of
+  each new version of an account's published read state, which the account
+  worker now builds at its quiescent points for reads that later move off the
+  worker (mdk#3273).
+- Add `durably_owned_key_packages_with_validity` to the engine, session and
+  account runtime: the owned KeyPackage list with the one clock reading its
+  lifetimes are judged at, the next lifetime bound ahead (a listed bundle's
+  `not_after` or a not-yet-valid bundle's `not_before`), whether a stored
+  bundle was skipped as undecodable, and whether a lifetime check disagreed
+  with that reading. A caller may keep the list only while no write reaches
+  the account database, the clock stays between that reading and the next
+  bound, and the read skipped no undecodable bundle and saw no disagreement
+  (mdk#3273).
+
+### Fixed
+
+- Fail `durably_owned_key_packages` with the storage error when proving a
+  stored bundle fails to read (I/O, busy, closed), instead of returning a
+  partial list that reports this device's own KeyPackages as not owned.
+  Bundles whose stored value does not decode are still skipped. Storage
+  backends classify OpenMLS storage errors through the new
+  `StorageProvider::mls_storage_failure` (mdk#3273).
+
 ## 0.16.0 - 2026-11-12
 
 ### Security

@@ -43,6 +43,7 @@ pub(crate) mod bounded_id_set;
 pub mod canonicalization;
 pub mod capabilities;
 pub mod capability_manager;
+pub mod change_generation;
 pub mod commit_class;
 #[cfg(feature = "test-conformance-snapshot")]
 pub mod conformance_snapshot;

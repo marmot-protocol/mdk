@@ -17,7 +17,7 @@ what lives here is in [`README.md`](README.md#what-lives-in-here).
 | Path | Owns |
 | --- | --- |
 | `src/engine.rs` | Public engine trait, send/create requests, outputs, group events. |
-| `src/storage.rs` | Storage traits, the `StorageProvider` aggregate (`type Mls` / `mls_storage()`), and the snapshot/rollback contract. |
+| `src/storage.rs` | Storage traits, the `StorageProvider` aggregate (`type Mls` / `mls_storage()`, and `mls_storage_failure()`, which tells a failed OpenMLS read from a stored value that did not decode), and the snapshot/rollback contract. |
 | `src/engine_state.rs` | Epoch and welcome state machines. |
 | `src/welcome.rs` | `PendingWelcome` pending-welcome persistence record; `SiblingWelcomeJoin`, what joining from a sibling Welcome came to: settled, or held while this device still holds the chat. |
 | `src/error.rs` | `EngineError` and `PeelerError` — the engine/peeler error vocabulary. |

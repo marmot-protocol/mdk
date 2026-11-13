@@ -64,7 +64,8 @@ macro_rules! define_openmls_value_labels {
         )+
 
         #[cfg(test)]
-        const ALL_LABELS: &[OpenMlsValueLabel] = &[$($name),+];
+        pub(in crate::protocol::openmls_storage) const ALL_LABELS: &[OpenMlsValueLabel] =
+            &[$($name),+];
     };
 }
 
@@ -106,6 +107,15 @@ pub(crate) fn build_key(label: &[u8], key: Vec<u8>) -> Vec<u8> {
     out.extend_from_slice(&key);
     out.extend_from_slice(&CURRENT_VERSION.to_be_bytes());
     out
+}
+
+/// The label a [`build_key`] storage key spells out, if it is one.
+#[cfg(test)]
+pub(in crate::protocol::openmls_storage) fn label_of_key(storage_key: &[u8]) -> Option<&[u8]> {
+    let (length, rest) = storage_key
+        .strip_prefix(VALUE_STORAGE_KEY_V1)?
+        .split_first_chunk::<8>()?;
+    rest.get(..usize::try_from(u64::from_be_bytes(*length)).ok()?)
 }
 
 /// Reconstructs the pre-#349 generic value-store key: the bare concatenation

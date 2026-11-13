@@ -30,7 +30,7 @@ use zeroize::Zeroizing;
 /// Marmot-level storage error. Every trait method returns
 /// `Result<_, StorageError>` so the engine can pattern-match rather than
 /// string-parse.
-#[derive(Debug, thiserror::Error)]
+#[derive(Clone, Debug, thiserror::Error)]
 pub enum StorageError {
     #[error("record not found")]
     NotFound,
@@ -112,6 +112,10 @@ impl StorageError {
 }
 
 pub type StorageResult<T> = Result<T, StorageError>;
+
+/// The error type of a [`StorageProvider`]'s OpenMLS storage.
+pub type MlsStorageError<S> =
+    <<S as StorageProvider>::Mls as OpenMlsStorageProvider<CURRENT_VERSION>>::Error;
 
 /// Immutable, branch-addressed canonical group-state checkpoint.
 ///
@@ -1252,6 +1256,24 @@ pub trait DeferredPeelGenerationStorage {
 
 // ── StorageProvider aggregate ───────────────────────────────────────────────
 
+/// Where one group's durable answer inputs stand, as counted by a backend
+/// that tracks its own writes (mdk#3273). Values from one open storage handle
+/// compare only for equality: a changed value means some input may have
+/// changed, an equal one that none has.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GroupWriteGeneration {
+    /// Moves on every write to a durable input of the group's published
+    /// answers: its record and commit-derived MLS state, its convergence
+    /// pass, disband rows, fanouts, maintenance rows, withdrawn-commit
+    /// message states, and the app's device-group and self-membership rows.
+    /// Application-message ratchet state and message rows that are not
+    /// withdrawn commits do not move it.
+    pub state: u64,
+    /// Moves on every write to the group's record or commit-derived MLS
+    /// state: what answers that need a loaded group read.
+    pub committed: u64,
+}
+
 /// The single storage type parameter carried by the engine.
 ///
 /// Marmot storage concerns live on this trait. OpenMLS storage is exposed
@@ -1286,6 +1308,16 @@ pub trait StorageProvider:
     /// `OpenMlsProvider`-shaped objects for MLS operations.
     fn mls_storage(&self) -> &Self::Mls;
 
+    /// The storage failure behind an error from [`Self::mls_storage`], or
+    /// `None` when the error is a stored value that did not decode: a fact
+    /// about that row, which a scan may skip. A failed read (I/O, busy,
+    /// closed) is never such a fact. A backend that cannot tell the two apart
+    /// keeps this default, which answers a failure for every error, so no
+    /// failed read is skipped.
+    fn mls_storage_failure(&self, error: &MlsStorageError<Self>) -> Option<StorageError> {
+        Some(StorageError::Backend(error.to_string()))
+    }
+
     /// Monotonic high-water covering every persisted, restorable pending-send
     /// reference in outbound fanouts or group evolutions. Writers must raise this account-device bound
     /// atomically with those artifacts, preserve all `u64` values, and never
@@ -1307,6 +1339,18 @@ pub trait StorageProvider:
     /// by other connections or processes, so a cached object can never
     /// outlive the state it was loaded from.
     fn mls_write_generation(&self) -> Option<u64> {
+        None
+    }
+
+    /// Where `group_id`'s durable answer inputs stand, when the backend
+    /// counts its own writes; see [`GroupWriteGeneration`]. `None` means the
+    /// backend does not count, and every answer must be treated as changed.
+    /// The count covers every write this process makes to the store, through
+    /// any of its handles, including transaction rollbacks and snapshot
+    /// restores, and moves only once the write is visible to readers. Writes
+    /// by other processes are not counted: a caller that caches by this value
+    /// keeps them off the store while it does.
+    fn group_write_generation(&self, _group_id: &GroupId) -> Option<GroupWriteGeneration> {
         None
     }
 

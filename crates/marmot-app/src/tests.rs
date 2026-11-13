@@ -34,6 +34,7 @@ mod push_snapshot;
 #[cfg(feature = "test-policy-overrides")]
 mod push_token_reshare;
 mod quarantine_receive;
+mod read_state;
 mod relay_event_limits;
 mod relay_plane_runtime;
 mod replaceable_delivery;
@@ -4804,6 +4805,7 @@ async fn failed_leave_push_compensation_body() {
     let key = app
         .sqlcipher_key("alice", &keys, &path, SqlcipherDatabaseKind::Session)
         .unwrap();
+    storage_sqlite::expect_uncounted_writes_for_test(&path);
     let db = rusqlite::Connection::open(path).unwrap();
     storage_sqlite::open_hardened_sqlcipher(
         &db,
@@ -11162,6 +11164,7 @@ async fn an_empty_checkpoint_skips_the_write_and_its_chat_list_rebuild() {
         let key = app
             .sqlcipher_key("alice", &keys, &path, crate::SqlcipherDatabaseKind::Session)
             .unwrap();
+        storage_sqlite::expect_uncounted_writes_for_test(&path);
         let connection = rusqlite::Connection::open(path).unwrap();
         storage_sqlite::open_hardened_sqlcipher(
             &connection,
@@ -19203,6 +19206,7 @@ async fn invite_recovery_failure_preserves_committed_effects_and_results() {
         let key = app
             .sqlcipher_key("alice", &keys, &path, SqlcipherDatabaseKind::Session)
             .unwrap();
+        storage_sqlite::expect_uncounted_writes_for_test(&path);
         let connection = rusqlite::Connection::open(path).unwrap();
         storage_sqlite::open_hardened_sqlcipher(
             &connection,
@@ -19655,6 +19659,7 @@ async fn accepted_projection_retries() {
         let key = app
             .sqlcipher_key("alice", &keys, &path, SqlcipherDatabaseKind::Session)
             .unwrap();
+        storage_sqlite::expect_uncounted_writes_for_test(&path);
         let connection = rusqlite::Connection::open(path).unwrap();
         storage_sqlite::open_hardened_sqlcipher(
             &connection,
@@ -19956,6 +19961,125 @@ async fn a_queued_send_is_not_failed_by_an_unrelated_failure_in_its_batch() {
             .await
             .is_err(),
         "an intent queued in another group is not evidence about this send"
+    );
+}
+
+/// Discard drops a failed own send and reports its removal. While the group
+/// still holds a send the engine may publish, discard refuses: that send could
+/// be this one, and the engine cannot cancel it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn discarding_a_failed_send_waits_for_the_groups_sends_then_drops_it() {
+    use cgka_traits::storage::{OutboundIntentStorage, QueuedOutboundIntent};
+
+    let dir = tempfile::tempdir().unwrap();
+    let account = AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://discard-failed-send.example")
+        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+    let mut client = app.client("alice").await.unwrap();
+    let group_id = client
+        .create_group("discard", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
+    let group_id_hex = hex::encode(group_id.as_slice());
+    let failed = "44".repeat(32);
+    app.record_account_app_event(
+        "alice",
+        &AppMessageProjection {
+            authority: None,
+            message_id_hex: failed.clone(),
+            source_message_id_hex: None,
+            direction: "sent".to_owned(),
+            group_id_hex: group_id_hex.clone(),
+            sender: account.account_id_hex.clone(),
+            plaintext: "never left".to_owned(),
+            kind: cgka_traits::MARMOT_APP_EVENT_KIND_CHAT,
+            tags: Vec::new(),
+            source_epoch: None,
+            retention: None,
+            recorded_at: Some(unix_now_seconds()),
+            origin_commit_id: None,
+            moderation_grant: false,
+        },
+    )
+    .unwrap();
+    app.invalidate_timeline_app_event(
+        "alice",
+        &group_id_hex,
+        &failed,
+        crate::LOCAL_PUBLISH_FAILED_REASON,
+    )
+    .unwrap();
+
+    let store = app.account_storage("alice").unwrap();
+    let held = cgka_traits::MessageId::new(vec![5; 32]);
+    store
+        .put_queued_outbound_intent(&QueuedOutboundIntent {
+            id: held.clone(),
+            group_id: group_id.clone(),
+            intent: cgka_traits::SendIntent::AppMessage {
+                group_id: group_id.clone(),
+                payload: b"held".to_vec(),
+                expected_epoch: None,
+            },
+            created_at_ms: 1,
+            reissue_attempts: 0,
+        })
+        .unwrap();
+    let mut updates = Vec::new();
+    let refused = client
+        .discard_failed_send_with_local_projection(&group_id, &failed, |update| {
+            updates.push(update)
+        })
+        .unwrap();
+    assert_eq!(
+        refused.outcome,
+        crate::DiscardFailedSendOutcome::StillSending
+    );
+    assert!(updates.is_empty());
+    assert!(
+        app.timeline_message("alice", &group_id_hex, &failed)
+            .unwrap()
+            .is_some()
+    );
+
+    store.delete_queued_outbound_intent(&held).unwrap();
+    let discarded = client
+        .discard_failed_send_with_local_projection(&group_id, &failed, |update| {
+            updates.push(update)
+        })
+        .unwrap();
+    assert_eq!(
+        discarded.outcome,
+        crate::DiscardFailedSendOutcome::Discarded
+    );
+    assert!(
+        updates
+            .iter()
+            .flat_map(|update| &update.timeline_changes)
+            .any(|change| matches!(
+                change,
+                TimelineMessageChange::Remove {
+                    message_id_hex,
+                    reason: storage_sqlite::TimelineRemoveReason::Cleared,
+                } if message_id_hex == &failed
+            )),
+        "subscribers hear the row leave"
+    );
+    assert!(
+        app.timeline_message("alice", &group_id_hex, &failed)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        client
+            .discard_failed_send_with_local_projection(&group_id, &failed, |_| {})
+            .unwrap()
+            .outcome,
+        crate::DiscardFailedSendOutcome::NotFailedSend
     );
 }
 
@@ -22127,22 +22251,38 @@ async fn retained_send_recovers_after_reconnect(host_wake: bool) {
     let failed_event_id = relay.attempted_event_ids()[attempts_before].clone();
 
     relay.allow_publishes();
+    let mut events = runtime.subscribe();
     runtime
         .shared_services()
         .relay_plane()
         .simulate_notification_consumer_exit_for_test();
-    let backoff_deadline = std::time::Instant::now() + Duration::from_secs(15);
-    loop {
-        match runtime.unhydrated_group_count_for_test("sender").await {
-            Err(AppError::TransportClosed) => break,
-            Ok(_) => tokio::task::yield_now().await,
-            Err(error) => panic!("unexpected reconnect probe error: {error:?}"),
+    // Wait for the failed receive before probing: the worker takes a ready
+    // command before its receive, so probes sent back to back would keep
+    // the receive that observes the exit from running.
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            match events.recv().await {
+                Ok(MarmotAppEvent::AccountError(error))
+                    if error.message.starts_with("runtime receive failed") =>
+                {
+                    break;
+                }
+                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    panic!("runtime events closed before the failed receive")
+                }
+            }
         }
-        assert!(
-            std::time::Instant::now() < backoff_deadline,
-            "account worker did not enter reconnect backoff"
-        );
-    }
+    })
+    .await
+    .expect("the consumer exit must fail the worker's receive");
+    assert!(
+        matches!(
+            runtime.unhydrated_group_count_for_test("sender").await,
+            Err(AppError::TransportClosed)
+        ),
+        "account worker did not enter reconnect backoff"
+    );
 
     if host_wake {
         runtime

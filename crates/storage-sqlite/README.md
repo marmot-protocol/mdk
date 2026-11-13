@@ -140,6 +140,10 @@ preconditions: this read is not an atomic authorization for a later write.
 
 ## Migrations
 
+Migration 0204 drops the timeline rows of own sends that failed and were then deleted. Such a send reached no one, so
+the projection no longer gives it a row; its source row stays in `app_events`. A deleted send a peer reacted to (or
+whose receipt retention kept) was received after all: it is settled as delivered and keeps its placeholder.
+
 Migration 0203 adds a nullable `member_outcomes_json` column to prepared group-image uploads. The app writes a versioned
 member-resolution report before canonical creation and keeps it when the upload is consumed. Idempotent retries read
 that original report instead of inferring recipient failures from a later roster. Existing rows retain `NULL`; a retry

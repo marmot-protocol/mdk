@@ -250,6 +250,15 @@ pub use cgka_traits::{
 pub use client::AppClient;
 #[cfg(not(feature = "test-support"))]
 pub(crate) use client::AppClient;
+
+/// How many account read-state publishes the test oracle checked in this
+/// process (mdk#3273). The oracle runs only in marmot-app's own tests, so a
+/// downstream crate's tests read zero here even after a worker published.
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub fn read_state_oracle_checks() -> u64 {
+    client::read_state::oracle::checks()
+}
 #[cfg(feature = "test-policy-overrides")]
 #[doc(hidden)]
 pub use client::DevSealedHistoryBundle;
@@ -1269,6 +1278,32 @@ pub struct PendingWelcomeDelivery {
     pub size_class: Option<cgka_traits::EventSizeClass>,
 }
 
+/// What [`MarmotAppRuntime::discard_failed_send`] did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DiscardFailedSendOutcome {
+    /// The send is gone from this device: its timeline row, edits and media
+    /// references. Nothing was published.
+    Discarded,
+    /// The group has a send the engine may still publish, and this message
+    /// could be among them. Nothing changed; try again once the group's sends
+    /// settle.
+    StillSending,
+    /// No failed own send has this id: it was delivered, is still pending, a
+    /// peer's reaction confirmed it, or it is already gone. Nothing changed.
+    NotFailedSend,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DiscardFailedSendResult {
+    pub outcome: DiscardFailedSendOutcome,
+    /// Ciphertext hashes of the discarded send's encrypted media, for purging
+    /// a host's decrypted-media cache. Empty unless the send was discarded.
+    pub media_ciphertext_sha256: Vec<String>,
+    /// True when the send was discarded but secure WAL truncation remains
+    /// pending. The next secure delete in this group retries it.
+    pub erasure_pending: bool,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SecureDeleteExpiredResult {
     /// Number of expired raw app-event rows securely scrubbed and pruned.
@@ -2230,6 +2265,7 @@ impl MarmotApp {
             conversation_captures: Vec::new(),
             runtime_telemetry: None,
             send_telemetry: None,
+            read_state: None,
             app: self.clone(),
             maintenance_observation_generation: self.product_analytics.permit(),
             received_private_key_package_generation: 0,
@@ -7748,6 +7784,33 @@ impl MarmotApp {
                 &classifier,
             )?
             .into())
+    }
+
+    /// Drop one failed own send from storage; see
+    /// [`SqliteAppStorage::discard_failed_send`](storage_sqlite::SqliteAppStorage::discard_failed_send).
+    /// `None` when the row is not a failed own send.
+    pub(crate) fn discard_failed_send(
+        &self,
+        label: &str,
+        group_id_hex: &str,
+        message_id_hex: &str,
+    ) -> Result<Option<(SecurePruneAppEventsResult, AppProjectionUpdate)>, AppError> {
+        let account = self.account_home().account(label)?;
+        let classifier = Self::chat_list_mention_classifier(&account.account_id_hex);
+        let discarded = self
+            .account_storage(&account.label)?
+            .app_storage()
+            .discard_failed_send(
+                group_id_hex,
+                message_id_hex,
+                &account.account_id_hex,
+                &classifier,
+            )?;
+        discarded
+            .map(|(outcome, update)| {
+                Ok((outcome, self.app_projection_update(&account.label, update)?))
+            })
+            .transpose()
     }
 
     fn migrate_legacy_account_projection_if_needed(&self, label: &str) -> Result<(), AppError> {
