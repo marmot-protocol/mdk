@@ -680,7 +680,7 @@ fn validate_operational(kind: &crate::audit::AuditEventKind) -> Result<(), Contr
                 "a runner fetch plans at least one range in an ordered window",
             )?;
             require(
-                *owed_secs > 0 && *owed_secs <= owed_until_secs - owed_since_secs + 1,
+                *owed_secs > 0 && *owed_secs - 1 <= owed_until_secs - owed_since_secs,
                 "a runner fetch owes at least a second and no more than its window",
             )?;
             require(

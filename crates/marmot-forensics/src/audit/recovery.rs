@@ -1209,4 +1209,25 @@ mod tests {
         ]);
         assert_eq!(lines.len(), 2, "only the consistent rows are written");
     }
+
+    /// A window spanning every second is checked without overflow: the row is
+    /// written and the strict decoder reads it back.
+    #[test]
+    fn a_runner_fetch_over_the_whole_clock_validates_without_overflow() {
+        let mut whole = fetched();
+        if let AuditEventKind::RecoveryRunnerFetched {
+            owed_secs,
+            owed_since_secs,
+            owed_until_secs,
+            ..
+        } = &mut whole
+        {
+            (*owed_secs, *owed_since_secs, *owed_until_secs) = (u64::MAX, 0, u64::MAX);
+        }
+        let (_dir, lines) = v5_lines(vec![whole]);
+        let [line] = lines.as_slice() else {
+            panic!("the whole-clock row is written");
+        };
+        crate::v5::Record::from_json(line.as_bytes()).expect("the strict decoder accepts it");
+    }
 }
