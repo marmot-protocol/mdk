@@ -28,7 +28,7 @@ use marmot_forensics::{AuditEventContext, EpochStallBackfillTrigger, ForensicRec
 use marmot_observability::PerformanceRecorder;
 use marmot_observability::{AppPerformanceOperation, SyncFailureStage};
 
-use super::epoch_stall::BackfillDecision;
+use super::history_recovery::epoch_stall::BackfillDecision;
 use super::{AppClient, InventoryWrite};
 use crate::config::CursorPersistence;
 
@@ -693,7 +693,7 @@ impl AppClient {
     /// tick's own evolution carried it *through* are read at by nothing, so
     /// without the engine's own `EpochChanged` the detector cannot tell a device
     /// that recovered from one that is still stuck (see
-    /// [`EpochStallDetector::observe_epoch_passage`](super::epoch_stall::EpochStallDetector::observe_epoch_passage)).
+    /// [`EpochStallDetector::observe_epoch_passage`](super::history_recovery::epoch_stall::EpochStallDetector::observe_epoch_passage)).
     /// Of the three emitting sites only a convergence reorg spans more than one
     /// epoch; publish-confirm and peer-commit ingest are always adjacent, which
     /// is the case the passage rule is tuned for.
@@ -3724,7 +3724,7 @@ impl AppClient {
     /// proves the fetched history was not fully retained. A deferral whose
     /// engine-reported lineage is fork-side arms on the same threshold and
     /// carries its own trigger — see
-    /// [`backfill_trigger_for`](super::epoch_stall::backfill_trigger_for) for
+    /// [`backfill_trigger_for`](super::history_recovery::epoch_stall::backfill_trigger_for) for
     /// why the label moves and the decision does not. Repeated arming that
     /// never recovers the group escalates onto the next successful sync summary,
     /// the seam every worker surface already publishes. Only observed under
@@ -3762,7 +3762,7 @@ impl AppClient {
         }
         // A contested fork is eligible local work, not proof of a missing
         // transport object. Independent existing loss/gap obligations survive.
-        if crate::client::epoch_stall::backfill_trigger_for(outcome)
+        if crate::client::history_recovery::epoch_stall::backfill_trigger_for(outcome)
             == EpochStallBackfillTrigger::ContestedForkDeferral
         {
             self.epoch_stall
@@ -3820,7 +3820,7 @@ impl AppClient {
             &group_id,
             record.epoch.0,
             decision,
-            crate::client::epoch_stall::backfill_trigger_for(outcome),
+            crate::client::history_recovery::epoch_stall::backfill_trigger_for(outcome),
         );
     }
 
@@ -4290,7 +4290,7 @@ impl AppClient {
                 };
                 Some((
                     cgka_traits::GroupId::new(group_id),
-                    super::epoch_stall::EpochStallEvidence {
+                    super::history_recovery::epoch_stall::EpochStallEvidence {
                         stalled_epoch: entry.stalled_epoch,
                         fruitless_completions: entry.fruitless_completions,
                         fruitless_reported: entry.fruitless_reported,
@@ -4476,7 +4476,7 @@ impl AppClient {
     /// load-bearing: the nested drain has already emptied the stash.)
     ///
     /// A run is still forgotten when a caller discards the client outright; the
-    /// [`super::epoch_stall`] module header covers that case and what
+    /// [`super::history_recovery::epoch_stall`] module header covers that case and what
     /// re-escalating then costs.
     pub(crate) fn drain_epoch_stall_escalations(&mut self, summary: &mut SyncSummary) {
         summary
@@ -4565,7 +4565,7 @@ impl AppClient {
     pub(crate) async fn repair_full_history_cancellable(
         &mut self,
         cancelled: &(dyn Fn() -> bool + Sync),
-        spawned: Option<&mut super::recovery_runner::host::SpawnedRunner>,
+        spawned: Option<&mut super::history_recovery::recovery_runner::host::SpawnedRunner>,
     ) -> Result<SyncSummary, ClassifiedSyncFailure> {
         if !cancelled() {
             // Explicit Repair authorizes a fresh finite rejoin episode before
@@ -7674,7 +7674,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn contested_fork_evidence_keeps_independent_recovery_demand() {
-        use crate::client::epoch_stall::BackfillDecision;
+        use crate::client::history_recovery::epoch_stall::BackfillDecision;
         use cgka_traits::ingest::{DeferralLineage, IngestOutcome};
         use marmot_forensics::EpochStallBackfillTrigger;
         let dir = tempfile::tempdir().unwrap();
@@ -8534,7 +8534,7 @@ mod tests {
     /// stall evidence, even without EOSE, and keeps what was admitted.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_replay_that_ends_terminal_escalates_nothing_and_leaves_no_evidence() {
-        use crate::client::epoch_stall::BackfillDecision;
+        use crate::client::history_recovery::epoch_stall::BackfillDecision;
         use marmot_forensics::EpochStallBackfillTrigger;
         for (disbanded, admit_prefix) in
             [(false, false), (false, true), (true, false), (true, true)]
@@ -8920,7 +8920,9 @@ mod routed_loss_observation_tests {
 
     use storage_sqlite::{RecoveryLossCause, TransportReconciliationRoute};
 
-    use crate::client::recovery_coverage::scenario_tests::{fixture, relay, routes};
+    use crate::client::history_recovery::recovery_coverage::scenario_tests::{
+        fixture, relay, routes,
+    };
 
     /// Under an overflow storm the marker writer is usually mid-write when
     /// the worker observes a generation, so the observation runs past the

@@ -205,7 +205,10 @@ impl RunnerWorker {
     }
 
     /// Ask the worker's runner for one pass, off the worker.
-    async fn pass(&self) -> oneshot::Receiver<Option<crate::client::recovery_runner::PassReport>> {
+    async fn pass(
+        &self,
+    ) -> oneshot::Receiver<Option<crate::client::history_recovery::recovery_runner::PassReport>>
+    {
         let (respond, report) = oneshot::channel();
         self.runtime
             .accounts()
@@ -426,7 +429,7 @@ async fn the_workers_runner_serves_an_explicit_repair() {
 /// group's broken unit, whose next timed probe is an hour away.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_repair_queued_during_startup_goes_through_the_runner() {
-    use crate::client::recovery_runner::RecoveryRunnerPolicy;
+    use crate::client::history_recovery::recovery_runner::RecoveryRunnerPolicy;
     use storage_sqlite::{RecoveryUnitBreak, RecoveryUnitOutcome, RecoveryUnitState};
 
     let _serial = BOUNDED_WORKER_FIXTURE_LOCK.lock().await;
@@ -967,7 +970,7 @@ async fn a_rejoin_the_survey_does_not_show_is_still_announced() {
             &worker.route,
             &transport_nostr::canonical_relay(&url),
             storage_sqlite::RecoveryUnitOutcome::RateLimited,
-            &crate::client::recovery_runner::RecoveryRunnerPolicy::default().unit,
+            &crate::client::history_recovery::recovery_runner::RecoveryRunnerPolicy::default().unit,
             crate::unix_now_seconds(),
         )
         .unwrap();

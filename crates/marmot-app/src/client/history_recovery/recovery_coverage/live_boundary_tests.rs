@@ -15,7 +15,7 @@ use super::{
     LiveCountFact, LiveCoverage, fence_plan, live_boundary_since, observe_live_counts,
     retention_floor,
 };
-use crate::client::recovery_runner::LiveFence;
+use crate::client::history_recovery::recovery_runner::LiveFence;
 use crate::unix_now_seconds;
 
 const HOUR: u64 = 60 * 60;

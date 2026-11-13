@@ -114,28 +114,28 @@
     "crates/marmot-app/src/client/audit_v5_probe/tests.rs": {
       "short_timeout": 1
     },
+    "crates/marmot-app/src/client/history_recovery/recovery_coverage/live_boundary_tests.rs": {
+      "sleep": 2
+    },
+    "crates/marmot-app/src/client/history_recovery/recovery_runner/host/tests.rs": {
+      "sleep": 3
+    },
+    "crates/marmot-app/src/client/history_recovery/recovery_runner/host/tests/rejoin.rs": {
+      "sleep": 1
+    },
+    "crates/marmot-app/src/client/history_recovery/recovery_runner/repair/tests.rs": {
+      "sleep": 1,
+      "short_timeout": 2
+    },
+    "crates/marmot-app/src/client/history_recovery/recovery_runner/tests.rs": {
+      "sleep": 5
+    },
     "crates/marmot-app/src/client/mod.rs": {
       "sleep": 1,
       "short_timeout": 1
     },
     "crates/marmot-app/src/client/push/tests.rs": {
       "sleep": 2
-    },
-    "crates/marmot-app/src/client/recovery_coverage/live_boundary_tests.rs": {
-      "sleep": 2
-    },
-    "crates/marmot-app/src/client/recovery_runner/host/tests.rs": {
-      "sleep": 3
-    },
-    "crates/marmot-app/src/client/recovery_runner/host/tests/rejoin.rs": {
-      "sleep": 1
-    },
-    "crates/marmot-app/src/client/recovery_runner/repair/tests.rs": {
-      "sleep": 1,
-      "short_timeout": 2
-    },
-    "crates/marmot-app/src/client/recovery_runner/tests.rs": {
-      "sleep": 5
     },
     "crates/marmot-app/src/client/sync/native_comparison_tests/live_rejoin_tests.rs": {
       "short_timeout": 2

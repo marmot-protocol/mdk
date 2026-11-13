@@ -145,9 +145,9 @@ discover_constants \
 discover_constants \
     "crates/storage-sqlite/src/app/account_recovery/plan.rs" \
     "RECOVERY_PARK_AFTER_[A-Z0-9_]+"
-discover_constants "crates/marmot-app/src/client/epoch_stall.rs" "EPOCH_STALL_[A-Z0-9_]+"
+discover_constants "crates/marmot-app/src/client/history_recovery/epoch_stall.rs" "EPOCH_STALL_[A-Z0-9_]+"
 discover_constants \
-    "crates/marmot-app/src/client/recovery_runner/policy.rs" \
+    "crates/marmot-app/src/client/history_recovery/recovery_runner/policy.rs" \
     "RUNNER_[A-Z0-9_]+"
 discover_constants "crates/transport-nostr-adapter/src/compare/mod.rs" "COMPARE_[A-Z0-9_]+"
 discover_constants "crates/transport-nostr-adapter/src/sweep/mod.rs" "INTERRUPT_[A-Z0-9_]+"

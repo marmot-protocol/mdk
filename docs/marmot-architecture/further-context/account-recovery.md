@@ -884,14 +884,14 @@ leave staging in one transaction.
 
 ### 9. The recovery runner
 
-`client/recovery_runner.rs` is phase 4's runner: one task per account that schedules history
+`client/history_recovery/recovery_runner.rs` is phase 4's runner: one task per account that schedules history
 fetches over the ledger and the retry state above, for every account. The old owner's grant,
 native capture, comparison job and the `runner_owns_debt` gate that chose between them are
 deleted (5c2a846b4 is the last commit with the old owner). Before any
 subscription activates, ownership preparation converts retained obligations and imports loss as
 ledger debt. The adapter fetches no history of its own: a full live reply leaves the rest to the
 runner, while ordinary native input, count facts and bounded fences remain.
-With runner ownership (`recovery_runner/host.rs`), the account worker
+With runner ownership (`history_recovery/recovery_runner/host.rs`), the account worker
 spawns the runner with itself, serves its turns between its other work and stops it on every
 exit, a quantum in flight included. A directly owned client runs one pass in place from
 `sync()` and from `next_event()` when it meets delivery loss. No worker reads what that pass's
@@ -1242,7 +1242,7 @@ the recovery modules, not a rewrite that adds a second system alongside the curr
 - Epoch-stall detector facts.
 - The Welcome floor (design section 5): a joined group's standing goal starts at the
   Welcome that installed the copy, less a fifteen-minute clock-skew allowance. The
-  runner's post-join collection (`recovery_runner/post_join.rs`) replaces the
+  runner's post-join collection (`history_recovery/recovery_runner/post_join.rs`) replaces the
   maintenance subscriptions a grant installed, which are deleted.
 - The #1946 rule that recovery debt is never evicted. Spill rows are capped; unresolved loss
   is not. Every unresolved loss generation and every parked obligation stays, with no fixed

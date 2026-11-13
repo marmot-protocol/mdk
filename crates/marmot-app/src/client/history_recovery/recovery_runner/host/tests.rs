@@ -22,8 +22,8 @@ use super::{
 };
 use crate::client::AppClient;
 use crate::client::audit_recovery::recorded_v5_rows;
-use crate::client::history_notices::park_recovery_for_test;
-use crate::client::recovery_coverage::scenario_tests::{
+use crate::client::history_recovery::history_notices::park_recovery_for_test;
+use crate::client::history_recovery::recovery_coverage::scenario_tests::{
     Fixture, clear_coverage_goals, fault_connection, fixture,
 };
 use crate::unix_now_seconds;
@@ -376,7 +376,7 @@ async fn aged_capture() -> (
     TransportReconciliationRoute,
     storage_sqlite::RecoveryCoverageRange,
 ) {
-    use crate::client::recovery_coverage::scenario_tests::fixture_on;
+    use crate::client::history_recovery::recovery_coverage::scenario_tests::fixture_on;
     let fixture = fixture_on(
         vec!["wss://a.example".into()],
         None,
@@ -436,7 +436,9 @@ async fn a_cursor_reopen_owes_each_relays_restart_gap_without_fencing() {
 }
 
 async fn cursor_reopen_owes_restart_gap(fail_open_write: bool) {
-    use crate::client::recovery_coverage::scenario_tests::{fixture_on, reactivate_client};
+    use crate::client::history_recovery::recovery_coverage::scenario_tests::{
+        fixture_on, reactivate_client,
+    };
     let Fixture {
         client,
         storage,
@@ -588,7 +590,7 @@ async fn cursor_reopen_owes_restart_gap(fail_open_write: bool) {
 /// runner selects work, with no restart or epoch-gap demand (mdk#2862).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_new_current_route_gets_a_standing_goal_before_the_runner_selects_it() {
-    use crate::client::recovery_coverage::scenario_tests::fixture_on;
+    use crate::client::history_recovery::recovery_coverage::scenario_tests::fixture_on;
     let Fixture {
         mut client,
         storage,
@@ -966,7 +968,7 @@ async fn failed_route_goal_writes_retry_without_spinning_or_a_new_wake() {
 }
 
 async fn failed_route_goal_writes(failed_steps: usize) {
-    use crate::client::recovery_coverage::scenario_tests::fixture_on;
+    use crate::client::history_recovery::recovery_coverage::scenario_tests::fixture_on;
     let Fixture {
         mut client,
         storage,
@@ -1086,7 +1088,7 @@ async fn failed_route_goal_writes(failed_steps: usize) {
 /// the copy has no hint: a broad goal could never narrow after recovery.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unreadable_welcome_metadata_never_widens_the_goal() {
-    use crate::client::recovery_coverage::scenario_tests::fixture_on;
+    use crate::client::history_recovery::recovery_coverage::scenario_tests::fixture_on;
     use cgka_traits::storage::{GroupStorage, StorageError};
     let Fixture {
         mut client,
@@ -1267,7 +1269,9 @@ async fn a_relay_plane_shutdown_settles_the_cut_quantum_as_preempted() {
 /// unchanged obligation must not erase the replacement proof.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn new_epoch_gap_reopens_covered_history_once_and_atomically() {
-    use crate::client::recovery_coverage::scenario_tests::{fixture_on, relay, routes};
+    use crate::client::history_recovery::recovery_coverage::scenario_tests::{
+        fixture_on, relay, routes,
+    };
     let fixture = fixture_on(vec![relay()], Some(1), None).await;
     let client = &fixture.client;
     let app = fixture.storage.app_storage();
@@ -2029,7 +2033,7 @@ async fn a_run_of_turns_never_starves_a_repairs_cancel() {
 /// back both causes' reclamation; retry never certifies the missing history.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn runner_loss_handoff_restores_the_guard_after_reclaim_failure() {
-    use crate::client::recovery_coverage::scenario_tests::fixture_on;
+    use crate::client::history_recovery::recovery_coverage::scenario_tests::fixture_on;
     use storage_sqlite::RecoveryLossCause;
     let Fixture {
         mut client,

@@ -14,7 +14,7 @@
 use storage_sqlite::{SqliteAppStorage, TransportReconciliationRoute};
 
 use crate::client::AppClient;
-use crate::client::recovery_coverage::LiveTails;
+use crate::client::history_recovery::recovery_coverage::LiveTails;
 
 /// One worker turn's read of the live tails.
 pub(crate) trait LiveTailRead: Send + Sync {

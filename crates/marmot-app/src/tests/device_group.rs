@@ -1073,7 +1073,7 @@ async fn the_host_never_learns_of_the_device_group() {
         .collect();
     assert_eq!(gaps.len(), 2);
     for gap in gaps {
-        crate::client::history_notices::park_recovery_for_test(&storage, gap);
+        crate::client::history_recovery::history_notices::park_recovery_for_test(&storage, gap);
     }
     let notices: Vec<_> = phone
         .history_notices()

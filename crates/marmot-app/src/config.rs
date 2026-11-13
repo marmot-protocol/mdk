@@ -189,7 +189,7 @@ pub struct MarmotAppConfig {
     pub dev_fail_invite_local_refresh: bool,
     /// Dev/test-only override for how long a group wedged at one stalled epoch
     /// must wait between paced re-arms
-    /// ([`crate::client::epoch_stall::EPOCH_STALL_WEDGE_REARM_INTERVAL_MS`]).
+    /// ([`crate::client::history_recovery::epoch_stall::EPOCH_STALL_WEDGE_REARM_INTERVAL_MS`]).
     /// Honored only with `test-policy-overrides`; the production interval is an
     /// hour, so this is the only way a test can reach the second and third
     /// re-arm of a frozen device without sleeping through them.
