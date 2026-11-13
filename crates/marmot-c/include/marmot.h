@@ -859,6 +859,25 @@ typedef enum MarmotAppGroupHydrationQuarantineReason {
 } MarmotAppGroupHydrationQuarantineReason;
 
 /**
+ * What `marmot_discard_failed_send` did.
+ */
+typedef enum MarmotDiscardFailedSendOutcome {
+  /**
+   * The send is gone from this device. Nothing was published.
+   */
+  MARMOT_DISCARD_FAILED_SEND_OUTCOME_DISCARDED,
+  /**
+   * The group has a send the engine may still publish, and this
+   * message could be among them. Nothing changed; try again later.
+   */
+  MARMOT_DISCARD_FAILED_SEND_OUTCOME_STILL_SENDING,
+  /**
+   * No failed own send has this id. Nothing changed.
+   */
+  MARMOT_DISCARD_FAILED_SEND_OUTCOME_NOT_FAILED_SEND,
+} MarmotDiscardFailedSendOutcome;
+
+/**
  * Native push platform.
  */
 typedef enum MarmotPushPlatform {
@@ -3689,6 +3708,23 @@ typedef struct MarmotLocalSendStatus {
   uint32_t state;
   struct MarmotSendSummary *summary;
 } MarmotLocalSendStatus;
+
+/**
+ * Result of discarding a failed own send.
+ */
+typedef struct MarmotDiscardFailedSendResult {
+  enum MarmotDiscardFailedSendOutcome outcome;
+  /**
+   * Ciphertext hashes of the discarded send's encrypted media.
+   */
+  char **media_ciphertext_sha256;
+  uintptr_t media_ciphertext_sha256_len;
+  /**
+   * True when secure WAL truncation remains pending; the next secure
+   * delete in this group retries it.
+   */
+  bool erasure_pending;
+} MarmotDiscardFailedSendResult;
 
 /**
  * Result of the per-group secure-delete sweep.
@@ -10174,6 +10210,24 @@ MarmotStatus marmot_edit_message(const struct MarmotClient *client,
                                  struct MarmotSendSummary **out);
 
 /**
+ * Remove a failed own send from this device without publishing
+ * anything; use it instead of `marmot_delete_message` for a row whose
+ * invalidation status is `local_publish_failed`. Free with
+ * `marmot_discard_failed_send_result_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_discard_failed_send(const struct MarmotClient *client,
+                                        const char *account_ref,
+                                        const char *group_id_hex,
+                                        const char *message_id_hex,
+                                        struct MarmotDiscardFailedSendResult **out);
+
+/**
  * Securely delete this group's expired disappearing messages now.
  * Free with `marmot_secure_delete_expired_result_free`.
  *
@@ -15903,6 +15957,16 @@ void marmot_app_message_record_list_free(struct MarmotAppMessageRecordList *list
  * this library.
  */
 void marmot_secure_delete_expired_result_free(struct MarmotSecureDeleteExpiredResult *ptr);
+
+/**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
+void marmot_discard_failed_send_result_free(struct MarmotDiscardFailedSendResult *ptr);
 
 /**
  * Free a value of this type returned by this library. NULL

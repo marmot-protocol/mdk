@@ -4,6 +4,10 @@
 
 ### Breaking changes
 
+- Account migration 0204 drops timeline rows of own sends that failed and were then deleted; such a send no longer
+  projects a row. The source rows stay. A deleted send a peer reacted to is delivered instead, also when the reaction
+  arrived after the deletion, and keeps its placeholder. Account schema advances from 203 to 204; older binaries
+  refuse the upgraded database. Downgrade is unsupported.
 - Account migration 0203 adds `member_outcomes_json` to prepared group-image
   uploads, retaining the original partial member-resolution report across
   consumed-upload retries (#1813). Account schema advances from 202 to 203;
@@ -13,6 +17,8 @@
 
 ### Added
 
+- `SqliteAppStorage::discard_failed_send` securely drops one failed own send (row, edits, media references) and
+  returns its projection update; removals of a user-removed failed send carry `TimelineRemoveReason::Cleared`.
 - `SqliteAppStorage::sticker_pack_relays` and `set_sticker_pack_relays` retain sticker-pack relay hints independently
   of NIP-01 replacement metadata (mdk#3283). Account migration 0202 adds `relays_json`, defaulting existing packs to
   an empty list. Pack replacement preserves retained hints.
