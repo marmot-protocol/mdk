@@ -229,14 +229,24 @@ impl<T> ReadReply<T> {
     /// Answer the read, ending its wait if dispatch has not. An answer that
     /// takes work where the worker took the read up goes through
     /// [`Self::send_with`] instead, so that work is not counted as waiting.
+    /// The worker answers through its `reply`, which publishes A first
+    /// (mdk#3273).
     pub(crate) fn send(mut self, value: T) -> Result<(), T> {
         self.dispatched();
         self.reply.send(value)
     }
 
-    /// Answer the read where the worker took it up without dispatching it,
-    /// from a snapshot or a hydration: the wait ends before `answer` runs.
-    pub(crate) fn send_with(mut self, answer: impl FnOnce() -> T) -> Result<(), T> {
+    /// Answer the read where the worker took it up without dispatching it:
+    /// the wait ends before `answer` runs.
+    #[cfg(test)]
+    fn send_with(mut self, answer: impl FnOnce() -> T) -> Result<(), T> {
+        self.dispatched();
+        self.reply.send(answer())
+    }
+
+    /// Answer the read from a snapshot while a long unit holds the client:
+    /// mid-unit, so the answer describes the state from before that unit.
+    pub(crate) fn send_from_snapshot(mut self, answer: impl FnOnce() -> T) -> Result<(), T> {
         self.dispatched();
         self.reply.send(answer())
     }
@@ -261,6 +271,8 @@ impl<T> ReadReply<T> {
 /// A worker command's reply half: a bare oneshot sender, or a host read's
 /// [`ReadReply`].
 pub(crate) trait WorkerReply<T> {
+    /// The answer itself. The worker sends it through its `reply`, which
+    /// publishes A first (mdk#3273).
     fn send_reply(self, value: T) -> Result<(), T>;
 }
 

@@ -627,14 +627,43 @@ async fn accept_group_invite_retrying_busy(
     account_ref: &str,
     group_id: &GroupId,
 ) -> Result<marmot_app::AppGroupRecord, AppError> {
+    let group_id_hex = hex::encode(group_id.as_slice());
+    // Whether the last attempt found no saved row for the group.
+    let mut row_missing = false;
     timeout(Duration::from_secs(5), async {
         loop {
-            match runtime.accept_group_invite(account_ref, group_id).await {
-                Err(AppError::AccountWorkerBusy | AppError::UnknownGroup(_)) => {
-                    sleep(Duration::from_millis(10)).await
+            if row_missing {
+                // Wait for the row with the lookup `accept_group_invite`
+                // makes, read off the account worker: a refused attempt
+                // would cost the worker a turn, and attempts back to back can
+                // keep it from receiving the Welcome. `GroupJoined` is no such
+                // signal: a projection save that fails after the Welcome's
+                // ingest announces the join before the row exists, and its
+                // retry saves the row without announcing it again. A probe
+                // that finds the row starts a group-state watch, dropped
+                // here, which reads off the worker and ends at the row's
+                // next change or at shutdown.
+                row_missing = matches!(
+                    runtime
+                        .subscribe_group_state(account_ref, &group_id_hex)
+                        .await,
+                    Err(AppError::UnknownGroup(_))
+                );
+                if !row_missing {
+                    continue;
                 }
-                result => return result,
+            } else {
+                match runtime.accept_group_invite(account_ref, group_id).await {
+                    Err(AppError::UnknownGroup(_)) => row_missing = true,
+                    // A startup or catch-up sync holds the live client and
+                    // refused before starting the mutation. The runtime emits
+                    // nothing when that sync lets go; these refusals answer
+                    // without a worker turn.
+                    Err(AppError::AccountWorkerBusy) => {}
+                    result => return result,
+                }
             }
+            sleep(Duration::from_millis(10)).await;
         }
     })
     .await
@@ -1689,6 +1718,35 @@ fn sqlite_file_requires_key_for_test(path: &Path) -> bool {
             })
         })
         .is_err()
+}
+
+/// The account read-state oracle runs in marmot-app's integration tests,
+/// which link this crate without `cfg(test)`: their runner names the package.
+/// `marmot-uniffi`'s `read_state_oracle_stays_off_in_downstream_tests` is the
+/// other half (mdk#3273).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn read_state_oracle_runs_in_marmot_app_integration_tests() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, url) = mock_app(&dir).await;
+    let runtime = MarmotAppRuntime::new(app);
+    let account = create_network_ready_identity(
+        &runtime,
+        AccountSetupRequest {
+            default_relays: vec![endpoint(&url)],
+            bootstrap_relays: vec![endpoint(&url)],
+            ..AccountSetupRequest::default()
+        },
+    )
+    .await
+    .account
+    .account_id_hex;
+    // A worker command publishes the read state before it replies.
+    runtime
+        .key_package_maintenance_status(&account)
+        .await
+        .unwrap();
+    assert!(marmot_app::read_state_oracle_checks() > 0);
+    runtime.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

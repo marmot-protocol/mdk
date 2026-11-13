@@ -671,6 +671,7 @@ struct FlakyGroupRecordStorage {
     fail_mark_disband_tombstone_announced: Arc<AtomicBool>,
     fail_list_queued_outbound_intents: Arc<AtomicBool>,
     fail_disband_request: Arc<AtomicBool>,
+    close_after_key_package_scan: Arc<AtomicBool>,
     snapshot_refusal: Arc<Mutex<Option<SnapshotRefusal>>>,
 }
 
@@ -684,8 +685,16 @@ impl FlakyGroupRecordStorage {
             fail_mark_disband_tombstone_announced: Arc::new(AtomicBool::new(false)),
             fail_list_queued_outbound_intents: Arc::new(AtomicBool::new(false)),
             fail_disband_request: Arc::new(AtomicBool::new(false)),
+            close_after_key_package_scan: Arc::new(AtomicBool::new(false)),
             snapshot_refusal: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Close the database once the next KeyPackage scan has read its rows,
+    /// so the lookups that follow it fail.
+    fn close_after_next_key_package_scan(&self) {
+        self.close_after_key_package_scan
+            .store(true, Ordering::SeqCst);
     }
 
     fn set_fail_get_group(&self, fail: bool) {
@@ -1165,7 +1174,14 @@ impl DeviceGroupWelcomeStorage for FlakyGroupRecordStorage {
 
 impl KeyPackageBundleStorage for FlakyGroupRecordStorage {
     fn stored_key_package_bundles(&self) -> StorageResult<Vec<StoredKeyPackageBundle>> {
-        self.inner.stored_key_package_bundles()
+        let bundles = self.inner.stored_key_package_bundles()?;
+        if self
+            .close_after_key_package_scan
+            .swap(false, Ordering::SeqCst)
+        {
+            self.inner.close()?;
+        }
+        Ok(bundles)
     }
 
     fn delete_stored_key_package_bundle(&self, storage_key: &[u8]) -> StorageResult<()> {
@@ -1226,6 +1242,13 @@ impl StorageProvider for FlakyGroupRecordStorage {
 
     fn mls_storage(&self) -> &Self::Mls {
         self.inner.mls_storage()
+    }
+
+    fn mls_storage_failure(
+        &self,
+        error: &cgka_traits::storage::MlsStorageError<Self>,
+    ) -> Option<StorageError> {
+        self.inner.mls_storage_failure(error)
     }
 
     // Forwarded so hydration's durable group-evolution restore runs under this
@@ -1442,6 +1465,27 @@ fn build_current_named_client(name: &[u8]) -> Engine<SqliteAccountStorage> {
         .peeler(Box::new(MockPeeler))
         .build()
         .expect("build current-profile client")
+}
+
+/// The ownership read proves each stored bundle by looking it up by its
+/// reference. When that lookup fails (here the database closes between the
+/// scan and the lookup, as a terminal close can), the read fails with the
+/// storage error: an empty answer would report this device's own KeyPackage
+/// as not owned (mdk#3273).
+#[tokio::test]
+async fn a_failed_key_package_lookup_fails_the_ownership_read() {
+    let storage =
+        FlakyGroupRecordStorage::new(SqliteAccountStorage::in_memory_for_test().expect("storage"));
+    let mut engine = build_current_flaky_engine(storage.clone(), b"alice-owned-key-packages");
+    engine.fresh_key_package().await.expect("key package");
+    assert_eq!(engine.durably_owned_key_packages().unwrap().len(), 1);
+
+    storage.close_after_next_key_package_scan();
+    let failed = engine.durably_owned_key_packages();
+    assert!(
+        matches!(failed, Err(EngineError::Storage(StorageError::Closed(_)))),
+        "{failed:?}"
+    );
 }
 
 #[tokio::test]

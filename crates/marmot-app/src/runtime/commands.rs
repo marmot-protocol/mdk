@@ -14,7 +14,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use super::account_worker::GroupCreationRequest;
 use super::{
-    AccountManager, AccountWorkerCommand, ReadClass, account_worker_response,
+    AccountManager, AccountWorkerCommand, Emit, ReadClass, Unpublished, account_worker_response,
     group_contributes_co_members, local_account_worker_response,
     long_account_worker_catch_up_response, long_account_worker_response,
     publish_app_runtime_group_state_updated,
@@ -1081,6 +1081,7 @@ impl AccountManager {
         {
             if changed {
                 publish_app_runtime_group_state_updated(
+                    Emit::Unpublished(Unpublished::NoClient),
                     &self.events,
                     &account.account_id_hex,
                     &account.label,
@@ -1119,6 +1120,7 @@ impl AccountManager {
         {
             if deleted {
                 publish_app_runtime_group_state_updated(
+                    Emit::Unpublished(Unpublished::NoClient),
                     &self.events,
                     &account.account_id_hex,
                     &account.label,

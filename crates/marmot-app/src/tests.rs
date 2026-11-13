@@ -34,6 +34,7 @@ mod push_snapshot;
 #[cfg(feature = "test-policy-overrides")]
 mod push_token_reshare;
 mod quarantine_receive;
+mod read_state;
 mod relay_event_limits;
 mod relay_plane_runtime;
 mod replaceable_delivery;
@@ -4804,6 +4805,7 @@ async fn failed_leave_push_compensation_body() {
     let key = app
         .sqlcipher_key("alice", &keys, &path, SqlcipherDatabaseKind::Session)
         .unwrap();
+    storage_sqlite::expect_uncounted_writes_for_test(&path);
     let db = rusqlite::Connection::open(path).unwrap();
     storage_sqlite::open_hardened_sqlcipher(
         &db,
@@ -11162,6 +11164,7 @@ async fn an_empty_checkpoint_skips_the_write_and_its_chat_list_rebuild() {
         let key = app
             .sqlcipher_key("alice", &keys, &path, crate::SqlcipherDatabaseKind::Session)
             .unwrap();
+        storage_sqlite::expect_uncounted_writes_for_test(&path);
         let connection = rusqlite::Connection::open(path).unwrap();
         storage_sqlite::open_hardened_sqlcipher(
             &connection,
@@ -19203,6 +19206,7 @@ async fn invite_recovery_failure_preserves_committed_effects_and_results() {
         let key = app
             .sqlcipher_key("alice", &keys, &path, SqlcipherDatabaseKind::Session)
             .unwrap();
+        storage_sqlite::expect_uncounted_writes_for_test(&path);
         let connection = rusqlite::Connection::open(path).unwrap();
         storage_sqlite::open_hardened_sqlcipher(
             &connection,
@@ -19655,6 +19659,7 @@ async fn accepted_projection_retries() {
         let key = app
             .sqlcipher_key("alice", &keys, &path, SqlcipherDatabaseKind::Session)
             .unwrap();
+        storage_sqlite::expect_uncounted_writes_for_test(&path);
         let connection = rusqlite::Connection::open(path).unwrap();
         storage_sqlite::open_hardened_sqlcipher(
             &connection,
@@ -22246,22 +22251,38 @@ async fn retained_send_recovers_after_reconnect(host_wake: bool) {
     let failed_event_id = relay.attempted_event_ids()[attempts_before].clone();
 
     relay.allow_publishes();
+    let mut events = runtime.subscribe();
     runtime
         .shared_services()
         .relay_plane()
         .simulate_notification_consumer_exit_for_test();
-    let backoff_deadline = std::time::Instant::now() + Duration::from_secs(15);
-    loop {
-        match runtime.unhydrated_group_count_for_test("sender").await {
-            Err(AppError::TransportClosed) => break,
-            Ok(_) => tokio::task::yield_now().await,
-            Err(error) => panic!("unexpected reconnect probe error: {error:?}"),
+    // Wait for the failed receive before probing: the worker takes a ready
+    // command before its receive, so probes sent back to back would keep
+    // the receive that observes the exit from running.
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            match events.recv().await {
+                Ok(MarmotAppEvent::AccountError(error))
+                    if error.message.starts_with("runtime receive failed") =>
+                {
+                    break;
+                }
+                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    panic!("runtime events closed before the failed receive")
+                }
+            }
         }
-        assert!(
-            std::time::Instant::now() < backoff_deadline,
-            "account worker did not enter reconnect backoff"
-        );
-    }
+    })
+    .await
+    .expect("the consumer exit must fail the worker's receive");
+    assert!(
+        matches!(
+            runtime.unhydrated_group_count_for_test("sender").await,
+            Err(AppError::TransportClosed)
+        ),
+        "account worker did not enter reconnect backoff"
+    );
 
     if host_wake {
         runtime

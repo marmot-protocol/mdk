@@ -618,6 +618,14 @@ impl AccountDeviceSession {
         Ok(self.engine.durably_owned_key_packages()?)
     }
 
+    /// [`Self::durably_owned_key_packages`] with how long the list holds while
+    /// nothing writes (mdk#3273).
+    pub fn durably_owned_key_packages_with_validity(
+        &self,
+    ) -> SessionResult<cgka_engine::key_package::OwnedKeyPackages> {
+        Ok(self.engine.durably_owned_key_packages_with_validity()?)
+    }
+
     pub fn key_package_metadata(
         &self,
         key_package: &KeyPackage,
@@ -1110,6 +1118,22 @@ impl AccountDeviceSession {
         component_ids: &[AppComponentId],
     ) -> SessionResult<Vec<Option<Vec<u8>>>> {
         Ok(self.engine.app_components(group_id, component_ids)?)
+    }
+
+    /// See `Engine::app_owned_components` (mdk#3273).
+    pub fn app_owned_components(
+        &self,
+        group_id: &GroupId,
+    ) -> SessionResult<Vec<(AppComponentId, Vec<u8>)>> {
+        Ok(self.engine.app_owned_components(group_id)?)
+    }
+
+    /// See `Engine::group_change_generations` (mdk#3273).
+    pub fn group_change_generations<'a>(
+        &self,
+        group_ids: impl IntoIterator<Item = &'a GroupId>,
+    ) -> Vec<cgka_engine::change_generation::GroupChangeGeneration> {
+        self.engine.group_change_generations(group_ids)
     }
 
     pub fn safe_export_secret(

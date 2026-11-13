@@ -250,6 +250,15 @@ pub use cgka_traits::{
 pub use client::AppClient;
 #[cfg(not(feature = "test-support"))]
 pub(crate) use client::AppClient;
+
+/// How many account read-state publishes the test oracle checked in this
+/// process (mdk#3273). The oracle runs only in marmot-app's own tests, so a
+/// downstream crate's tests read zero here even after a worker published.
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub fn read_state_oracle_checks() -> u64 {
+    client::read_state::oracle::checks()
+}
 #[cfg(feature = "test-policy-overrides")]
 #[doc(hidden)]
 pub use client::DevSealedHistoryBundle;
@@ -2256,6 +2265,7 @@ impl MarmotApp {
             conversation_captures: Vec::new(),
             runtime_telemetry: None,
             send_telemetry: None,
+            read_state: None,
             app: self.clone(),
             maintenance_observation_generation: self.product_analytics.permit(),
             received_private_key_package_generation: 0,
