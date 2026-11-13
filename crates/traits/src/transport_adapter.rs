@@ -695,6 +695,7 @@ impl OutboundFanout {
                 if status == FanoutTargetStatus::Attempting {
                     self.target_possible_exposure[index] = true;
                 }
+                self.fold_stored_exposure(index);
                 self.target_statuses[index] = FanoutTargetStatus::Attempting;
                 self.target_attempt_counts[index] =
                     self.target_attempt_counts[index].saturating_add(1);
@@ -745,7 +746,11 @@ impl OutboundFanout {
     ///   floor, a known limit, a connection never made;
     /// - anything else sets the bit: a relay's retryable answer
     ///   (`rate-limited:`, `auth-required:`), a timeout, a close after the
-    ///   write, an unclassified failure.
+    ///   write, an unclassified failure;
+    /// - a stored status that records exposure sets the bit before it is
+    ///   replaced, here or by a new attempt: `PossiblyExposed`, and a
+    ///   `RetryableUnavailable` whose failure does not prove nothing was sent,
+    ///   as rows stored before that proof existed record a retryable answer.
     ///
     /// A target whose bit is set stays `PossiblyExposed` whatever it is told
     /// later, so a pending commit that may have reached a relay never rolls
@@ -995,7 +1000,27 @@ impl OutboundFanout {
                 _ => failure.proves_nothing_sent(),
             },
         };
-        if !keeps_bit || current == FanoutTargetStatus::PossiblyExposed {
+        self.fold_stored_exposure(index);
+        if !keeps_bit {
+            self.target_possible_exposure[index] = true;
+        }
+    }
+
+    /// Set the exposure bit when the target's stored status records exposure,
+    /// before anything replaces that status. A `PossiblyExposed` status does.
+    /// So does a `RetryableUnavailable` whose failure does not prove nothing
+    /// was sent: a row stored before that proof existed (mdk#2332) records a
+    /// relay's `rate-limited:` or `auth-required:` answer that way, with the
+    /// bit clear.
+    fn fold_stored_exposure(&mut self, index: usize) {
+        let exposed = match self.target_statuses[index] {
+            FanoutTargetStatus::PossiblyExposed => true,
+            FanoutTargetStatus::RetryableUnavailable => !self.target_failures[index]
+                .as_ref()
+                .is_some_and(TransportEndpointFailure::proves_nothing_sent),
+            _ => false,
+        };
+        if exposed {
             self.target_possible_exposure[index] = true;
         }
     }
@@ -1957,6 +1982,13 @@ mod tests {
             Interrupted,
             Unavailable,
             Exposed,
+            /// `RetryableUnavailable` stored before pre-send proof existed:
+            /// its failure is a relay's `rate-limited:` answer, its bit clear.
+            LegacyAnswered,
+            /// Each of these, then marked again: the current attempt.
+            RetriedAfterUnavailable,
+            RetriedAfterAnswer,
+            RetriedAfterExposure,
         }
         #[derive(Clone, Copy, Debug, PartialEq)]
         enum Outcome {
@@ -1990,6 +2022,12 @@ mod tests {
             pre_send,
         };
         let stored = |state: Stored, bit: bool| {
+            let (state, retried) = match state {
+                RetriedAfterUnavailable => (Unavailable, true),
+                RetriedAfterAnswer => (LegacyAnswered, true),
+                RetriedAfterExposure => (Exposed, true),
+                state => (state, false),
+            };
             let mut fanout = OutboundFanout::stage(
                 fanout_request(),
                 Some(crate::engine_state::PendingStateRef::new(9)),
@@ -2002,11 +2040,14 @@ mod tests {
             }
             match state {
                 NotAttempted | Current => {}
+                RetriedAfterUnavailable | RetriedAfterAnswer | RetriedAfterExposure => {
+                    unreachable!("mapped to the state it retries")
+                }
                 CurrentCopy => fanout = fanout.clone(),
                 Interrupted => {
                     fanout = serde_json::from_slice(&serde_json::to_vec(&fanout).unwrap()).unwrap();
                 }
-                Unavailable => {
+                Unavailable | LegacyAnswered => {
                     fanout
                         .record_target_failure(
                             0,
@@ -2031,6 +2072,21 @@ mod tests {
             // before the bit existed; a set one on an outstanding target is
             // a row written by an earlier ambiguous attempt.
             fanout.target_possible_exposure[0] = bit;
+            if state == LegacyAnswered {
+                fanout.target_failures[0] = Some(failure(
+                    TransportEndpointFailureKind::RetryableUnavailable,
+                    Some(TransportEndpointRejectionCategory::RateLimited),
+                    false,
+                ));
+                // A row with no proof serializes as one written before the
+                // proof existed did.
+                let row = serde_json::to_vec(&fanout).unwrap();
+                assert!(!String::from_utf8_lossy(&row).contains("pre_send"));
+                fanout = serde_json::from_slice(&row).unwrap();
+            }
+            if retried {
+                fanout.mark_attempt_started_at(0, 200).unwrap();
+            }
             fanout
         };
         let apply = |fanout: &mut OutboundFanout, outcome: Outcome| {
@@ -2112,6 +2168,38 @@ mod tests {
             (Exposed, Timeout, PE, true),
             (Exposed, CloseAfterWrite, PE, true),
             (Exposed, Unclassified, F, true),
+            (LegacyAnswered, Accepted, A, true),
+            (LegacyAnswered, PreSend, PE, true),
+            (LegacyAnswered, LocalRefusal, PE, true),
+            (LegacyAnswered, Definitive, PE, true),
+            (LegacyAnswered, RetryableAnswer, PE, true),
+            (LegacyAnswered, Timeout, PE, true),
+            (LegacyAnswered, CloseAfterWrite, PE, true),
+            (LegacyAnswered, Unclassified, F, true),
+            (RetriedAfterUnavailable, Accepted, A, false),
+            (RetriedAfterUnavailable, PreSend, RU, false),
+            (RetriedAfterUnavailable, LocalRefusal, F, false),
+            (RetriedAfterUnavailable, Definitive, F, false),
+            (RetriedAfterUnavailable, RetryableAnswer, PE, true),
+            (RetriedAfterUnavailable, Timeout, PE, true),
+            (RetriedAfterUnavailable, CloseAfterWrite, PE, true),
+            (RetriedAfterUnavailable, Unclassified, F, true),
+            (RetriedAfterAnswer, Accepted, A, true),
+            (RetriedAfterAnswer, PreSend, PE, true),
+            (RetriedAfterAnswer, LocalRefusal, PE, true),
+            (RetriedAfterAnswer, Definitive, PE, true),
+            (RetriedAfterAnswer, RetryableAnswer, PE, true),
+            (RetriedAfterAnswer, Timeout, PE, true),
+            (RetriedAfterAnswer, CloseAfterWrite, PE, true),
+            (RetriedAfterAnswer, Unclassified, F, true),
+            (RetriedAfterExposure, Accepted, A, true),
+            (RetriedAfterExposure, PreSend, PE, true),
+            (RetriedAfterExposure, LocalRefusal, PE, true),
+            (RetriedAfterExposure, Definitive, PE, true),
+            (RetriedAfterExposure, RetryableAnswer, PE, true),
+            (RetriedAfterExposure, Timeout, PE, true),
+            (RetriedAfterExposure, CloseAfterWrite, PE, true),
+            (RetriedAfterExposure, Unclassified, F, true),
         ];
         for (state, outcome, status, bit) in clear_rows {
             for bit_before in [false, true] {
@@ -2140,8 +2228,15 @@ mod tests {
                 // Storage admits every result recorded out of `Attempting`,
                 // and every failure recorded before marking. An acceptance
                 // with no attempt in flight is not an edge this rule adds.
-                if matches!(state, Current | CurrentCopy | Interrupted)
-                    || !matches!(outcome, Accepted | Unclassified)
+                if matches!(
+                    state,
+                    Current
+                        | CurrentCopy
+                        | Interrupted
+                        | RetriedAfterUnavailable
+                        | RetriedAfterAnswer
+                        | RetriedAfterExposure
+                ) || !matches!(outcome, Accepted | Unclassified)
                 {
                     after
                         .validate_successor_of(&before)
