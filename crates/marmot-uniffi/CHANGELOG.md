@@ -11,6 +11,11 @@
   other detailed mutations keep `GroupMutationResultFfi`. Regenerate Swift and
   Kotlin bindings with the matching native library.
 
+### Added
+
+- `sticker_pack_share_link(account_ref, coordinate)` builds a canonical Sonar pack link locally with retained
+  relay hints, falling back to current account outbox candidates for packs without hints (mdk#3283).
+
 ### Fixed
 
 - Isolate Apple release-profile mock build outputs from inherited

@@ -20,7 +20,8 @@ per feature.
 - Feature notes: [runtime construction](#runtime-construction),
   [experimental device-group test builds](#experimental-device-group-test-builds), [local sends](#local-sends),
   [attachment handoff leases](#attachment-handoff-leases), [attachment storage](#attachment-storage),
-  [custom reaction artwork](#custom-reaction-artwork), [emoji set installs](#emoji-set-installs),
+  [custom reaction artwork](#custom-reaction-artwork), [sticker pack sharing](#sticker-pack-sharing),
+  [emoji set installs](#emoji-set-installs),
   [file-backed media upload](#file-backed-media-upload),
   [account attachment history](#account-attachment-history),
   [public event verification](#public-event-verification), [host performance stages](#host-performance-stages),
@@ -303,6 +304,12 @@ the standalone result with `marmot_attachment_entry_free`; never use that free
 for an entry borrowed from a page. Use its original source target with ordinary
 attachment acquisition and local reads. See the
 [shared reaction contract](../marmot-uniffi/ATTACHMENT-HISTORY.md#reaction-artwork).
+
+## Sticker pack sharing
+
+`marmot_sticker_pack_share_link(account_ref, coordinate)` follows the shared
+[sticker sharing contract](../marmot-uniffi/README.md#stickers). It runs synchronously without network I/O and
+returns an owned string through its output pointer. Free that string with `marmot_string_free`.
 
 ## Emoji set installs
 

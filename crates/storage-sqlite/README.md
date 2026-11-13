@@ -140,7 +140,7 @@ preconditions: this read is not an atomic authorization for a later write.
 
 ## Migrations
 
-Migration 0202 adds a nullable `member_outcomes_json` column to prepared group-image uploads. The app writes a versioned
+Migration 0203 adds a nullable `member_outcomes_json` column to prepared group-image uploads. The app writes a versioned
 member-resolution report before canonical creation and keeps it when the upload is consumed. Idempotent retries read
 that original report instead of inferring recipient failures from a later roster. Existing rows retain `NULL`; a retry
 of an already-created group returns `CreatedGroupMemberReportUnavailable` with its canonical id rather than inventing

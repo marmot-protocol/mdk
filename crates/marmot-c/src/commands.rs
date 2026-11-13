@@ -3784,6 +3784,12 @@ c_cmd! {
         account_ref: str, input: str,
     ) -> opt_rec(MarmotStickerPack) = sticker_pack;
 
+    /// Build a canonical pack share link locally, without network I/O.
+    /// Free the returned string with `marmot_string_free`.
+    sync fn marmot_sticker_pack_share_link(
+        account_ref: str, coordinate: str,
+    ) -> string = sticker_pack_share_link;
+
     /// Refresh recent public packs and this account's installed list.
     /// Free with `marmot_sticker_sync_result_free`.
     async fn marmot_sync_sticker_packs(

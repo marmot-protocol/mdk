@@ -1288,6 +1288,12 @@ pack by coordinate or Sonar link when the user opens a shared pack. `installStic
 change the account's published installed list after a complete read of it; without one, the change stays pending for
 a later sync.
 
+Use `stickerPackShareLink(accountRef, coordinate)` for sharing rather than constructing a URL in the host.
+It validates the coordinate and builds a canonical Sonar link without network I/O, using retained relay hints from
+successful pack fetches. Packs without retained hints use the account's current outbox relay candidates.
+Links contain at most eight normalized, unique relay hints and stay within the parser's 2048-character limit;
+hints that do not fit are omitted.
+
 A sticker message is kind 9 and carries one exact `(coordinate, shortcode, plaintext hash)` reference, exposed as
 `sticker: StickerRefFfi?` on message, preview and timeline records (`nil` for a deleted row). Hosts pass that typed
 reference to `fetchStickerAsset` to get validated bytes and never parse tags or fetch a sticker URL themselves; a

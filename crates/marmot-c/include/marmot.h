@@ -12573,6 +12573,21 @@ MarmotStatus marmot_sticker_pack(const struct MarmotClient *client,
                                  struct MarmotStickerPack **out);
 
 /**
+ * Build a canonical pack share link locally, without network I/O.
+ * Free the returned string with `marmot_string_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_sticker_pack_share_link(const struct MarmotClient *client,
+                                            const char *account_ref,
+                                            const char *coordinate,
+                                            char **out);
+
+/**
  * Refresh recent public packs and this account's installed list.
  * Free with `marmot_sticker_sync_result_free`.
  *

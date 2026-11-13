@@ -36,6 +36,7 @@ const MAX_DISCOVERY_PACKS: usize = 100;
 const MAX_INSTALLED_PACKS: usize = 100;
 const MAX_LINK_CHARS: usize = 2048;
 const MAX_STICKER_RELAY_HINTS: usize = 8;
+const STICKER_SHARE_LINK_BASE: &str = "https://sonarprivacy.xyz/stickers";
 const MAX_FUTURE_EVENT_SKEW_SECONDS: u64 = 5 * 60;
 /// Replaceable versions read per pack or installed-list fetch.
 const MAX_REPLACEABLE_VERSIONS_PER_FETCH: usize = 16;
@@ -213,14 +214,15 @@ fn parse_sticker_pack_input_with_relays(input: &str) -> Result<ParsedStickerPack
         });
     }
     let url = Url::parse(input).map_err(|_| invalid_sticker("invalid sticker pack link"))?;
+    let canonical = Url::parse(STICKER_SHARE_LINK_BASE).expect("valid sticker viewer URL");
     if url.scheme() != "https"
         || !url.username().is_empty()
         || url.password().is_some()
         || url.port_or_known_default() != Some(443)
-        || !url
-            .host_str()
-            .is_some_and(|host| matches!(host, "sonarprivacy.xyz" | "www.sonarprivacy.xyz"))
-        || url.path().trim_end_matches('/') != "/stickers"
+        || !url.host_str().is_some_and(|host| {
+            Some(host) == canonical.host_str() || host == "www.sonarprivacy.xyz"
+        })
+        || url.path().trim_end_matches('/') != canonical.path()
     {
         return Err(invalid_sticker("untrusted sticker pack link"));
     }
@@ -255,6 +257,9 @@ fn normalize_sticker_relay_hints(
             continue;
         };
         let endpoint = TransportEndpoint(relay.to_string());
+        if cgka_traits::app_components::validate_nostr_relay_url(endpoint.as_str()).is_err() {
+            continue;
+        }
         if !normalized.contains(&endpoint) {
             normalized.push(endpoint);
         }
@@ -263,6 +268,55 @@ fn normalize_sticker_relay_hints(
         }
     }
     normalized
+}
+
+fn safe_sticker_relays(
+    app: &MarmotApp,
+    relays: impl IntoIterator<Item = String>,
+) -> Vec<TransportEndpoint> {
+    let candidates = relays.into_iter().map(TransportEndpoint).collect();
+    normalize_sticker_relay_hints(
+        app.retain_safe_discovered_endpoints(candidates, "sticker pack relay hints")
+            .into_iter()
+            .map(|endpoint| endpoint.0),
+    )
+}
+
+fn build_sticker_share_link(address: &PackAddress, relays: &[TransportEndpoint]) -> String {
+    let mut url = Url::parse(STICKER_SHARE_LINK_BASE).expect("valid sticker viewer URL");
+    url.query_pairs_mut()
+        .append_pair("a", &address.coordinate());
+    let mut link = url.to_string();
+    for relay in relays {
+        let query = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("relay", relay.as_str())
+            .finish();
+        if link.len() + 1 + query.len() <= MAX_LINK_CHARS {
+            link.push('&');
+            link.push_str(&query);
+        }
+    }
+    link
+}
+
+fn retain_sticker_relays(
+    app: &MarmotApp,
+    storage: &SqliteAppStorage,
+    coordinate: &str,
+    endpoints: &[TransportEndpoint],
+) -> Result<(), AppError> {
+    let relays = safe_sticker_relays(
+        app,
+        endpoints
+            .iter()
+            .map(|endpoint| endpoint.0.clone())
+            .chain(storage.sticker_pack_relays(coordinate)?),
+    )
+    .into_iter()
+    .map(|endpoint| endpoint.0)
+    .collect::<Vec<_>>();
+    storage.set_sticker_pack_relays(coordinate, &relays)?;
+    Ok(())
 }
 
 fn validate_signal_sticker_link(input: &str) -> Result<String, AppError> {
@@ -303,6 +357,33 @@ fn validate_signal_sticker_link(input: &str) -> Result<String, AppError> {
 }
 
 impl MarmotApp {
+    /// Build a Sonar viewer link without network I/O. Retained fetch candidates
+    /// take precedence over account relays; hints are not delivery guarantees.
+    pub fn sticker_pack_share_link(
+        &self,
+        account_ref: &str,
+        coordinate: &str,
+    ) -> Result<String, AppError> {
+        let address = PackAddress::parse(coordinate)
+            .map_err(|_| invalid_sticker("invalid sticker pack coordinate"))?;
+        let account = self.account_home().account(account_ref)?;
+        let storage = self.account_storage(&account.label)?.app_storage();
+        let mut relays =
+            safe_sticker_relays(self, storage.sticker_pack_relays(&address.coordinate())?);
+        if relays.is_empty() {
+            let relay_lists = self
+                .directory()
+                .account_relay_list_status_for_account_id(&account.account_id_hex)?;
+            relays = safe_sticker_relays(
+                self,
+                self.key_package_endpoints(&account.label, &relay_lists)?
+                    .into_iter()
+                    .map(|endpoint| endpoint.0),
+            );
+        }
+        Ok(build_sticker_share_link(&address, &relays))
+    }
+
     pub fn sticker_packs(
         &self,
         account_ref: &str,
@@ -440,7 +521,7 @@ impl MarmotApp {
             .map_err(AppError::StickerRelay)?
             .events;
         let discovered = events.len().min(MAX_DISCOVERY_PACKS);
-        let updated = ingest_pack_events(&context.storage, events)?;
+        let updated = ingest_pack_events(self, &context.storage, events, &context.endpoints)?;
 
         let desired = context.storage.desired_installed_sticker_packs()?;
         for coordinate in desired.iter().take(MAX_INSTALLED_PACKS) {
@@ -665,7 +746,11 @@ async fn fetch_pack_from_endpoints(
 ) -> Result<(bool, bool), AppError> {
     let events = app
         .relay_plane
-        .fetch_public_events(endpoints, vec![filter], MAX_REPLACEABLE_VERSIONS_PER_FETCH)
+        .fetch_public_events(
+            endpoints.clone(),
+            vec![filter],
+            MAX_REPLACEABLE_VERSIONS_PER_FETCH,
+        )
         .await
         .map_err(AppError::StickerRelay)?
         .events;
@@ -679,10 +764,18 @@ async fn fetch_pack_from_endpoints(
         found = true;
         updated |= context.storage.replace_sticker_pack_if_newer(&stored)?;
     }
+    if found {
+        retain_sticker_relays(app, &context.storage, coordinate, &endpoints)?;
+    }
     Ok((updated, found))
 }
 
-fn ingest_pack_events(storage: &SqliteAppStorage, events: Vec<Event>) -> Result<usize, AppError> {
+fn ingest_pack_events(
+    app: &MarmotApp,
+    storage: &SqliteAppStorage,
+    events: Vec<Event>,
+    endpoints: &[TransportEndpoint],
+) -> Result<usize, AppError> {
     let mut updated = 0_usize;
     let mut seen = HashSet::new();
     for event in events.into_iter().take(MAX_DISCOVERY_PACKS * 2) {
@@ -699,6 +792,7 @@ fn ingest_pack_events(storage: &SqliteAppStorage, events: Vec<Event>) -> Result<
         if storage.replace_sticker_pack_if_newer(&stored)? {
             updated += 1;
         }
+        retain_sticker_relays(app, storage, &stored.coordinate, endpoints)?;
     }
     storage
         .prune_uninstalled_sticker_discovery(MAX_DISCOVERY_PACKS, "")
@@ -1374,7 +1468,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn unsigned_external_pack_fetch() {
-        let (_directory, app, _keys, account_id, coordinate, _relay) =
+        let (directory, app, _keys, account_id, coordinate, relay) =
             external_sticker_fixture().await;
         assert!(!app.has_external_signer(&account_id));
         let context = app.sticker_context(&account_id).unwrap();
@@ -1390,6 +1484,93 @@ mod tests {
         assert!(!pack.installed);
         assert!(context.storage.sticker_pack(&coordinate).unwrap().is_some());
         assert!(!app.has_external_signer(&account_id));
+        drop(context);
+        drop(app);
+        let app = MarmotApp::with_relays_and_account_home_and_config(
+            directory.path(),
+            vec!["wss://different.example".to_owned()],
+            crate::AccountHome::open(directory.path()),
+            crate::MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+        );
+        let link = app
+            .sticker_pack_share_link(&account_id, &coordinate)
+            .unwrap();
+        assert_eq!(
+            parse_sticker_pack_input_with_relays(&link).unwrap(),
+            ParsedStickerPackInput {
+                coordinate,
+                relay_hints: vec![TransportEndpoint(relay.url().await.to_string())],
+            }
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn share_hints_refresh_safely() {
+        let (directory, app, _keys, account_id, coordinate, _relay) =
+            external_sticker_fixture().await;
+        app.fetch_sticker_pack(&account_id, &coordinate)
+            .await
+            .unwrap();
+        drop(app);
+        let app = MarmotApp::with_relays_and_account_home_and_config(
+            directory.path(),
+            vec![
+                "wss://10.1.2.3/".to_owned(),
+                "ws://plain.example".to_owned(),
+                format!("wss://{}", crate::retired_relay_hosts()[0]),
+                "wss://current.example".to_owned(),
+            ],
+            crate::AccountHome::open(directory.path()),
+            crate::MarmotAppConfig::default(),
+        );
+        let account = app.account_home().account(&account_id).unwrap();
+        let storage = app.account_storage(&account.label).unwrap().app_storage();
+        let rejected = vec![
+            format!("wss://{}", crate::retired_relay_hosts()[0]),
+            "ws://127.0.0.1:7777".to_owned(),
+            "wss://user:token@relay.example".to_owned(),
+            "wss://fragment.example/#token".to_owned(),
+            "wss://10.1.2.3/".to_owned(),
+        ];
+        storage
+            .set_sticker_pack_relays(&coordinate, &rejected)
+            .unwrap();
+        let link = app
+            .sticker_pack_share_link(&account_id, &coordinate)
+            .unwrap();
+        assert_eq!(
+            parse_sticker_pack_input_with_relays(&link)
+                .unwrap()
+                .relay_hints,
+            vec![TransportEndpoint("wss://current.example".to_owned())],
+        );
+
+        let old = (0..8)
+            .map(|i| format!("wss://old{i}.example"))
+            .collect::<Vec<_>>();
+        storage.set_sticker_pack_relays(&coordinate, &old).unwrap();
+        let mut offered = rejected
+            .into_iter()
+            .map(TransportEndpoint)
+            .collect::<Vec<_>>();
+        offered.push(TransportEndpoint("wss://fresh.example".to_owned()));
+        retain_sticker_relays(&app, &storage, &coordinate, &offered).unwrap();
+        let expected = std::iter::once("wss://fresh.example".to_owned())
+            .chain(old.into_iter().take(7))
+            .collect::<Vec<_>>();
+        assert_eq!(storage.sticker_pack_relays(&coordinate).unwrap(), expected);
+        let link = app
+            .sticker_pack_share_link(&account_id, &coordinate)
+            .unwrap();
+        assert_eq!(
+            parse_sticker_pack_input_with_relays(&link)
+                .unwrap()
+                .relay_hints,
+            expected
+                .into_iter()
+                .map(TransportEndpoint)
+                .collect::<Vec<_>>(),
+        );
     }
 
     enum StickerAction {
@@ -1565,6 +1746,64 @@ mod tests {
             .is_err()
         );
         assert!(parse_sticker_pack_input("http://sonarprivacy.xyz/stickers").is_err());
+    }
+
+    #[test]
+    fn share_link_roundtrip() {
+        let coordinate = format!("30031:{}:cats._-", "ab".repeat(32));
+        let address = PackAddress::parse(&coordinate).unwrap();
+        let relays = (0..10).map(|index| format!("wss://relay{index}.example/path?q=a&b=c"));
+        let relays = normalize_sticker_relay_hints(
+            [
+                "invalid".to_owned(),
+                "wss://relay0.example/path?q=a&b=c".to_owned(),
+            ]
+            .into_iter()
+            .chain(relays),
+        );
+        let link = build_sticker_share_link(&address, &relays);
+        assert!(link.starts_with("https://sonarprivacy.xyz/stickers?a=30031%3A"));
+        assert_eq!(
+            parse_sticker_pack_input_with_relays(&link).unwrap(),
+            ParsedStickerPackInput {
+                coordinate,
+                relay_hints: (0..8)
+                    .map(|index| TransportEndpoint(format!(
+                        "wss://relay{index}.example/path?q=a&b=c"
+                    )))
+                    .collect(),
+            }
+        );
+        let bare = build_sticker_share_link(&PackAddress::parse(&self::coordinate()).unwrap(), &[]);
+        assert_eq!(parse_sticker_pack_input(&bare).unwrap(), self::coordinate());
+        assert_eq!(Url::parse(&bare).unwrap().query_pairs().count(), 1);
+    }
+
+    #[test]
+    fn share_link_length_limit() {
+        let coordinate = coordinate();
+        let first = format!("wss://first.example/?q={}", ":".repeat(350));
+        let second = format!("wss://second.example/?q={}", ":".repeat(350));
+        for relay in [&first, &second] {
+            cgka_traits::app_components::validate_nostr_relay_url(relay).unwrap();
+        }
+        let relays = normalize_sticker_relay_hints([
+            first.clone(),
+            second,
+            "wss://short.example".to_owned(),
+        ]);
+        let link = build_sticker_share_link(&PackAddress::parse(&coordinate).unwrap(), &relays);
+        assert!(link.len() <= MAX_LINK_CHARS);
+        assert_eq!(
+            parse_sticker_pack_input_with_relays(&link).unwrap(),
+            ParsedStickerPackInput {
+                coordinate,
+                relay_hints: vec![
+                    TransportEndpoint(first),
+                    TransportEndpoint("wss://short.example".to_owned()),
+                ],
+            }
+        );
     }
 
     #[test]

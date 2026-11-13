@@ -39,6 +39,17 @@ impl Marmot {
             .map_err(Into::into)
     }
 
+    /// Build a canonical pack share link from local relay hints without network I/O.
+    pub fn sticker_pack_share_link(
+        &self,
+        account_ref: String,
+        coordinate: String,
+    ) -> Result<String, MarmotKitError> {
+        self.app
+            .sticker_pack_share_link(&account_ref, &coordinate)
+            .map_err(Into::into)
+    }
+
     pub async fn sync_sticker_packs(
         &self,
         account_ref: String,
