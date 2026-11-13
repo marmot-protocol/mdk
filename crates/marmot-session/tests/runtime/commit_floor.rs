@@ -437,3 +437,102 @@ async fn a_held_relay_keeps_the_exposure_it_had() {
     );
     assert!(matches!(fanout.mls_state(), FanoutMlsState::Pending(_)));
 }
+
+/// A relay's `rate-limited:` answer stored before pre-send proof existed: a
+/// `RetryableUnavailable` row whose failure carries no proof, bit clear. That
+/// relay received the commit, so neither a size refusal before marking nor a
+/// definitive refusal of a later retry lets the commit roll back.
+#[tokio::test]
+async fn a_relay_answer_stored_before_the_upgrade_keeps_the_commit_pending() {
+    for floor_refusal in [true, false] {
+        let name = if floor_refusal {
+            "legacy-answer-floor"
+        } else {
+            "legacy-answer-retry"
+        };
+        let answered = TransportEndpoint(format!("wss://{name}-answered.example"));
+        let refusing = TransportEndpoint(format!("wss://{name}-refusing.example"));
+        let (fixture, alice) = FloorFixture::new(name, &[&answered, &refusing]).await;
+        let failure = |endpoint: &TransportEndpoint, kind, category, pre_send| {
+            TransportEndpointFailure {
+                endpoint: endpoint.clone(),
+                reason: "scripted".into(),
+                kind,
+                rejection_category: category,
+                size_class: None,
+                pre_send,
+            }
+        };
+        let adapter = RecordingAdapter::default();
+        adapter.script_failures(
+            answered.clone(),
+            vec![
+                failure(&answered, TransportEndpointFailureKind::RetryableUnavailable, None, true),
+                failure(
+                    &answered,
+                    TransportEndpointFailureKind::TerminalRejected,
+                    Some(TransportEndpointRejectionCategory::Invalid),
+                    false,
+                ),
+            ],
+        );
+        adapter.script_failures(
+            refusing.clone(),
+            vec![failure(
+                &refusing,
+                TransportEndpointFailureKind::TerminalRejected,
+                Some(TransportEndpointRejectionCategory::Invalid),
+                false,
+            )],
+        );
+        let mut runtime = fixture.runtime(alice, &adapter);
+        let first = runtime.send(fixture.rename()).await.unwrap();
+        assert!(first.pending.is_empty(), "{name}: {:?}", first.pending);
+        drop(runtime);
+
+        // Rewrite the waiting target as the previous release stored an answer.
+        let alice = fixture.reopen();
+        let stored = alice.outbound_fanouts().unwrap().remove(0);
+        let index = stored
+            .request()
+            .target
+            .endpoints()
+            .iter()
+            .position(|target| target == &answered)
+            .unwrap();
+        assert_eq!(
+            stored.target_status(index),
+            Some(FanoutTargetStatus::RetryableUnavailable)
+        );
+        let answer = failure(
+            &answered,
+            TransportEndpointFailureKind::RetryableUnavailable,
+            Some(TransportEndpointRejectionCategory::RateLimited),
+            false,
+        );
+        let mut row = serde_json::to_value(&stored).unwrap();
+        row["target_failures"][index] = serde_json::to_value(&answer).unwrap();
+        assert!(!row.to_string().contains("pre_send"), "{name}: no proof field");
+        let legacy: cgka_traits::OutboundFanout = serde_json::from_value(row).unwrap();
+        assert!(!legacy.possible_exposure(), "{name}: the old row's bit is clear");
+        alice.put_outbound_fanout(&legacy).unwrap();
+
+        if floor_refusal {
+            adapter.refuse_commits_as_too_large(vec![answered.clone()]);
+        }
+        fixture.wall.set(100_000 + 60 * 60);
+        let mut restarted = fixture.runtime(alice, &adapter);
+        let effects = restarted.resume_outbound_fanouts().await.unwrap();
+
+        assert!(effects.pending.is_empty(), "{name}: {:?}", effects.pending);
+        let stored = restarted.session().outbound_fanouts().unwrap();
+        assert_eq!(stored.len(), 1, "{name}");
+        assert_eq!(
+            stored[0].target_status(index),
+            Some(FanoutTargetStatus::PossiblyExposed),
+            "{name}"
+        );
+        assert!(matches!(stored[0].mls_state(), FanoutMlsState::Pending(_)), "{name}");
+        assert_eq!(restarted.session().epoch(&fixture.group_id).unwrap().0, 2, "{name}");
+    }
+}
