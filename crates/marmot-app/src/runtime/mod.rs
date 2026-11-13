@@ -6268,7 +6268,7 @@ impl MarmotAppRuntime {
         // An account that signs on a worker archives through it, so the
         // worker's in-memory `AccountState` changes in place (mdk#178,
         // mdk#3318); only an account that runs none writes storage directly.
-        let (group, _on_worker) = self
+        let (group, unpublished) = self
             .accounts
             .set_group_archived_on_worker(account_ref, &group_id, archived)
             .await?;
@@ -6284,7 +6284,7 @@ impl MarmotAppRuntime {
             ChatListUpdateTrigger::ArchiveChanged,
         );
         publish_app_runtime_group_state_updated(
-            Emit::Unpublished(Unpublished::AfterReply),
+            Emit::Unpublished(unpublished),
             &self.events,
             &account.account_id_hex,
             &account.label,

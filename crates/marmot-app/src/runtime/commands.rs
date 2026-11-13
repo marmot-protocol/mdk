@@ -1779,8 +1779,10 @@ impl AccountManager {
             .map(|(group, _)| group)
     }
 
-    /// [`Self::set_group_archived`], and whether the account's worker made
-    /// the change.
+    /// [`Self::set_group_archived`], and why the caller's events about the
+    /// change go out without publishing A: the worker published it before
+    /// replying ([`Unpublished::AfterReply`]), or the account runs no worker
+    /// ([`Unpublished::NoClient`]).
     ///
     /// An account that signs on a worker archives through it, so the
     /// worker's in-memory `AccountState` changes in place: a direct write
@@ -1795,7 +1797,7 @@ impl AccountManager {
         account_ref: &str,
         group_id: &GroupId,
         archived: bool,
-    ) -> Result<(AppGroupRecord, bool), AppError> {
+    ) -> Result<(AppGroupRecord, Unpublished), AppError> {
         let account = self.resolve(account_ref)?;
         if !self.signs_on_worker(&account)
             && let Some((_, group)) = self
@@ -1808,7 +1810,7 @@ impl AccountManager {
                 })
                 .await?
         {
-            return Ok((group, false));
+            return Ok((group, Unpublished::NoClient));
         }
         let command = self.worker_commands(account_ref).await?;
         let (respond, response) = oneshot::channel();
@@ -1820,7 +1822,10 @@ impl AccountManager {
             })
             .await
             .map_err(|_| AppError::TransportClosed)?;
-        Ok((local_account_worker_response(response).await?, true))
+        Ok((
+            local_account_worker_response(response).await?,
+            Unpublished::AfterReply,
+        ))
     }
 
     pub async fn update_group_image(
