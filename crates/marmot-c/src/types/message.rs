@@ -2,9 +2,9 @@
 
 use super::sticker::MarmotStickerRef;
 use marmot_uniffi::conversions::{
-    AppMessageRecordFfi, MessageUpdateFfi, ReceivedMessageFfi, RetentionSweepGroupOutcomeFfi,
-    RetentionSweepReportFfi, RetentionSweepStatusFfi, RuntimeMessageReceivedFfi,
-    SecureDeleteExpiredResultFfi,
+    AppMessageRecordFfi, DiscardFailedSendOutcomeFfi, DiscardFailedSendResultFfi, MessageUpdateFfi,
+    ReceivedMessageFfi, RetentionSweepGroupOutcomeFfi, RetentionSweepReportFfi,
+    RetentionSweepStatusFfi, RuntimeMessageReceivedFfi, SecureDeleteExpiredResultFfi,
 };
 
 use super::common::MarmotMessageTag;
@@ -47,6 +47,32 @@ c_mirror! {
         copy pruned_messages: u64,
         copy secrets_deleted: u64,
         str_vec media_ciphertext_sha256/media_ciphertext_sha256_len,
+        copy erasure_pending: bool,
+    }
+}
+
+c_enum! {
+    /// What `marmot_discard_failed_send` did.
+    MarmotDiscardFailedSendOutcome from DiscardFailedSendOutcomeFfi {
+        /// The send is gone from this device. Nothing was published.
+        Discarded,
+        /// The group has a send the engine may still publish, and this
+        /// message could be among them. Nothing changed; try again later.
+        StillSending,
+        /// No failed own send has this id. Nothing changed.
+        NotFailedSend,
+    }
+}
+
+c_mirror! {
+    /// Result of discarding a failed own send.
+    MarmotDiscardFailedSendResult from DiscardFailedSendResultFfi,
+    free marmot_discard_failed_send_result_free {
+        copy outcome: MarmotDiscardFailedSendOutcome,
+        /// Ciphertext hashes of the discarded send's encrypted media.
+        str_vec media_ciphertext_sha256/media_ciphertext_sha256_len,
+        /// True when secure WAL truncation remains pending; the next secure
+        /// delete in this group retries it.
         copy erasure_pending: bool,
     }
 }

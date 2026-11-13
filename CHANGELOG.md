@@ -11,6 +11,13 @@
   Prepared-image retries retain the original report across restart. Stable
   agent-control v2 creation and invitation remain atomic.
 
+### Added
+
+- Discard a failed own send locally with `discard_failed_send` (Rust, UniFFI,
+  C) instead of publishing a group delete for a message nobody received. A
+  failed send the user deletes now leaves the timeline instead of staying as a
+  "deleted" row that still reports failure.
+
 ### Fixed
 
 - Stop a large group change from staying pending for good at a relay whose

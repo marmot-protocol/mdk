@@ -385,6 +385,8 @@ mod migration_0201_device_inactivity_clock;
 mod migration_0202_sticker_pack_relays;
 #[path = "migrations/0203_prepared_group_member_outcomes.rs"]
 mod migration_0203_prepared_group_member_outcomes;
+#[path = "migrations/0204_deleted_failed_sends.rs"]
+mod migration_0204_deleted_failed_sends;
 
 const MIGRATIONS: &[Migration] = &[
     Migration {
@@ -1458,7 +1460,20 @@ const MIGRATIONS: &[Migration] = &[
         suspend_foreign_keys: &[],
         apply: migration_0203_prepared_group_member_outcomes::apply,
     },
+    Migration {
+        version: 204,
+        name: "0204_deleted_failed_sends",
+        suspend_foreign_keys: &[],
+        apply: migration_0204_deleted_failed_sends::apply,
+    },
 ];
+
+/// Run migration 0204's deleted-failed-send settle and drop on an open database,
+/// so a test can compare it with the live projector. Test support only.
+#[cfg(test)]
+pub(crate) fn rerun_deleted_failed_sends(connection: &Connection) -> StorageResult<()> {
+    migration_0204_deleted_failed_sends::settle_and_drop_deleted_failed_sends(connection)
+}
 
 /// Run migration 0173's recipient-confirmed backfill on an open database, so a
 /// test can compare it with the live projector. Test support only.
