@@ -52,8 +52,11 @@ mod telemetry;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 
-pub use known_limits::{KnownLimitPublishClient, RelayEventLimits};
-use known_limits::{event_json_bytes, join_refusals, refuse_over_known_limits, refused_everywhere};
+pub use known_limits::{COMMIT_SIZE_FLOOR_BYTES, KnownLimitPublishClient, RelayEventLimits};
+use known_limits::{
+    CommitSizeVerdict, admit_commit, commit_size_verdict, event_json_bytes, held_everywhere,
+    join_refusals, refuse_over_known_limits, refused_everywhere,
+};
 use safety::join_unsafe_refusals;
 pub use safety::{RelayEndpointClassification, RelayEndpointPolicy, retired_relay_hosts};
 pub use telemetry::{
@@ -3390,6 +3393,170 @@ impl MarmotRelayPlaneAccountAdapter {
         self
     }
 
+    /// `publish`, or with `commit` set `publish_commit`: a commit also meets
+    /// the size floor where a relay's limit is unknown (mdk#2332).
+    async fn publish_request(
+        &self,
+        request: TransportPublishRequest,
+        commit: bool,
+    ) -> Result<TransportPublishReport, TransportAdapterError> {
+        if request.account_id != self.account_id {
+            return Err(TransportAdapterError::AccountNotActive(request.account_id));
+        }
+        request.validate_envelope_matches_target()?;
+        let event = NostrTransportEvent::from_transport_message(&request.message)
+            .map_err(|e| TransportAdapterError::Publish(format!("Nostr payload: {e}")))?;
+        // Admission respells each relay it sends to; the result names each
+        // one as the request did, so the caller finds its answer (mdk#3305).
+        let spellings = self
+            .relay_plane
+            .inner
+            .relay_safety
+            .requested_spellings(request.target.endpoints());
+        // A relay the host-safety rule refuses is never contacted, so it is a
+        // definite failure before exposure, not an unknown (mdk#3276).
+        let (request, unsafe_refused) = self
+            .relay_plane
+            .inner
+            .relay_safety
+            .admit_publish_request(request, hex::decode(&event.id).ok().map(MessageId::new))?;
+        // An event over a relay's known limit is never sent there: the relay
+        // would refuse it, or close the socket on the oversized frame, which
+        // reads as a possible exposure and resends the event (mdk#2334). A
+        // commit also meets the floor where the limit is unknown (mdk#2332).
+        let event_bytes = event_json_bytes(&event);
+        let (endpoints, refused, held) = if commit {
+            let admission = admit_commit(
+                self.event_limits.as_deref(),
+                self.group_event_client(&event),
+                request.target.endpoints(),
+                event_bytes,
+            )
+            .await;
+            (admission.sendable, admission.refused, admission.held)
+        } else {
+            let (endpoints, refused) = refuse_over_known_limits(
+                self.event_limits.as_deref(),
+                request.target.endpoints(),
+                event_bytes,
+            )
+            .await;
+            (endpoints, refused, Vec::new())
+        };
+        if endpoints.is_empty() && !held.is_empty() {
+            // Nothing was sent, and a held relay proves no size.
+            return Err(join_unsafe_refusals(
+                spellings.restore_error(held_everywhere(
+                    refused.into_iter().chain(held).collect(),
+                    &event,
+                )),
+                unsafe_refused,
+            ));
+        }
+        // The size proof covers the relays publish can reach, as the size
+        // preflight judges them; the unsafe ones join its failures after.
+        if endpoints.is_empty() && !refused.is_empty() {
+            // No relay was contacted, so no publish attempt is counted.
+            return Err(join_unsafe_refusals(
+                spellings.restore_error(refused_everywhere(
+                    request.target.endpoints(),
+                    refused,
+                    &event,
+                )),
+                unsafe_refused,
+            ));
+        }
+        // Refused endpoints count against the request's threshold in the
+        // report; the endpoints still sent to can meet at most their number.
+        let required_acks = if refused.is_empty() && held.is_empty() && unsafe_refused.is_empty() {
+            request.required_acks
+        } else {
+            request.required_acks.min(endpoints.len())
+        };
+        // Welcome fanout keeps its account publisher; a blocked inbox write
+        // cannot stall the independent anonymous group publisher.
+        let publication = async {
+            if matches!(
+                request.target,
+                cgka_traits::TransportPublishTarget::Group { .. }
+            ) {
+                self.publish_signed_event(
+                    self.publish_client.as_ref(),
+                    &endpoints,
+                    &event,
+                    required_acks,
+                )
+                .await
+            } else {
+                self.publish_client
+                    .publish_event_for_account(&self.account_id, &endpoints, &event, required_acks)
+                    .await
+            }
+        };
+        let outcome = match self
+            .relay_plane
+            .inner
+            .transport
+            .adapter
+            .publish_event_with_client(publication, request.required_acks)
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                return Err(join_unsafe_refusals(
+                    spellings.restore_error(join_refusals(
+                        error,
+                        request.target.endpoints(),
+                        refused.into_iter().chain(held).collect(),
+                    )),
+                    unsafe_refused,
+                ));
+            }
+        };
+        let local_fanout_endpoints = if !outcome.accepted.is_empty() {
+            outcome
+                .accepted
+                .iter()
+                .map(|receipt| receipt.endpoint.clone())
+                .collect::<Vec<_>>()
+        } else if outcome.failed.is_empty() {
+            endpoints
+        } else {
+            Vec::new()
+        };
+        if !local_fanout_endpoints.is_empty() {
+            let mut local_message = request.message.clone();
+            if let Some(message_id) = outcome.message_id.clone() {
+                local_message.id = message_id;
+            }
+            self.relay_plane
+                .inner
+                .transport
+                .adapter
+                .deliver_local_publish(&local_message, &local_fanout_endpoints)
+                .await?;
+        }
+        let mut report = publish_report_from_outcome(outcome, request);
+        report.failed.extend(refused);
+        report.failed.extend(held);
+        spellings.restore_report(&mut report);
+        report.failed.extend(unsafe_refused);
+        Ok(report)
+    }
+
+    /// The client a group event is sent with, as `publish_signed_event`
+    /// chooses it; its connections are the ones a commit's floor asks about.
+    fn group_event_client(&self, event: &NostrTransportEvent) -> &dyn NostrRelayClient {
+        match self
+            .anonymous_publish_client
+            .as_ref()
+            .filter(|_| event.sig.is_some())
+        {
+            Some(client) => client,
+            None => self.publish_client.as_ref(),
+        }
+    }
+
     #[doc(hidden)]
     pub async fn publish_signed_event(
         &self,
@@ -3411,6 +3578,7 @@ impl MarmotRelayPlaneAccountAdapter {
         let deadline = tokio::time::Instant::now() + ACCOUNT_PUBLISH_WAIT;
         let required_acks = required_acks.max(1);
         let unknown = |endpoint: &TransportEndpoint| TransportEndpointFailure {
+            pre_send: false,
             size_class: None,
             endpoint: endpoint.clone(),
             reason: "publish acknowledgement unknown".to_owned(),
@@ -3452,6 +3620,7 @@ impl MarmotRelayPlaneAccountAdapter {
                         if earlier_exposure && failure.endpoint == *endpoint {
                             failure.kind = TransportEndpointFailureKind::PossiblyExposed;
                             failure.size_class = None;
+                            failure.pre_send = false;
                         }
                         failure
                     };
@@ -3489,11 +3658,13 @@ impl MarmotRelayPlaneAccountAdapter {
                                             )
                                 });
                             if auth_required {
+                                // The relay answered the anonymous write, so it
+                                // received the event: no later answer proves it
+                                // unseen (mdk#2332).
                                 let earlier_exposure =
                                     error.publish_endpoint_failures().iter().any(|failure| {
                                         failure.endpoint == *endpoint
-                                            && failure.kind
-                                                == TransportEndpointFailureKind::PossiblyExposed
+                                            && !failure.proves_nothing_sent()
                                     });
                                 retrying.insert(endpoint);
                                 retries.push(async move {
@@ -4376,123 +4547,47 @@ impl TransportAdapter for MarmotRelayPlaneAccountAdapter {
         &self,
         request: TransportPublishRequest,
     ) -> Result<TransportPublishReport, TransportAdapterError> {
-        if request.account_id != self.account_id {
-            return Err(TransportAdapterError::AccountNotActive(request.account_id));
-        }
-        request.validate_envelope_matches_target()?;
-        let event = NostrTransportEvent::from_transport_message(&request.message)
-            .map_err(|e| TransportAdapterError::Publish(format!("Nostr payload: {e}")))?;
-        // Admission respells each relay it sends to; the result names each
-        // one as the request did, so the caller finds its answer (mdk#3305).
-        let spellings = self
-            .relay_plane
-            .inner
-            .relay_safety
-            .requested_spellings(request.target.endpoints());
-        // A relay the host-safety rule refuses is never contacted, so it is a
-        // definite failure before exposure, not an unknown (mdk#3276).
-        let (request, unsafe_refused) = self
-            .relay_plane
-            .inner
-            .relay_safety
-            .admit_publish_request(request, hex::decode(&event.id).ok().map(MessageId::new))?;
-        // An event over a relay's known limit is never sent there: the relay
-        // would refuse it, or close the socket on the oversized frame, which
-        // reads as a possible exposure and resends the event (mdk#2334).
-        let (endpoints, refused) = refuse_over_known_limits(
-            self.event_limits.as_deref(),
-            request.target.endpoints(),
-            event_json_bytes(&event),
-        )
-        .await;
-        // The size proof covers the relays publish can reach, as the size
-        // preflight judges them; the unsafe ones join its failures after.
-        if endpoints.is_empty() && !refused.is_empty() {
-            // No relay was contacted, so no publish attempt is counted.
-            return Err(join_unsafe_refusals(
-                spellings.restore_error(refused_everywhere(
-                    request.target.endpoints(),
-                    refused,
-                    &event,
-                )),
-                unsafe_refused,
-            ));
-        }
-        // Refused endpoints count against the request's threshold in the
-        // report; the endpoints still sent to can meet at most their number.
-        let required_acks = if refused.is_empty() && unsafe_refused.is_empty() {
-            request.required_acks
-        } else {
-            request.required_acks.min(endpoints.len())
+        self.publish_request(request, false).await
+    }
+
+    async fn publish_commit(
+        &self,
+        request: TransportPublishRequest,
+    ) -> Result<TransportPublishReport, TransportAdapterError> {
+        self.publish_request(request, true).await
+    }
+
+    async fn commit_size_refusals(
+        &self,
+        commit: &cgka_traits::TransportMessage,
+        target: &cgka_traits::TransportPublishTarget,
+    ) -> Vec<TransportEndpointFailure> {
+        let Some(limits) = self.event_limits.as_deref() else {
+            return Vec::new();
         };
-        // Welcome fanout keeps its account publisher; a blocked inbox write
-        // cannot stall the independent anonymous group publisher.
-        let publication = async {
-            if matches!(
-                request.target,
-                cgka_traits::TransportPublishTarget::Group { .. }
-            ) {
-                self.publish_signed_event(
-                    self.publish_client.as_ref(),
-                    &endpoints,
-                    &event,
-                    required_acks,
-                )
-                .await
-            } else {
-                self.publish_client
-                    .publish_event_for_account(&self.account_id, &endpoints, &event, required_acks)
-                    .await
-            }
+        // An unreadable payload is refused by `publish_commit` itself.
+        let Ok(event) = NostrTransportEvent::from_transport_message(commit) else {
+            return Vec::new();
         };
-        let outcome = match self
-            .relay_plane
-            .inner
-            .transport
-            .adapter
-            .publish_event_with_client(publication, request.required_acks)
-            .await
-        {
-            Ok(outcome) => outcome,
-            Err(error) => {
-                return Err(join_unsafe_refusals(
-                    spellings.restore_error(join_refusals(
-                        error,
-                        request.target.endpoints(),
-                        refused,
-                    )),
-                    unsafe_refused,
-                ));
-            }
-        };
-        let local_fanout_endpoints = if !outcome.accepted.is_empty() {
-            outcome
-                .accepted
-                .iter()
-                .map(|receipt| receipt.endpoint.clone())
-                .collect::<Vec<_>>()
-        } else if outcome.failed.is_empty() {
-            endpoints
-        } else {
-            Vec::new()
-        };
-        if !local_fanout_endpoints.is_empty() {
-            let mut local_message = request.message.clone();
-            if let Some(message_id) = outcome.message_id.clone() {
-                local_message.id = message_id;
-            }
-            self.relay_plane
-                .inner
-                .transport
-                .adapter
-                .deliver_local_publish(&local_message, &local_fanout_endpoints)
-                .await?;
-        }
-        let mut report = publish_report_from_outcome(outcome, request);
-        report.failed.extend(refused);
-        spellings.restore_report(&mut report);
-        report.failed.extend(unsafe_refused);
-        Ok(report)
+        let event_bytes = event_json_bytes(&event);
+        let connections = self.group_event_client(&event);
+        // Judge each endpoint as the one-endpoint request `publish_commit`
+        // gets would reach it, and name it as `target` does. A held or unsafe
+        // endpoint is the send's to report.
+        let verdicts =
+            futures::future::join_all(target.endpoints().iter().map(|endpoint| async move {
+                let reached = self
+                    .relay_plane
+                    .inner
+                    .relay_safety
+                    .reachable_publish_endpoint(target, endpoint)?;
+                let verdict = commit_size_verdict(limits, connections, &reached, event_bytes).await;
+                matches!(verdict, CommitSizeVerdict::Refuse).then(|| {
+                    TransportEndpointFailure::over_known_limit(endpoint.clone(), event_bytes)
+                })
+            }))
+            .await;
+        verdicts.into_iter().flatten().collect()
     }
 
     async fn receive(&self) -> Result<Option<TransportDelivery>, TransportAdapterError> {

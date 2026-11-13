@@ -19,7 +19,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
-use cgka_traits::{MemberId, TransportAdapterError, TransportEndpoint};
+use cgka_traits::{MemberId, TransportAdapterError, TransportEndpoint, TransportEndpointFailure};
 use transport_nostr_adapter::{
     NostrAcquisitionCancellation, NostrAcquisitionError, NostrAcquisitionRequest,
     NostrAcquisitionResult, NostrEventPublishRequest, NostrNotificationLoss, NostrPublishBatch,
@@ -228,6 +228,14 @@ impl UnlinkedPublishGate {
 
 #[async_trait]
 impl NostrRelayClient for UnlinkedPublishGate {
+    /// A connect sends nothing, so the gate leaves it alone.
+    async fn connect_for_publish(
+        &self,
+        endpoint: &TransportEndpoint,
+    ) -> Result<(), TransportEndpointFailure> {
+        self.inner.connect_for_publish(endpoint).await
+    }
+
     fn relay_connection(
         &self,
         account: &MemberId,

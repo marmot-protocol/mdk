@@ -145,6 +145,7 @@ impl NostrRelayClient for FakeRelayClient {
                 .skip(accepted_limit)
                 .cloned()
                 .map(|endpoint| TransportEndpointFailure {
+                    pre_send: false,
                     size_class: None,
                     endpoint,
                     reason: "not accepted by in-memory relay".into(),

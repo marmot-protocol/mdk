@@ -1677,6 +1677,7 @@ impl NostrRelayClient for ScriptedPushRelayClient {
                         .iter()
                         .cloned()
                         .map(|endpoint| cgka_traits::TransportEndpointFailure {
+                            pre_send: false,
                             size_class: None,
                             endpoint,
                             reason: "relay unavailable".into(),
@@ -1698,6 +1699,7 @@ impl NostrRelayClient for ScriptedPushRelayClient {
                         .iter()
                         .cloned()
                         .map(|endpoint| cgka_traits::TransportEndpointFailure {
+                            pre_send: false,
                             size_class: None,
                             endpoint,
                             reason: "send event timed out".into(),
@@ -1736,6 +1738,7 @@ impl NostrRelayClient for ScriptedPushRelayClient {
                     .iter()
                     .cloned()
                     .map(|endpoint| cgka_traits::TransportEndpointFailure {
+                        pre_send: false,
                         size_class: None,
                         endpoint,
                         reason: "injected terminal rejection".into(),
@@ -1768,6 +1771,7 @@ impl NostrRelayClient for ScriptedPushRelayClient {
                     .iter()
                     .cloned()
                     .map(|endpoint| cgka_traits::TransportEndpointFailure {
+                        pre_send: false,
                         endpoint,
                         reason: "relay rejected event (too-large)".into(),
                         kind: cgka_traits::TransportEndpointFailureKind::TerminalRejected,

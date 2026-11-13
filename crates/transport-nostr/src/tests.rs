@@ -6414,7 +6414,9 @@ async fn publish_auth_reply_sequence(
 }
 
 /// Authentication fallback must not replace an earlier uncertain send with
-/// definite rejection; a real later ACK still succeeds.
+/// definite rejection; a real later ACK still succeeds. The anonymous
+/// attempt's `auth-required:` answer is itself such a send: the relay received
+/// the event, so the authenticated refusal cannot prove it unseen (mdk#2332).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn publish_auth_preserves_uncertainty() {
     for (earlier_uncertainty, completion, last_reply, category) in [
@@ -6480,18 +6482,12 @@ async fn publish_auth_preserves_uncertainty() {
             assert_eq!(failure_endpoint.rejection_category, Some(category));
             assert_eq!(
                 failure_endpoint.kind,
-                if earlier_uncertainty {
-                    TransportEndpointFailureKind::PossiblyExposed
-                } else {
-                    TransportEndpointFailureKind::TerminalRejected
-                },
-                "authentication fallback cannot erase earlier publication uncertainty"
+                TransportEndpointFailureKind::PossiblyExposed,
+                "authentication fallback cannot erase earlier publication uncertainty \
+                 (earlier uncertainty: {earlier_uncertainty})"
             );
-            assert_eq!(
-                failure_endpoint.size_class,
-                (!earlier_uncertainty && category == TransportEndpointRejectionCategory::TooLarge)
-                    .then_some(cgka_traits::EventSizeClass::Under64Kib)
-            );
+            assert!(!failure_endpoint.pre_send);
+            assert_eq!(failure_endpoint.size_class, None);
             assert_eq!(failure.event_size_class, None);
         } else {
             let outcome = result.expect("a real fallback acknowledgement remains successful");
@@ -7235,11 +7231,26 @@ impl RelayEventLimits for KnownLimits {
 struct SizeRefusingClient {
     too_large: Vec<TransportEndpoint>,
     sent_to: StdMutex<Vec<TransportEndpoint>>,
+    /// Relays it cannot connect to (mdk#2332).
+    unreachable: Vec<TransportEndpoint>,
+    /// Every relay a connect-only probe asked about.
+    probed: StdMutex<Vec<TransportEndpoint>>,
 }
 
 #[async_trait]
 impl NostrRelayClient for SizeRefusingClient {
     async fn subscribe(&self, _: NostrSubscription) -> Result<(), TransportAdapterError> {
+        Ok(())
+    }
+
+    async fn connect_for_publish(
+        &self,
+        endpoint: &TransportEndpoint,
+    ) -> Result<(), TransportEndpointFailure> {
+        self.probed.lock().unwrap().push(endpoint.clone());
+        if self.unreachable.contains(endpoint) {
+            return Err(unreachable_relay(endpoint));
+        }
         Ok(())
     }
 
@@ -7268,6 +7279,7 @@ impl NostrRelayClient for SizeRefusingClient {
         let failed = refusing
             .into_iter()
             .map(|endpoint| TransportEndpointFailure {
+                pre_send: false,
                 endpoint: endpoint.clone(),
                 reason: "relay rejected event (too-large)".into(),
                 kind: TransportEndpointFailureKind::TerminalRejected,
@@ -7390,6 +7402,185 @@ async fn an_event_over_every_known_limit_is_refused_unsent() {
     );
     assert!(client.sent_to.lock().unwrap().is_empty());
     assert_eq!(counted, (0, 0, 0), "no relay was contacted");
+}
+
+fn unreachable_relay(endpoint: &TransportEndpoint) -> TransportEndpointFailure {
+    TransportEndpointFailure {
+        endpoint: endpoint.clone(),
+        reason: "connect relay failed".into(),
+        kind: TransportEndpointFailureKind::RetryableUnavailable,
+        rejection_category: None,
+        size_class: None,
+        pre_send: true,
+    }
+}
+
+/// A signed group event whose serialized JSON is exactly `bytes` long.
+fn group_event_of_bytes(transport_group_id: &[u8], bytes: usize) -> NostrTransportEvent {
+    let sized = |content_bytes: usize| {
+        let mut event = group_event("44", transport_group_id);
+        event.content = "x".repeat(content_bytes);
+        sign_group_event(&mut event);
+        event
+    };
+    let base = event_json_bytes(&sized(0));
+    let event = sized(bytes - base);
+    assert_eq!(event_json_bytes(&event), bytes);
+    event
+}
+
+/// An account adapter over `client` whose only known limit is `known`, and a
+/// group publish request of `event` to `endpoints`.
+fn floor_adapter(
+    client: Arc<SizeRefusingClient>,
+    known: Vec<(TransportEndpoint, usize)>,
+) -> (
+    MarmotRelayPlaneAccountAdapter,
+    impl Fn(&NostrTransportEvent, Vec<TransportEndpoint>) -> TransportPublishRequest,
+) {
+    let relay_plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), client.clone());
+    let account = MemberId::new(vec![0xA1; 32]);
+    let adapter = relay_plane
+        .account_adapter(account.clone(), client)
+        .with_event_limits(Arc::new(KnownLimits(known)));
+    let request = move |event: &NostrTransportEvent, endpoints| TransportPublishRequest {
+        account_id: account.clone(),
+        message: event.to_transport_message().unwrap(),
+        target: TransportPublishTarget::Group {
+            group_id: GroupId::new(vec![0xC3; 16]),
+            transport_group_id: vec![0xD4; 32],
+            endpoints,
+        },
+        required_acks: 1,
+    };
+    (adapter, request)
+}
+
+/// mdk#2332: a commit over 64 KiB is refused unsent at a relay whose limit is
+/// unknown, before and at its publication alike. Other events over 64 KiB,
+/// commits up to 64 KiB, and commits to a relay whose known limit fits are
+/// sent as before. Refusals name each relay as the request spelled it.
+#[tokio::test]
+async fn a_commit_over_the_floor_is_refused_unsent_where_the_limit_is_unknown() {
+    let unknown = TransportEndpoint("wss://unknown.example".into());
+    let roomy = TransportEndpoint("wss://roomy.example".into());
+    let client = Arc::new(SizeRefusingClient::default());
+    let (adapter, request) = floor_adapter(client.clone(), vec![(roomy.clone(), usize::MAX)]);
+    let transport_group_id = vec![0xD4; 32];
+    let over = group_event_of_bytes(&transport_group_id, 64 * 1024 + 1);
+    let at_floor = group_event_of_bytes(&transport_group_id, 64 * 1024);
+    let over_bytes = event_json_bytes(&over);
+
+    let Err(TransportAdapterError::PublishEndpoints(failure)) = adapter
+        .publish_commit(request(&over, vec![unknown.clone()]))
+        .await
+    else {
+        panic!("the commit is refused");
+    };
+    assert_eq!(
+        failure.endpoint_failures,
+        [TransportEndpointFailure::over_known_limit(
+            unknown.clone(),
+            over_bytes
+        )]
+    );
+    assert_eq!(
+        failure.event_size_class,
+        Some(cgka_traits::EventSizeClass::of_bytes(over_bytes))
+    );
+    assert!(
+        client.sent_to.lock().unwrap().is_empty(),
+        "nothing was sent"
+    );
+
+    let spelled = TransportEndpoint("wss://Unknown.Example:443".into());
+    assert_eq!(
+        adapter
+            .commit_size_refusals(
+                &over.to_transport_message().unwrap(),
+                &request(&over, vec![spelled.clone(), roomy.clone()]).target,
+            )
+            .await,
+        [TransportEndpointFailure::over_known_limit(
+            spelled, over_bytes
+        )]
+    );
+    assert!(client.sent_to.lock().unwrap().is_empty());
+
+    for (event, endpoint, commit) in [
+        (&at_floor, &unknown, true),
+        (&over, &roomy, true),
+        (&over, &unknown, false),
+    ] {
+        let message = request(event, vec![endpoint.clone()]);
+        let report = if commit {
+            adapter.publish_commit(message).await
+        } else {
+            adapter.publish(message).await
+        }
+        .unwrap_or_else(|error| panic!("{commit} to {endpoint} is sent: {error}"));
+        assert_eq!(report.accepted.len(), 1);
+    }
+    assert_eq!(
+        *client.sent_to.lock().unwrap(),
+        [unknown.clone(), roomy, unknown.clone()]
+    );
+    assert_eq!(
+        client.probed.lock().unwrap().len(),
+        2,
+        "only a commit over the floor to a relay of unknown limit asks for a connection"
+    );
+
+    // Without a limits source the adapter enforces no limit, the floor included.
+    let client = Arc::new(SizeRefusingClient::default());
+    let relay_plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), client.clone());
+    let account = MemberId::new(vec![0xA1; 32]);
+    let unlimited = relay_plane.account_adapter(account.clone(), client.clone());
+    let mut message = request(&over, vec![unknown.clone()]);
+    message.account_id = account;
+    unlimited.publish_commit(message).await.unwrap();
+    assert_eq!(*client.sent_to.lock().unwrap(), [unknown]);
+}
+
+/// mdk#2332 (D9): whether a relay of unknown limit is offline is judged by its
+/// connection. One the device cannot connect to holds a commit over the floor
+/// unsent and retryable, never refused as too large; one it can connect to
+/// refuses it.
+#[tokio::test]
+async fn a_commit_over_the_floor_waits_for_a_relay_it_cannot_reach() {
+    let offline = TransportEndpoint("wss://offline.example".into());
+    let online = TransportEndpoint("wss://online.example".into());
+    let client = Arc::new(SizeRefusingClient {
+        unreachable: vec![offline.clone()],
+        ..SizeRefusingClient::default()
+    });
+    let (adapter, request) = floor_adapter(client.clone(), Vec::new());
+    let over = group_event_of_bytes(&[0xD4; 32], 70_000);
+
+    let Err(TransportAdapterError::PublishEndpoints(failure)) = adapter
+        .publish_commit(request(&over, vec![offline.clone()]))
+        .await
+    else {
+        panic!("the commit cannot be sent");
+    };
+    assert_eq!(failure.endpoint_failures, [unreachable_relay(&offline)]);
+    assert!(failure.endpoint_failures[0].proves_nothing_sent());
+    assert_eq!(failure.event_size_class, None, "no size proof");
+
+    assert_eq!(
+        adapter
+            .commit_size_refusals(
+                &over.to_transport_message().unwrap(),
+                &request(&over, vec![offline.clone(), online.clone()]).target,
+            )
+            .await,
+        [TransportEndpointFailure::over_known_limit(
+            online,
+            event_json_bytes(&over)
+        )],
+        "the offline relay is held, not refused"
+    );
+    assert!(client.sent_to.lock().unwrap().is_empty());
 }
 
 /// mdk#2334: the size preflight counts every relay a publish can reach. Group

@@ -5693,6 +5693,48 @@ where
             .collect::<Vec<_>>();
         let attempted_any = !due.is_empty();
         if !due.is_empty() {
+            // A commit too large for a relay is refused there before any
+            // target is marked, so the refusal leaves no attempt that might
+            // have left. A target already left `Attempting` by an interrupted
+            // attempt is not exempt: the refusal ends it possibly exposed
+            // (mdk#2332).
+            let commit = matches!(
+                fanout.pending_kind(),
+                Some(FanoutPendingKind::GroupEvolution | FanoutPendingKind::Disband)
+            ) && matches!(
+                fanout.request().message.envelope,
+                TransportEnvelope::GroupMessage { .. }
+            );
+            let mut refused_before_send = Vec::new();
+            let mut pass_failed = Vec::new();
+            if commit {
+                let checked = publish_target_with_endpoints(
+                    &fanout.request().target,
+                    due.iter().map(|&index| endpoints[index].clone()).collect(),
+                );
+                for failure in self
+                    .adapter
+                    .commit_size_refusals(&fanout.request().message, &checked)
+                    .await
+                {
+                    if let Some(&index) = due.iter().find(|&&index| {
+                        endpoints[index] == failure.endpoint
+                            && !refused_before_send.contains(&index)
+                    }) {
+                        pass_failed.push(PublishRelayFailure {
+                            relay_url: failure.endpoint.0.clone(),
+                            reason: failure.reason.clone(),
+                        });
+                        fanout.record_target_failure(index, failure)?;
+                        refused_before_send.push(index);
+                    }
+                }
+            }
+            let due = due
+                .iter()
+                .copied()
+                .filter(|index| !refused_before_send.contains(index))
+                .collect::<Vec<_>>();
             for &index in &due {
                 fanout.mark_attempt_started_at(index, now_ms)?;
             }
@@ -5707,8 +5749,9 @@ where
                     artifact_kind: None,
                     target_kind: "frozen_group_fanout".into(),
                     relay_url: None,
-                    relay_urls: due
+                    relay_urls: refused_before_send
                         .iter()
+                        .chain(&due)
                         .map(|&index| endpoints[index].0.clone())
                         .collect(),
                     required_acks: fanout.request().required_acks as u64,
@@ -5734,7 +5777,6 @@ where
             // explicit foreground pressure may interrupt this secondary tail.
             let finish_retries = accepted >= ack_goal;
             let mut pass_accepted = Vec::new();
-            let mut pass_failed = Vec::new();
             let mut attempts = due
                 .iter()
                 .map(|&index| {
@@ -5747,7 +5789,14 @@ where
                         ),
                         required_acks: 1,
                     };
-                    async move { (index, adapter.publish(attempt).await) }
+                    async move {
+                        let result = if commit {
+                            adapter.publish_commit(attempt).await
+                        } else {
+                            adapter.publish(attempt).await
+                        };
+                        (index, result)
+                    }
                 })
                 .collect::<FuturesUnordered<_>>();
             loop {
@@ -6734,6 +6783,7 @@ fn publish_target_with_endpoints(
 
 fn ambiguous_endpoint_failure(endpoint: TransportEndpoint) -> TransportEndpointFailure {
     TransportEndpointFailure {
+        pre_send: false,
         size_class: None,
         endpoint,
         reason: "publish acknowledgement unknown".into(),
@@ -6796,6 +6846,7 @@ fn frozen_fanout_report(fanout: &OutboundFanout) -> TransportPublishReport {
             cgka_traits::FanoutTargetStatus::Failed => {
                 failed.push(fanout.target_failure(index).cloned().unwrap_or_else(|| {
                     TransportEndpointFailure {
+                        pre_send: false,
                         size_class: None,
                         endpoint: endpoint.clone(),
                         reason: "publish attempt failed before exposure".into(),
@@ -7720,6 +7771,7 @@ mod tests {
             ),
         ] {
             let failure = TransportEndpointFailure {
+                pre_send: false,
                 endpoint: TransportEndpoint("wss://relay.example/".into()),
                 reason: "publication refused".into(),
                 kind,
@@ -7764,6 +7816,8 @@ mod tests {
             .record_target_failure(
                 0,
                 TransportEndpointFailure {
+                    // An unavailable failure here is a connect failure.
+                    pre_send: kind == TransportEndpointFailureKind::RetryableUnavailable,
                     size_class: None,
                     endpoint,
                     reason: "test failure".into(),
@@ -7794,6 +7848,7 @@ mod tests {
             .record_target_failure(
                 0,
                 TransportEndpointFailure {
+                    pre_send: false,
                     endpoint: fanout.request().target.endpoints()[0].clone(),
                     reason: "relay rejected event (too-large)".into(),
                     kind: TransportEndpointFailureKind::TerminalRejected,
@@ -7916,6 +7971,7 @@ mod tests {
             cgka_traits::TransportPublishFailure::with_endpoint_failures(
                 "size refusal",
                 vec![TransportEndpointFailure {
+                    pre_send: false,
                     endpoint,
                     reason: "relay rejected event (too-large)".into(),
                     kind: TransportEndpointFailureKind::TerminalRejected,

@@ -279,6 +279,7 @@ pub fn lower_stack_rows() -> Vec<ErrorKindRow> {
         let mut failure = cgka_traits::TransportPublishFailure::with_endpoint_failures(
             "relay rejected event (too-large)",
             vec![cgka_traits::TransportEndpointFailure {
+                pre_send: false,
                 endpoint: cgka_traits::TransportEndpoint("wss://relay.example".into()),
                 reason: "relay rejected event (too-large)".into(),
                 kind: cgka_traits::TransportEndpointFailureKind::TerminalRejected,
