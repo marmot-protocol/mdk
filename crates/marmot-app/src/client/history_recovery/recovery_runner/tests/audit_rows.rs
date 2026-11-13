@@ -8,7 +8,7 @@ use marmot_forensics::{
 };
 
 use super::*;
-use crate::client::recovery_runner::audit;
+use crate::client::history_recovery::recovery_runner::audit;
 use crate::history_notices::ledger_route_tag;
 
 const GROUP_ID: [u8; 16] = [0x47; 16];

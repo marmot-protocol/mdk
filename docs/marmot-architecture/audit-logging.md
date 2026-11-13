@@ -1314,10 +1314,10 @@ before the account's caps. The pause changes no unit; units stay due and run onc
 
 ### Recovery runner rows (v5 only)
 
-What the recovery runner (`client/recovery_runner/`, mdk#2660 phase 4) did for each group over time: every fetch it
+What the recovery runner (`client/history_recovery/recovery_runner/`, mdk#2660 phase 4) did for each group over time: every fetch it
 settled, the begins it abandoned, and each unit or route state change. The runner writes them through its turns' audit
 hook (`WorkerTurn::audit`, `DebtTurn::audit`); the account host writes the route-change and retention-prune rows from
-its debt-turn preparation. Producers: [`recovery_runner/audit.rs`](../../crates/marmot-app/src/client/recovery_runner/audit.rs).
+its debt-turn preparation. Producers: [`recovery_runner/audit.rs`](../../crates/marmot-app/src/client/history_recovery/recovery_runner/audit.rs).
 
 A group route's rows carry the group's `group_ref`; the inbox's and the aggregate rows are account-scoped. Where a row
 names its route, `obligation_ref` is the hash of the route's one-way ledger tag, so every row about one route joins
