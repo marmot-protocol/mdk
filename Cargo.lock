@@ -3667,8 +3667,6 @@ dependencies = [
  "cgka-traits",
  "chrono",
  "hex",
- "httpdate",
- "jsonschema",
  "marmot-forensics",
  "nostr-relay-builder",
  "nostr-sdk",

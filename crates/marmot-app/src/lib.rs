@@ -236,7 +236,7 @@ pub use audit_log::{
     AUDIT_LOG_DEFAULT_MAX_BYTES_PER_ACCOUNT, AUDIT_LOG_MAX_AGE_DAYS,
     AUDIT_LOG_MIN_MAX_BYTES_PER_ACCOUNT, AuditDeliveryBacklog, AuditDeliveryFailure,
     AuditDeliveryFailureKind, AuditDeliveryStatus, AuditLogDeleteOutcome, AuditLogFile,
-    AuditLogRetention, AuditLogSettings, AuditLogTrackerUpdateResult, AuditLogUploadResult,
+    AuditLogRetention, AuditLogSettings, AuditLogSource, AuditLogTrackerUpdateResult,
     AuditOtlpTrackerResult,
 };
 pub use cgka_traits::{
@@ -281,8 +281,8 @@ pub use client::history_imports::{ChatHistoryImport, ChatHistoryImportState};
 pub use client::sign_ins::{SignInResponse, UnrecognizedSignIn, UnrecognizedSignInState};
 pub(crate) use client::{ConvergenceScheduleState, EpochBackfillRunOutcome};
 pub use config::{
-    AttachmentAcquisitionMode, AttachmentAcquisitionPolicy, AuditLogTrackerConfig,
-    CursorPersistence, MarmotAppConfig, MarmotServiceEndpoints, RelayTelemetrySettings,
+    AttachmentAcquisitionMode, AttachmentAcquisitionPolicy, CursorPersistence, MarmotAppConfig,
+    MarmotServiceEndpoints, RelayTelemetrySettings,
 };
 pub use drafts::{
     ChatListDraftVersion, MessageDraft, MessageDraftAttachment, MessageDraftAttachmentSummary,
@@ -310,8 +310,8 @@ pub use ids::{
 };
 pub use marmot_observability::{
     AppPerformanceOperationSnapshot, AppPerformanceSnapshot, AppPerformanceTelemetry,
-    AuditLogUploadSource, DiagnosticsExporterStatus, DiagnosticsPermit, ExportHistogram,
-    ExportMetricPoint, ExportMetricValue, HostPerformanceOperation, HostPerformanceOutcome,
+    DiagnosticsExporterStatus, DiagnosticsPermit, ExportHistogram, ExportMetricPoint,
+    ExportMetricValue, HostPerformanceOperation, HostPerformanceOutcome,
     PRODUCT_DURATION_BOUNDS_MS, PRODUCT_OUTCOMES, PRODUCT_REGISTRY_VERSION, ProductAnalytics,
     ProductAnalyticsActivity, ProductAnalyticsError, ProductAnalyticsMetadata,
     ProductAnalyticsRuntimeConfig, ProductEvent, ProductEventMode, ProductEventSchema,
@@ -710,7 +710,7 @@ pub struct MarmotApp {
     account_state_ready: Arc<Mutex<HashSet<String>>>,
     chat_list_projection_warmed: Arc<Mutex<HashSet<String>>>,
     chat_list_projection_stale: Arc<Mutex<ChatListStaleness>>,
-    audit_log_tracker_config: Arc<Mutex<AuditLogTrackerConfig>>,
+    audit_log_source: Arc<Mutex<AuditLogSource>>,
     audit_recorders: Arc<Mutex<HashMap<String, audit_log::AuditRecorderSlot>>>,
     product_analytics: marmot_observability::ProductRecorder,
     startup_diagnostics: startup_diagnostics::NativeStartupDiagnostics,
@@ -1870,7 +1870,7 @@ impl MarmotApp {
             account_state_ready: Arc::new(Mutex::new(HashSet::new())),
             chat_list_projection_warmed: Arc::new(Mutex::new(HashSet::new())),
             chat_list_projection_stale: Arc::default(),
-            audit_log_tracker_config: Arc::new(Mutex::new(AuditLogTrackerConfig::default())),
+            audit_log_source: Arc::default(),
             audit_recorders: Arc::default(),
             product_analytics,
             startup_diagnostics: Default::default(),
@@ -1997,7 +1997,7 @@ impl MarmotApp {
             account_state_ready: Arc::new(Mutex::new(HashSet::new())),
             chat_list_projection_warmed: Arc::new(Mutex::new(HashSet::new())),
             chat_list_projection_stale: Arc::default(),
-            audit_log_tracker_config: Arc::new(Mutex::new(AuditLogTrackerConfig::default())),
+            audit_log_source: Arc::default(),
             audit_recorders: Arc::default(),
             product_analytics,
             startup_diagnostics: Default::default(),
@@ -5240,7 +5240,7 @@ impl MarmotApp {
         };
         // Optional forensic audit log. Enable `AuditLogSettings` before opening
         // an account session to record per-account/device JSONL at
-        // `<account_dir>/audit-<engine_id>-v4.jsonl`. The v4 schema contains
+        // `<account_dir>/audit-<engine_id>-v5.jsonl`. The v5 schema contains
         // privacy-safe derived values only: obfuscated identifiers, digests,
         // lengths, counts, reduced convergence data, and typed outcomes.
         let mut session_config = SessionConfig::with_storage(

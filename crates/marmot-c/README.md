@@ -34,7 +34,7 @@ per feature.
   [undelivered Welcomes](#undelivered-welcomes),
   [backup recovery](#backup-recovery),
   [host-driven agent publishing](#host-driven-agent-publishing),
-  [audit v5 recording and delivery](#audit-v5-recording-and-delivery), [legacy audit v4 upload](#legacy-audit-v4-upload)
+  [audit v5 recording and delivery](#audit-v5-recording-and-delivery), [audit source metadata and legacy files](#audit-source-metadata-and-legacy-files)
 - [Smoke test and example](#smoke-test-and-example)
 - [Regenerating the header](#regenerating-the-header)
 
@@ -176,7 +176,7 @@ Read the exact version's header and docs. The `marmot_nip46_*` adapter supports 
 signer login and registration. Arbitrary host signer callbacks and external-signer
 onboarding remain UniFFI-only. The host secret-store vtable is a separate interface.
 The catalog includes C-only compatibility shims; prefer the
-versioned audit configuration setters and the composable runtime options constructor for new integrations.
+composable runtime options constructor for new integrations.
 
 ## Lifecycle and teardown
 
@@ -784,15 +784,13 @@ v5 replaces v4 as the audit format. Recording remains opt-in through `MarmotAudi
 and new recordings write only v5 JSONL files. Hosts that record audit logs must configure v5
 delivery, or new evidence never leaves the device. Call `marmot_set_audit_otlp_config_v5` with a
 dedicated OTLP `/v1/logs` destination and bearer token on every launch, because it is held in
-memory only. Then call `marmot_post_audit_log_tracker_update_v5`, in place of the v4 tracker
-update, for a manual pass. The returned config redacts the token; free it with
-`marmot_audit_otlp_config_v5_free`.
-Free the versioned result with `marmot_audit_log_tracker_update_result_v5_free`. It reports v5
-accepted, pending, blocked, and idle counts independently of v4 whole-file uploads. The existing
-tracker activity triggers use the same in-memory v5 config with their batching and retry policy.
+memory only. The returned config redacts the token; free it with `marmot_audit_otlp_config_v5_free`.
+Call `marmot_post_audit_log_tracker_update_v5` for a manual pass and free its result with
+`marmot_audit_log_tracker_update_result_v5_free`. The result's `v5` member reports accepted,
+pending, blocked, and idle counts, and is NULL when no destination is configured. The tracker's
+activity triggers use the same in-memory v5 config with their batching and retry policy.
 Set `enabled` to false to clear the destination. Loopback requires the explicit
-`allow_loopback_dev` flag, while public destinations require HTTPS. v4 files written before
-0.11.0 remain available to drain through the legacy endpoint; v5 bytes never go there.
+`allow_loopback_dev` flag, while public destinations require HTTPS.
 
 `marmot_audit_delivery_status_v5` returns a `MarmotAuditDeliveryStatusV5List` with one row per
 account; free it with `marmot_audit_delivery_status_v5_list_free`, which also frees each row's
@@ -806,13 +804,16 @@ is read with `marmot_audit_log_retention` and replaced with `marmot_set_audit_lo
 which takes a borrowed `MarmotAuditLogRetention` and returns the clamped stored value. Free both
 results with `marmot_audit_log_retention_free`.
 
-## Legacy audit v4 upload
+## Audit source metadata and legacy files
 
-Use `MarmotAuditLogTrackerConfigV4` and `marmot_set_audit_log_tracker_config_v4` to supply optional
-system `hardware_model`, platform and app version. Free its returned config with
-`marmot_audit_log_tracker_config_v4_free`. Never pass a device name, hostname or serial number as the model.
-The legacy config/setter retains its binary layout, ignores `device_label`, and returns that field as NULL;
-it never reinterprets an old device name as a hardware model. Both setters use the same v4-only upload gate.
+Call `marmot_set_audit_log_source` with a borrowed `MarmotAuditLogSource` at startup, before opening
+accounts, to supply the optional system `hardware_model`, `platform` and `app_version` that each new
+audit recorder writes into its source row. It is held in memory, so set it on every launch. It
+returns the trimmed stored copy; free that with `marmot_audit_log_source_free`. Never pass a device
+name, hostname or serial number as the model.
+
+v5 OTLP delivery is the only remote audit path. Historical v4 files are never delivered; they stay
+listable and deletable until local retention expires them.
 
 ## Backup recovery
 

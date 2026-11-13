@@ -2,9 +2,9 @@
 # collector dial discipline: build it through `collector_host_safety`, which
 # wraps a fresh reqwest builder with the `http_builder` marmot-app hands in.
 #
-# The crate also creates and opens no files: marmot-app keeps every audit,
-# checkpoint and id file on fs-private and hands the uploader a file it has
-# already opened. Only a test that writes a temporary file allows this lint.
+# The crate also creates and opens no files: marmot-app keeps every audit and
+# id file on fs-private. Only a test that writes a temporary file allows this
+# lint.
 disallowed-methods = [
     { path = "reqwest::Client::builder", reason = "build collector clients through collector_host_safety" },
     { path = "reqwest::Client::new", reason = "build collector clients through collector_host_safety" },

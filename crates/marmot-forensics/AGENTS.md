@@ -45,8 +45,8 @@ Shared JSONL forensic audit schema for Marmot incident capture.
   refusal row in `src/audit/refusal.rs`); a v4 recorder drops them, and the frozen v4 schema and its catalog tests
   exclude them. A new string field on an operational kind needs an explicit `protect` classification in
   `src/v5/operational.rs` (category, diagnostic reference, or hash), or v5 refuses to write the row. The v5
-  local-delivery path sends original validated bodies; v4 files and the legacy v4-only whole-file upload contract
-  remain separate. Rust validation remains authoritative for rules JSON Schema cannot express.
+  local-delivery path sends original validated bodies; v4 files are never delivered. Rust validation remains
+  authoritative for rules JSON Schema cannot express.
 - The White Noise audit receiver (in `internet-privacy/whitenoise-data`) pins this crate's v5 schema bytes and ports
   `src/v5/validation.rs`; it rejects a whole batch on any record it cannot validate, and the sender then skips those
   records. Any v5 change to a kind, field (even optional), enum value or relational rule needs a whitenoise-data

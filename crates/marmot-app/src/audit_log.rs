@@ -1,17 +1,19 @@
-//! Forensic audit-log feature: settings, per-account-device JSONL recorders,
-//! file enumeration, upload, and audit-log path validation.
+//! Forensic audit-log feature: settings, the host-supplied source metadata,
+//! per-account-device JSONL recorders, file enumeration, and audit-log path
+//! validation.
 //!
 //! The audit log is an opt-in, privacy-safe forensic measure recorded per
 //! account-device at `<account_dir>/audit-<engine_id>-v5.jsonl`. This module owns
 //! the audit DTOs, the stable domain-separated hash identity derivation, the
-//! audit files and the upload checkpoint file, and the `MarmotApp` methods that
-//! drive recording, enumeration, validation, and upload. The upload's HTTP half
-//! is `audit_upload.rs`; it gets each file already opened here.
+//! audit files, and the `MarmotApp` methods that drive recording, enumeration
+//! and validation. Recorded v5 rows leave the device only through the runtime's
+//! OTLP delivery (`runtime/audit_tracker.rs`); older local files stay listable
+//! and deletable until retention expires them.
 
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use cgka_traits::MemberId;
 use marmot_account::AccountSummary;
@@ -21,14 +23,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
+use crate::MarmotApp;
 use crate::conversions::{audit_log_settings_from_storage, audit_log_settings_to_storage};
 use crate::error::AppError;
-use crate::{MarmotApp, config};
-use marmot_observability::{
-    AuditSnapshotPost, AuditUploadCheckpoint, AuditUploadSnapshot, ListedAuditFile,
-    invalid_audit_upload, post_audit_upload_snapshot, system_time_ms,
-    validate_audit_upload_endpoint,
-};
 
 mod legacy_cleanup;
 pub(crate) use legacy_cleanup::cleanup_legacy_audit_logs;
@@ -47,12 +44,6 @@ const AUDIT_DEVICE_ID_FILE: &str = "audit-device-id";
 /// The name matches the `audit-*.jsonl` glob so it is enumerable via
 /// [`MarmotApp::audit_log_files`].
 const KEY_REVEAL_AUDIT_FILE: &str = "audit-key-reveal.jsonl";
-/// Per-account record of which audit files the tracker has already handed to
-/// the upload endpoint (mdk#1181).
-///
-/// Deliberately *not* an `audit-*.jsonl` name: it must never be enumerated by
-/// [`MarmotApp::audit_log_files`] and uploaded as if it were forensic data.
-const AUDIT_UPLOAD_CHECKPOINT_FILE: &str = "audit-upload-checkpoint.json";
 pub(crate) const AUDIT_ID_BYTES: usize = 16;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -64,20 +55,33 @@ pub struct AuditLogFile {
     pub modified_at_ms: Option<u64>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct AuditLogUploadResult {
-    pub path: String,
-    pub status: u16,
-    pub bytes_sent: u64,
+/// Host-supplied provenance recorded in each new recorder's `source_context`
+/// row. Not persisted: hosts set it at startup, before account sessions open.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AuditLogSource {
+    /// System model identifier (for example `iPhone17,3`); never a
+    /// user-assigned device name, hostname, or serial number.
+    pub hardware_model: Option<String>,
+    pub platform: Option<String>,
+    pub app_version: Option<String>,
+}
+
+impl AuditLogSource {
+    /// Trim every field; a blank field becomes `None`.
+    pub(crate) fn normalize(self) -> Self {
+        Self {
+            hardware_model: marmot_observability::trim_optional(self.hardware_model),
+            platform: marmot_observability::trim_optional(self.platform),
+            app_version: marmot_observability::trim_optional(self.app_version),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AuditLogTrackerUpdateResult {
+    /// Whether audit logging is enabled.
     pub enabled: bool,
-    /// Historical whole-file v4 uploads to the legacy tracker endpoint.
-    pub uploaded: Vec<AuditLogUploadResult>,
-    pub skipped_reason: Option<String>,
-    /// v5 OTLP delivery, present when a dedicated sender was configured.
+    /// v5 OTLP delivery, present when a dedicated sender is configured.
     pub v5: Option<AuditOtlpTrackerResult>,
 }
 
@@ -176,29 +180,6 @@ pub struct AuditDeliveryStatus {
     /// configuration or a manual tracker update lifts it.
     pub paused: bool,
     pub backlog: Option<AuditDeliveryBacklog>,
-}
-
-/// Internal receipt: only a complete snapshot of the enumerated file may be
-/// checkpointed. The public upload result describes bytes actually sent.
-pub(crate) struct AuditUploadReceipt {
-    pub result: AuditLogUploadResult,
-    pub observed_bytes: u64,
-    pub modified_at_ms: Option<u64>,
-    pub complete: bool,
-}
-
-pub(crate) enum AuditUploadAttempt {
-    Uploaded(AuditUploadReceipt),
-    Ineligible {
-        observed_bytes: u64,
-        modified_at_ms: Option<u64>,
-    },
-    Deferred,
-    FileFailure(AppError),
-    Rejected {
-        status: u16,
-        retry_after: Option<Duration>,
-    },
 }
 
 fn audit_v5_producer() -> marmot_forensics::v5::Producer {
@@ -336,15 +317,11 @@ fn audit_log_file_name(path: &Path) -> Option<String> {
         .then(|| file_name.into_owned())
 }
 
-/// The upload checkpoint keys a listed file by its name, size and mtime.
-impl<'a> From<&'a AuditLogFile> for ListedAuditFile<'a> {
-    fn from(file: &'a AuditLogFile) -> Self {
-        Self {
-            file_name: &file.file_name,
-            size_bytes: file.size_bytes,
-            modified_at_ms: file.modified_at_ms,
-        }
-    }
+/// Milliseconds since the Unix epoch, truncated; `None` before the epoch.
+pub(crate) fn system_time_ms(time: SystemTime) -> Option<u64> {
+    time.duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok())
 }
 
 impl MarmotApp {
@@ -390,23 +367,24 @@ impl MarmotApp {
         ))
     }
 
-    pub(crate) fn audit_log_tracker_config(&self) -> config::AuditLogTrackerConfig {
-        self.audit_log_tracker_config
+    pub(crate) fn audit_log_source(&self) -> AuditLogSource {
+        self.audit_log_source
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
     }
 
-    pub(crate) fn set_audit_log_tracker_config(
+    /// Store the source metadata later recorder opens record, normalized.
+    pub(crate) fn set_audit_log_source(
         &self,
-        config: config::AuditLogTrackerConfig,
-    ) -> Result<config::AuditLogTrackerConfig, AppError> {
-        let config = config.normalize().map_err(AppError::AuditLogUpload)?;
+        source: AuditLogSource,
+    ) -> Result<AuditLogSource, AppError> {
+        let source = source.normalize();
         *self
-            .audit_log_tracker_config
+            .audit_log_source
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = config.clone();
-        Ok(config)
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = source.clone();
+        Ok(source)
     }
 
     fn audit_source_context_for_recorder(
@@ -414,12 +392,12 @@ impl MarmotApp {
         device_id_hex: &str,
         account_id: &MemberId,
     ) -> marmot_forensics::AuditSourceContext {
-        let upload_source = self.audit_log_tracker_config().source;
+        let source = self.audit_log_source();
         marmot_forensics::AuditSourceContext {
             device_id: Some(device_id_hex.to_owned()),
-            hardware_model: upload_source.hardware_model,
-            platform: upload_source.platform,
-            app_version: upload_source.app_version,
+            hardware_model: source.hardware_model,
+            platform: source.platform,
+            app_version: source.app_version,
             local_member_ref: Some(marmot_forensics::member_ref_hex(account_id.as_slice())),
             ..Default::default()
         }
@@ -459,152 +437,6 @@ impl MarmotApp {
         Ok(files)
     }
 
-    /// Load the tracker's upload checkpoint for `account_ref`.
-    ///
-    /// Never fails: a missing, unreadable, or malformed sidecar reads as empty,
-    /// which costs one re-upload per still-present file and nothing else.
-    pub(crate) fn audit_upload_checkpoint(&self, account_ref: &str) -> AuditUploadCheckpoint {
-        let path = self
-            .account_dir(account_ref)
-            .join(AUDIT_UPLOAD_CHECKPOINT_FILE);
-        fs::read(path)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-            .unwrap_or_default()
-    }
-
-    /// Persist the tracker's upload checkpoint for `account_ref`.
-    ///
-    /// Written to an owner-only staging sibling and renamed into place, so a
-    /// crash mid-write leaves the previous checkpoint intact rather than a torn
-    /// one that would strand every entry.
-    pub(crate) fn store_audit_upload_checkpoint(
-        &self,
-        account_ref: &str,
-        checkpoint: &AuditUploadCheckpoint,
-    ) -> Result<(), AppError> {
-        let path = self
-            .account_dir(account_ref)
-            .join(AUDIT_UPLOAD_CHECKPOINT_FILE);
-        let mut staged = path.clone().into_os_string();
-        staged.push(".tmp");
-        let staged = PathBuf::from(staged);
-        fs_private::write_private(&staged, &serde_json::to_vec(checkpoint)?)?;
-        // `rename` preserves the staged 0600 mode, so the checkpoint is never
-        // reachable at umask-default permissions.
-        if let Err(err) = fs::rename(&staged, &path) {
-            let _ = fs::remove_file(&staged);
-            return Err(err.into());
-        }
-        Ok(())
-    }
-
-    pub async fn post_audit_log_file(
-        &self,
-        path: &str,
-        endpoint: &str,
-    ) -> Result<AuditLogUploadResult, AppError> {
-        let config = config::AuditLogTrackerConfig {
-            endpoint: Some(endpoint.to_owned()),
-            ..Default::default()
-        };
-        self.post_audit_log_file_with_tracker_config(path, &config)
-            .await
-    }
-
-    pub async fn post_audit_log_file_with_tracker_config(
-        &self,
-        path: &str,
-        config: &config::AuditLogTrackerConfig,
-    ) -> Result<AuditLogUploadResult, AppError> {
-        match self.post_audit_log_snapshot(path, config).await? {
-            AuditUploadAttempt::Uploaded(receipt) => Ok(receipt.result),
-            AuditUploadAttempt::Deferred => Err(AppError::AuditLogUpload(
-                "audit snapshot has no complete lines".into(),
-            )),
-            AuditUploadAttempt::FileFailure(error) => Err(error),
-            AuditUploadAttempt::Ineligible { .. } => Err(invalid_audit_upload().into()),
-            AuditUploadAttempt::Rejected { status, .. } => Err(AppError::AuditLogUpload(format!(
-                "upload returned HTTP {status}"
-            ))),
-        }
-    }
-
-    /// An empty complete-line prefix is deferred without an HTTP request.
-    pub(crate) async fn post_audit_log_snapshot(
-        &self,
-        path: &str,
-        config: &config::AuditLogTrackerConfig,
-    ) -> Result<AuditUploadAttempt, AppError> {
-        let path = match self.validate_audit_log_path(path) {
-            Ok(path) => path,
-            Err(error) => return Ok(AuditUploadAttempt::FileFailure(error)),
-        };
-        let config = config
-            .clone()
-            .normalize()
-            .map_err(AppError::AuditLogUpload)?;
-        let endpoint = config
-            .resolved_endpoint(self.service_endpoints())
-            .ok_or_else(|| AppError::AuditLogUpload("forensic upload endpoint is empty".into()))
-            .and_then(|endpoint| {
-                Ok(validate_audit_upload_endpoint(
-                    &endpoint,
-                    config.authorization_bearer_token.as_deref(),
-                )?)
-            })?;
-        // The upload half opens no file: it captures from this handle.
-        let snapshot = match async {
-            let file = tokio::fs::File::open(&path).await?;
-            AuditUploadSnapshot::capture(file)
-                .await
-                .map_err(AppError::from)
-        }
-        .await
-        {
-            Ok(snapshot) => snapshot,
-            Err(error) => return Ok(AuditUploadAttempt::FileFailure(error)),
-        };
-        let posted = post_audit_upload_snapshot(
-            snapshot,
-            &endpoint,
-            config.authorization_bearer_token.as_deref(),
-            config.source.hardware_model.as_deref(),
-            config.source.platform.as_deref(),
-            config.source.app_version.as_deref(),
-        )
-        .await?;
-        Ok(match posted {
-            AuditSnapshotPost::Uploaded(receipt) => {
-                AuditUploadAttempt::Uploaded(AuditUploadReceipt {
-                    observed_bytes: receipt.observed_bytes,
-                    modified_at_ms: receipt.modified_at_ms,
-                    complete: receipt.complete,
-                    result: AuditLogUploadResult {
-                        path: path.to_string_lossy().into_owned(),
-                        status: receipt.status,
-                        bytes_sent: receipt.bytes_sent,
-                    },
-                })
-            }
-            AuditSnapshotPost::Ineligible {
-                observed_bytes,
-                modified_at_ms,
-            } => AuditUploadAttempt::Ineligible {
-                observed_bytes,
-                modified_at_ms,
-            },
-            AuditSnapshotPost::Deferred => AuditUploadAttempt::Deferred,
-            AuditSnapshotPost::Rejected {
-                status,
-                retry_after,
-            } => AuditUploadAttempt::Rejected {
-                status,
-                retry_after,
-            },
-        })
-    }
-
     /// Open the file-backed forensic recorder for `label`, or `None` if it
     /// could not be prepared.
     ///
@@ -640,7 +472,8 @@ impl MarmotApp {
         // while the recorder kept appending to the orphaned inode.
         let account_dir = fs::canonicalize(&account_dir).unwrap_or(account_dir);
         // Start a distinct v5 file. Exclusive-root startup retires v1-v3 files;
-        // historical v4 files remain available for explicit legacy upload.
+        // historical v4 files stay listable and deletable until retention
+        // expires them.
         let audit_path = marmot_forensics::default_v5_jsonl_path(&account_dir, &engine_id_hex);
         match marmot_forensics::JsonlRecorder::open_v5_with_account_ref(
             &audit_path,
@@ -650,7 +483,7 @@ impl MarmotApp {
         ) {
             Ok(recorder) => {
                 // Emit a source_context row identifying the producing account and
-                // the host-supplied device/client metadata from tracker config.
+                // the host-supplied device/client metadata (`AuditLogSource`).
                 // JsonlRecorder repeats the latest explicit source row in each
                 // size-rotated segment; metadata remains in the validated body.
                 use marmot_forensics::ForensicRecorder as _;
@@ -718,7 +551,7 @@ impl MarmotApp {
         }
         // Refuse a symlinked final component. `canonicalize` below resolves it
         // to its target, so without this an `audit-*.jsonl` symlink could make
-        // us delete (or upload) an unrelated file that merely sits under the app
+        // us delete an unrelated file that merely sits under the app
         // root — e.g. the shared storage database.
         if fs::symlink_metadata(&path)?.file_type().is_symlink() {
             return Err(AppError::InvalidAuditLogFile(
@@ -904,8 +737,7 @@ mod tests {
 
     use marmot_account::AccountHome;
 
-    use crate::{AuditLogTrackerConfig, AuditLogUploadSource, MarmotApp};
-    use marmot_observability::AuditUploadOutcome;
+    use crate::MarmotApp;
 
     #[test]
     fn audit_engine_id_is_stable_hash_not_raw_account_prefix() {
@@ -1070,15 +902,14 @@ mod tests {
         let home = AccountHome::open(dir.path());
         home.create_account("alice").unwrap();
         let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
-        app.set_audit_log_tracker_config(AuditLogTrackerConfig {
-            source: AuditLogUploadSource {
-                hardware_model: Some("iPhone17,3".to_owned()),
+        let stored = app
+            .set_audit_log_source(AuditLogSource {
+                hardware_model: Some(" iPhone17,3 ".to_owned()),
                 platform: Some("ios".to_owned()),
                 app_version: Some("2026.6.8".to_owned()),
-            },
-            ..Default::default()
-        })
-        .unwrap();
+            })
+            .unwrap();
+        assert_eq!(stored.hardware_model.as_deref(), Some("iPhone17,3"));
 
         let recorder = app.build_audit_recorder("alice", true);
         let path = recorder
@@ -1121,20 +952,17 @@ mod tests {
         assert!(!first_line.contains("alice"));
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn size_rotated_audit_segments_keep_configured_source_in_validated_body() {
+    #[test]
+    fn size_rotated_audit_segments_keep_configured_source_in_validated_body() {
         let dir = tempfile::tempdir().unwrap();
         AccountHome::open(dir.path())
             .create_account("alice")
             .unwrap();
         let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
-        app.set_audit_log_tracker_config(AuditLogTrackerConfig {
-            source: AuditLogUploadSource {
-                hardware_model: Some("iPhone17,3".into()),
-                platform: Some("ios".into()),
-                app_version: Some("2026.9.18".into()),
-            },
-            ..Default::default()
+        app.set_audit_log_source(AuditLogSource {
+            hardware_model: Some("iPhone17,3".into()),
+            platform: Some("ios".into()),
+            app_version: Some("2026.9.18".into()),
         })
         .unwrap();
         let recorder = app.build_audit_recorder("alice", true);
@@ -1156,13 +984,9 @@ mod tests {
             for field in ["source_ref", "session_id"] {
                 assert_eq!(source[field], initial[field]);
             }
-            let snapshot =
-                AuditUploadSnapshot::capture(tokio::fs::File::open(&file.path).await.unwrap())
-                    .await
-                    .unwrap();
-            assert!(snapshot.complete_for_test());
-            for line in snapshot
-                .body_for_test()
+            let body = fs::read(&file.path).unwrap();
+            assert!(body.ends_with(b"\n"), "segments hold only complete rows");
+            for line in body
                 .split(|byte| *byte == b'\n')
                 .filter(|line| !line.is_empty())
             {
@@ -1247,75 +1071,14 @@ mod tests {
     }
 
     #[test]
-    fn audit_upload_checkpoint_round_trips_and_is_never_enumerated_as_forensic_data() {
-        let dir = tempfile::tempdir().unwrap();
-        let home = AccountHome::open(dir.path());
-        home.create_account("alice").unwrap();
-        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
-        std::fs::write(
-            home.account_dir("alice").join("audit-engine-v3.jsonl"),
-            b"{\"seq\":1}\n",
-        )
-        .unwrap();
-        let file = app.audit_log_files().unwrap().remove(0);
-
-        assert!(
-            app.audit_upload_checkpoint("alice")
-                .acknowledged(&file)
-                .is_none()
-        );
-        let mut checkpoint = AuditUploadCheckpoint::default();
-        checkpoint.acknowledge(&file, file.size_bytes, AuditUploadOutcome::Uploaded);
-        app.store_audit_upload_checkpoint("alice", &checkpoint)
-            .unwrap();
-
+    fn file_timestamp_milliseconds_use_the_unix_epoch_and_truncate_submilliseconds() {
+        use std::time::Duration;
+        assert_eq!(system_time_ms(UNIX_EPOCH), Some(0));
+        assert_eq!(system_time_ms(UNIX_EPOCH - Duration::from_nanos(1)), None);
         assert_eq!(
-            app.audit_upload_checkpoint("alice").acknowledged(&file),
-            Some(AuditUploadOutcome::Uploaded)
+            system_time_ms(UNIX_EPOCH + Duration::from_nanos(1_234_567)),
+            Some(1)
         );
-        // The sidecar must never be uploaded as if it were forensic data.
-        let enumerated = app.audit_log_files().unwrap();
-        assert_eq!(enumerated.len(), 1);
-        assert_eq!(enumerated[0].file_name, "audit-engine-v3.jsonl");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let path = home.account_dir("alice").join(AUDIT_UPLOAD_CHECKPOINT_FILE);
-            assert_eq!(
-                fs::metadata(path).unwrap().permissions().mode() & 0o777,
-                0o600
-            );
-        }
-    }
-
-    #[test]
-    fn audit_upload_checkpoint_acknowledgement_is_scoped_to_unchanged_content() {
-        let file = AuditLogFile {
-            account_ref: "alice".to_owned(),
-            path: "/tmp/audit-engine-v3.jsonl".to_owned(),
-            file_name: "audit-engine-v3.jsonl".to_owned(),
-            size_bytes: 10,
-            modified_at_ms: Some(1_000),
-        };
-        let mut checkpoint = AuditUploadCheckpoint::default();
-        checkpoint.acknowledge(&file, file.size_bytes, AuditUploadOutcome::Uploaded);
-
-        let grown = AuditLogFile {
-            size_bytes: 20,
-            modified_at_ms: Some(1_100),
-            ..file.clone()
-        };
-        assert!(checkpoint.acknowledged(&grown).is_none());
-        // Same length, rewritten content: the mtime change still forces a
-        // re-upload rather than silently skipping unsent forensic data.
-        let replaced = AuditLogFile {
-            modified_at_ms: Some(2_000),
-            ..file.clone()
-        };
-        assert!(checkpoint.acknowledged(&replaced).is_none());
-
-        assert!(checkpoint.retain_present(["audit-other.jsonl"]));
-        assert!(checkpoint.acknowledged(&file).is_none());
     }
 
     #[test]
