@@ -123,8 +123,10 @@ fn application_data_extension_rejects_malformed_length_framing() {
             .unwrap(),
     );
 
-    assert!(matches!(Extension::tls_deserialize_exact(malformed),
-        Err(tls_codec::Error::DecodingError(reason)) if reason == "trailing bytes in app_data_dictionary extension"));
+    assert!(matches!(
+        Extension::tls_deserialize_exact(malformed),
+        Err(tls_codec::Error::TrailingData)
+    ));
 
     let mut truncated = app_data_extension().tls_serialize_detached().unwrap();
     truncated.pop();

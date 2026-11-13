@@ -40,23 +40,25 @@ members = [
 
 [workspace.package]
 edition = "2024"
-version = "0.16.0"
+version = "0.17.0-dev"
 license = "MIT"
 publish = false
 
 [workspace.dependencies]
 # Offline audit-schema validation; never enable remote reference resolution.
 jsonschema = { version = "0.56.0", default-features = false }
-# OpenMLS family — exact-pinned to a fork commit carrying the draft-10 last-resort
-# KeyPackage fix and the RustCrypto 0.14 / HPKE 0.8 provider backport (upstream
-# openmls#2249 and #2261; fixes RUSTSEC-2026-0387 and RUSTSEC-2026-0330/0331).
+# OpenMLS family — exact-pinned to an upstream main commit. It carries the
+# draft-10 last-resort KeyPackage encoding (openmls#2133), the RustCrypto 0.14 /
+# HPKE 0.8 provider (openmls#2249 and #2261; fixes RUSTSEC-2026-0387 and
+# RUSTSEC-2026-0330/0331), and the 0.9.1/0.9.2 security fixes, none of which
+# any OpenMLS release has together yet.
 # Keep every companion crate on the same repository commit to prevent source skew.
-# Migration: once an upstream OpenMLS release contains both, replace all four
-# git entries together with one matching upstream release series and remove the fork pin.
-openmls = { git = "https://github.com/erskingardner/openmls.git", rev = "94f57b829d95840fc5b415b7a86f547f5c1f65ba", features = ["extensions-draft"] }
-openmls_basic_credential = { git = "https://github.com/erskingardner/openmls.git", rev = "94f57b829d95840fc5b415b7a86f547f5c1f65ba" }
-openmls_rust_crypto = { git = "https://github.com/erskingardner/openmls.git", rev = "94f57b829d95840fc5b415b7a86f547f5c1f65ba", features = ["extensions-draft"] }
-openmls_traits = { git = "https://github.com/erskingardner/openmls.git", rev = "94f57b829d95840fc5b415b7a86f547f5c1f65ba", features = ["extensions-draft"] }
+# Migration: once an upstream OpenMLS release contains all of them, replace all
+# four git entries together with that release series.
+openmls = { git = "https://github.com/openmls/openmls.git", rev = "6100df3fb1d8c3eeab53e349fcbd621f98c44fe2", features = ["extensions-draft"] }
+openmls_basic_credential = { git = "https://github.com/openmls/openmls.git", rev = "6100df3fb1d8c3eeab53e349fcbd621f98c44fe2" }
+openmls_rust_crypto = { git = "https://github.com/openmls/openmls.git", rev = "6100df3fb1d8c3eeab53e349fcbd621f98c44fe2", features = ["extensions-draft"] }
+openmls_traits = { git = "https://github.com/openmls/openmls.git", rev = "6100df3fb1d8c3eeab53e349fcbd621f98c44fe2", features = ["extensions-draft"] }
 tls_codec = "~0.5"
 
 # async

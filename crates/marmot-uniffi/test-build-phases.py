@@ -103,7 +103,7 @@ class BuildPhases(unittest.TestCase):
         fixtures["write_ar"](archive, [("obj.o", fixtures["macho64"](True, b"__TEXT"))])
         self.crate = self.root / "crates/marmot-uniffi"
         self.crate.mkdir(parents=True)
-        for folder in ["apple-privacy", "kotlin-support"]:
+        for folder in ["apple-privacy", "kotlin-support", "swift-support"]:
             shutil.copytree(TOOLS / folder, self.crate / folder)
         (self.crate / "marmotkit-release-profile.env").write_text("fixture profile\n")
         self.bin = self.root / ".cargo/bin"
@@ -155,16 +155,65 @@ class BuildPhases(unittest.TestCase):
         self.assertTrue((self.crate / "build/ios/swift/marmot_uniffi.swift").exists())
         self.assertFalse((self.crate / "output").exists())
 
-    def test_ios_assembly_preserves_inputs_and_does_not_compile(self):
+    def test_apple_assembly_packages_shared_support_once_and_preserves_inputs(self):
         self.run_phase("xcframework.sh", "generate")
+        shutil.copytree(self.crate / "build/ios/swift", self.crate / "build/macos/swift")
         for target in TARGETS[:2]:
             self.run_phase("xcframework.sh", "native", target)
-        self.log.unlink()
-        self.run_phase("xcframework.sh", "assemble")
-        self.assertEqual([c["tool"] for c in self.commands()], ["xcodebuild"])
-        self.assertEqual((self.crate / "output/MarmotKit.swift").read_bytes(),
-            (self.crate / "build/ios/swift/marmot_uniffi.swift").read_bytes())
-        self.assertTrue((self.crate / "output/PrivacyInfo.xcprivacy").exists())
+        self.run_phase("xcframework-macos.sh", "native")
+        support = self.crate / "swift-support/CancellableSubscriptions.swift"
+        raw = (self.crate / "build/ios/swift/marmot_uniffi.swift").read_bytes()
+        expected = raw + b"\n" + support.read_bytes()
+        archive_paths = [self.root / "target" / target / "release/libmarmot_uniffi.a"
+            for target in TARGETS]
+        archives = {path: path.read_bytes() for path in archive_paths}
+        outputs = []
+        for script, platform, output in [
+            ("xcframework.sh", "ios", "output"),
+            ("xcframework-macos.sh", "macos", "output/macos"),
+        ]:
+            with self.subTest(platform=platform):
+                for _ in range(2):
+                    self.log.unlink()
+                    self.run_phase(script, "assemble")
+                    self.assertEqual([c["tool"] for c in self.commands()], ["xcodebuild"])
+                    packaged = (self.crate / output / "MarmotKit.swift").read_bytes()
+                    self.assertEqual(packaged, expected)
+                outputs.append(packaged)
+                swift = self.crate / "build" / platform / "swift"
+                headers = self.crate / "build" / platform / "headers"
+                self.assertEqual((swift / "marmot_uniffi.swift").read_bytes(), raw)
+                for source, staged in [("marmot_uniffiFFI.h", "marmot_uniffiFFI.h"),
+                    ("marmot_uniffiFFI.modulemap", "module.modulemap")]:
+                    self.assertEqual((headers / staged).read_bytes(), (swift / source).read_bytes())
+                self.assertTrue((self.crate / output / "PrivacyInfo.xcprivacy").exists())
+        self.assertEqual(outputs[0], outputs[1])
+        for path, original in archives.items():
+            self.assertEqual(path.read_bytes(), original)
+
+    def test_missing_swift_support_preserves_previous_apple_outputs(self):
+        self.run_phase("xcframework.sh", "generate")
+        shutil.copytree(self.crate / "build/ios/swift", self.crate / "build/macos/swift")
+        for target in TARGETS[:2]:
+            self.run_phase("xcframework.sh", "native", target)
+        self.run_phase("xcframework-macos.sh", "native")
+        support = self.crate / "swift-support/CancellableSubscriptions.swift"
+        support.unlink()
+        for script, output in [("xcframework.sh", "output"),
+            ("xcframework-macos.sh", "output/macos")]:
+            with self.subTest(script=script):
+                root = self.crate / output
+                previous = [root / "MarmotKit.swift", root / "PrivacyInfo.xcprivacy",
+                    root / "MarmotKit.xcframework/previous.a"]
+                for path in previous:
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_bytes(b"previous bundle")
+                self.log.unlink(missing_ok=True)
+                result = self.run_phase(script, "assemble", success=False)
+                self.assertIn(f"missing assembly input: {support}", result.stderr)
+                self.assertEqual(self.commands(), [])
+                for path in previous:
+                    self.assertEqual(path.read_bytes(), b"previous bundle")
 
     def test_missing_slice_fails_before_replacing_output(self):
         self.run_phase("xcframework.sh", "generate")

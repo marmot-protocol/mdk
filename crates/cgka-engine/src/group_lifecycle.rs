@@ -2588,7 +2588,9 @@ pub(crate) fn build_group_context_snapshot<S: StorageProvider>(
             EXPORTER_CONTEXT,
             32,
         )
-        .map_err(|e| EngineError::Backend(format!("export_secret: {e:?}")))?;
+        .map_err(|e| EngineError::Backend(format!("export_secret: {e:?}")))?
+        .as_slice()
+        .to_vec();
     let mut map = std::collections::HashMap::new();
     map.insert(EXPORTER_SNAPSHOT_KEY.to_string(), secret);
     Ok(cgka_traits::group_context::GroupContextSnapshot::new(

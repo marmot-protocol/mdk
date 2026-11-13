@@ -2141,14 +2141,22 @@ async fn run_app_runtime_account_worker(
             _ = scheduled_convergence.timer.as_mut(), if !scheduled_convergence_held_for_test(&account_id_hex) => {
                 yield_to_convergence = false;
                 let Some(group_id) = scheduled_convergence.take_ready() else { continue };
-                let secondary_retry_yield = wait_for_local_submission_or_shutdown(
+                let local_submission_yield = wait_for_local_submission_or_shutdown(
                     app.clone(),
                     account_label.clone(),
                     shared.local_submission_gate(&account_id_hex),
                     shared.local_submission_wakeups.subscribe(),
                     lifecycle.subscribe_shutdown(),
                 ).boxed().shared();
-                let yield_observation = secondary_retry_yield.clone();
+                let yield_observation = local_submission_yield.clone();
+                let (send_waiting, send_requested) = oneshot::channel();
+                let secondary_retry_yield = async move {
+                    tokio::select! {
+                        biased;
+                        _ = local_submission_yield => {},
+                        _ = send_requested => {},
+                    }
+                };
                 let phase = shared.observer.performance().observe(RuntimeOp::WorkerConvergence);
                 let _unit = unit.enter(WorkerUnit::Convergence);
                 // Recovery owns the live client, but member/roster reads can
@@ -2274,9 +2282,12 @@ async fn run_app_runtime_account_worker(
                     &mut pending,
                     &app,
                     &account_label,
+                    Some(send_waiting),
                 ))
                 .await;
-                if yield_observation.peek().is_some() {
+                // Durable work can arrive after a direct send ended the relay
+                // wait. Poll again before deciding whether it is owed a turn.
+                if yield_observation.now_or_never().is_some() {
                     local_submission_service_owed = true;
                     // Never erase the ordinary drain's contention/completion
                     // backoff merely because another optional pass yielded.
@@ -4568,6 +4579,7 @@ async fn serve_snapshot_reads_until<Fut>(
     pending: &mut VecDeque<AccountWorkerCommand>,
     app: &MarmotApp,
     account_label: &str,
+    mut send_waiting: Option<oneshot::Sender<()>>,
 ) -> Fut::Output
 where
     Fut: Future,
@@ -4595,6 +4607,17 @@ where
         let Some(command) = command else {
             continue;
         };
+        // Keep mutation FIFO, but let optional relay retries finish early at
+        // their safe boundary. Never drop the client-owning work future.
+        if matches!(
+            command,
+            AccountWorkerCommand::SendMessage { .. }
+                | AccountWorkerCommand::SendMessageDraft { .. }
+                | AccountWorkerCommand::SendAppEvent { .. }
+        ) && let Some(waiting) = send_waiting.take()
+        {
+            let _ = waiting.send(());
+        }
         let snapshot_reads_available = read_snapshot.is_some();
         match command {
             AccountWorkerCommand::Members { group_id, respond } if snapshot_reads_available => {
@@ -4902,6 +4925,7 @@ fn account_worker_command_future<'a>(
                 pending,
                 app,
                 account_label,
+                None,
             ))
             .await;
             let result = match repaired {
@@ -5093,6 +5117,7 @@ fn account_worker_command_future<'a>(
                     pending,
                     app,
                     account_label,
+                    None,
                 ))
                 .await;
             }
@@ -5553,6 +5578,7 @@ fn account_worker_command_future<'a>(
                     pending,
                     app,
                     account_label,
+                    None,
                 ))
                 .await;
             }
@@ -8471,6 +8497,7 @@ mod tests {
                 &mut pending,
                 &app,
                 "alice",
+                None,
             );
             let check = async {
                 assert!(matches!(
@@ -8519,6 +8546,7 @@ mod tests {
             &mut pending,
             &app,
             "alice",
+            None,
         );
         let check = async {
             assert!(
@@ -8580,6 +8608,7 @@ mod tests {
             &mut pending,
             &app,
             "alice",
+            None,
         );
         let check = async {
             assert!(

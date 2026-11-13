@@ -308,6 +308,8 @@ pub enum AppError {
     ExternalSignerMismatch,
     #[error("external signer request was rejected or cancelled by the user")]
     ExternalSignerRejected,
+    #[error(transparent)]
+    Nip46(#[from] crate::Nip46Error),
     #[error("invalid Marmot KeyPackage event: {0}")]
     InvalidKeyPackageEvent(String),
     #[error("no directory entry for account")]
@@ -787,6 +789,7 @@ impl AppError {
             Self::ExternalSignerUnavailable(_) => "external_signer_unavailable",
             Self::ExternalSignerMismatch => "external_signer_mismatch",
             Self::ExternalSignerRejected => "external_signer_rejected",
+            Self::Nip46(_) => "nip46",
             Self::InvalidKeyPackageEvent(_) => "invalid_key_package_event",
             Self::MissingDirectoryEntry(_) => "missing_directory_entry",
             Self::InvalidDirectorySearch(_) => "invalid_directory_search",

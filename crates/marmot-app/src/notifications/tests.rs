@@ -2020,6 +2020,88 @@ fn group_invite_notification_is_not_a_mention() {
     assert!(!update.is_mention);
 }
 
+#[test]
+fn notification_dm_projection() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    let account = app.account_home().create_account("alice").unwrap();
+    let local = &account.account_id_hex;
+    let actor = Keys::generate().public_key().to_hex();
+    let mut message = received_chat("hello", vec![]);
+    message.sender = actor.clone();
+    app.set_local_notifications_enabled("alice", true).unwrap();
+    let mut state = app.load_state("alice").unwrap();
+    let group_id = message.group_id.clone();
+    let group_id_hex = hex::encode(group_id.as_slice());
+    let events = [
+        MarmotAppEvent::MessageReceived(RuntimeMessageReceived {
+            account_id_hex: local.clone(),
+            account_label: "alice".to_owned(),
+            message,
+        }),
+        MarmotAppEvent::GroupJoined {
+            account_id_hex: local.clone(),
+            account_label: "alice".to_owned(),
+            group_id: group_id.clone(),
+        },
+        MarmotAppEvent::GroupEvent(RuntimeGroupEvent {
+            account_id_hex: local.clone(),
+            account_label: "alice".to_owned(),
+            event: group_state_event(
+                group_id,
+                Some(&actor),
+                cgka_traits::engine::GroupStateChange::AdminAdded {
+                    member: member_id_from_hex(local),
+                },
+            ),
+        }),
+    ];
+    for (name, members, pending, expected) in [
+        (Some(""), Some(2), false, true),
+        (Some(" \t"), Some(2), true, true),
+        (Some("Team"), Some(2), false, false),
+        (Some(""), Some(3), false, false),
+        (Some(""), Some(1), false, false),
+        (Some(""), None, false, false),
+        (None, None, false, false),
+    ] {
+        let mut group = AppGroupRecord::new(
+            group_id_hex.clone(),
+            crate::AppGroupNostrRoutingComponent::new(
+                cgka_traits::NostrRoutingV1::new(
+                    [0xEE; 32],
+                    vec!["wss://relay.example".to_owned()],
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+            name.unwrap_or_default().to_owned(),
+            String::new(),
+            crate::AppGroupImageInput::default(),
+            crate::AppGroupAdminPolicyComponent::new(Vec::new()),
+            crate::AppGroupMessageRetentionComponent::disabled(),
+        );
+        group.welcomer_account_id_hex = Some(actor.clone());
+        group.member_count = members;
+        group.pending_confirmation = pending;
+        state.groups = name.map(|_| group).into_iter().collect();
+        app.save_state(&state).unwrap();
+        let mut resolver = NotificationResolver::default();
+        for event in &events {
+            let update = notification_update_from_event_cached(&app, &mut resolver, event).unwrap();
+            if name.is_none() && matches!(event, MarmotAppEvent::MessageReceived(_)) {
+                assert_eq!(update, None, "messages from unknown groups are suppressed");
+                continue;
+            }
+            let update = update.expect("eligible notification");
+            assert_eq!(
+                update.is_dm, expected,
+                "{name:?} {members:?} {pending} {event:?}"
+            );
+        }
+    }
+}
+
 // #639: the per-batch NotificationResolver caches the raw directory-derived user
 // (display_name from the directory, or None). The per-message sender-display-name
 // fallback must apply to the RETURNED clone only, never mutate the cache — so two

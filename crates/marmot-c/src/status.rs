@@ -339,6 +339,7 @@ pub(crate) fn status_from_error(err: &MarmotKitError) -> MarmotStatus {
         MarmotKitError::Runtime { .. } => MarmotStatus::Runtime,
         MarmotKitError::ExternalSignerUnavailable { .. } => MarmotStatus::ExternalSignerUnavailable,
         MarmotKitError::ExternalSignerMismatch => MarmotStatus::ExternalSignerMismatch,
+        MarmotKitError::Nip46 { reason } => crate::nip46::status_from_nip46_error(reason),
         MarmotKitError::ExternalSignerRejected => MarmotStatus::ExternalSignerRejected,
         MarmotKitError::InvalidGroupMembershipPage { .. } => {
             MarmotStatus::InvalidGroupMembershipPage

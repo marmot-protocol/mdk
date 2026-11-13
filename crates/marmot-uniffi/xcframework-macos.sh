@@ -137,6 +137,7 @@ fi
 # Assembly only consumes existing slices and generated bindings. In particular,
 # never delete build/*/swift downloaded from the generation job.
 for input in "$BUILD_DIR/swift/${LIB_BASENAME}.swift" \
+  "$CRATE_DIR/swift-support/CancellableSubscriptions.swift" \
   "$BUILD_DIR/swift/${LIB_BASENAME}FFI.h" \
   "$BUILD_DIR/swift/${LIB_BASENAME}FFI.modulemap" \
   "$TARGET_DIR/aarch64-apple-darwin/release/lib${LIB_BASENAME}.a"; do
@@ -165,8 +166,12 @@ xcodebuild -create-xcframework \
 python3 "$TOOL_DIR/apple-privacy.py" "$OUT_DIR/PrivacyInfo.xcprivacy" \
   --privacy-dir "$CRATE_DIR/apple-privacy" --product-analytics "${PRODUCT_ANALYTICS_EXPORT:-0}"
 
-echo "==> Copying generated Swift binding to output dir"
-cp "$BUILD_DIR/swift/${LIB_BASENAME}.swift" "$OUT_DIR/${FRAMEWORK_NAME}.swift"
+echo "==> Packaging generated Swift binding and cancellation support"
+{
+  cat "$BUILD_DIR/swift/${LIB_BASENAME}.swift"
+  printf '\n'
+  cat "$CRATE_DIR/swift-support/CancellableSubscriptions.swift"
+} > "$OUT_DIR/${FRAMEWORK_NAME}.swift"
 
 echo ""
 echo "Done."

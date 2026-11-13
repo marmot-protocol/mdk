@@ -14,6 +14,7 @@ See [dev device linking](../cli/README.md#device-linking-dev-builds).
 ## Contents
 
 - [Runtime overview](#runtime-overview)
+- [Remote signer accounts](#remote-signer-accounts)
 - [SOCKS5 routing](#socks5-routing)
 - [Local storage](#local-storage)
 - [Account bootstrap and KeyPackages](#account-bootstrap-and-keypackages)
@@ -66,9 +67,10 @@ MLS confirmation are complete, even if a secondary relay still has a later repli
 keeps the original relay event and retry deadline. Unmet required acknowledgements and pending MLS confirmation keep
 their publication barrier.
 
-A new same-account durable admission also lets the managed worker yield a scheduled secondary retry that is already
-waiting on a relay. This applies only after required acknowledgements and MLS confirmation are complete. Unfinished
-attempts remain conservatively recorded as possibly exposed and retry their exact saved bytes after backoff. The
+A queued direct send (plain text, draft, or app event) or a new same-account durable admission lets the managed worker
+yield a scheduled secondary retry that is already waiting on a relay. Direct commands retain FIFO order. This applies
+only after required acknowledgements and MLS confirmation are complete. Unfinished attempts remain conservatively
+recorded as possibly exposed and retry their exact saved bytes after backoff. The
 worker finishes its current local effects before servicing the new send; required publication and confirmation work
 is not cancelled. After a yielded pass, one durable submission receives service ahead of overdue secondary retry
 passes once the finite backlog of deferred and buffered worker commands has drained. Earlier blocked commands keep
@@ -119,6 +121,28 @@ For where the code lives (`src/runtime/`, `src/client/`, `src/media/`, and so on
 and the diagnostics exporters are the [`marmot-observability`](../marmot-observability) crate) see
 [`AGENTS.md`](AGENTS.md).
 
+## Remote signer accounts
+
+The runtime owns NIP-46 sessions for `bunker://` and client-initiated
+`nostrconnect://` pairing. Each account has an independent transport and
+communication key. Permission approval precedes connection, and stored sessions
+restore before account workers without host signer callbacks. Sign-out and wipe
+erase the communication key; terminal storage close preserves it for restart.
+Native login/register adoption is runtime-owned once admitted: dropping its future
+stops waiting, not adoption. First await successful session `connect`; `nip46_login`
+accepts only an already-verified `Ready` session and never silently connects.
+Pairing is separately caller-owned and cancellable, with no account mutation while unbound.
+Reconnect never resumes an adoption retired by an earlier disconnect.
+Rollback still cleans its binding without cancelling a newer generation.
+Account deletion excludes session resume until credential erasure and removal finish;
+a queued resume reports the removed account, leaving a fresh pairing free to log in.
+Explicit session cancellation, disconnect, or logout interrupts adoption; shutdown
+interrupts and settles owned adoption before returning. Failed completed-account
+rebind restores prior local signer state and activation, but does not retract
+already-published KeyPackages. Host callback/NIP-55 login behavior is unchanged.
+See [external signer accounts](../../docs/external-signer-accounts.md#nip-46-sessions)
+for pairing, permission versions, recovery, cancellation, and credential storage.
+
 ## SOCKS5 routing
 
 Set the process environment before the first network-policy use (including runtime or NIP-46 client construction):
@@ -137,7 +161,7 @@ including invalid configuration. Later environment changes, including clearing t
 or unblock an invalid policy. Restart the process to apply a different configuration.
 
 The policy covers relay publishing, account receive/history pools, directory relay clients (including completion-aware
-reads), C NIP-46 signer sessions, and the shared HTTP clients for media, Open Ranking, and collectors (including audit
+reads), shared NIP-46 signer sessions, and the shared HTTP clients for media, Open Ranking, and collectors (including audit
 uploads). Completion-aware reads retain pre-admission wire-event counts under the proxy transport. Relay hostnames are
 resolved by the proxy. HTTP clients still resolve and validate destinations locally, then send the pinned IP through
 SOCKS5 while retaining the original HTTP Host header and TLS identity. The proxy is an explicitly trusted egress.
@@ -881,12 +905,15 @@ retires nothing further. Retired spans stay in the relay re-check; loss inside t
 re-arms them.
 
 `dismiss_history_notice(account_ref, notice_id)` runs on the account worker. After the user accepts that the history may
-be incomplete, it durably retires exactly that occurrence as its own outcome (`state = 2`), never as coverage. A retired
-loss keeps its evidence as a watermark, so a delayed duplicate cannot rearm it, and releases the transport-cursor fence
-once no loss obligation remains pending, without counting a recovery success. It returns false for a stale id. New
-evidence re-arms recovery under a new revision, so the notice disappears and a later parking is a new notice with a new
-id. New loss, a higher missing epoch, each startup's incremental comparison, or a new explicit repair reopens retired
-demand as fresh debt. A malformed id is `AppError::Hex`.
+be incomplete, it durably retires exactly the shown occurrence, never as coverage or a recovery success. A ledger notice
+retires its shown parked spans and clears its route's remainder. Ordinary recovery and account reopen do not undo that
+dismissal. A qualified proof can replace retirement with coverage. Loss import, not dismissal, releases the delivery-loss
+fence; unchanged loss evidence is not imported again. It returns false for a stale id. A malformed id is `AppError::Hex`.
+
+History outside the dismissed spans remains owed. Without a healthy live tail, advancing time can add unproved seconds.
+A relay refusing those seconds can raise a fresh `UnprovenHistory` notice without reopening any dismissed second.
+New loss can reopen a dismissed span. If recovery parks it again, that notice has a fresh revision.
+Explicit full-history repair re-arms retired debt. A higher missing epoch starts a new epoch-gap occurrence.
 
 ## User blocking
 

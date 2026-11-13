@@ -19,7 +19,7 @@ use cgka_traits::{GroupId, MemberId, SecretBytes, TransportAdapterError, Transpo
 use futures::stream::{FuturesUnordered, StreamExt};
 use marmot_account::{
     AccountHome, AccountHomeError, AccountSetupKind, AccountSetupPhase, AccountSummary,
-    NostrAccountImport,
+    Nip46Removal, NostrAccountImport,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::{
@@ -61,6 +61,7 @@ use marmot_observability::{
     AppPerformanceOperation, AppPerformanceTelemetry, SyncErrorClass, SyncFailureClassification,
     SyncFailureStage, bounded_advisory_step,
 };
+use nostr::prelude::PublicKey;
 use nostr_directory::DirectorySyncHandle;
 
 const MEDIA_COMMAND_QUEUE_LIMIT: usize = 8;
@@ -121,6 +122,7 @@ mod commands;
 mod event_routing;
 mod local_submission_queue;
 mod local_submissions;
+mod nip46;
 mod onboarding;
 mod presentation;
 mod presented_chat_list;
@@ -268,6 +270,7 @@ pub struct AccountManager {
     #[cfg(test)]
     reconcile_invocations: Arc<std::sync::atomic::AtomicU64>,
     invite_catch_up_tasks: Arc<StdMutex<InviteCatchUpTasks>>,
+    nip46_adoption_owner: Arc<()>,
 }
 
 #[derive(Default)]
@@ -1362,6 +1365,27 @@ pub struct AccountSetupResult {
     pub readiness: AccountSetupReadiness,
 }
 
+enum ExternalSetupSigner {
+    Host(Arc<dyn crate::ExternalAccountSigner>),
+    Nip46 {
+        session: crate::Nip46Session,
+        generation: u64,
+    },
+}
+
+enum ExternalSetupOrigin {
+    Created,
+    Promoted,
+    Existing,
+}
+
+struct Nip46Binding {
+    session: crate::Nip46Session,
+    generation: u64,
+    previous: marmot_account::Nip46SessionWrite,
+    previous_signer: Option<Arc<dyn crate::ExternalAccountSigner>>,
+}
+
 /// Host-visible readiness for account setup. Local readiness is sufficient
 /// for local reads and profile rendering but is deliberately not evidence that another
 /// user can fetch this account's KeyPackage yet.
@@ -1861,6 +1885,7 @@ impl MarmotAppRuntime {
                     self.shared.relay_telemetry_runtime_config(),
                     self.shared.service_endpoints(),
                 );
+            self.restore_nip46_sessions().await?;
             self.resume_generated_account_setup().await?;
             self.reconcile_accounts().await?;
             self.shared.lifecycle().mark_running();
@@ -6570,6 +6595,9 @@ impl MarmotAppRuntime {
     pub async fn shutdown(&self) {
         let started_at = Instant::now();
         self.shared.lifecycle().begin_shutdown();
+        self.accounts
+            .finish_nip46_adoptions(nip46::Nip46AdoptionScope::Runtime)
+            .await;
         self.shared
             .local_submission_queue
             .lock()
@@ -6637,8 +6665,8 @@ impl MarmotAppRuntime {
         );
     }
 
-    /// Stop admitting runtime work, close every SQLite database and release the
-    /// root runtime lease, then make a bounded attempt to drain graceful
+    /// Stop admitting runtime work, settle NIP-46 adoption, close every SQLite
+    /// database and release the root runtime lease, then drain graceful
     /// shutdown work. When this returns, nothing this process owns holds a file
     /// lock inside the Marmot root.
     ///
@@ -6654,7 +6682,8 @@ impl MarmotAppRuntime {
     /// App Group container).
     ///
     /// Ordering is the point of this method: the lifecycle stop latch closes
-    /// admission first, then storage closure takes priority over graceful
+    /// admission first. NIP-46 network waits are interrupted and local credential
+    /// mutations settle before storage closes. Closure takes priority over graceful
     /// draining. This is deliberately different from [`Self::shutdown`]. A
     /// host suspension deadline cannot safely sit behind directory, worker,
     /// relay, or audit cleanup that may be awaiting network or task progress.
@@ -6688,6 +6717,10 @@ impl MarmotAppRuntime {
 
     async fn run_terminal_shutdown_and_close(self) -> Result<(), AppError> {
         self.shared.lifecycle().begin_shutdown();
+        // Finish Native local rollback before storage and its root lease close.
+        self.accounts
+            .finish_nip46_adoptions(nip46::Nip46AdoptionScope::App)
+            .await;
         self.shared
             .local_submission_queue
             .lock()
@@ -6855,6 +6888,22 @@ async fn catch_up_account_commands_with_retry(
     }
 }
 
+impl MarmotApp {
+    fn onboarding_transaction(&self, id: &str) -> Arc<Mutex<()>> {
+        let mut locks = self
+            .onboarding_transactions
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = locks.get(id).and_then(std::sync::Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(Mutex::new(()));
+        locks.insert(id.to_owned(), Arc::downgrade(&lock));
+        lock
+    }
+}
+
 // Account setup reaches the workers only through this surface. The worker
 // transaction is a tokio `Mutex` and not reentrant, so every call keeps the lock
 // state it had when onboarding lived on this type, and each says which it is:
@@ -6923,6 +6972,7 @@ impl AccountManager {
                 accepting: true,
                 handles: Vec::new(),
             })),
+            nip46_adoption_owner: Arc::new(()),
         }
     }
 
@@ -7136,8 +7186,38 @@ impl AccountManager {
         self.shared.schedule_audit_log_tracker_update(trigger);
     }
 
+    async fn lock_nip46_removal(
+        &self,
+        gate: Arc<Mutex<()>>,
+        account_id: &str,
+    ) -> tokio::sync::OwnedMutexGuard<()> {
+        let user = PublicKey::from_hex(account_id).ok();
+        let acquisition = gate.lock_owned();
+        tokio::pin!(acquisition);
+        let ready = {
+            let adoptions = self
+                .app
+                .nip46_adoptions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // Queue before releasing admission: later adoptions must wait behind teardown.
+            let ready = futures::FutureExt::now_or_never(acquisition.as_mut());
+            for adoption in &adoptions.active {
+                if Some(adoption.user) == user {
+                    adoption.session.cancel();
+                }
+            }
+            ready
+        };
+        match ready {
+            Some(guard) => guard,
+            None => acquisition.await,
+        }
+    }
+
     pub async fn remove_account(&self, account_ref: &str) -> Result<(), AppError> {
         let account = self.app.account_home().account(account_ref)?;
+        self.finish_nip46_account(&account).await;
         let fence = self
             .setup
             .fence_generated_teardown(self, &account.account_id_hex)
@@ -7155,7 +7235,6 @@ impl AccountManager {
         // A label may have been reused while foreground setup finished.
         // Check before purging reports and after taking the worker transaction.
         self.resolve_original(expected)?;
-
         // Stop and delete the account's moderation reports, and admit none
         // until the removal below has committed (every removal entry point).
         // Fenced before the global lock: the purge may open account storage.
@@ -7204,6 +7283,7 @@ impl AccountManager {
                 // or async cleanup runs while this account gate is held.
                 let gate = self.shared.local_submission_gate(&account.account_id_hex);
                 let _admission = gate.lock().await;
+                self.erase_nip46_session(&account.label, Nip46Removal::Recorded)?;
                 self.app.drop_account_caches(&account.label);
                 self.app
                     .remove_account_key_package_artifacts(&account.label)?;
@@ -7410,6 +7490,8 @@ impl AccountManager {
         account_ref: &str,
         unlinked: bool,
     ) -> Result<(), AppError> {
+        let account = self.resolve(account_ref)?;
+        self.finish_nip46_account(&account).await;
         // Queued moderation reports never outlive a sign-out: stop and delete
         // them, and admit none until the sign-out below has committed. Fenced
         // before the global lock: the purge may open account storage. A failed
@@ -7440,6 +7522,7 @@ impl AccountManager {
             } else {
                 home.set_account_signed_out(&account.label, true)?;
             }
+            self.erase_nip46_session(&account.label, Nip46Removal::Recorded)?;
             self.clear_startup_retry(&account.account_id_hex);
             self.shared
                 .attachment_permissions
@@ -7503,6 +7586,9 @@ impl AccountManager {
 
     /// Explicitly re-activate a reversibly signed-out local account.
     pub async fn sign_in_account(&self, account_ref: &str) -> Result<ManagedAccount, AppError> {
+        let account = self.resolve(account_ref)?;
+        let gate = self.app.onboarding_transaction(&account.account_id_hex);
+        let _transaction = gate.lock().await;
         let observed = self.shared.observer.product().observed(
             crate::ProductFamily::Account,
             "login",
@@ -8666,6 +8752,20 @@ impl AccountManager {
     where
         S: crate::ExternalAccountSigner + 'static,
     {
+        self.login_with_external(
+            public_key,
+            ExternalSetupSigner::Host(Arc::new(signer)),
+            request,
+        )
+        .await
+    }
+
+    async fn login_with_external(
+        &self,
+        public_key: String,
+        signer: ExternalSetupSigner,
+        request: AccountSetupRequest,
+    ) -> Result<AccountSetupResult, AppError> {
         let observed = self.shared.observer.product().observed(
             crate::ProductFamily::Account,
             "external_signer",
@@ -8674,171 +8774,242 @@ impl AccountManager {
         let work = async move {
             let result = async {
                 self.shared.lifecycle().ensure_running()?;
-                let signer_public_key = signer
-                    .get_public_key()
-                    .await
-                    .map_err(crate::external_signer_public_key_error)?;
+                let signer_public_key = match &signer {
+                    ExternalSetupSigner::Host(signer) => signer
+                        .get_public_key()
+                        .await
+                        .map_err(crate::external_signer_public_key_error)?,
+                    ExternalSetupSigner::Nip46 { session, .. } => session.public_key()?,
+                };
                 let account_id_hex = AccountHome::account_id_for_public_key(&public_key)?;
                 if signer_public_key.to_hex() != account_id_hex {
                     return Err(AppError::ExternalSignerMismatch);
                 }
-                let existing_account = self.app.account_home().account(&account_id_hex).ok();
-                if let Some(account) = existing_account.as_ref() {
-                    refuse_unlinked(account)?;
-                    self.setup_records()
-                        .require_onboarding_complete(&account.label)?;
+                let native_adoption = match &signer {
+                    ExternalSetupSigner::Nip46 {
+                        session,
+                        generation,
+                    } => Some((session.clone(), *generation)),
+                    ExternalSetupSigner::Host(_) => None,
+                };
+                let gate = self.app.onboarding_transaction(&account_id_hex);
+                let _transaction =
+                    crate::Nip46Session::during_adoption(native_adoption.as_ref(), async {
+                        Ok(gate.lock().await)
+                    })
+                    .await?;
+                if native_adoption.is_some() {
+                    self.shared.lifecycle().ensure_running()?;
+                    self.app.ensure_storage_open("NIP-46 adoption")?;
                 }
-                let created_account = existing_account.is_none();
-                // add_external_signer_account below promotes a pre-existing tracked
-                // (public) account to external_signing, so a later setup failure must
-                // revert that promotion — not skip cleanup and leave a torn account.
-                // Created accounts are deleted, already-external accounts are left as-is.
-                let upgraded_public_account = existing_account
-                    .is_some_and(|account| !account.external_signing && !account.local_signing);
+                let (existing_account, previous_setup) =
+                    match self.app.account_home().account(&account_id_hex).ok() {
+                        Some(account) => {
+                            refuse_unlinked(&account)?;
+                            self.setup_records()
+                                .require_onboarding_complete(&account.label)?;
+                            let setup = self
+                                .app
+                                .account_home()
+                                .account_setup_state(&account.label)?;
+                            if account.external_signing && !account.local_signing && setup.is_none()
+                            {
+                                return self
+                                    .rebind_external_account(
+                                        account,
+                                        signer_public_key,
+                                        signer,
+                                        request,
+                                    )
+                                    .await;
+                            }
+                            (Some(account), setup)
+                        }
+                        None => (None, None),
+                    };
+                let origin = match existing_account {
+                    None => ExternalSetupOrigin::Created,
+                    Some(account) if !account.external_signing && !account.local_signing => {
+                        ExternalSetupOrigin::Promoted
+                    }
+                    Some(_) => ExternalSetupOrigin::Existing,
+                };
                 let mut account = self
                     .app
                     .account_home()
                     .add_external_signer_account(&public_key)?;
                 self.app.presentation_signals.catalog_changed();
                 let reactivating_existing = account.signed_out;
-                if let Err(err) = self
-                    .app
-                    .register_external_signer(&account.account_id_hex, signer)
-                    .await
-                {
-                    return self.rollback_external_signer_setup(
-                        &account.label,
-                        created_account,
-                        upgraded_public_account,
-                        err,
-                    );
-                }
-                if self
-                    .app
-                    .account_home()
-                    .account_setup_state(&account.label)?
-                    .is_none()
-                {
-                    self.app.account_home().begin_account_setup_with(
-                        &account,
-                        false,
-                        AccountSetupKind::ExternalSigner,
-                        AccountSetupPhase::LocalStateCreated,
-                    )?;
-                }
-                let directory_bootstrap_relays = directory_bootstrap_relays_for_setup(&request);
-                // An external-signer account is pre-existing by definition, so resolve
-                // its profile from public indexers (its outbox metadata does not live on
-                // the app's messaging relays). Runs before the relay-list setup so
-                // discovery keeps its anti-clobber ordering.
-                // Discovery is advisory (its error path already proceeds without it),
-                // so a stalled indexer must not hold the whole login hostage.
-                let recent_relay_lists = bounded_advisory_step(
-                    self.shared.observer.performance(),
-                    ACCOUNT_DIRECTORY_PREFLIGHT_WAIT,
-                    "login_directory_preflight",
-                    self.preflight_existing_account_directory(
-                        &account.account_id_hex,
-                        directory_discovery_relays_for_setup(&request),
-                    ),
-                )
-                .await
-                .flatten();
-
-                let relay_lists = match self
-                    .setup_relay_lists_for_account(
-                        &account,
-                        &request,
-                        true,
-                        false,
-                        recent_relay_lists,
-                    )
-                    .await
-                {
-                    Ok(relay_lists) => relay_lists,
-                    Err(err) => {
-                        if !self.setup_failure_can_roll_back(&account, account.signed_out)? {
-                            return Err(err);
-                        }
-                        return self.rollback_external_signer_setup(
-                            &account.label,
-                            created_account,
-                            upgraded_public_account,
-                            err,
-                        );
+                let mut binding = None;
+                let mut readiness = AccountSetupReadiness::Initializing;
+                let setup = async {
+                    binding = self
+                        .bind_external_signer(&account, signer_public_key, signer)
+                        .await?;
+                    if previous_setup.is_none() {
+                        self.app.account_home().begin_account_setup_with(
+                            &account,
+                            false,
+                            AccountSetupKind::ExternalSigner,
+                            AccountSetupPhase::LocalStateCreated,
+                        )?;
                     }
-                };
+                    let network = async {
+                        let directory_bootstrap_relays =
+                            directory_bootstrap_relays_for_setup(&request);
+                        let relay_lists = self.resolve_external_relays(&account, &request).await?;
 
-                let key_package_bytes = if request.publish_initial_key_package {
-                    if account.signed_out {
-                        account = self
-                            .app
-                            .account_home()
-                            .set_account_signed_out(&account.label, false)?;
-                        self.app.presentation_signals.catalog_changed();
-                    }
-                    self.app.account_home().set_account_setup_phase(
-                        &account.label,
-                        AccountSetupPhase::KeyPackagePublicationStarted,
-                    )?;
-                    match self.publish_initial_key_package_for_account(&account).await {
-                        Ok(bytes) => {
+                        let key_package_bytes = if request.publish_initial_key_package {
+                            if account.signed_out {
+                                account = self
+                                    .app
+                                    .account_home()
+                                    .set_account_signed_out(&account.label, false)?;
+                                self.app.presentation_signals.catalog_changed();
+                            }
                             self.app.account_home().set_account_setup_phase(
                                 &account.label,
-                                AccountSetupPhase::KeyPackagePublicationConfirmed,
+                                AccountSetupPhase::KeyPackagePublicationStarted,
                             )?;
-                            Some(bytes)
-                        }
-                        Err(err) => {
-                            // Session lifecycle state owns exact signed bytes and
-                            // private material before network exposure. Once
-                            // KeyPackage setup has started, deleting a freshly-added
-                            // external account could orphan an ambiguously accepted
-                            // publication; keep it for an exact-byte retry instead.
-                            // A previously signed-out account is different: restore
-                            // that durable state while retaining its setup journal.
-                            if reactivating_existing {
-                                self.restore_signed_out_after_key_package_failure(&account.label)
-                                    .await;
+                            match self.publish_initial_key_package_for_account(&account).await {
+                                Ok(bytes) => {
+                                    self.app.account_home().set_account_setup_phase(
+                                        &account.label,
+                                        AccountSetupPhase::KeyPackagePublicationConfirmed,
+                                    )?;
+                                    Some(bytes)
+                                }
+                                Err(err) => {
+                                    // Session lifecycle state owns exact signed bytes and
+                                    // private material before network exposure. Once
+                                    // KeyPackage setup has started, deleting a freshly-added
+                                    // external account could orphan an ambiguously accepted
+                                    // publication; keep it for an exact-byte retry instead.
+                                    // A previously signed-out account is different: restore
+                                    // that durable state while retaining its setup journal.
+                                    if reactivating_existing && native_adoption.is_none() {
+                                        self.restore_signed_out_after_key_package_failure(
+                                            &account.label,
+                                        )
+                                        .await;
+                                    }
+                                    return Err(err);
+                                }
                             }
-                            return Err(err);
+                        } else {
+                            None
+                        };
+
+                        // Single-hop advisory refresh keeps the shorter profile-refresh bound.
+                        let _ = bounded_advisory_step(
+                            self.shared.observer.performance(),
+                            ACCOUNT_SETUP_ADVISORY_WAIT,
+                            "login_directory_refresh",
+                            self.app.directory().refresh_user_directory_for_account_id(
+                                &account.account_id_hex,
+                                directory_bootstrap_relays,
+                            ),
+                        )
+                        .await;
+                        if account.signed_out {
+                            account = self
+                                .app
+                                .account_home()
+                                .set_account_signed_out(&account.label, false)?;
+                            self.app.presentation_signals.catalog_changed();
                         }
-                    }
-                } else {
-                    None
-                };
+                        self.retry_and_reconcile_for_account(&account.account_id_hex)
+                            .await?;
+                        // Journal cleanup may remove its first file before failing.
+                        // A network-ready account and signer are already committed.
+                        readiness = AccountSetupReadiness::NetworkReady;
+                        self.app
+                            .account_home()
+                            .complete_account_setup(&account.label)?;
 
-                // Single-hop advisory refresh keeps the shorter profile-refresh bound.
-                let _ = bounded_advisory_step(
-                    self.shared.observer.performance(),
-                    ACCOUNT_SETUP_ADVISORY_WAIT,
-                    "login_directory_refresh",
-                    self.app.directory().refresh_user_directory_for_account_id(
-                        &account.account_id_hex,
-                        directory_bootstrap_relays,
-                    ),
-                )
-                .await;
-                if account.signed_out {
-                    account = self
-                        .app
-                        .account_home()
-                        .set_account_signed_out(&account.label, false)?;
-                    self.app.presentation_signals.catalog_changed();
+                        Ok((relay_lists, key_package_bytes))
+                    };
+                    crate::Nip46Session::during_adoption(native_adoption.as_ref(), network).await
                 }
-                self.retry_and_reconcile_for_account(&account.account_id_hex)
-                    .await?;
-                self.app
-                    .account_home()
-                    .complete_account_setup(&account.label)?;
-
-                Ok(AccountSetupResult {
-                    account,
-                    relay_lists,
-                    key_package_bytes,
-                    profile: None,
-                    readiness: AccountSetupReadiness::NetworkReady,
-                })
+                .await;
+                match setup {
+                    Ok((relay_lists, key_package_bytes)) => Ok(AccountSetupResult {
+                        account,
+                        relay_lists,
+                        key_package_bytes,
+                        profile: None,
+                        readiness,
+                    }),
+                    Err(error) => {
+                        let restored = if native_adoption.is_some()
+                            && reactivating_existing
+                            && !account.signed_out
+                            && readiness != AccountSetupReadiness::NetworkReady
+                        {
+                            self.app
+                                .account_home()
+                                .set_account_signed_out(&account.label, true)
+                                .map(drop)
+                        } else {
+                            Ok(())
+                        };
+                        let durable_account = self.app.account_home().account(&account.label);
+                        let setup_state =
+                            self.app.account_home().account_setup_state(&account.label);
+                        let credential_existed = binding.as_ref().is_some_and(|binding| {
+                            matches!(
+                                &binding.previous,
+                                marmot_account::Nip46SessionWrite::Existing(_)
+                            )
+                        });
+                        let unpublished = readiness != AccountSetupReadiness::NetworkReady
+                            && setup_state.as_ref().is_ok_and(|state| {
+                                state.as_ref().is_none_or(|state| {
+                                    state.phase == AccountSetupPhase::LocalStateCreated
+                                })
+                            });
+                        let rollback_account =
+                            !reactivating_existing && unpublished && !credential_existed;
+                        if let Some(binding) = binding {
+                            let restore_signer = binding.previous_signer.is_some();
+                            let signed_out = durable_account
+                                .as_ref()
+                                .is_ok_and(|account| account.signed_out);
+                            if readiness != AccountSetupReadiness::NetworkReady
+                                && (restore_signer || signed_out || rollback_account)
+                            {
+                                // Setup owns the handoff: retain committed retry material,
+                                // otherwise restore the prior callback and credential record.
+                                let cleanup = blocking_app_task(move || {
+                                    binding
+                                        .session
+                                        .unbind_account(
+                                            &binding.previous,
+                                            binding.previous_signer,
+                                            binding.generation,
+                                        )
+                                        .map_err(AppError::from)
+                                })
+                                .await;
+                                let reconciliation =
+                                    self.reconcile_nip46_cleanup(&account.account_id_hex).await;
+                                cleanup?;
+                                reconciliation?;
+                            }
+                        }
+                        restored?;
+                        durable_account?;
+                        setup_state?;
+                        if rollback_account {
+                            return self.rollback_external_signer_setup(
+                                &account.label,
+                                origin,
+                                error,
+                            );
+                        }
+                        Err(error)
+                    }
+                }
             }
             .await;
             self.app.presentation_signals.catalog_changed();
@@ -8847,6 +9018,149 @@ impl AccountManager {
         observed
             .run_async(work, marmot_observability::success_or_failure)
             .await
+    }
+
+    async fn bind_external_signer(
+        &self,
+        account: &AccountSummary,
+        public_key: nostr::prelude::PublicKey,
+        signer: ExternalSetupSigner,
+    ) -> Result<Option<Nip46Binding>, AppError> {
+        match signer {
+            ExternalSetupSigner::Nip46 {
+                session,
+                generation,
+            } => {
+                let accounts = self.clone();
+                let label = account.label.clone();
+                blocking_app_task(move || accounts.track_nip46_session(&label, session, generation))
+                    .await
+            }
+            ExternalSetupSigner::Host(signer) => {
+                self.app
+                    .pin_external_signer(&account.account_id_hex, public_key, signer);
+                Ok(None)
+            }
+        }
+    }
+
+    async fn resolve_external_relays(
+        &self,
+        account: &AccountSummary,
+        request: &AccountSetupRequest,
+    ) -> Result<AccountRelayListStatus, AppError> {
+        // Discovery precedes default publication so existing relay lists are not clobbered.
+        let recent = bounded_advisory_step(
+            self.shared.observer.performance(),
+            ACCOUNT_DIRECTORY_PREFLIGHT_WAIT,
+            "login_directory_preflight",
+            self.preflight_existing_account_directory(
+                &account.account_id_hex,
+                directory_discovery_relays_for_setup(request),
+            ),
+        )
+        .await
+        .flatten();
+        self.setup_relay_lists_for_account(account, request, true, false, recent)
+            .await
+    }
+
+    async fn rebind_external_account(
+        &self,
+        mut account: AccountSummary,
+        public_key: nostr::prelude::PublicKey,
+        signer: ExternalSetupSigner,
+        request: AccountSetupRequest,
+    ) -> Result<AccountSetupResult, AppError> {
+        let reactivating = account.signed_out;
+        let native_adoption = match &signer {
+            ExternalSetupSigner::Nip46 {
+                session,
+                generation,
+            } => Some((session.clone(), *generation)),
+            ExternalSetupSigner::Host(_) => None,
+        };
+        let binding = self
+            .bind_external_signer(&account, public_key, signer)
+            .await?;
+        // A completed account owns no setup journal. Relay repair and signer adoption
+        // must not turn its maintenance work into first-time provisioning.
+        let adoption = async {
+            let relay_lists = self.resolve_external_relays(&account, &request).await?;
+            if account.signed_out {
+                account = self
+                    .app
+                    .account_home()
+                    .set_account_signed_out(&account.label, false)?;
+                self.app.presentation_signals.catalog_changed();
+            }
+            let key_package_bytes = if request.publish_initial_key_package {
+                Some(
+                    self.publish_initial_key_package_for_account(&account)
+                        .await?,
+                )
+            } else {
+                None
+            };
+            let _ = bounded_advisory_step(
+                self.shared.observer.performance(),
+                ACCOUNT_SETUP_ADVISORY_WAIT,
+                "login_directory_refresh",
+                self.app.directory().refresh_user_directory_for_account_id(
+                    &account.account_id_hex,
+                    directory_bootstrap_relays_for_setup(&request),
+                ),
+            )
+            .await;
+            self.retry_and_reconcile_for_account(&account.account_id_hex)
+                .await?;
+            Ok((relay_lists, key_package_bytes))
+        };
+        let adoption =
+            crate::Nip46Session::during_adoption(native_adoption.as_ref(), adoption).await;
+        match adoption {
+            Ok((relay_lists, key_package_bytes)) => Ok(AccountSetupResult {
+                account,
+                relay_lists,
+                key_package_bytes,
+                profile: None,
+                readiness: AccountSetupReadiness::NetworkReady,
+            }),
+            Err(error) => {
+                let restored = if reactivating && !account.signed_out {
+                    self.app
+                        .account_home()
+                        .set_account_signed_out(&account.label, true)
+                        .map(drop)
+                } else {
+                    Ok(())
+                };
+                let cleanup = if let Some(binding) = binding {
+                    blocking_app_task(move || {
+                        binding
+                            .session
+                            .unbind_account(
+                                &binding.previous,
+                                binding.previous_signer,
+                                binding.generation,
+                            )
+                            .map_err(AppError::from)
+                    })
+                    .await
+                } else {
+                    Ok(())
+                };
+                let reconciliation = if native_adoption.is_some() {
+                    self.reconcile_nip46_cleanup(&account.account_id_hex).await
+                } else {
+                    self.reconcile_for_account(&account.account_id_hex).await
+                };
+                restored?;
+                cleanup?;
+                reconciliation?;
+                Err(error)
+            }
+        }
     }
 
     pub async fn register_external_signer<S>(
@@ -9411,19 +9725,21 @@ impl AccountManager {
     fn rollback_external_signer_setup<T>(
         &self,
         label: &str,
-        created_account: bool,
-        upgraded_public_account: bool,
+        origin: ExternalSetupOrigin,
         err: AppError,
     ) -> Result<T, AppError> {
-        if created_account {
-            return self.rollback_account_after_setup_failure(label, err);
-        }
-        if upgraded_public_account {
-            let _ = self.app.account_home().complete_account_setup(label);
-            let _ = self
-                .app
-                .account_home()
-                .revert_external_signer_upgrade(label);
+        match origin {
+            ExternalSetupOrigin::Created => {
+                return self.rollback_account_after_setup_failure(label, err);
+            }
+            ExternalSetupOrigin::Promoted => {
+                self.erase_nip46_session(label, Nip46Removal::Recorded)?;
+                self.app.account_home().complete_account_setup(label)?;
+                self.app
+                    .account_home()
+                    .revert_external_signer_upgrade(label)?;
+            }
+            ExternalSetupOrigin::Existing => {}
         }
         Err(err)
     }
@@ -9437,6 +9753,7 @@ impl AccountManager {
         // storage/directory handles. Evict them before the directory is deleted
         // so a later re-import does not reuse a handle bound to the now-unlinked
         // inode. See `drop_account_caches` and mdk#220.
+        self.erase_nip46_session(account, Nip46Removal::Recorded)?;
         self.app.drop_account_caches(account);
         if let Err(rollback) = self.app.remove_account_key_package_artifacts(account) {
             return Err(AppError::RelayDirectory(format!(
@@ -9515,6 +9832,8 @@ impl AccountManager {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clear();
+        self.finish_nip46_adoptions(nip46::Nip46AdoptionScope::Runtime)
+            .await;
         self.app.stop_emoji_set_installs();
         for task in self.app.abort_all_public_indexer_copies() {
             let _ = task.await;
