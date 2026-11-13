@@ -822,7 +822,9 @@ impl Marmot {
     }
 
     /// Invite eligible accounts from `member_refs` and report each account's
-    /// resolution outcome. No eligible accounts means no operation or commit.
+    /// resolution outcome. A nonempty request with no eligible account creates
+    /// no operation or Commit. Empty requests and native membership-edit
+    /// refusals remain errors.
     pub async fn invite_members(
         &self,
         account_ref: String,

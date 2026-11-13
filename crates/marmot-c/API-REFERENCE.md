@@ -2713,7 +2713,7 @@ After a complete installed-list read, signs the proposed list before saving inst
 MarmotStatus marmot_invite_members(const struct MarmotClient *client, const char *account_ref, const char *group_id_hex, const char *const *member_refs, uintptr_t member_refs_len, struct MarmotInviteMembersResult **out);
 ```
 
-Invite available members (`npub` or hex account id) into one group Commit. Requires admin. Ordered outcomes report selection, not Welcome delivery. `summary` is NULL and no Commit is created for empty or all-unavailable input. Free the whole result with `marmot_invite_members_free`.
+Invite available members (`npub` or hex account id) into one group Commit. Requires admin. Ordered outcomes report selection, not Welcome delivery. `summary` is NULL and no Commit is created for nonempty all-unavailable input. Empty input and native membership-edit refusals remain errors. Free the whole result with `marmot_invite_members_free`.
 
 [Shared method and API guidance](../marmot-uniffi/API-REFERENCE.md#marmotinvite_members) · [Header contract](include/marmot.h#L8865)
 

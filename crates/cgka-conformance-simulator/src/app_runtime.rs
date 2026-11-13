@@ -3425,6 +3425,56 @@ mod tests {
         assert!(!paused, "maintenance must resume after the failed command");
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn member_refusals_are_atomic() {
+        let clients = vec!["alice".to_owned(), "bob".to_owned()];
+        let mut subject = AppRuntimeHarness::new_in_process_stress(&clients)
+            .await
+            .unwrap();
+        let ready = subject.participant("bob").unwrap().account_id.clone();
+        let participant = subject.participant("alice").unwrap();
+        let account = participant.account_id.clone();
+        let runtime = participant.runtime().unwrap();
+        let members = vec![
+            ready,
+            "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798".to_owned(),
+        ];
+        let create_category = runtime
+            .create_group(&account, "must not be created", &members, None)
+            .await
+            .map_err(app_error)
+            .err()
+            .map(|error| error.category);
+        let ParticipantApp::Local(app) = &participant.app else {
+            unreachable!("in-process fixture");
+        };
+        let after_create = app.groups(&account).unwrap();
+        let group = runtime
+            .create_group(&account, "invitation refusal", &[], None)
+            .await
+            .unwrap();
+        let before_invite = runtime.group_mls_state(&account, &group).await.unwrap();
+        let invite_category = runtime
+            .invite_members(&account, &group, &members)
+            .await
+            .map_err(app_error)
+            .err()
+            .map(|error| error.category);
+        let after_invite = runtime.group_mls_state(&account, &group).await.unwrap();
+        subject.shutdown().await.unwrap();
+
+        assert_eq!(
+            create_category,
+            Some(SubjectFailureCategory::ExpectedRefusal)
+        );
+        assert!(after_create.is_empty());
+        assert_eq!(
+            invite_category,
+            Some(SubjectFailureCategory::ExpectedRefusal)
+        );
+        assert_eq!(after_invite, before_invite);
+    }
+
     #[test]
     fn public_group_checkpoint_allows_maintenance_epochs_but_rejects_semantic_drift() {
         let members = vec!["alice".into(), "bob".into()];

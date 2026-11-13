@@ -12,8 +12,8 @@ use std::path::PathBuf;
 use cgka_traits::{GroupId, TransportEndpoint};
 use marmot_account::AccountHome;
 use marmot_app::{
-    AccountSetupRequest, AppError, AppMessageQuery, MarmotApp, MarmotAppConfig, MarmotAppRuntime,
-    SendSummary,
+    AccountSetupRequest, AppCreateGroupOptions, AppError, AppMessageQuery, MarmotApp,
+    MarmotAppConfig, MarmotAppRuntime, MemberResolutionPolicy, SendSummary,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -460,7 +460,15 @@ impl NodeServer {
             } => {
                 let group_id = state
                     .runtime
-                    .create_group(&state.account_id, &name, &member_accounts, None)
+                    .create_group_with_options(
+                        &state.account_id,
+                        &name,
+                        &member_accounts,
+                        AppCreateGroupOptions {
+                            member_resolution: MemberResolutionPolicy::Atomic,
+                            ..Default::default()
+                        },
+                    )
                     .await
                     .and_then(crate::app_runtime::require_member_operation)
                     .map_err(app_node_error)?;
@@ -480,7 +488,13 @@ impl NodeServer {
                 let group_id = active_group(state)?;
                 let summary = state
                     .runtime
-                    .invite_members(&state.account_id, &group_id, &member_accounts)
+                    .invite_members_with_initial_admins(
+                        &state.account_id,
+                        &group_id,
+                        &member_accounts,
+                        &[],
+                        MemberResolutionPolicy::Atomic,
+                    )
                     .await
                     .and_then(crate::app_runtime::require_member_operation)
                     .map_err(app_node_error)?;

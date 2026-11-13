@@ -3,8 +3,9 @@ use super::process_io::{ProcessClient, WireError};
 use cgka_traits::engine::GroupEvent;
 use cgka_traits::{GroupId, MessageId};
 use marmot_app::{
-    AppError, AppGroupMemberRecord, AppGroupMlsState, AppGroupRecord, AppMessageQuery,
-    AppPerformanceSnapshot, AppStatus, GroupRecoveryStatus, MarmotApp, MarmotAppRuntime,
+    AppCreateGroupOptions, AppError, AppGroupMemberRecord, AppGroupMlsState, AppGroupRecord,
+    AppMessageQuery, AppPerformanceSnapshot, AppStatus, GroupRecoveryStatus, MarmotApp,
+    MarmotAppRuntime, MemberResolutionPolicy,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -13,16 +14,6 @@ use std::sync::{Arc, Mutex};
 pub(crate) fn require_member_operation<T>(
     result: marmot_app::GroupMemberResult<T>,
 ) -> Result<T, AppError> {
-    if result
-        .member_outcomes
-        .iter()
-        .any(|outcome| outcome.status != marmot_app::MemberResolutionStatus::Selected)
-    {
-        return Err(AppError::Io(std::io::Error::other(format!(
-            "scenario member resolution incomplete: {:?}",
-            result.member_outcomes
-        ))));
-    }
     result.operation.ok_or_else(|| {
         AppError::Io(std::io::Error::other(
             "scenario member operation unavailable",
@@ -270,9 +261,19 @@ impl ParticipantRuntime {
         description: Option<String>,
     ) -> Result<GroupId, AppError> {
         match self {
-            Self::Local(r) => {
-                require_member_operation(r.create_group(account, name, members, description).await?)
-            }
+            Self::Local(r) => r
+                .create_group_with_options(
+                    account,
+                    name,
+                    members,
+                    AppCreateGroupOptions {
+                        description: description.unwrap_or_default(),
+                        member_resolution: MemberResolutionPolicy::Atomic,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .and_then(require_member_operation),
             Self::Remote(p) => p
                 .call_async("create_group", json!([account, name, members, description]))
                 .await
@@ -387,7 +388,13 @@ impl ParticipantRuntime {
     ) -> Result<SendReceipt, AppError> {
         match self {
             Self::Local(r) => r
-                .invite_members(account, group, members)
+                .invite_members_with_initial_admins(
+                    account,
+                    group,
+                    members,
+                    &[],
+                    MemberResolutionPolicy::Atomic,
+                )
                 .await
                 .and_then(require_member_operation)
                 .map(Into::into),
@@ -678,8 +685,17 @@ impl ParticipantServer {
                     Option<String>,
                 ) = args(arguments)?;
                 value(require_member_operation(
-                    r.create_group(&account, &name, &members, description)
-                        .await?,
+                    r.create_group_with_options(
+                        &account,
+                        &name,
+                        &members,
+                        AppCreateGroupOptions {
+                            description: description.unwrap_or_default(),
+                            member_resolution: MemberResolutionPolicy::Atomic,
+                            ..Default::default()
+                        },
+                    )
+                    .await?,
                 )?)
             }
             "group_members" => {
@@ -732,7 +748,14 @@ impl ParticipantServer {
             "invite_members" => {
                 let (account, group, members): (String, GroupId, Vec<String>) = args(arguments)?;
                 value(SendReceipt::from(require_member_operation(
-                    r.invite_members(&account, &group, &members).await?,
+                    r.invite_members_with_initial_admins(
+                        &account,
+                        &group,
+                        &members,
+                        &[],
+                        MemberResolutionPolicy::Atomic,
+                    )
+                    .await?,
                 )?))
             }
             "remove_members" => {

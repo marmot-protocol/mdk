@@ -8714,6 +8714,9 @@ async fn partial_invite_route_retry() {
     assert_eq!(roster, expected);
     let after_epoch = client.group_mls_state(&group).unwrap().epoch;
     assert_eq!(after_epoch, before_epoch + 1);
+    let before_refusal = client.group_mls_state(&group).unwrap();
+    client.invite_members(&group, &refs).await.unwrap_err();
+    assert_eq!(client.group_mls_state(&group).unwrap(), before_refusal);
     let none = client
         .invite_members(&group, &[missing.as_str()])
         .await
@@ -8728,9 +8731,7 @@ async fn partial_invite_route_retry() {
         }]
     );
     assert_eq!(client.group_mls_state(&group).unwrap().epoch, after_epoch);
-    let empty = client.invite_members(&group, &[]).await.unwrap();
-    assert_eq!(empty.operation, None);
-    assert!(empty.member_outcomes.is_empty());
+    client.invite_members(&group, &[]).await.unwrap_err();
     assert_eq!(client.group_mls_state(&group).unwrap().epoch, after_epoch);
     fetcher
         .events

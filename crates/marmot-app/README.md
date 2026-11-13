@@ -369,11 +369,13 @@ operation. If a nonempty roster has no eligible account, `operation` is `None` a
 An explicitly empty create still creates a creator-only group.
 
 Invalid input, self-inclusion, invalid admin intent, and authorization failures remain whole-operation errors.
+Empty invitations and invitations that add no device remain errors, even when another requested account is unavailable.
 Storage failures propagate instead of being classified as unavailable recipients. Initial admins must belong to the
 requested roster, but only selected accounts receive their requested role.
 `AppCreateGroupOptions::member_resolution` defaults to `Partial`; `Atomic` rejects the entire roster on its first
 recipient failure. `invite_members_with_initial_admins` takes the same policy explicitly. `start_direct_conversation`
 and stable agent-control v2 creation/invitation use atomic resolution, preserving their existing failure behavior.
+Simulator app/process membership actions also use atomic resolution before mutating their tracked groups.
 
 - Cached packages are useful for discovery, but cannot authorize an invitation or substitute for a failed relay lookup.
   This also applies to another account on the same installation: its local package record is not an invitation

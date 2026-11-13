@@ -3224,7 +3224,7 @@ impl AppClient {
             member_outcomes,
             ..
         } = key_packages?;
-        if key_packages.is_empty() {
+        if !member_refs.is_empty() && key_packages.is_empty() {
             return Ok(crate::GroupMemberResult {
                 operation: None,
                 member_outcomes,
