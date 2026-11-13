@@ -5602,6 +5602,68 @@ impl AppClient {
         Ok(summary)
     }
 
+    /// Drop a failed own send from this device without publishing anything;
+    /// see [`crate::MarmotAppRuntime::discard_failed_send`].
+    pub(crate) fn discard_failed_send_with_local_projection<F>(
+        &mut self,
+        group_id: &GroupId,
+        message_id_hex: &str,
+        mut on_projection: F,
+    ) -> Result<crate::DiscardFailedSendResult, AppError>
+    where
+        F: FnMut(crate::AppProjectionUpdate),
+    {
+        let result = |outcome, media_ciphertext_sha256| crate::DiscardFailedSendResult {
+            outcome,
+            media_ciphertext_sha256,
+        };
+        let group_id_hex = hex::encode(group_id.as_slice());
+        let failed = self
+            .app
+            .account_storage(&self.state.label)?
+            .app_storage()
+            .timeline_message(&group_id_hex, message_id_hex)?
+            .is_some_and(|row| {
+                row.direction == "sent"
+                    && row.source_message_id_hex.is_none()
+                    && row.invalidation_status.as_deref()
+                        == Some(crate::LOCAL_PUBLISH_FAILED_REASON)
+            });
+        if !failed {
+            return Ok(result(
+                crate::DiscardFailedSendOutcome::NotFailedSend,
+                Vec::new(),
+            ));
+        }
+        // A failed verdict is not always final: an intent the engine still
+        // queues, or a fanout it still retries, can publish the message later
+        // (`revive_published_local_send`). The engine cannot cancel one, so
+        // discard waits until the group's sends settle.
+        if self.runtime.has_queued_outbound_intents(group_id)?
+            || self.runtime.has_pending_outbound_fanouts(group_id)?
+        {
+            return Ok(result(
+                crate::DiscardFailedSendOutcome::StillSending,
+                Vec::new(),
+            ));
+        }
+        Ok(
+            match self
+                .app
+                .discard_failed_send(&self.state.label, &group_id_hex, message_id_hex)?
+            {
+                Some((media_ciphertext_sha256, update)) => {
+                    on_projection(update);
+                    result(
+                        crate::DiscardFailedSendOutcome::Discarded,
+                        media_ciphertext_sha256,
+                    )
+                }
+                None => result(crate::DiscardFailedSendOutcome::NotFailedSend, Vec::new()),
+            },
+        )
+    }
+
     /// Submit exactly the selected composer revision. Media references must be
     /// prepared in selected attachment order. Durable outbox acceptance clears
     /// only that revision; a later delivery error does not restore the composer.

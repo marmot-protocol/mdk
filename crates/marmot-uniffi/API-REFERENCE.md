@@ -2913,6 +2913,18 @@ Mark `target_message_id` deleted for the whole group. This is a tombstone — th
 
 [Source](src/commands/message.rs#L153)
 
+### `Marmot::discard_failed_send`
+
+**Current.**
+
+```rust
+pub async fn discard_failed_send( &self, account_ref: String, group_id_hex: String, message_id_hex: String, ) -> Result<DiscardFailedSendResultFfi, MarmotKitError>
+```
+
+Remove a failed own send from this device without publishing anything. Offer it, instead of `delete_message`, on a row whose `invalidation_status` is `local_publish_failed`: a delete would tell the group about a message nobody received. `Discarded` securely deletes the row, its edits and its media references, and timeline subscribers receive the row's removal with reason `Cleared`; purge `media_ciphertext_sha256` from any decrypted-media cache. `StillSending` means the group has a send the engine may still publish, which could be this one, so nothing changed: keep the row and offer the action again later. `NotFailedSend` means the row was delivered, is still pending, was confirmed by a peer's reaction, or is already gone.
+
+[Source](src/commands/message.rs#L174)
+
 ### `Marmot::secure_delete_expired`
 
 **Current.**
@@ -2923,7 +2935,7 @@ pub async fn secure_delete_expired( &self, account_ref: String, group_id_hex: St
 
 Securely scrub and prune expired disappearing-message plaintext for a group according to its active retention component. The media hash list identifies pruned encrypted-media blobs so host apps can purge their own decrypted-media disk caches keyed by ciphertext hash.
 
-[Source](src/commands/message.rs#L171)
+[Source](src/commands/message.rs#L192)
 
 ### `Marmot::sweep_expired_retention`
 
@@ -2935,7 +2947,7 @@ pub async fn sweep_expired_retention( &self, account_ref: String, now_ms: u64, )
 
 Run the engine-owned disappearing-message sweep for one account using the supplied Unix wall-clock time in milliseconds. Each group reports pruning, a fail-closed deferral, or a privacy-safe failure category.
 
-[Source](src/commands/message.rs#L187)
+[Source](src/commands/message.rs#L208)
 
 ### `Marmot::edit_message`
 
@@ -2947,7 +2959,7 @@ pub async fn edit_message( &self, account_ref: String, group_id_hex: String, tar
 
 Edit `target_message_id` by publishing a kind-1009 event that references it and carries the replacement plaintext in `content`. Recipients honour the edit only when its authenticated author matches the target's author; MDK ignores mismatched edits. It returns `InvalidEditTarget`, publishing nothing, unless the target is an available chat message this account sent. Competing edits resolve by `created_at`, then the larger event id.
 
-[Source](src/commands/message.rs#L211)
+[Source](src/commands/message.rs#L232)
 
 ### `Marmot::send_custom_event`
 
@@ -2959,7 +2971,7 @@ pub async fn send_custom_event( &self, account_ref: String, group_id_hex: String
 
 Send an app-defined event with an arbitrary non-reserved kind. `tags` and `content` pass through verbatim; kinds MDK owns (chat, reaction, edit, delete, agent, group system, push token, device group: 457, 458, 459, 460, 461, 473, 475, 476) are rejected so an app cannot forge protocol events. Custom events appear in the timeline as standalone rows and can be fetched via `Marmot::messages` with a `kinds` filter.
 
-[Source](src/commands/message.rs#L232)
+[Source](src/commands/message.rs#L253)
 
 ### `Marmot::create_poll`
 
@@ -2975,7 +2987,7 @@ poll projection. Creation follows MDK's canonical conversation classification: n
 groups, while unnamed two-member conversations are direct. Polls are neither anonymous nor election-grade. See
 [Polls](POLLS.md).
 
-[Source](src/commands/message.rs#L250)
+[Source](src/commands/message.rs#L271)
 
 ### `Marmot::cast_poll_vote`
 
@@ -2990,7 +3002,7 @@ or one through ten unique ids for multiple choice; use the ids from `TimelineMes
 This is a replacement, not a delta or unvote. MDK revalidates the poll against the response event's actual timestamp at
 send time, and an accepted open poll remains votable after conversation reclassification. See [Polls](POLLS.md).
 
-[Source](src/commands/message.rs#L275)
+[Source](src/commands/message.rs#L296)
 
 ### `Marmot::message_reactions`
 
@@ -3031,7 +3043,7 @@ pub fn messages( &self, account_ref: String, group_id_hex: Option<String>, limit
 
 Initial history fetch for a group (or, when `group_id_hex` is None, the account-wide tail). Used to populate the conversation view before the subscription stream takes over.
 
-[Source](src/commands/message.rs#L296)
+[Source](src/commands/message.rs#L317)
 
 </details>
 
@@ -4452,7 +4464,7 @@ pub fn new_with_configuration( root_path: String, relay_urls: Vec<String>, optio
 
 Open with any combination of runtime options, including the required deployment. The other constructors are wrappers around this entry point and take the deployment as their last argument.
 
-[Source](src/lib.rs#L338)
+[Source](src/lib.rs#L339)
 
 ### `Marmot::new_with_experimental_device_groups`
 
@@ -4462,7 +4474,7 @@ pub fn new_with_experimental_device_groups( root_path: String, relay_urls: Vec<S
 
 Open a controlled development build with device-group capability and explicit runtime intent. The library must enable `dev-device-groups`; otherwise it returns Runtime with `experimental_device_groups_unavailable` before opening the root or acquiring host secret storage. It takes the same `MarmotOptions` and required deployment as `new_with_configuration`, preserving their ordinary meanings and ownership. Ordinary constructors remain disabled even in a capable library. Use this constructor for every foreground/background opener of the experimental root, a notification service extension included: an ordinary constructor does not open an account that holds or is joining a device group and reports Runtime with `experimental_device_groups_required`; see the [shared host test-build guidance](README.md#experimental-device-group-test-builds). Production timing is unchanged. This is not release activation or proof of mobile artifact/device validation.
 
-[Source](src/lib.rs#L353)
+[Source](src/lib.rs#L354)
 
 ### `Marmot::new_with_options`
 
@@ -4474,7 +4486,7 @@ pub fn new_with_options( root_path: String, relay_urls: Vec<String>, relay_polic
 
 Open with an explicit relay policy and optional host-owned key storage. Existing constructors retain their public-only relay policy.
 
-[Source](src/lib.rs#L364)
+[Source](src/lib.rs#L365)
 
 ### `Marmot::new`
 
@@ -4486,7 +4498,7 @@ pub fn new( root_path: String, relay_urls: Vec<String>, deployment: MarmotDeploy
 
 Open the Marmot app at `root_path`, configured with the given default relay URLs and `deployment`. Account secrets (Nostr private keys) are stored in the platform keyring (Keychain on Apple platforms, Android's native keyring on Android) under the deployment's `keychain_service` — not in a plaintext file. Fallible because initializing the platform secret store can fail or another process may own the same root (`MarmotKitError::RuntimeBusy`). Root ownership is nonblocking and remains held until the final `Marmot`/runtime handle is dropped, even after `Marmot::shutdown`. Call `Marmot::start` before subscribing to events.
 
-[Source](src/lib.rs#L393)
+[Source](src/lib.rs#L394)
 
 ### `Marmot::new_with_secret_store`
 
@@ -4498,7 +4510,7 @@ pub fn new_with_secret_store( root_path: String, relay_urls: Vec<String>, secret
 
 Open the Marmot app with host-supplied account-secret storage instead of the platform keychain. Identical to `Marmot::new` except that every read, write, and removal of an account signing key goes through `secret_store`.
 
-[Source](src/lib.rs#L419)
+[Source](src/lib.rs#L420)
 
 ### `Marmot::new_with_cursor_persistence`
 
@@ -4510,7 +4522,7 @@ pub fn new_with_cursor_persistence( root_path: String, relay_urls: Vec<String>, 
 
 Construct with explicit advancing/frozen relay cursor behavior; new_with_configuration composes this with other options.
 
-[Source](src/lib.rs#L450)
+[Source](src/lib.rs#L451)
 
 ### `Marmot::new_with_client_name`
 
@@ -4522,7 +4534,7 @@ pub fn new_with_client_name( root_path: String, relay_urls: Vec<String>, client_
 
 Open with an optional public client label for new KeyPackage publications. Existing constructors remain untagged. Whitespace-only labels, and labels longer than 64 bytes once trimmed, are omitted rather than truncated. Hosts must supply this on every foreground/background runtime construction.
 
-[Source](src/lib.rs#L471)
+[Source](src/lib.rs#L472)
 
 ### `Marmot::start`
 
@@ -4534,7 +4546,7 @@ pub async fn start(&self) -> Result<(), MarmotKitError>
 
 Bring the runtime to local readiness.
 
-[Source](src/lib.rs#L509)
+[Source](src/lib.rs#L510)
 
 ### `Marmot::shutdown`
 
@@ -4546,7 +4558,7 @@ pub async fn shutdown(&self)
 
 Tear the runtime down. Drops all subscriptions; long-lived `EventsSubscription` / `ChatsSubscription` / etc. instances on the host side will see their `next()` return `None` shortly after.
 
-[Source](src/lib.rs#L521)
+[Source](src/lib.rs#L522)
 
 ### `Marmot::shutdown_and_close`
 
@@ -4558,7 +4570,7 @@ pub async fn shutdown_and_close(&self) -> Result<(), MarmotKitError>
 
 Terminally stop work, close storage and release root ownership; reconstruct before further reads/work.
 
-[Source](src/lib.rs#L557)
+[Source](src/lib.rs#L558)
 
 ### `Marmot::storage_is_closed`
 
@@ -4570,7 +4582,7 @@ pub fn storage_is_closed(&self) -> bool
 
 True once `Marmot::shutdown_and_close` has closed the store. A host can check this to confirm it is safe to be suspended, or to notice it is holding a spent handle and needs a fresh one.
 
-[Source](src/lib.rs#L565)
+[Source](src/lib.rs#L566)
 
 ### `Marmot::is_stopping`
 
@@ -4582,7 +4594,7 @@ pub fn is_stopping(&self) -> bool
 
 True once shutdown has started. Host apps can use this to avoid launching more subscriptions or account work while they are moving to the background.
 
-[Source](src/lib.rs#L572)
+[Source](src/lib.rs#L573)
 
 </details>
 
@@ -6015,4 +6027,3 @@ Attempt bounded remote courtesy logout and erase the session's communication cre
 [Source](src/nip46.rs#L241)
 
 </details>
-

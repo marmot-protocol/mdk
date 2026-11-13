@@ -4,8 +4,8 @@ use marmot_app::AppMessageQuery;
 
 use crate::Marmot;
 use crate::conversions::{
-    AppMessageRecordFfi, PollTypeFfi, RetentionSweepReportFfi, SecureDeleteExpiredResultFfi,
-    SendSummaryFfi, StickerRefFfi, group_id_from_hex,
+    AppMessageRecordFfi, DiscardFailedSendResultFfi, PollTypeFfi, RetentionSweepReportFfi,
+    SecureDeleteExpiredResultFfi, SendSummaryFfi, StickerRefFfi, group_id_from_hex,
 };
 use crate::errors::MarmotKitError;
 use crate::optional_group_id_hex;
@@ -162,6 +162,27 @@ impl Marmot {
             .delete_message(&account_ref, &group_id, &target_message_id)
             .await?;
         Ok(summary.into())
+    }
+
+    /// Remove a failed own send from this device without publishing anything.
+    /// Use it, not `delete_message`, for a message whose timeline row reports
+    /// `invalidation_status == "local_publish_failed"`: a delete would tell
+    /// the group about a message nobody received. `StillSending` means the
+    /// group has a send the engine may still publish, so nothing changed;
+    /// `NotFailedSend` means the row is not a failed own send. On `Discarded`,
+    /// timeline subscribers receive the row's removal with reason `Cleared`.
+    pub async fn discard_failed_send(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+        message_id_hex: String,
+    ) -> Result<DiscardFailedSendResultFfi, MarmotKitError> {
+        let group_id = group_id_from_hex(&group_id_hex)?;
+        let result = self
+            .runtime
+            .discard_failed_send(&account_ref, &group_id, &message_id_hex)
+            .await?;
+        Ok(result.into())
     }
 
     /// Securely scrub and prune expired disappearing-message plaintext for a

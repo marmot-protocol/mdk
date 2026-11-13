@@ -4297,6 +4297,31 @@ impl MarmotAppRuntime {
             .await
     }
 
+    /// Drop a failed own send from this device, publishing nothing. Use this,
+    /// not [`Self::delete_message`], to remove a message that never left the
+    /// device: a delete would tell the group about a message nobody received.
+    ///
+    /// Only a row that reports `local_publish_failed` qualifies; anything else
+    /// returns [`DiscardFailedSendOutcome::NotFailedSend`] and changes nothing.
+    /// While the group still has a send the engine may publish, the call
+    /// returns [`DiscardFailedSendOutcome::StillSending`], because that send
+    /// could be this one. A discarded send's row, edits and media references
+    /// are securely deleted, and subscribers receive the row's removal with
+    /// reason `Cleared`.
+    ///
+    /// [`DiscardFailedSendOutcome::NotFailedSend`]: crate::DiscardFailedSendOutcome::NotFailedSend
+    /// [`DiscardFailedSendOutcome::StillSending`]: crate::DiscardFailedSendOutcome::StillSending
+    pub async fn discard_failed_send(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+        message_id_hex: &str,
+    ) -> Result<crate::DiscardFailedSendResult, AppError> {
+        self.accounts
+            .discard_failed_send(account_ref, group_id, message_id_hex)
+            .await
+    }
+
     /// Edit a prior message: publish a kind-1009 event whose single `e` tag
     /// references `target_message_id` and whose content is the replacement
     /// text. Recipients honor an edit only when its authenticated author
