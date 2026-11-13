@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Fixed
+
+- `NotificationUpdate.is_dm` follows the chat-list conversation kind for
+  messages, group-state notices, and invitations, including pending DM
+  Welcomes. Named chats and unknown roster projections remain non-DM
+  (mdk#2773).
+
 ## 0.16.0 - 2026-11-12
 
 ### Breaking changes
