@@ -1929,7 +1929,7 @@ The host then calls `post_audit_log_tracker_update_v5()`, in place of
 audit tracker also uses this configuration on its activity triggers with the usual batching,
 retry, and shutdown behavior. The v5 result reports accepted batches, pending accounts, blocked
 accounts, and idle accounts separately from legacy v4 uploads. No host should infer receiver
-acceptance from an empty v4 `uploaded` list. The v4 whole-file Goggles endpoint never receives
+acceptance from an empty v4 `uploaded` list. The legacy v4 whole-file endpoint never receives
 v5 records.
 
 `audit_delivery_status_v5()` returns one `AuditDeliveryStatusV5Ffi` per account so a host can
@@ -1974,7 +1974,7 @@ and its `deviceLabel`. The versioned config type changes the setter ABI checksum
 silently reinterpret a device label as a hardware model.
 Populate this field from system model information (e.g. `iPhone17,3` or `Pixel 9a`), never from a device name,
 hostname or serial number. Omit it if unavailable. Platform and app version are unchanged.
-Uploads of leftover v4 files still need a v4-compatible Goggles endpoint; new evidence goes to v5.
+Uploads of leftover v4 files still need a v4-compatible whole-file endpoint; new evidence goes to v5.
 
 Native metadata lift/lower checks: `./crates/marmot-uniffi/audit-v4-smoke.sh swift` and
 `MDK_KOTLIN_CLASSPATH=<JNA:Android:annotations:coroutines jars> ./crates/marmot-uniffi/audit-v4-smoke.sh kotlin`.

@@ -437,8 +437,8 @@ These are the scenarios another implementation should be able to load from JSON 
 
 ## Incident-Replay Vectors
 
-These vectors are synthesized from Goggles `agent-state.json` forensic exports by the `incident-replay` adapter, then
-verified against the simulator before they are committed. They live under `vectors/incidents/`, and
+These vectors were synthesized from forensic exports of real incidents by the former `incident-replay` adapter (removed
+with the audit service those exports came from), then verified against the simulator before they were committed. They live under `vectors/incidents/`, and
 `canonical_vector_fixtures_match_generated_traces` in `tests/canonical_scenarios.rs` runs them alongside the top-level
 portable vectors.
 

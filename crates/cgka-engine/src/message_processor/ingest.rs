@@ -751,8 +751,8 @@ impl<S: StorageProvider> Engine<S> {
         // Plain decrypt misses are expected for future epochs, pre-join
         // messages, and retained-snapshot fallback. The terminal state
         // transition below is the useful audit breadcrumb for no-snapshot
-        // deferrals; logging every raw miss here swamps Goggles with
-        // routine retry noise.
+        // deferrals; logging every raw miss here swamps the audit receiver
+        // with routine retry noise.
         if !matches!(&peel_result, Err(PeelerError::DecryptFailed)) {
             let raw_outcome = match &peel_result {
                 Ok(_) => marmot_forensics::PeelerOutcomeKind::Success,

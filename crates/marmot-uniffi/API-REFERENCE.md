@@ -916,7 +916,7 @@ Persist the local audit retention policy and return the stored value, with `max_
 pub fn set_audit_log_tracker_config( &self, config: AuditLogTrackerConfigV4Ffi, ) -> Result<AuditLogTrackerConfigV4Ffi, MarmotKitError>
 ```
 
-Supply non-persisted audit tracker upload metadata: optional Goggles upload URL override, bearer token from the host app, and optional system hardware model, platform, and app version.
+Supply non-persisted audit tracker upload metadata: optional legacy v4 whole-file upload URL override, bearer token from the host app, and optional system hardware model, platform, and app version.
 
 [Source](src/commands/audit.rs#L64)
 
@@ -5337,7 +5337,7 @@ Run an immediate audit tracker pass and receive separate v4 whole-file and v5 OT
 pub fn set_audit_otlp_config_v5( &self, mut config: AuditOtlpConfigV5Ffi, ) -> Result<AuditOtlpConfigV5Ffi, MarmotKitError>
 ```
 
-Install or remove an in-memory v5 OTLP audit destination. With `enabled: true`, provide a stable destination identity, an HTTPS `/v1/logs` endpoint, and a bearer token; local loopback testing additionally requires `allow_loopback_dev: true`. The returned configuration always omits the token. With `enabled: false`, the runtime clears the sender. This does not enable recording, change the v4 Goggles route, or persist credentials. A configuration change fences in-flight acknowledgments.
+Install or remove an in-memory v5 OTLP audit destination. With `enabled: true`, provide a stable destination identity, an HTTPS `/v1/logs` endpoint, and a bearer token; local loopback testing additionally requires `allow_loopback_dev: true`. The returned configuration always omits the token. With `enabled: false`, the runtime clears the sender. This does not enable recording, change the legacy v4 whole-file route, or persist credentials. A configuration change fences in-flight acknowledgments.
 
 [Source](src/commands/audit.rs#L75)
 

@@ -155,10 +155,10 @@ pub(crate) const EPOCH_STALL_ESCALATION_ARM_THRESHOLD: u32 = 3;
 /// later replay. Both are time-shaped, which is why the pacing is a clock and
 /// not a count.
 ///
-/// One hour, cited to `CATCH_UP_GRACE_MS`
-/// (`crates/incident-replay/src/classify.rs`), which already answers almost
-/// exactly this question — how long being behind stops being ordinary catch-up
-/// — and records a measured insensitivity plateau across [15 min, ~6 h]. Safety
+/// One hour, matching the catch-up grace of the former `incident-replay`
+/// classifier (`CATCH_UP_GRACE_MS`), which answered almost exactly this
+/// question — how long being behind stops being ordinary catch-up
+/// — and measured an insensitivity plateau across [15 min, ~6 h]. Safety
 /// is structural on both sides: too low costs extra whole-account replays,
 /// which is the same operation a key-package publish already performs and is
 /// separately bounded by the fruitless-replay retry cooldown; too high only
@@ -181,7 +181,7 @@ pub(crate) const EPOCH_STALL_WEDGE_REARM_INTERVAL_MS: u64 = 60 * 60 * 1_000;
 /// length is what keeps the field shape — the 2026-07-29 cohort ran for hours —
 /// while making a weeks-later arm start fresh.
 ///
-/// Twenty-four hours, sized off the same incident-replay cohort
+/// Twenty-four hours, sized off the same incident cohort
 /// `EPOCH_STALL_WEDGE_REARM_INTERVAL_MS` cites: its real incidents stayed
 /// behind 6 h and 18 h, so a genuine long stall stays one run.
 ///

@@ -86,4 +86,5 @@ Hosts enable the first two on `marmot-app`, whose features of the same names for
   for the app-side tests, and CI's "Test consent and both diagnostic exporters" commands.
 - `cargo clippy -p marmot-observability --all-targets --all-features --locked -- -D warnings`; a change to a `pub` item
   `marmot-app` uses runs CI's workspace lint once (root `AGENTS.md`).
-- Audit OTLP envelope changes also run `just audit-otlp-receiver-contract`.
+- Audit OTLP envelope changes are a contract change for the White Noise audit receiver in
+  `internet-privacy/whitenoise-data`; see [Downstream: whitenoise-data](../../docs/marmot-architecture/audit-logging.md#downstream-whitenoise-data).

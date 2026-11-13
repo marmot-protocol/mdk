@@ -360,8 +360,8 @@ multi-group isolation, and late Welcome backfill. Other directories:
 
 - [`vectors/byte-fixtures/`](vectors/byte-fixtures/) — first app-component byte fixtures, following
   [`schema.v1.json`](vectors/byte-fixtures/schema.v1.json). There is not yet a full byte-level wire-event suite.
-- [`vectors/incidents/`](vectors/incidents/) — vectors synthesized from Goggles forensic exports by
-  [`incident-replay`](../incident-replay/) and verified against the simulator before commit.
+- [`vectors/incidents/`](vectors/incidents/) — vectors synthesized from forensic exports of real incidents by the former
+  `incident-replay` adapter and verified against the simulator before commit.
 - [`vectors/generated-inputs/`](vectors/generated-inputs/) — subject-pinned saved generated inputs, outside the manifest
   and `VectorFixture` discovery (see [saved generated inputs](#saved-generated-inputs-and-adapter-overrides)).
 

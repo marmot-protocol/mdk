@@ -208,7 +208,7 @@ pub(crate) fn row_state_is_awaiting_retry(state: Option<MessageState>) -> bool {
 ///
 /// They differ only for a past-epoch commit on direct ingest: the row keeps the
 /// epoch the commit forks from, while `MessageStateChanged.epoch` must keep
-/// saying where this engine was — `incident-replay` folds that field into an
+/// saying where this engine was — audit analysis folds that field into an
 /// engine's current position and reads a drop as a rollback.
 #[derive(Clone, Copy)]
 pub(crate) struct RowEpochs {
@@ -829,7 +829,7 @@ impl<S: StorageProvider> Engine<S> {
     /// Only past-epoch commits on direct ingest need them apart: the row must
     /// carry the epoch the commit forks from (see the commit-row rule in
     /// `AGENTS.md`), while the forensic trail must keep saying where this engine
-    /// was when it handled the message — `incident-replay` folds
+    /// was when it handled the message — audit analysis folds
     /// `MessageStateChanged.epoch` into an engine's current position and reads a
     /// drop as a rollback.
     pub(crate) fn persist_openmls_wire_message_with_processed_transport_id_at(

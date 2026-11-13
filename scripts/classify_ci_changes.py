@@ -99,7 +99,6 @@ INDEPENDENT_WORKSPACE_CRATES = {
     "agent-control",
     "agent-stream-compose",
     "cli",
-    "incident-replay",
 }
 
 CLASSIFIED_WORKSPACE_CRATES = (
