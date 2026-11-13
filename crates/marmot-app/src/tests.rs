@@ -1678,7 +1678,11 @@ impl NostrRelayClient for ScriptedPushRelayClient {
                         .iter()
                         .cloned()
                         .map(|endpoint| cgka_traits::TransportEndpointFailure {
-                            pre_send: false,
+                            // The relay cannot be reached, so nothing was
+                            // sent, as the SDK client reports a failed
+                            // connect. Without the proof, the failure would
+                            // read as a relay's retryable answer (mdk#2332).
+                            pre_send: true,
                             size_class: None,
                             endpoint,
                             reason: "relay unavailable".into(),
