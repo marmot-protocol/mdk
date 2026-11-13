@@ -161,7 +161,7 @@ still land on the same epoch and group state. The engine — not relay order or 
 | | [`marmot-markdown`](crates/marmot-markdown/README.md) | Odin CommonMark + Nostr parser with a Rust AST bridge |
 | | [`marmot-markdown-ast`](crates/marmot-markdown-ast/README.md) | Owned Markdown types and serde implementations; compiled alongside the native parser |
 | | [`marmot-forensics`](crates/marmot-forensics/README.md) | Append-only JSONL forensic audit schema |
-| Bindings | [`marmot-uniffi`](crates/marmot-uniffi/README.md) | MarmotKit: Swift and Kotlin bindings |
+| Bindings | [`marmot-uniffi`](crates/marmot-uniffi/README.md) | MarmotKit: Swift and Kotlin bindings; [native-host test recipe](crates/marmot-uniffi/NATIVE-HOST-TESTS.md) |
 | | [`marmot-uniffi-macros`](crates/marmot-uniffi-macros/README.md) | Runs MarmotKit's async exports on its own Tokio runtime |
 | | [`marmot-c`](crates/marmot-c/README.md) | C ABI bindings |
 | Front ends | [`cli`](crates/cli/README.md) (`wn-cli`) | `wn`, `wnd`, and `wn tui` |
