@@ -6199,6 +6199,74 @@ async fn dropped_cancel_after_reaper_finishes_still_cleans_up_and_restarts() {
     runtime.shutdown_and_close().await.unwrap();
 }
 
+/// mdk#3318: a cancellation dropped while onboarding reaps its worker leaves
+/// that worker retiring outside `worker_reapers`, with the account signed
+/// out. A direct group write for the account refuses, with nothing written,
+/// until that reap finishes, so it never lands beside a worker that may
+/// still save the group's record.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn direct_group_write_refuses_while_onboarding_reaps_the_worker() {
+    let (_dir, runtime, _network, _keys, id) = fixture().await;
+    let manager = runtime.accounts();
+    manager
+        .app
+        .account_home()
+        .set_account_signed_out(&id, false)
+        .unwrap();
+    let mut c = manager
+        .setup_records()
+        .onboarding_checkpoint(&id)
+        .unwrap()
+        .unwrap();
+    c.set(
+        OnboardingStep::KeyPackage,
+        OnboardingStatus::Checking,
+        vec![],
+    );
+    manager.account_setup().save_onboarding(&mut c).unwrap();
+    manager.reconcile().await.unwrap();
+    assert!(manager.onboarding_worker_tracked(&id).await);
+    let hold = manager
+        .account_setup()
+        .install_onboarding_worker_reap_hold();
+    let cancel = tokio::spawn({
+        let manager = manager.clone();
+        let account = id.clone();
+        async move { manager.account_setup().cancel_onboarding(&account).await }
+    });
+    hold.wait_until_entered().await;
+    cancel.abort();
+    let _ = cancel.await;
+    assert!(manager.resolve(&id).unwrap().signed_out);
+    assert!(
+        manager
+            .account_setup()
+            .onboarding_worker_reap_in_flight(&id)
+    );
+
+    // Archiving a group the account does not hold fails in storage, so the
+    // error says whether the write ran.
+    let group = cgka_traits::GroupId::new(vec![7; 16]);
+    let refused = manager.set_group_archived(&id, &group, true).await;
+    assert!(
+        matches!(&refused, Err(AppError::BlockingTask(reason))
+            if reason == "account worker cleanup still in progress"),
+        "the write must not run beside the retiring worker: {refused:?}"
+    );
+
+    hold.release.notify_one();
+    manager
+        .account_setup()
+        .await_onboarding_owned_handles_finished()
+        .await;
+    let written = manager.set_group_archived(&id, &group, true).await;
+    assert!(
+        matches!(&written, Err(AppError::UnknownGroup(hex)) if *hex == "07".repeat(16)),
+        "once the reap finishes the write runs: {written:?}"
+    );
+    runtime.shutdown_and_close().await.unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn dropped_reconcile_reap_completes_with_zero_receivers_then_restarts() {
     let (_dir, runtime, _network, keys, id) = fixture().await;

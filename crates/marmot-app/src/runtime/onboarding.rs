@@ -123,6 +123,22 @@ impl SetupState {
         self.generated_setup_local_transaction.lock().await
     }
 
+    /// Direct-write hook, called under the worker transaction before an
+    /// account's storage is written beside no worker (`write_without_worker`):
+    /// fails, without waiting, while a worker onboarding took out of the map
+    /// is still retiring. Onboarding waits for that reap under the
+    /// transaction, so one is left only after its bounded wait gave up or its
+    /// cancellation was dropped.
+    pub(super) async fn ensure_worker_reap_settled(
+        &self,
+        manager: &AccountManager,
+        account_id: &str,
+    ) -> Result<(), AppError> {
+        AccountSetup::new(self, manager)
+            .await_tracked_worker_reap(account_id, Duration::ZERO)
+            .await
+    }
+
     /// Removal hook, called under the worker transaction after the removal
     /// commit point: drops the account's update channel.
     pub(super) fn account_removed(&self, account_id: &str) {

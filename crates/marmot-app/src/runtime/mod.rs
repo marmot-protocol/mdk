@@ -7743,7 +7743,8 @@ impl AccountManager {
     /// mdk#3318). Every worker start, sign-in and sign-out takes the worker
     /// transaction, so no worker starts during `write`. A worker kept from
     /// before the account stopped signing on one is retired first, as
-    /// reconcile would, and any worker still retiring is reaped first.
+    /// reconcile would, and any worker still retiring is reaped first; one
+    /// onboarding is still reaping fails the call with nothing written.
     pub(super) async fn write_without_worker<T>(
         &self,
         account_ref: &str,
@@ -7765,6 +7766,12 @@ impl AccountManager {
             self.register_worker_reapers(vec![(account.account_id_hex.clone(), worker)]);
         }
         self.ensure_worker_reaped(&account.account_id_hex).await?;
+        self.setup
+            .ensure_worker_reap_settled(self, &account.account_id_hex)
+            .await
+            .map_err(|_| {
+                AppError::BlockingTask("account worker cleanup still in progress".into())
+            })?;
         let written = write(&account)?;
         Ok(Some((account, written)))
     }
