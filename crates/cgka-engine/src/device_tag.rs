@@ -203,21 +203,18 @@ impl<S: StorageProvider> Engine<S> {
             return Ok(None);
         };
         self.ensure_group_live(group_id)?;
-        let device_group = MlsGroup::load(
-            storage.mls_storage(),
-            &openmls::group::GroupId::from_slice(group_id.as_slice()),
-        )
-        .map_err(|error| EngineError::Backend(format!("load device group: {error:?}")))
-        .and_then(|device_group| {
-            device_group.ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))
-        })
-        .inspect_err(|_| {
-            tracing::warn!(
-                target: "cgka_engine::device_tag",
-                method = "own_device_tag",
-                "the device group did not load; building untagged"
-            );
-        })?;
+        let device_group = self
+            .load_mls_group_in(storage.mls_storage(), group_id)
+            .and_then(|device_group| {
+                device_group.ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))
+            })
+            .inspect_err(|_| {
+                tracing::warn!(
+                    target: "cgka_engine::device_tag",
+                    method = "own_device_tag",
+                    "the device group did not load; building untagged"
+                );
+            })?;
         let own_slot = own_device_slot(storage)?;
         Ok(self.own_device_tag_after(&device_group, &[], own_slot))
     }
@@ -370,22 +367,21 @@ impl<S: StorageProvider> Engine<S> {
         if own_leaves.is_empty() || self.ensure_group_live(device_group_id).is_err() {
             return Vec::new();
         }
-        let Some(roster) = MlsGroup::load(
-            storage.mls_storage(),
-            &openmls::group::GroupId::from_slice(device_group_id.as_slice()),
-        )
-        .ok()
-        .flatten()
-        .filter(|device_group| {
-            crate::app_components::group_requires_device_roster(device_group).unwrap_or(false)
-        })
-        .and_then(|device_group| {
-            crate::app_components::app_component_data_of_group(
-                &device_group,
-                DEVICE_ROSTER_COMPONENT_ID,
-            )
-        })
-        .and_then(|roster| decode_device_roster_v1(&roster).ok()) else {
+        let Some(roster) = self
+            .load_mls_group_in(storage.mls_storage(), device_group_id)
+            .ok()
+            .flatten()
+            .filter(|device_group| {
+                crate::app_components::group_requires_device_roster(device_group).unwrap_or(false)
+            })
+            .and_then(|device_group| {
+                crate::app_components::app_component_data_of_group(
+                    &device_group,
+                    DEVICE_ROSTER_COMPONENT_ID,
+                )
+            })
+            .and_then(|roster| decode_device_roster_v1(&roster).ok())
+        else {
             return Vec::new();
         };
         let mut slots = Vec::new();

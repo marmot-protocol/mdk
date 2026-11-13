@@ -282,13 +282,7 @@ impl<S: StorageProvider> Engine<S> {
         self.epoch_manager.ensure_pending_space()?;
         // Load group + require Stable.
         let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
-        let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
-        let mut mls_group = MlsGroup::load(
-            <EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(&provider),
-            &mls_gid,
-        )
-        .map_err(|e| EngineError::Backend(format!("load: {e:?}")))?
-        .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;
+        let mut mls_group = self.load_mls_group(&group_id)?;
 
         if let Some(state) = self.epoch_manager.state(&group_id)
             && !matches!(state, EpochState::Stable { .. })
@@ -831,13 +825,7 @@ impl<S: StorageProvider> Engine<S> {
         }
 
         let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
-        let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
-        let mut mls_group = MlsGroup::load(
-            <EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(&provider),
-            &mls_gid,
-        )
-        .map_err(|e| EngineError::Backend(format!("load: {e:?}")))?
-        .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;
+        let mut mls_group = self.load_mls_group(&group_id)?;
 
         if let Some(state) = self.epoch_manager.state(&group_id)
             && !matches!(state, EpochState::Stable { .. })
@@ -1219,13 +1207,7 @@ impl<S: StorageProvider> Engine<S> {
         // MIP-03 SelfRemove only. The legacy Remove-self flow is not exposed
         // by this engine.
         let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
-        let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
-        let mut mls_group = MlsGroup::load(
-            <EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(&provider),
-            &mls_gid,
-        )
-        .map_err(|e| EngineError::Backend(format!("load: {e:?}")))?
-        .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;
+        let mut mls_group = self.load_mls_group(group_id)?;
 
         if let Some(state) = self.epoch_manager.state(group_id)
             && !matches!(state, EpochState::Stable { .. })

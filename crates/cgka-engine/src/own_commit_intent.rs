@@ -23,7 +23,6 @@
 //! are regenerated against the canonical state with every existing gate.
 
 use crate::engine::Engine;
-use crate::provider::EngineOpenMlsProvider;
 use cgka_traits::app_components::{AppComponentData, GROUP_ADMIN_POLICY_COMPONENT_ID};
 use cgka_traits::engine::{
     SendIntent, SupersededIntentKind, SupersededIntentOutcome, SupersededIntentReport,
@@ -34,8 +33,6 @@ use cgka_traits::storage::{
     OwnCommitBaseline, OwnCommitIntent, QueuedOutboundIntent, StorageProvider,
 };
 use cgka_traits::types::{GroupId, MessageId};
-use openmls::group::MlsGroup;
-use openmls_traits::OpenMlsProvider;
 use std::collections::BTreeSet;
 
 /// How many times one intent may be re-queued after losing a same-epoch race.
@@ -108,14 +105,6 @@ impl<S: StorageProvider> Engine<S> {
             | SendIntent::ImportDeviceGroupRejections { .. }
             | SendIntent::Disband { .. } => None,
         })
-    }
-
-    fn load_mls_group(&self, group_id: &GroupId) -> Result<MlsGroup, EngineError> {
-        let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
-        let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
-        MlsGroup::load(provider.storage(), &mls_gid)
-            .map_err(|error| EngineError::Backend(format!("load group: {error:?}")))?
-            .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))
     }
 
     /// Decide what becomes of the intent behind `commit_id` now that

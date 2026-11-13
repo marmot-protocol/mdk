@@ -878,12 +878,7 @@ impl<S: StorageProvider> Engine<S> {
             .epoch_manager
             .state(group_id)
             .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;
-        crate::conformance_snapshot::capture_group_snapshot(
-            &self.storage,
-            &self.crypto,
-            group_id,
-            epoch_state,
-        )
+        crate::conformance_snapshot::capture_group_snapshot(self, group_id, epoch_state)
     }
 
     /// Capture exact canonical state for either a live group or an
@@ -1739,21 +1734,9 @@ impl<S: StorageProvider> Engine<S> {
     /// record epoch; the session-open seed treats that lag as a stale route
     /// set and schedules a backfill repair (mdk#1161).
     pub(crate) fn reindex_transport_group_id(&mut self, group_id: &GroupId) {
-        let mls_group = {
-            let provider = crate::provider::EngineOpenMlsProvider::<S>::new(
-                &self.crypto,
-                self.storage.mls_storage(),
-            );
-            let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
-            match openmls::group::MlsGroup::load(
-                <crate::provider::EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(
-                    &provider,
-                ),
-                &mls_gid,
-            ) {
-                Ok(Some(group)) => group,
-                _ => return,
-            }
+        let Ok(Some(mls_group)) = self.load_mls_group_in(self.storage.mls_storage(), group_id)
+        else {
+            return;
         };
         if let Ok(transport_group_id) =
             crate::app_components::transport_group_id_of_group(&mls_group)
@@ -2196,7 +2179,13 @@ impl<S: StorageProvider> Engine<S> {
             );
             let provider_storage =
                 <crate::provider::EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(&provider);
-            openmls::group::MlsGroup::load(provider_storage, &mls_gid)
+            // Hydration validates the stored state it loads, and maps a load
+            // failure to its quarantine reason; it never runs on a failed
+            // restore's group, which retry refuses and the seed skips (see
+            // clippy.toml).
+            #[allow(clippy::disallowed_methods)]
+            let loaded = openmls::group::MlsGroup::load(provider_storage, &mls_gid);
+            loaded
                 .map_err(|_| GroupHydrationQuarantineReason::OpenMlsLoadFailed)?
                 .ok_or(GroupHydrationQuarantineReason::OpenMlsGroupMissing)?
         };
@@ -2341,7 +2330,10 @@ impl<S: StorageProvider> Engine<S> {
                     &preparing[0].id,
                 )
                 .map_err(|_| GroupHydrationQuarantineReason::PendingCommitRecoveryFailed)?;
-                mls_group = openmls::group::MlsGroup::load(self.storage.mls_storage(), &mls_gid)
+                // Hydration reloads the state its recovery rolled back (see clippy.toml).
+                #[allow(clippy::disallowed_methods)]
+                let reloaded = openmls::group::MlsGroup::load(self.storage.mls_storage(), &mls_gid);
+                mls_group = reloaded
                     .map_err(|_| GroupHydrationQuarantineReason::PendingCommitRecoveryFailed)?
                     .ok_or(GroupHydrationQuarantineReason::PendingCommitRecoveryFailed)?;
                 // Hydration reads the record it validates (see clippy.toml).
@@ -3026,17 +3018,8 @@ impl<S: StorageProvider> Engine<S> {
         storage_provider: &S,
         group_id: &GroupId,
     ) -> Result<(), EngineError> {
-        let provider = crate::provider::EngineOpenMlsProvider::<S>::new(
-            &self.crypto,
-            storage_provider.mls_storage(),
-        );
-        let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
-        let storage = <crate::provider::EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(
-            &provider,
-        );
-        let loaded = openmls::group::MlsGroup::load(storage, &mls_gid)
-            .map_err(|e| EngineError::Backend(format!("load live group: {e:?}")))?;
-        if let Some(mut mls_group) = loaded {
+        let storage = storage_provider.mls_storage();
+        if let Some(mut mls_group) = self.load_mls_group_in(storage, group_id)? {
             mls_group
                 .delete(storage)
                 .map_err(|e| EngineError::Backend(format!("delete live group: {e:?}")))?;
@@ -4682,13 +4665,7 @@ impl<S: StorageProvider> Engine<S> {
             &self.crypto,
             self.storage.mls_storage(),
         );
-        let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
-        let mut mls_group = openmls::group::MlsGroup::load(
-            <crate::provider::EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(&provider),
-            &mls_gid,
-        )
-        .map_err(|e| EngineError::Backend(format!("load: {e:?}")))?
-        .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;
+        let mut mls_group = self.load_mls_group(group_id)?;
 
         let required_components =
             crate::app_components::required_app_components_of_group(&mls_group)?;

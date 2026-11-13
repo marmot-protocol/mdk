@@ -290,7 +290,10 @@ impl<S: StorageProvider> Drop for NewGroupCleanupGuard<S> {
         let cleanup = storage.with_transaction(|storage| {
             let crypto = openmls_rust_crypto::RustCrypto::default();
             let provider = EngineOpenMlsProvider::<S>::new(&crypto, storage.mls_storage());
-            if let Some(mut group) = MlsGroup::load(provider.storage(), &mls_gid)
+            // Deletes the group its own create just made (see clippy.toml).
+            #[allow(clippy::disallowed_methods)]
+            let loaded = MlsGroup::load(provider.storage(), &mls_gid);
+            if let Some(mut group) = loaded
                 .map_err(|error| StorageError::Backend(format!("load new group: {error:?}")))?
             {
                 group.delete(provider.storage()).map_err(|error| {
@@ -331,7 +334,9 @@ impl<S: StorageProvider> Engine<S> {
     /// OpenMLS refuses an id with live state on its own, but a removed or
     /// forgotten copy can keep a Marmot record without it, and the cleanup
     /// guard of a failed creation would delete that record.
-    // A quarantined group's id is taken too (see clippy.toml).
+    // A quarantined group's id is taken too, so this reads the record and
+    // the OpenMLS state of any group, only to see whether they exist (see
+    // clippy.toml).
     #[allow(clippy::disallowed_methods)]
     fn ensure_chosen_group_id_is_free(&self, group_id: &GroupId) -> Result<(), EngineError> {
         if !(1..=MAX_CHOSEN_GROUP_ID_LEN).contains(&group_id.as_slice().len()) {
@@ -1191,7 +1196,6 @@ impl<S: StorageProvider> Engine<S> {
         &self,
         group_id: Option<&GroupId>,
     ) -> Result<Vec<PendingWelcome>, EngineError> {
-        let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
         let mut candidates = Vec::new();
         for mut candidate in self.storage.list_welcomes()? {
             if group_id.is_some_and(|id| id != &candidate.group_id) {
@@ -1200,19 +1204,12 @@ impl<S: StorageProvider> Engine<S> {
             let Some(rejoin) = &mut candidate.rejoin else {
                 continue;
             };
-            // A failed rewind restore left this group's OpenMLS state on a
-            // retained anchor until the next open (mdk#3272), so its token
-            // would offer the anchor branch for consent. Every other
-            // quarantine keeps genuine local state, and a re-join repairs it.
-            if self.quarantined_reason(&candidate.group_id)
-                == Some(cgka_traits::engine::GroupHydrationQuarantineReason::RewindRestoreFailed)
-            {
-                continue;
-            }
-            let group = match MlsGroup::load(
-                provider.storage(),
-                &openmls::group::GroupId::from_slice(candidate.group_id.as_slice()),
-            ) {
+            // The load refuses a group whose rewind restore failed (mdk#3272):
+            // its token would offer the anchor branch for consent, so its
+            // offer waits for the next open. Every other quarantine keeps
+            // genuine local state, and a re-join repairs it.
+            let loaded = self.load_mls_group_in(self.storage.mls_storage(), &candidate.group_id);
+            let group = match loaded {
                 Ok(Some(group)) => group,
                 Ok(None) => continue,
                 Err(_) => {
@@ -1304,21 +1301,11 @@ impl<S: StorageProvider> Engine<S> {
             .rejoin
             .as_ref()
             .ok_or(EngineError::InvalidWelcome)?;
-        // The local branch is a retained anchor's until the next open
-        // (mdk#3272): no token can consent to discarding it. The offer stays
-        // stored and is offered again then.
-        if self.quarantined_reason(&candidate.group_id)
-            == Some(cgka_traits::engine::GroupHydrationQuarantineReason::RewindRestoreFailed)
-        {
-            return Err(EngineError::UnknownGroup(candidate.group_id));
-        }
-        let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
-        let group = MlsGroup::load(
-            provider.storage(),
-            &openmls::group::GroupId::from_slice(candidate.group_id.as_slice()),
-        )
-        .map_err(|error| EngineError::Backend(format!("load group: {error:?}")))?
-        .ok_or_else(|| EngineError::UnknownGroup(candidate.group_id.clone()))?;
+        // The load refuses a group whose rewind restore failed: its local
+        // branch is a retained anchor's until the next open (mdk#3272), so no
+        // token can consent to discarding it. The offer stays stored and is
+        // offered again then.
+        let group = self.load_mls_group(&candidate.group_id)?;
         if Sha256::digest(group.epoch_authenticator().as_slice()).as_slice() != local_state_token {
             return Err(rejoin_confirmation_required());
         }
@@ -1711,12 +1698,9 @@ impl<S: StorageProvider> Engine<S> {
                     if self_is_recorded_member && !group.unrecoverable {
                         // A usable fork can be newer than the replacement.
                         // Epoch ordering never grants replacement authority.
-                        let old = MlsGroup::load(
-                            provider.storage(),
-                            &openmls::group::GroupId::from_slice(group_id.as_slice()),
-                        )
-                        .map_err(|error| EngineError::Backend(format!("load group: {error:?}")))?
-                        .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;
+                        let old = self
+                            .load_mls_group_in(provider.storage(), &group_id)?
+                            .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;
                         if old.pending_commit().is_some() {
                             return Err(rejoin_confirmation_required());
                         }

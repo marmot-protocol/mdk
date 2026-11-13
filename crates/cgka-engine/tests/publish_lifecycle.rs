@@ -12,7 +12,7 @@
 //! 4. Double-confirm and confirm-after-fail both error with
 //!    `EngineError::UnknownPending`.
 
-// Tests read stored records directly (see the crate clippy.toml).
+// Tests read stored records and OpenMLS state directly (see the crate clippy.toml).
 #![allow(clippy::disallowed_methods)]
 
 use async_trait::async_trait;

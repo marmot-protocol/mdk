@@ -6,6 +6,9 @@
 //! Admin-related guards are enforced through Marmot group data and capability
 //! tracking rather than by OpenMLS alone.
 
+// Tests load OpenMLS state directly (see the crate clippy.toml).
+#![allow(clippy::disallowed_methods)]
+
 use async_trait::async_trait;
 use cgka_engine::canonicalization::{CanonicalizationPolicy, DroppedMessageReason};
 use cgka_engine::commit_class::classify_staged_commit;

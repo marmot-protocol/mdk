@@ -74,7 +74,6 @@ impl<S: StorageProvider> Engine<S> {
             .epoch_manager
             .group_for_pending(pending)
             .ok_or(EngineError::UnknownPending)?;
-        let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
 
         // Read the bookkeeping a successful confirm needs BEFORE any mutation,
         // so the durable transaction below can do every storage write while the
@@ -92,10 +91,7 @@ impl<S: StorageProvider> Engine<S> {
         let origin_commit_id = self.peek_pending_origin_commit(pending);
         let queued_intent = self.queued_intent_by_pending.get(&pending).cloned();
 
-        let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
-        let mut mls_group = MlsGroup::load(provider.storage(), &mls_gid)
-            .map_err(|e| EngineError::Backend(format!("load: {e:?}")))?
-            .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;
+        let mut mls_group = self.load_mls_group(&group_id)?;
         let has_pending_commit = mls_group.pending_commit().is_some();
         let sibling_context = if has_pending_commit {
             self.sibling_self_removal_context(&group_id)?
@@ -490,7 +486,6 @@ impl<S: StorageProvider> Engine<S> {
         mut fanout: Option<&mut OutboundFanout>,
         retired: Option<(&QueuedOutboundIntent, &EngineError)>,
     ) -> Result<(), EngineError> {
-        let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
         let origin_commit_id = self.peek_pending_origin_commit(pending);
 
         let group_id = self
@@ -502,10 +497,7 @@ impl<S: StorageProvider> Engine<S> {
             .kind_for_pending(pending)
             .ok_or(EngineError::UnknownPending)?;
 
-        let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
-        let mut mls_group = MlsGroup::load(provider.storage(), &mls_gid)
-            .map_err(|e| EngineError::Backend(format!("load: {e:?}")))?
-            .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;
+        let mut mls_group = self.load_mls_group(&group_id)?;
 
         let rolled_back_fanout = fanout
             .as_deref()

@@ -161,13 +161,7 @@ impl<S: StorageProvider> Engine<S> {
                 "adding own account devices requires at least one KeyPackage".into(),
             ));
         }
-        let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
-        let mls_group = MlsGroup::load(
-            provider.storage(),
-            &openmls::group::GroupId::from_slice(group_id.as_slice()),
-        )
-        .map_err(|e| EngineError::Backend(format!("load: {e:?}")))?
-        .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;
+        let mls_group = self.load_mls_group(group_id)?;
         self.sibling_welcome_plan(&mls_group, siblings).map(|_| ())
     }
 
@@ -259,12 +253,7 @@ impl<S: StorageProvider> Engine<S> {
     ) -> Result<SendResult, EngineError> {
         self.epoch_manager.ensure_pending_space()?;
         let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
-        let mut mls_group = MlsGroup::load(
-            provider.storage(),
-            &openmls::group::GroupId::from_slice(group_id.as_slice()),
-        )
-        .map_err(|e| EngineError::Backend(format!("load: {e:?}")))?
-        .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;
+        let mut mls_group = self.load_mls_group(&group_id)?;
         if let Some(state) = self.epoch_manager.state(&group_id)
             && !matches!(state, EpochState::Stable { .. })
         {

@@ -1943,17 +1943,7 @@ impl<S: StorageProvider> Engine<S> {
         }
 
         let mut mls_group = {
-            let provider =
-                EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
-            let mls_gid = openmls::group::GroupId::from_slice(schedule.group_id.as_slice());
-            let mls_group = MlsGroup::load(
-                <EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(
-                    &provider,
-                ),
-                &mls_gid,
-            )
-            .map_err(|e| EngineError::Backend(format!("load auto-commit replay: {e:?}")))?
-            .ok_or_else(|| EngineError::UnknownGroup(schedule.group_id.clone()))?;
+            let mls_group = self.load_mls_group(&schedule.group_id)?;
             if EpochId(mls_group.epoch().as_u64()) != schedule.source_epoch {
                 return Ok(ScheduledAutoCommitReplay::NotApplicable);
             }
@@ -2527,7 +2517,9 @@ impl<S: StorageProvider> Engine<S> {
     /// MLS load failure keeps the id pending because full hydration owns that
     /// failure — every backfill-pending group is also in `unhydrated_groups`,
     /// so `ensure_hydrated` will either index its route or quarantine it.
-    // Routing resolves a quarantined group too, so its input reaches the retaining gate (see clippy.toml).
+    // Routing resolves a quarantined group too, so its input reaches the retaining gate; the probe reads
+    // only a route-pending group's OpenMLS route, and such a group is unhydrated, so no rewind of it has
+    // failed (see clippy.toml).
     #[allow(clippy::disallowed_methods)]
     fn resolve_or_backfill_group_id_for_transport(
         &mut self,
@@ -2891,13 +2883,7 @@ impl<S: StorageProvider> Engine<S> {
         EngineError,
     > {
         let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
-        let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
-        let mls_group = MlsGroup::load(
-            <EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(&provider),
-            &mls_gid,
-        )
-        .map_err(|e| EngineError::Backend(format!("load snapshot group: {e:?}")))?
-        .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;
+        let mls_group = self.load_mls_group(group_id)?;
         if !mls_group.is_active() {
             return Ok(None);
         }
