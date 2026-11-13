@@ -3424,6 +3424,13 @@ fn recovery_runner_policy_holds_the_starting_values() {
     );
     assert_eq!(
         (
+            policy.unit.probe_base_seconds,
+            policy.unit.probe_cap_seconds
+        ),
+        (HOUR, 24 * HOUR)
+    );
+    assert_eq!(
+        (
             policy.unit.cooldown_after_unreachable,
             policy.unit.cooldown_base_seconds,
             policy.unit.cooldown_cap_seconds

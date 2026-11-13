@@ -39,7 +39,8 @@
   on a timer instead of waiting for the user to dismiss its notice: an hour after it breaks, then on an interval that
   doubles to a day. A probe goes through the runner's ordinary scheduling, budgets, relay cooldowns and account
   breaker, raises no notice and never shows as catching up. Units broken before the upgrade have a probe time in the
-  past, so each probes once right after the upgrade.
+  past, so each probes once right after the upgrade; one whose probe fails then waits the full day, since its stored
+  backoff step predates the schedule.
 
 ### Fixed
 
