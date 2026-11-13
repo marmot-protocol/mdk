@@ -3874,6 +3874,18 @@ Reads one cached pack without network I/O. Returns none when the coordinate is a
 
 [Source](src/commands/sticker.rs#L31)
 
+### `Marmot::sticker_pack_share_link`
+
+**Current.**
+
+```rust
+pub fn sticker_pack_share_link( &self, account_ref: String, coordinate: String, ) -> Result<String, MarmotKitError>
+```
+
+Builds `https://sonarprivacy.xyz/stickers?a=...` from a valid pack coordinate without network I/O. Call off the UI thread because it reads local storage. Includes up to eight normalized, unique relay candidates retained by pack fetches, or current account relays when none are retained. Hints are candidates, not confirmed event locations; oversized hints are omitted to keep links within the parser's 2048-character limit. An uncached coordinate can be shared. Invalid coordinates return `InvalidSticker`.
+
+[Source](src/commands/sticker.rs#L43)
+
 ### `Marmot::sync_sticker_packs`
 
 **Current.**
@@ -3884,7 +3896,7 @@ pub async fn sync_sticker_packs( &self, account_ref: String, ) -> Result<Sticker
 
 Refreshes at most `MAX_DISCOVERY_PACKS` recent public packs and separately refreshes cached installed packs. Pending install changes are published only after a complete installed-list read. Uninstalled discovery above that bound is pruned; installed packs, pending operations, and message-referenced assets stay.
 
-[Source](src/commands/sticker.rs#L42)
+[Source](src/commands/sticker.rs#L53)
 
 ### `Marmot::fetch_sticker_pack`
 
@@ -3896,7 +3908,7 @@ pub async fn fetch_sticker_pack( &self, account_ref: String, input: String, ) ->
 
 Fetches one pack by coordinate or trusted Sonar link, querying the link's relay hints and the account relays; the newest version wins NIP-01 ordering, so a hint cannot hide a newer pack. The requested coordinate is protected from discovery eviction. Call this when the user opens a shared pack, not from a background crawl.
 
-[Source](src/commands/sticker.rs#L53)
+[Source](src/commands/sticker.rs#L64)
 
 ### `Marmot::install_sticker_pack`
 
@@ -3908,7 +3920,7 @@ pub async fn install_sticker_pack( &self, account_ref: String, input: String, ) 
 
 After a complete installed-list read, signs the proposed list before saving local install intent. A signing refusal does not queue this install. Without a complete read, intent stays pending for a later `sync_sticker_packs`. This is the user action after previewing a pack; it does not upload sticker bytes.
 
-[Source](src/commands/sticker.rs#L65)
+[Source](src/commands/sticker.rs#L76)
 
 ### `Marmot::uninstall_sticker_pack`
 
@@ -3920,7 +3932,7 @@ pub async fn uninstall_sticker_pack( &self, account_ref: String, input: String, 
 
 After a complete installed-list read, signs the proposed list before saving local uninstall intent. A signing refusal does not queue this uninstall. Without a complete read, intent stays pending for a later `sync_sticker_packs`. Previously received messages can still resolve their exact historical asset.
 
-[Source](src/commands/sticker.rs#L77)
+[Source](src/commands/sticker.rs#L88)
 
 ### `Marmot::import_signal_sticker_pack`
 
@@ -3932,7 +3944,7 @@ pub async fn import_signal_sticker_pack( &self, account_ref: String, signal_link
 
 Validates a canonical HTTPS Signal pack link, then refuses before any network call. The pinned importer dials Signal's CDN without address pinning, so this command does not download, upload, or publish until that fetch can be injected. The Signal key stays in memory only and is not persisted.
 
-[Source](src/commands/sticker.rs#L92)
+[Source](src/commands/sticker.rs#L103)
 
 ### `Marmot::fetch_sticker_asset`
 
@@ -3944,7 +3956,7 @@ pub async fn fetch_sticker_asset( &self, account_ref: String, sticker_ref: Stick
 
 Downloads one exact sticker after the account has its `(coordinate, shortcode, hash)` mapping. Hosts pass the typed reference from a timeline row; MDK never asks the host to parse tags. A missing mapping returns `StickerNotFound` rather than fetching an unvalidated URL.
 
-[Source](src/commands/sticker.rs#L105)
+[Source](src/commands/sticker.rs#L116)
 
 </details>
 
@@ -5999,3 +6011,4 @@ Attempt bounded remote courtesy logout and erase the session's communication cre
 [Source](src/nip46.rs#L241)
 
 </details>
+

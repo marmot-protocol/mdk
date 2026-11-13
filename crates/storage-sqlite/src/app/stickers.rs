@@ -196,6 +196,41 @@ impl SqliteAppStorage {
         sticker_pack_tx(&conn, coordinate)
     }
 
+    /// Retained relay hints, or an empty list for an unknown pack.
+    pub fn sticker_pack_relays(&self, coordinate: &str) -> StorageResult<Vec<String>> {
+        let json: Option<String> = self
+            .lock()?
+            .query_row(
+                "SELECT relays_json FROM app_sticker_packs WHERE coordinate = ?1",
+                params![coordinate],
+                |row| row.get(0),
+            )
+            .optional()
+            .storage()?;
+        json.map(|json| {
+            serde_json::from_str(&json).map_err(|err| StorageError::Serialization(err.to_string()))
+        })
+        .transpose()
+        .map(Option::unwrap_or_default)
+    }
+
+    /// Set relay hints on an existing pack without changing its replacement version.
+    pub fn set_sticker_pack_relays(
+        &self,
+        coordinate: &str,
+        relays: &[String],
+    ) -> StorageResult<()> {
+        let json = serde_json::to_string(relays)
+            .map_err(|err| StorageError::Serialization(err.to_string()))?;
+        self.lock()?
+            .execute(
+                "UPDATE app_sticker_packs SET relays_json = ?2 WHERE coordinate = ?1",
+                params![coordinate, json],
+            )
+            .storage()?;
+        Ok(())
+    }
+
     /// Return pre-shaped packs. `installed_only` filters through the committed
     /// installed-list projection with pending local operations rebased over it;
     /// search is bounded and matches only non-secret public metadata.
@@ -1044,6 +1079,75 @@ mod tests {
             stickers: vec![sticker("wave", hash)],
             license: Some("CC0".to_owned()),
         }
+    }
+
+    #[test]
+    fn relay_hints_keep_replacement() {
+        let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
+        let original = pack(&"cc".repeat(32), 10, &"aa".repeat(32));
+        assert!(
+            store
+                .sticker_pack_relays(&original.coordinate)
+                .unwrap()
+                .is_empty()
+        );
+        store
+            .set_sticker_pack_relays(&original.coordinate, &["wss://missing.example/".to_owned()])
+            .unwrap();
+        assert_eq!(store.sticker_pack(&original.coordinate).unwrap(), None);
+        assert!(store.replace_sticker_pack_if_newer(&original).unwrap());
+        assert!(
+            store
+                .sticker_pack_relays(&original.coordinate)
+                .unwrap()
+                .is_empty()
+        );
+
+        let relays = vec![
+            "wss://one.example/".to_owned(),
+            "wss://two.example/".to_owned(),
+        ];
+        store
+            .set_sticker_pack_relays(&original.coordinate, &relays)
+            .unwrap();
+        assert_eq!(
+            store.sticker_pack(&original.coordinate).unwrap(),
+            Some(original.clone())
+        );
+        assert_eq!(
+            store.sticker_pack_relays(&original.coordinate).unwrap(),
+            relays
+        );
+
+        let losing = pack(&"dd".repeat(32), 10, &"bb".repeat(32));
+        assert!(!store.replace_sticker_pack_if_newer(&losing).unwrap());
+        assert_eq!(
+            store.sticker_pack(&original.coordinate).unwrap(),
+            Some(original)
+        );
+        let winner = pack(&"bb".repeat(32), 10, &"bb".repeat(32));
+        assert!(store.replace_sticker_pack_if_newer(&winner).unwrap());
+        assert_eq!(
+            store.sticker_pack(&winner.coordinate).unwrap(),
+            Some(winner.clone())
+        );
+        assert_eq!(
+            store.sticker_pack_relays(&winner.coordinate).unwrap(),
+            relays
+        );
+        store
+            .set_sticker_pack_relays(&winner.coordinate, &[])
+            .unwrap();
+        assert!(
+            store
+                .sticker_pack_relays(&winner.coordinate)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            store.sticker_pack(&winner.coordinate).unwrap(),
+            Some(winner)
+        );
     }
 
     #[test]
