@@ -50,10 +50,10 @@ Expose `marmot-app` behavior through bindings, following [MDK's host boundary](.
   Keep `test-build-phases.py` covering phase isolation, required assembly inputs and deployment/strip behavior.
   Shared Swift generation feeds both Apple assemblers; transfer phase inputs only from the same workflow run.
 - Own the host Swift/Kotlin DTO round-trip checks: `chat-projections-smoke.sh`, `options-smoke.sh`,
-  `audit-v4-smoke.sh`, `details-markdown-smoke.sh` and `usage-diagnostics-smoke.sh`.
+  `details-markdown-smoke.sh` and `usage-diagnostics-smoke.sh`.
 - Own `build-provenance.py`, `test-build-phases.py`, `test-android-artifact.py` and `test-native-archive.py`.
-- Own `marmotkit-endpoints.env` build-time defaults for audit-log tracker, relay-telemetry OTLP and optional
-  product-analytics route URLs.
+- Own `marmotkit-endpoints.env` build-time defaults for relay-telemetry OTLP and optional product-analytics route
+  URLs. Audit delivery has no build-time default; hosts configure it at runtime.
 - Keep generated bindings out of git; host apps vendor artifacts from `output/` after running the scripts.
 
 ## Invariants
@@ -182,7 +182,7 @@ Static gates covering this crate (all in `just fast-ci`): `just binding-docs-gat
 
 Chat-screen DTO changes also use `just uniffi-projections-smoke swift` (requires `swiftc`) and
 `just uniffi-projections-smoke kotlin` (requires `kotlinc` and `MDK_KOTLIN_CLASSPATH` containing JNA with native
-libraries, Android platform, annotations, and coroutines jars). Options, audit-v4, Details Markdown and
+libraries, Android platform, annotations, and coroutines jars). Options, Details Markdown and
 usage-diagnostics DTO changes use the matching `./crates/marmot-uniffi/<name>-smoke.sh swift|kotlin` with the same
 requirements. `options-smoke.sh swift|kotlin --dev-device-groups` additionally checks the explicit
 constructor in a narrow capable native library; the ordinary invocation checks its unavailable error. These host

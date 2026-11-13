@@ -1,7 +1,7 @@
 ---
 title: "Current State — Implementations & Spec"
 created: 2026-04-19
-updated: 2026-11-12
+updated: 2026-11-13
 tags: [marmot, overview, current-state, implementations]
 status: overview
 ---
@@ -337,10 +337,10 @@ This repository now has the main engine candidate:
 - `crates/cgka-conformance-simulator` — multi-client simulator, vectors, generated scenarios, and property tests.
 - `crates/marmot-markdown` — CommonMark and Nostr-aware display parser for app message rendering.
 - `crates/marmot-forensics` — opt-in v5 JSONL forensic audit schema and recorder traits, with the frozen v4 schema
-  kept to validate and drain older files. Account/device display names are excluded; platform, app version and
+  kept to validate older files. Account/device display names are excluded; platform, app version and
   optional system hardware model are retained. Size-rotated segments repeat the latest source context with fresh
-  sequence numbers in the same recorder session. New recording writes v5 and delivers it over OTLP; the legacy
-  whole-file upload validates v4-only snapshots. Exclusive-root app startup removes recognized legacy forensic files and segments, including failed-wipe
+  sequence numbers in the same recorder session. New recording writes v5 and delivers it over OTLP; v4 files are
+  never delivered. Exclusive-root app startup removes recognized legacy forensic files and segments, including failed-wipe
   remnants, while preserving v4 files and the separate key-reveal log. See [audit logging](../audit-logging.md).
 - `crates/marmot-uniffi` — UniFFI bindings and build scripts for Swift/Kotlin app runtimes.
 - `crates/agent-control` — `marmot.agent-control.v2` DTOs and newline-delimited JSON framing for agent integrations.

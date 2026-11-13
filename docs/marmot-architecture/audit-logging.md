@@ -39,9 +39,8 @@ The host can configure a dedicated v5 OTLP `/v1/logs` sender in memory through
 `MarmotAppRuntime::set_audit_otlp_sender(Some(sender))`, or through the additive
 `set_audit_otlp_config_v5` binding method. Recording consent is separate from this destination.
 The manual `post_audit_log_tracker_update_v5` binding method reports v5 accepted, pending,
-blocked, and idle account counts separately from v4 whole-file uploads. Existing tracker
-activity triggers use the same 30-second coalescing window, retry delay, and shutdown
-cancellation; they drain bounded v5 batches per account. V5 cursor state lives in
+blocked, and idle account counts. Tracker activity triggers use a 30-second coalescing window,
+retry delay, and shutdown cancellation; they drain bounded v5 batches per account. V5 cursor state lives in
 `audit-otlp-delivery-v5`, so historical v4 cursor state and files are untouched. A complete
 receiver acceptance advances the v5 cursor. `409` (the receiver may have stored part of the
 batch), `429` and `5xx` are retryable and resend the same range. `400`, `413` and `422` reject
@@ -62,17 +61,15 @@ releases its account reservation; routine healthy outcomes rewrite the file at m
 `audit_delivery_status_v5`. The tracker's `warn` log carries the same failure category and HTTP
 status, nothing else.
 
-The legacy v4 whole-file tracker endpoint remains a v4-only route. Direct whole-file upload validates
-the exact v4 schema version and rejects v5; the tracker excludes v5 filenames from its v4 pass.
-The v5 sender preserves each original JSONL body inside one OTLP log record, stripping only its
+v5 OTLP delivery is the only remote audit path; historical v4 files stay local until retention
+expires them. The v5 sender preserves each original JSONL body inside one OTLP log record, stripping only its
 terminal newline. It validates and pins collector addresses before connection and never stores
 the bearer token on disk.
 
-**Host adoption requirement:** enabling audit on this build creates v5 files, not new v4 files.
-Hosts that previously relied only on the v4 whole-file tracker must configure a compatible v5 OTLP
-receiver and destination before relying on remote audit delivery. Until then, new evidence stays
-local and the v5 tracker reports it as pending or unconfigured; explicit v4 whole-file upload of a
-v5 file is rejected. Deploy the compatible receiver before activating v5 delivery in a host.
+**Host adoption requirement:** hosts must configure a compatible v5 OTLP receiver and destination
+before relying on remote audit delivery. Until then, new evidence stays local and the v5 tracker
+reports it as pending or unconfigured. Deploy the compatible receiver before activating v5 delivery
+in a host.
 
 ## Downstream: whitenoise-data
 
@@ -85,9 +82,8 @@ team-internal repository. It builds two separate Odin programs that share only s
 | **White Noise audit receiver** (`audit-receiver`) | The write side. Accepts MDK's restricted OTLP/HTTP JSON `/v1/logs` profile (the envelope the v5 sender above produces), validates the whole batch against a pinned copy of [`audit-log-event.v5.schema.json`](../../crates/marmot-forensics/schema/audit-log-event.v5.schema.json) plus ports of the relational rules in `marmot-forensics` `src/v5/validation.rs`, and pushes the original bodies to Loki. It accepts v5 only. |
 | **White Noise audit reader** (`audit-reader`) | The read side. A read-only HTTP API that answers investigation questions about one group (`history`, `convergence`, `welcome`, `recovery`, `workload`) and returns original records, citing the exact records and queries behind every finding. An absent record is never proof that something did not happen. |
 
-These replace Goggles, the earlier Django audit service, which is retired. Do not describe either
-program, or any current audit consumer, as Goggles. The legacy v4 whole-file tracker path and its
-`X-Goggles-*` header names below are Goggles' old wire contract, which MDK still speaks.
+These replace Goggles, the earlier Django audit service, which is retired along with MDK's v4
+whole-file upload to it. Do not describe either program, or any current audit consumer, by the old name.
 
 **Investigating a group.** Agents query the reader through the `whitenoise-reader` skill, which
 whitenoise-data ships in `docs/reader/skill/`. Install it into your agent's skills directory as
@@ -112,8 +108,8 @@ MDK PR.
 | Local JSONL recording | Historical v4 files remain readable; new app audit sessions and runtime recorder swaps use v5 when `AuditLogSettings.enabled` is true. |
 | Default behavior | Off. Without an installed recorder, the engine uses `NoopRecorder` and emits no JSONL records. |
 | File shape | Append-only JSONL/NDJSON, one `AuditEvent` per line, schema version `marmot-forensics-audit/v4`; the line-level JSON Schema is [`audit-log-event.v4.schema.json`](../../crates/marmot-forensics/schema/audit-log-event.v4.schema.json). |
-| Local file location | `<account_dir>/audit-<engine_id>-v4.jsonl` for app-opened account sessions, sealed into `-seg<NNNNNN>` siblings at 1 MiB. Exclusive-root startup deletes recognized v1/v2/v3 files and segments. |
-| Upload/listing | App and bindings list remaining local `audit-*.jsonl` files for inspection/deletion. Both explicit and tracker uploads accept only valid v4 snapshots; any legacy files left after cleanup and the separate key-reveal log are never sent. |
+| Local file location | Historical `<account_dir>/audit-<engine_id>-v4.jsonl` files and their `-v4-seg<NNNNNN>` siblings, written by app-opened account sessions before v5 recording. New sessions write `audit-<engine_id>-v5.jsonl` instead. Exclusive-root startup deletes recognized v1/v2/v3 files and segments. |
+| Listing | App and bindings list remaining local `audit-*.jsonl` files for inspection/deletion. V4 files, any legacy files left after cleanup, and the separate key-reveal log are never sent. |
 | Audit OTLP delivery | The dedicated v5 sender is configured in memory by the host, with additive UniFFI and C APIs. Manual tracker requests and configured activity triggers use the existing runtime scheduler. |
 | Static bundle analyzer | Not present in the current repo path. The current artifact model is raw append-only JSONL audit logs. |
 
@@ -127,7 +123,7 @@ MDK PR.
 | Stable audit string helpers | [`crates/cgka-engine/src/audit_helpers.rs`](../../crates/cgka-engine/src/audit_helpers.rs) |
 | Engine audit call sites | [`engine.rs`](../../crates/cgka-engine/src/engine.rs), [`message_processor/`](../../crates/cgka-engine/src/message_processor), [`publish.rs`](../../crates/cgka-engine/src/publish.rs), [`distributed_convergence.rs`](../../crates/cgka-engine/src/distributed_convergence.rs), [`update_group_data.rs`](../../crates/cgka-engine/src/update_group_data.rs), [`upgrade.rs`](../../crates/cgka-engine/src/upgrade.rs), [`group_lifecycle.rs`](../../crates/cgka-engine/src/group_lifecycle.rs) |
 | Account publish audit call sites | [`crates/marmot-session/src/runtime.rs`](../../crates/marmot-session/src/runtime.rs) |
-| App settings, file identities, listing, upload | [`crates/marmot-app/src/lib.rs`](../../crates/marmot-app/src/lib.rs), [`crates/marmot-app/src/config.rs`](../../crates/marmot-app/src/config.rs), [`crates/storage-sqlite/src/shared.rs`](../../crates/storage-sqlite/src/shared.rs) |
+| App settings, file identities, listing | [`crates/marmot-app/src/lib.rs`](../../crates/marmot-app/src/lib.rs), [`crates/marmot-app/src/config.rs`](../../crates/marmot-app/src/config.rs), [`crates/storage-sqlite/src/shared.rs`](../../crates/storage-sqlite/src/shared.rs) |
 | Runtime tracker scheduling | [`crates/marmot-app/src/runtime/`](../../crates/marmot-app/src/runtime) |
 | UniFFI bridge | [`crates/marmot-uniffi/src/lib.rs`](../../crates/marmot-uniffi/src/lib.rs), [`crates/marmot-uniffi/src/conversions/`](../../crates/marmot-uniffi/src/conversions) |
 | Tests | [`crates/marmot-forensics/src/audit.rs`](../../crates/marmot-forensics/src/audit.rs), [`crates/cgka-engine/tests/audit_log.rs`](../../crates/cgka-engine/tests/audit_log.rs), [`crates/marmot-app/tests/audit_logs.rs`](../../crates/marmot-app/tests/audit_logs.rs) |
@@ -171,10 +167,9 @@ The UniFFI bridge exposes:
 
 - `audit_log_settings()`;
 - `set_audit_log_settings(...)`;
-- `audit_log_files()`;
-- `post_audit_log_file(path, endpoint)`;
-- `set_audit_log_tracker_config(...)`;
-- `post_audit_log_tracker_update()`.
+- `audit_log_files()` and `delete_audit_log_file(path)`;
+- `set_audit_log_source(...)`;
+- `set_audit_otlp_config_v5(...)`, `post_audit_log_tracker_update_v5()` and `audit_delivery_status_v5()`.
 
 ## Files and identities
 
@@ -182,13 +177,14 @@ When audit logging is enabled for an account session, `MarmotApp::open_account()
 
 | Value | How it is produced | Where it appears |
 | --- | --- | --- |
-| `audit-device-id` | Random 16 bytes, hex encoded, generated once per account directory and stored in `<account_dir>/audit-device-id`. | Input to `engine_id` and included as `source.device_id` in the recorder source row. |
+| `audit-device-id` | Random 16 bytes, hex encoded, generated once per account directory and stored in `<account_dir>/audit-device-id`. | Input to `engine_id`. The v5 recorder source row carries it hashed as `device_ref`; historical v4 rows carry it as `source.device_id`. |
 | `account_ref` | First 16 bytes of `SHA-256("marmot-audit-account-ref/v1" + account_id)`, hex encoded. | Top-level JSONL `account_ref`. |
 | `local_member_ref` | First 16 bytes of `SHA-256("marmot-audit-member-ref/v1" + account_id)`, hex encoded. Same domain and width as `group_state_changed` actor/subject member refs. | Optional `kind.source.local_member_ref` on `source_context` rows (also permitted on `context.source`). |
 | `engine_id` | First 16 bytes of `SHA-256("marmot-audit-engine-id/v2" + account_id + device_id_hex)`, hex encoded. | Top-level JSONL `engine_id` and the file name. |
-| File path | `<account_dir>/audit-<engine_id>-v4.jsonl`. | Listed and uploaded by app APIs. |
+| File path | `<account_dir>/audit-<engine_id>-v5.jsonl` (historical v4 sessions wrote `-v4.jsonl`). | Listed and deleted by app APIs. |
 
-The generic schema helper `default_jsonl_path(dir, engine_id)` also returns `<dir>/audit-<engine_id>-v4.jsonl`.
+The generic schema helpers `default_v5_jsonl_path(dir, engine_id)` and `default_jsonl_path(dir, engine_id)` return
+`<dir>/audit-<engine_id>-v5.jsonl` and the historical `<dir>/audit-<engine_id>-v4.jsonl`.
 
 Identity properties:
 
@@ -196,7 +192,7 @@ Identity properties:
 - `local_member_ref` is stable for the same account/member identity bytes and uses a different hash domain from `account_ref`. Equality between them is not meaningful.
 - `engine_id` is stable for the same account id plus the account directory's stored `audit-device-id`.
 - These are 16-byte hex strings derived from hashes/randomness, not raw account ids. `local_member_ref` is a diagnostic join key, not authentication or a membership verdict. Absence means unknown or unavailable, including older rows; it is never evidence that a producer was removed.
-- `group_ref` and `msg_id` fields are raw hex forms of group/message identifiers. Uploaded logs retain these identifiers and remain sensitive.
+- `group_ref` and `msg_id` fields are raw hex forms of group/message identifiers. Delivered records retain these identifiers and remain sensitive.
 
 ## JSONL envelope
 
@@ -1053,11 +1049,12 @@ Shared conventions:
 
 #### `recovery_need_changed`
 
-Recovery need changed for one obligation, or for one coverage-ledger route's notice (`unproven_history`).
+Recovery need changed for one obligation. Earlier releases also recorded one coverage-ledger route's notice
+(`unproven_history`); since mdk#3308 the ledger raises no notice, so this row no longer carries that cause.
 
 | Field | Meaning |
 | --- | --- |
-| `cause` | `queue_loss`, `notification_loss`, `epoch_gap`, `maintenance`, `explicit_history`, `known_event`, `incremental_history`, or `subscription_replay` (the code's `RecoveryCause`), or `unproven_history`: a route the recovery runner parked or could not prove, which has no obligation (mdk#2660, unproduced until the runner owns history). |
+| `cause` | `queue_loss`, `notification_loss`, `epoch_gap`, `maintenance`, `explicit_history`, `known_event`, `incremental_history`, or `subscription_replay` (the code's `RecoveryCause`), or `unproven_history`: a route the recovery runner parked or could not prove, which has no obligation (mdk#2660). No longer produced for notices since mdk#3308; kept for older logs. |
 | `change` | `recorded` (new debt), `joined` (charged to pending work), `resumed` (new evidence reopened a parked or retired obligation), `notice_shown` (it parked; its "history may be incomplete" notice is now shown), `notice_dismissed` (the user retired it), `closed` (a parked obligation completed with qualified coverage), or `closed_below_window` (an explicit full-history request closed because its whole retained window was certified and what remains lies below it; neither coverage nor a dismissal). |
 | `obligation_ref` | Hashed obligation id; for `unproven_history`, the hashed route tag, never the route. |
 | `obligation_revision` | Revision the change left; for `unproven_history`, the route's park revision. |
@@ -1486,15 +1483,15 @@ metadata keys for indexing.
 | `SubscriptionRefusalCategory` | `duplicate`, `pow`, `blocked`, `rate_limited`, `invalid`, `error`, `unsupported`, `auth_required`, `restricted`, `unclassified` |
 | `SubscriptionRefusalOutcome` | `pending`, `dropped` |
 
-## Upload and tracker path
+## Delivery and tracker path
 
-The app can list and upload audit logs, but upload is separate from local recording.
+The app can list, delete and deliver audit logs; delivery is separate from local recording.
 
 ### Inactive audit OTLP runtime seam
 
-`MarmotAppRuntime::send_audit_otlp_once` is internal and requires a caller-supplied dedicated sender and one account. It prepares at most one bounded range of original v4 JSONL bodies under the existing exclusive root lease. Local admission covers preparation and, after a response, any durable finish; the HTTP request holds no local file, database, or lifecycle guard. One process-local reservation rejects overlapping attempts for the account. The root lease itself remains held until terminal storage close.
+`MarmotAppRuntime::send_audit_otlp_once` is internal and requires a caller-supplied dedicated sender and one account. It prepares at most one bounded range of original, validated v5 JSONL bodies under the existing exclusive root lease. Local admission covers preparation and, after a response, any durable finish; the HTTP request holds no local file, database, or lifecycle guard. One process-local reservation rejects overlapping attempts for the account. The root lease itself remains held until terminal storage close.
 
-Preparation verifies and owns the source bytes and local generation. Before sending and before finish, the attempt rechecks runtime state, account identity, recording consent, and the sender's stable destination profile without re-reading the source. `LocalAuditDelivery::finish` deliberately acknowledges the owned prepared bytes without reopening their source; external in-place file rewrites are outside this local lifecycle guarantee. Disable/re-enable, file deletion, account removal, destination change, and terminal close reject a pending result. A late response can still represent remote receipt, but cannot advance the old local cursor. Complete `200 {}` finishes locally; `400`, `413` and `422` finish as a permanent rejection; `409`, retryable and unknown outcomes retain the range. A blocked receiver verdict has no local finish action. Cancellation retains the prepared range for identical replay, so duplicates remain possible. This seam does not start automatic OTLP delivery, configure a production endpoint, set retention, or claim downstream Loki durability. The legacy v4 whole-file manual and tracker uploads keep their own checkpoint and defaults.
+Preparation verifies and owns the source bytes and local generation. Before sending and before finish, the attempt rechecks runtime state, account identity, recording consent, and the sender's stable destination profile without re-reading the source. `LocalAuditDelivery::finish` deliberately acknowledges the owned prepared bytes without reopening their source; external in-place file rewrites are outside this local lifecycle guarantee. Disable/re-enable, file deletion, account removal, destination change, and terminal close reject a pending result. A late response can still represent remote receipt, but cannot advance the old local cursor. Complete `200 {}` finishes locally; `400`, `413` and `422` finish as a permanent rejection; `409`, retryable and unknown outcomes retain the range. A blocked receiver verdict has no local finish action. Cancellation retains the prepared range for identical replay, so duplicates remain possible. This seam does not start automatic OTLP delivery, configure a production endpoint, set retention, or claim downstream Loki durability.
 
 ### Listing
 
@@ -1517,8 +1514,8 @@ Files are sorted by app account label, then file name.
 
 The recorder seals the active file into an immutable segment once new event bytes, excluding the repeated source
 prefix, reach `AUDIT_LOG_SEGMENT_MAX_BYTES` (1 MiB), or a day elapses before the next row, and
-continues into a fresh file at the same path. Segments are named `audit-<engine_id>-v4-seg<NNNNNN>.jsonl`, so they are
-still enumerated by `audit_log_files()` and sort ahead of the active file.
+continues into a fresh file at the same path. Segments are named `audit-<engine_id>-v5-seg<NNNNNN>.jsonl` (historical
+v4 sessions wrote `-v4-seg<NNNNNN>`), so they are still enumerated by `audit_log_files()` and sort ahead of the active file.
 
 - Rotation is a rename: existing event bytes and identities are preserved without deletion or truncation.
   Each fresh segment starts with the latest known `source_context`, assigned a fresh sequence number. Ordinary
@@ -1527,10 +1524,10 @@ still enumerated by `audit_log_files()` and sort ahead of the active file.
   not suppress later events. Writing the prefix cannot recursively trigger rollover. Repeated prefix bytes are
   excluded from the next segment's 1 MiB event budget, avoiding a roll per event when metadata itself is oversized.
 - `seq`, the recorder session id, and the health counters carry across a segment boundary, and no `recorder_started`
-  row is written: a roll is not a new recorder session, and the upload endpoint's content-keyed line dedupe never
-  re-mints a line just because it moved to a new file name.
+  row is written: a roll is not a new recorder session, and a line is never re-minted just because it moved to a new
+  file name.
 - A file already over the threshold at open — the upgrade path from builds without rotation, including one already past
-  the 64 MiB request ceiling — is rolled aside on the first open, so a session always starts on an uploadable file.
+  the old 64 MiB upload ceiling — is rolled aside on the first open, so a session always starts on a bounded file.
 - A failed roll is compensated and retried later, not absorbed: the rename is the only step that moves data, so a failed
   reopen renames the segment back to the active path and recording continues into the same file. The recorder then stops
   attempting rolls for a 30-second backoff before retrying, so transient `ENOSPC`/`EMFILE` errors cost a delayed roll,
@@ -1562,7 +1559,7 @@ filenames and metadata; expiry consults bounded delivery state (at most 1 MiB) a
 a cursor exists. Startup reads the stored policy only once some file is older than a day or an account exceeds the
 smallest budget; if the policy cannot be read, expiry uses 30 days and the budget waits for a later pass.
 An installation-wide hourly worker also covers signed-out/dormant accounts and remnants created after launch,
-independently of recording consent, upload configuration and upload success. The same worker checks budgets, at
+independently of recording consent, delivery configuration and delivery success. The same worker checks budgets, at
 most every 30 seconds, when recording activity schedules an audit tracker pass and after each automatic delivery pass
 (when delivered segments become evictable): a replay storm can seal several segments a minute. A policy change
 requests a full sweep. Its metadata scanner has a size-one
@@ -1580,7 +1577,7 @@ its writer lock. Expired idle data is sealed into a closed inode after a fresh e
 rows or record failures, and source context is deferred to the next actual event. Uncertain writers stay protected,
 including the actual segment path after failed roll compensation.
 Expiry serializes local cursor work for the source directory and cancels only an attempt owning the expiring inode.
-Other uploads remain valid, including another file in the same account; their local completion waits for retirement.
+Other delivery attempts remain valid, including another file in the same account; their local completion waits for retirement.
 No account-file lookup or installation-wide cancellation is needed for orphan directories or failed wipes.
 
 Before deleting a tracked source still known as active, retirement seals its filename and durably publishes its closed
@@ -1595,73 +1592,10 @@ stays conservative. Delivery drops retired,
 gap-free acknowledged journals while retaining real gaps and unaccepted extents. Retention never claims expired data
 reached a receiver.
 
-### Explicit upload
-
-`MarmotApp::post_audit_log_file(path, endpoint)` / `post_audit_log_file_with_tracker_config(...)` upload one selected
-file.
-
-Validation:
-
-- path must be non-empty;
-- basename must match `audit-*.jsonl`;
-- canonical path must be inside the app root;
-- file must be at most `64 MiB`;
-- the endpoint must pass the shared collector structural parser (`parse_relay_telemetry_endpoint`): `https`, or loopback `http` for local testing; missing hosts, unusable ports, userinfo, fragments, and unsupported schemes are rejected before DNS;
-- configured hosts on the centralized retired-relay list are rejected, including case and trailing-root-dot equivalents;
-- non-loopback endpoints require a bearer token;
-- exact `localhost` or a loopback IP literal remains the local-test opt-in, including a manual loopback upload without a token. Ordinary hostnames, `localhost` subdomains, and trailing-dot aliases do not receive that exception.
-
-HTTP request:
-
-Each upload attempt is a separate chokepoint: resolve once, validate every DNS answer with the shared classifier, reject empty or mixed-unsafe answers, and build a fresh pinned client. Redirects and system proxies are disabled. TLS verification stays enabled, including for local HTTPS. The configured hostname, port, path, and query are retained for Host/SNI; the URL is never rewritten to a resolved IP. There is no process-global client, DNS cache, or connection pool.
-
-| Property | Value |
-| --- | --- |
-| Method | `POST` |
-| Body | Captured complete-line JSONL snapshot |
-| `Content-Type` | `application/x-ndjson` |
-| `Content-Length` | Snapshot length |
-| Authorization | Optional bearer token, required for non-loopback endpoints |
-| Timeout | Shared collector `10s` DNS/connect limits; `60s` request override and enclosing network-attempt deadline |
-
-A 3xx response is `AuditUploadAttempt::Rejected` with its numeric status. The client never follows `Location`, so a separate redirect target receives no body or source/auth headers. Failed or refused uploads are not checkpointed.
-
-Optional source headers (the header names are the retired Goggles service's wire contract):
-
-- `X-Goggles-Hardware-Model`
-- `X-Goggles-Platform`
-- `X-Goggles-App-Version`
-
-The deterministic `account_ref` remains in JSONL. Neither JSONL nor upload headers carry account or free-form device names.
-`X-Goggles-Account-Label` and `X-Goggles-Device-Label` are not sent.
-
-`AuditLogUploadResult` fields:
-
-| Field | Meaning |
-| --- | --- |
-| `path` | Uploaded local path. |
-| `status` | HTTP success status code. |
-| `bytes_sent` | File size sent. |
-
-Upload errors are normalized to safe messages such as `HTTP <status>`, `request timed out`, `connection failed`,
-`invalid response body`, or `request failed`.
-
-### V4 upload boundary
-
-Before HTTP, MDK validates each complete row in the immutable upload snapshot against the bundled v4 JSON Schema.
-Strict typed deserialization rejects unknown and duplicate fields (including nested source metadata); schema
-validation also enforces value constraints. One invalid row rejects the entire snapshot without modifying local bytes.
-A file's name never substitutes for validation. An unfinished trailing row stays deferred until a later snapshot.
-The validator has HTTP/file reference resolution disabled and compiles only the bundled schema.
-
-No v1-v3 migration or sanitization is performed. Historical schemas remain committed for offline interpretation.
-New app recording writes v5 only; this gate remains to drain v4 files written before v5 recording, and the v4
-schema is frozen. A receiver must not store rejected bodies as quarantined artifacts.
-
 ### Legacy local cleanup
 
 Legacy forensic logs are permanently retired on upgrade. This replaces the interim v4-cutover policy of retaining
-v1-v3 files for manual inspection. Those files no longer have a supported upload path, and older FullData-mode
+v1-v3 files for manual inspection. Those files have no delivery path, and older FullData-mode
 logs can contain decrypted content in plaintext outside SQLCipher. Orphaned/unreadable account directories are
 not exposed by `audit_log_files()`, so leaving cleanup to the host's list/delete UI would miss them.
 The policy is automatic with no host opt-out or per-file callback. It removes these diagnostic artifacts, not
@@ -1670,7 +1604,7 @@ file listing after opening a new runtime; historical file paths are not durable 
 
 `MarmotApp::try_with_relays_and_account_home_and_config` removes the app's legacy forensic files after acquiring
 the exclusive root lease and before exposing the app or opening recorders. Swift/Kotlin constructors already use
-this path; no new host call is required. Cleanup runs regardless of the recording toggle or upload configuration.
+this path; no new host call is required. Cleanup runs regardless of the recording toggle or delivery configuration.
 Constructors for tests/embeddings with externally coordinated ownership do not run this cleanup.
 
 The scan is limited to regular files directly inside `<root>/accounts/<account-directory>/` and
@@ -1679,43 +1613,39 @@ missing, unreadable, or signed out. These are fixed historical namespaces inside
 the reserved app filenames `audit-<32-lowercase-hex-engine-id>.jsonl` and the `-v1.jsonl` / `-v2.jsonl` / `-v3.jsonl`
 variants, plus their `-seg<index>.jsonl` siblings (u32 decimal index, padded to at least six digits). Classification is by that historical
 filename convention, so empty, corrupt, or partially written files are removed too; payloads are not read or copied.
-This is distinct from the upload gate, which always validates content.
+It also deletes `audit-upload-checkpoint.json` and its `.tmp` staging sibling: bookkeeping the removed v4 whole-file
+upload kept per account, naming files already sent and holding no evidence.
 
-V4/future filenames, names outside those reserved forms, temporary files, databases, the device ID, and
+V4/future filenames, names outside those reserved forms, other temporary files, databases, the device ID, and
 `audit-key-reveal.jsonl` are preserved. A custom file that uses a reserved legacy name is also deleted. Symlinks
 are skipped at every scan level; a symlinked or non-directory container is reported as a cleanup failure.
 Nested directories are not traversed, and files outside the leased root are not scanned. Cleanup is idempotent;
 a scan/deletion failure does not prevent startup or processing
-other accounts/files, and a later exclusive-root open retries. Logs contain only deleted/failed counts. Remaining
-legacy files still fail the v4 upload gate. Cleanup does not rewrite the upload-checkpoint sidecar; the tracker
-retains its existing pruning behavior. Ongoing v4/v5 expiry is owned by the separate local retention sweep.
+other accounts/files, and a later exclusive-root open retries. Logs contain only deleted/failed counts. Ongoing v4/v5 expiry is owned by the separate local retention sweep.
 There is no date-based sunset: direct upgrades from old builds, restored backups, and previous deletion failures
 can reintroduce legacy files later. Removing the scan requires an explicit change to those upgrade/restore guarantees.
 
-### Tracker config
+### Audit source metadata
 
-`AuditLogTrackerConfig` is runtime-only:
+`AuditLogSource` is runtime-only and set with `MarmotAppRuntime::set_audit_log_source` (UniFFI
+`set_audit_log_source`, C `marmot_set_audit_log_source`):
 
 | Field | Meaning |
 | --- | --- |
-| `endpoint` | Optional tracker endpoint override. If absent, the app can use the compiled/default endpoint. |
-| `authorization_bearer_token` | Bearer token supplied by the host app. |
-| `source` | Optional system metadata (`hardware_model`, `platform`, `app_version`). |
+| `hardware_model` | Optional OS-provided model identifier. |
+| `platform` | Optional platform name. |
+| `app_version` | Optional host app version. |
 
-At recorder open the app writes a `source_context` JSONL row with stable `device_id`, the host-supplied
-platform, app version and optional hardware model, and an optional `local_member_ref` derived from the
-already-available account `MemberId`. Hardware model must be an OS-provided model identifier, not
-a hostname, serial number, or user-assigned name; omit it when unavailable. Hosts must update their Swift/Kotlin
-config construction to `AuditLogTrackerConfigV4Ffi` / `AuditLogUploadSourceV4Ffi` and replace `deviceLabel` with
-`hardwareModel` explicitly. The versioned config changes the UniFFI setter checksum so old generated bindings fail
-the compatibility check instead of reinterpreting a device label. The legacy C config ignores and returns NULL
-for `device_label`; C hosts use `marmot_set_audit_log_tracker_config_v4` for hardware-model support.
+Fields are trimmed and a blank field becomes absent. At recorder open the app writes a `source_context` JSONL row
+with the stable hashed `device_ref`, the host-supplied platform, app version and optional hardware model, and an optional
+`local_member_ref` derived from the already-available account `MemberId`. Set the source before opening accounts;
+already-open recorders keep the source they started with. Hardware model must be an OS-provided model identifier,
+not a hostname, serial number, or user-assigned name; omit it when unavailable.
 The producer member reference is derived internally; hosts do not supply it. Destructive live rotation
 (`JsonlRecorder::rotate`, including app delete of the active file) emits `recorder_started` and then the most
 recently recorded `source_context` into the fresh file. Size-based segment rolls stay one continuous session and
-repeat the latest source row before ordinary events, without replaying lifecycle rows. New recording writes v5, and
-the legacy whole-file upload accepts only v4 files; historical v2/v3 source rows remain valid under their original
-schemas and do not carry this field.
+repeat the latest source row before ordinary events, without replaying lifecycle rows. Historical v2/v3 source rows
+remain valid under their original schemas and do not carry this field.
 Older segments, or recorders that never received source context, may still lack source metadata; analyzers may associate it with validated source rows
 for the same producer/session or leave identity unknown. Joining `local_member_ref` to a later
 `group_state_changed.subject_member_ref` is a diagnostic correlation, not a membership interval or
@@ -1731,67 +1661,20 @@ no fields or schema version; source metadata stays in the validated JSONL body, 
 account/device names. A consumer can correlate retained metadata by engine/account/recorder-session identity, but cannot
 recover startup evidence that was never uploaded or has expired.
 
-Compiled/default endpoint source:
+### Tracker scheduling
 
-- `MarmotServiceEndpoints.audit_log_tracker_endpoint`;
-- default reads `MARMOT_AUDIT_LOG_TRACKER_ENDPOINT` at compile time if present.
-
-### Tracker update
-
-`post_audit_log_tracker_update_for_app()` considers listed audit files only when:
-
-- audit logging is enabled;
-- a resolved tracker endpoint exists;
-- a bearer token exists;
-- endpoint transport validation passes;
-- at least one `audit-*.jsonl` file exists.
-
-Structured skip reasons:
-
-- `audit logging disabled`
-- `audit log tracker endpoint missing`
-- `audit log tracker authorization token missing`
-- `audit log tracker not configured`
-- `audit log files missing`
-
-`AuditLogTrackerUpdateResult` fields:
+`MarmotAppRuntime::post_audit_log_tracker_update()` runs one manual v5 delivery pass. Its
+`AuditLogTrackerUpdateResult` reports:
 
 | Field | Meaning |
 | --- | --- |
 | `enabled` | Whether local audit logging was enabled at update time. |
-| `uploaded` | Per-file upload results. |
-| `skipped_reason` | Optional reason the update did not upload. |
+| `v5` | The v5 OTLP pass result, or absent when no destination is configured. |
 
-### Upload checkpoint
-
-Each account directory holds `audit-upload-checkpoint.json` (owner-only, staged-and-renamed, deliberately not an
-`audit-*.jsonl` name). It records, per audit file, the size and mtime the file had when the tracker last finished with
-it, plus whether that was an accepted upload, a file above the request ceiling, or an ineligible schema snapshot.
-
-- A file whose current size and mtime match its entry is never re-read or re-posted. Sealed segments never change, so
-  one `2xx` is a durable acknowledgment of their whole content.
-- The active file changes on every append and therefore re-transfers in full on each trigger. That residual is accepted
-  by design and is bounded by the segment threshold plus the repeated source prefix and final row; a byte-offset acknowledgment protocol was considered and rejected.
-- Identity is metadata, not a content hash, because the point of the checkpoint is to avoid reading the file. Audit
-  files only grow, so every mismatch — including the racy ones where the file grew between enumeration and upload —
-  falls back to re-uploading, which the endpoint short-circuits on `file_sha256` without parsing a line.
-- Losing or corrupting the sidecar costs repeat validation and, for eligible files, one repeat transfer.
-- Legacy, malformed and schema-ineligible snapshots are recorded as `ineligible_schema`; they do not trigger retry
-  cooldowns or block later files. A size/mtime change makes them eligible for validation again, never for bypassing it.
-  A new rejection emits a warning with only the file index and byte count; a cached verdict does not repeat it.
-- A file above the 64 MiB ceiling is recorded as such, logged once with aggregate counts, and skipped on later runs
-  instead of failing on every trigger. It never blocks the files behind it.
-- There is no app-level escape hatch for a file above the ceiling. `post_audit_log_file` enforces the same limit before
-  it opens a request body, so an oversized legacy audit file is not transferable through any app API: it stays on disk
-  for local handling until its records expire through local retention. A receiver must reject legacy schemas even
-  through other upload paths. Segment rotation keeps newly produced files below the ceiling, so this is an upgrade-path condition.
-- The sidecar is bounded by the account's *live* audit files, not by its upload history: entries for files that are gone
-  are pruned each run. Local retention removes expired segments; each tracker run stats every enumerated file and
-  rewrites the whole sidecar. Both costs are linear in file count and small next to the HTTP request each run makes.
-
-The runtime has a coalescing uploader queue of size `1`: triggers arriving while an update is scheduled or running
-collapse into exactly one follow-up run, and two updates never upload concurrently. It schedules tracker updates after
-these triggers:
+Automatic passes run only while a v5 OTLP sender is configured. The runtime has a coalescing queue of size `1`:
+triggers arriving while a pass is scheduled or running collapse into exactly one follow-up run, and two passes never
+run concurrently. Triggers join a fixed 30-second window; a failed pass retries after 60 seconds, doubling up to five
+minutes. It schedules passes after these triggers:
 
 - `create_group`
 - `invite_members`
@@ -1817,14 +1700,8 @@ these triggers:
 - `catch_up`
 - `receive`
 
-Tracker scheduling itself logs only the trigger, skip reason, file sizes, the file index for failed and skipped
-uploads, and aggregate counts: `uploaded`, `acknowledged` (already accepted by the endpoint), `too_large_recorded`
-(newly found above the ceiling this run, which is what warrants the warning), `too_large_known` (already recorded as
-above the ceiling, so skipped without a repeat warning), `ineligible_recorded` (new schema rejection),
-`ineligible_known` (cached schema rejection), and `failed`. Newly rejected files warrant a warning; cached rejections
-stay silent. Acknowledged-and-uploaded is kept distinct from skipped files so the counts never report a permanently
-untransferable file as delivered. It does not log audit
-file names, paths, or contents.
+Tracker scheduling logs only the trigger, skip reason and aggregate delivery counts. It does not log audit file
+names, paths, or contents.
 
 ## Coverage audit
 
@@ -1895,11 +1772,11 @@ Audit JSONL does not currently include:
 - raw member ids in `group_state_changed` rows;
 - raw changed group-profile values such as group name, description, avatar URL, image keys, admin pubkeys, or member ids
   in `human_action`;
-- upload endpoint, upload token, or upload source headers;
+- delivery endpoint or bearer token;
 - normal telemetry export resource attributes.
 
 Even without plaintext/ciphertext, these logs are sensitive because they reveal group/message identifiers, timing, and
-engine and relay behavior. Treat them as local forensic artifacts and upload only to trusted internal tooling.
+engine and relay behavior. Treat them as local forensic artifacts and deliver them only to trusted internal tooling.
 
 ## Tooling guidance
 
@@ -1921,8 +1798,8 @@ Recommended indexes for downstream ingestion:
 
 Recommended parser behavior:
 
-- Uploaded rows must use `marmot-forensics-audit/v4`; retained v1-v3 files remain local only.
-- Validate before any raw persistence. Preserve only accepted v4 lines when normalizing into columns;
+- Delivered rows use `marmot-forensics-audit/v5`; v4 and retained v1-v3 files remain local only.
+- Validate before any raw persistence. Preserve only accepted lines when normalizing into columns;
   schema rejection must not quarantine legacy or prohibited raw content.
 - Do not assume the following:
   - `seq` is globally unique.

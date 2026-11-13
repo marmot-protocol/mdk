@@ -2,10 +2,10 @@
 //! (route, relay) unit, each relay's health, the account's rolling-hour
 //! budget, and the parked and retired spans, which are never coverage.
 //!
-//! Each quantum's outcome, each re-arm rule and each dismissal is one
-//! transaction. The policy values come from the caller. Whether an active
-//! unit is caught up, owed or backing off is not stored: it follows from the
-//! unit's debt in the coverage ledger and from its next attempt time.
+//! Each quantum's outcome and each re-arm rule is one transaction. The
+//! policy values come from the caller. Whether an active unit is caught up,
+//! owed or backing off is not stored: it follows from the unit's debt in the
+//! coverage ledger and from its next attempt time.
 //! "Sweeping" is the runner's in-memory lease, so a restart reads it as owed.
 //!
 //! An attempt is charged to the account when it begins, so a process that
@@ -56,10 +56,12 @@ pub enum RecoveryUnitBreak {
 pub enum RecoveryUnitState {
     /// Retried as its debt and backoff allow.
     Active,
-    /// Not retried until new evidence re-arms it; its remaining debt is parked.
+    /// Not retried until new evidence or its next timed probe re-arms it;
+    /// its remaining debt is parked.
     Broken(RecoveryUnitBreak),
-    /// Its parked debt was dismissed. Any debt it owes besides its retired
-    /// spans is served as for an active unit, with a fresh budget, until
+    /// Its parked debt was retired: its relay left the route, or a dismissal
+    /// under the old recovery owner was converted. Any debt it owes besides
+    /// its retired spans is served as for an active unit, with a fresh budget, until
     /// progress makes it active or its budget breaks it again; its retired
     /// spans stay retired either way.
     Retired,
@@ -117,6 +119,11 @@ pub struct RecoveryUnitPolicy {
     /// A relay cooldown spell longer than this makes every re-check on the
     /// relay due when the spell ends.
     pub recheck_after_cooldown_seconds: u64,
+    /// How long a newly broken unit waits before its first timed probe
+    /// ([`SqliteAppStorage::arm_due_recovery_probes`]); each failed probe
+    /// doubles the wait.
+    pub probe_base_seconds: u64,
+    pub probe_cap_seconds: u64,
 }
 
 /// A broken unit's park. Its revision identifies the occurrence: a failed
@@ -147,10 +154,14 @@ pub struct RecoveryUnit {
     pub route: TransportReconciliationRoute,
     pub relay: String,
     pub state: RecoveryUnitState,
-    /// A broken unit holds one probe attempt, earned by new loss over its park.
+    /// A broken unit holds one probe attempt, earned by new loss over its
+    /// park or armed once its next probe time passes.
     pub probe: bool,
     pub no_progress: u32,
+    /// An active unit's no-progress backoff, or a broken unit's failed
+    /// probes since it parked.
     pub backoff_step: u32,
+    /// An active unit's next retry, or a broken unit's next timed probe.
     pub next_attempt_at_seconds: u64,
     pub slice_width_seconds: Option<u64>,
     pub observed_cap: Option<u32>,
@@ -208,9 +219,9 @@ pub struct RecoveryUnitSpan {
     pub retired: Option<RecoverySpanRetirement>,
 }
 
-/// A route with at least one broken unit: one notice, whose revision is the
-/// newest park among them and the route's remainder. Not `Debug`: it carries
-/// the route and relays.
+/// A route with at least one broken unit, whose revision is the newest park
+/// among them and the route's remainder. Not `Debug`: it carries the route
+/// and relays.
 #[derive(Clone, PartialEq, Eq)]
 pub struct RecoveryParkedRoute {
     pub route: TransportReconciliationRoute,
@@ -222,7 +233,8 @@ pub struct RecoveryParkedRoute {
 
 /// Debt the retention floor overtook on a route while some relay still owed
 /// it: the earliest and latest such second. It is never fetched and never
-/// coverage; only a dismissal clears it. Not `Debug`: it carries the route.
+/// coverage, and raises no notice; only a rejoin or the route's end clears it.
+/// Not `Debug`: it carries the route.
 #[derive(Clone, PartialEq, Eq)]
 pub struct RecoveryRouteRemainder {
     pub route: TransportReconciliationRoute,
@@ -640,21 +652,43 @@ pub(crate) fn next_park_revision_tx(conn: &Connection) -> StorageResult<i64> {
 
 /// Break the unit and park its remaining debt. `revision` keeps an existing
 /// park's identity (a failed probe); `None` starts a new park.
+///
+/// It also schedules the unit's next timed probe. A new park waits the
+/// policy's probe base; a kept one (a failed probe) waits the base doubled
+/// once per probe failed since it parked, up to the cap. Without a policy
+/// (the upgrade conversion) the probe is due at once, and its failure waits
+/// the base.
 fn park_tx(
     conn: &Connection,
     unit: &RecoveryUnit,
     reason: RecoveryUnitBreak,
     keep: Option<RecoveryUnitPark>,
+    policy: Option<&RecoveryUnitPolicy>,
     now_seconds: u64,
 ) -> StorageResult<()> {
     let (revision, parked_at) = match keep {
         Some(park) => (integer(park.revision)?, integer(park.parked_at_seconds)?),
         None => (next_park_revision_tx(conn)?, integer(now_seconds)?),
     };
+    let (step, next_probe) = match policy {
+        None => (0, 0),
+        Some(policy) => {
+            let step = if keep.is_some() { unit.backoff_step } else { 0 };
+            (
+                step.saturating_add(1),
+                now_seconds.saturating_add(doubling(
+                    policy.probe_base_seconds,
+                    step,
+                    policy.probe_cap_seconds,
+                )),
+            )
+        }
+    };
     let (kind, id) = unit.route.storage_key();
     conn.execute_cached(
         "UPDATE account_recovery_units SET state = ?4, broken_reason = ?5, probe = 0,
-         park_revision = ?6, parked_at_seconds = ?7
+         park_revision = ?6, parked_at_seconds = ?7, backoff_step = ?8,
+         next_attempt_at_seconds = ?9
          WHERE route_kind = ?1 AND route_id = ?2 AND relay = ?3",
         params![
             kind,
@@ -663,7 +697,9 @@ fn park_tx(
             BROKEN,
             break_code(reason),
             revision,
-            parked_at
+            parked_at,
+            i64::from(step),
+            integer(next_probe)?
         ],
     )
     .storage()?;
@@ -1205,7 +1241,7 @@ pub(crate) fn probe_on_uncover_tx(
 
 /// Coverage now proves part of a unit's parked or retired spans; those parts
 /// are no longer debt of either kind. A broken unit whose last parked part is
-/// proved has nothing parked left, so it is re-armed and its notice ends. Runs
+/// proved has nothing parked left, so it is re-armed. Runs
 /// inside every coverage write.
 pub(crate) fn trim_spans_tx(
     conn: &Connection,
@@ -1264,8 +1300,8 @@ pub(crate) fn trim_spans_tx(
 /// Only seconds from the route's
 /// settled floor up count: an earlier prune parked or dropped everything
 /// below it and kept no coverage there, so a goal widened back below it
-/// parks nothing twice, and a dismissed remainder stays dismissed until loss
-/// lowers the settled floor. A route's first remainder takes a new park
+/// parks nothing twice; only loss, which lowers the settled floor, parks
+/// there again. A route's first remainder takes a new park
 /// revision; a later one widens it under the same revision. Runs inside that
 /// prune, before it drops anything.
 pub(crate) fn park_overtaken_tx(
@@ -1392,10 +1428,11 @@ pub(crate) fn prune_spans_tx(conn: &Connection, floor: i64) -> StorageResult<()>
 /// old owner becomes a park on each of `relays` that owes the route history
 /// up to `now_seconds`. Each breaks for no progress, keeping
 /// `parked_at_seconds`, the time the obligation parked. The route's converted
-/// parks share one revision, its remainder's when it has one, so they are one
-/// notice whose id stays put while some of them re-arm. A relay that owes
-/// nothing is left as it is, and so is one already broken: its own park
-/// stands. Returns the units broken.
+/// parks share one revision, its remainder's when it has one. Conversion has
+/// no runner policy, so each park's first probe is due at once and a failed
+/// one waits the policy's probe base. A relay that owes nothing is left as it
+/// is, and so is one already broken: its own park stands. Returns the units
+/// broken.
 pub(crate) fn break_converted_route_tx(
     conn: &Connection,
     route: &TransportReconciliationRoute,
@@ -1429,6 +1466,7 @@ pub(crate) fn break_converted_route_tx(
                 revision,
                 parked_at_seconds,
             }),
+            None,
             now_seconds,
         )?;
         broken += 1;
@@ -1599,7 +1637,7 @@ impl SqliteAppStorage {
                     relay_answered_tx(&conn, relay, policy, now_seconds)?;
                     match unit.state {
                         RecoveryUnitState::Broken(reason) if unit.probe => {
-                            park_tx(&conn, &unit, reason, unit.park, now_seconds)?;
+                            park_tx(&conn, &unit, reason, unit.park, Some(policy), now_seconds)?;
                         }
                         RecoveryUnitState::Active | RecoveryUnitState::Retired => {
                             let no_progress = unit.no_progress.saturating_add(1);
@@ -1610,7 +1648,14 @@ impl SqliteAppStorage {
                                     params![kind, id, relay, i64::from(no_progress)],
                                 )
                                 .storage()?;
-                                park_tx(&conn, &unit, RecoveryUnitBreak::NoProgress, None, now_seconds)?;
+                                park_tx(
+                                    &conn,
+                                    &unit,
+                                    RecoveryUnitBreak::NoProgress,
+                                    None,
+                                    Some(policy),
+                                    now_seconds,
+                                )?;
                             } else {
                                 let next = now_seconds.saturating_add(doubling(
                                     policy.backoff_base_seconds,
@@ -1652,10 +1697,24 @@ impl SqliteAppStorage {
                 Outcome::RateLimited => relay_cool_down_tx(&conn, relay, policy, now_seconds)?,
                 Outcome::Refused => match unit.state {
                     RecoveryUnitState::Broken(_) if unit.probe => {
-                        park_tx(&conn, &unit, RecoveryUnitBreak::Refused, unit.park, now_seconds)?;
+                        park_tx(
+                            &conn,
+                            &unit,
+                            RecoveryUnitBreak::Refused,
+                            unit.park,
+                            Some(policy),
+                            now_seconds,
+                        )?;
                     }
                     RecoveryUnitState::Active | RecoveryUnitState::Retired => {
-                        park_tx(&conn, &unit, RecoveryUnitBreak::Refused, None, now_seconds)?;
+                        park_tx(
+                            &conn,
+                            &unit,
+                            RecoveryUnitBreak::Refused,
+                            None,
+                            Some(policy),
+                            now_seconds,
+                        )?;
                     }
                     _ => {}
                 },
@@ -1844,88 +1903,26 @@ impl SqliteAppStorage {
         })
     }
 
-    /// Dismiss a parked route's notice: its broken units become retired with
-    /// a fresh budget for anything else they owe, their parked spans are
-    /// retired as dismissed, never covered, and its remainder is gone. Returns
-    /// `false` when `revision` is not the route's current park: the newest
-    /// among its broken units and its remainder.
-    pub fn dismiss_recovery_route_park(
-        &self,
-        route: &TransportReconciliationRoute,
-        revision: u64,
-    ) -> StorageResult<bool> {
-        self.dismiss_route_park(route, None, revision)
-    }
-
-    /// [`Self::dismiss_recovery_route_park`] for what a notice shows: the
-    /// route's broken units on `relays` and its remainder. `revision` must be
-    /// the newest park among them, and only they are dismissed; a broken unit
-    /// on any other relay is left as it is.
-    pub fn dismiss_recovery_route_park_on(
-        &self,
-        route: &TransportReconciliationRoute,
-        relays: &[String],
-        revision: u64,
-    ) -> StorageResult<bool> {
-        self.dismiss_route_park(route, Some(relays), revision)
-    }
-
-    fn dismiss_route_park(
-        &self,
-        route: &TransportReconciliationRoute,
-        relays: Option<&[String]>,
-        revision: u64,
-    ) -> StorageResult<bool> {
-        self.connection.with_transaction(|| {
-            let conn = self.lock()?;
-            let (kind, id) = route.storage_key();
-            let broken = units_tx(
-                &conn,
-                "WHERE state = 1 AND route_kind = ?1 AND route_id = ?2",
-                params![kind, id],
-            )?
-            .into_iter()
-            .filter(|unit| relays.is_none_or(|relays| relays.contains(&unit.relay)))
-            .collect::<Vec<_>>();
-            let current = broken
-                .iter()
-                .filter_map(|unit| unit.park)
-                .map(|park| park.revision)
-                .chain(remainder_revision_tx(&conn, route)?)
-                .max();
-            if current != Some(revision) {
-                return Ok(false);
-            }
-            conn.execute_cached(
-                "DELETE FROM account_recovery_coverage_remainders
-                 WHERE route_kind = ?1 AND route_id = ?2",
-                params![kind, id],
+    /// Arm a probe on every broken unit whose next timed probe is due at
+    /// `now_seconds`: its debt includes its park again, and the runner serves
+    /// it under its ordinary scheduling, budgets and cooldowns. A failed probe
+    /// re-parks under the same revision and waits longer
+    /// ([`RecoveryUnitPolicy::probe_base_seconds`]); one that advances, or
+    /// finds nothing owed, re-arms the unit. Returns the units armed.
+    pub fn arm_due_recovery_probes(&self, now_seconds: u64) -> StorageResult<usize> {
+        self.lock()?
+            .execute_cached(
+                "UPDATE account_recovery_units SET probe = 1
+                 WHERE state = ?1 AND probe = 0 AND next_attempt_at_seconds <= ?2",
+                params![BROKEN, integer(now_seconds)?],
             )
-            .storage()?;
-            for unit in &broken {
-                let mut retired = spans_tx(&conn, route, &unit.relay, RETIRED_SPAN)?;
-                retired.extend(
-                    spans_tx(&conn, route, &unit.relay, PARKED_SPAN)?
-                        .into_iter()
-                        .map(|span| RecoveryUnitSpan {
-                            range: span.range,
-                            retired: Some(RecoverySpanRetirement::Dismissed),
-                        }),
-                );
-                retired.sort_by_key(|span| span.range);
-                replace_spans_tx(&conn, route, &unit.relay, PARKED_SPAN, &[])?;
-                replace_spans_tx(&conn, route, &unit.relay, RETIRED_SPAN, &retired)?;
-                conn.execute_cached(
-                    "UPDATE account_recovery_units SET state = ?4, broken_reason = NULL,
-                     probe = 0, no_progress = 0, backoff_step = 0, next_attempt_at_seconds = 0,
-                     parked_at_seconds = NULL
-                     WHERE route_kind = ?1 AND route_id = ?2 AND relay = ?3",
-                    params![kind, id, unit.relay, RETIRED],
-                )
-                .storage()?;
-            }
-            Ok(true)
-        })
+            .storage()
+    }
+
+    /// Every broken unit waiting for its next timed probe, which falls due at
+    /// its `next_attempt_at_seconds`.
+    pub fn pending_recovery_probes(&self) -> StorageResult<Vec<RecoveryUnit>> {
+        units_tx(&*self.lock()?, "WHERE state = 1 AND probe = 0", [])
     }
 
     /// Retire what `relays` owe `route` now that it no longer carries them:
@@ -2286,8 +2283,8 @@ impl SqliteAppStorage {
         Ok(Some(u64::MAX))
     }
 
-    /// Every route with a broken unit, one notice each. Its revision also
-    /// covers the route's remainder, so dismissing the notice clears both.
+    /// Every route with a broken unit. Its revision is the newest among their
+    /// parks and the route's remainder.
     pub fn parked_recovery_routes(&self) -> StorageResult<Vec<RecoveryParkedRoute>> {
         let conn = self.lock()?;
         let units = units_tx(&conn, "WHERE state = 1", [])?;
@@ -2389,5 +2386,40 @@ impl SqliteAppStorage {
         )
         .first()
         .map(|range| range.since_seconds))
+    }
+}
+
+#[cfg(test)]
+impl SqliteAppStorage {
+    /// Test support: what the upgrade conversion leaves of a park the old
+    /// owner's user dismissed ([`retire_converted_ranges_tx`]): each broken
+    /// unit of `route` retired with a fresh budget, its parked spans retired
+    /// as dismissed, and no remainder (conversion drops them all).
+    pub(crate) fn retire_route_park_as_converted(&self, route: &TransportReconciliationRoute) {
+        self.connection
+            .with_transaction(|| {
+                let conn = self.lock()?;
+                let (kind, id) = route.storage_key();
+                conn.execute_cached(
+                    "DELETE FROM account_recovery_coverage_remainders
+                     WHERE route_kind = ?1 AND route_id = ?2",
+                    params![kind, id],
+                )
+                .storage()?;
+                for unit in units_tx(
+                    &conn,
+                    "WHERE state = 1 AND route_kind = ?1 AND route_id = ?2",
+                    params![kind, id],
+                )? {
+                    let parked = spans_tx(&conn, route, &unit.relay, PARKED_SPAN)?
+                        .iter()
+                        .map(|span| span.range)
+                        .collect::<Vec<_>>();
+                    rearm_tx(&conn, route, &unit.relay)?;
+                    retire_converted_ranges_tx(&conn, route, &unit.relay, &parked)?;
+                }
+                Ok::<_, cgka_traits::storage::StorageError>(())
+            })
+            .unwrap();
     }
 }

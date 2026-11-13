@@ -19,7 +19,13 @@ pub(crate) async fn relays_command(
     relay: Option<String>,
 ) -> Result<CommandOutput, WnError> {
     let runtime = app.runtime();
-    relays_command_with_runtime(account_home, app, &runtime, command, account_flag, relay).await
+    let result =
+        relays_command_with_runtime(account_home, app, &runtime, command, account_flag, relay)
+            .await;
+    // Shut down before the process exits: a recovery request the exit cut
+    // would settle as the relay's unreachable verdict for the next process.
+    runtime.shutdown().await;
+    result
 }
 
 pub(crate) async fn relays_command_with_runtime(

@@ -13,7 +13,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
-use crate::{audit_upload::audit_upload_host_is_retired, collector_host_safety, export_config};
+use crate::{collector_host_safety, export_config};
 
 const MAX_RECORDS: usize = 96;
 const MAX_BODY_BYTES: usize = 65_535;
@@ -161,7 +161,7 @@ impl AuditOtlpSender {
             || destination.len() > 256
             || url.path() != "/v1/logs"
             || url.query().is_some()
-            || audit_upload_host_is_retired(host)
+            || collector_host_safety::host_is_retired(host)
             || (export_config::endpoint_host_is_loopback(&endpoint) && !allow_loopback)
             || bearer_token.is_empty()
             || !bearer_token.is_ascii()

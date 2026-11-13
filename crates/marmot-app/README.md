@@ -910,8 +910,11 @@ account-wide ones (loss, incremental and explicit history) appear only in the li
 `MarmotAppRuntime::account_recovery_status(account_ref)` reads the account's recovery as one `AccountRecoveryStatus`:
 the groups whose history is still being fetched, whether the inbox's is, and every notice as `history_notices` lists
 them. Re-read it on `MarmotAppEvent::RecoveryStatusChanged`; the recovery runner supplies the catching-up fields.
-Current epoch-gap exhaustion emits `EpochGap`; coverage-ledger parks emit `HistoryNoticeCause::UnprovenHistory`
-without attributing the original reason history was owed. Other cause labels preserve compatibility.
+Current epoch-gap exhaustion emits `EpochGap`. Other cause labels preserve compatibility; keep exhaustive matches.
+`HistoryNoticeCause::UnprovenHistory` is no longer emitted: what the coverage ledger parks (a relay that refused or
+could not prove a route's history, or history the retention window passed before anything proved it) is no evidence
+that messages are missing, so it raises no notice. The recovery runner probes a broken relay quietly, an hour after it
+breaks and then on an interval doubling to a day.
 
 A rejoin emits one `HistoryNoticeCause::BeforeRejoin` per new copy of the group. A replacement Welcome (the copy's
 install epoch moved and its join epoch was reset) makes the recovery runner retire what the group's routes owed or
@@ -920,15 +923,14 @@ retires nothing further. Retired spans stay in the relay re-check; loss inside t
 re-arms them.
 
 `dismiss_history_notice(account_ref, notice_id)` runs on the account worker. After the user accepts that the history may
-be incomplete, it durably retires exactly the shown occurrence, never as coverage or a recovery success. A ledger notice
-retires its shown parked spans and clears its route's remainder. Ordinary recovery and account reopen do not undo that
-dismissal. A qualified proof can replace retirement with coverage. Loss import, not dismissal, releases the delivery-loss
-fence; unchanged loss evidence is not imported again. It returns false for a stale id. A malformed id is `AppError::Hex`.
+be incomplete, it durably retires exactly the shown occurrence (a parked obligation or a rejoin), never as coverage or a
+recovery success. Loss import, not dismissal, releases the delivery-loss fence; unchanged loss evidence is not imported
+again. It returns false for a stale id, including any `UnprovenHistory` notice id an older build showed, which changes
+nothing. A malformed id is `AppError::Hex`. A higher missing epoch starts a new epoch-gap occurrence.
 
-History outside the dismissed spans remains owed. Without a healthy live tail, advancing time can add unproved seconds.
-A relay refusing those seconds can raise a fresh `UnprovenHistory` notice without reopening any dismissed second.
-New loss can reopen a dismissed span. If recovery parks it again, that notice has a fresh revision.
-Explicit full-history repair re-arms retired debt. A higher missing epoch starts a new epoch-gap occurrence.
+A relay the recovery runner gave up on raises no notice and needs no dismissal: its unit probes again on its own an hour
+after it parks, doubling to a day, under the same park (mdk#3308). New loss over a parked span earns a probe at once.
+Explicit full-history repair re-arms every unit.
 
 ## User blocking
 
@@ -1012,7 +1014,7 @@ See [moderation reports](../../docs/marmot-architecture/moderation-reports.md) f
 ## Audit v5 Welcome evidence
 
 Opt-in audit recording writes v5 files (see [`marmot-forensics`](../marmot-forensics/README.md)); historical v4 files
-keep their separate legacy whole-file upload path. With audit logging enabled, the app records v5 Welcome evidence from
+stay local until retention expires them. With audit logging enabled, the app records v5 Welcome evidence from
 real founding, publication, receipt, peel, join and checkpoint boundaries. The
 [Welcome probe notes](tests/audit-v5-welcome-probe.md) describe those boundaries and the unit tests that exercise them:
 

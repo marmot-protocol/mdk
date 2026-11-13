@@ -10,6 +10,7 @@ use std::{
 };
 
 use cgka_traits::app_components::{is_loopback_ip, reject_non_public_ip};
+use transport_nostr::retired_relay_hosts;
 use url::{Host, Url};
 
 use crate::export_config::{endpoint_host_is_loopback, parse_relay_telemetry_endpoint};
@@ -108,6 +109,17 @@ impl PinnedCollector {
             .build()
             .map_err(|_| CollectorRequestError)
     }
+}
+
+/// Whether `host` names a host on the centralized retired-relay denylist.
+/// The match is exact and ASCII case-insensitive, ignoring trailing root dots;
+/// a subdomain of a retired host is a different host. A collector that dials a
+/// host-supplied URL rejects these before resolving it.
+pub(crate) fn host_is_retired(host: &str) -> bool {
+    let host = host.trim_end_matches('.');
+    retired_relay_hosts()
+        .iter()
+        .any(|retired| host.eq_ignore_ascii_case(retired))
 }
 
 pub async fn system_resolve(host: String, port: u16) -> std::io::Result<Vec<IpAddr>> {

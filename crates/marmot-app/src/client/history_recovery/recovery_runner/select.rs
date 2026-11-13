@@ -64,9 +64,13 @@ pub(super) struct Survey {
     /// The routes whose group has a conversation window open.
     pub(super) window: BTreeSet<TransportReconciliationRoute>,
     /// The required units still catching up: they owe history after their
-    /// live tails and are neither broken nor suspended
+    /// live tails and are neither broken (even while probing) nor suspended
     /// ([`RunnerHost::surveyed`](super::RunnerHost)).
     pub(super) catching_up: BTreeSet<UnitKey>,
+    /// When the earliest timed probe of a broken unit on a relay a current,
+    /// unsuspended route requires falls due. Its unit is blocked until a debt
+    /// turn arms it, so an idle runner wakes for it.
+    pub(super) probe_due: Option<u64>,
 }
 
 pub(super) enum Pick {
@@ -270,13 +274,13 @@ pub(super) fn survey(
                 .map(|range| range.until_seconds - range.since_seconds + 1)
                 .fold(0u64, u64::saturating_add);
             let unit = app.recovery_unit(&route.route, relay)?;
-            let (retry_at, broken) = match (&unit, best_effort) {
+            let (retry_at, parked, broken) = match (&unit, best_effort) {
                 // A best-effort relay keeps no retry state.
-                (_, true) | (None, false) => (0, false),
-                (Some(unit), false) => (
-                    unit.next_attempt_at_seconds,
-                    matches!(unit.state, RecoveryUnitState::Broken(_)) && !unit.probe,
-                ),
+                (_, true) | (None, false) => (0, false, false),
+                (Some(unit), false) => {
+                    let parked = matches!(unit.state, RecoveryUnitState::Broken(_));
+                    (unit.next_attempt_at_seconds, parked, parked && !unit.probe)
+                }
             };
             let cooldown = cooldown_until(app, &mut cooldowns, relay, now)?;
             let key = UnitKey {
@@ -288,7 +292,9 @@ pub(super) fn survey(
             // leaves the admission frontier.
             let held_back =
                 stalled.holds(route) || admission.backpressured(&key, &policy.staging, true)?;
-            if !best_effort && !broken && !suspended(route) {
+            // A probe is quiet: one quantum that re-parks or re-arms, never
+            // a catch-up the account's status shows.
+            if !best_effort && !parked && !suspended(route) {
                 catching_up.insert(key.clone());
             }
             candidates.push(Candidate {
@@ -303,6 +309,18 @@ pub(super) fn survey(
             });
         }
     }
+    let probe_due = app
+        .pending_recovery_probes()?
+        .into_iter()
+        .filter(|unit| {
+            turn.routes.iter().any(|route| {
+                route.route == unit.route
+                    && !suspended(route)
+                    && route.required.contains(&unit.relay)
+            })
+        })
+        .map(|unit| unit.next_attempt_at_seconds)
+        .min();
     Ok(Survey {
         candidates,
         rechecks: recheck::survey(turn, policy, stalled, &mut admission)?,
@@ -315,6 +333,7 @@ pub(super) fn survey(
             .map(|route| route.route.clone())
             .collect(),
         catching_up,
+        probe_due,
     })
 }
 
@@ -348,7 +367,8 @@ pub(super) fn pick(
             next_due: Some(until),
         };
     }
-    let mut next_due: Option<u64> = None;
+    // A pending probe's unit is blocked until a debt turn arms it.
+    let mut next_due = survey.probe_due;
     let mut eligible = Vec::new();
     let rechecks = survey.rechecks;
     for candidate in survey.candidates {

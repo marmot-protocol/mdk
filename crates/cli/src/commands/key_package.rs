@@ -22,7 +22,12 @@ pub(crate) async fn key_package_command(
     account_flag: Option<String>,
 ) -> Result<CommandOutput, WnError> {
     let runtime = app.runtime();
-    key_package_command_with_runtime(account_home, app, &runtime, command, account_flag).await
+    let result =
+        key_package_command_with_runtime(account_home, app, &runtime, command, account_flag).await;
+    // Shut down before the process exits: a recovery request the exit cut
+    // would settle as the relay's unreachable verdict for the next process.
+    runtime.shutdown().await;
+    result
 }
 
 pub(crate) async fn key_package_command_with_runtime(

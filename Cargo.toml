@@ -78,7 +78,6 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 hex = "0.4"
 base64 = "0.22"
-httpdate = "1.0"
 getrandom = "0.4"
 web-time = "1.1"
 hmac = "0.12"

@@ -889,7 +889,7 @@ impl AppClient {
     /// The last second of `group_id`'s history that a parked remainder on one
     /// of its current routes still owes: debt the retention floor overtook,
     /// which [`Self::group_history_proved`] does not read, since it lasts
-    /// until a user dismisses it.
+    /// until a rejoin or the route's end clears it.
     pub(crate) fn group_parked_until(&self, group_id: &[u8]) -> Result<Option<u64>, AppError> {
         let routes = self
             .current_coverage_routes()

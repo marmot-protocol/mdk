@@ -360,7 +360,6 @@ async fn running_runtime_pushes_to_default_telemetry_endpoint_when_runtime_endpo
     let config = MarmotAppConfig::white_noise()
         .with_service_endpoints(MarmotServiceEndpoints {
             relay_telemetry_otlp_endpoint: Some(format!("http://{addr}/v1/metrics")),
-            audit_log_tracker_endpoint: None,
             ..MarmotServiceEndpoints::default()
         })
         // Replacing the endpoints used to clear Open Ranking too; keep tests off the live provider.

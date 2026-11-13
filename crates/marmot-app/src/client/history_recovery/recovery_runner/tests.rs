@@ -34,8 +34,8 @@ use transport_nostr_adapter::sweep::{
 
 use super::admission::{Drained, LiveFence, Stalled, live_fences};
 use super::policy::{
-    RUNNER_BACKOFF_BASE_SECS, RUNNER_QUANTUM, RUNNER_RECHECK_INTERVAL_SECS, RUNNER_REQUEST_TIMEOUT,
-    RUNNER_UNREACHABLE_RETRY_SECS,
+    RUNNER_BACKOFF_BASE_SECS, RUNNER_PROBE_BASE_SECS, RUNNER_QUANTUM, RUNNER_RECHECK_INTERVAL_SECS,
+    RUNNER_REQUEST_TIMEOUT, RUNNER_UNREACHABLE_RETRY_SECS,
 };
 use super::quantum::{SinkStop, classify};
 use super::select::{Survey, survey};
@@ -1170,6 +1170,9 @@ impl RunnerHost for TestHost {
         T: Send + 'static,
     {
         let now = self.clock.now();
+        if let Err(error) = self.app.arm_due_recovery_probes(now) {
+            return Some(Err(error));
+        }
         let tails: Box<dyn LiveTailRead> = match &self.client {
             Some(client) => client.recovery_runner_live_tails(&self.app, now).await,
             None => Box::new(self.tails.read()),
@@ -2127,13 +2130,12 @@ async fn recovery_runner_breaks_a_unit_after_six_answers_without_progress() {
         unit.state,
         RecoveryUnitState::Broken(RecoveryUnitBreak::NoProgress)
     );
+    // It waits for evidence or its probe, an hour on, not its old backoff.
+    let due = unit.park.unwrap().parked_at_seconds + RUNNER_PROBE_BASE_SECS;
+    assert_eq!(unit.next_attempt_at_seconds, due);
     let requests = relay.requests();
-    clock.advance(DAY);
-    assert_eq!(
-        idle(runner.step().await),
-        None,
-        "a broken unit waits for evidence, not for time"
-    );
+    clock.advance_to(due - 1);
+    assert_eq!(idle(runner.step().await), Some(due));
     assert_eq!(relay.requests(), requests);
 }
 
@@ -2167,16 +2169,18 @@ async fn recovery_runner_rearms_nothing_on_an_unknown_caps_read() {
         }
     }
     let requests = relay.requests();
+    // Only its timed probe is ahead.
+    let probe = Some(account.unit(&route, RELAY).next_attempt_at_seconds);
 
     // The relay reconnects without a document: no evidence its caps changed.
     host.caps_unknown.store(true, Ordering::SeqCst);
     handle.relay_reconnected(RELAY);
-    assert_eq!(idle(runner.step().await), None);
+    assert_eq!(idle(runner.step().await), probe);
     assert_eq!(account.unit(&route, RELAY).state, broken);
     // Nor is reading the caps it was planned with.
     host.caps_unknown.store(false, Ordering::SeqCst);
     handle.relay_reconnected(RELAY);
-    assert_eq!(idle(runner.step().await), None);
+    assert_eq!(idle(runner.step().await), probe);
     assert_eq!(account.unit(&route, RELAY).state, broken);
     assert_eq!(relay.requests(), requests, "a broken unit fetches nothing");
 }
@@ -2841,6 +2845,7 @@ fn recovery_runner_sizes_a_route_last_seen_empty_by_its_span() {
         fenced: BTreeSet::new(),
         window: BTreeSet::new(),
         catching_up: BTreeSet::new(),
+        probe_due: None,
     };
     let select::Pick::Unit(first) =
         select::pick(survey, &mut memory, &PriorityHints::default(), 0, true)
@@ -3420,6 +3425,13 @@ fn recovery_runner_policy_holds_the_starting_values() {
             policy.unit.break_after_no_progress
         ),
         (30, HOUR, 6)
+    );
+    assert_eq!(
+        (
+            policy.unit.probe_base_seconds,
+            policy.unit.probe_cap_seconds
+        ),
+        (HOUR, 24 * HOUR)
     );
     assert_eq!(
         (

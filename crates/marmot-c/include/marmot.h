@@ -654,10 +654,11 @@ typedef enum MarmotEventSizeClass {
 } MarmotEventSizeClass;
 
 /**
- * Why recovery parked. Current epoch-gap exhaustion emits `EpochGap`;
- * coverage-ledger parks emit `UnprovenHistory`; a rejoin emits
- * `BeforeRejoin`. Other labels preserve compatibility; `KnownEvent` and
- * `MaintenanceBoundary` remain reserved for parking policy.
+ * Why recovery parked. Current epoch-gap exhaustion emits `EpochGap`; a
+ * rejoin emits `BeforeRejoin`. Other labels preserve compatibility, so
+ * keep exhaustive switches: `UnprovenHistory` is no longer emitted, and
+ * `KnownEvent` and `MaintenanceBoundary` remain reserved for parking
+ * policy.
  */
 typedef enum MarmotHistoryNoticeCause {
   /**
@@ -690,9 +691,9 @@ typedef enum MarmotHistoryNoticeCause {
    */
   MARMOT_HISTORY_NOTICE_CAUSE_MAINTENANCE_BOUNDARY,
   /**
-   * The recovery runner could not prove this history on a route's
-   * relays and stopped retrying them: a group's (`group_id_hex` names
-   * it) or the account inbox's.
+   * No longer emitted; kept for compatibility. Earlier releases raised
+   * it when the recovery runner could not prove history on a route's
+   * relays. The runner now retries them quietly.
    */
   MARMOT_HISTORY_NOTICE_CAUSE_UNPROVEN_HISTORY,
   /**
@@ -3911,15 +3912,6 @@ typedef struct MarmotAuditLogFileList {
 } MarmotAuditLogFileList;
 
 /**
- * Result of uploading one audit-log file.
- */
-typedef struct MarmotAuditLogUploadResult {
-  char *path;
-  uint16_t status;
-  uint64_t bytes_sent;
-} MarmotAuditLogUploadResult;
-
-/**
  * Result of deleting one audit-log file.
  */
 typedef struct MarmotAuditLogDeleteResult {
@@ -3930,16 +3922,6 @@ typedef struct MarmotAuditLogDeleteResult {
    */
   bool still_recording;
 } MarmotAuditLogDeleteResult;
-
-/**
- * Result of a tracker-driven upload pass.
- */
-typedef struct MarmotAuditLogTrackerUpdateResult {
-  bool enabled;
-  struct MarmotAuditLogUploadResult *uploaded;
-  uintptr_t uploaded_len;
-  char *skipped_reason;
-} MarmotAuditLogTrackerUpdateResult;
 
 /**
  * Result of one v5 OTLP tracker pass.
@@ -3953,13 +3935,11 @@ typedef struct MarmotAuditOtlpTrackerResultV5 {
 } MarmotAuditOtlpTrackerResultV5;
 
 /**
- * Additive tracker result with independent v4 and v5 outcomes.
+ * Result of one manual tracker pass. `v5` is NULL when no delivery
+ * destination is configured.
  */
 typedef struct MarmotAuditLogTrackerUpdateResultV5 {
   bool enabled;
-  struct MarmotAuditLogUploadResult *v4_uploaded;
-  uintptr_t v4_uploaded_len;
-  char *v4_skipped_reason;
   struct MarmotAuditOtlpTrackerResultV5 *v5;
 } MarmotAuditLogTrackerUpdateResultV5;
 
@@ -5260,42 +5240,15 @@ typedef struct MarmotRelayTelemetryRuntimeConfig {
 } MarmotRelayTelemetryRuntimeConfig;
 
 /**
- * Legacy ABI input. `device_label` is ignored and always returned NULL.
- * Use the v4 config entry point to supply a system hardware model.
+ * Audit source metadata recorded by each audit recorder opened later.
+ * Also a borrowed input to `marmot_set_audit_log_source`. The hardware
+ * model must be a system model identifier, never a device name.
  */
-typedef struct MarmotAuditLogUploadSource {
-  char *device_label;
-  char *platform;
-  char *app_version;
-} MarmotAuditLogUploadSource;
-
-/**
- * Audit-log tracker endpoint config. Also a borrowed input to
- * `marmot_set_audit_log_tracker_config`.
- */
-typedef struct MarmotAuditLogTrackerConfig {
-  char *endpoint;
-  char *authorization_bearer_token;
-  struct MarmotAuditLogUploadSource source;
-} MarmotAuditLogTrackerConfig;
-
-/**
- * V4 provenance. Hardware model must be system-sourced, never a device name.
- */
-typedef struct MarmotAuditLogUploadSourceV4 {
+typedef struct MarmotAuditLogSource {
   char *hardware_model;
   char *platform;
   char *app_version;
-} MarmotAuditLogUploadSourceV4;
-
-/**
- * V4 tracker input/output. Credentials are redacted from returned values.
- */
-typedef struct MarmotAuditLogTrackerConfigV4 {
-  char *endpoint;
-  char *authorization_bearer_token;
-  struct MarmotAuditLogUploadSourceV4 source;
-} MarmotAuditLogTrackerConfigV4;
+} MarmotAuditLogSource;
 
 /**
  * Write-only v5 OTLP delivery configuration. Credentials are redacted in
@@ -10449,21 +10402,6 @@ MarmotStatus marmot_audit_log_files(const struct MarmotClient *client,
                                     struct MarmotAuditLogFileList **out);
 
 /**
- * Upload one audit-log file to `endpoint`. Free with
- * `marmot_audit_log_upload_result_free`.
- *
- * # Safety
- * `client` must be a live handle; string arguments must be valid
- * NUL-terminated strings (nullable ones may be NULL); array
- * arguments must hold their stated length (or be NULL with
- * length 0); out-pointers must be valid.
- */
-MarmotStatus marmot_post_audit_log_file(const struct MarmotClient *client,
-                                        const char *path,
-                                        const char *endpoint,
-                                        struct MarmotAuditLogUploadResult **out);
-
-/**
  * Delete one on-disk audit-log file. Free with
  * `marmot_audit_log_delete_result_free`.
  *
@@ -10478,20 +10416,8 @@ MarmotStatus marmot_delete_audit_log_file(const struct MarmotClient *client,
                                           struct MarmotAuditLogDeleteResult **out);
 
 /**
- * Run one tracker-driven upload pass with the configured tracker.
- * Free with `marmot_audit_log_tracker_update_result_free`.
- *
- * # Safety
- * `client` must be a live handle; string arguments must be valid
- * NUL-terminated strings (nullable ones may be NULL); array
- * arguments must hold their stated length (or be NULL with
- * length 0); out-pointers must be valid.
- */
-MarmotStatus marmot_post_audit_log_tracker_update(const struct MarmotClient *client,
-                                                  struct MarmotAuditLogTrackerUpdateResult **out);
-
-/**
- * Run the same tracker pass with independent v4/v5 outcomes.
+ * Run one manual v5 OTLP delivery pass. Free with
+ * `marmot_audit_log_tracker_update_result_v5_free`.
  *
  * # Safety
  * `client` must be a live handle; string arguments must be valid
@@ -11695,28 +11621,18 @@ MarmotStatus marmot_set_audit_log_retention(const struct MarmotClient *client,
                                             struct MarmotAuditLogRetention **out);
 
 /**
- * Replace the audit-log tracker endpoint config. Free the result with
- * `marmot_audit_log_tracker_config_free`.
+ * Set the audit source metadata (system hardware model, platform, app
+ * version) recorded by audit recorders opened after this call. Call it
+ * before opening accounts. Free the returned copy with
+ * `marmot_audit_log_source_free`.
  *
  * # Safety
- * `client` must be a live handle; `config` a valid borrowed struct;
+ * `client` must be a live handle; `source` a valid borrowed struct;
  * `out` valid.
  */
-MarmotStatus marmot_set_audit_log_tracker_config(const struct MarmotClient *client,
-                                                 const struct MarmotAuditLogTrackerConfig *config,
-                                                 struct MarmotAuditLogTrackerConfig **out);
-
-/**
- * Replace the audit-log tracker endpoint config. Free the result with
- * `marmot_audit_log_tracker_config_v4_free`.
- *
- * # Safety
- * `client` must be a live handle; `config` a valid borrowed struct;
- * `out` valid.
- */
-MarmotStatus marmot_set_audit_log_tracker_config_v4(const struct MarmotClient *client,
-                                                    const struct MarmotAuditLogTrackerConfigV4 *config,
-                                                    struct MarmotAuditLogTrackerConfigV4 **out);
+MarmotStatus marmot_set_audit_log_source(const struct MarmotClient *client,
+                                         const struct MarmotAuditLogSource *source,
+                                         struct MarmotAuditLogSource **out);
 
 /**
  * Configure or disable the dedicated v5 OTLP audit sender. The returned
@@ -15134,17 +15050,7 @@ void marmot_audit_log_retention_free(struct MarmotAuditLogRetention *ptr);
  * The pointer must be NULL or an unfreed pointer returned by
  * this library.
  */
-void marmot_audit_log_tracker_config_v4_free(struct MarmotAuditLogTrackerConfigV4 *ptr);
-
-/**
- * Free a value of this type returned by this library. NULL
- * is a no-op.
- *
- * # Safety
- * The pointer must be NULL or an unfreed pointer returned by
- * this library.
- */
-void marmot_audit_log_tracker_config_free(struct MarmotAuditLogTrackerConfig *ptr);
+void marmot_audit_log_source_free(struct MarmotAuditLogSource *ptr);
 
 /**
  * Free a value of this type returned by this library. NULL
@@ -15173,27 +15079,7 @@ void marmot_audit_log_file_list_free(struct MarmotAuditLogFileList *list);
  * The pointer must be NULL or an unfreed pointer returned by
  * this library.
  */
-void marmot_audit_log_upload_result_free(struct MarmotAuditLogUploadResult *ptr);
-
-/**
- * Free a value of this type returned by this library. NULL
- * is a no-op.
- *
- * # Safety
- * The pointer must be NULL or an unfreed pointer returned by
- * this library.
- */
 void marmot_audit_log_delete_result_free(struct MarmotAuditLogDeleteResult *ptr);
-
-/**
- * Free a value of this type returned by this library. NULL
- * is a no-op.
- *
- * # Safety
- * The pointer must be NULL or an unfreed pointer returned by
- * this library.
- */
-void marmot_audit_log_tracker_update_result_free(struct MarmotAuditLogTrackerUpdateResult *ptr);
 
 /**
  * Free a value of this type returned by this library. NULL

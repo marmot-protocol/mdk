@@ -380,8 +380,10 @@ window is cheap once we are caught up.
 > obligations into ledger debt, so only epoch gaps the runner's visit budget exhausted, and
 > maintenance or known-event parks an upgrade kept, still park as obligations. Their notices
 > and dismissal work as below. The loss and incremental-history notices, the cursor-fence
-> release on dismissal and the remembered incremental dismissal are deleted; the ledger's
-> `UnprovenHistory` notices (section 9) replace them.
+> release on dismissal and the remembered incremental dismissal are deleted. The ledger's
+> `UnprovenHistory` notices that replaced them are gone too (section 9): decided with Jeff,
+> 2026-11-13, notices only for evidence of loss or a useful action; broken units probe quietly
+> on a 1 h → 24 h backoff (mdk#3308). Notices remain for parked obligations and rejoins.
 
 Decided with Jeff: parked history is shown to the user as "history may be incomplete",
 and the user can dismiss a particular occurrence durably. That dismissal is decision 3's
@@ -636,14 +638,13 @@ routes before selecting debt.
 **Parked remainders.** Debt the moving retention floor overtakes before anything covers it,
 and loss whose floor is unknown or older than the window, is parked rather than dropped: each
 route keeps one remainder, the earliest and latest such second, under a park revision from the
-same counter as unit parks. It is never fetched and never coverage, and only a dismissal clears
-it. Debt counts as overtaken only once a debt turn could have read it: the seconds between a
+same counter as unit parks. It is never fetched and never coverage, raises no notice (section
+9), and only a rejoin or the route's end clears it. Debt counts as overtaken only once a debt turn could have read it: the seconds between a
 goal seeded at the retention floor (an account open seeds the inbox there) and a later floor
 were never asked of a relay, so the runner's prune lags one debt turn and the sweep fetches
-them (mdk#3040). A route's notice revision is the newest among its broken units' parks and its
-remainder, so dismissing the notice clears both. Each prune also settles every route below its floor: a later
+them (mdk#3040). Each prune also settles every route below its floor: a later
 prune parks only from there up, because it no longer holds the coverage below. Widening a goal
-back below that floor therefore parks nothing twice and does not bring back a dismissed remainder; only loss lowers the settled floor
+back below that floor therefore parks nothing twice; only loss lowers the settled floor
 to its own. Pre-conversion shadow mode performed no sweeps, so routes could accumulate
 remainders without an acquisition attempt. Ownership conversion discards that shadow evidence
 and rebuilds authoritative debt from retained obligations and current route floors.
@@ -827,10 +828,10 @@ its next attempt time. Each quantum's outcome is one transaction:
 | --- | --- | --- | --- |
 | Advanced | Active, budget and backoff reset, park dropped | Streak and cooldown reset | Charged |
 | Nothing owed | Re-armed as for Advanced, except that a broken unit without a probe is unchanged and a retired unit stays retired with its backoff reset | — | Refunded |
-| Answered, no progress | Backoff doubles from its base; the budget's last breaks it and parks its debt. A failed probe re-parks under the same revision | Streak and cooldown reset | Charged |
+| Answered, no progress | Backoff doubles from its base; the budget's last breaks it and parks its debt. A failed probe re-parks under the same revision and waits twice as long for the next | Streak and cooldown reset | Charged |
 | Unreachable | Retries after the unreachable delay | Streak +1; cools down after the threshold, each cooldown in a spell doubling | Charged |
 | Rate-limited | — | Cools down | Charged |
-| Refused | Breaks at once and parks its debt | — | Charged |
+| Refused | Breaks at once and parks its debt; a refused probe re-parks under the same revision and waits twice as long | — | Charged |
 | Unanswered, local failure | — | — | Refunded |
 
 A quantum whose every slice was proven but whose coverage an un-cover took back during the
@@ -843,6 +844,18 @@ the attempt as unanswered instead, unless the quantum's own settle came in time.
 shutdown (`shutdown_and_close`) refunds the same way if storage is still open as the runner
 stops, and otherwise keeps the charge until it leaves the hour. A crash keeps the charge too,
 which caps a reply that crashes the process.
+A broken unit also probes on a timer, so nothing waits on a user to retry it (mdk#3308;
+decided with Jeff, 2026-11-13: notices only for evidence of loss or a useful action; broken
+units probe quietly on a 1 h → 24 h backoff). A new park schedules its first probe an hour
+later; a failed probe re-parks under the same revision and doubles the wait, up to a day. Each
+debt turn first arms every broken unit whose probe time has passed
+(`arm_due_recovery_probes`): its debt includes its park again, and it is served under the
+ordinary scheduling, budgets, relay cooldowns and account breaker. An unreachable probe keeps
+its probe and retries after the unreachable delay. A probe that advances, or finds nothing
+owed, re-arms the unit. The runner wakes for the earliest pending probe on a relay a current,
+unsuspended route requires. The upgrade conversion's parks have no runner policy, so their
+first probe is due at once. A broken unit, probing or not, is never "catching up" in the
+account's recovery status, and raises no notice.
 Newer loss over a parked span earns one probe under the same park. Newer loss inside a
 retired span reopens that part whatever the unit's state: an active unit owes it as ordinary
 debt, a broken one adds it to its park with one probe, and a retired one parks it under a new
@@ -850,11 +863,11 @@ revision with one probe. A failed probe re-parks under the same revision and kee
 second the relay still does not cover. A relay added
 to a route and a known caps read that differs from what a broken unit was planned with re-arm
 it and drop its park; explicit repair re-arms every unit and drops retired spans too, so they
-are owed again. An unknown caps read is never evidence. Dismissing a route's
-notice checks its newest park revision and retires its broken units' parked spans, which are
-never coverage; the units then serve anything else they owe with a fresh budget. Any
+are owed again. An unknown caps read is never evidence. Nothing dismisses a park: the route
+notices that once did are gone (section 9), and a retired unit now comes only from a relay
+leaving its route or from a dismissal under the old owner that conversion carried over. Any
 coverage write on a unit's relay trims its parked and retired spans; once
-its last parked part is proved, a broken unit re-arms and its notice ends. The retention prune
+its last parked part is proved, a broken unit re-arms. The retention prune
 trims parked and retired spans at its floor, as it does coverage and goals, so no span reaches
 below its route's goal and a re-arm owes exactly what the window still holds.
 
@@ -955,7 +968,7 @@ not to support NIP-77, or refuses a comparison, is swept until it reconnects. Pr
 newly covered seconds: a single second whose difference is larger than one quantum may fetch is
 taken in parts that certify nothing until the last, so a second holding more than six quanta of
 missing events (about 12,000 typical group messages) breaks its unit and parks behind the
-notice, as a sweep's saturated second does. What those parts fetched stays staged.
+unit, as a sweep's saturated second does. What those parts fetched stays staged.
 
 Re-checks look for late input on history already covered or retired. Each group (route,
 relay) on a required relay with NIP-77 has one resumable pass over its covered and retired
@@ -1090,7 +1103,9 @@ no owner can open them.
 The inbox (PR 5e) is a route of its own: its units compare the account's gift wraps and are
 never swept, admission takes its events as a group of their own and never fences them, and
 re-checks visit it as they do a group route. A relay that will not compare the inbox refuses
-its unit, which breaks and parks behind a notice, and keeps comparing groups. Explicit repair
+its unit, which breaks and parks quietly, and keeps comparing groups. The inbox owes up to the
+current second on such a relay, since it has no healthy live tail there, so its unit always has
+more debt: only its timed probe asks the relay again (section 8), never every later quantum. Explicit repair
 is one request the account's runner owns. The runner takes it between its own
 steps, with no quantum in flight, and in one turn widens every current route's goal to the
 retention floor and re-arms every unit. Passes then run within the repair's 60 s while the
@@ -1103,14 +1118,20 @@ re-checked since the re-arm wherever the re-check survey owes a pass. As today, 
 have been judged: a route with no required relay keeps the window unproven, and so does a
 repair whose every route is suspended. The caller decides a cancel first, as today, even over a
 covered window; a covered window wins over the deadline. `Cancelled` or `Deadline` when the
-caller or the budget ends it. Otherwise `CoverageUnproven` after a pass that served nothing. A
-route the ledger parks on a relay it requires is one "history may be incomplete" notice with
-the cause `UnprovenHistory`, whose id is a hash of the route with its park revision; a group
-route's also shows in that group's status. A park on a relay the route now carries only as best
-effort, or no longer, raises none. What a notice shows, its revision (the newest park among
-them) and what dismissing it retires are one set, so such a park moves no revision and is never
-dismissed. A remainder is a notice only once the runner has surveyed and catches up nothing on
-its route. A suspended (Unrecoverable) group's routes give no notice. A rejoin is one
+caller or the budget ends it. Otherwise `CoverageUnproven` after a pass that served nothing.
+
+The coverage ledger raises no "history may be incomplete" notice. Decided with Jeff,
+2026-11-13: notices only for evidence of loss or a useful action; broken units probe quietly on
+a 1 h → 24 h backoff (mdk#3308). A broken unit's park is no such evidence: its relay refused or
+could not prove the history, which the probes keep asking. Neither is a remainder, history the
+retention floor passed before anything proved it, as it does on every route after an upgrade
+resets coverage. Until this decision both were `UnprovenHistory` notices whose dismissal was
+the only retry: an inbox relay that refused comparison parked anew about a second after every
+dismissal and on every app open, and remainders put a notice in nearly every chat, flashing in
+busy ones as live input moved their live edge. The cause stays in the public enums, never
+emitted, and a dismissal of an old ledger notice id returns `false` and retires nothing.
+Notices remain for parked obligations (epoch gaps the runner's visits exhausted, plus
+maintenance or known-event parks an upgrade kept) and for rejoins. A rejoin is one
 `BeforeRejoin` notice for its group, whose id is a hash of the group with the notice's
 revision, shown while the group has a current route that is not suspended. Rejoin notices are
 not written to the forensic audit, whose recovery vocabulary has no rejoin cause. Each survey
@@ -1189,6 +1210,13 @@ the old owner):
   holds pace it. Epoch-gap visits take every pending gap that is not parked, so one the old
   owner left waiting for capacity or a capability is served too. A route change no longer
   rewrites eligibility.
+
+Deleted when the ledger stopped raising notices (mdk#3308):
+
+- The ledger's `UnprovenHistory` notices (`LedgerNotice`, `ledger_notices`), their dismissal
+  (`dismiss_ledger_notice`, storage's `dismiss_recovery_route_park` and
+  `dismiss_recovery_route_park_on`) and their audit rows. Broken units probe on a timer
+  instead.
 
 Still to delete:
 

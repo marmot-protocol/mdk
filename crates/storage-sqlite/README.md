@@ -342,7 +342,7 @@ runner supplies validated facts and owns execution policy. Design:
   back to it. `prune_recovery_coverage` drops coverage below the retention floor, raises goals to it and ages the log;
   pruning is not an un-cover. First, what each route the caller passes still owes below the floor on any of its
   certifying relays joins the route's parked remainder (migration 0130): one range per route under a park revision,
-  never coverage, cleared only by dismissal. The prune then marks every route settled below its floor, and a later
+  never coverage, cleared only by a rejoin or the route's end. The prune then marks every route settled below its floor, and a later
   prune parks only from that mark up, so a goal widened back below it parks nothing twice; loss lowers the mark to its
   floor. A released receipt below the window changes nothing in the ledger (its coverage stays until the prune), so only loss parks debt from below it. The recovery
   runner schedules on it.
@@ -354,9 +354,12 @@ runner supplies validated facts and owns execution policy. Design:
   the account's recovery runner owns these visits.
 - **Retry state and staging (`recovery_units.rs`, `recovery_staging.rs`, migration 0127, mdk#2660).** One row per
   `(route, relay)` unit holds the recovery runner's retry state: active, broken (no progress or refused, with a park
-  revision and one probe a newer loss can earn) or retired, plus backoff, slicing, planned relay caps and re-check progress. Relay health (unreachable streak, cooldown, NIP-11 caps), the account's rolling-hour attempt and
+  revision and one probe, which a newer loss earns and `arm_due_recovery_probes` arms once its next probe time passes)
+  or retired, plus backoff, slicing, planned relay caps and re-check progress. Relay health (unreachable streak, cooldown, NIP-11 caps), the account's rolling-hour attempt and
   byte budget, each unit's parked and retired spans and the capture ranges it fences (migration 0135) sit beside it. `settle_recovery_unit` applies one quantum's
-  outcome in one transaction with policy values the caller passes; `settle_recovery_unit_saturated` also records
+  outcome in one transaction with policy values the caller passes. A new park schedules the unit's first probe at the
+  policy's probe base; a failed probe re-parks under the same revision and doubles the wait, up to the probe cap; a
+  probe that advances or finds nothing owed re-arms the unit. `settle_recovery_unit_saturated` also records
   the second an answered quantum stopped on because its relay cannot prove it (`saturated_second`, migration 0151),
   which only an answered quantum sets or clears and a change in the relay's recorded caps clears; a unit's debt is the route goal minus that relay's
   coverage, its retired spans and, unless it holds a probe, its parked spans. Parked and retired spans are never
@@ -415,7 +418,7 @@ runner supplies validated facts and owns execution policy. Design:
   they recorded, below where live loss reaches that route; live loss un-covers what it reached once, as an import
   charges it (a generation that named its routes reaches only those, from their bounds; any other reaches every route
   from its floor), parks what lies below the window, and counts as imported; parked rows break their routes' required relays that still owe history,
-  under one revision per route (one notice), keeping the earliest park time; a pending explicit repair re-arms every
+  under one revision per route, keeping the earliest park time, each with a probe due at once; a pending explicit repair re-arms every
   unit; satisfied rows go and satisfied epoch gaps reopen. Converted rows are deleted with their scopes, with no third
   state, and nothing becomes coverage. `recovery_conversion_report` keeps the counts by cause and disposition, and the
   reopened epoch gaps (`epoch_gaps_reopened`, migration 0152), until `acknowledge_recovery_conversion_report`, and `recovery_conversion_notices_changed` asks for one announcement of

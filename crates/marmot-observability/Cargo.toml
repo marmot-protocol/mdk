@@ -6,7 +6,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "Marmot diagnostics exporters: relay-telemetry OTLP export, product analytics and its consent state, the app-performance recorder, audit delivery's HTTP halves and the collector dial-safety helper."
+description = "Marmot diagnostics exporters: relay-telemetry OTLP export, product analytics and its consent state, the app-performance recorder, the audit OTLP sender and the collector dial-safety helper."
 
 [features]
 default = []
@@ -23,8 +23,6 @@ test-support = []
 cgka-traits.workspace = true
 chrono.workspace = true
 hex.workspace = true
-httpdate.workspace = true
-jsonschema.workspace = true
 marmot-forensics.workspace = true
 opentelemetry-proto = { workspace = true, optional = true }
 prost = { workspace = true, optional = true }

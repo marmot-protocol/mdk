@@ -700,6 +700,11 @@ fn a_v0_14_0_database_converts_every_row_kind() {
         unit.state,
         RecoveryUnitState::Broken(RecoveryUnitBreak::NoProgress)
     );
+    // Conversion has no runner policy: the park's first probe is due at once.
+    assert_eq!(
+        (unit.probe, unit.backoff_step, unit.next_attempt_at_seconds),
+        (false, 0, 0)
+    );
 
     // Converting the incremental history settled the comparison slot it held.
     assert!(comparison_settled(&store));
@@ -1285,6 +1290,8 @@ const POLICY: RecoveryUnitPolicy = RecoveryUnitPolicy {
     max_attempts_per_hour: 720,
     max_event_bytes_per_hour: 256 << 20,
     recheck_after_cooldown_seconds: 3_600,
+    probe_base_seconds: 3_600,
+    probe_cap_seconds: 86_400,
 };
 
 /// A converted park is planned with unknown caps, as the old owner never read

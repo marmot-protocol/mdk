@@ -43,6 +43,11 @@ rather than restating it here.
 Each top-level command maps to a `*Command` enum in `src/args.rs` and a handler module in `src/commands/`. Per-command
 behavior and JSON fields are documented in the README; the rules below are the ones to preserve when editing.
 
+- A one-shot `foo_command` that builds an app runtime calls `runtime.shutdown()` before it returns, whatever the
+  command's result. The runtime hosts every local account's worker. Exiting without shutdown cuts a recovery request
+  in flight, and that cut persists as the relay's unreachable verdict, holding the account's live group input for the
+  retry delay in its next process. `a_one_shot_send_leaves_no_worker_connected_after_it_returns` owns this.
+
 - Accounts (`create-identity`, `login`, `logout`, `whoami`, `accounts`, hidden `account`, `reset`): `export-nsec` exists
   but must keep returning `private_key_export_disabled`.
 - `keys`: `rotate` keeps its `force-publish` alias; routine replacement must not publish kind-5 deletions.

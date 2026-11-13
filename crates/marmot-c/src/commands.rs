@@ -35,9 +35,8 @@ use crate::types::account::{
 use crate::types::agent_stream::MarmotAgentStreamStart;
 use crate::types::audit::{
     MarmotAuditDeliveryStatusV5List, MarmotAuditLogDeleteResult, MarmotAuditLogFileList,
-    MarmotAuditLogRetention, MarmotAuditLogSettings, MarmotAuditLogTrackerConfig,
-    MarmotAuditLogTrackerConfigV4, MarmotAuditLogTrackerUpdateResult,
-    MarmotAuditLogTrackerUpdateResultV5, MarmotAuditLogUploadResult, MarmotAuditOtlpConfigV5,
+    MarmotAuditLogRetention, MarmotAuditLogSettings, MarmotAuditLogSource,
+    MarmotAuditLogTrackerUpdateResultV5, MarmotAuditOtlpConfigV5,
 };
 use crate::types::backups::{
     MarmotBackgroundBackupOutcome, MarmotBackupHistoryAvailabilityList, MarmotBackupRestoreStatus,
@@ -1199,19 +1198,12 @@ c_cmd! {
     /// `marmot_audit_log_file_list_free`.
     sync fn marmot_audit_log_files() -> rec(MarmotAuditLogFileList) = audit_log_files;
 
-    /// Upload one audit-log file to `endpoint`. Free with
-    /// `marmot_audit_log_upload_result_free`.
-    async fn marmot_post_audit_log_file(path: str, endpoint: str) -> rec(MarmotAuditLogUploadResult) = post_audit_log_file;
-
     /// Delete one on-disk audit-log file. Free with
     /// `marmot_audit_log_delete_result_free`.
     async fn marmot_delete_audit_log_file(path: str) -> rec(MarmotAuditLogDeleteResult) = delete_audit_log_file;
 
-    /// Run one tracker-driven upload pass with the configured tracker.
-    /// Free with `marmot_audit_log_tracker_update_result_free`.
-    async fn marmot_post_audit_log_tracker_update() -> rec(MarmotAuditLogTrackerUpdateResult) = post_audit_log_tracker_update;
-
-    /// Run the same tracker pass with independent v4/v5 outcomes.
+    /// Run one manual v5 OTLP delivery pass. Free with
+    /// `marmot_audit_log_tracker_update_result_v5_free`.
     async fn marmot_post_audit_log_tracker_update_v5() -> rec(MarmotAuditLogTrackerUpdateResultV5) = post_audit_log_tracker_update_v5;
 
     /// Per-account v5 OTLP audit delivery status (local read; never dials).
@@ -1793,45 +1785,26 @@ pub unsafe extern "C" fn marmot_set_audit_log_retention(
     })
 }
 
-/// Replace the audit-log tracker endpoint config. Free the result with
-/// `marmot_audit_log_tracker_config_free`.
+/// Set the audit source metadata (system hardware model, platform, app
+/// version) recorded by audit recorders opened after this call. Call it
+/// before opening accounts. Free the returned copy with
+/// `marmot_audit_log_source_free`.
 ///
 /// # Safety
-/// `client` must be a live handle; `config` a valid borrowed struct;
+/// `client` must be a live handle; `source` a valid borrowed struct;
 /// `out` valid.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn marmot_set_audit_log_tracker_config(
+pub unsafe extern "C" fn marmot_set_audit_log_source(
     client: *const MarmotClient,
-    config: *const MarmotAuditLogTrackerConfig,
-    out: *mut *mut MarmotAuditLogTrackerConfig,
+    source: *const MarmotAuditLogSource,
+    out: *mut *mut MarmotAuditLogSource,
 ) -> MarmotStatus {
     ffi_guard(|| {
         try_arg!(unsafe { crate::preflight_out_ptr(out) });
         let client = try_arg!(unsafe { client_ref(client) });
-        let config = try_arg!(unsafe { borrowed(config) });
-        let config = try_arg!(unsafe { config.to_ffi() });
-        unsafe { deliver(client.marmot.set_audit_log_tracker_config(config), out) }
-    })
-}
-
-/// Replace the audit-log tracker endpoint config. Free the result with
-/// `marmot_audit_log_tracker_config_v4_free`.
-///
-/// # Safety
-/// `client` must be a live handle; `config` a valid borrowed struct;
-/// `out` valid.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn marmot_set_audit_log_tracker_config_v4(
-    client: *const MarmotClient,
-    config: *const MarmotAuditLogTrackerConfigV4,
-    out: *mut *mut MarmotAuditLogTrackerConfigV4,
-) -> MarmotStatus {
-    ffi_guard(|| {
-        try_arg!(unsafe { crate::preflight_out_ptr(out) });
-        let client = try_arg!(unsafe { client_ref(client) });
-        let config = try_arg!(unsafe { borrowed(config) });
-        let config = try_arg!(unsafe { config.to_ffi() });
-        unsafe { deliver(client.marmot.set_audit_log_tracker_config(config), out) }
+        let source = try_arg!(unsafe { borrowed(source) });
+        let source = try_arg!(unsafe { source.to_ffi() });
+        unsafe { deliver(client.marmot.set_audit_log_source(source), out) }
     })
 }
 

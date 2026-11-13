@@ -27,9 +27,10 @@ fn prove_history(client: &AppClient, group: &GroupId) {
 
 /// Widen the goal of each of `group`'s routes in `client`'s ledger to
 /// `goal_from`, cover it from `covered_from` through a day from now on every
-/// relay, and dismiss the routes' remainders: the setup's first prune can
+/// relay, and drop the account's remainders: the setup's first prune can
 /// park the seconds between a goal's start and that prune, which a device
-/// whose clock had run as long as the tests plant would have proved.
+/// whose clock had run as long as the tests plant would have proved. Nothing
+/// but a rejoin or a route's end clears a remainder.
 /// Returns the routes with the relays that certify them.
 fn prove_history_from(
     client: &AppClient,
@@ -69,15 +70,9 @@ fn prove_history_from(
                 .unwrap();
         }
     }
-    for remainder in storage.recovery_coverage_remainders().unwrap() {
-        if routes.iter().any(|route| route.route == remainder.route) {
-            assert!(
-                storage
-                    .dismiss_recovery_route_park(&remainder.route, remainder.revision)
-                    .unwrap()
-            );
-        }
-    }
+    storage
+        .execute_batch_for_test("DELETE FROM account_recovery_coverage_remainders")
+        .unwrap();
     routes
         .into_iter()
         .map(|route| (route.route, route.required))
@@ -278,8 +273,8 @@ async fn a_gap_of_more_than_a_day_between_caught_up_passes_restarts_every_clock(
 /// History since the clock last restarted that the retention floor overtook
 /// unproved, a parked remainder, may hold a heartbeat this device never
 /// read: a caught-up pass that finds one restarts every clock rather than
-/// marking. The remainder lasts until a user dismisses it, but restarts
-/// nothing once the clock has restarted after it.
+/// marking. The remainder lasts until a rejoin or the route's end, but
+/// restarts nothing once the clock has restarted after it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_remainder_since_the_last_restart_restarts_every_clock() {
     let (mut devices, group) = settled_linked_devices().await;

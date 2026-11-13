@@ -76,7 +76,12 @@ pub(crate) async fn message_command(
     account_flag: Option<String>,
 ) -> Result<CommandOutput, WnError> {
     let runtime = app.runtime();
-    message_command_with_runtime(account_home, app, &runtime, command, account_flag).await
+    let result =
+        message_command_with_runtime(account_home, app, &runtime, command, account_flag).await;
+    // Shut down before the process exits: a recovery request the exit cut
+    // would settle as the relay's unreachable verdict for the next process.
+    runtime.shutdown().await;
+    result
 }
 
 pub(crate) async fn message_command_with_runtime(
@@ -1268,5 +1273,104 @@ mod tests {
             timeline_message_list_plain(&[timeline.clone(), timeline]),
             "group=aa[Hbb from=alice31m: rowforged deleted=true\ngroup=aa[Hbb from=alice31m: rowforged deleted=true"
         );
+    }
+
+    /// A one-shot command's runtime hosts every local account's worker. If a
+    /// worker outlives the command, the process exit cuts its recovery request
+    /// in flight, which persists as the relay's unreachable verdict and holds
+    /// that account's live group input for the retry delay in its next
+    /// process. Every connection the command opened must be gone once the
+    /// command has returned and its app is dropped, as at process exit.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_one_shot_send_leaves_no_worker_connected_after_it_returns() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        let relay = nostr_relay_builder::MockRelay::run().await.unwrap();
+        let upstream = relay
+            .url()
+            .await
+            .to_string()
+            .trim_start_matches("ws://")
+            .trim_end_matches('/')
+            .to_owned();
+        // Count the connections open to the relay through a local proxy.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let (live, _) = tokio::sync::watch::channel(0_usize);
+        let live = Arc::new(live);
+        let opened = Arc::new(AtomicUsize::new(0));
+        let proxy = {
+            let live = live.clone();
+            let opened = opened.clone();
+            tokio::spawn(async move {
+                while let Ok((mut inbound, _)) = listener.accept().await {
+                    opened.fetch_add(1, Ordering::SeqCst);
+                    live.send_modify(|count| *count += 1);
+                    let live = live.clone();
+                    let upstream = upstream.clone();
+                    tokio::spawn(async move {
+                        if let Ok(mut outbound) = tokio::net::TcpStream::connect(upstream).await {
+                            let _ =
+                                tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+                        }
+                        live.send_modify(|count| *count -= 1);
+                    });
+                }
+            })
+        };
+        let all_closed = || {
+            let mut live = live.subscribe();
+            async move {
+                tokio::time::timeout(Duration::from_secs(20), live.wait_for(|count| *count == 0))
+                    .await
+                    .is_ok()
+            }
+        };
+
+        let home = tempfile::tempdir().unwrap();
+        let account_home = AccountHome::open(home.path());
+        let alice = account_home.create_account("alice").unwrap().account_id_hex;
+        let config =
+            marmot_app::MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true);
+        let app = MarmotApp::with_relay_and_config(home.path(), url.clone(), config.clone());
+        let created = crate::commands::groups::group_command(
+            &account_home,
+            &app,
+            crate::GroupCommand::Create {
+                name: "one-shot".into(),
+                members: Vec::new(),
+                description: None,
+            },
+            Some(alice.clone()),
+            crate::commands::groups::AcceptedGroupChangeRisks::default(),
+        )
+        .await
+        .unwrap();
+        let group_id = created.json["group_id"].as_str().unwrap().to_owned();
+        drop(app);
+        assert!(all_closed().await, "the group command left a connection");
+
+        let app = MarmotApp::with_relay_and_config(home.path(), url, config);
+        let opened_before = opened.load(Ordering::SeqCst);
+        let sent = message_command(
+            &account_home,
+            &app,
+            MessageCommand::Send {
+                group_flag: Some(group_id),
+                reply_to: None,
+                args: vec!["hello".into()],
+            },
+            Some(alice.clone()),
+        )
+        .await
+        .unwrap();
+        drop(app);
+        assert_eq!(sent.json["message_ids"].as_array().map(Vec::len), Some(1));
+        assert!(opened.load(Ordering::SeqCst) > opened_before);
+        assert!(all_closed().await, "a worker outlived the one-shot command");
+        proxy.abort();
+        relay.shutdown();
     }
 }

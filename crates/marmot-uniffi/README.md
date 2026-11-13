@@ -42,7 +42,7 @@ Read the documentation at the tag matching your binaries; `master` can describe 
   [account attachment history](#account-attachment-history),
   [bounded attachment history](#bounded-attachment-history), [local attachment access](#local-attachment-access)
 - Audit logs: [audit v5 recording and delivery](#audit-v5-recording-and-delivery),
-  [legacy audit v4 upload](#legacy-audit-v4-upload)
+  [audit source metadata and legacy files](#audit-source-metadata-and-legacy-files)
 - Building and packaging: [building local bindings](#building-local-bindings), [build phases](#build-phases),
   [Kotlin / Android](#kotlin--android), [release profile](#release-profile),
   [Apple privacy resources](#apple-privacy-resources)
@@ -147,7 +147,7 @@ All methods, including less common management/diagnostic operations, are listed 
 | Notifications and push | Notification preferences, native registration, bounded wake/catch-up and notification subscriptions. The host owns OS tokens, permission prompts, background budgets and notification presentation. |
 | Relays and maintenance | Relay safety/classification, account/user relay lists, health, connectivity restoration, KeyPackage rotation and periodic group updates. Loopback development policy is explicit; connectivity recovery is not permission to reset user settings. |
 | Agent streams | Start/watch live text previews or use a publisher handle to append then finish a durable transcript. Preview transport and durable message delivery have different outcomes; ephemeral handles do not provide restart persistence. |
-| Diagnostics | Fixed performance milestones/snapshots, consent-gated product events, relay telemetry, audit recording/files/uploads. Keep each configuration and consent boundary explicit; do not dump secrets or DTOs into logs. |
+| Diagnostics | Fixed performance milestones/snapshots, consent-gated product events, relay telemetry, audit recording/files/v5 delivery. Keep each configuration and consent boundary explicit; do not dump secrets or DTOs into logs. |
 
 ### Runtime lifecycle, threads and errors
 
@@ -246,7 +246,7 @@ must not be summed. See the [operation definitions](../marmot-observability/src/
 Use typed presentation, capability, deletion and group-system fields rather than parsing English
 strings or guessing from membership counts. Clients localize fallback labels and system wording.
 Preserve unknown variants/provenance as neutral presentation rather than inventing an actor.
-Configure consent-gated analytics, audit uploads and relay telemetry deliberately; endpoint URLs
+Configure consent-gated analytics, audit delivery and relay telemetry deliberately; endpoint URLs
 are not credentials. Never log message bodies, asset references, keys, account/group identifiers,
 raw DTO stringification or relay URLs as performance labels. Use bounded performance operations
 and aggregate snapshots; keep secrets out of diagnostics and host callback errors.
@@ -486,7 +486,6 @@ every binding.
 
 `marmotkit-endpoints.env` sets the public build-time defaults consumed by Marmot's compiled endpoint config:
 
-- `MARMOT_AUDIT_LOG_TRACKER_ENDPOINT`
 - `MARMOT_RELAY_TELEMETRY_OTLP_ENDPOINT`
 - `MARMOT_PRODUCT_ANALYTICS_EVENTS_ENDPOINT` (optional full Aptabase events URL; no default)
 
@@ -1792,9 +1791,11 @@ analytics. C callers: see the [C guide](../marmot-c/README.md#history-may-be-inc
 history is still being fetched (`catching_up_group_ids_hex`), whether the inbox's is
 (`inbox_catching_up`), and every notice as `history_notices` lists them. Show the first two
 as "catching up" and re-read on `MarmotEventFfi::RecoveryStatusChanged`. The recovery
-runner supplies those fields. Current epoch-gap exhaustion emits `EpochGap`; coverage-ledger
-parks emit `HistoryNoticeCauseFfi::UnprovenHistory` without attributing the original reason
-history was owed. Other cause labels preserve compatibility; keep exhaustive switches.
+runner supplies those fields. Current epoch-gap exhaustion emits `EpochGap`. Other cause
+labels preserve compatibility; keep exhaustive switches. `HistoryNoticeCauseFfi::UnprovenHistory`
+is no longer emitted: the recovery runner retries a route whose relays could not prove its
+history quietly, on a growing interval, and raises a notice only for evidence that messages
+are missing.
 
 When a Welcome installs a new copy of a group in place of this device's old one (an automatic
 rejoin after the old copy could not be repaired, a reentry after a trusted removal, or a fork
@@ -1924,13 +1925,10 @@ To deliver v5, supply a dedicated OTLP `/v1/logs` destination and bearer token
 with `set_audit_otlp_config_v5(AuditOtlpConfigV5Ffi)`. The configuration is held in memory, so
 apply it on every launch; the returned record omits the token. Set `enabled: false` to remove delivery configuration.
 An exact loopback endpoint requires `allow_loopback_dev: true`; public endpoints require HTTPS.
-The host then calls `post_audit_log_tracker_update_v5()`, in place of
-`post_audit_log_tracker_update()`, for an immediate pass; the existing
-audit tracker also uses this configuration on its activity triggers with the usual batching,
-retry, and shutdown behavior. The v5 result reports accepted batches, pending accounts, blocked
-accounts, and idle accounts separately from legacy v4 uploads. No host should infer receiver
-acceptance from an empty v4 `uploaded` list. The legacy v4 whole-file endpoint never receives
-v5 records.
+The host calls `post_audit_log_tracker_update_v5()` for an immediate pass; the audit tracker
+also uses this configuration on its activity triggers with the usual batching, retry, and
+shutdown behavior. The result's `v5` reports accepted batches, pending accounts, blocked
+accounts, and idle accounts, and is `None` when no destination is configured.
 
 `audit_delivery_status_v5()` returns one `AuditDeliveryStatusV5Ffi` per account so a host can
 show "audit delivery stalled since X: reason" and offer a retry. It reads local status only and
@@ -1959,26 +1957,23 @@ Read and change both with `audit_log_retention()` and
 `set_audit_log_retention(AuditLogRetentionFfi)`; the policy is persisted, and the returned record
 is the clamped value stored. The explicit delete and clear calls are unaffected.
 
-## Legacy audit v4 upload
+## Audit source metadata and legacy files
 
-The v4 whole-file route only drains v4 files written before 0.11.0; keep its configuration until
-they are gone, and do not build new v4 infrastructure. Whole-file uploads accept only
-`marmot-forensics-audit/v4`; older local files are never migrated or sent.
-App construction automatically removes recognized v1-v3 forensic files and rotated segments after acquiring the
-root lease, including files in failed account-wipe remnants, even with recording disabled. V4 files and the separate
-key-reveal log are preserved; failures are nonfatal and retried on the next open. No additional Swift/Kotlin cleanup
-call is needed.
+Call `set_audit_log_source(AuditLogSourceFfi)` at startup, before opening accounts, to supply the
+`hardwareModel`, `platform` and `appVersion` that each new audit recorder writes into its
+`source_context` row. The value is held in memory, so set it on every launch; recorders that are
+already open keep the source they started with. Fields are trimmed and a blank field becomes
+`None`. Populate `hardwareModel` from system model information (e.g. `iPhone17,3` or
+`Pixel 9a`), never from a device name, hostname or serial number, and omit it if unavailable.
 
-Use `AuditLogTrackerConfigV4Ffi` with `AuditLogUploadSourceV4Ffi.hardwareModel` in place of the old source record
-and its `deviceLabel`. The versioned config type changes the setter ABI checksum so old generated bindings cannot
-silently reinterpret a device label as a hardware model.
-Populate this field from system model information (e.g. `iPhone17,3` or `Pixel 9a`), never from a device name,
-hostname or serial number. Omit it if unavailable. Platform and app version are unchanged.
-Uploads of leftover v4 files still need a v4-compatible whole-file endpoint; new evidence goes to v5.
-
-Native metadata lift/lower checks: `./crates/marmot-uniffi/audit-v4-smoke.sh swift` and
-`MDK_KOTLIN_CLASSPATH=<JNA:Android:annotations:coroutines jars> ./crates/marmot-uniffi/audit-v4-smoke.sh kotlin`.
-These regenerate host bindings and execute DTO round trips; platform package builds remain separate.
+v5 OTLP delivery is the only remote audit path. Historical `marmot-forensics-audit/v4` files are
+never delivered: they stay listable and deletable through `audit_log_files()` and
+`delete_audit_log_file()` until local retention expires them.
+App construction automatically removes recognized v1-v3 forensic files and rotated segments, and
+the retired v4 upload's checkpoint sidecar, after acquiring the root lease, including files in
+failed account-wipe remnants, even with recording disabled. V4 files and the separate key-reveal
+log are preserved; failures are nonfatal and retried on the next open. No additional Swift/Kotlin
+cleanup call is needed.
 
 ## Building local bindings
 
