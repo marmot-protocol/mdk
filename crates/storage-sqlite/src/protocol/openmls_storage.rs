@@ -88,6 +88,12 @@ impl SqliteOpenMlsStorage {
     }
 }
 
+/// The label of a stored KeyPackage bundle, one of the rows the owned
+/// KeyPackage list reads (mdk#3273).
+pub(crate) fn key_package_label() -> &'static [u8] {
+    labels::KEY_PACKAGE_LABEL.as_bytes()
+}
+
 /// Labels of the per-message ratchet: rows an application message or a
 /// secret export advances without changing the group's commit-derived state
 /// (mdk#3273).

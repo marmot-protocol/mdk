@@ -11,6 +11,8 @@
 //! list, and each group entry, is reused only while its validity holds: a
 //! typed value the build returns with the answers, recording what they were
 //! read at and how long they hold (`KeyPackagesValidity`, `EntryValidity`).
+//! The list is keyed on its own write count, which only its inputs move, so a
+//! send keeps it.
 //! Reuse checks that value alone, so every input of a reused answer must be
 //! either a write those counts see or a field of its validity. App components
 //! are reused while the group's hydrated generation holds. A publish that
@@ -31,6 +33,7 @@ use std::time::Instant;
 
 use cgka_traits::app_components::AppComponentId;
 use cgka_traits::engine::KeyPackage;
+use cgka_traits::group::ProtocolProfile;
 use cgka_traits::types::{GroupId, MemberId};
 use cgka_traits::{
     GroupMaintenanceStatus, KeyPackageLifecycleState, PeriodicMaintenancePolicy, Timestamp,
@@ -406,14 +409,17 @@ fn settled<T>(answer: &Result<T, impl std::ops::Deref<Target = AppError>>) -> bo
 /// What the owned KeyPackage list was read at and how long it holds. The
 /// build returns it with the list, and reuse checks it alone. The list reads
 /// the stored bundles and the private KeyPackages issued to siblings, both in
-/// the account database, and checks each bundle's lifetime against the
-/// system clock.
+/// the account database, keeps the bundles of the engine's protocol profile,
+/// and checks each bundle's lifetime against the system clock.
 #[derive(Clone)]
 struct KeyPackagesValidity {
-    /// The account database's total write count before the read: every write
-    /// to the file, through any connection this process has open on it.
-    /// `None` once the database is closed.
-    write_count: Option<u64>,
+    /// The account database's KeyPackage write count before the read: every
+    /// write to a stored bundle or an issued private KeyPackage, through any
+    /// connection this process has open on it, and every change of the file
+    /// it cannot attribute to a row. `None` once the database is closed.
+    key_package_writes: Option<u64>,
+    /// The engine's protocol profile, read before the read.
+    profile: ProtocolProfile,
     /// The system-clock window the lifetimes leave the list in: from the one
     /// reading every lifetime was judged at until the first bound ahead.
     window: WallClockWindow,
@@ -424,12 +430,19 @@ struct KeyPackagesValidity {
 }
 
 impl KeyPackagesValidity {
-    /// Whether a list read at `self` still holds with the database at
-    /// `write_count` and the system clock at `now`.
-    fn holds(&self, write_count: Option<u64>, now: Timestamp) -> bool {
+    /// Whether a list read at `self` still holds with the database's
+    /// KeyPackage write count at `key_package_writes`, the engine's protocol
+    /// profile at `profile` and the system clock at `now`.
+    fn holds(
+        &self,
+        key_package_writes: Option<u64>,
+        profile: ProtocolProfile,
+        now: Timestamp,
+    ) -> bool {
         self.reusable
-            && self.write_count.is_some()
-            && self.write_count == write_count
+            && self.key_package_writes.is_some()
+            && self.key_package_writes == key_package_writes
+            && self.profile == profile
             && self.window.contains(now)
     }
 }
@@ -437,27 +450,33 @@ impl KeyPackagesValidity {
 /// The owned KeyPackage list, by today's read code, with its validity.
 fn owned_key_packages(
     client: &AppClient,
-    write_count: Option<u64>,
+    key_package_writes: Option<u64>,
+    profile: ProtocolProfile,
 ) -> (ReadAnswer<Vec<KeyPackage>>, KeyPackagesValidity) {
     key_package_answer(
         client.durably_owned_key_packages_with_validity(),
-        write_count,
+        key_package_writes,
+        profile,
     )
 }
 
-/// The answer and validity of a KeyPackage list `read` with the database at
-/// `write_count`: it holds from the clock reading its lifetimes were judged
-/// at until the first lifetime bound ahead, and only a full success, with no
-/// lifetime check on the other side of a bound from that reading, is reused.
+/// The answer and validity of a KeyPackage list `read` with the database's
+/// KeyPackage write count at `key_package_writes` and the engine's protocol
+/// profile at `profile`: it holds from the clock reading its lifetimes were
+/// judged at until the first lifetime bound ahead, and only a full success,
+/// with no lifetime check on the other side of a bound from that reading, is
+/// reused.
 fn key_package_answer(
     read: Result<marmot_session::OwnedKeyPackages, AppError>,
-    write_count: Option<u64>,
+    key_package_writes: Option<u64>,
+    profile: ProtocolProfile,
 ) -> (ReadAnswer<Vec<KeyPackage>>, KeyPackagesValidity) {
     match read {
         Ok(owned) => (
             Ok(owned.key_packages),
             KeyPackagesValidity {
-                write_count,
+                key_package_writes,
+                profile,
                 window: WallClockWindow {
                     from: owned.checked_at,
                     until: owned.changes_at,
@@ -468,7 +487,8 @@ fn key_package_answer(
         Err(error) => (
             Err(Arc::new(error)),
             KeyPackagesValidity {
-                write_count,
+                key_package_writes,
+                profile,
                 window: WallClockWindow::ALWAYS,
                 reusable: false,
             },
@@ -601,11 +621,14 @@ impl ReadStatePublisher {
 
         // Read before the build, so a write that lands during it ends the
         // reuse at the next publish.
-        let write_count =
-            (!client.engine_storage.is_closed()).then(|| client.engine_storage.write_count());
+        let key_package_writes = (!client.engine_storage.is_closed())
+            .then(|| client.engine_storage.key_package_write_count());
+        let profile = client.runtime.new_protocol_profile();
         let (key_packages, key_package_validity, key_packages_reused) =
             match self.key_packages.take() {
-                Some((answer, validity)) if validity.holds(write_count, system_clock_now()) => {
+                Some((answer, validity))
+                    if validity.holds(key_package_writes, profile, system_clock_now()) =>
+                {
                     (answer, validity, true)
                 }
                 _ => {
@@ -618,7 +641,8 @@ impl ReadStatePublisher {
                             .then(|| oracle::KeyPackageInputs::read(client).ok())
                             .flatten();
                     }
-                    let (answer, validity) = owned_key_packages(client, write_count);
+                    let (answer, validity) =
+                        owned_key_packages(client, key_package_writes, profile);
                     (answer, validity, false)
                 }
             };
@@ -962,7 +986,6 @@ pub(crate) mod oracle {
     use std::collections::BTreeSet;
 
     use cgka_traits::StorageError;
-    use cgka_traits::group::ProtocolProfile;
     use cgka_traits::storage::StoredKeyPackageBundle;
 
     use super::*;
@@ -1416,13 +1439,15 @@ mod tests {
     use super::*;
     use crate::AccountError;
 
-    /// A KeyPackage list is reused only while the database's write count is
-    /// the one it was read at, the system clock is inside its window (not
-    /// moved back before the reading its lifetimes were judged at, not past
-    /// the next lifetime bound), and the read fully succeeded with every
-    /// lifetime check agreeing with that reading.
+    /// A KeyPackage list is reused only while the database's KeyPackage
+    /// write count and the engine's protocol profile are the ones it was read
+    /// at, the system clock is inside its window (not moved back before the
+    /// reading its lifetimes were judged at, not past the next lifetime
+    /// bound), and the read fully succeeded with every lifetime check
+    /// agreeing with that reading.
     #[test]
     fn a_key_package_list_holds_only_inside_its_validity() {
+        use ProtocolProfile::{Current, Legacy};
         let owned = marmot_session::OwnedKeyPackages {
             key_packages: Vec::new(),
             checked_at: Timestamp(100),
@@ -1430,32 +1455,35 @@ mod tests {
             skipped_undecodable: false,
             clock_moved: false,
         };
-        let (_, validity) = key_package_answer(Ok(owned.clone()), Some(5));
-        assert!(validity.holds(Some(5), Timestamp(150)));
-        assert!(!validity.holds(Some(6), Timestamp(150)));
-        assert!(!validity.holds(None, Timestamp(150)));
-        assert!(!validity.holds(Some(5), Timestamp(99)));
-        assert!(!validity.holds(Some(5), Timestamp(200)));
-        let (_, closed) = key_package_answer(Ok(owned.clone()), None);
-        assert!(!closed.holds(None, Timestamp(150)));
+        let (_, validity) = key_package_answer(Ok(owned.clone()), Some(5), Current);
+        assert!(validity.holds(Some(5), Current, Timestamp(150)));
+        assert!(!validity.holds(Some(6), Current, Timestamp(150)));
+        assert!(!validity.holds(None, Current, Timestamp(150)));
+        assert!(!validity.holds(Some(5), Legacy, Timestamp(150)));
+        assert!(!validity.holds(Some(5), Current, Timestamp(99)));
+        assert!(!validity.holds(Some(5), Current, Timestamp(200)));
+        let (_, closed) = key_package_answer(Ok(owned.clone()), None, Current);
+        assert!(!closed.holds(None, Current, Timestamp(150)));
         let (_, skipped) = key_package_answer(
             Ok(marmot_session::OwnedKeyPackages {
                 skipped_undecodable: true,
                 ..owned.clone()
             }),
             Some(5),
+            Current,
         );
-        assert!(!skipped.holds(Some(5), Timestamp(150)));
+        assert!(!skipped.holds(Some(5), Current, Timestamp(150)));
         let (_, moved) = key_package_answer(
             Ok(marmot_session::OwnedKeyPackages {
                 clock_moved: true,
                 ..owned
             }),
             Some(5),
+            Current,
         );
-        assert!(!moved.holds(Some(5), Timestamp(150)));
-        let (_, failed) = key_package_answer(Err(closed_storage()), Some(5));
-        assert!(!failed.holds(Some(5), Timestamp(150)));
+        assert!(!moved.holds(Some(5), Current, Timestamp(150)));
+        let (_, failed) = key_package_answer(Err(closed_storage()), Some(5), Current);
+        assert!(!failed.holds(Some(5), Current, Timestamp(150)));
     }
 
     /// Only a fact about the group keeps a failed answer in a reused entry;

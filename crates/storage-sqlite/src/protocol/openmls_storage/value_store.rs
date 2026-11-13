@@ -782,6 +782,62 @@ mod tests {
         );
     }
 
+    /// Every row is keyed from its own label: each write keys its row by
+    /// the label it stores, which the key spells out. The owned KeyPackage
+    /// list reads a stored bundle by its storage key alone (OpenMLS's
+    /// `key_package`), while the KeyPackage count in `cross::group_writes`
+    /// sees a write by its row's label. So that read returns only
+    /// KeyPackage-labelled rows, and a REPLACE of a row with another label
+    /// never deletes one (mdk#3273). Older builds' keys, still read and
+    /// deleted, spell the label with no length; no other label is a prefix
+    /// of `KeyPackage` or has it as one, so none of those is a bundle's key
+    /// either.
+    #[test]
+    fn every_row_is_keyed_from_its_own_label() {
+        use super::super::labels::{ALL_LABELS, KEY_PACKAGE_LABEL, label_of_key};
+
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let mls = &store.openmls;
+        for &label in ALL_LABELS {
+            mls.write_entity(label, b"value".to_vec(), None, &TestEntity(1))
+                .unwrap();
+            for entity in [TestEntity(1), TestEntity(2)] {
+                mls.append_entity(label, b"list".to_vec(), None, &entity)
+                    .unwrap();
+            }
+            mls.remove_entity(label, b"list".to_vec(), None, &TestEntity(1))
+                .unwrap();
+        }
+        let rows: Vec<(Vec<u8>, Vec<u8>)> = store
+            .lock()
+            .unwrap()
+            .prepare("SELECT label, storage_key FROM openmls_values")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(rows.len(), 2 * ALL_LABELS.len());
+        for (label, storage_key) in &rows {
+            assert_eq!(
+                label_of_key(storage_key),
+                Some(label.as_slice()),
+                "{:?}",
+                String::from_utf8_lossy(label)
+            );
+        }
+
+        let key_package = KEY_PACKAGE_LABEL.as_bytes();
+        for label in ALL_LABELS.iter().map(|label| label.as_bytes()) {
+            assert!(
+                label == key_package
+                    || !(label.starts_with(key_package) || key_package.starts_with(label)),
+                "{:?}",
+                String::from_utf8_lossy(label)
+            );
+        }
+    }
+
     #[test]
     fn value_storage_key_length_delimits_label_and_key() {
         let store = SqliteAccountStorage::in_memory().unwrap();

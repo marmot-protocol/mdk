@@ -1157,11 +1157,12 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   entry (`EntryValidity`) holds while its change generation, mirror record and maintenance pause are unchanged,
   the clock is inside its commit-delivery window (from the reading that answer was computed at to its next
   deadline), and no answer failed on something other than a fact about the group (`settled_failure`) nor did the
-  device-group check that hides it fail. The KeyPackage list (`KeyPackagesValidity`) holds while the file's total
-  write count is the one read before the build, the system clock is inside the window from the one reading its
-  lifetimes are judged at to its next lifetime bound (a listed `not_after` or a pending bundle's `not_before`), and
-  the read fully succeeded, with no bundle skipped as undecodable and no lifetime check that disagrees with that
-  reading. `ReadState::valid_until` is the earliest window end;
+  device-group check that hides it fail. The KeyPackage list (`KeyPackagesValidity`) holds while the file's
+  KeyPackage write count (`key_package_write_count`: stored bundles and issued private KeyPackages only, so a send
+  keeps it) and the engine's protocol profile are the ones read before the build, the system clock is inside the
+  window from the one reading its lifetimes are judged at to its next lifetime bound (a listed `not_after` or a
+  pending bundle's `not_before`), and the read fully succeeded, with no bundle skipped as undecodable and no lifetime
+  check that disagrees with that reading. `ReadState::valid_until` is the earliest window end;
   a change of it alone publishes a version. A new input of a reused answer must be in its validity or move one of
   its counts (a new table needs a `storage-sqlite` `cross/group_writes.rs` trigger). In this crate's own tests,
   every publish that changed something, and every reused KeyPackage list, is checked against today's live reads

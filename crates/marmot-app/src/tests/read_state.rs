@@ -196,14 +196,17 @@ async fn a_failed_account_read_recovers_without_a_write() {
 
 /// The owned KeyPackage list is the one account answer A reuses: its read
 /// re-checks every stored bundle's signatures. It is kept while the account
-/// database's total write count holds, which every write to the file moves
-/// through any connection: here bundles change through the app's own
-/// connection, not the engine. The version carries the list's lifetime bound,
-/// and a read that skipped a bundle that does not decode is never reused. The
-/// oracle checks a settled reuse by the list's inputs, without reading the
-/// list afresh.
+/// database's KeyPackage write count holds, which only a write to its inputs
+/// moves, through any connection: a send keeps it, and a stored bundle's
+/// replace or delete or an issued private KeyPackage's write ends it, here
+/// through the app's own connection, not the engine. The version carries the
+/// list's lifetime bound, and a read that skipped a bundle that does not
+/// decode is never reused. The oracle checks a settled reuse by the list's
+/// inputs, without reading the list afresh.
 #[tokio::test]
-async fn the_owned_key_package_list_is_reused_only_until_the_file_is_written() {
+async fn the_owned_key_package_list_is_reused_until_a_key_package_input_is_written() {
+    use cgka_traits::storage::{IssuedPrivateKeyPackage, PrivateKeyPackageStorage as _};
+
     let dir = tempfile::tempdir().unwrap();
     AccountHome::open(dir.path())
         .create_account("alice")
@@ -212,6 +215,7 @@ async fn the_owned_key_package_list_is_reused_only_until_the_file_is_written() {
         .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
     let mut client = app.client("alice").await.unwrap();
     client.publish_key_package().await.unwrap();
+    let group = client.create_group("sent", &[]).await.unwrap();
     client.start_read_state(UploadsInFlight::default());
     let state = client.subscribe_read_state().unwrap();
     let owned = state
@@ -230,14 +234,51 @@ async fn the_owned_key_package_list_is_reused_only_until_the_file_is_written() {
     assert!(client.read_state_reused_key_packages());
     assert!(!client.read_state_read_key_packages_afresh());
 
+    client.send(&group, b"kept").await.unwrap();
+    client.publish_read_state();
+    assert!(client.read_state_reused_key_packages(), "a send");
+
     let storage = app.account_storage("alice").unwrap().app_storage();
+    storage
+        .execute_batch_for_test(
+            "INSERT OR REPLACE INTO openmls_values
+             SELECT * FROM openmls_values WHERE label = CAST('KeyPackage' AS BLOB)",
+        )
+        .unwrap();
+    client.publish_read_state();
+    assert!(!client.read_state_reused_key_packages(), "a replace");
+    client.publish_read_state();
+    assert!(client.read_state_reused_key_packages());
+
+    client
+        .engine_storage
+        .put_issued_private_key_package(&IssuedPrivateKeyPackage {
+            key_package_ref: vec![0xaa; 32],
+            recipient_slot: [0xbb; 32],
+            not_before: 0,
+            not_after: u64::MAX,
+            key_package: Vec::new(),
+            issued_at: 1,
+            hand_off_queued: true,
+            counted: true,
+            request_id: None,
+        })
+        .unwrap();
+    client.publish_read_state();
+    assert!(
+        !client.read_state_reused_key_packages(),
+        "a private KeyPackage"
+    );
+    client.publish_read_state();
+    assert!(client.read_state_reused_key_packages());
+
     storage
         .execute_batch_for_test(
             "DELETE FROM openmls_values WHERE label = CAST('KeyPackage' AS BLOB)",
         )
         .unwrap();
     client.publish_read_state();
-    assert!(!client.read_state_reused_key_packages());
+    assert!(!client.read_state_reused_key_packages(), "a delete");
     let state_now = state.borrow().clone();
     assert!(
         state_now
@@ -256,6 +297,47 @@ async fn the_owned_key_package_list_is_reused_only_until_the_file_is_written() {
         )
         .unwrap();
     client.publish_read_state();
+    client.publish_read_state();
+    assert!(!client.read_state_reused_key_packages());
+}
+
+/// A write to a stored bundle through a connection no trigger counts, here
+/// another SQLite connection on the account database, still ends the owned
+/// KeyPackage list's reuse: reading the KeyPackage write count checks the
+/// database's `data_version`, and a change no counted commit explains moves
+/// the count.
+#[tokio::test]
+async fn an_uncounted_key_package_write_ends_the_lists_reuse() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+    let mut client = app.client("alice").await.unwrap();
+    client.publish_key_package().await.unwrap();
+    client.start_read_state(UploadsInFlight::default());
+    client.publish_read_state();
+    assert!(client.read_state_reused_key_packages());
+
+    let path = app.account_storage_path("alice");
+    let keys = app.account_home().load_signing_keys("alice").unwrap();
+    let key = app
+        .sqlcipher_key("alice", &keys, &path, SqlcipherDatabaseKind::Session)
+        .unwrap();
+    storage_sqlite::expect_uncounted_writes_for_test(&path);
+    let db = rusqlite::Connection::open(path).unwrap();
+    storage_sqlite::open_hardened_sqlcipher(
+        &db,
+        &key,
+        storage_sqlite::SqlCipherHardening::cipher_only(),
+    )
+    .unwrap();
+    db.execute_batch(
+        "INSERT OR REPLACE INTO openmls_values
+         SELECT * FROM openmls_values WHERE label = CAST('KeyPackage' AS BLOB)",
+    )
+    .unwrap();
     client.publish_read_state();
     assert!(!client.read_state_reused_key_packages());
 }

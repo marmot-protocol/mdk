@@ -35,13 +35,23 @@
 //! message ratchet rows (`MessageSecrets`, `ApplicationExportTree`) and message
 //! rows that are not withdrawn commits move neither, so ingesting an
 //! application message leaves a group's answers cached.
+//!
+//! One more count, apart from every group's: the KeyPackage count moves on
+//! every write to an input of the owned KeyPackage list, a stored KeyPackage
+//! bundle (an `openmls_values` row with the KeyPackage label, which has no
+//! group) or an issued private KeyPackage, so a send leaves that list cached.
+//! The list also reads a bundle by its storage key alone, with no label;
+//! every row is keyed from its own label, so no row the triggers leave out
+//! holds a bundle's key, and a REPLACE of one never deletes a bundle
+//! (`every_row_is_keyed_from_its_own_label`). A change the counter cannot
+//! attribute (an uncounted writer, a `VACUUM`) moves it too.
 
 use crate::SqliteResultExt;
 use crate::base::codec::message_state_to_i64;
 use crate::base::connection::{
     ConnectionHooks, HooklessMove, SharedConnection, WeakSharedConnection,
 };
-use crate::protocol::openmls_storage::ratchet_labels;
+use crate::protocol::openmls_storage::{key_package_label, ratchet_labels};
 use cgka_traits::message::MessageState;
 use cgka_traits::storage::{GroupWriteGeneration, StorageResult};
 use cgka_traits::types::GroupId;
@@ -66,6 +76,9 @@ const HEX_ID: i64 = 1;
 const OPENMLS_GROUP_KEY: i64 = 2;
 /// A write this counter cannot attribute to one group: it moves every group.
 const EVERY_GROUP: i64 = 3;
+/// A write to an input of the owned KeyPackage list: it moves the KeyPackage
+/// count and no group.
+const KEY_PACKAGES: i64 = 4;
 
 /// One database file's counts, by file identity, while a connection to it is
 /// open.
@@ -175,6 +188,9 @@ struct Counts {
     /// group.
     unattributed: GroupWriteGeneration,
     groups: HashMap<Vec<u8>, GroupWriteGeneration>,
+    /// Writes to the owned KeyPackage list's inputs, as applied, and changes
+    /// this counter could not attribute.
+    key_packages: u64,
     /// The path the file was first opened by, under test (see
     /// [`expect_uncounted_writes_for_test`]).
     #[cfg(any(test, feature = "test-support"))]
@@ -188,7 +204,14 @@ struct Counts {
 }
 
 impl Counts {
-    fn note(&mut self, group: Option<Vec<u8>>, scope: i64) {
+    fn note(&mut self, note: Note) {
+        let (group, scope) = match note {
+            Note::KeyPackages => {
+                self.key_packages += 1;
+                return;
+            }
+            Note::Group(group, scope) => (group, scope),
+        };
         self.sequence += 1;
         let sequence = self.sequence;
         let entry = match group {
@@ -200,6 +223,21 @@ impl Counts {
             entry.committed = sequence;
         }
     }
+
+    /// A change of the file no trigger attributed: it moves every count.
+    fn note_unattributed_change(&mut self) {
+        self.note(Note::Group(None, COMMITTED));
+        self.note(Note::KeyPackages);
+        self.writes += 1;
+    }
+}
+
+/// What one trigger call counts.
+enum Note {
+    /// A group's input, in a scope; `None` is every group.
+    Group(Option<Vec<u8>>, i64),
+    /// An input of the owned KeyPackage list.
+    KeyPackages,
 }
 
 /// One connection's part of the counts.
@@ -214,7 +252,7 @@ struct ConnectionCounts {
 /// One connection's notes that have not joined the file's counts yet.
 #[derive(Default)]
 struct Pending {
-    notes: Vec<(Option<Vec<u8>>, i64)>,
+    notes: Vec<Note>,
     /// The connection's `total_changes` when its writes last joined.
     applied_changes: u64,
     /// This connection's commits that have joined the file's count.
@@ -303,12 +341,20 @@ impl GroupWriteCounter {
         self.lock().writes
     }
 
+    /// Writes to the owned KeyPackage list's inputs through any of this
+    /// process's connections to the file, after the same check as
+    /// [`Self::writes`]: a change that check cannot explain moves it too.
+    pub(crate) fn key_package_writes(&self, connection: &SharedConnection) -> u64 {
+        self.check_unexplained_commits(connection);
+        self.lock().key_packages
+    }
+
     /// The safety net under the triggers: SQLite moves a connection's
     /// `PRAGMA data_version` when any other connection, in this process or
     /// another, commits to the file. A move that no commit by another of this
     /// process's counted connections explains may have been made by a writer
-    /// the triggers did not see, so every group's count and the write count
-    /// move.
+    /// the triggers did not see, so every group's count, the KeyPackage count
+    /// and the write count move.
     ///
     /// SQLite also moves it without a commit hook: a WAL truncate (its own
     /// checkpoints, a close's), a `VACUUM`, and the rollback of a transaction
@@ -409,8 +455,7 @@ impl GroupWriteCounter {
                 _ => (false, false),
             };
             if unexplained {
-                counts.note(None, COMMITTED);
-                counts.writes += 1;
+                counts.note_unattributed_change();
             }
             pending.checked = Some(now);
             reported
@@ -448,8 +493,8 @@ impl GroupWriteCounter {
         pending.applied_changes = changes;
         counts.commits += commits;
         pending.own_commits += commits;
-        for (group, scope) in pending.notes.drain(..) {
-            counts.note(group, scope);
+        for note in pending.notes.drain(..) {
+            counts.note(note);
         }
     }
 
@@ -457,7 +502,7 @@ impl GroupWriteCounter {
     /// another connection would still wait for a later read: with the
     /// connection held (a truncate, a `VACUUM`, a rollback, a close), or in
     /// a drop before the connection is marked released. A `VACUUM` also
-    /// moves every group, since it may renumber rows without a trigger
+    /// moves every count, since it may renumber rows without a trigger
     /// seeing them; it is noted after the copy, so a count that moved is
     /// never read beside rows the copy had yet to renumber.
     fn note_hookless_move(&self, vacuum: bool) {
@@ -466,8 +511,7 @@ impl GroupWriteCounter {
         counts.hookless += 1;
         pending.own_hookless += 1;
         if vacuum {
-            counts.note(None, COMMITTED);
-            counts.writes += 1;
+            counts.note_unattributed_change();
         }
     }
 
@@ -487,19 +531,23 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-fn group_named(kind: i64, key: ValueRef<'_>) -> Option<Option<Vec<u8>>> {
-    match (kind, key) {
-        (EVERY_GROUP, _) => Some(None),
-        (_, ValueRef::Null) => None,
-        (RAW_ID, ValueRef::Blob(bytes)) => Some(Some(bytes.to_vec())),
-        (HEX_ID, ValueRef::Text(text)) => Some(hex::decode(text).ok()),
-        (OPENMLS_GROUP_KEY, ValueRef::Blob(bytes)) => Some(
+/// What a trigger's `(scope, kind, key)` call counts; `None` for a row with
+/// no group.
+fn note_named(scope: i64, kind: i64, key: ValueRef<'_>) -> Option<Note> {
+    let group = match (kind, key) {
+        (KEY_PACKAGES, _) => return Some(Note::KeyPackages),
+        (EVERY_GROUP, _) => None,
+        (_, ValueRef::Null) => return None,
+        (RAW_ID, ValueRef::Blob(bytes)) => Some(bytes.to_vec()),
+        (HEX_ID, ValueRef::Text(text)) => hex::decode(text).ok(),
+        (OPENMLS_GROUP_KEY, ValueRef::Blob(bytes)) => {
             serde_json::from_slice::<openmls::group::GroupId>(bytes)
                 .ok()
-                .map(|group| group.as_slice().to_vec()),
-        ),
-        _ => Some(None),
-    }
+                .map(|group| group.as_slice().to_vec())
+        }
+        _ => None,
+    };
+    Some(Note::Group(group, scope))
 }
 
 /// Register the counting function and commit hook on `connection`, create
@@ -513,8 +561,8 @@ pub(crate) fn install(connection: &SharedConnection) -> StorageResult<GroupWrite
         lock(&counter.connection.pending).applied_changes = conn.total_changes();
         let noted = Arc::clone(&counter.connection);
         conn.create_scalar_function(FUNCTION, 3, FunctionFlags::SQLITE_UTF8, move |ctx| {
-            if let Some(group) = group_named(ctx.get::<i64>(1)?, ctx.get_raw(2)) {
-                lock(&noted.pending).notes.push((group, ctx.get::<i64>(0)?));
+            if let Some(note) = note_named(ctx.get::<i64>(0)?, ctx.get::<i64>(1)?, ctx.get_raw(2)) {
+                lock(&noted.pending).notes.push(note);
             }
             Ok(0i64)
         })
@@ -589,6 +637,26 @@ fn withdrawn_messages(row: &str) -> String {
         message_state_to_i64(MessageState::EpochInvalidated),
         message_state_to_i64(MessageState::ConvergenceDeferred),
     )
+}
+
+/// A stored KeyPackage bundle. Every row is keyed from its own label, so the
+/// rows this leaves out never hold a bundle's storage key.
+fn key_package_bundles(row: &str) -> String {
+    format!("{row}.label = X'{}'", hex::encode(key_package_label()))
+}
+
+/// Rows of a table that matter, as a condition on `{row}`; empty for every
+/// row.
+type Rows = fn(&str) -> String;
+
+/// Every table the owned KeyPackage list reads, with the rows of it that
+/// matter. A REPLACE deletes a row of the table it writes, which these count
+/// whole, so no row a REPLACE deletes goes uncounted.
+fn key_package_tables() -> [(&'static str, Rows); 2] {
+    [
+        ("openmls_values", key_package_bundles),
+        ("cgka_private_key_packages", every_row),
+    ]
 }
 
 /// Every table a published group answer reads.
@@ -858,6 +926,30 @@ fn trigger_sql() -> String {
         &[old],
     );
 
+    // The owned KeyPackage list's inputs, counted apart from every group.
+    let key_packages = call(STATE, KEY_PACKAGES, "NULL");
+    for (table, rows) in key_package_tables() {
+        let (new_when, old_when) = (rows("NEW"), rows("OLD"));
+        let either = if new_when.is_empty() {
+            String::new()
+        } else {
+            format!("({old_when}) OR ({new_when})")
+        };
+        for (event, when) in [
+            ("INSERT", new_when),
+            ("UPDATE", either),
+            ("DELETE", old_when),
+        ] {
+            trigger(
+                &format!("key_packages_{table}_{}", event.to_ascii_lowercase()),
+                event,
+                table,
+                &when,
+                std::slice::from_ref(&key_packages),
+            );
+        }
+    }
+
     // The roster read overlays the stored self membership; the rest of the
     // row is the in-memory mirror's.
     let new = call(STATE, HEX_ID, "NEW.group_id_hex");
@@ -913,8 +1005,9 @@ mod tests {
     }
 
     /// Commit-derived OpenMLS state moves both scopes of the group its key
-    /// names and of no other group. The application-message ratchet moves
-    /// neither, so ingesting a message leaves the group's answers cached.
+    /// names and of no other group, including when an update moves a row out
+    /// of it. The application-message ratchet moves neither, so ingesting a
+    /// message leaves the group's answers cached.
     #[test]
     fn openmls_rows_move_their_group_unless_they_are_the_message_ratchet() {
         let storage = SqliteAccountStorage::in_memory().unwrap();
@@ -935,6 +1028,17 @@ mod tests {
             write_openmls(&storage, &group, label, &format!("ratchet-{index}"));
         }
         assert_eq!(generation(&storage, &group), committed);
+
+        // An update counts the row it leaves as well as the one it makes.
+        storage
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE openmls_values SET label = ?1 WHERE storage_key = ?2",
+                rusqlite::params![ratchet_labels()[0], b"tree".as_slice()],
+            )
+            .unwrap();
+        assert!(generation(&storage, &group).committed > committed.committed);
     }
 
     fn write_device_group(storage: &SqliteAccountStorage, group: &GroupId) {
@@ -1043,7 +1147,9 @@ mod tests {
     /// - every foreign-key action into a covered table is keyed by the group
     ///   on both sides, so a cascade moves the group its parent's write does;
     /// - every unique key that leaves out the group column has its
-    ///   REPLACE-conflict triggers, and none is an expression.
+    ///   REPLACE-conflict triggers, and none is an expression;
+    /// - each table the owned KeyPackage list reads has its own insert,
+    ///   update and delete triggers on the KeyPackage count.
     #[test]
     fn every_write_into_a_covered_table_is_counted() {
         let storage = SqliteAccountStorage::in_memory().unwrap();
@@ -1080,6 +1186,20 @@ mod tests {
                         && row[1].contains(&format!("AFTER {event} ON main.{}", covered.table))),
                     "{} has no {event} trigger",
                     covered.table
+                );
+            }
+        }
+        for (table, _) in super::key_package_tables() {
+            for event in ["INSERT", "UPDATE", "DELETE"] {
+                let name = format!(
+                    "mdk_group_writes_key_packages_{table}_{} AFTER {event} ON main.{table}",
+                    event.to_ascii_lowercase()
+                );
+                assert!(
+                    counting
+                        .iter()
+                        .any(|row| row[0] == table && row[1].contains(&name)),
+                    "{table} has no KeyPackage {event} trigger"
                 );
             }
         }
@@ -1205,6 +1325,72 @@ mod tests {
         assert!(after.committed > before.committed);
     }
 
+    /// The owned KeyPackage list's inputs move the KeyPackage count, and
+    /// nothing else does: every write to a stored bundle (an insert, a
+    /// replace, an update to or from the KeyPackage label, a delete) and to
+    /// an issued private KeyPackage moves it; a group's write and a row of
+    /// another label with no group do not, so a send leaves the list cached.
+    #[test]
+    fn only_a_write_to_a_key_package_input_moves_the_key_package_count() {
+        let storage = SqliteAccountStorage::in_memory().unwrap();
+        let mut count = storage.key_package_write_count();
+        let mut moved = || {
+            let now = storage.key_package_write_count();
+            std::mem::replace(&mut count, now) != now
+        };
+        let group = GroupId::new(vec![12; 16]);
+        write_openmls(&storage, &group, b"tree", "tree");
+        write_device_group(&storage, &group);
+        assert!(!moved(), "a group's write");
+
+        for (sql, moves) in [
+            (
+                "INSERT INTO openmls_values (provider_version, label, storage_key, group_key, value)
+                 VALUES (1, CAST('SignatureKeyPair' AS BLOB), x'01', NULL, x'00')",
+                false,
+            ),
+            (
+                "INSERT INTO openmls_values (provider_version, label, storage_key, group_key, value)
+                 VALUES (1, CAST('KeyPackage' AS BLOB), x'02', NULL, x'00')",
+                true,
+            ),
+            (
+                "INSERT OR REPLACE INTO openmls_values
+                     (provider_version, label, storage_key, group_key, value)
+                 VALUES (1, CAST('KeyPackage' AS BLOB), x'02', NULL, x'01')",
+                true,
+            ),
+            (
+                "UPDATE openmls_values SET label = CAST('KeyPackage' AS BLOB)
+                 WHERE storage_key = x'01'",
+                true,
+            ),
+            (
+                "UPDATE openmls_values SET label = CAST('SignatureKeyPair' AS BLOB)
+                 WHERE storage_key = x'02'",
+                true,
+            ),
+            (
+                "UPDATE openmls_values SET value = x'02' WHERE storage_key = x'02'",
+                false,
+            ),
+            ("DELETE FROM openmls_values WHERE storage_key = x'01'", true),
+            (
+                "INSERT INTO cgka_private_key_packages VALUES (x'aa', 1, x'00')",
+                true,
+            ),
+            (
+                "INSERT OR REPLACE INTO cgka_private_key_packages VALUES (x'aa', 2, x'00')",
+                true,
+            ),
+            ("UPDATE cgka_private_key_packages SET issued_at = 3", true),
+            ("DELETE FROM cgka_private_key_packages", true),
+        ] {
+            execute(&storage, sql);
+            assert_eq!(moved(), moves, "{sql}");
+        }
+    }
+
     fn insert_group(storage: &SqliteAccountStorage, group: &GroupId) {
         storage
             .lock()
@@ -1262,8 +1448,9 @@ mod tests {
     }
 
     /// The safety net: a commit no counted connection made moves every
-    /// group, and under test it panics. Commits through counted connections
-    /// and another counted open explain themselves.
+    /// group and the KeyPackage count, and under test it panics. Reading the
+    /// KeyPackage count runs it. Commits through counted connections and
+    /// another counted open explain themselves.
     #[test]
     fn only_an_uncounted_commit_trips_the_data_version_net() {
         let directory = tempfile::tempdir().unwrap();
@@ -1285,16 +1472,18 @@ mod tests {
              VALUES ('ff', 'untrusted', NULL, 0)",
         )
         .unwrap();
-        let before = (
-            generation(&engine, &group),
-            engine.group_writes.lock().writes,
-        );
+        let before = {
+            let counts = engine.group_writes.lock();
+            (counts.writes, counts.key_packages)
+        };
+        let before = (generation(&engine, &group), before.0, before.1);
         let tripped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            engine.write_count();
+            engine.key_package_write_count();
         }));
         assert!(tripped.is_err());
         assert!(generation(&engine, &group).committed > before.0.committed);
         assert!(engine.group_writes.lock().writes > before.1);
+        assert!(engine.group_writes.lock().key_packages > before.2);
     }
 
     /// SQLite moves another connection's `PRAGMA data_version` without a
@@ -1316,18 +1505,25 @@ mod tests {
             "CREATE TABLE spill (bytes BLOB); PRAGMA cache_size = 10;",
         );
         // Measured from after the change: the other connection's read moves
-        // every group only if it saw the move.
+        // every group and the KeyPackage count only if it saw the move.
         let moves_every_group = |change: &str, make: &dyn Fn()| {
             engine.write_count();
             make();
-            let before = generation(&engine, &group);
+            let before = (
+                generation(&engine, &group),
+                engine.group_writes.lock().key_packages,
+            );
             let read = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 engine.write_count();
             }));
             assert!(read.is_ok(), "{change} was reported");
             assert!(
-                generation(&engine, &group).committed > before.committed,
+                generation(&engine, &group).committed > before.0.committed,
                 "{change} moved no group"
+            );
+            assert!(
+                engine.group_writes.lock().key_packages > before.1,
+                "{change} moved no KeyPackage count"
             );
         };
 
