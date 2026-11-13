@@ -1376,8 +1376,8 @@ A unit or route changed state. Transition-driven: each appears once per change.
 
 | `change` | When | Carries |
 | --- | --- | --- |
-| `broken` | An active or retired unit broke: its remaining debt is parked behind the "history may be incomplete" notice and it is not retried until new evidence re-arms it. | route, `endpoint_ref`, `break_reason` (`no_progress`, `refused`), `park_revision` |
-| `probe_failed` | A broken unit's probe made no progress or was refused; it stays parked under the same park. | as `broken` |
+| `broken` | An active or retired unit broke: its remaining debt is parked, and it is retried only by a timed probe (an hour after it breaks, doubling to a day) or when new evidence re-arms it. | route, `endpoint_ref`, `break_reason` (`no_progress`, `refused`), `park_revision` |
+| `probe_failed` | A broken unit's probe made no progress or was refused; it stays parked under the same park and waits longer for its next timed probe. | as `broken` |
 | `rearmed` | A broken unit is active again after a quantum (often its probe) advanced or found nothing owed. | route, `endpoint_ref` |
 | `caps_rearmed` | A relay's recorded NIP-11 caps changed and re-armed its broken units planned with other caps. | `endpoint_ref`, `units` |
 | `repair_rearmed` | An explicit repair re-armed every broken and retired unit. | `units` |

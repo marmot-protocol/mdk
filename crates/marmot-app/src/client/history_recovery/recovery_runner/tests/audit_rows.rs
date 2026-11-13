@@ -421,3 +421,127 @@ fn recovery_runner_audits_a_remainder_the_retention_floor_parked_and_widened() {
         )
     );
 }
+
+/// A relay that broke while required and is now best effort keeps its unit
+/// row and the probe a timer armed on it. Its fetch rows never claim a probe:
+/// a best-effort relay keeps no retry state, and the strict writer drops a
+/// row that says both.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovery_runner_never_marks_a_best_effort_fetch_as_a_probe() {
+    let account = account();
+    let clock = Clock::new();
+    let t0 = clock.now();
+    let route = group(1);
+    let floor = t0 - HOUR;
+    let relay = stalling_relay([1; 32], floor).build();
+    let host = TestHost::new(&account, &clock, vec![grouped(&route, &[RELAY])], &[&relay]);
+    account.goal(&route, floor);
+    host.tails.stand(&route, RELAY, t0);
+    let (mut runner, _handle) = runner(&host, test_policy());
+    let broken = RecoveryUnitState::Broken(RecoveryUnitBreak::NoProgress);
+    while account
+        .app
+        .recovery_unit(&route, RELAY)
+        .unwrap()
+        .map(|unit| unit.state)
+        != Some(broken)
+    {
+        match runner.step().await {
+            Step::Ran(_) => {}
+            Step::Idle { next_due } => clock.advance_to(next_due.unwrap()),
+            Step::Raced | Step::Stopped => panic!("the unit runs until it breaks"),
+        }
+    }
+    let probe_at = idle(runner.step().await).expect("a broken unit waits for its timed probe");
+    {
+        let mut routes = host.routes.lock().unwrap();
+        routes[0].best_effort = std::mem::take(&mut routes[0].required);
+    }
+    clock.advance_to(probe_at);
+    host.take_audited();
+
+    assert!(ran(runner.step().await).best_effort);
+    assert!(
+        account.unit(&route, RELAY).probe,
+        "best-effort settlement leaves the armed probe on the old unit row"
+    );
+    let rows = fetched(&host);
+    assert!(
+        matches!(
+            rows.as_slice(),
+            [(
+                _,
+                AuditEventKind::RecoveryRunnerFetched {
+                    best_effort: true,
+                    probe: false,
+                    ..
+                }
+            )]
+        ),
+        "{rows:?}"
+    );
+}
+
+/// A begin that races and so closes its route's window leaves the coalesced
+/// row for the next survey turn: the raced step awaits no turn to write it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovery_runner_writes_a_closed_race_window_in_its_next_survey() {
+    let account = account();
+    let clock = Clock::new();
+    let t0 = clock.now();
+    let route = group(1);
+    let relay = ModelRelay::new(RELAY, caps(500, true)).build();
+    let host = TestHost::new(&account, &clock, vec![grouped(&route, &[RELAY])], &[&relay]);
+    let opened = t0 - HOUR;
+    account.goal(&route, t0 - DAY);
+    account.live_boundary(&route, RELAY, t0 - DAY, opened - 1);
+    let credits = recovery_credits::private_recovery_credit_pool_for_test();
+    let held = hold_all_credits_for_test(&credits);
+    let (mut runner, _handle) = runner_sharing(&host, &credits);
+    // An earlier race opened the route's window a full window ago.
+    assert!(
+        runner
+            .races
+            .raced(&route, t0 - RECOVERY_RUNNER_RACED_WINDOW_SECS)
+            .is_none()
+    );
+    let stepping = tokio::spawn(async move {
+        let step = runner.step().await;
+        (runner, step)
+    });
+    wait_until("the survey", WAIT, || host.debt_turns() == 2).await;
+    // While it waits for a credit, a new tail stands over the whole debt.
+    host.tails.stand(&route, RELAY, opened);
+    drop(held);
+
+    let (mut runner, step) = stepping.await.unwrap();
+    assert!(matches!(step, Step::Raced), "begin found nothing owed");
+    assert!(
+        host.take_audited().is_empty(),
+        "the raced step writes nothing itself"
+    );
+    runner.step().await;
+    let rows = host
+        .take_audited()
+        .into_iter()
+        .filter(|(_, kind)| matches!(kind, AuditEventKind::RecoveryRunnerRaced { .. }))
+        .collect::<Vec<_>>();
+    let tag = hex::encode(ledger_route_tag(&route));
+    assert!(
+        matches!(
+            rows.as_slice(),
+            [(
+                Some(group),
+                AuditEventKind::RecoveryRunnerRaced {
+                    route_kind: RecoveryRunnerRoute::Group,
+                    obligation_id,
+                    raced: 2,
+                    window_secs,
+                }
+            )] if *group == GROUP_ID.to_vec()
+                && *obligation_id == tag
+                && *window_secs >= RECOVERY_RUNNER_RACED_WINDOW_SECS
+        ),
+        "{rows:?}"
+    );
+}

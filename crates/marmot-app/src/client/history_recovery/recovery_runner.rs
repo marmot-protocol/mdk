@@ -567,6 +567,9 @@ pub(crate) struct RecoveryRunner<H> {
     open: OpenAttempts,
     /// Begins abandoned as raced, coalesced per route for the audit.
     races: audit::Races,
+    /// Raced rows whose window closed, for the next survey turn to write: no
+    /// turn is awaited only to write a row.
+    unwritten_races: Vec<(Option<Vec<u8>>, AuditEventKind)>,
     /// The routes the last survey found suspended, for the audit; `None`
     /// before the first.
     suspended: Option<BTreeSet<TransportReconciliationRoute>>,
@@ -610,6 +613,7 @@ impl<H: RunnerHost> RecoveryRunner<H> {
             reported_pause: None,
             open: OpenAttempts::default(),
             races: audit::Races::default(),
+            unwritten_races: Vec::new(),
             suspended: None,
         };
         let handle = RecoveryRunnerHandle {
@@ -751,8 +755,12 @@ impl<H: RunnerHost> RecoveryRunner<H> {
         };
         let policy = self.policy;
         let suspended = self.suspended.clone();
+        let races = std::mem::take(&mut self.unwritten_races);
         let (mut survey, epoch_gap_due) = match self
             .debt_turn(pass, move |turn| {
+                for (group, row) in races {
+                    (turn.audit)(group.as_deref(), row);
+                }
                 let due = epoch_gap::advance(turn, &policy, &stalled)?.next_due;
                 let survey = select::survey(turn, &policy, &stalled)?;
                 Ok((survey, due, audit::suspensions(turn, suspended.as_ref())))
@@ -862,7 +870,7 @@ impl<H: RunnerHost> RecoveryRunner<H> {
                                 best_effort,
                                 plan.compare.is_some(),
                                 audit::debt_purpose(turn, route, repair, fenced),
-                                audit::probing(plan.prior.as_ref()),
+                                !best_effort && audit::probing(plan.prior.as_ref()),
                                 &plan.ranges,
                             )
                         });
@@ -873,7 +881,7 @@ impl<H: RunnerHost> RecoveryRunner<H> {
         {
             None => return Step::Stopped,
             Some(Ok(Some(begun))) => begun,
-            Some(Ok(None)) => return self.raced(&candidate).await,
+            Some(Ok(None)) => return self.raced(&candidate),
             Some(Err(error)) => {
                 log_failure("begin", error);
                 let outcome = RecoveryUnitOutcome::LocalFailure;
@@ -1044,7 +1052,7 @@ impl<H: RunnerHost> RecoveryRunner<H> {
         {
             None => return Step::Stopped,
             Some(Ok(Some(begun))) => begun,
-            Some(Ok(None)) => return self.raced(&candidate).await,
+            Some(Ok(None)) => return self.raced(&candidate),
             Some(Err(error)) => {
                 log_failure("recheck_begin", error);
                 let outcome = RecoveryUnitOutcome::LocalFailure;
@@ -1157,16 +1165,13 @@ impl<H: RunnerHost> RecoveryRunner<H> {
     }
 
     /// The begin turn found `candidate` owing nothing, or no longer eligible:
-    /// count the race on its route, and write the route's coalesced row when
-    /// this race ends its window ([`audit::Races`]). A lost row changes
-    /// nothing else.
-    async fn raced(&mut self, candidate: &Candidate) -> Step {
+    /// count the race on its route. When this race ends the route's window
+    /// ([`audit::Races`]), the coalesced row waits for the next survey turn;
+    /// a row a stop loses changes nothing else.
+    fn raced(&mut self, candidate: &Candidate) -> Step {
         let route = &candidate.key.route;
         if let Some(row) = self.races.raced(route, self.host.now_seconds()) {
-            let group = candidate.group_id.clone();
-            self.host
-                .turn(move |turn| (turn.audit)(group.as_deref(), row))
-                .await;
+            self.unwritten_races.push((candidate.group_id.clone(), row));
         }
         Step::Raced
     }
