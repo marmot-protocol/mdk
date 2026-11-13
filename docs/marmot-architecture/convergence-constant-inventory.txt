@@ -86,6 +86,8 @@ A17|crates/transport-nostr-adapter/src/sdk_client.rs|SDK_NOTIFICATION_CAPACITY
 A19|crates/marmot-app/src/client/recovery_runner/policy.rs|RUNNER_BACKOFF_BASE_SECS
 A19|crates/marmot-app/src/client/recovery_runner/policy.rs|RUNNER_BACKOFF_CAP_SECS
 A19|crates/marmot-app/src/client/recovery_runner/policy.rs|RUNNER_BREAK_AFTER_NO_PROGRESS
+A19|crates/marmot-app/src/client/recovery_runner/policy.rs|RUNNER_PROBE_BASE_SECS
+A19|crates/marmot-app/src/client/recovery_runner/policy.rs|RUNNER_PROBE_CAP_SECS
 A19|crates/marmot-app/src/client/recovery_runner/policy.rs|RUNNER_UNREACHABLE_RETRY_SECS
 A19|crates/marmot-app/src/client/recovery_runner/policy.rs|RUNNER_COOLDOWN_AFTER_UNREACHABLE
 A19|crates/marmot-app/src/client/recovery_runner/policy.rs|RUNNER_COOLDOWN_BASE_SECS
