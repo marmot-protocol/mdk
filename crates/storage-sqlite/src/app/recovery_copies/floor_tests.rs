@@ -32,6 +32,8 @@ const POLICY: RecoveryUnitPolicy = RecoveryUnitPolicy {
     max_attempts_per_hour: 720,
     max_event_bytes_per_hour: 256 << 20,
     recheck_after_cooldown_seconds: 3_600,
+    probe_base_seconds: 3_600,
+    probe_cap_seconds: 86_400,
 };
 
 /// A group a rejoin settled, in wall-clock time so that the release and
@@ -97,8 +99,8 @@ impl Rejoined {
         )
         .unwrap();
         if !young {
-            let parked = park(&app, &route, now);
-            assert!(app.dismiss_recovery_route_park(&route, parked).unwrap());
+            park(&app, &route, now);
+            app.retire_route_park_as_converted(&route);
             app.uncover_recovery_coverage(
                 std::slice::from_ref(&route),
                 now - 4_500,
@@ -398,13 +400,8 @@ fn no_writer_reopens_what_lay_before_a_rejoined_copy() {
                     .rearm_recovery_unit(&rejoined.route, RELAY)
                     .unwrap()
             );
-            let parked = park(&rejoined.app, &rejoined.route, rejoined.now);
-            assert!(
-                rejoined
-                    .app
-                    .dismiss_recovery_route_park(&rejoined.route, parked)
-                    .unwrap()
-            );
+            park(&rejoined.app, &rejoined.route, rejoined.now);
+            rejoined.app.retire_route_park_as_converted(&rejoined.route);
         }),
         // Retention overtakes the floor, as it does a month after the rejoin:
         // what each route still owes from the floor up is parked, and nothing

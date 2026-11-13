@@ -654,10 +654,11 @@ typedef enum MarmotEventSizeClass {
 } MarmotEventSizeClass;
 
 /**
- * Why recovery parked. Current epoch-gap exhaustion emits `EpochGap`;
- * coverage-ledger parks emit `UnprovenHistory`; a rejoin emits
- * `BeforeRejoin`. Other labels preserve compatibility; `KnownEvent` and
- * `MaintenanceBoundary` remain reserved for parking policy.
+ * Why recovery parked. Current epoch-gap exhaustion emits `EpochGap`; a
+ * rejoin emits `BeforeRejoin`. Other labels preserve compatibility, so
+ * keep exhaustive switches: `UnprovenHistory` is no longer emitted, and
+ * `KnownEvent` and `MaintenanceBoundary` remain reserved for parking
+ * policy.
  */
 typedef enum MarmotHistoryNoticeCause {
   /**
@@ -690,9 +691,9 @@ typedef enum MarmotHistoryNoticeCause {
    */
   MARMOT_HISTORY_NOTICE_CAUSE_MAINTENANCE_BOUNDARY,
   /**
-   * The recovery runner could not prove this history on a route's
-   * relays and stopped retrying them: a group's (`group_id_hex` names
-   * it) or the account inbox's.
+   * No longer emitted; kept for compatibility. Earlier releases raised
+   * it when the recovery runner could not prove history on a route's
+   * relays. The runner now retries them quietly.
    */
   MARMOT_HISTORY_NOTICE_CAUSE_UNPROVEN_HISTORY,
   /**

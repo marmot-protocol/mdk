@@ -8,10 +8,11 @@ use marmot_uniffi::conversions::{
 use crate::macros::{c_enum, c_mirror};
 
 c_enum! {
-    /// Why recovery parked. Current epoch-gap exhaustion emits `EpochGap`;
-    /// coverage-ledger parks emit `UnprovenHistory`; a rejoin emits
-    /// `BeforeRejoin`. Other labels preserve compatibility; `KnownEvent` and
-    /// `MaintenanceBoundary` remain reserved for parking policy.
+    /// Why recovery parked. Current epoch-gap exhaustion emits `EpochGap`; a
+    /// rejoin emits `BeforeRejoin`. Other labels preserve compatibility, so
+    /// keep exhaustive switches: `UnprovenHistory` is no longer emitted, and
+    /// `KnownEvent` and `MaintenanceBoundary` remain reserved for parking
+    /// policy.
     MarmotHistoryNoticeCause from HistoryNoticeCauseFfi {
         /// Deliveries were dropped from a full account queue, or spilled
         /// rows could not be admitted, and comparison could not recover them.
@@ -28,9 +29,9 @@ c_enum! {
         KnownEvent,
         /// A post-join maintenance boundary was never observed.
         MaintenanceBoundary,
-        /// The recovery runner could not prove this history on a route's
-        /// relays and stopped retrying them: a group's (`group_id_hex` names
-        /// it) or the account inbox's.
+        /// No longer emitted; kept for compatibility. Earlier releases raised
+        /// it when the recovery runner could not prove history on a route's
+        /// relays. The runner now retries them quietly.
         UnprovenHistory,
         /// This device rejoined the group (`group_id_hex` names it): a
         /// Welcome installed a new copy in place of its old one. That is an

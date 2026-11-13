@@ -216,7 +216,7 @@ fn cover_inbox(client: &AppClient, storage: &SqliteAppStorage) {
     }
 }
 
-/// A repair re-arms a parked route, so its notice goes, then serves the
+/// A repair re-arms a parked route, then serves the
 /// whole retained window: covered on every relay, it ends below the window,
 /// as today, never in success.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -244,13 +244,13 @@ async fn a_repair_re_arms_and_covers_the_window_then_ends_below_it() {
             now,
         )
         .unwrap();
-    assert_eq!(client.history_notices().unwrap().len(), 1);
+    assert_eq!(storage.parked_recovery_routes().unwrap().len(), 1);
 
     let result = client
         .repair_full_history_cancellable(&|| false, None)
         .await;
     assert_eq!(reason(result), Reason::BelowRetentionWindow);
-    assert!(client.history_notices().unwrap().is_empty());
+    assert!(storage.parked_recovery_routes().unwrap().is_empty());
     let floor = unix_now_seconds() - storage_sqlite::TRANSPORT_RECONCILIATION_RETENTION_SECS;
     for candidate in client.recovery_runner_routes() {
         for relay in &candidate.required {
@@ -807,7 +807,7 @@ async fn a_repair_cancelled_before_it_starts_re_arms_nothing() {
 
 /// A repair on a client that never built a runner, as a worker's before its
 /// ownership preparation succeeds, touches no unit: a parked unit stays
-/// parked behind its notice, and nothing can prove the repair.
+/// parked, and nothing can prove the repair.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_repair_before_any_runner_re_arms_nothing() {
     let (_dir, _relay, client, storage, route) = client(&Sweeps::default()).await;
@@ -843,7 +843,7 @@ async fn a_repair_before_any_runner_re_arms_nothing() {
         .unwrap();
     assert!(!local.repairs_through_runner(None));
     let units = storage.recovery_units().unwrap();
-    assert_eq!(local.history_notices().unwrap().len(), 1);
+    assert_eq!(storage.parked_recovery_routes().unwrap().len(), 1);
 
     let result = local.repair_full_history_cancellable(&|| false, None).await;
     assert_eq!(reason(result), Reason::CoverageUnproven);
@@ -851,5 +851,5 @@ async fn a_repair_before_any_runner_re_arms_nothing() {
         storage.recovery_units().unwrap() == units,
         "no unit re-armed"
     );
-    assert_eq!(local.history_notices().unwrap().len(), 1);
+    assert_eq!(storage.parked_recovery_routes().unwrap().len(), 1);
 }

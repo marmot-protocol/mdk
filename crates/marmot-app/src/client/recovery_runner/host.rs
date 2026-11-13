@@ -196,6 +196,10 @@ impl RunnerHost for AccountRunnerHost {
                 if let Err(error) = client.prune_runner_retention(&app, now) {
                     return Some(Err(error));
                 }
+                // Broken units whose probe time passed owe their park again.
+                if let Err(error) = app.arm_due_recovery_probes(now) {
+                    return Some(Err(error));
+                }
                 let tails = client.recovery_runner_live_tails(&app, now).await;
                 let mut routes = client.recovery_runner_routes();
                 if inbox.is_none() {

@@ -4,10 +4,10 @@
 use marmot_app::{AccountRecoveryStatus, HistoryNotice, HistoryNoticeCause};
 
 /// Why recovery parked; choose the host's wording from it. Current epoch-gap
-/// exhaustion emits `EpochGap`; the coverage ledger emits `UnprovenHistory`
-/// without attributing the original reason its route's history was owed; a
-/// rejoin emits `BeforeRejoin`. Other labels preserve compatibility;
-/// `KnownEvent` and `MaintenanceBoundary` remain reserved for parking policy.
+/// exhaustion emits `EpochGap`; a rejoin emits `BeforeRejoin`. Other labels
+/// preserve compatibility, so keep exhaustive switches: `UnprovenHistory` is
+/// no longer emitted, and `KnownEvent` and `MaintenanceBoundary` remain
+/// reserved for parking policy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
 pub enum HistoryNoticeCauseFfi {
     /// Deliveries were dropped from a full account queue, or spilled rows
@@ -25,9 +25,9 @@ pub enum HistoryNoticeCauseFfi {
     KnownEvent,
     /// A post-join maintenance boundary was never observed.
     MaintenanceBoundary,
-    /// The recovery runner could not prove this history on a route's relays
-    /// and stopped retrying them: a group's (`group_id_hex` names it) or the
-    /// account inbox's.
+    /// No longer emitted; kept for compatibility. Earlier releases raised it
+    /// when the recovery runner could not prove history on a route's relays.
+    /// The runner now retries them quietly.
     UnprovenHistory,
     /// This device rejoined the group (`group_id_hex` names it): a Welcome
     /// installed a new copy in place of its old one. That is an automatic
