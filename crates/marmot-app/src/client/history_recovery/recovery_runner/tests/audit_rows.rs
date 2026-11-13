@@ -363,6 +363,46 @@ async fn recovery_runner_writes_a_suspension_once_when_its_survey_turn_fails() {
     );
 }
 
+/// A route already suspended when the recorder starts keeping rows is
+/// recorded at the first survey after it does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovery_runner_records_a_suspension_found_before_audit_recording_began() {
+    let account = account();
+    let clock = Clock::new();
+    let t0 = clock.now();
+    let route = group(1);
+    let relay = ModelRelay::new(RELAY, caps(500, false)).build();
+    let host = TestHost::new(
+        &account,
+        &clock,
+        vec![RunnerRoute {
+            unrecoverable: true,
+            ..grouped(&route, &[RELAY])
+        }],
+        &[&relay],
+    );
+    account.goal(&route, t0 - HOUR);
+    host.tails.stand(&route, RELAY, t0);
+    let (mut runner, _handle) = runner(&host, test_policy());
+
+    host.audits.store(false, Ordering::SeqCst);
+    idle(runner.step().await);
+    host.audits.store(true, Ordering::SeqCst);
+    idle(runner.step().await);
+    let changes = host
+        .take_audited()
+        .into_iter()
+        .filter_map(|(group, kind)| match kind {
+            AuditEventKind::RecoveryRunnerChanged { change, .. } => Some((group, change)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        changes,
+        [(Some(GROUP_ID.to_vec()), RecoveryRunnerChange::Suspended)]
+    );
+}
+
 /// Raced begins are counted per route and written at most once per window;
 /// a route's next fetch row takes what its open window holds.
 #[test]

@@ -578,9 +578,9 @@ pub(crate) struct RecoveryRunner<H> {
     /// turn, so a turn whose preparation fails leaves them for the retry.
     unwritten_races: Arc<Mutex<Vec<AuditRow>>>,
     /// The routes the last survey found suspended, for the audit; `None`
-    /// before the first. The survey updates it inside its turn, where it
-    /// writes the rows for the change, so a turn that fails after them
-    /// writes none of them again.
+    /// before the first, and while the recorder keeps no rows. The survey
+    /// updates it inside its turn, where it writes the rows for the change,
+    /// so a turn that fails after them writes none of them again.
     suspended: Arc<Mutex<Option<BTreeSet<TransportReconciliationRoute>>>>,
 }
 
@@ -771,13 +771,17 @@ impl<H: RunnerHost> RecoveryRunner<H> {
                 // fails later in the turn, none of them is written again.
                 let races =
                     std::mem::take(&mut *races.lock().unwrap_or_else(PoisonError::into_inner));
-                for (group, row) in races {
-                    (turn.audit)(group.as_deref(), row);
+                let mut suspended = suspended.lock().unwrap_or_else(PoisonError::into_inner);
+                if turn.audits {
+                    for (group, row) in races {
+                        (turn.audit)(group.as_deref(), row);
+                    }
+                    audit::suspensions(turn, &mut suspended);
+                } else {
+                    // The recorder keeps no rows: the first survey once it
+                    // does records every route it finds suspended.
+                    *suspended = None;
                 }
-                audit::suspensions(
-                    turn,
-                    &mut suspended.lock().unwrap_or_else(PoisonError::into_inner),
-                );
                 let due = epoch_gap::advance(turn, &policy, &stalled)?.next_due;
                 let survey = select::survey(turn, &policy, &stalled)?;
                 Ok((survey, due))

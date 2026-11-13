@@ -1010,6 +1010,8 @@ struct TestHost {
     /// Debt turns to let through, then one that fails after its closure
     /// succeeds.
     failing_fence: Mutex<Option<usize>>,
+    /// Whether the recorder keeps v5 rows, as debt turns say.
+    audits: AtomicBool,
     closed: OnceLock<Account>,
     /// The relay pool's connection generations, by relay.
     connections: watch::Sender<BTreeMap<String, u64>>,
@@ -1090,6 +1092,7 @@ impl TestHost {
             failing_turns: AtomicUsize::new(0),
             failing_preparations: Mutex::default(),
             failing_fence: Mutex::default(),
+            audits: AtomicBool::new(true),
             closed: OnceLock::new(),
             connections: watch::channel(BTreeMap::new()).0,
             audited: Mutex::default(),
@@ -1135,7 +1138,11 @@ impl TestHost {
         });
     }
 
+    /// Keeps the row, unless the recorder keeps none ([`Self::audits`]).
     fn record_audit(&self, group: Option<&[u8]>, kind: AuditEventKind) {
+        if !self.audits.load(Ordering::SeqCst) {
+            return;
+        }
         self.audited
             .lock()
             .unwrap()
@@ -1251,7 +1258,7 @@ impl RunnerHost for TestHost {
             live_counts: &counts,
             inbox: INBOX_KEY,
             audit: &audit,
-            audits: true,
+            audits: self.audits.load(Ordering::SeqCst),
         });
         let fence_fails = {
             let mut failing = self.failing_fence.lock().unwrap();
