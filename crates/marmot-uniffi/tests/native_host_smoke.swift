@@ -96,7 +96,7 @@ final class NativeHostSmoke: XCTestCase {
     XCTAssertTrue(try alice.listAccounts().contains { $0.accountIdHex == aliceId.accountIdHex })
     XCTAssertTrue(try bob.listAccounts().contains { $0.accountIdHex == bobId.accountIdHex })
 
-    // start().totalRelays is a pool snapshot, not an account-publication barrier.
+    // RelayHealthFfi.totalRelays is a pool snapshot, not an account-publication barrier.
     try await waitUntil("Alice account publication") {
       try self.networkReady(alice, account: aliceId.label)
     }
