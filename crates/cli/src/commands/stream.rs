@@ -177,7 +177,12 @@ pub(crate) async fn stream_command_app(
     account_flag: Option<String>,
 ) -> Result<CommandOutput, WnError> {
     let runtime = app.runtime();
-    stream_command_app_with_runtime(account_home, app, &runtime, command, account_flag).await
+    let result =
+        stream_command_app_with_runtime(account_home, app, &runtime, command, account_flag).await;
+    // Shut down before the process exits: a recovery request the exit cut
+    // would settle as the relay's unreachable verdict for the next process.
+    runtime.shutdown().await;
+    result
 }
 
 pub(crate) async fn stream_command_app_with_runtime(
