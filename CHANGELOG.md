@@ -20,6 +20,16 @@
   Prepared-image retries retain the original report across restart. Stable
   agent-control v2 creation and invitation remain atomic.
 
+### Fixed
+
+- Archive, forget and delete an external-signer account's chat through its
+  running account worker, as for a local-signing account (#3318). These wrote
+  storage directly while the worker kept its own copy of the account: its next
+  save of the chat's record, for example after another member renamed the
+  chat, unarchived it again, and after a forget or delete it kept answering for
+  the removed group. An account that runs no worker still writes storage
+  directly, now with worker starts held off until the write is done.
+
 ### Added
 
 - Discard a failed own send locally with `discard_failed_send` (Rust, UniFFI,

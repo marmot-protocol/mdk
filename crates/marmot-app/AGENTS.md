@@ -33,10 +33,11 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   generated setup's procedures stay `MarmotAppRuntime` methods in that module tree. Hosts reach onboarding through
   `MarmotAppRuntime::account_setup()`; `AccountManager` exposes no onboarding methods.
   Helpers that only return another future return it directly: extra async wrappers hit the simulator's layout-depth limit.
-  `AccountManager` holds one `SetupState` for four hooks only, each where it is called: reconcile (worker transaction
+  `AccountManager` holds one `SetupState` for five hooks only, each where it is called: reconcile (worker transaction
   held; it never takes it again), the teardown fence (removal and sign-out, before the worker transaction), removal
-  (under the transaction, after the removal commit point) and shutdown's two phases (before the invite catch-up drain;
-  after the first reaper drain). A generated setup background task continues only the account it was scheduled for
+  (under the transaction, after the removal commit point), the direct-write check (under the transaction, before
+  `write_without_worker` writes) and shutdown's two phases (before the invite catch-up drain; after the first reaper
+  drain). A generated setup background task continues only the account it was scheduled for
   and ends once that account is removed, signed out or set up; it never resumes or creates another identity
   (whitenoise-ios#1302). Every teardown takes the fence before it touches the account, and the runtime's `sign_out`
   and `sign_out_and_wipe` take it before their first stage. The fence cancels the attempt in flight (an attempt
@@ -60,6 +61,14 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   transaction, generated local preparation admission (removal only), the worker transaction, then the worker map.
   Local preparation never waits for the onboarding transaction. The cancellation registry precedes the per-account
   state lock.
+- Write an account's groups through its worker whenever it signs on one (`AccountManager::signs_on_worker`: an active
+  local signer, or a signed-in external signer whose signer is registered). The worker keeps the account's state in
+  memory and saves each dirty group's whole record, so a storage write beside it is undone at its next save and leaves
+  its reads stale (mdk#178, mdk#3318). A worker that cannot start or answer fails the call; never fall back to a
+  direct write. Archive, forget and delete write storage directly only for an account that signs on no worker, through
+  `write_without_worker`, which holds the worker transaction so no worker starts during the write, reaps any worker
+  still retiring in `worker_reapers` first, and fails with nothing written while one onboarding took out of the map
+  is still retiring.
 - Keep app-client commands and query methods in the `src/client/` module; the crate root should construct clients but
   not absorb their behavior again. The `AppClient` inherent impl is split across the module along these seams: `mod.rs`
   (the `AppClient` struct plus the broadly-shared command/query API — key-package, group lifecycle, message/media/agent

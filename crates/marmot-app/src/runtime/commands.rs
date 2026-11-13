@@ -1065,12 +1065,20 @@ impl AccountManager {
     ) -> Result<bool, AppError> {
         self.shared.lifecycle().ensure_running()?;
         let account = self.resolve(account_ref)?;
-        if !account.is_active_local_signing() {
-            use cgka_traits::storage::GroupStorage;
-            let changed = self
-                .app
-                .account_storage(&account.label)?
-                .forget_group_local(group_id, cgka_traits::Timestamp(crate::unix_now_seconds()))?;
+        if !self.signs_on_worker(&account)
+            && let Some((account, changed)) = self
+                .write_without_worker(account_ref, |account| {
+                    use cgka_traits::storage::GroupStorage;
+                    Ok(self
+                        .app
+                        .account_storage(&account.label)?
+                        .forget_group_local(
+                            group_id,
+                            cgka_traits::Timestamp(crate::unix_now_seconds()),
+                        )?)
+                })
+                .await?
+        {
             if changed {
                 publish_app_runtime_group_state_updated(
                     Emit::Unpublished(Unpublished::NoClient),
@@ -1102,11 +1110,14 @@ impl AccountManager {
     ) -> Result<bool, AppError> {
         self.shared.lifecycle().ensure_running()?;
         let account = self.resolve(account_ref)?;
-        if !account.is_active_local_signing() {
-            let group_id_hex = hex::encode(group_id.as_slice());
-            let deleted = self
-                .app
-                .delete_group_local_data(&account.label, &group_id_hex)?;
+        if !self.signs_on_worker(&account)
+            && let Some((account, deleted)) = self
+                .write_without_worker(account_ref, |account| {
+                    self.app
+                        .delete_group_local_data(&account.label, &hex::encode(group_id.as_slice()))
+                })
+                .await?
+        {
             if deleted {
                 publish_app_runtime_group_state_updated(
                     Emit::Unpublished(Unpublished::NoClient),
@@ -1763,26 +1774,43 @@ impl AccountManager {
         group_id: &GroupId,
         archived: bool,
     ) -> Result<AppGroupRecord, AppError> {
-        // Prefer the account worker so its authoritative in-memory
-        // `AccountState` is updated in place; otherwise a later inbound
-        // delivery would re-persist the stale `archived = false` snapshot and
-        // silently un-archive the chat (mdk#178).
-        //
-        // Only a non-local-signing (public-only) account can never own a
-        // long-lived worker, so its direct persistence write is safe: there is
-        // no live in-memory snapshot to clobber it. For local-signing accounts
-        // we MUST route through the worker and propagate any worker error. A
-        // transient worker startup / `reconcile()` failure (e.g. an
-        // `APP_RUNTIME_ACCOUNT_READY_WAIT` timeout while the worker is still in
-        // startup sync) must NOT fall back to a direct write, because a freshly
-        // spawned worker may already hold the pre-archive snapshot and would
-        // later re-persist it, reverting the flag again.
+        self.set_group_archived_on_worker(account_ref, group_id, archived)
+            .await
+            .map(|(group, _)| group)
+    }
+
+    /// [`Self::set_group_archived`], and why the caller's events about the
+    /// change go out without publishing A: the worker published it before
+    /// replying ([`Unpublished::AfterReply`]), or the account runs no worker
+    /// ([`Unpublished::NoClient`]).
+    ///
+    /// An account that signs on a worker archives through it, so the
+    /// worker's in-memory `AccountState` changes in place: a direct write
+    /// would be undone by the worker's next save of that group's record, for
+    /// example for an inbound commit (mdk#178, mdk#3318). A worker error,
+    /// such as a startup or `reconcile()` failure, fails the call and never
+    /// falls back to a direct write, because a worker that is starting may
+    /// already hold the record from before the archive. Only an account that
+    /// signs on no worker writes storage directly.
+    pub(super) async fn set_group_archived_on_worker(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+        archived: bool,
+    ) -> Result<(AppGroupRecord, Unpublished), AppError> {
         let account = self.resolve(account_ref)?;
-        if !account.is_active_local_signing() {
-            let group_id_hex = hex::encode(group_id.as_slice());
-            return self
-                .app
-                .set_group_archived(&account.label, &group_id_hex, archived);
+        if !self.signs_on_worker(&account)
+            && let Some((_, group)) = self
+                .write_without_worker(account_ref, |account| {
+                    self.app.set_group_archived(
+                        &account.label,
+                        &hex::encode(group_id.as_slice()),
+                        archived,
+                    )
+                })
+                .await?
+        {
+            return Ok((group, Unpublished::NoClient));
         }
         let command = self.worker_commands(account_ref).await?;
         let (respond, response) = oneshot::channel();
@@ -1794,7 +1822,10 @@ impl AccountManager {
             })
             .await
             .map_err(|_| AppError::TransportClosed)?;
-        local_account_worker_response(response).await
+        Ok((
+            local_account_worker_response(response).await?,
+            Unpublished::AfterReply,
+        ))
     }
 
     pub async fn update_group_image(

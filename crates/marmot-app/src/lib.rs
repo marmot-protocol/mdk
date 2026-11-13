@@ -5083,6 +5083,10 @@ impl MarmotApp {
         Ok(Some(group))
     }
 
+    /// Write a group's `archived` flag to storage directly. A running account
+    /// worker would undo it at its next save of that group's record, so the
+    /// runtime calls this only for an account that runs no worker and
+    /// otherwise archives through the worker (mdk#178, mdk#3318).
     pub fn set_group_archived(
         &self,
         label: &str,
