@@ -11,6 +11,7 @@ mod open_ranking;
 mod previews;
 mod published_records;
 mod records;
+mod reference;
 mod resources;
 mod search;
 mod service;
