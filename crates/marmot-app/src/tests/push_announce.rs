@@ -146,7 +146,9 @@ async fn joiner_announces_once_when_its_join_window_ends() {
         .client
         .invite_members(&group, &[fx.carol.account_id_hex.as_str()])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     assert!(!fx.alice.client.send_owed_push_snapshots().await);
     fx.carol.join(&relay, &group).await;
     fx.carol.receive(&relay).await;
@@ -223,7 +225,9 @@ async fn joiner_without_a_snapshot_announces_with_no_tokens() {
         .client
         .invite_members(&group, &[fx.carol.account_id_hex.as_str()])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     fx.carol.join(&relay, &group).await;
     finish_post_join_fetch(&fx.carol, &group);
 
@@ -256,7 +260,9 @@ async fn owed_join_window_announce_waits_for_the_catch_up_after_a_restart() {
         .client
         .invite_members(&group, &[fx.carol.account_id_hex.as_str()])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     fx.carol.join(&relay, &group).await;
     finish_post_join_fetch(&fx.carol, &group);
     fx.carol.client.advance_push_join_windows().await;

@@ -78,7 +78,13 @@ fn slot_deletions(relay: &ScriptedPushRelayClient, account_id_hex: &str, slot: &
 /// The phone founds a chat, which requires account-devices, and adds the
 /// laptop's tagged KeyPackage; the laptop joins.
 pub(super) async fn chat_with_both(devices: &mut Devices) -> GroupId {
-    let chat = devices.phone.create_group("team", &[]).await.unwrap();
+    let chat = devices
+        .phone
+        .create_group("team", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let mut laptop_cursor = published_count(&devices.relay);
     let key_package = published_key_package(&mut devices.laptop, &devices.relay).await;
     let effects = devices

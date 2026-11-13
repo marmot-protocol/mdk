@@ -20,7 +20,9 @@ async fn chats(device: &mut Device, count: usize) -> Vec<GroupId> {
                 .client
                 .create_group(&format!("chat {index}"), &[])
                 .await
-                .unwrap(),
+                .unwrap()
+                .operation
+                .expect("eligible fixture members"),
         );
     }
     chats
@@ -381,7 +383,9 @@ async fn invite_account_pending(
             },
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let keys = vec![
         published_key_package(&mut phone.client, relay).await,
         published_key_package(&mut laptop.client, relay).await,
@@ -1140,7 +1144,9 @@ async fn invitation_work_preserves_a_pending_chat_projection() {
     let chat = bob
         .create_group("old invitation profile", &[])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let key = published_key_package(&mut phone.client, &relay).await;
     let effects = bob
         .runtime
@@ -1417,7 +1423,12 @@ async fn a_declined_generation_holds_automatic_adds_until_a_later_accept() {
     let mut bob = bob_app.client("bob").await.unwrap();
     let mut invitations = Vec::new();
     for name in ["direct declined invitation", "gap declined invitation"] {
-        let chat = bob.create_group(name, &[]).await.unwrap();
+        let chat = bob
+            .create_group(name, &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         let phone_key = published_key_package(&mut phone.client, &relay).await;
         let tablet_key = published_key_package(&mut tablet.client, &relay).await;
         let effects = bob
@@ -2373,7 +2384,13 @@ async fn a_new_device_without_add_to_all_my_chats_is_added_to_none() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_device_being_removed_is_added_to_no_chat() {
     let (relay, [mut phone, mut laptop]) = alice_devices::<2>().await;
-    let chat = phone.client.create_group("chat", &[]).await.unwrap();
+    let chat = phone
+        .client
+        .create_group("chat", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let group = link(&relay, &mut phone, &mut laptop, "Laptop").await;
     hold_key_packages(&relay, &mut phone, &mut laptop).await;
     phone
@@ -2392,7 +2409,9 @@ async fn a_device_being_removed_is_added_to_no_chat() {
         .client
         .create_group("new while removing", &[])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     assert_eq!(leaves_of(&phone, &laptop, &founded, &group), 0);
     phone
         .client
@@ -2410,7 +2429,13 @@ async fn a_device_being_removed_is_added_to_no_chat() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_device_a_dropped_removal_held_as_removed_is_added_to_no_chat() {
     let (relay, [mut phone, mut laptop]) = alice_devices::<2>().await;
-    let chat = phone.client.create_group("chat", &[]).await.unwrap();
+    let chat = phone
+        .client
+        .create_group("chat", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let group = link(&relay, &mut phone, &mut laptop, "Laptop").await;
     hold_key_packages(&relay, &mut phone, &mut laptop).await;
     drop_a_removal_decided_elsewhere(&relay, &mut phone, &mut laptop, &group, false).await;
@@ -2420,7 +2445,9 @@ async fn a_device_a_dropped_removal_held_as_removed_is_added_to_no_chat() {
         .client
         .create_group("new after dropped removal", &[])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     assert_eq!(leaves_of(&phone, &laptop, &founded, &group), 0);
     phone
         .client
@@ -2437,7 +2464,13 @@ async fn a_device_a_dropped_removal_held_as_removed_is_added_to_no_chat() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_device_that_answers_after_its_removal_is_dropped_is_added_to_no_chat() {
     let (relay, [mut phone, mut laptop]) = alice_devices::<2>().await;
-    let chat = phone.client.create_group("chat", &[]).await.unwrap();
+    let chat = phone
+        .client
+        .create_group("chat", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let group = link(&relay, &mut phone, &mut laptop, "Laptop").await;
     drop_a_removal_decided_elsewhere(&relay, &mut phone, &mut laptop, &group, true).await;
     assert_eq!(held_from(&phone, &laptop), 0);
@@ -2457,7 +2490,13 @@ async fn a_device_that_answers_after_its_removal_is_dropped_is_added_to_no_chat(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_chat_closed_to_linked_devices_is_counted_and_takes_no_key_package() {
     let (relay, [mut phone, mut laptop]) = alice_devices::<2>().await;
-    let open = phone.client.create_group("open", &[]).await.unwrap();
+    let open = phone
+        .client
+        .create_group("open", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     // One relay named twice, spelled two ways.
     let closed = phone
         .client
@@ -2473,7 +2512,9 @@ async fn a_chat_closed_to_linked_devices_is_counted_and_takes_no_key_package() {
             },
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     assert_eq!(phone.client.chats_closed_to_linked_devices().unwrap(), 0);
     let group = link(&relay, &mut phone, &mut laptop, "Laptop").await;
     assert_eq!(phone.client.chats_closed_to_linked_devices().unwrap(), 1);
@@ -2512,12 +2553,23 @@ async fn a_chat_that_already_holds_the_new_device_gets_no_add() {
     .with_test_relay_client(relay.clone());
     remember_test_member_inbox(&bob_app, &alice_id, "wss://relay.example");
     let mut bob = bob_app.client("bob").await.unwrap();
-    let invited = bob.create_group("invited", &[&alice_id]).await.unwrap();
+    let invited = bob
+        .create_group("invited", &[&alice_id])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     passes(&relay, &mut [&mut phone, &mut laptop], 1).await;
     for device in [&mut phone, &mut laptop] {
         device.client.accept_group_invite(&invited).unwrap();
     }
-    let alone = phone.client.create_group("alone", &[]).await.unwrap();
+    let alone = phone
+        .client
+        .create_group("alone", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let group = link(&relay, &mut phone, &mut laptop, "Laptop").await;
     assert_eq!(leaves_of(&phone, &laptop, &invited, &group), 1);
     passes(&relay, &mut [&mut phone, &mut laptop], 4).await;
@@ -2761,7 +2813,13 @@ async fn cancelling_a_lost_toggle_wakes_gap_targets_without_a_roster_change() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_chat_busy_with_the_approving_devices_commit_waits_for_it() {
     let (relay, [mut phone, mut laptop]) = alice_devices::<2>().await;
-    let chat = phone.client.create_group("busy", &[]).await.unwrap();
+    let chat = phone
+        .client
+        .create_group("busy", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     link(&relay, &mut phone, &mut laptop, "Laptop").await;
     let marmot_session::PreparedSessionSend::Commit(staged) = phone
         .client
@@ -2852,7 +2910,13 @@ async fn a_new_chat_founds_with_its_linked_sibling_even_with_old_chats_off() {
     .await;
     hold_key_packages(&relay, &mut phone, &mut laptop).await;
     let before = taken_from(&phone, &laptop);
-    let chat = phone.client.create_group("new chat", &[]).await.unwrap();
+    let chat = phone
+        .client
+        .create_group("new chat", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     assert_eq!(phone.client.runtime.device_tag_group(), Some(&group));
     assert_eq!(
         leaves_of(&phone, &laptop, &chat, &group),
@@ -2908,7 +2972,9 @@ async fn a_new_chat_founds_with_its_linked_sibling_even_with_old_chats_off() {
         .client
         .create_group("after deferred open", &[])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     assert_eq!(phone.client.runtime.device_tag_group(), Some(&group));
     assert!(!phone.client.runtime.unhydrated_group_ids().is_empty());
     assert!(
@@ -2939,7 +3005,9 @@ async fn a_new_chat_founds_with_its_linked_sibling_even_with_old_chats_off() {
         .client
         .create_group("ready device group", &[])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     assert!(!phone.client.runtime.unhydrated_group_ids().is_empty());
     assert_eq!(leaves_of(&phone, &laptop, &ready, &group), 1);
     assert_eq!(taken_from(&phone, &laptop), before + 2);
@@ -2978,7 +3046,9 @@ async fn founding_sibling_selection_uses_private_stock_and_linked_status() {
         .client
         .create_group("no private stock", &[])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     assert_eq!(leaves_of(&phone, &laptop, &missing, &group), 0);
     hold_key_packages(&relay, &mut phone, &mut laptop).await;
     let before = taken_from(&phone, &laptop);
@@ -3002,7 +3072,7 @@ async fn founding_sibling_selection_uses_private_stock_and_linked_status() {
             .create_group("unavailable private stock", &[])
             .await;
         database.execute_batch(restore_stock).unwrap();
-        let chat = result.unwrap();
+        let chat = result.unwrap().operation.expect("eligible fixture members");
         assert_eq!(leaves_of(&phone, &laptop, &chat, &group), 0);
         assert_eq!(phone.client.runtime.members(&chat).unwrap().len(), 1);
         assert_eq!(taken_from(&phone, &laptop), before);
@@ -3025,7 +3095,9 @@ async fn founding_sibling_selection_uses_private_stock_and_linked_status() {
             },
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     assert_eq!(leaves_of(&phone, &laptop, &closed, &group), 0);
     assert_eq!(taken_from(&phone, &laptop), before);
     let key = laptop.client.runtime.own_signature_key();
@@ -3044,7 +3116,13 @@ async fn founding_sibling_selection_uses_private_stock_and_linked_status() {
             .await
             .unwrap();
         let before = taken_from(&phone, &laptop);
-        let chat = phone.client.create_group("status", &[]).await.unwrap();
+        let chat = phone
+            .client
+            .create_group("status", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         assert_eq!(leaves_of(&phone, &laptop, &chat, &group), expected);
         assert_eq!(taken_from(&phone, &laptop), before + expected);
     }
@@ -3085,7 +3163,13 @@ async fn founding_sibling_selection_uses_private_stock_and_linked_status() {
             );
         }
         let before = taken_from(&phone, &laptop);
-        let chat = phone.client.create_group("unmade link", &[]).await.unwrap();
+        let chat = phone
+            .client
+            .create_group("unmade link", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         assert_eq!(leaves_of(&phone, &laptop, &chat, &group), 0);
         assert_eq!(taken_from(&phone, &laptop), before);
     }
@@ -3150,7 +3234,9 @@ async fn a_later_link_by_another_approver_outlives_a_local_failed_link() {
         .client
         .create_group("after another approver linked", &[])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     assert_eq!(
         leaves_of(&phone, &laptop, &chat, &group),
         1,
@@ -3338,11 +3424,19 @@ async fn compatible_private_stock_reaches_the_chat(founding: bool) {
                 .client
                 .create_group_with_options("existing retention", &[], options())
                 .await
-                .unwrap(),
+                .unwrap()
+                .operation
+                .expect("eligible fixture members"),
         )
     };
     let plain = if let Some(retention) = &existing {
-        let plain = phone.client.create_group("plain", &[]).await.unwrap();
+        let plain = phone
+            .client
+            .create_group("plain", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         phone
             .app
             .set_chat_pinned("alice", &hex::encode(retention.as_slice()), true)
@@ -3420,6 +3514,8 @@ async fn compatible_private_stock_reaches_the_chat(founding: bool) {
             .create_group_with_options("no compatible stock", &[], options())
             .await
             .unwrap()
+            .operation
+            .expect("eligible fixture members")
     } else {
         phone
             .client
@@ -3446,6 +3542,8 @@ async fn compatible_private_stock_reaches_the_chat(founding: bool) {
             .create_group_with_options("compatible stock", &[], options())
             .await
             .unwrap()
+            .operation
+            .expect("eligible fixture members")
     } else {
         phone
             .client
@@ -3516,7 +3614,9 @@ async fn hold_only_stock_lacking_retention(
             },
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let group = link(relay, phone, laptop, "Laptop").await;
     hold_key_packages(relay, phone, laptop).await;
     // Held stock settles the first request's need, so a later request is
@@ -3689,7 +3789,13 @@ async fn send_heartbeat(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_unopenable_add_leaf_is_retired_and_the_sibling_added_again() {
     let (relay, [mut phone, mut laptop]) = alice_devices::<2>().await;
-    let chat = phone.client.create_group("stale add", &[]).await.unwrap();
+    let chat = phone
+        .client
+        .create_group("stale add", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let group = link(&relay, &mut phone, &mut laptop, "Laptop").await;
     hold_key_packages(&relay, &mut phone, &mut laptop).await;
     let issuer = laptop.slot_hex();
@@ -3804,7 +3910,9 @@ async fn compatible_private_stock_keeps_usable_order_and_longest_fallback() {
             },
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let group = link(&relay, &mut phone, &mut laptop, "Laptop").await;
     hold_key_packages(&relay, &mut phone, &mut laptop).await;
     let issuer = hex::decode(laptop.slot_hex()).unwrap().try_into().unwrap();

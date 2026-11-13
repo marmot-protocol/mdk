@@ -110,8 +110,18 @@ async fn rejoin_eviction_invalidates_both_group_projections_without_mls_reads() 
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
         .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
     let mut client = app.client("alice").await.unwrap();
-    let old_group = client.create_group("old offer", &[]).await.unwrap();
-    let new_group = client.create_group("new offer", &[]).await.unwrap();
+    let old_group = client
+        .create_group("old offer", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
+    let new_group = client
+        .create_group("new offer", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let storage = app.account_storage("alice").unwrap();
     let old = PendingWelcome {
         message_id: cgka_traits::MessageId::new(vec![0xe1; 32]),
@@ -165,7 +175,12 @@ async fn rejoin_decline_does_not_require_live_mls_state() {
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
         .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
     let mut client = app.client("alice").await.unwrap();
-    let template_id = client.create_group("offer", &[]).await.unwrap();
+    let template_id = client
+        .create_group("offer", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let storage = app.account_storage("alice").unwrap();
     // Keep a real Marmot record but deliberately omit its corresponding MLS rows.
     let group_id = cgka_traits::GroupId::new(vec![0xf1; 16]);
@@ -212,7 +227,12 @@ async fn send_finalizes_once() {
     let app = MarmotApp::with_relay(dir.path(), "wss://history.example")
         .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
     let mut client = app.client("alice").await.unwrap();
-    let group = client.create_group("send projection", &[]).await.unwrap();
+    let group = client
+        .create_group("send projection", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     client.take_pending_projection_updates();
     let mut updates = Vec::new();
     let result = client
@@ -260,7 +280,12 @@ async fn send_history_timings() {
     let app = MarmotApp::with_relay(dir.path(), "wss://history.example")
         .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
     let mut client = app.client("alice").await.unwrap();
-    let group = client.create_group("history probe", &[]).await.unwrap();
+    let group = client
+        .create_group("history probe", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let epoch = client.runtime.group_record(&group).unwrap().epoch.0;
     let group_hex = hex::encode(group.as_slice());
     let storage = app.account_storage("alice").unwrap();
@@ -323,12 +348,14 @@ async fn send_history_timings() {
 #[test]
 fn prepared_group_image_create_has_no_upload_phase_and_is_idempotent() {
     run_composed_app_runtime_test("prepared-group-image-create", || async {
-        let dir = tempfile::tempdir().unwrap();
-        AccountHome::open(dir.path())
-            .create_account("alice")
-            .unwrap();
-        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
-            .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+        let (_dir, app, accounts, fetcher) = member_resolution_fixture(2, false).await;
+        app.account_home().create_account("alice").unwrap();
+        let missing = accounts[1].account_id_hex.clone();
+        fetcher
+            .events
+            .lock()
+            .unwrap()
+            .retain(|event| event.kind != KIND_MARMOT_INBOX_RELAY_LIST || event.pubkey != missing);
         let mut client = app.client("alice").await.unwrap();
         let staged = client
             .stage_prepared_initial_group_image(&one_pixel_png(), "image/png")
@@ -374,18 +401,35 @@ fn prepared_group_image_create_has_no_upload_phase_and_is_idempotent() {
         ));
 
         let telemetry = marmot_observability::PerformanceRecorder::default();
-        let group_id = client
+        let created = client
             .create_group_with_prepared_initial_image_and_telemetry(
                 "prepared image",
-                &[],
+                &[accounts[0].account_id_hex.as_str(), missing.as_str()],
                 AppCreateGroupOptions::default(),
                 &staged.upload_id,
                 &telemetry,
             )
             .await
-            .unwrap()
-            .group_id;
-        let group_id_again = client
+            .unwrap();
+        let group_id = created.operation.unwrap().group_id;
+        let expected = vec![
+            MemberResolutionOutcome {
+                account_id_hex: accounts[0].account_id_hex.clone(),
+                status: MemberResolutionStatus::Selected,
+                selected_device_count: 1,
+            },
+            MemberResolutionOutcome {
+                account_id_hex: missing,
+                status: MemberResolutionStatus::MissingInboxRoute,
+                selected_device_count: 0,
+            },
+        ];
+        assert_eq!(created.member_outcomes, expected);
+        drop(client);
+        let mut client = app.client("alice").await.unwrap();
+        fetcher.events.lock().unwrap().clear();
+        fetcher.requests.lock().unwrap().clear();
+        let retried = client
             .create_group_with_prepared_initial_image_and_telemetry(
                 "ignored on idempotent retry",
                 &[],
@@ -394,8 +438,10 @@ fn prepared_group_image_create_has_no_upload_phase_and_is_idempotent() {
                 &telemetry,
             )
             .await
-            .unwrap()
-            .group_id;
+            .unwrap();
+        assert_eq!(retried.member_outcomes, expected);
+        assert!(fetcher.requests.lock().unwrap().is_empty());
+        let group_id_again = retried.operation.unwrap().group_id;
         assert_eq!(group_id_again, group_id);
         assert_eq!(client.state.groups.len(), 1);
         assert!(client.state.groups[0].image.present);
@@ -429,32 +475,49 @@ fn uploaded_prepared_group_image_retry_recovers_from_engine_without_projection()
         client
             .finish_initial_group_image_upload(&staged.upload_id, &Ok(()))
             .unwrap();
-        let component_data = app
+        let prepared = app
             .account_storage("alice")
             .unwrap()
             .app_storage()
             .prepared_group_image_upload(&staged.upload_id)
             .unwrap()
-            .unwrap()
-            .component_data;
+            .unwrap();
         let telemetry = marmot_observability::PerformanceRecorder::default();
 
         // Simulate the narrow crash window: MLS creation is canonical, but
         // consumption fails and the best-effort app projection is absent.
+        let path = app.account_storage_path("alice");
+        let keys = app.account_home().load_signing_keys("alice").unwrap();
+        let key = app
+            .sqlcipher_key("alice", &keys, &path, SqlcipherDatabaseKind::Session)
+            .unwrap();
+        let connection = rusqlite::Connection::open(path).unwrap();
+        storage_sqlite::open_hardened_sqlcipher(
+            &connection,
+            &key,
+            storage_sqlite::SqlCipherHardening::cipher_only(),
+        )
+        .unwrap();
+        connection.execute_batch("CREATE TRIGGER fail_prepared_consume BEFORE UPDATE OF state ON app_prepared_group_image_upload WHEN NEW.state = 'consumed' BEGIN SELECT RAISE(FAIL, 'injected consume failure'); END;").unwrap();
         let group_id = client
             .create_group_with_initial_source_and_optional_telemetry(
                 "crash-window group",
                 &[],
                 AppCreateGroupOptions::default(),
                 Some(crate::client::InitialGroupImageSource::Prepared {
-                    upload_id: "injected-missing-consume-row".to_owned(),
-                    component_data,
+                    upload_id: staged.upload_id.clone(),
+                    component_data: prepared.component_data.clone(),
                 }),
                 Some(&telemetry),
             )
             .await
             .unwrap()
+            .operation
+            .expect("eligible fixture members")
             .group_id;
+        connection
+            .execute_batch("DROP TRIGGER fail_prepared_consume")
+            .unwrap();
         client.state.groups.clear();
         client
             .save_state_with_pending_local_group_deletion_frontier_clears()
@@ -478,6 +541,8 @@ fn uploaded_prepared_group_image_retry_recovers_from_engine_without_projection()
             )
             .await
             .unwrap()
+            .operation
+            .expect("eligible fixture members")
             .group_id;
 
         assert_eq!(recovered, group_id);
@@ -495,6 +560,32 @@ fn uploaded_prepared_group_image_retry_recovers_from_engine_without_projection()
                 .group_create_mls_prepare_persist
                 .attempts,
             1
+        );
+        // Restore the pre-consumption ledger as an upgraded legacy upload.
+        connection.execute(
+            "UPDATE app_prepared_group_image_upload SET state = 'uploaded', component_data = ?1, encrypted_blob = ?2, upload_secret = ?3, group_id_hex = NULL, member_outcomes_json = NULL WHERE upload_id = ?4",
+            rusqlite::params![&prepared.component_data, &prepared.encrypted_blob, &prepared.upload_secret, &staged.upload_id],
+        ).unwrap();
+        let error = client
+            .create_group_with_prepared_initial_image_and_telemetry(
+                "legacy retry cannot recreate",
+                &[],
+                AppCreateGroupOptions::default(),
+                &staged.upload_id,
+                &telemetry,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, AppError::CreatedGroupMemberReportUnavailable(group_id_hex) if group_id_hex == &hex::encode(recovered.as_slice()))
+        );
+        assert_eq!(client.runtime.live_group_ids().unwrap(), vec![recovered]);
+        assert_eq!(
+            client
+                .prepared_initial_group_image_status(&staged.upload_id)
+                .unwrap()
+                .state,
+            AppPreparedGroupImageUploadState::Consumed,
         );
     });
 }
@@ -610,14 +701,13 @@ pub(crate) struct ScriptedPushRelayClient {
 #[derive(Default)]
 pub(crate) struct MemberResolutionDirectoryFetcher {
     pub(crate) requests: std::sync::Mutex<Vec<transport_nostr::DirectoryFetchRequest>>,
-    events: std::sync::Mutex<Vec<NostrTransportEvent>>,
+    pub(super) events: std::sync::Mutex<Vec<NostrTransportEvent>>,
     events_by_endpoint:
         std::sync::Mutex<std::collections::HashMap<String, Vec<NostrTransportEvent>>>,
     reject_multi_author: std::sync::atomic::AtomicBool,
     key_packages_only_in_single_author: std::sync::Mutex<std::collections::HashSet<String>>,
     key_packages_only_in_multi_author: std::sync::Mutex<std::collections::HashSet<String>>,
-    reject_multi_author_incomplete: std::sync::atomic::AtomicBool,
-    failing_single_author: std::sync::Mutex<Option<String>>,
+    pub(super) failing_single_author: std::sync::Mutex<Option<String>>,
     stalled_endpoint: std::sync::Mutex<Option<String>>,
     incomplete_endpoint: std::sync::Mutex<Option<String>>,
     incomplete_query_kind: std::sync::Mutex<Option<u64>>,
@@ -821,14 +911,6 @@ impl transport_nostr::DirectoryRelayFetcher for MemberResolutionDirectoryFetcher
         &self,
         request: transport_nostr::DirectoryFetchRequest,
     ) -> Result<transport_nostr::DirectoryFetchOutcome, String> {
-        if self
-            .reject_multi_author_incomplete
-            .load(std::sync::atomic::Ordering::SeqCst)
-            && request.queries.iter().any(|query| query.authors.len() > 1)
-        {
-            self.requests.lock().unwrap().push(request);
-            return Ok(transport_nostr::DirectoryFetchOutcome::default());
-        }
         let incomplete_kind = *self.incomplete_query_kind.lock().unwrap();
         let complete = !self
             .incomplete_endpoint
@@ -848,7 +930,15 @@ impl transport_nostr::DirectoryRelayFetcher for MemberResolutionDirectoryFetcher
             });
         let queries = request.queries.clone();
         let endpoints = request.endpoints.clone();
-        let mut records = self.fetch_directory_events(request).await?;
+        let mut records = match self.fetch_directory_events(request).await {
+            Ok(records) => records,
+            Err(error) if self.fail_all.load(std::sync::atomic::Ordering::SeqCst) => {
+                return Err(error);
+            }
+            // Relay rejection and failed routes are incomplete reads; only
+            // the explicit resource-failure knob fails the fetch operation.
+            Err(_) => return Ok(transport_nostr::DirectoryFetchOutcome::default()),
+        };
         records.sort_by(|a, b| {
             b.event
                 .created_at
@@ -1841,7 +1931,9 @@ fn cancelled_sync_keeps_profile() {
         let group_id = alice
             .create_group("before", &[bob_account.account_id_hex.as_str()])
             .await
-            .unwrap();
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         bob.sync().await.unwrap();
         let storage = app.account_storage("bob").unwrap();
         let epoch = storage.get_group(&group_id).unwrap().epoch;
@@ -1962,7 +2054,12 @@ async fn recovery_warning_is_hidden_for_terminal_groups_but_not_repairable_group
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
         .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
     let mut client = app.client("alice").await.unwrap();
-    let group_id = client.create_group("recovery status", &[]).await.unwrap();
+    let group_id = client
+        .create_group("recovery status", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let storage = app.account_storage("alice").unwrap();
     let original = storage.get_group(&group_id).unwrap();
     storage
@@ -2024,7 +2121,12 @@ async fn sibling_device_message_clears_the_recovery_warning() {
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
         .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
     let mut client = app.client("alice").await.unwrap();
-    let group_id = client.create_group("sibling recovery", &[]).await.unwrap();
+    let group_id = client
+        .create_group("sibling recovery", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let epoch = client.runtime.group_record(&group_id).unwrap().epoch;
     app.account_storage("alice")
         .unwrap()
@@ -2150,7 +2252,9 @@ fn create_group_options_apply_initial_retention_atomically() {
                 },
             )
             .await
-            .unwrap();
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         let disabled = client
             .create_group_with_options(
                 "disabled retention compatibility",
@@ -2158,7 +2262,9 @@ fn create_group_options_apply_initial_retention_atomically() {
                 AppCreateGroupOptions::default(),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
 
         assert_eq!(client.group_mls_state(&retained).unwrap().epoch, 0);
         assert_eq!(
@@ -2190,8 +2296,18 @@ fn live_group_archive_checkpoints_seen_and_target_group_deltas() {
         let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
             .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
         let mut client = app.client("alice").await.unwrap();
-        let alpha = client.create_group("alpha", &[]).await.unwrap();
-        let beta = client.create_group("beta", &[]).await.unwrap();
+        let alpha = client
+            .create_group("alpha", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
+        let beta = client
+            .create_group("beta", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
 
         client.state.seen_events = (0..256).map(|index| format!("event-{index:05}")).collect();
         client.seen_events_index = client.state.seen_events.iter().cloned().collect();
@@ -2371,7 +2487,12 @@ async fn media_send_refuses_stale_epoch_body() {
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
         .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
     let mut client = app.client("alice").await.unwrap();
-    let group_id = client.create_group("media", &[]).await.unwrap();
+    let group_id = client
+        .create_group("media", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let current_epoch = client.group_mls_state(&group_id).unwrap().epoch;
 
     // The tag has no epoch field, so a recipient would derive the key for the
@@ -2448,7 +2569,12 @@ async fn media_send_epoch_pin_body() {
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
         .with_test_relay_client(relay.clone());
     let mut client = app.client("alice").await.unwrap();
-    let group_id = client.create_group("media", &[]).await.unwrap();
+    let group_id = client
+        .create_group("media", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let current_epoch = client.group_mls_state(&group_id).unwrap().epoch;
     let published_before = relay.published_event_ids().len();
 
@@ -2610,7 +2736,9 @@ async fn media_send_branch_pin_body(before_send: bool, upload_and_send: bool, re
     let group = alice
         .create_group("branch pin", &[&bob_account.account_id_hex])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let mut bob_cursor = 0;
     deliver_new(&mut bob, &relay, &mut bob_cursor).await;
     bob.sync().await.unwrap();
@@ -2806,7 +2934,12 @@ async fn edit_target_preflight_body() {
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
         .with_test_relay_client(relay.clone());
     let mut client = app.client("alice").await.unwrap();
-    let group_id = client.create_group("edits", &[]).await.unwrap();
+    let group_id = client
+        .create_group("edits", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let group_hex = hex::encode(group_id.as_slice());
     let edit = |target: &str, content: &str| AppMessageIntent::Edit {
         target_message_id: target.to_owned(),
@@ -2920,7 +3053,12 @@ async fn inbound_disband_candidate_blocks_local_delete_body() {
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
         .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
     let mut client = app.client("alice").await.unwrap();
-    let group_id = client.create_group("terminal", &[]).await.unwrap();
+    let group_id = client
+        .create_group("terminal", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let group_id_hex = hex::encode(group_id.as_slice());
     app.account_storage("alice")
         .unwrap()
@@ -2962,7 +3100,12 @@ async fn pending_disband_keeps_a_worker_wakeup_after_acceptance_and_reopen() {
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
         .with_test_relay_client(relay.clone());
     let mut client = app.client("alice").await.unwrap();
-    let group_id = client.create_group("pending closure", &[]).await.unwrap();
+    let group_id = client
+        .create_group("pending closure", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     client.take_pending_convergence_groups();
     client.disband_group(&group_id).await.unwrap();
     assert!(client.take_pending_convergence_groups().contains(&group_id));
@@ -3014,7 +3157,12 @@ async fn failed_or_unrecoverable_disband_does_not_create_an_idle_poll_loop() {
         let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
             .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
         let mut client = app.client("alice").await.unwrap();
-        let group_id = client.create_group("paused closure", &[]).await.unwrap();
+        let group_id = client
+            .create_group("paused closure", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         client.disband_group(&group_id).await.unwrap();
         let storage = app.account_storage("alice").unwrap();
         if unrecoverable {
@@ -3052,7 +3200,12 @@ async fn pending_disband_composer_gate_body() {
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
         .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
     let mut client = app.client("alice").await.unwrap();
-    let group_id = client.create_group("terminal", &[]).await.unwrap();
+    let group_id = client
+        .create_group("terminal", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let group_id_hex = hex::encode(group_id.as_slice());
 
     let request = client.disband_group(&group_id).await.unwrap();
@@ -3190,7 +3343,9 @@ async fn invite_members_detaches_post_mutation_catch_up_body() {
     let group_id = runtime
         .create_group("alice", "invite latency", &[], None)
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     // Group creation's own detached catch-up finishes first, so the hold below
     // catches the invite's.
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -3316,7 +3471,9 @@ fn founding_create_leaves_reconstructable_welcome_index_off_response_path() {
                 None,
             )
             .await
-            .unwrap();
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         tokio::time::timeout(Duration::from_secs(5), relay.wait_for_blocked_publish())
             .await
             .expect("post-response Welcome publish should be blocked");
@@ -3388,7 +3545,9 @@ fn joined_group_is_visible_before_subscription_rebuild_and_accept_is_prompt_duri
                 None,
             )
             .await
-            .unwrap();
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
 
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
@@ -3512,11 +3671,15 @@ async fn concurrent_invites_keep_projections_readable_body() {
     let alice_group = runtime
         .create_group("alice", "alice invite", &[], None)
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let bob_group = runtime
         .create_group("bob", "bob invite", &[], None)
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     // A create catch-up must not consume either invite's one-shot hold.
     tokio::time::timeout(Duration::from_secs(5), async {
         while runtime
@@ -3664,7 +3827,9 @@ async fn local_ready_send_pending_on_activation_failure_body() {
     let group_id = setup_client
         .create_group("local-ready send", &[])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     drop(setup_client);
     let publishes_before_runtime = relay.published_event_ids().len();
 
@@ -3816,7 +3981,9 @@ async fn local_ready_queued_send_ordering_body() {
     let group_id = setup_client
         .create_group("local-ready ordering", &[])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     drop(setup_client);
     let publishes_before_runtime = relay.published_event_ids().len();
 
@@ -3946,7 +4113,9 @@ async fn locally_queued_send_restart_body() {
     let group_id = setup_client
         .create_group("local-ready restart", &[])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     drop(setup_client);
 
     relay.block_and_fail_next_subscribe();
@@ -4030,7 +4199,9 @@ async fn disable_native_push_removal_body() {
     runtime
         .create_group("alice", "alpha", &[], None)
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     runtime
         .set_native_push_enabled("alice", true)
         .await
@@ -4097,8 +4268,18 @@ async fn push_registration_update_retry_survives_failure_partial_success_and_res
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
         .with_test_relay_client(relay.clone());
     let mut client = app.client("alice").await.unwrap();
-    client.create_group("alpha", &[]).await.unwrap();
-    client.create_group("beta", &[]).await.unwrap();
+    client
+        .create_group("alpha", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
+    client
+        .create_group("beta", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     app.set_native_push_enabled("alice", true).unwrap();
     let server_pubkey_hex = nostr::prelude::Keys::generate().public_key().to_hex();
     app.upsert_push_registration(
@@ -4164,8 +4345,18 @@ async fn foreground_push_registration_preserves_completed_gossip_after_reopen() 
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
         .with_test_relay_client(relay.clone());
     let mut client = app.client("alice").await.unwrap();
-    client.create_group("alpha", &[]).await.unwrap();
-    client.create_group("beta", &[]).await.unwrap();
+    client
+        .create_group("alpha", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
+    client
+        .create_group("beta", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     app.set_native_push_enabled("alice", true).unwrap();
     let server = nostr::prelude::Keys::generate().public_key().to_hex();
     let first = client
@@ -4269,7 +4460,9 @@ async fn push_registration_idle_retry_body() {
     runtime
         .create_group("alice", "alpha", &[], None)
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     runtime
         .set_native_push_enabled("alice", true)
         .await
@@ -4331,7 +4524,9 @@ async fn push_registration_local_projection_body() {
     let group_id = runtime
         .create_group("alice", "alpha", &[], None)
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     runtime
         .set_native_push_enabled("alice", true)
         .await
@@ -4394,7 +4589,9 @@ async fn local_group_wipe_push_removal_body() {
     let group_id = runtime
         .create_group("alice", "alpha", &[], None)
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     runtime
         .set_native_push_enabled("alice", true)
         .await
@@ -4483,7 +4680,12 @@ async fn failed_leave_push_compensation_body() {
         .client_with_relay_plane("bob", &plane, None)
         .await
         .unwrap();
-    let group_id = bob.create_group("alpha", &[alice.as_str()]).await.unwrap();
+    let group_id = bob
+        .create_group("alpha", &[alice.as_str()])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     assert!(
         alice_client
             .sync()
@@ -4703,8 +4905,18 @@ async fn an_admin_leave_without_device_groups_waits_for_the_host_demotion() {
         .unwrap();
     remember_test_member_inbox(&app, &bob_id, "wss://relay.example");
     let mut alice = app.client("alice").await.unwrap();
-    let solo = alice.create_group("solo", &[]).await.unwrap();
-    let group_id = alice.create_group("coadmins", &[&bob_id]).await.unwrap();
+    let solo = alice
+        .create_group("solo", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
+    let group_id = alice
+        .create_group("coadmins", &[&bob_id])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     alice.promote_admin(&group_id, &bob_id).await.unwrap();
     let group_hex = hex::encode(group_id.as_slice());
     // A shared token would be withdrawn before a departure: a refusal after
@@ -4797,7 +5009,9 @@ async fn an_admin_invitee_without_device_groups_demotes_before_declining() {
             },
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     assert!(
         bob_client
             .sync()
@@ -4855,7 +5069,12 @@ fn sole_admin_self_demote_surfaces_the_admin_policy_refusal() {
         let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
             .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
         let mut client = app.client("alice").await.unwrap();
-        let group_id = client.create_group("sole admin", &[]).await.unwrap();
+        let group_id = client
+            .create_group("sole admin", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
 
         // Alice is the only admin, so demoting herself would leave the group
         // with none. The host must receive that as the admin-policy refusal it
@@ -4892,11 +5111,15 @@ async fn push_registration_removal_retry_body() {
     runtime
         .create_group("alice", "alpha", &[], None)
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     runtime
         .create_group("alice", "beta", &[], None)
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     runtime
         .set_native_push_enabled("alice", true)
         .await
@@ -7862,7 +8085,7 @@ async fn cached_retired_inbox_with_failed_refresh_remains_retryable() {
         .await
         .expect_err("a failed refresh cannot use a retired-only cached inbox");
     assert!(
-        matches!(error, DirectoryError::DirectoryLookupIncomplete(ref id) if *id == account_id),
+        matches!(error, DirectoryError::RelayDirectory(_)),
         "{error:?}"
     );
 
@@ -8088,7 +8311,9 @@ async fn runtime_group_create_resolves_local_member_aliases_with_fresh_relay_pac
                 AppCreateGroupOptions::default(),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         let roster = runtime.group_members("creator", &group).await.unwrap();
         assert_eq!(roster.len(), 2);
         assert!(
@@ -8156,7 +8381,9 @@ async fn runtime_group_create_sets_founding_admins_and_rejects_non_members() {
                 },
             )
             .await
-            .unwrap();
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         let group = app
             .group("creator", &hex::encode(group_id.as_slice()))
             .unwrap()
@@ -8209,8 +8436,9 @@ async fn runtime_group_create_sets_founding_admins_and_rejects_non_members() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn runtime_group_create_rejects_creator_aliases_before_group_mutation() {
-    let (_directory, app, accounts, _fetcher) = member_resolution_fixture(1, false).await;
+    let (_directory, app, accounts, fetcher) = member_resolution_fixture(1, false).await;
     let creator = &accounts[0];
+    fetcher.events.lock().unwrap().clear();
     let runtime = MarmotAppRuntime::new(app.clone());
     for reference in [
         creator.label.clone(),
@@ -8231,6 +8459,7 @@ async fn runtime_group_create_rejects_creator_aliases_before_group_mutation() {
         );
         assert!(app.groups(&creator.label).unwrap().is_empty());
     }
+    assert!(fetcher.requests.lock().unwrap().is_empty());
     // Empty rosters remain valid: the creator is included implicitly by MLS.
     let group = runtime
         .create_group_with_options(
@@ -8240,7 +8469,9 @@ async fn runtime_group_create_rejects_creator_aliases_before_group_mutation() {
             AppCreateGroupOptions::default(),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     assert_eq!(
         runtime
             .group_members(&creator.label, &group)
@@ -8378,14 +8609,20 @@ async fn create_group_with_key_package_but_no_inbox_route_fails_before_group_cre
         .unwrap();
     let mut client = app.client(&inviter.label).await.unwrap();
 
-    let error = client
+    let result = client
         .create_group("create route readiness", &[account_id.as_str()])
         .await
-        .expect_err("a KeyPackage alone must not create a founding Add commit");
-    assert!(matches!(
-        error,
-        AppError::MissingMemberInboxRoute(ref recipient) if recipient == &account_id
-    ));
+        .unwrap();
+    assert_eq!(result.operation, None);
+    assert_eq!(
+        result.member_outcomes,
+        vec![MemberResolutionOutcome {
+            account_id_hex: account_id.clone(),
+            status: MemberResolutionStatus::MissingInboxRoute,
+            selected_device_count: 0,
+        }]
+    );
+    assert!(client.runtime.live_group_ids().unwrap().is_empty());
     assert!(
         app.groups(&inviter.label).unwrap().is_empty(),
         "route readiness must fail before a group is persisted"
@@ -8406,7 +8643,9 @@ async fn create_group_with_key_package_but_no_inbox_route_fails_before_group_cre
     let group_id = client
         .create_group("create route readiness", &[account_id.as_str()])
         .await
-        .expect("the explicit retry should refetch the unconsumed KeyPackage");
+        .expect("the explicit retry should refetch the unconsumed KeyPackage")
+        .operation
+        .expect("the recipient now has a route");
     assert_eq!(client.group_mls_state(&group_id).unwrap().member_count, 2);
     assert!(fetcher.requests.lock().unwrap().iter().any(|request| {
         request
@@ -8417,70 +8656,342 @@ async fn create_group_with_key_package_but_no_inbox_route_fails_before_group_cre
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-/// A mixed roster fails atomically without consuming any valid KeyPackage.
-async fn mixed_invite_route_readiness_does_not_consume_key_packages_or_mutate_membership() {
+/// Only routeable accounts enter the roster; unavailable accounts stay retryable.
+async fn partial_invite_route_retry() {
     let (directory, app, accounts, fetcher) = member_resolution_fixture(2, false).await;
-    let missing_inbox_account = accounts[1].account_id_hex.clone();
-    fetcher.events.lock().unwrap().retain(|event| {
-        event.kind != KIND_MARMOT_INBOX_RELAY_LIST || event.pubkey != missing_inbox_account
-    });
-
+    let missing = accounts[1].account_id_hex.clone();
+    fetcher
+        .events
+        .lock()
+        .unwrap()
+        .retain(|event| event.kind != KIND_MARMOT_INBOX_RELAY_LIST || event.pubkey != missing);
     let inviter = AccountHome::open(directory.path())
         .create_account("route-readiness-inviter")
         .unwrap();
     let mut client = app.client(&inviter.label).await.unwrap();
-    let group_id = client
-        .create_group("atomic route readiness", &[])
+    let group = client
+        .create_group("partial route readiness", &[])
+        .await
+        .unwrap()
+        .operation
+        .unwrap();
+    let before_epoch = client.group_mls_state(&group).unwrap().epoch;
+    let refs = [
+        accounts[0].account_id_hex.as_str(),
+        missing.as_str(),
+        accounts[0].account_id_hex.as_str(),
+    ];
+    let result = client.invite_members(&group, &refs).await.unwrap();
+    assert_eq!(
+        result.operation.unwrap().accept_disposition,
+        cgka_traits::SendAcceptDisposition::Published
+    );
+    assert_eq!(
+        result.member_outcomes,
+        vec![
+            MemberResolutionOutcome {
+                account_id_hex: accounts[0].account_id_hex.clone(),
+                status: MemberResolutionStatus::Selected,
+                selected_device_count: 1
+            },
+            MemberResolutionOutcome {
+                account_id_hex: missing.clone(),
+                status: MemberResolutionStatus::MissingInboxRoute,
+                selected_device_count: 0
+            },
+        ]
+    );
+    let mut roster = client
+        .members(&group)
+        .unwrap()
+        .into_iter()
+        .map(|member| member.member_id_hex)
+        .collect::<Vec<_>>();
+    roster.sort();
+    let mut expected = vec![inviter.account_id_hex, accounts[0].account_id_hex.clone()];
+    expected.sort();
+    assert_eq!(roster, expected);
+    let after_epoch = client.group_mls_state(&group).unwrap().epoch;
+    assert_eq!(after_epoch, before_epoch + 1);
+    let before_refusal = client.group_mls_state(&group).unwrap();
+    client.invite_members(&group, &refs).await.unwrap_err();
+    assert_eq!(client.group_mls_state(&group).unwrap(), before_refusal);
+    let none = client
+        .invite_members(&group, &[missing.as_str()])
         .await
         .unwrap();
-    let member_refs = accounts
-        .iter()
-        .map(|account| account.account_id_hex.as_str())
-        .collect::<Vec<_>>();
-
-    let error = client
-        .invite_members(&group_id, &member_refs)
-        .await
-        .expect_err("one unrouteable member must reject the whole invite");
-    assert!(matches!(
-        error,
-        AppError::MissingMemberInboxRoute(ref recipient)
-            if recipient == &missing_inbox_account
-    ));
+    assert_eq!(none.operation, None);
     assert_eq!(
-        client.group_mls_state(&group_id).unwrap().member_count,
-        1,
-        "route readiness must fail before the MLS roster changes"
+        none.member_outcomes,
+        vec![MemberResolutionOutcome {
+            account_id_hex: missing.clone(),
+            status: MemberResolutionStatus::MissingInboxRoute,
+            selected_device_count: 0
+        }]
     );
-
+    assert_eq!(client.group_mls_state(&group).unwrap().epoch, after_epoch);
+    client.invite_members(&group, &[]).await.unwrap_err();
+    assert_eq!(client.group_mls_state(&group).unwrap().epoch, after_epoch);
     fetcher
         .events
         .lock()
         .unwrap()
         .push(NostrTransportEvent::new_unsigned(
-            missing_inbox_account,
+            missing.clone(),
             KIND_MARMOT_INBOX_RELAY_LIST,
             vec![vec!["relay".into(), "wss://shared.example".into()]],
             String::new(),
         ));
     fetcher.requests.lock().unwrap().clear();
-
-    client
-        .invite_members(&group_id, &member_refs)
+    let retry = client
+        .invite_members(&group, &[missing.as_str()])
         .await
-        .expect("the explicit retry should refetch both unconsumed KeyPackages");
-    assert_eq!(client.group_mls_state(&group_id).unwrap().member_count, 3);
-    assert!(
-        fetcher
-            .requests
-            .lock()
-            .unwrap()
+        .unwrap();
+    assert!(retry.operation.is_some());
+    assert_eq!(
+        retry.member_outcomes,
+        vec![MemberResolutionOutcome {
+            account_id_hex: missing,
+            status: MemberResolutionStatus::Selected,
+            selected_device_count: 1
+        }]
+    );
+    assert_eq!(client.group_mls_state(&group).unwrap().member_count, 3);
+    assert!(fetcher.requests.lock().unwrap().iter().any(|request| {
+        request
+            .queries
             .iter()
-            .any(|request| request
-                .queries
-                .iter()
-                .any(|query| query.kind == KIND_MARMOT_KEY_PACKAGE)),
-        "the retry must refetch packages even though failed preflight did not consume them"
+            .any(|query| query.kind == KIND_MARMOT_KEY_PACKAGE)
+    }));
+    let before_fault = client.group_mls_state(&group).unwrap();
+    fetcher.fail_all_fetches();
+    client
+        .invite_members(&group, &[accounts[0].account_id_hex.as_str()])
+        .await
+        .expect_err("a directory resource failure is not a recipient no-op");
+    assert_eq!(client.group_mls_state(&group).unwrap(), before_fault);
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn oversized_member_is_partial() {
+    for kind in [KIND_NIP65_RELAY_LIST, KIND_MARMOT_INBOX_RELAY_LIST] {
+        let (_directory, app, accounts, fetcher) = member_resolution_fixture(2, false).await;
+        let tag = if kind == KIND_NIP65_RELAY_LIST {
+            "r"
+        } else {
+            "relay"
+        };
+        for event in fetcher.events.lock().unwrap().iter_mut() {
+            if event.kind == kind && event.pubkey == accounts[1].account_id_hex {
+                event.tags = (0..17)
+                    .map(|index| vec![tag.into(), format!("wss://outbox-{index}.example")])
+                    .collect();
+            }
+        }
+        app.directory()
+            .prewarm_group_member_key_packages(&[accounts[1].account_id_hex.as_str()])
+            .await
+            .expect_err("an inadmissible route is not ready for prewarm reuse");
+        let creator = app
+            .account_home()
+            .create_account("route-cap-creator")
+            .unwrap();
+        let mut client = app.client(&creator.label).await.unwrap();
+        let result = client
+            .create_group(
+                "partial route cap",
+                &[&accounts[0].account_id_hex, &accounts[1].account_id_hex],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result.member_outcomes,
+            vec![
+                MemberResolutionOutcome {
+                    account_id_hex: accounts[0].account_id_hex.clone(),
+                    status: MemberResolutionStatus::Selected,
+                    selected_device_count: 1,
+                },
+                MemberResolutionOutcome {
+                    account_id_hex: accounts[1].account_id_hex.clone(),
+                    status: MemberResolutionStatus::Incomplete,
+                    selected_device_count: 0,
+                },
+            ]
+        );
+        let group = result.operation.unwrap();
+        let mut roster = client
+            .members(&group)
+            .unwrap()
+            .into_iter()
+            .map(|member| member.member_id_hex)
+            .collect::<Vec<_>>();
+        let mut expected = vec![creator.account_id_hex, accounts[0].account_id_hex.clone()];
+        roster.sort();
+        expected.sort();
+        assert_eq!(roster, expected);
+        for event in fetcher.events.lock().unwrap().iter_mut() {
+            if event.kind == kind && event.pubkey == accounts[1].account_id_hex {
+                event.tags = vec![vec![tag.into(), "wss://shared.example".into()]];
+                event.created_at += 1;
+            }
+        }
+        let retry = client
+            .invite_members(&group, &[accounts[1].account_id_hex.as_str()])
+            .await
+            .unwrap();
+        assert!(retry.operation.is_some());
+        assert_eq!(
+            retry.member_outcomes[0].status,
+            MemberResolutionStatus::Selected
+        );
+        expected.push(accounts[1].account_id_hex.clone());
+        expected.sort();
+        let mut roster = client
+            .members(&group)
+            .unwrap()
+            .into_iter()
+            .map(|member| member.member_id_hex)
+            .collect::<Vec<_>>();
+        roster.sort();
+        assert_eq!(roster, expected);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn direct_requires_ready_peer() {
+    let (_dir, app, accounts, fetcher) = member_resolution_fixture(1, false).await;
+    let creator = app.account_home().create_account("direct-creator").unwrap();
+    fetcher
+        .events
+        .lock()
+        .unwrap()
+        .retain(|event| event.kind != KIND_MARMOT_KEY_PACKAGE);
+    let runtime = app.runtime();
+    let result = runtime
+        .start_direct_conversation(&creator.label, &accounts[0].account_id_hex)
+        .await;
+    runtime.shutdown().await;
+    let canonical_groups = {
+        let client = app.client(&creator.label).await.unwrap();
+        client.runtime.live_group_ids().unwrap()
+    };
+    app.close_storage().unwrap();
+    assert!(matches!(result, Err(AppError::MissingKeyPackage { .. })));
+    assert!(canonical_groups.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn partial_admins_follow_members() {
+    let (_directory, app, accounts, fetcher) = member_resolution_fixture(3, false).await;
+    let creator = app
+        .account_home()
+        .create_account("partial-admin-creator")
+        .unwrap();
+    let unavailable = accounts[1].account_id_hex.clone();
+    fetcher
+        .events
+        .lock()
+        .unwrap()
+        .retain(|event| event.kind != KIND_MARMOT_INBOX_RELAY_LIST || event.pubkey != unavailable);
+    let mut client = app.client(&creator.label).await.unwrap();
+    let telemetry = marmot_observability::PerformanceRecorder::default();
+    let result = client
+        .create_group_with_options(
+            "partial admins",
+            &[&accounts[0].account_id_hex, &unavailable],
+            AppCreateGroupOptions {
+                initial_admins: vec![
+                    accounts[0].account_id_hex.clone(),
+                    unavailable.clone(),
+                    creator.label.clone(),
+                ],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        result.member_outcomes,
+        vec![
+            MemberResolutionOutcome {
+                account_id_hex: accounts[0].account_id_hex.clone(),
+                status: MemberResolutionStatus::Selected,
+                selected_device_count: 1
+            },
+            MemberResolutionOutcome {
+                account_id_hex: unavailable.clone(),
+                status: MemberResolutionStatus::MissingInboxRoute,
+                selected_device_count: 0
+            },
+        ]
+    );
+    let group = result.operation.unwrap();
+    let admins = |client: &AppClient| {
+        client
+            .runtime
+            .admin_pubkeys(&group)
+            .unwrap()
+            .into_iter()
+            .map(hex::encode)
+            .collect::<HashSet<_>>()
+    };
+    assert_eq!(
+        admins(&client),
+        HashSet::from([
+            creator.account_id_hex.clone(),
+            accounts[0].account_id_hex.clone()
+        ])
+    );
+    let requests_before = fetcher.requests.lock().unwrap().len();
+    client
+        .invite_members_with_telemetry(
+            &group,
+            &[&unavailable],
+            &[&accounts[2].account_id_hex],
+            crate::MemberResolutionPolicy::Partial,
+            &telemetry,
+        )
+        .await
+        .expect_err("an initial admin outside the requested roster must be rejected");
+    let self_invite = client
+        .invite_members(&group, &[&creator.account_id_hex])
+        .await
+        .unwrap_err();
+    assert!(matches!(self_invite, AppError::GroupInviteIncludesInviter));
+    assert_eq!(fetcher.requests.lock().unwrap().len(), requests_before);
+    let invited = client
+        .invite_members_with_telemetry(
+            &group,
+            &[&unavailable, &accounts[2].account_id_hex],
+            &[&unavailable, &accounts[2].account_id_hex],
+            crate::MemberResolutionPolicy::Partial,
+            &telemetry,
+        )
+        .await
+        .unwrap();
+    assert!(invited.operation.is_some());
+    assert_eq!(
+        invited.member_outcomes,
+        vec![
+            MemberResolutionOutcome {
+                account_id_hex: unavailable,
+                status: MemberResolutionStatus::MissingInboxRoute,
+                selected_device_count: 0
+            },
+            MemberResolutionOutcome {
+                account_id_hex: accounts[2].account_id_hex.clone(),
+                status: MemberResolutionStatus::Selected,
+                selected_device_count: 1
+            },
+        ]
+    );
+    assert_eq!(
+        admins(&client),
+        HashSet::from([
+            creator.account_id_hex,
+            accounts[0].account_id_hex.clone(),
+            accounts[2].account_id_hex.clone()
+        ])
     );
 }
 
@@ -8504,7 +9015,9 @@ async fn thirty_incremental_invites_with_large_directory_cache_converge_without_
     let group_id = client
         .create_group("incremental route readiness", &[])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
 
     for (batch_index, batch) in accounts.chunks(5).enumerate() {
         let member_refs = batch
@@ -8684,7 +9197,9 @@ async fn member_key_package_resolution_never_falls_back_to_cached_key_packages()
         let group = inviter
             .create_group("reinvite discovery", &[])
             .await
-            .unwrap();
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         let requirements = inviter
             .runtime
             .session()
@@ -8695,6 +9210,7 @@ async fn member_key_package_resolution_never_falls_back_to_cached_key_packages()
                 members.clone(),
                 &requirements,
                 nostr_directory::MemberResolutionPurpose::CommitFresh,
+                nostr_directory::MemberResolutionPolicy::Atomic,
             )
             .await
             .unwrap();
@@ -8723,6 +9239,7 @@ async fn member_key_package_resolution_never_falls_back_to_cached_key_packages()
                 members.clone(),
                 &requirements,
                 nostr_directory::MemberResolutionPurpose::CommitFresh,
+                nostr_directory::MemberResolutionPolicy::Atomic,
             )
             .await
             .err()
@@ -8946,40 +9463,6 @@ async fn member_key_package_set_falls_back_when_multi_author_queries_are_rejecte
             .count(),
         6,
         "discovery, outbox, and KeyPackage batches must each fall back per member"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn member_key_package_set_falls_back_when_multi_author_queries_are_incomplete() {
-    let (_directory, app, accounts, fetcher) = member_resolution_fixture(2, false).await;
-    fetcher
-        .reject_multi_author_incomplete
-        .store(true, std::sync::atomic::Ordering::SeqCst);
-    let members = accounts
-        .iter()
-        .map(|account| account.account_id_hex.as_str())
-        .collect::<Vec<_>>();
-
-    let summary = app
-        .directory()
-        .prewarm_group_member_key_packages(&members)
-        .await
-        .expect("CLOSED-shaped incomplete batches must retry per author");
-
-    assert_eq!(summary.network_resolved_members, 2);
-    let requests = fetcher.requests.lock().unwrap();
-    assert!(
-        requests
-            .iter()
-            .any(|request| request.queries.iter().any(|query| query.authors.len() == 2))
-    );
-    assert_eq!(
-        requests
-            .iter()
-            .filter(|request| request.queries.iter().all(|query| query.authors.len() == 1))
-            .count(),
-        4,
-        "both relay-list hops retry each member; successful prewarm needs no preference refetch"
     );
 }
 
@@ -10798,7 +11281,9 @@ async fn an_empty_checkpoint_skips_the_write_and_its_chat_list_rebuild() {
     let group_id = client
         .create_group("archived elsewhere", &[])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     save(&mut client, &probe);
     assert_eq!(save(&mut client, &probe), (false, false), "settled");
     let (skipped, invalidated) = skips();
@@ -10878,7 +11363,12 @@ async fn an_empty_checkpoint_skips_the_write_and_its_chat_list_rebuild() {
         let generation = staleness.generation("alice");
         staleness.record_rebuilt("alice", generation);
     }
-    client.create_group("created after", &[]).await.unwrap();
+    client
+        .create_group("created after", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     assert!(
         app.chat_list_projection_stale
             .lock()
@@ -10906,7 +11396,12 @@ async fn an_invalidation_during_a_chat_list_refresh_survives_it() {
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
         .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
     let mut client = app.client("alice").await.unwrap();
-    let group = client.create_group("refreshed", &[]).await.unwrap();
+    let group = client
+        .create_group("refreshed", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     client
         .save_state_with_pending_local_group_deletion_frontier_clears()
         .unwrap();
@@ -11003,7 +11498,9 @@ async fn a_self_membership_write_reaches_the_warmed_chat_list() {
     let group = alice
         .create_group("left behind", &[bob.account_id_hex.as_str()])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     assert!(
         bob_client
             .sync()
@@ -12164,7 +12661,12 @@ fn full_account_queue_spills_durably_and_admits_every_delivery_without_loss() {
             true,
         );
         let mut client = client_on_app_relay_plane(&app, "alice").await;
-        let group_id = client.create_group("overflow spill", &[]).await.unwrap();
+        let group_id = client
+            .create_group("overflow spill", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         let nostr_group_id_hex = app
             .group("alice", &hex::encode(group_id.as_slice()))
             .unwrap()
@@ -12294,7 +12796,9 @@ fn process_local_overflow_fence_freezes_cursor_while_marker_write_retries() {
         let group_id = client
             .create_group("overflow cursor fence", &[])
             .await
-            .unwrap();
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         let nostr_group_id_hex = app
             .group("alice", &hex::encode(group_id.as_slice()))
             .unwrap()
@@ -12676,7 +13180,12 @@ impl LiveCursorFixture {
             app.save_state(&seeded).unwrap();
         }
         let mut client = client_on_app_relay_plane(&app, "alice").await;
-        let group_id = client.create_group("live cursor", &[]).await.unwrap();
+        let group_id = client
+            .create_group("live cursor", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         let nostr_group_id_hex = app
             .group("alice", &hex::encode(group_id.as_slice()))
             .unwrap()
@@ -12907,7 +13416,12 @@ fn live_ingest_keeps_the_cursor_until_every_subscription_replayed_stored_history
         seeded.last_transport_timestamp = Some(cursor_before);
         app.save_state(&seeded).unwrap();
         let mut client = client_on_app_relay_plane(&app, "alice").await;
-        let group_id = client.create_group("live cursor", &[]).await.unwrap();
+        let group_id = client
+            .create_group("live cursor", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         let nostr_group_id_hex = app
             .group("alice", &hex::encode(group_id.as_slice()))
             .unwrap()
@@ -13572,7 +14086,9 @@ async fn reconnect_drains_deferred_hydration_before_steady_state_serves_groups_b
                 client
                     .create_group(&format!("reconnect group {group}"), &[donor_id.as_str()])
                     .await
-                    .unwrap(),
+                    .unwrap()
+                    .operation
+                    .expect("eligible fixture members"),
             );
         }
     }
@@ -15244,7 +15760,12 @@ async fn a_drained_disband_sweeps_the_held_send_its_first_pass_never_reached() {
     let app = MarmotApp::with_relay(dir.path(), "wss://drained-disband.example")
         .with_test_relay_client(relay.clone());
     let mut client = app.client("alice").await.unwrap();
-    let group_id = client.create_group("drained disband", &[]).await.unwrap();
+    let group_id = client
+        .create_group("drained disband", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let group_id_hex = hex::encode(group_id.as_slice());
 
     // A send the engine accepted and retained: no published source id, so it
@@ -15325,7 +15846,12 @@ async fn reopening_an_account_replays_a_disband_once_and_then_stays_silent() {
     let app = MarmotApp::with_relay(dir.path(), "wss://announce-once.example")
         .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
     let mut client = app.client("alice").await.unwrap();
-    let group_id = client.create_group("announce once", &[]).await.unwrap();
+    let group_id = client
+        .create_group("announce once", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
 
     // The durable terminal guard a settled disband commits. Written directly so
     // the test pins the hydration seam instead of re-driving convergence.
@@ -15421,7 +15947,12 @@ async fn an_open_heals_a_held_send_from_an_already_announced_guard() {
     let app = MarmotApp::with_relay(dir.path(), "wss://announced-guard-heals.example")
         .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
     let mut client = app.client("alice").await.unwrap();
-    let group_id = client.create_group("terminal", &[]).await.unwrap();
+    let group_id = client
+        .create_group("terminal", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let group_id_hex = hex::encode(group_id.as_slice());
 
     // A send the engine accepted and retained: no published source id, so it
@@ -15542,7 +16073,12 @@ async fn a_drained_member_departure_removes_that_members_group_push_tokens() {
     let app = MarmotApp::with_relay(dir.path(), "wss://drained-departure.example")
         .with_test_relay_client(relay);
     let mut client = app.client("alice").await.unwrap();
-    let group_id = client.create_group("drained departure", &[]).await.unwrap();
+    let group_id = client
+        .create_group("drained departure", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let group_id_hex = hex::encode(group_id.as_slice());
 
     let departing = nostr::prelude::Keys::generate().public_key().to_hex();
@@ -15598,7 +16134,12 @@ async fn host_departure_event_carries_no_leaf_index() {
     let app = MarmotApp::with_relay(dir.path(), "wss://device-departure.example")
         .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
     let mut client = app.client("alice").await.unwrap();
-    let group_id = client.create_group("device departure", &[]).await.unwrap();
+    let group_id = client
+        .create_group("device departure", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let group_id_hex = hex::encode(group_id.as_slice());
     let peer = nostr::prelude::Keys::generate().public_key().to_hex();
     for leaf in [1, 2] {
@@ -15685,7 +16226,9 @@ async fn a_drained_self_departure_and_rejoin_move_stored_self_membership() {
     let group_id = client
         .create_group("drained membership", &[])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let group_id_hex = hex::encode(group_id.as_slice());
     assert_eq!(
         app.stored_group_self_membership("alice", &group_id_hex)
@@ -15756,7 +16299,12 @@ async fn a_peer_member_added_leaves_stored_self_membership_alone() {
     let app =
         MarmotApp::with_relay(dir.path(), "wss://peer-added.example").with_test_relay_client(relay);
     let mut client = app.client("alice").await.unwrap();
-    let group_id = client.create_group("peer added", &[]).await.unwrap();
+    let group_id = client
+        .create_group("peer added", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let group_id_hex = hex::encode(group_id.as_slice());
     let state_change = |change| marmot_session::AccountDeviceEffects {
         events: vec![cgka_traits::engine::GroupEvent::GroupStateChanged {
@@ -15818,7 +16366,12 @@ async fn a_self_departure_marks_transport_routes_dirty() {
     let app = MarmotApp::with_relay(dir.path(), "wss://routes-dirty.example")
         .with_test_relay_client(relay);
     let mut client = app.client("alice").await.unwrap();
-    let group_id = client.create_group("routes dirty", &[]).await.unwrap();
+    let group_id = client
+        .create_group("routes dirty", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let departure = |change| cgka_traits::engine::GroupEvent::GroupStateChanged {
         group_id: group_id.clone(),
         epoch: cgka_traits::EpochId(1),
@@ -15878,7 +16431,12 @@ async fn a_drained_disband_performs_the_terminal_push_sweep() {
     let app = MarmotApp::with_relay(dir.path(), "wss://drained-sweep.example")
         .with_test_relay_client(relay);
     let mut client = app.client("alice").await.unwrap();
-    let group_id = client.create_group("drained sweep", &[]).await.unwrap();
+    let group_id = client
+        .create_group("drained sweep", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let group_id_hex = hex::encode(group_id.as_slice());
 
     app.upsert_push_registration(
@@ -15977,7 +16535,9 @@ async fn a_drained_invalidation_event_withdraws_the_timeline_record() {
     let group_id = client
         .create_group("drained invalidation", &[])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let group_id_hex = hex::encode(group_id.as_slice());
     let source_message_id = MessageId::new(vec![0x5c; 32]);
     let source_message_id_hex = hex::encode(source_message_id.as_slice());
@@ -16057,7 +16617,12 @@ async fn replaying_a_drained_batch_the_seam_already_applied_is_a_no_op() {
     let app = MarmotApp::with_relay(dir.path(), "wss://drained-replay.example")
         .with_test_relay_client(relay);
     let mut client = app.client("alice").await.unwrap();
-    let group_id = client.create_group("drained replay", &[]).await.unwrap();
+    let group_id = client
+        .create_group("drained replay", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     // The replay fixture represents an already terminal canonical copy the
     // account was removed from, so the account is off its roster.
     let storage = app.account_storage("alice").unwrap();
@@ -16155,7 +16720,9 @@ async fn a_drained_state_change_synthesizes_the_system_row_the_live_seam_does() 
     let group_id = client
         .create_group("drained system rows", &[])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let group_id_hex = hex::encode(group_id.as_slice());
     let actor = MemberId::new(hex::decode(&account.account_id_hex).unwrap());
 
@@ -16253,7 +16820,9 @@ async fn a_retained_event_resend_revives_the_row_its_failed_send_retracted() {
     let group_id = client
         .create_group("same second resend", &[])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let group_id_hex = hex::encode(group_id.as_slice());
     let sender = account.account_id_hex.clone();
 
@@ -16459,7 +17028,9 @@ async fn a_drained_batch_leaves_no_live_system_row_for_a_commit_it_supersedes() 
     let group_id = client
         .create_group("drained superseded rows", &[])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let group_id_hex = hex::encode(group_id.as_slice());
     let actor = MemberId::new(hex::decode(&account.account_id_hex).unwrap());
 
@@ -16575,7 +17146,12 @@ async fn account_open_repairs_a_branch_selection_announcement_a_crash_lost() {
     let app = MarmotApp::with_relay(dir.path(), "wss://crash-repair.example")
         .with_test_relay_client(relay);
     let mut client = app.client("alice").await.unwrap();
-    let group_id = client.create_group("crash repair", &[]).await.unwrap();
+    let group_id = client
+        .create_group("crash repair", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let group_id_hex = hex::encode(group_id.as_slice());
     let actor = MemberId::new(hex::decode(&account.account_id_hex).unwrap());
 
@@ -16720,7 +17296,9 @@ async fn a_batch_that_flips_its_verdict_projects_the_last_one() {
     let group_id = client
         .create_group("flipped verdict rows", &[])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let group_id_hex = hex::encode(group_id.as_slice());
     let actor = MemberId::new(hex::decode(&account.account_id_hex).unwrap());
 
@@ -16820,7 +17398,9 @@ async fn a_live_batch_leaves_no_live_system_row_for_a_commit_it_supersedes() {
     let group_id = client
         .create_group("live superseded rows", &[])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let group_id_hex = hex::encode(group_id.as_slice());
     let actor = MemberId::new(hex::decode(&account.account_id_hex).unwrap());
 
@@ -17108,11 +17688,15 @@ async fn a_deferred_open_never_subscribes_a_departed_groups_route() {
     let removed_group = alice
         .create_group("deferred removal", &[bob.account_id_hex.as_str()])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let kept_group = alice
         .create_group("deferred keeper", &[bob.account_id_hex.as_str()])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let joined = bob_client.sync().await.unwrap().joined_groups;
     assert!(
         joined.contains(&removed_group) && joined.contains(&kept_group),
@@ -17199,7 +17783,9 @@ async fn a_committed_leave_stops_routing_the_group_across_a_reopen() {
     let group_id = alice
         .create_group("leaving for good", &[bob.account_id_hex.as_str()])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     assert!(
         bob_client
             .sync()
@@ -17283,7 +17869,9 @@ async fn a_pending_leave_request_keeps_its_group_route_across_a_reopen() {
     let group_id = alice
         .create_group("leaving", &[bob.account_id_hex.as_str()])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     assert!(
         bob_client
             .sync()
@@ -17354,11 +17942,15 @@ async fn an_admin_removal_clears_the_removed_devices_group_routes() {
     let removed_group = alice
         .create_group("removal target", &[bob.account_id_hex.as_str()])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let kept_group = alice
         .create_group("still a member", &[bob.account_id_hex.as_str()])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let joined = bob_client.sync().await.unwrap().joined_groups;
     assert!(
         joined.contains(&removed_group) && joined.contains(&kept_group),
@@ -17467,11 +18059,15 @@ async fn a_routing_rebuild_after_a_removal_does_not_resubscribe_the_removed_grou
     let removed_group = alice
         .create_group("removal target", &[bob.account_id_hex.as_str()])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let kept_group = alice
         .create_group("still a member", &[bob.account_id_hex.as_str()])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let joined = bob_client.sync().await.unwrap().joined_groups;
     assert!(
         joined.contains(&removed_group) && joined.contains(&kept_group),
@@ -17562,7 +18158,9 @@ async fn a_removed_device_fails_a_composer_send_before_projecting_a_row() {
     let group_id = alice
         .create_group("removal target", &[bob.account_id_hex.as_str()])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let group_id_hex = hex::encode(group_id.as_slice());
     assert!(
         bob_client
@@ -17638,7 +18236,12 @@ async fn local_delete_compensation_preserves_primary_error_and_attempts_route_re
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
         .with_test_relay_client(relay.clone());
     let mut client = app.client("alice").await.unwrap();
-    let group_id = client.create_group("compensation", &[]).await.unwrap();
+    let group_id = client
+        .create_group("compensation", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let group_id_hex = hex::encode(group_id.as_slice());
     let routes_before = client.routing.snapshot().group_routes;
 
@@ -17705,7 +18308,9 @@ async fn local_delete_restart_preserves_rotated_route_relay_pairs_for_resurrecti
     let group_id = client
         .create_group("rotated local delete", &[])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let group_id_hex = hex::encode(group_id.as_slice());
     let old_route = app
         .group("alice", &group_id_hex)
@@ -17875,7 +18480,12 @@ async fn local_delete_batch_suppresses_historical_chat_in_both_event_orders() {
         let app =
             MarmotApp::with_relay(dir.path(), "wss://relay.example").with_test_relay_client(relay);
         let mut client = app.client("alice").await.unwrap();
-        let group_id = client.create_group("batch frontier", &[]).await.unwrap();
+        let group_id = client
+            .create_group("batch frontier", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         let group_id_hex = hex::encode(group_id.as_slice());
         let sender_hex = app.account_home().account("alice").unwrap().account_id_hex;
         let sender = MemberId::new(hex::decode(&sender_hex).unwrap());
@@ -17987,7 +18597,12 @@ async fn account_open_recovers_first_fresh_chat_after_protocol_projection_crash(
     let app =
         MarmotApp::with_relay(dir.path(), "wss://relay.example").with_test_relay_client(relay);
     let mut client = app.client("alice").await.unwrap();
-    let group_id = client.create_group("crash recovery", &[]).await.unwrap();
+    let group_id = client
+        .create_group("crash recovery", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let group_id_hex = hex::encode(group_id.as_slice());
     let sender_hex = app.account_home().account("alice").unwrap().account_id_hex;
     let sender = MemberId::new(hex::decode(&sender_hex).unwrap());
@@ -18073,7 +18688,12 @@ async fn account_open_keeps_first_fresh_chat_pending_when_group_projection_is_un
     let app =
         MarmotApp::with_relay(dir.path(), "wss://relay.example").with_test_relay_client(relay);
     let mut client = app.client("alice").await.unwrap();
-    let group_id = client.create_group("crash recovery", &[]).await.unwrap();
+    let group_id = client
+        .create_group("crash recovery", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let group_id_hex = hex::encode(group_id.as_slice());
     let sender_hex = app.account_home().account("alice").unwrap().account_id_hex;
     let sender = MemberId::new(hex::decode(&sender_hex).unwrap());
@@ -18206,7 +18826,9 @@ async fn an_escalation_recorded_before_a_failing_sync_is_reported_by_the_next_sy
     let group_id = client
         .create_group("escalation redelivery", &[])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
 
     let escalated = client
         .sync()
@@ -18323,7 +18945,12 @@ async fn a_resource_refusal_for_a_terminal_group_arms_no_recovery() {
     app.set_audit_log_settings(AuditLogSettings { enabled: true })
         .unwrap();
     let mut client = app.client("alice").await.unwrap();
-    let group_id = client.create_group("terminal refusal", &[]).await.unwrap();
+    let group_id = client
+        .create_group("terminal refusal", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     // Disbanded rather than removed: the sweep gate already stops the removed
     // copy, so this is the shape that actually reaches the arm site.
     make_group_terminal(&client, &group_id, true);
@@ -18405,7 +19032,9 @@ async fn a_publish_failure_in_the_session_event_drain_still_arms_recovery() {
     let group_id = client
         .create_group("drain arm ordering", &[])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     assert_eq!(audit_rows_of_kind(&app, "epoch_stall_backfill_armed"), 0);
 
     // One drained batch that carries both a resource refusal for the live group
@@ -18496,7 +19125,9 @@ async fn a_publish_failure_after_scheduled_convergence_still_arms_recovery() {
     let group_id = client
         .create_group("advance arm ordering", &[])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     assert_eq!(audit_rows_of_kind(&app, "epoch_stall_backfill_armed"), 0);
 
     let effects = a_refusal_riding_a_rolled_back_publish(&group_id);
@@ -18532,7 +19163,12 @@ async fn invite_recovery_failure_preserves_committed_effects_and_results() {
         let app = MarmotApp::with_relay(dir.path(), "wss://recovery-failure.example")
             .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
         let mut client = app.client("alice").await.unwrap();
-        let group_id = client.create_group("committed effects", &[]).await.unwrap();
+        let group_id = client
+            .create_group("committed effects", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         let storage = app.account_storage("alice").unwrap().app_storage();
         let epoch = client.runtime.group_record(&group_id).unwrap().epoch;
         storage
@@ -18666,7 +19302,12 @@ async fn assert_mixed_publish_batch_finalizes_successful_message(
         runtime
     };
     let mut client = app.client("alice").await.unwrap();
-    let group_id = client.create_group("mixed publish", &[]).await.unwrap();
+    let group_id = client
+        .create_group("mixed publish", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let group_id_hex = hex::encode(group_id.as_slice());
     let app_event_id = "successful-app-message";
     let failed_app_event_id = "failed-app-message";
@@ -18917,7 +19558,9 @@ async fn published_message_acknowledgement_failure_retries_cleanup_without_repub
     let group_id = client
         .create_group("acknowledgement failure", &[])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let group_id_hex = hex::encode(group_id.as_slice());
     let publish_attempts_before = relay.attempted_event_ids().len();
 
@@ -19004,7 +19647,9 @@ async fn accepted_projection_retries() {
         let group_id = client
             .create_group("projection failure", &[])
             .await
-            .unwrap();
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         let path = app.account_storage_path("alice");
         let keys = app.account_home().load_signing_keys("alice").unwrap();
         let key = app
@@ -19106,7 +19751,9 @@ async fn a_publish_failure_during_a_convergence_retry_still_arms_recovery() {
     let group_id = client
         .create_group("retry arm ordering", &[])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     assert_eq!(audit_rows_of_kind(&app, "epoch_stall_backfill_armed"), 0);
 
     let effects = a_refusal_riding_a_rolled_back_publish(&group_id);
@@ -19178,7 +19825,12 @@ async fn a_publish_failure_on_the_send_path_still_arms_recovery() {
     app.set_audit_log_settings(AuditLogSettings { enabled: true })
         .unwrap();
     let mut client = app.client("alice").await.unwrap();
-    let group_id = client.create_group("send arm ordering", &[]).await.unwrap();
+    let group_id = client
+        .create_group("send arm ordering", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     assert_eq!(audit_rows_of_kind(&app, "epoch_stall_backfill_armed"), 0);
 
     let effects = a_refusal_riding_a_rolled_back_publish(&group_id);
@@ -19219,7 +19871,9 @@ async fn a_confirmed_but_partial_send_publish_still_passes_the_arming_gate() {
     let group_id = client
         .create_group("send soft arm ordering", &[])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
 
     let effects = a_refusal_riding_a_confirmed_but_partial_publish(&group_id);
     let result = client
@@ -19254,7 +19908,12 @@ async fn a_queued_send_is_not_failed_by_an_unrelated_failure_in_its_batch() {
     let app = MarmotApp::with_relay(dir.path(), "wss://queued-send-gate.example")
         .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
     let mut client = app.client("alice").await.unwrap();
-    let group_id = client.create_group("queued send gate", &[]).await.unwrap();
+    let group_id = client
+        .create_group("queued send gate", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let queued_for = |group_id: &cgka_traits::GroupId| marmot_session::QueuedIntentRef {
         group_id: group_id.clone(),
         intent_id: cgka_traits::MessageId::new(vec![0x22; 32]),
@@ -19370,7 +20029,12 @@ async fn a_relay_accepted_send_revives_its_local_publish_failure() {
         assert!(row.poll.is_none(), "a retracted poll has no projection");
     };
 
-    let live = client.create_group("revive live", &[]).await.unwrap();
+    let live = client
+        .create_group("revive live", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let live_event = "11".repeat(32);
     retracted(&live_event, &live);
     client
@@ -19391,7 +20055,12 @@ async fn a_relay_accepted_send_revives_its_local_publish_failure() {
     );
     assert!(row.poll.is_some(), "the revived poll projects again");
 
-    let terminal = client.create_group("revive terminal", &[]).await.unwrap();
+    let terminal = client
+        .create_group("revive terminal", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let terminal_event = "22".repeat(32);
     retracted(&terminal_event, &terminal);
     make_group_terminal(&client, &terminal, false);
@@ -19464,7 +20133,12 @@ async fn the_arming_publish_gate_classifies_exactly_as_the_bare_publish_check() 
     let app = MarmotApp::with_relay(dir.path(), "wss://gate-parity.example")
         .with_test_relay_client(relay.clone());
     let mut client = app.client("alice").await.unwrap();
-    let group_id = client.create_group("gate parity", &[]).await.unwrap();
+    let group_id = client
+        .create_group("gate parity", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
 
     let clean = marmot_session::AccountDeviceEffects::default();
     let mut failure_without_pending = marmot_session::AccountDeviceEffects::default();
@@ -19568,7 +20242,12 @@ async fn a_convergence_reorg_ends_the_unrecovered_arm_run() {
     let app = MarmotApp::with_relay(dir.path(), "wss://convergence-reorg.example")
         .with_test_relay_client(relay.clone());
     let mut client = app.client("alice").await.unwrap();
-    let group_id = client.create_group("convergence reorg", &[]).await.unwrap();
+    let group_id = client
+        .create_group("convergence reorg", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
 
     // Two arms of one run, at two epochs the device armed at.
     assert_eq!(
@@ -19630,7 +20309,9 @@ async fn a_maintenance_tick_reports_its_own_epoch_passage_to_the_stall_detector(
     let group_id = client
         .create_group("maintenance passage", &[])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
 
     // The group is stuck and arms once, at epoch 10.
     assert_eq!(
@@ -19701,7 +20382,9 @@ async fn a_confirmed_local_publish_reports_its_epoch_passage_through_the_publish
     let group_id = client
         .create_group("own publish passage", &[])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
 
     // The group is stuck and arms once, at epoch 10.
     assert_eq!(
@@ -19764,7 +20447,12 @@ async fn an_escalation_recorded_during_a_received_delivery_rides_that_seam() {
     let app = MarmotApp::with_relay(dir.path(), "wss://ingest-seam.example")
         .with_test_relay_client(relay.clone());
     let mut client = app.client("alice").await.unwrap();
-    let group_id = client.create_group("ingest seam", &[]).await.unwrap();
+    let group_id = client
+        .create_group("ingest seam", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
 
     client.apply_backfill_decision(
         &group_id,
@@ -19854,7 +20542,9 @@ async fn assert_failed_cursor_pin(recovery: FailedDeliveryRecovery) {
     let group_id = alice
         .create_group("retryable failed ingest", &[bob.account_id_hex.as_str()])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     assert!(
         bob_client
             .sync()
@@ -20139,7 +20829,9 @@ pub(crate) async fn undecryptable_probe_route(
     let group_id = client
         .create_group("undecryptable retention cap", &[])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let nostr_group_id_hex = app
         .group("alice", &hex::encode(group_id.as_slice()))
         .unwrap()
@@ -20411,7 +21103,12 @@ fn a_transport_deferred_delivery_is_still_marked_seen() {
             true,
         );
         let mut client = client_on_app_relay_plane(&app, "alice").await;
-        let group_id = client.create_group("deferred fence", &[]).await.unwrap();
+        let group_id = client
+            .create_group("deferred fence", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         let route = UndecryptableProbeRoute {
             account_id_hex,
             nostr_group_id_hex: app
@@ -21174,7 +21871,9 @@ async fn a_send_that_reaches_the_transport_reports_published() {
     let group_id = setup_client
         .create_group("accept disposition", &[])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     drop(setup_client);
 
     let runtime = MarmotAppRuntime::new(app.clone());
@@ -21206,7 +21905,9 @@ async fn unavailable_send_retries_the_exact_event_after_transport_recovers() {
     let group_id = setup_client
         .create_group("send recovery", &[])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     drop(setup_client);
 
     let runtime = MarmotAppRuntime::new(app.clone());
@@ -21316,7 +22017,9 @@ async fn connectivity_restored_wakes_a_retained_send_before_the_retry_timer() {
     let group_id = setup_client
         .create_group("send recovery wake", &[])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     drop(setup_client);
 
     let runtime = MarmotAppRuntime::new(app.clone());
@@ -21404,7 +22107,9 @@ async fn retained_send_recovers_after_reconnect(host_wake: bool) {
     let group_id = setup_client
         .create_group("reconnect send recovery", &[])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     drop(setup_client);
 
     let runtime = MarmotAppRuntime::new(app.clone());
@@ -21498,7 +22203,12 @@ async fn eventless_drain_projects_every_retained_send_it_publishes() {
     let app = MarmotApp::with_relay(dir.path(), "wss://eventless-drain.example")
         .with_test_relay_client(relay.clone());
     let mut client = app.client("sender").await.unwrap();
-    let group_id = client.create_group("eventless drain", &[]).await.unwrap();
+    let group_id = client
+        .create_group("eventless drain", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     relay.fail_publishes_as_unavailable();
 
     for plaintext in ["first eventless retained", "second eventless retained"] {
@@ -21588,7 +22298,9 @@ async fn two_unavailable_sends_retry_once_in_order_after_transport_recovers() {
     let group_id = setup_client
         .create_group("ordered recovery", &[])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     drop(setup_client);
 
     let runtime = MarmotAppRuntime::new(app.clone());
@@ -21669,14 +22381,18 @@ async fn unavailable_group_invite_retries_the_exact_commit_after_transport_recov
     let group_id = runtime
         .create_group("sender", "invite recovery", &[], None)
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
 
     let attempts_before = relay.attempted_event_ids().len();
     relay.fail_publishes_as_unavailable();
     let summary = runtime
         .invite_members("sender", &group_id, &[invited.account_id_hex])
         .await
-        .expect("a temporary invite publish failure must retain the exact commit");
+        .expect("a temporary invite publish failure must retain the exact commit")
+        .operation
+        .expect("the invite must retain its actual summary");
     assert_eq!(
         summary.accept_disposition,
         cgka_traits::SendAcceptDisposition::CompletionUnknown
@@ -21766,7 +22482,12 @@ async fn unresolved_invite() -> UnresolvedInvite {
         .await
         .unwrap();
     bob_client.sync().await.unwrap();
-    let group = alice.create_group("unresolved invite", &[]).await.unwrap();
+    let group = alice
+        .create_group("unresolved invite", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let attempted_before = relay.attempted_events().len();
     relay.fail_publishes_of_kind(transport_nostr_peeler::KIND_MARMOT_GROUP_MESSAGE);
     UnresolvedInvite {
@@ -21798,7 +22519,9 @@ async fn invite_with_unresolved_commit_holds_its_welcome() {
         .alice
         .invite_members(&invite.group, &[invite.bob_id_hex.as_str()])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     assert_eq!(
         summary.accept_disposition,
         cgka_traits::SendAcceptDisposition::CompletionUnknown
@@ -21827,10 +22550,13 @@ async fn invite_with_unresolved_commit_leaves_no_welcome_slot() {
             &invite.group,
             &[invite.bob_id_hex.as_str()],
             &[],
+            crate::MemberResolutionPolicy::Partial,
             &telemetry,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     assert_eq!(
         summary.accept_disposition,
         cgka_traits::SendAcceptDisposition::CompletionUnknown
@@ -21876,7 +22602,9 @@ async fn retained_invite_leaves_no_welcome_for_a_later_create_to_send() {
                 &marmot_observability::PerformanceRecorder::default(),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         (staged.upload_id, created.group_id)
     };
     let runtime = MarmotAppRuntime::new(app);
@@ -21885,14 +22613,18 @@ async fn retained_invite_leaves_no_welcome_for_a_later_create_to_send() {
     let group_id = runtime
         .create_group("sender", "retained invite", &[], None)
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
 
     let attempted_before = relay.attempted_events().len();
     relay.fail_publishes_of_kind(transport_nostr_peeler::KIND_MARMOT_GROUP_MESSAGE);
     let summary = runtime
         .invite_members("sender", &group_id, &[invited.account_id_hex])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     assert_eq!(
         summary.accept_disposition,
         cgka_traits::SendAcceptDisposition::CompletionUnknown
@@ -21906,14 +22638,18 @@ async fn retained_invite_leaves_no_welcome_for_a_later_create_to_send() {
             upload_id,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     assert_eq!(again, image_group);
     // Worker mutations run in order, so this one starts only after the
     // create's post-reply Welcome delivery has finished.
     runtime
         .create_group("sender", "after the retry", &[], None)
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
 
     let attempted = attempted_kinds_since(&relay, attempted_before);
     assert!(
@@ -21941,7 +22677,12 @@ fn encrypted_media_warm_skips_authoritative_rechecks_at_an_unchanged_epoch() {
             .with_test_relay_client(relay.clone());
 
         let mut client = app.client("alice").await.unwrap();
-        let group_id = client.create_group("warm pass", &[]).await.unwrap();
+        let group_id = client
+            .create_group("warm pass", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         let group_id_hex = hex::encode(group_id.as_slice());
         assert_eq!(client.state.groups.len(), 1);
         assert!(client.state.groups[0].encrypted_media.required);
@@ -22053,7 +22794,12 @@ async fn check_received_media_source_epoch_secret(carried_secret: bool) {
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
         .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
     let mut client = app.client("alice").await.unwrap();
-    let group_id = client.create_group("left epoch media", &[]).await.unwrap();
+    let group_id = client
+        .create_group("left epoch media", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let group_id_hex = hex::encode(group_id.as_slice());
     let sender_hex = app.account_home().account("alice").unwrap().account_id_hex;
     let storage = app.account_storage("alice").unwrap().app_storage();
@@ -22213,7 +22959,12 @@ fn idle_sync_skips_the_checkpoint_route_recomputation() {
             .with_test_relay_client(relay.clone());
 
         let mut client = app.client("alice").await.unwrap();
-        client.create_group("idle sync", &[]).await.unwrap();
+        client
+            .create_group("idle sync", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
 
         // Settle startup/replay traffic, then reset the counter: syncs below
         // drain an empty channel, so nothing can have changed routing.
@@ -22242,7 +22993,12 @@ fn member_ids_page_reads_admins_from_the_durable_group_projection() {
             .with_test_relay_client(relay.clone());
 
         let mut client = app.client("alice").await.unwrap();
-        let group_id = client.create_group("durable admins", &[]).await.unwrap();
+        let group_id = client
+            .create_group("durable admins", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         assert_eq!(
             client.admin_policy_for_group(&group_id).admins,
             vec![alice.account_id_hex.clone()],
@@ -22478,7 +23234,12 @@ async fn direct_miss_skips_unhydrated() {
         .with_test_relay_client(relay.clone());
     let unrelated = {
         let mut client = app.client("alice").await.unwrap();
-        client.create_group("unrelated", &[]).await.unwrap()
+        client
+            .create_group("unrelated", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members")
     };
     let missing = {
         let failing = MarmotApp::with_relay_and_config(
@@ -22489,8 +23250,18 @@ async fn direct_miss_skips_unhydrated() {
         .with_test_relay_client(relay.clone());
         let mut client = failing.client("alice").await.unwrap();
         [
-            client.create_group("unprojected", &[]).await.unwrap(),
-            client.create_group("", &[]).await.unwrap(),
+            client
+                .create_group("unprojected", &[])
+                .await
+                .unwrap()
+                .operation
+                .expect("eligible fixture members"),
+            client
+                .create_group("", &[])
+                .await
+                .unwrap()
+                .operation
+                .expect("eligible fixture members"),
         ]
     };
     assert_eq!(app.groups("alice").unwrap().len(), 1);
@@ -22575,6 +23346,8 @@ async fn direct_retry_blocks_quarantine() {
             )
             .await
             .unwrap()
+            .operation
+            .expect("eligible fixture members")
     };
     assert!(app.groups("alice").unwrap().is_empty());
     let group_hex = hex::encode(group_id.as_slice());
@@ -22654,6 +23427,8 @@ async fn direct_retry_skips_removed() {
             .create_group("", &[&bob.account_id_hex])
             .await
             .unwrap()
+            .operation
+            .expect("eligible fixture members")
     };
     let storage = app.account_storage("alice").unwrap();
     let mut removed = storage.get_group(&group_id).unwrap();
@@ -22721,7 +23496,12 @@ async fn reconcile_repairs_stale_three_member_count_on_two_member_direct_body() 
         let mut bob = app.client("bob").await.unwrap();
         bob.publish_key_package().await.unwrap();
         let mut alice = app.client("alice").await.unwrap();
-        let group_id = alice.create_group("", &[bob_id.as_str()]).await.unwrap();
+        let group_id = alice
+            .create_group("", &[bob_id.as_str()])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         group_id_hex = hex::encode(group_id.as_slice());
     }
 
@@ -22789,7 +23569,9 @@ async fn reconcile_repairs_stale_two_member_count_on_three_member_group_body() {
         let group_id = alice
             .create_group("", &[bob_id.as_str(), carol_id.as_str()])
             .await
-            .unwrap();
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         group_id_hex = hex::encode(group_id.as_slice());
     }
 
@@ -23229,7 +24011,9 @@ async fn assert_peer_leave_behind_fanout(remove_observer: bool) {
             &[&alice_account.account_id_hex, &bob.account_id_hex],
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     assert!(
         bob_client
             .sync()
@@ -23433,7 +24217,12 @@ async fn a_parked_convergence_pass_owes_hosts_one_notice_per_change() {
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
         .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
     let mut client = app.client("alice").await.unwrap();
-    let group_id = client.create_group("parked", &[]).await.unwrap();
+    let group_id = client
+        .create_group("parked", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let epoch = client.group_mls_state(&group_id).unwrap().epoch;
     assert!(client.take_convergence_park_notices().is_empty());
     plant_parked_convergence_pass(&app, &group_id, epoch);
@@ -23490,7 +24279,12 @@ async fn an_explicit_convergence_retry_whose_advance_fails_still_wakes_the_group
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
         .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
     let mut client = app.client("alice").await.unwrap();
-    let group_id = client.create_group("parked", &[]).await.unwrap();
+    let group_id = client
+        .create_group("parked", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let epoch = client.group_mls_state(&group_id).unwrap().epoch;
     plant_parked_convergence_pass(&app, &group_id, epoch);
     client.take_pending_convergence_groups();
@@ -23529,7 +24323,9 @@ async fn voluntary_left_classification_survives_reopen_but_resets_on_rejoin() {
     let group_id = client
         .create_group("departure attribution", &[])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let group_hex = hex::encode(group_id.as_slice());
     app.set_group_self_membership("alice", &group_hex, SelfMembership::Left)
         .unwrap();
@@ -23599,7 +24395,9 @@ async fn due_peer_leave_does_not_shorten_a_collecting_convergence_pass() {
             &[&bob.account_id_hex, &carol.account_id_hex],
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     assert!(
         bob_client
             .sync()
@@ -23664,7 +24462,12 @@ async fn diagnostics_maintenance_reuses_failed_obligation_levels_across_ticks() 
     let app = MarmotApp::with_relay(root.path(), "wss://relay.example")
         .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
     let mut client = app.client("alice").await.unwrap();
-    let group_id = client.create_group("maintenance", &[]).await.unwrap();
+    let group_id = client
+        .create_group("maintenance", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     client
         .runtime
         .schedule_manual_self_update(&group_id)
@@ -23713,7 +24516,9 @@ fn presentation_worker_refreshes_without_screen_subscribers_and_recovers_notific
         let created = runtime
             .create_group_detailed("alice", "", std::slice::from_ref(&bob.account_id_hex), None)
             .await
-            .unwrap();
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         let group = created.chat_list_row.group_id_hex;
         let storage = app.account_storage("alice").unwrap();
         // No UI or presentation subscriber is attached for initial hydration or this update.
@@ -23838,7 +24643,9 @@ fn presentation_quarantine_preserves_existing_chat_kind_and_direct_reuse() {
             group_id = alice
                 .create_group("", &[&bob_account.account_id_hex])
                 .await
-                .unwrap();
+                .unwrap()
+                .operation
+                .expect("eligible fixture members");
         }
         let id = hex::encode(group_id.as_slice());
         let storage = app.account_storage("alice").unwrap();
@@ -23930,7 +24737,12 @@ async fn group_changes_refuse_while_epoch_gap_recovery_holds_the_group() {
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
         .with_test_relay_client(relay.clone());
     let mut client = app.client("alice").await.unwrap();
-    let group_id = client.create_group("behind", &[]).await.unwrap();
+    let group_id = client
+        .create_group("behind", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let group_hex = hex::encode(group_id.as_slice());
     let epoch = client.runtime.group_record(&group_id).unwrap().epoch;
     let storage = app.account_storage("alice").unwrap().app_storage();
@@ -24124,7 +24936,12 @@ async fn group_changes_refuse_while_the_last_commit_is_owed_to_a_relay() {
     let mut client = app.client("alice").await.unwrap();
     // Refuse as soon as a relay is owed instead of after the grace.
     client.commit_delivery_gate_grace_secs = 0;
-    let group_id = client.create_group("owed", &[]).await.unwrap();
+    let group_id = client
+        .create_group("owed", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let group_hex = hex::encode(group_id.as_slice());
     assert_eq!(client.group_commit_delivery(&group_id).unwrap(), None);
     assert!(
@@ -24205,7 +25022,12 @@ async fn a_quick_follow_up_change_is_not_refused_within_the_delivery_grace() {
     )
     .with_test_relay_client(relay.clone());
     let mut client = app.client("alice").await.unwrap();
-    let group_id = client.create_group("grace", &[]).await.unwrap();
+    let group_id = client
+        .create_group("grace", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     relay.make_endpoints_unavailable(&["wss://relay-b.example"]);
     client
         .update_group_profile(&group_id, Some("first"), None)
@@ -24239,7 +25061,12 @@ async fn both_advisory_gates_can_be_acknowledged_in_turn() {
     let mut client = app.client("alice").await.unwrap();
     // Refuse as soon as a relay is owed instead of after the grace.
     client.commit_delivery_gate_grace_secs = 0;
-    let group_id = client.create_group("both gates", &[]).await.unwrap();
+    let group_id = client
+        .create_group("both gates", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     relay.make_endpoints_unavailable(&["wss://relay-b.example"]);
     client
         .update_group_profile(&group_id, Some("owed"), None)
@@ -24291,7 +25118,12 @@ async fn epoch_gap_below_the_local_epoch_does_not_hold_group_changes() {
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
         .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
     let mut client = app.client("alice").await.unwrap();
-    let group_id = client.create_group("moved on", &[]).await.unwrap();
+    let group_id = client
+        .create_group("moved on", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let stalled = client.runtime.group_record(&group_id).unwrap().epoch;
     client
         .update_group_profile(&group_id, Some("first"), None)
@@ -24322,8 +25154,18 @@ async fn forget_group_local_stops_work_and_survives_reopen() {
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
         .with_test_relay_client(relay.clone());
     let mut client = app.client("alice").await.unwrap();
-    let forgotten = client.create_group("forgotten", &[]).await.unwrap();
-    let kept = client.create_group("kept", &[]).await.unwrap();
+    let forgotten = client
+        .create_group("forgotten", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
+    let kept = client
+        .create_group("kept", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let group_hex = hex::encode(forgotten.as_slice());
     let publishes = relay.published_event_ids().len();
     client.pending_convergence_groups.insert(forgotten.clone());
@@ -24405,7 +25247,9 @@ async fn forget_group_local_rejects_old_welcome_then_rejoins_from_fresh_invitati
         let group = alice
             .create_group("abandoned", &[bob.account_id_hex.as_str()])
             .await
-            .unwrap();
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         let welcome = relay
             .published_events
             .lock()
@@ -24513,7 +25357,9 @@ async fn forget_group_local_rejects_old_welcome_then_rejoins_from_fresh_invitati
         alice
             .invite_members(&group, &[bob.account_id_hex.as_str()])
             .await
-            .unwrap();
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         let fresh = relay
             .published_events
             .lock()
@@ -24707,7 +25553,9 @@ async fn runtime_forget_group_local_body() {
     let group = runtime
         .create_group("alice", "abandoned", &[], None)
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     assert!(runtime.forget_group_local("alice", &group).await.unwrap());
     assert!(
         app.group("alice", &hex::encode(group.as_slice()))
@@ -24751,7 +25599,12 @@ async fn authenticated_system_previews_keep_actor_subject_and_multi_commit_row_i
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
         .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
     let mut client = app.client("alice").await.unwrap();
-    let group_id = client.create_group("system previews", &[]).await.unwrap();
+    let group_id = client
+        .create_group("system previews", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let group_hex = hex::encode(group_id.as_slice());
     let actor = MemberId::new(vec![0xbb; 32]);
     let peer = MemberId::new(vec![0xcc; 32]);

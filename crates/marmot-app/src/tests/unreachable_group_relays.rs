@@ -24,7 +24,12 @@ async fn sends_and_group_changes_continue_while_the_group_subscription_is_refuse
         .with_test_relay_client(relay.clone());
     let mut client = app.client("alice").await.unwrap();
     relay.refuse_group_subscribes(true);
-    let group = client.create_group("unreachable", &[]).await.unwrap();
+    let group = client
+        .create_group("unreachable", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     assert!(
         client.has_pending_runtime_group_subscription_refresh(),
         "the new group's subscription was refused, so its refresh stays owed"
@@ -153,7 +158,12 @@ async fn a_group_relay_the_safety_rule_refuses_is_a_definite_non_delivery() {
     let relay = Arc::new(ScriptedPushRelayClient::default());
     let app = MarmotApp::with_relay(dir.path(), SAFE_RELAY).with_test_relay_client(relay.clone());
     let mut client = app.client("alice").await.unwrap();
-    let group = client.create_group("unsafe route", &[]).await.unwrap();
+    let group = client
+        .create_group("unsafe route", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     route_group_through(&mut client, &group, &[SAFE_RELAY, UNSAFE_RELAY]).await;
     let epoch = client.runtime.epoch_state(&group).unwrap().epoch();
     let attempted = relay.attempted_routes().len();
@@ -206,7 +216,12 @@ async fn a_group_whose_relays_all_fail_the_safety_rule_sends_nothing() {
     let relay = Arc::new(ScriptedPushRelayClient::default());
     let app = MarmotApp::with_relay(dir.path(), SAFE_RELAY).with_test_relay_client(relay.clone());
     let mut client = app.client("alice").await.unwrap();
-    let group = client.create_group("unsafe route", &[]).await.unwrap();
+    let group = client
+        .create_group("unsafe route", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     route_group_through(&mut client, &group, &[UNSAFE_RELAY]).await;
     let epoch = client.runtime.epoch_state(&group).unwrap().epoch();
     let attempted = relay.attempted_routes().len();
@@ -253,7 +268,12 @@ async fn a_commit_counts_the_answer_of_a_group_relay_spelled_another_way() {
     let relay = Arc::new(ScriptedPushRelayClient::default());
     let app = MarmotApp::with_relay(dir.path(), SAFE_RELAY).with_test_relay_client(relay.clone());
     let mut client = app.client("alice").await.unwrap();
-    let group = client.create_group("respelled route", &[]).await.unwrap();
+    let group = client
+        .create_group("respelled route", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     route_group_through(&mut client, &group, &[RESPELLED_GROUP_RELAY]).await;
     let epoch = client.runtime.epoch_state(&group).unwrap().epoch();
 

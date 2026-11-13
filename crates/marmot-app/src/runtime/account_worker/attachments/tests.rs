@@ -274,6 +274,139 @@ fn context() -> (MediaHttpContext, mpsc::UnboundedReceiver<MediaHttpDone>) {
     )
 }
 
+#[test]
+fn promotion_resumes_after_skip() {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .thread_stack_size(8 * 1024 * 1024)
+        .max_blocking_threads(1)
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let (_dir, client, storage, reference) = offline_fixture().await;
+            let app = storage.app_storage();
+            let media = client.app.account_media_store("alice", &storage).unwrap();
+            let body = b"retained worker bytes";
+            let mut tokens = Vec::new();
+            // One unbound upload keeps the final empty pass reachable.
+            for _ in 0..2 {
+                let token = app
+                    .reserve_attachment_upload(GROUP, 3, crate::unix_now_seconds())
+                    .unwrap()
+                    .unwrap();
+                crate::media::outgoing::stage_body(
+                    &media,
+                    &app.attachment_upload_stage(&token),
+                    &mut body.as_slice(),
+                    body.len() as u64,
+                    &|| false,
+                )
+                .unwrap();
+                tokens.push(token);
+            }
+            let tag = reference.imeta_tag();
+            app.bind_attachment_uploads(
+                &tokens[..1],
+                &[(
+                    serde_json::to_value(&tag).unwrap(),
+                    crate::media::media_hash_from_reference(&reference).unwrap(),
+                )],
+            )
+            .unwrap();
+            let staged = app.attachment_upload_file(&tokens[0]).unwrap().unwrap();
+            // Expired sources fill the first page without promoting a body.
+            // Only the next page can publish the final source.
+            for index in 0..=crate::media::outgoing::UPLOAD_PROMOTION_BATCH {
+                let message = format!("{index:064x}");
+                let retention = (index < crate::media::outgoing::UPLOAD_PROMOTION_BATCH)
+                    .then(|| crate::AppMessageRetentionDecision::new(10, 1));
+                app.record_app_event_with_retention(
+                    &StoredAppEvent {
+                        group_id_hex: GROUP.into(),
+                        message_id_hex: message.clone(),
+                        source_message_id_hex: Some(message.clone()),
+                        source_epoch: Some(3),
+                        direction: "sent".into(),
+                        sender: "33".repeat(32),
+                        plaintext: String::new(),
+                        kind: 9,
+                        tags: vec![tag.clone()],
+                        recorded_at: 10,
+                        received_at: 10,
+                        origin_commit_id: None,
+                        moderation_grant: false,
+                    },
+                    retention,
+                )
+                .unwrap();
+                app.protect_attachment_uploads(GROUP, &message, std::slice::from_ref(&tag))
+                    .unwrap();
+            }
+            let shared = RuntimeSharedServices::default();
+            let mut admission = Admission::default();
+            let (release, held) = std::sync::mpsc::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                held.recv().unwrap();
+            });
+            let spawn = |admission: &mut Admission| {
+                spawn_upload_promotion(
+                    admission,
+                    storage.clone(),
+                    media.clone(),
+                    shared.attachment_updates.clone(),
+                    shared.observer.performance(),
+                )
+            };
+            spawn(&mut admission);
+            // The only blocking thread is held, so this pass must skip the batch.
+            spawn(&mut admission);
+            assert!(!admission.upload_promotion.as_ref().unwrap().is_finished());
+            release.send(()).unwrap();
+            blocker.await.unwrap();
+            tokio::time::timeout(Duration::from_secs(10), async {
+                for (index, expected) in [true, true, false].into_iter().enumerate() {
+                    assert!(
+                        admission.is_waiting(),
+                        "promotion completion was not observed"
+                    );
+                    let more = admission.ready().await;
+                    assert_eq!(more, expected);
+                    if index == 0 {
+                        assert_eq!(
+                            media.file_state(&staged).unwrap(),
+                            Some(media_store::FileState::Staged)
+                        );
+                    }
+                    if more {
+                        spawn(&mut admission);
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            assert!(
+                !admission.is_waiting(),
+                "an idle batch must stop rescheduling"
+            );
+            let message = format!("{:064x}", crate::media::outgoing::UPLOAD_PROMOTION_BATCH);
+            let status = app
+                .attachment_transfer_status(
+                    GROUP,
+                    &message,
+                    &message,
+                    0,
+                    crate::unix_now_seconds(),
+                    true,
+                )
+                .unwrap();
+            assert_eq!(
+                status.map(|status| status.state),
+                Some(storage_sqlite::AttachmentTransferState::Ready)
+            );
+        });
+}
+
 /// Count loopback response bytes once, then prove the retained asset survives a client restart.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn attachment_worker_downloads_without_engine_group_or_screen_and_retains_through_restart() {
@@ -819,7 +952,12 @@ fn attachment_explicit_retry_derives_an_uncached_source_epoch_key() {
         .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
         let mut client = app.client("alice").await.unwrap();
         let storage = app.account_storage("alice").unwrap();
-        let group_id = client.create_group("retry media", &[]).await.unwrap();
+        let group_id = client
+            .create_group("retry media", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         let group_hex = hex::encode(group_id.as_slice());
         // Group creation caches its founding epoch; the source epoch is the
         // next one, and the group has left it by the time the row exists.

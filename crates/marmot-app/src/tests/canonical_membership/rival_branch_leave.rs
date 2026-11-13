@@ -60,7 +60,9 @@ impl Fork {
                 },
             )
             .await
-            .unwrap();
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         let mut cursors = [0; 3];
         deliver_new(&mut bob, &relay, &mut cursors[1]).await;
         deliver_new(&mut carol, &relay, &mut cursors[2]).await;

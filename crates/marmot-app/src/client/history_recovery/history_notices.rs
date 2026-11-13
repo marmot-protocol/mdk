@@ -615,8 +615,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let app = app(&dir);
         let mut client = client_on_app_relay_plane(&app, "alice").await;
-        let group = client.create_group("history notices", &[]).await.unwrap();
-        let other = client.create_group("still parked", &[]).await.unwrap();
+        let group = client
+            .create_group("history notices", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
+        let other = client
+            .create_group("still parked", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         let storage = app.account_storage("alice").unwrap();
         let intents = [&group, &other]
             .into_iter()

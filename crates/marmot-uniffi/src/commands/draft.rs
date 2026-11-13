@@ -132,7 +132,9 @@ mod tests {
                 None,
             )
             .await
-            .expect("create group");
+            .expect("create group")
+            .group_id_hex
+            .expect("selected members create a group");
         let attachment = MessageDraftAttachmentFfi {
             id: "attachment-1".to_owned(),
             file_name: "note.txt".to_owned(),

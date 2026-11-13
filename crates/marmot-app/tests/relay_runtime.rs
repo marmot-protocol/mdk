@@ -105,7 +105,9 @@ async fn active_group_send_timings() {
         )
         .await
         .expect("group setup completes")
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
         eprintln!("created group members={member_count}");
         for index in 1..member_count {
             accept_group_invite_retrying_busy(&runtimes[index], &accounts[index], &group)
@@ -267,7 +269,9 @@ async fn send_connection_reuse() {
     let group = runtimes[0]
         .create_group(&accounts[0], "socket reuse", &accounts[1..], None)
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     accept_group_invite_retrying_busy(&runtimes[1], &accounts[1], &group)
         .await
         .unwrap();
@@ -3404,7 +3408,9 @@ async fn app_runtime_executes_group_and_message_intents_on_managed_accounts() {
             Some("initial description".to_owned()),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     assert_eq!(
         account_sync_attempts(),
         sync_attempts_before_create,
@@ -3591,7 +3597,9 @@ async fn app_component_lifecycle() {
     let group = runtime
         .create_group(&alice, "components", std::slice::from_ref(&bob), None)
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     wait_for_event(&mut events, |event| matches!(event,
         MarmotAppEvent::GroupJoined { account_id_hex, group_id, .. } if account_id_hex == &bob && group_id == &group
     )).await;
@@ -3658,7 +3666,9 @@ async fn app_component_lifecycle() {
     runtime
         .invite_members(&alice, &group, std::slice::from_ref(&carol))
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     wait_for_event(&mut events, |event| matches!(event,
         MarmotAppEvent::GroupJoined { account_id_hex, group_id, .. } if account_id_hex == &carol && group_id == &group
     )).await;
@@ -3788,7 +3798,9 @@ async fn app_runtime_custom_events_roundtrip_and_filter_by_kind() {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     wait_for_event(&mut events, |event| {
         matches!(
             event,
@@ -3918,7 +3930,9 @@ async fn app_runtime_delete_group_local_removes_projection_without_publishing_le
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     wait_for_event(&mut events, |event| {
         matches!(
             event,
@@ -3942,7 +3956,9 @@ async fn app_runtime_delete_group_local_removes_projection_without_publishing_le
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     wait_for_event(&mut events, |event| {
         matches!(
             event,
@@ -4193,7 +4209,9 @@ async fn app_runtime_serves_member_reads_during_scheduled_convergence() {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     wait_for_event(&mut events, |event| {
         matches!(event, MarmotAppEvent::GroupJoined { account_id_hex, group_id: joined, .. }
             if account_id_hex == &bob_id && joined == &group_id)
@@ -4289,7 +4307,9 @@ async fn app_runtime_serves_member_reads_before_initial_catch_up_completes() {
     let group_id = runtime
         .create_group(&alice_id, "fast reads", std::slice::from_ref(&bob_id), None)
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     wait_for_event(&mut events, |event| {
         matches!(
             event,
@@ -4408,7 +4428,9 @@ async fn group_conversation_snapshot_is_internally_consistent_around_mutation() 
     let group_id = runtime
         .create_group(&alice_id, "before snapshot", &[], None)
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
 
     let before = runtime
         .group_conversation_snapshot(&alice_id, &group_id)
@@ -4497,7 +4519,9 @@ async fn group_roster_reports_left_after_local_leave_without_worker_restart() {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     wait_for_event(&mut events, |event| {
         matches!(
             event,
@@ -4554,7 +4578,9 @@ async fn group_roster_reports_removed_after_admin_eviction_without_worker_restar
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     wait_for_event(&mut events, |event| {
         matches!(
             event,
@@ -4630,7 +4656,9 @@ async fn app_runtime_schedules_audit_tracker_update_after_managed_send() {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -4762,7 +4790,9 @@ async fn app_runtime_schedules_audit_tracker_update_after_inbound_welcome() {
     let group_id = runtime
         .create_group("alice", "runtime inbound audit", &["bob".to_owned()], None)
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     wait_for_event(&mut events, |event| {
         matches!(
             event,
@@ -4834,7 +4864,9 @@ async fn app_runtime_uploads_armed_backfill_row_without_visible_activity() {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     wait_for_event(&mut events, |event| {
         matches!(
             event,
@@ -4935,7 +4967,9 @@ async fn app_runtime_coalesces_audit_tracker_updates_while_upload_is_in_flight()
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -5140,7 +5174,9 @@ async fn push_token_gossip_register_replace_and_remove_lifecycle() {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     wait_for_push_group_member(&app, &bob.account.label, &group_id).await;
     let server_pubkey = nostr::prelude::Keys::generate().public_key().to_hex();
 
@@ -5291,7 +5327,9 @@ async fn push_registration_before_join_is_automatically_shared_without_catch_up(
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     // No host retry/share/catch-up follows creation: the worker-owned receive
     // tail must discover and drain the new group's durable push outbox itself.
     wait_for_push_group_member(&app, &bob.account.label, &group).await;
@@ -5393,7 +5431,9 @@ async fn removed_member_triggers_local_push_token_cleanup() {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     // Bob's token reaches Alice before Carol is added, so only Bob's re-share
     // after the add can bring it to Carol (mdk#2604).
     wait_for_member_push_token(
@@ -5410,7 +5450,9 @@ async fn removed_member_triggers_local_push_token_cleanup() {
             std::slice::from_ref(&carol.account.account_id_hex),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     wait_for_member_push_token(
         &runtime,
         &carol.account.account_id_hex,
@@ -5537,12 +5579,16 @@ async fn push_debug_info_reads_real_leaves_after_a_removal() {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     wait_for_member_push_token(&runtime, alice_id, &group_id, bob_id).await;
     runtime
         .invite_members(alice_id, &group_id, std::slice::from_ref(carol_id))
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     wait_for_member_push_token(&runtime, carol_id, &group_id, bob_id).await;
     wait_for_member_push_token(&runtime, carol_id, &group_id, carol_id).await;
     wait_for_member_push_token(&runtime, alice_id, &group_id, carol_id).await;
@@ -5602,7 +5648,9 @@ async fn eviction_projects_removed_from_group_notification() {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     app.set_local_notifications_enabled(&bob.account.account_id_hex, true)
         .unwrap();
     runtime.catch_up_accounts().await.unwrap();
@@ -5654,7 +5702,9 @@ async fn admin_grant_projects_made_admin_notification() {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     app.set_local_notifications_enabled(&bob.account.account_id_hex, true)
         .unwrap();
     runtime.catch_up_accounts().await.unwrap();
@@ -5697,7 +5747,9 @@ async fn admin_revoke_projects_removed_as_admin_notification() {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     app.set_local_notifications_enabled(&bob.account.account_id_hex, true)
         .unwrap();
     runtime.catch_up_accounts().await.unwrap();
@@ -5760,7 +5812,9 @@ async fn remove_members_sends_context_free_wake_from_snapshotted_tokens() {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let server_pubkey = nostr::prelude::Keys::generate().public_key().to_hex();
     app.set_native_push_enabled(&bob.account.account_id_hex, true)
         .unwrap();
@@ -5828,7 +5882,9 @@ async fn remove_members_succeeds_when_wake_publish_fails() {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let server_pubkey = nostr::prelude::Keys::generate().public_key().to_hex();
     app.set_native_push_enabled(&bob.account.account_id_hex, true)
         .unwrap();
@@ -5880,7 +5936,9 @@ async fn unauthorized_remove_and_self_demotion_send_no_wake() {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     runtime.catch_up_accounts().await.unwrap();
     sleep(Duration::from_millis(300)).await;
     let wraps_before = gate.count();
@@ -5971,7 +6029,9 @@ async fn live_muted_chat_notifies_direct_mentions_but_not_ordinary_messages() {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let group_hex = hex::encode(group_id.as_slice());
     app.set_local_notifications_enabled(&bob_id, true).unwrap();
     runtime.catch_up_accounts().await.unwrap();
@@ -6112,7 +6172,9 @@ async fn concurrent_wake_collection_and_foreground_subscription_share_notificati
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
 
     app.set_local_notifications_enabled(&bob.account.account_id_hex, true)
         .unwrap();
@@ -6220,7 +6282,9 @@ async fn message_send_succeeds_when_notification_trigger_publish_fails() {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let server_pubkey = nostr::prelude::Keys::generate().public_key().to_hex();
 
     app.set_native_push_enabled(&bob.account.account_id_hex, true)
@@ -6272,11 +6336,15 @@ async fn overlapping_reciprocal_invites_deliver_both_incoming_welcomes() {
     let alice_group = runtime
         .create_group(&alice_id, "alice reciprocal invite", &[], None)
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let bob_group = runtime
         .create_group(&bob_id, "bob reciprocal invite", &[], None)
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let mut alice_events = runtime.subscribe();
     let mut bob_events = runtime.subscribe();
 
@@ -6358,11 +6426,15 @@ async fn successful_invite_delivers_while_overlapping_invite_fails() {
     let alice_group = runtime
         .create_group(&alice_id, "successful overlap", &[], None)
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let bob_group = runtime
         .create_group(&bob_id, "failed overlap", &[], None)
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let mut bob_events = runtime.subscribe();
 
     gate.arm(1);
@@ -6389,10 +6461,14 @@ async fn successful_invite_delivers_while_overlapping_invite_fails() {
             std::slice::from_ref(&missing_key_package_member),
         )
         .await;
-    assert!(
-        failed.is_err(),
-        "invite without a published KeyPackage must fail"
+    let failed = failed.unwrap();
+    assert!(failed.operation.is_none());
+    assert_eq!(failed.member_outcomes.len(), 1);
+    assert_eq!(
+        failed.member_outcomes[0].account_id_hex,
+        missing_key_package_member
     );
+    assert_eq!(failed.member_outcomes[0].selected_device_count, 0);
     gate.release();
     successful_invite
         .await
@@ -6436,7 +6512,9 @@ async fn app_runtime_marks_welcome_joined_groups_pending_until_accepted() {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     wait_for_event(&mut events, |event| {
         matches!(
             event,
@@ -6506,7 +6584,9 @@ async fn app_runtime_readd_after_remove_resurfaces_removed_member_group() {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     wait_for_event(&mut events, |event| {
         matches!(
             event,
@@ -6631,7 +6711,9 @@ async fn app_runtime_readd_after_remove_resurfaces_removed_member_group() {
     runtime
         .invite_members(&alice_id, &group_id, std::slice::from_ref(&bob_id))
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     wait_for_event(&mut events, |event| {
         matches!(
             event,
@@ -6737,7 +6819,9 @@ async fn app_runtime_archive_survives_subsequent_inbound_delivery() {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     wait_for_event(&mut events, |event| {
         matches!(
             event,
@@ -6839,7 +6923,9 @@ async fn app_runtime_archive_does_not_direct_write_when_worker_unavailable() {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     wait_for_event(&mut events, |event| {
         matches!(
             event,
@@ -6908,7 +6994,9 @@ async fn app_runtime_declines_pending_invite_by_leaving_and_archiving() {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     wait_for_event(&mut events, |event| {
         matches!(
             event,
@@ -7005,7 +7093,9 @@ async fn app_runtime_emits_live_messages_for_local_accounts_without_manual_sync(
     let group_id = runtime
         .create_group("alice", "live", &["bob".to_owned()], None)
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     wait_for_event(&mut events, |event| {
         matches!(
             event,
@@ -7211,7 +7301,9 @@ async fn app_runtime_message_subscription_returns_snapshot_then_live_updates() {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     wait_for_event(&mut events, |event| {
         matches!(
             event,
@@ -7302,7 +7394,9 @@ async fn app_runtime_message_subscription_kinds_filter_applies_to_live_updates()
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     wait_for_event(&mut events, |event| {
         matches!(
             event,
@@ -7495,7 +7589,9 @@ async fn app_runtime_chat_and_group_state_subscriptions_stream_projection_update
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let group_id_hex = hex::encode(group_id.as_slice());
     let chat = wait_for_chat_update(&mut bob_chats, |chat| chat.group_id_hex == group_id_hex).await;
     assert_eq!(chat.profile.name, "runtime chats");
@@ -7575,7 +7671,9 @@ async fn group_state_subscription_observes_rename_applied_during_interleaved_sen
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     wait_for_event(&mut events, |event| {
         matches!(
             event,
@@ -7689,7 +7787,9 @@ async fn group_state_subscription_observes_rename_applied_during_failed_send() {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     wait_for_event(&mut events, |event| {
         matches!(
             event,
@@ -7771,7 +7871,9 @@ async fn app_runtime_timeline_subscription_reopen_keeps_local_sent_message() {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let group_id_hex = hex::encode(group_id.as_slice());
     let query = TimelineMessageQuery {
         group_id_hex: Some(group_id_hex.clone()),
@@ -7842,7 +7944,9 @@ async fn app_runtime_timeline_subscription_paginates_backwards_through_real_stor
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let group_id_hex = hex::encode(group_id.as_slice());
 
     // Five messages, oldest to newest. (Intra-second `timeline_at` ties are
@@ -8032,7 +8136,9 @@ async fn accepted_disband_finishes_for_both_members_without_followup_commands() 
     let group_id = runtime
         .create_group(&alice_id, "closure", std::slice::from_ref(&bob_id), None)
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     wait_for_event(&mut events, |event| {
         matches!(event, MarmotAppEvent::GroupJoined { account_id_hex, group_id: joined, .. }
             if account_id_hex == &bob_id && joined == &group_id)
@@ -8110,7 +8216,12 @@ async fn relay_app_runtime_exchanges_messages_without_lab() {
     bob.publish_key_package().await.unwrap();
 
     let mut alice = app.client("alice").await.unwrap();
-    let group_id = alice.create_group("general", &["bob"]).await.unwrap();
+    let group_id = alice
+        .create_group("general", &["bob"])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
 
     let joined = bob.sync().await.unwrap();
     assert_eq!(joined.joined_groups, vec![group_id.clone()]);
@@ -8152,7 +8263,9 @@ async fn self_removal_suppresses_account_unread_while_peer_removal_advances_it()
     let group_id = alice
         .create_group("departures", &["bob", "carol"])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     bob.sync().await.unwrap();
     carol.sync().await.unwrap();
 
@@ -8264,7 +8377,12 @@ async fn local_leave_suppresses_account_unread_total() {
     bob.publish_key_package().await.unwrap();
 
     let mut alice = app.client("alice").await.unwrap();
-    let group_id = alice.create_group("departures", &["bob"]).await.unwrap();
+    let group_id = alice
+        .create_group("departures", &["bob"])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     bob.sync().await.unwrap();
 
     // Account attention excludes invitations until explicitly accepted.
@@ -8353,7 +8471,9 @@ async fn pending_leave_request_survives_a_cold_launch() {
     let group_id = alice
         .create_group("pending departures", &["bob"])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     bob.sync().await.unwrap();
     let group_id_hex = hex::encode(group_id.as_slice());
 
@@ -8454,7 +8574,12 @@ async fn open_backfill_preserves_unread_for_still_member_account() {
     bob.publish_key_package().await.unwrap();
 
     let mut alice = app.client("alice").await.unwrap();
-    let group_id = alice.create_group("backfill", &["bob"]).await.unwrap();
+    let group_id = alice
+        .create_group("backfill", &["bob"])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     bob.sync().await.unwrap();
 
     // Account attention excludes invitations until explicitly accepted.
@@ -8532,7 +8657,12 @@ async fn unresolved_send_keeps_local_message_read_marker_and_inbound_unread() {
     bob.publish_key_package().await.unwrap();
 
     let mut alice = app.client("alice").await.unwrap();
-    let group_id = alice.create_group("markers", &["bob"]).await.unwrap();
+    let group_id = alice
+        .create_group("markers", &["bob"])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     bob.sync().await.unwrap();
 
     // Account attention excludes invitations until explicitly accepted.
@@ -8681,7 +8811,12 @@ async fn relay_app_runtime_publishes_member_leave() {
     bob.publish_key_package().await.unwrap();
 
     let mut alice = app.client("alice").await.unwrap();
-    let group_id = alice.create_group("departures", &["bob"]).await.unwrap();
+    let group_id = alice
+        .create_group("departures", &["bob"])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     bob.sync().await.unwrap();
 
     let leave = bob.leave_group(&group_id).await.unwrap();
@@ -8745,11 +8880,21 @@ async fn relay_app_runtime_synthesizes_system_row_for_own_invite() {
     carol.publish_key_package().await.unwrap();
 
     let mut alice = app.client("alice").await.unwrap();
-    let group_id = alice.create_group("ops", &["bob"]).await.unwrap();
+    let group_id = alice
+        .create_group("ops", &["bob"])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
 
     // Own action: alice invites carol post-creation. The confirmed commit
     // synthesizes a kind-1210 member_added row in alice's own timeline.
-    alice.invite_members(&group_id, &["carol"]).await.unwrap();
+    alice
+        .invite_members(&group_id, &["carol"])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
 
     let alice_timeline = MarmotApp::with_relay(dir.path(), url)
         .timeline_messages_with_query(
@@ -8784,7 +8929,12 @@ async fn relay_app_runtime_synthesizes_system_row_for_retention_change() {
 
     let alice_id = home.account("alice").unwrap().account_id_hex;
     let mut alice = app.client("alice").await.unwrap();
-    let group_id = alice.create_group("ops", &["bob"]).await.unwrap();
+    let group_id = alice
+        .create_group("ops", &["bob"])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     bob.sync().await.unwrap();
 
     alice.update_message_retention(&group_id, 60).await.unwrap();
@@ -8881,7 +9031,9 @@ async fn app_runtime_retention_sweep_prunes_with_the_supplied_clock() {
     let group_id = alice
         .create_group("retention sweep", &["bob"])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     alice.update_message_retention(&group_id, 60).await.unwrap();
     alice
         .send(&group_id, b"expire through runtime")
@@ -8924,12 +9076,22 @@ async fn relay_app_runtime_synthesizes_initial_retention_row_on_join() {
 
     let alice_id = home.account("alice").unwrap().account_id_hex;
     let mut alice = app.client("alice").await.unwrap();
-    let group_id = alice.create_group("ops", &["bob"]).await.unwrap();
+    let group_id = alice
+        .create_group("ops", &["bob"])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     bob.sync().await.unwrap();
     alice.update_message_retention(&group_id, 60).await.unwrap();
     bob.sync().await.unwrap();
 
-    alice.invite_members(&group_id, &["carol"]).await.unwrap();
+    alice
+        .invite_members(&group_id, &["carol"])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     carol.sync().await.unwrap();
 
     let carol_timeline = MarmotApp::with_relay(dir.path(), url)
@@ -8983,14 +9145,21 @@ async fn relay_app_runtime_synthesizes_rows_for_multi_member_invite() {
     }
 
     let mut alice = app.client("alice").await.unwrap();
-    let group_id = alice.create_group("ops", &["bob"]).await.unwrap();
+    let group_id = alice
+        .create_group("ops", &["bob"])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
 
     // One commit invites two members, so two member_added rows must both persist
     // — previously they collided on the unique source index and one was dropped.
     alice
         .invite_members(&group_id, &["carol", "dave"])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
 
     let alice_timeline = MarmotApp::with_relay(dir.path(), url)
         .timeline_messages_with_query(
@@ -9028,7 +9197,12 @@ async fn relay_app_runtime_projects_typed_reactions_and_deletes() {
     bob.publish_key_package().await.unwrap();
 
     let mut alice = app.client("alice").await.unwrap();
-    let group_id = alice.create_group("updates", &["bob"]).await.unwrap();
+    let group_id = alice
+        .create_group("updates", &["bob"])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     bob.sync().await.unwrap();
 
     let sent = alice
@@ -9179,7 +9353,12 @@ async fn relay_app_runtime_creates_default_agent_text_stream_group() {
     bob.publish_key_package().await.unwrap();
 
     let mut alice = app.client("alice").await.unwrap();
-    let group_id = alice.create_group("agent", &["bob"]).await.unwrap();
+    let group_id = alice
+        .create_group("agent", &["bob"])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let group_id_hex = hex::encode(group_id.as_slice());
 
     let alice_group = app.group("alice", &group_id_hex).unwrap().unwrap();
@@ -9246,7 +9425,9 @@ async fn tagged_upload_and_text_reach_peer() {
     let group = runtime
         .create_group(a, "tagged", std::slice::from_ref(b), None)
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     wait_for_event(&mut events, |event| matches!(event, MarmotAppEvent::GroupJoined { account_id_hex, group_id, .. } if account_id_hex == b && group_id == &group)).await;
     accept_group_invite_retrying_busy(&runtime, b, &group)
         .await
@@ -9324,7 +9505,12 @@ async fn encrypted_media_upload_sends_ciphertext_and_download_decrypts_plaintext
     bob.publish_key_package().await.unwrap();
 
     let mut alice = app.client("alice").await.unwrap();
-    let group_id = alice.create_group("media", &["bob"]).await.unwrap();
+    let group_id = alice
+        .create_group("media", &["bob"])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     bob.sync().await.unwrap();
     let group_state = alice.group_mls_state(&group_id).unwrap();
     assert!(
@@ -9575,7 +9761,9 @@ async fn retained_media_rehydrates_a_retired_current_epoch_before_the_group_adva
     let group_id = alice
         .create_group("retired media epoch", &["bob"])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let group_id_hex = hex::encode(group_id.as_slice());
     bob.sync().await.unwrap();
     // Keep automatic wall-clock pruning out of this regression: relay sync
@@ -9718,7 +9906,9 @@ async fn sweep_keeps_unread_message_in_read_marker_wall_second() {
     let group_id = alice
         .create_group("read cursor retention", &["bob"])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let group_id_hex = hex::encode(group_id.as_slice());
     bob.sync().await.unwrap();
     alice
@@ -9861,7 +10051,9 @@ async fn encrypted_media_endpoint_updates_are_full_replacement_and_admin_only() 
     let group_id = alice
         .create_group("media endpoints", &["bob"])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let group_id_hex = hex::encode(group_id.as_slice());
     bob.sync().await.unwrap();
 
@@ -9950,7 +10142,12 @@ async fn a_neutral_deployment_creates_text_only_groups_and_refuses_group_images(
     bob.publish_key_package().await.unwrap();
 
     let mut alice = app.client("alice").await.unwrap();
-    let group_id = alice.create_group("text only", &["bob"]).await.unwrap();
+    let group_id = alice
+        .create_group("text only", &["bob"])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let group = app
         .group("alice", &hex::encode(group_id.as_slice()))
         .unwrap()
@@ -10009,7 +10206,9 @@ async fn upload_media_errors_when_policy_has_no_blossom_endpoint() {
     let group_id = alice
         .create_group("non-blossom media", &["bob"])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     bob.sync().await.unwrap();
 
     // Replace the default Blossom policy with one that serves only a non-Blossom
@@ -10068,7 +10267,12 @@ async fn relay_app_runtime_reopens_account_state() {
     bob.publish_key_package().await.unwrap();
 
     let mut alice = app.client("alice").await.unwrap();
-    let group_id = alice.create_group("restart", &["bob"]).await.unwrap();
+    let group_id = alice
+        .create_group("restart", &["bob"])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     assert!(bob.sync().await.unwrap().joined_groups.contains(&group_id));
     drop(alice);
     drop(bob);
@@ -10915,7 +11119,9 @@ async fn nip30_emoji_media_and_reaction_reach_peer() {
     let group = runtime
         .create_group(a, "emoji", std::slice::from_ref(b), None)
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     wait_for_event(&mut events, |event| matches!(event, MarmotAppEvent::GroupJoined { account_id_hex, group_id, .. } if account_id_hex == b && group_id == &group)).await;
     accept_group_invite_retrying_busy(&runtime, b, &group)
         .await
@@ -11490,7 +11696,12 @@ async fn account_storage_records_received_messages() {
     bob.publish_key_package().await.unwrap();
 
     let mut alice = app.client("alice").await.unwrap();
-    let group_id = alice.create_group("messages", &["bob"]).await.unwrap();
+    let group_id = alice
+        .create_group("messages", &["bob"])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let alice_groups = app.groups("alice").unwrap();
     assert_eq!(alice_groups[0].profile.component_id, 0x8001);
     assert_eq!(alice_groups[0].profile.component, "marmot.group.profile.v1");
@@ -12010,7 +12221,9 @@ async fn app_runtime_sign_out_and_wipe_leaves_pending_confirmation_groups() {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     wait_for_event(&mut events, |event| {
         matches!(
             event,
@@ -12964,7 +13177,9 @@ async fn runtime_records_app_checkpoint_and_separate_broadcast_outcomes_for_rece
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     wait_for_event(&mut events, |event| {
         matches!(event, MarmotAppEvent::GroupJoined { account_id_hex, group_id: joined, .. }
             if account_id_hex == &bob.account.account_id_hex && joined == &group_id)
@@ -13180,7 +13395,9 @@ async fn explicit_shutdown_during_startup_hydration_records_clean_audit_stop() {
     client
         .create_group("stored hydration group", &[])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     drop(client);
 
     let app = MarmotApp::with_relay_and_config(
@@ -13247,7 +13464,9 @@ async fn create_group_returns_before_blocked_founding_welcome() {
     )
     .await
     .expect("create_group must return while a founding Welcome is still blocked")
-    .unwrap();
+    .unwrap()
+    .operation
+    .expect("eligible fixture members");
 
     timeout(Duration::from_secs(5), gate.wait_for_blocked(1))
         .await
@@ -13432,7 +13651,9 @@ async fn direct_reuse_preserves_roles() {
         let group_id = runtime
             .create_group(alice_id, name, std::slice::from_ref(bob_id), None)
             .await
-            .unwrap();
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         wait_for_event(&mut events, |event| {
             matches!(
                 event,
@@ -13662,7 +13883,9 @@ async fn create_group_detailed_returns_durable_emitted_chat_list_row() {
     )
     .await
     .expect("detailed create must return before Welcome fanout")
-    .unwrap();
+    .unwrap()
+    .operation
+    .expect("eligible fixture members");
 
     assert_eq!(
         created.chat_list_row.group_id_hex,
@@ -13769,7 +13992,9 @@ async fn create_group_post_canonical_projection_crash_recovers_visibility_and_we
             None,
         )
         .await
-        .expect("the compatibility API must preserve post-canonical success");
+        .expect("the compatibility API must preserve post-canonical success")
+        .operation
+        .expect("eligible fixture members");
     assert!(
         app.groups(&alice.account.label)
             .unwrap()
@@ -13840,7 +14065,9 @@ async fn invite_members_returns_before_blocked_welcome() {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     wait_for_event(&mut events, |event| {
         matches!(
             event,
@@ -13861,7 +14088,9 @@ async fn invite_members_returns_before_blocked_welcome() {
     )
     .await
     .expect("invite_members must return while a Welcome is still blocked")
-    .unwrap();
+    .unwrap()
+    .operation
+    .expect("eligible fixture members");
 
     timeout(Duration::from_secs(5), gate.wait_for_blocked(1))
         .await
@@ -13945,7 +14174,9 @@ async fn invite_deferred_during_startup_keeps_projection_reads_off_welcome_fanou
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     wait_for_event(&mut events, |event| {
         matches!(
             event,
@@ -14081,7 +14312,9 @@ async fn invite_members_survives_injected_post_canonical_failure(config: MarmotA
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     wait_for_event(&mut events, |event| {
         matches!(
             event,
@@ -14102,7 +14335,9 @@ async fn invite_members_survives_injected_post_canonical_failure(config: MarmotA
     )
     .await
     .expect("invite_members must return while a Welcome is still blocked")
-    .expect("canonical invite must not tell the caller to retry after a post-confirm failure");
+    .expect("canonical invite must not tell the caller to retry after a post-confirm failure")
+    .operation
+    .expect("eligible fixture members");
 
     timeout(Duration::from_secs(5), gate.wait_for_blocked(1))
         .await
@@ -14162,7 +14397,9 @@ async fn invite_members_with_initial_admins_grants_admin_in_one_epoch() {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     wait_for_event(&mut events, |event| {
         matches!(
             event,
@@ -14184,9 +14421,12 @@ async fn invite_members_with_initial_admins_grants_admin_in_one_epoch() {
             &group_id,
             std::slice::from_ref(&carol_id),
             std::slice::from_ref(&carol_id),
+            marmot_app::MemberResolutionPolicy::Partial,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
 
     let roster = runtime.group_roster(&alice_id, &group_id).await.unwrap();
     assert_eq!(
@@ -14272,7 +14512,9 @@ async fn founding_welcome_resumes_exactly_once_after_restart() {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let pending = timeout(Duration::from_secs(5), async {
         loop {
             let pending = runtime.pending_welcome_deliveries(&alice_id).await.unwrap();
@@ -14367,7 +14609,9 @@ async fn confirmed_invite_welcome_resumes_after_restart() {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     wait_for_event(&mut events, |event| {
         matches!(
             event,
@@ -14381,7 +14625,9 @@ async fn confirmed_invite_welcome_resumes_after_restart() {
     runtime
         .invite_members(&alice_id, &group_id, std::slice::from_ref(&carol_id))
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     timeout(Duration::from_secs(5), async {
         loop {
             if !runtime
@@ -14529,7 +14775,9 @@ async fn resolved_inbox_route_survives_restart_and_delivers_exact_welcome() {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     wait_for_event(&mut events, |event| {
         matches!(
             event,
@@ -14571,7 +14819,9 @@ async fn resolved_inbox_route_survives_restart_and_delivers_exact_welcome() {
     runtime
         .invite_members(&alice_id, &group_id, std::slice::from_ref(&carol_id))
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     wait_for_event(&mut restarted_events, |event| {
         matches!(
             event,
@@ -14696,7 +14946,9 @@ async fn outbox_resolved_inbox_survives_restart_and_delivers_exact_welcome() {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     wait_for_event(&mut events, |event| {
         matches!(
             event,
@@ -14738,7 +14990,9 @@ async fn outbox_resolved_inbox_survives_restart_and_delivers_exact_welcome() {
     runtime
         .invite_members(&alice_id, &group_id, std::slice::from_ref(&carol_id))
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     wait_for_event(&mut restarted_events, |event| {
         matches!(
             event,
@@ -14893,7 +15147,9 @@ async fn independent_sender_outbox_invite_survives_restart(stale_discovery: bool
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     assert!(
         sender
             .directory()
@@ -14958,7 +15214,9 @@ async fn independent_sender_outbox_invite_survives_restart(stale_discovery: bool
     sender_runtime
         .invite_members(&alice_id, &group_id, std::slice::from_ref(&carol_id))
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     wait_for_event(&mut receiver_events, |event| {
         matches!(event, MarmotAppEvent::GroupJoined { account_id_hex, group_id: joined_group, .. }
             if account_id_hex == &carol_id && joined_group == &group_id)
@@ -15044,7 +15302,9 @@ async fn app_runtime_exposes_welcome_redelivery_surface() {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
 
     // The welcome delivered over the live relay, so nothing is queued...
     assert!(
@@ -15106,7 +15366,9 @@ async fn concurrent_leaves_report_already_requested_not_an_opaque_error() {
     let group_id = runtime
         .create_group(&alice_id, "double tap", std::slice::from_ref(&bob_id), None)
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     wait_for_event(&mut events, |event| {
         matches!(
             event,
@@ -15201,7 +15463,9 @@ async fn convergence_settles_across_generations_with_mid_window_queued_sends() {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     wait_for_event(&mut events, |event| {
         matches!(
             event,
@@ -16821,7 +17085,9 @@ async fn race_two_admin_profile_edits(
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     // Both invitees join concurrently, in either order: waiting for one at a
     // time would consume and drop the other's `GroupJoined`.
     let mut awaiting_join: std::collections::HashSet<String> =
@@ -17054,7 +17320,9 @@ async fn peer_leave_is_committed_by_remaining_runtimes_without_manual_retry() {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     // Either recipient can join first; do not discard the other recipient's event.
     let mut awaiting = std::collections::HashSet::from([bob_id.clone(), carol_id.clone()]);
     while !awaiting.is_empty() {
@@ -17222,7 +17490,9 @@ async fn user_blocks_dm_history_send_gate_and_invite_admission() {
     let group = runtime
         .create_group(&alice, "", std::slice::from_ref(&bob), None)
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     accept_group_invite_retrying_busy(&runtime, &bob, &group)
         .await
         .unwrap();
@@ -17250,7 +17520,9 @@ async fn user_blocks_dm_history_send_gate_and_invite_admission() {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     timeout(Duration::from_secs(5), async {
         while runtime
             .chat_list_row(&alice, &hex::encode(pending.as_slice()))
@@ -17340,7 +17612,9 @@ async fn user_blocks_dm_history_send_gate_and_invite_admission() {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     sleep(Duration::from_millis(500)).await;
     assert!(
         runtime
@@ -17425,7 +17699,9 @@ async fn user_blocks_shared_group_keeps_protocol_and_other_participants_live() {
     let group = runtime
         .create_group(alice, "shared group", &accounts[1..], None)
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     accept_group_invite_retrying_busy(&runtime, bob, &group)
         .await
         .unwrap();
@@ -17527,7 +17803,12 @@ async fn moderation_report_wraps_reach_only_the_reports_relay_and_leave_group_re
     let mut bob = app.client("bob").await.unwrap();
     bob.publish_key_package().await.unwrap();
     let mut alice = app.client("alice").await.unwrap();
-    let group = alice.create_group("review room", &["bob"]).await.unwrap();
+    let group = alice
+        .create_group("review room", &["bob"])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     bob.sync().await.unwrap();
     let sent = bob.send(&group, b"content under review").await.unwrap();
     let target = &sent.message_ids[0];
@@ -17635,7 +17916,12 @@ async fn encrypted_reports_and_individual_dismissals_do_not_create_chat_rows() {
     let mut bob = app.client("bob").await.unwrap();
     bob.publish_key_package().await.unwrap();
     let mut alice = app.client("alice").await.unwrap();
-    let group = alice.create_group("review room", &["bob"]).await.unwrap();
+    let group = alice
+        .create_group("review room", &["bob"])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     bob.sync().await.unwrap();
     let sent = bob.send(&group, b"content under review").await.unwrap();
     let target = &sent.message_ids[0];
@@ -17785,7 +18071,9 @@ async fn live_report_indicator_uses_existing_timeline_subscription() {
     let group = runtime
         .create_group(&a, "reports", std::slice::from_ref(&b), None)
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     wait_for_event(&mut events,|e|matches!(e,MarmotAppEvent::GroupJoined{account_id_hex,group_id,..} if account_id_hex==&b && group_id==&group)).await;
     accept_group_invite_retrying_busy(&runtime, &b, &group)
         .await
@@ -17882,7 +18170,9 @@ async fn offline_member_recovers_dismissal_label_after_admin_demotion() {
     let group = alice
         .create_group(&a, "review room", &[b.clone(), c.clone()], None)
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     wait_for_event(
         &mut bob_events,
         |event| matches!(event,MarmotAppEvent::GroupJoined{group_id,..} if group_id==&group),

@@ -56,7 +56,9 @@ async fn comparison_result_waits_for_worker_submission_before_durable_admission(
             },
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     timeout(Duration::from_secs(10), async {
         loop {
             runtime.catch_up_accounts().await.unwrap();

@@ -376,7 +376,7 @@ pub(crate) enum AccountWorkerCommand {
         queued_at: Instant,
         request: GroupCreationRequest,
         options: AppCreateGroupOptions,
-        respond: oneshot::Sender<Result<CanonicalCreatedGroup, AppError>>,
+        respond: oneshot::Sender<Result<crate::GroupMemberResult<CanonicalCreatedGroup>, AppError>>,
     },
     StagePreparedGroupImage {
         plaintext: Vec<u8>,
@@ -471,7 +471,8 @@ pub(crate) enum AccountWorkerCommand {
         group_id: GroupId,
         members: Vec<String>,
         initial_admins: Vec<String>,
-        respond: oneshot::Sender<Result<SendSummary, AppError>>,
+        member_resolution: crate::MemberResolutionPolicy,
+        respond: oneshot::Sender<Result<crate::GroupMemberResult<SendSummary>, AppError>>,
     },
     RemoveMembers {
         group_id: GroupId,
@@ -2742,8 +2743,8 @@ async fn run_app_runtime_account_worker(
                     }
                 };
             }
-            _ = attachment_admission.ready(), if attachment_admission.is_waiting() => {
-                attachment_due = true;
+            more = attachment_admission.ready(), if attachment_admission.is_waiting() => {
+                attachment_due |= more;
             }
             _ = tokio::task::yield_now(), if attachment_due => {
                 if lifecycle.is_stopping() { continue 'worker; }
@@ -5024,7 +5025,10 @@ fn account_worker_command_future<'a>(
                                 shared,
                                 storage_permit.as_ref(),
                                 respond,
-                                Ok(created),
+                                Ok(crate::GroupMemberResult {
+                                    operation: Some(created),
+                                    member_outcomes: Vec::new(),
+                                }),
                             );
                             return true;
                         }
@@ -5046,6 +5050,7 @@ fn account_worker_command_future<'a>(
                         Ok(None) => {}
                     }
                     options.initial_admins = vec![peer_account_id_hex.clone()];
+                    options.member_resolution = nostr_directory::MemberResolutionPolicy::Atomic;
                     (String::new(), vec![peer_account_id_hex], None)
                 }
             };
@@ -5074,10 +5079,16 @@ fn account_worker_command_future<'a>(
                 }
             };
             let response_handoff_started_at = Instant::now();
-            if let Ok(created_group) = &result {
+            if let Ok(crate::GroupMemberResult {
+                operation: Some(created_group),
+                ..
+            }) = &result
+            {
                 publish_created_group(events, account_id_hex, account_label, created_group);
             }
-            let created = result.is_ok();
+            let created = result
+                .as_ref()
+                .is_ok_and(|result| result.operation.is_some());
             let response_sent =
                 respond_diagnosed(shared, storage_permit.as_ref(), respond, result).is_ok();
             telemetry.record(
@@ -5512,6 +5523,7 @@ fn account_worker_command_future<'a>(
             group_id,
             members,
             initial_admins,
+            member_resolution,
             respond,
         } => Box::pin(async move {
             let invite_unit = unit.enter(WorkerUnit::InviteOrCreate);
@@ -5523,12 +5535,20 @@ fn account_worker_command_future<'a>(
                     .map(String::as_str)
                     .collect::<Vec<_>>();
                 client
-                    .invite_members_with_telemetry(&group_id, &member_refs, &admin_refs, &telemetry)
+                    .invite_members_with_telemetry(
+                        &group_id,
+                        &member_refs,
+                        &admin_refs,
+                        member_resolution,
+                        &telemetry,
+                    )
                     .await
             }
             .await;
-            let canonical = result.as_ref().is_ok_and(|summary| {
-                summary.accept_disposition == cgka_traits::SendAcceptDisposition::Published
+            let canonical = result.as_ref().is_ok_and(|result| {
+                result.operation.as_ref().is_some_and(|summary| {
+                    summary.accept_disposition == cgka_traits::SendAcceptDisposition::Published
+                })
             });
             if canonical {
                 publish_client_pending_projection_updates(
@@ -8687,7 +8707,9 @@ mod tests {
                 None,
             )
             .await
-            .unwrap();
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         let second = runtime
             .create_group(
                 "alice",
@@ -8696,7 +8718,9 @@ mod tests {
                 None,
             )
             .await
-            .unwrap();
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         runtime.catch_up_accounts().await.unwrap();
         let commands = runtime.accounts().worker_commands("bob").await.unwrap();
         runtime
@@ -8818,7 +8842,9 @@ mod tests {
         let group_id = client
             .create_group("recovery notifications", &[])
             .await
-            .unwrap();
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         let epoch = client.runtime.group_record(&group_id).unwrap().epoch;
         let (events, mut received) = broadcast::channel(16);
         publish_client_pending_projection_updates(
@@ -8920,7 +8946,12 @@ mod tests {
         let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
             .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
         let mut client = app.client("alice").await.unwrap();
-        let group_id = client.create_group("history notices", &[]).await.unwrap();
+        let group_id = client
+            .create_group("history notices", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         let epoch = client.runtime.group_record(&group_id).unwrap().epoch.0;
         let storage = app.account_storage("alice").unwrap();
         let arm = |epoch| {
@@ -9966,7 +9997,12 @@ mod tests {
         let app =
             MarmotApp::with_relay(dir.path(), "wss://relay.example").with_test_relay_client(relay);
         let mut client = app.client(&account.label).await.unwrap();
-        let group = client.create_group("held snapshot", &[]).await.unwrap();
+        let group = client
+            .create_group("held snapshot", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         let group_hex = hex::encode(group.as_slice());
         let epoch = client.runtime.epoch_state(&group).unwrap().epoch().0;
         // Owed once the group's epoch passes the current one.
@@ -10019,7 +10055,12 @@ mod tests {
         let app =
             MarmotApp::with_relay(dir.path(), "wss://relay.example").with_test_relay_client(relay);
         let mut client = app.client(&account.label).await.unwrap();
-        let group = client.create_group("periodic announce", &[]).await.unwrap();
+        let group = client
+            .create_group("periodic announce", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         let group_hex = hex::encode(group.as_slice());
         // The device can fetch and has settled, so it announces as soon as
         // it owes one.
@@ -10063,7 +10104,12 @@ mod tests {
         let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
             .with_test_relay_client(relay.clone());
         let mut client = app.client(&account.label).await.unwrap();
-        client.create_group("push retry", &[]).await.unwrap();
+        client
+            .create_group("push retry", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         app.set_native_push_enabled(&account.label, true).unwrap();
         app.upsert_push_registration(
             &account.label,

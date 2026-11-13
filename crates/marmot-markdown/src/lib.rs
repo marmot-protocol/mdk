@@ -77,7 +77,9 @@ pub fn classify_link_destination(destination: &str) -> LinkDestinationKind {
 /// failed candidates fall back to ordinary Markdown without discarding text.
 ///
 /// Nostr HRPs are `npub`, `note`, `nevent`, `nprofile`, `naddr` and `nrelay`.
-/// Bech32 validation checks shape, not checksums. Private-key entities never
+/// [`Inline::NostrUri`] covers `nostr:` URIs and checksum-valid bare `note`,
+/// `nevent` and `naddr` references. Bare `npub` mentions and prefixed URIs check
+/// shape only; recognition does not validate event payloads. Private-key entities never
 /// become ergonomic Nostr references; explicit destinations containing them
 /// are preserved with [`LinkDestinationKind::Sensitive`].
 pub fn parse(input: &str) -> Document {

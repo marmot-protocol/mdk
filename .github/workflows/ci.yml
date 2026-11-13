@@ -520,6 +520,9 @@ jobs:
       - name: Verify Swift subscription cancellation against native futures
         run: bash crates/marmot-uniffi/subscription-cancellation-smoke.sh
 
+      - name: Verify native MarmotKit host lifecycle
+        run: bash crates/marmot-uniffi/native-host-smoke.sh
+
   # The broader integration matrix explicitly enables test-policy-overrides.
   # This focused default-feature job proves ordinary debug/release consumers
   # reject every non-v1 convergence policy (mdk#970).

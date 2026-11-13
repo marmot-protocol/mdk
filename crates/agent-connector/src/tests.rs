@@ -1096,7 +1096,9 @@ async fn stream_store_evicts_idle() {
     let group = runtime
         .create_group(&account.account.account_id_hex, "idle streams", &[], None)
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("fixture group is created");
     let store = StreamSessionStore::default();
     for (id, age) in [(0xaa, 3600), (0xbb, 0)] {
         let publisher = runtime
@@ -1164,7 +1166,9 @@ async fn stream_store_sweep_spares_sealed_session() {
     let group = runtime
         .create_group(&account.account.account_id_hex, "sealed streams", &[], None)
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("fixture group is created");
     let publisher = runtime
         .open_agent_publisher(
             account.account.account_id_hex.clone(),
@@ -1884,7 +1888,9 @@ async fn connector_edit_message_replaces_own_text_and_reports_refusals() {
     let group_id = setup_runtime
         .create_group(&agent.account.account_id_hex, "agent status", &[], None)
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("fixture group is created");
     setup_runtime.shutdown().await;
 
     let account_id_hex = agent.account.account_id_hex.clone();
@@ -2011,7 +2017,9 @@ async fn connector_socket_subscribes_to_inbound_messages() {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("fixture group is created");
     accept_group_invite_retrying_busy(&setup_runtime, &human.account.account_id_hex, &group_id)
         .await;
     setup_runtime.shutdown().await;
@@ -2915,7 +2923,9 @@ async fn connector_policy_accepts_allowed_welcomer() {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("fixture group is created");
     let group_id_hex = hex::encode(group_id.as_slice());
     wait_for_group_state(&agent_app, &agent.account.label, &group_id_hex, |group| {
         !group.pending_confirmation && !group.archived
@@ -2974,7 +2984,9 @@ async fn connector_policy_declines_unlisted_welcomer() {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("fixture group is created");
     let group_id_hex = hex::encode(group_id.as_slice());
     wait_for_group_state(&agent_app, &agent.account.label, &group_id_hex, |group| {
         !group.pending_confirmation && group.archived
@@ -3043,7 +3055,9 @@ async fn connector_policy_any_authenticated_direct_accepts_unlisted_direct_welco
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("fixture group is created");
     let group_id_hex = hex::encode(group_id.as_slice());
     wait_for_group_state(&agent_app, &agent.account.label, &group_id_hex, |group| {
         !group.pending_confirmation && !group.archived
@@ -3120,7 +3134,9 @@ async fn assert_multiparty_invite_policy(policy: AgentControlInvitePolicy, expec
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("fixture group is created");
     let group_id_hex = hex::encode(group_id.as_slice());
     wait_for_group_state(&agent_app, &agent.account.label, &group_id_hex, |group| {
         !group.pending_confirmation && group.archived == expect_archived
@@ -3956,7 +3972,9 @@ async fn connector_socket_sends_final_message() {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("fixture group is created");
     setup_runtime.shutdown().await;
 
     let group_id_hex = hex::encode(group_id.as_slice());
@@ -4133,7 +4151,9 @@ async fn group_info_reads_current_chat_list_group_name_without_using_title() {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("fixture group is created");
     let unnamed_group = setup_runtime
         .create_group(
             &agent.account.account_id_hex,
@@ -4142,7 +4162,9 @@ async fn group_info_reads_current_chat_list_group_name_without_using_title() {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("fixture group is created");
     let other_group = setup_runtime
         .create_group(
             &other_agent.account.account_id_hex,
@@ -4151,7 +4173,9 @@ async fn group_info_reads_current_chat_list_group_name_without_using_title() {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("fixture group is created");
     setup_runtime.shutdown().await;
 
     let named_group_hex = hex::encode(named_group.as_slice());
@@ -4304,7 +4328,9 @@ async fn connector_socket_composes_and_finalizes_stream_without_quic_candidates(
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("fixture group is created");
     setup_runtime.shutdown().await;
 
     let group_id_hex = hex::encode(group_id.as_slice());
@@ -4668,7 +4694,9 @@ async fn connector_socket_finalize_mismatch_keeps_stream_session_retryable() {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("fixture group is created");
     setup_runtime.shutdown().await;
 
     let group_id_hex = hex::encode(group_id.as_slice());
@@ -4833,7 +4861,9 @@ async fn connector_finish_reuses_receipt() {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("fixture group is created");
     setup_runtime.shutdown().await;
 
     let group_id_hex = hex::encode(group_id.as_slice());
@@ -5031,7 +5061,9 @@ async fn connector_socket_cancels_stream_session() {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("fixture group is created");
     setup_runtime.shutdown().await;
 
     let group_id_hex = hex::encode(group_id.as_slice());
@@ -5279,7 +5311,9 @@ async fn setup_existing_pending_invite(group_name: &str) -> ExistingPendingInvit
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("fixture group is created");
     let group_id_hex = hex::encode(group_id.as_slice());
     wait_for_group_state(&app, &agent.account.label, &group_id_hex, |group| {
         group.pending_confirmation && !group.archived
@@ -5865,7 +5899,9 @@ async fn replay_missed_inbound_recovers_dropped_messages_and_dedups() {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("fixture group is created");
     setup_runtime.shutdown().await;
     let group_id_hex = hex::encode(group_id.as_slice());
 
@@ -6192,7 +6228,9 @@ async fn concurrent_send_final_with_repeated_idempotency_key_sends_once() {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("fixture group is created");
     setup_runtime.shutdown().await;
     let group_id_hex = hex::encode(group_id.as_slice());
 
@@ -7184,7 +7222,9 @@ async fn bench_idle_reconciliation_scaling() {
                 None,
             )
             .await
-            .unwrap();
+            .unwrap()
+            .operation
+            .expect("fixture group is created");
         accept_group_invite_retrying_busy(&setup_runtime, &agent.account.account_id_hex, &group_id)
             .await;
         group_ids.push(group_id);
@@ -7530,6 +7570,29 @@ async fn connector_socket_creates_group_with_member_refs_and_relay_override() {
         peer.account_id_hex.clone(),
         marmot_app::npub_for_account_id(&peer.account_id_hex).unwrap(),
     ];
+    let unavailable = connector
+        .account_home
+        .create_account("unavailable")
+        .unwrap();
+    let rejected = serve_control_request_once(
+        &connector,
+        &listener,
+        &socket,
+        "atomic-create",
+        AgentControlRequest::GroupCreate {
+            account_id_hex: agent.account_id_hex.clone(),
+            name: "Atomic control request".into(),
+            members: vec![peer.label.clone(), unavailable.label],
+            description: None,
+            relays: None,
+        },
+    )
+    .await;
+    assert!(matches!(
+        rejected.payload,
+        AgentControlResponse::Error { code, .. } if code == "app_error"
+    ));
+    assert!(connector.app.groups(&agent.label).unwrap().is_empty());
     for (index, member_ref) in member_refs.into_iter().enumerate() {
         let relays = (index == 1).then(|| vec![alternate_url.clone()]);
         let response = serve_control_request_once(
@@ -7615,7 +7678,9 @@ async fn connector_socket_creates_group_with_member_refs_and_relay_override() {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("fixture group is created");
     assert!(matches!(
         connector
             .group_info_response(&agent.account_id_hex, &hex::encode(other.as_slice()))
@@ -7706,7 +7771,9 @@ async fn connector_group_profile_update_preserves_fields_and_requires_current_ad
             Some("Keep this description".into()),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("fixture group is created");
     let group_id_hex = hex::encode(group_id.as_slice());
     let listener = bind_connector_socket(&socket).unwrap();
 
@@ -9120,7 +9187,9 @@ async fn group_admin_checks_authority_changes_membership_and_reads_back() {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("fixture group is created");
     let group = hex::encode(id.as_slice());
     let change = |promote, add, remove| GroupAdminChange {
         promote,
@@ -9188,6 +9257,21 @@ async fn group_admin_checks_authority_changes_membership_and_reads_back() {
         .await
         .unwrap_err();
     assert_eq!(error.code(), "invalid_hex");
+    let unavailable_home = tempfile::tempdir().unwrap();
+    let unavailable = marmot_account::AccountHome::open(unavailable_home.path())
+        .create_account("unpublished")
+        .unwrap()
+        .account_id_hex;
+    let error = status(agent_id, &unavailable, change(false, true, false))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), "app_error");
+    assert_eq!(
+        status(agent_id, &unavailable, change(false, false, false))
+            .await
+            .unwrap(),
+        (false, false, 0)
+    );
     // Read-only query, promotion, and an idempotent repeat.
     assert_eq!(
         status(agent_id, peer_id, change(false, false, false))

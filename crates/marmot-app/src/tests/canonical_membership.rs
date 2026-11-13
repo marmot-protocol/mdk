@@ -182,7 +182,9 @@ async fn real_departure_then_disband_projects_after_mls_deletion() {
             &[&bob_account.account_id_hex, &carol_account.account_id_hex],
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let group_hex = hex::encode(group.as_slice());
     let mut alice_cursor = 0;
     let mut bob_cursor = 0;
@@ -382,7 +384,9 @@ async fn late_competing_commit_cannot_restore_terminal_app_copy() {
             &[&bob_account.account_id_hex, &carol_account.account_id_hex],
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let group_hex = hex::encode(group.as_slice());
     let mut bob_cursor = 0;
     let mut carol_cursor = 0;
@@ -604,7 +608,9 @@ async fn sibling_selfremove_through_author_command(profile_command: bool) {
     let group = alice
         .create_group("sibling departure", &[&bob.account_id_hex])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     deliver_new(&mut bob_client, &relay, &mut bob_cursor).await;
     bob_client.sync().await.unwrap();
     bob_client.accept_group_invite(&group).unwrap();
@@ -919,7 +925,12 @@ async fn native_restoration_restores_projection_unread_without_invitation() {
         .unwrap();
     let app = app_at(&dir, Arc::new(ScriptedPushRelayClient::default()));
     let mut client = app.client("alice").await.unwrap();
-    let group = client.create_group("unread contract", &[]).await.unwrap();
+    let group = client
+        .create_group("unread contract", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let group_hex = hex::encode(group.as_slice());
     app.initialize_chat_read_state("alice", &group_hex).unwrap();
     // An explicit projection fixture; authenticity/reorg reachability belongs
@@ -1026,7 +1037,12 @@ async fn termination_then_restoration_preserves_failed_sends_and_archive() {
         let account = home.create_account("alice").unwrap();
         let app = app_at(&dir, Arc::new(ScriptedPushRelayClient::default()));
         let mut client = app.client("alice").await.unwrap();
-        let group = client.create_group("effect batch", &[]).await.unwrap();
+        let group = client
+            .create_group("effect batch", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         let group_hex = hex::encode(group.as_slice());
         client.set_group_archived(&group, archived).unwrap();
         let peer = nostr::prelude::Keys::generate().public_key().to_hex();
@@ -1185,7 +1201,9 @@ async fn maintenance_counts_one_recovery_transition() {
     let group = client
         .create_group("maintenance observation", &[])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let effects = marmot_session::AccountDeviceEffects {
         events: vec![GroupEvent::PendingCommitRecovered {
             group_id: group,
@@ -1226,7 +1244,12 @@ async fn partial_native_projection_retries_without_republishing() {
         let app = app_at(&dir, relay.clone());
         let mut client = app.client("alice").await.unwrap();
         client.prepare_transport().await.unwrap();
-        let group = client.create_group("projection retry", &[]).await.unwrap();
+        let group = client
+            .create_group("projection retry", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         let group_hex = hex::encode(group.as_slice());
         client.take_pending_applied_sync_summary();
         app.record_account_app_event(
@@ -1476,7 +1499,12 @@ async fn committed_activity_tail_retries_after_storage_failure() {
     let app = app_at(&dir, relay.clone());
     let mut client = app.client("alice").await.unwrap();
     client.prepare_transport().await.unwrap();
-    let group = client.create_group("row retry", &[]).await.unwrap();
+    let group = client
+        .create_group("row retry", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     client.take_pending_applied_sync_summary();
     let path = app.account_storage_path("alice");
     let keys = app.account_home().load_signing_keys("alice").unwrap();
@@ -1566,8 +1594,18 @@ async fn failed_push_sweep_does_not_block_other_groups_or_routes() {
     let app = app_at(&dir, Arc::new(ScriptedPushRelayClient::default()));
     let mut client = app.client("alice").await.unwrap();
     client.prepare_transport().await.unwrap();
-    let first = client.create_group("first repair", &[]).await.unwrap();
-    let second = client.create_group("second repair", &[]).await.unwrap();
+    let first = client
+        .create_group("first repair", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
+    let second = client
+        .create_group("second repair", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     for group in [&first, &second] {
         app.upsert_group_push_token(
             "alice",
@@ -1675,7 +1713,9 @@ async fn assert_managed_worker_retains_activity(late_checkpoint: bool) {
     let group = bob
         .create_group("worker retry", &[&alice_account.account_id_hex])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let mut cursor = 0;
     deliver_new(&mut alice, &relay, &mut cursor).await;
     alice.sync().await.unwrap();
@@ -1818,7 +1858,9 @@ async fn welcome_failed_after_convergence_reaches_the_host_once() {
         .client
         .create_group("released welcome", &[&bob.account_id_hex])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     bob.join(&relay, &group).await;
     // Bob's Commit opens a settlement window on Alice, which holds her invite
     // back for convergence to commit.
@@ -1834,7 +1876,9 @@ async fn welcome_failed_after_convergence_reaches_the_host_once() {
         .client
         .invite_members(&group, &[carol.account_id_hex.as_str()])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     assert!(
         alice
             .client
@@ -1918,7 +1962,9 @@ async fn invite_needs_no_pending_welcome_row() {
         .client
         .create_group("no pending row", &[&bob.account_id_hex])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     bob.join(&relay, &group).await;
 
     let connection = alice.raw_connection();
@@ -1932,7 +1978,9 @@ async fn invite_needs_no_pending_welcome_row() {
         .client
         .invite_members(&group, &[carol.account_id_hex.as_str()])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     connection
         .execute_batch("DROP TRIGGER no_pending_welcome")
         .unwrap();

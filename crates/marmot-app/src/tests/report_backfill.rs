@@ -10,8 +10,24 @@ async fn report_backfill_retries_entire_batch_after_projection_failure() {
         .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
     let mut client = app.client("alice").await.unwrap();
     let mut groups = vec![
-        hex::encode(client.create_group("first", &[]).await.unwrap().as_slice()),
-        hex::encode(client.create_group("second", &[]).await.unwrap().as_slice()),
+        hex::encode(
+            client
+                .create_group("first", &[])
+                .await
+                .unwrap()
+                .operation
+                .unwrap()
+                .as_slice(),
+        ),
+        hex::encode(
+            client
+                .create_group("second", &[])
+                .await
+                .unwrap()
+                .operation
+                .unwrap()
+                .as_slice(),
+        ),
     ];
     groups.sort();
     client.take_pending_projection_updates();

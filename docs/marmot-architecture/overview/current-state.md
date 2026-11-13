@@ -1,7 +1,7 @@
 ---
 title: "Current State — Implementations & Spec"
 created: 2026-04-19
-updated: 2026-11-10
+updated: 2026-11-12
 tags: [marmot, overview, current-state, implementations]
 status: overview
 ---
@@ -311,7 +311,9 @@ This repository now has the main engine candidate:
 - `crates/marmot-app` — first multi-account app runtime over account home, per-account projections, shared
   relay/directory cache, relay-list setup, KeyPackage lookup, runtime subscriptions, and app-facing
   group/message/member methods. Detailed group creation returns the exact chat-list row committed with the local
-  projection; founding Welcome fanout stays post-response and its app repair index is reconstructed from
+  projection inside an optional operation result. Create/invite reports preserve per-account resolution outcomes;
+  unavailable accounts do not block eligible accounts, and a wholly unavailable nonempty roster mutates nothing.
+  Founding Welcome fanout stays post-response and its app repair index is reconstructed from
   engine-authoritative retained obligations. Its per-account directory cache has an independent numbered migration
   ledger and future-version refusal; installation-wide `shared.sqlite3` now has its own independent
   `shared_schema_migrations` history with transactional adoption of recognized unversioned layouts. See

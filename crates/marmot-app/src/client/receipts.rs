@@ -175,7 +175,12 @@ mod tests {
             let app = MarmotApp::with_relay(dir.path(), "wss://receipts.example")
                 .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
             let mut client = app.client("alice").await.unwrap();
-            let group = client.create_group("receipt boundary", &[]).await.unwrap();
+            let group = client
+                .create_group("receipt boundary", &[])
+                .await
+                .unwrap()
+                .operation
+                .expect("eligible fixture members");
             let storage = app.account_storage("alice").unwrap();
             let route = TransportReconciliationRoute::Group(
                 hex::decode(

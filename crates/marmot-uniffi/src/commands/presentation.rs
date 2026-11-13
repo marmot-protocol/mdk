@@ -108,15 +108,21 @@ mod tests {
         let direct = kit
             .create_group(alice.clone(), String::new(), vec![bob.clone()], None)
             .await
-            .unwrap();
+            .unwrap()
+            .group_id_hex
+            .expect("selected members create a group");
         let named = kit
             .create_group(alice.clone(), "Custom pair".into(), vec![bob.clone()], None)
             .await
-            .unwrap();
+            .unwrap()
+            .group_id_hex
+            .expect("selected members create a group");
         let fallback = kit
             .create_group(alice.clone(), String::new(), vec![], None)
             .await
-            .unwrap();
+            .unwrap()
+            .group_id_hex
+            .expect("selected members create a group");
         kit.runtime.shutdown_and_close().await.unwrap();
         drop(kit);
         drop(relay);
@@ -230,7 +236,9 @@ mod tests {
         let group = kit
             .create_group(label.clone(), "Native name".into(), vec![], None)
             .await
-            .unwrap();
+            .unwrap()
+            .group_id_hex
+            .expect("selected members create a group");
         let sub = kit
             .open_presented_chat_list(label.clone(), false)
             .await

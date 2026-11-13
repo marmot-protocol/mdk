@@ -258,7 +258,12 @@ async fn host_reads_wait_behind_held_worker_units() {
         .with_test_relay_client(relay.clone());
     let group = {
         let mut client = app.client("alice").await.unwrap();
-        client.create_group("held reads", &[]).await.unwrap()
+        client
+            .create_group("held reads", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members")
     };
     let runtime = crate::MarmotAppRuntime::new(app.clone());
     let telemetry = runtime.shared_services().observer.performance().clone();
@@ -411,7 +416,9 @@ async fn host_reads_wait_behind_a_held_convergence_pass() {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     runtime.catch_up_accounts().await.unwrap();
     runtime
         .update_group_profile("alice", &group, Some("changed".into()), None)

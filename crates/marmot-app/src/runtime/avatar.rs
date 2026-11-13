@@ -162,6 +162,8 @@ mod tests {
                 .create_group("Avatar test", &[])
                 .await
                 .unwrap()
+                .operation
+                .expect("eligible fixture members")
                 .as_slice(),
         );
         let member = "bb".repeat(32);

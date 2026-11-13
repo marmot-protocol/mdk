@@ -66,6 +66,102 @@ pub struct GroupCommitDeliveryFfi {
     pub since: u64,
 }
 
+/// Eligibility of one requested account, not a Welcome delivery receipt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum MemberResolutionStatusFfi {
+    Selected,
+    MissingKeyPackage,
+    ObsoleteKeyPackage,
+    InvalidKeyPackage,
+    IncompatibleKeyPackage,
+    MissingInboxRoute,
+    Incomplete,
+}
+
+impl From<marmot_app::MemberResolutionStatus> for MemberResolutionStatusFfi {
+    fn from(value: marmot_app::MemberResolutionStatus) -> Self {
+        use marmot_app::MemberResolutionStatus as Status;
+        match value {
+            Status::Selected => Self::Selected,
+            Status::MissingKeyPackage => Self::MissingKeyPackage,
+            Status::ObsoleteKeyPackage => Self::ObsoleteKeyPackage,
+            Status::InvalidKeyPackage => Self::InvalidKeyPackage,
+            Status::IncompatibleKeyPackage => Self::IncompatibleKeyPackage,
+            Status::MissingInboxRoute => Self::MissingInboxRoute,
+            Status::Incomplete => Self::Incomplete,
+        }
+    }
+}
+
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct MemberResolutionOutcomeFfi {
+    pub account_id_hex: String,
+    pub status: MemberResolutionStatusFfi,
+    pub selected_device_count: u32,
+}
+
+impl From<marmot_app::MemberResolutionOutcome> for MemberResolutionOutcomeFfi {
+    fn from(value: marmot_app::MemberResolutionOutcome) -> Self {
+        Self {
+            account_id_hex: value.account_id_hex,
+            status: value.status.into(),
+            selected_device_count: value.selected_device_count,
+        }
+    }
+}
+
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct GroupCreationResultFfi {
+    pub group_id_hex: Option<String>,
+    pub member_outcomes: Vec<MemberResolutionOutcomeFfi>,
+}
+
+impl From<marmot_app::GroupMemberResult<cgka_traits::GroupId>> for GroupCreationResultFfi {
+    fn from(value: marmot_app::GroupMemberResult<cgka_traits::GroupId>) -> Self {
+        Self {
+            group_id_hex: value.operation.map(|id| hex::encode(id.as_slice())),
+            member_outcomes: value.member_outcomes.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct DetailedGroupCreationResultFfi {
+    pub created: Option<CreatedGroupFfi>,
+    pub member_outcomes: Vec<MemberResolutionOutcomeFfi>,
+}
+
+impl From<marmot_app::GroupMemberResult<CreatedGroup>> for DetailedGroupCreationResultFfi {
+    fn from(value: marmot_app::GroupMemberResult<CreatedGroup>) -> Self {
+        Self {
+            created: value.operation.map(Into::into),
+            member_outcomes: value.member_outcomes.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct InviteMembersResultFfi {
+    pub summary: Option<SendSummaryFfi>,
+    pub member_outcomes: Vec<MemberResolutionOutcomeFfi>,
+}
+
+impl From<marmot_app::GroupMemberResult<marmot_app::SendSummary>> for InviteMembersResultFfi {
+    fn from(value: marmot_app::GroupMemberResult<marmot_app::SendSummary>) -> Self {
+        Self {
+            summary: value.operation.map(Into::into),
+            member_outcomes: value.member_outcomes.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct GroupInviteResultFfi {
+    pub invite: InviteMembersResultFfi,
+    pub details: GroupDetailsFfi,
+    pub management_state: GroupManagementStateFfi,
+}
+
 /// Canonical create result carrying the exact durable chat-list projection.
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct CreatedGroupFfi {
@@ -1053,7 +1149,9 @@ mod group_state_tests {
                 },
             )
             .await
-            .unwrap();
+            .unwrap()
+            .operation
+            .expect("selected members create a group");
         runtime
             .enable_group_disbanding(self_id, &group)
             .await

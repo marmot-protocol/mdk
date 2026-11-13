@@ -95,6 +95,10 @@ prove.
 Public app, process, and container projections cannot establish exact MLS-private state, durable input dispositions,
 or active decryptability. Pair them with an engine-capable exact control when a claim needs those facts.
 
+App-runtime and process create/invite actions require every requested account to resolve and an operation to occur.
+These adapters request atomic resolution: an unavailable invitee refuses the action before a group or Commit is
+created, preserving the typed expected-refusal category and the scenario's tracked state.
+
 **Storage.** Engine clients use in-memory SQLite by default. Select storage with `--storage memory|file`; the flag
 overrides `MDK_CONFORMANCE_SQLITE_STORAGE` when both are present. File mode uses temporary encrypted SQLite databases,
 and a restart fully closes and reopens each client database before hydration.

@@ -7,6 +7,28 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ## [Unreleased]
 
+### Breaking changes
+
+- Group create outputs are `MarmotGroupCreationResult` or
+  `MarmotDetailedGroupCreationResult`; invite outputs are `MarmotInviteMembersResult`
+  or `MarmotGroupInviteResult`. Inspect the optional operation and ordered
+  `member_outcomes` before reporting success. Free each root with its corresponding
+  result free function, not `marmot_string_free` or `marmot_send_summary_free`.
+  `MarmotCreatedGroup` is embedded in the detailed result; its standalone
+  `marmot_created_group_free` export is removed.
+  Other group mutations retain their existing records. Rebuild clients with the
+  matching generated header and library. These changed output layouts are not
+  compatible with older binaries.
+
+- Status `MARMOT_STATUS_CREATED_GROUP_MEMBER_REPORT_UNAVAILABLE` (130) identifies
+  an already-created legacy prepared-image group without its original member
+  report. Open the group named in the error detail rather than creating another.
+
+### Added
+
+- `marmot_sticker_pack_share_link` synchronously builds a canonical Sonar pack link with local relay hints
+  (mdk#3283). Inputs are borrowed; free the returned owned string with `marmot_string_free`.
+
 ## [0.16.0] - 2026-11-12
 
 ### Breaking changes

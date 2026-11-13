@@ -1488,6 +1488,9 @@ fn read_marker_error_code(error: &AppError) -> &'static str {
         AppError::CreatedGroupProjectionUnavailable(_) => {
             "read_marker_failed:created_group_projection_unavailable"
         }
+        AppError::CreatedGroupMemberReportUnavailable(_) => {
+            "read_marker_failed:created_group_member_report_unavailable"
+        }
         AppError::InvalidGroupMembershipPage(_) => {
             "read_marker_failed:invalid_group_membership_page"
         }

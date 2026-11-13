@@ -57,6 +57,7 @@ This is the current integration entry point for Swift/iOS, Swift/macOS and Kotli
 | [Release integration index](../../docs/integration/README.md) | Per-release upgrade guides: required changes, changed defaults, optional adoption, examples and acceptance checks. Read every intervening guide when skipping versions. |
 | [Changelog](CHANGELOG.md) | Binding-level changes per release, including unreleased work on `master`. |
 | [Distribution](DISTRIBUTION.md) | Exact artifact layout, platform setup, checksums, Apple resources and source/binary pairing. |
+| [Native-host tests](NATIVE-HOST-TESTS.md) | Runnable Swift XCTest with a local MockRelay, injected test-only secret storage, delivery assertions, and same-root reopening; corresponding Android configuration. |
 | [Chat lists](../../docs/marmot-architecture/further-context/chat-projections-native.md) | Bounded list windows, account attention, navigation and sequence handling. |
 | [Chat-list rows](CHAT-LIST-ROWS.md) | Selected previews, per-message expiry handling, live draft updates and row-action availability. |
 | [Conversation windows](CONVERSATION-WINDOW.md) | Initial unread/latest positioning, live snapshots, paging, drafts and cancellation. |
@@ -109,6 +110,8 @@ screen API exists. The method reference marks explicit alternatives individually
 | Start a direct chat | `startDirectConversation(accountRef, peerAccountId)` | `existingDirectConversation` is lookup-only. Generic `createGroup` remains supported and retains creator-only founding admins. |
 
 ### Start a direct chat
+
+`startDirectConversation` requires its peer and never reports a creator-only success.
 
 Use `startDirectConversation` with a hex or npub peer identity. MDK serializes lookup and creation on the account worker.
 It reuses the deterministic local direct-conversation selection, or creates an unnamed group with both accounts as admins
@@ -380,6 +383,10 @@ configuration changes.
 Native construction/default checks: `./crates/marmot-uniffi/options-smoke.sh swift`
 and `MDK_KOTLIN_CLASSPATH=<JNA:Android:annotations:coroutines jars>
 ./crates/marmot-uniffi/options-smoke.sh kotlin`.
+
+For a generated Swift end-to-end test without platform-keychain credentials or public relays, run
+`bash crates/marmot-uniffi/native-host-smoke.sh`. See the [native-host recipe](NATIVE-HOST-TESTS.md)
+and its checked [XCTest source](tests/native_host_smoke.swift).
 
 ### Deployment
 
@@ -903,8 +910,30 @@ guarantee capability compatibility; creation and invitation check the actual gro
 
 ## Invitation lookup outcomes
 
-Creating or inviting looks up each recipient's relay lists and KeyPackage. The
-first recipient that cannot be used ends the call, in request order:
+Group creation returns `GroupCreationResultFfi` with an optional `groupIdHex`;
+detailed creation returns `DetailedGroupCreationResultFfi` with an optional `created` row.
+Invites return `InviteMembersResultFfi` with an optional `summary`. Detailed invites
+return `GroupInviteResultFfi`, whose `invite` contains that result alongside refreshed
+details and management state. Other detailed mutations keep `GroupMutationResultFfi`.
+
+Inspect `memberOutcomes` even when an operation is present. Each canonical account
+appears once, in request order. `selected` means its fresh KeyPackages were eligible,
+not that the recipient joined or received a Welcome. `selectedDeviceCount` counts
+devices, not accounts. Unavailable accounts do not prevent eligible accounts from
+being included. A nonempty roster with no eligible account returns no operation and
+does not mutate a group. An empty creation roster creates a creator-only group;
+an empty invitation remains an error.
+
+Invalid input, authorization, lifecycle and storage failures remain errors. Native
+membership-edit refusals, including an invitation that adds no device, are not
+converted to successful partial results.
+
+`CreatedGroupMemberReportUnavailable` identifies a legacy prepared-image upload that
+already created a group but lacks its original member report. Use the error's
+`groupIdHex` to open the existing group. Do not create a replacement group or present
+current directory results as the original creation outcome.
+
+Direct-chat creation remains atomic. A peer that cannot resolve produces an error:
 
 - `MissingKeyPackage { account, reason }`: the lookup completed and found nothing
   invitable. `reason` is `NotFound`, or `ObsoleteOnly` when the recipient has only
@@ -1263,6 +1292,12 @@ packs; `stickerPacks` and `stickerPack` read the local projection without networ
 pack by coordinate or Sonar link when the user opens a shared pack. `installStickerPack` and `uninstallStickerPack`
 change the account's published installed list after a complete read of it; without one, the change stays pending for
 a later sync.
+
+Use `stickerPackShareLink(accountRef, coordinate)` for sharing rather than constructing a URL in the host.
+It validates the coordinate and builds a canonical Sonar link without network I/O, using retained relay hints from
+successful pack fetches. Packs without retained hints use the account's current outbox relay candidates.
+Links contain at most eight normalized, unique relay hints and stay within the parser's 2048-character limit;
+hints that do not fit are omitted.
 
 A sticker message is kind 9 and carries one exact `(coordinate, shortcode, plaintext hash)` reference, exposed as
 `sticker: StickerRefFfi?` on message, preview and timeline records (`nil` for a deleted row). Hosts pass that typed

@@ -17,7 +17,9 @@ async fn genuine_outgoing_upload_is_local_after_confirmed_send_and_restart() {
         let group = alice
             .create_group("outgoing retention", &["bob"])
             .await
-            .unwrap();
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         bob.sync().await.unwrap();
         drop(alice);
         drop(bob);

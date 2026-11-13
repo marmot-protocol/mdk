@@ -11,6 +11,7 @@ mod open_ranking;
 mod previews;
 mod published_records;
 mod records;
+mod reference;
 mod resources;
 mod search;
 mod service;
@@ -26,7 +27,8 @@ pub use ids::{
     parse_account_id_hex, validate_relay_urls,
 };
 pub use member_key_packages::{
-    MemberKeyPackagePrewarmSummary, MemberKeyPackageResolutionStats, MemberResolutionPurpose,
+    MemberKeyPackagePrewarmSummary, MemberKeyPackageResolutionStats, MemberResolutionOutcome,
+    MemberResolutionPolicy, MemberResolutionPurpose, MemberResolutionStatus,
     ResolvedMemberKeyPackages,
 };
 pub use observer::{DirectoryObservation, DirectoryObserver, ObservedFamily, ObservedUnit};

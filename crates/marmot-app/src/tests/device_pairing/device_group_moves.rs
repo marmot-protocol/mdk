@@ -27,7 +27,9 @@ fn a_move_keeps_old_trust_until_made_and_retries_its_atomic_cut_after_reopen() {
             .client
             .create_group("Keep this chat", &[])
             .await
-            .unwrap();
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         let blossom = local_blossom();
         use_blossom(
             &mut moving.client,
@@ -44,7 +46,9 @@ fn a_move_keeps_old_trust_until_made_and_retries_its_atomic_cut_after_reopen() {
             .client
             .create_group("Receive old history", &[])
             .await
-            .unwrap();
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         use_blossom(
             &mut original.client,
             &received_chat,

@@ -1187,9 +1187,11 @@ class RunnerEvidenceTests(unittest.TestCase):
             self.assertEqual(outcome["exit_code"], 37)
 
     def test_wrapper_cancellation_drains_the_child_and_records_interruption(self):
-        program = """import signal,sys
-signal.signal(signal.SIGTERM, lambda *_: (print('last cancellation evidence', flush=True), sys.exit(0)))
-print('ready for cancellation', flush=True)
+        # SIGTERM can arrive before the readiness write returns. Neither write
+        # may hold a buffered stdout lock that the signal handler could reenter.
+        program = """import os,signal,sys
+signal.signal(signal.SIGTERM, lambda *_: (os.write(1, b'last cancellation evidence\\n'), sys.exit(0)))
+os.write(1, b'ready for cancellation\\n')
 signal.pause()
 """
         with tempfile.TemporaryDirectory() as tmp:

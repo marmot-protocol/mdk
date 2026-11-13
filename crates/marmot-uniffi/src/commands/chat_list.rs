@@ -363,7 +363,9 @@ mod tests {
                 None,
             )
             .await
-            .expect("create first group");
+            .expect("create first group")
+            .group_id_hex
+            .expect("selected members create a group");
         let second = kit
             .create_group(
                 account_ref.clone(),
@@ -372,7 +374,9 @@ mod tests {
                 None,
             )
             .await
-            .expect("create second group");
+            .expect("create second group")
+            .group_id_hex
+            .expect("selected members create a group");
 
         let isolated_endpoint = TransportEndpoint(relay_url);
         let isolated_account = kit
@@ -396,7 +400,9 @@ mod tests {
                 None,
             )
             .await
-            .expect("create isolated group");
+            .expect("create isolated group")
+            .group_id_hex
+            .expect("selected members create a group");
         let isolated_state = kit
             .set_chat_pinned(isolated_account_ref.clone(), isolated_group.clone(), true)
             .expect("pin isolated group");
@@ -736,12 +742,16 @@ mod tests {
                 None,
             )
             .await
-            .expect("create isolated group");
+            .expect("create isolated group")
+            .group_id_hex
+            .expect("selected members create a group");
 
         let detailed = kit
             .create_group_detailed(account_ref.clone(), "Detailed".to_owned(), Vec::new(), None)
             .await
-            .expect("create detailed group");
+            .expect("create detailed group")
+            .created
+            .expect("selected members create a group");
         let queried_detailed = kit
             .chat_list_row(account_ref.clone(), detailed.group_id_hex.clone())
             .expect("query detailed group")
@@ -753,7 +763,9 @@ mod tests {
             group_ids.push(
                 kit.create_group(account_ref.clone(), title.to_owned(), Vec::new(), None)
                     .await
-                    .expect("create group"),
+                    .expect("create group")
+                    .group_id_hex
+                    .expect("selected members create a group"),
             );
         }
         let target = group_ids[2].clone();
@@ -911,7 +923,9 @@ mod tests {
         for title in ["Alpha", "Beta", "Gamma"] {
             kit.create_group(account_ref.clone(), title.to_owned(), Vec::new(), None)
                 .await
-                .expect("create unrelated group");
+                .expect("create unrelated group")
+                .group_id_hex
+                .expect("selected members create a group");
         }
 
         let unknown_peer = "dd".repeat(32);
@@ -950,7 +964,9 @@ mod tests {
                 None,
             )
             .await
-            .expect("create first direct conversation");
+            .expect("create first direct conversation")
+            .group_id_hex
+            .expect("selected members create a group");
         let second = kit
             .create_group(
                 account_ref.clone(),
@@ -959,7 +975,9 @@ mod tests {
                 None,
             )
             .await
-            .expect("create duplicate historical direct conversation");
+            .expect("create duplicate historical direct conversation")
+            .group_id_hex
+            .expect("selected members create a group");
         kit.send_text(account_ref.clone(), second.clone(), "later".into())
             .await
             .expect("bump activity on the newer duplicate");
@@ -995,7 +1013,9 @@ mod tests {
                 None,
             )
             .await
-            .expect("create other-peer direct conversation");
+            .expect("create other-peer direct conversation")
+            .group_id_hex
+            .expect("selected members create a group");
         }
 
         let candidates = kit

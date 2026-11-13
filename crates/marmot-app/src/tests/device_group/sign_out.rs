@@ -699,12 +699,16 @@ async fn sign_out_and_wipe_finishes_when_removed_mid_wait() {
         .laptop
         .create_group("existing chat", &[])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let co_admin = devices
         .laptop
         .create_group("co-admin chat", &[])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let phone_slot = slot_of(&devices.phone);
     assert!(matches!(
         devices
@@ -742,11 +746,21 @@ async fn sign_out_and_wipe_finishes_when_removed_mid_wait() {
     let mut bob = bob_app.client("bob").await.unwrap();
     bob.publish_key_package().await.unwrap();
     remember_test_member_inbox(&laptop_app, &bob_id, "wss://relay.example");
-    laptop.invite_members(&with_bob, &[&bob_id]).await.unwrap();
+    laptop
+        .invite_members(&with_bob, &[&bob_id])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     laptop.promote_admin(&with_bob, &bob_id).await.unwrap();
     laptop.self_demote_admin(&with_bob).await.unwrap();
     bob.publish_key_package().await.unwrap();
-    laptop.invite_members(&co_admin, &[&bob_id]).await.unwrap();
+    laptop
+        .invite_members(&co_admin, &[&bob_id])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     laptop.promote_admin(&co_admin, &bob_id).await.unwrap();
     let laptop_key = laptop.runtime.own_signature_key();
     drop(laptop);

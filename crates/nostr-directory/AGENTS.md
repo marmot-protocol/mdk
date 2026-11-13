@@ -41,6 +41,7 @@ The directory of other people's public Nostr data (step 3 of the 2026-10 archite
 | `src/member_key_packages.rs`, `src/key_package_recovery.rs` | Whole-roster KeyPackage resolution for create, invite and prewarm, and bounded discovery recovery. |
 | `src/search.rs`, `src/cached_search.rs`, `src/open_ranking.rs` | Streaming web-of-trust search, network-free cached search, and the bounded Open Ranking client. |
 | `src/previews.rs` | Verified previews of `nostr:` references, stored in the directory cache (tests in `src/previews/tests.rs`). |
+| `src/reference.rs` | The shared Nostr reference decoder (`decode_reference`, context gating, bounded errors, length budgets). |
 | `src/sync.rs` | The directory-subscription sync worker and plan. |
 | `src/cache.rs`, `src/cache/` | The per-account SQLCipher cache: its numbered migration runner (`cache/migrations.rs`), frozen schemas (`cache/v1.sql`, `cache/v2.sql`), and populated/interrupted-upgrade tests (`cache/assurance_tests.rs`, fixture `cache/fixtures/pre_ledger.sql`). |
 

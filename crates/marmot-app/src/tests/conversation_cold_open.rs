@@ -25,7 +25,12 @@ impl History {
         let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
             .with_test_relay_client(relay.clone());
         let mut client = app.client("alice").await.unwrap();
-        let group = client.create_group("cold history", &[]).await.unwrap();
+        let group = client
+            .create_group("cold history", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         let store = app.account_storage("alice").unwrap();
         let group_hex = hex::encode(group.as_slice());
         let epoch = client.runtime.group_record(&group).unwrap().epoch;

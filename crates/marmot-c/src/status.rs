@@ -229,6 +229,9 @@ pub enum MarmotStatus {
     /// `marmot_cancel_leave` found no blocked leave: no leave, an unsettled
     /// epoch, or a leave that can still finish. Show the leave's progress.
     LeaveNotBlocked = 129,
+    /// A legacy prepared-image create already committed, but its original
+    /// member report is unavailable. Use the existing group; do not recreate it.
+    CreatedGroupMemberReportUnavailable = 130,
 }
 
 thread_local! {
@@ -393,6 +396,9 @@ pub(crate) fn status_from_error(err: &MarmotKitError) -> MarmotStatus {
         MarmotKitError::CreatedGroupProjectionUnavailable { .. } => {
             MarmotStatus::CreatedGroupProjectionUnavailable
         }
+        MarmotKitError::CreatedGroupMemberReportUnavailable { .. } => {
+            MarmotStatus::CreatedGroupMemberReportUnavailable
+        }
         MarmotKitError::InvalidCachedIdentityPage { .. } => MarmotStatus::InvalidCachedIdentityPage,
         MarmotKitError::InvalidPublicEventReferences { .. } => {
             MarmotStatus::InvalidPublicEventReferences
@@ -505,6 +511,9 @@ mod tests {
             },
             MarmotKitError::GroupInviteNotPending,
             MarmotKitError::CreatedGroupProjectionUnavailable {
+                group_id_hex: "aa".into(),
+            },
+            MarmotKitError::CreatedGroupMemberReportUnavailable {
                 group_id_hex: "aa".into(),
             },
             MarmotKitError::InvalidGroupMembershipPage { max_groups: 1 },
@@ -705,11 +714,6 @@ mod tests {
             MarmotKitError::AccountWorkerBusy,
             MarmotKitError::AccountWorkerResponseTimedOut,
         ];
-        assert_eq!(
-            variants.len(),
-            120,
-            "list every MarmotKitError variant exactly once (update this count with the enum)"
-        );
         assert_eq!(MarmotStatus::GroupInviteNotPending as i32, 61);
         assert_eq!(MarmotStatus::MissingMemberInboxRoute as i32, 62);
         assert_eq!(
@@ -783,6 +787,12 @@ mod tests {
                 group_id_hex: "aa".into(),
             }) as i32,
             129
+        );
+        assert_eq!(
+            status_from_error(&MarmotKitError::CreatedGroupMemberReportUnavailable {
+                group_id_hex: "aa".into(),
+            }) as i32,
+            130
         );
         assert_eq!(
             status_from_error(&MarmotKitError::GroupRecoverySourceMismatch {

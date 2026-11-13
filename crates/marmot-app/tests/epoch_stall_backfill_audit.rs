@@ -290,7 +290,9 @@ async fn stalled_bob_in_a_live_group_with_config(
     let group_id = alice
         .create_group("epoch-stall backfill audit", &[bob_id.as_str()])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let group_id_hex = hex::encode(group_id.as_slice());
 
     // bob joins by draining the welcome; poll `sync` until the group is live so
