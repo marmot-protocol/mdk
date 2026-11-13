@@ -13,6 +13,9 @@
 
 ### Added
 
+- `discard_failed_send(account_ref, group_id_hex, message_id_hex)` removes a failed own send from this device without
+  publishing and returns `DiscardFailedSendResultFfi`. Offer it instead of `delete_message` on a row whose
+  `invalidation_status` is `local_publish_failed`. The removal reaches timeline subscribers with reason `Cleared`.
 - Add the [native-host test recipe](NATIVE-HOST-TESTS.md) and runnable Swift XCTest command
   `bash crates/marmot-uniffi/native-host-smoke.sh`, using a local MockRelay and injected test-only secret storage
   to check delivery and same-root reopening without production credentials (mdk#2947).

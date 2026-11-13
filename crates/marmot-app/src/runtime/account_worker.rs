@@ -756,6 +756,11 @@ pub(crate) enum AccountWorkerCommand {
         group_id: GroupId,
         respond: oneshot::Sender<Result<SecureDeleteExpiredResult, AppError>>,
     },
+    DiscardFailedSend {
+        group_id: GroupId,
+        message_id_hex: String,
+        respond: oneshot::Sender<Result<crate::DiscardFailedSendResult, AppError>>,
+    },
     SweepExpiredRetention {
         now_ms: u64,
         respond: oneshot::Sender<Result<RetentionSweepReport, AppError>>,
@@ -6691,6 +6696,32 @@ fn account_worker_command_future<'a>(
                 true
             })
         }
+        AccountWorkerCommand::DiscardFailedSend {
+            group_id,
+            message_id_hex,
+            respond,
+        } => Box::pin(async move {
+            // The discard holds the client while it reports its update, so
+            // the update waits for the call to return and goes out at that
+            // quiescent point, before the reply.
+            let mut updates = Vec::new();
+            let result = client.discard_failed_send_with_local_projection(
+                &group_id,
+                &message_id_hex,
+                |update| updates.push(update),
+            );
+            for update in updates {
+                publish_app_runtime_projection_update(
+                    Emit::Quiescent(client),
+                    events,
+                    account_id_hex,
+                    account_label,
+                    update,
+                );
+            }
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result, client);
+            true
+        }),
         AccountWorkerCommand::SweepExpiredRetention { now_ms, respond } => Box::pin(async move {
             let result = client.sweep_expired_retention(now_ms);
             let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result, client);

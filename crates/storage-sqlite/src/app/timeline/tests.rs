@@ -4863,8 +4863,9 @@ fn peer_reaction_settles_a_failed_send_across_reopen() {
 }
 
 /// Only a live reaction from another account on the exact send settles it.
-/// Own, unrelated, untagged, invalidated and retracted reactions do not, a
-/// deleted send stays as it is, and a convergence withdrawal stays withdrawn.
+/// Own, unrelated, untagged, invalidated and retracted reactions do not, and a
+/// convergence withdrawal stays withdrawn. A peer reaction settles a deleted
+/// send too, even one that arrived after the deletion: it proves receipt.
 #[test]
 fn only_a_live_peer_reaction_on_the_exact_send_settles_it() {
     let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
@@ -4937,7 +4938,14 @@ fn only_a_live_peer_reaction_on_the_exact_send_settles_it() {
     store
         .record_app_event(&reaction("late", "peer", "gone", 10, "+"))
         .unwrap();
-    assert_eq!(delivery(&store, "gone"), failed);
+    assert_eq!(delivery(&store, "gone"), (None, true));
+    assert!(
+        store
+            .timeline_message(&group, "gone")
+            .unwrap()
+            .unwrap()
+            .deleted
+    );
 }
 
 /// A pending send a peer reacted to is delivered, and the terminal-group sweep
@@ -5083,6 +5091,84 @@ fn migration_backfill_matches_the_live_projection() {
             "rows are back in the pre-0173 shape"
         );
         crate::base::migrations::rerun_recipient_confirmed_settle(&conn).unwrap();
+    }
+    assert_eq!(list(&store), live);
+}
+
+/// Migration 0204's frozen settle and drop leaves exactly the rows the live
+/// projector leaves for deleted failed sends, so an upgraded database reads
+/// like a fresh one.
+#[test]
+fn deleted_failed_send_migration_matches_the_live_projection() {
+    let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
+    let group = "11".repeat(32);
+    for id in ["quiet", "seen", "retracted", "kept", "second"] {
+        store.record_app_event(&own_send(id, 1)).unwrap();
+        store
+            .invalidate_app_event_by_message_id(&group, id, LOCAL_PUBLISH_FAILED_REASON)
+            .unwrap();
+    }
+    for target in ["seen", "retracted"] {
+        store
+            .record_app_event(&reaction(&format!("r_{target}"), "peer", target, 2, "+"))
+            .unwrap();
+    }
+    // A reaction applies to its first `e` tag only: naming "second" after
+    // another message confirms nothing.
+    let mut elsewhere = reaction("r_second", "peer", "elsewhere", 2, "+");
+    elsewhere
+        .tags
+        .push(vec![EVENT_REF_TAG.to_owned(), "second".to_owned()]);
+    store.record_app_event(&elsewhere).unwrap();
+    store
+        .record_app_event(&delete("d_reaction", "peer", "r_retracted", 3))
+        .unwrap();
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            "INSERT INTO kept_recipient_receipts (group_id_hex, message_id_hex) VALUES (?1, 'kept')",
+            [&group],
+        )
+        .unwrap();
+    for id in ["quiet", "seen", "retracted", "kept", "second"] {
+        store
+            .record_app_event(&delete(&format!("d_{id}"), "me", id, 4))
+            .unwrap();
+    }
+    let live = list(&store);
+    let live_ids = live
+        .iter()
+        .map(|row| row.message_id_hex.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        live_ids,
+        ["kept", "seen"],
+        "confirmed sends keep a placeholder"
+    );
+
+    {
+        // The pre-0204 shape: every deleted failed send has a row, unsettled.
+        let conn = store.lock().unwrap();
+        for id in ["quiet", "retracted", "second"] {
+            conn.execute(
+                "INSERT INTO message_timeline (
+                    group_id_hex, message_id_hex, source_message_id_hex, direction, sender,
+                    plaintext, kind, tags_json, timeline_at, received_at, reactions_json,
+                    deleted, invalidation_status
+                 ) SELECT ?1, ?2, NULL, 'sent', 'me', '', 9, '[]', 1, 1, reactions_json, 1, ?3
+                   FROM message_timeline WHERE group_id_hex = ?1 AND message_id_hex = 'kept'",
+                rusqlite::params![group, id, LOCAL_PUBLISH_FAILED_REASON],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "UPDATE message_timeline SET invalidation_status = ?1, recipient_confirmed = 0
+             WHERE message_id_hex IN ('seen', 'kept')",
+            [LOCAL_PUBLISH_FAILED_REASON],
+        )
+        .unwrap();
+        crate::base::migrations::rerun_deleted_failed_sends(&conn).unwrap();
     }
     assert_eq!(list(&store), live);
 }
@@ -5241,4 +5327,167 @@ fn reactions_that_settle_nothing_leave_replies_alone() {
             "a reaction on {target} must not re-emit its replies"
         );
     }
+}
+
+fn removed_as_cleared(update: &TimelineProjectionUpdate, message_id_hex: &str) -> bool {
+    update.changes.iter().any(|change| {
+        matches!(
+            change,
+            TimelineMessageChange::Remove {
+                message_id_hex: id,
+                reason: TimelineRemoveReason::Cleared,
+            } if id == message_id_hex
+        )
+    })
+}
+
+/// A send that reached no one leaves the timeline when its author deletes it,
+/// in the live update and on a rebuild. A delivered send keeps its placeholder.
+#[test]
+fn deleting_a_failed_send_drops_its_row() {
+    let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
+    let group = "11".repeat(32);
+    store.record_app_event(&own_send("failed", 1)).unwrap();
+    store
+        .invalidate_app_event_by_message_id(&group, "failed", LOCAL_PUBLISH_FAILED_REASON)
+        .unwrap();
+    store
+        .record_app_event(&StoredAppEvent {
+            source_message_id_hex: Some("source-delivered".to_owned()),
+            ..own_send("delivered", 2)
+        })
+        .unwrap();
+
+    let own_delete = |id: &str, target: &str| StoredAppEvent {
+        direction: "sent".to_owned(),
+        source_message_id_hex: None,
+        ..delete(id, "me", target, 3)
+    };
+    let update = store
+        .record_app_event(&own_delete("delete-failed", "failed"))
+        .unwrap();
+    assert!(
+        removed_as_cleared(&update, "failed"),
+        "{:?}",
+        update.changes
+    );
+    assert!(store.timeline_message(&group, "failed").unwrap().is_none());
+    store
+        .record_app_event(&own_delete("delete-delivered", "delivered"))
+        .unwrap();
+    assert!(
+        store
+            .timeline_message(&group, "delivered")
+            .unwrap()
+            .expect("a delivered send keeps its placeholder")
+            .deleted
+    );
+
+    store.rebuild_message_timeline_for_group(&group).unwrap();
+    assert!(store.timeline_message(&group, "failed").unwrap().is_none());
+    assert!(
+        store
+            .timeline_message(&group, "delivered")
+            .unwrap()
+            .is_some()
+    );
+}
+
+/// Discard drops a failed own send and reports its removal. A pending,
+/// delivered, received or peer-confirmed row is not a failed send: discard
+/// leaves it alone.
+#[test]
+fn discard_drops_only_a_failed_send() {
+    let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
+    let group = "11".repeat(32);
+    let discard = |id: &str| {
+        store
+            .discard_failed_send(&group, id, "me", &no_mentions)
+            .unwrap()
+    };
+    for id in ["failed", "confirmed"] {
+        store.record_app_event(&own_send(id, 1)).unwrap();
+        store
+            .invalidate_app_event_by_message_id(&group, id, LOCAL_PUBLISH_FAILED_REASON)
+            .unwrap();
+    }
+    store
+        .record_app_event(&reaction("peer-reaction", "peer", "confirmed", 2, "+"))
+        .unwrap();
+    store.record_app_event(&own_send("pending", 3)).unwrap();
+    store
+        .record_app_event(&StoredAppEvent {
+            source_message_id_hex: Some("source-delivered".to_owned()),
+            ..own_send("delivered", 4)
+        })
+        .unwrap();
+    store
+        .record_app_event(&chat("received", "peer", 5, "hi"))
+        .unwrap();
+
+    for id in ["confirmed", "pending", "delivered", "received"] {
+        assert!(discard(id).is_none(), "{id} is not a failed send");
+        assert!(store.timeline_message(&group, id).unwrap().is_some());
+    }
+
+    let (outcome, update) = discard("failed").expect("a failed send is discarded");
+    assert_eq!(outcome.pruned_messages, 1);
+    assert!(
+        removed_as_cleared(&update, "failed"),
+        "{:?}",
+        update.changes
+    );
+    assert!(store.timeline_message(&group, "failed").unwrap().is_none());
+    assert!(
+        !store
+            .local_message_identity_exists(&group, "failed")
+            .unwrap()
+    );
+    assert!(discard("failed").is_none());
+}
+
+/// Discarding a send updates the loaded replies that quote it in the same
+/// projection update.
+#[test]
+fn discarding_a_send_updates_the_replies_that_quote_it() {
+    let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
+    let group = "11".repeat(32);
+    store.record_app_event(&own_send("mine", 1)).unwrap();
+    store
+        .invalidate_app_event_by_message_id(&group, "mine", LOCAL_PUBLISH_FAILED_REASON)
+        .unwrap();
+    store
+        .record_app_event(&StoredAppEvent {
+            direction: "sent".to_owned(),
+            ..reply("answer", "me", "mine", 2, "also")
+        })
+        .unwrap();
+    assert!(
+        store
+            .timeline_message(&group, "answer")
+            .unwrap()
+            .unwrap()
+            .reply_preview
+            .is_some()
+    );
+
+    let (_, update) = store
+        .discard_failed_send(&group, "mine", "me", &no_mentions)
+        .unwrap()
+        .expect("a failed send is discarded");
+    assert!(removed_as_cleared(&update, "mine"), "{:?}", update.changes);
+    assert_eq!(
+        trigger_for(&update, "answer"),
+        Some(TimelineUpdateTrigger::ReplyPreviewChanged)
+    );
+    let answer = update
+        .messages
+        .iter()
+        .find(|message| message.message_id_hex == "answer")
+        .expect("the quoting reply is in the update");
+    assert_eq!(
+        Some(answer),
+        store.timeline_message(&group, "answer").unwrap().as_ref(),
+        "the update carries the reply as it now reads"
+    );
 }

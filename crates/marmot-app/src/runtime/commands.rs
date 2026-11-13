@@ -2562,6 +2562,25 @@ impl AccountManager {
         account_worker_response(response).await
     }
 
+    pub(crate) async fn discard_failed_send(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+        message_id_hex: &str,
+    ) -> Result<crate::DiscardFailedSendResult, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::DiscardFailedSend {
+                group_id: group_id.clone(),
+                message_id_hex: message_id_hex.to_owned(),
+                respond,
+            })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        account_worker_response(response).await
+    }
+
     pub(crate) async fn sweep_expired_retention(
         &self,
         account_ref: &str,

@@ -13,6 +13,10 @@
 
 ### Added
 
+- Discard a failed own send locally with `discard_failed_send` (Rust, UniFFI,
+  C) instead of publishing a group delete for a message nobody received. A
+  failed send the user deletes now leaves the timeline instead of staying as a
+  "deleted" row that still reports failure.
 - Record `read_state_publish` runtime telemetry: the count and duration of
   each new version of an account's published read state, which the account
   worker now builds at its quiescent points for reads that later move off the

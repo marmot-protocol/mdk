@@ -1980,6 +1980,42 @@ impl SqliteAppStorage {
         )
     }
 
+    /// Drop one own send that reached no one, at the user's request: its
+    /// source row, edits, media references and timeline row, securely, as
+    /// retention drops an expired message. Nothing is published. `None` when
+    /// the row is not a failed own send (delivered, pending, confirmed by a
+    /// peer's reaction, or gone); nothing changes then. Whether the engine
+    /// still holds the send is the caller's question: this store cannot see it.
+    pub fn discard_failed_send(
+        &self,
+        group_id_hex: &str,
+        message_id_hex: &str,
+        local_account_id_hex: &str,
+        mention_classifier: &crate::app::chat_list::MentionClassifier<'_>,
+    ) -> StorageResult<
+        Option<(
+            crate::app::timeline::SecurePruneAppEventsResult,
+            crate::app::timeline::TimelineProjectionUpdate,
+        )>,
+    > {
+        let (outcome, update) =
+            self.secure_prune_with(group_id_hex, "discard_failed_send", |tx| {
+                Ok(
+                    match crate::app::timeline::discard_failed_send_tx(
+                        tx,
+                        group_id_hex,
+                        message_id_hex,
+                        local_account_id_hex,
+                        mention_classifier,
+                    )? {
+                        Some((outcome, update)) => (outcome, Some(update)),
+                        None => (Default::default(), None),
+                    },
+                )
+            })?;
+        Ok(update.map(|update| (outcome, update)))
+    }
+
     fn secure_prune_app_events(
         &self,
         group_id_hex: &str,
@@ -1987,12 +2023,48 @@ impl SqliteAppStorage {
         local_account_id_hex: &str,
         mention_classifier: &crate::app::chat_list::MentionClassifier<'_>,
     ) -> StorageResult<crate::app::timeline::SecurePruneAppEventsResult> {
+        self.secure_prune_with(group_id_hex, mode.trace_method(), |tx| {
+            let outcome = match mode {
+                SecurePruneAppEventsMode::RecordedBefore(cutoff) => {
+                    crate::app::timeline::secure_prune_app_events_before_tx(
+                        tx,
+                        group_id_hex,
+                        cutoff,
+                        local_account_id_hex,
+                        mention_classifier,
+                    )?
+                }
+                SecurePruneAppEventsMode::ExpiredAt(now) => {
+                    crate::app::timeline::secure_prune_expired_app_events_tx(
+                        tx,
+                        group_id_hex,
+                        now,
+                        local_account_id_hex,
+                        mention_classifier,
+                    )?
+                }
+            };
+            Ok((outcome, ()))
+        })
+        .map(|(outcome, ())| outcome)
+    }
+
+    /// Run one secure prune transaction and its durable checkpoint intent.
+    /// `prune` may run more than once when the database is busy.
+    fn secure_prune_with<T>(
+        &self,
+        group_id_hex: &str,
+        method: &'static str,
+        prune: impl Fn(
+            &rusqlite::Connection,
+        ) -> StorageResult<(crate::app::timeline::SecurePruneAppEventsResult, T)>,
+    ) -> StorageResult<(crate::app::timeline::SecurePruneAppEventsResult, T)> {
         // `secure_delete` must be ON *before* the prune transaction begins:
         // SQLite does not guarantee zero-on-free for pages freed in the same
         // transaction that toggles the pragma, so setting it inside the
         // transaction (the previous shape) silently weakened the prune on
         // connections opened with `secure_delete: false`.
-        let outcome = retry_on_busy(|| {
+        let (outcome, value) = retry_on_busy(|| {
             // Keep the connection mutex for the entire save/set/prune/restore
             // sequence. `secure_delete` is connection-global, so releasing it
             // between those steps lets concurrent prunes save each other's
@@ -2004,31 +2076,12 @@ impl SqliteAppStorage {
                 let tx = conn
                     .transaction_with_behavior(TransactionBehavior::Immediate)
                     .storage()?;
-                let outcome = match mode {
-                    SecurePruneAppEventsMode::RecordedBefore(cutoff) => {
-                        crate::app::timeline::secure_prune_app_events_before_tx(
-                            &tx,
-                            group_id_hex,
-                            cutoff,
-                            local_account_id_hex,
-                            mention_classifier,
-                        )?
-                    }
-                    SecurePruneAppEventsMode::ExpiredAt(now) => {
-                        crate::app::timeline::secure_prune_expired_app_events_tx(
-                            &tx,
-                            group_id_hex,
-                            now,
-                            local_account_id_hex,
-                            mention_classifier,
-                        )?
-                    }
-                };
+                let (outcome, value) = prune(&tx)?;
                 if outcome.pruned_messages > 0 || outcome.pruned_media_epoch_secrets > 0 {
                     merge_secure_prune_intent_tx(&tx, group_id_hex, &outcome)?;
                 }
                 tx.commit().storage()?;
-                Ok(outcome)
+                Ok((outcome, value))
             })();
             let restore = restore_secure_delete_pragma(&conn, original);
             combine_secure_delete_operation_and_restore(prune_outcome, restore)
@@ -2041,12 +2094,12 @@ impl SqliteAppStorage {
         if outcome.pruned_media_epoch_secrets > 0 {
             tracing::debug!(
                 target: "storage_sqlite::app::account_projection",
-                method = mode.trace_method(),
+                method = method,
                 pruned_media_epoch_secrets = outcome.pruned_media_epoch_secrets,
                 "retired encrypted-media epoch secrets after final retained references expired"
             );
         }
-        Ok(outcome)
+        Ok((outcome, value))
     }
 
     pub fn account_import_marker(&self, name: &str) -> StorageResult<bool> {

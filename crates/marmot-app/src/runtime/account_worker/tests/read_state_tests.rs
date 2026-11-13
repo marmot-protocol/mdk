@@ -149,3 +149,79 @@ async fn the_worker_publishes_a() {
     assert!(state.borrow().groups.contains_key(&group));
     runtime.shutdown().await;
 }
+
+/// A discarded failed send's removal reaches the host's subscription by the
+/// time the discard's reply does: the worker holds the update until the
+/// discard returns, emits it at that quiescent point, then replies.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_discarded_sends_removal_is_heard_by_its_reply() {
+    let dir = tempfile::tempdir().unwrap();
+    let account = AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+    let runtime = crate::MarmotAppRuntime::new(app.clone());
+    runtime.reconcile_accounts().await.unwrap();
+    let group = runtime
+        .create_group("alice", "discard", &[], None)
+        .await
+        .unwrap()
+        .operation
+        .unwrap();
+    let group_id_hex = hex::encode(group.as_slice());
+    let failed = "44".repeat(32);
+    app.record_account_app_event(
+        "alice",
+        &crate::AppMessageProjection {
+            authority: None,
+            message_id_hex: failed.clone(),
+            source_message_id_hex: None,
+            direction: "sent".to_owned(),
+            group_id_hex: group_id_hex.clone(),
+            sender: account.account_id_hex.clone(),
+            plaintext: "never left".to_owned(),
+            kind: cgka_traits::MARMOT_APP_EVENT_KIND_CHAT,
+            tags: Vec::new(),
+            source_epoch: None,
+            retention: None,
+            recorded_at: Some(1),
+            origin_commit_id: None,
+            moderation_grant: false,
+        },
+    )
+    .unwrap();
+    app.invalidate_timeline_app_event(
+        "alice",
+        &group_id_hex,
+        &failed,
+        crate::LOCAL_PUBLISH_FAILED_REASON,
+    )
+    .unwrap();
+    let mut received = runtime.subscribe();
+
+    let discarded = runtime
+        .discard_failed_send("alice", &group, &failed)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        discarded.outcome,
+        crate::DiscardFailedSendOutcome::Discarded
+    );
+    let heard = std::iter::from_fn(|| received.try_recv().ok()).any(|event| {
+        matches!(
+            event,
+            MarmotAppEvent::ProjectionUpdated(RuntimeProjectionUpdate { update, .. })
+                if update.timeline_changes.iter().any(|change| matches!(
+                    change,
+                    crate::TimelineMessageChange::Remove {
+                        message_id_hex,
+                        reason: storage_sqlite::TimelineRemoveReason::Cleared,
+                    } if message_id_hex == &failed
+                ))
+        )
+    });
+    assert!(heard, "the removal is out when the reply arrives");
+    runtime.shutdown().await;
+}
