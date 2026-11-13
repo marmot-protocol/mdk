@@ -1,7 +1,7 @@
 ---
 title: "Telemetry, Logging, and Tracing Inventory"
 created: 2026-06-10
-updated: 2026-11-01
+updated: 2026-11-13
 tags: [marmot, architecture, telemetry, logging, tracing, privacy]
 status: current
 ---
@@ -771,7 +771,7 @@ Notable tracing targets currently present:
 | `marmot_app::relay_plane` | Relay notification consumer and pool shutdown, directory subscription/fetch lifecycle, router shutdown/drop warnings; fields are status/counts and bounded error categories. |
 | `marmot_observability::relay_telemetry_export` | Exporter construction, `export_once`, `run`; fields include `point_count` and safe warning categories. |
 | `marmot_observability::app_telemetry` | `bounded_advisory_step` when an advisory account-setup step hits its time cap; fields are the step name and `cap_ms`. |
-| `marmot_app::audit_log` | Audit tracker scheduling/upload summaries; fields include `trigger`, `skipped_reason`, uploaded/failed counts, and file index. Audit content is not logged. |
+| `marmot_app::audit_log` | Audit tracker scheduling and v5 delivery summaries; fields include `trigger`, `skipped_reason` and `accepted_batches`, and a failed v5 attempt logs `automatic`, `failure_kind` and `http_status`. Audit content is not logged. |
 | `marmot_app::runtime` | Startup/shutdown and worker lifecycle, and the warning when relay telemetry export is requested in a build without `otlp-export`; fields include elapsed times and active operation counts. |
 | `marmot_session::session` | Session lifecycle method markers such as open, send, ingest, publish confirmation, and catch-up. |
 | `marmot_session::runtime` | Account-device runtime markers and warnings: transport activation, publish-confirmation retries, KeyPackage publication and republication, and due maintenance; fields are counts, attempts, and safe error categories. |

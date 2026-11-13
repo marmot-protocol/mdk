@@ -108,7 +108,7 @@ MDK PR.
 | Local JSONL recording | Historical v4 files remain readable; new app audit sessions and runtime recorder swaps use v5 when `AuditLogSettings.enabled` is true. |
 | Default behavior | Off. Without an installed recorder, the engine uses `NoopRecorder` and emits no JSONL records. |
 | File shape | Append-only JSONL/NDJSON, one `AuditEvent` per line, schema version `marmot-forensics-audit/v4`; the line-level JSON Schema is [`audit-log-event.v4.schema.json`](../../crates/marmot-forensics/schema/audit-log-event.v4.schema.json). |
-| Local file location | `<account_dir>/audit-<engine_id>-v4.jsonl` for app-opened account sessions, sealed into `-seg<NNNNNN>` siblings at 1 MiB. Exclusive-root startup deletes recognized v1/v2/v3 files and segments. |
+| Local file location | Historical `<account_dir>/audit-<engine_id>-v4.jsonl` files and their `-v4-seg<NNNNNN>` siblings, written by app-opened account sessions before v5 recording. New sessions write `audit-<engine_id>-v5.jsonl` instead. Exclusive-root startup deletes recognized v1/v2/v3 files and segments. |
 | Listing | App and bindings list remaining local `audit-*.jsonl` files for inspection/deletion. V4 files, any legacy files left after cleanup, and the separate key-reveal log are never sent. |
 | Audit OTLP delivery | The dedicated v5 sender is configured in memory by the host, with additive UniFFI and C APIs. Manual tracker requests and configured activity triggers use the existing runtime scheduler. |
 | Static bundle analyzer | Not present in the current repo path. The current artifact model is raw append-only JSONL audit logs. |
@@ -181,9 +181,10 @@ When audit logging is enabled for an account session, `MarmotApp::open_account()
 | `account_ref` | First 16 bytes of `SHA-256("marmot-audit-account-ref/v1" + account_id)`, hex encoded. | Top-level JSONL `account_ref`. |
 | `local_member_ref` | First 16 bytes of `SHA-256("marmot-audit-member-ref/v1" + account_id)`, hex encoded. Same domain and width as `group_state_changed` actor/subject member refs. | Optional `kind.source.local_member_ref` on `source_context` rows (also permitted on `context.source`). |
 | `engine_id` | First 16 bytes of `SHA-256("marmot-audit-engine-id/v2" + account_id + device_id_hex)`, hex encoded. | Top-level JSONL `engine_id` and the file name. |
-| File path | `<account_dir>/audit-<engine_id>-v4.jsonl`. | Listed and deleted by app APIs. |
+| File path | `<account_dir>/audit-<engine_id>-v5.jsonl` (historical v4 sessions wrote `-v4.jsonl`). | Listed and deleted by app APIs. |
 
-The generic schema helper `default_jsonl_path(dir, engine_id)` also returns `<dir>/audit-<engine_id>-v4.jsonl`.
+The generic schema helpers `default_v5_jsonl_path(dir, engine_id)` and `default_jsonl_path(dir, engine_id)` return
+`<dir>/audit-<engine_id>-v5.jsonl` and the historical `<dir>/audit-<engine_id>-v4.jsonl`.
 
 Identity properties:
 
@@ -1487,7 +1488,7 @@ The app can list, delete and deliver audit logs; delivery is separate from local
 
 ### Inactive audit OTLP runtime seam
 
-`MarmotAppRuntime::send_audit_otlp_once` is internal and requires a caller-supplied dedicated sender and one account. It prepares at most one bounded range of original v4 JSONL bodies under the existing exclusive root lease. Local admission covers preparation and, after a response, any durable finish; the HTTP request holds no local file, database, or lifecycle guard. One process-local reservation rejects overlapping attempts for the account. The root lease itself remains held until terminal storage close.
+`MarmotAppRuntime::send_audit_otlp_once` is internal and requires a caller-supplied dedicated sender and one account. It prepares at most one bounded range of original, validated v5 JSONL bodies under the existing exclusive root lease. Local admission covers preparation and, after a response, any durable finish; the HTTP request holds no local file, database, or lifecycle guard. One process-local reservation rejects overlapping attempts for the account. The root lease itself remains held until terminal storage close.
 
 Preparation verifies and owns the source bytes and local generation. Before sending and before finish, the attempt rechecks runtime state, account identity, recording consent, and the sender's stable destination profile without re-reading the source. `LocalAuditDelivery::finish` deliberately acknowledges the owned prepared bytes without reopening their source; external in-place file rewrites are outside this local lifecycle guarantee. Disable/re-enable, file deletion, account removal, destination change, and terminal close reject a pending result. A late response can still represent remote receipt, but cannot advance the old local cursor. Complete `200 {}` finishes locally; `400`, `413` and `422` finish as a permanent rejection; `409`, retryable and unknown outcomes retain the range. A blocked receiver verdict has no local finish action. Cancellation retains the prepared range for identical replay, so duplicates remain possible. This seam does not start automatic OTLP delivery, configure a production endpoint, set retention, or claim downstream Loki durability.
 
@@ -1512,8 +1513,8 @@ Files are sorted by app account label, then file name.
 
 The recorder seals the active file into an immutable segment once new event bytes, excluding the repeated source
 prefix, reach `AUDIT_LOG_SEGMENT_MAX_BYTES` (1 MiB), or a day elapses before the next row, and
-continues into a fresh file at the same path. Segments are named `audit-<engine_id>-v4-seg<NNNNNN>.jsonl`, so they are
-still enumerated by `audit_log_files()` and sort ahead of the active file.
+continues into a fresh file at the same path. Segments are named `audit-<engine_id>-v5-seg<NNNNNN>.jsonl` (historical
+v4 sessions wrote `-v4-seg<NNNNNN>`), so they are still enumerated by `audit_log_files()` and sort ahead of the active file.
 
 - Rotation is a rename: existing event bytes and identities are preserved without deletion or truncation.
   Each fresh segment starts with the latest known `source_context`, assigned a fresh sequence number. Ordinary
