@@ -67,9 +67,10 @@ MLS confirmation are complete, even if a secondary relay still has a later repli
 keeps the original relay event and retry deadline. Unmet required acknowledgements and pending MLS confirmation keep
 their publication barrier.
 
-A new same-account durable admission also lets the managed worker yield a scheduled secondary retry that is already
-waiting on a relay. This applies only after required acknowledgements and MLS confirmation are complete. Unfinished
-attempts remain conservatively recorded as possibly exposed and retry their exact saved bytes after backoff. The
+A queued direct send (plain text, draft, or app event) or a new same-account durable admission lets the managed worker
+yield a scheduled secondary retry that is already waiting on a relay. Direct commands retain FIFO order. This applies
+only after required acknowledgements and MLS confirmation are complete. Unfinished attempts remain conservatively
+recorded as possibly exposed and retry their exact saved bytes after backoff. The
 worker finishes its current local effects before servicing the new send; required publication and confirmation work
 is not cancelled. After a yielded pass, one durable submission receives service ahead of overdue secondary retry
 passes once the finite backlog of deferred and buffered worker commands has drained. Earlier blocked commands keep
