@@ -181,8 +181,8 @@ pub(crate) async fn create_or_import_account_command(
     let default_relays = relay_endpoints(default_relays)?;
     let bootstrap_relays = relay_endpoints(bootstrap_relays)?;
     let discovery_relays = bootstrap_relays.clone();
-    let setup = app
-        .runtime()
+    let runtime = app.runtime();
+    let setup = runtime
         .create_or_import_account(AccountSetupRequest {
             identity,
             import_nsec: import_nsec.map(ImportNsec::into_inner),
@@ -193,10 +193,12 @@ pub(crate) async fn create_or_import_account_command(
             publish_missing_relay_lists,
             publish_initial_key_package,
         })
-        .await
-        .map_err(map_account_setup_error)?;
+        .await;
+    // Setup reconciles every local account's worker. Shut down before the
+    // process exits, as the other one-shot commands do.
+    runtime.shutdown().await;
 
-    account_setup_command_output(setup)
+    account_setup_command_output(setup.map_err(map_account_setup_error)?)
 }
 
 pub(crate) fn account_setup_command_output(

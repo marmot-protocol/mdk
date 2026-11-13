@@ -46,7 +46,7 @@ behavior and JSON fields are documented in the README; the rules below are the o
 - A one-shot `foo_command` that builds an app runtime calls `runtime.shutdown()` before it returns, whatever the
   command's result. The runtime hosts every local account's worker. Exiting without shutdown cuts a recovery request
   in flight, and that cut persists as the relay's unreachable verdict, holding the account's live group input for the
-  retry delay in its next process.
+  retry delay in its next process. `a_one_shot_send_leaves_no_worker_connected_after_it_returns` owns this.
 
 - Accounts (`create-identity`, `login`, `logout`, `whoami`, `accounts`, hidden `account`, `reset`): `export-nsec` exists
   but must keep returning `private_key_export_disabled`.
