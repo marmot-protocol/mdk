@@ -57,7 +57,12 @@ async fn a_member_who_joined_later_imports_the_history_it_missed() {
     let mut bob = app.client("bob").await.unwrap();
     bob.publish_key_package().await.unwrap();
     let mut alice = app.client("alice").await.unwrap();
-    let chat = alice.create_group("book club", &[]).await.unwrap();
+    let chat = alice
+        .create_group("book club", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let chat_hex = hex::encode(chat.as_slice());
 
     let first = send(&mut alice, &chat, text("first")).await;
@@ -79,7 +84,9 @@ async fn a_member_who_joined_later_imports_the_history_it_missed() {
     alice
         .invite_members(&chat, &[&bob_account.account_id_hex])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let mut cursor = 0;
     deliver_new(&mut bob, &relay, &mut cursor).await;
     bob.sync().await.unwrap();
@@ -316,7 +323,12 @@ async fn an_imported_photo_comes_with_its_attachment_key() {
     let mut bob = app.client("bob").await.unwrap();
     bob.publish_key_package().await.unwrap();
     let mut alice = app.client("alice").await.unwrap();
-    let chat = alice.create_group("photos", &[]).await.unwrap();
+    let chat = alice
+        .create_group("photos", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let chat_hex = hex::encode(chat.as_slice());
 
     let ciphertext_sha256 = "11".repeat(32);
@@ -386,7 +398,9 @@ async fn an_imported_photo_comes_with_its_attachment_key() {
     alice
         .invite_members(&chat, &[&bob_account.account_id_hex])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let mut cursor = 0;
     deliver_new(&mut bob, &relay, &mut cursor).await;
     bob.sync().await.unwrap();

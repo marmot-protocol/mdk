@@ -1,7 +1,7 @@
 {
   "scenario_name": "account-devices-own-device-removal-loses-to-admin-remove/v1",
   "vector_version": "1",
-  "conformance_version": "0.16.0",
+  "conformance_version": "0.17.0-dev",
   "seed": null,
   "application_profile": {
     "name": "current",

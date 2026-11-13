@@ -23,7 +23,12 @@ async fn draft_send_acceptance_is_durable_before_relay_io_and_survives_cancellat
     let app = MarmotApp::with_relay(dir.path(), "wss://draft.example")
         .with_test_relay_client(relay.clone());
     let mut client = app.client("alice").await.unwrap();
-    let group = client.create_group("draft", &[]).await.unwrap();
+    let group = client
+        .create_group("draft", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let hex = hex::encode(group.as_slice());
     app.save_message_draft("alice", &hex, "send this", None, vec![])
         .unwrap();
@@ -93,7 +98,12 @@ async fn editing_after_submission_preserves_the_newer_draft_and_sends_captured_c
     let app = MarmotApp::with_relay(dir.path(), "wss://draft.example")
         .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
     let mut client = app.client("alice").await.unwrap();
-    let group = client.create_group("draft", &[]).await.unwrap();
+    let group = client
+        .create_group("draft", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let hex = hex::encode(group.as_slice());
     let initial = app.selected_message_draft("alice", &hex).unwrap();
     let old = app
@@ -156,7 +166,12 @@ async fn draft_metadata_and_conditional_commands_remain_available_through_runtim
     let app = MarmotApp::with_relay(dir.path(), "wss://draft.example")
         .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
     let mut client = app.client("alice").await.unwrap();
-    let group = client.create_group("draft", &[]).await.unwrap();
+    let group = client
+        .create_group("draft", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let hex = hex::encode(group.as_slice());
     drop(client);
     let runtime = MarmotAppRuntime::new(app);
@@ -196,7 +211,12 @@ async fn attachment_draft_reply_validates_references_before_clearing() {
     let app = MarmotApp::with_relay(dir.path(), "wss://draft.example")
         .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
     let mut client = app.client("alice").await.unwrap();
-    let group = client.create_group("media", &[]).await.unwrap();
+    let group = client
+        .create_group("media", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let hex = hex::encode(group.as_slice());
     let reply = "aa".repeat(32);
     app.save_message_draft(
@@ -316,7 +336,12 @@ async fn draft_conflict_and_missing_group_have_distinct_codes() {
     let app = MarmotApp::with_relay(dir.path(), "wss://draft.example")
         .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
     let mut client = app.client("alice").await.unwrap();
-    let group = client.create_group("draft", &[]).await.unwrap();
+    let group = client
+        .create_group("draft", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let hex = hex::encode(group.as_slice());
     let initial = app.selected_message_draft("alice", &hex).unwrap();
     app.save_message_draft("alice", &hex, "edit", None, vec![])

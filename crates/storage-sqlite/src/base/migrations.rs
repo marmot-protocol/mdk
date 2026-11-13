@@ -381,6 +381,10 @@ mod migration_0180_removal_validation;
 mod migration_0200_chat_list_search_text;
 #[path = "migrations/0201_device_inactivity_clock.rs"]
 mod migration_0201_device_inactivity_clock;
+#[path = "migrations/0202_sticker_pack_relays.rs"]
+mod migration_0202_sticker_pack_relays;
+#[path = "migrations/0203_prepared_group_member_outcomes.rs"]
+mod migration_0203_prepared_group_member_outcomes;
 
 const MIGRATIONS: &[Migration] = &[
     Migration {
@@ -1442,6 +1446,18 @@ const MIGRATIONS: &[Migration] = &[
         suspend_foreign_keys: &[],
         apply: migration_0201_device_inactivity_clock::apply,
     },
+    Migration {
+        version: 202,
+        name: "0202_sticker_pack_relays",
+        suspend_foreign_keys: &[],
+        apply: migration_0202_sticker_pack_relays::apply,
+    },
+    Migration {
+        version: 203,
+        name: "0203_prepared_group_member_outcomes",
+        suspend_foreign_keys: &[],
+        apply: migration_0203_prepared_group_member_outcomes::apply,
+    },
 ];
 
 /// Run migration 0173's recipient-confirmed backfill on an open database, so a
@@ -2146,6 +2162,31 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM chat_list_rows", [], |row| row.get(0))
             .unwrap();
         assert_eq!(chat_rows, 1);
+    }
+
+    #[test]
+    fn sticker_relays_upgrade() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        run_through(&mut conn, 201).unwrap();
+        conn.execute_batch(
+            "INSERT INTO app_sticker_packs(
+                coordinate, author_pubkey_hex, identifier, event_id_hex, created_at, title
+             ) VALUES ('pack', 'ab', 'cats', 'ee', 42, 'Cats');",
+        )
+        .unwrap();
+        run_through(&mut conn, 202).unwrap();
+        let row: (String, i64, String, String) = conn
+            .query_row(
+                "SELECT event_id_hex, created_at, title, relays_json
+                 FROM app_sticker_packs WHERE coordinate = 'pack'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            row,
+            ("ee".to_owned(), 42, "Cats".to_owned(), "[]".to_owned())
+        );
     }
 
     #[test]

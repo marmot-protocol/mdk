@@ -351,7 +351,8 @@ pub use nostr_directory::{
 };
 pub use nostr_directory::{
     CachedIdentityProjection, DirectoryKeyPackage, MAX_CACHED_IDENTITY_PAGE_SIZE, MatchQuality,
-    MatchedField, MemberKeyPackagePrewarmSummary, OFF_GRAPH_SEARCH_RADIUS, SearchUpdateTrigger,
+    MatchedField, MemberKeyPackagePrewarmSummary, MemberResolutionOutcome, MemberResolutionPolicy,
+    MemberResolutionStatus, OFF_GRAPH_SEARCH_RADIUS, SearchUpdateTrigger,
     UserDirectoryLocalAccount, UserDirectoryRecord, UserDirectoryRefresh, UserDirectorySearch,
     UserDirectorySearchResult, UserProfileMetadata, UserSearchParams, UserSearchSubscription,
     UserSearchUpdate, sort_user_search_results,
@@ -402,6 +403,14 @@ pub use transport_nostr_adapter::{
     RelayDeliveryStats, RelayLabelResolution, RelayLatencyStats, RelayRefusalStats,
     RelaySyncSnapshot, SubscriptionRefusalDisposition, SubscriptionRouteKind,
 };
+
+/// Member selection and the operation performed with the eligible members.
+/// A nonempty roster with no eligible members has no operation.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct GroupMemberResult<T> {
+    pub operation: Option<T>,
+    pub member_outcomes: Vec<MemberResolutionOutcome>,
+}
 
 /// Canonical group-create result at the host response boundary.
 ///

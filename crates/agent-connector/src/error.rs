@@ -37,6 +37,8 @@ pub enum ConnectorError {
     Stream(String),
     #[error("invalid group create request: {0}")]
     InvalidGroupCreate(&'static str),
+    #[error("no requested group member is available")]
+    MemberResolutionFailed,
     #[error("invalid profile name: {0}")]
     InvalidProfileName(&'static str),
     #[error("invalid profile {0}: {1}")]
@@ -113,6 +115,7 @@ impl ConnectorError {
             Self::UnsafeControlPlaneConfig(_) => "unsafe_control_plane_config",
             Self::Stream(_) => "stream_error",
             Self::InvalidGroupCreate(_) => "invalid_group_create",
+            Self::MemberResolutionFailed => "member_resolution_failed",
             Self::InvalidProfileName(_) => "invalid_profile_name",
             Self::InvalidProfileField(_, _) => "invalid_profile_field",
             Self::InvalidRelayUrl(_) => "invalid_relay_url",
@@ -177,6 +180,9 @@ impl ConnectorError {
                 "only a group admin can make this change"
             }
             Self::InvalidGroupCreate(_) => "invalid group create request",
+            Self::MemberResolutionFailed => {
+                "member has no usable current KeyPackage and Marmot inbox route; nothing was changed"
+            }
             Self::InvalidProfileName(_) => "invalid profile name",
             Self::InvalidProfileField(_, _) => "invalid profile field",
             Self::InvalidRelayUrl(_) => "invalid relay URL",

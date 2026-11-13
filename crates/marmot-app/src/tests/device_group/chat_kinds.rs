@@ -27,7 +27,12 @@ async fn device_group_kinds_in_a_chat_are_ignored_and_never_sent_as_custom_event
     let mut bob = app.client("bob").await.unwrap();
     bob.publish_key_package().await.unwrap();
     let mut alice = app.client("alice").await.unwrap();
-    let chat = alice.create_group("chat", &[&bob_id]).await.unwrap();
+    let chat = alice
+        .create_group("chat", &[&bob_id])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let chat_hex = hex::encode(chat.as_slice());
     let mut cursor = 0;
     deliver_new(&mut bob, &relay, &mut cursor).await;

@@ -218,7 +218,9 @@ mod tests {
         let group = kit
             .create_group(account.clone(), "attachment pages".into(), vec![], None)
             .await
-            .unwrap();
+            .unwrap()
+            .group_id_hex
+            .expect("selected members create a group");
         let (server, upload_task) = upload_sink().await;
         let uploaded = kit
             .upload_media(

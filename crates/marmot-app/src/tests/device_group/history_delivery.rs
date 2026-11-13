@@ -430,7 +430,13 @@ async fn history_devices() -> (Devices, GroupId, GroupId, String) {
         entry.settings.bring_history = true;
     })
     .await;
-    let chat = devices.phone.create_group("team", &[]).await.unwrap();
+    let chat = devices
+        .phone
+        .create_group("team", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let first = send_text(&mut devices.phone, &chat, "before the laptop").await;
     (devices, group, chat, first)
 }
@@ -504,7 +510,13 @@ async fn owed_history_waits_only_for_a_differing_local_history_toggle() {
             })
             .await;
         }
-        let chat = devices.phone.create_group("owed", &[]).await.unwrap();
+        let chat = devices
+            .phone
+            .create_group("owed", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         send_text(&mut devices.phone, &chat, "owed history").await;
         add_laptop(&mut devices, &chat).await;
         lose_phone_edit(&mut devices, &group, desired).await;
@@ -580,7 +592,13 @@ async fn owed_history_waits_only_for_a_differing_local_history_toggle() {
 async fn the_device_that_adds_a_sibling_to_a_chat_sends_it_the_history() {
     let (mut devices, group) = tagging_devices().await;
     let phone_storage = storage(&devices.phone_app);
-    let quiet = devices.phone.create_group("quiet", &[]).await.unwrap();
+    let quiet = devices
+        .phone
+        .create_group("quiet", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     send_text(&mut devices.phone, &quiet, "never sent").await;
     add_laptop(&mut devices, &quiet).await;
     let adds = devices
@@ -609,7 +627,13 @@ async fn the_device_that_adds_a_sibling_to_a_chat_sends_it_the_history() {
         entry.settings.bring_history = true;
     })
     .await;
-    let chat = devices.phone.create_group("team", &[]).await.unwrap();
+    let chat = devices
+        .phone
+        .create_group("team", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let chat_hex = hex::encode(chat.as_slice());
     let first = send_text(&mut devices.phone, &chat, "before the laptop").await;
     add_laptop(&mut devices, &chat).await;
@@ -1037,7 +1061,13 @@ async fn a_history_too_long_to_send_inline_goes_through_blossom() {
                     .is_empty()
             );
 
-            let longer = devices.phone.create_group("longer", &[]).await.unwrap();
+            let longer = devices
+                .phone
+                .create_group("longer", &[])
+                .await
+                .unwrap()
+                .operation
+                .expect("eligible fixture members");
             let longer_hex = hex::encode(longer.as_slice());
             devices
                 .phone
@@ -1150,7 +1180,13 @@ async fn the_runtime_fetches_a_blossom_history_and_shows_it_at_once() {
     let phone = phone_named(&devices, "Phone");
     let blossom = local_blossom();
     let long = "x".repeat(15_000);
-    let longer = devices.phone.create_group("longer", &[]).await.unwrap();
+    let longer = devices
+        .phone
+        .create_group("longer", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let longer_hex = hex::encode(longer.as_slice());
     use_blossom(
         &mut devices.phone,
@@ -1487,7 +1523,13 @@ async fn a_long_history_of_a_text_only_chat_is_forgotten() {
         laptop,
         link,
     };
-    let text_only = devices.phone.create_group("text only", &[]).await.unwrap();
+    let text_only = devices
+        .phone
+        .create_group("text only", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let text_only_hex = hex::encode(text_only.as_slice());
     let blossom = local_blossom();
     use_blossom(
@@ -1536,7 +1578,13 @@ async fn a_long_history_of_a_text_only_chat_is_forgotten() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_long_history_of_a_chat_with_no_blossom_endpoint_is_forgotten() {
     let (mut devices, _group, chat, _first) = history_devices().await;
-    let undialable = devices.phone.create_group("undialable", &[]).await.unwrap();
+    let undialable = devices
+        .phone
+        .create_group("undialable", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     for (chat, locator_kind, server) in [
         (chat, "other-v1", "https://store.example/"),
         (undialable, BLOSSOM_LOCATOR_KIND_V1, "http://store.example/"),

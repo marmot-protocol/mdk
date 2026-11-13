@@ -119,7 +119,9 @@ impl RunnerWorker {
                 },
             )
             .await
-            .unwrap();
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         let route_hex = app
             .group(&account.label, &hex::encode(&group))
             .unwrap()
@@ -752,7 +754,9 @@ async fn successive_group_joins_lose_nothing_and_catch_up() {
                 },
             )
             .await
-            .unwrap();
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         // An account-wide un-cover fails the assertions below; stop waiting.
         let owed = timeout(Duration::from_secs(20), async {
             loop {
@@ -881,7 +885,9 @@ async fn a_burst_of_quiet_joins_costs_recovery_linear_in_the_joins() {
                     },
                 )
                 .await
-                .unwrap(),
+                .unwrap()
+                .operation
+                .expect("eligible fixture members"),
         );
         // One join at a time, so each restarts the REQs of every group
         // joined before it, and the next group's commit lands in a later

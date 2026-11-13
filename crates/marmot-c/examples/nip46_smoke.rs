@@ -17,7 +17,7 @@ use marmot_c::secret_store::{MarmotSecretStore, MarmotSecretStoreStatus};
 use marmot_c::subscriptions::*;
 use marmot_c::types::account::*;
 use marmot_c::types::chat_list::marmot_chat_list_row_free;
-use marmot_c::types::group::marmot_app_group_record_free;
+use marmot_c::types::group::{marmot_app_group_record_free, marmot_group_creation_free};
 use marmot_c::types::message::marmot_app_message_record_list_free;
 use marmot_c::*;
 use nostr::nips::{nip04, nip44};
@@ -835,7 +835,7 @@ fn welcome_and_message(client: Handle, local: &str, remote: &str, fixture: &Fixt
     let remote_c = c(remote);
     let members = [remote_c.as_ptr()];
     let name = c("NIP-46 shared signer welcome");
-    let mut group = ptr::null_mut();
+    let mut creation = ptr::null_mut();
     check(
         unsafe {
             marmot_create_group(
@@ -845,12 +845,16 @@ fn welcome_and_message(client: Handle, local: &str, remote: &str, fixture: &Fixt
                 members.as_ptr(),
                 members.len(),
                 ptr::null(),
-                &mut group,
+                &mut creation,
             )
         },
         "create group inviting remote signer",
     );
-    let group = take_string(group);
+    assert!(!creation.is_null());
+    let group_id = unsafe { (*creation).group_id_hex };
+    assert!(!group_id.is_null(), "ready remote signer was not selected");
+    let group = unsafe { input(group_id) };
+    unsafe { marmot_group_creation_free(creation) };
     let deadline = std::time::Instant::now() + WAIT;
     loop {
         let (changed, pending) = invitations.next(deadline);

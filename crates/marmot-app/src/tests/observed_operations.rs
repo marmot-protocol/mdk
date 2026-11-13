@@ -62,7 +62,12 @@ async fn an_operation_records_success_or_failure() {
         .unwrap();
     let app = observed_app(&dir, Arc::new(ScriptedPushRelayClient::default()));
     let mut client = app.client("alice").await.unwrap();
-    let group = client.create_group("observed", &[]).await.unwrap();
+    let group = client
+        .create_group("observed", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let unknown = GroupId::new(vec![0x5a; 16]);
 
     client.set_group_archived(&group, true).unwrap();
@@ -116,8 +121,18 @@ async fn a_send_records_its_delivery_outcome() {
     let relay = Arc::new(ScriptedPushRelayClient::default());
     let app = observed_app(&dir, relay.clone());
     let mut client = app.client("alice").await.unwrap();
-    let group = client.create_group("sends", &[]).await.unwrap();
-    let held = client.create_group("held", &[]).await.unwrap();
+    let group = client
+        .create_group("sends", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
+    let held = client
+        .create_group("held", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
 
     let published = client.send(&group, b"published").await.unwrap();
     relay.fail_publishes_as_unavailable();
@@ -177,7 +192,9 @@ async fn welcome_redelivery_records_confirmed_or_failure() {
     alice
         .create_group("redelivery", &[&bob.account_id_hex])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let owed = alice.pending_welcome_deliveries().unwrap();
     assert_eq!(owed.len(), 1, "the Welcome no relay took stays owed");
     assert_eq!(
@@ -262,7 +279,12 @@ async fn wake_collection_records_whether_it_reported_an_error() {
     let relay = Arc::new(ScriptedPushRelayClient::default());
     let app = observed_app(&dir, relay.clone());
     let mut setup = app.client("alice").await.unwrap();
-    let group = setup.create_group("wake", &[]).await.unwrap();
+    let group = setup
+        .create_group("wake", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     drop(setup);
     let runtime = MarmotAppRuntime::new(app.clone());
     runtime.reconcile_accounts().await.unwrap();
@@ -317,7 +339,12 @@ async fn a_dropped_call_records_cancelled() {
     let relay = Arc::new(ScriptedPushRelayClient::default());
     let app = observed_app(&dir, relay.clone());
     let mut client = app.client("alice").await.unwrap();
-    let group = client.create_group("dropped", &[]).await.unwrap();
+    let group = client
+        .create_group("dropped", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
 
     relay.block_next_publish();
     tokio::select! {

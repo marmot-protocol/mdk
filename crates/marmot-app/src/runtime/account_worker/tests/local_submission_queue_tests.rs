@@ -44,14 +44,18 @@ async fn blocked_account_admission_does_not_delay_sibling_send_or_resurrect_dele
         .unwrap()
         .create_group("blocked group", &[])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let bob_group = app
         .client(&bob.label)
         .await
         .unwrap()
         .create_group("healthy group", &[])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let runtime = crate::MarmotAppRuntime::new(app.clone());
     runtime.reconcile_accounts().await.unwrap();
     for account in [&alice, &bob] {
@@ -175,7 +179,9 @@ async fn failed_permanent_removal_preserves_live_row_timing_then_committed_remov
         .unwrap()
         .create_group("retained send", &[])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let runtime = crate::MarmotAppRuntime::new(app.clone());
     runtime
         .shared_services()
@@ -264,6 +270,8 @@ async fn unhydrated_durable_send_waits_for_safety_and_survives_terminal_close() 
             .create_group("only unhydrated group", &[])
             .await
             .unwrap()
+            .operation
+            .expect("eligible fixture members")
     };
     let held = normal
         .clone()

@@ -212,7 +212,9 @@ async fn media_replies_reach_recipient() {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("fixture group is created");
     accept_group_invite_retrying_busy(&connector.runtime, &human.label, &group).await;
     let group_hex = hex::encode(group.as_slice());
     let target = connector

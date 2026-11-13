@@ -32,7 +32,12 @@ async fn a_reply_follows_the_publish_that_holds_its_write() {
     let dir = tempfile::tempdir().unwrap();
     let app = app(&dir);
     let (mut client, state) = publishing_client(&app).await;
-    let group = client.create_group("replied", &[]).await.unwrap();
+    let group = client
+        .create_group("replied", &[])
+        .await
+        .unwrap()
+        .operation
+        .unwrap();
     assert!(!state.borrow().groups.contains_key(&group));
 
     let (respond, mut answer) = oneshot::channel();
@@ -51,7 +56,12 @@ async fn an_event_follows_the_publish_that_holds_its_write() {
     let (mut client, state) = publishing_client(&app).await;
     let (events, mut received) = broadcast::channel(4);
 
-    let echoed = client.create_group("echoed", &[]).await.unwrap();
+    let echoed = client
+        .create_group("echoed", &[])
+        .await
+        .unwrap()
+        .operation
+        .unwrap();
     publish_app_runtime_group_state_updated(
         Emit::Unpublished(Unpublished::LocalEcho),
         &events,
@@ -133,6 +143,8 @@ async fn the_worker_publishes_a() {
     let group = runtime
         .create_group("alice", "replied", &[], None)
         .await
+        .unwrap()
+        .operation
         .unwrap();
     assert!(state.borrow().groups.contains_key(&group));
     runtime.shutdown().await;

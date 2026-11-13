@@ -776,7 +776,12 @@ async fn authoritative_worker_acceptance_preserves_archive_and_rejoin_restores_o
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
         .with_test_relay_client(Arc::new(crate::tests::ScriptedPushRelayClient::default()));
     let mut client = app.client("alice").await.unwrap();
-    let group = client.create_group("Invite", &[]).await.unwrap();
+    let group = client
+        .create_group("Invite", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let id = hex::encode(group.as_slice());
     // Install the invitation's persisted confirmation state, as inbound projection does.
     client.state.groups[0].pending_confirmation = true;
@@ -1130,7 +1135,9 @@ async fn declined_invitation_rejoins_through_real_client_flow_and_restores_chats
     let group = alice
         .create_group("Invite", &[&bob.account_id_hex])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     assert!(
         bob_client
             .sync()
@@ -1173,7 +1180,9 @@ async fn declined_invitation_rejoins_through_real_client_flow_and_restores_chats
     alice
         .invite_members(&group, &[&bob.account_id_hex])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     assert!(
         bob_client
             .sync()

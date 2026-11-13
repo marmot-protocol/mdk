@@ -146,7 +146,9 @@ async fn pending_message_batch(messages: Vec<String>) -> PendingMessageBatch {
     let group_id = alice
         .create_group("partial sync summary", &[bob_id.as_str()])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     wait_for_event(&mut events_bob_boot1, |event| {
         matches!(
             event,
@@ -354,7 +356,9 @@ async fn pending_welcome(group_name: &str) -> PendingWelcome {
     let group_id = alice
         .create_group(group_name, &[bob_id.as_str()])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     PendingWelcome {
         _relay: relay,
         relay_url,
@@ -462,11 +466,15 @@ async fn route_changing_delivery_persists_seen_id_before_later_failure() {
     let first_group_id = alice
         .create_group("route boundary one", &[bob_id.as_str()])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let second_group_id = alice
         .create_group("route boundary two", &[bob_id.as_str()])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let expected_groups = [first_group_id, second_group_id];
 
     // Both welcomes are already stored in MockRelay before this sync starts,

@@ -244,13 +244,27 @@ async fn invite_adds_every_device_of_the_account_in_one_commit() {
     let (mut bobs, _apps, key_packages) =
         devices_with_key_packages(&app, &home, "bob", &device_dirs, &relay).await;
     let mut alice = app.client("alice").await.unwrap();
-    let group = alice.create_group("team", &[]).await.unwrap();
+    let group = alice
+        .create_group("team", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
 
     let before = relay.published_events.lock().unwrap().len();
-    alice
+    let invited = alice
         .invite_members(&group, &[bob_id.as_str()])
         .await
         .unwrap();
+    assert!(invited.operation.is_some());
+    assert_eq!(
+        invited.member_outcomes,
+        vec![MemberResolutionOutcome {
+            account_id_hex: bob_id.clone(),
+            status: MemberResolutionStatus::Selected,
+            selected_device_count: 3,
+        }]
+    );
     let published = relay.published_events.lock().unwrap()[before..].to_vec();
     assert_eq!(
         published
@@ -301,11 +315,18 @@ async fn reinviting_an_account_adds_only_its_device_outside_the_group() {
     let (mut phones, _apps, _) = devices_with_key_packages(&app, &home, "bob", &[], &relay).await;
     let phone = &mut phones[0];
     let mut alice = app.client("alice").await.unwrap();
-    let group = alice.create_group("team", &[]).await.unwrap();
+    let group = alice
+        .create_group("team", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     alice
         .invite_members(&group, &[bob_id.as_str()])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let mut phone_cursor = 0;
     deliver_new(phone, &relay, &mut phone_cursor).await;
     phone.sync().await.unwrap();
@@ -327,6 +348,7 @@ async fn reinviting_an_account_adds_only_its_device_outside_the_group() {
                 .invite_key_package_requirements(&group)
                 .unwrap(),
             nostr_directory::MemberResolutionPurpose::Commit,
+            nostr_directory::MemberResolutionPolicy::Atomic,
         )
         .await
         .unwrap()
@@ -342,7 +364,9 @@ async fn reinviting_an_account_adds_only_its_device_outside_the_group() {
     alice
         .invite_members(&group, &[bob_id.as_str()])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let published = relay.published_events.lock().unwrap()[before..].to_vec();
     assert_eq!(
         published
@@ -393,7 +417,12 @@ async fn direct_chat_created_with_a_two_device_account_adds_both_and_stays_direc
     let alice = &mut alices[0];
 
     let before = relay.published_events.lock().unwrap().len();
-    let group = alice.create_group("", &[&bob_id]).await.unwrap();
+    let group = alice
+        .create_group("", &[&bob_id])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let published = relay.published_events.lock().unwrap()[before..].to_vec();
     let mut expected_key_packages = bob_key_packages;
     expected_key_packages.sort();
@@ -489,7 +518,12 @@ async fn inviting_the_inviters_own_account_publishes_nothing() {
         devices_with_key_packages(&app, &home, "alice", &alice_dirs, &relay).await;
     assert_eq!(alice_key_packages.len(), 2);
     let alice = &mut alices[0];
-    let group = alice.create_group("team", &[]).await.unwrap();
+    let group = alice
+        .create_group("team", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let alone = vec![(alice_id.clone(), 1)];
 
     let before = relay.published_events.lock().unwrap().len();
@@ -509,7 +543,9 @@ async fn inviting_the_inviters_own_account_publishes_nothing() {
     alice
         .invite_members(&group, &[bob_id.as_str()])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     assert_eq!(
         member_view(alice, &group),
         sorted(vec![(alice_id.clone(), 1), (bob_id.clone(), 1)])
@@ -544,7 +580,12 @@ async fn direct_chat_with_a_two_device_account_stays_direct() {
     bob.sync().await.unwrap();
     let mut alice = app.client("alice").await.unwrap();
     let mut bob_cursor = 0;
-    let group = alice.create_group("", &[&bob_id]).await.unwrap();
+    let group = alice
+        .create_group("", &[&bob_id])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     deliver_new(&mut bob, &relay, &mut bob_cursor).await;
     bob.sync().await.unwrap();
     bob.accept_group_invite(&group).unwrap();
@@ -633,7 +674,9 @@ async fn second_device_joins_and_leaves_without_membership_notices() {
     let group = alice
         .create_group("team", &[&bob_id, &carol_id])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     deliver_new(&mut bob, &relay, &mut bob_cursor).await;
     bob.sync().await.unwrap();
     bob.accept_group_invite(&group).unwrap();

@@ -121,6 +121,175 @@ fn passes(client: &AppClient) -> u32 {
     }
 }
 
+/// Dismissal survives recovery and a file-backed account reopen (mdk#3308).
+/// A refusal after fresh loss in that interval must still raise a new notice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inbox_dismissal_survives_open() {
+    use storage_sqlite::{CopyFloorReason, RecoveryLossCause, RecoverySpanRetirement};
+
+    let relay = MockRelay::run().await.unwrap();
+    let url = relay.url().await.to_string();
+    let endpoint = transport_nostr::canonical_relay(&url);
+    let dir = tempfile::tempdir().unwrap();
+    crate::AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let config = crate::MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true);
+    let app = crate::MarmotApp::with_relay_and_config(dir.path(), &url, config.clone())
+        .with_unvouched_relay_replies_for_test();
+    let now = unix_now_seconds();
+    let route = TransportReconciliationRoute::Inbox;
+    let floor = now - DAY;
+    let storage = app.account_storage("alice").unwrap().app_storage();
+    storage
+        .widen_recovery_coverage_goals(std::slice::from_ref(&route), floor, CopyFloorReason::Clamp)
+        .unwrap();
+    // A prior refusal parked history; empty live replies must not prove it away.
+    storage
+        .begin_recovery_unit_attempt(&route, &endpoint, None, now - HOUR)
+        .unwrap();
+    storage
+        .settle_recovery_unit(
+            &route,
+            &endpoint,
+            RecoveryUnitOutcome::Refused,
+            &RecoveryRunnerPolicy::default().unit,
+            now - HOUR,
+        )
+        .unwrap();
+    // A periodic recheck could replace retirement with new coverage evidence.
+    assert!(
+        storage
+            .record_recovery_recheck(&route, &endpoint, 0, 0, true, now)
+            .unwrap()
+    );
+
+    let mut client = crate::tests::client_on_app_relay_plane(&app, "alice").await;
+    let notices = client.history_notices().unwrap();
+    assert_eq!(notices.len(), 1);
+    assert_eq!(notices[0].cause, crate::HistoryNoticeCause::UnprovenHistory);
+    assert_eq!(notices[0].group_id_hex, None);
+    let dismissed = notices[0].notice_id.clone();
+    assert!(client.dismiss_history_notice(&dismissed).unwrap());
+    assert!(
+        !storage
+            .recovery_unit_debt(&route, &endpoint, floor - 1)
+            .unwrap()
+            .is_empty(),
+        "the pass must owe history outside the dismissed span"
+    );
+    client.run_recovery_runner_pass().await.unwrap();
+    assert!(
+        storage
+            .recovery_unit_debt(&route, &endpoint, floor - 1)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(client.history_notices().unwrap().is_empty());
+    let spans = storage.recovery_unit_spans(&route, &endpoint).unwrap();
+    assert!(spans.iter().any(|span| {
+        span.range.since_seconds == floor && span.retired == Some(RecoverySpanRetirement::Dismissed)
+    }));
+
+    drop(client);
+    app.relay_plane.shutdown().await;
+    app.close_storage().unwrap();
+    drop(storage);
+    drop(app);
+
+    let app = crate::MarmotApp::with_relay_and_config(dir.path(), &url, config)
+        .with_unvouched_relay_replies_for_test();
+    let mut client = crate::tests::client_on_app_relay_plane(&app, "alice").await;
+    client.run_recovery_runner_pass().await.unwrap();
+    let storage = app.account_storage("alice").unwrap().app_storage();
+    assert!(client.history_notices().unwrap().is_empty());
+    assert_eq!(
+        storage.recovery_unit_spans(&route, &endpoint).unwrap(),
+        spans
+    );
+    assert!(!client.dismiss_history_notice(&dismissed).unwrap());
+
+    // New loss, unlike opening the same ledger again, reopens acknowledged history.
+    let loss_floor = floor + HOUR;
+    let loss_at = unix_now_seconds();
+    storage
+        .record_account_recovery_loss_routed(
+            "alice",
+            RecoveryLossCause::Queue,
+            41,
+            1,
+            loss_at,
+            Some(loss_floor),
+            Some(&[(route.clone(), loss_floor)]),
+        )
+        .unwrap();
+    client.synchronize_recovery_loss(&storage).unwrap();
+    let now = unix_now_seconds();
+    assert_eq!(
+        storage.recovery_unit_debt(&route, &endpoint, now).unwrap()[0].since_seconds,
+        loss_floor,
+        "fresh loss reopens the acknowledged interval"
+    );
+    // Settle another refusal, now for the history the new loss reopened.
+    storage
+        .begin_recovery_unit_attempt(&route, &endpoint, None, now)
+        .unwrap();
+    storage
+        .settle_recovery_unit(
+            &route,
+            &endpoint,
+            RecoveryUnitOutcome::Refused,
+            &RecoveryRunnerPolicy::default().unit,
+            now,
+        )
+        .unwrap();
+    assert!(
+        storage
+            .recovery_unit_spans(&route, &endpoint)
+            .unwrap()
+            .iter()
+            .any(|span| {
+                span.retired.is_none()
+                    && span.range.since_seconds == loss_floor
+                    && span.range.until_seconds == now
+            })
+    );
+    let fresh = client.history_notices().unwrap();
+    assert_eq!(fresh.len(), 1);
+    assert_eq!(fresh[0].cause, crate::HistoryNoticeCause::UnprovenHistory);
+    assert_eq!(fresh[0].group_id_hex, None);
+    assert_ne!(fresh[0].notice_id, dismissed);
+    assert!(client.dismiss_history_notice(&fresh[0].notice_id).unwrap());
+    let acknowledged = storage.recovery_unit_spans(&route, &endpoint).unwrap();
+    storage
+        .record_account_recovery_loss_routed(
+            "alice",
+            RecoveryLossCause::Queue,
+            41,
+            1,
+            loss_at,
+            Some(loss_floor),
+            Some(&[(route.clone(), loss_floor)]),
+        )
+        .unwrap();
+    client.synchronize_recovery_loss(&storage).unwrap();
+    assert_eq!(
+        storage.recovery_unit_spans(&route, &endpoint).unwrap(),
+        acknowledged
+    );
+    assert!(
+        storage
+            .recovery_unit_debt(&route, &endpoint, now)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(client.history_notices().unwrap().is_empty());
+
+    drop(client);
+    app.relay_plane.shutdown().await;
+    app.close_storage().unwrap();
+}
+
 /// A subscriber to the account's runner wake, with what it has seen marked.
 fn wake(client: &AppClient) -> watch::Receiver<u64> {
     let mut wake = client.routing.recovery_runner_wake().subscribe();
@@ -480,7 +649,9 @@ async fn a_new_current_route_gets_a_standing_goal_before_the_runner_selects_it()
     let second_group = client
         .create_group("after the first survey", &[])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let route = client
         .recovery_runner_routes()
         .into_iter()
@@ -532,8 +703,18 @@ async fn a_direct_clients_pass_serves_each_due_unit_once() {
     client.sync().await.unwrap();
     assert_eq!(passes(&client), 1, "an explicit sync runs one pass");
 
-    client.create_group("first", &[]).await.unwrap();
-    client.create_group("second", &[]).await.unwrap();
+    client
+        .create_group("first", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
+    client
+        .create_group("second", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let groups = group_routes(&client);
     assert_eq!(groups.len(), 2);
     let storage = app.account_storage("alice").unwrap().app_storage();
@@ -615,7 +796,9 @@ async fn a_crash_before_the_inventory_write_readmits_the_held_message() {
             },
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let joined = one_shot_sync(bob_dir.path(), &url).await;
     assert_eq!(joined.joined_groups, std::slice::from_ref(&group));
     alice.send(&group, b"held across a crash").await.unwrap();
@@ -774,7 +957,9 @@ async fn one_shot_syncs_read_what_their_pass_released() {
             },
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let joined = one_shot_sync(bob_dir.path(), &url).await;
     assert_eq!(joined.joined_groups, std::slice::from_ref(&group));
 
@@ -857,7 +1042,9 @@ async fn failed_route_goal_writes(failed_steps: usize) {
     let group = client
         .create_group("goal write failure", &[])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let route = client
         .recovery_runner_routes()
         .into_iter()
@@ -1023,7 +1210,12 @@ async fn held_client(
     let relay = LocalRelay::new(RelayBuilder::default().query_policy(hold.clone()));
     relay.run().await.unwrap();
     let (dir, app, mut client) = direct_client_on(relay.url().await.to_string()).await;
-    client.create_group("held", &[]).await.unwrap();
+    client
+        .create_group("held", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let storage = app.account_storage("alice").unwrap().app_storage();
     // A loss owes the last hour: the quiet group's live REQ, which its relay
     // answered with nothing, already proved it.
@@ -1610,7 +1802,12 @@ async fn each_chokepoint_wakes_the_runner() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn no_route_changes_are_kept_before_the_runner_is_built() {
     let (_dir, _relay, app, mut client) = direct_client().await;
-    let group = client.create_group("untracked", &[]).await.unwrap();
+    let group = client
+        .create_group("untracked", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     app.relay_plane
         .deactivate_account_context(client.adapter.account_id())
         .await
@@ -1644,7 +1841,12 @@ async fn a_relay_dropped_from_its_route_retires_once_confirmed() {
     use cgka_traits::TransportEndpoint;
     use storage_sqlite::{RecoverySpanRetirement, RecoveryUnitState};
     let (_dir, _relay, app, mut client) = direct_client().await;
-    let group = client.create_group("gone", &[]).await.unwrap();
+    let group = client
+        .create_group("gone", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let storage = app.account_storage("alice").unwrap().app_storage();
     let installed = client
         .routing
@@ -2040,7 +2242,12 @@ async fn an_upgraded_accounts_old_loss_converts_before_the_runner_covers_it() {
     )
     .with_unvouched_relay_replies_for_test();
     let mut client = app.client("alice").await.unwrap();
-    client.create_group("upgrade", &[]).await.unwrap();
+    client
+        .create_group("upgrade", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let storage = app.account_storage("alice").unwrap().app_storage();
     // The new group's own history first, so what the reopen owes is the
     // conversion's.
@@ -2133,9 +2340,24 @@ async fn an_upgraded_accounts_certified_epoch_gap_is_visited_only_while_its_grou
         crate::MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
     );
     let mut client = app.client("alice").await.unwrap();
-    let stalled = client.create_group("stalled", &[]).await.unwrap();
-    let recovered = client.create_group("recovered", &[]).await.unwrap();
-    let left = client.create_group("left", &[]).await.unwrap();
+    let stalled = client
+        .create_group("stalled", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
+    let recovered = client
+        .create_group("recovered", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
+    let left = client
+        .create_group("left", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     client
         .update_group_profile(&recovered, Some("moved on"), None)
         .await

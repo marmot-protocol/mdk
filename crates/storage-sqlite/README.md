@@ -140,6 +140,12 @@ preconditions: this read is not an atomic authorization for a later write.
 
 ## Migrations
 
+Migration 0203 adds a nullable `member_outcomes_json` column to prepared group-image uploads. The app writes a versioned
+member-resolution report before canonical creation and keeps it when the upload is consumed. Idempotent retries read
+that original report instead of inferring recipient failures from a later roster. Existing rows retain `NULL`; a retry
+of an already-created group returns `CreatedGroupMemberReportUnavailable` with its canonical id rather than inventing
+an original report.
+
 Migration 0180 records whether a complete removal was valid and its exact target, independently of the sender's
 moderation authority. Tag recovery cannot make an invalid decision valid. Validated removals survive retention and tag
 damage, including decisions with permitted extra tags. The upgrade classifies existing records only where the original

@@ -443,7 +443,9 @@ mod tests {
         let group = client
             .create_group("new route while inbox owes", &[])
             .await
-            .unwrap();
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         let live_since = relay
             .accepted_subscriptions()
             .into_iter()

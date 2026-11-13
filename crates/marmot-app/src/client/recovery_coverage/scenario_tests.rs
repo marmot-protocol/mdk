@@ -77,7 +77,12 @@ pub(in crate::client) async fn fixture_on(
         .connect_relays(&endpoints.iter().map(String::as_str).collect::<Vec<_>>())
         .await;
     let mut client = client_on_app_relay_plane(&app, "alice").await;
-    let group = client.create_group("coverage ledger", &[]).await.unwrap();
+    let group = client
+        .create_group("coverage ledger", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
             client.synchronize_native_replay().await.unwrap();

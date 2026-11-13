@@ -67,9 +67,10 @@ MLS confirmation are complete, even if a secondary relay still has a later repli
 keeps the original relay event and retry deadline. Unmet required acknowledgements and pending MLS confirmation keep
 their publication barrier.
 
-A new same-account durable admission also lets the managed worker yield a scheduled secondary retry that is already
-waiting on a relay. This applies only after required acknowledgements and MLS confirmation are complete. Unfinished
-attempts remain conservatively recorded as possibly exposed and retry their exact saved bytes after backoff. The
+A queued direct send (plain text, draft, or app event) or a new same-account durable admission lets the managed worker
+yield a scheduled secondary retry that is already waiting on a relay. Direct commands retain FIFO order. This applies
+only after required acknowledgements and MLS confirmation are complete. Unfinished attempts remain conservatively
+recorded as possibly exposed and retry their exact saved bytes after backoff. The
 worker finishes its current local effects before servicing the new send; required publication and confirmation work
 is not cancelled. After a yielded pass, one durable submission receives service ahead of overdue secondary retry
 passes once the finite backlog of deferred and buffered worker commands has drained. Earlier blocked commands keep
@@ -360,6 +361,21 @@ The creator remains an admin. Omitting this option preserves creator-only admin 
 **Creating and inviting.** Group creation and invites take pubkeys at the action boundary. The app canonicalizes and
 deduplicates the requested roster and fetches current KeyPackages in bounded multi-author relay batches before building
 the MLS add.
+
+Create and invite return `GroupMemberResult<T>`: an optional operation result and ordered `member_outcomes`, one per
+canonical account. Each selected account reports its device count; selection does not imply Welcome delivery or joining.
+Unavailable accounts carry typed package, inbox-route, or incomplete-lookup outcomes and are omitted from the one MLS
+operation. If a nonempty roster has no eligible account, `operation` is `None` and no group or commit is created.
+An explicitly empty create still creates a creator-only group.
+
+Invalid input, self-inclusion, invalid admin intent, and authorization failures remain whole-operation errors.
+Empty invitations and invitations that add no device remain errors, even when another requested account is unavailable.
+Storage failures propagate instead of being classified as unavailable recipients. Initial admins must belong to the
+requested roster, but only selected accounts receive their requested role.
+`AppCreateGroupOptions::member_resolution` defaults to `Partial`; `Atomic` rejects the entire roster on its first
+recipient failure. `invite_members_with_initial_admins` takes the same policy explicitly. `start_direct_conversation`
+and stable agent-control v2 creation/invitation use atomic resolution, preserving their existing failure behavior.
+Simulator app/process membership actions also use atomic resolution before mutating their tracked groups.
 
 - Cached packages are useful for discovery, but cannot authorize an invitation or substitute for a failed relay lookup.
   This also applies to another account on the same installation: its local package record is not an invitation
@@ -904,12 +920,15 @@ retires nothing further. Retired spans stay in the relay re-check; loss inside t
 re-arms them.
 
 `dismiss_history_notice(account_ref, notice_id)` runs on the account worker. After the user accepts that the history may
-be incomplete, it durably retires exactly that occurrence as its own outcome (`state = 2`), never as coverage. A retired
-loss keeps its evidence as a watermark, so a delayed duplicate cannot rearm it, and releases the transport-cursor fence
-once no loss obligation remains pending, without counting a recovery success. It returns false for a stale id. New
-evidence re-arms recovery under a new revision, so the notice disappears and a later parking is a new notice with a new
-id. New loss, a higher missing epoch, each startup's incremental comparison, or a new explicit repair reopens retired
-demand as fresh debt. A malformed id is `AppError::Hex`.
+be incomplete, it durably retires exactly the shown occurrence, never as coverage or a recovery success. A ledger notice
+retires its shown parked spans and clears its route's remainder. Ordinary recovery and account reopen do not undo that
+dismissal. A qualified proof can replace retirement with coverage. Loss import, not dismissal, releases the delivery-loss
+fence; unchanged loss evidence is not imported again. It returns false for a stale id. A malformed id is `AppError::Hex`.
+
+History outside the dismissed spans remains owed. Without a healthy live tail, advancing time can add unproved seconds.
+A relay refusing those seconds can raise a fresh `UnprovenHistory` notice without reopening any dismissed second.
+New loss can reopen a dismissed span. If recovery parks it again, that notice has a fresh revision.
+Explicit full-history repair re-arms retired debt. A higher missing epoch starts a new epoch-gap occurrence.
 
 ## User blocking
 

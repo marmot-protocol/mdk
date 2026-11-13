@@ -63,7 +63,12 @@ impl Fixture {
         let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
             .with_test_relay_client(Arc::new(crate::tests::ScriptedPushRelayClient::default()));
         let mut client = app.client("alice").await.unwrap();
-        let group = client.create_group("window test", &[]).await.unwrap();
+        let group = client
+            .create_group("window test", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         let store = app.account_storage("alice").unwrap();
         let runtime = MarmotAppRuntime::new(app.clone());
         let mode = Arc::new(AtomicUsize::new(0));
@@ -1427,7 +1432,12 @@ async fn send_checkpoints_are_query_scoped_coherent_and_released_on_close() {
         "intermediate navigation invalidates the speculative tail capture"
     );
 
-    let other_group = client.create_group("unrelated window", &[]).await.unwrap();
+    let other_group = client
+        .create_group("unrelated window", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     f.store
         .app_storage()
         .refresh_chat_list_row(&f.account, &hex::encode(other_group.as_slice()), &|_, _| {

@@ -3,6 +3,14 @@ use marmot_markdown::{Inline, NostrEntity, NostrHrp};
 mod common;
 use common::{parse_inlines, t};
 
+#[allow(dead_code)]
+mod identities {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../marmot-app/tests/support/identity_reference_vectors.rs"
+    ));
+}
+
 fn npub(b32: &str) -> Inline {
     Inline::NostrMention(NostrEntity {
         hrp: NostrHrp::Npub,
@@ -262,9 +270,79 @@ fn bare_nsec_rejected() {
 }
 
 #[test]
-fn bare_nevent_not_recognized() {
-    // Only `npub` is allowed in bare form; `nevent1…` requires `nostr:`.
-    assert_eq!(parse_inlines(&nevent_str()), vec![t(&nevent_str())]);
+fn bare_events_recognized() {
+    for (hrp, token) in [
+        (NostrHrp::Note, identities::NOTE_EVENT_HRP),
+        (NostrHrp::Nevent, identities::NEVENT_EVENT_HRP),
+        (NostrHrp::Nevent, identities::NEVENT_RELAY_HINT_EVENT_HRP),
+        (NostrHrp::Nevent, identities::NEVENT_SIZE_1023),
+        (NostrHrp::Naddr, identities::NADDR_EVENT_HRP),
+    ] {
+        for (prefix, suffix) in [("", ""), ("see ", "."), ("(", ")"), ("see:", "!")] {
+            let input = format!("{prefix}{token}{suffix}");
+            let mut expected = Vec::new();
+            if !prefix.is_empty() {
+                expected.push(t(prefix));
+            }
+            expected.push(uri(hrp, token));
+            if !suffix.is_empty() {
+                expected.push(t(suffix));
+            }
+            assert_eq!(parse_inlines(&input), expected, "{input}");
+        }
+    }
+}
+
+#[test]
+fn bare_events_reject_invalid() {
+    for token in [
+        identities::NOTE_EVENT_HRP,
+        identities::NEVENT_EVENT_HRP,
+        identities::NADDR_EVENT_HRP,
+    ] {
+        for prefix in ["x", "1", "_", "/", "@", "foonostr:"] {
+            let input = format!("{prefix}{token}");
+            assert_eq!(parse_inlines(&input), vec![t(&input)], "{input}");
+        }
+        for input in [
+            format!("{token}hello"),
+            format!("{token}qq"),
+            token.to_uppercase(),
+            token.replacen('q', "Q", 1),
+            format!("{}q", &token[..token.len() - 1]),
+        ] {
+            assert_eq!(parse_inlines(&input), vec![t(&input)], "{input}");
+        }
+    }
+    for input in [
+        nevent_str(),
+        "footnote1".to_owned(),
+        identities::NEVENT_SIZE_1025.to_owned(),
+        identities::NSEC_SYNTHETIC_REJECTION.to_owned(),
+        identities::NO_RELAY_NPROFILE.to_owned(),
+        identities::NRELAY_EXAMPLE.to_owned(),
+        identities::EVENT_ID_32_HEX.to_owned(),
+    ] {
+        assert_eq!(parse_inlines(&input), vec![t(&input)], "{input}");
+    }
+}
+
+#[test]
+fn bare_events_preserve_contexts() {
+    let token = identities::NOTE_EVENT_HRP;
+    assert_eq!(
+        parse_inlines(&format!("`{token}`")),
+        vec![Inline::Code(token.to_owned())]
+    );
+    assert_eq!(
+        parse_inlines(&format!("[event]({token})")),
+        vec![Inline::Link {
+            children: vec![t("event")],
+            dest: token.to_owned(),
+            title: None,
+            classification: marmot_markdown::LinkDestinationKind::Nostr,
+        }]
+    );
 }
 
 #[test]

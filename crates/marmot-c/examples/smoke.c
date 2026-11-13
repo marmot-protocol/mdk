@@ -21,6 +21,9 @@
 
 #include <marmot.h>
 
+_Static_assert(MARMOT_MEMBER_RESOLUTION_STATUS_SELECTED == 0, "selected member ABI value");
+_Static_assert(MARMOT_MEMBER_RESOLUTION_STATUS_INCOMPLETE == 6, "incomplete member ABI value");
+
 _Static_assert(MARMOT_CONVERSATION_OPEN_MODE_AUTOMATIC == 0, "automatic ABI value");
 _Static_assert(MARMOT_CONVERSATION_OPEN_MODE_LATEST == 1, "latest ABI value");
 _Static_assert(MARMOT_CONVERSATION_OPEN_MODE_MESSAGE == 2, "message ABI value");

@@ -120,7 +120,9 @@ async fn snapshot_relays_an_offline_members_record_and_tombstone() {
         .client
         .invite_members(&group, &[fx.carol.account_id_hex.as_str()])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     assert_eq!(
         owed(&fx.alice, &group_hex),
         Some(current_epoch(&fx.alice, &group) - 1),
@@ -191,7 +193,9 @@ async fn snapshot_splits_into_group_messages_that_fit_64_kib() {
         .client
         .invite_members(&group, &[fx.carol.account_id_hex.as_str()])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let before = relay.published_events.lock().unwrap().len();
     assert!(!fx.alice.client.send_owed_push_snapshots().await);
     let sent = group_messages_since(&relay, before);
@@ -231,7 +235,9 @@ async fn owed_snapshot_is_sent_after_a_restart() {
         .client
         .invite_members(&group, &[carol.account_id_hex.as_str()])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let app = alice.client.app.clone();
     let (label, account_id_hex, cursor) = (
         alice.label.clone(),
@@ -277,7 +283,9 @@ async fn device_that_holds_nothing_sends_no_snapshot() {
         .client
         .invite_members(&group, &[fx.carol.account_id_hex.as_str()])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     assert!(owed(&fx.alice, &group_hex).is_some());
 
     let before = group_message_count(&relay);
@@ -428,7 +436,9 @@ async fn queued_invite_owes_a_snapshot_across_a_restart() {
         .client
         .invite_members(&group, &[carol.account_id_hex.as_str()])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     assert!(
         alice
             .client
@@ -506,7 +516,9 @@ async fn unhydrated_group_keeps_its_owed_snapshot() {
         .client
         .invite_members(&group, &[carol.account_id_hex.as_str()])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     // Leave the snapshot as the only push work.
     alice.client.share_push_registration().await.unwrap();
     let app = alice.client.app.clone();
@@ -563,7 +575,9 @@ async fn disband_in_progress_keeps_the_owed_snapshot() {
         .client
         .invite_members(&group, &[fx.carol.account_id_hex.as_str()])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     // Leave the snapshot as the only push work.
     fx.alice.client.share_push_registration().await.unwrap();
     fx.alice.client.disband_group(&group).await.unwrap();

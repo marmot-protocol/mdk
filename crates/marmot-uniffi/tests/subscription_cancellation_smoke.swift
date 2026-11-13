@@ -197,8 +197,11 @@ private struct SubscriptionCancellationSmoke {
     let account = try await kit.createIdentityWithProfile(
       defaultRelays: [relay], bootstrapRelays: [relay]
     ).account
-    let group = try await kit.createGroup(
+    let creation = try await kit.createGroup(
       accountRef: account.label, name: "Cancellation smoke", memberRefs: [], description: nil)
+    guard let group = creation.groupIdHex else {
+      preconditionFailure("creator-only group was not created")
+    }
     let presented = try await kit.openPresentedChatList(
       accountRef: account.label, includeArchived: false)
     let list = try await kit.openChatListWindow(

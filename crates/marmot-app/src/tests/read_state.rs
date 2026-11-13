@@ -34,6 +34,8 @@ async fn an_application_message_keeps_the_group_entry_and_a_commit_replaces_it()
         .client
         .create_group("cached entry", &[&bob.account_id_hex])
         .await
+        .unwrap()
+        .operation
         .unwrap();
     bob.join(&relay, &group).await;
     bob.client.start_read_state(UploadsInFlight::default());
@@ -79,7 +81,12 @@ async fn a_fanout_write_alone_rebuilds_the_group_entry() {
     )
     .with_test_relay_client(relay.clone());
     let mut client = app.client("alice").await.unwrap();
-    let group = client.create_group("owed", &[]).await.unwrap();
+    let group = client
+        .create_group("owed", &[])
+        .await
+        .unwrap()
+        .operation
+        .unwrap();
     relay.make_endpoints_unavailable(&["wss://relay-b.example"]);
     client
         .update_group_profile(&group, Some("owed"), None)
@@ -126,8 +133,18 @@ async fn a_bulk_delete_rebuilds_every_group_entry_it_touches() {
     .with_test_relay_client(relay.clone());
     let mut client = app.client("alice").await.unwrap();
     let groups = [
-        client.create_group("first", &[]).await.unwrap(),
-        client.create_group("second", &[]).await.unwrap(),
+        client
+            .create_group("first", &[])
+            .await
+            .unwrap()
+            .operation
+            .unwrap(),
+        client
+            .create_group("second", &[])
+            .await
+            .unwrap()
+            .operation
+            .unwrap(),
     ];
     relay.make_endpoints_unavailable(&["wss://relay-b.example"]);
     for group in &groups {
@@ -215,7 +232,12 @@ async fn the_owned_key_package_list_is_reused_until_a_key_package_input_is_writt
         .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
     let mut client = app.client("alice").await.unwrap();
     client.publish_key_package().await.unwrap();
-    let group = client.create_group("sent", &[]).await.unwrap();
+    let group = client
+        .create_group("sent", &[])
+        .await
+        .unwrap()
+        .operation
+        .unwrap();
     client.start_read_state(UploadsInFlight::default());
     let state = client.subscribe_read_state().unwrap();
     let owned = state
@@ -562,7 +584,12 @@ async fn a_group_hidden_by_a_failed_device_group_check_is_read_again() {
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
         .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
     let mut client = app.client("alice").await.unwrap();
-    let group = client.create_group("visible", &[]).await.unwrap();
+    let group = client
+        .create_group("visible", &[])
+        .await
+        .unwrap()
+        .operation
+        .unwrap();
     let storage = app.account_storage("alice").unwrap().app_storage();
     storage
         .execute_batch_for_test("CREATE TEMP TABLE device_groups (shadow INTEGER)")
@@ -609,7 +636,12 @@ async fn a_clock_moved_back_rebuilds_the_time_dependent_entry() {
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
         .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
     let mut client = app.client("alice").await.unwrap();
-    let group = client.create_group("bounded", &[]).await.unwrap();
+    let group = client
+        .create_group("bounded", &[])
+        .await
+        .unwrap()
+        .operation
+        .unwrap();
     let clock = Arc::new(AtomicU64::new(1_200));
     let step_after_read = Arc::new(AtomicU64::new(0));
     client.runtime = client.runtime.with_maintenance_sources(
@@ -705,7 +737,12 @@ async fn a_snapshot_never_leads_a() {
     let mut client = app.client("alice").await.unwrap();
     client.start_read_state(UploadsInFlight::default());
     let state = client.subscribe_read_state().unwrap();
-    let group = client.create_group("snapshotted", &[]).await.unwrap();
+    let group = client
+        .create_group("snapshotted", &[])
+        .await
+        .unwrap()
+        .operation
+        .unwrap();
     assert!(!state.borrow().groups.contains_key(&group));
 
     let snapshot = client.group_read_snapshot().unwrap();

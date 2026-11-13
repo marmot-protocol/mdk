@@ -19,6 +19,54 @@ use marmot_uniffi::{
 };
 
 use super::account::MarmotSendSummary;
+use marmot_uniffi::conversions::{
+    DetailedGroupCreationResultFfi, GroupCreationResultFfi, GroupInviteResultFfi,
+    InviteMembersResultFfi, MemberResolutionOutcomeFfi, MemberResolutionStatusFfi,
+};
+
+c_enum! {
+    MarmotMemberResolutionStatus from MemberResolutionStatusFfi {
+        Selected, MissingKeyPackage, ObsoleteKeyPackage, InvalidKeyPackage,
+        IncompatibleKeyPackage, MissingInboxRoute, Incomplete,
+    }
+}
+
+c_mirror! {
+    MarmotMemberResolutionOutcome from MemberResolutionOutcomeFfi {
+        str account_id_hex,
+        copy status: MarmotMemberResolutionStatus,
+        copy selected_device_count: u32,
+    }
+}
+c_mirror! {
+    MarmotGroupCreationResult from GroupCreationResultFfi,
+    free marmot_group_creation_free {
+        opt_str group_id_hex,
+        vec member_outcomes/member_outcomes_len: MarmotMemberResolutionOutcome,
+    }
+}
+c_mirror! {
+    MarmotDetailedGroupCreationResult from DetailedGroupCreationResultFfi,
+    free marmot_detailed_creation_free {
+        opt_rec created: MarmotCreatedGroup,
+        vec member_outcomes/member_outcomes_len: MarmotMemberResolutionOutcome,
+    }
+}
+c_mirror! {
+    MarmotInviteMembersResult from InviteMembersResultFfi,
+    free marmot_invite_members_free {
+        opt_rec summary: MarmotSendSummary,
+        vec member_outcomes/member_outcomes_len: MarmotMemberResolutionOutcome,
+    }
+}
+c_mirror! {
+    MarmotGroupInviteResult from GroupInviteResultFfi,
+    free marmot_group_invite_free {
+        rec invite: MarmotInviteMembersResult,
+        rec details: MarmotGroupDetails,
+        rec management_state: MarmotGroupManagementState,
+    }
+}
 use crate::MarmotStatus;
 use crate::macros::{c_enum, c_mirror};
 use crate::memory::{CFree, optional_str, required_str};
@@ -591,6 +639,51 @@ mod tests {
         assert_eq!(crate::memory::audit::live_allocations(), start);
     }
 
+    #[cfg(feature = "alloc-audit")]
+    #[test]
+    fn partial_member_result_free() {
+        let _guard = crate::memory::audit::test_lock();
+        let start = crate::memory::audit::live_allocations();
+        let result: MarmotGroupCreationResult = GroupCreationResultFfi {
+            group_id_hex: Some("0102".into()),
+            member_outcomes: vec![
+                MemberResolutionOutcomeFfi {
+                    account_id_hex: "aa".into(),
+                    status: MemberResolutionStatusFfi::Selected,
+                    selected_device_count: 2,
+                },
+                MemberResolutionOutcomeFfi {
+                    account_id_hex: "bb".into(),
+                    status: MemberResolutionStatusFfi::MissingKeyPackage,
+                    selected_device_count: 0,
+                },
+            ],
+        }
+        .into();
+        unsafe {
+            marmot_group_creation_free(boxed(result));
+            marmot_invite_members_free(boxed(
+                InviteMembersResultFfi {
+                    summary: None,
+                    member_outcomes: vec![MemberResolutionOutcomeFfi {
+                        account_id_hex: "cc".into(),
+                        status: MemberResolutionStatusFfi::Incomplete,
+                        selected_device_count: 0,
+                    }],
+                }
+                .into(),
+            ));
+            marmot_detailed_creation_free(boxed(
+                DetailedGroupCreationResultFfi {
+                    created: None,
+                    member_outcomes: vec![],
+                }
+                .into(),
+            ));
+        }
+        assert_eq!(crate::memory::audit::live_allocations(), start);
+    }
+
     fn record() -> AppGroupRecordFfi {
         AppGroupRecordFfi {
             group_id_hex: "01".repeat(16),
@@ -703,11 +796,9 @@ c_mirror! {
 }
 
 c_mirror! {
-    /// A newly created group plus its chat-list row, so a caller can
-    /// render the conversation without a follow-up read. Free with
-    /// `marmot_created_group_free`.
-    MarmotCreatedGroup from CreatedGroupFfi,
-    free marmot_created_group_free {
+    /// Created-group payload owned by MarmotDetailedGroupCreationResult.
+    /// Its fields are released by the parent's deep-free.
+    MarmotCreatedGroup from CreatedGroupFfi {
         str group_id_hex,
         rec chat_list_row: super::chat_list::MarmotChatListRow,
     }

@@ -100,20 +100,16 @@ impl<R: DirectoryResources> Directory<R> {
             .collect::<Vec<_>>();
         let mut package_coverage = primary_complete;
         if !supplementary.is_empty() {
-            match self
+            let outcome = self
                 .relay_plane
                 .fetch_directory_events_with_completion(
                     supplementary.clone(),
                     key_package_queries(vec![account.to_owned()]),
                 )
                 .await
-            {
-                Ok(outcome) => {
-                    observed.extend(outcome.records);
-                    package_coverage &= outcome.complete;
-                }
-                Err(_) => package_coverage = false,
-            }
+                .map_err(DirectoryError::RelayDirectory)?;
+            observed.extend(outcome.records);
+            package_coverage &= outcome.complete;
         }
         let routes = distinct_recovery_routes(searched.iter().chain(&supplementary));
         // Deletion requests read with the KeyPackages count from the start; a
@@ -211,17 +207,13 @@ impl<R: DirectoryResources> Directory<R> {
             // Separate e/a existence filters (OR), each limit one: unrelated
             // post deletions cannot consume the proof's bounded result budget.
             for endpoints in routes.chunks(RECOVERY_ENDPOINT_LIMIT) {
-                match self
+                let outcome = self
                     .relay_plane
                     .fetch_directory_events_with_completion(endpoints.to_vec(), queries.clone())
                     .await
-                {
-                    Ok(outcome) => {
-                        deletion_coverage &= outcome.complete;
-                        deletions.extend(outcome.records);
-                    }
-                    Err(_) => deletion_coverage = false,
-                }
+                    .map_err(DirectoryError::RelayDirectory)?;
+                deletion_coverage &= outcome.complete;
+                deletions.extend(outcome.records);
                 let (_, gathered) =
                     without_revoked_slot_winners(account, observed.clone(), &deletions, freshness);
                 // A verified positive is sufficient to reject a candidate,

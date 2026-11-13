@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+### Breaking changes
+
+- Group creation and invitation methods return concrete partial-member result
+  records. Creation's `groupIdHex` or `created`, and invitation's `summary`, are
+  optional. Inspect ordered `memberOutcomes` for unavailable accounts, including
+  when an operation succeeded. Detailed invites return `GroupInviteResultFfi`;
+  other detailed mutations keep `GroupMutationResultFfi`. Regenerate Swift and
+  Kotlin bindings with the matching native library.
+
+### Added
+
+- Add the [native-host test recipe](NATIVE-HOST-TESTS.md) and runnable Swift XCTest command
+  `bash crates/marmot-uniffi/native-host-smoke.sh`, using a local MockRelay and injected test-only secret storage
+  to check delivery and same-root reopening without production credentials (mdk#2947).
+- `sticker_pack_share_link(account_ref, coordinate)` builds a canonical Sonar pack link locally with retained
+  relay hints, falling back to current account outbox candidates for packs without hints (mdk#3283).
+
+### Fixed
+
+- Isolate Apple release-profile mock build outputs from inherited
+  `CARGO_TARGET_DIR` values (mdk#2906).
+
 ## 0.16.0 - 2026-11-12
 
 ### Breaking changes

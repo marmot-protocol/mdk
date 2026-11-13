@@ -31,6 +31,8 @@ async fn token_sends_to_a_group_with_a_refused_subscription_are_never_rejected()
         )
         .await
         .unwrap()
+        .operation
+        .expect("eligible fixture members")
         .group_id;
     let group_hex = hex::encode(group.as_slice());
 

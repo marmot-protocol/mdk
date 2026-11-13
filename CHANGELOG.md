@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Breaking changes
+
+- Return optional create/invite operation results with ordered per-account
+  resolution outcomes across Rust, C, UniFFI, and CLI (#1813). Available accounts
+  proceed in one MLS operation; unavailable accounts are reported individually.
+  A nonempty roster with no available account creates no group or commit.
+  Prepared-image retries retain the original report across restart. Stable
+  agent-control v2 creation and invitation remain atomic.
+
 ### Added
 
 - Record `read_state_publish` runtime telemetry: the count and duration of

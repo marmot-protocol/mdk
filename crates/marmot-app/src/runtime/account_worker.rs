@@ -377,7 +377,7 @@ pub(crate) enum AccountWorkerCommand {
         queued_at: Instant,
         request: GroupCreationRequest,
         options: AppCreateGroupOptions,
-        respond: oneshot::Sender<Result<CanonicalCreatedGroup, AppError>>,
+        respond: oneshot::Sender<Result<crate::GroupMemberResult<CanonicalCreatedGroup>, AppError>>,
     },
     StagePreparedGroupImage {
         plaintext: Vec<u8>,
@@ -472,7 +472,8 @@ pub(crate) enum AccountWorkerCommand {
         group_id: GroupId,
         members: Vec<String>,
         initial_admins: Vec<String>,
-        respond: oneshot::Sender<Result<SendSummary, AppError>>,
+        member_resolution: crate::MemberResolutionPolicy,
+        respond: oneshot::Sender<Result<crate::GroupMemberResult<SendSummary>, AppError>>,
     },
     RemoveMembers {
         group_id: GroupId,
@@ -2168,14 +2169,22 @@ async fn run_app_runtime_account_worker(
             _ = scheduled_convergence.timer.as_mut(), if !scheduled_convergence_held_for_test(&account_id_hex) => {
                 yield_to_convergence = false;
                 let Some(group_id) = scheduled_convergence.take_ready() else { continue };
-                let secondary_retry_yield = wait_for_local_submission_or_shutdown(
+                let local_submission_yield = wait_for_local_submission_or_shutdown(
                     app.clone(),
                     account_label.clone(),
                     shared.local_submission_gate(&account_id_hex),
                     shared.local_submission_wakeups.subscribe(),
                     lifecycle.subscribe_shutdown(),
                 ).boxed().shared();
-                let yield_observation = secondary_retry_yield.clone();
+                let yield_observation = local_submission_yield.clone();
+                let (send_waiting, send_requested) = oneshot::channel();
+                let secondary_retry_yield = async move {
+                    tokio::select! {
+                        biased;
+                        _ = local_submission_yield => {},
+                        _ = send_requested => {},
+                    }
+                };
                 let phase = shared.observer.performance().observe(RuntimeOp::WorkerConvergence);
                 let _unit = unit.enter(WorkerUnit::Convergence);
                 // Recovery owns the live client, but member/roster reads can
@@ -2304,9 +2313,12 @@ async fn run_app_runtime_account_worker(
                     &mut pending,
                     &app,
                     &account_label,
+                    Some(send_waiting),
                 ))
                 .await;
-                if yield_observation.peek().is_some() {
+                // Durable work can arrive after a direct send ended the relay
+                // wait. Poll again before deciding whether it is owed a turn.
+                if yield_observation.now_or_never().is_some() {
                     local_submission_service_owed = true;
                     // Never erase the ordinary drain's contention/completion
                     // backoff merely because another optional pass yielded.
@@ -2773,8 +2785,8 @@ async fn run_app_runtime_account_worker(
                     }
                 };
             }
-            _ = attachment_admission.ready(), if attachment_admission.is_waiting() => {
-                attachment_due = true;
+            more = attachment_admission.ready(), if attachment_admission.is_waiting() => {
+                attachment_due |= more;
             }
             _ = tokio::task::yield_now(), if attachment_due => {
                 if lifecycle.is_stopping() { continue 'worker; }
@@ -4648,6 +4660,7 @@ async fn serve_snapshot_reads_until<Fut>(
     pending: &mut VecDeque<AccountWorkerCommand>,
     app: &MarmotApp,
     account_label: &str,
+    mut send_waiting: Option<oneshot::Sender<()>>,
 ) -> Fut::Output
 where
     Fut: Future,
@@ -4675,6 +4688,17 @@ where
         let Some(command) = command else {
             continue;
         };
+        // Keep mutation FIFO, but let optional relay retries finish early at
+        // their safe boundary. Never drop the client-owning work future.
+        if matches!(
+            command,
+            AccountWorkerCommand::SendMessage { .. }
+                | AccountWorkerCommand::SendMessageDraft { .. }
+                | AccountWorkerCommand::SendAppEvent { .. }
+        ) && let Some(waiting) = send_waiting.take()
+        {
+            let _ = waiting.send(());
+        }
         let snapshot_reads_available = read_snapshot.is_some();
         match command {
             AccountWorkerCommand::Members { group_id, respond } if snapshot_reads_available => {
@@ -5005,6 +5029,7 @@ fn account_worker_command_future<'a>(
                 pending,
                 app,
                 account_label,
+                None,
             ))
             .await;
             let result = match repaired {
@@ -5105,7 +5130,10 @@ fn account_worker_command_future<'a>(
                                 shared,
                                 storage_permit.as_ref(),
                                 respond,
-                                Ok(created),
+                                Ok(crate::GroupMemberResult {
+                                    operation: Some(created),
+                                    member_outcomes: Vec::new(),
+                                }),
                                 client,
                             );
                             return true;
@@ -5129,6 +5157,7 @@ fn account_worker_command_future<'a>(
                         Ok(None) => {}
                     }
                     options.initial_admins = vec![peer_account_id_hex.clone()];
+                    options.member_resolution = nostr_directory::MemberResolutionPolicy::Atomic;
                     (String::new(), vec![peer_account_id_hex], None)
                 }
             };
@@ -5157,7 +5186,11 @@ fn account_worker_command_future<'a>(
                 }
             };
             let response_handoff_started_at = Instant::now();
-            if let Ok(created_group) = &result {
+            if let Ok(crate::GroupMemberResult {
+                operation: Some(created_group),
+                ..
+            }) = &result
+            {
                 publish_created_group(
                     Emit::Quiescent(client),
                     events,
@@ -5166,7 +5199,9 @@ fn account_worker_command_future<'a>(
                     created_group,
                 );
             }
-            let created = result.is_ok();
+            let created = result
+                .as_ref()
+                .is_ok_and(|result| result.operation.is_some());
             let response_sent =
                 respond_diagnosed(shared, storage_permit.as_ref(), respond, result, client).is_ok();
             telemetry.record(
@@ -5206,6 +5241,7 @@ fn account_worker_command_future<'a>(
                     pending,
                     app,
                     account_label,
+                    None,
                 ))
                 .await;
             }
@@ -5622,6 +5658,7 @@ fn account_worker_command_future<'a>(
             group_id,
             members,
             initial_admins,
+            member_resolution,
             respond,
         } => Box::pin(async move {
             let invite_unit = unit.enter(WorkerUnit::InviteOrCreate);
@@ -5633,12 +5670,20 @@ fn account_worker_command_future<'a>(
                     .map(String::as_str)
                     .collect::<Vec<_>>();
                 client
-                    .invite_members_with_telemetry(&group_id, &member_refs, &admin_refs, &telemetry)
+                    .invite_members_with_telemetry(
+                        &group_id,
+                        &member_refs,
+                        &admin_refs,
+                        member_resolution,
+                        &telemetry,
+                    )
                     .await
             }
             .await;
-            let canonical = result.as_ref().is_ok_and(|summary| {
-                summary.accept_disposition == cgka_traits::SendAcceptDisposition::Published
+            let canonical = result.as_ref().is_ok_and(|result| {
+                result.operation.as_ref().is_some_and(|summary| {
+                    summary.accept_disposition == cgka_traits::SendAcceptDisposition::Published
+                })
             });
             if canonical {
                 publish_client_pending_projection_updates(
@@ -5689,6 +5734,7 @@ fn account_worker_command_future<'a>(
                     pending,
                     app,
                     account_label,
+                    None,
                 ))
                 .await;
             }
@@ -8836,6 +8882,7 @@ mod tests {
                 &mut pending,
                 &app,
                 "alice",
+                None,
             );
             let check = async {
                 assert!(matches!(
@@ -8884,6 +8931,7 @@ mod tests {
             &mut pending,
             &app,
             "alice",
+            None,
         );
         let check = async {
             assert!(
@@ -8945,6 +8993,7 @@ mod tests {
             &mut pending,
             &app,
             "alice",
+            None,
         );
         let check = async {
             assert!(
@@ -9023,7 +9072,9 @@ mod tests {
                 None,
             )
             .await
-            .unwrap();
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         let second = runtime
             .create_group(
                 "alice",
@@ -9032,7 +9083,9 @@ mod tests {
                 None,
             )
             .await
-            .unwrap();
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         runtime.catch_up_accounts().await.unwrap();
         let commands = runtime.accounts().worker_commands("bob").await.unwrap();
         runtime
@@ -9154,7 +9207,9 @@ mod tests {
         let group_id = client
             .create_group("recovery notifications", &[])
             .await
-            .unwrap();
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         let epoch = client.runtime.group_record(&group_id).unwrap().epoch;
         let (events, mut received) = broadcast::channel(16);
         publish_client_pending_projection_updates(
@@ -9256,7 +9311,12 @@ mod tests {
         let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
             .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
         let mut client = app.client("alice").await.unwrap();
-        let group_id = client.create_group("history notices", &[]).await.unwrap();
+        let group_id = client
+            .create_group("history notices", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         let epoch = client.runtime.group_record(&group_id).unwrap().epoch.0;
         let storage = app.account_storage("alice").unwrap();
         let arm = |epoch| {
@@ -10314,7 +10374,12 @@ mod tests {
         let app =
             MarmotApp::with_relay(dir.path(), "wss://relay.example").with_test_relay_client(relay);
         let mut client = app.client(&account.label).await.unwrap();
-        let group = client.create_group("held snapshot", &[]).await.unwrap();
+        let group = client
+            .create_group("held snapshot", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         let group_hex = hex::encode(group.as_slice());
         let epoch = client.runtime.epoch_state(&group).unwrap().epoch().0;
         // Owed once the group's epoch passes the current one.
@@ -10367,7 +10432,12 @@ mod tests {
         let app =
             MarmotApp::with_relay(dir.path(), "wss://relay.example").with_test_relay_client(relay);
         let mut client = app.client(&account.label).await.unwrap();
-        let group = client.create_group("periodic announce", &[]).await.unwrap();
+        let group = client
+            .create_group("periodic announce", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         let group_hex = hex::encode(group.as_slice());
         // The device can fetch and has settled, so it announces as soon as
         // it owes one.
@@ -10411,7 +10481,12 @@ mod tests {
         let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
             .with_test_relay_client(relay.clone());
         let mut client = app.client(&account.label).await.unwrap();
-        client.create_group("push retry", &[]).await.unwrap();
+        client
+            .create_group("push retry", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         app.set_native_push_enabled(&account.label, true).unwrap();
         app.upsert_push_registration(
             &account.label,

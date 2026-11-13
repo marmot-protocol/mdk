@@ -161,13 +161,17 @@ async fn four_members() -> Fixture {
         .client
         .invite_members(&group, &[fx.carol.account_id_hex.as_str()])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     fx.carol.join(&relay, &group).await;
     fx.alice
         .client
         .invite_members(&group, &[fx.dave.account_id_hex.as_str()])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     fx.dave.join(&relay, &group).await;
     fx.carol.register("carol-token", &fx.server);
     fx.dave.register("dave-token", &fx.server);
@@ -208,7 +212,9 @@ async fn an_offline_owners_record_reaches_a_joiner_through_repair_body() {
         .client
         .invite_members(&group, &[fx.carol.account_id_hex.as_str()])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     fx.carol.join(&relay, &group).await;
     finish_post_join_fetch(&fx.carol, &group);
     fx.carol.can_fetch().await;
@@ -250,7 +256,9 @@ async fn a_request_draws_replies_from_at_most_the_top_three_leaves_body() {
         .client
         .invite_members(&group, &[erin.account_id_hex.as_str()])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     erin.join(&relay, &group).await;
     let mut devices = [
         &mut fx.alice,

@@ -127,7 +127,12 @@ async fn a_rejoined_copy_owes_only_its_own_span_and_says_so_once() {
     let mut bob_client = crate::tests::client_on_app_relay_plane(&app, &bob.label).await;
     bob_client.publish_key_package().await.unwrap();
     let mut alice_client = app.client(&alice.label).await.unwrap();
-    let group = alice_client.create_group("rejoin", &["bob"]).await.unwrap();
+    let group = alice_client
+        .create_group("rejoin", &["bob"])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let group_hex = hex::encode(group.as_slice());
     bob_client.sync().await.unwrap();
     bob_client.accept_group_invite(&group).unwrap();
@@ -293,7 +298,12 @@ async fn a_rejoined_copy_owes_only_its_own_span_and_says_so_once() {
 async fn a_relay_added_after_a_rejoin_owes_only_the_new_copys_span() {
     use cgka_traits::{EpochId, TransportEndpoint};
     let (_dir, _relay, app, mut client) = super::direct_client().await;
-    let group = client.create_group("later", &[]).await.unwrap();
+    let group = client
+        .create_group("later", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let account = app.account_storage("alice").unwrap();
     let ledger = account.app_storage();
     let installed = client

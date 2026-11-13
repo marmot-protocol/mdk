@@ -1683,7 +1683,12 @@ async fn download_prepare_stays_local() {
     let app = crate::MarmotApp::with_relay(dir.path(), "wss://relay.example")
         .with_test_relay_client(relay.clone());
     let mut client = app.client("alice").await.unwrap();
-    let group = client.create_group("media", &[]).await.unwrap();
+    let group = client
+        .create_group("media", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let mut reference = loopback_reference();
     reference.source_epoch = client.runtime.group_record(&group).unwrap().epoch.0;
     client

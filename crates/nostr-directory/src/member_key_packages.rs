@@ -17,7 +17,7 @@ use cgka_engine::key_package::key_package_metadata;
 use cgka_traits::TransportEndpoint;
 use cgka_traits::engine::KeyPackage;
 use cgka_traits::group::ProtocolProfile;
-use futures::{StreamExt, stream};
+use futures::{StreamExt, TryStreamExt, stream};
 use nostr_sdk::prelude::PublicKey;
 use transport_nostr_adapter::{KIND_MARMOT_INBOX_RELAY_LIST, KIND_NIP65_RELAY_LIST};
 
@@ -70,6 +70,40 @@ mod tests {
             Instant::now() - MEMBER_PREWARM_CACHE_TTL - Duration::from_secs(1);
         assert!(cache.get(&newest).is_none());
         assert!(!cache.order.contains(&newest));
+    }
+
+    #[test]
+    fn partial_errors_keep_internal() {
+        use cgka_traits::error::EngineError;
+
+        assert_eq!(
+            recipient_resolution_status(&DirectoryError::TransportClosed),
+            None
+        );
+        let incompatible =
+            DirectoryError::KeyPackageRequirements(EngineError::InvalidKeyPackageCapabilities {
+                member: cgka_traits::MemberId::new(vec![1; 32]),
+            });
+        assert_eq!(
+            recipient_resolution_status(&incompatible),
+            Some(MemberResolutionStatus::IncompatibleKeyPackage)
+        );
+        for error in [
+            EngineError::Backend("key package provider failed".into()),
+            EngineError::Other("unexpected admission failure".into()),
+        ] {
+            assert_eq!(
+                recipient_resolution_status(&DirectoryError::KeyPackageRequirements(error)),
+                None
+            );
+        }
+        assert_eq!(
+            recipient_resolution_status(&DirectoryError::MissingKeyPackage {
+                account: "01".repeat(32),
+                reason: MissingKeyPackageReason::ObsoleteOnly,
+            }),
+            Some(MemberResolutionStatus::ObsoleteKeyPackage)
+        );
     }
 }
 
@@ -140,6 +174,36 @@ pub enum MemberResolutionPurpose {
     Prewarm,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemberResolutionStatus {
+    /// Fresh, compatible devices and a safe inbox route are available.
+    /// This does not mean the account joined or received a Welcome.
+    Selected,
+    MissingKeyPackage,
+    ObsoleteKeyPackage,
+    InvalidKeyPackage,
+    IncompatibleKeyPackage,
+    MissingInboxRoute,
+    Incomplete,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MemberResolutionOutcome {
+    pub account_id_hex: String,
+    pub status: MemberResolutionStatus,
+    /// Number of eligible devices, zero for every unavailable status.
+    pub selected_device_count: u32,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemberResolutionPolicy {
+    Atomic,
+    #[default]
+    Partial,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MemberKeyPackagePrewarmSummary {
     /// Number of member references supplied by the host.
@@ -189,6 +253,8 @@ pub struct ResolvedMemberKeyPackages {
     /// order. An account with several devices contributes several.
     pub key_packages: Vec<KeyPackage>,
     pub stats: MemberKeyPackageResolutionStats,
+    /// One result per canonical account, in first-input order.
+    pub member_outcomes: Vec<MemberResolutionOutcome>,
 }
 
 impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
@@ -219,13 +285,19 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
             .key_packages)
     }
 
+    /// Resolve fresh packages against the operation's admission requirements.
+    /// Partial resolution keeps eligible accounts and reports recipient-local
+    /// failures, including when no account is eligible. Invalid requests and
+    /// resource, storage or internal failures still fail the whole operation.
+    /// Atomic resolution returns the first unresolved account's error instead.
     pub async fn resolve_compatible_member_key_packages(
         &self,
         member_refs: Vec<String>,
         requirements: &cgka_engine::key_package::KeyPackageRequirements,
         purpose: MemberResolutionPurpose,
+        policy: MemberResolutionPolicy,
     ) -> Result<ResolvedMemberKeyPackages, DirectoryError> {
-        self.resolve_member_key_packages_for_purpose(member_refs, purpose, Some(requirements))
+        self.resolve_members_with_policy(member_refs, purpose, Some(requirements), policy)
             .await
     }
 
@@ -277,12 +349,34 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
         purpose: MemberResolutionPurpose,
         requirements: Option<&cgka_engine::key_package::KeyPackageRequirements>,
     ) -> Result<ResolvedMemberKeyPackages, DirectoryError> {
+        self.resolve_members_with_policy(
+            member_refs,
+            purpose,
+            requirements,
+            MemberResolutionPolicy::Atomic,
+        )
+        .await
+    }
+
+    async fn resolve_members_with_policy(
+        &self,
+        member_refs: Vec<String>,
+        purpose: MemberResolutionPurpose,
+        requirements: Option<&cgka_engine::key_package::KeyPackageRequirements>,
+        policy: MemberResolutionPolicy,
+    ) -> Result<ResolvedMemberKeyPackages, DirectoryError> {
         let observation =
             self.resources
                 .begin(ObservedFamily::KeyPackage, "lookup", ObservedUnit::Action);
         let deadline = tokio::time::Instant::now() + MEMBER_RESOLUTION_DEADLINE;
         let result = self
-            .resolve_member_key_packages_inner(&member_refs, purpose, requirements, deadline)
+            .resolve_member_key_packages_inner(
+                &member_refs,
+                purpose,
+                requirements,
+                deadline,
+                policy,
+            )
             .await;
         if let Some(observation) = observation {
             observation.finish(match &result {
@@ -304,6 +398,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
         purpose: MemberResolutionPurpose,
         requirements: Option<&cgka_engine::key_package::KeyPackageRequirements>,
         deadline: tokio::time::Instant,
+        policy: MemberResolutionPolicy,
     ) -> Result<ResolvedMemberKeyPackages, DirectoryError> {
         let directory_observation = self
             .resources
@@ -315,10 +410,18 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
             .map(DirectoryObservation::counts_only);
         let mut seen = HashSet::new();
         let mut targets = Vec::new();
+        let local_accounts = if member_refs.is_empty() {
+            HashMap::new()
+        } else {
+            self.resources
+                .local_accounts()?
+                .into_iter()
+                .map(|account| (account.label, account.account_id_hex))
+                .collect::<HashMap<_, _>>()
+        };
         for member_ref in member_refs {
-            let local = self.resources.account_id_for_label(member_ref).ok();
-            let account_id_hex = match local {
-                Some(account_id_hex) => account_id_hex,
+            let account_id_hex = match local_accounts.get(member_ref) {
+                Some(account_id_hex) => account_id_hex.clone(),
                 None => PublicKey::parse(member_ref)
                     .map_err(|_| DirectoryError::InvalidPublicKey)?
                     .to_hex(),
@@ -394,14 +497,15 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
         )
         .await
         {
-            Ok(RelayListResolution { completed, errors }) => {
+            Ok(resolution) => {
+                let RelayListResolution { completed, errors } = resolution?;
                 for (index, error) in errors {
                     outcomes[index] = Some(Err(error));
                 }
                 let key_package_unresolved = (0..targets.len())
                     .filter(|index| outcomes[*index].is_none())
                     .collect::<Vec<_>>();
-                let finished = tokio::time::timeout_at(
+                let finished = match tokio::time::timeout_at(
                     deadline,
                     self.resolve_missing_key_packages(
                         &targets,
@@ -412,7 +516,13 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                     ),
                 )
                 .await
-                .is_ok();
+                {
+                    Ok(result) => {
+                        result?;
+                        true
+                    }
+                    Err(_) => false,
+                };
                 (completed, true, finished)
             }
             Err(_) => (HashSet::new(), false, false),
@@ -436,6 +546,41 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                 };
                 observation.directory_sample(outcome, "network", 1);
             }
+        }
+        for (target, outcome) in targets.iter().zip(&mut outcomes) {
+            let Some(result) = outcome.take() else {
+                continue;
+            };
+            *outcome = Some(result.and_then(|packages| {
+                if packages.is_empty() {
+                    return Err(DirectoryError::MissingKeyPackage {
+                        account: target.account_id_hex.clone(),
+                        reason: MissingKeyPackageReason::NotFound,
+                    });
+                }
+                let safe_inbox = self.relay_plane.retain_safe_discovered_endpoints(
+                    target
+                        .relay_lists
+                        .inbox
+                        .relays
+                        .iter()
+                        .cloned()
+                        .map(TransportEndpoint)
+                        .collect(),
+                    "member invite inbox readiness",
+                );
+                if safe_inbox.is_empty() {
+                    return Err(DirectoryError::MissingMemberInboxRoute(
+                        target.account_id_hex.clone(),
+                    ));
+                }
+                self.relay_plane
+                    .sanitize_relay_endpoints(safe_inbox, "member invite inbox admission")
+                    .map_err(|_| {
+                        DirectoryError::DirectoryLookupIncomplete(target.account_id_hex.clone())
+                    })?;
+                Ok(packages)
+            }));
         }
         match purpose {
             // A cancelled relay-list stage may hold a discovery-only snapshot.
@@ -474,41 +619,45 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
             }
         }
 
-        let mut key_packages = Vec::with_capacity(targets.len());
-        for (index, outcome) in outcomes.into_iter().enumerate() {
-            match outcome.unwrap_or_else(|| {
+        let unique_members = targets.len();
+        let mut key_packages = Vec::with_capacity(unique_members);
+        let mut member_outcomes = Vec::with_capacity(unique_members);
+        for (target, outcome) in targets.into_iter().zip(outcomes) {
+            let outcome = outcome.unwrap_or_else(|| {
                 Err(DirectoryError::MissingKeyPackage {
-                    account: targets[index].account_id_hex.clone(),
+                    account: target.account_id_hex.clone(),
                     reason: MissingKeyPackageReason::NotFound,
                 })
-            }) {
-                Ok(key_package) => {
-                    let safe_inbox = self.relay_plane.retain_safe_discovered_endpoints(
-                        targets[index]
-                            .relay_lists
-                            .inbox
-                            .relays
-                            .iter()
-                            .cloned()
-                            .map(TransportEndpoint)
-                            .collect(),
-                        "member invite inbox readiness",
-                    );
-                    if safe_inbox.is_empty() {
-                        return Err(DirectoryError::MissingMemberInboxRoute(
-                            targets[index].account_id_hex.clone(),
-                        ));
-                    }
-                    key_packages.extend(key_package);
+            });
+            let (status, selected_device_count) = match outcome {
+                Ok(packages) => {
+                    let device_count = packages.len() as u32;
+                    key_packages.extend(packages);
+                    (MemberResolutionStatus::Selected, device_count)
                 }
-                Err(error) => return Err(error),
-            }
+                Err(error) => {
+                    let status = match policy {
+                        MemberResolutionPolicy::Atomic => return Err(error),
+                        MemberResolutionPolicy::Partial => recipient_resolution_status(&error),
+                    };
+                    let Some(status) = status else {
+                        return Err(error);
+                    };
+                    (status, 0)
+                }
+            };
+            member_outcomes.push(MemberResolutionOutcome {
+                account_id_hex: target.account_id_hex,
+                status,
+                selected_device_count,
+            });
         }
         Ok(ResolvedMemberKeyPackages {
             key_packages,
+            member_outcomes,
             stats: MemberKeyPackageResolutionStats {
                 requested_members: member_refs.len(),
-                unique_members: targets.len(),
+                unique_members,
             },
         })
     }
@@ -596,7 +745,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
         &self,
         targets: &mut [MemberTarget],
         groups: Vec<(Vec<TransportEndpoint>, Vec<usize>)>,
-    ) -> HashSet<usize> {
+    ) -> Result<HashSet<usize>, DirectoryError> {
         let specs = groups
             .into_iter()
             .flat_map(|(endpoints, indices)| {
@@ -627,20 +776,20 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                         )
                     })
                     .collect();
-                let result = directory
+                let outcome = directory
                     .relay_plane
                     .fetch_directory_events_with_completion(endpoints.clone(), queries)
-                    .await;
-                let outcome = result.unwrap_or_default();
+                    .await
+                    .map_err(DirectoryError::RelayDirectory)?;
                 if members.len() == 1 || outcome.complete {
-                    return members
+                    return Ok(members
                         .into_iter()
                         .map(|(index, _)| (index, endpoints.clone(), outcome.clone()))
-                        .collect::<Vec<_>>();
+                        .collect::<Vec<_>>());
                 }
                 // CLOSED and other incomplete outcomes need the same fallback
-                // as transport errors. Retain positive batch records even when
-                // the single-author retry also fails.
+                // as a rejected batch. Retain positive records when the
+                // single-author retry is also incomplete.
                 stream::iter(members.into_iter().map(|(index, account_id)| {
                     let directory = directory.clone();
                     let endpoints = endpoints.clone();
@@ -665,9 +814,9 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                             .relay_plane
                             .fetch_directory_events_with_completion(endpoints.clone(), queries)
                             .await
-                            .unwrap_or_default();
+                            .map_err(DirectoryError::RelayDirectory)?;
                         records.extend(retry.records);
-                        (
+                        Ok::<_, DirectoryError>((
                             index,
                             endpoints,
                             DirectoryFetchOutcome {
@@ -675,18 +824,18 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                                 complete: retry.complete,
                                 complete_endpoints: retry.complete_endpoints,
                             },
-                        )
+                        ))
                     }
                 }))
-                .buffered(MEMBER_RESOLUTION_FALLBACK_CONCURRENCY)
-                .collect::<Vec<_>>()
+                .buffer_unordered(MEMBER_RESOLUTION_FALLBACK_CONCURRENCY)
+                .try_collect::<Vec<_>>()
                 .await
             }
         });
         let results = stream::iter(work)
-            .buffered(MEMBER_RESOLUTION_RELAY_CONCURRENCY)
-            .collect::<Vec<_>>()
-            .await;
+            .buffer_unordered(MEMBER_RESOLUTION_RELAY_CONCURRENCY)
+            .try_collect::<Vec<_>>()
+            .await?;
         let mut completed = HashSet::new();
         for (index, endpoints, outcome) in results.into_iter().flatten() {
             let account_id = targets[index].account_id_hex.clone();
@@ -712,25 +861,25 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                 completed.insert(index);
             }
         }
-        completed
+        Ok(completed)
     }
 
     async fn resolve_missing_relay_lists(
         &self,
         targets: &mut [MemberTarget],
         unresolved: &[usize],
-    ) -> RelayListResolution {
+    ) -> Result<RelayListResolution, DirectoryError> {
         let needs_discovery = unresolved.to_vec();
         if needs_discovery.is_empty() {
-            return RelayListResolution::default();
+            return Ok(RelayListResolution::default());
         }
         let endpoints = self.directory_source_relays(&[]);
         if endpoints.is_empty() {
-            return RelayListResolution::default();
+            return Ok(RelayListResolution::default());
         }
         let completed_discovery = self
             .resolve_relay_list_hop(targets, vec![(endpoints.clone(), needs_discovery.clone())])
-            .await;
+            .await?;
         let incomplete_discovery = needs_discovery
             .iter()
             .copied()
@@ -768,9 +917,23 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
             .flatten()
             .copied()
             .collect::<HashSet<_>>();
-        let completed_outbox = self
-            .resolve_relay_list_hop(targets, by_outboxes.into_iter().collect())
-            .await;
+        let mut invalid_outboxes = HashSet::new();
+        let outbox_groups = by_outboxes
+            .into_iter()
+            .filter_map(|(endpoints, indices)| {
+                match self
+                    .relay_plane
+                    .sanitize_relay_endpoints(endpoints, "member inbox outbox admission")
+                {
+                    Ok(endpoints) => Some((endpoints, indices)),
+                    Err(_) => {
+                        invalid_outboxes.extend(indices);
+                        None
+                    }
+                }
+            })
+            .collect();
+        let completed_outbox = self.resolve_relay_list_hop(targets, outbox_groups).await?;
         let completed = completed_discovery
             .iter()
             .copied()
@@ -779,6 +942,9 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
         let errors = needs_discovery
             .into_iter()
             .filter(|index| {
+                if invalid_outboxes.contains(index) {
+                    return true;
+                }
                 let has_inbox = !self
                     .relay_plane
                     .retain_safe_discovered_endpoints(
@@ -805,7 +971,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                 (index, DirectoryError::DirectoryLookupIncomplete(account))
             })
             .collect();
-        RelayListResolution { completed, errors }
+        Ok(RelayListResolution { completed, errors })
     }
 
     async fn resolve_missing_key_packages(
@@ -815,11 +981,11 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
         outcomes: &mut [Option<Result<Vec<KeyPackage>, DirectoryError>>],
         purpose: MemberResolutionPurpose,
         requirements: Option<&cgka_engine::key_package::KeyPackageRequirements>,
-    ) {
+    ) -> Result<(), DirectoryError> {
         let defaults = self.directory_source_relays(&[]);
         let mut by_endpoints = BTreeMap::<Vec<TransportEndpoint>, Vec<usize>>::new();
         for index in unresolved.iter().copied() {
-            let mut endpoints = self.relay_plane.retain_safe_discovered_endpoints(
+            let endpoints = self.relay_plane.retain_safe_discovered_endpoints(
                 targets[index]
                     .relay_lists
                     .nip65
@@ -830,6 +996,18 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                     .collect(),
                 "member KeyPackage batch fetch",
             );
+            let mut endpoints = match self
+                .relay_plane
+                .sanitize_relay_endpoints(endpoints, "member KeyPackage route admission")
+            {
+                Ok(endpoints) => endpoints,
+                Err(_) => {
+                    outcomes[index] = Some(Err(DirectoryError::DirectoryLookupIncomplete(
+                        targets[index].account_id_hex.clone(),
+                    )));
+                    continue;
+                }
+            };
             if endpoints.is_empty() {
                 endpoints.clone_from(&defaults);
             }
@@ -868,11 +1046,10 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                 async move {
                     let result = directory
                         .relay_plane
-                        .fetch_directory_events(endpoints, queries)
+                        .fetch_directory_events_with_completion(endpoints, queries)
                         .await
-                        .map_err(|error| {
-                            DirectoryError::RelayDirectory(format!("fetch key packages: {error}"))
-                        });
+                        .map(|outcome| outcome.records)
+                        .map_err(DirectoryError::RelayDirectory);
                     (indices, result)
                 }
             });
@@ -884,10 +1061,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
         let mut fallback = Vec::new();
         let mut fallback_records = BTreeMap::new();
         while let Some((indices, result)) = batches.next().await {
-            let Ok(records) = result else {
-                fallback.extend(indices);
-                continue;
-            };
+            let records = result?;
             let multiple_authors = indices.len() > 1;
             let mut records_by_author = BTreeMap::<_, Vec<_>>::new();
             for record in records {
@@ -977,14 +1151,12 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                     async move {
                         let queries = key_package_queries(vec![target.account_id_hex.clone()]);
                         let result = async {
-                            let (mut records, complete) = match directory
+                            let fetched = directory
                                 .relay_plane
                                 .fetch_directory_events_with_completion(endpoints.clone(), queries)
                                 .await
-                            {
-                                Ok(outcome) => (outcome.records, outcome.complete),
-                                Err(_) => (Vec::new(), false),
-                            };
+                                .map_err(DirectoryError::RelayDirectory)?;
+                            let mut records = fetched.records;
                             // This supplementary lookup must not discard a
                             // valid package observed in this call's batch.
                             // Never load a previously cached package here.
@@ -995,7 +1167,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                                         account: &target.account_id_hex,
                                         searched: &endpoints,
                                         observed: records,
-                                        primary_complete: complete,
+                                        primary_complete: fetched.complete,
                                         discovery: &directory.directory_source_relays(&[]),
                                         requirements,
                                         cached_target: None,
@@ -1025,6 +1197,43 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                 self.accept_fetched_key_packages(purpose, selected, &targets[index].relay_lists)
             }));
         }
+        Ok(())
+    }
+}
+
+fn recipient_resolution_status(error: &DirectoryError) -> Option<MemberResolutionStatus> {
+    use MemberResolutionStatus as Status;
+    use cgka_traits::error::EngineError;
+
+    match error {
+        DirectoryError::MissingKeyPackage {
+            reason: MissingKeyPackageReason::NotFound,
+            ..
+        } => Some(Status::MissingKeyPackage),
+        DirectoryError::MissingKeyPackage {
+            reason: MissingKeyPackageReason::ObsoleteOnly,
+            ..
+        } => Some(Status::ObsoleteKeyPackage),
+        DirectoryError::InvalidKeyPackageEvent(_) => Some(Status::InvalidKeyPackage),
+        DirectoryError::MissingMemberInboxRoute(_) => Some(Status::MissingInboxRoute),
+        DirectoryError::DirectoryLookupIncomplete(_) | DirectoryError::MissingRelayLists(_) => {
+            Some(Status::Incomplete)
+        }
+        DirectoryError::KeyPackageRequirements(
+            EngineError::MissingRequiredCapabilities { .. }
+            | EngineError::InvalidKeyPackageCapabilities { .. },
+        ) => Some(Status::IncompatibleKeyPackage),
+        DirectoryError::KeyPackageRequirements(
+            EngineError::InvalidKeyPackageLifetime { .. }
+            | EngineError::InvalidAccountIdentityProof(_)
+            | EngineError::Serialize(_),
+        ) => Some(Status::InvalidKeyPackage),
+        DirectoryError::KeyPackageRequirements(EngineError::Other(message))
+            if message == "KeyPackage does not match target group profile or ciphersuite" =>
+        {
+            Some(Status::IncompatibleKeyPackage)
+        }
+        _ => None,
     }
 }
 

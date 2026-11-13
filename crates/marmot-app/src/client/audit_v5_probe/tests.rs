@@ -271,7 +271,9 @@ async fn blocked_inbox_single_unseal() {
                 None,
             )
             .await
-            .unwrap();
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         let retained = alice.runtime.outstanding_welcome_deliveries().unwrap();
         assert_eq!(retained.len(), 1);
         let welcome_id = hex::encode(retained[0].1.id.as_slice());
@@ -431,6 +433,8 @@ async fn welcome_policy_single_unseal() {
                 )
                 .await
                 .unwrap()
+                .operation
+                .expect("eligible fixture members")
                 .group_id;
             let retained = alice.runtime.outstanding_welcome_deliveries().unwrap();
             let welcome = &retained
@@ -595,6 +599,8 @@ mod rejoin_policy {
                 )
                 .await
                 .unwrap()
+                .operation
+                .expect("eligible fixture members")
                 .group_id;
             let initial = alice.runtime.outstanding_welcome_deliveries().unwrap()[0]
                 .1
@@ -623,6 +629,7 @@ mod rejoin_policy {
                     vec![bob_account.account_id_hex.clone()],
                     &requirements,
                     nostr_directory::MemberResolutionPurpose::CommitFresh,
+                    nostr_directory::MemberResolutionPolicy::Atomic,
                 )
                 .await
                 .unwrap()
@@ -843,7 +850,9 @@ async fn opened_inventory_selects_current_groups_before_the_64_group_cap() {
             client
                 .create_group(&format!("mixed profile group {index}"), &[])
                 .await
-                .unwrap(),
+                .unwrap()
+                .operation
+                .expect("eligible fixture members"),
         );
     }
     ids.sort_by(|a, b| a.as_slice().cmp(b.as_slice()));
@@ -920,6 +929,8 @@ async fn normal_opt_in_records_real_welcome_and_operational_v5_rows() {
             )
             .await
             .unwrap()
+            .operation
+            .expect("eligible fixture members")
             .group_id;
         let retained = alice.runtime.outstanding_welcome_deliveries().unwrap();
         assert_eq!(retained.len(), 1);
@@ -1138,6 +1149,8 @@ impl Scenario {
             )
             .await
             .unwrap()
+            .operation
+            .expect("eligible fixture members")
             .group_id;
         // Independent product oracle at the post-canonical, pre-publish seam:
         // the engine retained the exact outbound artifact, not an app index.
@@ -1866,6 +1879,8 @@ async fn founding_preparation_matches_two_recipients_without_order_inference() {
             )
             .await
             .unwrap()
+            .operation
+            .expect("eligible fixture members")
             .group_id;
         assert_eq!(scenario.alice.members(&group).unwrap().len(), 3);
         let retained = scenario
@@ -2077,6 +2092,8 @@ async fn founding_preparation_records_every_device_of_one_account() {
             )
             .await
             .unwrap()
+            .operation
+            .expect("eligible fixture members")
             .group_id;
         let retained = scenario
             .alice

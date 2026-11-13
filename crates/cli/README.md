@@ -309,10 +309,19 @@ devices are in the group, and member counts, admin counts and the last-admin che
 **Invites.** `groups invites` lists groups still awaiting local confirmation. `groups accept` clears that pending state;
 `groups decline` leaves and archives the auto-joined pending group.
 
+Group creation and member invites resolve each requested account independently using fresh KeyPackages.
+Eligible accounts proceed even if others are unavailable. JSON `member_outcomes` lists each canonical account once,
+with `account_id_hex`, `status`, and `selected_device_count`. `selected` means eligible for the operation, not joined or delivered.
+Other statuses are `missing_key_package`, `obsolete_key_package`, `invalid_key_package`, `incompatible_key_package`,
+`missing_inbox_route`, and `incomplete`. If no requested account is eligible, creation returns `group_id: null`;
+an invite returns `summary: null` and nullable publication fields, without changing the group.
+An empty create roster still creates a creator-only group.
+
 **Names and admins.** `groups update` is the canonical spelling for name and/or description changes; `groups rename`
 and legacy `group update` keep working. `groups add-members ... --admin <member>` (and legacy `group invite --admin`)
 grants admin to an invitee inside the same invite commit. An `--admin` that is not one of the invitees fails with
-`initial_admin_not_invited` before anything is published. Invite results carry an `initial_admins` list.
+`initial_admin_not_invited` before anything is published. Invite results carry selected `initial_admins` and the
+original `requested_initial_admins`. An unavailable invitee receives no admin rights.
 `groups management` mirrors the MarmotKit management state (`is_self_admin`, `can_invite`, `can_leave`,
 `requires_self_demote_before_leave`, `leave_blocked`, `can_enable_disbanding`, `can_disband`, `disbanding_blockers`,
 per-member `member_actions`). Leave hints use the shared core capability selector and remain advisory; the command

@@ -271,7 +271,9 @@ mod tests {
                 None,
             )
             .await
-            .unwrap();
+            .unwrap()
+            .operation
+            .expect("available peer group created");
         // Explicitly fetch and persist the real published profile. Search's
         // ephemeral tier and the background directory sync are not a fence for
         // a later signed-out read of the shared directory.

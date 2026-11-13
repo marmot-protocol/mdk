@@ -471,7 +471,7 @@ mod tests {
     use crate::types::presentation::marmot_presented_chat_row_free;
     use crate::{
         MarmotRelayPolicy, marmot_client_free, marmot_client_new_with_options,
-        marmot_client_shutdown, marmot_client_start, marmot_string_free,
+        marmot_client_shutdown, marmot_client_start,
     };
     use std::ffi::CString;
     use std::ptr;
@@ -544,7 +544,7 @@ mod tests {
                 ),
                 MarmotStatus::Ok
             );
-            let mut group = ptr::null_mut();
+            let mut creation = ptr::null_mut();
             assert_eq!(
                 marmot_create_group(
                     client,
@@ -553,10 +553,11 @@ mod tests {
                     ptr::null(),
                     0,
                     ptr::null(),
-                    &mut group
+                    &mut creation
                 ),
                 MarmotStatus::Ok
             );
+            let group = (*creation).group_id_hex;
             let mut draft = ptr::null_mut();
             assert_eq!(
                 marmot_save_message_draft(
@@ -649,7 +650,7 @@ mod tests {
             assert_eq!(covered, 0);
             marmot_presented_chat_row_free(row);
             crate::types::conversation_window::marmot_selected_message_draft_free(selected);
-            marmot_string_free(group);
+            crate::types::group::marmot_group_creation_free(creation);
             marmot_account_summary_free(account);
             assert_eq!(marmot_client_shutdown(client), MarmotStatus::Ok);
             marmot_client_free(client);

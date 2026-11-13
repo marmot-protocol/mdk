@@ -1,25 +1,17 @@
 //! Nostr account ids and profile references: one parser, one `nprofile` rule.
+//!
+//! Every reference decision lives in [`crate::reference`]; the functions here
+//! are the identity surface over it.
 
 use crate::error::DirectoryError;
-use nostr::nips::nip19::FromBech32;
-use nostr::nips::nip19::Nip19Profile;
-use nostr::nips::nip19::ToBech32;
+use crate::reference::{ReferenceContext, ReferenceTarget, decode_reference, parse_account_key};
+use nostr::nips::nip19::{Nip19Profile, ToBech32};
 use nostr::prelude::RelayUrl;
-use nostr_sdk::prelude::PublicKey;
 
 pub fn parse_account_id_hex(value: &str) -> Result<String, DirectoryError> {
     parse_account_key(value)
         .map(|pubkey| pubkey.to_hex())
         .map_err(|_| DirectoryError::InvalidPublicKey)
-}
-
-pub(crate) fn parse_account_key(value: &str) -> Result<PublicKey, DirectoryError> {
-    // The 0.45 parser also accepts nprofile. Preserve this narrower account-id
-    // contract; only account_id_hex_from_ref intentionally accepts profiles.
-    if value.starts_with("nprofile1") || value.starts_with("nostr:nprofile1") {
-        return Err(DirectoryError::InvalidPublicKey);
-    }
-    PublicKey::parse(value).map_err(|_| DirectoryError::InvalidPublicKey)
 }
 
 pub fn normalize_account_ids(values: Vec<String>) -> Result<Vec<String>, DirectoryError> {
@@ -66,10 +58,6 @@ pub fn nprofile_for_account_id(
         .map_err(|_| DirectoryError::InvalidPublicKey)
 }
 
-/// Matches the currently locked Bech32/Bech32m code-length ceiling
-/// (`bech32` 0.11.1), not a universal NIP-19 protocol limit.
-pub(crate) const MAX_NPROFILE_REFERENCE_BYTES: usize = 1023;
-
 /// Normalize a public identity reference into a canonical hex account id.
 ///
 /// Accepts hex, `npub`, `nostr:npub`, `nprofile`, and `nostr:nprofile`.
@@ -84,21 +72,13 @@ pub(crate) const MAX_NPROFILE_REFERENCE_BYTES: usize = 1023;
 /// Whitespace and `marmot://profile/...` normalization belong to FFI.
 /// Failures return [`DirectoryError::InvalidPublicKey`] without echoing the input.
 pub fn account_id_hex_from_ref(reference: &str) -> Result<String, DirectoryError> {
-    if let Ok(pubkey) = parse_account_key(reference) {
-        return Ok(pubkey.to_hex());
-    }
-    let profile_ref = nprofile_fallback_token(reference)?;
-    Nip19Profile::from_bech32(profile_ref)
-        .map(|profile| profile.public_key.to_hex())
-        .map_err(|_| DirectoryError::InvalidPublicKey)
-}
-
-pub(crate) fn nprofile_fallback_token(reference: &str) -> Result<&str, DirectoryError> {
-    let profile_ref = reference.strip_prefix("nostr:").unwrap_or(reference);
-    if profile_ref.len() > MAX_NPROFILE_REFERENCE_BYTES {
-        return Err(DirectoryError::InvalidPublicKey);
-    }
-    Ok(profile_ref)
+    decode_reference(reference, ReferenceContext::Identity)
+        .ok()
+        .and_then(|decoded| match decoded.target {
+            ReferenceTarget::Identity(key) => Some(key.to_hex()),
+            _ => None,
+        })
+        .ok_or(DirectoryError::InvalidPublicKey)
 }
 
 pub fn npub_for_account_id_lossy(account_id_hex: &str) -> String {
@@ -108,8 +88,7 @@ pub fn npub_for_account_id_lossy(account_id_hex: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_NPROFILE_REFERENCE_BYTES, account_id_hex_from_ref, nprofile_fallback_token,
-        nprofile_for_account_id, npub_for_account_id, parse_account_id_hex,
+        account_id_hex_from_ref, nprofile_for_account_id, npub_for_account_id, parse_account_id_hex,
     };
     use crate::error::DirectoryError;
 
@@ -167,36 +146,6 @@ mod tests {
                 }
             }
         }
-    }
-
-    #[test]
-    fn nprofile_fallback_token_rejects_oversized_tokens_before_sdk_decode() {
-        let accepted = "q".repeat(MAX_NPROFILE_REFERENCE_BYTES);
-        assert_eq!(
-            nprofile_fallback_token(&accepted).expect("1023-byte token stays eligible"),
-            accepted.as_str()
-        );
-        let wrapped = format!("nostr:{accepted}");
-        assert_eq!(
-            nprofile_fallback_token(&wrapped).expect("prefix is excluded from the budget"),
-            accepted.as_str()
-        );
-
-        let oversized = "q".repeat(MAX_NPROFILE_REFERENCE_BYTES + 1);
-        assert!(
-            matches!(
-                nprofile_fallback_token(&oversized),
-                Err(DirectoryError::InvalidPublicKey)
-            ),
-            "1024-byte token must not reach Nip19Profile::from_bech32"
-        );
-        assert!(
-            matches!(
-                nprofile_fallback_token(&format!("nostr:{oversized}")),
-                Err(DirectoryError::InvalidPublicKey)
-            ),
-            "prefixed oversized token must not reach Nip19Profile::from_bech32"
-        );
     }
 
     #[test]

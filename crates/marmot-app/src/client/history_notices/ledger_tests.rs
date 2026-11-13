@@ -71,7 +71,12 @@ async fn opened(
     TransportReconciliationRoute,
 ) {
     let mut client = client_on_app_relay_plane(&app, "alice").await;
-    let group = client.create_group("ledger notices", &[]).await.unwrap();
+    let group = client
+        .create_group("ledger notices", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let route = client
         .recovery_runner_routes()
         .into_iter()
@@ -420,7 +425,9 @@ async fn a_park_on_a_relay_the_route_carries_only_as_best_effort_is_no_notice() 
             },
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let route = client
         .recovery_runner_routes()
         .into_iter()
@@ -500,7 +507,9 @@ async fn a_hidden_park_moves_no_notice_revision_and_is_never_dismissed() {
             },
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let route = client
         .recovery_runner_routes()
         .into_iter()

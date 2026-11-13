@@ -215,7 +215,9 @@ async fn a_device_takes_only_its_siblings_own_key_packages() {
         .phone
         .create_group("receive stock", &[])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let mut selection = Default::default();
     assert!(
         devices
@@ -2009,7 +2011,9 @@ async fn a_refused_sibling_add_spends_its_key_package() {
             },
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let phone_slot = slot(&devices.phone);
     let stock = received_from(&devices.laptop, &phone_slot).len();
     let before = devices.relay.published_events.lock().unwrap().len();
@@ -2049,7 +2053,9 @@ async fn a_queued_sibling_add_the_drain_refuses_spends_its_key_package() {
         .laptop
         .invite_members(&chat, &[&bob_id])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     deliver_all(&mut bob, &devices.relay).await;
     bob.accept_group_invite(&chat).unwrap();
 
@@ -2133,7 +2139,9 @@ async fn founding_and_initial_welcome_wait_for_the_senders_own_tag() {
         .laptop
         .create_group("before sender ready", &[])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     assert_eq!(
         devices
             .laptop
@@ -2162,7 +2170,9 @@ async fn founding_and_initial_welcome_wait_for_the_senders_own_tag() {
         .laptop
         .create_group("sender ready", &[])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     assert_eq!(
         devices
             .laptop
@@ -2558,7 +2568,9 @@ async fn a_shared_decline_keeps_native_leave_work_across_a_later_accept_and_rest
     let chat = bob
         .create_group("shared external admission", &[&alice])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     deliver_all(&mut devices.phone, &devices.relay).await;
     deliver_all(&mut devices.laptop, &devices.relay).await;
     let chat_hex = hex::encode(chat.as_slice());
@@ -2810,7 +2822,12 @@ async fn a_shared_decline_keeps_native_leave_work_across_a_later_accept_and_rest
         // A held maximum cannot create a newer local decision. Once local
         // blocking is lifted, an explicit action may still apply that SAME
         // winning acceptance without writing or broadcasting another value.
-        let maximum_chat = bob.create_group("maximum invitation", &[]).await.unwrap();
+        let maximum_chat = bob
+            .create_group("maximum invitation", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         let key = published_key_package(&mut devices.phone, &devices.relay).await;
         let effects = bob
             .runtime
@@ -3003,7 +3020,9 @@ async fn a_pre_welcome_decline_survives_a_failed_join_projection_checkpoint() {
     let chat = bob
         .create_group("checkpoint retains invitation work", &[&alice])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let welcomes: Vec<_> = devices.relay.published_events.lock().unwrap()[first_welcome..]
         .iter()
         .filter(|event| event.kind == 1059)

@@ -430,6 +430,7 @@ impl AppClient {
                             members,
                             &requirements,
                             nostr_directory::MemberResolutionPurpose::CommitFresh,
+                            nostr_directory::MemberResolutionPolicy::Atomic,
                         )
                         .await
                     {
@@ -529,8 +530,18 @@ mod tests {
                 .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
             let mut client = app.client("alice").await.unwrap();
             let mut groups = [
-                client.create_group("first", &[]).await.unwrap(),
-                client.create_group("second", &[]).await.unwrap(),
+                client
+                    .create_group("first", &[])
+                    .await
+                    .unwrap()
+                    .operation
+                    .expect("eligible fixture members"),
+                client
+                    .create_group("second", &[])
+                    .await
+                    .unwrap()
+                    .operation
+                    .expect("eligible fixture members"),
             ];
             groups.sort_by(|left, right| left.as_slice().cmp(right.as_slice()));
             drop(client);

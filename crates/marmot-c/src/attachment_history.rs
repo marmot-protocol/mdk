@@ -375,7 +375,9 @@ mod tests {
                 vec![],
                 None,
             ))
-            .unwrap();
+            .unwrap()
+            .group_id_hex
+            .expect("selected members create a group");
         let (server, upload_task) = client.block_on(upload_sink());
         let uploaded = client
             .block_on(client.marmot.upload_media(

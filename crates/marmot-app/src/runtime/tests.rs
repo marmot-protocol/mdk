@@ -440,7 +440,9 @@ mod live_notifications {
         let group = runtime
             .create_group("alice", "Before", &[], None)
             .await
-            .unwrap();
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         let mut resolver = crate::notifications::NotificationResolver::default();
         let warm = crate::notifications::notification_update_from_event_cached(
             &app,
@@ -722,18 +724,24 @@ async fn polls_can_be_created_and_voted_in_direct_and_group_conversations() {
         let direct = alice
             .create_group("", &[bob.account_id_hex.as_str()])
             .await
-            .unwrap();
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         let named_pair = alice
             .create_group("Design", &[erin.account_id_hex.as_str()])
             .await
-            .unwrap();
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         let group = alice
             .create_group(
                 "Poll group",
                 &[carol.account_id_hex.as_str(), dave.account_id_hex.as_str()],
             )
             .await
-            .unwrap();
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         (direct, named_pair, group)
     };
 
@@ -1279,7 +1287,9 @@ async fn a_wipe_keeps_a_chat_its_account_is_the_last_admin_of() {
     let group = runtime
         .create_group("alice", "sole admin", &[], None)
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let attempted = relay.attempted_events().len();
 
     let outcome = runtime.sign_out_and_wipe("alice").await.unwrap();
@@ -2343,7 +2353,12 @@ async fn timeline_search_window() {
     let app = MarmotApp::with_relay(root.path(), "wss://test.example")
         .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
     let mut client = app.client("alice").await.unwrap();
-    let group = client.create_group("search", &[]).await.unwrap();
+    let group = client
+        .create_group("search", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let group_hex = hex::encode(group.as_slice());
     let storage = app.account_storage("alice").unwrap().app_storage();
     let sender = "ee".repeat(32);
@@ -4908,7 +4923,12 @@ async fn message_journey_overflow() {
     let app =
         MarmotApp::with_relay(root.path(), "wss://journey.example").with_test_relay_client(relay);
     let mut client = app.client("sender").await.unwrap();
-    let group = client.create_group("journey", &[]).await.unwrap();
+    let group = client
+        .create_group("journey", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let runtime = app.runtime();
     let mut timeline = runtime
         .subscribe_timeline_messages(
@@ -4971,7 +4991,12 @@ async fn accepted_edit_emits_content_row_and_recovered_snapshot_without_activity
     let app = MarmotApp::with_relay(root.path(), "wss://test.example")
         .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
     let mut client = app.client("alice").await.unwrap();
-    let group = client.create_group("edits", &[]).await.unwrap();
+    let group = client
+        .create_group("edits", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let group_hex = hex::encode(group.as_slice());
     let storage = app.account_storage("alice").unwrap().app_storage();
     let original = storage_sqlite::StoredAppEvent {
@@ -5260,7 +5285,12 @@ async fn system_reactions_update_live_timeline_through_existing_commands() {
     let app = MarmotApp::with_relay(root.path(), "wss://test.example")
         .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
     let mut client = app.client("alice").await.unwrap();
-    let group = client.create_group("system reactions", &[]).await.unwrap();
+    let group = client
+        .create_group("system reactions", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let actor = cgka_traits::MemberId::new(hex::decode(&account.account_id_hex).unwrap());
     let change = GroupStateChange::GroupRenamed {
         name: "renamed".into(),
@@ -5551,7 +5581,9 @@ async fn abandoned_invite_decline_does_not_leave_the_group() {
         let group = alice
             .create_group("Invite", &[&bob.account_id_hex])
             .await
-            .unwrap();
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         assert!(
             bob_client
                 .sync()

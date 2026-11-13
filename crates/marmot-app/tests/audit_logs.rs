@@ -556,7 +556,12 @@ async fn deferred_runtime_open_records_the_stored_group_baseline() {
         .unwrap();
     let app = MarmotApp::with_relay(tmp.path(), "wss://relay.example");
     let mut client = app.client(&account.label).await.unwrap();
-    let group = client.create_group("stored baseline", &[]).await.unwrap();
+    let group = client
+        .create_group("stored baseline", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     drop(client);
     app.set_audit_log_settings(AuditLogSettings { enabled: true })
         .unwrap();
@@ -638,7 +643,9 @@ async fn opened_baseline_inventory_exposes_the_64_group_cap() {
         client
             .create_group(&format!("baseline group {index}"), &[])
             .await
-            .unwrap();
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
     }
     drop(client);
     app.set_audit_log_settings(AuditLogSettings { enabled: true })
@@ -679,7 +686,12 @@ async fn local_group_action_writes_human_action_context() {
         .unwrap();
 
     let mut client = app.client(&account.label).await.unwrap();
-    client.create_group("audit actions", &[]).await.unwrap();
+    client
+        .create_group("audit actions", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
 
     let files = app.audit_log_files().unwrap();
     assert_eq!(files.len(), 1);
@@ -742,7 +754,12 @@ async fn local_message_send_tags_engine_rows_with_human_action() {
         .unwrap();
 
     let mut client = app.client(&account.label).await.unwrap();
-    let group_id = client.create_group("audit actions", &[]).await.unwrap();
+    let group_id = client
+        .create_group("audit actions", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     client
         .send(&group_id, b"hello marmots")
         .await

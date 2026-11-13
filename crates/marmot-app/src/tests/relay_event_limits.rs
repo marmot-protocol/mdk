@@ -41,7 +41,12 @@ async fn group_events_over_a_known_limit_are_refused_unsent() {
     let relay = Arc::new(ScriptedPushRelayClient::default());
     let app = app_with_event_limits(&dir, relay.clone(), &[("wss://relay.example", 200)]);
     let mut client = app.client("alice").await.unwrap();
-    let group = client.create_group("limited", &[]).await.unwrap();
+    let group = client
+        .create_group("limited", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let epoch = client.runtime.epoch_state(&group).unwrap().epoch();
     let attempted = relay.attempted_events().len();
 
@@ -158,7 +163,9 @@ async fn a_create_whose_welcome_fits_one_inbox_relay_sends_it_only_there() {
     alice
         .create_group("invite", &[&bob.account_id_hex])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
 
     let welcome_routes: Vec<_> = relay
         .attempted_routes()
@@ -190,7 +197,12 @@ async fn an_invite_whose_welcome_fits_no_inbox_relay_is_refused_unsent() {
         .await
         .unwrap();
     let mut alice = app.client("alice").await.unwrap();
-    let group = alice.create_group("invite", &[]).await.unwrap();
+    let group = alice
+        .create_group("invite", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let epoch = alice.runtime.epoch_state(&group).unwrap().epoch();
     let attempted = relay.attempted_events().len();
 
@@ -417,7 +429,9 @@ async fn a_bulk_create_fits_a_known_limit_up_to_the_fixture_boundary() {
         alice
             .create_group("sizes", &invitees[..members - 1])
             .await
-            .unwrap();
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         measured.push(founding_welcome_size(&relay, sent_before, members, &keys));
     }
     let too_large_wrap = measured[1].gift_wrap_json_bytes;
@@ -462,7 +476,9 @@ async fn a_bulk_create_fits_a_known_limit_up_to_the_fixture_boundary() {
     alice
         .create_group("sizes", &invitees[..fits - 1])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let welcome_routes: Vec<_> = relay.attempted_routes()[routes_before..]
         .iter()
         .filter(|(kind, _)| *kind == 1059)
@@ -542,7 +558,9 @@ async fn chat_with_an_open_settlement_window(
         .client
         .create_group("queued", &[&bob.account_id_hex])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     bob.join(relay, &group).await;
     bob.client
         .runtime
@@ -670,7 +688,9 @@ async fn a_queued_invite_whose_welcome_fits_no_inbox_relay_is_retired_unsent() {
         .client
         .invite_members(&group, &[carol.account_id_hex.as_str()])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     assert!(
         alice
             .client

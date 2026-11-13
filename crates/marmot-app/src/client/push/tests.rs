@@ -79,7 +79,12 @@ async fn push_batch_case(
         MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
     );
     let mut client = app.client("alice").await.unwrap();
-    let group = client.create_group("push batch", &[]).await.unwrap();
+    let group = client
+        .create_group("push batch", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let group_hex = hex::encode(group.as_slice());
     let server = Keys::generate();
     let mut expected = std::collections::BTreeSet::new();
@@ -250,7 +255,12 @@ async fn push_trigger_wakes_each_sibling_device_once() {
         MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
     );
     let mut client = app.client("alice").await.unwrap();
-    let group = client.create_group("siblings", &[]).await.unwrap();
+    let group = client
+        .create_group("siblings", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let alice = app.account_home().account("alice").unwrap().account_id_hex;
     let bob = "bb".repeat(32);
     let server = Keys::generate();

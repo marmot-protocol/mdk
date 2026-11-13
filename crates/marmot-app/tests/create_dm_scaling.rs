@@ -76,7 +76,12 @@ async fn run_case(case: &str, existing_chats: usize) {
         let app = open_store(&dir_bench, &url);
         let mut client = app.client(BENCH_ACCOUNT).await.unwrap();
         for _ in 0..existing_chats {
-            client.create_group("", &[existing_peer]).await.unwrap();
+            client
+                .create_group("", &[existing_peer])
+                .await
+                .unwrap()
+                .operation
+                .expect("eligible fixture members");
         }
     }
     let fixture = fixture_started.elapsed();
@@ -103,7 +108,9 @@ async fn run_case(case: &str, existing_chats: usize) {
         let created = runtime
             .create_group_detailed(BENCH_ACCOUNT, "", std::slice::from_ref(peer), None)
             .await
-            .unwrap();
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         timings.push(started.elapsed());
         runtime
             .group_members(BENCH_ACCOUNT, &created.group_id)

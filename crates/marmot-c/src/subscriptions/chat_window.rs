@@ -533,6 +533,8 @@ mod tests {
                         .create_group(account.clone(), name.into(), vec![], None),
                 )
                 .unwrap()
+                .group_id_hex
+                .expect("creator-only group")
         });
         client
             .marmot
@@ -777,7 +779,9 @@ mod tests {
                 vec![],
                 None,
             ))
-            .unwrap();
+            .unwrap()
+            .group_id_hex
+            .expect("selected members create a group");
         for i in 0..3 {
             client
                 .block_on(client.marmot.send_text(

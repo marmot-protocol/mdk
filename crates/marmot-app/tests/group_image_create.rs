@@ -131,7 +131,9 @@ async fn measure_prepared_group_image_case(
     runtime
         .create_group_with_prepared_initial_image(BENCH_ACCOUNT, case, &[], None, staged.upload_id)
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let create = create_started.elapsed();
     let baseline_serialized = preprocess + upload + create;
     println!(
@@ -168,7 +170,9 @@ async fn run_measurement_matrix() {
     runtime
         .create_group(BENCH_ACCOUNT, "no image", &[], None)
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let no_image = create_started.elapsed();
     println!(
         "MDK_BENCH group_image_create case=no_image source_bytes=0 \
@@ -222,7 +226,9 @@ async fn run_measurement_matrix() {
             ready.upload_id,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let create = create_started.elapsed();
     println!(
         "MDK_BENCH group_image_create case=stalled_server source_bytes={} \
