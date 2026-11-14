@@ -5,6 +5,7 @@
 //!
 //! Each child keeps the reach it had as a direct child of `client`.
 
+mod epoch_backfill;
 pub(crate) mod epoch_stall;
 pub(crate) mod history_notices;
 pub(in crate::client) mod recovery_coverage;
