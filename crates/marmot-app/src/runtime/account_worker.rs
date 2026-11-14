@@ -3767,9 +3767,13 @@ async fn handle_startup_hydration_command(
             let failure = hydrate_named_groups(client, &group_ids);
             acknowledge_hydration(client, respond, failure);
         }
-        // A forget runs at its position, as it does once startup ends, so
-        // one accepted before its group's batch drops the group before
-        // hydration recovers anything of it for the host (mdk#3273 PR 4).
+        // A forget runs at its position, as it does once startup ends, so no
+        // command accepted after it, a read's hydration request included,
+        // runs first, and one served before its group's batch drops the
+        // group before hydration recovers anything of it for the host
+        // (mdk#3273 PR 4). Like every command here it waits for the window
+        // between batches and its budget, so one still queued when a batch
+        // starts runs after that batch, which reports the group first.
         // The engine commits the forget before it touches memory, so a
         // failed one leaves its group whole and still awaiting its batch.
         // Its subscription refresh is best-effort and, before startup sync
