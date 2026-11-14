@@ -717,12 +717,15 @@ async fn a_group_hidden_by_a_failed_device_group_check_is_read_again() {
     client.start_read_state(read_state_channel().0, UploadsInFlight::default());
     let state = client.subscribe_read_state().unwrap();
     assert_eq!(state.borrow().host_may_see(&group), Some(false));
+    // A hidden group's roster is not trusted either (mdk#3273 PR 6).
+    assert!(state.borrow().trusted_rosters().is_empty());
 
     storage
         .execute_batch_for_test("DROP TABLE temp.device_groups")
         .unwrap();
     client.publish_read_state();
     assert_eq!(state.borrow().host_may_see(&group), Some(true));
+    assert_eq!(state.borrow().trusted_rosters().len(), 1);
 }
 
 /// A legacy self-update fanout owes its relays only until its bound, so the
@@ -1009,5 +1012,300 @@ async fn a_cleared_invite_counts_toward_co_members_from_the_save_that_writes_it(
         co_members(&state, &alice_id),
         vec![bob.account_id_hex.clone()],
         "the publish after the save of the clear counts the group"
+    );
+}
+
+/// The members of each roster `state`'s current version trusts, read on
+/// `storage` at that version's revisions, as hex per group (mdk#3273 PR 6).
+fn trusted_members(
+    state: &watch::Receiver<Arc<ReadState>>,
+    storage: &storage_sqlite::SqliteAppStorage,
+) -> Vec<(GroupId, Vec<String>)> {
+    state
+        .borrow()
+        .trusted_roster_members(storage)
+        .unwrap()
+        .into_iter()
+        .map(|(group_id, members)| {
+            let members = members
+                .ids()
+                .iter()
+                .map(|member_id| hex::encode(member_id.as_slice()))
+                .collect();
+            (group_id, members)
+        })
+        .collect()
+}
+
+/// A write to a group's committed roster alone, as the hydration backfill
+/// makes, moves its change generation, so the next publish rebuilds the
+/// entry and records the new revision, with no other answer changed
+/// (mdk#3273 PR 6).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_roster_write_alone_moves_the_recorded_revision() {
+    use cgka_traits::storage::{CommittedMembers, CommittedRosterStorage};
+
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let alice_account = home.create_account("alice").unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+    let mut client = app.client("alice").await.unwrap();
+    let group = client
+        .create_group("rewritten", &[])
+        .await
+        .unwrap()
+        .operation
+        .unwrap();
+    client.start_read_state(read_state_channel().0, UploadsInFlight::default());
+    let state = client.subscribe_read_state().unwrap();
+    let (version, before) = entry(&state, &group);
+    let storage = app.account_storage("alice").unwrap();
+    let stranger = MemberId::new(vec![0xee; 32]);
+    let alice = MemberId::new(hex::decode(&alice_account.account_id_hex).unwrap());
+    storage
+        .put_committed_roster(
+            &group,
+            &CommittedMembers::from_ids([alice, stranger.clone()]),
+        )
+        .unwrap();
+    let written = storage.committed_roster_revision(&group).unwrap().unwrap();
+    assert_ne!(*before.roster_revision.as_ref().unwrap(), Some(written));
+
+    client.publish_read_state();
+    let (after, rebuilt) = entry(&state, &group);
+    assert!(after > version);
+    assert_eq!(*rebuilt.roster_revision.as_ref().unwrap(), Some(written));
+    assert_eq!(
+        state.borrow().trusted_rosters(),
+        vec![(group.clone(), written)]
+    );
+    let members = state
+        .borrow()
+        .trusted_roster_members(&storage.app_storage())
+        .unwrap();
+    assert_eq!(members.len(), 1);
+    assert!(members[0].1.ids().contains(&stranger));
+}
+
+/// Between the engine's roster write and A's next publish, a read on
+/// another connection bound to the published version's revisions matches
+/// neither the roster that version recorded nor the one written since: the
+/// write moved the revision, which the version does not name yet. The
+/// publish after it records the new revision, and the read matches the new
+/// roster (mdk#3273 PR 6).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_roster_written_after_the_published_version_never_matches_until_it_is_published() {
+    use cgka_traits::storage::CommittedRosterStorage;
+
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let alice_account = home.create_account("alice").unwrap();
+    let bob_account = home.create_account("bob").unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+    remember_test_member_inbox(&app, &bob_account.account_id_hex, "wss://relay.example");
+    app.client("bob")
+        .await
+        .unwrap()
+        .publish_key_package()
+        .await
+        .unwrap();
+    let mut alice = app.client("alice").await.unwrap();
+    let group = alice
+        .create_group("rostered", &[])
+        .await
+        .unwrap()
+        .operation
+        .unwrap();
+    alice.start_read_state(read_state_channel().0, UploadsInFlight::default());
+    let state = alice.subscribe_read_state().unwrap();
+    // The app's cached connection; the engine writes rosters on its own.
+    let storage = app.account_storage("alice").unwrap();
+    let second = storage.app_storage();
+    let recorded = storage.committed_roster_revision(&group).unwrap().unwrap();
+    assert_eq!(
+        state.borrow().trusted_rosters(),
+        vec![(group.clone(), recorded)]
+    );
+    assert_eq!(
+        trusted_members(&state, &second),
+        vec![(group.clone(), vec![alice_account.account_id_hex.clone()])]
+    );
+
+    alice
+        .invite_members(&group, &[&bob_account.account_id_hex])
+        .await
+        .unwrap();
+    let written = storage.committed_roster(&group).unwrap().unwrap();
+    assert!(written.revision > recorded);
+    assert_eq!(written.members.ids().len(), 2);
+    assert_eq!(
+        state.borrow().trusted_rosters(),
+        vec![(group.clone(), recorded)],
+        "the version still names the revision it recorded"
+    );
+    assert_eq!(
+        trusted_members(&state, &second),
+        Vec::new(),
+        "a roster the published version has not recorded matched"
+    );
+
+    alice.publish_read_state();
+    assert_eq!(
+        state.borrow().trusted_rosters(),
+        vec![(group.clone(), written.revision)]
+    );
+    let mut both = vec![
+        alice_account.account_id_hex.clone(),
+        bob_account.account_id_hex.clone(),
+    ];
+    both.sort();
+    assert_eq!(trusted_members(&state, &second), vec![(group, both)]);
+}
+
+/// Hydration, quarantine and a successful retry change whether A trusts a
+/// group's committed roster, while the roster and its revision stay what
+/// they were (mdk#3273 PR 6). A seeded group is not trusted until it is
+/// hydrated; a group hydration quarantines is not trusted; the retry that
+/// brings it back is trusted again at the same revision.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hydration_quarantine_and_retry_move_trust_but_not_the_roster() {
+    use cgka_traits::storage::{CommittedRosterStorage, GroupStorage};
+
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let alice_account = home.create_account("alice").unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    let group = app
+        .client("alice")
+        .await
+        .unwrap()
+        .create_group("trusted", &[])
+        .await
+        .unwrap()
+        .operation
+        .unwrap();
+    let storage = app.account_storage("alice").unwrap();
+    let second = storage.app_storage();
+    let roster = storage.committed_roster(&group).unwrap().unwrap();
+    let trusted = vec![(group.clone(), roster.revision)];
+    let members = vec![(group.clone(), vec![alice_account.account_id_hex.clone()])];
+
+    let plane = MarmotRelayPlane::new(None, relay);
+    let mut alice = app
+        .local_client_with_relay_plane_and_hydration("alice", &plane, None, true, None)
+        .await
+        .unwrap();
+    alice.start_read_state(read_state_channel().0, UploadsInFlight::default());
+    let state = alice.subscribe_read_state().unwrap();
+    {
+        let version = state.borrow();
+        let seeded = &version.groups[&group];
+        assert!(seeded.awaits_hydration && !seeded.serves_reads);
+        assert_eq!(
+            *seeded.roster_revision.as_ref().unwrap(),
+            Some(roster.revision)
+        );
+        assert!(version.trusted_rosters().is_empty());
+    }
+    assert!(trusted_members(&state, &second).is_empty());
+    assert!(alice.runtime.ensure_group_hydrated(&group).unwrap());
+    alice.publish_read_state();
+    assert_eq!(state.borrow().trusted_rosters(), trusted, "hydrated");
+    assert_eq!(trusted_members(&state, &second), members);
+    drop(alice);
+
+    // A record hydration refuses quarantines the group at the next open.
+    let original = storage.get_group(&group).unwrap();
+    let mut damaged = original.clone();
+    damaged.protocol_profile = cgka_traits::group::ProtocolProfile::Legacy;
+    assert_ne!(damaged.protocol_profile, original.protocol_profile);
+    storage.put_group(&damaged).unwrap();
+    let mut alice = app.client("alice").await.unwrap();
+    assert_eq!(alice.quarantined_groups().len(), 1);
+    alice.start_read_state(read_state_channel().0, UploadsInFlight::default());
+    let state = alice.subscribe_read_state().unwrap();
+    assert!(
+        state
+            .borrow()
+            .groups
+            .get(&group)
+            .is_none_or(|group| !group.serves_reads)
+    );
+    assert!(state.borrow().trusted_rosters().is_empty(), "quarantined");
+    assert!(trusted_members(&state, &second).is_empty());
+
+    storage.put_group(&original).unwrap();
+    assert!(alice.retry_hydrate_quarantined_group(&group).unwrap());
+    alice.publish_read_state();
+    assert_eq!(state.borrow().trusted_rosters(), trusted, "retried");
+    assert_eq!(trusted_members(&state, &second), members);
+    assert_eq!(storage.committed_roster(&group).unwrap(), Some(roster));
+}
+
+/// A group stored before rosters existed, which nothing else touches, is
+/// trusted after the hydration that records its roster and one publish
+/// (mdk#3273 PR 6). Until that publish, the version names no revision for
+/// it, so the recorded roster does not match.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_group_stored_before_rosters_is_trusted_after_its_backfill_and_one_publish() {
+    use cgka_traits::storage::CommittedRosterStorage;
+
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let alice_account = home.create_account("alice").unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    let group = app
+        .client("alice")
+        .await
+        .unwrap()
+        .create_group("backfilled", &[])
+        .await
+        .unwrap()
+        .operation
+        .unwrap();
+    let storage = app.account_storage("alice").unwrap();
+    let second = storage.app_storage();
+    // As migration 0206 leaves a group stored before it: no roster.
+    second
+        .execute_batch_for_test(&format!(
+            "DELETE FROM cgka_committed_rosters WHERE group_id = x'{}'",
+            hex::encode(group.as_slice())
+        ))
+        .unwrap();
+    assert_eq!(storage.committed_roster(&group).unwrap(), None);
+
+    let plane = MarmotRelayPlane::new(None, relay);
+    let mut alice = app
+        .local_client_with_relay_plane_and_hydration("alice", &plane, None, true, None)
+        .await
+        .unwrap();
+    alice.start_read_state(read_state_channel().0, UploadsInFlight::default());
+    let state = alice.subscribe_read_state().unwrap();
+    assert_eq!(
+        *state.borrow().groups[&group]
+            .roster_revision
+            .as_ref()
+            .unwrap(),
+        None
+    );
+    assert!(alice.runtime.ensure_group_hydrated(&group).unwrap());
+    let recorded = storage.committed_roster_revision(&group).unwrap().unwrap();
+    assert!(state.borrow().trusted_rosters().is_empty());
+    assert!(trusted_members(&state, &second).is_empty());
+
+    alice.publish_read_state();
+    assert_eq!(
+        state.borrow().trusted_rosters(),
+        vec![(group.clone(), recorded)]
+    );
+    assert_eq!(
+        trusted_members(&state, &second),
+        vec![(group, vec![alice_account.account_id_hex.clone()])]
     );
 }

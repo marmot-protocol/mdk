@@ -41,6 +41,10 @@
 
 ### Added
 
+- `SqliteAppStorage::trusted_roster_members` reads the members of each committed roster whose stored revision is the
+  one a trusted `(group, revision)` pair names, in one statement (mdk#3273). A pair at another revision, or naming a
+  group with no roster, never matches. A write to a group's committed roster moves the group's state write count
+  (`group_write_generation`).
 - `SqliteAppStorage::discard_failed_send` securely drops one failed own send (row, edits, media references) and
   returns its projection update; removals of a user-removed failed send carry `TimelineRemoveReason::Cleared`.
 - `SqliteAppStorage::sticker_pack_relays` and `set_sticker_pack_relays` retain sticker-pack relay hints independently

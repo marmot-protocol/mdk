@@ -12,6 +12,8 @@
   cheap pass does this from its tombstone. A wrong roster it cannot replace quarantines the group
   (`GroupRecordLoadFailed`) until an open replaces it; a missing one it cannot record stays missing, which never
   reads as a known membership.
+- `GroupChangeGeneration::serves_reads` says whether the engine served the group's gated reads when the generation
+  was read: neither quarantined nor awaiting hydration (mdk#3273).
 
 ### Fixed
 
