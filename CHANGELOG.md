@@ -70,6 +70,12 @@
   as possibly seen at a relay that received it and answered `rate-limited:` or
   `auth-required:`, so a later refusal there no longer rolls back a commit
   members may have.
+- The same rule covers every send, not only commits (#2332). A message a
+  relay answered `rate-limited:` or `auth-required:` and then refused
+  (`invalid:`, `blocked:`) no longer fails: it stays pending and keeps
+  retrying, and while no relay has accepted it, later sends in its group wait
+  behind it, as they already do behind a send that timed out. Such an answer
+  still retries after 5 seconds, as before.
 
 ## 0.16.0 - 2026-11-12
 
