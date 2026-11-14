@@ -2,31 +2,6 @@ package markdown
 
 import "base:runtime"
 
-HelpersLineIter :: struct {
-	input: string,
-	pos:   int,
-}
-helpers_lines :: proc(input: string) -> HelpersLineIter {
-	return HelpersLineIter{input = input}
-}
-// Streaming scanner preserving byte offsets and CRLF/bare-CR semantics.
-helpers_next_line :: proc(it: ^HelpersLineIter) -> (string, int, bool) {
-	if it.pos >= len(it.input) {return "", it.pos, false}
-	start := it.pos
-	j := start
-	for j < len(it.input) {
-		if it.input[j] == '\n' || it.input[j] == '\r' {
-			step := 1
-			if it.input[j] == '\r' && j + 1 < len(it.input) && it.input[j + 1] == '\n' {step = 2}
-			it.pos = j + step
-			return it.input[start:j], start, true
-		}
-		j += 1
-	}
-	it.pos = len(it.input)
-	return it.input[start:len(it.input)], start, true
-}
-
 helpers_lowercase :: proc(s: string) -> string {
 	result: [dynamic]u8
 	non_zero_reserve(&result, len(s))

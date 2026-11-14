@@ -598,19 +598,32 @@ fn a_stale_checkpoint_operation_finishes_before_a_newer_one_starts() {
     let stale = std::thread::spawn(move || stale_store.checkpoint_append(&stale, 3, b"old"));
     waiting.recv().unwrap();
     catalog.supersede_checkpoint(0);
+    enum NewerProgress {
+        Waiting,
+        Finished,
+    }
+    let (observed, progress) = std::sync::mpsc::channel();
+    let completed = observed.clone();
+    *store.inner.before_checkpoint_wait_for_test.lock().unwrap() = Some(Box::new(move || {
+        observed.send(NewerProgress::Waiting).unwrap();
+    }));
     let newer_store = store.clone();
     let newer_catalog = catalog.clone();
     let newer = std::thread::spawn(move || {
-        newer_store.checkpoint_append(&newer_catalog.checkpoint(0), 3, b"new")
+        let result = newer_store.checkpoint_append(&newer_catalog.checkpoint(0), 3, b"new");
+        completed.send(NewerProgress::Finished).unwrap();
+        result
     });
-    std::thread::sleep(Duration::from_millis(100));
+    let progress = progress.recv().unwrap();
+    release.send(()).unwrap();
+    let stale_result = stale.join().unwrap();
+    let newer_result = newer.join().unwrap();
     assert!(
-        !newer.is_finished(),
+        matches!(progress, NewerProgress::Waiting),
         "the newer append waits for the stale one"
     );
-    release.send(()).unwrap();
-    assert_eq!(stale.join().unwrap(), Ok(false));
-    assert_eq!(newer.join().unwrap(), Ok(true));
+    assert_eq!(stale_result, Ok(false));
+    assert_eq!(newer_result, Ok(true));
     assert_eq!(
         restored(&store, &catalog.checkpoint(0)).unwrap(),
         b"abcnew".to_vec()

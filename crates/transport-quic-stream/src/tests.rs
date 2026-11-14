@@ -1024,9 +1024,3 @@ async fn receiver_replaces_invalid_utf8_frame_instead_of_aborting_stream() {
     // never desyncs the receiver transcript from the sender's.
     assert_eq!(received.transcript_hash, expected_transcript.hash());
 }
-
-#[test]
-fn non_utf8_frame_decodes_lossily_per_record() {
-    let record = AgentTextStreamRecordV1::text_delta(vec![0x11; 32], 1, vec![0xff, 0xfe]);
-    assert_eq!(stream_record_text(&record), "\u{FFFD}\u{FFFD}");
-}

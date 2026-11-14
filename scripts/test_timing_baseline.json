@@ -225,9 +225,6 @@
     "crates/marmot-app/src/runtime/attachment_access/tests.rs": {
       "sleep": 9
     },
-    "crates/marmot-app/src/runtime/audit_tracker_tests.rs": {
-      "short_timeout": 1
-    },
     "crates/marmot-app/src/runtime/chat_list_window/tests.rs": {
       "sleep": 1,
       "short_timeout": 3
@@ -340,8 +337,7 @@
       "short_timeout": 1
     },
     "crates/marmot-app/tests/audit_logs.rs": {
-      "sleep": 5,
-      "short_timeout": 5
+      "sleep": 5
     },
     "crates/marmot-app/tests/catch_up_snapshot_failure.rs": {
       "sleep": 1
@@ -430,9 +426,6 @@
       "sleep": 1
     },
     "crates/marmot-uniffi/tests/smoke.rs": {
-      "sleep": 1
-    },
-    "crates/media-store/src/store_tests.rs": {
       "sleep": 1
     },
     "crates/storage-sqlite/src/app/attachment_acquisition/tests/outgoing_files.rs": {

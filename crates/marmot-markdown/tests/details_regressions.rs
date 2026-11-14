@@ -502,34 +502,3 @@ fn failed_summary_replay_respects_remaining_container_depth() {
     }
     assert!(texts(&doc).contains("content"));
 }
-
-#[test]
-fn many_line_open_summary_release_probe_compares_to_control() {
-    use std::time::Instant;
-    let n = 32_749usize;
-    let mut hostile = String::from("<details>\n<summary>\n");
-    for _ in 0..n {
-        hostile.push_str("x\n");
-    }
-    let mut control = String::from("<details>\n");
-    for _ in 0..n {
-        control.push_str("x\n");
-    }
-    let _ = parse(&hostile);
-    let _ = parse(&control);
-    let started = Instant::now();
-    let _ = parse(&hostile);
-    let hostile_us = started.elapsed().as_micros();
-    let started = Instant::now();
-    let _ = parse(&control);
-    let control_us = started.elapsed().as_micros();
-    eprintln!(
-        "many-line open-summary probe bytes={} hostile_us={} control_us={} ratio={:.2}",
-        hostile.len(),
-        hostile_us,
-        control_us,
-        hostile_us as f64 / control_us.max(1) as f64
-    );
-    // Timing is diagnostic only: CPU contention must not fail this probe.
-    // The library's counted-work tests enforce the linear complexity bound.
-}

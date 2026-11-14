@@ -834,40 +834,6 @@ impl StreamSessionStore {
             .ok_or(ConnectorError::StreamCapabilityDenied)
     }
 
-    #[cfg(test)]
-    pub(crate) fn get_for_test(
-        &self,
-        stream_id_hex: &str,
-    ) -> Result<ActiveStreamSession, ConnectorError> {
-        let stream_id_hex = normalize_hex(stream_id_hex)?;
-        crate::lock_recover(&self.sessions)
-            .get(&stream_id_hex)
-            .cloned()
-            .ok_or(ConnectorError::StreamCapabilityDenied)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn insert(&self, stream_id_hex: String, session: ActiveStreamSession) {
-        self.insert_new(stream_id_hex, session)
-            .expect("test stream id must be unused");
-    }
-
-    #[cfg(test)]
-    pub(crate) fn get(&self, stream_id_hex: &str) -> Result<ActiveStreamSession, ConnectorError> {
-        self.get_for_test(stream_id_hex)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn remove(
-        &self,
-        stream_id_hex: &str,
-    ) -> Result<ActiveStreamSession, ConnectorError> {
-        let stream_id_hex = normalize_hex(stream_id_hex)?;
-        crate::lock_recover(&self.sessions)
-            .remove(&stream_id_hex)
-            .ok_or(ConnectorError::StreamCapabilityDenied)
-    }
-
     /// Evict idle active publishers, retaining sealed durable-send retries.
     pub(crate) async fn sweep_idle(&self, max_idle: Duration) -> usize {
         let now = Instant::now();
