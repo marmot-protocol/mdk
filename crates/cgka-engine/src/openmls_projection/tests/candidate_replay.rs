@@ -408,6 +408,7 @@ fn probe_path(
     let mut budget = super::ReplayBudget::for_pass(commits.len(), V1_MAX_REWIND_COMMITS);
     super::probe_candidate_path(
         storage,
+        &crate::snapshot_guard::Rewinds::default(),
         group_id,
         commits.to_vec(),
         &digests,
@@ -886,6 +887,7 @@ async fn resumable_search_matches_original_bfs_without_repeating_probes() {
             let done = search
                 .advance(
                     &storage,
+                    &crate::snapshot_guard::Rewinds::default(),
                     &group_id,
                     &inputs.own_commits,
                     ReplayProfilePolicy::default(),
@@ -1384,6 +1386,7 @@ async fn candidate_reconstruction_measurement() {
             let start = std::time::Instant::now();
             let result = super::build_stored_openmls_candidate_paths(
                 &storage,
+                &crate::snapshot_guard::Rewinds::default(),
                 &group_id,
                 inputs.commit_messages.clone(),
                 &inputs.pending_messages,
@@ -1422,6 +1425,7 @@ async fn candidate_reconstruction_measurement() {
                 let complete = search
                     .advance(
                         &storage,
+                        &crate::snapshot_guard::Rewinds::default(),
                         &group_id,
                         &inputs.own_commits,
                         ReplayProfilePolicy::default(),
@@ -1523,6 +1527,7 @@ async fn replay_transaction_preserves_results_and_restores_after_error_and_panic
         .unwrap();
         let changed = super::replay_openmls_messages_prevalidated_output(
             &storage,
+            &crate::snapshot_guard::Rewinds::default(),
             &group_id,
             messages,
             &own,
@@ -1543,6 +1548,7 @@ async fn replay_transaction_preserves_results_and_restores_after_error_and_panic
     assert!(matches!(
         super::replay_openmls_messages_prevalidated_output(
             &storage,
+            &crate::snapshot_guard::Rewinds::default(),
             &group_id,
             &messages,
             &own,
@@ -1557,6 +1563,7 @@ async fn replay_transaction_preserves_results_and_restores_after_error_and_panic
             assert!(matches!(
                 super::replay_openmls_messages_prevalidated_output(
                     &storage,
+                    &crate::snapshot_guard::Rewinds::default(),
                     &group_id,
                     &messages,
                     &own,
@@ -1573,6 +1580,7 @@ async fn replay_transaction_preserves_results_and_restores_after_error_and_panic
         let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             super::replay_openmls_messages_prevalidated_output(
                 &storage,
+                &crate::snapshot_guard::Rewinds::default(),
                 &group_id,
                 &rivals[..1],
                 &own,
@@ -1595,6 +1603,7 @@ async fn replay_transaction_preserves_results_and_restores_after_error_and_panic
     // A fresh successful call proves transaction ownership was released.
     super::replay_openmls_messages_prevalidated_output(
         &storage,
+        &crate::snapshot_guard::Rewinds::default(),
         &group_id,
         &rivals[..1],
         &own,
@@ -1622,6 +1631,7 @@ async fn replay_transaction_measurement() {
                 let output = if batched {
                     super::replay_openmls_messages_prevalidated_output(
                         &storage,
+                        &crate::snapshot_guard::Rewinds::default(),
                         &group_id,
                         std::slice::from_ref(rival),
                         &own,
@@ -1854,6 +1864,7 @@ async fn own_checkpoint_checks_parent() {
     let ledger = storage.list_messages(&group_id, EpochId(0)).unwrap();
     let replay = super::replay_openmls_messages_prevalidated_output(
         &storage,
+        &crate::snapshot_guard::Rewinds::default(),
         &group_id,
         &[next],
         &inputs.own_commits,
@@ -2373,6 +2384,7 @@ async fn own_private_checkpoint_refused() {
     // turn that classification into permission to restore a checkpoint.
     let replay = super::replay_openmls_messages_prevalidated_output(
         &storage,
+        &crate::snapshot_guard::Rewinds::default(),
         &group_id,
         &[message],
         &inputs.own_commits,
@@ -3024,6 +3036,7 @@ async fn candidate_context_capture_keeps_a_late_native_storage_error() {
     let mut budget = super::ReplayBudget::for_pass(messages.len(), V1_MAX_REWIND_COMMITS);
     let paths = super::build_stored_openmls_candidate_paths(
         &storage,
+        &crate::snapshot_guard::Rewinds::default(),
         &group_id,
         inputs.commit_messages,
         &inputs.pending_messages,
@@ -3069,6 +3082,7 @@ async fn candidate_context_capture_keeps_a_late_native_storage_error() {
     let consumed = budget.consumed;
     let failed = super::candidate_path_peel_context(
         &storage,
+        &crate::snapshot_guard::Rewinds::default(),
         &group_id,
         path,
         &pending,
@@ -3094,6 +3108,7 @@ async fn candidate_context_capture_keeps_a_late_native_storage_error() {
         .unwrap();
     let context = super::candidate_path_peel_context(
         &storage,
+        &crate::snapshot_guard::Rewinds::default(),
         &group_id,
         path,
         &pending,

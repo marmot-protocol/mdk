@@ -662,6 +662,10 @@ struct SnapshotRefusal {
 /// becomes readable. OpenMLS state is left intact, so once `get_group`
 /// succeeds the group is fully recoverable — exactly the partial-restore case
 /// the retry path targets.
+///
+/// It keeps the trait's default transaction and group savepoint, so every
+/// write commits when it is made and a group savepoint is the snapshot
+/// fallback: a backend without either.
 #[derive(Clone)]
 struct FlakyGroupRecordStorage {
     inner: SqliteAccountStorage,
@@ -673,6 +677,7 @@ struct FlakyGroupRecordStorage {
     fail_disband_request: Arc<AtomicBool>,
     close_after_key_package_scan: Arc<AtomicBool>,
     snapshot_refusal: Arc<Mutex<Option<SnapshotRefusal>>>,
+    crash_at_restore: Arc<Mutex<Option<&'static str>>>,
 }
 
 impl FlakyGroupRecordStorage {
@@ -687,7 +692,21 @@ impl FlakyGroupRecordStorage {
             fail_disband_request: Arc::new(AtomicBool::new(false)),
             close_after_key_package_scan: Arc::new(AtomicBool::new(false)),
             snapshot_refusal: Arc::new(Mutex::new(None)),
+            crash_at_restore: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// The process dies when it starts restoring a snapshot whose name starts
+    /// with `prefix`: the database closes there, so nothing written after it
+    /// reaches disk. Every earlier write has already committed, so the file is
+    /// what a kill at that point leaves.
+    fn crash_at_restore_of(&self, prefix: &'static str) {
+        *self.crash_at_restore.lock().unwrap() = Some(prefix);
+    }
+
+    /// Whether the selected crash point was reached.
+    fn crashed(&self) -> bool {
+        self.inner.is_closed()
     }
 
     /// Close the database once the next KeyPackage scan has read its rows,
@@ -891,6 +910,15 @@ impl MessageStorage for FlakyGroupRecordStorage {
         self.inner.list_group_snapshots(group_id)
     }
     fn rollback_group_to_snapshot(&self, group_id: &GroupId, name: &str) -> StorageResult<()> {
+        let crash = self
+            .crash_at_restore
+            .lock()
+            .unwrap()
+            .take_if(|prefix| name.starts_with(*prefix));
+        if crash.is_some() {
+            self.inner.close()?;
+            return Err(StorageError::Backend("the test process died here".into()));
+        }
         self.check_snapshot_operation(SnapshotOperation::Restore, name)?;
         self.inner.rollback_group_to_snapshot(group_id, name)
     }

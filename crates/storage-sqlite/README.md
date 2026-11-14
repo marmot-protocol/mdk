@@ -241,7 +241,8 @@ short exclusive transaction and restores live state before releasing it or await
 `mls_write_generation`, and the caller's transaction stays open. The exception is a transaction SQLite rolls back by
 itself (a full disk, an I/O error or out of memory mid-statement, a trigger's `RAISE(ROLLBACK)`): the unit's error comes
 back, the rest of the caller's transaction fails instead of committing write by write, and the connection stays usable
-for the next one. Canonical convergence apply uses it in place of a full
+for the next one. It reports `has_atomic_group_savepoints`, which the engine's contained rewind windows require before
+they run inside it (mdk#3278). Canonical convergence apply uses it in place of a full
 group snapshot, so its rollback cost no longer grows with stored history (mdk#2326).
 `StorageProvider::rollback_group_state_keeping_live_records`, the rewind onto a retained anchor that a reorg's apply and
 the convergence probes use, restores canonical state only, even from a legacy full anchor, and leaves message,
