@@ -2524,6 +2524,7 @@ async fn attachment_disk_pressure_parks_before_receipt_and_readmits_when_space_f
                 free,
                 true,
                 storage_sqlite::ReadmitAdmission::NONE,
+                |_| 0
             )
             .unwrap(),
         0,
@@ -2541,6 +2542,7 @@ async fn attachment_disk_pressure_parks_before_receipt_and_readmits_when_space_f
                     checkpointed_at_least: 0,
                     uncheckpointed: true,
                 },
+                |_| 0
             )
             .unwrap(),
         1

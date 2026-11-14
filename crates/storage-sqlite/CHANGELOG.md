@@ -4,6 +4,15 @@
 
 ### Breaking changes
 
+- `SqliteAppStorage::readmit_storage_blocked_attachments` takes a `need` function (what admission needs for a job's
+  checkpoint) and readmits parked jobs, explicit first and then by priority, only while free space funds them together:
+  each is charged the larger of its target and that need, the need of every job whose writes may not show in free
+  space yet still counts (jobs in flight, and queued or retrying jobs readmission released), and the first that does
+  not fit ends the batch (#3414).
+- Account migration 0205 adds `attachment_acquisition.storage_readmitted`, set when readmission releases a
+  storage-parked job and cleared when it finishes or the user retries, cancels or resets it (#3414). Account schema
+  advances from 204 to 205; older binaries refuse the upgraded database. Downgrade is unsupported. New `park_attachment_admission` parks a due job that
+  worker admission refused for disk space as storage-blocked with a target, rather than deferring it on a timer.
 - Account migration 0204 drops timeline rows of own sends that failed and were then deleted; such a send no longer
   projects a row. The source rows stay. A deleted send a peer reacted to is delivered instead, also when the reaction
   arrived after the deletion, and keeps its placeholder. Account schema advances from 203 to 204; older binaries
