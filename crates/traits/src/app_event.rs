@@ -595,14 +595,13 @@ mod tests {
     }
 
     #[test]
-    fn canonical_id_is_deterministic_hex32() {
+    fn canonical_id_matches_nip01() {
         let id = canonical_event_id(&"00".repeat(32), 0, MARMOT_APP_EVENT_KIND_CHAT, &[], "");
-        assert_eq!(id.len(), 64);
-        assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
-        // Stable across calls with identical inputs.
+        // sha256sum of the literal NIP-01 preimage (no trailing newline):
+        // [0,"0000000000000000000000000000000000000000000000000000000000000000",0,9,[],""]
         assert_eq!(
             id,
-            canonical_event_id(&"00".repeat(32), 0, MARMOT_APP_EVENT_KIND_CHAT, &[], "")
+            "da824251ccc2eb3ce8a9e9994e9b0683d520a9729c3611992f8b143cc806ba19"
         );
     }
 

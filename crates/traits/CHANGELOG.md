@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Changed
+
+- Pin an independently calculated NIP-01 digest for empty tags and content, including lowercase hex output (mdk#3383).
+
 ## 0.16.0 - 2026-11-12
 
 ### Breaking changes
