@@ -3966,7 +3966,10 @@ async fn handle_startup_hydration_command(
     }
 }
 
-const MEDIA_HTTP_IN_FLIGHT_LIMIT: usize = 4;
+/// Media HTTP work in flight per account: every attachment download the
+/// runtime admits ([`super::ATTACHMENT_TRANSFER_LIMIT`]) plus the one slot
+/// background admission keeps free for foreground work.
+pub(crate) const MEDIA_HTTP_IN_FLIGHT_LIMIT: usize = super::ATTACHMENT_TRANSFER_LIMIT + 1;
 
 struct MediaHttpContext {
     product: marmot_observability::ProductRecorder,

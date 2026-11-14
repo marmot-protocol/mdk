@@ -65,6 +65,8 @@ use nostr::prelude::PublicKey;
 use nostr_directory::DirectorySyncHandle;
 
 const MEDIA_COMMAND_QUEUE_LIMIT: usize = 8;
+/// Attachment downloads in flight at once across every account of a runtime.
+pub(crate) const ATTACHMENT_TRANSFER_LIMIT: usize = 4;
 
 pub(crate) mod account_worker;
 mod agent_publisher;
@@ -378,6 +380,8 @@ pub struct RuntimeSharedServices {
     // global mutex is never held during storage, engine, or network work.
     local_submission_queue: Arc<StdMutex<local_submission_queue::LocalSubmissionQueue>>,
     attachment_transfer: Arc<tokio::sync::Semaphore>,
+    /// The largest attachment transfer limit any account admitted under.
+    attachment_limit_bound: Arc<std::sync::atomic::AtomicU64>,
     attachment_updates: attachment_controls::AttachmentUpdates,
     attachment_cancellations: watch::Sender<()>,
     /// Latest platform facts survive an interval with no workers/receivers.
@@ -487,7 +491,8 @@ impl Default for RuntimeSharedServices {
             ordinary_drop_witness: Arc::new(StdMutex::new(None)),
             #[cfg(test)]
             ordinary_delivery_dropped: Arc::new(Notify::new()),
-            attachment_transfer: Arc::new(tokio::sync::Semaphore::new(1)),
+            attachment_transfer: Arc::new(tokio::sync::Semaphore::new(ATTACHMENT_TRANSFER_LIMIT)),
+            attachment_limit_bound: Default::default(),
             local_submission_wakeups: watch::channel(()).0,
             local_submission_queue: Arc::new(StdMutex::new(Default::default())),
             attachment_updates: Default::default(),
@@ -592,7 +597,8 @@ impl RuntimeSharedServices {
             ordinary_drop_witness: Arc::new(StdMutex::new(None)),
             #[cfg(test)]
             ordinary_delivery_dropped: Arc::new(Notify::new()),
-            attachment_transfer: Arc::new(tokio::sync::Semaphore::new(1)),
+            attachment_transfer: Arc::new(tokio::sync::Semaphore::new(ATTACHMENT_TRANSFER_LIMIT)),
+            attachment_limit_bound: Default::default(),
             attachment_updates: Default::default(),
             local_submission_wakeups: watch::channel(()).0,
             local_submission_queue: Arc::new(StdMutex::new(Default::default())),

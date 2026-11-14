@@ -2080,6 +2080,7 @@ fn automatic_request(
                 allowed,
             ),
         )
+        .map(|(status, queued, _)| (status, queued))
         .unwrap()
 }
 
@@ -2347,7 +2348,7 @@ fn automatic_history_replacement_is_independent_but_slot_removal_stays_suppresse
         disk_reserve: 0,
         transfer_limit: 100,
     };
-    let (status, queued) = app
+    let (status, queued, _) = app
         .request_automatic_attachment(GROUP, &entry, digest(), 12, (&policy, true))
         .unwrap();
     assert!(queued);
@@ -2367,7 +2368,7 @@ fn automatic_history_replacement_is_independent_but_slot_removal_stays_suppresse
         .attachment_control_entry(GROUP, "one", "third-source", 0, 12)
         .unwrap()
         .unwrap();
-    let (status, queued) = app
+    let (status, queued, _) = app
         .request_automatic_attachment(GROUP, &entry, digest(), 12, (&policy, true))
         .unwrap();
     assert!(!queued);
@@ -4081,3 +4082,102 @@ mod outgoing;
 mod outgoing_files;
 mod outgoing_media;
 mod promotion;
+
+#[test]
+fn automatic_request_moves_queued_work_ahead_of_newer_backlog_but_not_taps() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
+    for (message, received_at) in [("shown", 10), ("newer", 20), ("tapped", 5)] {
+        store.lock().unwrap().execute("INSERT INTO account_groups(group_id_hex,endpoint,updated_at) VALUES(?1,'',0) ON CONFLICT DO NOTHING",[GROUP]).unwrap();
+        app.record_app_event(&StoredAppEvent {
+            received_at,
+            ..source(message)
+        })
+        .unwrap();
+        request(&app, message);
+    }
+    let order = |now| -> Vec<String> {
+        app.attachment_transfer_candidates(now, 32, true)
+            .unwrap()
+            .iter()
+            .map(|r| {
+                store
+                    .lock()
+                    .unwrap()
+                    .query_row(
+                        "SELECT message_id_hex FROM attachment_acquisition WHERE token=?1",
+                        [&r.token],
+                        |row| row.get(0),
+                    )
+                    .unwrap()
+            })
+            .collect()
+    };
+    // Background demand follows message recency.
+    assert_eq!(order(30), ["newer", "shown", "tapped"]);
+    let tapped = app
+        .attachment_control_entry(GROUP, "tapped", "source-tapped", 0, 25)
+        .unwrap()
+        .unwrap();
+    app.request_explicit_attachment(GROUP, &tapped, digest(), 25)
+        .unwrap();
+    let policy = AttachmentDownloadPolicy {
+        automatic: true,
+        retained_bytes: 10000,
+        disk_reserve: 0,
+        transfer_limit: 100,
+    };
+    let shown = app
+        .attachment_control_entry(GROUP, "shown", "source-shown", 0, 30)
+        .unwrap()
+        .unwrap();
+    let (status, newly_queued, reprioritized) = app
+        .request_automatic_attachment(GROUP, &shown, digest(), 30, (&policy, true))
+        .unwrap();
+    assert!(!newly_queued, "already queued work is not queued again");
+    assert!(reprioritized, "the order changed");
+    assert_eq!(status.unwrap().state, AttachmentTransferState::Queued);
+    // The shown image overtakes newer background work; a tap stays first.
+    assert_eq!(order(30), ["tapped", "shown", "newer"]);
+    // A later request in the same clock second still goes first, and
+    // repeating the leading request leaves its priority where it is.
+    let priority = |message: &str| -> i64 {
+        store
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT priority_at FROM attachment_acquisition WHERE message_id_hex=?1",
+                [message],
+                |row| row.get(0),
+            )
+            .unwrap()
+    };
+    let newer = app
+        .attachment_control_entry(GROUP, "newer", "source-newer", 0, 30)
+        .unwrap()
+        .unwrap();
+    let moved: Vec<bool> = (0..3)
+        .map(|_| {
+            app.request_automatic_attachment(GROUP, &newer, digest(), 30, (&policy, true))
+                .unwrap()
+                .2
+        })
+        .collect();
+    assert_eq!(
+        moved,
+        [true, false, false],
+        "only the request that changes the order reports it"
+    );
+    assert_eq!(order(30), ["tapped", "newer", "shown"]);
+    assert_eq!(priority("newer"), priority("shown") + 1);
+    app.request_automatic_attachment(GROUP, &shown, digest(), 30, (&policy, true))
+        .unwrap();
+    assert_eq!(order(30), ["tapped", "shown", "newer"]);
+    // Repeating the leading request seconds later leaves it where it is.
+    let leading = priority("shown");
+    let (_, _, moved) = app
+        .request_automatic_attachment(GROUP, &shown, digest(), 45, (&policy, true))
+        .unwrap();
+    assert!(!moved, "the leader does not climb with the clock");
+    assert_eq!(priority("shown"), leading);
+}

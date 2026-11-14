@@ -1012,7 +1012,7 @@ fn outgoing_staging_blocks_all_network_routes_after_promotion_fault() {
         disk_reserve: 0,
         transfer_limit: 1024,
     };
-    let (_, admitted) = app
+    let (_, admitted, _) = app
         .request_automatic_attachment(GROUP, &selected("managed"), digest(), 12, (&policy, true))
         .unwrap();
     assert!(

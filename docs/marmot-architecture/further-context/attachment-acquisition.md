@@ -163,9 +163,12 @@ after admission or rejection. Repeated account saves do not rescan/requeue histo
 Explicit-removal suppression, ready bytes, backoff and terminal failures survive rediscovery.
 
 Automatic work uses the existing cancellable media executor. A FIFO semaphore permits
-one automatic transfer across all accounts in a runtime; each account has at most one
-pending permit request. A permit remains held through queued plaintext publication.
-At least one of the four per-account media slots is reserved for foreground work.
+four transfers across all accounts in a runtime; each account has at most one pending
+permit request, and each worker pass starts one transfer and, once it has claimed it, asks
+for another pass while candidates remain. A candidate that stays due (its deferral changed
+nothing) does not ask, so it cannot be selected again at once. A permit remains held through queued plaintext publication. One of the
+five per-account media slots is reserved for foreground work, so one account may run all
+four transfers.
 Preparation reads projected group policy and retained source-epoch secrets; it never
 hydrates MLS state. Projecting a received media message caches the source-epoch secret
 that the engine captured while authenticating it. Replay and live ingest export it while
@@ -182,7 +185,7 @@ Starting Rust-configurable resource defaults (`AttachmentAcquisitionPolicy::defa
 | Retained plaintext per account | 2 GiB, no eviction |
 | Free disk reserve | 256 MiB, plus four admission-sized objects for SQLite/WAL overhead |
 | Automatic ciphertext ceiling | 64 MiB, enforced during streaming, including chunked bodies |
-| Concurrent automatic transfers | One across accounts in a runtime |
+| Concurrent transfers | Four across accounts in a runtime |
 
 `MarmotAppConfig::attachment_acquisition` defaults to `Some(default_policy)`. Rust callers may
 supply `None` to disable the fallback. Durable per-account policy overrides that fallback;
@@ -192,6 +195,16 @@ transfer limit (64 MiB by default) against quota, including explicit queued requ
 references have no declared size. This avoids requiring 512 MiB of unused quota for tiny
 explicit files. Checkpoint and publication checks enforce actual quota and disk use as files
 grow; a final remainder below the admission reservation can still stay unused.
+
+Transfers run concurrently only while free space, above the reserve, covers all four
+writing the most the largest account limit seen in the runtime allows, so none needs to
+know what the others still write. An explicit download may be far larger than the
+automatic limit that rule prices, so it always runs alone. Below that room, and for every
+explicit download, a transfer holds all four global permits and runs alone, exactly as
+with a single slot, and admission measures free space with nothing
+else in flight. A pass that finds others still in flight waits for all four permits in the
+semaphore's FIFO queue: its candidates stay queued and due, and the wait ends as soon as
+the last transfer finishes, in any account.
 Unknown free space fails closed. These are resource limits, not an OS background-execution
 entitlement or mobile throughput evidence.
 
@@ -345,13 +358,19 @@ subscriptions keep a one-second fallback. Idle/terminal subscriptions refresh at
 notifications wake them promptly. Cross-writer changes without a notification may take up
 to 30 seconds to appear while idle. Every byte read still revalidates source/expiry immediately.
 
-Explicit requests precede automatic work, and recent incoming sources precede older backfill.
+Explicit requests precede automatic work. Among automatic work, a host's
+`request_automatic_attachment` for queued work (an image on screen) moves it to the
+front, most recent request first; otherwise recent incoming sources precede older
+backfill. That request changes only ordering, never state, backoff or budgets. Work that
+already leads the other queued automatic work is left as it is. A request that changes the
+order wakes the account's worker, without reporting a state change; one that changes
+nothing writes and wakes nothing.
 Candidate queries seek the due range before sorting eligible jobs by priority, so future
 backoff and active leases are not scanned. The explicit-only path also seeks past disabled
 automatic work. Priority sorting still visits currently eligible jobs; this is not a claim
 of constant work for an arbitrarily large due backlog.
-The global one-transfer permit uses FIFO account admission. Transfer/idle deadlines prevent a
-stalled server retaining that slot indefinitely. Raising the automatic cap readmits size-policy
+The global four-transfer permit uses FIFO account admission. Transfer/idle deadlines prevent a
+stalled server retaining a slot indefinitely. Raising the automatic cap readmits size-policy
 failures, while integrity failures still require explicit retry. Invalid zero/over-ceiling policy
 values, including a quota smaller than the admission reservation, are rejected before mutation,
 and invalid Rust policy is rejected at runtime start. Disk reserves may intentionally exceed

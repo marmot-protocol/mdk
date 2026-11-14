@@ -294,7 +294,9 @@ For every network or preference change:
    runtime/account. Never obtain a fresh generation from an old callback to bypass
    that result. To revoke without enabling anything, step 1 alone is sufficient.
 3. Call `requestAutomaticAttachment(account, group, target)` for eligible demand.
-   Both foreground callers and restored workers may safely repeat this call.
+   Both foreground callers and restored workers may safely repeat this call. Each
+   call for queued work moves it ahead of other automatic work, most recent call
+   first, so call it for what is on screen; taps (explicit requests) still go first.
 
 Use an ordered host policy coordinator: process the revocation step in event order,
 then perform asynchronous evaluation with that event's captured generation. Do not

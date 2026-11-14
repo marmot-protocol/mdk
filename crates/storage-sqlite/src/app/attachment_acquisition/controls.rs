@@ -234,8 +234,61 @@ impl SqliteAppStorage {
         })
     }
 
+    /// Moves queued automatic work to the front of the automatic queue, most
+    /// recently requested first, so what a screen shows downloads before
+    /// background backlog. Explicit work keeps its tap time and stays ahead.
+    /// Only the ordering changes: state, backoff and budgets are untouched.
+    ///
+    /// Work that already leads every other queued automatic row is left as
+    /// it is, so a screen repeating its request writes and wakes nothing.
+    /// Otherwise it takes the later of now and one past the highest other
+    /// queued automatic priority: clock seconds alone would tie a fling's
+    /// requests. Returns whether the order changed, so the caller wakes the
+    /// worker only then.
+    fn prioritize_queued_automatic(
+        &self,
+        status: Option<&AttachmentTransferStatus>,
+        now: u64,
+    ) -> StorageResult<bool> {
+        let Some(reference) = status
+            .filter(|s| s.state == AttachmentTransferState::Queued)
+            .and_then(|s| s.reference.as_ref())
+        else {
+            return Ok(false);
+        };
+        let conn = self.lock()?;
+        let Some((own, highest_other)) = conn
+            .query_row(
+                "SELECT q.priority_at,(SELECT max(o.priority_at) FROM attachment_acquisition AS o
+                    WHERE o.token<>q.token AND o.explicit_request=0 AND o.cancelled=0
+                    AND o.due IS NOT NULL)
+                FROM attachment_acquisition AS q
+                WHERE q.token=?1 AND q.explicit_request=0 AND q.cancelled=0 AND q.due IS NOT NULL",
+                [&reference.token],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?)),
+            )
+            .optional()
+            .storage()?
+        else {
+            return Ok(false);
+        };
+        let Some(highest_other) = highest_other.filter(|other| own <= *other) else {
+            return Ok(false);
+        };
+        let target = u64_to_i64(now)?.max(highest_other.saturating_add(1));
+        conn.execute(
+            "UPDATE attachment_acquisition SET priority_at=?2 WHERE token=?1",
+            params![reference.token, target],
+        )
+        .storage()?;
+        Ok(true)
+    }
+
     /// Policy, source validation, idempotent demand and returned status share a
     /// transaction. The caller holds its runtime permission fence for this call.
+    /// A request for queued work also moves it ahead of other automatic work.
+    /// Returns the status, whether this request queued the work, and whether
+    /// it moved queued work ahead (the order changed).
     pub fn request_automatic_attachment(
         &self,
         group: &str,
@@ -243,7 +296,7 @@ impl SqliteAppStorage {
         digest: [u8; 32],
         now: u64,
         policy: (&AttachmentDownloadPolicy, bool),
-    ) -> StorageResult<(Option<AttachmentTransferStatus>, bool)> {
+    ) -> StorageResult<(Option<AttachmentTransferStatus>, bool, bool)> {
         let index = u32::try_from(selected.attachment_index)
             .map_err(|_| invalid("invalid attachment index"))?;
         self.connection.with_transaction(|| {
@@ -257,7 +310,7 @@ impl SqliteAppStorage {
             if !current.is_some_and(|entry| {
                 entry.slot == selected.slot && entry.source_epoch == selected.source_epoch
             }) {
-                return Ok((None, false));
+                return Ok((None, false, false));
             }
             self.lock()?.execute("UPDATE attachment_acquisition SET automatic_history=1
                 WHERE group_id_hex=?1 AND message_id_hex=?2 AND source_message_id_hex=?3 AND attachment_index=?4 AND automatic_history=0",
@@ -272,21 +325,23 @@ impl SqliteAppStorage {
                 automatic,
             )?;
             if self.attachment_source_has_upload(group,&selected.message_id_hex,selected.attachment_index)? {
-                return Ok((status,false));
+                return Ok((status, false, false));
             }
             // Existing state (including cancellation, loss of bytes and retry
             // deadlines) wins over demand and is never reset by a screen render.
+            // A render only moves queued work ahead of other automatic work.
             if status.as_ref().is_none_or(|s| {
                 !matches!(
                     s.state,
                     AttachmentTransferState::NotRequested | AttachmentTransferState::Paused
                 )
             }) {
-                return Ok((status, false));
+                let reprioritized = self.prioritize_queued_automatic(status.as_ref(), now)?;
+                return Ok((status, false, reprioritized));
             }
             if let Some(reference) = status.as_ref().and_then(|s| s.reference.as_ref()) {
                 let paused: bool = self.lock()?.query_row("SELECT permission_paused FROM attachment_acquisition WHERE token=?1", [&reference.token], |r| r.get(0)).storage()?;
-                if paused { return Ok((status, false)); }
+                if paused { return Ok((status, false, false)); }
             }
             if !automatic {
                 return Ok((
@@ -297,22 +352,22 @@ impl SqliteAppStorage {
                         s
                     }),
                     false,
+                    false,
                 ));
             }
             match self.request_automatic_acquisition(group, selected, digest, now)? {
                 AttachmentDemand::Requested(reference) => {
                     self.lock()?.execute("UPDATE attachment_acquisition SET automatic_history=1 WHERE token=?1", [&reference.token]).storage()?;
-                    Ok((
-                    self.attachment_transfer_status(
+                    let status = self.attachment_transfer_status(
                         group,
                         &selected.message_id_hex,
                         &selected.source_message_id_hex,
                         index,
                         now,
                         automatic,
-                    )?,
-                    true,
-                ))
+                    )?;
+                    let reprioritized = self.prioritize_queued_automatic(status.as_ref(), now)?;
+                    Ok((status, true, reprioritized))
                 },
                 // Past the "Keep media" window: report the slot as cleaned.
                 AttachmentDemand::Suppressed => Ok((
@@ -325,8 +380,9 @@ impl SqliteAppStorage {
                         automatic,
                     )?,
                     false,
+                    false,
                 )),
-                AttachmentDemand::Unavailable => Ok((None, false)),
+                AttachmentDemand::Unavailable => Ok((None, false, false)),
             }
         })
     }
