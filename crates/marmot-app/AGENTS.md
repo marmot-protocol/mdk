@@ -1140,7 +1140,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
 - Publish the account read state A (`src/client/read_state.rs`, mdk#3273) before anything leaves the account
   worker. Reply through `reply` or `respond_diagnosed` and send host events through `emit` with
   `Emit::Quiescent`; both publish first. An exit that cannot publish names why: `Emit::Unpublished`,
-  `answer_off_quiescent` or `send_from_snapshot`; capturing a group-read snapshot publishes A first.
+  `answer_off_quiescent` or `send_from_published`; a unit that holds the client publishes A before it starts
+  (`publish_before_unit`), and what it answers meanwhile comes from that version.
   `read_state_tests::every_reply_and_event_leaves_the_worker_through_a_named_exit` fails on a new raw send.
   Every account answer is rebuilt at every publish except the owned-KeyPackage list. That list and each group
   entry are reused only while the typed validity built with them holds, and reuse checks nothing else. A group
@@ -1173,11 +1174,21 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   class. A storage read counts its failure as the worker's
   `respond_diagnosed` would. Moving a read to A moves its row in `read_queue_tests.rs` and in
   `runtime-latency-telemetry.md`'s "Host read classes"; don't move a multi-device read (mdk#2628) without Jeff.
+- The group reads (`read_group_from_state`) answer the same way, with one exception, the hydration request. When
+  the version shows a named group awaiting hydration (`GroupAnswers::awaits_hydration`, only during startup's
+  hydration pipeline), the read sends `HydrateGroups` for those groups and answers from the version the worker
+  acknowledges with (`HydrationAck`), so it waits as long as the worker read did, and only for an unhydrated group.
+  The request takes the queue position of a command accepted at that moment, deferred commands included, so it
+  never runs ahead of an accepted forget: the main loop runs it in order, the hydration phase runs it at its
+  position, and a unit that holds the client acknowledges it from the version published before the unit when no
+  named group awaits hydration there (`acknowledge_from_published`), else defers it in order. A group that
+  quarantined or is gone by then answers `UnknownGroup` from that version.
 - A read answered from A waits for no worker unit, so it fences nothing. Tests here and in the host crates fence the
   worker through `src/worker_fences.rs` (startup finished, startup sync took the queued commands, a worker round
   trip), never a read they pick; wn-cli's socket tests mirror the startup fence in `wait_for_daemon_worker_startup`.
-  Moving a read to A, or retiring startup's snapshot reads, updates those helpers; `each_fence_waits_for_what_it_names`
-  fails until it does.
+  Moving a read to A, or changing how startup answers it, updates those helpers; `each_fence_waits_for_what_it_names`
+  fails until it does. The account worker's own unit tests fence a held unit with
+  `held_unit_took_queued_commands`, a hydration request that needs none, which a held unit acknowledges in order.
 
 ## Code map (modules not covered above)
 

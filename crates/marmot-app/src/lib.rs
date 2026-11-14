@@ -4740,17 +4740,6 @@ impl MarmotApp {
             .group_self_membership(group_id_hex)?)
     }
 
-    pub(crate) fn account_group_self_memberships(
-        &self,
-        label: &str,
-    ) -> Result<std::collections::HashMap<String, SelfMembership>, AppError> {
-        self.ensure_account_state(label)?;
-        Ok(self
-            .account_storage(label)?
-            .app_storage()
-            .account_group_self_memberships()?)
-    }
-
     pub(crate) fn arm_epoch_backfill_intents(
         &self,
         label: &str,

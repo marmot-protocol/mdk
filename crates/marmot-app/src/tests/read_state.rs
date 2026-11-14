@@ -843,29 +843,3 @@ async fn a_clock_moved_back_rebuilds_the_time_dependent_entry() {
     assert_eq!(window.from, Timestamp(1_200));
     assert!(!window.contains(client.runtime.wall_clock_now()));
 }
-
-/// A snapshot answers reads while a long unit holds the client, so it never
-/// leads A: capturing one publishes what it describes first.
-#[tokio::test]
-async fn a_snapshot_never_leads_a() {
-    let dir = tempfile::tempdir().unwrap();
-    AccountHome::open(dir.path())
-        .create_account("alice")
-        .unwrap();
-    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
-        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
-    let mut client = app.client("alice").await.unwrap();
-    client.start_read_state(read_state_channel().0, UploadsInFlight::default());
-    let state = client.subscribe_read_state().unwrap();
-    let group = client
-        .create_group("snapshotted", &[])
-        .await
-        .unwrap()
-        .operation
-        .unwrap();
-    assert!(!state.borrow().groups.contains_key(&group));
-
-    let snapshot = client.group_read_snapshot().unwrap();
-    assert!(snapshot.group_mls_state(&group).is_ok());
-    assert!(state.borrow().groups.contains_key(&group));
-}

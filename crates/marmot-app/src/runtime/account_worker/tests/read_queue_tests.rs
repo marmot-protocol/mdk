@@ -6,9 +6,9 @@
 //! Every read the worker still answers goes down the account's real lane, in
 //! one FIFO, while a barrier or a held relay publish keeps the worker inside
 //! the unit. The unit's `read_queue_behind_<unit>` series must count each of
-//! them. The reads that answer from A, the published read state (PR 3), go
-//! through their host wrappers instead: each must answer while the unit is
-//! still held, and none may count in a queue series.
+//! them. The reads that answer from A, the published read state (PRs 3 and
+//! 4), go through their host wrappers instead: each must answer while the
+//! unit is still held, and none may count in a queue series.
 
 use futures::future::{BoxFuture, join_all};
 use marmot_observability::{PerformanceRecorder, RuntimePerformanceSnapshot};
@@ -18,12 +18,14 @@ use crate::AccountManager;
 
 const SETTLE: Duration = Duration::from_secs(10);
 
-/// What a unit that serves reads from a snapshot (startup sync, an explicit
-/// catch-up, a convergence pass) does with a read today.
+/// What a unit that holds the client while it answers some commands
+/// (startup sync, an explicit catch-up, a convergence pass) does with a read
+/// today.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum InSnapshotUnit {
-    /// Answered from the snapshot the unit took when it started.
-    Snapshot,
+enum InHeldUnit {
+    /// A hydration request for groups the version of A published before the
+    /// unit shows hydrated: acknowledged at once from that version.
+    Acknowledged,
     /// Answered `NotReady` at once; the conversation window retries it.
     NotReady,
     /// Waits in the worker's FIFO until the unit ends.
@@ -32,7 +34,7 @@ enum InSnapshotUnit {
 
 struct Probe {
     read: &'static str,
-    in_snapshot_unit: InSnapshotUnit,
+    in_held_unit: InHeldUnit,
     response: Box<dyn Pending>,
 }
 
@@ -90,7 +92,7 @@ fn host_reads(
                 (
                     Probe {
                         read: stringify!($variant),
-                        in_snapshot_unit: InSnapshotUnit::$in_unit,
+                        in_held_unit: InHeldUnit::$in_unit,
                         response: Box::new(PendingResponse { response, answered: false }),
                     },
                     AccountWorkerCommand::$variant { $($field: $value,)* respond },
@@ -100,10 +102,7 @@ fn host_reads(
     }
     let group_id = || group.clone();
     reads! {
-        Snapshot Members { group_id: group_id() }
-        Snapshot MemberIdsPage { group_ids: vec![group_id()] }
-        Snapshot GroupMlsState { group_id: group_id() }
-        Snapshot GroupRoster { group_id: group_id() }
+        Acknowledged HydrateGroups { group_ids: vec![group_id()] }
         NotReady CaptureConversation {
             queued: None,
             group_id: group_id(),
@@ -118,7 +117,6 @@ fn host_reads(
         Waits HistoryImportProvenance { group_id: group_id(), event_id: "00".repeat(32) }
         Waits PendingWelcomeDeliveries {}
         Waits AccountDevicesActivation { group_id: group_id() }
-        Waits GroupAppComponent { group_id: group_id(), component_id: 0 }
         Waits GroupPushDebugInfo { group_id: group_id() }
         Waits ExporterSecret { group_id: group_id(), label: "probe".into(), length: 32 }
         Waits SafeExportSecret { group_id: group_id(), component_id: 0 }
@@ -152,10 +150,11 @@ fn host_reads(
     }
 }
 
-/// The reads that answer from A (mdk#3273 PR 3), each through its host
-/// wrapper while `behind` holds the worker: every one answers before the unit
-/// ends, and none queues on the worker, so neither its class's series nor the
-/// unit's counts it.
+/// The reads that answer from A (mdk#3273 PRs 3 and 4), each through its
+/// host wrapper while `behind` holds the worker: every one answers before the
+/// unit ends, and none queues on the worker, so neither its class's series
+/// nor the unit's counts it. The group reads find their group hydrated, so
+/// they send no hydration request.
 async fn reads_from_published_state(
     accounts: &AccountManager,
     account: &str,
@@ -164,33 +163,95 @@ async fn reads_from_published_state(
     behind: RuntimeOp,
 ) {
     let queued = || {
-        [behind, RuntimeOp::ReadQueueR3, RuntimeOp::ReadQueueR7]
-            .map(|operation| sample(telemetry, operation).started)
+        [
+            behind,
+            RuntimeOp::ReadQueueR3,
+            RuntimeOp::ReadQueueR4,
+            RuntimeOp::ReadQueueR7,
+        ]
+        .map(|operation| sample(telemetry, operation).started)
     };
     let before = queued();
-    timeout(SETTLE, async {
-        accounts.quarantined_groups(account).await.unwrap();
-        accounts
-            .group_commit_delivery(account, group)
-            .await
-            .unwrap();
-        accounts.maintenance_status(account, group).await.unwrap();
-        accounts
-            .key_package_maintenance_status(account)
-            .await
-            .unwrap();
-        accounts
-            .diagnostic_key_package_maintenance_status(account)
-            .await
-            .unwrap()
-            .expect("the worker is running");
-        accounts.durably_owned_key_packages(account).await.unwrap();
-        accounts.periodic_maintenance_policy(account).await.unwrap();
-        accounts.backup_restore_status(account).await.unwrap();
-        accounts.watch_backup_restore(account).await.unwrap();
-    })
-    .await
-    .unwrap_or_else(|_| panic!("a held {behind:?} keeps a read of A waiting"));
+    // Each read answers within the settle bound, named if it does not.
+    macro_rules! answers {
+        ($read:literal, $call:expr) => {
+            timeout(SETTLE, $call)
+                .await
+                .unwrap_or_else(|_| panic!("a held {behind:?} keeps {} waiting", $read))
+        };
+    }
+    answers!("quarantined_groups", accounts.quarantined_groups(account)).unwrap();
+    answers!(
+        "group_commit_delivery",
+        accounts.group_commit_delivery(account, group)
+    )
+    .unwrap();
+    answers!(
+        "maintenance_status",
+        accounts.maintenance_status(account, group)
+    )
+    .unwrap();
+    answers!(
+        "key_package_maintenance_status",
+        accounts.key_package_maintenance_status(account)
+    )
+    .unwrap();
+    answers!(
+        "diagnostic_key_package_maintenance_status",
+        accounts.diagnostic_key_package_maintenance_status(account)
+    )
+    .unwrap()
+    .expect("the worker is running");
+    answers!(
+        "durably_owned_key_packages",
+        accounts.durably_owned_key_packages(account)
+    )
+    .unwrap();
+    answers!(
+        "periodic_maintenance_policy",
+        accounts.periodic_maintenance_policy(account)
+    )
+    .unwrap();
+    answers!(
+        "backup_restore_status",
+        accounts.backup_restore_status(account)
+    )
+    .unwrap();
+    answers!(
+        "watch_backup_restore",
+        accounts.watch_backup_restore(account)
+    )
+    .unwrap();
+    answers!("group_members", accounts.group_members(account, group)).unwrap();
+    answers!(
+        "group_member_ids_page",
+        accounts.group_member_ids_page(account, std::slice::from_ref(group))
+    )
+    .unwrap();
+    answers!("group_mls_state", accounts.group_mls_state(account, group)).unwrap();
+    answers!(
+        "diagnostic_group_mls_state",
+        accounts.diagnostic_group_mls_state(account, group)
+    )
+    .unwrap()
+    .expect("the worker is running");
+    answers!("group_roster", accounts.group_roster(account, group)).unwrap();
+    answers!(
+        "group_app_component",
+        accounts.group_app_component(
+            account,
+            group,
+            cgka_traits::app_components::APP_OWNED_APP_COMPONENT_ID_START
+        )
+    )
+    .unwrap();
+    assert!(matches!(
+        answers!(
+            "group_app_component in protocol space",
+            accounts.group_app_component(account, group, 0)
+        ),
+        Err(AppError::InvalidAppComponent(_))
+    ));
     assert_eq!(queued(), before, "a read of A queued on the worker");
 }
 
@@ -208,6 +269,9 @@ struct HeldUnit {
     behind: RuntimeOp,
     before: RuntimePerformanceSnapshot,
     probes: Vec<Probe>,
+    /// Reads waiting in the unit's series before `before` was sampled,
+    /// answered with the probes once the unit ends.
+    earlier: u64,
 }
 
 impl HeldUnit {
@@ -222,17 +286,20 @@ impl HeldUnit {
         .await
         .unwrap_or_else(|_| panic!("every read is answered once {:?} ends", self.behind));
         let after = sample(telemetry, self.behind);
-        assert_eq!(after.completed - self.before.completed, total);
+        assert_eq!(
+            after.completed - self.before.completed,
+            total + self.earlier
+        );
         assert_eq!(after.cancelled, self.before.cancelled);
         assert_eq!(after.in_flight, 0);
     }
 }
 
 /// Sends every probe down `lane` while the worker is held inside a unit
-/// that serves reads from a snapshot, then a snapshot read whose answer
-/// proves the worker took up each probe before it. Checks which reads the
-/// unit answered and what its series counted.
-async fn probe_held_snapshot_unit(
+/// that answers some commands, then a fence whose answer proves the worker
+/// took up each probe before it.
+/// Checks which reads the unit answered and what its series counted.
+async fn probe_held_unit(
     lane: &WorkerLane,
     telemetry: &PerformanceRecorder,
     group: &GroupId,
@@ -244,19 +311,7 @@ async fn probe_held_snapshot_unit(
         lane.commands.send(command).await.unwrap();
         probes.push(probe);
     }
-    let (respond, fence) = ReadReply::unobserved();
-    lane.commands
-        .send(AccountWorkerCommand::Members {
-            group_id: group.clone(),
-            respond,
-        })
-        .await
-        .unwrap();
-    timeout(SETTLE, fence)
-        .await
-        .unwrap_or_else(|_| panic!("a held {behind:?} answers snapshot reads"))
-        .unwrap()
-        .unwrap();
+    held_unit_took_queued_commands(&lane.commands).await;
 
     let answered = probes
         .iter_mut()
@@ -264,7 +319,7 @@ async fn probe_held_snapshot_unit(
         .collect::<Vec<_>>();
     let expected = probes
         .iter()
-        .map(|probe| (probe.read, probe.in_snapshot_unit != InSnapshotUnit::Waits))
+        .map(|probe| (probe.read, probe.in_held_unit != InHeldUnit::Waits))
         .collect::<Vec<_>>();
     assert_eq!(answered, expected, "the reads a held {behind:?} answers");
 
@@ -279,13 +334,14 @@ async fn probe_held_snapshot_unit(
         behind,
         before,
         probes,
+        earlier: 0,
     }
 }
 
 /// Startup sync, an explicit catch-up and a send, each held in turn on one
-/// account. Startup sync and the catch-up answer four reads from their
-/// snapshot and the conversation capture with `NotReady`; every other read
-/// the worker answers waits for the unit to end. A send answers nothing: the
+/// account. Startup sync and the catch-up acknowledge the hydration request
+/// from A and answer the conversation capture with `NotReady`; every other
+/// read the worker answers waits for the unit to end. A send answers nothing: the
 /// worker takes no command until its relays answer, so the lane fills and a
 /// ninth read cannot even be admitted. The reads of A answer through each.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -318,7 +374,7 @@ async fn host_reads_wait_behind_held_worker_units() {
         .await
         .expect("the worker reaches startup sync");
     let lane = runtime.accounts().worker_lane("alice").await.unwrap();
-    let held = probe_held_snapshot_unit(
+    let held = probe_held_unit(
         &lane,
         &telemetry,
         &group,
@@ -347,20 +403,27 @@ async fn host_reads_wait_behind_held_worker_units() {
     timeout(SETTLE, catch_up.wait())
         .await
         .expect("the explicit catch-up reaches its hold");
-    // A host read through its public wrapper records its class and the unit.
-    let class_before = sample(&telemetry, RuntimeOp::ReadQueueR3);
+    // A host read through its public wrapper records its class, and the
+    // unit it waits behind once that ends: the fresh-start flag still waits
+    // on the worker.
+    let class_before = sample(&telemetry, RuntimeOp::ReadQueueR2);
     let unit_before = sample(&telemetry, RuntimeOp::ReadQueueBehindCatchUp);
-    timeout(SETTLE, runtime.group_members("alice", &group))
-        .await
-        .expect("a held catch-up answers members from its snapshot")
-        .unwrap();
-    let class_after = sample(&telemetry, RuntimeOp::ReadQueueR3);
-    let unit_after = sample(&telemetry, RuntimeOp::ReadQueueBehindCatchUp);
-    assert_eq!(class_after.successes - class_before.successes, 1);
-    assert_eq!(unit_after.successes - unit_before.successes, 1);
-    let held =
-        probe_held_snapshot_unit(&lane, &telemetry, &group, RuntimeOp::ReadQueueBehindCatchUp)
-            .await;
+    let wrapped = tokio::spawn({
+        let runtime = runtime.clone();
+        async move { runtime.started_fresh("alice").await }
+    });
+    timeout(SETTLE, async {
+        while sample(&telemetry, RuntimeOp::ReadQueueBehindCatchUp).in_flight
+            == unit_before.in_flight
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the wrapped read waits behind the held catch-up");
+    let mut held =
+        probe_held_unit(&lane, &telemetry, &group, RuntimeOp::ReadQueueBehindCatchUp).await;
+    held.earlier = 1;
     reads_from_published_state(
         &runtime.accounts(),
         "alice",
@@ -375,6 +438,10 @@ async fn host_reads_wait_behind_held_worker_units() {
         .unwrap()
         .unwrap()
         .unwrap();
+    timeout(SETTLE, wrapped).await.unwrap().unwrap().unwrap();
+    let class_after = sample(&telemetry, RuntimeOp::ReadQueueR2);
+    assert_eq!(class_after.successes - class_before.successes, 1);
+    // The unit's series counts it with the probes.
     held.all_answered(&telemetry).await;
 
     relay.block_next_publish();
@@ -444,15 +511,16 @@ async fn host_reads_wait_behind_held_worker_units() {
         behind: RuntimeOp::ReadQueueBehindSend,
         before,
         probes,
+        earlier: 0,
     }
     .all_answered(&telemetry)
     .await;
     runtime.shutdown_and_close().await.unwrap();
 }
 
-/// A scheduled convergence pass answers the same reads from its snapshot as
-/// startup sync and an explicit catch-up; every other read the worker answers
-/// waits for the pass to end, and the reads of A answer through it.
+/// A scheduled convergence pass answers the same reads as startup sync and an
+/// explicit catch-up; every other read the worker answers waits for the pass
+/// to end, and the reads of A answer through it.
 // Pauses the clock, which needs the current-thread runtime.
 #[tokio::test(flavor = "current_thread")]
 #[cfg(feature = "test-policy-overrides")]
@@ -521,7 +589,7 @@ async fn host_reads_wait_behind_a_held_convergence_pass() {
     timeout(Duration::from_secs(30), pass.wait())
         .await
         .expect("the due pass reaches its hold");
-    let held = probe_held_snapshot_unit(
+    let held = probe_held_unit(
         &lane,
         &telemetry,
         &group,

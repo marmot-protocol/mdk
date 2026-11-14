@@ -6,6 +6,7 @@ use crate::RuntimePerformanceOperation as RuntimeOp;
 use zeroize::Zeroizing;
 
 use std::collections::BTreeSet;
+use std::sync::Arc;
 use std::time::Instant;
 
 use cgka_traits::app_event::MarmotAppEvent as MarmotInnerEvent;
@@ -34,7 +35,7 @@ use crate::{
 use marmot_observability::AppPerformanceOperation;
 
 /// How a read answered from A behaves where its worker command differs: the
-/// wait a fallback to the worker takes, and whether a failure is counted.
+/// wait a request to the worker takes, and whether a failure is counted.
 #[derive(Clone, Copy)]
 enum StateRead {
     /// An in-memory read the worker answers through `reply`, within the
@@ -43,6 +44,51 @@ enum StateRead {
     /// A storage read the worker answers through `respond_diagnosed`,
     /// within the app wait: a failure is counted as a storage failure.
     Diagnosed,
+    /// A read the worker answers through `respond_diagnosed` within the
+    /// local wait: a failure is counted as a storage failure.
+    DiagnosedLocal,
+}
+
+impl StateRead {
+    fn counts_failures(self) -> bool {
+        matches!(self, Self::Diagnosed | Self::DiagnosedLocal)
+    }
+
+    async fn wait<T>(
+        self,
+        response: oneshot::Receiver<Result<T, AppError>>,
+    ) -> Result<T, AppError> {
+        match self {
+            Self::Local | Self::DiagnosedLocal => local_account_worker_response(response).await,
+            Self::Diagnosed => account_worker_response(response).await,
+        }
+    }
+}
+
+/// How a read reaches the worker when it has to.
+#[derive(Clone, Copy)]
+enum Admission {
+    /// Wait for room in the worker's queue, as any host command does.
+    Queue,
+    /// Refuse a full queue rather than wait in it, as diagnostics do.
+    Refuse,
+}
+
+/// What a group read does with a failed hydration of a group it names: the
+/// reads that propagated one before they answered from A return it, the
+/// others answer from the acknowledging version regardless.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HydrationFailure {
+    Returned,
+    Ignored,
+}
+
+/// Why a group read did not reach an answer.
+enum GroupReadVersionError {
+    /// The worker did not answer the hydration request: not counted.
+    Wait(AppError),
+    /// The read's own failure: counted as its answer would be.
+    Answer(AppError),
 }
 
 impl AccountManager {
@@ -64,15 +110,8 @@ impl AccountManager {
         if let Some(answer) = self.answer_from_state(&lane, read, answer) {
             return answer;
         }
-        let (respond, response) = lane.read_reply(self.shared.observer.performance(), class);
-        lane.commands
-            .send(command(respond))
+        self.ask_worker(&lane, class, read, Admission::Queue, command)
             .await
-            .map_err(|_| AppError::TransportClosed)?;
-        match read {
-            StateRead::Local => local_account_worker_response(response).await,
-            StateRead::Diagnosed => account_worker_response(response).await,
-        }
     }
 
     /// `answer` from `lane`'s current version of A, or `None` when the
@@ -89,11 +128,133 @@ impl AccountManager {
             Ok(None) => return None,
             Err(error) => Err(error),
         };
-        if let (StateRead::Diagnosed, Err(error)) = (read, &result) {
+        Some(self.counted(read, result))
+    }
+
+    /// One group read answered from A (mdk#3273 PR 4), as
+    /// [`Self::read_from_state`], with the hydration request: when the
+    /// version shows a group in `group_ids` seeded but not hydrated, the
+    /// read asks the worker to hydrate it, within the read's wait, and
+    /// answers from the version that acknowledges the request. There each
+    /// named group is live, quarantined or gone. `answer` gives `None` for a
+    /// published failure with no exact copy, which the worker then answers.
+    #[allow(clippy::too_many_arguments)]
+    async fn read_group_from_state<T, Fut>(
+        &self,
+        lane: &WorkerLane,
+        class: ReadClass,
+        read: StateRead,
+        admission: Admission,
+        group_ids: &[GroupId],
+        hydration: HydrationFailure,
+        answer: impl FnOnce(Arc<ReadState>) -> Fut,
+        command: impl FnOnce(ReadReply<Result<T, AppError>>) -> AccountWorkerCommand,
+    ) -> Result<T, AppError>
+    where
+        Fut: Future<Output = Option<Result<T, AppError>>>,
+    {
+        let state = match self
+            .group_read_version(lane, class, read, admission, group_ids, hydration)
+            .await
+        {
+            Ok(Some(state)) => state,
+            Ok(None) => return self.ask_worker(lane, class, read, admission, command).await,
+            Err(GroupReadVersionError::Wait(error)) => return Err(error),
+            Err(GroupReadVersionError::Answer(error)) => return self.counted(read, Err(error)),
+        };
+        match answer(state).await {
+            Some(result) => self.counted(read, result),
+            None => self.ask_worker(lane, class, read, admission, command).await,
+        }
+    }
+
+    /// The version a group read answers from: the lane's current one, or
+    /// once a named group awaits hydration there, the one acknowledging the
+    /// request to hydrate it. `None` before the worker's first publish.
+    async fn group_read_version(
+        &self,
+        lane: &WorkerLane,
+        class: ReadClass,
+        read: StateRead,
+        admission: Admission,
+        group_ids: &[GroupId],
+        hydration: HydrationFailure,
+    ) -> Result<Option<Arc<ReadState>>, GroupReadVersionError> {
+        let state = match lane.read_state.version(&self.app.storage_closed) {
+            Ok(Some(state)) => state,
+            Ok(None) => return Ok(None),
+            Err(error) => return Err(GroupReadVersionError::Answer(error)),
+        };
+        let awaiting = state.awaiting_hydration(group_ids);
+        if awaiting.is_empty() {
+            return Ok(Some(state));
+        }
+        let ack = self
+            .ask_worker(lane, class, read, admission, |respond| {
+                AccountWorkerCommand::HydrateGroups {
+                    group_ids: awaiting,
+                    respond,
+                }
+            })
+            .await
+            .map_err(GroupReadVersionError::Wait)?;
+        let state = ack
+            .version(&self.app.storage_closed)
+            .map_err(GroupReadVersionError::Answer)?;
+        match ack.failure {
+            Some(failure) if hydration == HydrationFailure::Returned => {
+                Err(GroupReadVersionError::Answer(failure))
+            }
+            _ => Ok(Some(state)),
+        }
+    }
+
+    /// Send `command` to the worker and wait for its answer, within the
+    /// read's wait and observed under its class.
+    async fn ask_worker<T>(
+        &self,
+        lane: &WorkerLane,
+        class: ReadClass,
+        read: StateRead,
+        admission: Admission,
+        command: impl FnOnce(ReadReply<Result<T, AppError>>) -> AccountWorkerCommand,
+    ) -> Result<T, AppError> {
+        let (respond, response) = lane.read_reply(self.shared.observer.performance(), class);
+        match admission {
+            Admission::Queue => lane
+                .commands
+                .send(command(respond))
+                .await
+                .map_err(|_| AppError::TransportClosed)?,
+            Admission::Refuse => {
+                lane.commands
+                    .try_send(command(respond))
+                    .map_err(|error| match error {
+                        mpsc::error::TrySendError::Full(_) => {
+                            AppError::AccountWorkerResponseTimedOut
+                        }
+                        mpsc::error::TrySendError::Closed(_) => AppError::TransportClosed,
+                    })?
+            }
+        }
+        read.wait(response).await
+    }
+
+    /// `result`, its failure counted as a storage failure where the read's
+    /// worker command counts one.
+    fn counted<T>(&self, read: StateRead, result: Result<T, AppError>) -> Result<T, AppError> {
+        if let (true, Err(error)) = (read.counts_failures(), &result) {
             let product = self.shared.observer.product();
             product.storage_failure(product.permit().as_ref(), error);
         }
-        Some(result)
+        result
+    }
+
+    /// The account profiles a member read names members by, loaded at read
+    /// time off the caller's task, as the worker loaded them for its read.
+    async fn member_profiles(&self) -> Result<std::collections::HashMap<String, String>, AppError> {
+        let app = self.app.clone();
+        crate::blocking_app_task(move || app.profiles_by_id()).await
     }
 
     #[cfg(test)]
@@ -639,15 +800,29 @@ impl AccountManager {
         account_ref: &str,
         group_id: &GroupId,
     ) -> Result<Vec<AppGroupMemberRecord>, AppError> {
-        let (command, respond, response) = self.read_command(account_ref, ReadClass::R3).await?;
-        command
-            .send(AccountWorkerCommand::Members {
+        let lane = self.worker_lane(account_ref).await?;
+        self.read_group_from_state(
+            &lane,
+            ReadClass::R3,
+            StateRead::DiagnosedLocal,
+            Admission::Queue,
+            std::slice::from_ref(group_id),
+            HydrationFailure::Ignored,
+            |state| async move {
+                // The profiles load before anything else, as for the
+                // worker's read.
+                let profiles = match self.member_profiles().await {
+                    Ok(profiles) => profiles,
+                    Err(error) => return Some(Err(error)),
+                };
+                reissue(state.members(group_id, &profiles))
+            },
+            |respond| AccountWorkerCommand::Members {
                 group_id: group_id.clone(),
                 respond,
-            })
-            .await
-            .map_err(|_| AppError::TransportClosed)?;
-        local_account_worker_response(response).await
+            },
+        )
+        .await
     }
 
     /// Read identifier-only member and admin rosters for a bounded page of
@@ -666,15 +841,21 @@ impl AccountManager {
                 crate::MAX_GROUP_MEMBER_IDS_PAGE_SIZE
             )));
         }
-        let (command, respond, response) = self.read_command(account_ref, ReadClass::R3).await?;
-        command
-            .send(AccountWorkerCommand::MemberIdsPage {
+        let lane = self.worker_lane(account_ref).await?;
+        self.read_group_from_state(
+            &lane,
+            ReadClass::R3,
+            StateRead::Diagnosed,
+            Admission::Queue,
+            group_ids,
+            HydrationFailure::Returned,
+            |state| async move { reissue(state.member_ids_page(group_ids)) },
+            |respond| AccountWorkerCommand::MemberIdsPage {
                 group_ids: group_ids.to_vec(),
                 respond,
-            })
-            .await
-            .map_err(|_| AppError::TransportClosed)?;
-        account_worker_response(response).await
+            },
+        )
+        .await
     }
 
     pub async fn group_mls_state(
@@ -684,16 +865,9 @@ impl AccountManager {
     ) -> Result<AppGroupMlsState, AppError> {
         let started_at = Instant::now();
         let result = async {
-            let (command, respond, response) =
-                self.read_command(account_ref, ReadClass::R4).await?;
-            command
-                .send(AccountWorkerCommand::GroupMlsState {
-                    group_id: group_id.clone(),
-                    respond,
-                })
+            let lane = self.worker_lane(account_ref).await?;
+            self.group_mls_state_from(&lane, Admission::Queue, group_id)
                 .await
-                .map_err(|_| AppError::TransportClosed)?;
-            account_worker_response(response).await
         }
         .await;
         self.shared.observer.performance().record(
@@ -723,24 +897,66 @@ impl AccountManager {
         ))
     }
 
-    /// Capture the group record, member projection, and MLS state in one
-    /// account-worker command, then enrich member display names on a blocking
-    /// task without worker queue re-entry.
+    /// `GroupMlsState` from A, for the host read and its diagnostic form.
+    async fn group_mls_state_from(
+        &self,
+        lane: &WorkerLane,
+        admission: Admission,
+        group_id: &GroupId,
+    ) -> Result<AppGroupMlsState, AppError> {
+        self.read_group_from_state(
+            lane,
+            ReadClass::R4,
+            StateRead::Diagnosed,
+            admission,
+            std::slice::from_ref(group_id),
+            HydrationFailure::Ignored,
+            |state| async move { reissue(state.group_mls_state(group_id)) },
+            |respond| AccountWorkerCommand::GroupMlsState {
+                group_id: group_id.clone(),
+                respond,
+            },
+        )
+        .await
+    }
+
+    /// Read the group record, member projection, and MLS state from one
+    /// version of A, then enrich member display names on a blocking task
+    /// without worker queue re-entry.
     pub async fn group_conversation_snapshot(
         &self,
         account_ref: &str,
         group_id: &GroupId,
     ) -> Result<AppGroupConversationSnapshot, AppError> {
         let account = self.resolve(account_ref)?;
-        let (command, respond, response) = self.read_command(account_ref, ReadClass::R3).await?;
-        command
-            .send(AccountWorkerCommand::GroupRoster {
-                group_id: group_id.clone(),
-                respond,
-            })
-            .await
-            .map_err(|_| AppError::TransportClosed)?;
-        let session = account_worker_response(response).await?;
+        let lane = self.worker_lane(account_ref).await?;
+        let session = self
+            .read_group_from_state(
+                &lane,
+                ReadClass::R3,
+                StateRead::Diagnosed,
+                Admission::Queue,
+                std::slice::from_ref(group_id),
+                HydrationFailure::Returned,
+                |state| async move {
+                    // The profiles load once the group is known, as for the
+                    // worker's read.
+                    let profiles = if state.groups.contains_key(group_id) {
+                        self.member_profiles().await
+                    } else {
+                        Ok(Default::default())
+                    };
+                    match state.group_roster(group_id, move || profiles) {
+                        Ok(session) => Some(Ok(session)),
+                        Err(error) => reissue(Err(error)),
+                    }
+                },
+                |respond| AccountWorkerCommand::GroupRoster {
+                    group_id: group_id.clone(),
+                    respond,
+                },
+            )
+            .await?;
         let member_ids = session
             .members
             .iter()
@@ -1946,16 +2162,25 @@ impl AccountManager {
         group_id: &GroupId,
         component_id: u16,
     ) -> Result<Option<Vec<u8>>, AppError> {
-        let (command, respond, response) = self.read_command(account_ref, ReadClass::R4).await?;
-        command
-            .send(AccountWorkerCommand::GroupAppComponent {
+        let lane = self.worker_lane(account_ref).await?;
+        // A protocol-space id fails on its own input, so it is answered here,
+        // ahead of any hydration request, and never reaches the worker.
+        crate::client::validate_app_component(component_id, &[])?;
+        self.read_group_from_state(
+            &lane,
+            ReadClass::R4,
+            StateRead::DiagnosedLocal,
+            Admission::Queue,
+            std::slice::from_ref(group_id),
+            HydrationFailure::Returned,
+            |state| async move { reissue(state.group_app_component(group_id, component_id)) },
+            |respond| AccountWorkerCommand::GroupAppComponent {
                 group_id: group_id.clone(),
                 component_id,
                 respond,
-            })
-            .await
-            .map_err(|_| AppError::TransportClosed)?;
-        local_account_worker_response(response).await
+            },
+        )
+        .await
     }
 
     pub async fn update_app_component(
@@ -2897,17 +3122,15 @@ impl AccountManager {
         ) {
             return answer.map(Some);
         }
-        let (respond, response) =
-            lane.read_reply(self.shared.observer.performance(), ReadClass::R3);
-        lane.commands
-            .try_send(AccountWorkerCommand::KeyPackageMaintenanceStatus { respond })
-            .map_err(|error| match error {
-                tokio::sync::mpsc::error::TrySendError::Full(_) => {
-                    AppError::AccountWorkerResponseTimedOut
-                }
-                tokio::sync::mpsc::error::TrySendError::Closed(_) => AppError::TransportClosed,
-            })?;
-        Ok(Some(account_worker_response(response).await?))
+        self.ask_worker(
+            &lane,
+            ReadClass::R3,
+            StateRead::Diagnosed,
+            Admission::Refuse,
+            |respond| AccountWorkerCommand::KeyPackageMaintenanceStatus { respond },
+        )
+        .await
+        .map(Some)
     }
 
     pub async fn diagnostic_group_mls_state(
@@ -2918,20 +3141,9 @@ impl AccountManager {
         let Some(lane) = self.existing_worker_commands(account_ref).await? else {
             return Ok(None);
         };
-        let (respond, response) =
-            lane.read_reply(self.shared.observer.performance(), ReadClass::R4);
-        lane.commands
-            .try_send(AccountWorkerCommand::GroupMlsState {
-                group_id: group_id.clone(),
-                respond,
-            })
-            .map_err(|error| match error {
-                tokio::sync::mpsc::error::TrySendError::Full(_) => {
-                    AppError::AccountWorkerResponseTimedOut
-                }
-                tokio::sync::mpsc::error::TrySendError::Closed(_) => AppError::TransportClosed,
-            })?;
-        Ok(Some(account_worker_response(response).await?))
+        self.group_mls_state_from(&lane, Admission::Refuse, group_id)
+            .await
+            .map(Some)
     }
 
     pub async fn durably_owned_key_packages(

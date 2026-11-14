@@ -339,9 +339,6 @@
     "crates/marmot-app/tests/audit_logs.rs": {
       "sleep": 5
     },
-    "crates/marmot-app/tests/catch_up_snapshot_failure.rs": {
-      "sleep": 1
-    },
     "crates/marmot-app/tests/create_dm_scaling.rs": {
       "sleep": 1
     },

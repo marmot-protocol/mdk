@@ -87,6 +87,28 @@ pub(crate) struct ReadState {
     pub(crate) groups: Arc<HashMap<GroupId, Arc<GroupAnswers>>>,
 }
 
+/// The worker's answer to a hydration request (mdk#3273 PR 4): the version
+/// it published after it hydrated the named groups, and the first failure a
+/// hydration returned, which the reads that return that failure today hand
+/// back.
+#[derive(Debug)]
+pub(crate) struct HydrationAck {
+    pub(crate) state: Arc<ReadState>,
+    pub(crate) failure: Option<AppError>,
+}
+
+impl HydrationAck {
+    /// The acknowledging version, checked as [`ReadStateReader::version`]
+    /// checks the version it takes: storage closed is checked now that the
+    /// acknowledgement has arrived, before any of its answers is read.
+    pub(crate) fn version(&self, storage_closed: &AtomicBool) -> Result<Arc<ReadState>, AppError> {
+        if storage_closed.load(Ordering::Acquire) {
+            return Err(storage_closed_error());
+        }
+        Ok(Arc::clone(&self.state))
+    }
+}
+
 /// The per-account answers.
 #[derive(Debug)]
 pub(crate) struct AccountAnswers {
@@ -186,6 +208,9 @@ pub(crate) struct GroupAnswers {
     pub(crate) record: AppGroupRecord,
     /// Whether the host may see the group: false for a device group.
     pub(crate) host_may_see: bool,
+    /// Whether the engine has seeded the group without hydrating it yet: a
+    /// read that hydrates on demand asks the worker to hydrate it first.
+    pub(crate) awaits_hydration: bool,
     /// Member accounts and their device counts, without profiles.
     pub(crate) members: ReadAnswer<Vec<(MemberId, u32)>>,
     /// The stored self membership the roster overlays on the mirror record.
@@ -205,6 +230,7 @@ impl GroupAnswers {
         let Self {
             record,
             host_may_see,
+            awaits_hydration,
             members,
             self_membership,
             mls_state,
@@ -214,6 +240,7 @@ impl GroupAnswers {
         } = self;
         *record == other.record
             && *host_may_see == other.host_may_see
+            && *awaits_hydration == other.awaits_hydration
             && same_answer(members, &other.members, PartialEq::eq)
             && same_answer(self_membership, &other.self_membership, PartialEq::eq)
             && same_answer(mls_state, &other.mls_state, PartialEq::eq)
@@ -227,7 +254,6 @@ fn unknown_group(group_id: &GroupId) -> Arc<AppError> {
     Arc::new(AppError::UnknownGroup(hex::encode(group_id.as_slice())))
 }
 
-#[cfg_attr(not(test), allow(dead_code))] // Group reads answer from A (mdk#3273 PRs 4–5).
 fn with_profiles(
     members: &[(MemberId, u32)],
     profiles: &HashMap<String, String>,
@@ -248,7 +274,6 @@ fn with_profiles(
 }
 
 /// The answers the moved reads give, from this version alone.
-#[cfg_attr(not(test), allow(dead_code))] // Group reads answer from A (mdk#3273 PRs 4–5).
 impl ReadState {
     fn group(&self, group_id: &GroupId) -> ReadAnswer<&GroupAnswers> {
         self.groups
@@ -351,11 +376,29 @@ impl ReadState {
 
     /// Whether the host may see a group in the mirror; `None` outside it,
     /// where every group read already answers `UnknownGroup`.
+    #[cfg_attr(not(test), allow(dead_code))] // Only the oracle reads it.
     pub(crate) fn host_may_see(&self, group_id: &GroupId) -> Option<bool> {
         self.groups.get(group_id).map(|group| group.host_may_see)
     }
 
+    /// The groups of `group_ids`, in order, that this version shows seeded
+    /// but not hydrated: a read that hydrates on demand today sends them to
+    /// the worker first. A group outside the mirror awaits nothing; every
+    /// read answers it `UnknownGroup`.
+    pub(crate) fn awaiting_hydration(&self, group_ids: &[GroupId]) -> Vec<GroupId> {
+        group_ids
+            .iter()
+            .filter(|group_id| {
+                self.groups
+                    .get(*group_id)
+                    .is_some_and(|group| group.awaits_hydration)
+            })
+            .cloned()
+            .collect()
+    }
+
     /// `PreparedGroupImageStatus`.
+    #[cfg_attr(not(test), allow(dead_code))] // Account reads answer from A (mdk#3273 PR 5).
     pub(crate) fn prepared_group_image_status(
         &self,
         upload_id: &str,
@@ -823,7 +866,6 @@ impl ReadStatePublisher {
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn subscribe(&self) -> watch::Receiver<Arc<ReadState>> {
         self.sender.subscribe()
     }
@@ -1099,6 +1141,7 @@ fn group_entry(
         };
     let answers = GroupAnswers {
         host_may_see: matches!(device_group, Ok(false)),
+        awaits_hydration: generation.awaits_hydration(),
         members: client
             .runtime
             .members(group_id)
@@ -1248,13 +1291,23 @@ impl AppClient {
         })
     }
 
-    /// A receiver of every version this client publishes, if it publishes.
-    #[cfg(test)]
+    /// A receiver of every version this client publishes, if it publishes:
+    /// a long unit that holds the client acknowledges a hydration request
+    /// that needs no hydration from its latest version (mdk#3273 PR 4).
     pub(crate) fn subscribe_read_state(&self) -> Option<watch::Receiver<Arc<ReadState>>> {
         self.read_state.as_ref().map(|slot| {
             slot.lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .subscribe()
+        })
+    }
+
+    /// The version this client published last, if it publishes.
+    pub(crate) fn published_read_state(&self) -> Option<Arc<ReadState>> {
+        self.read_state.as_ref().map(|slot| {
+            slot.lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .current()
         })
     }
 }
@@ -1650,7 +1703,16 @@ pub(crate) mod oracle {
         group_ids.retain(|group_id| seen.insert(group_id.clone()));
 
         let profiles = client.app.profiles_by_id();
+        let unhydrated: HashSet<GroupId> =
+            client.runtime.unhydrated_group_ids().into_iter().collect();
         for group_id in &group_ids {
+            if let Some(group) = state.groups.get(group_id) {
+                assert_eq!(
+                    group.awaits_hydration,
+                    unhydrated.contains(group_id),
+                    "read state differs from the live read for awaiting hydration"
+                );
+            }
             if let Ok(profiles) = &profiles {
                 same(
                     window,

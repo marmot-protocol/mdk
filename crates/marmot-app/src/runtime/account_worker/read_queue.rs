@@ -256,9 +256,10 @@ impl<T> ReadReply<T> {
         self.reply.send(answer())
     }
 
-    /// Answer the read from a snapshot while a long unit holds the client:
-    /// mid-unit, so the answer describes the state from before that unit.
-    pub(crate) fn send_from_snapshot(mut self, answer: impl FnOnce() -> T) -> Result<(), T> {
+    /// Answer the read with a published version of A, which the answer
+    /// carries: the version just published, or while a long unit holds the
+    /// client, the latest one from before it (mdk#3273 PR 4).
+    pub(crate) fn send_from_published(mut self, answer: impl FnOnce() -> T) -> Result<(), T> {
         self.dispatched();
         self.reply.send(answer())
     }

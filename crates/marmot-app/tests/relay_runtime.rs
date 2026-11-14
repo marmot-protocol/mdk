@@ -4394,8 +4394,9 @@ async fn app_runtime_serves_member_reads_before_initial_catch_up_completes() {
         .await
         .expect("restarted worker must reach initial sync");
 
-    // The bounded chat-list companion read uses the same snapshot during the
-    // detached catch-up, so batching does not reintroduce a readiness wait.
+    // The bounded chat-list companion read answers from the read state
+    // published before the detached catch-up, so batching does not
+    // reintroduce a readiness wait.
     let member_ids_page = timeout(
         Duration::from_secs(2),
         runtime.group_member_ids_page(&bob_id, std::slice::from_ref(&group_id)),
@@ -4414,8 +4415,8 @@ async fn app_runtime_serves_member_reads_before_initial_catch_up_completes() {
         !member_ids_page[0].admin_ids_hex.contains(&bob_id),
         "invited member must not be reported as an admin"
     );
-    // The combined roster read must also use the post-hydration snapshot
-    // while the startup sync is held behind the barrier.
+    // The combined roster read must also answer from that post-hydration
+    // version while the startup sync is held behind the barrier.
     let roster = timeout(
         Duration::from_secs(2),
         runtime.group_roster(&bob_id, &group_id),
@@ -4432,7 +4433,7 @@ async fn app_runtime_serves_member_reads_before_initial_catch_up_completes() {
         .collect::<std::collections::HashSet<_>>();
     assert!(
         roster_member_ids.contains(&alice_id) && roster_member_ids.contains(&bob_id),
-        "snapshot/live roster read must report the full roster",
+        "the published roster read must report the full roster",
     );
 
     // The existing member-only read remains command-ready as well.
@@ -4449,7 +4450,7 @@ async fn app_runtime_serves_member_reads_before_initial_catch_up_completes() {
         .collect::<std::collections::HashSet<_>>();
     assert!(
         member_ids.contains(&alice_id) && member_ids.contains(&bob_id),
-        "snapshot/live read must report the full roster",
+        "the published member read must report the full roster",
     );
 
     // Release Bob's initial sync and await the real catch-up result so the
@@ -7174,7 +7175,7 @@ async fn external_signer_forget_and_delete_go_through_the_accounts_worker() {
         let mls_state = runtime.group_mls_state(&account_id, &group).await;
         assert!(
             matches!(&mls_state, Err(AppError::UnknownGroup(id)) if *id == group_hex),
-            "forget={forget}: the worker must not know the removed group: {mls_state:?}"
+            "forget={forget}: the worker's published reads must not hold the removed group: {mls_state:?}"
         );
         let snapshot = runtime
             .group_conversation_snapshot(&account_id, &group)
@@ -7182,7 +7183,7 @@ async fn external_signer_forget_and_delete_go_through_the_accounts_worker() {
             .map(|_| ());
         assert!(
             matches!(&snapshot, Err(AppError::UnknownGroup(id)) if *id == group_hex),
-            "forget={forget}: the worker must not know the removed group: {snapshot:?}"
+            "forget={forget}: the worker's published reads must not hold the removed group: {snapshot:?}"
         );
     }
 
@@ -14431,7 +14432,8 @@ async fn invite_members_returns_before_blocked_welcome() {
     runtime.shutdown().await;
 }
 
-/// mdk#1803: snapshot reads bypass queued mutations during Welcome fanout.
+/// mdk#1803: group reads bypass queued mutations during Welcome fanout: they
+/// answer from the read state published before the fanout (mdk#3273 PR 4).
 /// After the queued mutation completes, fresh reads observe its result.
 #[cfg(feature = "test-policy-overrides")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -14532,12 +14534,12 @@ async fn invite_deferred_during_startup_keeps_projection_reads_off_welcome_fanou
     });
     let members = timeout(Duration::from_secs(1), read)
         .await
-        .expect("snapshot read must bypass the startup-deferred remove")
+        .expect("a group read must bypass the startup-deferred remove")
         .expect("read task should not panic")
-        .expect("snapshot members should remain readable");
+        .expect("published members should remain readable");
     assert!(
         members.iter().any(|member| member.member_id_hex == bob_id),
-        "snapshot must retain the member whose removal is still queued"
+        "the published read state must retain the member whose removal is still queued"
     );
     assert!(
         !remove.is_finished(),

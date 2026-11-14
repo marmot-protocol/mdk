@@ -1799,30 +1799,6 @@ impl SqliteAppStorage {
         Ok(value.map(|stored| SelfMembership::from_storage(&stored)))
     }
 
-    /// Authoritative `account_groups.self_membership` for every group row.
-    pub fn account_group_self_memberships(
-        &self,
-    ) -> StorageResult<std::collections::HashMap<String, SelfMembership>> {
-        let conn = self.lock()?;
-        let mut statement = conn
-            .prepare_cached("SELECT group_id_hex, self_membership FROM account_groups")
-            .storage()?;
-        let rows = statement
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    SelfMembership::from_storage(&row.get::<_, String>(1)?),
-                ))
-            })
-            .storage()?;
-        let mut memberships = std::collections::HashMap::new();
-        for row in rows {
-            let (group_id_hex, membership) = row.storage()?;
-            memberships.insert(group_id_hex, membership);
-        }
-        Ok(memberships)
-    }
-
     /// App presentation query; visibility is applied before its limit.
     pub fn visible_app_messages(
         &self,

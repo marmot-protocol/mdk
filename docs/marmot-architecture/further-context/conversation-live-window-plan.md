@@ -72,8 +72,9 @@ live handle and adversarial integration coverage pass.
 
 The existing `presentation_source_revision` cannot serve as an authority revision: migration 0065
 invalidates it for title/avatar/member presentation changes, not admin policy or engine lifecycle.
-The startup/recovery `GroupReadSnapshot` freezes engine facts before network work while account
-storage can advance. Zipping its MLS state with a fresh account capture is therefore not coherent.
+While a startup or recovery unit holds the account worker, the group reads answer from the read
+state published before the unit, which freezes engine facts before network work while account
+storage can advance. Zipping that MLS state with a fresh account capture is therefore not coherent.
 
 Opening first reads the durable account snapshot directly. `header.epoch = None` marks local-only
 presentation and suppresses all live permissions, preserving persisted membership/invitation/departure
@@ -88,8 +89,8 @@ so worker teardown and its lifecycle lock cannot be abandoned; transient acquisi
 The initial read deliberately never spends the 50 ms authority budget, even on a warm open: local
 first paint remains independent of global account reconciliation. This adds one initial read-only
 transition; readiness wakes the actor immediately rather than waiting for the quiet retry timer.
-Frozen-snapshot dispatch paths still return `NotReady`; no old `GroupReadSnapshot` is combined
-with newer persisted fields. Live capture never forces group hydration: background recovery owns
+Capture requests that reach a unit holding the worker still return `NotReady`; no group read
+answered from an older published version is combined with newer persisted fields. Live capture never forces group hydration: background recovery owns
 that work. Tests cover stalled production relay sync at 200/5,000 retained messages, seeded but
 unhydrated groups, quiet authority upgrades, local paging, resets and worker replacement.
 Cached facts must be invalidated by role/membership/capability/lifecycle

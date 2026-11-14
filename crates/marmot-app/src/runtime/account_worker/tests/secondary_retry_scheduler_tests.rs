@@ -214,19 +214,8 @@ async fn overdue_secondary_groups_service_durable_send(deferred_count: usize) {
             .unwrap();
         predecessors.push(response);
     }
-    // This snapshot read fences the two mutation commands into the deferred FIFO.
-    let (respond, response) = ReadReply::unobserved();
-    commands
-        .try_send(AccountWorkerCommand::Members {
-            group_id: groups[0].clone(),
-            respond,
-        })
-        .unwrap();
-    timeout(Duration::from_secs(5), response)
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
+    // This fences the two mutation commands into the deferred FIFO.
+    held_unit_took_queued_commands(&commands).await;
     let accepted = runtime
         .submit_text(
             "alice",
@@ -248,18 +237,7 @@ async fn overdue_secondary_groups_service_durable_send(deferred_count: usize) {
         .unwrap();
     // Fence the direct command into the deferred FIFO before releasing the
     // pass, so both foreground signals are ready at its secondary retry.
-    let (respond, response) = ReadReply::unobserved();
-    commands
-        .try_send(AccountWorkerCommand::Members {
-            group_id: groups[0].clone(),
-            respond,
-        })
-        .unwrap();
-    timeout(Duration::from_secs(5), response)
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
+    held_unit_took_queued_commands(&commands).await;
     let admission_gate = runtime
         .shared_services()
         .local_submission_gate(&account.account_id_hex);
