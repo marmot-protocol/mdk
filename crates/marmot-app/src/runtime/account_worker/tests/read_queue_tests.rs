@@ -222,7 +222,14 @@ async fn reads_from_published_state(
         accounts.watch_backup_restore(account)
     )
     .unwrap();
+    let profile_loads = || telemetry.snapshot().account_profile_load.attempts;
+    let loads_before = profile_loads();
     answers!("group_members", accounts.group_members(account, group)).unwrap();
+    assert_eq!(
+        profile_loads(),
+        loads_before + 1,
+        "a member read records the profile load it names members by"
+    );
     answers!(
         "group_member_ids_page",
         accounts.group_member_ids_page(account, std::slice::from_ref(group))

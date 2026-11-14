@@ -252,9 +252,17 @@ impl AccountManager {
 
     /// The account profiles a member read names members by, loaded at read
     /// time off the caller's task, as the worker loaded them for its read.
+    /// Each load is one `account_profile_load` sample.
     async fn member_profiles(&self) -> Result<std::collections::HashMap<String, String>, AppError> {
         let app = self.app.clone();
-        crate::blocking_app_task(move || app.profiles_by_id()).await
+        let started_at = Instant::now();
+        let profiles = crate::blocking_app_task(move || app.profiles_by_id()).await;
+        self.shared.observer.performance().record(
+            AppPerformanceOperation::AccountProfileLoad,
+            started_at.elapsed(),
+            profiles.is_ok(),
+        );
+        profiles
     }
 
     #[cfg(test)]

@@ -235,8 +235,7 @@ Collected operations:
 | `account_open` | One sample per newly spawned account worker, from worker spawn until the ready signal. | Covers the seeded SQLCipher/session open, local engine-group reconciliation, and local projection backfill. Full group hydration and the read-snapshot capture run after the ready signal (mdk#1161) and are measured separately below. It does not include relay work. |
 | `account_session_open` | `AccountDeviceSession::open` inside the worker's account open: SQLCipher storage open, engine construction (including key-package retirement), and the cheap group seed pass. | Stage attribution for `account_open`; recorded from `SessionOpenTimings` after a successful open, so it has no failure samples. |
 | `account_group_hydration` | Two samples per runtime account open (mdk#1161): the cheap seed pass inside `AccountDeviceSession::open` (subset of `account_session_open`), and the worker's background hydration pipeline from readiness until every group is fully hydrated. | The pipeline sample is the stage that scales with stored group state; the seed sample stays flat. |
-| `account_profile_load` | The one shared account-profile load at the start of the startup group-read-snapshot capture. | Single storage read reused across every group in the snapshot. |
-| `account_group_read_snapshot` | The full startup `GroupReadSnapshot` capture after the ready signal. | Scales with groups × members; snapshot answers worker read commands during initial catch-up. |
+| `account_profile_load` | The account-profile load a host member read (`group_members`, `group_conversation_snapshot`) takes off the caller's task to name the members it answers from the published read state. | One storage read per member read; it never waits on the account worker. |
 | `account_transport_activation` | Initial account signer installation and inbox transport activation after local readiness. | Runs asynchronously after the worker ready signal; includes no caller-supplied relay label. |
 | `account_subscription_registration` | Initial registration of the hydrated account's group subscriptions. | Runs after transport activation and before relay catch-up; a slow registration cannot delay local readiness. |
 | `account_catch_up` | `AccountManager::catch_up_accounts()`, including its reconcile step, catch-up command fanout, and waiting for every worker response. | Multi-account aggregate. |
@@ -553,10 +552,6 @@ Unresolved relay indices are skipped rather than exported as opaque ids.
 | `app_account_profile_load_attempts` | none | Counter | `AppPerformanceSnapshot.account_profile_load.attempts` |
 | `app_account_profile_load_successes` | none | Counter | `AppPerformanceSnapshot.account_profile_load.successes` |
 | `app_account_profile_load_failures` | none | Counter | `AppPerformanceSnapshot.account_profile_load.failures` |
-| `app_account_group_read_snapshot_duration_ms` | none | Histogram | `AppPerformanceSnapshot.account_group_read_snapshot.duration_ms` |
-| `app_account_group_read_snapshot_attempts` | none | Counter | `AppPerformanceSnapshot.account_group_read_snapshot.attempts` |
-| `app_account_group_read_snapshot_successes` | none | Counter | `AppPerformanceSnapshot.account_group_read_snapshot.successes` |
-| `app_account_group_read_snapshot_failures` | none | Counter | `AppPerformanceSnapshot.account_group_read_snapshot.failures` |
 | `app_account_setup_identity_local_duration_ms` | none | Histogram | `AppPerformanceSnapshot.account_setup_identity_local.duration_ms` |
 | `app_account_setup_identity_local_attempts` | none | Counter | `AppPerformanceSnapshot.account_setup_identity_local.attempts` |
 | `app_account_setup_identity_local_successes` | none | Counter | `AppPerformanceSnapshot.account_setup_identity_local.successes` |

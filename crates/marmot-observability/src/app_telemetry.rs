@@ -30,7 +30,6 @@ pub enum AppPerformanceOperation {
     AccountSessionOpen,
     AccountGroupHydration,
     AccountProfileLoad,
-    AccountGroupReadSnapshot,
     AccountTransportActivation,
     AccountSubscriptionRegistration,
     AccountCatchUp,
@@ -338,8 +337,6 @@ pub struct AppPerformanceSnapshot {
     #[serde(default)]
     pub account_profile_load: AppPerformanceOperationSnapshot,
     #[serde(default)]
-    pub account_group_read_snapshot: AppPerformanceOperationSnapshot,
-    #[serde(default)]
     pub account_transport_activation: AppPerformanceOperationSnapshot,
     #[serde(default)]
     pub account_subscription_registration: AppPerformanceOperationSnapshot,
@@ -518,7 +515,6 @@ struct AppPerformanceTelemetryInner {
     account_session_open: AppPerformanceOperationTelemetry,
     account_group_hydration: AppPerformanceOperationTelemetry,
     account_profile_load: AppPerformanceOperationTelemetry,
-    account_group_read_snapshot: AppPerformanceOperationTelemetry,
     account_transport_activation: AppPerformanceOperationTelemetry,
     account_subscription_registration: AppPerformanceOperationTelemetry,
     account_catch_up: AppPerformanceOperationTelemetry,
@@ -822,9 +818,6 @@ impl AppPerformanceTelemetry {
             }
             AppPerformanceOperation::AccountProfileLoad => {
                 inner.account_profile_load.record(duration, success);
-            }
-            AppPerformanceOperation::AccountGroupReadSnapshot => {
-                inner.account_group_read_snapshot.record(duration, success);
             }
             AppPerformanceOperation::AccountTransportActivation => {
                 inner.account_transport_activation.record(duration, success);
@@ -1232,7 +1225,6 @@ impl AppPerformanceTelemetry {
             account_session_open: inner.account_session_open.snapshot(),
             account_group_hydration: inner.account_group_hydration.snapshot(),
             account_profile_load: inner.account_profile_load.snapshot(),
-            account_group_read_snapshot: inner.account_group_read_snapshot.snapshot(),
             account_transport_activation: inner.account_transport_activation.snapshot(),
             account_subscription_registration: inner.account_subscription_registration.snapshot(),
             account_catch_up: inner.account_catch_up.snapshot(),
@@ -1601,7 +1593,6 @@ mod tests {
             (AppPerformanceOperation::AccountSessionOpen, 120),
             (AppPerformanceOperation::AccountGroupHydration, 80),
             (AppPerformanceOperation::AccountProfileLoad, 15),
-            (AppPerformanceOperation::AccountGroupReadSnapshot, 40),
             (
                 AppPerformanceOperation::AccountBootstrapRelayAndFollowPublish,
                 55,
@@ -1627,8 +1618,6 @@ mod tests {
         assert_eq!(snapshot.account_group_hydration.duration_ms.sum_ms, 80);
         assert_eq!(snapshot.account_profile_load.successes, 1);
         assert_eq!(snapshot.account_profile_load.duration_ms.sum_ms, 15);
-        assert_eq!(snapshot.account_group_read_snapshot.successes, 1);
-        assert_eq!(snapshot.account_group_read_snapshot.duration_ms.sum_ms, 40);
         assert_eq!(
             snapshot
                 .account_bootstrap_relay_and_follow_publish

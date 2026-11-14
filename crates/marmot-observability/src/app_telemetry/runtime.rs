@@ -97,7 +97,6 @@ operations! {
     AccountStartupReadyHandoff => "account_startup_ready_handoff",
     WorkerHydration => "worker_hydration",
     WorkerCatchUp => "worker_catch_up",
-    WorkerSnapshot => "worker_snapshot",
     WorkerConvergence => "worker_convergence",
     WorkerReceive => "worker_receive",
     WorkerReconnectWait => "worker_reconnect_wait",
