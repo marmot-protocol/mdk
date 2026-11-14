@@ -32,11 +32,13 @@ MarmotAppRuntime                  the host API and its typed event stream
     account worker(account B)  →  AppClient
     ...
   account setup                   interactive onboarding and generated setup
-MarmotApp                         account home, storage handles, directory, config; every layer holds a clone
+MarmotApp                         account home, storage handles, directory, config
 ```
 
-Hosts reach account setup through `runtime.account_setup()`. Setup's state lives in `runtime/onboarding/`, and it
-reaches the workers only through `AccountManager`.
+`AccountManager`, each account worker and each `AppClient` hold a clone of `MarmotApp`. Hosts reach interactive
+onboarding through `runtime.account_setup()`. Generated setup (`create_identity`, `login` and their variants) stays on
+`MarmotAppRuntime`. Both keep their state in `runtime/onboarding/` and reach the workers only through
+`AccountManager`.
 
 Each account's worker task owns that account's writer, `AppClient`. `AppClient` is crate-private; the `test-support`
 feature makes it public for tests that drive one directly, and `wn sync` runs its one pass through
@@ -50,8 +52,8 @@ feature makes it public for tests that drive one directly, and `wn sync` runs it
 - **history recovery's ledger side:** one component held as one field, `HistoryRecovery` in `client/history_recovery/`.
   It holds the recovery runner's host state, the coverage-ledger recorder, epoch-gap evidence, and history notices and
   status. Its state is private to that module tree: the rest of the writer records a fact or drains an output through
-  one of its methods. The recovery runner schedules every history fetch. Its decisions and storage writes run as
-  short turns on the worker, and its network work runs off the worker.
+  one of its methods. The recovery runner schedules relay history recovery. Its survey and storage writes run as
+  short turns on the worker; choosing the next unit, waiting for a credit and the relay I/O run off the worker.
 
 ## Startup Readiness Contract
 
@@ -103,10 +105,12 @@ was reused during that wait, the replacement account is not signed out or remove
 
 ## Threading Model
 
-`marmot-app` never builds a Tokio runtime. It spawns account workers, relay-plane tasks, subscription forwarders and
-timers onto the runtime that is current when a call reaches it, and a few paths that may run outside any runtime
-(construction, some `Drop` cleanups) use `Handle::try_current` and skip work when there is none. Each binding decides
-which runtime that is and which thread polls the calling future:
+`marmot-app` builds a Tokio runtime only for a NIP-46 remote signer's transport, which runs on its own
+`nip46-transport` thread with a current-thread runtime so that it keeps running while a caller signs synchronously.
+Everything else runs on the caller's runtime. `marmot-app` spawns account workers, relay-plane tasks, subscription
+forwarders and timers onto the runtime that is current when a call reaches it, and a few paths that may run outside
+any runtime (construction, some `Drop` cleanups) use `Handle::try_current` and skip work when there is none. Each
+binding decides which runtime that is and which thread polls the calling future:
 
 | Binding | Runtime | Who runs a call's own work | Spawned MDK tasks |
 | --- | --- | --- | --- |
@@ -135,7 +139,8 @@ graceful cleanup.
 
 `marmot-app`'s integration suites (`crates/marmot-app/tests/`, including `relay_runtime`) drive whole runtimes on a
 two-worker multi-thread test runtime, so ordering that only holds on one thread fails in CI. A test that needs one
-thread stays on the current-thread flavor and says why. The unit-level suites under `src/` follow the same rule.
+thread stays on the current-thread flavor and says why. Async tests under `src/` default to the same two-worker
+runtime; a few still use Tokio's current-thread default.
 `transport-nostr`'s suite runs on the same two-worker multi-thread runtime, apart from a few current-thread and
 paused-clock tests.
 
@@ -329,8 +334,9 @@ The remaining work is narrower than the original refactor, but still real:
 - directory, profile, follow-list, and KeyPackage discovery now use a shared relay-plane fetch path with in-flight
   coalescing; the remaining production work is turning hot directory data into long-lived subscription maintenance;
 - relay auth, relay scoring, and explicit reconnect/backoff policy are still delegated mostly to `nostr-sdk`;
-- stream watch execution still lives in the CLI/daemon adapter, while runtime owns stream state and typed updates and
-  the daemon tracks watch worker lifecycle;
+- the runtime runs brokered QUIC stream watches itself (`MarmotAppRuntime::watch_agent_text_stream`) and owns stream
+  state and typed updates, but `wn stream watch` still runs through the CLI's own watch path, and the daemon tracks
+  those watch workers' lifecycle;
 - `sync` remains as a diagnostic/repair command and some internal function names still say `sync` for catch-up/replay
   work;
 - production apps still need lifecycle hooks for mobile/desktop foregrounding, backgrounding, and shutdown.
