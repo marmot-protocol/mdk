@@ -775,10 +775,24 @@ async fn download_without_engine_and_retain(
             "a deliberately retried outgoing receipt remains single-body; pure explicit received work keeps its existing contract"
         );
     }
+    assert!(
+        shared
+            .attachment_reserved_bytes
+            .load(std::sync::atomic::Ordering::Acquire)
+            > 0,
+        "an admitted download reserves disk until its body is stored"
+    );
     complete_and_settle(&mut client, done, &shared, &http, &mut completions).await;
     assert_eq!(
         shared.attachment_transfer.available_permits(),
         crate::runtime::ATTACHMENT_TRANSFER_LIMIT
+    );
+    assert_eq!(
+        shared
+            .attachment_reserved_bytes
+            .load(std::sync::atomic::Ordering::Acquire),
+        0,
+        "storing the body releases its reservation"
     );
     assert_eq!(
         &*read_retained(
@@ -2791,7 +2805,7 @@ async fn a_file_left_behind_mid_pass_is_reached_by_a_restarted_sweep() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn attachment_worker_runs_the_transfer_limit_concurrently() {
     let limit = crate::runtime::ATTACHMENT_TRANSFER_LIMIT;
-    let (shared, http) = drive_held_backlog(None, limit).await;
+    let (shared, http) = drive_held_backlog(None, None, limit).await;
     assert_eq!(shared.attachment_transfer.available_permits(), 0);
     assert_eq!(
         http.permits.available_permits(),
@@ -2810,11 +2824,26 @@ async fn attachment_worker_reserves_disk_for_transfers_in_flight() {
     let one =
         policy.disk_reserve + media_store::DiskPolicy::download_need(policy.transfer_limit, 0);
     assert!(capacity(&policy, policy.transfer_limit, None, one));
-    let (shared, _http) = drive_held_backlog(Some(one), 1).await;
+    let (shared, _http) = drive_held_backlog(Some(one), None, 1).await;
     assert_eq!(
         shared.attachment_transfer.available_permits(),
         crate::runtime::ATTACHMENT_TRANSFER_LIMIT - 1
     );
+}
+
+/// Another account's admitted download reserves what its own limit needs,
+/// not this account's: a 512 MiB-limit transfer in flight leaves no room for
+/// this account's download where pricing it at this account's limit would.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn attachment_worker_reserves_other_accounts_transfer_needs() {
+    let policy =
+        super::super::super::attachment_controls::default_policy(&MarmotAppConfig::white_noise());
+    let own = media_store::DiskPolicy::download_need(policy.transfer_limit, 0);
+    let foreign = media_store::DiskPolicy::download_need(512 * 1024 * 1024, 0);
+    assert!(foreign > 2 * own);
+    // No transfer starts: free space covers this account's download only if
+    // the foreign transfer is priced at this account's limit.
+    drive_held_backlog(Some(policy.disk_reserve + 2 * own), Some(foreign), 0).await;
 }
 
 /// Seed one more attachment than the transfer limit against a server that
@@ -2822,6 +2851,7 @@ async fn attachment_worker_reserves_disk_for_transfers_in_flight() {
 /// that exactly `expected` transfers start.
 async fn drive_held_backlog(
     free: Option<u64>,
+    foreign_reservation: Option<u64>,
     expected: usize,
 ) -> (RuntimeSharedServices, MediaHttpContext) {
     use tokio::io::AsyncReadExt;
@@ -2904,6 +2934,18 @@ async fn drive_held_backlog(
         )
         .unwrap();
     let shared = RuntimeSharedServices::default();
+    // Another account's admitted transfer: a global permit and its reservation.
+    let _foreign = foreign_reservation.map(|bytes| TransferSlot {
+        _permit: shared
+            .attachment_transfer
+            .clone()
+            .try_acquire_owned()
+            .unwrap(),
+        _reserved: Some(DiskReservation::new(
+            &shared.attachment_reserved_bytes,
+            bytes,
+        )),
+    });
     let (mut http, _completions) = context();
     http.permits = Arc::new(Semaphore::new(super::super::MEDIA_HTTP_IN_FLIGHT_LIMIT));
     let mut admission = Admission::default();

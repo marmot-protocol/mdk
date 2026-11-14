@@ -194,10 +194,11 @@ downloads retain their 512 MiB ciphertext cap. Admission reserves the configured
 transfer limit (64 MiB by default) against quota, including explicit queued requests whose
 references have no declared size. This avoids requiring 512 MiB of unused quota for tiny
 explicit files. Checkpoint and publication checks enforce actual quota and disk use as files
-grow; a final remainder below the admission reservation can still stay unused. Free space
-for admission first sets aside one download's need for every transfer already holding a
-global permit, which may not have written its body yet, so back-to-back passes cannot all
-admit against the same free bytes.
+grow; a final remainder below the admission reservation can still stay unused. Each admitted
+download reserves its own need, under its account's limit, in a runtime-wide total until
+its body is stored or the attempt ends; admission sets that total aside from free space,
+since a transfer in flight may not have written its body yet. Back-to-back passes, in any
+account, therefore cannot all admit against the same free bytes.
 Unknown free space fails closed. These are resource limits, not an OS background-execution
 entitlement or mobile throughput evidence.
 

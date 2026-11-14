@@ -38,6 +38,40 @@ type PermitWait = std::pin::Pin<
     >,
 >;
 
+/// One admitted attachment transfer's hold on runtime capacity: its global
+/// permit, and the disk its download may still write. Both are held until the
+/// transfer's result is stored (or it ends without one), then released together.
+pub(super) struct TransferSlot {
+    _permit: OwnedSemaphorePermit,
+    _reserved: Option<DiskReservation>,
+}
+
+/// Disk an admitted download may still write, counted in the runtime's shared
+/// total until dropped. Admission sets that total aside from measured free
+/// space: a transfer in flight may not have written its body yet, and other
+/// accounts' transfers may have different limits.
+struct DiskReservation {
+    bytes: u64,
+    total: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl DiskReservation {
+    fn new(total: &Arc<std::sync::atomic::AtomicU64>, bytes: u64) -> Self {
+        total.fetch_add(bytes, std::sync::atomic::Ordering::AcqRel);
+        Self {
+            bytes,
+            total: total.clone(),
+        }
+    }
+}
+
+impl Drop for DiskReservation {
+    fn drop(&mut self) {
+        self.total
+            .fetch_sub(self.bytes, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
 /// At most one queued permit request per active account. Keeping the future
 /// across worker select turns preserves Tokio semaphore FIFO fairness.
 #[derive(Default)]
@@ -647,11 +681,17 @@ fn capacity(
     let disk = media_store::DiskPolicy {
         reserve_bytes: policy.disk_reserve,
     };
+    admissible_limit(max)
+        && disk.admit(free, admission_need(max, recorded)) == media_store::Admission::Admitted
+}
+
+/// What a download of up to `max` body bytes may still write, crediting a
+/// recorded checkpoint with one unrecorded append (see [`capacity`]).
+fn admission_need(max: u64, recorded: Option<u64>) -> u64 {
     let on_disk = recorded.map_or(0, |recorded| {
         recorded.saturating_add(media_store::CHECKPOINT_APPEND_MAX as u64)
     });
-    let needed = media_store::DiskPolicy::download_need(max, on_disk);
-    admissible_limit(max) && disk.admit(free, needed) == media_store::Admission::Admitted
+    media_store::DiskPolicy::download_need(max, on_disk)
 }
 
 fn admissible_limit(max: u64) -> bool {
@@ -862,10 +902,18 @@ pub(super) fn schedule(
         admission.waiting = None;
         return Ok(more);
     }
+    // Transfers already admitted, in any account, may not have written their
+    // bodies yet: set aside what each reserved, so passes that run back to
+    // back cannot all admit against the same free bytes. Readmission and
+    // admission decide on this same figure.
+    let reserved = shared
+        .attachment_reserved_bytes
+        .load(std::sync::atomic::Ordering::Acquire);
     let free = crate::media::attachment_resume::available_space(
         &client.app.account_dir(&client.state.label),
     )
-    .ok();
+    .ok()
+    .map(|free| free.saturating_sub(reserved));
     // Jobs parked for disk space rejoin the due page only once the device can
     // publish them; their checkpoints make the readmitted attempt local work.
     // Unknown free space readmits nothing, as it admits nothing below.
@@ -884,17 +932,7 @@ pub(super) fn schedule(
         shared.attachment_updates.state_changed();
     }
     let more = more || readmitted == ATTACHMENT_ACQUISITION_BATCH_LIMIT;
-    // Transfers already holding a global permit may not have written their
-    // bodies yet: reserve what each may still write, so passes that run back
-    // to back cannot all admit against the same free bytes.
-    let in_flight = crate::runtime::ATTACHMENT_TRANSFER_LIMIT
-        .saturating_sub(shared.attachment_transfer.available_permits())
-        .saturating_sub(usize::from(held_permit.is_some()));
-    let free =
-        free.unwrap_or(0)
-            .saturating_sub((in_flight as u64).saturating_mul(
-                media_store::DiskPolicy::download_need(policy.transfer_limit, 0),
-            ));
+    let free = free.unwrap_or(0);
     let candidates =
         storage
             .app_storage()
@@ -984,6 +1022,10 @@ pub(super) fn schedule(
                     .claim_attachment_acquisition(&candidate, now, lease_until)?
             else {
                 continue;
+            };
+            let background_permit = TransferSlot {
+                _permit: background_permit,
+                _reserved: None,
             };
             let media = client
                 .app
@@ -1109,6 +1151,13 @@ pub(super) fn schedule(
                 .claim_attachment_acquisition(&candidate, now, lease_until)?
         else {
             continue;
+        };
+        let background_permit = TransferSlot {
+            _permit: background_permit,
+            _reserved: Some(DiskReservation::new(
+                &shared.attachment_reserved_bytes,
+                admission_need(reservation, recorded),
+            )),
         };
         let media = client
             .app

@@ -379,6 +379,8 @@ pub struct RuntimeSharedServices {
     // global mutex is never held during storage, engine, or network work.
     local_submission_queue: Arc<StdMutex<local_submission_queue::LocalSubmissionQueue>>,
     attachment_transfer: Arc<tokio::sync::Semaphore>,
+    /// Disk the runtime's admitted attachment downloads may still write.
+    attachment_reserved_bytes: Arc<std::sync::atomic::AtomicU64>,
     attachment_updates: attachment_controls::AttachmentUpdates,
     attachment_cancellations: watch::Sender<()>,
     /// Latest platform facts survive an interval with no workers/receivers.
@@ -489,6 +491,7 @@ impl Default for RuntimeSharedServices {
             #[cfg(test)]
             ordinary_delivery_dropped: Arc::new(Notify::new()),
             attachment_transfer: Arc::new(tokio::sync::Semaphore::new(ATTACHMENT_TRANSFER_LIMIT)),
+            attachment_reserved_bytes: Default::default(),
             local_submission_wakeups: watch::channel(()).0,
             local_submission_queue: Arc::new(StdMutex::new(Default::default())),
             attachment_updates: Default::default(),
@@ -594,6 +597,7 @@ impl RuntimeSharedServices {
             #[cfg(test)]
             ordinary_delivery_dropped: Arc::new(Notify::new()),
             attachment_transfer: Arc::new(tokio::sync::Semaphore::new(ATTACHMENT_TRANSFER_LIMIT)),
+            attachment_reserved_bytes: Default::default(),
             attachment_updates: Default::default(),
             local_submission_wakeups: watch::channel(()).0,
             local_submission_queue: Arc::new(StdMutex::new(Default::default())),

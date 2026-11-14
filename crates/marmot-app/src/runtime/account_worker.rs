@@ -4176,12 +4176,12 @@ fn store_acquired_avatar(
 enum MediaHttpCompletion {
     AttachmentRetained {
         result: Result<(), AppError>,
-        background_permit: OwnedSemaphorePermit,
+        background_permit: attachments::TransferSlot,
     },
     Attachment {
         job: storage_sqlite::AttachmentAcquisition,
         result: Result<crate::client::AcquiredMediaBody, crate::media::AttachmentDownloadFailure>,
-        background_permit: OwnedSemaphorePermit,
+        background_permit: attachments::TransferSlot,
     },
     Avatar {
         job: storage_sqlite::AvatarAcquisition,
