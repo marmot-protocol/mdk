@@ -1,7 +1,7 @@
 ---
 title: "App Core Boundary"
 created: 2026-05-15
-updated: 2026-10-01
+updated: 2026-11-14
 tags: [marmot, app-core, android, swift, cli, tui]
 status: overview
 ---
@@ -45,10 +45,12 @@ rollback.
 
 `crates/marmot-account` owns account identity: account records, setup journals, and signing-key storage.
 
-`crates/marmot-app` owns app-core integration: account projections, account-private and shared directory caches,
-relay-list setup and discovery, local development relay support, Nostr SDK relay access, group/message records, and
-the long-running `MarmotAppRuntime` used by app surfaces. `AppClient` remains a lower-level compatibility surface, not
-the preferred host-owned runtime boundary.
+`crates/marmot-app` owns app-core integration: account projections, the lifecycle of the account-private and shared
+directory caches (the directory logic itself is `crates/nostr-directory`), relay-list setup, the dev/test gate for
+loopback relay endpoints, group/message records, and the long-running `MarmotAppRuntime`, the runtime API app surfaces
+use. It runs the Nostr relay plane, `crates/transport-nostr`, as a shared service. Each account's state is a
+crate-private writer, `AppClient`, owned by that account's worker; see
+[Marmot App Runtime Shape](marmot-app-runtime.md#shape).
 
 `crates/cli` owns commands and output. Its JSON envelope is intentionally stable enough for a future TUI or harness, but
 Swift and other host apps should prefer app-core bindings over shelling out to the CLI.
@@ -57,8 +59,8 @@ Swift and other host apps should prefer app-core bindings over shelling out to t
 
 The current app-core concepts are:
 
-- **Account home:** a platform user-data directory containing account records, per-account databases, a shared store,
-  and local development relay state.
+- **Account home:** a platform user-data directory containing account records, per-account databases and a shared
+  store.
 - **Secret store:** platform keychain by default, with a file-backed development store for deterministic tests.
 - **Per-account session DB:** one SQLCipher-backed durable database per Marmot account-device identity. It contains
   OpenMLS/Marmot state and the operational app projections needed to preserve groups, messages, delivery state, and

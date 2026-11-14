@@ -1,7 +1,7 @@
 ---
 title: "Review — Core Crate Structure"
 created: 2026-10-15
-updated: 2026-10-26
+updated: 2026-11-14
 tags: [marmot, architecture, review, structure, crates]
 status: draft for discussion
 ---
@@ -30,7 +30,8 @@ the citations behind it. §4 is a proposal, not a finding.
    belongs lower in the stack or in a crate of its own.
 2. **The real per-account core is an undocumented god object.** (Observed; §2.1.) `AppClient` has 58 fields and 449
    methods, 299 of them taking `&mut self`. The docs call it "a lower-level compatibility surface", and they describe a
-   `MarmotAccountSession` and `SharedServices` that don't exist. The public runtime mostly forwards calls: 179 of its
+   `MarmotAccountSession` and `SharedServices` that don't exist (since corrected; see
+   [Doc drift](#doc-drift-found-in-this-pass)). The public runtime mostly forwards calls: 179 of its
    250 public methods are thin delegations, and a feature crosses four hand-written layers.
 3. **`storage-sqlite` is the app's whole data model with a protocol store inside it.** (Observed; §2.2.) Protocol
    persistence is 16% of its production code. It exposes 370 public app and transport methods next to 122
@@ -98,6 +99,13 @@ modules. Forty `_unobserved` functions exist only to pair each public operation 
 
 Sync and history recovery are one subsystem split across two files: they share about 10 `AppClient` fields, and sync
 references 48 recovery symbols.
+
+**Corrected 2026-11-14 ([#2782](https://github.com/marmot-protocol/mdk/issues/2782)):** they are two things. Live sync
+and native replay ingress are the writer's ingest: they seal the transport cursor and move the projection checkpoint,
+so they stay in the writer core. What was split was history recovery's ledger side: its state was 16 `AppClient`
+fields, and part of its code was a block in `sync.rs`. It is now one component, `HistoryRecovery`, under
+`client/history_recovery/`, with its state private to that module tree. See
+[Marmot App Runtime Shape](../overview/marmot-app-runtime.md#shape).
 
 **Evidence (observed at `ab1de296f`):**
 - Hub objects: `MarmotApp` (`crates/marmot-app/src/lib.rs:484`), `AppClient` (`client/mod.rs:788`),
@@ -361,10 +369,17 @@ Answered 2026-10-17:
 
 ## Doc drift found in this pass
 
-These architecture docs describe structure the code doesn't have:
-- [`app-core-boundary.md`](../overview/app-core-boundary.md) calls `AppClient` a compatibility surface;
-- [`marmot-app-runtime.md`](../overview/marmot-app-runtime.md) describes `MarmotAccountSession` and `SharedServices`;
-- `storage-sqlite`'s crate docs describe a protocol store;
-- `DurableTransportFanout` is labelled legacy but is the live Welcome path.
+At the baseline, these architecture docs described structure the code doesn't have:
+- [`app-core-boundary.md`](../overview/app-core-boundary.md) called `AppClient` a compatibility surface;
+- [`marmot-app-runtime.md`](../overview/marmot-app-runtime.md) described `MarmotAccountSession` and `SharedServices`;
+- `storage-sqlite`'s crate docs described a protocol store;
+- `DurableTransportFanout` was labelled legacy but was the live Welcome path.
 
-They should be corrected when the target structure is agreed.
+Status on 2026-11-14:
+- **Corrected:** `app-core-boundary.md` and `marmot-app-runtime.md` describe the runtime's real objects
+  ([#2782](https://github.com/marmot-protocol/mdk/issues/2782)). `AppClient` is crate-private, and the `test-support`
+  feature makes it public for tests.
+- **Corrected:** `storage-sqlite`'s README and `AGENTS.md` describe both of its sides, protocol storage and app
+  storage, with separate handles.
+- **Still open:** `marmot-session` still calls `DurableTransportFanout` the legacy fanout, and it is still the Welcome
+  path.

@@ -1,16 +1,16 @@
 ---
 title: "Marmot App Runtime Shape"
 created: 2026-05-19
-updated: 2026-11-12
+updated: 2026-11-14
 tags: [marmot, overview, app-runtime, daemon, tui]
 status: implemented-first-slice
 ---
 
 # Marmot App Runtime Shape
 
-`marmot-app` should become the runtime boundary for client applications. A daemon, TUI, Flutter app, or desktop app
-should create a `MarmotAppRuntime` and send it intents. The runtime owns accounts, shared directory state, relay
-subscriptions, projections, and typed event streams.
+`marmot-app` is the runtime boundary for client applications. A daemon or native app opens a `MarmotApp` over its
+account home, starts a `MarmotAppRuntime` from it, and sends the runtime intents; the TUI is a client of the daemon.
+The runtime owns accounts, shared directory state, relay subscriptions, projections, and typed event streams.
 
 The lower crates already point in this direction. `cgka-engine` owns convergence and engine state. `marmot-session` owns
 one account-device session and the runtime that coordinates it with transport and publish confirmation.
@@ -20,27 +20,40 @@ one account-device session and the runtime that coordinates it with transport an
 ## Shape
 
 ```text
-MarmotAppRuntime
-  SharedServices
-    account home
-    shared directory cache
+MarmotAppRuntime                  the host API and its typed event stream
+  RuntimeSharedServices           shared by every account's worker
     Nostr relay plane (transport-nostr)
-    app event hubs
-    projection stores
-    background maintenance tasks
-  AccountManager
-    MarmotAccountSession(account A)
-    MarmotAccountSession(account B)
+    recovery credits, local submission queue
+    attachment transfers and permissions, backup conditions
+    observer, relay telemetry and audit export
+    agent stream watches
+  AccountManager                  the account workers
+    account worker(account A)  →  AppClient
+    account worker(account B)  →  AppClient
     ...
+  account setup                   interactive onboarding and generated setup
+MarmotApp                         account home, storage handles, directory, config
 ```
 
-`MarmotAccountSession` should wrap the current account-device stack:
+`AccountManager`, each account worker and each `AppClient` hold a clone of `MarmotApp`. Hosts reach interactive
+onboarding through `runtime.account_setup()`. Generated setup (`create_identity`, `login` and their variants) stays on
+`MarmotAppRuntime`. Both keep their state in `runtime/onboarding/` and reach the workers only through
+`AccountManager`.
 
-- account identity and secret access;
-- `AccountDeviceSession`;
-- per-account app projection state;
-- account-scoped group, message, profile, key-package, and stream operations;
-- account inbox subscription state.
+Each account's worker task owns that account's writer, `AppClient`. `AppClient` is crate-private; the `test-support`
+feature makes it public for tests that drive one directly, and `wn sync` runs its one pass through
+`MarmotApp::sync_account`. It holds:
+
+- **the writer core:** the engine runtime, the account projection and its checkpoint bookkeeping, and the product
+  state that commands change;
+- **the writer's ingest:** live sync (`client/sync.rs`), native replay ingress (`client/recovery.rs` and
+  `client/sync/native_ingress.rs`), the delivery spill and the overflow marker. Ingest seals the transport cursor and
+  moves the projection checkpoint, so it is part of the writer core, not of recovery;
+- **history recovery's ledger side:** one component held as one field, `HistoryRecovery` in `client/history_recovery/`.
+  It holds the recovery runner's host state, the coverage-ledger recorder, epoch-gap evidence, and history notices and
+  status. Its state is private to that module tree: the rest of the writer records a fact or drains an output through
+  one of its methods. The recovery runner schedules relay history recovery. Its survey and storage writes run as
+  short turns on the worker; choosing the next unit, waiting for a credit and the relay I/O run off the worker.
 
 ## Startup Readiness Contract
 
@@ -90,20 +103,14 @@ New setup skips signed-out and unlinked journals, leaving their accounts intact.
 Teardown rechecks the captured public key after waiting for its fence. If a label
 was reused during that wait, the replacement account is not signed out or removed.
 
-`SharedServices` should hold runtime state shared by every account:
-
-- directory/user cache;
-- relay-list and KeyPackage lookup state;
-- app-wide stream hubs;
-- app settings and runtime config;
-- the Nostr relay plane.
-
 ## Threading Model
 
-`marmot-app` never builds a Tokio runtime. It spawns account workers, relay-plane tasks, subscription forwarders and
-timers onto the runtime that is current when a call reaches it, and a few paths that may run outside any runtime
-(construction, some `Drop` cleanups) use `Handle::try_current` and skip work when there is none. Each binding decides
-which runtime that is and which thread polls the calling future:
+`marmot-app` builds a Tokio runtime only for a NIP-46 remote signer's transport, which runs on its own
+`nip46-transport` thread with a current-thread runtime so that it keeps running while a caller signs synchronously.
+Everything else runs on the caller's runtime. `marmot-app` spawns account workers, relay-plane tasks, subscription
+forwarders and timers onto the runtime that is current when a call reaches it, and a few paths that may run outside
+any runtime (construction, some `Drop` cleanups) use `Handle::try_current` and skip work when there is none. Each
+binding decides which runtime that is and which thread polls the calling future:
 
 | Binding | Runtime | Who runs a call's own work | Spawned MDK tasks |
 | --- | --- | --- | --- |
@@ -131,9 +138,9 @@ per-worker runtimes: they cannot be aborted, and an earlier attempt to do so was
 graceful cleanup.
 
 `marmot-app`'s integration suites (`crates/marmot-app/tests/`, including `relay_runtime`) drive whole runtimes on a
-two-worker multi-thread test runtime, so ordering that only holds on one thread fails in CI. A test that needs one
-thread stays on the current-thread flavor and says why. The unit-level suites under `src/runtime/` still run on one
-thread: many of them build exact interleavings, and they have not yet been made independent of scheduling.
+multi-thread test runtime, two workers unless a test asks for more, so ordering that only holds on one thread fails
+in CI. A test that needs one thread stays on the current-thread flavor and says why. Async tests under `src/` default
+to the same two-worker runtime; a few still use Tokio's current-thread default.
 `transport-nostr`'s suite runs on the same two-worker multi-thread runtime, apart from a few current-thread and
 paused-clock tests.
 
@@ -149,11 +156,10 @@ owner for Nostr subscriptions and relay policy:
 - keep discovery and directory subscriptions coalesced across accounts;
 - keep account inbox subscriptions for signed-in accounts;
 - keep group subscriptions for account/group routes;
-- route inbound relay events to the right `MarmotAccountSession`;
-- apply reconnect, catch-up, replay-window, and relay-safety policy;
-- emit typed runtime events after account sessions ingest deliveries.
+- hand each account's inbound relay events to that account's worker;
+- apply reconnect, catch-up, replay-window, and relay-safety policy.
 
-The adapter is transport plumbing. The relay plane is the shared orchestration above it, and the app drives it per
+`marmot-app` emits the typed runtime events once a worker has ingested a delivery. The adapter is transport plumbing. The relay plane is the shared orchestration above it, and the app drives it per
 account.
 
 ## Inbound / Convergence Boundary Contracts
@@ -328,11 +334,14 @@ The remaining work is narrower than the original refactor, but still real:
 - directory, profile, follow-list, and KeyPackage discovery now use a shared relay-plane fetch path with in-flight
   coalescing; the remaining production work is turning hot directory data into long-lived subscription maintenance;
 - relay auth, relay scoring, and explicit reconnect/backoff policy are still delegated mostly to `nostr-sdk`;
-- stream watch execution still lives in the CLI/daemon adapter, while runtime owns stream state and typed updates and
-  the daemon tracks watch worker lifecycle;
+- the runtime runs brokered QUIC stream watches itself (`MarmotAppRuntime::watch_agent_text_stream`) and owns stream
+  state and typed updates, but `wn stream watch` still runs through the CLI's own watch path, and the daemon tracks
+  those watch workers' lifecycle;
 - `sync` remains as a diagnostic/repair command and some internal function names still say `sync` for catch-up/replay
   work;
-- production apps still need lifecycle hooks for mobile/desktop foregrounding, backgrounding, and shutdown.
+- hosts can shut the runtime down (`shutdown`), close storage before a suspension (`shutdown_and_close`), report
+  backup background conditions and pause an account's maintenance, but there is no general foreground/background
+  hook yet.
 
 ## Crate Responsibility After The Refactor
 
@@ -341,7 +350,10 @@ The remaining work is narrower than the original refactor, but still real:
 - `crates/marmot-session`: one encrypted account-device session, and the account/session coordinator for
   publish-before-apply and transport activation.
 - `crates/marmot-account`: account identity, files and secrets.
-- `crates/marmot-app`: multi-account runtime, shared services, projections, app events.
+- `crates/marmot-app`: multi-account runtime, shared services, each account's writer, projections, app events.
+- `crates/nostr-directory`: the user directory: lookups, search, KeyPackage resolution and the directory cache schema.
+- `crates/media-store`: the encrypted per-file media store.
+- `crates/marmot-observability`: diagnostics exporters (relay telemetry over OTLP, product analytics, audit delivery).
 - `crates/transport-nostr`: the shared Nostr relay plane.
 - `crates/transport-nostr-adapter`: reusable Nostr transport adapter and SDK bridge.
 - `crates/transport-nostr-peeler`: Nostr event peeling and wrapping.
