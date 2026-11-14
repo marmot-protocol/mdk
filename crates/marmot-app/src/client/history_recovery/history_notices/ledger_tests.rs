@@ -11,6 +11,7 @@ use storage_sqlite::{
     TransportReconciliationRoute,
 };
 
+use crate::client::history_recovery::history_notices::LiveFacts;
 use crate::client::history_recovery::recovery_runner::{RecoveryRunnerPolicy, UnitKey};
 use crate::history_notices::{encode_notice_id, ledger_route_tag};
 use crate::tests::{ScriptedPushRelayClient, client_on_app_relay_plane};
@@ -226,13 +227,14 @@ async fn the_status_reports_what_the_runner_catches_up() {
 async fn the_answers_mark_a_survey_that_lands_after_them() {
     let dir = tempfile::tempdir().unwrap();
     let (client, _, group, route) = fixture(&dir).await;
-    let unmoved = client.recovery_answers().unwrap();
+    let unmoved = client.read_recovery().unwrap();
     catching_up(&client, &[&route]);
-    assert!(unmoved.survey.landed_since(), "the first survey lands");
+    assert!(unmoved.survey().landed_since(), "the first survey lands");
 
-    let answers = client.recovery_answers().unwrap();
-    assert!(!answers.survey.landed_since());
-    assert_eq!(answers.status, client.account_recovery_status().unwrap());
+    let answers = client.read_recovery().unwrap();
+    assert!(!answers.survey().landed_since());
+    let published = answers.account_status(&LiveFacts(&client));
+    assert_eq!(published, client.account_recovery_status().unwrap());
     let same = BTreeSet::from([UnitKey {
         route: route.clone(),
         relay: RELAY.to_owned(),
@@ -246,14 +248,14 @@ async fn the_answers_mark_a_survey_that_lands_after_them() {
             changed
         });
     assert!(
-        !sent && !answers.survey.landed_since(),
+        !sent && !answers.survey().landed_since(),
         "the same set is no survey"
     );
 
     catching_up(&client, &[]);
-    assert!(answers.survey.landed_since());
+    assert!(answers.survey().landed_since());
     assert_eq!(
-        answers.status.catching_up_group_ids_hex,
+        published.catching_up_group_ids_hex,
         vec![hex::encode(group.as_slice())]
     );
     assert!(
@@ -345,14 +347,16 @@ fn rejoin(app: &SqliteAppStorage, group: &GroupId, route: &TransportReconciliati
     );
 }
 
-/// Every group's notice ids, read at once, are each group's own as its
-/// recovery status lists them, through every change that moves them:
-/// parking, an account-wide occurrence (no group's), a rejoin, a copy turned
+/// One recovery read gives each group's notice ids as its recovery status
+/// lists them, through every change that moves them: parking, an
+/// account-wide occurrence (no group's), a rejoin, a copy turned
 /// Unrecoverable, a group turned device group, a route gone and a dismissal.
-/// The routes are read without any group's record, and list what the
-/// runner's routes list.
+/// What A compares, a group's notices before the facts apply, moves on every
+/// change its change generation does not count; a change only to the facts
+/// moves the generation instead (mdk#3273). The routes are read without any
+/// group's record, and list what the runner's routes list.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn every_groups_notice_ids_are_each_groups_own() {
+async fn each_groups_notices_move_with_what_they_read() {
     let dir = tempfile::tempdir().unwrap();
     let (mut client, app, group, route) = fixture(&dir).await;
     let other = client
@@ -369,7 +373,7 @@ async fn every_groups_notice_ids_are_each_groups_own() {
         .route;
     let storage = client.app.account_storage("alice").unwrap();
     let unknown = GroupId::new(vec![0xa5; 16]);
-    let check = |client: &AppClient| {
+    let read = |client: &AppClient| {
         assert_eq!(
             client.current_route_groups(),
             client
@@ -378,24 +382,38 @@ async fn every_groups_notice_ids_are_each_groups_own() {
                 .map(|route| (route.route, route.group_id))
                 .collect::<Vec<_>>()
         );
-        let answers = client.recovery_answers().unwrap();
-        let every = answers.group_notice_ids;
-        for id in [&group, &other, &unknown] {
+        let read = client.read_recovery().unwrap();
+        let facts = LiveFacts(client);
+        for id in [&group, &other] {
             assert_eq!(
-                every.of(id),
-                client.group_history_notice_ids(id).unwrap().as_slice()
+                read.group_notice_ids(id, &facts),
+                client.group_recovery_status(id).unwrap().history_notice_ids
             );
         }
+        assert!(read.group_notice_ids(&unknown, &facts).is_empty());
         // Each notice the host is shown is among its group's ids.
-        for notice in &answers.status.notices {
+        for notice in read.notices(&facts) {
             if let Some(hex) = &notice.group_id_hex {
                 let group_id = GroupId::new(hex::decode(hex).unwrap());
-                assert!(every.of(&group_id).contains(&notice.notice_id));
+                assert!(
+                    read.group_notice_ids(&group_id, &facts)
+                        .contains(&notice.notice_id)
+                );
             }
         }
-        every
+        read
     };
-    assert!(check(&client).of(&group).is_empty());
+    let ids =
+        |client: &AppClient, id: &GroupId| read(client).group_notice_ids(id, &LiveFacts(client));
+    let generation = |client: &AppClient, id: &GroupId| {
+        client
+            .runtime
+            .group_change_generations([id])
+            .pop()
+            .unwrap()
+            .state
+    };
+    assert!(ids(&client, &group).is_empty());
 
     let intents = [&group, &other]
         .into_iter()
@@ -418,22 +436,36 @@ async fn every_groups_notice_ids_are_each_groups_own() {
         ms = now * 1000,
     ))
     .unwrap();
-    assert_eq!(check(&client).of(&group).len(), 1);
+    assert_eq!(ids(&client, &group).len(), 1);
+    assert_eq!(read(&client).notices(&LiveFacts(&client)).len(), 3);
 
     rejoin(&app, &group, &route);
     rejoin(&app, &other, &other_route);
-    let every = check(&client);
-    assert_eq!((every.of(&group).len(), every.of(&other).len()), (2, 2));
+    assert_eq!(
+        (ids(&client, &group).len(), ids(&client, &other).len()),
+        (2, 2)
+    );
 
+    // Facts only: the compared notices stay and the generation moves.
+    let (notices, at) = (
+        read(&client).group_notices(&other),
+        generation(&client, &other),
+    );
     let mut halted = storage.get_group(&other).unwrap();
     halted.unrecoverable = true;
     storage.put_group(&halted).unwrap();
     assert_eq!(
-        check(&client).of(&other).len(),
+        ids(&client, &other).len(),
         1,
         "an Unrecoverable copy's rejoin notice waits; its parked one stays"
     );
+    assert!(read(&client).group_notices(&other) == notices);
+    assert!(!generation(&client, &other).unchanged_since(&at));
 
+    let (notices, at) = (
+        read(&client).group_notices(&group),
+        generation(&client, &group),
+    );
     assert!(
         app.insert_device_group(&storage_sqlite::DeviceGroupRecord {
             group_id_hex: hex::encode(group.as_slice()),
@@ -444,14 +476,22 @@ async fn every_groups_notice_ids_are_each_groups_own() {
         .unwrap()
     );
     assert_eq!(
-        check(&client).of(&group).len(),
+        ids(&client, &group).len(),
         1,
         "a hidden group's rejoin notice goes; its parked one stays"
     );
+    assert!(read(&client).group_notices(&group) == notices);
+    assert!(!generation(&client, &group).unchanged_since(&at));
     app.execute_batch_for_test("DELETE FROM device_groups")
         .unwrap();
-    let rejoin_id = check(&client).of(&group)[1].clone();
+    let rejoin_id = ids(&client, &group)[1].clone();
 
+    // A route lives in memory: the compared notices move, the generation
+    // does not.
+    let (notices, at) = (
+        read(&client).group_notices(&group),
+        generation(&client, &group),
+    );
     let routes = client
         .routing
         .snapshot()
@@ -461,13 +501,16 @@ async fn every_groups_notice_ids_are_each_groups_own() {
         .collect::<Vec<_>>();
     client.routing.replace_group_routes(&group, Vec::new());
     assert_eq!(
-        check(&client).of(&group).len(),
+        ids(&client, &group).len(),
         1,
         "a rejoin notice shows only while its group is routed"
     );
+    assert!(read(&client).group_notices(&group) != notices);
+    assert!(generation(&client, &group).unchanged_since(&at));
     client.routing.replace_group_routes(&group, routes);
-    assert_eq!(check(&client).of(&group).len(), 2);
+    assert_eq!(ids(&client, &group).len(), 2);
 
     assert!(client.dismiss_history_notice(&rejoin_id).unwrap());
-    assert_eq!(check(&client).of(&group).len(), 1);
+    assert_eq!(ids(&client, &group).len(), 1);
+    assert!(read(&client).group_notices(&group) != notices);
 }

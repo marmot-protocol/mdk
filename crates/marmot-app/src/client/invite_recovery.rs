@@ -1,6 +1,7 @@
 //! Durable invitation recovery. Relay discovery stays in the app; the engine
 //! validates identities and atomically transfers fresh intent into its queue.
 use super::AppClient;
+use super::history_recovery::history_notices::{GroupFacts, LiveFacts, RecoveryRead};
 use crate::AppError;
 use cgka_traits::engine::{
     SendIntent, SupersededIntentKind, SupersededIntentOutcome, SupersededIntentReport,
@@ -52,6 +53,19 @@ impl AppClient {
         &self,
         group_id: &cgka_traits::GroupId,
     ) -> Result<crate::GroupRecoveryStatus, AppError> {
+        let read = self.read_recovery()?;
+        self.group_recovery_status_in(group_id, &read, &LiveFacts(self))
+    }
+
+    /// [`Self::group_recovery_status`] from a recovery read and the group's
+    /// facts the caller has: A builds a group's entry with those it holds
+    /// (mdk#3273).
+    pub(crate) fn group_recovery_status_in(
+        &self,
+        group_id: &cgka_traits::GroupId,
+        read: &RecoveryRead,
+        facts: &dyn GroupFacts,
+    ) -> Result<crate::GroupRecoveryStatus, AppError> {
         let group = self.runtime.group_record(group_id)?;
         let rejoin_invitations = self
             .runtime
@@ -96,7 +110,7 @@ impl AppClient {
             }
         }
         let storage = self.app.account_storage(&self.state.label)?;
-        let history_notice_ids = self.group_history_notice_ids(group_id)?;
+        let history_notice_ids = read.group_notice_ids(group_id, facts);
         Ok(crate::GroupRecoveryStatus {
             pending_reinvites,
             failed_reinvites,
