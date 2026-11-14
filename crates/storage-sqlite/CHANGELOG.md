@@ -35,6 +35,9 @@
 
 ### Fixed
 
+- Withdrawing a delete of an edit reports `MessageEditedOrReprojected` for the edited message and
+  `ReplyPreviewChanged` for replies quoting it, instead of `ReactionAdded`. Restored poll responses also use the
+  reprojection trigger; restored reactions keep `ReactionAdded` (mdk#3377).
 - Batch timeline withdrawals and branch-selection revivals attribute each changed row's trigger to an event that
   affected it, rather than the first event in the batch. Every cause participates: conflicting or unmatched causes
   use the generic reprojection trigger, including simultaneous reaction and reply-preview changes (mdk#2843).

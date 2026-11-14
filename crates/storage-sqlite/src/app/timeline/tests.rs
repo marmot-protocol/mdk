@@ -1507,6 +1507,85 @@ fn batch_overlap_triggers() {
 }
 
 #[test]
+fn modifier_withdrawal_triggers() {
+    for modifier in ["edit", "edit-and-reaction", "reaction", "poll-response"] {
+        let app = SqliteAccountStorage::in_memory().unwrap().app_storage();
+        let parent_id = "22".repeat(32);
+        let parent = if modifier == "poll-response" {
+            poll(&parent_id, "alice", 10)
+        } else {
+            chat(&parent_id, "alice", 10, "original")
+        };
+        app.record_app_event(&parent).unwrap();
+        app.record_app_event(&reaction("reaction", "alice", &parent_id, 11, "+"))
+            .unwrap();
+        app.record_app_event(&reply("quoted", "bob", &parent_id, 12, "quote"))
+            .unwrap();
+        let target = match modifier {
+            "edit" | "edit-and-reaction" => {
+                app.record_app_event(&edit("live-edit", "alice", &parent_id, 13, "live edit"))
+                    .unwrap();
+                "live-edit"
+            }
+            "reaction" => "reaction",
+            "poll-response" => {
+                app.record_app_event(&poll_response(
+                    "vote", "alice", &parent_id, 13, "0", "received",
+                ))
+                .unwrap();
+                "vote"
+            }
+            _ => unreachable!(),
+        };
+        let mut targets = vec![target];
+        if modifier == "edit-and-reaction" {
+            targets.push("reaction");
+        }
+        for target in targets {
+            let mut event = delete(&format!("delete-{target}"), "alice", target, 14);
+            event.origin_commit_id = Some("commit".to_owned());
+            app.record_app_event(&event).unwrap();
+        }
+        let update = app
+            .invalidate_app_events_by_origin_commit("commit", "LosingBranch")
+            .unwrap()
+            .unwrap();
+        let mut triggers = update
+            .changes
+            .iter()
+            .map(|change| match change {
+                TimelineMessageChange::Upsert { message, trigger } => {
+                    if modifier.starts_with("edit") && message.message_id_hex == parent_id {
+                        assert_eq!(message.plaintext, "live edit");
+                    }
+                    if modifier.starts_with("edit") && message.message_id_hex == "quoted" {
+                        assert_eq!(
+                            message.reply_preview.as_ref().unwrap().plaintext,
+                            "live edit"
+                        );
+                    }
+                    (message.message_id_hex.as_str(), trigger.clone())
+                }
+                TimelineMessageChange::Remove { .. } => panic!("unexpected removal"),
+            })
+            .collect::<Vec<_>>();
+        triggers.sort_by_key(|(id, _)| *id);
+        let mut expected = vec![(
+            parent_id.as_str(),
+            if modifier == "reaction" {
+                TimelineUpdateTrigger::ReactionAdded
+            } else {
+                TimelineUpdateTrigger::MessageEditedOrReprojected
+            },
+        )];
+        if modifier.starts_with("edit") {
+            expected.push(("quoted", TimelineUpdateTrigger::ReplyPreviewChanged));
+        }
+        assert_eq!(triggers, expected, "{modifier}");
+    }
+}
+
+#[test]
 fn batch_confirmation_triggers() {
     for ids in [["a-delete", "z-delete"], ["z-delete", "a-delete"]] {
         let app = SqliteAccountStorage::in_memory().unwrap().app_storage();
