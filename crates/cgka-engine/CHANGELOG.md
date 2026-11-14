@@ -10,6 +10,12 @@
   restore or release keeps that snapshot and quarantines the group for the session (`RewindRestoreFailed`), as a
   committing window's does, unless an enclosing committing window answers for it; that window keeps its own snapshot
   when it cannot release the nested one. SQLite is unchanged.
+### Added
+
+- `Engine::private_key_packages_next_expiry` returns when the earliest issued private KeyPackage expires, and
+  `Engine::has_rejoin_offers` whether any stored Welcome is a rejoin offer, so maintenance can wake for them
+  (mdk#3265).
+
 ### Changed
 
 - `Engine::discard_private_key_packages` reads first and opens no writer transaction when nothing matches, so an

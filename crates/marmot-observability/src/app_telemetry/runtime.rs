@@ -118,6 +118,9 @@ operations! {
     WorkerMaintenanceSession => "worker_maintenance_session",
     WorkerMaintenanceEffects => "worker_maintenance_effects",
     WorkerMaintenanceHistoryDispatch => "worker_maintenance_history_dispatch",
+    // The read of when session maintenance next has work (mdk#3265), once
+    // per wake that may have moved it.
+    WorkerMaintenanceNextDue => "worker_maintenance_next_due",
     // A job the worker's schedule drives had work with no wake or deadline
     // pending, found by the maintenance tick's watchdog (mdk#2923 step B).
     WatchdogMissedWakeRecovery => "watchdog_missed_wake_recovery",
@@ -133,6 +136,10 @@ operations! {
     WatchdogMissedWakeKeyPackageCatchUp => "watchdog_missed_wake_key_package_catch_up",
     WatchdogMissedWakePush => "watchdog_missed_wake_push",
     WatchdogMissedWakeHistoryDispatch => "watchdog_missed_wake_history_dispatch",
+    // Session maintenance had work due that its deadline should already have
+    // run, and the relay-config retry had no deadline (mdk#3265).
+    WatchdogMissedWakeSessionMaintenance => "watchdog_missed_wake_session_maintenance",
+    WatchdogMissedWakeRelayConfig => "watchdog_missed_wake_relay_config",
     WorkerPresentationPass => "worker_presentation_pass",
     WorkerAvatarPass => "worker_avatar_pass",
     WorkerAttachmentPass => "worker_attachment_pass",

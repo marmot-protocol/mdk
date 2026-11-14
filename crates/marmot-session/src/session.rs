@@ -780,6 +780,11 @@ impl AccountDeviceSession {
     }
 
     /// See [`cgka_engine::Engine::discard_private_key_packages`].
+    /// When the earliest issued private KeyPackage expires.
+    pub fn private_key_packages_next_expiry(&self) -> SessionResult<Option<u64>> {
+        Ok(self.engine.private_key_packages_next_expiry()?)
+    }
+
     pub fn discard_private_key_packages(
         &mut self,
         now: u64,
@@ -1709,6 +1714,11 @@ impl AccountDeviceSession {
     /// See `Engine::owes_superseded_own_commit_reissue`.
     pub fn owes_superseded_own_commit_reissue(&self, group_id: &GroupId) -> SessionResult<bool> {
         Ok(self.engine.owes_superseded_own_commit_reissue(group_id)?)
+    }
+
+    /// Whether any stored Welcome is a rejoin offer.
+    pub fn has_rejoin_offers(&self) -> SessionResult<bool> {
+        Ok(self.engine.has_rejoin_offers()?)
     }
 
     pub async fn retry_rejoins_after_trusted_removal(&mut self) -> SessionResult<bool> {

@@ -149,6 +149,41 @@ where
 
     /// Reserve one bounded recovery turn before the host resolves inbox routes.
     /// Cancellation retains the durable retry deadline, never a reusable permit.
+    /// When group recovery next has work, in unix seconds (mdk#3265): the
+    /// earliest `retry_at` among the records [`Self::prepare_group_recovery`]
+    /// would take, and whether a coordinator still has a grant or
+    /// publication under way, which is advanced once per run and retried
+    /// every 15 s while it lasts. `None` when no record is live.
+    pub(super) fn group_recovery_due(&self) -> AccountResult<(Option<u64>, bool)> {
+        if self.maintenance_paused {
+            return Ok((None, false));
+        }
+        let now = self.wall_clock.now().0;
+        let records = self
+            .session
+            .storage
+            .list_group_recoveries()
+            .map_err(SessionError::from)?;
+        let mut next = None::<u64>;
+        let mut coordinating = false;
+        for record in &records {
+            if record.phase == Phase::Complete
+                || record.phase == Phase::Parked
+                || (record.role == Role::Coordinator
+                    && self.recovery_group_quarantined(&record.group_id))
+                || (record.role == Role::Recipient
+                    && record.total_attempts >= MAX_RECIPIENT_ATTEMPTS)
+                || (record.expires_at <= now && record.phase != Phase::Publishing)
+            {
+                continue;
+            }
+            coordinating |= record.role == Role::Coordinator
+                && matches!(record.phase, Phase::Grant | Phase::Publishing);
+            next = Some(next.map_or(record.retry_at, |at| at.min(record.retry_at)));
+        }
+        Ok((next, coordinating))
+    }
+
     pub fn prepare_group_recovery(&mut self) -> AccountResult<Vec<MemberId>> {
         self.recovery_turn.clear();
         if self.maintenance_paused {

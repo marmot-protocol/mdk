@@ -78,6 +78,20 @@
 
 ### Changed
 
+- Session maintenance (`run_due_maintenance`) no longer runs on every 15 s maintenance tick (mdk#3265). The account
+  worker runs it at the earliest time its data gives: a periodic rotation or leaf refresh deadline, a self-update
+  obligation's phase deadline, a KeyPackage refresh, expiry or relay backoff, a transport fanout's backoff or bound, a
+  private KeyPackage expiry, a reinvite retry, or the 10-minute component recheck. A self-update held by an epoch gap
+  is due when its 24 h hold ends, and one held by an undelivered commit an hour after that commit's first
+  acknowledgement. Work with no stored time (a send failure, an in-memory retry, a rejoin offer, an unrecoverable
+  group, device-group passes) retries 15 s after the last run while it lasts, as before. KeyPackage publication
+  retries now follow their stored backoff (30 s doubling to 1 h) instead of every tick. The due time is re-read at
+  most once a second, after a command, a receive, a convergence pass, a recovery turn or a maintenance run, and timed
+  as `worker_maintenance_next_due`. The relay-config retry after an inactive account (mdk#3263) moves from the tick to
+  the same schedule. The tick's watchdog counts session maintenance found due before its deadline
+  (`watchdog_missed_wake_session_maintenance`) and a relay-config retry with no deadline
+  (`watchdog_missed_wake_relay_config`).
+
 - Every job the 15 s maintenance tick ran, other than session maintenance (`run_due_maintenance`), now runs on the
   account worker's own schedule (mdk#2923 step B): local-submission retries, the content-report backfill, legacy
   message promotion, device pairing timers, the compaction and housekeeping batch, the KeyPackage catch-up, push join

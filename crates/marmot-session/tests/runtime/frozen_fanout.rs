@@ -3418,3 +3418,32 @@ async fn assert_recovery_chat(
         GroupEvent::MessageReceived { group_id, sender, payload: actual, .. }
             if group_id == group && sender == &alice_id && actual == &payload)));
 }
+
+/// mdk#3265: a coordinator's recovery job makes session maintenance due at
+/// once, and owed while its grant is under way, so its reply does not wait
+/// for an unrelated wake before the request's ten minutes run out.
+#[tokio::test]
+async fn a_recovery_job_makes_session_maintenance_due() {
+    let mut peers = recovery_peers(0).await;
+    let before = peers.coordinator.maintenance_due(&[]).unwrap();
+    exchange_recovery(&mut peers).await;
+    let after = peers.coordinator.maintenance_due(&[]).unwrap();
+    let storage = SqliteAccountStorage::open_encrypted(
+        peers._dir.path().join("alice.sqlite"),
+        &SqlCipherKey::new("live recovery cancellation key").unwrap(),
+    )
+    .unwrap();
+    let retry_at = storage
+        .list_group_recoveries()
+        .unwrap()
+        .iter()
+        .map(|record| record.retry_at)
+        .min()
+        .expect("the coordinator holds a recovery job");
+    assert_eq!(before.at, None, "{before:?}");
+    assert_eq!(
+        after.at,
+        Some(cgka_traits::Timestamp(retry_at)),
+        "before {before:?}, after {after:?}"
+    );
+}

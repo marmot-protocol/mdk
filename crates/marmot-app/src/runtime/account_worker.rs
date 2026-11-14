@@ -75,7 +75,8 @@ pub(crate) struct ManagedAccountWorker {
 enum RelayConfigWork {
     Idle,
     Ready,
-    RetryOnTick,
+    /// A failed update retries on the worker's schedule (mdk#3265).
+    Retry,
 }
 
 impl ManagedAccountWorker {
@@ -917,6 +918,51 @@ pub(crate) enum AccountWorkerCommand {
         respond:
             oneshot::Sender<Option<watch::Receiver<Arc<crate::client::read_state::ReadState>>>>,
     },
+}
+
+impl AccountWorkerCommand {
+    /// Whether serving this command can change what session maintenance
+    /// owes, so the worker re-reads its due time after it (mdk#3265). Reads
+    /// cannot, nor can the transport's subscription retry, which runs about
+    /// once a second while relays are out of reach; anything not listed here
+    /// counts as a change.
+    fn may_change_maintenance(&self) -> bool {
+        !matches!(
+            self,
+            Self::PreparedGroupImageStatus { .. }
+                | Self::PreparedGroupImages { .. }
+                | Self::Members { .. }
+                | Self::MemberIdsPage { .. }
+                | Self::GroupMlsState { .. }
+                | Self::GroupRoster { .. }
+                | Self::QuarantinedGroups { .. }
+                | Self::ExporterSecret { .. }
+                | Self::GroupRecoveryStatus { .. }
+                | Self::HistoryNotices { .. }
+                | Self::AccountRecoveryStatus { .. }
+                | Self::LinkedDevices { .. }
+                | Self::ChatHistoryImports { .. }
+                | Self::KeyPackageRefreshOverdue { .. }
+                | Self::UnrecognizedSignIns { .. }
+                | Self::CompromiseWarning { .. }
+                | Self::RemovedDeviceLeftoverChats { .. }
+                | Self::ChatsClosedToLinkedDevices { .. }
+                | Self::BackupRestoreStatus { .. }
+                | Self::WatchBackupRestore { .. }
+                | Self::HistoryImportProvenance { .. }
+                | Self::BackupHistoryAvailability { .. }
+                | Self::BackupSettings { .. }
+                | Self::GroupCommitDelivery { .. }
+                | Self::GroupAppComponent { .. }
+                | Self::PendingWelcomeDeliveries { .. }
+                | Self::KeyPackageMaintenanceStatus { .. }
+                | Self::DurablyOwnedKeyPackages { .. }
+                | Self::MaintenanceStatus { .. }
+                | Self::PeriodicMaintenancePolicy { .. }
+                | Self::GroupPushDebugInfo { .. }
+                | Self::RetryRuntimeGroupSubscriptions { .. }
+        )
+    }
 }
 
 impl AccountWorkerCommand {
@@ -1784,6 +1830,15 @@ async fn run_app_runtime_account_worker(
     #[cfg(test)]
     let started = (TokioInstant::now(), std::time::Instant::now());
     let mut maintenance_paused = client.runtime.maintenance_is_paused();
+    // When session maintenance next has work is re-read once after anything
+    // that may have moved it: a command that can change state, a receive, a
+    // convergence pass, a recovery turn, a scheduled recovery, post-join or
+    // KeyPackage catch-up, or a maintenance run (mdk#3265).
+    let mut maintenance_due_dirty = true;
+    let mut maintenance_last_run: Option<MaintenanceRun> = None;
+    // The wall second the current plan aims at, for the watchdog.
+    let mut maintenance_planned_wall: Option<u64> = None;
+    let mut maintenance_due_read_at: Option<TokioInstant> = None;
     let mut avatar_resumed = false;
     let mut avatar_identities = super::avatar::IdentityAvatarMaintenance::default();
 
@@ -1980,7 +2035,32 @@ async fn run_app_runtime_account_worker(
             );
         }
         let ready_command = ready_command_index(&pending, &media_http);
-        let scheduled_at = schedule.next_at(TokioInstant::now(), crate::unix_now_seconds());
+        // Spaced, so a burst of deliveries reads it once, not once each.
+        let due_read_ready =
+            maintenance_due_read_at.is_none_or(|at| at.elapsed() >= MAINTENANCE_DUE_READ_SPACING);
+        if maintenance_due_dirty && due_read_ready {
+            maintenance_due_dirty = false;
+            maintenance_due_read_at = Some(TokioInstant::now());
+            let step = shared
+                .observer
+                .performance()
+                .observe(RuntimeOp::WorkerMaintenanceNextDue);
+            let due = client.maintenance_due();
+            step.finish(TelemetryOutcome::Success);
+            let plan = maintenance_plan(
+                due,
+                maintenance_last_run,
+                crate::unix_now_seconds(),
+                TokioInstant::now(),
+            );
+            maintenance_planned_wall = plan.planned_wall;
+            schedule.reschedule(schedule::Job::SessionMaintenance, plan.at, plan.wall);
+        }
+        let mut scheduled_at = schedule.next_at(TokioInstant::now(), crate::unix_now_seconds());
+        if maintenance_due_dirty && let Some(read_at) = maintenance_due_read_at {
+            let reread = read_at + MAINTENANCE_DUE_READ_SPACING;
+            scheduled_at = Some(scheduled_at.map_or(reread, |at| at.min(reread)));
+        }
         #[cfg(test)]
         tests::secondary_retry_scheduler_tests::record_turn(
             &account_id_hex,
@@ -2005,7 +2085,7 @@ async fn run_app_runtime_account_worker(
             () = std::future::ready(()), if relay_config_work == RelayConfigWork::Ready => {
                 relay_config_work = match client.sync_relay_liveness().await {
                     Ok(_) => RelayConfigWork::Idle,
-                    Err(error) if error.is_account_not_active() => RelayConfigWork::RetryOnTick,
+                    Err(error) if error.is_account_not_active() => RelayConfigWork::Retry,
                     Err(error) => {
                         publish_app_runtime_account_error(
                             Emit::Quiescent(&client),
@@ -2014,9 +2094,15 @@ async fn run_app_runtime_account_worker(
                             &account_label,
                             account_error_message("relay configuration reconciliation failed", &error),
                         );
-                        RelayConfigWork::RetryOnTick
+                        RelayConfigWork::Retry
                     }
                 };
+                if relay_config_work == RelayConfigWork::Retry {
+                    schedule.arm(
+                        schedule::Job::RelayConfig,
+                        Some(TokioInstant::now() + schedule::RETRY_WHILE_OWED),
+                    );
+                }
             }
             result = relay_config_updates.recv() => {
                 let mut changed = match result {
@@ -2138,6 +2224,14 @@ async fn run_app_runtime_account_worker(
                 }
             }, if !yield_to_convergence || !scheduled_convergence.has_ready() || scheduled_convergence_held_for_test(&account_id_hex) => {
                 yield_to_convergence = true;
+                // A command that can change state can change what session
+                // maintenance owes; a read cannot.
+                if command
+                    .as_ref()
+                    .is_none_or(AccountWorkerCommand::may_change_maintenance)
+                {
+                    maintenance_due_dirty = true;
+                }
                 match command {
                     Some(command) => {
                         #[cfg(test)]
@@ -2260,6 +2354,7 @@ async fn run_app_runtime_account_worker(
             }
             _ = scheduled_convergence.timer.as_mut(), if !scheduled_convergence_held_for_test(&account_id_hex) => {
                 yield_to_convergence = false;
+                maintenance_due_dirty = true;
                 let Some(group_id) = scheduled_convergence.take_ready() else { continue };
                 let local_submission_yield = wait_for_local_submission_or_shutdown(
                     app.clone(),
@@ -2449,6 +2544,8 @@ async fn run_app_runtime_account_worker(
                 );
             }
             received = client.receive_next_delivery(), if !client.has_pending_effect_projections() => {
+                // An inbound commit or Welcome can open or settle an obligation.
+                maintenance_due_dirty = true;
                 #[cfg(test)]
                 if let Ok(transport_nostr::AccountDeliveryReceive::Delivery(delivery)) = &received
                     && let (Ok(event_id), Some(subscription_id)) = (
@@ -2831,6 +2928,7 @@ async fn run_app_runtime_account_worker(
             // An idle worker waits for the runner's next turn here; the
             // loop's top serves one per pass while other work is ready.
             turn = next_runner_turn(&mut recovery_runner), if !client.has_pending_effect_projections() => {
+                maintenance_due_dirty = true;
                 turn.serve(&mut client).await;
                 publish_settled_recovery_copies(&mut client, &events, &account_id_hex, &account_label);
             }
@@ -2963,10 +3061,14 @@ async fn run_app_runtime_account_worker(
                     shared: &shared,
                 };
                 if schedule.due(schedule::Job::Recovery, now, now_wall) {
+                    // Recovery applies inbound state, which can change what
+                    // session maintenance owes (mdk#3265).
+                    maintenance_due_dirty = true;
                     let owed = run_scheduled_recovery(&mut client, context).await;
                     schedule.ran(schedule::Job::Recovery, owed, TokioInstant::now());
                 }
                 if schedule.due(schedule::Job::PostJoin, now, now_wall) {
+                    maintenance_due_dirty = true;
                     let owed = run_scheduled_post_join(&mut client, context).await;
                     client.post_join_advanced = false;
                     schedule.ran(schedule::Job::PostJoin, owed, TokioInstant::now());
@@ -3059,6 +3161,9 @@ async fn run_app_runtime_account_worker(
                 }
                 if schedule.due(schedule::Job::KeyPackageCatchUp, now, now_wall) {
                     if client.key_package_maintenance_requires_catch_up() {
+                        // The catch-up syncs inbound state and can consume
+                        // or replace the KeyPackage (mdk#3265).
+                        maintenance_due_dirty = true;
                         run_key_package_catch_up(
                             &mut client,
                             &shared,
@@ -3111,18 +3216,37 @@ async fn run_app_runtime_account_worker(
                         TokioInstant::now(),
                     );
                 }
+                if schedule.due(schedule::Job::RelayConfig, now, now_wall) {
+                    if relay_config_work == RelayConfigWork::Retry {
+                        relay_config_work = RelayConfigWork::Ready;
+                    }
+                    schedule.arm(schedule::Job::RelayConfig, None);
+                }
+                if schedule.due(schedule::Job::SessionMaintenance, now, now_wall) {
+                    maintenance_last_run = Some(MaintenanceRun {
+                        wall: crate::unix_now_seconds(),
+                        at: TokioInstant::now(),
+                    });
+                    maintenance_planned_wall = None;
+                    finish_periodic_maintenance(
+                        &mut client,
+                        &events,
+                        &account_id_hex,
+                        &account_label,
+                        &shared,
+                        &product_backlog,
+                        &mut scheduled_convergence,
+                    )
+                    .await;
+                    schedule.arm(schedule::Job::SessionMaintenance, None);
+                    maintenance_due_dirty = true;
+                }
             }
             _ = maintenance_tick.tick() => {
-                // Every scheduled job runs on its own wakes and deadlines; the
-                // tick runs session maintenance (until it gets its own
-                // deadlines), the relay-config retry and the watchdog below,
-                // which checks that no job missed a wake.
-                if relay_config_work == RelayConfigWork::RetryOnTick {
-                    relay_config_work = RelayConfigWork::Ready;
-                }
-                // Periodic maintenance is never urgent: skip the tick
-                // outright once shutdown is requested rather than starting
-                // work the drain would then have to wait out.
+                // Every job runs on its own wakes and deadlines, session
+                // maintenance included (mdk#3265). The tick only runs the
+                // watchdog below, which checks that none was missed. Skip it
+                // once shutdown is requested.
                 if lifecycle.is_stopping() {
                     continue 'worker;
                 }
@@ -3139,12 +3263,33 @@ async fn run_app_runtime_account_worker(
                         local_submission_due,
                         legacy_promotion_pending: legacy_message_promotion.status
                             == LegacyMessagePromotionStatus::Pending,
+                        relay_config_retry: relay_config_work == RelayConfigWork::Retry,
                         admission: &attachment_admission,
                     };
                     schedule::Job::ALL.map(|job| job_owed_now(job, &client, &flags))
                 };
                 for (job, owed) in schedule::Job::ALL.into_iter().zip(owed_jobs) {
-                    let Some(first) = schedule.missed(job, owed, TokioInstant::now(), crate::unix_now_seconds()) else {
+                    let missed = if job == schedule::Job::SessionMaintenance {
+                        // A re-read is already pending: nothing was missed.
+                        if maintenance_due_dirty {
+                            continue;
+                        }
+                        let step = telemetry.observe(RuntimeOp::WorkerMaintenanceNextDue);
+                        let due = client.maintenance_due();
+                        step.finish(TelemetryOutcome::Success);
+                        schedule.late(
+                            job,
+                            session_maintenance_late(
+                                due,
+                                maintenance_last_run.map(|run| run.wall),
+                                maintenance_planned_wall,
+                                crate::unix_now_seconds(),
+                            ),
+                        )
+                    } else {
+                        schedule.missed(job, owed, TokioInstant::now(), crate::unix_now_seconds())
+                    };
+                    let Some(first) = missed else {
                         continue;
                     };
                     telemetry.record_runtime(
@@ -3164,16 +3309,6 @@ async fn run_app_runtime_account_worker(
                         _ => schedule.wake(job),
                     }
                 }
-                finish_periodic_maintenance(
-                    &mut client,
-                    &events,
-                    &account_id_hex,
-                    &account_label,
-                    &shared,
-                    &product_backlog,
-                    &mut scheduled_convergence,
-                )
-                .await;
                 phase.finish(TelemetryOutcome::Success);
             }
         }
@@ -3428,6 +3563,7 @@ struct WatchdogFlags<'a> {
     presentation_due: bool,
     local_submission_due: bool,
     legacy_promotion_pending: bool,
+    relay_config_retry: bool,
     admission: &'a attachments::Admission,
 }
 
@@ -3457,6 +3593,237 @@ fn job_owed_now(job: schedule::Job, client: &AppClient, flags: &WatchdogFlags<'_
         schedule::Job::HistoryDispatch => client
             .history_dispatch_next_at()
             .is_some_and(|at| at <= crate::unix_now_seconds()),
+        schedule::Job::RelayConfig => flags.relay_config_retry,
+        // Its own check compares its plan with its due time (mdk#3265).
+        schedule::Job::SessionMaintenance => false,
+    }
+}
+
+/// How often the worker re-reads when session maintenance next has work, at
+/// most. A due time cannot move before now, so a later read delays work by
+/// at most this (mdk#3265).
+const MAINTENANCE_DUE_READ_SPACING: Duration = Duration::from_secs(1);
+
+/// When the last session maintenance run started: the wall second, which
+/// stored due times compare against, and the worker's clock, which spaces
+/// retries so a wall-clock step cannot stretch them (mdk#3265).
+#[derive(Clone, Copy, Debug)]
+struct MaintenanceRun {
+    wall: u64,
+    at: TokioInstant,
+}
+
+/// When session maintenance next runs (mdk#3265), from when it next has
+/// work (`due`), its last run and the time now: `at` by the worker's clock,
+/// `wall` a unix second the schedule reaches through
+/// [`schedule::wall_deadline`], and `planned_wall`, the wall second the plan
+/// aims at, for the watchdog.
+/// - A stored time after the last run started runs then by wall time, or at
+///   once if it has passed.
+/// - A stored time the last run already saw but could not act on (a held
+///   group, a pause, a gate), and work with no stored time, retry 15 s after
+///   that run by the worker's clock, as the tick did, or at once before the
+///   first run.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct MaintenancePlan {
+    at: Option<TokioInstant>,
+    wall: Option<u64>,
+    planned_wall: Option<u64>,
+}
+
+fn maintenance_plan(
+    due: marmot_session::MaintenanceDue,
+    last_run: Option<MaintenanceRun>,
+    now_wall: u64,
+    now: TokioInstant,
+) -> MaintenancePlan {
+    let retry = last_run.map_or((now, now_wall), |run| {
+        (
+            run.at + schedule::RETRY_WHILE_OWED,
+            run.wall
+                .saturating_add(schedule::RETRY_WHILE_OWED.as_secs()),
+        )
+    });
+    let mut by_clock = due.retry_while_owed.then_some(retry);
+    let mut wall = None;
+    if let Some(at) = due.at {
+        match last_run {
+            Some(run) if at.0 <= run.wall => by_clock = Some(retry),
+            _ if at.0 <= now_wall => by_clock = Some((now, at.0)),
+            _ => wall = Some(at.0),
+        }
+        if due.retry_while_owed && by_clock.is_some_and(|(clock, _)| clock > retry.0) {
+            by_clock = Some(retry);
+        }
+    }
+    // The wall second of whichever comes first by the worker's clock.
+    let by_wall = wall.map(|wall| (schedule::wall_deadline(wall, now_wall, now), wall));
+    MaintenancePlan {
+        at: by_clock.map(|(at, _)| at),
+        wall,
+        planned_wall: by_clock
+            .into_iter()
+            .chain(by_wall)
+            .min_by_key(|(at, _)| *at)
+            .map(|(_, planned)| planned),
+    }
+}
+
+/// The watchdog's check of session maintenance (mdk#3265), in wall seconds:
+/// a stored time passed after the last run started, yet the plan aims later
+/// than it, or there is owed work and no plan at all. Either means a change
+/// moved what maintenance owes without a re-read. A plan that aims at or
+/// before the due time is not late, even if its timer has not fired, as
+/// after the device was suspended.
+fn session_maintenance_late(
+    due: marmot_session::MaintenanceDue,
+    last_run_wall: Option<u64>,
+    planned_wall: Option<u64>,
+    now_wall: u64,
+) -> bool {
+    let timed = due.at.is_some_and(|at| {
+        at.0 < now_wall
+            && last_run_wall.is_none_or(|run| at.0 > run)
+            && planned_wall.is_none_or(|planned| planned > at.0)
+    });
+    let untimed = due.retry_while_owed && planned_wall.is_none();
+    timed || untimed
+}
+
+#[cfg(test)]
+mod maintenance_plan_tests {
+    use super::{MaintenanceRun, maintenance_plan, schedule, session_maintenance_late};
+    use cgka_traits::Timestamp;
+    use marmot_session::MaintenanceDue;
+    use std::time::Duration;
+    use tokio::time::Instant;
+
+    fn due(at: Option<u64>, retry_while_owed: bool) -> MaintenanceDue {
+        MaintenanceDue {
+            at: at.map(Timestamp),
+            retry_while_owed,
+        }
+    }
+
+    /// When the plan runs, in seconds after `now`, as the schedule reaches
+    /// it, and the wall second it aims at.
+    fn plan(
+        due: MaintenanceDue,
+        last_run: Option<(u64, u64)>,
+        now_wall: u64,
+    ) -> Option<(u64, u64)> {
+        let now = Instant::now();
+        let last_run = last_run.map(|(wall, ago)| MaintenanceRun {
+            wall,
+            at: now - Duration::from_secs(ago),
+        });
+        let plan = maintenance_plan(due, last_run, now_wall, now);
+        let wall = plan
+            .wall
+            .map(|wall| schedule::wall_deadline(wall, now_wall, now));
+        let at = plan.at.into_iter().chain(wall).min()?;
+        Some((
+            at.saturating_duration_since(now).as_secs(),
+            plan.planned_wall.expect("a plan aims at a wall second"),
+        ))
+    }
+
+    /// A future stored time runs then; nothing owed waits for a wake; a far
+    /// one is read again within the longest sleep.
+    #[test]
+    fn a_stored_due_time_runs_at_that_time() {
+        assert_eq!(
+            plan(due(Some(1_100), false), Some((900, 100)), 1_000),
+            Some((100, 1_100))
+        );
+        assert_eq!(plan(due(None, false), Some((900, 100)), 1_000), None);
+        let far = 1_000 + 24 * 60 * 60;
+        assert_eq!(
+            plan(due(Some(far), false), Some((900, 100)), 1_000),
+            Some((schedule::LONGEST_WALL_SLEEP.as_secs(), far))
+        );
+    }
+
+    /// Work that came due after the last run started runs at once; work
+    /// that run already saw retries 15 s after it, so a gate that holds it
+    /// cannot spin the worker.
+    #[test]
+    fn past_due_work_runs_at_once_unless_the_last_run_saw_it() {
+        assert_eq!(
+            plan(due(Some(950), false), Some((900, 100)), 1_000),
+            Some((0, 950))
+        );
+        assert_eq!(plan(due(Some(950), false), None, 1_000), Some((0, 950)));
+        assert_eq!(
+            plan(due(Some(880), false), Some((900, 10)), 1_000),
+            Some((5, 915))
+        );
+    }
+
+    /// Work with no stored time retries 15 s after the last run by the
+    /// worker's clock, not the wall clock, and runs at once before the
+    /// first run. This is what stops a "due now" from re-running maintenance
+    /// on every read.
+    #[test]
+    fn untimed_work_retries_15_s_after_the_last_run() {
+        assert_eq!(
+            plan(due(None, true), Some((900, 10)), 1_000),
+            Some((5, 915))
+        );
+        assert_eq!(plan(due(None, true), None, 1_000), Some((0, 1_000)));
+        // The wall clock stepped back an hour: the retry still comes 15 s
+        // after the run by the worker's clock.
+        assert_eq!(
+            plan(due(None, true), Some((4_600, 10)), 1_000).map(|(at, _)| at),
+            Some(5)
+        );
+        assert_eq!(
+            plan(due(Some(1_003), true), Some((900, 10)), 1_000),
+            Some((3, 1_003))
+        );
+    }
+
+    /// A stored time that passed after the last run, with the plan aimed
+    /// later, is late; aimed at it, it is not, even if the timer has not
+    /// fired; owed work with no plan is late; work the last run saw is not.
+    #[test]
+    fn the_watchdog_counts_work_the_plan_does_not_reach() {
+        assert!(session_maintenance_late(
+            due(Some(950), false),
+            Some(900),
+            Some(1_500),
+            1_000
+        ));
+        assert!(!session_maintenance_late(
+            due(Some(950), false),
+            Some(900),
+            Some(950),
+            1_000
+        ));
+        assert!(!session_maintenance_late(
+            due(Some(880), false),
+            Some(900),
+            Some(915),
+            1_000
+        ));
+        assert!(session_maintenance_late(
+            due(None, true),
+            Some(900),
+            None,
+            1_000
+        ));
+        assert!(!session_maintenance_late(
+            due(None, true),
+            Some(900),
+            Some(915),
+            1_000
+        ));
+        assert!(!session_maintenance_late(
+            due(Some(1_100), false),
+            Some(900),
+            None,
+            1_000
+        ));
     }
 }
 
@@ -3477,6 +3844,8 @@ fn watchdog_missed_wake_op(job: schedule::Job) -> RuntimeOp {
         Job::KeyPackageCatchUp => RuntimeOp::WatchdogMissedWakeKeyPackageCatchUp,
         Job::Push => RuntimeOp::WatchdogMissedWakePush,
         Job::HistoryDispatch => RuntimeOp::WatchdogMissedWakeHistoryDispatch,
+        Job::SessionMaintenance => RuntimeOp::WatchdogMissedWakeSessionMaintenance,
+        Job::RelayConfig => RuntimeOp::WatchdogMissedWakeRelayConfig,
     }
 }
 
@@ -3488,7 +3857,8 @@ async fn sleep_until_scheduled(at: Option<TokioInstant>) {
     }
 }
 
-/// The periodic tick's session and app maintenance (`run_due_maintenance`).
+/// Session and app maintenance (`run_due_maintenance`), run when its due
+/// time comes on the worker's schedule (mdk#3265).
 async fn finish_periodic_maintenance(
     client: &mut AppClient,
     events: &broadcast::Sender<MarmotAppEvent>,
@@ -11007,6 +11377,7 @@ mod tests {
             presentation_due: false,
             local_submission_due: false,
             legacy_promotion_pending: false,
+            relay_config_retry: false,
             admission: &admission,
         };
         assert!(!job_owed_now(schedule::Job::Push, &client, &flags));
