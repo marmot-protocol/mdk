@@ -41,7 +41,10 @@ impl CommittedRosterStorage for SqliteAccountStorage {
         group_id: &GroupId,
         members: &CommittedMembers,
     ) -> StorageResult<CommittedRosterWrite> {
-        self.connection.with_transaction(|| {
+        // A savepoint, not a flattened nested transaction: inside a caller's
+        // transaction a refused write must undo its own rows, since the
+        // hydration backfill survives the error and the caller can commit.
+        self.connection.with_savepoint(|| {
             let conn = self.lock()?;
             write_committed_roster(&conn, group_id, members)
         })
@@ -309,6 +312,39 @@ mod tests {
             Err(StorageError::NotFound)
         ));
         assert_eq!(store.committed_roster(&group.id).unwrap(), None);
+    }
+
+    /// A roster write is its own unit inside a caller's transaction. Hydration
+    /// survives a backfill that cannot record a missing roster, so the
+    /// caller's transaction can still commit, and the refused write must leave
+    /// no roster behind: not a revision without its members.
+    #[test]
+    fn a_refused_roster_write_inside_a_committed_transaction_leaves_no_roster() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let group = sample_group(gid(1), 1, 2);
+        store.put_group_keeping_roster(&group).unwrap();
+        store
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TEMP TRIGGER refuse_roster_member BEFORE INSERT ON cgka_committed_roster_members
+                 BEGIN SELECT RAISE(ABORT, 'roster member refused'); END;",
+            )
+            .unwrap();
+        store
+            .with_transaction(|store| {
+                let refused =
+                    store.put_committed_roster(&group.id, &CommittedMembers::of_members(&group.members));
+                assert!(
+                    matches!(&refused, Err(StorageError::Backend(reason)) if reason.contains("roster member refused")),
+                    "{refused:?}"
+                );
+                Ok::<_, StorageError>(())
+            })
+            .unwrap();
+        assert_eq!(store.committed_roster(&group.id).unwrap(), None);
+        assert_eq!(store.committed_roster_revision(&group.id).unwrap(), None);
+        assert_eq!(store.get_group(&group.id).unwrap(), group);
     }
 
     thread_local! {

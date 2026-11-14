@@ -587,6 +587,115 @@ async fn own_disband_roster_comes_from_the_tree_it_ends_not_the_record() {
     assert_eq!(storage.committed_roster(&gid).unwrap(), Some(joined));
 }
 
+/// A canonical apply that rewinds below a confirmed own disband and realizes
+/// it again from its checkpoint writes the members the disband ends. The
+/// checkpoint holds the committer alone, so they are read from the parent
+/// tree before the checkpoint replaces it. Through the engine only a
+/// flip-back reorg reaches this, so the test drives the replay API on the
+/// stored shape such a reorg leaves: the disband parked behind live state and
+/// another roster recorded.
+#[tokio::test]
+async fn own_disband_realized_from_its_checkpoint_writes_the_members_it_ends() {
+    use cgka_engine::canonicalization::CanonicalizationState;
+    use cgka_engine::openmls_projection::{
+        apply_openmls_canonicalization_result, canonicalize_stored_openmls_messages,
+    };
+    let clock = ManualConvergenceClock::new(1_000, 10_000);
+    let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
+    let mut alice = current_client(b"checkpoint-disband-alice", storage.clone(), &clock);
+    let mut bob = current_client(
+        b"checkpoint-disband-bob",
+        SqliteAccountStorage::in_memory_for_test().unwrap(),
+        &clock,
+    );
+    let (gid, created) = alice
+        .create_group(CreateGroupRequest {
+            name: "checkpoint disband".into(),
+            description: String::new(),
+            members: vec![bob.fresh_key_package().await.unwrap()],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let SendResult::FoundingGroupCreated { mut welcomes } = created else {
+        panic!("founding create")
+    };
+    bob.join_welcome(welcomes.remove(0)).await.unwrap();
+    let joined = checked_committed_roster(&alice, &storage, &gid);
+    assert_eq!(joined.members.ids().len(), 2);
+    let source_epoch = storage.get_group(&gid).unwrap().epoch.0;
+
+    alice
+        .send(SendIntent::Disband {
+            group_id: gid.clone(),
+        })
+        .await
+        .unwrap();
+    let prepared = alice
+        .converge_and_drain_queued_outbound_intents(&gid, clock.now().monotonic_ms)
+        .await
+        .unwrap();
+    let (disband, pending) = evolution(prepared.into_iter().next().expect("prepared disband"));
+    alice.confirm_published(pending).await.unwrap();
+    assert_eq!(storage.get_group(&gid).unwrap().epoch.0, source_epoch + 1);
+
+    let mut record = storage.get_message(&disband.id).unwrap();
+    record.state = MessageState::ConvergenceDeferred;
+    storage.put_message(&record).unwrap();
+    let other = CommittedMembers::from_ids([
+        alice.self_id(),
+        MemberId::new(pad32(b"checkpoint-disband-stranger")),
+    ]);
+    assert_ne!(other, joined.members);
+    storage.put_committed_roster(&gid, &other).unwrap();
+
+    let policy = CanonicalizationPolicy::default();
+    let selection = canonicalize_stored_openmls_messages(
+        &storage,
+        &gid,
+        CanonicalizationState {
+            current_tip_epoch: source_epoch + 1,
+            retained_anchor_epoch: 0,
+            last_convergence_relevant_input_ms: 0,
+            seen_message_ids: std::collections::BTreeSet::new(),
+        },
+        Vec::new(),
+        policy.clone(),
+        u64::MAX,
+    )
+    .expect("the parked disband is selected");
+    assert_eq!(
+        selection.accepted_commits,
+        vec![hex::encode(disband.id.as_slice())],
+        "the apply starts below the live tip, at the disband"
+    );
+    apply_openmls_canonicalization_result(
+        &storage,
+        &gid,
+        &selection,
+        policy.convergence.max_rewind_commits,
+    )
+    .expect("the disband is realized from its checkpoint");
+
+    let group = storage.get_group(&gid).unwrap();
+    assert_eq!(group.epoch.0, source_epoch + 1);
+    assert_eq!(
+        group.members.iter().map(|m| &m.id).collect::<Vec<_>>(),
+        vec![&alice.self_id()],
+        "the checkpoint holds the committer alone"
+    );
+    assert_eq!(
+        storage
+            .committed_roster(&gid)
+            .unwrap()
+            .map(|roster| roster.members),
+        Some(joined.members),
+        "the roster holds the members the disband ends"
+    );
+}
+
 #[tokio::test]
 async fn demoted_disband_request_fails_durably_and_is_acknowledged_once() {
     use cgka_traits::app_components::{
