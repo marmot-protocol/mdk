@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Added
+
+- The engine keeps each group's committed roster (mdk#3273). Every record write that merges, clears or re-derives
+  membership writes the distinct member account ids of the merged state in the same transaction, never a staged
+  commit's projection, and a rewind leaves it as it was. Full hydration records the roster of a group stored before
+  rosters existed and replaces one that disagrees, with a warning that carries only a count.
+
 ### Fixed
 
 - A contained rewind window on a storage provider without atomic group savepoints writes one snapshot, not two

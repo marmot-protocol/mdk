@@ -37,13 +37,14 @@ use cgka_traits::message::{MessageRecord, MessageState, StoredMessagePayload};
 use cgka_traits::peeler::TransportPeeler;
 use cgka_traits::storage::{
     AccountDeviceHistoryKey, AccountDeviceHistoryKeyStorage, AccountDeviceSignerBinding,
-    AccountDeviceSignerStorage, CapabilityStorage, ConvergencePassStorage,
-    ConvergencePolicyStorage, DeviceGroupWelcomeExpectation, DeviceGroupWelcomeStorage,
-    DisbandCandidate, DisbandCandidateStorage, DisbandRequest, DisbandRequestStatus,
-    DisbandRequestStorage, DisbandTombstoneStorage, GroupStateCheckpointRef, GroupStorage,
-    KeyPackageBundleStorage, LeaveRequest, LeaveRequestStorage, MaintenanceStorage,
-    MemberValidationCacheStorage, MessageStorage, OutboundFanoutStorage, OutboundIntentStorage,
-    QueuedOutboundIntent, StorageError, StorageProvider, StorageResult, StoredKeyPackageBundle,
+    AccountDeviceSignerStorage, CapabilityStorage, CommittedMembers, CommittedRoster,
+    CommittedRosterStorage, CommittedRosterWrite, ConvergencePassStorage, ConvergencePolicyStorage,
+    DeviceGroupWelcomeExpectation, DeviceGroupWelcomeStorage, DisbandCandidate,
+    DisbandCandidateStorage, DisbandRequest, DisbandRequestStatus, DisbandRequestStorage,
+    DisbandTombstoneStorage, GroupStateCheckpointRef, GroupStorage, KeyPackageBundleStorage,
+    LeaveRequest, LeaveRequestStorage, MaintenanceStorage, MemberValidationCacheStorage,
+    MessageStorage, OutboundFanoutStorage, OutboundIntentStorage, QueuedOutboundIntent,
+    RosterRevision, StorageError, StorageProvider, StorageResult, StoredKeyPackageBundle,
     WelcomeStorage,
 };
 use cgka_traits::transport::{
@@ -59,6 +60,7 @@ use storage_sqlite::SqliteAccountStorage;
 mod late_descriptor;
 
 mod support;
+use support::committed_roster::checked_committed_roster;
 use support::proof_signer;
 
 fn pad32(name: &[u8]) -> Vec<u8> {
@@ -258,6 +260,12 @@ async fn active_rival_rearms_disband_then_terminal_retry_keeps_authenticated_ros
         .await
         .unwrap();
     assert_eq!(alice.members(&gid).unwrap().len(), 3);
+    let roster = checked_committed_roster(&alice, &storage, &gid);
+    assert_eq!(
+        roster.members.ids().len(),
+        2,
+        "the requester's two leaves are one account"
+    );
     let source_epoch = alice.epoch(&gid).unwrap();
     assert_eq!(bob.epoch(&gid).unwrap(), source_epoch);
     let (other_gid, _) = alice
@@ -317,6 +325,11 @@ async fn active_rival_rearms_disband_then_terminal_retry_keeps_authenticated_ros
         .unwrap();
     assert_eq!(storage.get_group(&gid).unwrap().name, "active winner");
     assert!(storage.disband_tombstone(&gid).unwrap().is_none());
+    assert_eq!(
+        checked_committed_roster(&alice, &storage, &gid),
+        roster,
+        "neither the confirmed disband nor the rewind past it changed the committed roster"
+    );
     assert!(
         storage.list_disband_candidates(&gid).unwrap().is_empty(),
         "losing terminal evidence is stale"
@@ -394,6 +407,13 @@ async fn active_rival_rearms_disband_then_terminal_retry_keeps_authenticated_ros
     assert_eq!(tombstone.origin_commit_id, Some(terminal.id.clone()));
     assert_eq!(tombstone.former_members, candidate.former_members);
     assert!(tombstone.local_was_committer_leaf);
+    let settled = storage.committed_roster(&gid).unwrap().unwrap();
+    assert_eq!(
+        settled.members,
+        CommittedMembers::of_members(&tombstone.former_members),
+        "a disbanded group's committed roster is its former members"
+    );
+    assert_eq!(settled.members, roster.members);
     let events = alice.drain_events();
     let changes = events
         .iter()
@@ -475,6 +495,11 @@ async fn active_rival_rearms_disband_then_terminal_retry_keeps_authenticated_ros
     );
     assert!(alice.disbanding_support_blockers(&gid).unwrap().is_empty());
     assert_eq!(reopened.get_group(&other_gid).unwrap(), unrelated);
+    assert_eq!(
+        reopened.committed_roster(&gid).unwrap(),
+        Some(settled),
+        "hydrating the tombstone finds the roster already settled"
+    );
 }
 
 #[tokio::test]
@@ -1297,9 +1322,16 @@ async fn invite_publish_failed_rolls_back_projected_member_set() {
         SendResult::GroupCreated { pending, .. } => pending,
         _ => unreachable!(),
     };
+    // The staged create projects bob into the record; the committed roster
+    // holds alice alone until the create's commit merges.
+    let solo = checked_committed_roster(&alice, &storage, &gid);
+    assert_eq!(solo.members.ids().len(), 1);
     alice.confirm_published(pending).await.unwrap();
     assert_eq!(alice.members(&gid).unwrap().len(), 2, "alice + bob");
     assert_eq!(alice.epoch(&gid).unwrap().0, 1);
+    let created = checked_committed_roster(&alice, &storage, &gid);
+    assert_eq!(created.members.ids().len(), 2);
+    assert!(created.revision > solo.revision);
 
     // Invite carol — projection puts her in the member list immediately.
     let carol_kp = carol.fresh_key_package().await.unwrap();
@@ -1343,6 +1375,11 @@ async fn invite_publish_failed_rolls_back_projected_member_set() {
     );
     // EpochState reports the projected new epoch.
     assert_eq!(alice.epoch(&gid).unwrap().0, 2);
+    assert_eq!(
+        checked_committed_roster(&alice, &storage, &gid),
+        created,
+        "staging never reaches the committed roster"
+    );
 
     // Transport publish "fails" — engine rolls back.
     alice.publish_failed(inv_pending).await.unwrap();
@@ -1368,6 +1405,11 @@ async fn invite_publish_failed_rolls_back_projected_member_set() {
     assert_eq!(alice.epoch(&gid).unwrap().0, 1);
     let members = alice.members(&gid).unwrap();
     assert_eq!(members.len(), 2, "carol dropped on rollback: {members:?}");
+    assert_eq!(
+        checked_committed_roster(&alice, &storage, &gid),
+        created,
+        "a failed publish leaves the committed roster and its revision"
+    );
 
     // Capture a second authentic failed attempt for the historical raw-format
     // fixture. Neither fixture invents ids, origins or transport bytes.
@@ -1461,6 +1503,9 @@ async fn invite_publish_failed_rolls_back_projected_member_set() {
     );
     assert_eq!(alice.epoch(&gid).unwrap().0, 2);
     assert_eq!(alice.members(&gid).unwrap().len(), 3);
+    let confirmed = checked_committed_roster(&alice, &storage, &gid);
+    assert_eq!(confirmed.members.ids().len(), 3);
+    assert!(confirmed.revision > created.revision);
 }
 
 #[tokio::test]
@@ -1888,6 +1933,25 @@ struct FaultStorage {
     confirmation_fault: ConfirmationFault,
 }
 
+impl CommittedRosterStorage for FaultStorage {
+    fn committed_roster(&self, group_id: &GroupId) -> StorageResult<Option<CommittedRoster>> {
+        self.inner.committed_roster(group_id)
+    }
+    fn committed_roster_revision(
+        &self,
+        group_id: &GroupId,
+    ) -> StorageResult<Option<RosterRevision>> {
+        self.inner.committed_roster_revision(group_id)
+    }
+    fn put_committed_roster(
+        &self,
+        group_id: &GroupId,
+        members: &CommittedMembers,
+    ) -> StorageResult<CommittedRosterWrite> {
+        self.inner.put_committed_roster(group_id, members)
+    }
+}
+
 impl GroupStorage for FaultStorage {
     fn invitation_admission(
         &self,
@@ -1902,8 +1966,15 @@ impl GroupStorage for FaultStorage {
     ) -> StorageResult<()> {
         self.inner.put_invitation_admission(id, admission)
     }
-    fn put_group(&self, group: &Group) -> StorageResult<()> {
-        self.inner.put_group(group)
+    fn put_group_with_roster(
+        &self,
+        group: &Group,
+        committed: &CommittedMembers,
+    ) -> StorageResult<()> {
+        self.inner.put_group_with_roster(group, committed)
+    }
+    fn put_group_keeping_roster(&self, group: &Group) -> StorageResult<()> {
+        self.inner.put_group_keeping_roster(group)
     }
     fn get_group(&self, id: &GroupId) -> StorageResult<Group> {
         if self.confirmation_fault.after_anchor.load(Ordering::SeqCst) != 0

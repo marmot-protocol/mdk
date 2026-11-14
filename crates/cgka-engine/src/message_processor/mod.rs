@@ -105,7 +105,7 @@ pub(crate) fn prepare_local_group_termination<S: StorageProvider>(
     let newly_removed = !record.removed;
     if record.disbanded.is_none() {
         record.removed = true;
-        storage.put_group(&record)?;
+        storage.put_group_keeping_roster(&record)?;
     }
     storage.delete_deferred_peel_generation(group_id)?;
     let queued = storage.list_queued_outbound_intents(group_id)?;

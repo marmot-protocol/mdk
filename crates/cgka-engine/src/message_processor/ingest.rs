@@ -2426,7 +2426,10 @@ impl<S: StorageProvider> Engine<S> {
             .any(|active| &active.id == self.identity.self_id());
         group.members = canonical_members;
         let prepared = self.storage.with_transaction(|storage| {
-            storage.put_group(&group)?;
+            storage.put_group_with_roster(
+                &group,
+                &cgka_traits::storage::CommittedMembers::of_members(&group.members),
+            )?;
             super::prepare_local_group_termination(storage, group_id)
         })?;
         if account_departed {

@@ -1165,7 +1165,7 @@ mod tests {
     #[test]
     fn bounded_backfill_queues_canonical_unresolved_control_authority() {
         use crate::base::test_support::{sample_group, sample_message};
-        use cgka_traits::storage::{GroupStorage, MessageStorage};
+        use cgka_traits::storage::MessageStorage;
         use cgka_traits::{EpochId, GroupId, MemberId, MessageId};
         use sha2::{Digest, Sha256};
 

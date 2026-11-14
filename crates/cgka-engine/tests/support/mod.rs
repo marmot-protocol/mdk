@@ -1,3 +1,4 @@
+pub mod committed_roster;
 pub mod epoch_sealed_peeler;
 
 use std::sync::Arc;

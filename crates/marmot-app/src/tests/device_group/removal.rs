@@ -1429,13 +1429,13 @@ async fn a_removal_waits_while_the_device_group_copy_is_terminal() {
         .unwrap();
     let mut removed = stored.clone();
     removed.removed = true;
-    cgka_traits::storage::GroupStorage::put_group(&storage, &removed).unwrap();
+    cgka_traits::storage::GroupStorage::put_group_keeping_roster(&storage, &removed).unwrap();
 
     phone.run_due_maintenance().await.unwrap();
     assert!(trust(&phone_app, &group).is_some_and(DeviceGroupTrust::is_trusted));
     assert_eq!(pending_removals(&phone_app), 1, "the decision is kept");
 
-    cgka_traits::storage::GroupStorage::put_group(&storage, &stored).unwrap();
+    cgka_traits::storage::GroupStorage::put_group_keeping_roster(&storage, &stored).unwrap();
     phone.run_due_maintenance().await.unwrap();
     assert!(
         !roster(&phone, &group)

@@ -4,6 +4,14 @@
 
 ### Breaking changes
 
+- Account migration 0205 adds each group's committed roster (`cgka_committed_rosters`,
+  `cgka_committed_roster_members`) and the account-wide revision counter (`cgka_committed_roster_revision`)
+  (mdk#3273). It seeds no roster, because a stored record can hold a staged commit's projected members; the engine
+  records each group's roster when it next fully hydrates the group. Account schema advances from 204 to 205; older
+  binaries refuse the upgraded database. Downgrade is unsupported.
+- `SqliteAccountStorage` implements `put_group_with_roster`, `put_group_keeping_roster` and `CommittedRosterStorage`.
+  The inherent `put_group` remains for test fixtures, under `test-support` only, and writes the record without a
+  roster.
 - Account migration 0204 drops timeline rows of own sends that failed and were then deleted; such a send no longer
   projects a row. The source rows stay. A deleted send a peer reacted to is delivered instead, also when the reaction
   arrived after the deletion, and keeps its placeholder. Account schema advances from 203 to 204; older binaries

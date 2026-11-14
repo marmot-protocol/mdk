@@ -5794,10 +5794,10 @@ async fn group_evolution_confirms_pending_when_commit_was_partially_exposed() {
 // inbound traffic at all.
 #[tokio::test]
 async fn drain_surfaces_hydration_quarantine_without_inbound_delivery() {
+    use cgka_traits::GroupCapabilities;
     use cgka_traits::engine::GroupHydrationQuarantineReason;
     use cgka_traits::group::Group;
     use cgka_traits::types::{EpochId, GroupId};
-    use cgka_traits::{GroupCapabilities, GroupStorage};
     use storage_sqlite::SqliteAccountStorage;
 
     let dir = relaxed_storage_dir().unwrap();

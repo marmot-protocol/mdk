@@ -3430,6 +3430,15 @@ fn replay_messages_for_canonicalization_result<S: StorageProvider>(
         .collect())
 }
 
+/// Which state of a durable apply a replayed record holds. Only the final
+/// selected state writes the committed roster (mdk#3273 B); the per-commit
+/// records before it share its transaction, so no reader sees them.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReplayedRecord {
+    Intermediate,
+    Final,
+}
+
 // Replay inside the pass or a rewind window reads and writes the record and OpenMLS state it replayed (see clippy.toml).
 #[allow(clippy::disallowed_methods)]
 fn update_group_record_from_replay<S: StorageProvider>(
@@ -3438,6 +3447,7 @@ fn update_group_record_from_replay<S: StorageProvider>(
     output: &OpenMlsReplayOutput,
     current_departures: &BTreeSet<cgka_traits::app_components::DeviceSlotId>,
     final_context: Option<&crate::membership_effects::SiblingSelfRemovalContext>,
+    replayed: ReplayedRecord,
 ) -> Result<(), OpenMlsProjectionError> {
     let mut group = storage.get_group(group_id)?;
     // A restored anchor or checkpoint cannot revive current-membership
@@ -3473,9 +3483,14 @@ fn update_group_record_from_replay<S: StorageProvider>(
         })?;
     }
 
-    storage
-        .put_group(&group)
-        .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))
+    match replayed {
+        ReplayedRecord::Intermediate => storage.put_group_keeping_roster(&group),
+        ReplayedRecord::Final => storage.put_group_with_roster(
+            &group,
+            &cgka_traits::storage::CommittedMembers::of_members(&group.members),
+        ),
+    }
+    .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))
 }
 
 fn required_capabilities_from_group(
@@ -4082,6 +4097,7 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                     &intermediate,
                     &self_removed_slots,
                     None,
+                    ReplayedRecord::Intermediate,
                 )?;
                 retain_current_group_epoch_snapshot(storage, group_id, max_rewind)?;
             }
@@ -4485,6 +4501,7 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                         &intermediate,
                         &self_removed_slots,
                         None,
+                        ReplayedRecord::Intermediate,
                     )?;
                     retain_current_group_epoch_snapshot(
                         storage,
@@ -4609,6 +4626,7 @@ fn process_openmls_messages_inner<S: StorageProvider>(
             &output,
             &self_removed_slots,
             sibling_context,
+            ReplayedRecord::Final,
         )?;
     }
     Ok(output)

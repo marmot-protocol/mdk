@@ -268,7 +268,10 @@ impl<S: StorageProvider> Engine<S> {
                 }
                 g.required_capabilities = required_capabilities_from_group(&mls_group);
                 crate::group_lifecycle::mirror_app_components_into_record(&mls_group, &mut g);
-                storage.put_group(&g)?;
+                storage.put_group_with_roster(
+                    &g,
+                    &cgka_traits::storage::CommittedMembers::of_members(&g.members),
+                )?;
                 if kind == crate::epoch_manager::PendingKind::CreateGroup {
                     storage.put_invitation_admission(
                         &group_id,
@@ -581,7 +584,10 @@ impl<S: StorageProvider> Engine<S> {
                 g.members = crate::group_lifecycle::marmot_members(&mls_group);
                 g.required_capabilities = required_capabilities_from_group(&mls_group);
                 crate::group_lifecycle::mirror_app_components_into_record(&mls_group, &mut g);
-                storage.put_group(&g)?;
+                storage.put_group_with_roster(
+                    &g,
+                    &crate::group_lifecycle::committed_members(&mls_group),
+                )?;
                 if let Some(fanout) = rolled_back_fanout.as_ref() {
                     storage.put_outbound_fanout(fanout)?;
                 }

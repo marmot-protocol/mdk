@@ -4199,7 +4199,7 @@ mod tests {
     fn concurrent_writer_contention_is_retried_not_surfaced() {
         use crate::base::test_support::{gid, mid, sample_group, sample_message};
         use crate::protocol::storage::write_contention::{Release, SharedDatabase};
-        use cgka_traits::storage::{GroupStorage, MessageStorage};
+        use cgka_traits::storage::MessageStorage;
 
         let db = SharedDatabase::new();
         let store = db.open();

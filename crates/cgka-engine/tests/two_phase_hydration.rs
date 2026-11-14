@@ -34,6 +34,7 @@ use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
 use storage_sqlite::SqliteAccountStorage;
 
 mod support;
+use support::committed_roster::checked_committed_roster;
 use support::proof_signer;
 
 fn pad32(name: &[u8]) -> Vec<u8> {
@@ -819,6 +820,53 @@ fn inbound(route: [u8; 32], id: &[u8]) -> TransportMessage {
             transport_group_id: route.to_vec(),
         },
     }
+}
+
+/// Full hydration records the committed roster (mdk#3273 B) of a group
+/// stored before rosters existed, which migration 0205 leaves without one,
+/// and replaces a roster that disagrees with the group's merged membership.
+/// Seeding alone writes none: a stored record can hold a staged commit's
+/// projected members.
+#[tokio::test]
+async fn full_hydration_records_a_missing_committed_roster_and_repairs_a_wrong_one() {
+    use cgka_traits::storage::{CommittedMembers, CommittedRosterStorage};
+    use storage_sqlite::{SqlCipherHardening, SqlCipherKey, open_hardened_sqlcipher};
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("alice.sqlite");
+    let key = SqlCipherKey::raw([0x31; 32]);
+    let storage = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    let mut initial = build_engine(storage.clone());
+    let missing = create_confirmed_group(&mut initial, false).await;
+    let wrong = create_confirmed_group(&mut initial, false).await;
+    let recorded = storage.committed_roster(&wrong).unwrap().unwrap();
+    drop(initial);
+
+    let stranger = CommittedMembers::from_ids([MemberId::new(pad32(b"stranger"))]);
+    storage.put_committed_roster(&wrong, &stranger).unwrap();
+    let wrong_revision = storage.committed_roster_revision(&wrong).unwrap().unwrap();
+    let raw = rusqlite::Connection::open(&path).unwrap();
+    open_hardened_sqlcipher(&raw, &key, SqlCipherHardening::live_cache()).unwrap();
+    raw.execute(
+        "DELETE FROM cgka_committed_rosters WHERE group_id = ?1",
+        [missing.as_slice()],
+    )
+    .unwrap();
+    drop(raw);
+
+    let mut reopened = build_engine(storage.clone());
+    assert_eq!(
+        storage.committed_roster(&missing).unwrap(),
+        None,
+        "seeding a group leaves its roster unknown"
+    );
+    reopened.hydrate_all_stored_groups().expect("hydrate");
+    assert!(reopened.quarantined_groups().is_empty());
+    let backfilled = checked_committed_roster(&reopened, &storage, &missing);
+    assert_eq!(backfilled.members.ids().len(), 1);
+    let repaired = checked_committed_roster(&reopened, &storage, &wrong);
+    assert_eq!(repaired.members, recorded.members);
+    assert!(repaired.revision > wrong_revision);
 }
 
 #[tokio::test]

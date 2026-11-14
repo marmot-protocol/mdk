@@ -903,6 +903,69 @@ impl<S: StorageProvider> Engine<S> {
             .map(crate::conformance_snapshot::ConformanceCanonicalStateSnapshot::Live)
     }
 
+    /// Where `group_id`'s committed roster disagrees with its stored
+    /// committed membership (mdk#3273 B), or `None` when it agrees: the
+    /// differential oracle for every write path that commits membership.
+    ///
+    /// The membership is read from stored state, not from the record a write
+    /// path left: the merged OpenMLS tree, a pending commit's changes
+    /// excluded (the record's members only once the group's lifecycle is
+    /// Disbanded, and a tombstone's former members). A group with no record
+    /// has no roster. A quarantined group is skipped: the app never trusts
+    /// its roster, and its stored state can be a retained anchor's (a failed
+    /// rewind restore) or unreadable. Test-only and read-only; the answer
+    /// names no ids.
+    #[cfg(feature = "test-conformance-snapshot")]
+    pub fn committed_roster_divergence(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<Option<String>, EngineError> {
+        if self.quarantined_reason(group_id).is_some() {
+            return Ok(None);
+        }
+        let roster = self.storage.committed_roster(group_id)?;
+        // The oracle reads the stored state it checks (see clippy.toml).
+        #[allow(clippy::disallowed_methods)]
+        let record = match self.storage.get_group(group_id) {
+            Ok(record) => record,
+            Err(cgka_traits::storage::StorageError::NotFound) => {
+                return Ok(roster.map(|_| "a group with no record holds a committed roster".into()));
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let expected = if let Some(tombstone) = self.storage.disband_tombstone(group_id)? {
+            cgka_traits::storage::CommittedMembers::of_members(&tombstone.former_members)
+        } else {
+            let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
+            #[allow(clippy::disallowed_methods)]
+            let loaded = openmls::group::MlsGroup::load(self.storage.mls_storage(), &mls_gid)
+                .map_err(|error| EngineError::Backend(format!("load: {error:?}")))?;
+            let Some(mls_group) = loaded else {
+                return Ok(Some("group record has no OpenMLS state".into()));
+            };
+            crate::group_lifecycle::committed_membership(&record, &mls_group)
+        };
+        Ok(match roster {
+            None => Some(format!(
+                "no committed roster; committed membership holds {} ids",
+                expected.ids().len()
+            )),
+            Some(roster) if roster.members != expected => Some(format!(
+                "committed roster at revision {} holds {} ids; committed membership holds {} ids, {} in common",
+                roster.revision.0,
+                roster.members.ids().len(),
+                expected.ids().len(),
+                roster
+                    .members
+                    .ids()
+                    .iter()
+                    .filter(|id| expected.ids().contains(id))
+                    .count()
+            )),
+            Some(_) => None,
+        })
+    }
+
     /// Capture aggregate outstanding work for the synthetic conformance
     /// simulator. This is an oracle diagnostic only and never affects engine
     /// scheduling or protocol decisions.
@@ -2166,8 +2229,11 @@ impl<S: StorageProvider> Engine<S> {
             // Same once-only reconciliation as the cheap pass: idempotent if it
             // does replay, and silent once the guard is marked announced.
             let epoch = tombstone.epoch;
+            let former_members =
+                cgka_traits::storage::CommittedMembers::of_members(&tombstone.former_members);
             self.restore_disband_tombstone(group_id.clone(), tombstone)
                 .map_err(|_| GroupHydrationQuarantineReason::GroupRecordLoadFailed)?;
+            self.backfill_committed_roster(group_id, &former_members);
             return Ok(epoch);
         }
 
@@ -2465,7 +2531,7 @@ impl<S: StorageProvider> Engine<S> {
                     group.required_capabilities =
                         crate::capability_manager::required_capabilities_from_group(&mls_group);
                     crate::group_lifecycle::mirror_app_components_into_record(&mls_group, &mut group);
-                    storage.put_group(&group)?;
+                    storage.put_group_with_roster(&group, &crate::group_lifecycle::committed_members(&mls_group))?;
                     Ok::<_, EngineError>(recovered_epoch)
                 })
                 .map_err(|_| GroupHydrationQuarantineReason::PendingCommitRecoveryFailed)?;
@@ -2642,7 +2708,45 @@ impl<S: StorageProvider> Engine<S> {
         {
             self.schedule_pending_convergence_group(group_id);
         }
+        self.backfill_committed_roster(
+            group_id,
+            &crate::group_lifecycle::committed_membership(&group, &mls_group),
+        );
         Ok(group.epoch)
+    }
+
+    /// Make a group full hydration just validated hold `committed` as its
+    /// committed roster (mdk#3273 B), writing nothing when it already does.
+    /// This is the backfill for a group stored before committed rosters
+    /// existed, and it repairs a roster that disagrees with the group's
+    /// committed membership, which no write path should leave.
+    ///
+    /// A failed write leaves the roster as it was and the group live: a
+    /// group with no roster has an unknown membership, which never matches.
+    fn backfill_committed_roster(
+        &self,
+        group_id: &GroupId,
+        committed: &cgka_traits::storage::CommittedMembers,
+    ) {
+        use cgka_traits::storage::CommittedRosterWrite;
+        match self.storage.put_committed_roster(group_id, committed) {
+            Ok(CommittedRosterWrite::Unchanged(_) | CommittedRosterWrite::Recorded(_)) => {}
+            // Privacy-safe: aggregate signal only, no group or member ids
+            // (observability.md).
+            Ok(CommittedRosterWrite::Replaced(_)) => tracing::warn!(
+                target: "cgka_engine::engine",
+                method = "backfill_committed_roster",
+                repaired_rosters = 1_u64,
+                "hydration replaced a committed roster that disagreed with the group's committed membership"
+            ),
+            Err(error) => tracing::warn!(
+                target: "cgka_engine::engine",
+                method = "backfill_committed_roster",
+                error_code = "committed_roster_backfill_failed",
+                transient = error.is_transient(),
+                "hydration could not record the group's committed roster"
+            ),
+        }
     }
 
     /// Restore a prepared/attempted evolution from its exact signed transport

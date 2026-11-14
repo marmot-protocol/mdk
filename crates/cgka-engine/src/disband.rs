@@ -486,7 +486,10 @@ impl<S: StorageProvider> Engine<S> {
                 group.removed = false;
                 group.unrecoverable = false;
                 group.disbanded = Some(tombstone.clone());
-                storage.put_group(&group)?;
+                storage.put_group_with_roster(
+                    &group,
+                    &cgka_traits::storage::CommittedMembers::of_members(&group.members),
+                )?;
                 storage.clear_disband_request(group_id)?;
                 storage.clear_disband_candidates(group_id)?;
                 storage.clear_leave_request(group_id)?;

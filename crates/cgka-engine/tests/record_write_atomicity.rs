@@ -31,12 +31,13 @@ use cgka_traits::message::{MessageRecord, MessageState};
 use cgka_traits::peeler::TransportPeeler;
 use cgka_traits::storage::{
     AccountDeviceHistoryKey, AccountDeviceHistoryKeyStorage, AccountDeviceSignerBinding,
-    AccountDeviceSignerStorage, CapabilityStorage, ConvergencePassStorage,
-    ConvergencePolicyStorage, DeviceGroupWelcomeExpectation, DeviceGroupWelcomeStorage,
-    DisbandCandidate, DisbandCandidateStorage, DisbandRequest, DisbandRequestStorage,
-    DisbandTombstoneStorage, GroupStateCheckpointRef, GroupStorage, KeyPackageBundleStorage,
-    LeaveRequest, LeaveRequestStorage, MemberValidationCacheStorage, MessageStorage,
-    OpenMlsContentFilter, OutboundFanoutStorage, OutboundIntentStorage, QueuedOutboundIntent,
+    AccountDeviceSignerStorage, CapabilityStorage, CommittedMembers, CommittedRoster,
+    CommittedRosterStorage, CommittedRosterWrite, ConvergencePassStorage, ConvergencePolicyStorage,
+    DeviceGroupWelcomeExpectation, DeviceGroupWelcomeStorage, DisbandCandidate,
+    DisbandCandidateStorage, DisbandRequest, DisbandRequestStorage, DisbandTombstoneStorage,
+    GroupStateCheckpointRef, GroupStorage, KeyPackageBundleStorage, LeaveRequest,
+    LeaveRequestStorage, MemberValidationCacheStorage, MessageStorage, OpenMlsContentFilter,
+    OutboundFanoutStorage, OutboundIntentStorage, QueuedOutboundIntent, RosterRevision,
     StorageError, StorageProvider, StorageResult, StoredKeyPackageBundle, WelcomeStorage,
 };
 use cgka_traits::transport::{
@@ -458,6 +459,25 @@ struct FaultStorage {
     message_list_fault: LeaveWriteFault,
 }
 
+impl CommittedRosterStorage for FaultStorage {
+    fn committed_roster(&self, group_id: &GroupId) -> StorageResult<Option<CommittedRoster>> {
+        self.inner.committed_roster(group_id)
+    }
+    fn committed_roster_revision(
+        &self,
+        group_id: &GroupId,
+    ) -> StorageResult<Option<RosterRevision>> {
+        self.inner.committed_roster_revision(group_id)
+    }
+    fn put_committed_roster(
+        &self,
+        group_id: &GroupId,
+        members: &CommittedMembers,
+    ) -> StorageResult<CommittedRosterWrite> {
+        self.inner.put_committed_roster(group_id, members)
+    }
+}
+
 impl GroupStorage for FaultStorage {
     fn invitation_admission(
         &self,
@@ -472,11 +492,21 @@ impl GroupStorage for FaultStorage {
     ) -> StorageResult<()> {
         self.inner.put_invitation_admission(id, admission)
     }
-    fn put_group(&self, group: &Group) -> StorageResult<()> {
+    fn put_group_with_roster(
+        &self,
+        group: &Group,
+        committed: &CommittedMembers,
+    ) -> StorageResult<()> {
         if self.fault.should_fail() {
             return Err(StorageError::Busy("injected put_group failure".into()));
         }
-        self.inner.put_group(group)
+        self.inner.put_group_with_roster(group, committed)
+    }
+    fn put_group_keeping_roster(&self, group: &Group) -> StorageResult<()> {
+        if self.fault.should_fail() {
+            return Err(StorageError::Busy("injected put_group failure".into()));
+        }
+        self.inner.put_group_keeping_roster(group)
     }
     fn get_group(&self, id: &GroupId) -> StorageResult<Group> {
         if self.deferred_release_read_fault.should_fail() {

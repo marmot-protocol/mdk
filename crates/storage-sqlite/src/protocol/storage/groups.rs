@@ -2,7 +2,9 @@ use crate::base::connection::CachedSql;
 use crate::protocol::openmls_storage::mls_group_key;
 use crate::{SqliteAccountStorage, SqliteResultExt, deserialize, epoch_to_i64, serialize};
 use cgka_traits::group::Group;
-use cgka_traits::storage::{GroupStorage, StorageError, StorageResult, TransportGroupRoute};
+use cgka_traits::storage::{
+    CommittedMembers, GroupStorage, StorageError, StorageResult, TransportGroupRoute,
+};
 use cgka_traits::types::{EpochId, GroupId};
 use rusqlite::{OptionalExtension, params};
 
@@ -99,22 +101,23 @@ impl GroupStorage for SqliteAccountStorage {
         Ok(())
     }
 
-    fn put_group(&self, group: &Group) -> StorageResult<()> {
-        self.lock()?
-            .execute_cached(
-                "INSERT INTO cgka_groups (id, epoch, record)
-                 VALUES (?1, ?2, ?3)
-                 ON CONFLICT(id) DO UPDATE SET
-                    epoch = excluded.epoch,
-                    record = excluded.record",
-                params![
-                    group.id.as_slice(),
-                    epoch_to_i64(group.epoch)?,
-                    serialize(group)?
-                ],
-            )
-            .storage()?;
-        Ok(())
+    fn put_group_with_roster(
+        &self,
+        group: &Group,
+        committed: &CommittedMembers,
+    ) -> StorageResult<()> {
+        // Joins a caller's `with_transaction` rather than beginning its own.
+        self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            put_group_record(&conn, group)?;
+            super::committed_rosters::write_committed_roster(&conn, &group.id, committed)?;
+            Ok(())
+        })
+    }
+
+    fn put_group_keeping_roster(&self, group: &Group) -> StorageResult<()> {
+        let conn = self.lock()?;
+        put_group_record(&conn, group)
     }
 
     fn get_group(&self, id: &GroupId) -> StorageResult<Group> {
@@ -195,6 +198,35 @@ impl GroupStorage for SqliteAccountStorage {
     fn delete_transport_group_routes_for_group(&self, group_id: &GroupId) -> StorageResult<()> {
         super::transport_routes::delete_for_group(self, group_id)
     }
+}
+
+impl SqliteAccountStorage {
+    /// Test fixtures: write `group`'s record only, as
+    /// [`GroupStorage::put_group_keeping_roster`] does. It writes no committed
+    /// roster, so a group seeded this way has an unknown membership. Engine
+    /// code is generic over its storage and cannot call this.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn put_group(&self, group: &Group) -> StorageResult<()> {
+        let conn = self.lock()?;
+        put_group_record(&conn, group)
+    }
+}
+
+fn put_group_record(conn: &rusqlite::Connection, group: &Group) -> StorageResult<()> {
+    conn.execute_cached(
+        "INSERT INTO cgka_groups (id, epoch, record)
+         VALUES (?1, ?2, ?3)
+         ON CONFLICT(id) DO UPDATE SET
+            epoch = excluded.epoch,
+            record = excluded.record",
+        params![
+            group.id.as_slice(),
+            epoch_to_i64(group.epoch)?,
+            serialize(group)?
+        ],
+    )
+    .storage()?;
+    Ok(())
 }
 
 /// Runs in the caller's transaction: `delete_group`'s, or the local-forget

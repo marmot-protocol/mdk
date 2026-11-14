@@ -915,7 +915,7 @@ impl<S: StorageProvider> Engine<S> {
             // the previous owner. Hot indexes wait until the pending handoff.
             self.storage.with_transaction(|storage| {
                 // Message/group foreign keys require this row first.
-                storage.put_group(&group_record)?;
+                storage.put_group_with_roster(&group_record, &committed_members(&mls_group))?;
                 if let Ok(transport_group_id) =
                     crate::app_components::transport_group_id_of_group(&mls_group)
                 {
@@ -965,7 +965,7 @@ impl<S: StorageProvider> Engine<S> {
                             // inspecting the staged Add; it is overwritten
                             // with the canonical epoch and roster after the
                             // merge below.
-                            storage.put_group(&group_record)?;
+                            storage.put_group_keeping_roster(&group_record)?;
                             {
                                 let staged = mls_group.pending_commit().ok_or_else(|| {
                                     EngineError::Backend(
@@ -994,7 +994,10 @@ impl<S: StorageProvider> Engine<S> {
                         let mut canonical_record = group_record.clone();
                         canonical_record.epoch = canonical_epoch;
                         canonical_record.members = marmot_members(&mls_group);
-                        storage.put_group(&canonical_record)?;
+                        storage.put_group_with_roster(
+                            &canonical_record,
+                            &committed_members(&mls_group),
+                        )?;
                         storage.put_invitation_admission(
                             &group_id,
                             Some(&cgka_traits::group::InvitationAdmission {
@@ -1979,7 +1982,7 @@ impl<S: StorageProvider> Engine<S> {
             if reset_cutoff.is_some() {
                 storage.complete_group_local_reset(&group_id)?;
             }
-            storage.put_group(&group_record)?;
+            storage.put_group_with_roster(&group_record, &committed_members(&mls_group))?;
             storage.put_invitation_admission(&group_id, admission.as_ref())?;
             crate::roster_tag_keys::record_roster_tag_keys(
                 storage, &group_id, &mls_group, joined_at,
@@ -2522,6 +2525,31 @@ pub(crate) fn compute_validated_tree_marker(
     hasher.update(u16::from(ciphersuite).to_be_bytes());
     hasher.update(&tree_bytes);
     Ok(hasher.finalize().to_vec())
+}
+
+/// The distinct member account ids of `group`'s merged state: OpenMLS's
+/// tree without any pending commit's changes. What a committed roster holds
+/// (mdk#3273 B).
+pub(crate) fn committed_members(group: &MlsGroup) -> cgka_traits::storage::CommittedMembers {
+    cgka_traits::storage::CommittedMembers::of_members(&marmot_members(group))
+}
+
+/// What a group's committed roster holds, given its record and its merged
+/// OpenMLS state: the merged tree's distinct ids, except once the group's
+/// lifecycle is Disbanded and before the disband settles. Then the record's
+/// members are the roster (an own disband's confirmation keeps the members
+/// the disband ended, as `members()` answers them), as they are for the
+/// tombstone that follows.
+pub(crate) fn committed_membership(
+    record: &cgka_traits::group::Group,
+    group: &MlsGroup,
+) -> cgka_traits::storage::CommittedMembers {
+    match crate::app_components::lifecycle_of_group(group) {
+        Ok(Some(cgka_traits::app_components::GroupLifecycleV1::Disbanded)) => {
+            cgka_traits::storage::CommittedMembers::of_members(&record.members)
+        }
+        _ => committed_members(group),
+    }
 }
 
 pub(crate) fn marmot_members(group: &MlsGroup) -> Vec<Member> {

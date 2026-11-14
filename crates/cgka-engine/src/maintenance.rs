@@ -758,7 +758,8 @@ pub(crate) fn rollback_recovery_stage<S: StorageProvider>(
         record.required_capabilities =
             crate::capability_manager::required_capabilities_from_group(&group);
         crate::group_lifecycle::mirror_app_components_into_record(&group, &mut record);
-        storage.put_group(&record)?;
+        storage
+            .put_group_with_roster(&record, &crate::group_lifecycle::committed_members(&group))?;
         if let Some(message_id) = &evolution.signed_message_id {
             match storage.get_message(message_id) {
                 Ok(record) => {

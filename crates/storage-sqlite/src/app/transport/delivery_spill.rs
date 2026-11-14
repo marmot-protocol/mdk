@@ -318,7 +318,6 @@ mod tests {
     use super::*;
     use crate::RecoveryLossCause;
     use crate::base::test_support::{gid, sample_group};
-    use cgka_traits::storage::GroupStorage;
     use cgka_traits::storage::StorageError;
     use cgka_traits::transport::{TransportEnvelope, TransportMessage, TransportSource};
     use cgka_traits::{MemberId, MessageId, TransportDeliveryPlane, TransportDeliverySource};
