@@ -2023,9 +2023,11 @@ async fn startup_never_publishes_an_expired_links_welcome() {
             .is_err(),
         "a maintenance pass waits for initial sync"
     );
-    // Answered during startup, behind the queued pass, so that pass is
-    // deferred before initial sync is released.
-    runtime.quarantined_groups("alice").await.unwrap();
+    // Startup serves this membership page from its snapshot, behind the
+    // queued pass, so that pass is deferred before initial sync is released.
+    // A read answered from the published read state would not queue behind
+    // it (mdk#3273).
+    runtime.group_member_ids_page("alice", &[]).await.unwrap();
     startup.wait().await;
     maintenance.await.unwrap();
     runtime.drain_in_flight_work().await.unwrap();

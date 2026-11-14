@@ -900,9 +900,11 @@ async fn a_due_backup_request_waits_through_startup() {
         .expect("the real worker reaches initial sync");
     let mut completion = Box::pin(runtime.run_due_backup_pass("alice"));
     assert!(futures::poll!(&mut completion).is_pending());
-    // This snapshot reply is behind the request in the actual worker's FIFO:
-    // the backup command is deferred while the startup rendezvous stays held.
-    runtime.quarantined_groups("alice").await.unwrap();
+    // Startup serves this membership page from its snapshot, behind the
+    // request in the actual worker's FIFO: the backup command is deferred
+    // while the startup rendezvous stays held. A read answered from the
+    // published read state would not queue behind it (mdk#3273).
+    runtime.group_member_ids_page("alice", &[]).await.unwrap();
     tokio::time::pause();
     tokio::time::advance(crate::APP_RUNTIME_LOCAL_WORKER_RESPONSE_WAIT + Duration::from_millis(1))
         .await;
