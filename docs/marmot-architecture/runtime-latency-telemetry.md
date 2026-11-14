@@ -158,28 +158,32 @@ Publication success retains the existing required-ack semantics, not recipient d
 
 The `read_queue_r<n>` series follow the read classes of the read-path plan (mdk#3273), sorted
 by what a read needs from the account worker. Reads are named by their `AccountManager` method.
+Reads marked *A* answer from the worker's published read state on the caller's task, so they
+wait for no unit and record in their class's series only when the worker answers them instead:
+before the worker's first publish, or for a published failure that has no exact copy.
 
 | Class | Reads |
 | --- | --- |
 | R1, prepared group images | `prepared_group_image_status`, `prepared_group_images` |
 | R2, device-group history | `chat_history_imports`, `started_fresh`, `history_import_provenance` |
-| R3, durable engine facts | `group_members`, `group_member_ids_page`, `group_conversation_snapshot`, `quarantined_groups`, `group_commit_delivery`, `pending_welcome_deliveries`, `key_package_maintenance_status` and its diagnostic form, `durably_owned_key_packages`, `maintenance_status`, `periodic_maintenance_policy` |
+| R3, durable engine facts | `group_members`, `group_member_ids_page`, `group_conversation_snapshot`, `pending_welcome_deliveries`; from A: `quarantined_groups`, `group_commit_delivery`, `key_package_maintenance_status` and its diagnostic form, `durably_owned_key_packages`, `maintenance_status`, `periodic_maintenance_policy` |
 | R4, facts that need a hydrated group | `group_mls_state` and its diagnostic form, `account_devices_activation`, `group_app_component`, `group_push_debug_info`, the conversation window's authority capture |
 | R5, exporter secrets | `exporter_secret`, `safe_export_secret` |
 | R6, device roster | `linked_devices`, `key_package_refresh_overdue`, `unrecognized_sign_ins`, `compromise_warning`, `removed_device_leftover_chats`, `chats_closed_to_linked_devices`, `backup_history_availability`, `backup_settings` |
-| R7, backup restore | `backup_restore_status`, `watch_backup_restore` |
+| R7, backup restore | from A: `backup_restore_status`, `watch_backup_restore` |
 | R8, media imeta tag | `build_media_imeta_tag` |
 | R9, recovery state | `group_recovery_status`, `history_notices`, `account_recovery_status` |
 
 Startup sync, an explicit catch-up, a scheduled convergence pass, a full-history repair and a
-Welcome fanout answer the members, member-id page, MLS state, roster and quarantine reads from
-the snapshot they took when they started, and answer the authority capture `not_ready`; every
-other read waits until the unit ends. The other units take no command at all: a send awaiting
+Welcome fanout answer the members, member-id page, MLS state and roster reads from the snapshot
+they took when they started, and answer the authority capture `not_ready`; every other read the
+worker answers waits until the unit ends. The other units take no command at all: a send awaiting
 its relays, a host-requested convergence retry, a create or invite until its Welcome fanout, and
 a maintenance tick. While one runs, the account's eight-slot lane fills and later reads wait for
-a slot. `read_queue_behind_convergence` therefore mixes scheduled passes, which answer those five
-reads, with retries, which answer none. `src/runtime/account_worker/tests/read_queue_tests.rs` in
-`marmot-app` pins this for startup sync, a catch-up, a scheduled pass and a send.
+a slot. `read_queue_behind_convergence` therefore mixes scheduled passes, which answer those four
+reads, with retries, which answer none. The reads from A answer through every unit, a full lane
+included. `src/runtime/account_worker/tests/read_queue_tests.rs` in `marmot-app` pins this for
+startup sync, a catch-up, a scheduled pass and a send.
 
 ### Reading account startup stages
 

@@ -16,6 +16,9 @@ use tokio::sync::{mpsc, oneshot};
 
 use super::AccountWorkerCommand;
 use crate::RuntimePerformanceOperation as RuntimeOp;
+use crate::client::read_state::ReadStateReader;
+#[cfg(test)]
+use crate::client::read_state::read_state_channel;
 
 /// The read classes of the read-path plan (mdk#3273, "Which reads, and what
 /// they need"), sorted by what a read needs from the writer.
@@ -140,14 +143,22 @@ impl Drop for WorkerUnitGuard<'_> {
 pub(crate) struct WorkerLane {
     pub(crate) commands: mpsc::Sender<AccountWorkerCommand>,
     unit: Arc<WorkerUnitGauge>,
+    /// The worker's published read state, A, which the account reads answer
+    /// from without a queue wait (mdk#3273).
+    pub(crate) read_state: ReadStateReader,
 }
 
 impl WorkerLane {
     pub(crate) fn new(
         commands: mpsc::Sender<AccountWorkerCommand>,
         unit: Arc<WorkerUnitGauge>,
+        read_state: ReadStateReader,
     ) -> Self {
-        Self { commands, unit }
+        Self {
+            commands,
+            unit,
+            read_state,
+        }
     }
 
     /// The reply half of one host read of `class` on this lane, whose wait
@@ -175,11 +186,12 @@ impl WorkerLane {
     }
 }
 
-/// A test lane for a fake worker: its gauge never leaves idle.
+/// A test lane for a fake worker: its gauge never leaves idle, and it never
+/// publishes A, so every read is sent to it.
 #[cfg(test)]
 impl From<mpsc::Sender<AccountWorkerCommand>> for WorkerLane {
     fn from(commands: mpsc::Sender<AccountWorkerCommand>) -> Self {
-        Self::new(commands, Arc::default())
+        Self::new(commands, Arc::default(), read_state_channel().1)
     }
 }
 
@@ -355,7 +367,7 @@ mod tests {
     fn send_with_ends_the_wait_before_the_answer_runs() {
         let telemetry = PerformanceRecorder::default();
         let (commands, _receiver) = mpsc::channel::<AccountWorkerCommand>(1);
-        let lane = WorkerLane::new(commands, Arc::default());
+        let lane = WorkerLane::from(commands);
         let _unit = lane.unit.enter(WorkerUnit::CatchUp);
         let in_flight = |operation| {
             telemetry
@@ -384,7 +396,7 @@ mod tests {
     fn a_not_ready_answer_to_a_gone_caller_is_cancelled() {
         let telemetry = PerformanceRecorder::default();
         let (commands, _receiver) = mpsc::channel::<AccountWorkerCommand>(1);
-        let lane = WorkerLane::new(commands, Arc::default());
+        let lane = WorkerLane::from(commands);
         let _unit = lane.unit.enter(WorkerUnit::StartupSync);
         let (respond, waiting) = lane.read_reply(&telemetry, ReadClass::R4);
         respond.send_not_ready(()).unwrap();

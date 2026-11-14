@@ -1,10 +1,12 @@
 //! A: the account's published read state (mdk#3273).
 //!
 //! At each quiescent point the account worker publishes an immutable,
-//! versioned copy of the answers that moved host reads will give, behind a
+//! versioned copy of the answers that moved host reads give, behind a
 //! `watch` of `Arc`s. Each answer is computed by today's read code on the
 //! writer at the moment of publishing, so a read that answers from one
-//! version never mixes two states. Nothing reads A yet except tests.
+//! version never mixes two states. The account reads answer from it (PR 3):
+//! a host takes the worker's lane as before, then reads one version through
+//! its [`ReadStateReader`] instead of queueing on the worker.
 //!
 //! Cost: account answers are rebuilt at every publish, except the owned
 //! KeyPackages, whose read re-checks every stored bundle's signatures. That
@@ -15,28 +17,38 @@
 //! send keeps it.
 //! Reuse checks that value alone, so every input of a reused answer must be
 //! either a write those counts see or a field of its validity. App components
-//! are reused while the group's hydrated generation holds. A publish that
-//! finds nothing changed keeps the current version. Writes are counted across
-//! every connection this process has open on the account database; another
-//! process's writes are not, and the root runtime lease keeps other runtimes
-//! off the database while this one runs.
+//! are reused while the group's hydrated generation holds. A publish whose
+//! answers all equal the published ones keeps the current version, rebuilt
+//! group entries included: a rebuild that finds its answers unchanged keeps
+//! the published entry. Writes are counted across every connection this
+//! process has open on the account database; another process's writes are
+//! not, and the root runtime lease keeps other runtimes off the database
+//! while this one runs.
 //!
 //! Each version carries `valid_until`, the earliest time an answer in it can
-//! change with no write. Nothing publishes at that time yet (mdk#3273 PR 3).
+//! change with no write. The worker publishes when it passes
+//! ([`AppClient::read_state_deadline`]); a deadline that passes inside a long
+//! unit is published at that unit's next quiescent point, as a write in it
+//! would be.
 //!
 //! Left out: profiles, which a read attaches at read time, and secrets.
-//! Errors are kept as `Arc<AppError>`: `AppError` is not `Clone`.
+//! Errors are kept as `Arc<AppError>`: `AppError` is not `Clone`. A read
+//! serves an exact copy of a failure it can rebuild ([`reissue`]); any other
+//! published failure is answered by the worker, as before.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use cgka_traits::app_components::AppComponentId;
 use cgka_traits::engine::KeyPackage;
+use cgka_traits::error::EngineError;
 use cgka_traits::group::ProtocolProfile;
 use cgka_traits::types::{GroupId, MemberId};
 use cgka_traits::{
-    GroupMaintenanceStatus, KeyPackageLifecycleState, PeriodicMaintenancePolicy, Timestamp,
+    GroupMaintenanceStatus, KeyPackageLifecycleState, PeriodicMaintenancePolicy, StorageError,
+    Timestamp,
 };
 use marmot_session::{GroupChangeGeneration, GroupMaintenanceRows, WallClockWindow};
 use storage_sqlite::SelfMembership;
@@ -47,7 +59,7 @@ use crate::groups::AppGroupRosterSession;
 use crate::{
     AppError, AppGroupMemberIds, AppGroupMemberRecord, AppGroupMlsState, AppGroupRecord,
     AppPreparedGroupImageUpload, AppPreparedGroupImageUploadState, AppQuarantinedGroup,
-    BackupRestoreStatus, ChatHistoryImport, GroupCommitDelivery,
+    BackupRestoreStatus, BackupRestoreWatch, ChatHistoryImport, GroupCommitDelivery,
 };
 
 const TRACE_TARGET: &str = "marmot_app::read_state";
@@ -68,9 +80,7 @@ pub(crate) struct ReadState {
     /// write: a commit-delivery deadline (on the account's wall clock) or an
     /// owned KeyPackage's lifetime bound (on the system clock OpenMLS checks
     /// lifetimes against). The account's wall clock is that system clock
-    /// except where a test injects one. Nothing publishes at it yet (mdk#3273
-    /// PR 3).
-    #[cfg_attr(not(test), allow(dead_code))] // Read by PR 3.
+    /// except where a test injects one. The worker publishes when it passes.
     pub(crate) valid_until: Option<Timestamp>,
     pub(crate) account: Arc<AccountAnswers>,
     /// One entry per group in the account's group mirror.
@@ -79,17 +89,23 @@ pub(crate) struct ReadState {
 
 /// The per-account answers.
 #[derive(Debug)]
-#[cfg_attr(not(test), allow(dead_code))] // Moved reads answer from A (mdk#3273 PRs 3–5).
 pub(crate) struct AccountAnswers {
     pub(crate) quarantined_groups: Vec<AppQuarantinedGroup>,
     pub(crate) key_package_maintenance_status: ReadAnswer<Option<KeyPackageLifecycleState>>,
     pub(crate) durably_owned_key_packages: ReadAnswer<Vec<KeyPackage>>,
     pub(crate) periodic_maintenance_policy: ReadAnswer<PeriodicMaintenancePolicy>,
+    #[cfg_attr(not(test), allow(dead_code))] // Only the oracle reads it.
     pub(crate) maintenance_paused: bool,
     pub(crate) backup_restore_status: BackupRestoreStatus,
+    /// A receiver of the client's backup-restore progress channel, which
+    /// `WatchBackupRestore` hands out a copy of.
+    pub(crate) backup_restore_updates: watch::Receiver<BackupRestoreStatus>,
     /// With the in-flight upload overlay applied.
+    #[cfg_attr(not(test), allow(dead_code))] // Account reads answer from A (mdk#3273 PR 5).
     pub(crate) prepared_group_images: ReadAnswer<Vec<AppPreparedGroupImageUpload>>,
+    #[cfg_attr(not(test), allow(dead_code))] // Account reads answer from A (mdk#3273 PR 5).
     pub(crate) started_fresh: ReadAnswer<bool>,
+    #[cfg_attr(not(test), allow(dead_code))] // Account reads answer from A (mdk#3273 PR 5).
     pub(crate) chat_history_imports: ReadAnswer<Vec<ChatHistoryImport>>,
 }
 
@@ -104,6 +120,7 @@ impl AccountAnswers {
             periodic_maintenance_policy,
             maintenance_paused,
             backup_restore_status,
+            backup_restore_updates,
             prepared_group_images,
             started_fresh,
             chat_history_imports,
@@ -133,6 +150,7 @@ impl AccountAnswers {
             )
             && *maintenance_paused == other.maintenance_paused
             && *backup_restore_status == other.backup_restore_status
+            && backup_restore_updates.same_channel(&other.backup_restore_updates)
             && same_answer(
                 prepared_group_images,
                 &other.prepared_group_images,
@@ -163,7 +181,6 @@ fn same_answer<T>(
 
 /// The answers for one group in the mirror.
 #[derive(Debug)]
-#[cfg_attr(not(test), allow(dead_code))] // Moved reads answer from A (mdk#3273 PRs 3–5).
 pub(crate) struct GroupAnswers {
     /// The group's mirror record.
     pub(crate) record: AppGroupRecord,
@@ -180,12 +197,37 @@ pub(crate) struct GroupAnswers {
     pub(crate) app_components: ReadAnswer<Vec<(AppComponentId, Vec<u8>)>>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))] // Moved reads answer from A (mdk#3273 PRs 3–5).
+impl GroupAnswers {
+    /// Whether every answer equals `other`'s, failures compared by their
+    /// debug form as the oracle compares them: a rebuilt entry that is the
+    /// same keeps the published one, and the version (mdk#3273 PR 3).
+    fn same_as(&self, other: &Self) -> bool {
+        let Self {
+            record,
+            host_may_see,
+            members,
+            self_membership,
+            mls_state,
+            commit_delivery,
+            maintenance_status,
+            app_components,
+        } = self;
+        *record == other.record
+            && *host_may_see == other.host_may_see
+            && same_answer(members, &other.members, PartialEq::eq)
+            && same_answer(self_membership, &other.self_membership, PartialEq::eq)
+            && same_answer(mls_state, &other.mls_state, PartialEq::eq)
+            && same_answer(commit_delivery, &other.commit_delivery, PartialEq::eq)
+            && same_answer(maintenance_status, &other.maintenance_status, PartialEq::eq)
+            && same_answer(app_components, &other.app_components, PartialEq::eq)
+    }
+}
+
 fn unknown_group(group_id: &GroupId) -> Arc<AppError> {
     Arc::new(AppError::UnknownGroup(hex::encode(group_id.as_slice())))
 }
 
-#[cfg_attr(not(test), allow(dead_code))] // Moved reads answer from A (mdk#3273 PRs 3–5).
+#[cfg_attr(not(test), allow(dead_code))] // Group reads answer from A (mdk#3273 PRs 4–5).
 fn with_profiles(
     members: &[(MemberId, u32)],
     profiles: &HashMap<String, String>,
@@ -206,7 +248,7 @@ fn with_profiles(
 }
 
 /// The answers the moved reads give, from this version alone.
-#[cfg_attr(not(test), allow(dead_code))] // Moved reads answer from A (mdk#3273 PRs 3–5).
+#[cfg_attr(not(test), allow(dead_code))] // Group reads answer from A (mdk#3273 PRs 4–5).
 impl ReadState {
     fn group(&self, group_id: &GroupId) -> ReadAnswer<&GroupAnswers> {
         self.groups
@@ -330,6 +372,163 @@ impl ReadState {
                     "prepared group image upload was not found".into(),
                 ))
             })
+    }
+}
+
+/// The account reads that answer from A (mdk#3273 PR 3), from this version
+/// alone.
+impl ReadState {
+    /// `QuarantinedGroups`.
+    pub(crate) fn quarantined_groups(&self) -> Vec<AppQuarantinedGroup> {
+        self.account.quarantined_groups.clone()
+    }
+
+    /// `KeyPackageMaintenanceStatus`.
+    pub(crate) fn key_package_maintenance_status(
+        &self,
+    ) -> ReadAnswer<Option<KeyPackageLifecycleState>> {
+        self.account.key_package_maintenance_status.clone()
+    }
+
+    /// `DurablyOwnedKeyPackages`.
+    pub(crate) fn durably_owned_key_packages(&self) -> ReadAnswer<Vec<KeyPackage>> {
+        self.account.durably_owned_key_packages.clone()
+    }
+
+    /// `PeriodicMaintenancePolicy`.
+    pub(crate) fn periodic_maintenance_policy(&self) -> ReadAnswer<PeriodicMaintenancePolicy> {
+        self.account.periodic_maintenance_policy.clone()
+    }
+
+    /// `BackupRestoreStatus`.
+    pub(crate) fn backup_restore_status(&self) -> BackupRestoreStatus {
+        self.account.backup_restore_status.clone()
+    }
+
+    /// `WatchBackupRestore`: a new receiver of the client's progress channel
+    /// that has seen its current value, as subscribing to it gives.
+    pub(crate) fn watch_backup_restore(&self) -> BackupRestoreWatch {
+        let mut receiver = self.account.backup_restore_updates.clone();
+        receiver.mark_unchanged();
+        BackupRestoreWatch { receiver }
+    }
+}
+
+/// An exact copy of a published answer for the host, or `None` when it is a
+/// failure [`reissue_error`] cannot copy: the caller then asks the worker.
+pub(crate) fn reissue<T>(answer: ReadAnswer<T>) -> Option<Result<T, AppError>> {
+    match answer {
+        Ok(value) => Some(Ok(value)),
+        Err(error) => reissue_error(&error).map(Err),
+    }
+}
+
+/// An exact copy of `error`, for the failures the moved reads give whose
+/// payloads can be copied: an unknown group in the mirror or the engine, a
+/// group not hydrated yet, and a storage failure, from the app or the engine.
+/// Any other failure (SQLite, I/O, JSON, the rest of the engine's) has no
+/// copy, so it is never rebuilt into a different error.
+pub(crate) fn reissue_error(error: &AppError) -> Option<AppError> {
+    use marmot_session::AccountError;
+    match error {
+        AppError::UnknownGroup(group) => Some(AppError::UnknownGroup(group.clone())),
+        AppError::Storage(storage) => Some(AppError::Storage(storage.clone())),
+        AppError::Account(AccountError::Engine(engine)) => {
+            let engine = match engine {
+                EngineError::UnknownGroup(group) => EngineError::UnknownGroup(group.clone()),
+                EngineError::GroupNotHydrated(group) => {
+                    EngineError::GroupNotHydrated(group.clone())
+                }
+                EngineError::Storage(storage) => EngineError::Storage(storage.clone()),
+                _ => return None,
+            };
+            Some(AppError::Account(AccountError::Engine(engine)))
+        }
+        _ => None,
+    }
+}
+
+/// The failure every moved read gives once account storage is closed.
+fn storage_closed_error() -> AppError {
+    AppError::Storage(StorageError::Closed(
+        "account read state unavailable: app storage is closed".to_owned(),
+    ))
+}
+
+/// A host's handle on one account worker's A, carried by the worker's lane.
+#[derive(Clone, Debug)]
+pub(crate) struct ReadStateReader {
+    receiver: watch::Receiver<Arc<ReadState>>,
+}
+
+/// The worker's half of A's channel, which its publisher sends on.
+pub(crate) struct ReadStateSender(watch::Sender<Arc<ReadState>>);
+
+/// A new channel for one account worker's A, holding the empty version 0
+/// until the worker's first publish.
+pub(crate) fn read_state_channel() -> (ReadStateSender, ReadStateReader) {
+    let (sender, receiver) = watch::channel(Arc::new(ReadState {
+        version: 0,
+        valid_until: None,
+        account: Arc::new(AccountAnswers {
+            quarantined_groups: Vec::new(),
+            key_package_maintenance_status: Ok(None),
+            durably_owned_key_packages: Ok(Vec::new()),
+            periodic_maintenance_policy: Ok(PeriodicMaintenancePolicy::default()),
+            maintenance_paused: false,
+            backup_restore_status: BackupRestoreStatus::default(),
+            backup_restore_updates: watch::channel(BackupRestoreStatus::default()).1,
+            prepared_group_images: Ok(Vec::new()),
+            started_fresh: Ok(false),
+            chat_history_imports: Ok(Vec::new()),
+        }),
+        groups: Arc::new(HashMap::new()),
+    }));
+    (ReadStateSender(sender), ReadStateReader { receiver })
+}
+
+/// A reader whose worker never publishes, so every read is sent to the
+/// worker: for tests that hand-build a worker's lane.
+#[cfg(test)]
+impl Default for ReadStateReader {
+    fn default() -> Self {
+        read_state_channel().1
+    }
+}
+
+impl ReadStateReader {
+    /// A receiver of every version this reader sees, for tests that await
+    /// one.
+    #[cfg(test)]
+    pub(crate) fn subscribe(&self) -> watch::Receiver<Arc<ReadState>> {
+        self.receiver.clone()
+    }
+
+    /// The version a moved read answers from, or `None` before the worker's
+    /// first publish, when the read is sent to the worker. Storage closed is
+    /// checked after the version is taken and before any of its answers is
+    /// read: `close_storage` sets `storage_closed` before it closes any
+    /// database, so a version that holds a closed-storage failure was
+    /// published after the flag, and a check made after taking it sees the
+    /// flag. Checked first, a close starting between the check and the take
+    /// would let a version published across it through, some answers read
+    /// open and some closed. A worker that has exited, its publisher gone,
+    /// answers `TransportClosed`, as a send to its closed lane does.
+    pub(crate) fn version(
+        &self,
+        storage_closed: &AtomicBool,
+    ) -> Result<Option<Arc<ReadState>>, AppError> {
+        let state = Arc::clone(&self.receiver.borrow());
+        if storage_closed.load(Ordering::Acquire) {
+            return Err(storage_closed_error());
+        }
+        if state.version == 0 {
+            return Ok(None);
+        }
+        if self.receiver.has_changed().is_err() {
+            return Err(AppError::TransportClosed);
+        }
+        Ok(Some(state))
     }
 }
 
@@ -520,6 +719,9 @@ pub(crate) struct ReadStatePublisher {
     /// The owned KeyPackage list the last publish read or reused.
     key_packages: Option<(ReadAnswer<Vec<KeyPackage>>, KeyPackagesValidity)>,
     entries: HashMap<GroupId, EntryValidity>,
+    /// The earliest commit-delivery bound among `entries`, on the account's
+    /// wall clock.
+    groups_valid_until: Option<Timestamp>,
     /// Whether any account handle the publish reads was still open when the
     /// last publish began: the oracle's window for a terminal close.
     #[cfg(any(test, feature = "test-support"))]
@@ -539,28 +741,36 @@ pub(crate) struct ReadStatePublisher {
 }
 
 impl ReadStatePublisher {
-    pub(crate) fn new(uploads_in_flight: UploadsInFlight) -> Self {
-        let (sender, _) = watch::channel(Arc::new(ReadState {
-            version: 0,
-            valid_until: None,
-            account: Arc::new(AccountAnswers {
-                quarantined_groups: Vec::new(),
-                key_package_maintenance_status: Ok(None),
-                durably_owned_key_packages: Ok(Vec::new()),
-                periodic_maintenance_policy: Ok(PeriodicMaintenancePolicy::default()),
-                maintenance_paused: false,
-                backup_restore_status: BackupRestoreStatus::default(),
-                prepared_group_images: Ok(Vec::new()),
-                started_fresh: Ok(false),
-                chat_history_imports: Ok(Vec::new()),
-            }),
-            groups: Arc::new(HashMap::new()),
-        }));
+    /// How long until an answer in the published version can change with no
+    /// write, each bound measured on its own clock: KeyPackage lifetimes on
+    /// the system clock, commit-delivery bounds on the account's wall clock.
+    /// Never under a second, the clocks' resolution, so a bound the clock
+    /// does not show as passed yet is waited for rather than spun on.
+    fn deadline(&self, wall_now: Timestamp, system_now: Timestamp) -> Option<Duration> {
+        let remaining = |until: Timestamp, now: Timestamp| until.0.saturating_sub(now.0);
+        let key_packages = self
+            .key_packages
+            .as_ref()
+            .and_then(|(_, validity)| validity.window.until)
+            .map(|until| remaining(until, system_now));
+        let groups = self
+            .groups_valid_until
+            .map(|until| remaining(until, wall_now));
+        let seconds = match (key_packages, groups) {
+            (Some(key_packages), Some(groups)) => key_packages.min(groups),
+            (key_packages, groups) => key_packages.or(groups)?,
+        };
+        Some(Duration::from_secs(seconds.max(1)))
+    }
+
+    pub(crate) fn new(sender: ReadStateSender, uploads_in_flight: UploadsInFlight) -> Self {
+        let ReadStateSender(sender) = sender;
         Self {
             sender,
             uploads_in_flight,
             key_packages: None,
             entries: HashMap::new(),
+            groups_valid_until: None,
             #[cfg(any(test, feature = "test-support"))]
             storage_open_at_publish: true,
             #[cfg(any(test, feature = "test-support"))]
@@ -582,7 +792,7 @@ impl ReadStatePublisher {
         }
     }
 
-    #[cfg_attr(not(test), allow(dead_code))] // Moved reads subscribe (mdk#3273 PR 3).
+    #[cfg(test)]
     pub(crate) fn subscribe(&self) -> watch::Receiver<Arc<ReadState>> {
         self.sender.subscribe()
     }
@@ -656,7 +866,7 @@ impl ReadStatePublisher {
             uploads_in_flight.as_ref(),
             key_packages.clone(),
         );
-        let mut valid_until = key_package_validity.window.until;
+        let key_packages_valid_until = key_package_validity.window.until;
         self.key_packages = Some((key_packages, key_package_validity));
         let account_changed = !account.same_as(&current.account);
         let account = if account_changed {
@@ -665,14 +875,16 @@ impl ReadStatePublisher {
             Arc::clone(&current.account)
         };
 
-        let mirror: Vec<(GroupId, AppGroupRecord)> = client
+        // Borrowed: only a rebuilt entry copies its record (mdk#3273 PR 3
+        // measured the copy at two fifths of an unchanged publish).
+        let mirror: Vec<(GroupId, &AppGroupRecord)> = client
             .state
             .groups
             .iter()
             .filter_map(|record| {
                 hex::decode(&record.group_id_hex)
                     .ok()
-                    .map(|bytes| (GroupId::new(bytes), record.clone()))
+                    .map(|bytes| (GroupId::new(bytes), record))
             })
             .collect();
         let generations = client
@@ -681,21 +893,23 @@ impl ReadStatePublisher {
         let mut groups = HashMap::with_capacity(mirror.len());
         let mut entries = HashMap::with_capacity(mirror.len());
         let mut rebuilt = 0usize;
+        let mut changed = 0usize;
+        let mut groups_valid_until = None;
         // Loaded once, for the first entry rebuilt. A failed load leaves each
         // entry to the per-group reads, so its errors are theirs.
         let mut maintenance_rows = None;
+        let mut earlier_entries = std::mem::take(&mut self.entries);
         for ((group_id, record), generation) in mirror.into_iter().zip(generations) {
-            let earlier = self
-                .entries
-                .get(&group_id)
+            let earlier = earlier_entries
+                .remove(&group_id)
                 .zip(current.groups.get(&group_id));
             let (answers, validity) = match earlier {
                 Some((validity, answers))
-                    if validity.holds(&generation, &record, maintenance_paused, now) =>
+                    if validity.holds(&generation, record, maintenance_paused, now) =>
                 {
-                    (Arc::clone(answers), validity.clone())
+                    (Arc::clone(answers), validity)
                 }
-                _ => {
+                earlier => {
                     rebuilt += 1;
                     let rows = maintenance_rows
                         .get_or_insert_with(|| client.runtime.group_maintenance_rows())
@@ -704,16 +918,28 @@ impl ReadStatePublisher {
                     let (answers, validity) = group_entry(
                         client,
                         &group_id,
-                        record,
+                        record.clone(),
                         generation,
                         maintenance_paused,
-                        earlier,
+                        earlier
+                            .as_ref()
+                            .map(|(validity, answers)| (validity, *answers)),
                         rows,
                     );
-                    (Arc::new(answers), validity)
+                    // A rebuild whose answers are the published ones keeps
+                    // them, and so does not by itself move the version.
+                    match current.groups.get(&group_id) {
+                        Some(published) if answers.same_as(published) => {
+                            (Arc::clone(published), validity)
+                        }
+                        _ => {
+                            changed += 1;
+                            (Arc::new(answers), validity)
+                        }
+                    }
                 }
             };
-            valid_until = earliest(valid_until, validity.window.until);
+            groups_valid_until = earliest(groups_valid_until, validity.window.until);
             entries.insert(group_id.clone(), validity);
             groups.insert(group_id, answers);
         }
@@ -722,7 +948,16 @@ impl ReadStatePublisher {
             .keys()
             .any(|group_id| !groups.contains_key(group_id));
         self.entries = entries;
-        if !account_changed && rebuilt == 0 && !dropped && valid_until == current.valid_until {
+        self.groups_valid_until = groups_valid_until;
+        let valid_until = earliest(key_packages_valid_until, groups_valid_until);
+        // Version 0 is the channel's empty state, never a publish.
+        let first = current.version == 0;
+        if !first
+            && !account_changed
+            && changed == 0
+            && !dropped
+            && valid_until == current.valid_until
+        {
             return false;
         }
         let version = current.version + 1;
@@ -749,6 +984,7 @@ impl ReadStatePublisher {
             key_packages_reused,
             groups = group_count,
             groups_rebuilt = rebuilt,
+            groups_changed = changed,
             elapsed_us = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX),
             "published read state"
         );
@@ -775,6 +1011,7 @@ fn account_answers(
         periodic_maintenance_policy: arc_err(client.periodic_maintenance_policy()),
         maintenance_paused,
         backup_restore_status: client.backup_restore_status(),
+        backup_restore_updates: client.watch_backup_restore().receiver,
         prepared_group_images: arc_err(
             client
                 .prepared_initial_group_images()
@@ -875,11 +1112,25 @@ pub(crate) type ReadStateSlot = Mutex<ReadStatePublisher>;
 impl AppClient {
     /// Start publishing A from this client: the account worker calls this
     /// once, before its first unit.
-    pub(crate) fn start_read_state(&mut self, uploads_in_flight: UploadsInFlight) {
+    pub(crate) fn start_read_state(
+        &mut self,
+        sender: ReadStateSender,
+        uploads_in_flight: UploadsInFlight,
+    ) {
         self.read_state = Some(Box::new(Mutex::new(ReadStatePublisher::new(
+            sender,
             uploads_in_flight,
         ))));
         self.publish_read_state();
+    }
+
+    /// How long until the published version's `valid_until` passes, when it
+    /// has one: the worker publishes then (mdk#3273).
+    pub(crate) fn read_state_deadline(&self) -> Option<Duration> {
+        let slot = self.read_state.as_ref()?;
+        slot.lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .deadline(self.runtime.wall_clock_now(), system_clock_now())
     }
 
     /// Publish A at a quiescent point: the end of a unit, before a reply or
@@ -893,8 +1144,8 @@ impl AppClient {
         let _changed = publisher.publish(self);
         // Every changed publish checks every answer, reused entries included.
         // An unchanged one rebuilt account answers equal to the published
-        // ones and found every group entry's validity holding, so it skips
-        // the full check: the oracle's live reads hydrate on demand, and a
+        // ones and found every group entry holding or rebuilt to its
+        // published answers, so it skips the full check: the oracle's live reads hydrate on demand, and a
         // worker answering a tight poll would spend its time here. A reused
         // KeyPackage list is still checked at every publish: against a fresh
         // read, unless its raw inputs are the ones read before its build and
@@ -1281,6 +1532,13 @@ pub(crate) mod oracle {
             client.backup_restore_status(),
             "read state differs from the live read for backup restore status"
         );
+        assert!(
+            state
+                .account
+                .backup_restore_updates
+                .same_channel(&client.watch_backup_restore().receiver),
+            "read state holds another backup restore channel than the client's"
+        );
         let images = client
             .prepared_initial_group_images()
             .map(|statuses| with_uploads_in_flight(statuses, uploads_in_flight));
@@ -1547,5 +1805,110 @@ mod tests {
     fn a_one_sided_closed_error_without_a_close_in_the_window_is_a_mismatch() {
         assert!(rejects(false, true, Ok(1), Err(closed_storage())));
         assert!(rejects(true, false, Ok(1), Err(closed_storage())));
+    }
+
+    /// A published failure reaches the host as an exact copy, or not at all:
+    /// a failure with no copy is left for the worker to answer.
+    #[test]
+    fn a_reissued_failure_is_an_exact_copy_or_none() {
+        let group = GroupId::new(vec![0x11; 16]);
+        let engine = |error| AppError::Account(AccountError::Engine(error));
+        let copied = [
+            AppError::UnknownGroup("11".to_owned()),
+            AppError::Storage(StorageError::Closed("closed".to_owned())),
+            engine(EngineError::UnknownGroup(group.clone())),
+            engine(EngineError::GroupNotHydrated(group)),
+            closed_storage(),
+        ];
+        for error in copied {
+            let copy = reissue_error(&error).expect("a copyable failure");
+            assert_eq!(format!("{copy:?}"), format!("{error:?}"));
+        }
+        let uncopied = [
+            AppError::Sqlite(rusqlite::Error::InvalidQuery),
+            engine(EngineError::UnknownPending),
+            AppError::TransportClosed,
+        ];
+        for error in uncopied {
+            assert!(reissue_error(&error).is_none(), "{error:?} has no copy");
+        }
+        assert_eq!(reissue::<u8>(Ok(7)).unwrap().unwrap(), 7);
+        assert!(reissue::<u8>(Err(Arc::new(AppError::TransportClosed))).is_none());
+    }
+
+    /// The worker wakes when the first time-bound answer can change, each
+    /// bound measured on its own clock, and never sooner than a second.
+    #[test]
+    fn the_deadline_measures_each_bound_on_its_own_clock() {
+        let (sender, _) = read_state_channel();
+        let mut publisher = ReadStatePublisher::new(sender, UploadsInFlight::default());
+        assert_eq!(publisher.deadline(Timestamp(0), Timestamp(0)), None);
+        publisher.groups_valid_until = Some(Timestamp(1_100));
+        assert_eq!(
+            publisher.deadline(Timestamp(1_000), Timestamp(50_000)),
+            Some(Duration::from_secs(100))
+        );
+        let owned = marmot_session::OwnedKeyPackages {
+            key_packages: Vec::new(),
+            checked_at: Timestamp(50_000),
+            changes_at: Some(Timestamp(50_030)),
+            skipped_undecodable: false,
+            clock_moved: false,
+        };
+        publisher.key_packages = Some(key_package_answer(
+            Ok(owned),
+            Some(1),
+            ProtocolProfile::Current,
+        ));
+        assert_eq!(
+            publisher.deadline(Timestamp(1_000), Timestamp(50_000)),
+            Some(Duration::from_secs(30))
+        );
+        assert_eq!(
+            publisher.deadline(Timestamp(1_100), Timestamp(50_000)),
+            Some(Duration::from_secs(1)),
+            "a bound the clock reached waits a second, not zero"
+        );
+        publisher.groups_valid_until = None;
+        assert_eq!(
+            publisher.deadline(Timestamp(0), Timestamp(50_010)),
+            Some(Duration::from_secs(20))
+        );
+    }
+
+    /// Before the worker's first publish a read is sent to the worker; once
+    /// storage is closed every read answers so, whatever was published; and
+    /// a worker gone answers as its closed lane would.
+    #[test]
+    fn a_reader_answers_from_a_published_version_only() {
+        let open = AtomicBool::new(false);
+        let closed = AtomicBool::new(true);
+        let (ReadStateSender(sender), reader) = read_state_channel();
+        assert!(reader.version(&open).unwrap().is_none());
+        assert!(matches!(
+            reader.version(&closed),
+            Err(AppError::Storage(StorageError::Closed(_)))
+        ));
+        let published = {
+            let empty = reader.receiver.borrow();
+            Arc::new(ReadState {
+                version: 1,
+                valid_until: None,
+                account: Arc::clone(&empty.account),
+                groups: Arc::clone(&empty.groups),
+            })
+        };
+        sender.send_replace(Arc::clone(&published));
+        let state = reader.version(&open).unwrap().unwrap();
+        assert!(Arc::ptr_eq(&state, &published));
+        assert!(matches!(
+            reader.version(&closed),
+            Err(AppError::Storage(StorageError::Closed(_)))
+        ));
+        drop(sender);
+        assert!(matches!(
+            reader.version(&open),
+            Err(AppError::TransportClosed)
+        ));
     }
 }

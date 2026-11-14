@@ -38,7 +38,7 @@ use super::{
     runtime_shutdown_requested, wait_for_runtime_shutdown,
 };
 use crate::client::history_recovery::recovery_runner::host::{SpawnedRunner, next_runner_turn};
-use crate::client::read_state::UploadsInFlight;
+use crate::client::read_state::{ReadStateReader, ReadStateSender, UploadsInFlight};
 use crate::client::{
     CommittedSyncProgress, CompletedWelcomeDeliveryRecovery, EncryptedMediaUploadFinish,
     PreparedGroupImageUploadStart, RetainedSendWake,
@@ -68,6 +68,9 @@ pub(crate) struct ManagedAccountWorker {
     pub(crate) shutdown: oneshot::Sender<()>,
     /// Which long unit the worker is inside, for host-read telemetry.
     pub(crate) unit: Arc<WorkerUnitGauge>,
+    /// The worker's published read state, A, which the account reads
+    /// answer from (mdk#3273).
+    pub(crate) read_state: ReadStateReader,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -79,7 +82,11 @@ enum RelayConfigWork {
 
 impl ManagedAccountWorker {
     pub(crate) fn lane(&self) -> WorkerLane {
-        WorkerLane::new(self.commands.clone(), self.unit.clone())
+        WorkerLane::new(
+            self.commands.clone(),
+            self.unit.clone(),
+            self.read_state.clone(),
+        )
     }
 
     pub(crate) async fn shutdown(self) {
@@ -341,6 +348,8 @@ pub(crate) struct AccountWorkerRuntime {
     pub(crate) unlinked: oneshot::Sender<()>,
     /// The gauge the worker sets while it is inside a long unit.
     pub(crate) unit: Arc<WorkerUnitGauge>,
+    /// The sending half of A, which the client's publisher takes.
+    pub(crate) read_state: ReadStateSender,
 }
 
 pub(crate) enum GroupCreationRequest {
@@ -1153,6 +1162,7 @@ async fn run_app_runtime_account_worker(
         shared,
         unlinked,
         unit,
+        read_state,
     } = runtime;
     let mut lifecycle_shutdown = lifecycle.subscribe_shutdown();
     let mut relay_config_updates = app.presentation_signals.profile_updates.subscribe();
@@ -1215,7 +1225,7 @@ async fn run_app_runtime_account_worker(
     // A, the published read state, starts before readiness: a host that saw
     // the account ready reads at least the opened state (mdk#3273).
     let prepared_group_image_uploads = UploadsInFlight::default();
-    client.start_read_state(prepared_group_image_uploads.clone());
+    client.start_read_state(read_state, prepared_group_image_uploads.clone());
     let mut scheduled_convergence = ScheduledConvergence::with_test_delay(
         convergence_settlement_delay(&app),
         scheduled_convergence_test_delay(&app),
@@ -1909,6 +1919,9 @@ async fn run_app_runtime_account_worker(
                 &group_id,
             );
         }
+        // A changes with no write when a time-bound answer in it expires: wake
+        // then, and the loop top publishes it (mdk#3273).
+        let read_state_deadline = client.read_state_deadline();
         let ready_command = ready_command_index(&pending, &media_http);
         #[cfg(test)]
         tests::secondary_retry_scheduler_tests::record_turn(
@@ -2813,6 +2826,9 @@ async fn run_app_runtime_account_worker(
             // unrelated input; a paced retry wakes the loop when it is due.
             () = admission_retry.wait() => { continue 'worker; }
             _ = tokio::task::yield_now(), if admission_retry.ready() && native_progress => {
+                continue 'worker;
+            }
+            () = sleep(read_state_deadline.unwrap_or_default()), if read_state_deadline.is_some() => {
                 continue 'worker;
             }
             _ = maintenance_tick.tick() => {
@@ -9828,6 +9844,7 @@ mod tests {
         let (events, _) = broadcast::channel(8);
         let (ready, readiness) = oneshot::channel();
         let (shutdown, shutdown_rx) = oneshot::channel();
+        let (read_state_tx, read_state) = crate::client::read_state::read_state_channel();
         let worker = spawn_app_runtime_account_worker(
             AccountWorkerRuntime {
                 app: app.clone(),
@@ -9839,6 +9856,7 @@ mod tests {
                 shared: shared.clone(),
                 unlinked: oneshot::channel().0,
                 unit: Arc::default(),
+                read_state: read_state_tx,
             },
             commands.clone(),
             receiver,
@@ -9857,6 +9875,7 @@ mod tests {
                 shutdown,
                 media_admission: admission.clone(),
                 unit: Default::default(),
+                read_state,
             },
         );
         timeout(Duration::from_secs(5), readiness)

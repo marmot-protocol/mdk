@@ -1148,13 +1148,25 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   window from the one reading its lifetimes are judged at to its next lifetime bound (a listed `not_after` or a
   pending bundle's `not_before`), and the read fully succeeded, with no bundle skipped as undecodable and no lifetime
   check that disagrees with that reading. `ReadState::valid_until` is the earliest window end;
-  a change of it alone publishes a version. A new input of a reused answer must be in its validity or move one of
+  a change of it alone publishes a version, and the worker loop wakes when it passes
+  (`AppClient::read_state_deadline`, each bound on its own clock) and publishes at the loop top. A rebuilt entry
+  whose answers equal the published ones (`GroupAnswers::same_as`, which destructures every field) keeps the
+  published entry and the version. A new input of a reused answer must be in its validity or move one of
   its counts (a new table needs a `storage-sqlite` `cross/group_writes.rs` trigger). In this crate's own tests,
   every publish that changed something, and every reused KeyPackage list, is checked against today's live reads
   (`read_state::oracle`); the only pair let through unequal is one where a terminal storage close landed between
   the publish and the check and one side is that close's `Closed` error. The oracle runs in this crate's unit tests
   and, through the runner's `CARGO_PKG_NAME`, its integration tests; downstream crates' tests link `test-support`
   too (feature unification) and run without it (`oracle::enabled`). Keep its proof in this crate's suites.
+- The account reads in `runtime/commands.rs` that answer from A (`read_from_state`) take the worker lane's
+  admission, then answer from one version on the caller's task: no I/O, no queue wait. The lane carries a
+  `ReadStateReader`, paired with the worker's `ReadStateSender` at spawn. The reader checks
+  `MarmotApp::storage_closed` after taking the version and before reading it (`close_storage` sets the flag before it
+  closes any database), and answers `TransportClosed` once the worker's publisher is gone. A published failure is
+  served only as an exact copy (`read_state::reissue`); one with no copy, and any read before the first publish,
+  goes to the worker's command, which stays as that fallback. A storage read counts its failure as the worker's
+  `respond_diagnosed` would. Moving a read to A moves its row in `read_queue_tests.rs` and in
+  `runtime-latency-telemetry.md`'s "Host read classes"; don't move a multi-device read (mdk#2628) without Jeff.
 
 ## Code map (modules not covered above)
 
@@ -1191,8 +1203,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   `test_support.rs` (test-only gates/helpers).
 - `src/runtime/`: `worker_startup.rs` (per-account startup admission and retry backoff),
   `account_worker/recovery_credits.rs` (process-wide recovery credit pool), `account_worker/read_queue.rs` (host-read
-  queue-wait telemetry: `ReadReply`, the read classes and the worker-unit gauge, mdk#3273; observes only, never
-  reorders), `conversation_window.rs`, `chat_list_window.rs`,
+  queue-wait telemetry: `ReadReply`, the read classes, the worker-unit gauge and the lane's A reader, mdk#3273;
+  observes only, never reorders), `conversation_window.rs`, `chat_list_window.rs`,
   `presentation.rs`, `presented_chat_list.rs`, `account_attention.rs` (presentation windows and account-switcher
   attention), `chat_list_selection.rs` (select-all IDs and revalidation), `user_blocks.rs`, `moderation.rs` (reports, admin labels and operator moderation reports),
   `local_submissions.rs`,

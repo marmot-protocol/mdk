@@ -179,8 +179,22 @@ pub fn durably_owned_key_packages_with_validity<S: StorageProvider>(
 }
 
 /// The owned list with every bundle's lifetime judged at the system-clock
-/// reading `checked_at`, which OpenMLS's own checks may not share.
+/// reading `checked_at`, which OpenMLS's own checks may not share. Its reads
+/// (the issued private KeyPackages, the stored bundles and each bundle's
+/// lookup by reference) share one read snapshot, so a write on another
+/// connection lands wholly before or wholly after the list (mdk#3273).
 fn owned_key_packages_judged_at<S: StorageProvider>(
+    storage: &S,
+    protocol_profile: ProtocolProfile,
+    checked_at: u64,
+) -> Result<OwnedKeyPackages, EngineError> {
+    storage.with_read_snapshot(|storage| {
+        owned_key_packages_in_snapshot(storage, protocol_profile, checked_at)
+    })
+}
+
+/// [`owned_key_packages_judged_at`]'s reads, inside its read snapshot.
+fn owned_key_packages_in_snapshot<S: StorageProvider>(
     storage: &S,
     protocol_profile: ProtocolProfile,
     checked_at: u64,
