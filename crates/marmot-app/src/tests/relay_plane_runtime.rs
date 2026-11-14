@@ -371,20 +371,22 @@ async fn sdk_account_worker_reopens_after_notification_consumer_exit() {
         .relay_plane()
         .simulate_notification_consumer_exit_for_test();
     // The first reconnect waits two seconds plus jitter; later ones double.
+    // A group read answers from the published read state, which outlives the
+    // client, so the probe is a command the worker itself must answer.
     timeout(Duration::from_secs(20), async {
         let mut reconnecting = false;
         loop {
-            match runtime.group_members(&alice.label, &group).await {
-                Ok(_) if reconnecting => break,
-                Ok(_) => {}
+            match crate::worker_fences::worker_round_trip(&runtime, &alice.label).await {
+                Ok(()) if reconnecting => break,
+                Ok(()) => {}
                 Err(crate::AppError::TransportClosed) => reconnecting = true,
-                Err(error) => panic!("unexpected group read error: {error:?}"),
+                Err(error) => panic!("unexpected worker command error: {error:?}"),
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     })
     .await
-    .expect("the reopened worker serves reads again");
+    .expect("the reopened worker serves commands again");
     timeout(Duration::from_secs(30), runtime.catch_up_accounts())
         .await
         .expect("the reopened worker catches up")
@@ -463,9 +465,10 @@ async fn sdk_account_worker_keeps_serving_through_notification_lag() {
     for route in routes {
         assert!(storage.recovery_coverage_goal(&route).unwrap().unwrap() <= since);
     }
+    // A worker command, not a group read: the read state would answer a read
+    // even with the account's transport closed.
     for _ in 0..20 {
-        runtime
-            .group_members(&alice.label, &group)
+        crate::worker_fences::worker_round_trip(&runtime, &alice.label)
             .await
             .expect("a lag never closes the account's transport");
         tokio::time::sleep(Duration::from_millis(50)).await;

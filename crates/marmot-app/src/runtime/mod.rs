@@ -2305,6 +2305,10 @@ impl MarmotAppRuntime {
     /// group left, declined, or not yet accepted brings nobody. Archived
     /// groups do contribute: archival is a presentation choice, not a change
     /// in who you know.
+    ///
+    /// The groups' saved rows and their members come from one version of the
+    /// worker's published read state, so a group whose row was saved since
+    /// that version is not counted until the next one.
     pub async fn group_co_members(&self, account_ref: &str) -> Result<Vec<String>, AppError> {
         self.accounts.group_co_members(account_ref).await
     }
@@ -6085,6 +6089,15 @@ impl MarmotAppRuntime {
             }
             group_ids.push(GroupId::new(bytes));
         }
+        // The candidates are stored rows and their members come from A, so
+        // the read first waits for a version that holds every candidate: a
+        // group whose row committed before the read began, such as a create
+        // still sending its sibling Welcomes or a catch-up between
+        // publishes, then answers its members rather than failing as
+        // unknown, and is never skipped into a miss (mdk#3273 PR 4).
+        self.accounts
+            .wait_for_published_groups(account_ref, &group_ids)
+            .await?;
         let mut memberships = HashMap::new();
         for chunk in group_ids.chunks(crate::MAX_GROUP_MEMBER_IDS_PAGE_SIZE) {
             let page = self
@@ -10264,7 +10277,7 @@ mod tests;
 /// invite you have not accepted is not a relationship yet, and one you left or
 /// were removed from has stopped being one. A group the engine froze cannot
 /// answer for its membership at all.
-fn group_contributes_co_members(group: &AppGroupRecord) -> bool {
+pub(crate) fn group_contributes_co_members(group: &AppGroupRecord) -> bool {
     !group.pending_confirmation
         && !group.unrecoverable
         && matches!(group.self_membership, crate::SelfMembership::Member)

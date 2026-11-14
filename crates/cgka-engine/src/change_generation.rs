@@ -65,6 +65,16 @@ pub struct GroupChangeGeneration {
     pub hydrated: ChangeStamp,
 }
 
+impl GroupChangeGeneration {
+    /// Whether the session-open pass seeded the group without hydrating it,
+    /// as the engine's memory said when this generation was read: its gated
+    /// reads fail with `GroupNotHydrated` until a `&mut` entry point
+    /// hydrates it. A quarantined group does not await hydration.
+    pub fn awaits_hydration(&self) -> bool {
+        self.state.availability == Availability::Unhydrated
+    }
+}
+
 impl<S: StorageProvider> Engine<S> {
     /// The change generation of each group in `group_ids`, in order.
     pub fn group_change_generations<'a>(

@@ -5899,7 +5899,6 @@ typedef struct MarmotAppPerformanceSnapshot {
   struct MarmotAppPerformanceOperationSnapshot account_session_open;
   struct MarmotAppPerformanceOperationSnapshot account_group_hydration;
   struct MarmotAppPerformanceOperationSnapshot account_profile_load;
-  struct MarmotAppPerformanceOperationSnapshot account_group_read_snapshot;
   struct MarmotAppPerformanceOperationSnapshot account_transport_activation;
   struct MarmotAppPerformanceOperationSnapshot account_subscription_registration;
   struct MarmotAppPerformanceOperationSnapshot account_catch_up;

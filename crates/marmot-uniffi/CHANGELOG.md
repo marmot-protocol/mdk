@@ -4,6 +4,11 @@
 
 ### Breaking changes
 
+- `AppPerformanceSnapshotFfi` drops `accountGroupReadSnapshot`: group reads answer
+  from the published read state, so the startup group-read snapshot it timed no longer
+  exists. Remove any read of the field and regenerate Swift and Kotlin bindings with the
+  matching native library. `accountProfileLoad` stays and now times the profile load
+  each member read takes.
 - Remove the legacy v4 whole-file audit upload; v5 OTLP delivery is the only
   remote audit path. Replace `setAuditLogTrackerConfig(AuditLogTrackerConfigV4Ffi)`
   with `setAuditLogSource(AuditLogSourceFfi)`, which takes the same

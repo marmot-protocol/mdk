@@ -1140,7 +1140,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
 - Publish the account read state A (`src/client/read_state.rs`, mdk#3273) before anything leaves the account
   worker. Reply through `reply` or `respond_diagnosed` and send host events through `emit` with
   `Emit::Quiescent`; both publish first. An exit that cannot publish names why: `Emit::Unpublished`,
-  `answer_off_quiescent` or `send_from_snapshot`; capturing a group-read snapshot publishes A first.
+  `answer_off_quiescent` or `send_from_published`; a unit that holds the client publishes A before it starts
+  (`publish_before_unit`), and what it answers meanwhile comes from that version.
   `read_state_tests::every_reply_and_event_leaves_the_worker_through_a_named_exit` fails on a new raw send.
   Every account answer is rebuilt at every publish except the owned-KeyPackage list. That list and each group
   entry are reused only while the typed validity built with them holds, and reuse checks nothing else. A group
@@ -1173,11 +1174,37 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   class. A storage read counts its failure as the worker's
   `respond_diagnosed` would. Moving a read to A moves its row in `read_queue_tests.rs` and in
   `runtime-latency-telemetry.md`'s "Host read classes"; don't move a multi-device read (mdk#2628) without Jeff.
+- The group reads (`read_group_from_state`) answer the same way, with one exception, the hydration request. When the
+  version shows a named group awaiting hydration (`GroupAnswers::awaits_hydration`, only during startup's hydration
+  pipeline), the read sends `HydrateGroups` for those groups and answers from the version the worker acknowledges with
+  (`HydrationAck`), so it waits as long as the worker read did, and only for an unhydrated group. The request takes the
+  queue position of a command accepted at that moment, deferred commands included, so it never runs ahead of an accepted
+  forget: the main loop runs both in order, the hydration phase runs both at their positions (so a forget served there
+  before its group's batch drops the group first; one still queued when that batch starts runs after it), and a unit
+  that holds the client acknowledges it from the version published before the unit when no named group awaits hydration
+  there (`acknowledge_from_published`), else defers it in order. A delete still waits for the hydration phase to end:
+  its route changes need the account active in the transport, which startup sync makes it. A group that quarantined or
+  is gone by then answers `UnknownGroup` from that version.
+- A read that combines groups answers from one version of A, never one joined with live rows. `group_co_members`
+  takes its groups' saved-row standings and members from one version (`ReadState::co_members`), so a group not yet
+  published is not in its radius yet. It judges a group by its saved `account_groups` row alone (`group_standing`),
+  never by the account state's record, which a failed save leaves ahead of the row, so no answer counts a group that
+  a crash after a failed save takes back. Every column the standing reads is in the row's group-write trigger
+  (`cross/group_writes.rs`), so the save that changes it rebuilds the group's entry at the next publish. The
+  direct-conversation lookup's candidates are stored peer-index rows, so before it reads their members from A it waits
+  on the caller's task, within a diagnosed read's wait, for a version that holds every candidate whose stored row
+  remains or lists it quarantined (`AccountManager::wait_for_published_groups`). Every stored group is in the first
+  version published after its row commits: the account state loads every
+  `account_groups` row, rows are inserted only by saving that state, forget and delete drop the row with the group,
+  and `MarmotRootRuntimeLease` keeps any second writer out. The oracle checks at each publish that every stored row
+  is held. A candidate forgotten or deleted since it was read is not waited for, and a wait that runs out fails with
+  `AccountWorkerResponseTimedOut`, never a miss.
 - A read answered from A waits for no worker unit, so it fences nothing. Tests here and in the host crates fence the
   worker through `src/worker_fences.rs` (startup finished, startup sync took the queued commands, a worker round
   trip), never a read they pick; wn-cli's socket tests mirror the startup fence in `wait_for_daemon_worker_startup`.
-  Moving a read to A, or retiring startup's snapshot reads, updates those helpers; `each_fence_waits_for_what_it_names`
-  fails until it does.
+  Moving a read to A, or changing how startup answers it, updates those helpers; `each_fence_waits_for_what_it_names`
+  fails until it does. The account worker's own unit tests fence a held unit with
+  `held_unit_took_queued_commands`, a hydration request that needs none, which a held unit acknowledges in order.
 
 ## Code map (modules not covered above)
 

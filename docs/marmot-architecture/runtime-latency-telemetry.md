@@ -71,7 +71,7 @@ Names below omit `app_runtime_` and the suffix. Durations nest and overlap: **do
 | `send_queue` | Channel admission start to worker execution; includes admission wait, excludes worker acquisition |
 | `send_execution` | Worker-side direct/draft send through completion of publication and projection work |
 | `worker_acquire` | General worker lookup/reconciliation, across callers |
-| `read_queue_r1` … `read_queue_r9` | One per [host read class](#host-read-classes): a host read's wait on its account worker, from just before channel admission until the worker takes it up, answers it from a snapshot, or answers `not_ready` because the current phase cannot serve it. Includes waiting for a channel slot; excludes worker acquisition and the read's own work. A read dropped unanswered, or whose caller has gone when the worker takes it up, ends as cancelled |
+| `read_queue_r1` … `read_queue_r9` | One per [host read class](#host-read-classes): a host read's wait on its account worker, from just before channel admission until the worker takes it up, acknowledges a hydration request from the version published before its unit, or answers `not_ready` because the current phase cannot serve it. Includes waiting for a channel slot; excludes worker acquisition and the read's own work. A read dropped unanswered, or whose caller has gone when the worker takes it up, ends as cancelled |
 | `read_queue_behind_startup_sync`, `read_queue_behind_catch_up`, `read_queue_behind_convergence`, `read_queue_behind_welcome_fanout`, `read_queue_behind_repair`, `read_queue_behind_send`, `read_queue_behind_invite_or_create`, `read_queue_behind_maintenance` | The same wait recorded again for a read that arrived while its worker was inside that unit: startup sync, an explicit catch-up, a convergence pass (scheduled or retried), a Welcome fanout, a full-history repair, a send awaiting its relays, a create or invite including KeyPackage resolution, a periodic maintenance tick. The unit is sampled once, when the read is created, and is the innermost one: a fanout inside a create counts as the fanout |
 | `read_state_publish` | One per new version of an account's published read state (mdk#3273): the account worker rebuilding the answers whose inputs moved and swapping the version in, at the end of a worker unit or on a catch-up drain turn. A check that finds nothing changed records nothing |
 | `lifecycle_lock_wait` | Wait for the account manager's lifecycle transaction lock |
@@ -79,8 +79,7 @@ Names below omit `app_runtime_` and the suffix. Durations nest and overlap: **do
 | `account_startup_retry_suppressed` | Zero-duration completed-only `not_ready` count for each eligible account whose trigger was deferred by the worker-start cooldown |
 | `account_startup_spawned`, `account_startup_open_queued`, `account_startup_account_state`, `account_startup_session_open`, `account_startup_client_restore`, `account_startup_ready_handoff` | One span per pre-ready step a managed account worker enters (mdk#1911): entering the next step ends it as a success, readiness ends `ready_handoff`, a failed open ends the current step as a failure, and an abandoned startup ends it as cancelled. A span current when the worker's ready-wait expired ends as a timeout whenever it ends. Reopens and non-worker opens record none. See [Reading account startup stages](#reading-account-startup-stages) |
 | `worker_hydration` | Nonempty startup hydration pipeline, including command service between slices |
-| `worker_catch_up` | Worker catch-up including the preceding frozen read snapshot and coalescing |
-| `worker_snapshot` | Frozen group read snapshot immediately before catch-up |
+| `worker_catch_up` | Worker catch-up including the read-state publish before it and coalescing |
 | `worker_convergence`, `worker_maintenance` | Selected convergence/periodic maintenance work after no-work/shutdown skip checks; success means branch completed, not that every internally handled sub-operation succeeded |
 | `worker_maintenance_content_backfill`, `worker_maintenance_legacy_promotion`, `worker_maintenance_compaction`, `worker_maintenance_key_package_catch_up`, `worker_maintenance_push`, `worker_maintenance_recovery`, `worker_maintenance_post_join`, `worker_maintenance_due`, `worker_maintenance_history_dispatch` | One span per phase of a periodic maintenance tick, in tick order, nested in `worker_maintenance` (mdk#2923). `key_package_catch_up` runs only when a catch-up is due and ends as a timeout at its 15 s cap. `recovery` ends when a maintenance recovery job starts or settles. `due` covers `run_due_maintenance` including its effects. A phase a tick never reaches records nothing |
 | `worker_maintenance_app_passes`, `worker_maintenance_session`, `worker_maintenance_effects` | The three parts of `worker_maintenance_due`: the app-level passes before session maintenance, session maintenance (`run_due_maintenance_holding`), and the effects tail: its projection checkpoint, the maintenance summary and invite recovery. An early return in the app passes ends that span as cancelled. A host's `RunDueMaintenance` command runs `run_due_maintenance` too, so these three also appear without a `worker_maintenance_due` span around them; compare them with `worker_maintenance_due` only for periodic maintenance |
@@ -160,14 +159,16 @@ The `read_queue_r<n>` series follow the read classes of the read-path plan (mdk#
 by what a read needs from the account worker. Reads are named by their `AccountManager` method.
 Reads marked *A* answer from the worker's published read state on the caller's task, so they
 wait for no unit and record in their class's series only when the worker answers them instead:
-before the worker's first publish, or for a published failure that has no exact copy.
+before the worker's first publish, or for a published failure that has no exact copy. A group
+read from A also records there the wait of its hydration request: one worker command, sent only
+while startup's hydration pipeline has not reached a group the read names.
 
 | Class | Reads |
 | --- | --- |
 | R1, prepared group images | `prepared_group_image_status`, `prepared_group_images` |
 | R2, device-group history | `chat_history_imports`, `started_fresh`, `history_import_provenance` |
-| R3, durable engine facts | `group_members`, `group_member_ids_page`, `group_conversation_snapshot`, `pending_welcome_deliveries`; from A: `quarantined_groups`, `group_commit_delivery`, `key_package_maintenance_status` and its diagnostic form, `durably_owned_key_packages`, `maintenance_status`, `periodic_maintenance_policy` |
-| R4, facts that need a hydrated group | `group_mls_state` and its diagnostic form, `account_devices_activation`, `group_app_component`, `group_push_debug_info`, the conversation window's authority capture |
+| R3, durable engine facts | `pending_welcome_deliveries`; from A: `group_members`, `group_member_ids_page`, `group_conversation_snapshot` (and `group_roster`, built from it), `group_co_members`, `quarantined_groups`, `group_commit_delivery`, `key_package_maintenance_status` and its diagnostic form, `durably_owned_key_packages`, `maintenance_status`, `periodic_maintenance_policy` |
+| R4, facts that need a hydrated group | `account_devices_activation`, `group_push_debug_info`, the conversation window's authority capture; from A: `group_mls_state` and its diagnostic form, `group_app_component` |
 | R5, exporter secrets | `exporter_secret`, `safe_export_secret` |
 | R6, device roster | `linked_devices`, `key_package_refresh_overdue`, `unrecognized_sign_ins`, `compromise_warning`, `removed_device_leftover_chats`, `chats_closed_to_linked_devices`, `backup_history_availability`, `backup_settings` |
 | R7, backup restore | from A: `backup_restore_status`, `watch_backup_restore` |
@@ -175,15 +176,14 @@ before the worker's first publish, or for a published failure that has no exact 
 | R9, recovery state | `group_recovery_status`, `history_notices`, `account_recovery_status` |
 
 Startup sync, an explicit catch-up, a scheduled convergence pass, a full-history repair and a
-Welcome fanout answer the members, member-id page, MLS state and roster reads from the snapshot
-they took when they started, and answer the authority capture `not_ready`; every other read the
-worker answers waits until the unit ends. The other units take no command at all: a send awaiting
-its relays, a host-requested convergence retry, a create or invite until its Welcome fanout, and
-a maintenance tick. While one runs, the account's eight-slot lane fills and later reads wait for
-a slot. `read_queue_behind_convergence` therefore mixes scheduled passes, which answer those four
-reads, with retries, which answer none. The reads from A answer through every unit, a full lane
-included. `src/runtime/account_worker/tests/read_queue_tests.rs` in `marmot-app` pins this for
-startup sync, a catch-up, a scheduled pass and a send.
+Welcome fanout publish the read state before they start. While they run they answer the
+authority capture `not_ready` and acknowledge a hydration request from that version when it
+shows every named group hydrated; every other read the worker answers waits until the unit ends.
+The other units take no command at all: a send awaiting its relays, a host-requested convergence
+retry, a create or invite until its Welcome fanout, and a maintenance tick. While one runs, the
+account's eight-slot lane fills and later reads wait for a slot. The reads from A answer through
+every unit, a full lane included. `src/runtime/account_worker/tests/read_queue_tests.rs` in
+`marmot-app` pins this for startup sync, a catch-up, a scheduled pass and a send.
 
 ### Reading account startup stages
 
