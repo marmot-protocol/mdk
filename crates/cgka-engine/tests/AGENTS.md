@@ -28,7 +28,9 @@ cargo insta review
 SQLCipher's per-allocation memory locking; `sqlite_storage.rs` keeps the encrypted file-backed backend on the same rail.
 
 Snapshot-guard source policy is defined in [`../src/snapshot_guard.rs`](../src/snapshot_guard.rs): `Drop` releases
-after a failed restore unless a committing window had rewound, which keeps the snapshot for the next open (mdk#3272).
+after a failed restore unless a committing window had rewound, which keeps the snapshot for the next open (mdk#3272), or
+unless a contained window ran without atomic group savepoints and no enclosing window's snapshot holds the live state
+(mdk#3278).
 
 **Transport visibility.** The pass-through `MockPeeler` gives every test client perfect cross-branch visibility, which
 production does not have: a real transport seals a group message under the sender's current-epoch exporter secret and
@@ -242,7 +244,10 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     re-join refused, a stored rejoin offer hidden and its confirm refused, ingest retained whatever the anchor record reads, nothing committed), and the next open restores
     the live image and replays the input; a failed rewind and a failed contained restore leave the group live. After a
     failed restore or a crash inside a committing window, an engine reopened without hydration ingests and answers a
-    Welcome on live state, not on an anchor record that reads removed.
+    Welcome on live state, not on an anchor record that reads removed. It also owns mdk#3278 on
+    `FlakyGroupRecordStorage`, which keeps the trait's default transaction and group savepoint: a process killed
+    inside a contained replay leaves one guard snapshot that the next open restores, and a failed contained restore
+    keeps that one copy (alone, refusing a sweep that would overwrite it) or leaves it to the enclosing pass.
 
   Historical context capture on SQLite is contained: a restore failure rolls back exact native/group state and
   leaves the group live. The same owner coordinates a foreign writer through SQLite's busy handler, then checks

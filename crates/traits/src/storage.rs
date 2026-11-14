@@ -1496,7 +1496,8 @@ pub trait StorageProvider:
     /// the group's stored history. On a backend without transactions that
     /// snapshot survives a crash inside `f`, so callers choose a name their
     /// recovery can find and restore. SQLite overrides this with a `SAVEPOINT`,
-    /// whose cost does not grow with history and which writes no snapshot.
+    /// whose cost does not grow with history and which writes no snapshot
+    /// (see [`Self::has_atomic_group_savepoints`]).
     fn with_group_savepoint<T, E, F>(
         &self,
         group_id: &GroupId,
@@ -1509,6 +1510,20 @@ pub trait StorageProvider:
         F: FnOnce(&Self) -> Result<T, E>,
     {
         with_group_snapshot_rollback(self, group_id, fallback_snapshot, f)
+    }
+
+    /// Whether [`Self::with_group_savepoint`] is a real savepoint: it writes
+    /// no snapshot, and a crash inside `f` leaves none of `f`'s writes. The
+    /// default snapshot fallback is neither, so this is `false` unless a
+    /// backend overrides `with_group_savepoint` with a savepoint, as SQLite
+    /// does, and overrides this with it.
+    ///
+    /// A caller that keeps its own snapshot for crash recovery reads this.
+    /// Without atomic savepoints, wrapping its work in `with_group_savepoint`
+    /// would leave the fallback's snapshot beside its own after a crash, so it
+    /// runs the work outside one, on its own snapshot alone.
+    fn has_atomic_group_savepoints(&self) -> bool {
+        false
     }
 
     /// Roll `group_id`'s canonical state back to the snapshot `name` and leave

@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Added
+
+- `StorageProvider::has_atomic_group_savepoints` says whether `with_group_savepoint` is a real savepoint, which writes
+  no snapshot and leaves none of its unit's writes after a crash (mdk#3278). It defaults to `false`, matching the
+  snapshot fallback, so existing providers build unchanged; a provider that overrides `with_group_savepoint` with a
+  savepoint overrides this too.
+
 ### Changed
 
 - Pin an independently calculated NIP-01 digest for empty tags and content, including lowercase hex output (mdk#3383).

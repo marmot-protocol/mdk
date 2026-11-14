@@ -117,6 +117,10 @@ impl StorageProvider for SqliteAccountStorage {
         self.connection.with_savepoint(|| f(self))
     }
 
+    fn has_atomic_group_savepoints(&self) -> bool {
+        true
+    }
+
     fn rollback_group_state_keeping_live_records(
         &self,
         group_id: &cgka_traits::types::GroupId,

@@ -2886,9 +2886,10 @@ impl<S: StorageProvider> Engine<S> {
             })
         };
         if self.storage.past_peel_context_generation().is_none() {
-            // The generic savepoint fallback commits a second undo snapshot.
-            // Keep the existing recoverable committing window on backends that
-            // have not opted into atomic capture, and never cache its result.
+            // Without the generation no cached context can be validated, so
+            // never cache this one. Run it in a committing window, whose
+            // failed restore quarantines the group for the session; a
+            // contained one on a backend without atomic savepoints would not.
             if let Some(cache) = cache {
                 cache.synchronize_generation(None)?;
             }

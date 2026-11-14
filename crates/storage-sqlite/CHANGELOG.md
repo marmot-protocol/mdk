@@ -32,6 +32,8 @@
 - `SqliteAppStorage::arm_due_recovery_probes(now)` gives every broken unit without a probe whose next probe time has
   passed a probe, so its debt includes its park again; `pending_recovery_probes()` lists the broken units still
   waiting for one.
+- `SqliteAccountStorage` reports `has_atomic_group_savepoints` (mdk#3278), so the engine keeps running contained
+  rewind windows inside its `SAVEPOINT`, as before.
 
 ### Fixed
 

@@ -2532,6 +2532,10 @@ impl StorageProvider for FaultStorage {
             .with_group_savepoint(group_id, fallback_snapshot, |_inner| f(self))
     }
 
+    fn has_atomic_group_savepoints(&self) -> bool {
+        self.inner.has_atomic_group_savepoints()
+    }
+
     fn backend(&self) -> Backend {
         self.inner.backend()
     }
