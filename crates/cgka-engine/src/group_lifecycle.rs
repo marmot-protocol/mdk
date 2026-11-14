@@ -2537,9 +2537,9 @@ pub(crate) fn committed_members(group: &MlsGroup) -> cgka_traits::storage::Commi
 /// What a group's committed roster holds, given its record and its merged
 /// OpenMLS state: the merged tree's distinct ids, except once the group's
 /// lifecycle is Disbanded and before the disband settles. Then the record's
-/// members are the roster (an own disband's confirmation keeps the members
-/// the disband ended, as `members()` answers them), as they are for the
-/// tombstone that follows.
+/// members are the roster (an own disband's confirmation and a canonical
+/// apply that merges one both keep the members the disband ended, as
+/// `members()` answers them), as they are for the tombstone that follows.
 pub(crate) fn committed_membership(
     record: &cgka_traits::group::Group,
     group: &MlsGroup,

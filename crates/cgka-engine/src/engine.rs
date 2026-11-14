@@ -2229,11 +2229,14 @@ impl<S: StorageProvider> Engine<S> {
             // Same once-only reconciliation as the cheap pass: idempotent if it
             // does replay, and silent once the guard is marked announced.
             let epoch = tombstone.epoch;
-            let former_members =
-                cgka_traits::storage::CommittedMembers::of_members(&tombstone.former_members);
+            // Before the restore, which may replay `GroupDisbanded`: a roster
+            // that fails closed quarantines a group nothing has announced.
+            self.backfill_committed_roster(
+                group_id,
+                &cgka_traits::storage::CommittedMembers::of_members(&tombstone.former_members),
+            )?;
             self.restore_disband_tombstone(group_id.clone(), tombstone)
                 .map_err(|_| GroupHydrationQuarantineReason::GroupRecordLoadFailed)?;
-            self.backfill_committed_roster(group_id, &former_members);
             return Ok(epoch);
         }
 
@@ -2592,6 +2595,13 @@ impl<S: StorageProvider> Engine<S> {
         let has_deferred_peels = stored_message_records
             .iter()
             .any(|record| record.state == MessageState::PeelDeferred);
+        // The record and MLS state are final here, and nothing below changes
+        // their membership; the roster can still fail closed before any
+        // recovered state is exposed.
+        self.backfill_committed_roster(
+            group_id,
+            &crate::group_lifecycle::committed_membership(&group, &mls_group),
+        )?;
 
         // Same distinction the cheap pass draws: promoting a copy this device
         // was removed from is not a live group's promotion. The `unrecoverable`
@@ -2708,10 +2718,6 @@ impl<S: StorageProvider> Engine<S> {
         {
             self.schedule_pending_convergence_group(group_id);
         }
-        self.backfill_committed_roster(
-            group_id,
-            &crate::group_lifecycle::committed_membership(&group, &mls_group),
-        );
         Ok(group.epoch)
     }
 
@@ -2721,31 +2727,56 @@ impl<S: StorageProvider> Engine<S> {
     /// existed, and it repairs a roster that disagrees with the group's
     /// committed membership, which no write path should leave.
     ///
-    /// A failed write leaves the roster as it was and the group live: a
-    /// group with no roster has an unknown membership, which never matches.
+    /// A roster the write cannot record stays missing, an unknown membership
+    /// that never matches a recorded revision, so the group stays live. A
+    /// wrong roster the write cannot replace, or one that cannot be read,
+    /// would stay readable as committed, so the group fails closed: hydration
+    /// quarantines it, and the next open tries again.
     fn backfill_committed_roster(
         &self,
         group_id: &GroupId,
         committed: &cgka_traits::storage::CommittedMembers,
-    ) {
+    ) -> Result<(), GroupHydrationQuarantineReason> {
         use cgka_traits::storage::CommittedRosterWrite;
+        let stored = self
+            .storage
+            .committed_roster(group_id)
+            .map_err(|_| GroupHydrationQuarantineReason::GroupRecordLoadFailed)?;
+        if stored
+            .as_ref()
+            .is_some_and(|roster| &roster.members == committed)
+        {
+            return Ok(());
+        }
         match self.storage.put_committed_roster(group_id, committed) {
-            Ok(CommittedRosterWrite::Unchanged(_) | CommittedRosterWrite::Recorded(_)) => {}
-            // Privacy-safe: aggregate signal only, no group or member ids
-            // (observability.md).
-            Ok(CommittedRosterWrite::Replaced(_)) => tracing::warn!(
-                target: "cgka_engine::engine",
-                method = "backfill_committed_roster",
-                repaired_rosters = 1_u64,
-                "hydration replaced a committed roster that disagreed with the group's committed membership"
-            ),
-            Err(error) => tracing::warn!(
-                target: "cgka_engine::engine",
-                method = "backfill_committed_roster",
-                error_code = "committed_roster_backfill_failed",
-                transient = error.is_transient(),
-                "hydration could not record the group's committed roster"
-            ),
+            Ok(CommittedRosterWrite::Unchanged(_) | CommittedRosterWrite::Recorded(_)) => Ok(()),
+            Ok(CommittedRosterWrite::Replaced(_)) => {
+                // Privacy-safe: aggregate signal only, no group or member ids
+                // (observability.md).
+                tracing::warn!(
+                    target: "cgka_engine::engine",
+                    method = "backfill_committed_roster",
+                    repaired_rosters = 1_u64,
+                    "hydration replaced a committed roster that disagreed with the group's committed membership"
+                );
+                Ok(())
+            }
+            Err(error) => {
+                let wrong_roster_kept = stored.is_some();
+                tracing::warn!(
+                    target: "cgka_engine::engine",
+                    method = "backfill_committed_roster",
+                    error_code = "committed_roster_backfill_failed",
+                    transient = error.is_transient(),
+                    wrong_roster_kept,
+                    "hydration could not record the group's committed roster"
+                );
+                if wrong_roster_kept {
+                    Err(GroupHydrationQuarantineReason::GroupRecordLoadFailed)
+                } else {
+                    Ok(())
+                }
+            }
         }
     }
 

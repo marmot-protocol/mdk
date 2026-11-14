@@ -14,15 +14,18 @@ use std::collections::BTreeSet;
 
 impl CommittedRosterStorage for SqliteAccountStorage {
     fn committed_roster(&self, group_id: &GroupId) -> StorageResult<Option<CommittedRoster>> {
-        let conn = self.lock()?;
-        let Some(revision) = revision_on(&conn, group_id)? else {
-            return Ok(None);
-        };
-        let members = members_on(&conn, group_id)?;
-        Ok(Some(CommittedRoster {
-            revision,
-            members: CommittedMembers::from_ids(members.into_iter().map(MemberId::new)),
-        }))
+        // One snapshot, so another connection's write between the two
+        // queries never pairs one roster's revision with another's members.
+        self.connection.with_deferred_read(|conn| {
+            let Some(revision) = revision_on(conn, group_id)? else {
+                return Ok(None);
+            };
+            let members = members_on(conn, group_id)?;
+            Ok(Some(CommittedRoster {
+                revision,
+                members: CommittedMembers::from_ids(members.into_iter().map(MemberId::new)),
+            }))
+        })
     }
 
     fn committed_roster_revision(
@@ -306,5 +309,65 @@ mod tests {
             Err(StorageError::NotFound)
         ));
         assert_eq!(store.committed_roster(&group.id).unwrap(), None);
+    }
+
+    thread_local! {
+        static AFTER_REVISION_READ: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// A roster read takes its revision and its members from one snapshot: a
+    /// write another connection commits between the two queries never pairs
+    /// one roster's revision with another's members.
+    #[test]
+    fn a_roster_read_takes_its_revision_and_members_from_one_snapshot() {
+        use crate::SqlCipherKey;
+        use rusqlite::trace::{TraceEvent, TraceEventCodes};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rosters.sqlite");
+        let key = SqlCipherKey::raw([0x52; 32]);
+        let reader = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+        let writer = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+        let group = sample_group(gid(1), 1, 2);
+        reader
+            .put_group_with_roster(&group, &CommittedMembers::of_members(&group.members))
+            .unwrap();
+        let before = reader.committed_roster(&group.id).unwrap().unwrap();
+
+        let group_id = group.id.clone();
+        AFTER_REVISION_READ.set(Some(Box::new(move || {
+            writer
+                .put_committed_roster(&group_id, &members(&[0, 9]))
+                .unwrap();
+        })));
+        reader.lock().unwrap().trace_v2(
+            TraceEventCodes::SQLITE_TRACE_PROFILE,
+            Some(|event| {
+                if let TraceEvent::Profile(statement, _) = event
+                    && statement.sql().contains("FROM cgka_committed_rosters")
+                    && let Some(write) = AFTER_REVISION_READ.take()
+                {
+                    write();
+                }
+            }),
+        );
+        let during = reader.committed_roster(&group.id).unwrap().unwrap();
+        reader
+            .lock()
+            .unwrap()
+            .trace_v2(TraceEventCodes::empty(), None);
+        assert!(
+            AFTER_REVISION_READ.with_borrow(Option::is_none),
+            "the concurrent writer never ran"
+        );
+
+        assert_eq!(
+            during, before,
+            "one snapshot holds the revision and its members"
+        );
+        let after = reader.committed_roster(&group.id).unwrap().unwrap();
+        assert_eq!(after.members, members(&[0, 9]));
+        assert!(after.revision > before.revision);
     }
 }

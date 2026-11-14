@@ -826,7 +826,9 @@ fn inbound(route: [u8; 32], id: &[u8]) -> TransportMessage {
 /// stored before rosters existed, which migration 0205 leaves without one,
 /// and replaces a roster that disagrees with the group's merged membership.
 /// Seeding alone writes none: a stored record can hold a staged commit's
-/// projected members.
+/// projected members. When the write fails, a missing roster stays missing
+/// and its group live, while a wrong one quarantines its group until an open
+/// can replace it.
 #[tokio::test]
 async fn full_hydration_records_a_missing_committed_roster_and_repairs_a_wrong_one() {
     use cgka_traits::storage::{CommittedMembers, CommittedRosterStorage};
@@ -852,14 +854,44 @@ async fn full_hydration_records_a_missing_committed_roster_and_repairs_a_wrong_o
         [missing.as_slice()],
     )
     .unwrap();
-    drop(raw);
+    raw.execute_batch(
+        "CREATE TRIGGER refuse_roster_member BEFORE INSERT ON cgka_committed_roster_members
+         BEGIN SELECT RAISE(ABORT, 'roster member refused'); END;",
+    )
+    .unwrap();
 
-    let mut reopened = build_engine(storage.clone());
+    let mut refused = build_engine(storage.clone());
     assert_eq!(
         storage.committed_roster(&missing).unwrap(),
         None,
         "seeding a group leaves its roster unknown"
     );
+    refused.hydrate_all_stored_groups().expect("hydrate");
+    assert_eq!(
+        refused.quarantined_groups(),
+        vec![(
+            wrong.clone(),
+            GroupHydrationQuarantineReason::GroupRecordLoadFailed
+        )],
+        "a wrong roster hydration cannot replace fails its group closed"
+    );
+    assert_eq!(storage.committed_roster(&missing).unwrap(), None);
+    refused
+        .members(&missing)
+        .expect("an unknown roster leaves its group live");
+    assert_eq!(
+        storage
+            .committed_roster(&wrong)
+            .unwrap()
+            .map(|roster| roster.revision),
+        Some(wrong_revision)
+    );
+    drop(refused);
+    raw.execute_batch("DROP TRIGGER refuse_roster_member;")
+        .unwrap();
+    drop(raw);
+
+    let mut reopened = build_engine(storage.clone());
     reopened.hydrate_all_stored_groups().expect("hydrate");
     assert!(reopened.quarantined_groups().is_empty());
     let backfilled = checked_committed_roster(&reopened, &storage, &missing);

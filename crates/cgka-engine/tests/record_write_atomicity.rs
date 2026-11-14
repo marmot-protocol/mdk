@@ -4949,6 +4949,8 @@ async fn disband_cleanup_failure_preserves_earlier_canonical_activity_once() {
     };
     bob.join_welcome(welcomes.remove(0)).await.unwrap();
     bob.drain_events();
+    let joined = handle.committed_roster(&group_id).unwrap().unwrap();
+    assert_eq!(joined.members.ids().len(), 2);
     let SendResult::GroupEvolution {
         msg: mut rename,
         pending,
@@ -5002,6 +5004,13 @@ async fn disband_cleanup_failure_preserves_earlier_canonical_activity_once() {
     assert!(format!("{error:?}").contains("injected termination cleanup failure"));
     assert!(handle.disband_tombstone(&group_id).unwrap().is_none());
     assert!(handle.get_group(&group_id).unwrap().disbanded.is_none());
+    // The apply committed before the settle failed: the roster holds the
+    // members the disband ended, as the disbander's own confirmation keeps
+    // them, never the committer alone.
+    assert_eq!(
+        handle.committed_roster(&group_id).unwrap().as_ref(),
+        Some(&joined)
+    );
     let prefix = bob.drain_events();
     let activity: Vec<_> = prefix
         .iter()
@@ -5035,6 +5044,10 @@ async fn disband_cleanup_failure_preserves_earlier_canonical_activity_once() {
     bob.converge_stored_openmls_messages_at(&group_id, 3_000_000)
         .unwrap();
     assert!(handle.disband_tombstone(&group_id).unwrap().is_some());
+    assert_eq!(
+        handle.committed_roster(&group_id).unwrap().as_ref(),
+        Some(&joined)
+    );
     let suffix = bob.drain_events();
     let changes: Vec<_> = suffix
         .iter()

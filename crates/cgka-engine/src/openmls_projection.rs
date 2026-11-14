@@ -3456,7 +3456,6 @@ fn update_group_record_from_replay<S: StorageProvider>(
         .self_removed_sibling_slots
         .clone_from(current_departures);
     group.epoch = EpochId(output.final_epoch);
-    group.members = output.final_members.clone();
 
     // The replay just merged any GCE/AppData commits on the canonical path, so
     // the live MlsGroup carries the post-canonical RequiredCapabilities and
@@ -3466,9 +3465,23 @@ fn update_group_record_from_replay<S: StorageProvider>(
     let crypto = RustCrypto::default();
     let provider = EngineOpenMlsProvider::<S>::new(&crypto, storage.mls_storage());
     let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
-    if let Some(mls_group) = MlsGroup::load(provider.storage(), &mls_gid)
-        .map_err(|e| OpenMlsProjectionError::Storage(format!("load post-replay group: {e:?}")))?
-    {
+    let mls_group = MlsGroup::load(provider.storage(), &mls_gid)
+        .map_err(|e| OpenMlsProjectionError::Storage(format!("load post-replay group: {e:?}")))?;
+    // A disband's merge leaves only its committer in the tree. Its record
+    // keeps the members it ended until the disband settles, as an own
+    // disband's confirmation does, so the committed roster holds them too.
+    let disbanded = match &mls_group {
+        Some(mls_group) => {
+            crate::app_components::lifecycle_of_group(mls_group)
+                .map_err(|error| OpenMlsProjectionError::Replay(error.to_string()))?
+                == Some(cgka_traits::app_components::GroupLifecycleV1::Disbanded)
+        }
+        None => false,
+    };
+    if !disbanded {
+        group.members = output.final_members.clone();
+    }
+    if let Some(mls_group) = mls_group {
         group.required_capabilities = required_capabilities_from_group(&mls_group);
         crate::group_lifecycle::mirror_app_components_into_record(&mls_group, &mut group);
         // Intermediate retained anchors keep the accumulator intact; only the
