@@ -549,6 +549,14 @@ async fn download_without_engine_and_retain(
         }
     });
     let dir = tempfile::tempdir().unwrap();
+    // Room for concurrent transfers, so only explicit work runs alone.
+    crate::media::attachment_resume::test_free_space::set(dir.path(), 1 << 40);
+    // An explicit download runs alone, holding every global permit.
+    let held = if explicit {
+        crate::runtime::ATTACHMENT_TRANSFER_LIMIT
+    } else {
+        1
+    };
     AccountHome::open(dir.path())
         .create_account("alice")
         .unwrap();
@@ -744,7 +752,7 @@ async fn download_without_engine_and_retain(
     schedule(&client, &shared, &http, &mut admission).unwrap();
     assert_eq!(
         shared.attachment_transfer.available_permits(),
-        crate::runtime::ATTACHMENT_TRANSFER_LIMIT - 1
+        crate::runtime::ATTACHMENT_TRANSFER_LIMIT - held
     );
     assert_eq!(http.permits.available_permits(), 3);
     let done = tokio::time::timeout(Duration::from_secs(5), completions.recv())
@@ -753,7 +761,7 @@ async fn download_without_engine_and_retain(
         .unwrap();
     assert_eq!(
         shared.attachment_transfer.available_permits(),
-        crate::runtime::ATTACHMENT_TRANSFER_LIMIT - 1,
+        crate::runtime::ATTACHMENT_TRANSFER_LIMIT - held,
         "queued plaintext still owns global capacity"
     );
     let asset = match &done.completion {
@@ -832,6 +840,7 @@ async fn download_without_engine_and_retain(
         served_body_bytes.load(std::sync::atomic::Ordering::SeqCst),
         expected_body_bytes,
     );
+    crate::media::attachment_resume::test_free_space::clear(dir.path());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
