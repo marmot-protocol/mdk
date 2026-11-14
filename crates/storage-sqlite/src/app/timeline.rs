@@ -1946,13 +1946,15 @@ pub(crate) fn discard_failed_send_tx(
         mention_classifier,
     )?;
     let messages = timeline_records_by_ids_tx(tx, group_id_hex, affected_message_ids)?;
-    let mut changes = timeline_changes_for_invalidation(
-        &event.message_id_hex,
-        event.kind,
-        &event.tags,
-        &before,
-        &messages,
-    );
+    let cause = InvalidationEvents {
+        primary: InvalidationEvent {
+            message_id_hex: &event.message_id_hex,
+            kind: event.kind,
+            tags: &event.tags,
+        },
+        others: Vec::new(),
+    };
+    let mut changes = timeline_changes_for_invalidation(|_| Some(&cause), &before, &messages);
     for change in &mut changes {
         if let TimelineMessageChange::Remove { reason, .. } = change {
             *reason = TimelineRemoveReason::Cleared;
