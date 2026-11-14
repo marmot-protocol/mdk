@@ -9,24 +9,24 @@
   "rows": [
     {
       "members": 2,
-      "mls_welcome_bytes": 1469,
-      "rumor_json_bytes": 2272,
+      "mls_welcome_bytes": 1433,
+      "rumor_json_bytes": 2224,
       "seal_json_bytes": 3847,
       "gift_wrap_json_bytes": 5969,
       "gift_wrap_size_class": "under_64_kib"
     },
     {
       "members": 40,
-      "mls_welcome_bytes": 21265,
-      "rumor_json_bytes": 28668,
+      "mls_welcome_bytes": 21229,
+      "rumor_json_bytes": 28620,
       "seal_json_bytes": 38663,
       "gift_wrap_json_bytes": 55121,
       "gift_wrap_size_class": "under_64_kib"
     },
     {
       "members": 41,
-      "mls_welcome_bytes": 21777,
-      "rumor_json_bytes": 29348,
+      "mls_welcome_bytes": 21741,
+      "rumor_json_bytes": 29300,
       "seal_json_bytes": 44123,
       "gift_wrap_json_bytes": 66045,
       "gift_wrap_size_class": "from_64_to_128_kib"
