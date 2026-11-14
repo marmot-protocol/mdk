@@ -10,6 +10,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use cgka_traits::GroupId;
+use marmot_session::ChangeStamp;
 use storage_sqlite::{
     ParkedRecoveryObligation, RecoveryDemandTicket, SqliteAppStorage, TransportReconciliationRoute,
 };
@@ -52,21 +53,81 @@ pub(crate) type HistoryNoticeBaseline = Vec<([u8; 16], u64, Option<Vec<u8>>)>;
 /// them from the group's published entry (mdk#3273); [`LiveFacts`] reads them
 /// now.
 pub(crate) trait GroupFacts {
-    fn host_may_see(&self, group_id: &[u8]) -> bool;
-    fn unrecoverable(&self, group_id: &[u8]) -> bool;
+    fn host_may_see(&self, group_id: &[u8]) -> Fact;
+    fn unrecoverable(&self, group_id: &[u8]) -> Fact;
+    /// The group's change stamp its facts were read at: every input of both
+    /// moves it. `None` when they were read at none, as live facts are, or
+    /// the group is outside the mirror; an answer that used such a fact is
+    /// never kept.
+    fn stamp(&self, group_id: &[u8]) -> Option<ChangeStamp>;
 }
 
-/// [`GroupFacts`] read from the client when asked.
+/// One fact about a group, as an answer used it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Fact {
+    pub(crate) value: bool,
+    /// Whether the check behind it settled: it succeeded, or failed on a
+    /// fact about the group (the engine does not know the group, or has not
+    /// hydrated it). Any other failure can clear without a write, so an
+    /// answer that used the fact is never kept (mdk#3273).
+    pub(crate) settled: bool,
+}
+
+/// [`GroupFacts`] read from the client when asked, at no stamp.
 pub(crate) struct LiveFacts<'a>(pub(crate) &'a AppClient);
 
 impl GroupFacts for LiveFacts<'_> {
-    fn host_may_see(&self, group_id: &[u8]) -> bool {
-        self.0.host_may_see_group(&GroupId::new(group_id.to_vec()))
+    /// [`AppClient::host_may_see_group`], which hides the group when the
+    /// check fails.
+    fn host_may_see(&self, group_id: &[u8]) -> Fact {
+        match self.0.is_device_group(&GroupId::new(group_id.to_vec())) {
+            Ok(device_group) => Fact {
+                value: !device_group,
+                settled: true,
+            },
+            Err(_) => Fact {
+                value: false,
+                settled: false,
+            },
+        }
     }
 
-    fn unrecoverable(&self, group_id: &[u8]) -> bool {
-        self.0.group_unrecoverable(group_id)
+    /// [`AppClient::group_unrecoverable`], which reads a group it cannot
+    /// read as recoverable.
+    fn unrecoverable(&self, group_id: &[u8]) -> Fact {
+        match self
+            .0
+            .runtime
+            .group_record(&GroupId::new(group_id.to_vec()))
+        {
+            Ok(group) => Fact {
+                value: group.unrecoverable,
+                settled: true,
+            },
+            Err(error) => Fact {
+                value: false,
+                settled: failed_on_a_fact_about_the_group(&AppError::from(error)),
+            },
+        }
     }
+
+    fn stamp(&self, _: &[u8]) -> Option<ChangeStamp> {
+        None
+    }
+}
+
+/// Whether a failed check is a fact about the group that only a move of the
+/// group's change generation can change: the engine does not know the group,
+/// or has not hydrated it yet. Any other failure, a busy or failing database
+/// above all, can clear without a write. A's group entries judge their reads
+/// by the same rule.
+pub(crate) fn failed_on_a_fact_about_the_group(error: &AppError) -> bool {
+    use cgka_traits::error::EngineError;
+    matches!(error, AppError::UnknownGroup(_))
+        || matches!(
+            error.as_engine_error(),
+            Some(EngineError::UnknownGroup(_) | EngineError::GroupNotHydrated(_))
+        )
 }
 
 /// One read of what the account's recovery answers come from: the parked
@@ -105,7 +166,6 @@ pub(crate) struct GroupNotices {
 /// that would not (mdk#3273).
 pub(crate) struct SurveyMark(tokio::sync::watch::Receiver<Option<BTreeSet<UnitKey>>>);
 
-#[cfg_attr(not(test), allow(dead_code))] // A's oracle reads it (mdk#3273 PR 8).
 impl SurveyMark {
     /// Whether a survey changed what is catching up since the read. A
     /// runner's watch gone counts as changed.
@@ -122,7 +182,7 @@ impl RecoveryRead {
             parked
                 .group_id
                 .as_deref()
-                .is_none_or(|group_id| facts.host_may_see(group_id))
+                .is_none_or(|group_id| facts.host_may_see(group_id).value)
         });
         let rejoins = self.rejoins.iter().filter(|notice| shown(notice, facts));
         parked
@@ -140,7 +200,7 @@ impl RecoveryRead {
             catching_up_group_ids_hex: self
                 .catching_up
                 .iter()
-                .filter(|group_id| facts.host_may_see(group_id))
+                .filter(|group_id| facts.host_may_see(group_id).value)
                 .map(hex::encode)
                 .collect(),
             inbox_catching_up: self.inbox_catching_up,
@@ -158,7 +218,8 @@ impl RecoveryRead {
             return Vec::new();
         };
         let rejoin = notices.rejoin.as_ref().filter(|_| {
-            !facts.unrecoverable(group_id.as_slice()) && facts.host_may_see(group_id.as_slice())
+            !facts.unrecoverable(group_id.as_slice()).value
+                && facts.host_may_see(group_id.as_slice()).value
         });
         notices.parked.iter().chain(rejoin).cloned().collect()
     }
@@ -172,7 +233,6 @@ impl RecoveryRead {
             .unwrap_or_default()
     }
 
-    #[cfg_attr(not(test), allow(dead_code))] // A's oracle reads it (mdk#3273 PR 8).
     pub(crate) fn survey(&self) -> &SurveyMark {
         &self.survey
     }
@@ -181,7 +241,7 @@ impl RecoveryRead {
 /// A rejoin's notice shows while its copy is not Unrecoverable (as the
 /// runner's routes say) and the host may see its group.
 fn shown(notice: &RejoinNotice, facts: &dyn GroupFacts) -> bool {
-    !facts.unrecoverable(&notice.group_id) && facts.host_may_see(&notice.group_id)
+    !facts.unrecoverable(&notice.group_id).value && facts.host_may_see(&notice.group_id).value
 }
 
 impl AppClient {
@@ -547,6 +607,8 @@ pub(crate) fn park_recovery_for_test(storage: &storage_sqlite::SqliteAccountStor
             .unwrap()
     );
 }
+
+pub(crate) mod reuse;
 
 #[cfg(test)]
 mod ledger_tests;

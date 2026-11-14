@@ -45,6 +45,12 @@
 //! holds a bundle's key, and a REPLACE of one never deletes a bundle
 //! (`every_row_is_keyed_from_its_own_label`). A change the counter cannot
 //! attribute (an uncounted writer, a `VACUUM`) moves it too.
+//!
+//! And one more: the recovery-notice count moves on every write to the
+//! account's history-notice inputs, the recovery obligations (parked ones are
+//! the history-gap notices) and the recovery copies (rejoin notices). Neither
+//! table is read by group, so the count is the account's alone; an
+//! unattributed change moves it too.
 
 use crate::SqliteResultExt;
 use crate::base::codec::message_state_to_i64;
@@ -79,6 +85,9 @@ const EVERY_GROUP: i64 = 3;
 /// A write to an input of the owned KeyPackage list: it moves the KeyPackage
 /// count and no group.
 const KEY_PACKAGES: i64 = 4;
+/// A write to an input of the account's history notices: it moves the
+/// recovery-notice count and no group.
+const RECOVERY_NOTICES: i64 = 5;
 
 /// One database file's counts, by file identity, while a connection to it is
 /// open.
@@ -191,6 +200,9 @@ struct Counts {
     /// Writes to the owned KeyPackage list's inputs, as applied, and changes
     /// this counter could not attribute.
     key_packages: u64,
+    /// Writes to the history notices' inputs, as applied, and changes this
+    /// counter could not attribute.
+    recovery_notices: u64,
     /// The path the file was first opened by, under test (see
     /// [`expect_uncounted_writes_for_test`]).
     #[cfg(any(test, feature = "test-support"))]
@@ -208,6 +220,10 @@ impl Counts {
         let (group, scope) = match note {
             Note::KeyPackages => {
                 self.key_packages += 1;
+                return;
+            }
+            Note::RecoveryNotices => {
+                self.recovery_notices += 1;
                 return;
             }
             Note::Group(group, scope) => (group, scope),
@@ -228,6 +244,7 @@ impl Counts {
     fn note_unattributed_change(&mut self) {
         self.note(Note::Group(None, COMMITTED));
         self.note(Note::KeyPackages);
+        self.note(Note::RecoveryNotices);
         self.writes += 1;
     }
 }
@@ -238,6 +255,8 @@ enum Note {
     Group(Option<Vec<u8>>, i64),
     /// An input of the owned KeyPackage list.
     KeyPackages,
+    /// An input of the account's history notices.
+    RecoveryNotices,
 }
 
 /// One connection's part of the counts.
@@ -347,6 +366,14 @@ impl GroupWriteCounter {
     pub(crate) fn key_package_writes(&self, connection: &SharedConnection) -> u64 {
         self.check_unexplained_commits(connection);
         self.lock().key_packages
+    }
+
+    /// Writes to the history notices' inputs through any of this process's
+    /// connections to the file, after the same check as [`Self::writes`]: a
+    /// change that check cannot explain moves it too.
+    pub(crate) fn recovery_notice_writes(&self, connection: &SharedConnection) -> u64 {
+        self.check_unexplained_commits(connection);
+        self.lock().recovery_notices
     }
 
     /// The safety net under the triggers: SQLite moves a connection's
@@ -536,6 +563,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 fn note_named(scope: i64, kind: i64, key: ValueRef<'_>) -> Option<Note> {
     let group = match (kind, key) {
         (KEY_PACKAGES, _) => return Some(Note::KeyPackages),
+        (RECOVERY_NOTICES, _) => return Some(Note::RecoveryNotices),
         (EVERY_GROUP, _) => None,
         (_, ValueRef::Null) => return None,
         (RAW_ID, ValueRef::Blob(bytes)) => Some(bytes.to_vec()),
@@ -657,6 +685,14 @@ fn key_package_tables() -> [(&'static str, Rows); 2] {
         ("openmls_values", key_package_bundles),
         ("cgka_private_key_packages", every_row),
     ]
+}
+
+/// Every table the account's history notices read, counted whole: the
+/// recovery obligations (the parked ones) and the recovery copies (the
+/// rejoin notices). A REPLACE deletes a row of the table it writes, so no
+/// row a REPLACE deletes goes uncounted.
+fn recovery_notice_tables() -> [&'static str; 2] {
+    ["account_recovery_obligations", "account_recovery_copies"]
 }
 
 /// Every table a published group answer reads.
@@ -956,6 +992,20 @@ fn trigger_sql() -> String {
         }
     }
 
+    // The history notices' inputs, counted apart from every group.
+    let recovery_notices = call(STATE, RECOVERY_NOTICES, "NULL");
+    for table in recovery_notice_tables() {
+        for event in ["INSERT", "UPDATE", "DELETE"] {
+            trigger(
+                &format!("recovery_notices_{table}_{}", event.to_ascii_lowercase()),
+                event,
+                table,
+                "",
+                std::slice::from_ref(&recovery_notices),
+            );
+        }
+    }
+
     // The roster read overlays the stored self membership; the rest of the
     // row is the in-memory mirror's.
     let new = call(STATE, HEX_ID, "NEW.group_id_hex");
@@ -1196,7 +1246,8 @@ mod tests {
     /// - every unique key that leaves out the group column has its
     ///   REPLACE-conflict triggers, and none is an expression;
     /// - each table the owned KeyPackage list reads has its own insert,
-    ///   update and delete triggers on the KeyPackage count.
+    ///   update and delete triggers on the KeyPackage count, and each table
+    ///   the history notices read has its own on the recovery-notice count.
     #[test]
     fn every_write_into_a_covered_table_is_counted() {
         let storage = SqliteAccountStorage::in_memory().unwrap();
@@ -1247,6 +1298,20 @@ mod tests {
                         .iter()
                         .any(|row| row[0] == table && row[1].contains(&name)),
                     "{table} has no KeyPackage {event} trigger"
+                );
+            }
+        }
+        for table in super::recovery_notice_tables() {
+            for event in ["INSERT", "UPDATE", "DELETE"] {
+                let name = format!(
+                    "mdk_group_writes_recovery_notices_{table}_{} AFTER {event} ON main.{table} BEGIN",
+                    event.to_ascii_lowercase()
+                );
+                assert!(
+                    counting
+                        .iter()
+                        .any(|row| row[0] == table && row[1].contains(&name)),
+                    "{table} has no recovery-notice {event} trigger"
                 );
             }
         }
@@ -1438,6 +1503,109 @@ mod tests {
         }
     }
 
+    /// The recovery-notice count moves on every write to the history
+    /// notices' inputs and on nothing else: an insert, an upsert, an update
+    /// of any column and a delete of a recovery obligation or a recovery
+    /// copy, and an obligation deleted by its group's cascade, move it; a
+    /// group's write and a KeyPackage write do not, so a message or a send
+    /// leaves the notices cached.
+    #[test]
+    fn only_a_write_to_a_recovery_notice_input_moves_the_recovery_notice_count() {
+        let storage = SqliteAccountStorage::in_memory().unwrap();
+        let mut count = storage.recovery_notice_write_count();
+        let mut moved = || {
+            let now = storage.recovery_notice_write_count();
+            std::mem::replace(&mut count, now) != now
+        };
+        let group = GroupId::new(vec![13; 16]);
+        insert_group(&storage, &group);
+        write_openmls(&storage, &group, b"tree", "tree");
+        write_device_group(&storage, &group);
+        execute(
+            &storage,
+            "INSERT INTO cgka_private_key_packages VALUES (x'aa', 1, x'00')",
+        );
+        assert!(!moved(), "a group's write or a KeyPackage write");
+
+        let group_hex = hex::encode(group.as_slice());
+        for (sql, moves) in [
+            (
+                format!(
+                    "INSERT INTO account_recovery_obligations
+                         (demand_key, cause, group_id, stalled_epoch, created_at_ms, updated_at_ms)
+                     VALUES ('gap', 1, x'{group_hex}', 0, 0, 0)"
+                ),
+                true,
+            ),
+            (
+                "UPDATE account_recovery_obligations SET updated_at_ms = 1".to_owned(),
+                true,
+            ),
+            (
+                "UPDATE account_recovery_obligations SET state = 0, eligibility = 4,
+                     parked_at_ms = 2"
+                    .to_owned(),
+                true,
+            ),
+            (
+                format!(
+                    "INSERT INTO account_recovery_obligations
+                         (demand_key, cause, group_id, stalled_epoch, created_at_ms, updated_at_ms)
+                     VALUES ('gap', 1, x'{group_hex}', 1, 3, 3)
+                     ON CONFLICT (demand_key) DO UPDATE SET stalled_epoch = excluded.stalled_epoch"
+                ),
+                true,
+            ),
+            ("DELETE FROM account_recovery_obligations".to_owned(), true),
+            (
+                format!(
+                    "INSERT INTO account_recovery_copies (group_id, install_epoch)
+                     VALUES (x'{group_hex}', 0)"
+                ),
+                true,
+            ),
+            (
+                "UPDATE account_recovery_copies SET floor_seconds = 4, notice_revision = 1,
+                     noticed_at_seconds = 4"
+                    .to_owned(),
+                true,
+            ),
+            (
+                format!(
+                    "INSERT OR REPLACE INTO account_recovery_copies (group_id, install_epoch)
+                     VALUES (x'{group_hex}', 1)"
+                ),
+                true,
+            ),
+            ("DELETE FROM account_recovery_copies".to_owned(), true),
+            (
+                format!(
+                    "INSERT INTO account_recovery_obligations
+                         (demand_key, cause, group_id, stalled_epoch, created_at_ms, updated_at_ms)
+                     VALUES ('gap', 1, x'{group_hex}', 0, 0, 0)"
+                ),
+                true,
+            ),
+            (
+                format!("DELETE FROM cgka_groups WHERE id = x'{group_hex}'"),
+                true,
+            ),
+        ] {
+            execute(&storage, &sql);
+            assert_eq!(moved(), moves, "{sql}");
+        }
+        let left: i64 = storage
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM account_recovery_obligations",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(left, 0, "the group's delete cascaded to its obligation");
+    }
+
     fn insert_group(storage: &SqliteAccountStorage, group: &GroupId) {
         storage
             .lock()
@@ -1495,7 +1663,8 @@ mod tests {
     }
 
     /// The safety net: a commit no counted connection made moves every
-    /// group and the KeyPackage count, and under test it panics. Reading the
+    /// group, the KeyPackage count and the recovery-notice count, and under
+    /// test it panics. Reading the
     /// KeyPackage count runs it. Commits through counted connections and
     /// another counted open explain themselves.
     #[test]
@@ -1521,8 +1690,9 @@ mod tests {
         .unwrap();
         let before = {
             let counts = engine.group_writes.lock();
-            (counts.writes, counts.key_packages)
+            (counts.writes, counts.key_packages, counts.recovery_notices)
         };
+        let recovery_notices = before.2;
         let before = (generation(&engine, &group), before.0, before.1);
         let tripped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             engine.key_package_write_count();
@@ -1531,6 +1701,7 @@ mod tests {
         assert!(generation(&engine, &group).committed > before.0.committed);
         assert!(engine.group_writes.lock().writes > before.1);
         assert!(engine.group_writes.lock().key_packages > before.2);
+        assert!(engine.group_writes.lock().recovery_notices > recovery_notices);
     }
 
     /// SQLite moves another connection's `PRAGMA data_version` without a

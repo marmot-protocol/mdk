@@ -8519,6 +8519,8 @@ struct AppTransportRouting {
 /// One pointer per clone: every client and session carries the routing.
 struct SharedAppRouting {
     state: RwLock<AppRoutingState>,
+    /// Moves on every change of `state` ([`AppTransportRouting::version`]).
+    version: std::sync::atomic::AtomicU64,
     /// Bumped when the account's routes change, and from the client's other
     /// recovery chokepoints. The account's recovery runner, if one runs,
     /// reads its debt again (mdk#2660 phase 4).
@@ -8608,11 +8610,48 @@ struct AppRoutingState {
     required_acks: usize,
 }
 
+/// Where every routing version comes from: one sequence for the process,
+/// so no two routings, and no two states of one, share a version.
+static ROUTING_VERSIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn next_routing_version() -> u64 {
+    ROUTING_VERSIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// A write lock on the routing that moves its version at the first mutable
+/// borrow, before the change it allows: every change goes through one, and a
+/// look that changes nothing leaves the version alone.
+struct RoutingWrite<'a> {
+    state: RwLockWriteGuard<'a, AppRoutingState>,
+    version: &'a std::sync::atomic::AtomicU64,
+    moved: bool,
+}
+
+impl std::ops::Deref for RoutingWrite<'_> {
+    type Target = AppRoutingState;
+
+    fn deref(&self) -> &AppRoutingState {
+        &self.state
+    }
+}
+
+impl std::ops::DerefMut for RoutingWrite<'_> {
+    fn deref_mut(&mut self) -> &mut AppRoutingState {
+        if !self.moved {
+            self.moved = true;
+            self.version
+                .store(next_routing_version(), std::sync::atomic::Ordering::Release);
+        }
+        &mut self.state
+    }
+}
+
 impl AppTransportRouting {
     fn new(state: AppRoutingState) -> Self {
         Self {
             inner: Arc::new(SharedAppRouting {
                 state: RwLock::new(state),
+                version: std::sync::atomic::AtomicU64::new(next_routing_version()),
                 recovery_runner_wake: tokio::sync::watch::channel(0).0,
                 route_changes: Mutex::default(),
                 recovery_runner_catching_up: tokio::sync::watch::channel(None).0,
@@ -8777,11 +8816,28 @@ impl AppTransportRouting {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    fn write(&self) -> RwLockWriteGuard<'_, AppRoutingState> {
+    /// The routing's version: it moves on every change of its state, and no
+    /// other routing ever has it. Read it before reading the state, and what
+    /// that read found holds while the version stays the one read: a change
+    /// takes the write lock and moves the version before it changes anything,
+    /// so a change the read missed moved the version after it was read
+    /// (mdk#3273).
+    pub(crate) fn version(&self) -> u64 {
         self.inner
-            .state
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .version
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn write(&self) -> RoutingWrite<'_> {
+        RoutingWrite {
+            state: self
+                .inner
+                .state
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            version: &self.inner.version,
+            moved: false,
+        }
     }
 }
 

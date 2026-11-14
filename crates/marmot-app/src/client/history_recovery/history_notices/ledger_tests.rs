@@ -30,7 +30,7 @@ fn app(dir: &tempfile::TempDir) -> MarmotApp {
 
 /// One account with one group, its client opened directly, and the group's
 /// current route.
-async fn fixture(
+pub(super) async fn fixture(
     dir: &tempfile::TempDir,
 ) -> (
     AppClient,
@@ -115,7 +115,7 @@ fn park_on(app: &SqliteAppStorage, route: &TransportReconciliationRoute, relay: 
 }
 
 /// What the runner's survey would publish: these units catching up.
-fn catching_up(client: &AppClient, units: &[&TransportReconciliationRoute]) {
+pub(super) fn catching_up(client: &AppClient, units: &[&TransportReconciliationRoute]) {
     let units = units
         .iter()
         .map(|route| UnitKey {
@@ -333,7 +333,11 @@ async fn a_conversion_that_changed_the_notices_is_announced_once() {
 
 /// Raise `group`'s rejoin notice the way a debt turn settles a replaced
 /// copy, over its current `route`.
-fn rejoin(app: &SqliteAppStorage, group: &GroupId, route: &TransportReconciliationRoute) {
+pub(super) fn rejoin(
+    app: &SqliteAppStorage,
+    group: &GroupId,
+    route: &TransportReconciliationRoute,
+) {
     let now = crate::unix_now_seconds();
     assert!(
         app.settle_recovery_rejoin(&storage_sqlite::RecoveryRejoin {

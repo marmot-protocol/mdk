@@ -667,7 +667,9 @@ impl AppClient {
     pub(crate) fn current_route_groups(
         &self,
     ) -> Vec<(TransportReconciliationRoute, Option<Vec<u8>>)> {
-        let routing = self.routing.snapshot();
+        // Borrowed: a rebuilt recovery answer reads the routes, and a copy
+        // of the whole routing would cost more than the read.
+        let routing = self.routing.read();
         current_routes(&routing)
             .map(|(route, group_id, _, _)| (route, group_id))
             .collect()
