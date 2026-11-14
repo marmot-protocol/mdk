@@ -924,36 +924,7 @@ pub(super) fn schedule(
         }
         return Ok(more);
     };
-    // Transfers run concurrently only while free space covers every one the
-    // runtime may run writing the most any account's limit allows: none of
-    // them then needs to know what the others still write. Otherwise a
-    // transfer holds every global permit, one at a time as with a single
-    // slot, and admission measures free space with nothing else in flight.
-    // When others are in flight, wait for all of them in the semaphore's
-    // FIFO queue: candidates stay queued and due, and the wait ends the
-    // moment the last one finishes, in any account.
     let limit = crate::runtime::ATTACHMENT_TRANSFER_LIMIT;
-    if background_permit.num_permits() < limit
-        && !concurrent_admission_fits(&policy, free, limit_bound)
-    {
-        match shared
-            .attachment_transfer
-            .clone()
-            .try_acquire_many_owned((limit - background_permit.num_permits()) as u32)
-        {
-            Ok(rest) => background_permit.merge(rest),
-            Err(_) => {
-                drop(background_permit);
-                admission.waiting = Some(Box::pin(
-                    shared
-                        .attachment_transfer
-                        .clone()
-                        .acquire_many_owned(limit as u32),
-                ));
-                return Ok(more);
-            }
-        }
-    }
     let Ok(permit) = http.permits.clone().try_acquire_owned() else {
         return Ok(more);
     };
@@ -1067,6 +1038,36 @@ pub(super) fn schedule(
                 |completion| completion,
             );
             return Ok(started);
+        }
+        // Downloads run concurrently only while free space covers every one
+        // the runtime may run writing the most any account's automatic limit
+        // allows: none of them then needs to know what the others still
+        // write. An explicit download may be far larger than that limit, so it
+        // always runs alone, as a tap did with the single slot. Running alone
+        // holds every global permit, and admission measures free space with
+        // nothing else in flight. When others are in flight, wait for all of
+        // them in the semaphore's FIFO queue: candidates stay queued and due,
+        // and the wait ends the moment the last one finishes, in any account.
+        if background_permit.num_permits() < limit
+            && (explicit || !concurrent_admission_fits(&policy, free, limit_bound))
+        {
+            match shared
+                .attachment_transfer
+                .clone()
+                .try_acquire_many_owned((limit - background_permit.num_permits()) as u32)
+            {
+                Ok(rest) => background_permit.merge(rest),
+                Err(_) => {
+                    drop(background_permit);
+                    admission.waiting = Some(Box::pin(
+                        shared
+                            .attachment_transfer
+                            .clone()
+                            .acquire_many_owned(limit as u32),
+                    ));
+                    return Ok(more);
+                }
+            }
         }
         // References do not declare a trustworthy size. Reserve the configured
         // automatic-sized object even for explicit work, then enforce actual

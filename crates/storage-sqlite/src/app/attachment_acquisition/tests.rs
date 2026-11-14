@@ -2080,6 +2080,7 @@ fn automatic_request(
                 allowed,
             ),
         )
+        .map(|(status, queued, _)| (status, queued))
         .unwrap()
 }
 
@@ -2347,7 +2348,7 @@ fn automatic_history_replacement_is_independent_but_slot_removal_stays_suppresse
         disk_reserve: 0,
         transfer_limit: 100,
     };
-    let (status, queued) = app
+    let (status, queued, _) = app
         .request_automatic_attachment(GROUP, &entry, digest(), 12, (&policy, true))
         .unwrap();
     assert!(queued);
@@ -2367,7 +2368,7 @@ fn automatic_history_replacement_is_independent_but_slot_removal_stays_suppresse
         .attachment_control_entry(GROUP, "one", "third-source", 0, 12)
         .unwrap()
         .unwrap();
-    let (status, queued) = app
+    let (status, queued, _) = app
         .request_automatic_attachment(GROUP, &entry, digest(), 12, (&policy, true))
         .unwrap();
     assert!(!queued);
@@ -4130,10 +4131,11 @@ fn automatic_request_moves_queued_work_ahead_of_newer_backlog_but_not_taps() {
         .attachment_control_entry(GROUP, "shown", "source-shown", 0, 30)
         .unwrap()
         .unwrap();
-    let (status, newly_queued) = app
+    let (status, newly_queued, reprioritized) = app
         .request_automatic_attachment(GROUP, &shown, digest(), 30, (&policy, true))
         .unwrap();
     assert!(!newly_queued, "already queued work is not queued again");
+    assert!(reprioritized, "the order changed");
     assert_eq!(status.unwrap().state, AttachmentTransferState::Queued);
     // The shown image overtakes newer background work; a tap stays first.
     assert_eq!(order(30), ["tapped", "shown", "newer"]);
@@ -4154,10 +4156,18 @@ fn automatic_request_moves_queued_work_ahead_of_newer_backlog_but_not_taps() {
         .attachment_control_entry(GROUP, "newer", "source-newer", 0, 30)
         .unwrap()
         .unwrap();
-    for _ in 0..3 {
-        app.request_automatic_attachment(GROUP, &newer, digest(), 30, (&policy, true))
-            .unwrap();
-    }
+    let moved: Vec<bool> = (0..3)
+        .map(|_| {
+            app.request_automatic_attachment(GROUP, &newer, digest(), 30, (&policy, true))
+                .unwrap()
+                .2
+        })
+        .collect();
+    assert_eq!(
+        moved,
+        [true, false, false],
+        "only the request that changes the order reports it"
+    );
     assert_eq!(order(30), ["tapped", "newer", "shown"]);
     assert_eq!(priority("newer"), priority("shown") + 1);
     app.request_automatic_attachment(GROUP, &shown, digest(), 30, (&policy, true))

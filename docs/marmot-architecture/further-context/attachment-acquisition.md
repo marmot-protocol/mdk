@@ -198,8 +198,10 @@ grow; a final remainder below the admission reservation can still stay unused.
 
 Transfers run concurrently only while free space, above the reserve, covers all four
 writing the most the largest account limit seen in the runtime allows, so none needs to
-know what the others still write. Below that, a transfer holds all four global permits and
-runs alone, exactly as with a single slot, and admission measures free space with nothing
+know what the others still write. An explicit download may be far larger than the
+automatic limit that rule prices, so it always runs alone. Below that room, and for every
+explicit download, a transfer holds all four global permits and runs alone, exactly as
+with a single slot, and admission measures free space with nothing
 else in flight. A pass that finds others still in flight waits for all four permits in the
 semaphore's FIFO queue: its candidates stay queued and due, and the wait ends as soon as
 the last transfer finishes, in any account.
@@ -359,7 +361,9 @@ to 30 seconds to appear while idle. Every byte read still revalidates source/exp
 Explicit requests precede automatic work. Among automatic work, a host's
 `request_automatic_attachment` for queued work (an image on screen) moves it to the
 front, most recent request first; otherwise recent incoming sources precede older
-backfill. That request changes only ordering, never state, backoff or budgets.
+backfill. That request changes only ordering, never state, backoff or budgets. A request
+that changes the order wakes the account's worker, without reporting a state change; one
+that changes nothing wakes nothing.
 Candidate queries seek the due range before sorting eligible jobs by priority, so future
 backoff and active leases are not scanned. The explicit-only path also seeks past disabled
 automatic work. Priority sorting still visits currently eligible jobs; this is not a claim

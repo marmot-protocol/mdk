@@ -229,9 +229,14 @@ impl MarmotAppRuntime {
         let result = self
             .attachment_read(account_ref, move |storage, loopback| {
                 let now = crate::unix_now_seconds();
-                let unavailable = || AutomaticAttachmentRequest {
-                    status: None,
-                    newly_queued: false,
+                let unavailable = || {
+                    (
+                        AutomaticAttachmentRequest {
+                            status: None,
+                            newly_queued: false,
+                        },
+                        false,
+                    )
                 };
                 let Some(entry) = storage.app_storage().attachment_control_entry(
                     &group,
@@ -261,24 +266,33 @@ impl MarmotAppRuntime {
                     && (config.attachment_acquisition_mode
                         == AttachmentAcquisitionMode::NativeAutomatic
                         || Permissions::allows_locked(&map, &identity, &reference.media_type));
-                let (status, newly_queued) = storage.app_storage().request_automatic_attachment(
-                    &group,
-                    &entry,
-                    digest,
-                    now,
-                    (
-                        &super::attachment_controls::default_policy(&config),
-                        allowed,
-                    ),
-                )?;
-                Ok(AutomaticAttachmentRequest {
-                    status,
-                    newly_queued,
-                })
+                let (status, newly_queued, reprioritized) =
+                    storage.app_storage().request_automatic_attachment(
+                        &group,
+                        &entry,
+                        digest,
+                        now,
+                        (
+                            &super::attachment_controls::default_policy(&config),
+                            allowed,
+                        ),
+                    )?;
+                Ok((
+                    AutomaticAttachmentRequest {
+                        status,
+                        newly_queued,
+                    },
+                    reprioritized,
+                ))
             })
             .await?;
+        let (result, reprioritized) = result;
         if result.newly_queued {
             self.wake_attachment_work();
+        } else if reprioritized {
+            // Only the order changed: wake the worker, whose next pass may
+            // start this work at once, without reporting a state change.
+            self.accounts.app.presentation_signals.wake();
         }
         Ok(result)
     }

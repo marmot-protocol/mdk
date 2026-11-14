@@ -2872,6 +2872,35 @@ async fn concurrent_room_uses_the_largest_account_limit() {
     assert_eq!(backlog.still_due(), limit);
 }
 
+/// An explicit download may be far larger than the automatic limit the
+/// concurrent-room rule prices, so it runs alone even with room for four
+/// automatic ones; the rest stay queued and due behind it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn explicit_download_runs_alone_even_with_concurrent_room() {
+    let limit = crate::runtime::ATTACHMENT_TRANSFER_LIMIT;
+    let (policy, need) = default_disk();
+    let mut backlog = HeldBacklog::new(policy.disk_reserve + limit as u64 * need).await;
+    let now = crate::unix_now_seconds();
+    while admit_demands(&backlog.storage.app_storage(), now, true).unwrap() {}
+    let tapped = backlog
+        .storage
+        .app_storage()
+        .attachment_transfer_candidates(now, 1, true)
+        .unwrap()
+        .remove(0);
+    assert!(
+        backlog
+            .storage
+            .app_storage()
+            .explicitly_retry_attachment(&tapped, now)
+            .unwrap()
+    );
+    backlog.drive().await;
+    backlog.expect_started(1).await;
+    assert_eq!(backlog.shared.attachment_transfer.available_permits(), 0);
+    assert_eq!(backlog.still_due(), limit, "the rest wait queued and due");
+}
+
 /// One more attachment than the transfer limit, against a server that holds
 /// every request open so each admitted transfer stays in flight, with free
 /// space pinned for the account.
@@ -3108,4 +3137,88 @@ async fn attachment_pass_does_not_repeat_a_candidate_that_stays_due() {
         )
         .unwrap();
     assert_eq!(state, 1, "the stuck candidate is still due");
+}
+
+/// A request that moves queued work ahead wakes the worker, whose next pass
+/// may start it at once (an idle worker with free slots gets no completion to
+/// run one), without reporting a transfer state change. A request that
+/// changes nothing wakes nothing, so a screen re-requesting what it shows
+/// cannot loop.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reordering_queued_work_wakes_the_worker_only_when_the_order_changes() {
+    let (_dir, mut client, storage, _reference) = offline_fixture().await;
+    let entry = storage
+        .app_storage()
+        .attachment_history_page(GROUP, 100, None)
+        .unwrap()
+        .entries
+        .remove(0);
+    storage
+        .app_storage()
+        .record_app_event(&StoredAppEvent {
+            group_id_hex: GROUP.into(),
+            message_id_hex: "44".repeat(32),
+            source_message_id_hex: Some("45".repeat(32)),
+            source_epoch: Some(3),
+            direction: "received".into(),
+            sender: "33".repeat(32),
+            plaintext: String::new(),
+            kind: 9,
+            tags: vec![serde_json::from_value(entry.slot.clone()).unwrap()],
+            recorded_at: 10,
+            received_at: 10,
+            origin_commit_id: None,
+            moderation_grant: false,
+        })
+        .unwrap();
+    client.app.config.attachment_acquisition_mode = crate::AttachmentAcquisitionMode::HostManaged;
+    let runtime = client.app.runtime();
+    let group = GroupId::new(vec![0xab; 16]);
+    let generation = runtime
+        .begin_attachment_permission_update("alice")
+        .await
+        .unwrap();
+    assert!(
+        runtime
+            .set_attachment_automatic_permission("alice", generation, all_attachment_permission())
+            .await
+            .unwrap()
+    );
+    let sibling = crate::AttachmentLocalTarget {
+        message_id_hex: "44".repeat(32),
+        source_message_id_hex: "45".repeat(32),
+        attachment_index: 0,
+    };
+    // Both queued; the sibling, requested last, leads.
+    for target in [automatic_target(), sibling] {
+        assert!(
+            runtime
+                .request_automatic_attachment("alice", &group, target)
+                .await
+                .unwrap()
+                .newly_queued
+        );
+    }
+    let mut work = client.app.presentation_signals.subscribe_work();
+    work.mark_unchanged();
+    let updates = runtime.shared.attachment_updates.subscribe();
+    let moved = runtime
+        .request_automatic_attachment("alice", &group, automatic_target())
+        .await
+        .unwrap();
+    assert!(!moved.newly_queued);
+    assert!(work.has_changed().unwrap(), "the reorder wakes the worker");
+    assert!(
+        !updates.has_changed().unwrap(),
+        "a reorder is not a transfer state change"
+    );
+    work.mark_unchanged();
+    runtime
+        .request_automatic_attachment("alice", &group, automatic_target())
+        .await
+        .unwrap();
+    assert!(
+        !work.has_changed().unwrap(),
+        "repeating the leading request changes nothing and wakes nothing"
+    );
 }

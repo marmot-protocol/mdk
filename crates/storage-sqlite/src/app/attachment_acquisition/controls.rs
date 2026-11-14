@@ -243,33 +243,45 @@ impl SqliteAppStorage {
     /// one past the highest other queued automatic priority. That can run
     /// ahead of the clock only while the queue holds such requests; work that
     /// already leads keeps its value, so repeating a request never climbs.
+    /// Returns whether the order changed, so the caller wakes the worker only
+    /// then.
     fn prioritize_queued_automatic(
         &self,
         status: Option<&AttachmentTransferStatus>,
         now: u64,
-    ) -> StorageResult<()> {
+    ) -> StorageResult<bool> {
         let Some(reference) = status
             .filter(|s| s.state == AttachmentTransferState::Queued)
             .and_then(|s| s.reference.as_ref())
         else {
-            return Ok(());
+            return Ok(false);
         };
-        self.lock()?
-            .execute(
-                "UPDATE attachment_acquisition AS q SET priority_at=max(q.priority_at,?2,
-                    COALESCE((SELECT max(o.priority_at)+1 FROM attachment_acquisition AS o
-                        WHERE o.token<>q.token AND o.explicit_request=0 AND o.cancelled=0
-                        AND o.due IS NOT NULL),0))
-                WHERE token=?1 AND explicit_request=0 AND cancelled=0 AND due IS NOT NULL",
+        let conn = self.lock()?;
+        let target: i64 = conn
+            .query_row(
+                "SELECT max(?2,COALESCE((SELECT max(o.priority_at)+1 FROM attachment_acquisition AS o
+                    WHERE o.token<>?1 AND o.explicit_request=0 AND o.cancelled=0
+                    AND o.due IS NOT NULL),0))",
                 params![reference.token, u64_to_i64(now)?],
+                |row| row.get(0),
             )
             .storage()?;
-        Ok(())
+        Ok(conn
+            .execute(
+                "UPDATE attachment_acquisition SET priority_at=?2
+                WHERE token=?1 AND explicit_request=0 AND cancelled=0 AND due IS NOT NULL
+                AND priority_at<?2",
+                params![reference.token, target],
+            )
+            .storage()?
+            > 0)
     }
 
     /// Policy, source validation, idempotent demand and returned status share a
     /// transaction. The caller holds its runtime permission fence for this call.
     /// A request for queued work also moves it ahead of other automatic work.
+    /// Returns the status, whether this request queued the work, and whether
+    /// it moved queued work ahead (the order changed).
     pub fn request_automatic_attachment(
         &self,
         group: &str,
@@ -277,7 +289,7 @@ impl SqliteAppStorage {
         digest: [u8; 32],
         now: u64,
         policy: (&AttachmentDownloadPolicy, bool),
-    ) -> StorageResult<(Option<AttachmentTransferStatus>, bool)> {
+    ) -> StorageResult<(Option<AttachmentTransferStatus>, bool, bool)> {
         let index = u32::try_from(selected.attachment_index)
             .map_err(|_| invalid("invalid attachment index"))?;
         self.connection.with_transaction(|| {
@@ -291,7 +303,7 @@ impl SqliteAppStorage {
             if !current.is_some_and(|entry| {
                 entry.slot == selected.slot && entry.source_epoch == selected.source_epoch
             }) {
-                return Ok((None, false));
+                return Ok((None, false, false));
             }
             self.lock()?.execute("UPDATE attachment_acquisition SET automatic_history=1
                 WHERE group_id_hex=?1 AND message_id_hex=?2 AND source_message_id_hex=?3 AND attachment_index=?4 AND automatic_history=0",
@@ -306,7 +318,7 @@ impl SqliteAppStorage {
                 automatic,
             )?;
             if self.attachment_source_has_upload(group,&selected.message_id_hex,selected.attachment_index)? {
-                return Ok((status,false));
+                return Ok((status, false, false));
             }
             // Existing state (including cancellation, loss of bytes and retry
             // deadlines) wins over demand and is never reset by a screen render.
@@ -317,12 +329,12 @@ impl SqliteAppStorage {
                     AttachmentTransferState::NotRequested | AttachmentTransferState::Paused
                 )
             }) {
-                self.prioritize_queued_automatic(status.as_ref(), now)?;
-                return Ok((status, false));
+                let reprioritized = self.prioritize_queued_automatic(status.as_ref(), now)?;
+                return Ok((status, false, reprioritized));
             }
             if let Some(reference) = status.as_ref().and_then(|s| s.reference.as_ref()) {
                 let paused: bool = self.lock()?.query_row("SELECT permission_paused FROM attachment_acquisition WHERE token=?1", [&reference.token], |r| r.get(0)).storage()?;
-                if paused { return Ok((status, false)); }
+                if paused { return Ok((status, false, false)); }
             }
             if !automatic {
                 return Ok((
@@ -332,6 +344,7 @@ impl SqliteAppStorage {
                         }
                         s
                     }),
+                    false,
                     false,
                 ));
             }
@@ -346,8 +359,8 @@ impl SqliteAppStorage {
                         now,
                         automatic,
                     )?;
-                    self.prioritize_queued_automatic(status.as_ref(), now)?;
-                    Ok((status, true))
+                    let reprioritized = self.prioritize_queued_automatic(status.as_ref(), now)?;
+                    Ok((status, true, reprioritized))
                 },
                 // Past the "Keep media" window: report the slot as cleaned.
                 AttachmentDemand::Suppressed => Ok((
@@ -360,8 +373,9 @@ impl SqliteAppStorage {
                         automatic,
                     )?,
                     false,
+                    false,
                 )),
-                AttachmentDemand::Unavailable => Ok((None, false)),
+                AttachmentDemand::Unavailable => Ok((None, false, false)),
             }
         })
     }

@@ -42,7 +42,8 @@
   not counted again, so the recovery runner's `retired_gone` audit row is written once.
 - `SqliteAppStorage::request_automatic_attachment` moves queued automatic work to the front of the automatic queue,
   most recent request first (one past the highest other queued automatic priority), so attachments a host shows
-  download before background backlog. Explicit requests stay ahead; state, backoff and budgets are untouched.
+  download before background backlog. Explicit requests stay ahead; state, backoff and budgets are untouched. It now
+  returns a third value, whether the request changed the order, so a caller can wake its worker only then.
 
 ### Fixed
 
