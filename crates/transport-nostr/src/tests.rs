@@ -6417,27 +6417,48 @@ async fn publish_auth_reply_sequence(
 /// definite rejection; a real later ACK still succeeds. The anonymous
 /// attempt's `auth-required:` answer is itself such a send: the relay received
 /// the event, so the authenticated refusal cannot prove it unseen (mdk#2332).
+/// A retryable answer to the authenticated retry stays retryable, without
+/// pre-send proof, so the owner retries it as promptly as any such answer;
+/// after an earlier unknown outcome it reads as unknown, as before.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn publish_auth_preserves_uncertainty() {
-    for (earlier_uncertainty, completion, last_reply, category) in [
+    use TransportEndpointFailureKind::{PossiblyExposed, RetryableUnavailable};
+    for (earlier_uncertainty, completion, last_reply, category, kind) in [
         (
             true,
             PublishCompletion::Return,
             "invalid: bad event",
             Some(TransportEndpointRejectionCategory::Invalid),
+            PossiblyExposed,
         ),
         (
             true,
             PublishCompletion::FailureReceipt,
             "invalid: event too large: 999999999",
             Some(TransportEndpointRejectionCategory::TooLarge),
+            PossiblyExposed,
         ),
-        (true, PublishCompletion::Return, "", None),
+        (true, PublishCompletion::Return, "", None, PossiblyExposed),
         (
             false,
             PublishCompletion::Return,
             "invalid: event too large: 999999999",
             Some(TransportEndpointRejectionCategory::TooLarge),
+            PossiblyExposed,
+        ),
+        (
+            false,
+            PublishCompletion::Return,
+            "rate-limited: slow down",
+            Some(TransportEndpointRejectionCategory::RateLimited),
+            RetryableUnavailable,
+        ),
+        (
+            true,
+            PublishCompletion::Return,
+            "rate-limited: slow down",
+            Some(TransportEndpointRejectionCategory::RateLimited),
+            PossiblyExposed,
         ),
     ] {
         let mut replies = Vec::new();
@@ -6465,9 +6486,17 @@ async fn publish_auth_preserves_uncertainty() {
         )
         .await
         .expect("the wire sequence completes within the ordinary deadline");
-        assert_eq!(
-            *attempts.lock().await,
-            vec![signed.id.to_hex(); expected_attempts],
+        let observed = attempts.lock().await.clone();
+        // The SDK client itself resends after `rate-limited:`.
+        let resent_by_the_client = last_reply.starts_with("rate-limited:");
+        assert!(
+            observed.len() == expected_attempts
+                || (resent_by_the_client && observed.len() > expected_attempts),
+            "{} attempts for {last_reply}",
+            observed.len()
+        );
+        assert!(
+            observed.iter().all(|id| *id == signed.id.to_hex()),
             "anonymous attempts and authenticated fallback send the same actual event"
         );
         assert_eq!(*fallback.attempts.lock().await, vec![endpoint.clone()]);
@@ -6481,10 +6510,9 @@ async fn publish_auth_preserves_uncertainty() {
             assert_eq!(failure_endpoint.endpoint, endpoint);
             assert_eq!(failure_endpoint.rejection_category, Some(category));
             assert_eq!(
-                failure_endpoint.kind,
-                TransportEndpointFailureKind::PossiblyExposed,
+                failure_endpoint.kind, kind,
                 "authentication fallback cannot erase earlier publication uncertainty \
-                 (earlier uncertainty: {earlier_uncertainty})"
+                 (earlier uncertainty: {earlier_uncertainty}, {last_reply})"
             );
             assert!(!failure_endpoint.pre_send);
             assert_eq!(failure_endpoint.size_class, None);
@@ -6501,6 +6529,33 @@ async fn publish_auth_preserves_uncertainty() {
         server.abort();
         let _ = server.await;
     }
+}
+
+/// A relay that answered the anonymous attempt `auth-required:` holds the
+/// event, so a connection the authenticated retry never made proves nothing
+/// about it: that failure loses its pre-send proof and stays retryable
+/// (mdk#2332).
+#[test]
+fn an_answered_anonymous_attempt_keeps_a_retry_connect_failure_exposed() {
+    use TransportEndpointFailureKind::RetryableUnavailable;
+    let failure = |category, pre_send| TransportEndpointFailure {
+        pre_send,
+        size_class: None,
+        endpoint: TransportEndpoint("wss://relay.example".into()),
+        reason: "test failure".into(),
+        kind: RetryableUnavailable,
+        rejection_category: category,
+    };
+    let answered = failure(
+        Some(TransportEndpointRejectionCategory::AuthRequired),
+        false,
+    );
+    let earlier = EarlierAttempt::of(std::iter::once(&answered));
+    assert_eq!(earlier, EarlierAttempt::Answered);
+
+    let retry = earlier.carry_into(failure(None, true));
+    assert_eq!(retry.kind, RetryableUnavailable);
+    assert!(!retry.proves_nothing_sent());
 }
 
 /// Public and authenticated receipts must satisfy one required quorum.

@@ -123,6 +123,55 @@ const RELAY_NOTIFICATION_EVENT_QUEUE_CAPACITY: usize = 4096;
 
 const ACCOUNT_PUBLISH_WAIT: Duration = Duration::from_secs(20);
 
+/// What a relay's answer to the anonymous attempt before an authenticated
+/// retry proves, carried into the retry's own failure (mdk#2332).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EarlierAttempt {
+    /// No earlier attempt, or one that sent nothing.
+    Unexposed,
+    /// The relay answered it (`auth-required:`), so it received the event.
+    Answered,
+    /// Its outcome is unknown: it may have stored the event.
+    Ambiguous,
+}
+
+impl EarlierAttempt {
+    fn of<'a>(failures: impl Iterator<Item = &'a TransportEndpointFailure> + Clone) -> Self {
+        if failures
+            .clone()
+            .any(|failure| failure.kind == TransportEndpointFailureKind::PossiblyExposed)
+        {
+            Self::Ambiguous
+        } else if failures
+            .into_iter()
+            .any(|failure| !failure.proves_nothing_sent())
+        {
+            Self::Answered
+        } else {
+            Self::Unexposed
+        }
+    }
+
+    /// The retry's failure, given what the earlier attempt left. After an
+    /// answer, no later failure proves the event unseen, so none is pre-send;
+    /// a retryable one stays retryable and is retried as promptly as any such
+    /// answer, and a definitive refusal reads as unknown. After an unknown
+    /// outcome, every failure reads as unknown.
+    fn carry_into(self, mut failure: TransportEndpointFailure) -> TransportEndpointFailure {
+        let retryable = failure.kind == TransportEndpointFailureKind::RetryableUnavailable;
+        match self {
+            Self::Unexposed => return failure,
+            Self::Answered if retryable => {}
+            Self::Answered | Self::Ambiguous => {
+                failure.kind = TransportEndpointFailureKind::PossiblyExposed;
+                failure.size_class = None;
+            }
+        }
+        failure.pre_send = false;
+        failure
+    }
+}
+
 /// The process-wide relay plane every account shares.
 ///
 /// Construct it inside a Tokio runtime. The constructors start the
@@ -3601,7 +3650,7 @@ impl MarmotRelayPlaneAccountAdapter {
                 let result = publisher
                     .publish_event(std::slice::from_ref(endpoint), event, 1)
                     .await;
-                (endpoint, false, result)
+                (endpoint, EarlierAttempt::Unexposed, result)
             });
         }
         while !publishes.is_empty() || !retries.is_empty() {
@@ -3610,19 +3659,19 @@ impl MarmotRelayPlaneAccountAdapter {
                 next = timeout_at(deadline, retries.next()), if !retries.is_empty() => (true, next),
             };
             match next {
-                Ok(Some((endpoint, earlier_exposure, result))) => {
+                Ok(Some((endpoint, earlier, result))) => {
                     if is_retry {
                         retrying.remove(endpoint);
                     } else {
                         pending.remove(endpoint);
                     }
-                    let preserve_prior_exposure = |mut failure: TransportEndpointFailure| {
-                        if earlier_exposure && failure.endpoint == *endpoint {
-                            failure.kind = TransportEndpointFailureKind::PossiblyExposed;
-                            failure.size_class = None;
-                            failure.pre_send = false;
+                    let earlier_exposure = earlier != EarlierAttempt::Unexposed;
+                    let preserve_prior_exposure = |failure: TransportEndpointFailure| {
+                        if failure.endpoint == *endpoint {
+                            earlier.carry_into(failure)
+                        } else {
+                            failure
                         }
-                        failure
                     };
                     match result {
                         Ok(receipt) => {
@@ -3658,19 +3707,17 @@ impl MarmotRelayPlaneAccountAdapter {
                                             )
                                 });
                             if auth_required {
-                                // The relay answered the anonymous write, so it
-                                // received the event: no later answer proves it
-                                // unseen (mdk#2332).
-                                let earlier_exposure =
-                                    error.publish_endpoint_failures().iter().any(|failure| {
-                                        failure.endpoint == *endpoint
-                                            && !failure.proves_nothing_sent()
-                                    });
+                                let earlier = EarlierAttempt::of(
+                                    error
+                                        .publish_endpoint_failures()
+                                        .iter()
+                                        .filter(|failure| failure.endpoint == *endpoint),
+                                );
                                 retrying.insert(endpoint);
                                 retries.push(async move {
                                     (
                                         endpoint,
-                                        earlier_exposure,
+                                        earlier,
                                         fallback
                                             .publish_event_for_account(
                                                 &self.account_id,
