@@ -65,6 +65,8 @@ mod tests {
     use std::task::Poll;
     use std::time::Duration;
 
+    use cgka_traits::GroupId;
+
     use super::*;
     use crate::tests::ScriptedPushRelayClient;
     use crate::{AccountHome, MarmotApp};
@@ -97,6 +99,13 @@ mod tests {
             .await
             .expect("the worker reaches startup sync");
 
+        // Held startup sync answers invite acceptance busy at once: an earlier
+        // command whose answer shows when the worker took it.
+        let unknown = GroupId::new(vec![7; 16]);
+        let mut busy = Box::pin(tokio::task::unconstrained(
+            runtime.accept_group_invite("alice", &unknown),
+        ));
+        assert!(std::future::poll_fn(|cx| Poll::Ready(busy.as_mut().poll(cx).is_pending())).await);
         let mut finished = Box::pin(tokio::task::unconstrained(worker_startup_finished(
             &runtime, "alice",
         )));
@@ -105,14 +114,25 @@ mod tests {
         )));
         assert!(still_waiting(&mut finished).await);
         assert!(still_waiting(&mut round_trip).await);
-        tokio::time::timeout(
-            Duration::from_secs(5),
+        // The worker has not run since these polls: an answer here would come
+        // from the read state, not from startup sync behind those commands.
+        let mut took = Box::pin(tokio::task::unconstrained(
             startup_sync_took_queued_commands(&runtime, "alice"),
-        )
-        .await
-        .expect("held startup sync answers the queued-commands fence")
-        .unwrap();
-        // Both commands were taken before that answer: startup deferred them.
+        ));
+        assert!(
+            still_waiting(&mut took).await,
+            "the queued-commands fence must go through the worker"
+        );
+        tokio::time::timeout(Duration::from_secs(5), took)
+            .await
+            .expect("held startup sync answers the queued-commands fence")
+            .unwrap();
+        // The worker took every earlier command before that answer: it
+        // answered the acceptance and deferred the other two.
+        assert!(matches!(
+            std::future::poll_fn(|cx| Poll::Ready(busy.as_mut().poll(cx))).await,
+            Poll::Ready(Err(AppError::AccountWorkerBusy))
+        ));
         assert!(
             still_waiting(&mut finished).await,
             "the startup fence must wait for startup to end"
