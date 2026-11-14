@@ -13,6 +13,7 @@ use cgka_traits::GroupId;
 use storage_sqlite::{RecoveryDemandTicket, SqliteAppStorage, TransportReconciliationRoute};
 
 use crate::client::AppClient;
+use crate::client::history_recovery::recovery_runner::UnitKey;
 use crate::history_notices::{
     decode_notice_id, encode_notice_id, history_notice, rejoin_group_tag,
 };
@@ -43,13 +44,40 @@ impl RejoinNotice {
 /// revision, with its group for group-scoped demand.
 pub(crate) type HistoryNoticeBaseline = Vec<([u8; 16], u64, Option<Vec<u8>>)>;
 
-/// Every group's notice ids at one moment
-/// ([`AppClient::every_group_history_notice_ids`]). A compares a group's ids
-/// with those its published entry was built at at every publish, so a group
-/// whose notices changed is rebuilt even when nothing it holds was written:
-/// a dismissed rejoin notice, a route suspended or gone, a change of
-/// device-group trust (mdk#3273). Not `Debug`: it carries groups and notice
-/// ids.
+/// The account's recovery answers at one moment
+/// ([`AppClient::recovery_answers`]): what [`AppClient::account_recovery_status`]
+/// returns, and every group's notice ids. A builds them at every publish
+/// (mdk#3273). Not `Debug`: they carry groups and notice ids.
+#[cfg_attr(not(test), allow(dead_code))] // A publishes them (mdk#3273 PR 8).
+pub(crate) struct RecoveryAnswers {
+    pub(crate) status: AccountRecoveryStatus,
+    pub(crate) group_notice_ids: GroupNoticeIds,
+    pub(crate) survey: SurveyMark,
+}
+
+/// The runner's survey as [`AppClient::recovery_answers`] read it. The
+/// runner's task writes its survey off the worker, so a later live read can
+/// list other groups catching up than answers built before it without either
+/// being wrong. Only a survey that changed the set counts: the runner sends
+/// none that would not (mdk#3273).
+#[cfg_attr(not(test), allow(dead_code))] // A's oracle reads it (mdk#3273 PR 8).
+pub(crate) struct SurveyMark(tokio::sync::watch::Receiver<Option<BTreeSet<UnitKey>>>);
+
+#[cfg_attr(not(test), allow(dead_code))] // A's oracle reads it (mdk#3273 PR 8).
+impl SurveyMark {
+    /// Whether a survey changed what is catching up since the answers read
+    /// it. A runner's watch gone counts as changed.
+    pub(crate) fn landed_since(&self) -> bool {
+        self.0.has_changed().unwrap_or(true)
+    }
+}
+
+/// Every group's notice ids, each list as
+/// [`AppClient::group_history_notice_ids`] gives it. A compares a group's ids
+/// with those its published entry was built at, so a group whose notices
+/// changed is rebuilt even when nothing it holds was written: a dismissed
+/// rejoin notice, a route suspended or gone (mdk#3273). Not `Debug`: it
+/// carries groups and notice ids.
 #[cfg_attr(not(test), allow(dead_code))] // A compares them at every publish (mdk#3273 PR 8).
 pub(crate) struct GroupNoticeIds(HashMap<Vec<u8>, Vec<String>>);
 
@@ -66,15 +94,34 @@ impl AppClient {
     /// Every current occurrence: parked obligations oldest first, then
     /// rejoins oldest first.
     pub(crate) fn history_notices(&self) -> Result<Vec<HistoryNotice>, AppError> {
+        self.notices_by_group().map(|(notices, _)| notices)
+    }
+
+    /// [`Self::history_notices`] and every group's notice ids, from one read
+    /// of the parked set and one of the rejoins. A group's ids include its
+    /// parked occurrences the host may not see, as
+    /// [`Self::group_history_notice_ids`] does.
+    fn notices_by_group(&self) -> Result<(Vec<HistoryNotice>, GroupNoticeIds), AppError> {
         let app = self.app.account_storage(&self.state.label)?.app_storage();
-        let mut notices = app
-            .parked_recovery_obligations()?
-            .iter()
-            .filter(|parked| self.host_may_see_parked(parked.group_id.as_deref()))
-            .map(history_notice)
-            .collect::<Vec<_>>();
-        notices.extend(self.rejoin_notices(&app)?.iter().map(RejoinNotice::notice));
-        Ok(notices)
+        let mut notices = Vec::new();
+        let mut ids = HashMap::<Vec<u8>, Vec<String>>::new();
+        for parked in app.parked_recovery_obligations()? {
+            if self.host_may_see_parked(parked.group_id.as_deref()) {
+                notices.push(history_notice(&parked));
+            }
+            if let Some(group_id) = parked.group_id {
+                ids.entry(group_id)
+                    .or_default()
+                    .push(encode_notice_id(parked.ticket));
+            }
+        }
+        for rejoin in self.rejoin_notices(&app)? {
+            notices.push(rejoin.notice());
+            ids.entry(rejoin.group_id)
+                .or_default()
+                .push(encode_notice_id(rejoin.ticket));
+        }
+        Ok((notices, GroupNoticeIds(ids)))
     }
 
     /// Each rejoin's notice not yet dismissed, oldest first, for a group with
@@ -118,16 +165,36 @@ impl AppClient {
     /// survey found catching up. Until a runner has surveyed, nothing is.
     /// The routes are read only while something is catching up.
     pub(crate) fn account_recovery_status(&self) -> Result<AccountRecoveryStatus, AppError> {
+        self.recovery_answers().map(|answers| answers.status)
+    }
+
+    /// [`Self::account_recovery_status`] and every group's notice ids, at one
+    /// moment.
+    pub(crate) fn recovery_answers(&self) -> Result<RecoveryAnswers, AppError> {
+        let (notices, group_notice_ids) = self.notices_by_group()?;
         let mut status = AccountRecoveryStatus {
-            notices: self.history_notices()?,
+            notices,
             ..AccountRecoveryStatus::default()
         };
-        let Some(units) = self
-            .routing
-            .recovery_runner_catching_up_now()
-            .filter(|units| !units.is_empty())
-        else {
-            return Ok(status);
+        let mut survey = self.routing.subscribe_recovery_runner_catching_up();
+        let units = survey.borrow_and_update().clone();
+        self.add_catching_up(&mut status, units);
+        Ok(RecoveryAnswers {
+            status,
+            group_notice_ids,
+            survey: SurveyMark(survey),
+        })
+    }
+
+    /// The groups and inbox the runner's last survey, `units`, found catching
+    /// up.
+    fn add_catching_up(
+        &self,
+        status: &mut AccountRecoveryStatus,
+        units: Option<BTreeSet<UnitKey>>,
+    ) {
+        let Some(units) = units.filter(|units| !units.is_empty()) else {
+            return;
         };
         let groups = self
             .current_route_groups()
@@ -144,7 +211,6 @@ impl AppClient {
             }
         }
         status.catching_up_group_ids_hex = catching_up.into_iter().collect();
-        Ok(status)
     }
 
     /// Whether hosts are owed a `RecoveryStatusChanged`: the runner's survey
@@ -180,28 +246,6 @@ impl AppClient {
                 .map(|notice| encode_notice_id(notice.ticket)),
         );
         Ok(ids)
-    }
-
-    /// Every group's notice ids, each list as
-    /// [`Self::group_history_notice_ids`] gives it, from one read of the
-    /// parked set and one of the rejoins.
-    #[cfg_attr(not(test), allow(dead_code))] // A compares them at every publish (mdk#3273 PR 8).
-    pub(crate) fn every_group_history_notice_ids(&self) -> Result<GroupNoticeIds, AppError> {
-        let app = self.app.account_storage(&self.state.label)?.app_storage();
-        let mut ids = HashMap::<Vec<u8>, Vec<String>>::new();
-        for parked in app.parked_recovery_obligations()? {
-            if let Some(group_id) = parked.group_id {
-                ids.entry(group_id)
-                    .or_default()
-                    .push(encode_notice_id(parked.ticket));
-            }
-        }
-        for notice in self.rejoin_notices(&app)? {
-            ids.entry(notice.group_id)
-                .or_default()
-                .push(encode_notice_id(notice.ticket));
-        }
-        Ok(GroupNoticeIds(ids))
     }
 
     /// Retire exactly the dismissed occurrence as "history may be incomplete".

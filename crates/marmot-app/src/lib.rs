@@ -8668,15 +8668,6 @@ impl AppTransportRouting {
         self.inner.recovery_runner_catching_up.clone()
     }
 
-    /// What the account's recovery runner last found catching up; `None`
-    /// until one has surveyed.
-    fn recovery_runner_catching_up_now(
-        &self,
-    ) -> Option<std::collections::BTreeSet<client::history_recovery::recovery_runner::UnitKey>>
-    {
-        self.inner.recovery_runner_catching_up.borrow().clone()
-    }
-
     /// A receiver that changes whenever what the runner finds catching up
     /// does: a unit starts or stops owing, breaks or is re-armed.
     fn subscribe_recovery_runner_catching_up(

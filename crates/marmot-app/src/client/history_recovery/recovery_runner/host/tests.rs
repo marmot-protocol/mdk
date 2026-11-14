@@ -1013,7 +1013,11 @@ async fn failed_route_goal_writes(failed_steps: usize) {
         .find(|route| route.group_id.as_deref() == Some(group.as_slice()))
         .unwrap()
         .route;
-    let previous_status = client.routing.recovery_runner_catching_up_now();
+    let previous_status = client
+        .routing
+        .subscribe_recovery_runner_catching_up()
+        .borrow()
+        .clone();
     let faults = fault_connection(&client);
     faults
         .execute_batch(
@@ -1042,7 +1046,14 @@ async fn failed_route_goal_writes(failed_steps: usize) {
             "use the bounded local retry policy"
         );
         assert!(!woken(&mut wake), "failed preparation must not self-wake");
-        assert!(client.routing.recovery_runner_catching_up_now() == previous_status);
+        assert!(
+            client
+                .routing
+                .subscribe_recovery_runner_catching_up()
+                .borrow()
+                .clone()
+                == previous_status
+        );
         assert_eq!(ledger.recovery_coverage_goal(&route).unwrap(), None);
     }
     faults
@@ -2539,7 +2550,9 @@ async fn the_runner_sweeps_rather_than_parks_what_the_open_seeded() {
     assert!(
         client
             .routing
-            .recovery_runner_catching_up_now()
+            .subscribe_recovery_runner_catching_up()
+            .borrow()
+            .clone()
             .is_some_and(|units| units.is_empty())
     );
     assert!(client.account_recovery_status().unwrap().notices.is_empty());

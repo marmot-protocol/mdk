@@ -218,6 +218,54 @@ async fn the_status_reports_what_the_runner_catches_up() {
     assert!(status.catching_up_group_ids_hex.is_empty() && !status.inbox_catching_up);
 }
 
+/// The answers mark the survey they read: a survey that changes what is
+/// catching up afterwards is seen, and until one does the answers agree with
+/// a live read. The runner sends only changes, so a survey that finds the
+/// same set leaves the mark unmoved.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_answers_mark_a_survey_that_lands_after_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let (client, _, group, route) = fixture(&dir).await;
+    let unmoved = client.recovery_answers().unwrap();
+    catching_up(&client, &[&route]);
+    assert!(unmoved.survey.landed_since(), "the first survey lands");
+
+    let answers = client.recovery_answers().unwrap();
+    assert!(!answers.survey.landed_since());
+    assert_eq!(answers.status, client.account_recovery_status().unwrap());
+    let same = BTreeSet::from([UnitKey {
+        route: route.clone(),
+        relay: RELAY.to_owned(),
+    }]);
+    let sent = client
+        .routing
+        .recovery_runner_catching_up()
+        .send_if_modified(|last| {
+            let changed = last.as_ref() != Some(&same);
+            *last = Some(same.clone());
+            changed
+        });
+    assert!(
+        !sent && !answers.survey.landed_since(),
+        "the same set is no survey"
+    );
+
+    catching_up(&client, &[]);
+    assert!(answers.survey.landed_since());
+    assert_eq!(
+        answers.status.catching_up_group_ids_hex,
+        vec![hex::encode(group.as_slice())]
+    );
+    assert!(
+        client
+            .account_recovery_status()
+            .unwrap()
+            .catching_up_group_ids_hex
+            .is_empty(),
+        "a live read after the survey differs only in what is catching up"
+    );
+}
+
 /// A conversion that changed the notices is announced once, then
 /// acknowledged: the account's parked loss, a notice, becomes its routes'
 /// parks, which raise none.
@@ -330,12 +378,20 @@ async fn every_groups_notice_ids_are_each_groups_own() {
                 .map(|route| (route.route, route.group_id))
                 .collect::<Vec<_>>()
         );
-        let every = client.every_group_history_notice_ids().unwrap();
+        let answers = client.recovery_answers().unwrap();
+        let every = answers.group_notice_ids;
         for id in [&group, &other, &unknown] {
             assert_eq!(
                 every.of(id),
                 client.group_history_notice_ids(id).unwrap().as_slice()
             );
+        }
+        // Each notice the host is shown is among its group's ids.
+        for notice in &answers.status.notices {
+            if let Some(hex) = &notice.group_id_hex {
+                let group_id = GroupId::new(hex::decode(hex).unwrap());
+                assert!(every.of(&group_id).contains(&notice.notice_id));
+            }
         }
         every
     };
