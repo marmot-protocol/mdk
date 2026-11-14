@@ -789,6 +789,7 @@ mod tests {
                 shortcode: "wave".to_owned(),
                 plaintext_sha256: "11".repeat(32),
             },
+            message_tags: Vec::new(),
         };
         let action = super::AppClient::message_human_action_context(&sticker)
             .and_then(|context| context.human_action)

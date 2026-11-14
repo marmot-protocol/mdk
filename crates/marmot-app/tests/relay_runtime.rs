@@ -3963,6 +3963,212 @@ async fn app_runtime_custom_events_roundtrip_and_filter_by_kind() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tagged_poll_sticker_peer() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, url) = mock_app(&dir).await;
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let setup = AccountSetupRequest {
+        default_relays: vec![endpoint(&url)],
+        bootstrap_relays: vec![endpoint(&url)],
+        publish_initial_key_package: true,
+        ..Default::default()
+    };
+    let alice = create_network_ready_identity(&runtime, setup.relay_options_only())
+        .await
+        .account;
+    let bob = create_network_ready_identity(&runtime, setup).await.account;
+    let a = &alice.account_id_hex;
+    let b = &bob.account_id_hex;
+    let mut events = runtime.subscribe();
+    let group = runtime
+        .create_group(a, "tagged context", std::slice::from_ref(b), None)
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
+    wait_for_event(&mut events, |event| {
+        matches!(event, MarmotAppEvent::GroupJoined { account_id_hex, group_id, .. }
+            if account_id_hex == b && group_id == &group)
+    })
+    .await;
+    accept_group_invite_retrying_busy(&runtime, b, &group)
+        .await
+        .unwrap();
+    let group_hex = hex::encode(group.as_slice());
+    let mut bob_timeline = runtime
+        .subscribe_timeline_messages(
+            b,
+            TimelineMessageQuery {
+                group_id_hex: Some(group_hex.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let root = runtime
+        .send_message(a, &group, b"Choose a drink".to_vec())
+        .await
+        .unwrap();
+    let root_id = &root.message_ids[0];
+    let tags = vec![
+        vec!["e".into(), root_id.clone()],
+        vec!["E".into(), root_id.clone(), String::new(), a.clone()],
+        vec!["K".into(), "9".into()],
+        vec!["P".into(), a.clone()],
+        vec!["effect".into(), "party".into()],
+    ];
+    let sent = runtime
+        .create_tagged_poll(
+            a,
+            &group,
+            "Drink?".into(),
+            vec!["Tea".into(), "Coffee".into()],
+            cgka_traits::PollType::MultipleChoice,
+            None,
+            tags.clone(),
+        )
+        .await
+        .unwrap();
+    let poll_id = &sent.message_ids[0];
+    wait_for_timeline_update(&mut bob_timeline, |update| {
+        matches!(update, marmot_app::RuntimeTimelineMessageUpdate::Projection(projection)
+            if projection.update.timeline_messages.iter().any(|row| row.message_id_hex == *poll_id && row.poll.is_some()))
+    }).await;
+    let peer = runtime
+        .timeline_message(b, &group_hex, poll_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        peer.reply_to_message_id_hex.as_deref(),
+        Some(root_id.as_str())
+    );
+    assert_eq!(
+        peer.reply_preview.as_ref().unwrap().plaintext,
+        "Choose a drink"
+    );
+    for tag in &tags {
+        assert!(peer.tags.contains(tag));
+    }
+    let poll = peer.poll.unwrap();
+    assert_eq!(poll.question, "Drink?");
+    assert_eq!(poll.poll_type, cgka_traits::PollType::MultipleChoice);
+    assert_eq!(
+        poll.options
+            .iter()
+            .map(|option| option.label.as_str())
+            .collect::<Vec<_>>(),
+        ["Tea", "Coffee"]
+    );
+    runtime
+        .cast_poll_vote(b, &group, poll_id.clone(), vec!["0".into(), "1".into()])
+        .await
+        .unwrap();
+    let voted = runtime
+        .timeline_message(b, &group_hex, poll_id)
+        .unwrap()
+        .unwrap()
+        .poll
+        .unwrap();
+    assert_eq!(voted.participants, 1);
+    assert_eq!(voted.local_selection, ["0", "1"]);
+    assert_eq!(
+        voted
+            .options
+            .iter()
+            .map(|option| option.votes)
+            .collect::<Vec<_>>(),
+        [1, 1]
+    );
+
+    // Fetch a signed pack through the public path so sticker authorization is real.
+    use sonar_stickers::{PackAddress, Sticker, StickerPack, build_pack_tags};
+    let author = Keys::generate();
+    let coordinate = format!("30031:{}:context", author.public_key().to_hex());
+    let hash = "11".repeat(32);
+    let pack = StickerPack::new(
+        PackAddress::new(author.public_key().to_hex(), "context").unwrap(),
+        "Context",
+        None,
+        None,
+        vec![
+            Sticker::new(
+                "wave",
+                format!("https://cdn.example/{hash}.png"),
+                hash.clone(),
+                "image/png",
+                Some(32),
+                Some(32),
+                None,
+                None,
+            )
+            .unwrap(),
+        ],
+        None,
+    )
+    .unwrap();
+    let pack_tags = build_pack_tags(&pack)
+        .into_iter()
+        .map(|tag| {
+            let fields: Vec<String> =
+                serde_json::from_str(&serde_json::to_string(&tag).unwrap()).unwrap();
+            Tag::parse(fields).unwrap()
+        })
+        .collect::<Vec<_>>();
+    let signed = EventBuilder::new(Kind::Custom(30031), "")
+        .tags(pack_tags)
+        .finalize(&author)
+        .unwrap();
+    let relay_client = NostrSdkRelayClient::new(NostrSdkClient::builder().build());
+    relay_client
+        .publish_event(
+            &[endpoint(&url)],
+            &NostrTransportEvent::from_nostr_event(&signed).unwrap(),
+            1,
+        )
+        .await
+        .unwrap();
+    app.fetch_sticker_pack(a, &coordinate).await.unwrap();
+    let sent = runtime
+        .send_tagged_sticker(
+            a,
+            &group,
+            marmot_app::AppStickerRef {
+                pack_coordinate: coordinate,
+                shortcode: "wave".into(),
+                plaintext_sha256: hash,
+            },
+            tags.clone(),
+        )
+        .await
+        .unwrap();
+    let sticker_id = &sent.message_ids[0];
+    wait_for_timeline_update(&mut bob_timeline, |update| {
+        matches!(update, marmot_app::RuntimeTimelineMessageUpdate::Projection(projection)
+            if projection.update.timeline_messages.iter().any(|row| row.message_id_hex == *sticker_id))
+    }).await;
+    let peer = runtime
+        .timeline_message(b, &group_hex, sticker_id)
+        .unwrap()
+        .unwrap();
+    for tag in &tags {
+        assert!(peer.tags.contains(tag));
+    }
+    assert_eq!(
+        peer.reply_to_message_id_hex.as_deref(),
+        Some(root_id.as_str())
+    );
+    assert_eq!(peer.reply_preview.unwrap().plaintext, "Choose a drink");
+    assert_eq!(
+        marmot_app::sticker_ref_from_tags(peer.kind, &peer.tags)
+            .unwrap()
+            .shortcode,
+        "wave"
+    );
+    drop(bob_timeline);
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn app_runtime_delete_group_local_removes_projection_without_publishing_leave() {
     let dir = tempfile::tempdir().unwrap();
     let (_relay, app, url) = mock_app(&dir).await;

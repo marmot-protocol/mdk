@@ -43,6 +43,9 @@
 
 ### Fixed
 
+- Poll timeline rows retain their reply target and parent preview during incremental projection and full group
+  rebuilds (mdk#3408), without projecting chat-only media or stream metadata. Poll votes remain folded into the poll
+  row. No schema change.
 - Withdrawing a delete of an edit reports `MessageEditedOrReprojected` for the edited message and
   `ReplyPreviewChanged` for replies quoting it, instead of `ReactionAdded`. Restored poll responses also use the
   reprojection trigger; restored reactions keep `ReactionAdded` (mdk#3377).

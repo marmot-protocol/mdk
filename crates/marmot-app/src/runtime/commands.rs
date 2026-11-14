@@ -2423,28 +2423,6 @@ impl AccountManager {
         .await
     }
 
-    pub(crate) async fn create_poll(
-        &self,
-        account_ref: &str,
-        group_id: &GroupId,
-        question: String,
-        options: Vec<String>,
-        poll_type: cgka_traits::PollType,
-        ends_at: Option<u64>,
-    ) -> Result<SendSummary, AppError> {
-        self.send_app_event(
-            account_ref,
-            group_id,
-            AppMessageIntent::Poll {
-                question,
-                options,
-                poll_type,
-                ends_at,
-            },
-        )
-        .await
-    }
-
     pub(crate) async fn cast_poll_vote(
         &self,
         account_ref: &str,

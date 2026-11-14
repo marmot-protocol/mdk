@@ -3400,8 +3400,43 @@ impl MarmotAppRuntime {
         poll_type: cgka_traits::PollType,
         ends_at: Option<u64>,
     ) -> Result<SendSummary, AppError> {
+        self.create_tagged_poll(
+            account_ref,
+            group_id,
+            question,
+            options,
+            poll_type,
+            ends_at,
+            Vec::new(),
+        )
+        .await
+    }
+
+    /// Create a poll with reply, thread, or effect tags. Caller tags cannot
+    /// contain poll fields or `imeta`; the complete poll is limited to 32 tags.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_tagged_poll(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+        question: String,
+        options: Vec<String>,
+        poll_type: cgka_traits::PollType,
+        ends_at: Option<u64>,
+        message_tags: Vec<Vec<String>>,
+    ) -> Result<SendSummary, AppError> {
         self.accounts
-            .create_poll(account_ref, group_id, question, options, poll_type, ends_at)
+            .send_app_event(
+                account_ref,
+                group_id,
+                AppMessageIntent::Poll {
+                    question,
+                    options,
+                    poll_type,
+                    ends_at,
+                    message_tags,
+                },
+            )
             .await
     }
 
@@ -4166,12 +4201,28 @@ impl MarmotAppRuntime {
         group_id: &GroupId,
         sticker_ref: crate::AppStickerRef,
     ) -> Result<SendSummary, AppError> {
+        self.send_tagged_sticker(account_ref, group_id, sticker_ref, Vec::new())
+            .await
+    }
+
+    /// Send an authorized sticker with reply, thread, or effect tags.
+    /// Additional `sticker` and `imeta` tags are rejected.
+    pub async fn send_tagged_sticker(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+        sticker_ref: crate::AppStickerRef,
+        message_tags: Vec<Vec<String>>,
+    ) -> Result<SendSummary, AppError> {
         let summary = self
             .accounts
             .send_app_event(
                 account_ref,
                 group_id,
-                AppMessageIntent::Sticker { sticker_ref },
+                AppMessageIntent::Sticker {
+                    sticker_ref,
+                    message_tags,
+                },
             )
             .await?;
         let _ = self.publish_chat_list_projection_refresh(

@@ -68,6 +68,23 @@ impl Marmot {
         Ok(summary.into())
     }
 
+    /// Send a sticker with reply (`e`), NIP-22 (`E`, `K`, `P`), or effect tags.
+    /// Rejects `imeta` and extra `sticker` tags; native sticker authorization still applies.
+    pub async fn send_tagged_sticker(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+        sticker_ref: StickerRefFfi,
+        message_tags: Vec<Vec<String>>,
+    ) -> Result<SendSummaryFfi, MarmotKitError> {
+        let group_id = group_id_from_hex(&group_id_hex)?;
+        Ok(self
+            .runtime
+            .send_tagged_sticker(&account_ref, &group_id, sticker_ref.into(), message_tags)
+            .await?
+            .into())
+    }
+
     /// Re-attempt publishing a group's pending (committed-but-undelivered)
     /// commit(s) without minting a new event.
     ///
@@ -290,6 +307,36 @@ impl Marmot {
             )
             .await?;
         Ok(summary.into())
+    }
+
+    /// Create a poll with reply (`e`), NIP-22 (`E`, `K`, `P`), or effect tags.
+    /// Rejects `imeta`, `option`, `polltype`, `endsAt`, and `response` context tags.
+    /// Generated poll tags plus context tags must total at most 32.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_tagged_poll(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+        question: String,
+        options: Vec<String>,
+        poll_type: PollTypeFfi,
+        ends_at: Option<u64>,
+        message_tags: Vec<Vec<String>>,
+    ) -> Result<SendSummaryFfi, MarmotKitError> {
+        let group_id = group_id_from_hex(&group_id_hex)?;
+        Ok(self
+            .runtime
+            .create_tagged_poll(
+                &account_ref,
+                &group_id,
+                question,
+                options,
+                poll_type.into(),
+                ends_at,
+                message_tags,
+            )
+            .await?
+            .into())
     }
 
     /// Replace this account's selection; accepted open polls remain votable after reclassification.

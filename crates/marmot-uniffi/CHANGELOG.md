@@ -29,6 +29,8 @@
 - Add the [native-host test recipe](NATIVE-HOST-TESTS.md) and runnable Swift XCTest command
   `bash crates/marmot-uniffi/native-host-smoke.sh`, using a local MockRelay and injected test-only secret storage
   to check delivery and same-root reopening without production credentials (mdk#2947).
+- `create_tagged_poll` and `send_tagged_sticker` accept reply, NIP-22 context and effect tags without changing
+  existing method signatures (mdk#3408). Polls project reply previews like chat messages.
 - `sticker_pack_share_link(account_ref, coordinate)` builds a canonical Sonar pack link locally with retained
   relay hints, falling back to current account outbox candidates for packs without hints (mdk#3283).
 

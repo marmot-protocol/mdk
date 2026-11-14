@@ -58,6 +58,9 @@
   Bundles whose stored value does not decode are still skipped. Storage
   backends classify OpenMLS storage errors through the new
   `StorageProvider::mls_storage_failure` (mdk#3273).
+- Add tagged poll and sticker sends in the runtime, UniFFI, and C bindings.
+  Reply, thread, and effect context reaches peers; polls project reply links
+  and previews. Existing send signatures and C ABI remain unchanged (#3408).
 
 ## 0.16.0 - 2026-11-12
 

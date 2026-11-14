@@ -14,6 +14,9 @@ use cgka_traits::app_event::{
 use cgka_traits::app_event::{
     MARMOT_APP_EVENT_KIND_REMOVE, MARMOT_APP_EVENT_KIND_REPORT, MARMOT_APP_EVENT_KIND_REVIEW,
 };
+use cgka_traits::polls::{
+    POLL_ENDS_AT_TAG, POLL_MAX_TAGS, POLL_OPTION_TAG, POLL_RESPONSE_TAG, POLL_TYPE_TAG,
+};
 use cgka_traits::reporting::ReportReason;
 use cgka_traits::{
     MARMOT_APP_EVENT_KIND_POLL, MARMOT_APP_EVENT_KIND_POLL_RESPONSE, PollType, poll_response_tags,
@@ -212,6 +215,7 @@ pub(crate) enum AppMessageIntent {
     },
     Sticker {
         sticker_ref: crate::AppStickerRef,
+        message_tags: Vec<Vec<String>>,
     },
     Reaction {
         target_message_id: String,
@@ -244,6 +248,7 @@ pub(crate) enum AppMessageIntent {
         options: Vec<String>,
         poll_type: PollType,
         ends_at: Option<u64>,
+        message_tags: Vec<Vec<String>>,
     },
     PollResponse {
         poll_event_id: String,
@@ -352,11 +357,21 @@ pub(crate) fn build_inner_event_with_media_reply(
             }
             Ok(event(MARMOT_APP_EVENT_KIND_CHAT, tags, content.clone()))
         }
-        AppMessageIntent::Sticker { sticker_ref } => Ok(event(
-            MARMOT_APP_EVENT_KIND_CHAT,
-            vec![crate::stickers::sticker_ref_tag(sticker_ref)?],
-            String::new(),
-        )),
+        AppMessageIntent::Sticker {
+            sticker_ref,
+            message_tags,
+        } => {
+            validate_message_tags(message_tags)?;
+            if message_tags.iter().any(|tag| tag[0] == "sticker") {
+                return Err(AppError::InvalidAppMessagePayload(
+                    "sticker context cannot carry another sticker".into(),
+                ));
+            }
+            let mut tags = Vec::with_capacity(1 + message_tags.len());
+            tags.push(crate::stickers::sticker_ref_tag(sticker_ref)?);
+            tags.extend_from_slice(message_tags);
+            Ok(event(MARMOT_APP_EVENT_KIND_CHAT, tags, String::new()))
+        }
         AppMessageIntent::Reaction {
             target_message_id,
             emoji,
@@ -478,9 +493,27 @@ pub(crate) fn build_inner_event_with_media_reply(
             options,
             poll_type,
             ends_at,
+            message_tags,
         } => {
-            let tags = poll_tags(created_at, question, options, *poll_type, *ends_at)
+            validate_message_tags(message_tags)?;
+            if message_tags.iter().any(|tag| {
+                matches!(
+                    tag[0].as_str(),
+                    POLL_OPTION_TAG | POLL_TYPE_TAG | POLL_ENDS_AT_TAG | POLL_RESPONSE_TAG
+                )
+            }) {
+                return Err(AppError::InvalidAppMessagePayload(
+                    "poll context cannot override poll fields".into(),
+                ));
+            }
+            let mut tags = poll_tags(created_at, question, options, *poll_type, *ends_at)
                 .map_err(|error| AppError::InvalidAppMessagePayload(error.to_string()))?;
+            if tags.len() + message_tags.len() > POLL_MAX_TAGS {
+                return Err(AppError::InvalidAppMessagePayload(
+                    "poll tags exceed limits".into(),
+                ));
+            }
+            tags.extend_from_slice(message_tags);
             Ok(event(MARMOT_APP_EVENT_KIND_POLL, tags, question.clone()))
         }
         AppMessageIntent::PollResponse {

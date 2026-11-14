@@ -3004,6 +3004,57 @@ pub unsafe extern "C" fn marmot_create_poll(
     })
 }
 
+/// Create a poll with reply, NIP-22, or effect context tags. Generated and
+/// supplied tags must total at most 32. Rejects `imeta`, `option`, `polltype`,
+/// `endsAt`, and `response` context tags. Free with `marmot_send_summary_free`.
+///
+/// # Safety
+/// `client` must be live; strings and `options_len` option pointers valid;
+/// `tags` must hold `tags_len` valid rows with valid value pointers, or be NULL
+/// with length zero. `poll_type` must be a valid discriminant; `out` writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_create_tagged_poll(
+    client: *const MarmotClient,
+    account_ref: *const c_char,
+    group_id_hex: *const c_char,
+    question: *const c_char,
+    options: *const *const c_char,
+    options_len: usize,
+    poll_type: u32,
+    has_ends_at: u8,
+    ends_at: u64,
+    tags: *const MarmotStringArray,
+    tags_len: usize,
+    out: *mut *mut MarmotSendSummary,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { crate::preflight_out_ptr(out) });
+        let client = try_arg!(unsafe { client_ref(client) });
+        let account_ref = try_arg!(unsafe { required_str(account_ref) });
+        let group_id_hex = try_arg!(unsafe { required_str(group_id_hex) });
+        let question = try_arg!(unsafe { required_str(question) });
+        let options = try_arg!(unsafe { str_array(options, options_len) });
+        let poll_type = try_arg!(MarmotPollType::from_c(poll_type));
+        let tags = try_arg!(unsafe {
+            struct_array(tags, tags_len, |row| str_array(row.values, row.values_len))
+        });
+        unsafe {
+            deliver(
+                client.block_on(client.marmot.create_tagged_poll(
+                    account_ref,
+                    group_id_hex,
+                    question,
+                    options,
+                    poll_type.to_ffi(),
+                    (has_ends_at != 0).then_some(ends_at),
+                    tags,
+                )),
+                out,
+            )
+        }
+    })
+}
+
 /// Replace this account's selection; accepted open polls remain votable after reclassification.
 ///
 /// # Safety
@@ -3973,6 +4024,52 @@ pub unsafe extern "C" fn marmot_send_sticker(
                         .marmot
                         .send_sticker(account_ref, group_id_hex, sticker_ref),
                 ),
+                out,
+            )
+        }
+    })
+}
+
+/// Send a sticker with reply, NIP-22, or effect context tags.
+/// Rejects `imeta` and extra `sticker` tags. Free with `marmot_send_summary_free`.
+///
+/// # Safety
+/// `client` must be live; strings must be NUL-terminated; `tags` must hold
+/// `tags_len` valid rows with valid value pointers, or be NULL with length zero;
+/// `out` must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_send_tagged_sticker(
+    client: *const MarmotClient,
+    account_ref: *const c_char,
+    group_id_hex: *const c_char,
+    pack_coordinate: *const c_char,
+    shortcode: *const c_char,
+    plaintext_sha256: *const c_char,
+    tags: *const MarmotStringArray,
+    tags_len: usize,
+    out: *mut *mut MarmotSendSummary,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { crate::preflight_out_ptr(out) });
+        let client = try_arg!(unsafe { client_ref(client) });
+        let account_ref = try_arg!(unsafe { required_str(account_ref) });
+        let group_id_hex = try_arg!(unsafe { required_str(group_id_hex) });
+        let sticker_ref = marmot_uniffi::StickerRefFfi {
+            pack_coordinate: try_arg!(unsafe { required_str(pack_coordinate) }),
+            shortcode: try_arg!(unsafe { required_str(shortcode) }),
+            plaintext_sha256: try_arg!(unsafe { required_str(plaintext_sha256) }),
+        };
+        let tags = try_arg!(unsafe {
+            struct_array(tags, tags_len, |row| str_array(row.values, row.values_len))
+        });
+        unsafe {
+            deliver(
+                client.block_on(client.marmot.send_tagged_sticker(
+                    account_ref,
+                    group_id_hex,
+                    sticker_ref,
+                    tags,
+                )),
                 out,
             )
         }

@@ -1302,7 +1302,10 @@ A sticker message is kind 9 and carries one exact `(coordinate, shortcode, plain
 `sticker: StickerRefFfi?` on message, preview and timeline records (`nil` for a deleted row). Hosts pass that typed
 reference to `fetchStickerAsset` to get validated bytes and never parse tags or fetch a sticker URL themselves; a
 reference the account has no mapping for fails with `StickerNotFound`. `sendSticker` sends only a reference the
-account already holds. `importSignalStickerPack` validates a Signal pack link and then refuses before any network call.
+account already holds. `sendTaggedSticker` accepts the same reference plus a final `messageTags` list for reply
+`e`, NIP-22 `E`/`K`/`P`, and effects on that same message; `imeta` and extra `sticker` tags are rejected.
+Context uses the tagged-text bounds of 64 tags and 16 KiB of tag values.
+`importSignalStickerPack` validates a Signal pack link and then refuses before any network call.
 
 ## Emoji sets
 

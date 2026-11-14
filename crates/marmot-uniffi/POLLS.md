@@ -11,6 +11,12 @@ bidirectional-override text is rejected. Polls can be created and voted in direc
 same membership, application-message admission, payload validation and retention rules as other messages.
 Changing a conversation's name or membership classification does not disable an existing open poll.
 
+Use `createTaggedPoll` (`create_tagged_poll` in Rust) with a final `messageTags` list to add reply `e`, NIP-22
+`E`/`K`/`P`, or effect tags to the same poll event. Poll replies expose the same reply target and preview as chat
+messages. Context must not contain `imeta`, `option`, `polltype`, `endsAt`, or `response` tags. The generated
+`option` and `polltype` tags, optional `endsAt`, and supplied context must total at most 32 tags. `createPoll`
+keeps its existing signature and supplies no context.
+
 Use `castPollVote` with the poll event id and the complete selected option-id list. It is a replacement, not a delta:
 send one id for single choice and one through ten unique ids for multiple choice. The poll must already be a valid local
 timeline row in the same group and still be open. An empty selection is not an unvote operation.
@@ -56,6 +62,6 @@ Polls are coordination tools, not anonymous or election-grade voting. Every grou
 identity with each response, and distributed clients/relays do not provide a global sequencer at the closing boundary.
 Hosts must not describe the feature as anonymous or use the result for high-stakes elections.
 
-The C surface mirrors this contract as `marmot_create_poll`, `marmot_cast_poll_vote`, `marmot_poll_votes`, and the
+The C surface mirrors this contract as `marmot_create_poll`, `marmot_create_tagged_poll`, `marmot_cast_poll_vote`, `marmot_poll_votes`, and the
 nullable `MarmotTimelineMessageRecord.poll`. Recompile C clients against the matching generated header because the
 timeline record layout changes.

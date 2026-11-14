@@ -12165,6 +12165,29 @@ MarmotStatus marmot_create_poll(const struct MarmotClient *client,
                                 struct MarmotSendSummary **out);
 
 /**
+ * Create a poll with reply, NIP-22, or effect context tags. Generated and
+ * supplied tags must total at most 32. Rejects `imeta`, `option`, `polltype`,
+ * `endsAt`, and `response` context tags. Free with `marmot_send_summary_free`.
+ *
+ * # Safety
+ * `client` must be live; strings and `options_len` option pointers valid;
+ * `tags` must hold `tags_len` valid rows with valid value pointers, or be NULL
+ * with length zero. `poll_type` must be a valid discriminant; `out` writable.
+ */
+MarmotStatus marmot_create_tagged_poll(const struct MarmotClient *client,
+                                       const char *account_ref,
+                                       const char *group_id_hex,
+                                       const char *question,
+                                       const char *const *options,
+                                       uintptr_t options_len,
+                                       uint32_t poll_type,
+                                       uint8_t has_ends_at,
+                                       uint64_t ends_at,
+                                       const struct MarmotStringArray *tags,
+                                       uintptr_t tags_len,
+                                       struct MarmotSendSummary **out);
+
+/**
  * Replace this account's selection; accepted open polls remain votable after reclassification.
  *
  * # Safety
@@ -12825,6 +12848,25 @@ MarmotStatus marmot_send_sticker(const struct MarmotClient *client,
                                  const char *shortcode,
                                  const char *plaintext_sha256,
                                  struct MarmotSendSummary **out);
+
+/**
+ * Send a sticker with reply, NIP-22, or effect context tags.
+ * Rejects `imeta` and extra `sticker` tags. Free with `marmot_send_summary_free`.
+ *
+ * # Safety
+ * `client` must be live; strings must be NUL-terminated; `tags` must hold
+ * `tags_len` valid rows with valid value pointers, or be NULL with length zero;
+ * `out` must be writable.
+ */
+MarmotStatus marmot_send_tagged_sticker(const struct MarmotClient *client,
+                                        const char *account_ref,
+                                        const char *group_id_hex,
+                                        const char *pack_coordinate,
+                                        const char *shortcode,
+                                        const char *plaintext_sha256,
+                                        const struct MarmotStringArray *tags,
+                                        uintptr_t tags_len,
+                                        struct MarmotSendSummary **out);
 
 /**
  *

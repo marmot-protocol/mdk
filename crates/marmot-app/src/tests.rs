@@ -14399,6 +14399,7 @@ fn sticker_intent_builds_sonar_kind_nine_tag() {
             shortcode: "wave".to_owned(),
             plaintext_sha256: hash.clone(),
         },
+        message_tags: Vec::new(),
     });
     assert_eq!(event.kind, MARMOT_APP_EVENT_KIND_CHAT);
     assert!(event.content.is_empty());
@@ -14424,6 +14425,88 @@ fn reaction_intent_builds_kind_seven_with_e_tag() {
     assert_eq!(event.kind, MARMOT_APP_EVENT_KIND_REACTION);
     assert_eq!(event.content, "🔥");
     assert_eq!(tag_value(&event.tags, EVENT_REF_TAG), Some("abc123"));
+}
+
+#[test]
+fn poll_context_preserves_fields() {
+    let create = |message_tags| AppMessageIntent::Poll {
+        question: "Drink?".into(),
+        options: vec!["Tea".into(), "Coffee".into()],
+        poll_type: cgka_traits::PollType::MultipleChoice,
+        ends_at: Some(1_700_000_100),
+        message_tags,
+    };
+    for key in ["option", "polltype", "endsAt", "response", "imeta"] {
+        let result = build_inner_event(
+            &create(vec![vec![key.into(), "override".into()]]),
+            SENDER_HEX,
+            1_700_000_000,
+        );
+        let expected = if key == "imeta" {
+            "invalid additional message tag"
+        } else {
+            "poll context cannot override poll fields"
+        };
+        assert!(
+            matches!(result, Err(AppError::InvalidAppMessagePayload(detail)) if detail == expected)
+        );
+    }
+    let context = vec![vec!["p".into(), SENDER_HEX.into()]; cgka_traits::polls::POLL_MAX_TAGS - 4];
+    let event = build(create(context.clone()));
+    let poll = cgka_traits::parse_poll(&event).unwrap();
+    assert_eq!(event.tags.len(), 32);
+    assert_eq!(poll.question, "Drink?");
+    assert_eq!(poll.poll_type, cgka_traits::PollType::MultipleChoice);
+    assert_eq!(poll.ends_at, Some(1_700_000_100));
+    assert_eq!(
+        poll.options
+            .iter()
+            .map(|option| (option.id.as_str(), option.label.as_str()))
+            .collect::<Vec<_>>(),
+        [("0", "Tea"), ("1", "Coffee")]
+    );
+    let mut oversized = context;
+    oversized.push(vec!["p".into(), SENDER_HEX.into()]);
+    let result = build_inner_event(&create(oversized), SENDER_HEX, 1_700_000_000);
+    assert!(
+        matches!(result, Err(AppError::InvalidAppMessagePayload(detail)) if detail == "poll tags exceed limits")
+    );
+}
+
+#[test]
+fn sticker_context_rejects_tags() {
+    let sticker_ref = AppStickerRef {
+        pack_coordinate: format!("30031:{}:cats", "ab".repeat(32)),
+        shortcode: "wave".into(),
+        plaintext_sha256: "11".repeat(32),
+    };
+    for (tags, expected) in [
+        (
+            vec![vec!["sticker".into(), "other".into()]],
+            "sticker context cannot carry another sticker",
+        ),
+        (
+            vec![vec!["imeta".into(), "url https://example.com".into()]],
+            "invalid additional message tag",
+        ),
+        (vec![Vec::new()], "invalid additional message tag"),
+        (
+            vec![vec!["e".into(), " ".into()]],
+            "target message id cannot be empty",
+        ),
+    ] {
+        let result = build_inner_event(
+            &AppMessageIntent::Sticker {
+                sticker_ref: sticker_ref.clone(),
+                message_tags: tags,
+            },
+            SENDER_HEX,
+            1_700_000_000,
+        );
+        assert!(
+            matches!(result, Err(AppError::InvalidAppMessagePayload(detail)) if detail == expected)
+        );
+    }
 }
 
 #[test]

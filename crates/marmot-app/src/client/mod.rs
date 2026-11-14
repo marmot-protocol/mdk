@@ -4872,7 +4872,7 @@ impl AppClient {
             .observed(family, operation, ProductUnit::Action);
         let work = async move {
             self.ensure_group_application_messages_allowed(group_id)?;
-            if let AppMessageIntent::Sticker { sticker_ref } = &intent {
+            if let AppMessageIntent::Sticker { sticker_ref, .. } = &intent {
                 self.app
                     .authorize_sticker_ref(&self.state.label, sticker_ref)?;
             }

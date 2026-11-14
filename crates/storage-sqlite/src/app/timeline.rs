@@ -2433,7 +2433,7 @@ fn project_single_message_timeline_tx(
 
     let mut stream_start = None;
     let mut row = match event.kind {
-        MARMOT_APP_EVENT_KIND_CHAT => timeline_row_from_chat(&event),
+        MARMOT_APP_EVENT_KIND_CHAT | MARMOT_APP_EVENT_KIND_POLL => timeline_row_from_chat(&event),
         MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY
         | MARMOT_APP_EVENT_KIND_AGENT_OPERATION
         | MARMOT_APP_EVENT_KIND_GROUP_SYSTEM => timeline_row_from_app_event(&event),
@@ -4297,7 +4297,7 @@ fn project_group_events(
 
     for event in &events {
         match event.kind {
-            MARMOT_APP_EVENT_KIND_CHAT => {
+            MARMOT_APP_EVENT_KIND_CHAT | MARMOT_APP_EVENT_KIND_POLL => {
                 let mut row = timeline_row_from_chat(event);
                 if event.invalidated {
                     row.invalidation_status = Some(invalidation_status(event));
@@ -4708,6 +4708,14 @@ fn keep_receipts_of_pruned_reactions_tx(
 }
 
 fn timeline_row_from_chat(event: &RawAppEvent) -> TimelineRow {
+    let (media, agent_text_stream) = if event.kind == MARMOT_APP_EVENT_KIND_CHAT {
+        (
+            media_metadata(&event.tags),
+            agent_stream_final_metadata(&event.tags),
+        )
+    } else {
+        (None, None)
+    };
     TimelineRow {
         message_id_hex: event.message_id_hex.clone(),
         source_message_id_hex: event.source_message_id_hex.clone(),
@@ -4723,8 +4731,8 @@ fn timeline_row_from_chat(event: &RawAppEvent) -> TimelineRow {
         reply_to_message_id_hex: tag_value(&event.tags, QUOTE_REF_TAG)
             .or_else(|| tag_value(&event.tags, EVENT_REF_TAG))
             .map(ToOwned::to_owned),
-        media: media_metadata(&event.tags),
-        agent_text_stream: agent_stream_final_metadata(&event.tags),
+        media,
+        agent_text_stream,
         reactions: TimelineReactionSummary::default(),
         edit: None,
         deleted: false,
