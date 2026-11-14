@@ -792,6 +792,27 @@ impl OutboundFanout {
         Ok(true)
     }
 
+    /// Record a refusal made before the target is marked, such as the commit
+    /// size floor or a known limit, through [`Self::record_target_failure`]
+    /// (mdk#2332). It sent nothing, so no attempt is marked. A target an
+    /// earlier attempt may have exposed stays outstanding, though, so the
+    /// refusal restarts its retry clock at `refused_at_ms` and counts toward
+    /// its backoff as an attempt does; otherwise its last attempt's deadline,
+    /// once passed, would make it due, and refused, on every pass.
+    pub fn record_refusal_before_attempt(
+        &mut self,
+        index: usize,
+        failure: TransportEndpointFailure,
+        refused_at_ms: u64,
+    ) -> Result<bool, TransportAdapterError> {
+        let recorded = self.record_target_failure(index, failure)?;
+        if recorded && self.target_statuses[index].is_outstanding() {
+            self.target_attempt_counts[index] = self.target_attempt_counts[index].saturating_add(1);
+            self.target_last_attempt_at_ms[index] = Some(refused_at_ms);
+        }
+        Ok(recorded)
+    }
+
     pub fn record_published_message_id(
         &mut self,
         message_id: MessageId,

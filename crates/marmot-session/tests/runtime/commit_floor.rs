@@ -289,7 +289,9 @@ async fn a_size_refusal_before_marking_leaves_no_attempt_behind() {
 /// After the restart the relay's limit reads as unknown and the commit is
 /// over the floor, so the size check refuses it before any resend. The
 /// interrupted attempt may have reached the relay, so the refusal ends the
-/// target `PossiblyExposed` and the commit never rolls back.
+/// target `PossiblyExposed` and the commit never rolls back. Each refusal
+/// restarts the target's retry clock, so past the interrupted attempt's
+/// deadline the refused commit backs off instead of coming due on every pass.
 #[tokio::test]
 async fn a_size_refusal_after_an_interrupted_send_keeps_the_commit_pending() {
     let relay = TransportEndpoint("wss://floor-interrupted.example".into());
@@ -317,6 +319,32 @@ async fn a_size_refusal_after_an_interrupted_send_keeps_the_commit_pending() {
     assert!(matches!(stored[0].mls_state(), FanoutMlsState::Pending(_)));
     assert_eq!(adapter.publishes().len(), 1, "the refusal sent nothing");
     assert_eq!(restarted.session().epoch(&fixture.group_id).unwrap().0, 2);
+
+    // An hour on, past any deadline the interrupted attempt set, the target
+    // is due again and refused again; each refusal backs off further.
+    let retry_delay = |runtime: &AccountDeviceRuntime<_, _, _>| {
+        runtime
+            .outbound_fanout_retry_delay_ms(&fixture.group_id)
+            .unwrap()
+            .unwrap_or_default()
+    };
+    let first_backoff = retry_delay(&restarted);
+    fixture.wall.set(100_000 + 60 * 60);
+    let checks = adapter.commit_size_checks().len();
+    restarted.resume_outbound_fanouts().await.unwrap();
+    assert_eq!(adapter.commit_size_checks().len(), checks + 1);
+    let second_backoff = retry_delay(&restarted);
+    assert!(
+        second_backoff > first_backoff && first_backoff > 0,
+        "{first_backoff} ms, then {second_backoff} ms"
+    );
+    restarted.resume_outbound_fanouts().await.unwrap();
+    assert_eq!(
+        adapter.commit_size_checks().len(),
+        checks + 1,
+        "a pass at the same moment does not check the size again"
+    );
+    assert_eq!(adapter.publishes().len(), 1, "the refusals sent nothing");
 }
 
 /// Round 4's B2: a relay answered `rate-limited:`, so it received the commit.

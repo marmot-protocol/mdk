@@ -5834,7 +5834,7 @@ where
                             relay_url: failure.endpoint.0.clone(),
                             reason: failure.reason.clone(),
                         });
-                        fanout.record_target_failure(index, failure)?;
+                        fanout.record_refusal_before_attempt(index, failure, now_ms)?;
                         refused_before_send.push(index);
                     }
                 }
