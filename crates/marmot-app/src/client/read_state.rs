@@ -36,7 +36,7 @@
 //! serves an exact copy of a failure it can rebuild ([`reissue`]); any other
 //! published failure is answered by the worker, as before.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -51,7 +51,7 @@ use cgka_traits::{
     Timestamp,
 };
 use marmot_session::{GroupChangeGeneration, GroupMaintenanceRows, WallClockWindow};
-use storage_sqlite::SelfMembership;
+use storage_sqlite::{SelfMembership, StoredGroupStanding};
 use tokio::sync::watch;
 
 use super::AppClient;
@@ -85,6 +85,28 @@ pub(crate) struct ReadState {
     pub(crate) account: Arc<AccountAnswers>,
     /// One entry per group in the account's group mirror.
     pub(crate) groups: Arc<HashMap<GroupId, Arc<GroupAnswers>>>,
+}
+
+/// The worker's answer to a hydration request (mdk#3273 PR 4): the version
+/// it published after it hydrated the named groups, and the first failure a
+/// hydration returned, which the reads that return that failure today hand
+/// back.
+#[derive(Debug)]
+pub(crate) struct HydrationAck {
+    pub(crate) state: Arc<ReadState>,
+    pub(crate) failure: Option<AppError>,
+}
+
+impl HydrationAck {
+    /// The acknowledging version, checked as [`ReadStateReader::version`]
+    /// checks the version it takes: storage closed is checked now that the
+    /// acknowledgement has arrived, before any of its answers is read.
+    pub(crate) fn version(&self, storage_closed: &AtomicBool) -> Result<Arc<ReadState>, AppError> {
+        if storage_closed.load(Ordering::Acquire) {
+            return Err(storage_closed_error());
+        }
+        Ok(Arc::clone(&self.state))
+    }
 }
 
 /// The per-account answers.
@@ -186,10 +208,15 @@ pub(crate) struct GroupAnswers {
     pub(crate) record: AppGroupRecord,
     /// Whether the host may see the group: false for a device group.
     pub(crate) host_may_see: bool,
+    /// Whether the engine has seeded the group without hydrating it yet: a
+    /// read that hydrates on demand asks the worker to hydrate it first.
+    pub(crate) awaits_hydration: bool,
     /// Member accounts and their device counts, without profiles.
     pub(crate) members: ReadAnswer<Vec<(MemberId, u32)>>,
-    /// The stored self membership the roster overlays on the mirror record.
-    pub(crate) self_membership: ReadAnswer<Option<SelfMembership>>,
+    /// The saved row's standing, `None` when the group has no saved row:
+    /// the roster overlays its self membership on the mirror record, and
+    /// co-members judge the group by it alone.
+    pub(crate) standing: ReadAnswer<Option<StoredGroupStanding>>,
     pub(crate) mls_state: ReadAnswer<AppGroupMlsState>,
     pub(crate) commit_delivery: ReadAnswer<Option<GroupCommitDelivery>>,
     pub(crate) maintenance_status: ReadAnswer<GroupMaintenanceStatus>,
@@ -205,8 +232,9 @@ impl GroupAnswers {
         let Self {
             record,
             host_may_see,
+            awaits_hydration,
             members,
-            self_membership,
+            standing,
             mls_state,
             commit_delivery,
             maintenance_status,
@@ -214,8 +242,9 @@ impl GroupAnswers {
         } = self;
         *record == other.record
             && *host_may_see == other.host_may_see
+            && *awaits_hydration == other.awaits_hydration
             && same_answer(members, &other.members, PartialEq::eq)
-            && same_answer(self_membership, &other.self_membership, PartialEq::eq)
+            && same_answer(standing, &other.standing, PartialEq::eq)
             && same_answer(mls_state, &other.mls_state, PartialEq::eq)
             && same_answer(commit_delivery, &other.commit_delivery, PartialEq::eq)
             && same_answer(maintenance_status, &other.maintenance_status, PartialEq::eq)
@@ -223,11 +252,29 @@ impl GroupAnswers {
     }
 }
 
+/// Whether `group` counts toward co-members, by its saved row alone: the
+/// local account is a member and no invite awaits its confirmation, as
+/// [`crate::runtime::group_contributes_co_members`] judges a saved row
+/// (mdk#3273 PR 4). A group with no saved row counts nobody. The saved row
+/// keeps no `unrecoverable` mark, so that term of the judgement never
+/// excludes a saved row, and there is nothing here to read for it. No fact
+/// of the mirror decides, so a crash after a failed save cannot take an
+/// answer back.
+fn counts_toward_co_members(group: &GroupAnswers) -> ReadAnswer<bool> {
+    Ok(group
+        .standing
+        .as_ref()
+        .map_err(Arc::clone)?
+        .is_some_and(|standing| {
+            !standing.pending_confirmation
+                && matches!(standing.self_membership, SelfMembership::Member)
+        }))
+}
+
 fn unknown_group(group_id: &GroupId) -> Arc<AppError> {
     Arc::new(AppError::UnknownGroup(hex::encode(group_id.as_slice())))
 }
 
-#[cfg_attr(not(test), allow(dead_code))] // Group reads answer from A (mdk#3273 PRs 4–5).
 fn with_profiles(
     members: &[(MemberId, u32)],
     profiles: &HashMap<String, String>,
@@ -248,7 +295,6 @@ fn with_profiles(
 }
 
 /// The answers the moved reads give, from this version alone.
-#[cfg_attr(not(test), allow(dead_code))] // Group reads answer from A (mdk#3273 PRs 4–5).
 impl ReadState {
     fn group(&self, group_id: &GroupId) -> ReadAnswer<&GroupAnswers> {
         self.groups
@@ -299,8 +345,8 @@ impl ReadState {
         let profiles = profiles().map_err(Arc::new)?;
         let members = with_profiles(group.members.as_ref().map_err(Arc::clone)?, &profiles);
         let mut group_record = group.record.clone();
-        if let Some(membership) = group.self_membership.as_ref().map_err(Arc::clone)? {
-            group_record.self_membership = *membership;
+        if let Some(standing) = group.standing.as_ref().map_err(Arc::clone)? {
+            group_record.self_membership = standing.self_membership;
         }
         let mls_state = group.mls_state.clone()?;
         Ok(AppGroupRosterSession {
@@ -351,11 +397,85 @@ impl ReadState {
 
     /// Whether the host may see a group in the mirror; `None` outside it,
     /// where every group read already answers `UnknownGroup`.
+    #[cfg_attr(not(test), allow(dead_code))] // Only the oracle reads it.
     pub(crate) fn host_may_see(&self, group_id: &GroupId) -> Option<bool> {
         self.groups.get(group_id).map(|group| group.host_may_see)
     }
 
+    /// The groups of `group_ids`, in order, that this version shows seeded
+    /// but not hydrated: a read that hydrates on demand today sends them to
+    /// the worker first. A group outside the mirror awaits nothing; every
+    /// read answers it `UnknownGroup`.
+    pub(crate) fn awaiting_hydration(&self, group_ids: &[GroupId]) -> Vec<GroupId> {
+        group_ids
+            .iter()
+            .filter(|group_id| {
+                self.groups
+                    .get(*group_id)
+                    .is_some_and(|group| group.awaits_hydration)
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Whether this version holds every group in `group_ids` or lists it
+    /// quarantined. Every stored group is in the mirror, so a group whose
+    /// chat-list row has committed is held by the first version published
+    /// after it (mdk#3273 PR 4; the oracle checks it at every publish).
+    pub(crate) fn holds(&self, group_ids: &[GroupId]) -> bool {
+        group_ids.iter().all(|group_id| {
+            self.groups.contains_key(group_id)
+                || self
+                    .account
+                    .quarantined_groups
+                    .iter()
+                    .any(|group| group.group_id_hex == hex::encode(group_id.as_slice()))
+        })
+    }
+
+    /// The groups [`Self::co_members`] reads, in id order: those whose saved
+    /// row [`counts_toward_co_members`]. A read hydrates the ones awaiting
+    /// hydration first, as each member read hydrated its group.
+    pub(crate) fn co_member_groups(&self) -> Vec<GroupId> {
+        let mut groups = self
+            .groups
+            .iter()
+            .filter(|(_, group)| matches!(counts_toward_co_members(group), Ok(true)))
+            .map(|(group_id, _)| group_id.clone())
+            .collect::<Vec<_>>();
+        groups.sort_by(|a, b| a.as_slice().cmp(b.as_slice()));
+        groups
+    }
+
+    /// `GroupCoMembers`: every other account that shares with
+    /// `local_account_id_hex` one of [`Self::co_member_groups`], from
+    /// this version alone (mdk#3273 PR 4). A group this version doesn't hold
+    /// yet counts from the version that does. A failed read of a saved row
+    /// fails the read, as it failed the saved group listing; otherwise the
+    /// first group in id order whose members failed gives the failure.
+    pub(crate) fn co_members(&self, local_account_id_hex: &str) -> ReadAnswer<Vec<String>> {
+        for group in self.groups.values() {
+            group.standing.as_ref().map_err(Arc::clone)?;
+        }
+        let mut co_members = BTreeSet::new();
+        for group_id in self.co_member_groups() {
+            let members = self
+                .group(&group_id)?
+                .members
+                .as_ref()
+                .map_err(Arc::clone)?;
+            for (member_id, _) in members {
+                let member_id_hex = hex::encode(member_id.as_slice());
+                if member_id_hex != local_account_id_hex {
+                    co_members.insert(member_id_hex);
+                }
+            }
+        }
+        Ok(co_members.into_iter().collect())
+    }
+
     /// `PreparedGroupImageStatus`.
+    #[cfg_attr(not(test), allow(dead_code))] // Account reads answer from A (mdk#3273 PR 5).
     pub(crate) fn prepared_group_image_status(
         &self,
         upload_id: &str,
@@ -533,6 +653,41 @@ impl ReadStateReader {
     #[cfg(test)]
     pub(crate) fn subscribe(&self) -> watch::Receiver<Arc<ReadState>> {
         self.receiver.clone()
+    }
+
+    /// Resolves once a version [`ReadState::holds`] every group in
+    /// `group_ids` still stored, or before the worker's first publish (the
+    /// reads then go to the worker). When a version does not hold them,
+    /// `still_stored` narrows them to the ones whose stored rows remain: a
+    /// group forgotten or deleted since the caller read its row is in no
+    /// later version, so it is not waited for. Waits on the caller's task;
+    /// the caller bounds it. Fails as [`Self::version`] does, or as
+    /// `still_stored` does.
+    pub(crate) async fn holding(
+        &self,
+        storage_closed: &AtomicBool,
+        group_ids: &[GroupId],
+        mut still_stored: impl FnMut(Vec<GroupId>) -> Result<Vec<GroupId>, AppError>,
+    ) -> Result<(), AppError> {
+        let mut waiting = group_ids.to_vec();
+        let mut receiver = self.receiver.clone();
+        loop {
+            let state = Arc::clone(&receiver.borrow_and_update());
+            if storage_closed.load(Ordering::Acquire) {
+                return Err(storage_closed_error());
+            }
+            if state.version == 0 || state.holds(&waiting) {
+                return Ok(());
+            }
+            waiting = still_stored(waiting)?;
+            if state.holds(&waiting) {
+                return Ok(());
+            }
+            receiver
+                .changed()
+                .await
+                .map_err(|_| AppError::TransportClosed)?;
+        }
     }
 
     /// The version a moved read answers from, or `None` before the worker's
@@ -823,7 +978,6 @@ impl ReadStatePublisher {
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn subscribe(&self) -> watch::Receiver<Arc<ReadState>> {
         self.sender.subscribe()
     }
@@ -1099,15 +1253,16 @@ fn group_entry(
         };
     let answers = GroupAnswers {
         host_may_see: matches!(device_group, Ok(false)),
+        awaits_hydration: generation.awaits_hydration(),
         members: client
             .runtime
             .members(group_id)
             .map(|members| crate::groups::member_accounts(&members))
             .map_err(|error| Arc::new(AppError::from(error))),
-        self_membership: arc_err(
+        standing: arc_err(
             client
                 .app
-                .stored_group_self_membership(&client.state.label, &record.group_id_hex),
+                .stored_group_standing(&client.state.label, &record.group_id_hex),
         ),
         mls_state: arc_err(client.group_mls_state_unchecked(group_id)),
         commit_delivery,
@@ -1120,7 +1275,7 @@ fn group_entry(
     };
     let reusable = device_group.is_ok()
         && settled(&answers.members)
-        && settled(&answers.self_membership)
+        && settled(&answers.standing)
         && settled(&answers.mls_state)
         && settled(&answers.commit_delivery)
         && settled(&answers.maintenance_status)
@@ -1248,13 +1403,23 @@ impl AppClient {
         })
     }
 
-    /// A receiver of every version this client publishes, if it publishes.
-    #[cfg(test)]
+    /// A receiver of every version this client publishes, if it publishes:
+    /// a long unit that holds the client acknowledges a hydration request
+    /// that needs no hydration from its latest version (mdk#3273 PR 4).
     pub(crate) fn subscribe_read_state(&self) -> Option<watch::Receiver<Arc<ReadState>>> {
         self.read_state.as_ref().map(|slot| {
             slot.lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .subscribe()
+        })
+    }
+
+    /// The version this client published last, if it publishes.
+    pub(crate) fn published_read_state(&self) -> Option<Arc<ReadState>> {
+        self.read_state.as_ref().map(|slot| {
+            slot.lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .current()
         })
     }
 }
@@ -1617,6 +1782,43 @@ pub(crate) mod oracle {
             &client.chat_history_imports(),
         );
 
+        // Every stored group is in this version or listed quarantined: a
+        // read whose groups come from stored rows waits for the first
+        // version published after its rows commit (mdk#3273 PR 4).
+        if let Ok(storage) = client.app.account_storage(&client.state.label)
+            && let Ok(stored) = storage.app_storage().account_groups(None)
+        {
+            for row in stored {
+                let group_id = GroupId::new(hex::decode(&row.group_id_hex).expect("stored hex"));
+                assert!(
+                    state.holds(std::slice::from_ref(&group_id)),
+                    "a stored group is outside the read state"
+                );
+            }
+        }
+        // Co-members: this version's saved-row standings and members against
+        // the saved group listing, judged as `group_co_members` judged it
+        // before it answered from A, and the live engine reads.
+        if let Ok(local) = client.app.account_home().account(&client.state.label) {
+            same(
+                window,
+                "co members",
+                &state.co_members(&local.account_id_hex),
+                &client
+                    .co_member_groups()
+                    .and_then(|groups| client.co_members(&groups)),
+            );
+            if let Ok(live) = client.co_member_groups()
+                && state.groups.values().all(|group| group.standing.is_ok())
+            {
+                assert_eq!(
+                    state.co_member_groups(),
+                    live,
+                    "read state differs from the live read for co-member groups"
+                );
+            }
+        }
+
         // Group answers: every group in the mirror, every group the engine
         // or the device-group table knows (hidden, unhydrated, quarantined,
         // a failed rewind restore), and an id no one holds.
@@ -1650,7 +1852,16 @@ pub(crate) mod oracle {
         group_ids.retain(|group_id| seen.insert(group_id.clone()));
 
         let profiles = client.app.profiles_by_id();
+        let unhydrated: HashSet<GroupId> =
+            client.runtime.unhydrated_group_ids().into_iter().collect();
         for group_id in &group_ids {
+            if let Some(group) = state.groups.get(group_id) {
+                assert_eq!(
+                    group.awaits_hydration,
+                    unhydrated.contains(group_id),
+                    "read state differs from the live read for awaiting hydration"
+                );
+            }
             if let Ok(profiles) = &profiles {
                 same(
                     window,
@@ -1946,5 +2157,66 @@ mod tests {
         let mut watch = state.watch_backup_restore();
         assert!(watch.receiver.has_changed().unwrap());
         assert_eq!(watch.changed().await.unwrap(), later);
+    }
+
+    /// A read whose groups come from stored rows waits for a version that
+    /// holds them, here by listing them quarantined, and for no group whose
+    /// stored row is gone: resolving at once before the first publish and
+    /// for a forgotten group, and on the publish that holds a stored one.
+    #[tokio::test]
+    async fn a_wait_for_stored_groups_ends_on_the_version_that_holds_them() {
+        use futures::FutureExt as _;
+        let open = AtomicBool::new(false);
+        let group = GroupId::new(vec![0x31; 16]);
+        let quarantined = |account: &mut AccountAnswers| {
+            account.quarantined_groups = vec![AppQuarantinedGroup {
+                group_id_hex: hex::encode(group.as_slice()),
+                reason: crate::AppGroupHydrationQuarantineReason::OpenMlsGroupMissing,
+            }];
+        };
+        let (publisher, reader) = read_state_channel();
+        let group_ids = std::slice::from_ref(&group);
+        let unexpected = |_: Vec<GroupId>| -> Result<Vec<GroupId>, AppError> {
+            panic!("a held group needs no storage read")
+        };
+        reader
+            .holding(&open, group_ids, unexpected)
+            .now_or_never()
+            .expect("no wait before the first publish")
+            .expect("before the first publish the reads go to the worker");
+
+        publisher.publish_for_test(|_| {});
+        reader
+            .holding(&open, group_ids, |_| Ok(Vec::new()))
+            .now_or_never()
+            .expect("no wait for a group whose stored row is gone")
+            .expect("a group whose stored row is gone is not waited for");
+
+        let mut waiting = Box::pin(reader.holding(&open, group_ids, Ok));
+        assert!(
+            futures::poll!(&mut waiting).is_pending(),
+            "a stored group not yet in A is waited for"
+        );
+        publisher.publish_for_test(|_| {});
+        assert!(futures::poll!(&mut waiting).is_pending());
+        publisher.publish_for_test(quarantined);
+        tokio::time::timeout(std::time::Duration::from_secs(5), waiting)
+            .await
+            .expect("the version that holds it ends the wait")
+            .unwrap();
+        reader
+            .holding(&open, group_ids, unexpected)
+            .now_or_never()
+            .expect("no wait for a held group")
+            .expect("a quarantined group is held");
+
+        let closed = AtomicBool::new(true);
+        assert!(matches!(
+            reader
+                .holding(&closed, group_ids, unexpected)
+                .now_or_never()
+                .expect("no wait once storage closes"),
+            Err(AppError::Storage(StorageError::Closed(_)))
+        ));
     }
 }

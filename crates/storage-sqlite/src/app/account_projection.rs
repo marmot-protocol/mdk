@@ -111,6 +111,24 @@ impl SelfMembership {
     }
 }
 
+/// The saved-row facts a co-member read judges a group by (mdk#3273 PR 4),
+/// read by [`SqliteAppStorage::group_standing`] from the group's
+/// `account_groups` row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StoredGroupStanding {
+    /// The stored self membership, which only
+    /// [`SqliteAppStorage::set_group_self_membership`] writes.
+    pub self_membership: SelfMembership,
+    /// Whether the group's invite still awaits this device's confirmation.
+    pub pending_confirmation: bool,
+}
+
+/// The `account_groups` columns [`SqliteAppStorage::group_standing`] reads.
+/// A published group answer reads no other column of the saved row: the
+/// rest is the in-memory mirror's. `cross::group_writes` counts a change to
+/// any of them as a write to the group's state.
+pub(crate) const GROUP_STANDING_COLUMNS: [&str; 2] = ["self_membership", "pending_confirmation"];
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct StoredAccountState {
     pub label: String,
@@ -1799,28 +1817,23 @@ impl SqliteAppStorage {
         Ok(value.map(|stored| SelfMembership::from_storage(&stored)))
     }
 
-    /// Authoritative `account_groups.self_membership` for every group row.
-    pub fn account_group_self_memberships(
-        &self,
-    ) -> StorageResult<std::collections::HashMap<String, SelfMembership>> {
+    /// The group's [`StoredGroupStanding`], or `None` when it has no
+    /// `account_groups` row.
+    pub fn group_standing(&self, group_id_hex: &str) -> StorageResult<Option<StoredGroupStanding>> {
         let conn = self.lock()?;
-        let mut statement = conn
-            .prepare_cached("SELECT group_id_hex, self_membership FROM account_groups")
-            .storage()?;
-        let rows = statement
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    SelfMembership::from_storage(&row.get::<_, String>(1)?),
-                ))
-            })
-            .storage()?;
-        let mut memberships = std::collections::HashMap::new();
-        for row in rows {
-            let (group_id_hex, membership) = row.storage()?;
-            memberships.insert(group_id_hex, membership);
-        }
-        Ok(memberships)
+        conn.query_row_cached(
+            "SELECT self_membership, pending_confirmation FROM account_groups
+             WHERE group_id_hex = ?1",
+            params![group_id_hex],
+            |row| {
+                Ok(StoredGroupStanding {
+                    self_membership: SelfMembership::from_storage(&row.get::<_, String>(0)?),
+                    pending_confirmation: row.get::<_, i64>(1)? != 0,
+                })
+            },
+        )
+        .optional()
+        .storage()
     }
 
     /// App presentation query; visibility is applied before its limit.

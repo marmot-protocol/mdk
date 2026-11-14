@@ -470,7 +470,7 @@ impl SqliteAppStorage {
         }
         // Cancelling clears the storage-park marker and streak, so the kept
         // prefix expires and is pruned like any other cancelled checkpoint.
-        Ok(conn.execute("UPDATE attachment_acquisition SET cancelled=1,state=4,due=NULL,attempt=NULL,explicit_request=0,storage_blocked_headroom=NULL,storage_park_count=0
+        Ok(conn.execute("UPDATE attachment_acquisition SET cancelled=1,state=4,due=NULL,attempt=NULL,explicit_request=0,storage_blocked_headroom=NULL,storage_park_count=0,storage_readmitted=0
             WHERE token=?1 AND state<>3",[&reference.token]).storage()?==1)
     }
 
@@ -589,7 +589,7 @@ impl SqliteAppStorage {
             let conn=self.lock()?;
             if !matches_store(&conn,reference)? {return Ok(false);}
             let parked = partial::storage_parked(&conn, &reference.token)?;
-            let retried = conn.execute(&format!("UPDATE attachment_acquisition AS q SET cancelled=0,state=CASE WHEN state=1 THEN 1 ELSE 0 END,due=CASE WHEN state=1 THEN due ELSE ?2 END,attempt=CASE WHEN state=1 THEN attempt ELSE NULL END,explicit_request=1,keep_from=?2,size_blocked_max=NULL,storage_blocked_headroom=NULL,storage_park_count=0,permission_paused=0,retry_not_before=0,preparation_deferrals=0,acquisition_attempts=CASE WHEN state=1 THEN acquisition_attempts ELSE 0 END,network_attempts=CASE WHEN state=1 THEN network_attempts ELSE 0 END,body_completed=CASE WHEN state=1 THEN body_completed ELSE 0 END
+            let retried = conn.execute(&format!("UPDATE attachment_acquisition AS q SET cancelled=0,state=CASE WHEN state=1 THEN 1 ELSE 0 END,due=CASE WHEN state=1 THEN due ELSE ?2 END,attempt=CASE WHEN state=1 THEN attempt ELSE NULL END,explicit_request=1,keep_from=?2,size_blocked_max=NULL,storage_blocked_headroom=NULL,storage_park_count=0,storage_readmitted=0,permission_paused=0,retry_not_before=0,preparation_deferrals=0,acquisition_attempts=CASE WHEN state=1 THEN acquisition_attempts ELSE 0 END,network_attempts=CASE WHEN state=1 THEN network_attempts ELSE 0 END,body_completed=CASE WHEN state=1 THEN body_completed ELSE 0 END
                 WHERE token=?1 AND (state IN(0,1,2,4,5) OR (state=3 AND NOT {RETAINED_BODY})) AND {SOURCE_MATCH} AND {ACCEPTED} AND (expires_at IS NULL OR expires_at>?2)"),
                 params![reference.token,u64_to_i64(now)?]).storage()?==1;
             if retried && parked {
@@ -762,16 +762,77 @@ impl SqliteAppStorage {
         })
     }
 
-    /// Readmit at most one bounded page of storage-parked jobs whose recorded
-    /// headroom now fits below `free` less the policy reserve and a fixed
-    /// margin, and that worker admission would let start, as `admission`
-    /// states it. Both filters apply before the page is limited, so rows that
-    /// fail admission cannot hide later ones that pass. A readmitted row is
-    /// then not bounced back to a timer. The margin keeps measurement noise
-    /// from flipping a row every tick, and a job that parked more than once
-    /// waits out its park streak (15 s doubling to an hour) before it is due
-    /// again, so free space that oscillates around a target cannot drive a
-    /// hot loop. Checkpoints get a fresh idle expiry; cancelled work,
+    /// Park a due job that worker admission refused for disk space, rather
+    /// than retrying it on a timer. `headroom` is the free space beyond the
+    /// policy reserve the job's attempt needs, so readmission releases it
+    /// once the device can fund that, and the job shows as storage-blocked
+    /// meanwhile. Covers a readmitted job that lost its space to other work
+    /// before it was admitted. No attempt was claimed, so attempts and
+    /// budgets are untouched; the park streak grows as for any park, and a
+    /// checkpoint gets a fresh idle expiry. Returns whether the job parked.
+    pub fn park_attachment_admission(
+        &self,
+        reference: &AttachmentAssetRef,
+        headroom: u64,
+        now: u64,
+    ) -> StorageResult<bool> {
+        self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            if !matches_store(&conn, reference)? {
+                return Ok(false);
+            }
+            let parked = conn
+                .execute(
+                    "UPDATE attachment_acquisition SET state=4,storage_blocked_headroom=?3,
+                    due=NULL,attempt=NULL,storage_park_count=min(storage_park_count+1,2147483647)
+                    WHERE token=?1 AND due<=?2 AND state IN (0,2) AND cancelled=0
+                    AND permission_paused=0",
+                    params![reference.token, u64_to_i64(now)?, u64_to_i64(headroom)?],
+                )
+                .storage()?
+                == 1;
+            if parked {
+                conn.execute(
+                    "UPDATE attachment_partial SET expires_at=?2 WHERE token=?1",
+                    params![
+                        reference.token,
+                        u64_to_i64(now.saturating_add(super::partial::PARTIAL_TTL_SECONDS))?
+                    ],
+                )
+                .storage()?;
+            }
+            Ok(parked)
+        })
+    }
+
+    /// Readmit, from at most one bounded page of storage-parked jobs, those
+    /// that free space can fund together, in the order the worker starts
+    /// them (explicit first, then priority). Each is charged the larger of
+    /// its recorded headroom and what admission needs for its checkpoint now
+    /// (`need`: a pruned prefix or a raised limit can make that larger), and
+    /// is readmitted while its charge fits what is left of `free`, beyond the
+    /// policy reserve and a fixed margin, after the charges readmitted before
+    /// it. The first job that does not fit ends the batch, so a later one
+    /// cannot take the space an earlier one is waiting for. Jobs left out
+    /// stay parked with their targets.
+    ///
+    /// What is left starts below `free` by the need of every job whose
+    /// writes may not show in `free` yet: each job in flight, and each queued
+    /// or retrying job that readmission released (`storage_readmitted`, kept
+    /// through checkpoint progress and retries until it finishes or the user
+    /// retries, cancels or resets it), the queued ones only if they can run
+    /// (automatic ones while automatic acquisition is enabled). Other
+    /// retrying jobs reserve nothing: the worker's admission check parks one
+    /// that no longer fits. A need shrinks as its checkpoint grows, so bytes
+    /// already written are not counted again.
+    ///
+    /// The page is filtered by what fits `free` and `admission` (worker
+    /// admission at `free`) before it is limited, so rows that cannot fit at
+    /// all cannot hide later ones that can. The margin keeps measurement
+    /// noise from flipping a row every tick, and a job that parked more than
+    /// once waits out its park streak (15 s doubling to an hour) before it is
+    /// due again, so free space that oscillates around a target cannot drive
+    /// a hot loop. Checkpoints get a fresh idle expiry; cancelled work,
     /// size-policy blocks and, while automatic acquisition is disabled,
     /// automatic rows stay parked. Nothing is written when no row fits.
     pub fn readmit_storage_blocked_attachments(
@@ -781,10 +842,10 @@ impl SqliteAppStorage {
         free: u64,
         automatic: bool,
         admission: ReadmitAdmission,
+        need: impl Fn(Option<u64>) -> u64,
     ) -> StorageResult<usize> {
-        let Some(headroom) =
-            free.checked_sub(disk_reserve.saturating_add(STORAGE_READMIT_MARGIN_BYTES))
-        else {
+        let floor = disk_reserve.saturating_add(STORAGE_READMIT_MARGIN_BYTES);
+        let Some(headroom) = free.checked_sub(floor) else {
             return Ok(0);
         };
         let headroom = u64_to_i64(headroom.min(i64::MAX as u64))?;
@@ -808,22 +869,48 @@ impl SqliteAppStorage {
         if !fits {
             return Ok(0);
         }
+        let recorded = |received: Option<i64>| received.and_then(|r| u64::try_from(r).ok());
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
-            let tokens: Vec<Vec<u8>> = conn
+            let pending: u64 = conn
+                .prepare(
+                    "SELECT (SELECT p.received FROM attachment_partial p WHERE p.token=q.token)
+                    FROM attachment_acquisition q WHERE cancelled=0 AND (state=1
+                        OR (state IN (0,2) AND storage_readmitted=1
+                            AND (explicit_request=1 OR ?1)))",
+                )
+                .storage()?
+                .query_map([automatic], |row| row.get::<_, Option<i64>>(0))
+                .storage()?
+                .map(|received| received.map(|received| need(recorded(received))))
+                .try_fold(0u64, |sum, charge| charge.map(|charge| sum.saturating_add(charge)))
+                .storage()?;
+            let page: Vec<(Vec<u8>, i64, Option<i64>)> = conn
                 .prepare(&format!(
-                    "SELECT token FROM attachment_acquisition q WHERE {READMITTABLE}
-                    ORDER BY priority_at DESC,token LIMIT ?5"
+                    "SELECT token,storage_blocked_headroom,
+                        (SELECT p.received FROM attachment_partial p WHERE p.token=q.token)
+                    FROM attachment_acquisition q WHERE {READMITTABLE}
+                    ORDER BY explicit_request DESC,priority_at DESC,token LIMIT ?5"
                 ))
                 .storage()?
-                .query_map(params, |row| row.get(0))
+                .query_map(params, |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
                 .storage()?
                 .collect::<Result<_, _>>()
                 .storage()?;
-            for token in &tokens {
+            // Free space left beyond the floor for the next job.
+            let mut available = free.saturating_sub(floor).saturating_sub(pending);
+            let mut readmitted = 0;
+            for (token, target, received) in page {
+                let charge = u64::try_from(target)
+                    .unwrap_or(u64::MAX)
+                    .max(need(recorded(received)));
+                if charge > available {
+                    break;
+                }
+                available -= charge;
                 conn.execute(
                     "UPDATE attachment_acquisition SET state=0,storage_blocked_headroom=NULL,
-                    due=?2+CASE WHEN storage_park_count<=1 THEN 0 ELSE min(15*(1<<min(storage_park_count-2,8)),3600) END
+                    storage_readmitted=1,due=?2+CASE WHEN storage_park_count<=1 THEN 0 ELSE min(15*(1<<min(storage_park_count-2,8)),3600) END
                     WHERE token=?1",
                     params![token, u64_to_i64(now)?],
                 )
@@ -836,8 +923,9 @@ impl SqliteAppStorage {
                     ],
                 )
                 .storage()?;
+                readmitted += 1;
             }
-            Ok(tokens.len())
+            Ok(readmitted)
         })
     }
 

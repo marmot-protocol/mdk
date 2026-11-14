@@ -292,6 +292,48 @@ pub struct OutboundFanout {
     post_confirmation_welcomes_pending: bool,
     mls_state: FanoutMlsState,
     created_at_ms: u64,
+    /// The attempts this value started and has not recorded a result for: the
+    /// identity of each target's current attempt (mdk#2332). Never
+    /// serialized, so a fanout loaded from storage holds none, and a stored
+    /// `Attempting` can never be reported as unexposed.
+    #[serde(skip)]
+    held_attempts: HeldAttempts,
+}
+
+/// Per target, whether the in-memory fanout holding this started the target's
+/// current attempt and still awaits its result.
+///
+/// It lives only in process memory. Equality ignores it, so a stored record
+/// and the value that wrote it still compare equal.
+#[derive(Clone, Debug, Default)]
+struct HeldAttempts(Vec<bool>);
+
+impl HeldAttempts {
+    fn start(&mut self, index: usize, targets: usize) {
+        self.0.resize(targets, false);
+        self.0[index] = true;
+    }
+
+    /// End the target's current attempt, saying whether this value held it.
+    fn end(&mut self, index: usize) -> bool {
+        self.0.get_mut(index).is_some_and(std::mem::take)
+    }
+}
+
+impl PartialEq for HeldAttempts {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for HeldAttempts {}
+
+/// What a recorded result proves about the target's exposure.
+enum AttemptResult<'a> {
+    Accepted,
+    /// A failure with no classification.
+    Unclassified,
+    Failure(&'a TransportEndpointFailure),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -403,6 +445,7 @@ impl OutboundFanout {
             post_confirmation_welcomes,
             mls_state: pending.map_or(FanoutMlsState::NotApplicable, FanoutMlsState::Pending),
             created_at_ms,
+            held_attempts: HeldAttempts::default(),
         })
     }
 
@@ -628,6 +671,10 @@ impl OutboundFanout {
     /// pass. Its bytes may have reached the endpoint, so re-marking it records
     /// possible exposure, as an in-process cancellation does. A later definite
     /// answer then cannot end the target `Failed`.
+    ///
+    /// The stored `Attempting` is the attempt's write-ahead record. This value
+    /// also holds the attempt's identity in memory, so only it can later
+    /// report the attempt as unexposed (see [`Self::record_target_failure`]).
     pub fn mark_attempt_started(&mut self, index: usize) -> Result<bool, TransportAdapterError> {
         self.mark_attempt_started_at(index, self.created_at_ms)
     }
@@ -648,25 +695,66 @@ impl OutboundFanout {
                 if status == FanoutTargetStatus::Attempting {
                     self.target_possible_exposure[index] = true;
                 }
+                self.fold_stored_exposure(index);
                 self.target_statuses[index] = FanoutTargetStatus::Attempting;
                 self.target_attempt_counts[index] =
                     self.target_attempt_counts[index].saturating_add(1);
                 self.target_last_attempt_at_ms[index] = Some(attempted_at_ms);
                 self.target_failures[index] = None;
+                self.held_attempts.start(index, self.target_statuses.len());
                 Ok(true)
             }
             FanoutTargetStatus::Accepted | FanoutTargetStatus::Failed => Ok(false),
         }
     }
 
+    /// Record an acknowledgement. It leaves the exposure bit as it was: the
+    /// bit means the endpoint may hold the event without having acknowledged
+    /// it, and this endpoint acknowledged it.
     pub fn mark_target_accepted(&mut self, index: usize) -> Result<bool, TransportAdapterError> {
-        self.mark_target_terminal(index, FanoutTargetStatus::Accepted)
+        self.mark_target_terminal(index, FanoutTargetStatus::Accepted, AttemptResult::Accepted)
     }
 
+    /// End the target `Failed` with no classification. Nothing proves that
+    /// its frame stayed on the device, so the target counts as possibly
+    /// exposed from then on.
     pub fn mark_target_failed(&mut self, index: usize) -> Result<bool, TransportAdapterError> {
-        self.mark_target_terminal(index, FanoutTargetStatus::Failed)
+        self.mark_target_terminal(
+            index,
+            FanoutTargetStatus::Failed,
+            AttemptResult::Unclassified,
+        )
     }
 
+    /// Record one endpoint's failure (mdk#2332).
+    ///
+    /// The target's exposure bit is the one fact that it may hold the event.
+    /// It is never cleared, and every result that moves a target out of
+    /// `Attempting` sets it unless the result proves the attempt reached no
+    /// relay, or the relay definitively refused it:
+    /// - a failure that proves nothing was sent
+    ///   ([`TransportEndpointFailure::proves_nothing_sent`]), or a definitive
+    ///   refusal ([`TransportEndpointFailureKind::TerminalRejected`]), of the
+    ///   *current* attempt, the one this value started with
+    ///   [`Self::mark_attempt_started_at`], leaves the bit as it was;
+    /// - a stored `Attempting` loaded from storage belongs to an interrupted
+    ///   attempt that no value holds any more. Its frame may have left, so any
+    ///   result recorded on it sets the bit;
+    /// - on a target with no attempt in flight (`NotAttempted`,
+    ///   `RetryableUnavailable`, `PossiblyExposed`) only a refusal that sent
+    ///   nothing may be recorded without setting the bit: the commit size
+    ///   floor, a known limit, a connection never made;
+    /// - anything else sets the bit: a relay's retryable answer
+    ///   (`rate-limited:`, `auth-required:`), a timeout, a close after the
+    ///   write, an unclassified failure;
+    /// - a stored status that records exposure sets the bit before it is
+    ///   replaced, here or by a new attempt: `PossiblyExposed`, and a
+    ///   `RetryableUnavailable` whose failure does not prove nothing was sent,
+    ///   as rows stored before that proof existed record a retryable answer.
+    ///
+    /// A target whose bit is set stays `PossiblyExposed` whatever it is told
+    /// later, so a pending commit that may have reached a relay never rolls
+    /// back (mdk#1577).
     pub fn record_target_failure(
         &mut self,
         index: usize,
@@ -684,9 +772,7 @@ impl OutboundFanout {
         if current.is_terminal() {
             return Ok(false);
         }
-        if failure.kind == TransportEndpointFailureKind::PossiblyExposed {
-            self.target_possible_exposure[index] = true;
-        }
+        self.settle_exposure(index, current, AttemptResult::Failure(&failure));
         let next = if self.target_possible_exposure[index] {
             FanoutTargetStatus::PossiblyExposed
         } else {
@@ -704,6 +790,27 @@ impl OutboundFanout {
         self.target_statuses[index] = next;
         self.target_failures[index] = Some(failure);
         Ok(true)
+    }
+
+    /// Record a refusal made before the target is marked, such as the commit
+    /// size floor or a known limit, through [`Self::record_target_failure`]
+    /// (mdk#2332). It sent nothing, so no attempt is marked. A target an
+    /// earlier attempt may have exposed stays outstanding, though, so the
+    /// refusal restarts its retry clock at `refused_at_ms` and counts toward
+    /// its backoff as an attempt does; otherwise its last attempt's deadline,
+    /// once passed, would make it due, and refused, on every pass.
+    pub fn record_refusal_before_attempt(
+        &mut self,
+        index: usize,
+        failure: TransportEndpointFailure,
+        refused_at_ms: u64,
+    ) -> Result<bool, TransportAdapterError> {
+        let recorded = self.record_target_failure(index, failure)?;
+        if recorded && self.target_statuses[index].is_outstanding() {
+            self.target_attempt_counts[index] = self.target_attempt_counts[index].saturating_add(1);
+            self.target_last_attempt_at_ms[index] = Some(refused_at_ms);
+        }
+        Ok(recorded)
     }
 
     pub fn record_published_message_id(
@@ -879,14 +986,64 @@ impl OutboundFanout {
         &mut self,
         index: usize,
         terminal: FanoutTargetStatus,
+        result: AttemptResult<'_>,
     ) -> Result<bool, TransportAdapterError> {
         debug_assert!(terminal.is_terminal());
-        let status = self.target_status_mut(index)?;
-        if status.is_terminal() {
+        let current = *self.target_status_mut(index)?;
+        if current.is_terminal() {
             return Ok(false);
         }
-        *status = terminal;
+        self.ensure_target_metadata_len();
+        self.settle_exposure(index, current, result);
+        self.target_statuses[index] = terminal;
         Ok(true)
+    }
+
+    /// The single exposure transition (mdk#2332): see
+    /// [`Self::record_target_failure`]. Ends the target's current attempt and
+    /// sets its exposure bit unless `result` proves that bit can stay as it
+    /// was. Never clears it.
+    fn settle_exposure(
+        &mut self,
+        index: usize,
+        current: FanoutTargetStatus,
+        result: AttemptResult<'_>,
+    ) {
+        let held = self.held_attempts.end(index);
+        let keeps_bit = match result {
+            AttemptResult::Accepted => true,
+            AttemptResult::Unclassified => false,
+            AttemptResult::Failure(failure) => match current {
+                FanoutTargetStatus::Attempting => {
+                    held && (failure.proves_nothing_sent()
+                        || failure.kind == TransportEndpointFailureKind::TerminalRejected)
+                }
+                _ => failure.proves_nothing_sent(),
+            },
+        };
+        self.fold_stored_exposure(index);
+        if !keeps_bit {
+            self.target_possible_exposure[index] = true;
+        }
+    }
+
+    /// Set the exposure bit when the target's stored status records exposure,
+    /// before anything replaces that status. A `PossiblyExposed` status does.
+    /// So does a `RetryableUnavailable` whose failure does not prove nothing
+    /// was sent: a row stored before that proof existed (mdk#2332) records a
+    /// relay's `rate-limited:` or `auth-required:` answer that way, with the
+    /// bit clear.
+    fn fold_stored_exposure(&mut self, index: usize) {
+        let exposed = match self.target_statuses[index] {
+            FanoutTargetStatus::PossiblyExposed => true,
+            FanoutTargetStatus::RetryableUnavailable => !self.target_failures[index]
+                .as_ref()
+                .is_some_and(TransportEndpointFailure::proves_nothing_sent),
+            _ => false,
+        };
+        if exposed {
+            self.target_possible_exposure[index] = true;
+        }
     }
 }
 
@@ -897,6 +1054,13 @@ fn target_status_advances(prior: FanoutTargetStatus, next: FanoutTargetStatus) -
             (
                 FanoutTargetStatus::NotAttempted,
                 FanoutTargetStatus::Attempting
+            ) | (
+                // A refusal recorded before marking: the commit size floor or a
+                // known limit (mdk#2332). It sent nothing.
+                FanoutTargetStatus::NotAttempted | FanoutTargetStatus::RetryableUnavailable,
+                FanoutTargetStatus::Failed
+                    | FanoutTargetStatus::PossiblyExposed
+                    | FanoutTargetStatus::RetryableUnavailable
             ) | (
                 FanoutTargetStatus::Attempting,
                 FanoutTargetStatus::Accepted
@@ -1170,9 +1334,30 @@ pub struct TransportEndpointFailure {
     /// Absent on old persisted failures and when the size cannot be established.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size_class: Option<EventSizeClass>,
+    /// The adapter proved that no frame of this attempt left the device: the
+    /// connection was never made (a dial refusal, a DNS failure, a socket that
+    /// never opened) or the adapter refused the event itself. Only a
+    /// [`TransportEndpointFailureKind::RetryableUnavailable`] failure needs
+    /// it; [`TransportEndpointFailureKind::NotExposed`] already says so.
+    /// False, or absent on older records, means a frame may have left. A
+    /// relay's retryable answer (`rate-limited:`, `auth-required:`) is never
+    /// pre-send: the relay received the frame (mdk#2332).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pre_send: bool,
 }
 
 impl TransportEndpointFailure {
+    /// Whether this failure proves that nothing of its attempt left the
+    /// device: an adapter refusal, or a connection that was never made.
+    pub fn proves_nothing_sent(&self) -> bool {
+        match self.kind {
+            TransportEndpointFailureKind::NotExposed => true,
+            TransportEndpointFailureKind::RetryableUnavailable => self.pre_send,
+            TransportEndpointFailureKind::TerminalRejected
+            | TransportEndpointFailureKind::PossiblyExposed => false,
+        }
+    }
+
     /// The fixed reason of [`Self::over_known_limit`], which audit records as
     /// a failure before exposure.
     pub const OVER_KNOWN_LIMIT_REASON: &'static str = "event exceeds the endpoint's known limit";
@@ -1187,6 +1372,7 @@ impl TransportEndpointFailure {
             kind: TransportEndpointFailureKind::NotExposed,
             rejection_category: Some(TransportEndpointRejectionCategory::TooLarge),
             size_class: Some(EventSizeClass::of_bytes(event_bytes)),
+            pre_send: false,
         }
     }
 }
@@ -1472,6 +1658,36 @@ pub trait TransportAdapter: Send + Sync {
     ) -> Option<EventSizeClass> {
         None
     }
+
+    /// The endpoints of `target` that [`Self::publish_commit`] would refuse
+    /// `commit` on, unsent, for its size: over the endpoint's known limit or,
+    /// where the limit is unknown, over the adapter's commit size floor
+    /// (mdk#2332). Sends nothing. Each refusal proves nothing was sent
+    /// ([`TransportEndpointFailure::proves_nothing_sent`]) and names its
+    /// endpoint as `target` does.
+    ///
+    /// A publication owner asks this for a target before marking it
+    /// `Attempting`, so a refused target never carries an attempt that might
+    /// have left. It asks for each target on its own, since a check can wait
+    /// on a connection, and one target's check must not hold back another's
+    /// send. An endpoint left out is sent to. The default refuses nothing.
+    async fn commit_size_refusals(
+        &self,
+        _commit: &TransportMessage,
+        _target: &TransportPublishTarget,
+    ) -> Vec<TransportEndpointFailure> {
+        Vec::new()
+    }
+
+    /// Publish a commit (mdk#2332): [`Self::publish`], plus the commit size
+    /// floor of [`Self::commit_size_refusals`], applied again by the
+    /// publication itself. The default is [`Self::publish`].
+    async fn publish_commit(
+        &self,
+        request: TransportPublishRequest,
+    ) -> Result<TransportPublishReport, TransportAdapterError> {
+        self.publish(request).await
+    }
 }
 
 /// Judges a founding create's Welcomes before the engine writes anything
@@ -1604,6 +1820,7 @@ mod tests {
             .record_target_failure(
                 0,
                 TransportEndpointFailure {
+                    pre_send: false,
                     size_class: None,
                     endpoint: TransportEndpoint("wss://one.example".into()),
                     reason: "publish acknowledgement unknown".into(),
@@ -1647,6 +1864,7 @@ mod tests {
                 .record_target_failure(
                     index,
                     TransportEndpointFailure {
+                        pre_send: kind == TransportEndpointFailureKind::RetryableUnavailable,
                         size_class: None,
                         endpoint: fanout.request().target.endpoints()[index].clone(),
                         reason: "scripted failure".into(),
@@ -1692,6 +1910,7 @@ mod tests {
                 .record_target_failure(
                     index,
                     TransportEndpointFailure {
+                        pre_send: false,
                         size_class: None,
                         endpoint: fanout.request().target.endpoints()[index].clone(),
                         reason: "scripted failure".into(),
@@ -1737,6 +1956,7 @@ mod tests {
             .record_target_failure(
                 0,
                 TransportEndpointFailure {
+                    pre_send: false,
                     size_class: None,
                     endpoint: TransportEndpoint("wss://one.example".into()),
                     reason: "acknowledgement unknown".into(),
@@ -1750,6 +1970,7 @@ mod tests {
             .record_target_failure(
                 0,
                 TransportEndpointFailure {
+                    pre_send: false,
                     size_class: None,
                     endpoint: TransportEndpoint("wss://one.example".into()),
                     reason: "later explicit rejection".into(),
@@ -1767,6 +1988,287 @@ mod tests {
         assert!(!fanout.outcome().fanout_complete);
     }
 
+    /// mdk#2332: the single exposure transition. For every stored state,
+    /// exposure bit and attempt result, the bit is never cleared, and stays
+    /// clear only for a result proving nothing was sent, or for a definitive
+    /// refusal of the attempt this value started.
+    #[test]
+    fn exposure_bit_stays_clear_only_for_proof_that_nothing_reached_a_relay() {
+        #[derive(Clone, Copy, Debug, PartialEq)]
+        enum Stored {
+            NotAttempted,
+            /// Marked by this value, which awaits the result.
+            Current,
+            /// Marked by this value, then copied: the copy holds the attempt.
+            CurrentCopy,
+            /// Marked, then loaded from storage: a crash interrupted it.
+            Interrupted,
+            Unavailable,
+            Exposed,
+            /// `RetryableUnavailable` stored before pre-send proof existed:
+            /// its failure is a relay's `rate-limited:` answer, its bit clear.
+            LegacyAnswered,
+            /// Each of these, then marked again: the current attempt.
+            RetriedAfterUnavailable,
+            RetriedAfterAnswer,
+            RetriedAfterExposure,
+        }
+        #[derive(Clone, Copy, Debug, PartialEq)]
+        enum Outcome {
+            Accepted,
+            /// No connection was made.
+            PreSend,
+            /// The adapter refused the event unsent: a known limit or the
+            /// commit size floor.
+            LocalRefusal,
+            /// `invalid:`, `blocked:` and the rest.
+            Definitive,
+            /// `rate-limited:` or `auth-required:`.
+            RetryableAnswer,
+            Timeout,
+            CloseAfterWrite,
+            Unclassified,
+        }
+        use FanoutTargetStatus::{
+            Accepted as A, Failed as F, PossiblyExposed as PE, RetryableUnavailable as RU,
+        };
+        use Outcome::*;
+        use Stored::*;
+
+        let endpoint = TransportEndpoint("wss://one.example".into());
+        let failure = |kind, category, pre_send| TransportEndpointFailure {
+            endpoint: endpoint.clone(),
+            reason: "scripted".into(),
+            kind,
+            rejection_category: category,
+            size_class: None,
+            pre_send,
+        };
+        let stored = |state: Stored, bit: bool| {
+            let (state, retried) = match state {
+                RetriedAfterUnavailable => (Unavailable, true),
+                RetriedAfterAnswer => (LegacyAnswered, true),
+                RetriedAfterExposure => (Exposed, true),
+                state => (state, false),
+            };
+            let mut fanout = OutboundFanout::stage(
+                fanout_request(),
+                Some(crate::engine_state::PendingStateRef::new(9)),
+                Some(GroupId::new(vec![0xD4; 16])),
+                55,
+            )
+            .unwrap();
+            if state != NotAttempted {
+                fanout.mark_attempt_started_at(0, 100).unwrap();
+            }
+            match state {
+                NotAttempted | Current => {}
+                RetriedAfterUnavailable | RetriedAfterAnswer | RetriedAfterExposure => {
+                    unreachable!("mapped to the state it retries")
+                }
+                CurrentCopy => fanout = fanout.clone(),
+                Interrupted => {
+                    fanout = serde_json::from_slice(&serde_json::to_vec(&fanout).unwrap()).unwrap();
+                }
+                Unavailable | LegacyAnswered => {
+                    fanout
+                        .record_target_failure(
+                            0,
+                            failure(
+                                TransportEndpointFailureKind::RetryableUnavailable,
+                                None,
+                                true,
+                            ),
+                        )
+                        .unwrap();
+                }
+                Exposed => {
+                    fanout
+                        .record_target_failure(
+                            0,
+                            failure(TransportEndpointFailureKind::PossiblyExposed, None, false),
+                        )
+                        .unwrap();
+                }
+            }
+            // A clear bit on a `PossiblyExposed` target is a row written
+            // before the bit existed; a set one on an outstanding target is
+            // a row written by an earlier ambiguous attempt.
+            fanout.target_possible_exposure[0] = bit;
+            if state == LegacyAnswered {
+                fanout.target_failures[0] = Some(failure(
+                    TransportEndpointFailureKind::RetryableUnavailable,
+                    Some(TransportEndpointRejectionCategory::RateLimited),
+                    false,
+                ));
+                // A row with no proof serializes as one written before the
+                // proof existed did.
+                let row = serde_json::to_vec(&fanout).unwrap();
+                assert!(!String::from_utf8_lossy(&row).contains("pre_send"));
+                fanout = serde_json::from_slice(&row).unwrap();
+            }
+            if retried {
+                fanout.mark_attempt_started_at(0, 200).unwrap();
+            }
+            fanout
+        };
+        let apply = |fanout: &mut OutboundFanout, outcome: Outcome| {
+            use TransportEndpointFailureKind::*;
+            use TransportEndpointRejectionCategory as Category;
+            match outcome {
+                Outcome::Accepted => fanout.mark_target_accepted(0),
+                Unclassified => fanout.mark_target_failed(0),
+                PreSend => {
+                    fanout.record_target_failure(0, failure(RetryableUnavailable, None, true))
+                }
+                LocalRefusal => fanout.record_target_failure(
+                    0,
+                    TransportEndpointFailure::over_known_limit(endpoint.clone(), 70_000),
+                ),
+                Definitive => fanout.record_target_failure(
+                    0,
+                    failure(TerminalRejected, Some(Category::Invalid), false),
+                ),
+                RetryableAnswer => fanout.record_target_failure(
+                    0,
+                    failure(RetryableUnavailable, Some(Category::RateLimited), false),
+                ),
+                Timeout | CloseAfterWrite => {
+                    fanout.record_target_failure(0, failure(PossiblyExposed, None, false))
+                }
+            }
+            .unwrap();
+        };
+
+        // With the bit clear before the result: the status and bit after it.
+        let clear_rows = [
+            (NotAttempted, Accepted, A, false),
+            (NotAttempted, PreSend, RU, false),
+            (NotAttempted, LocalRefusal, F, false),
+            (NotAttempted, Definitive, PE, true),
+            (NotAttempted, RetryableAnswer, PE, true),
+            (NotAttempted, Timeout, PE, true),
+            (NotAttempted, CloseAfterWrite, PE, true),
+            (NotAttempted, Unclassified, F, true),
+            (Current, Accepted, A, false),
+            (Current, PreSend, RU, false),
+            (Current, LocalRefusal, F, false),
+            (Current, Definitive, F, false),
+            (Current, RetryableAnswer, PE, true),
+            (Current, Timeout, PE, true),
+            (Current, CloseAfterWrite, PE, true),
+            (Current, Unclassified, F, true),
+            (CurrentCopy, Accepted, A, false),
+            (CurrentCopy, PreSend, RU, false),
+            (CurrentCopy, LocalRefusal, F, false),
+            (CurrentCopy, Definitive, F, false),
+            (CurrentCopy, RetryableAnswer, PE, true),
+            (CurrentCopy, Timeout, PE, true),
+            (CurrentCopy, CloseAfterWrite, PE, true),
+            (CurrentCopy, Unclassified, F, true),
+            (Interrupted, Accepted, A, false),
+            (Interrupted, PreSend, PE, true),
+            (Interrupted, LocalRefusal, PE, true),
+            (Interrupted, Definitive, PE, true),
+            (Interrupted, RetryableAnswer, PE, true),
+            (Interrupted, Timeout, PE, true),
+            (Interrupted, CloseAfterWrite, PE, true),
+            (Interrupted, Unclassified, F, true),
+            (Unavailable, Accepted, A, false),
+            (Unavailable, PreSend, RU, false),
+            (Unavailable, LocalRefusal, F, false),
+            (Unavailable, Definitive, PE, true),
+            (Unavailable, RetryableAnswer, PE, true),
+            (Unavailable, Timeout, PE, true),
+            (Unavailable, CloseAfterWrite, PE, true),
+            (Unavailable, Unclassified, F, true),
+            // A `PossiblyExposed` status is exposure whatever its bit says.
+            (Exposed, Accepted, A, true),
+            (Exposed, PreSend, PE, true),
+            (Exposed, LocalRefusal, PE, true),
+            (Exposed, Definitive, PE, true),
+            (Exposed, RetryableAnswer, PE, true),
+            (Exposed, Timeout, PE, true),
+            (Exposed, CloseAfterWrite, PE, true),
+            (Exposed, Unclassified, F, true),
+            (LegacyAnswered, Accepted, A, true),
+            (LegacyAnswered, PreSend, PE, true),
+            (LegacyAnswered, LocalRefusal, PE, true),
+            (LegacyAnswered, Definitive, PE, true),
+            (LegacyAnswered, RetryableAnswer, PE, true),
+            (LegacyAnswered, Timeout, PE, true),
+            (LegacyAnswered, CloseAfterWrite, PE, true),
+            (LegacyAnswered, Unclassified, F, true),
+            (RetriedAfterUnavailable, Accepted, A, false),
+            (RetriedAfterUnavailable, PreSend, RU, false),
+            (RetriedAfterUnavailable, LocalRefusal, F, false),
+            (RetriedAfterUnavailable, Definitive, F, false),
+            (RetriedAfterUnavailable, RetryableAnswer, PE, true),
+            (RetriedAfterUnavailable, Timeout, PE, true),
+            (RetriedAfterUnavailable, CloseAfterWrite, PE, true),
+            (RetriedAfterUnavailable, Unclassified, F, true),
+            (RetriedAfterAnswer, Accepted, A, true),
+            (RetriedAfterAnswer, PreSend, PE, true),
+            (RetriedAfterAnswer, LocalRefusal, PE, true),
+            (RetriedAfterAnswer, Definitive, PE, true),
+            (RetriedAfterAnswer, RetryableAnswer, PE, true),
+            (RetriedAfterAnswer, Timeout, PE, true),
+            (RetriedAfterAnswer, CloseAfterWrite, PE, true),
+            (RetriedAfterAnswer, Unclassified, F, true),
+            (RetriedAfterExposure, Accepted, A, true),
+            (RetriedAfterExposure, PreSend, PE, true),
+            (RetriedAfterExposure, LocalRefusal, PE, true),
+            (RetriedAfterExposure, Definitive, PE, true),
+            (RetriedAfterExposure, RetryableAnswer, PE, true),
+            (RetriedAfterExposure, Timeout, PE, true),
+            (RetriedAfterExposure, CloseAfterWrite, PE, true),
+            (RetriedAfterExposure, Unclassified, F, true),
+        ];
+        for (state, outcome, status, bit) in clear_rows {
+            for bit_before in [false, true] {
+                let before = stored(state, bit_before);
+                let mut after = before.clone();
+                apply(&mut after, outcome);
+                // A set bit is never cleared, and keeps every failure exposed.
+                let (status, bit) = if bit_before {
+                    let status = match outcome {
+                        Accepted => A,
+                        Unclassified => F,
+                        _ => PE,
+                    };
+                    (status, true)
+                } else {
+                    (status, bit)
+                };
+                let case = format!("{state:?} with bit {bit_before}, then {outcome:?}");
+                assert_eq!(after.target_status(0), Some(status), "{case}");
+                assert_eq!(after.target_possible_exposure[0], bit, "{case}");
+                assert_eq!(
+                    after.possible_exposure(),
+                    bit,
+                    "{case}: the fanout reports the bit"
+                );
+                // Storage admits every result recorded out of `Attempting`,
+                // and every failure recorded before marking. An acceptance
+                // with no attempt in flight is not an edge this rule adds.
+                if matches!(
+                    state,
+                    Current
+                        | CurrentCopy
+                        | Interrupted
+                        | RetriedAfterUnavailable
+                        | RetriedAfterAnswer
+                        | RetriedAfterExposure
+                ) || !matches!(outcome, Accepted | Unclassified)
+                {
+                    after
+                        .validate_successor_of(&before)
+                        .unwrap_or_else(|error| panic!("{case}: storage refuses it: {error}"));
+                }
+            }
+        }
+    }
+
     #[test]
     fn late_ambiguous_result_cannot_reopen_terminal_no_exposure_target() {
         let mut fanout = OutboundFanout::stage(
@@ -1781,6 +2283,7 @@ mod tests {
             .record_target_failure(
                 0,
                 TransportEndpointFailure {
+                    pre_send: false,
                     size_class: None,
                     endpoint: TransportEndpoint("wss://one.example".into()),
                     reason: "connection failed before send".into(),
@@ -1796,6 +2299,7 @@ mod tests {
                 .record_target_failure(
                     0,
                     TransportEndpointFailure {
+                        pre_send: false,
                         size_class: None,
                         endpoint: TransportEndpoint("wss://one.example".into()),
                         reason: "late acknowledgement unknown".into(),
@@ -1821,6 +2325,7 @@ mod tests {
             TransportEndpointFailure::over_known_limit(endpoint.clone(), 70 * 1024)
         };
         let relay = TransportEndpointFailure {
+            pre_send: false,
             endpoint: b.clone(),
             reason: "relay rejected event (too-large)".into(),
             kind: TransportEndpointFailureKind::TerminalRejected,
@@ -2026,6 +2531,7 @@ mod tests {
                 .collect(),
             failed: (0..failed)
                 .map(|i| TransportEndpointFailure {
+                    pre_send: false,
                     size_class: None,
                     endpoint: TransportEndpoint(format!("wss://failed-{i}.example")),
                     reason: "unreachable".into(),

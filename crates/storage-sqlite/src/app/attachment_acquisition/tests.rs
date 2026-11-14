@@ -2968,6 +2968,7 @@ fn readmit(store: &SqliteAppStorage, now: u64, reserve: u64, free: u64, automati
             free,
             automatic,
             admission(reserve, free, 1),
+            |_| 0,
         )
         .unwrap()
 }
@@ -3183,7 +3184,8 @@ fn storage_readmission_waits_for_admission_capacity() {
             1000,
             1000 + 2 * limit - 1,
             true,
-            admission(1000, 1000 + 2 * limit - 1, limit)
+            admission(1000, 1000 + 2 * limit - 1, limit),
+            |_| 0
         )
         .unwrap(),
         0
@@ -3198,7 +3200,8 @@ fn storage_readmission_waits_for_admission_capacity() {
             1000,
             1000 + 2 * limit,
             true,
-            admission(1000, 1000 + 2 * limit, limit)
+            admission(1000, 1000 + 2 * limit, limit),
+            |_| 0
         )
         .unwrap(),
         1
@@ -3233,7 +3236,8 @@ fn storage_readmission_credits_the_saved_checkpoint() {
             1000,
             1000 + needed - 1,
             true,
-            admission(1000, 1000 + needed - 1, limit)
+            admission(1000, 1000 + needed - 1, limit),
+            |_| 0
         )
         .unwrap(),
         0
@@ -3244,7 +3248,8 @@ fn storage_readmission_credits_the_saved_checkpoint() {
             1000,
             1000 + needed,
             true,
-            admission(1000, 1000 + needed, limit)
+            admission(1000, 1000 + needed, limit),
+            |_| 0
         )
         .unwrap(),
         1
@@ -3300,7 +3305,7 @@ fn readmission_is_not_starved_by_a_page_admission_refuses() {
     let admission = admission(1000, free, limit);
     assert!(!admission.admits(None) && admission.admits(Some(saved)));
     assert_eq!(
-        app.readmit_storage_blocked_attachments(13, 1000, free, true, admission)
+        app.readmit_storage_blocked_attachments(13, 1000, free, true, admission, |_| 0)
             .unwrap(),
         1
     );
@@ -3888,7 +3893,14 @@ fn storage_readmission_probe_is_read_only_while_nothing_fits() {
     );
     // A row that fits does write, so the guard is effective.
     assert_failed_with(
-        app.readmit_storage_blocked_attachments(13, 0, u64::MAX, true, admission(0, u64::MAX, 1)),
+        app.readmit_storage_blocked_attachments(
+            13,
+            0,
+            u64::MAX,
+            true,
+            admission(0, u64::MAX, 1),
+            |_| 0,
+        ),
         "attempt to write a readonly database",
     );
     sql(&store, "PRAGMA query_only=0");
@@ -4180,4 +4192,209 @@ fn automatic_request_moves_queued_work_ahead_of_newer_backlog_but_not_taps() {
         .unwrap();
     assert!(!moved, "the leader does not climb with the clock");
     assert_eq!(priority("shown"), leading);
+}
+
+/// mdk#3414: readmission releases only the parked jobs free space can fund
+/// together, in the order the worker starts them. Each one's charge comes out
+/// of what is left for the next, and the first that does not fit ends the
+/// batch, so a smaller job behind it cannot take its space. Jobs left out stay
+/// storage-blocked with their targets.
+#[test]
+fn storage_readmission_funds_parked_jobs_together_in_start_order() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
+    let floor = STORAGE_READMIT_MARGIN_BYTES;
+    let first = park_with_priority(&store, "first", 1000, 30);
+    let second = park_with_priority(&store, "second", 1000, 20);
+    let small = park_with_priority(&store, "small", 100, 10);
+    // Room for each on its own, not for the first two together.
+    assert_eq!(readmit_funded(&app, floor + 1500, |_| 0), 1);
+    assert_eq!(parked_target(&store, &first), None, "the first leaves");
+    assert_eq!(
+        parked_target(&store, &second),
+        Some(1000),
+        "keeps its target"
+    );
+    assert_eq!(parked_target(&store, &small), Some(100), "cannot overtake");
+    // The first is readmitted but has not finished, so its need still counts
+    // against the same free space: nothing more is released.
+    assert_eq!(readmit_funded(&app, floor + 1500, |_| 1000), 0);
+    // With room for the first's need and the second's charge, the second
+    // readmits; the small one, charged its need of 1000, does not fit after.
+    assert_eq!(readmit_funded(&app, floor + 2100, |_| 1000), 1);
+    assert_eq!(parked_target(&store, &second), None);
+    assert_eq!(parked_target(&store, &small), Some(100));
+    assert_eq!(readmit_funded(&app, floor + 2100, |_| 0), 1);
+    assert_eq!(parked_target(&store, &small), None);
+}
+
+/// The worker starts explicit work first, so readmission funds it first too:
+/// an older tap is released before a newer automatic job that would take its
+/// space.
+#[test]
+fn storage_readmission_funds_explicit_work_first() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
+    let tapped = park_with_priority(&store, "tapped", 1000, 5);
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE attachment_acquisition SET explicit_request=1 WHERE token=?1",
+            [&tapped.token],
+        )
+        .unwrap();
+    let newer = park_with_priority(&store, "newer", 1000, 50);
+    assert_eq!(
+        readmit_funded(&app, STORAGE_READMIT_MARGIN_BYTES + 1500, |_| 0),
+        1
+    );
+    assert_eq!(parked_target(&store, &tapped), None);
+    assert_eq!(parked_target(&store, &newer), Some(1000));
+}
+
+/// A job is charged what admission needs for its checkpoint now when that
+/// exceeds its recorded target (its prefix was pruned, or the limit rose), so
+/// a second job is not released into space the first will use.
+#[test]
+fn storage_readmission_charges_the_live_admission_need() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
+    let stale = park_with_priority(&store, "stale", 100, 30);
+    let next = park_with_priority(&store, "next", 100, 20);
+    let floor = STORAGE_READMIT_MARGIN_BYTES;
+    // Both targets fit, but the first now needs 1000.
+    assert_eq!(readmit_funded(&app, floor + 1050, |_| 1000), 1);
+    assert_eq!(parked_target(&store, &stale), None);
+    assert_eq!(parked_target(&store, &next), Some(100));
+}
+
+/// Park one requested job with `headroom` and a priority.
+fn park_with_priority(
+    store: &SqliteAccountStorage,
+    message: &str,
+    headroom: u64,
+    priority: i64,
+) -> AttachmentAssetRef {
+    let app = store.app_storage();
+    seed(store, message);
+    let asset = request(&app, message);
+    let job = app
+        .claim_attachment_acquisition(&asset, 12, 100)
+        .unwrap()
+        .unwrap();
+    park(&app, &job, headroom, 12);
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE attachment_acquisition SET priority_at=?2 WHERE token=?1",
+            params![asset.token, priority],
+        )
+        .unwrap();
+    asset
+}
+
+/// The parked job's recorded target, or `None` once it left `StorageBlocked`.
+fn parked_target(store: &SqliteAccountStorage, asset: &AttachmentAssetRef) -> Option<i64> {
+    store
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT storage_blocked_headroom FROM attachment_acquisition WHERE token=?1 AND state=4",
+            [&asset.token],
+            |row| row.get::<_, Option<i64>>(0),
+        )
+        .optional()
+        .unwrap()
+        .flatten()
+}
+
+/// Readmit with no reserve and admission that admits every checkpoint, so
+/// only the funding rule and `need` decide.
+fn readmit_funded(store: &SqliteAppStorage, free: u64, need: impl Fn(Option<u64>) -> u64) -> usize {
+    store
+        .readmit_storage_blocked_attachments(
+            13,
+            0,
+            free,
+            true,
+            ReadmitAdmission {
+                checkpointed_at_least: 0,
+                uncheckpointed: true,
+            },
+            need,
+        )
+        .unwrap()
+}
+
+/// A readmitted job's need keeps counting after it records progress, which
+/// clears its park streak: while it is in flight, and once it falls back to a
+/// retry holding its checkpoint. A second job is not released into space the
+/// first still needs.
+#[test]
+fn storage_readmission_counts_a_readmitted_job_through_checkpoint_progress() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
+    let floor = STORAGE_READMIT_MARGIN_BYTES;
+    let first = park_with_priority(&store, "first", 1000, 30);
+    let second = park_with_priority(&store, "second", 1000, 20);
+    assert_eq!(readmit_funded(&app, floor + 1500, |_| 1000), 1);
+    let job = app
+        .claim_attachment_acquisition(&first, 13, 100)
+        .unwrap()
+        .unwrap();
+    let identity = partial_identity(4096);
+    assert!(checkpoint(&app, &job, &identity, 0, &[7; 64], 13).unwrap());
+    let streak: i64 = store
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT storage_park_count FROM attachment_acquisition WHERE token=?1",
+            [&first.token],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(streak, 0, "progress clears the park streak");
+    assert_eq!(
+        readmit_funded(&app, floor + 1500, |_| 1000),
+        0,
+        "in flight, it still counts"
+    );
+    sql(
+        &store,
+        "UPDATE attachment_acquisition SET state=2,attempt=NULL,due=0 WHERE message_id_hex='first'",
+    );
+    assert_eq!(
+        readmit_funded(&app, floor + 1500, |_| 1000),
+        0,
+        "retrying with its checkpoint, it still counts"
+    );
+    assert_eq!(parked_target(&store, &second), Some(1000));
+}
+
+/// Only jobs readmission released reserve space while queued or retrying: an
+/// unrelated download in network backoff with a checkpoint reserves nothing,
+/// so it cannot keep a parked job blocked while the worker could start it.
+#[test]
+fn storage_readmission_ignores_retrying_jobs_it_did_not_release() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
+    seed(&store, "backoff");
+    let busy = request(&app, "backoff");
+    let job = app
+        .claim_attachment_acquisition(&busy, 12, 100)
+        .unwrap()
+        .unwrap();
+    assert!(checkpoint(&app, &job, &partial_identity(4096), 0, &[7; 64], 12).unwrap());
+    sql(
+        &store,
+        "UPDATE attachment_acquisition SET state=2,attempt=NULL,due=100000 WHERE message_id_hex='backoff'",
+    );
+    let image = park_with_priority(&store, "image", 1000, 20);
+    assert_eq!(
+        readmit_funded(&app, STORAGE_READMIT_MARGIN_BYTES + 1500, |_| 1000),
+        1
+    );
+    assert_eq!(parked_target(&store, &image), None);
 }

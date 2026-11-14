@@ -63,7 +63,7 @@ impl AttachmentPublication<'_> {
     fn retain(&self, conn: &Connection, id: FileId) -> StorageResult<()> {
         attach_slot(conn, &self.job.reference.token, id)?;
         conn.execute(
-            "UPDATE attachment_acquisition SET state=3,due=NULL,attempt=NULL,storage_blocked_headroom=NULL,storage_park_count=0 WHERE token=?1",
+            "UPDATE attachment_acquisition SET state=3,due=NULL,attempt=NULL,storage_blocked_headroom=NULL,storage_park_count=0,storage_readmitted=0 WHERE token=?1",
             [&self.job.reference.token],
         )
         .storage()?;

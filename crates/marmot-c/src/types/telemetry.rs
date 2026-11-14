@@ -198,7 +198,6 @@ c_mirror! {
         rec account_session_open: MarmotAppPerformanceOperationSnapshot,
         rec account_group_hydration: MarmotAppPerformanceOperationSnapshot,
         rec account_profile_load: MarmotAppPerformanceOperationSnapshot,
-        rec account_group_read_snapshot: MarmotAppPerformanceOperationSnapshot,
         rec account_transport_activation: MarmotAppPerformanceOperationSnapshot,
         rec account_subscription_registration: MarmotAppPerformanceOperationSnapshot,
         rec account_catch_up: MarmotAppPerformanceOperationSnapshot,

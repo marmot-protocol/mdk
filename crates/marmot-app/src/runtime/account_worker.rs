@@ -410,6 +410,11 @@ pub(crate) enum AccountWorkerCommand {
         group_id: GroupId,
         respond: ReadReply<Result<Vec<AppGroupMemberRecord>, AppError>>,
     },
+    /// `group_co_members` read live, for a read A can't answer exactly
+    /// (before the first publish, or a failure with no exact copy).
+    GroupCoMembers {
+        respond: ReadReply<Result<Vec<String>, AppError>>,
+    },
     MemberIdsPage {
         group_ids: Vec<GroupId>,
         respond: ReadReply<Result<Vec<crate::AppGroupMemberIds>, AppError>>,
@@ -429,6 +434,14 @@ pub(crate) enum AccountWorkerCommand {
     GroupRoster {
         group_id: GroupId,
         respond: ReadReply<Result<crate::groups::AppGroupRosterSession, AppError>>,
+    },
+    /// A group read's hydration request (mdk#3273 PR 4): the read's version
+    /// of A shows these groups seeded but not hydrated. The worker hydrates
+    /// them in order at this command's queue position, publishes, and
+    /// acknowledges with the version it published.
+    HydrateGroups {
+        group_ids: Vec<GroupId>,
+        respond: ReadReply<Result<crate::client::read_state::HydrationAck, AppError>>,
     },
     EnableGroupDisbanding {
         group_id: GroupId,
@@ -969,37 +982,21 @@ enum DeferredStartupCommand {
 }
 
 /// The original startup command policy applies during both the initial sync
-/// future and its off-worker comparison wait. Snapshot reads remain available;
-/// mutations and catch-up keep their arrival order in `deferred`. If snapshot
-/// capture failed after readiness, reads join that FIFO and use live state
-/// after catch-up rather than guessing from an incomplete snapshot.
+/// future and its off-worker comparison wait. Group reads answer from A
+/// (mdk#3273 PR 4); mutations, catch-up and the reads still on the worker
+/// keep their arrival order in `deferred`. A hydration request whose groups
+/// the latest published version shows hydrated is acknowledged from it at
+/// once, and otherwise joins that FIFO.
 fn handle_startup_sync_command(
     command: AccountWorkerCommand,
-    read_snapshot: Option<&crate::client::GroupReadSnapshot>,
+    published: Option<&watch::Receiver<Arc<crate::client::read_state::ReadState>>>,
     deferred: &mut Vec<DeferredStartupCommand>,
     setup_key_package_result: &mut Option<Result<usize, AppError>>,
-    app: &MarmotApp,
-    account_label: &str,
 ) {
+    let Some(command) = acknowledge_from_published(command, published) else {
+        return;
+    };
     match command {
-        AccountWorkerCommand::Members { group_id, respond } => {
-            if let Some(snapshot) = read_snapshot {
-                let _ = respond.send_from_snapshot(|| snapshot.members(&group_id));
-            } else {
-                deferred.push(DeferredStartupCommand::Command(Box::new(
-                    AccountWorkerCommand::Members { group_id, respond },
-                )));
-            }
-        }
-        AccountWorkerCommand::MemberIdsPage { group_ids, respond } => {
-            if let Some(snapshot) = read_snapshot {
-                let _ = respond.send_from_snapshot(|| snapshot.member_ids_page(&group_ids));
-            } else {
-                deferred.push(DeferredStartupCommand::Command(Box::new(
-                    AccountWorkerCommand::MemberIdsPage { group_ids, respond },
-                )));
-            }
-        }
         AccountWorkerCommand::CaptureConversation {
             respond, queued, ..
         } => {
@@ -1008,35 +1005,6 @@ fn handle_startup_sync_command(
             }
             let _ = respond.send_not_ready(Err(ConversationWindowError::NotReady));
         }
-        AccountWorkerCommand::GroupMlsState { group_id, respond } => {
-            if let Some(snapshot) = read_snapshot {
-                let _ = respond.send_from_snapshot(|| snapshot.group_mls_state(&group_id));
-            } else {
-                deferred.push(DeferredStartupCommand::Command(Box::new(
-                    AccountWorkerCommand::GroupMlsState { group_id, respond },
-                )));
-            }
-        }
-        AccountWorkerCommand::GroupRoster { group_id, respond } => {
-            if let Some(snapshot) = read_snapshot {
-                let _ = respond.send_from_snapshot(|| {
-                    group_roster_from_snapshot(app, account_label, snapshot, &group_id)
-                });
-            } else {
-                deferred.push(DeferredStartupCommand::Command(Box::new(
-                    AccountWorkerCommand::GroupRoster { group_id, respond },
-                )));
-            }
-        }
-        AccountWorkerCommand::QuarantinedGroups { respond } => {
-            if let Some(snapshot) = read_snapshot {
-                let _ = respond.send_from_snapshot(|| Ok(snapshot.quarantined_groups()));
-            } else {
-                deferred.push(DeferredStartupCommand::Command(Box::new(
-                    AccountWorkerCommand::QuarantinedGroups { respond },
-                )));
-            }
-        }
         AccountWorkerCommand::ConfirmGroupRejoin { respond, .. } => {
             let _ = answer_off_quiescent(respond, Err(AppError::AccountWorkerBusy));
         }
@@ -1044,8 +1012,8 @@ fn handle_startup_sync_command(
             let _ = answer_off_quiescent(respond, Err(AppError::AccountWorkerBusy));
         }
         AccountWorkerCommand::AcceptGroupInvite { respond, .. } => {
-            // Invite acceptance needs live group state and cannot run from a
-            // frozen snapshot while initial sync is still pending.
+            // Invite acceptance needs the live client, which the initial
+            // sync holds until it ends.
             let _ = answer_off_quiescent(respond, Err(AppError::AccountWorkerBusy));
         }
         AccountWorkerCommand::CatchUp { respond } => {
@@ -1246,8 +1214,7 @@ async fn run_app_runtime_account_worker(
     // `AccountOpen` (recorded by `reconcile` as the ready-wait)
     // measures the seeded open; the mdk#1161 stage telemetry attributes it
     // (`AccountSessionOpen` / `AccountGroupHydration` for the open the
-    // worker just awaited, with the pipeline and snapshot capture measured
-    // separately below).
+    // worker just awaited, with the pipeline measured separately below).
 
     {
         let open_timings = client.runtime.open_timings();
@@ -1364,44 +1331,16 @@ async fn run_app_runtime_account_worker(
         return;
     }
 
-    // The snapshot answers read commands while the initial sync holds
-    // `&mut client`; its only failure is the shared profile load. Readiness
-    // was already acknowledged (the pipeline above served commands), so a
-    // capture failure must NOT kill the worker — a dead worker behind a
-    // successful `start()` is the failure mode mdk#1306 review flagged.
-    // Degrade instead: publish the error and run the catch-up window without
-    // a snapshot, deferring read commands alongside mutations so they replay
-    // on live state after catch-up.
-    let snapshot_started = Instant::now();
-    let read_snapshot = {
-        let capture =
-            client.group_read_snapshot_with_stage_telemetry(shared.observer.performance());
-        shared.observer.performance().record(
-            AppPerformanceOperation::AccountGroupReadSnapshot,
-            snapshot_started.elapsed(),
-            capture.is_ok(),
-        );
-        match capture {
-            Ok(snapshot) => Some(snapshot),
-            Err(err) => {
-                let message =
-                    account_error_message("runtime startup snapshot capture failed", &err);
-                publish_app_runtime_account_error(
-                    Emit::Quiescent(&client),
-                    &events,
-                    &account_id_hex,
-                    &account_label,
-                    message,
-                );
-                None
-            }
-        }
-    };
+    // Group reads answer from A while the initial sync holds `&mut client`
+    // (mdk#3273 PR 4): publish what they will see, and keep a receiver for
+    // the hydration requests the sync acknowledges without hydrating.
+    client.publish_read_state();
+    let published = client.subscribe_read_state();
 
     // Start signer installation, transport activation, group-subscription
     // registration, and initial catch-up only after local readiness has been
     // signalled. Until a comparison network job is selected, the sync future
-    // holds `&mut client`: read commands use `read_snapshot`, invite acceptance
+    // holds `&mut client`: group reads answer from A, invite acceptance
     // gets a typed definitely-not-started busy response, and other commands
     // join the startup FIFO. During an off-worker comparison the worker can
     // serve eligible live commands without passing ownership of `client` to
@@ -1496,11 +1435,9 @@ async fn run_app_runtime_account_worker(
                         None => break None,
                         Some(command) => handle_startup_sync_command(
                             command,
-                            read_snapshot.as_ref(),
+                            published.as_ref(),
                             &mut deferred,
                             &mut setup_key_package_result,
-                            &app,
-                            &account_label,
                         ),
                     }
                 }
@@ -1638,8 +1575,8 @@ async fn run_app_runtime_account_worker(
     // Replay commands deferred during the initial catch-up in arrival order, now
     // on live state. Coalesced `CatchUp` waiters are fulfilled at their position
     // with the initial catch-up's result. Replay uses the live command queue so
-    // post-canonical snapshot reads (Members / GroupRoster / …) can land while
-    // a deferred create/invite still owns Welcome fanout.
+    // later commands can land while a deferred create/invite still owns
+    // Welcome fanout.
     let (media_http_tx, mut media_http_rx) = mpsc::unbounded_channel();
     let (media_http_worker_lifetime, _) = watch::channel(());
     let media_http = MediaHttpContext {
@@ -1687,7 +1624,6 @@ async fn run_app_runtime_account_worker(
                     &mut commands,
                     &mut pending,
                     AccountWorkerCatchUpContext {
-                        app: &app,
                         events: &events,
                         account_id_hex: &account_id_hex,
                         account_label: &account_label,
@@ -2107,7 +2043,6 @@ async fn run_app_runtime_account_worker(
                                     &mut commands,
                                     &mut pending,
                                     AccountWorkerCatchUpContext {
-                                        app: &app,
                                         events: &events,
                                         account_id_hex: &account_id_hex,
                                         account_label: &account_label,
@@ -2208,18 +2143,12 @@ async fn run_app_runtime_account_worker(
                 };
                 let phase = shared.observer.performance().observe(RuntimeOp::WorkerConvergence);
                 let _unit = unit.enter(WorkerUnit::Convergence);
-                // Recovery owns the live client, but member/roster reads can
-                // use the last committed snapshot while its relay I/O waits.
-                // Mutations retain worker FIFO order; reads use the snapshot.
-                let read_snapshot = capture_group_read_snapshot(
-                    &client,
-                    &events,
-                    &account_id_hex,
-                    &account_label,
-                    "runtime scheduled convergence snapshot failed",
-                );
-                Box::pin(serve_snapshot_reads_until(
-                    read_snapshot,
+                // Recovery owns the live client while its relay I/O waits;
+                // group reads answer from A, and mutations retain worker FIFO
+                // order.
+                let published = publish_before_unit(&client);
+                Box::pin(defer_commands_until(
+                    published,
                     async {
                         #[cfg(any(test, feature = "test-policy-overrides"))]
                         if let Some(barrier) = shared.take_next_scheduled_convergence_barrier() {
@@ -2332,8 +2261,6 @@ async fn run_app_runtime_account_worker(
                     },
                     &mut commands,
                     &mut pending,
-                    &app,
-                    &account_label,
                     Some(send_waiting),
                 ))
                 .await;
@@ -3135,15 +3062,13 @@ async fn finish_periodic_maintenance_after_recovery(
     }
 }
 
-/// Run a steady-state catch-up while preserving prompt read-only projection
-/// access. The sync future exclusively borrows the live client, so reads that
-/// arrive during sync are answered from a snapshot captured immediately before
-/// it, including when mutations are deferred. Mutations retain FIFO order;
-/// reads observe pre-sync state until the window ends.
+/// Run a steady-state catch-up while group reads keep answering. The sync
+/// future exclusively borrows the live client; group reads answer from A,
+/// published immediately before it and at each drain turn (mdk#3273), and
+/// mutations retain FIFO order until the window ends.
 /// Additional catch-up requests received before such a command coalesce onto
 /// the in-flight sync.
 struct AccountWorkerCatchUpContext<'a> {
-    app: &'a MarmotApp,
     events: &'a broadcast::Sender<MarmotAppEvent>,
     account_id_hex: &'a str,
     account_label: &'a str,
@@ -3161,27 +3086,10 @@ async fn handle_account_worker_catch_up(
     let _unit = context.unit.enter(WorkerUnit::CatchUp);
     let telemetry = context.shared.observer.performance().clone();
     let catch_up_observation = telemetry.observe(RuntimeOp::WorkerCatchUp);
-    let snapshot_observation = telemetry.observe(RuntimeOp::WorkerSnapshot);
-    let snapshot_result = client.group_read_snapshot();
-    snapshot_observation.finish_app(&snapshot_result);
-    let read_snapshot = match snapshot_result {
-        Ok(snapshot) => Some(snapshot),
-        Err(err) => {
-            let message = account_error_message("runtime catch-up snapshot failed", &err);
-            publish_app_runtime_account_error(
-                Emit::Quiescent(client),
-                context.events,
-                context.account_id_hex,
-                context.account_label,
-                message,
-            );
-            // Snapshot availability controls whether reads can run concurrently
-            // with sync; it must not prevent the explicit catch-up itself from
-            // retrieving updates that may advance or repair degraded state.
-            // Defer reads to live state until sync releases `&mut client`.
-            None
-        }
-    };
+    // Group reads answer from A while the sync holds the client (mdk#3273
+    // PR 4): publish what they will see first.
+    client.publish_read_state();
+    let published = client.subscribe_read_state();
     let mut catch_up_responders = vec![respond];
     let mut deferred = VecDeque::new();
     let mut commands_open = true;
@@ -3220,22 +3128,10 @@ async fn handle_account_worker_catch_up(
             let Some(command) = command else {
                 continue;
             };
-            let snapshot_reads_available = read_snapshot.is_some();
+            let Some(command) = acknowledge_from_published(command, published.as_ref()) else {
+                continue;
+            };
             match command {
-                AccountWorkerCommand::Members { group_id, respond } if snapshot_reads_available => {
-                    let snapshot = read_snapshot
-                        .as_ref()
-                        .expect("snapshot availability checked above");
-                    let _ = respond.send_from_snapshot(|| snapshot.members(&group_id));
-                }
-                AccountWorkerCommand::MemberIdsPage { group_ids, respond }
-                    if snapshot_reads_available =>
-                {
-                    let snapshot = read_snapshot
-                        .as_ref()
-                        .expect("snapshot availability checked above");
-                    let _ = respond.send_from_snapshot(|| snapshot.member_ids_page(&group_ids));
-                }
                 AccountWorkerCommand::CaptureConversation {
                     respond, queued, ..
                 } => {
@@ -3243,35 +3139,6 @@ async fn handle_account_worker_catch_up(
                         queued.finish(TelemetryOutcome::NotReady);
                     }
                     let _ = respond.send_not_ready(Err(ConversationWindowError::NotReady));
-                }
-                AccountWorkerCommand::GroupMlsState { group_id, respond }
-                    if snapshot_reads_available =>
-                {
-                    let snapshot = read_snapshot
-                        .as_ref()
-                        .expect("snapshot availability checked above");
-                    let _ = respond.send_from_snapshot(|| snapshot.group_mls_state(&group_id));
-                }
-                AccountWorkerCommand::GroupRoster { group_id, respond }
-                    if snapshot_reads_available =>
-                {
-                    let snapshot = read_snapshot
-                        .as_ref()
-                        .expect("snapshot availability checked above");
-                    let _ = respond.send_from_snapshot(|| {
-                        group_roster_from_snapshot(
-                            context.app,
-                            context.account_label,
-                            snapshot,
-                            &group_id,
-                        )
-                    });
-                }
-                AccountWorkerCommand::QuarantinedGroups { respond } if snapshot_reads_available => {
-                    let snapshot = read_snapshot
-                        .as_ref()
-                        .expect("snapshot availability checked above");
-                    let _ = respond.send_from_snapshot(|| Ok(snapshot.quarantined_groups()));
                 }
                 AccountWorkerCommand::ConfirmGroupRejoin { respond, .. } => {
                     let _ = answer_off_quiescent(respond, Err(AppError::AccountWorkerBusy));
@@ -3289,8 +3156,8 @@ async fn handle_account_worker_catch_up(
                 AccountWorkerCommand::RetryRuntimeGroupSubscriptions { respond } => {
                     // This is worker-owned maintenance, not caller work. Keep
                     // its retry armed without placing it in the deferred FIFO;
-                    // otherwise it would unnecessarily force later snapshot
-                    // reads to wait behind the whole catch-up.
+                    // otherwise later catch-up requests could no longer
+                    // coalesce onto this one.
                     let _ = answer_off_quiescent(respond, true);
                 }
                 AccountWorkerCommand::CatchUp { respond } if deferred.is_empty() => {
@@ -3606,6 +3473,7 @@ async fn run_startup_hydration_pipeline(
                                 events,
                                 account_id_hex,
                                 account_label,
+                                shared,
                                 setup_key_package_result,
                             )
                             .await;
@@ -3627,6 +3495,7 @@ async fn run_startup_hydration_pipeline(
                         events,
                         account_id_hex,
                         account_label,
+                        shared,
                         setup_key_package_result,
                     )
                     .await;
@@ -3774,8 +3643,9 @@ pub(crate) async fn drain_deferred_hydration(client: &mut AppClient) -> Result<(
 /// they name first, so a read "waits for that group only". The quarantine
 /// list answers the incrementally-growing set; later additions reach
 /// subscribers through their `GroupHydrationQuarantined` events. Invite
-/// acceptance also runs live; everything else joins the startup deferral in
-/// arrival order.
+/// acceptance and a local forget also run live; everything else joins the
+/// startup deferral in arrival order.
+#[allow(clippy::too_many_arguments)]
 async fn handle_startup_hydration_command(
     client: &mut AppClient,
     command: AccountWorkerCommand,
@@ -3783,6 +3653,7 @@ async fn handle_startup_hydration_command(
     events: &broadcast::Sender<MarmotAppEvent>,
     account_id_hex: &str,
     account_label: &str,
+    shared: &RuntimeSharedServices,
     setup_key_package_result: &mut Option<Result<usize, AppError>>,
 ) {
     match command {
@@ -3829,6 +3700,10 @@ async fn handle_startup_hydration_command(
             respond.dispatched();
             let _ = client.runtime.ensure_group_hydrated(&group_id);
             let _ = reply(respond, client.members(&group_id), client);
+        }
+        AccountWorkerCommand::GroupCoMembers { mut respond } => {
+            respond.dispatched();
+            let _ = reply(respond, co_members_after_hydration(client), client);
         }
         AccountWorkerCommand::MemberIdsPage {
             group_ids,
@@ -3888,6 +3763,46 @@ async fn handle_startup_hydration_command(
                 group_roster_after_hydration(client, &group_id),
                 client,
             );
+        }
+        AccountWorkerCommand::HydrateGroups {
+            group_ids,
+            mut respond,
+        } => {
+            // A group read's hydration request runs at its position, as the
+            // group reads did before they answered from A, ahead of the
+            // commands the pipeline defers and behind a forget accepted
+            // before it.
+            respond.dispatched();
+            let failure = hydrate_named_groups(client, &group_ids);
+            acknowledge_hydration(client, respond, failure);
+        }
+        // A forget runs at its position, as it does once startup ends, so no
+        // command accepted after it, a read's hydration request included,
+        // runs first, and one served before its group's batch drops the
+        // group before hydration recovers anything of it for the host
+        // (mdk#3273 PR 4). Like every command here it waits for the window
+        // between batches and its budget, so one still queued when a batch
+        // starts runs after that batch, which reports the group first.
+        // The engine commits the forget before it touches memory, so a
+        // failed one leaves its group whole and still awaiting its batch.
+        // Its subscription refresh is best-effort and, before startup sync
+        // activates the account, stays owed to that activation. Convergence
+        // is scheduled only after startup sync, so no pass waits to be noted
+        // done; the forget drops the group's buffered convergence request
+        // with the rest of its state.
+        AccountWorkerCommand::ForgetGroupLocal { group_id, respond } => {
+            let storage_permit = shared.observer.product().permit();
+            let result = client.forget_group_local(&group_id).await;
+            if matches!(result, Ok(true)) {
+                publish_app_runtime_group_state_updated(
+                    Emit::Quiescent(client),
+                    events,
+                    account_id_hex,
+                    account_label,
+                    &group_id,
+                );
+            }
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result, client);
         }
         AccountWorkerCommand::GroupPushDebugInfo {
             group_id,
@@ -4653,40 +4568,28 @@ async fn complete_media_http(
     drop(permit);
 }
 
-fn capture_group_read_snapshot(
+/// Publish A before a long unit takes the client, and a receiver of what
+/// it publishes: group reads answer from it while the unit runs, and the
+/// unit acknowledges a hydration request that needs no hydration from its
+/// latest version (mdk#3273 PR 4).
+fn publish_before_unit(
     client: &AppClient,
-    events: &broadcast::Sender<MarmotAppEvent>,
-    account_id_hex: &str,
-    account_label: &str,
-    method: &'static str,
-) -> Option<crate::client::GroupReadSnapshot> {
-    match client.group_read_snapshot() {
-        Ok(snapshot) => Some(snapshot),
-        Err(err) => {
-            publish_app_runtime_account_error(
-                Emit::Quiescent(client),
-                events,
-                account_id_hex,
-                account_label,
-                account_error_message(method, &err),
-            );
-            None
-        }
-    }
+) -> Option<watch::Receiver<Arc<crate::client::read_state::ReadState>>> {
+    client.publish_read_state();
+    client.subscribe_read_state()
 }
 
-/// Serve safe snapshot reads while `work` exclusively borrows the live client.
-/// Mutations stay queued FIFO behind `work`; reads continue observing the
-/// snapshot until it completes. Worker-owned catch-up runs afterward because
-/// create/invite spawn it immediately after the caller-visible reply. Keep
-/// later deferred commands behind that catch-up in their arrival order.
-async fn serve_snapshot_reads_until<Fut>(
-    read_snapshot: Option<crate::client::GroupReadSnapshot>,
+/// Hold the worker's commands while `work` exclusively borrows the live
+/// client. Group reads answer from A meanwhile; mutations and the reads
+/// still on the worker stay queued FIFO behind `work`. Worker-owned catch-up
+/// runs afterward because create/invite spawn it immediately after the
+/// caller-visible reply. Keep later deferred commands behind that catch-up
+/// in their arrival order.
+async fn defer_commands_until<Fut>(
+    published: Option<watch::Receiver<Arc<crate::client::read_state::ReadState>>>,
     work: Fut,
     commands: &mut mpsc::Receiver<AccountWorkerCommand>,
     pending: &mut VecDeque<AccountWorkerCommand>,
-    app: &MarmotApp,
-    account_label: &str,
     mut send_waiting: Option<oneshot::Sender<()>>,
 ) -> Fut::Output
 where
@@ -4726,22 +4629,10 @@ where
         {
             let _ = waiting.send(());
         }
-        let snapshot_reads_available = read_snapshot.is_some();
+        let Some(command) = acknowledge_from_published(command, published.as_ref()) else {
+            continue;
+        };
         match command {
-            AccountWorkerCommand::Members { group_id, respond } if snapshot_reads_available => {
-                let snapshot = read_snapshot
-                    .as_ref()
-                    .expect("snapshot availability checked above");
-                let _ = respond.send_from_snapshot(|| snapshot.members(&group_id));
-            }
-            AccountWorkerCommand::MemberIdsPage { group_ids, respond }
-                if snapshot_reads_available =>
-            {
-                let snapshot = read_snapshot
-                    .as_ref()
-                    .expect("snapshot availability checked above");
-                let _ = respond.send_from_snapshot(|| snapshot.member_ids_page(&group_ids));
-            }
             AccountWorkerCommand::CaptureConversation {
                 respond, queued, ..
             } => {
@@ -4749,28 +4640,6 @@ where
                     queued.finish(TelemetryOutcome::NotReady);
                 }
                 let _ = respond.send_not_ready(Err(ConversationWindowError::NotReady));
-            }
-            AccountWorkerCommand::GroupMlsState { group_id, respond }
-                if snapshot_reads_available =>
-            {
-                let snapshot = read_snapshot
-                    .as_ref()
-                    .expect("snapshot availability checked above");
-                let _ = respond.send_from_snapshot(|| snapshot.group_mls_state(&group_id));
-            }
-            AccountWorkerCommand::GroupRoster { group_id, respond } if snapshot_reads_available => {
-                let snapshot = read_snapshot
-                    .as_ref()
-                    .expect("snapshot availability checked above");
-                let _ = respond.send_from_snapshot(|| {
-                    group_roster_from_snapshot(app, account_label, snapshot, &group_id)
-                });
-            }
-            AccountWorkerCommand::QuarantinedGroups { respond } if snapshot_reads_available => {
-                let snapshot = read_snapshot
-                    .as_ref()
-                    .expect("snapshot availability checked above");
-                let _ = respond.send_from_snapshot(|| Ok(snapshot.quarantined_groups()));
             }
             AccountWorkerCommand::CatchUp { .. } => {
                 catch_up_seen = true;
@@ -4786,6 +4655,59 @@ where
     pending.append(&mut deferred);
     pending.append(&mut follow_up);
     output
+}
+
+/// Acknowledge a hydration request from the latest published A while a unit
+/// holds the client, when no group it names awaits hydration there: the
+/// read it serves can answer from that version as it is. Any other command,
+/// and a request that still needs hydration, goes back to the caller.
+fn acknowledge_from_published(
+    command: AccountWorkerCommand,
+    published: Option<&watch::Receiver<Arc<crate::client::read_state::ReadState>>>,
+) -> Option<AccountWorkerCommand> {
+    let AccountWorkerCommand::HydrateGroups { group_ids, respond } = command else {
+        return Some(command);
+    };
+    match published.map(|published| Arc::clone(&published.borrow())) {
+        Some(state) if state.version > 0 && state.awaiting_hydration(&group_ids).is_empty() => {
+            let _ = respond.send_from_published(|| {
+                Ok(crate::client::read_state::HydrationAck {
+                    state,
+                    failure: None,
+                })
+            });
+            None
+        }
+        _ => Some(AccountWorkerCommand::HydrateGroups { group_ids, respond }),
+    }
+}
+
+/// Hydrate the named groups in order, as the group reads did before they
+/// answered from A: the first hydration error, if any, is the read's.
+fn hydrate_named_groups(client: &mut AppClient, group_ids: &[GroupId]) -> Option<AppError> {
+    group_ids.iter().find_map(|group_id| {
+        client
+            .runtime
+            .ensure_group_hydrated(group_id)
+            .err()
+            .map(AppError::from)
+    })
+}
+
+/// Answer a hydration request at a quiescent point: publish A, then reply
+/// with that version, which shows each named group live, quarantined or
+/// gone (mdk#3273 PR 4).
+fn acknowledge_hydration(
+    client: &AppClient,
+    respond: ReadReply<Result<crate::client::read_state::HydrationAck, AppError>>,
+    failure: Option<AppError>,
+) {
+    client.publish_read_state();
+    let ack = client
+        .published_read_state()
+        .map(|state| crate::client::read_state::HydrationAck { state, failure })
+        .ok_or(AppError::TransportClosed);
+    let _ = respond.send_from_published(|| ack);
 }
 
 struct AccountWorkerCommandContext<'a> {
@@ -4836,10 +4758,9 @@ fn answer_off_quiescent<T>(respond: oneshot::Sender<T>, value: T) -> Result<(), 
 }
 
 /// Commands that arrived while a previous handler held `&mut client` stay in
-/// `pending` until that handler returns. Read commands (`Members` /
-/// `MemberIdsPage` / `GroupMlsState` / `GroupRoster` / `QuarantinedGroups`) are
-/// intercepted inline during catch-up and Welcome fanout and answered from a
-/// `GroupReadSnapshot`; here they read the live session.
+/// `pending` until that handler returns. The reads that answer from A reach
+/// the worker only as a fallback or a hydration request (mdk#3273); here
+/// they read the live session.
 async fn handle_account_worker_command(
     client: &mut AppClient,
     mut command: AccountWorkerCommand,
@@ -5039,23 +4960,15 @@ fn account_worker_command_future<'a>(
         AccountWorkerCommand::RepairFullHistory { respond } => Box::pin(async move {
             let _unit = unit.enter(WorkerUnit::Repair);
             let sync_started_at = Instant::now();
-            let read_snapshot = capture_group_read_snapshot(
-                client,
-                events,
-                account_id_hex,
-                account_label,
-                "full-history repair snapshot failed",
-            );
+            let published = publish_before_unit(client);
             // Observe cancellation at checkpoint boundaries, never by dropping
             // an in-flight durable ingest or a live engine transaction.
             let cancelled = || respond.is_closed() || shared.lifecycle().is_stopping();
-            let repaired = Box::pin(serve_snapshot_reads_until(
-                read_snapshot,
+            let repaired = Box::pin(defer_commands_until(
+                published,
                 client.repair_full_history_cancellable(&cancelled, recovery_runner),
                 commands,
                 pending,
-                app,
-                account_label,
                 None,
             ))
             .await;
@@ -5239,15 +5152,9 @@ fn account_worker_command_future<'a>(
             drop(create_unit);
             if created {
                 let _unit = unit.enter(WorkerUnit::WelcomeFanout);
-                let read_snapshot = capture_group_read_snapshot(
-                    client,
-                    events,
-                    account_id_hex,
-                    account_label,
-                    "runtime post-create snapshot failed",
-                );
-                Box::pin(serve_snapshot_reads_until(
-                    read_snapshot,
+                let published = publish_before_unit(client);
+                Box::pin(defer_commands_until(
+                    published,
                     async {
                         // An undelivered Welcome stays owed; the events below
                         // report it.
@@ -5266,8 +5173,6 @@ fn account_worker_command_future<'a>(
                     },
                     commands,
                     pending,
-                    app,
-                    account_label,
                     None,
                 ))
                 .await;
@@ -5375,6 +5280,11 @@ fn account_worker_command_future<'a>(
             let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result, client);
             true
         }),
+        AccountWorkerCommand::GroupCoMembers { respond } => Box::pin(async move {
+            let result = co_members_after_hydration(client);
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result, client);
+            true
+        }),
         AccountWorkerCommand::MemberIdsPage { group_ids, respond } => Box::pin(async move {
             // The page is one worker command, but each requested group keeps
             // the same on-demand promotion and quarantine gate as `Members`.
@@ -5427,6 +5337,11 @@ fn account_worker_command_future<'a>(
         AccountWorkerCommand::GroupRoster { group_id, respond } => Box::pin(async move {
             let result = group_roster_after_hydration(client, &group_id);
             let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result, client);
+            true
+        }),
+        AccountWorkerCommand::HydrateGroups { group_ids, respond } => Box::pin(async move {
+            let failure = hydrate_named_groups(client, &group_ids);
+            acknowledge_hydration(client, respond, failure);
             true
         }),
         AccountWorkerCommand::EnableGroupDisbanding { group_id, respond } => Box::pin(async move {
@@ -5732,18 +5647,12 @@ fn account_worker_command_future<'a>(
             if canonical {
                 let _unit = unit.enter(WorkerUnit::WelcomeFanout);
                 // Reply first so the inviter is not blocked on Welcome publish.
-                // Snapshot reads (members, MLS state, roster) are served from a
-                // post-commit snapshot while fanout owns the live client.
+                // Group reads answer from A, published after the commit,
+                // while fanout owns the live client.
                 // Later mutations stay queued FIFO behind this delivery.
-                let read_snapshot = capture_group_read_snapshot(
-                    client,
-                    events,
-                    account_id_hex,
-                    account_label,
-                    "runtime post-invite snapshot failed",
-                );
-                Box::pin(serve_snapshot_reads_until(
-                    read_snapshot,
+                let published = publish_before_unit(client);
+                Box::pin(defer_commands_until(
+                    published,
                     async {
                         // An undelivered Welcome stays owed; the events below
                         // report it.
@@ -5759,8 +5668,6 @@ fn account_worker_command_future<'a>(
                     },
                     commands,
                     pending,
-                    app,
-                    account_label,
                     None,
                 ))
                 .await;
@@ -7247,6 +7154,17 @@ pub(super) fn group_roster_after_hydration(
     client.group_roster_session(group_id)
 }
 
+/// `GroupCoMembers` on the worker, as `group_co_members` read it before it
+/// answered from A: each contributing group promotes on demand first, as its
+/// member read did, and the read answers whatever promotion left.
+fn co_members_after_hydration(client: &mut AppClient) -> Result<Vec<String>, AppError> {
+    let groups = client.co_member_groups()?;
+    for group_id in &groups {
+        let _ = client.runtime.ensure_group_hydrated(group_id);
+    }
+    client.co_members(&groups)
+}
+
 fn member_ids_page_after_hydration(
     client: &mut AppClient,
     group_ids: &[GroupId],
@@ -7259,21 +7177,6 @@ fn member_ids_page_after_hydration(
         let _live = client.runtime.ensure_group_hydrated(group_id)?;
     }
     client.member_ids_page(group_ids)
-}
-
-fn group_roster_from_snapshot(
-    app: &MarmotApp,
-    account_label: &str,
-    snapshot: &crate::client::GroupReadSnapshot,
-    group_id: &GroupId,
-) -> Result<crate::groups::AppGroupRosterSession, AppError> {
-    let mut session = snapshot.group_roster(group_id)?;
-    if let Some(membership) =
-        app.stored_group_self_membership(account_label, &session.group_record.group_id_hex)?
-    {
-        session.group_record.self_membership = membership;
-    }
-    Ok(session)
 }
 
 #[derive(Debug, Clone)]
@@ -8793,6 +8696,8 @@ mod tests {
     #[cfg(feature = "test-policy-overrides")]
     mod automatic_group_recovery_tests;
     #[cfg(feature = "test-policy-overrides")]
+    mod hydration_request_tests;
+    #[cfg(feature = "test-policy-overrides")]
     mod local_submission_queue_tests;
     mod publication_progress_tests;
     mod read_queue_tests;
@@ -8805,6 +8710,28 @@ mod tests {
     mod worker_recovery_resume_tests;
 
     static BOUNDED_WORKER_FIXTURE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// While a unit that holds the client is held (startup sync, a
+    /// catch-up, a convergence pass, Welcome fanout or a repair), wait until
+    /// the worker has taken every command queued before this call: the unit
+    /// acknowledges a hydration request that needs no hydration at once,
+    /// from A (mdk#3273 PR 4). The main loop answers it too, so it says
+    /// nothing about whether a unit is held.
+    async fn held_unit_took_queued_commands(commands: &mpsc::Sender<AccountWorkerCommand>) {
+        let (respond, ack) = ReadReply::unobserved();
+        commands
+            .send(AccountWorkerCommand::HydrateGroups {
+                group_ids: Vec::new(),
+                respond,
+            })
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(10), ack)
+            .await
+            .expect("the worker acknowledges the hydration request")
+            .unwrap()
+            .unwrap();
+    }
 
     // Paused time pins the production retry deadlines without wall-clock sleeps.
     #[tokio::test(start_paused = true)]
@@ -8903,17 +8830,26 @@ mod tests {
         assert!(client.take_pending_welcome_delivery_events().is_empty());
     }
 
+    /// A client that publishes A, as the worker's does.
+    async fn publishing_client(app: &MarmotApp) -> AppClient {
+        let mut client = app.client("alice").await.unwrap();
+        client.start_read_state(
+            crate::client::read_state::read_state_channel().0,
+            Default::default(),
+        );
+        client
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn conversation_capture_retries_while_snapshot_work_owns_client_even_without_snapshot() {
+    async fn conversation_capture_retries_while_a_unit_owns_the_client() {
         let dir = tempfile::tempdir().unwrap();
         AccountHome::open(dir.path())
             .create_account("alice")
             .unwrap();
         let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
             .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
-        let client = app.client("alice").await.unwrap();
-        for available in [true, false] {
-            let snapshot = available.then(|| client.group_read_snapshot().unwrap());
+        let client = publishing_client(&app).await;
+        for published in [publish_before_unit(&client), None] {
             let (commands, mut receiver) = mpsc::channel(8);
             let (respond, response) = ReadReply::unobserved();
             commands
@@ -8928,15 +8864,7 @@ mod tests {
                 .unwrap();
             let (release, work) = oneshot::channel::<()>();
             let mut pending = VecDeque::new();
-            let serve = serve_snapshot_reads_until(
-                snapshot,
-                work,
-                &mut receiver,
-                &mut pending,
-                &app,
-                "alice",
-                None,
-            );
+            let serve = defer_commands_until(published, work, &mut receiver, &mut pending, None);
             let check = async {
                 assert!(matches!(
                     timeout(Duration::from_secs(1), response)
@@ -8956,45 +8884,50 @@ mod tests {
         }
     }
 
+    /// While a unit holds the client, a hydration request for groups the
+    /// latest published version shows hydrated is acknowledged at once from
+    /// that version; the mutation before it stays deferred (mdk#3273 PR 4).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn reads_bypass_deferred_work() {
+    async fn a_hydration_request_needing_none_is_acknowledged_while_work_is_held() {
         let dir = tempfile::tempdir().unwrap();
         AccountHome::open(dir.path())
             .create_account("alice")
             .unwrap();
         let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
             .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
-        let client = app.client("alice").await.unwrap();
-        let snapshot = client.group_read_snapshot().unwrap();
+        let mut client = publishing_client(&app).await;
+        let group = client
+            .create_group("live", &[])
+            .await
+            .unwrap()
+            .operation
+            .unwrap();
+        let published = publish_before_unit(&client);
+        let version = published.as_ref().unwrap().borrow().version;
         let (commands, mut receiver) = mpsc::channel(8);
         let (respond, mut mutation) = oneshot::channel();
         commands
             .try_send(AccountWorkerCommand::ConnectivityRestored { respond })
             .unwrap();
-        let (respond, read) = ReadReply::unobserved();
+        let (respond, ack) = ReadReply::unobserved();
         commands
-            .try_send(AccountWorkerCommand::QuarantinedGroups { respond })
+            .try_send(AccountWorkerCommand::HydrateGroups {
+                group_ids: vec![group.clone()],
+                respond,
+            })
             .unwrap();
         let (release, work) = oneshot::channel::<()>();
         let mut pending = VecDeque::new();
-        let serve = serve_snapshot_reads_until(
-            Some(snapshot),
-            work,
-            &mut receiver,
-            &mut pending,
-            &app,
-            "alice",
-            None,
-        );
+        let serve = defer_commands_until(published, work, &mut receiver, &mut pending, None);
         let check = async {
-            assert!(
-                timeout(Duration::from_secs(1), read)
-                    .await
-                    .expect("snapshot read must finish while work is held")
-                    .unwrap()
-                    .unwrap()
-                    .is_empty()
-            );
+            let ack = timeout(Duration::from_secs(1), ack)
+                .await
+                .expect("the request must be acknowledged while work is held")
+                .unwrap()
+                .unwrap();
+            assert!(ack.failure.is_none());
+            assert_eq!(ack.state.version, version);
+            assert!(ack.state.groups.contains_key(&group));
             assert!(matches!(
                 mutation.try_recv(),
                 Err(oneshot::error::TryRecvError::Empty)
@@ -9010,16 +8943,115 @@ mod tests {
         ));
     }
 
+    /// While a unit holds the client, a hydration request for a group the
+    /// latest published version shows awaiting hydration takes its queue
+    /// position behind a forget accepted before it. Run in that order, the
+    /// forget leaves nothing to hydrate, and the request acknowledges a
+    /// version where the group is gone (mdk#3273 PR 4).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn snapshot_work_preserves_catch_up_barrier_across_pending_and_channel() {
+    async fn a_hydration_request_stays_behind_a_forget_accepted_before_it() {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(relay.clone());
+        let group = {
+            let mut client = app.client("alice").await.unwrap();
+            client
+                .create_group("forgotten", &[])
+                .await
+                .unwrap()
+                .operation
+                .unwrap()
+        };
+        let plane = MarmotRelayPlane::new(None, relay);
+        let mut client = app
+            .local_client_with_relay_plane_and_hydration("alice", &plane, None, true, None)
+            .await
+            .unwrap();
+        client.start_read_state(
+            crate::client::read_state::read_state_channel().0,
+            Default::default(),
+        );
+        let published = publish_before_unit(&client);
+        assert_eq!(
+            published
+                .as_ref()
+                .unwrap()
+                .borrow()
+                .awaiting_hydration(std::slice::from_ref(&group)),
+            std::slice::from_ref(&group)
+        );
+        let (commands, mut receiver) = mpsc::channel(8);
+        let (respond, forgotten) = oneshot::channel();
+        commands
+            .try_send(AccountWorkerCommand::ForgetGroupLocal {
+                group_id: group.clone(),
+                respond,
+            })
+            .unwrap();
+        let (respond, mut ack) = ReadReply::unobserved();
+        commands
+            .try_send(AccountWorkerCommand::HydrateGroups {
+                group_ids: vec![group.clone()],
+                respond,
+            })
+            .unwrap();
+        let (release, work) = oneshot::channel::<()>();
+        let mut pending = VecDeque::new();
+        let serve = defer_commands_until(published, work, &mut receiver, &mut pending, None);
+        let check = async {
+            timeout(Duration::from_secs(10), async {
+                while commands.capacity() < commands.max_capacity() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the held unit takes both commands");
+            assert!(matches!(
+                ack.try_recv(),
+                Err(oneshot::error::TryRecvError::Empty)
+            ));
+            release.send(()).unwrap();
+        };
+        let (result, ()) = tokio::join!(serve, check);
+        result.unwrap();
+        let Some(AccountWorkerCommand::ForgetGroupLocal { respond, .. }) = pending.pop_front()
+        else {
+            panic!("the forget runs first");
+        };
+        let Some(AccountWorkerCommand::HydrateGroups {
+            group_ids,
+            respond: ack_reply,
+        }) = pending.pop_front()
+        else {
+            panic!("the hydration request runs second");
+        };
+        assert!(pending.is_empty());
+
+        // The worker's arms, in that order.
+        let _ = respond.send(client.forget_group_local(&group).await);
+        assert!(forgotten.await.unwrap().unwrap());
+        let failure = hydrate_named_groups(&mut client, &group_ids);
+        acknowledge_hydration(&client, ack_reply, failure);
+        let ack = ack.await.unwrap().unwrap();
+        assert!(ack.failure.is_none());
+        assert!(!ack.state.groups.contains_key(&group));
+        assert!(ack.state.awaiting_hydration(&group_ids).is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn held_work_preserves_catch_up_barrier_across_pending_and_channel() {
         let dir = tempfile::tempdir().unwrap();
         AccountHome::open(dir.path())
             .create_account("alice")
             .unwrap();
         let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
             .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
-        let client = app.client("alice").await.unwrap();
-        let snapshot = client.group_read_snapshot().unwrap();
+        let client = publishing_client(&app).await;
+        let published = publish_before_unit(&client);
         let (commands, mut receiver) = mpsc::channel(8);
         let mut pending = VecDeque::new();
         let (respond, mut before) = oneshot::channel();
@@ -9036,26 +9068,22 @@ mod tests {
             .unwrap();
         let (respond, read) = ReadReply::unobserved();
         commands
-            .try_send(AccountWorkerCommand::QuarantinedGroups { respond })
+            .try_send(AccountWorkerCommand::HydrateGroups {
+                group_ids: Vec::new(),
+                respond,
+            })
             .unwrap();
         let (release, work) = oneshot::channel::<()>();
-        let serve = serve_snapshot_reads_until(
-            Some(snapshot),
-            work,
-            &mut receiver,
-            &mut pending,
-            &app,
-            "alice",
-            None,
-        );
+        let serve = defer_commands_until(published, work, &mut receiver, &mut pending, None);
         let check = async {
             assert!(
                 timeout(Duration::from_secs(1), read)
                     .await
-                    .expect("snapshot read remains ready while work is held")
+                    .expect("a group read's request remains answered while work is held")
                     .unwrap()
                     .unwrap()
-                    .is_empty()
+                    .failure
+                    .is_none()
             );
             assert!(matches!(
                 before.try_recv(),
@@ -9483,6 +9511,7 @@ mod tests {
             &events,
             "",
             "alice",
+            &RuntimeSharedServices::default(),
             &mut setup,
         )
         .await;
@@ -9503,6 +9532,7 @@ mod tests {
             &events,
             "",
             "alice",
+            &RuntimeSharedServices::default(),
             &mut setup,
         )
         .await;
@@ -9897,17 +9927,8 @@ mod tests {
         timeout(Duration::from_secs(5), startup.wait())
             .await
             .unwrap();
-        // A snapshot reply proves every preceding command entered startup replay.
-        let (respond, snapshot) = ReadReply::unobserved();
-        commands
-            .send(AccountWorkerCommand::QuarantinedGroups { respond })
-            .await
-            .unwrap();
-        timeout(Duration::from_secs(5), snapshot)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
+        // Every preceding command entered startup replay.
+        held_unit_took_queued_commands(&commands).await;
         timeout(Duration::from_secs(5), startup.wait())
             .await
             .unwrap();

@@ -707,6 +707,7 @@ async fn terminal_application_fanout_replays_failure_after_restart_before_delete
         .record_target_failure(
             0,
             TransportEndpointFailure {
+                pre_send: false,
                 size_class,
                 endpoint: endpoint.clone(),
                 reason: "relay rejected the event".into(),
@@ -970,6 +971,7 @@ async fn deferred_fanout_blocks_newer_sends_but_not_convergence_settlement() {
         .record_target_failure(
             0,
             TransportEndpointFailure {
+                pre_send: false,
                 size_class: None,
                 endpoint: endpoint.clone(),
                 reason: "acknowledgement unknown".into(),
@@ -1151,6 +1153,7 @@ async fn assert_met_quorum_secondary_retry(newer_below_quorum: bool) {
         .record_target_failure(
             1,
             TransportEndpointFailure {
+                pre_send: false,
                 size_class: None,
                 endpoint: secondary.clone(),
                 reason: "acknowledgement unknown".into(),
@@ -1176,6 +1179,7 @@ async fn assert_met_quorum_secondary_retry(newer_below_quorum: bool) {
             .record_target_failure(
                 1,
                 TransportEndpointFailure {
+                    pre_send: false,
                     size_class: None,
                     endpoint: secondary.clone(),
                     reason: "second required acknowledgement unknown".into(),

@@ -256,9 +256,10 @@ impl<T> ReadReply<T> {
         self.reply.send(answer())
     }
 
-    /// Answer the read from a snapshot while a long unit holds the client:
-    /// mid-unit, so the answer describes the state from before that unit.
-    pub(crate) fn send_from_snapshot(mut self, answer: impl FnOnce() -> T) -> Result<(), T> {
+    /// Answer the read with a published version of A, which the answer
+    /// carries: the version just published, or while a long unit holds the
+    /// client, the latest one from before it (mdk#3273 PR 4).
+    pub(crate) fn send_from_published(mut self, answer: impl FnOnce() -> T) -> Result<(), T> {
         self.dispatched();
         self.reply.send(answer())
     }
@@ -325,8 +326,10 @@ host_reads!(
     ChatHistoryImports,
     HistoryImportProvenance,
     Members,
+    GroupCoMembers,
     MemberIdsPage,
     GroupRoster,
+    HydrateGroups,
     GroupCommitDelivery,
     KeyPackageMaintenanceStatus,
     DurablyOwnedKeyPackages,
@@ -388,6 +391,33 @@ mod tests {
         assert_eq!(waits(), (1, 1));
         respond.send_with(waits).unwrap();
         assert_eq!(response.try_recv().unwrap(), (0, 0));
+    }
+
+    /// A group read's hydration request ends its wait as the worker takes it
+    /// up, before it hydrates anything, as the hydration phase ends it
+    /// (mdk#3273 PR 4).
+    #[test]
+    fn a_hydration_request_ends_its_wait_when_taken_up() {
+        let telemetry = PerformanceRecorder::default();
+        let (commands, _receiver) = mpsc::channel::<AccountWorkerCommand>(1);
+        let lane = WorkerLane::from(commands);
+        let in_flight = || {
+            telemetry
+                .snapshot()
+                .runtime_operations
+                .into_iter()
+                .find(|sample| sample.operation == RuntimeOp::ReadQueueR3)
+                .unwrap()
+                .in_flight
+        };
+        let (respond, _response) = lane.read_reply(&telemetry, ReadClass::R3);
+        let mut command = AccountWorkerCommand::HydrateGroups {
+            group_ids: Vec::new(),
+            respond,
+        };
+        assert_eq!(in_flight(), 1);
+        command.read_dispatched();
+        assert_eq!(in_flight(), 0, "taking the request up ends its wait");
     }
 
     /// A read the worker cannot serve now ends as not ready, unless its caller

@@ -16,7 +16,7 @@ use cgka_traits::types::GroupId;
 use marmot_account::AccountHome;
 use marmot_app::{
     AppError, MAX_GROUP_MEMBER_IDS_PAGE_SIZE, MarmotApp, MarmotAppConfig, MarmotAppRuntime,
-    SelfMembership,
+    RuntimePerformanceOperation, SelfMembership,
 };
 use nostr_relay_builder::MockRelay;
 
@@ -59,6 +59,12 @@ fn sustained_command_traffic_does_not_starve_the_hydration_pipeline() {
 /// returns must not defer hydration indefinitely. A per-batch hold keeps the
 /// pipeline slow enough that the read flood genuinely overlaps it; the
 /// pipeline's completion telemetry sample proves it finished under load.
+///
+/// Group member reads answer from the published read state (mdk#3273 PR 4),
+/// so the flood is a read the worker still answers live between batches:
+/// the account-devices activation status. Its read-queue series proves every
+/// flood read reached the worker; if that read moves too, this test fails
+/// until it floods with another one.
 async fn sustained_traffic_body() {
     let relay = MockRelay::run().await.unwrap();
     let url = relay.url().await.to_string();
@@ -102,6 +108,15 @@ async fn sustained_traffic_body() {
     // state or promotes its group; the budget guarantees the pipeline still
     // advances between them.
     let telemetry = runtime.shared_services().app_performance_telemetry();
+    let worker_reads = || {
+        runtime
+            .app_performance_snapshot()
+            .runtime_operations
+            .into_iter()
+            .find(|sample| sample.operation == RuntimePerformanceOperation::ReadQueueR4)
+            .map_or(0, |sample| sample.successes)
+    };
+    let worker_reads_before = worker_reads();
     let flooded = group_ids.first().unwrap();
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut flood_reads = 0u64;
@@ -115,12 +130,20 @@ async fn sustained_traffic_body() {
             Instant::now() < deadline,
             "hydration pipeline starved by sustained reads ({flood_reads} served)"
         );
-        runtime.group_members(BENCH_ACCOUNT, flooded).await.unwrap();
+        runtime
+            .account_devices_activation(BENCH_ACCOUNT, flooded)
+            .await
+            .unwrap();
         flood_reads += 1;
     }
     assert!(
         flood_reads > 0,
         "flood must overlap the pipeline for this regression to mean anything"
+    );
+    assert_eq!(
+        worker_reads() - worker_reads_before,
+        flood_reads,
+        "every flood read must go through the worker"
     );
     // Every group finished hydrating despite the traffic.
     for group_id in &group_ids {
@@ -227,10 +250,10 @@ async fn held_hydration_body() {
     );
 
     // The identifier-only roster page is the bounded companion read for that
-    // chat projection (mdk#1314 / mdk#1461). One worker command promotes only
-    // the named groups from durable state and returns every member and admin
-    // identifier without waiting for the held background pipeline or doing
-    // profile enrichment.
+    // chat projection (mdk#1314 / mdk#1461). One hydration request promotes
+    // only the named groups from durable state, and the page returns every
+    // member and admin identifier without waiting for the held background
+    // pipeline or doing profile enrichment.
     let roster_reads_before = runtime
         .shared_services()
         .app_performance_telemetry()
@@ -295,8 +318,9 @@ async fn held_hydration_body() {
         Err(AppError::InvalidGroupMembershipPage(_))
     ));
 
-    // A group read issued during the hold hydrates exactly the group it
-    // names and answers from live state — it must not wait out the hold.
+    // A group read issued during the hold asks the worker to hydrate exactly
+    // the group it names, if it still awaits hydration, and answers from the
+    // version published after that: it must not wait out the hold.
     let probed: &GroupId = group_ids.last().unwrap();
     let read_started = Instant::now();
     let members = tokio::time::timeout(

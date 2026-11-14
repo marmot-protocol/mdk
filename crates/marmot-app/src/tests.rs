@@ -1688,6 +1688,11 @@ impl NostrRelayClient for ScriptedPushRelayClient {
                         .iter()
                         .cloned()
                         .map(|endpoint| cgka_traits::TransportEndpointFailure {
+                            // The relay cannot be reached, so nothing was
+                            // sent, as the SDK client reports a failed
+                            // connect. Without the proof, the failure would
+                            // read as a relay's retryable answer (mdk#2332).
+                            pre_send: true,
                             size_class: None,
                             endpoint,
                             reason: "relay unavailable".into(),
@@ -1709,6 +1714,7 @@ impl NostrRelayClient for ScriptedPushRelayClient {
                         .iter()
                         .cloned()
                         .map(|endpoint| cgka_traits::TransportEndpointFailure {
+                            pre_send: false,
                             size_class: None,
                             endpoint,
                             reason: "send event timed out".into(),
@@ -1747,6 +1753,7 @@ impl NostrRelayClient for ScriptedPushRelayClient {
                     .iter()
                     .cloned()
                     .map(|endpoint| cgka_traits::TransportEndpointFailure {
+                        pre_send: false,
                         size_class: None,
                         endpoint,
                         reason: "injected terminal rejection".into(),
@@ -1779,6 +1786,7 @@ impl NostrRelayClient for ScriptedPushRelayClient {
                     .iter()
                     .cloned()
                     .map(|endpoint| cgka_traits::TransportEndpointFailure {
+                        pre_send: false,
                         endpoint,
                         reason: "relay rejected event (too-large)".into(),
                         kind: cgka_traits::TransportEndpointFailureKind::TerminalRejected,
@@ -23507,6 +23515,163 @@ async fn direct_miss_skips_unhydrated() {
         ));
     }
     assert_eq!(app.groups("alice").unwrap().len(), 1);
+}
+
+/// Every direct-conversation candidate the peer index yields is in A or
+/// listed quarantined there, so the lookup's wait for its candidates ends at
+/// once for every class of stored row: a live direct conversation, a pending
+/// invitation, one left, one removed from, one whose device was removed, and
+/// one quarantined at hydration (mdk#3273 PR 4). The left and removed rows
+/// are not reusable and need no members; the quarantined one fails the
+/// lookup as unknown, as the worker's read failed it.
+#[test]
+fn every_direct_candidate_class_answers_without_waiting() {
+    run_composed_app_runtime_test(
+        "direct-candidate-classes",
+        every_direct_candidate_class_answers_without_waiting_body,
+    );
+}
+
+async fn every_direct_candidate_class_answers_without_waiting_body() {
+    use cgka_traits::storage::GroupStorage;
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    // Bob has his own home, so the runtime runs only Alice's worker.
+    let bob_dir = tempfile::tempdir().unwrap();
+    let bob_id = AccountHome::open(bob_dir.path())
+        .create_account("bob")
+        .unwrap()
+        .account_id_hex;
+    let bob_app = MarmotApp::with_relay(bob_dir.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    remember_test_member_inbox(&app, &bob_id, "wss://relay.example");
+    let [live, pending, left, removed, device_removed, quarantined] = {
+        let mut bob = bob_app.client("bob").await.unwrap();
+        let mut alice = app.client("alice").await.unwrap();
+        let mut created = Vec::new();
+        for _ in 0..6 {
+            bob.publish_key_package().await.unwrap();
+            created.push(
+                alice
+                    .create_group("", &[bob_id.as_str()])
+                    .await
+                    .unwrap()
+                    .operation
+                    .expect("eligible fixture members"),
+            );
+        }
+        created.try_into().unwrap()
+    };
+    let hex_of = |group: &GroupId| hex::encode(group.as_slice());
+    let mut state = app.load_state("alice").unwrap();
+    state
+        .groups
+        .iter_mut()
+        .find(|group| group.group_id_hex == hex_of(&pending))
+        .expect("the pending invitation")
+        .pending_confirmation = true;
+    app.save_state(&state).unwrap();
+    for (group, membership) in [
+        (&left, SelfMembership::Left),
+        (&removed, SelfMembership::Removed),
+        (&device_removed, SelfMembership::DeviceRemoved),
+    ] {
+        app.set_group_self_membership("alice", &hex_of(group), membership)
+            .unwrap();
+    }
+    let candidates = |app: &MarmotApp| {
+        app.direct_conversation_candidates("alice", &bob_id)
+            .unwrap()
+            .into_iter()
+            .map(|row| row.group_id_hex)
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+    let rows = |app: &MarmotApp| {
+        app.direct_conversation_candidates("alice", &bob_id)
+            .unwrap()
+            .into_iter()
+            .map(|row| {
+                (
+                    row.group_id_hex,
+                    row.self_membership,
+                    row.pending_confirmation,
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let every_class = [
+        &live,
+        &pending,
+        &left,
+        &removed,
+        &device_removed,
+        &quarantined,
+    ]
+    .map(hex_of)
+    .into_iter()
+    .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(candidates(&app), every_class);
+
+    let runtime = MarmotAppRuntime::new(app.clone());
+    runtime.start().await.unwrap();
+    let found = tokio::time::timeout(
+        Duration::from_secs(10),
+        runtime.existing_direct_conversation("alice", &bob_id),
+    )
+    .await
+    .expect("the lookup waits for no candidate")
+    .unwrap()
+    .expect("a reusable direct conversation");
+    // The one quarantined below is still a live member row here.
+    assert!(
+        [&live, &pending, &quarantined]
+            .map(hex_of)
+            .contains(&found.group_id_hex),
+        "only a member row is reused: found {}, rows {:?}",
+        found.group_id_hex,
+        rows(&app)
+    );
+    runtime.shutdown().await;
+
+    let storage = app.account_storage("alice").unwrap();
+    let mut damaged = storage.get_group(&quarantined).unwrap();
+    damaged.protocol_profile = cgka_traits::group::ProtocolProfile::Legacy;
+    storage.put_group(&damaged).unwrap();
+    drop(storage);
+    app.close_storage().unwrap();
+    let app =
+        MarmotApp::with_relay(dir.path(), "wss://relay.example").with_test_relay_client(relay);
+    assert_eq!(candidates(&app), every_class);
+    let runtime = MarmotAppRuntime::new(app.clone());
+    runtime.start().await.unwrap();
+    let error = tokio::time::timeout(
+        Duration::from_secs(10),
+        runtime.existing_direct_conversation("alice", &bob_id),
+    )
+    .await
+    .expect("the lookup waits for no quarantined candidate")
+    .expect_err("an unreadable direct conversation is never skipped into a miss");
+    assert!(
+        matches!(&error, AppError::UnknownGroup(id) if id == &hex_of(&quarantined))
+            || matches!(error.as_engine_error(), Some(cgka_traits::error::EngineError::UnknownGroup(id)) if id == &quarantined),
+        "{error:?}"
+    );
+    assert_eq!(
+        runtime
+            .quarantined_groups("alice")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|group| group.group_id_hex)
+            .collect::<Vec<_>>(),
+        vec![hex_of(&quarantined)]
+    );
+    runtime.shutdown_and_close().await.unwrap();
 }
 
 #[cfg(feature = "test-policy-overrides")]

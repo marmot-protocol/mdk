@@ -571,13 +571,8 @@ async fn a_repair_queued_during_startup_goes_through_the_runner() {
         .send(AccountWorkerCommand::RepairFullHistory { respond })
         .await
         .unwrap();
-    // A snapshot reply proves the repair entered startup replay before it.
-    let (respond, snapshot) = ReadReply::unobserved();
-    commands
-        .send(AccountWorkerCommand::QuarantinedGroups { respond })
-        .await
-        .unwrap();
-    timeout(SETTLE, snapshot).await.unwrap().unwrap().unwrap();
+    // The repair entered startup replay before this.
+    held_unit_took_queued_commands(&commands).await;
     timeout(SETTLE, startup.wait()).await.unwrap();
 
     let repaired = timeout(Duration::from_secs(90), repaired)
