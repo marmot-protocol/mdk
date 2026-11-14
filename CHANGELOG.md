@@ -59,6 +59,24 @@
   backends classify OpenMLS storage errors through the new
   `StorageProvider::mls_storage_failure` (mdk#3273).
 
+### Fixed
+
+- Stop a large group change from staying pending for good at a relay whose
+  event limit is unknown (#2332). A commit over 64 KiB is no longer sent to
+  such a relay, whose socket would close on the oversized frame and leave the
+  commit possibly seen: it is refused before sending, and a commit every relay
+  refuses rolls back as too large. A relay the device cannot connect to holds
+  the commit for a retry instead of refusing it. A pending commit now counts
+  as possibly seen at a relay that received it and answered `rate-limited:` or
+  `auth-required:`, so a later refusal there no longer rolls back a commit
+  members may have.
+- The same rule covers every send, not only commits (#2332). A message a
+  relay answered `rate-limited:` or `auth-required:` and then refused
+  (`invalid:`, `blocked:`) no longer fails: it stays pending and keeps
+  retrying, and while no relay has accepted it, later sends in its group wait
+  behind it, as they already do behind a send that timed out. Such an answer
+  still retries after 5 seconds, as before.
+
 ## 0.16.0 - 2026-11-12
 
 ### Security

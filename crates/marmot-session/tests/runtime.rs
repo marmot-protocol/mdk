@@ -413,6 +413,22 @@ struct RecordingAdapterInner {
     reported_message_ids: Mutex<VecDeque<MessageId>>,
     welcome_gate: Mutex<Option<Arc<WelcomePublishGate>>>,
     endpoint_gate: Mutex<Option<(TransportEndpoint, Arc<tokio::sync::Semaphore>)>>,
+    /// Each publish to the endpoint adds a permit to the semaphore.
+    publish_releases: Mutex<Option<(TransportEndpoint, Arc<tokio::sync::Semaphore>)>>,
+    /// Endpoints that refuse every commit for its size, unsent: over a known
+    /// limit, or over the commit size floor (mdk#2332).
+    commit_too_large: Mutex<Vec<TransportEndpoint>>,
+    /// Each commit size check's target endpoints, in order.
+    commit_size_checks: Mutex<Vec<Vec<TransportEndpoint>>>,
+    commit_size_check_gate: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
+    /// Holds each commit size check that covers the endpoint.
+    commit_size_check_endpoint_gate:
+        Mutex<Option<(TransportEndpoint, Arc<tokio::sync::Semaphore>)>>,
+    /// Every request the commit entry point received, sent or refused.
+    commit_publishes: Mutex<Vec<TransportPublishRequest>>,
+    /// Exact failures each endpoint answers its next publishes with, in order.
+    scripted_failures:
+        Mutex<std::collections::HashMap<TransportEndpoint, VecDeque<TransportEndpointFailure>>>,
 }
 
 struct WelcomePublishGate {
@@ -513,6 +529,59 @@ impl RecordingAdapter {
     fn publishes(&self) -> Vec<TransportPublishRequest> {
         self.inner.publishes.lock().unwrap().clone()
     }
+
+    /// Refuse every commit to `endpoints` for its size, unsent, in the size
+    /// check and in the commit entry point alike.
+    fn refuse_commits_as_too_large(&self, endpoints: Vec<TransportEndpoint>) {
+        *self.inner.commit_too_large.lock().unwrap() = endpoints;
+    }
+
+    /// Hold every commit size check until the returned gate gets a permit.
+    fn gate_commit_size_checks(&self) -> Arc<tokio::sync::Semaphore> {
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        *self.inner.commit_size_check_gate.lock().unwrap() = Some(gate.clone());
+        gate
+    }
+
+    /// Hold every commit size check that covers `endpoint` until the returned
+    /// gate gets a permit, as a connection probe to a relay of unknown limit
+    /// can stall.
+    fn gate_commit_size_checks_at(
+        &self,
+        endpoint: TransportEndpoint,
+    ) -> Arc<tokio::sync::Semaphore> {
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        *self.inner.commit_size_check_endpoint_gate.lock().unwrap() =
+            Some((endpoint, gate.clone()));
+        gate
+    }
+
+    fn commit_size_checks(&self) -> Vec<Vec<TransportEndpoint>> {
+        self.inner.commit_size_checks.lock().unwrap().clone()
+    }
+
+    fn commit_publishes(&self) -> Vec<TransportPublishRequest> {
+        self.inner.commit_publishes.lock().unwrap().clone()
+    }
+
+    /// Answer the next publishes to `endpoint` with `failures`, in order.
+    fn script_failures(
+        &self,
+        endpoint: TransportEndpoint,
+        failures: Vec<TransportEndpointFailure>,
+    ) {
+        self.inner
+            .scripted_failures
+            .lock()
+            .unwrap()
+            .entry(endpoint)
+            .or_default()
+            .extend(failures);
+    }
+
+    fn commit_size_refusal(endpoint: &TransportEndpoint) -> TransportEndpointFailure {
+        TransportEndpointFailure::over_known_limit(endpoint.clone(), 70_000)
+    }
 }
 
 #[async_trait]
@@ -545,6 +614,12 @@ impl TransportAdapter for RecordingAdapter {
         request: TransportPublishRequest,
     ) -> Result<TransportPublishReport, TransportAdapterError> {
         self.inner.publishes.lock().unwrap().push(request.clone());
+        let release = self.inner.publish_releases.lock().unwrap().clone();
+        if let Some((endpoint, gate)) = release
+            && request.target.endpoints().contains(&endpoint)
+        {
+            gate.add_permits(1);
+        }
         let endpoint_gate = self.inner.endpoint_gate.lock().unwrap().clone();
         if let Some((endpoint, gate)) = endpoint_gate
             && request.target.endpoints().contains(&endpoint)
@@ -563,6 +638,25 @@ impl TransportAdapter for RecordingAdapter {
             let permit = gate.release.acquire().await.unwrap();
             permit.forget();
             gate.active.fetch_sub(1, Ordering::SeqCst);
+        }
+        let scripted = match request.target.endpoints() {
+            [endpoint] => self
+                .inner
+                .scripted_failures
+                .lock()
+                .unwrap()
+                .get_mut(endpoint)
+                .and_then(VecDeque::pop_front),
+            _ => None,
+        };
+        if let Some(failure) = scripted {
+            return Err(TransportAdapterError::PublishEndpoints(
+                TransportPublishFailure::with_endpoint_failures(
+                    "scripted endpoint failure",
+                    vec![failure],
+                )
+                .with_message_id(request.message.id),
+            ));
         }
         let ambiguous_error = self
             .inner
@@ -593,6 +687,9 @@ impl TransportAdapter for RecordingAdapter {
                         .iter()
                         .cloned()
                         .map(|endpoint| TransportEndpointFailure {
+                            // An injected unavailable failure is a connect
+                            // failure: nothing was sent.
+                            pre_send: kind == TransportEndpointFailureKind::RetryableUnavailable,
                             size_class: None,
                             reason: reasons
                                 .iter()
@@ -655,6 +752,7 @@ impl TransportAdapter for RecordingAdapter {
                     .filter(|endpoint| !accepted_endpoints.contains(endpoint))
                     .cloned()
                     .map(|endpoint| TransportEndpointFailure {
+                        pre_send: false,
                         size_class: None,
                         endpoint,
                         reason: "injected explicit relay rejection".into(),
@@ -699,6 +797,66 @@ impl TransportAdapter for RecordingAdapter {
 
     async fn receive(&self) -> Result<Option<TransportDelivery>, TransportAdapterError> {
         Ok(None)
+    }
+
+    async fn commit_size_refusals(
+        &self,
+        _commit: &TransportMessage,
+        target: &TransportPublishTarget,
+    ) -> Vec<TransportEndpointFailure> {
+        self.inner
+            .commit_size_checks
+            .lock()
+            .unwrap()
+            .push(target.endpoints().to_vec());
+        let gate = self.inner.commit_size_check_gate.lock().unwrap().clone();
+        if let Some(gate) = gate {
+            gate.acquire().await.unwrap().forget();
+        }
+        let endpoint_gate = self
+            .inner
+            .commit_size_check_endpoint_gate
+            .lock()
+            .unwrap()
+            .clone();
+        if let Some((endpoint, gate)) = endpoint_gate
+            && target.endpoints().contains(&endpoint)
+        {
+            gate.acquire().await.unwrap().forget();
+        }
+        let too_large = self.inner.commit_too_large.lock().unwrap().clone();
+        target
+            .endpoints()
+            .iter()
+            .filter(|endpoint| too_large.contains(endpoint))
+            .map(Self::commit_size_refusal)
+            .collect()
+    }
+
+    async fn publish_commit(
+        &self,
+        request: TransportPublishRequest,
+    ) -> Result<TransportPublishReport, TransportAdapterError> {
+        self.inner
+            .commit_publishes
+            .lock()
+            .unwrap()
+            .push(request.clone());
+        let too_large = self.inner.commit_too_large.lock().unwrap().clone();
+        let refused = request
+            .target
+            .endpoints()
+            .iter()
+            .filter(|endpoint| too_large.contains(endpoint))
+            .map(Self::commit_size_refusal)
+            .collect::<Vec<_>>();
+        if !refused.is_empty() && refused.len() == request.target.endpoints().len() {
+            return Err(TransportAdapterError::PublishEndpoints(
+                TransportPublishFailure::with_endpoint_failures("refused unsent", refused)
+                    .with_message_id(request.message.id),
+            ));
+        }
+        self.publish(request).await
     }
 }
 
@@ -794,6 +952,7 @@ impl TransportRoutingPolicy for MismatchedPendingGroupRouting {
 
 include!("runtime/frozen_fanout.rs");
 include!("runtime/interrupted_attempt.rs");
+include!("runtime/commit_floor.rs");
 include!("runtime/hydrated_welcome.rs");
 include!("support/recovery_challenge.rs");
 include!("runtime/key_package_generation_upgrade.rs");

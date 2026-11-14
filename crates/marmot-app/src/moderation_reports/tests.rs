@@ -67,6 +67,7 @@ fn failures(
     endpoints
         .iter()
         .map(|endpoint| TransportEndpointFailure {
+            pre_send: false,
             size_class: None,
             endpoint: endpoint.clone(),
             reason: "scripted".into(),

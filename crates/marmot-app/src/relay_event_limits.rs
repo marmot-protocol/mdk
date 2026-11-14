@@ -22,6 +22,10 @@ const EVENT_MESSAGE_FRAMING_BYTES: usize = 10;
 /// strfry's default `events.maxEventSize`. No relay MDK knows of refuses a
 /// smaller event, so events up to this size skip the document lookup.
 const ADVERTISED_LIMIT_CHECK_ABOVE_BYTES: usize = 64 * 1024;
+// A commit over the floor at a relay of unknown limit is refused, so every
+// such commit must have had its relay's advertised limit looked up.
+const _: () =
+    assert!(ADVERTISED_LIMIT_CHECK_ABOVE_BYTES <= transport_nostr::COMMIT_SIZE_FLOOR_BYTES);
 
 pub(crate) struct AppRelayEventLimits {
     configured: HashMap<RelayUrl, usize>,

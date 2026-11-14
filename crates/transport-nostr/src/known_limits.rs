@@ -6,6 +6,9 @@
 //! [`KnownLimitPublishClient`] to everything else an account signs and
 //! publishes: profiles, follow and relay lists, KeyPackages and their
 //! deletions, the block list, stickers, the backup pointer.
+//!
+//! A commit also meets [`COMMIT_SIZE_FLOOR_BYTES`] at a relay whose limit is
+//! unknown (mdk#2332): [`admit_commit`].
 
 use std::future::Future;
 use std::sync::Arc;
@@ -14,7 +17,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use cgka_traits::{
     EventSizeClass, MemberId, MessageId, TransportAdapterError, TransportEndpoint,
-    TransportEndpointFailure, TransportPublishFailure,
+    TransportEndpointFailure, TransportEndpointFailureKind, TransportPublishFailure,
 };
 use transport_nostr_adapter::{
     NostrAcquisitionCancellation, NostrAcquisitionError, NostrAcquisitionRequest,
@@ -37,6 +40,13 @@ pub trait RelayEventLimits: Send + Sync {
         event_bytes: usize,
     ) -> Option<usize>;
 }
+
+/// The largest commit sent to a relay whose event limit is unknown
+/// (mdk#2332). A frame over a relay's limit closes the socket mid-send, which
+/// leaves the commit possibly seen and so pending for good; refused before
+/// sending, it rolls back instead. 64 KiB is strfry's default
+/// `events.maxEventSize`, the smallest event limit relays use.
+pub const COMMIT_SIZE_FLOOR_BYTES: usize = 64 * 1024;
 
 /// `,"sig":"` and a 64-byte hex signature with its closing quote: what
 /// signing adds to an unsigned event's JSON.
@@ -94,6 +104,119 @@ pub(crate) async fn refuse_over_known_limits(
     }
     (sendable, refused)
 }
+
+/// Where a commit of `event_bytes` may go: the endpoints it is sent to, a
+/// refusal for each whose limit it exceeds, and a hold for each it cannot be
+/// judged at yet (mdk#2332).
+///
+/// A known limit judges as for any event. An unknown limit allows
+/// [`COMMIT_SIZE_FLOOR_BYTES`], if the relay can be reached: whether a relay
+/// is offline is judged by connecting to it, not by its relay document. One
+/// that cannot be connected to is held, a failure that proves nothing was
+/// sent, so an offline device or a down relay never makes a commit look too
+/// large. With no limits source the adapter enforces no limit, the floor
+/// included.
+pub(crate) async fn admit_commit(
+    limits: Option<&dyn RelayEventLimits>,
+    connections: &dyn NostrRelayClient,
+    endpoints: &[TransportEndpoint],
+    event_bytes: usize,
+) -> CommitAdmission {
+    let mut admission = CommitAdmission::default();
+    let Some(limits) = limits else {
+        admission.sendable = endpoints.to_vec();
+        return admission;
+    };
+    let verdicts = futures::future::join_all(
+        endpoints
+            .iter()
+            .map(|endpoint| commit_size_verdict(limits, connections, endpoint, event_bytes)),
+    )
+    .await;
+    for (endpoint, verdict) in endpoints.iter().zip(verdicts) {
+        match verdict {
+            CommitSizeVerdict::Send => admission.sendable.push(endpoint.clone()),
+            CommitSizeVerdict::Refuse => {
+                admission
+                    .refused
+                    .push(TransportEndpointFailure::over_known_limit(
+                        endpoint.clone(),
+                        event_bytes,
+                    ))
+            }
+            CommitSizeVerdict::Hold(failure) => admission.held.push(failure),
+        }
+    }
+    if !admission.refused.is_empty() || !admission.held.is_empty() {
+        tracing::debug!(
+            target: "marmot_app::relay_plane",
+            method = "admit_commit",
+            refused_endpoint_count = admission.refused.len(),
+            held_endpoint_count = admission.held.len(),
+            sendable_endpoint_count = admission.sendable.len(),
+            "commit not sent to relays it may exceed"
+        );
+    }
+    admission
+}
+
+/// [`admit_commit`]'s split of a commit's endpoints.
+#[derive(Default)]
+pub(crate) struct CommitAdmission {
+    pub(crate) sendable: Vec<TransportEndpoint>,
+    pub(crate) refused: Vec<TransportEndpointFailure>,
+    pub(crate) held: Vec<TransportEndpointFailure>,
+}
+
+/// How a commit's size stands at one relay.
+pub(crate) enum CommitSizeVerdict {
+    Send,
+    Refuse,
+    /// No connection to the relay, so its unknown limit cannot be judged.
+    Hold(TransportEndpointFailure),
+}
+
+/// [`admit_commit`]'s rule for one endpoint.
+pub(crate) async fn commit_size_verdict(
+    limits: &dyn RelayEventLimits,
+    connections: &dyn NostrRelayClient,
+    endpoint: &TransportEndpoint,
+    event_bytes: usize,
+) -> CommitSizeVerdict {
+    match limits.max_event_bytes(endpoint, event_bytes).await {
+        Some(limit) if event_bytes > limit => CommitSizeVerdict::Refuse,
+        Some(_) => CommitSizeVerdict::Send,
+        None if event_bytes <= COMMIT_SIZE_FLOOR_BYTES => CommitSizeVerdict::Send,
+        None => match connections.connect_for_publish(endpoint).await {
+            Ok(()) => CommitSizeVerdict::Refuse,
+            // A connect sends no event, so whatever the client reports, the
+            // hold proves nothing was sent.
+            Err(failure) => CommitSizeVerdict::Hold(TransportEndpointFailure {
+                endpoint: endpoint.clone(),
+                reason: failure.reason,
+                kind: TransportEndpointFailureKind::RetryableUnavailable,
+                rejection_category: None,
+                size_class: None,
+                pre_send: true,
+            }),
+        },
+    }
+}
+
+/// The failure of a commit sent nowhere: refused or held at every endpoint,
+/// with at least one held. A hold proves no size, so neither does the
+/// failure.
+pub(crate) fn held_everywhere(
+    failures: Vec<TransportEndpointFailure>,
+    event: &NostrTransportEvent,
+) -> TransportAdapterError {
+    let mut failure =
+        TransportPublishFailure::with_endpoint_failures(COMMIT_HELD_REASON.to_owned(), failures);
+    failure.message_id = hex::decode(&event.id).ok().map(MessageId::new);
+    TransportAdapterError::PublishEndpoints(failure)
+}
+
+const COMMIT_HELD_REASON: &str = "commit held until its relays can be reached";
 
 /// The failure of an event refused on every endpoint of `targets`. It was
 /// sent nowhere, and it proves its size as relays' own refusals would.
@@ -282,6 +405,13 @@ fn join_outcome(
 /// Only publishes change; everything else is the inner client's.
 #[async_trait]
 impl NostrRelayClient for KnownLimitPublishClient {
+    async fn connect_for_publish(
+        &self,
+        endpoint: &TransportEndpoint,
+    ) -> Result<(), TransportEndpointFailure> {
+        self.inner.connect_for_publish(endpoint).await
+    }
+
     fn relay_notification_source(&self) -> Option<Arc<dyn NostrRelayNotificationSource>> {
         self.inner.relay_notification_source()
     }

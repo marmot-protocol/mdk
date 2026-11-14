@@ -122,7 +122,9 @@ const TRANSPORT_FANOUT_RETENTION_SECS: u64 = 24 * 60 * 60;
 const COMMIT_DELIVERY_SELF_UPDATE_HOLD_SECS: u64 = 60 * 60;
 const FROZEN_FANOUT_AMBIGUOUS_RETRY_BASE_MS: u64 = 30 * 1_000;
 const FROZEN_FANOUT_AMBIGUOUS_RETRY_MAX_MS: u64 = 60 * 60 * 1_000;
-/// A relay that proved it never accepted the event can be retried promptly.
+/// A relay that proved it never accepted the event can be retried promptly:
+/// a connection never made, or a retryable answer (`rate-limited:`,
+/// `auth-required:`), even though the answer exposes the target (mdk#2332).
 /// Keep this aligned with the adapter's fixed reconnect interval so restoring
 /// connectivity does not leave a user send behind the ambiguity backoff.
 const FROZEN_FANOUT_UNAVAILABLE_RETRY_DELAY_MS: u64 = 5 * 1_000;
@@ -5800,10 +5802,27 @@ where
             .collect::<Vec<_>>();
         let attempted_any = !due.is_empty();
         if !due.is_empty() {
-            for &index in &due {
-                fanout.mark_attempt_started_at(index, now_ms)?;
+            // A commit too large for a relay is refused there before that
+            // target is marked, so the refusal leaves no attempt that might
+            // have left. A target already left `Attempting` by an interrupted
+            // attempt is not exempt: the refusal ends it possibly exposed
+            // (mdk#2332). Each target is checked on its own and sent once its
+            // check passes, so a slow check, such as a connection probe to a
+            // relay of unknown limit, holds back no other target's send.
+            let commit = matches!(
+                fanout.pending_kind(),
+                Some(FanoutPendingKind::GroupEvolution | FanoutPendingKind::Disband)
+            ) && matches!(
+                fanout.request().message.envelope,
+                TransportEnvelope::GroupMessage { .. }
+            );
+            let mut pass_failed = Vec::new();
+            if !commit {
+                for &index in &due {
+                    fanout.mark_attempt_started_at(index, now_ms)?;
+                }
+                self.session.put_outbound_fanout(&fanout)?;
             }
-            self.session.put_outbound_fanout(&fanout)?;
             // Every pass is audited, including secondary retries after the
             // first acknowledgement confirmed the pending MLS state (mdk#2255).
             self.record_audit_event(
@@ -5835,27 +5854,46 @@ where
             // one-awaited-ack-at-a-time serialization.
             let adapter = &self.adapter;
             let account_id = fanout.request().account_id.clone();
+            let message = fanout.request().message.clone();
+            let target = fanout.request().target.clone();
             let mut accepted = fanout.outcome().accepted_targets;
             let ack_goal = fanout.request().required_acks.max(1);
             // An already-met quorum alone must not cancel every retry. Only
             // explicit foreground pressure may interrupt this secondary tail.
             let finish_retries = accepted >= ack_goal;
             let mut pass_accepted = Vec::new();
-            let mut pass_failed = Vec::new();
-            let mut attempts = due
-                .iter()
-                .map(|&index| {
+            // A commit's target is first checked for size, then, once marked,
+            // sent; any other target is sent at once, marked above.
+            let step = |index: usize, checked: bool| {
+                let message = message.clone();
+                let target = publish_target_with_endpoints(&target, vec![endpoints[index].clone()]);
+                let account_id = account_id.clone();
+                async move {
+                    if !checked {
+                        let refusal = adapter
+                            .commit_size_refusals(&message, &target)
+                            .await
+                            .into_iter()
+                            .find(|failure| target.endpoints().contains(&failure.endpoint));
+                        return FanoutStep::Checked { index, refusal };
+                    }
                     let attempt = TransportPublishRequest {
-                        account_id: account_id.clone(),
-                        message: fanout.request().message.clone(),
-                        target: publish_target_with_endpoints(
-                            &fanout.request().target,
-                            vec![endpoints[index].clone()],
-                        ),
+                        account_id,
+                        message,
+                        target,
                         required_acks: 1,
                     };
-                    async move { (index, adapter.publish(attempt).await) }
-                })
+                    let result = if commit {
+                        adapter.publish_commit(attempt).await
+                    } else {
+                        adapter.publish(attempt).await
+                    };
+                    FanoutStep::Sent { index, result }
+                }
+            };
+            let mut attempts = due
+                .iter()
+                .map(|&index| step(index, !commit))
                 .collect::<FuturesUnordered<_>>();
             loop {
                 // Drain immediately ready receipts after reaching quorum, but
@@ -5877,8 +5915,35 @@ where
                 } else {
                     attempts.next().await
                 };
-                let Some((index, result)) = next else {
-                    break;
+                let (index, result) = match next {
+                    None => break,
+                    Some(FanoutStep::Checked {
+                        index,
+                        refusal: Some(failure),
+                    }) => {
+                        pass_failed.push(PublishRelayFailure {
+                            relay_url: failure.endpoint.0.clone(),
+                            reason: failure.reason.clone(),
+                        });
+                        fanout.record_refusal_before_attempt(index, failure, now_ms)?;
+                        self.session.put_outbound_fanout(&fanout)?;
+                        continue;
+                    }
+                    Some(FanoutStep::Checked {
+                        index,
+                        refusal: None,
+                    }) => {
+                        // Past quorum, a send started now would be cancelled
+                        // before it could finish; the target stays unmarked
+                        // for the next pass.
+                        if accepted < ack_goal || finish_retries {
+                            fanout.mark_attempt_started_at(index, now_ms)?;
+                            self.session.put_outbound_fanout(&fanout)?;
+                            attempts.push(step(index, true));
+                        }
+                        continue;
+                    }
+                    Some(FanoutStep::Sent { index, result }) => (index, result),
                 };
                 let endpoint = endpoints[index].clone();
                 let failure = match result {
@@ -6839,8 +6904,23 @@ fn publish_target_with_endpoints(
     }
 }
 
+/// One step of a frozen fanout pass for one target (mdk#2332): a commit's
+/// size check, then the send.
+enum FanoutStep {
+    /// The commit's size check, with the target's refusal if it has one.
+    Checked {
+        index: usize,
+        refusal: Option<TransportEndpointFailure>,
+    },
+    Sent {
+        index: usize,
+        result: Result<TransportPublishReport, TransportAdapterError>,
+    },
+}
+
 fn ambiguous_endpoint_failure(endpoint: TransportEndpoint) -> TransportEndpointFailure {
     TransportEndpointFailure {
+        pre_send: false,
         size_class: None,
         endpoint,
         reason: "publish acknowledgement unknown".into(),
@@ -6862,26 +6942,31 @@ fn frozen_fanout_target_retry_delay_ms(
 
     match fanout.target_status(index) {
         Some(FanoutTargetStatus::NotAttempted | FanoutTargetStatus::Attempting) => Some(0),
-        Some(FanoutTargetStatus::PossiblyExposed) => {
-            let attempt_count = fanout.target_attempt_count(index);
-            let shift = attempt_count.saturating_sub(1).min(7);
-            let backoff_ms = FROZEN_FANOUT_AMBIGUOUS_RETRY_BASE_MS
-                .saturating_mul(1_u64 << shift)
-                .min(FROZEN_FANOUT_AMBIGUOUS_RETRY_MAX_MS);
+        Some(
+            status @ (FanoutTargetStatus::PossiblyExposed
+            | FanoutTargetStatus::RetryableUnavailable),
+        ) => {
+            // The delay follows the last recorded failure, not the status: a
+            // relay's retryable answer exposes the target, yet retries as
+            // promptly as a connection never made (mdk#2332).
+            let retries_promptly = fanout.target_failure(index).map_or(
+                status == FanoutTargetStatus::RetryableUnavailable,
+                |failure| failure.kind == TransportEndpointFailureKind::RetryableUnavailable,
+            );
+            let delay_ms = if retries_promptly {
+                FROZEN_FANOUT_UNAVAILABLE_RETRY_DELAY_MS
+            } else {
+                let shift = fanout.target_attempt_count(index).saturating_sub(1).min(7);
+                FROZEN_FANOUT_AMBIGUOUS_RETRY_BASE_MS
+                    .saturating_mul(1_u64 << shift)
+                    .min(FROZEN_FANOUT_AMBIGUOUS_RETRY_MAX_MS)
+            };
             fanout
                 .target_last_attempt_at_ms(index)
                 .map_or(Some(0), |last| {
-                    Some(last.saturating_add(backoff_ms).saturating_sub(now_ms))
+                    Some(last.saturating_add(delay_ms).saturating_sub(now_ms))
                 })
         }
-        Some(FanoutTargetStatus::RetryableUnavailable) => fanout
-            .target_last_attempt_at_ms(index)
-            .map_or(Some(0), |last| {
-                Some(
-                    last.saturating_add(FROZEN_FANOUT_UNAVAILABLE_RETRY_DELAY_MS)
-                        .saturating_sub(now_ms),
-                )
-            }),
         Some(FanoutTargetStatus::Accepted | FanoutTargetStatus::Failed) | None => None,
     }
 }
@@ -6903,6 +6988,7 @@ fn frozen_fanout_report(fanout: &OutboundFanout) -> TransportPublishReport {
             cgka_traits::FanoutTargetStatus::Failed => {
                 failed.push(fanout.target_failure(index).cloned().unwrap_or_else(|| {
                     TransportEndpointFailure {
+                        pre_send: false,
                         size_class: None,
                         endpoint: endpoint.clone(),
                         reason: "publish attempt failed before exposure".into(),
@@ -7869,6 +7955,7 @@ mod tests {
             ),
         ] {
             let failure = TransportEndpointFailure {
+                pre_send: false,
                 endpoint: TransportEndpoint("wss://relay.example/".into()),
                 reason: "publication refused".into(),
                 kind,
@@ -7885,6 +7972,28 @@ mod tests {
     }
 
     fn failed_frozen_fanout(kind: TransportEndpointFailureKind) -> OutboundFanout {
+        let mut fanout = staged_frozen_fanout(None);
+        fanout.mark_attempt_started_at(0, 1_000).unwrap();
+        fanout
+            .record_target_failure(
+                0,
+                TransportEndpointFailure {
+                    // An unavailable failure here is a connect failure.
+                    pre_send: kind == TransportEndpointFailureKind::RetryableUnavailable,
+                    size_class: None,
+                    endpoint: fanout.request().target.endpoints()[0].clone(),
+                    reason: "test failure".into(),
+                    kind,
+                    rejection_category: None,
+                },
+            )
+            .unwrap();
+        fanout
+    }
+
+    /// One group fanout to one relay: a commit with `pending`, else an
+    /// application message.
+    fn staged_frozen_fanout(pending: Option<PendingStateRef>) -> OutboundFanout {
         let group_id = GroupId::new(vec![0x11; 16]);
         let transport_group_id = vec![0x22; 32];
         let endpoint = TransportEndpoint("wss://relay.example".into());
@@ -7901,38 +8010,105 @@ mod tests {
                 },
             },
             target: TransportPublishTarget::Group {
-                group_id,
+                group_id: group_id.clone(),
                 transport_group_id,
-                endpoints: vec![endpoint.clone()],
+                endpoints: vec![endpoint],
             },
             required_acks: 1,
         };
-        let mut fanout = OutboundFanout::stage(request, None, None, 1_000).unwrap();
-        fanout.mark_attempt_started_at(0, 1_000).unwrap();
-        fanout
-            .record_target_failure(
-                0,
-                TransportEndpointFailure {
-                    size_class: None,
-                    endpoint,
-                    reason: "test failure".into(),
-                    kind,
-                    rejection_category: None,
-                },
-            )
-            .unwrap();
-        fanout
+        match pending {
+            Some(pending) => {
+                OutboundFanout::stage(request, Some(pending), Some(group_id), 1_000).unwrap()
+            }
+            None => {
+                let mut fanout = OutboundFanout::stage(request, None, None, 1_000).unwrap();
+                fanout
+                    .set_application_message(OutboundApplicationMessage {
+                        group_id,
+                        app_event_id: "event".into(),
+                        source_epoch: EpochId(1),
+                        retention: cgka_traits::app_event::AppMessageRetentionDecision::new(10, 0),
+                        authority: None,
+                    })
+                    .unwrap();
+                fanout
+            }
+        }
     }
 
+    /// The retry delay follows the target's last recorded failure, not its
+    /// exposure (mdk#2332). A relay's retryable answer exposes the target, yet
+    /// it retries after 5 s like a connection never made; an ambiguous
+    /// failure, or a definitive refusal on an exposed target, backs off from
+    /// 30 s. The same for an application message and a commit.
     #[test]
     fn unavailable_fanout_retries_promptly_without_shortening_ambiguous_backoff() {
-        let unavailable = failed_frozen_fanout(TransportEndpointFailureKind::RetryableUnavailable);
-        assert!(!frozen_fanout_target_retry_due(&unavailable, 0, 5_999));
-        assert!(frozen_fanout_target_retry_due(&unavailable, 0, 6_000));
+        use TransportEndpointFailureKind as Kind;
+        use TransportEndpointRejectionCategory as Category;
 
-        let ambiguous = failed_frozen_fanout(TransportEndpointFailureKind::PossiblyExposed);
-        assert!(!frozen_fanout_target_retry_due(&ambiguous, 0, 30_999));
-        assert!(frozen_fanout_target_retry_due(&ambiguous, 0, 31_000));
+        let failure = |kind, category, pre_send| TransportEndpointFailure {
+            pre_send,
+            size_class: None,
+            endpoint: TransportEndpoint("wss://relay.example".into()),
+            reason: "test failure".into(),
+            kind,
+            rejection_category: category,
+        };
+        let connect_failure = failure(Kind::RetryableUnavailable, None, true);
+        let rate_limited = failure(
+            Kind::RetryableUnavailable,
+            Some(Category::RateLimited),
+            false,
+        );
+        let auth_required = failure(
+            Kind::RetryableUnavailable,
+            Some(Category::AuthRequired),
+            false,
+        );
+        let timeout = failure(Kind::PossiblyExposed, None, false);
+        let invalid = failure(Kind::TerminalRejected, Some(Category::Invalid), false);
+
+        for (publication, pending) in [
+            ("application message", None),
+            ("commit", Some(PendingStateRef::new(7))),
+        ] {
+            // Each case: its attempts' results, whether they expose the
+            // target, and when the last attempt (at 1 s) is due again.
+            for (case, results, exposed, due_at_ms) in [
+                ("connect failure", vec![&connect_failure], false, 6_000),
+                ("rate-limited answer", vec![&rate_limited], true, 6_000),
+                ("auth-required answer", vec![&auth_required], true, 6_000),
+                (
+                    "connect failure after an answer",
+                    vec![&rate_limited, &connect_failure],
+                    true,
+                    6_000,
+                ),
+                ("timeout", vec![&timeout], true, 31_000),
+                // The second attempt doubles the backoff.
+                (
+                    "definitive refusal after an answer",
+                    vec![&rate_limited, &invalid],
+                    true,
+                    61_000,
+                ),
+            ] {
+                let mut fanout = staged_frozen_fanout(pending);
+                for result in results {
+                    fanout.mark_attempt_started_at(0, 1_000).unwrap();
+                    fanout.record_target_failure(0, result.clone()).unwrap();
+                }
+                assert_eq!(fanout.possible_exposure(), exposed, "{publication}, {case}");
+                assert!(
+                    !frozen_fanout_target_retry_due(&fanout, 0, due_at_ms - 1),
+                    "{publication}, {case}: not due before {due_at_ms} ms"
+                );
+                assert!(
+                    frozen_fanout_target_retry_due(&fanout, 0, due_at_ms),
+                    "{publication}, {case}: due at {due_at_ms} ms"
+                );
+            }
+        }
     }
 
     #[test]
@@ -7943,6 +8119,7 @@ mod tests {
             .record_target_failure(
                 0,
                 TransportEndpointFailure {
+                    pre_send: false,
                     endpoint: fanout.request().target.endpoints()[0].clone(),
                     reason: "relay rejected event (too-large)".into(),
                     kind: TransportEndpointFailureKind::TerminalRejected,
@@ -8065,6 +8242,7 @@ mod tests {
             cgka_traits::TransportPublishFailure::with_endpoint_failures(
                 "size refusal",
                 vec![TransportEndpointFailure {
+                    pre_send: false,
                     endpoint,
                     reason: "relay rejected event (too-large)".into(),
                     kind: TransportEndpointFailureKind::TerminalRejected,
