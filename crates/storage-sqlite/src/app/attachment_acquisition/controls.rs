@@ -238,6 +238,11 @@ impl SqliteAppStorage {
     /// recently requested first, so what a screen shows downloads before
     /// background backlog. Explicit work keeps its tap time and stays ahead.
     /// Only the ordering changes: state, backoff and budgets are untouched.
+    ///
+    /// Clock seconds alone would tie a fling's requests, so the request takes
+    /// one past the highest other queued automatic priority. That can run
+    /// ahead of the clock only while the queue holds such requests; work that
+    /// already leads keeps its value, so repeating a request never climbs.
     fn prioritize_queued_automatic(
         &self,
         status: Option<&AttachmentTransferStatus>,
@@ -251,7 +256,10 @@ impl SqliteAppStorage {
         };
         self.lock()?
             .execute(
-                "UPDATE attachment_acquisition SET priority_at=max(priority_at,?2)
+                "UPDATE attachment_acquisition AS q SET priority_at=max(q.priority_at,?2,
+                    COALESCE((SELECT max(o.priority_at)+1 FROM attachment_acquisition AS o
+                        WHERE o.token<>q.token AND o.explicit_request=0 AND o.cancelled=0
+                        AND o.due IS NOT NULL),0))
                 WHERE token=?1 AND explicit_request=0 AND cancelled=0 AND due IS NOT NULL",
                 params![reference.token, u64_to_i64(now)?],
             )

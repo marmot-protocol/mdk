@@ -4137,4 +4137,30 @@ fn automatic_request_moves_queued_work_ahead_of_newer_backlog_but_not_taps() {
     assert_eq!(status.unwrap().state, AttachmentTransferState::Queued);
     // The shown image overtakes newer background work; a tap stays first.
     assert_eq!(order(30), ["tapped", "shown", "newer"]);
+    // A later request in the same clock second still goes first, and
+    // repeating the leading request leaves its priority where it is.
+    let priority = |message: &str| -> i64 {
+        store
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT priority_at FROM attachment_acquisition WHERE message_id_hex=?1",
+                [message],
+                |row| row.get(0),
+            )
+            .unwrap()
+    };
+    let newer = app
+        .attachment_control_entry(GROUP, "newer", "source-newer", 0, 30)
+        .unwrap()
+        .unwrap();
+    for _ in 0..3 {
+        app.request_automatic_attachment(GROUP, &newer, digest(), 30, (&policy, true))
+            .unwrap();
+    }
+    assert_eq!(order(30), ["tapped", "newer", "shown"]);
+    assert_eq!(priority("newer"), priority("shown") + 1);
+    app.request_automatic_attachment(GROUP, &shown, digest(), 30, (&policy, true))
+        .unwrap();
+    assert_eq!(order(30), ["tapped", "shown", "newer"]);
 }

@@ -2790,6 +2790,40 @@ async fn a_file_left_behind_mid_pass_is_reached_by_a_restarted_sweep() {
 /// HTTP slot reserved for foreground work stays free.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn attachment_worker_runs_the_transfer_limit_concurrently() {
+    let limit = crate::runtime::ATTACHMENT_TRANSFER_LIMIT;
+    let (shared, http) = drive_held_backlog(None, limit).await;
+    assert_eq!(shared.attachment_transfer.available_permits(), 0);
+    assert_eq!(
+        http.permits.available_permits(),
+        1,
+        "the foreground slot stays free"
+    );
+}
+
+/// Transfers in flight have not written their bodies yet, so a pass reserves
+/// what each may still write: free space for one download admits one, not
+/// one per back-to-back pass.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn attachment_worker_reserves_disk_for_transfers_in_flight() {
+    let policy =
+        super::super::super::attachment_controls::default_policy(&MarmotAppConfig::white_noise());
+    let one =
+        policy.disk_reserve + media_store::DiskPolicy::download_need(policy.transfer_limit, 0);
+    assert!(capacity(&policy, policy.transfer_limit, None, one));
+    let (shared, _http) = drive_held_backlog(Some(one), 1).await;
+    assert_eq!(
+        shared.attachment_transfer.available_permits(),
+        crate::runtime::ATTACHMENT_TRANSFER_LIMIT - 1
+    );
+}
+
+/// Seed one more attachment than the transfer limit against a server that
+/// holds every request open, drive the worker's attachment passes, and check
+/// that exactly `expected` transfers start.
+async fn drive_held_backlog(
+    free: Option<u64>,
+    expected: usize,
+) -> (RuntimeSharedServices, MediaHttpContext) {
     use tokio::io::AsyncReadExt;
     let limit = crate::runtime::ATTACHMENT_TRANSFER_LIMIT;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2807,6 +2841,9 @@ async fn attachment_worker_runs_the_transfer_limit_concurrently() {
         }
     });
     let dir = tempfile::tempdir().unwrap();
+    if let Some(free) = free {
+        crate::media::attachment_resume::test_free_space::set(dir.path(), free);
+    }
     AccountHome::open(dir.path())
         .create_account("alice")
         .unwrap();
@@ -2885,23 +2922,92 @@ async fn attachment_worker_runs_the_transfer_limit_concurrently() {
             break;
         }
     }
-    for started in 0..limit {
+    for started in 0..expected {
         tokio::time::timeout(Duration::from_secs(5), requests.recv())
             .await
-            .unwrap_or_else(|_| panic!("transfer {} of {limit} never started", started + 1))
+            .unwrap_or_else(|_| panic!("transfer {} of {expected} never started", started + 1))
             .unwrap();
     }
     assert!(
         tokio::time::timeout(Duration::from_millis(300), requests.recv())
             .await
             .is_err(),
-        "a transfer past the limit started"
+        "a transfer past {expected} started"
     );
-    assert_eq!(shared.attachment_transfer.available_permits(), 0);
-    assert_eq!(
-        http.permits.available_permits(),
-        1,
-        "the foreground slot stays free"
-    );
+    if free.is_some() {
+        crate::media::attachment_resume::test_free_space::clear(dir.path());
+    }
     server.abort();
+    (shared, http)
+}
+
+/// A pass whose candidate stays due must not ask for another pass. Deferral
+/// moves only queued rows, so an expired lease whose preparation fails stays
+/// first on the due page; asking again would select it at once, forever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn attachment_pass_does_not_repeat_a_candidate_that_stays_due() {
+    let (_dir, client, storage, reference) = offline_fixture().await;
+    let entry = storage
+        .app_storage()
+        .attachment_history_page(GROUP, 100, None)
+        .unwrap()
+        .entries
+        .remove(0);
+    // A sibling, so the page holds a candidate after the stuck one.
+    storage
+        .app_storage()
+        .record_app_event(&StoredAppEvent {
+            group_id_hex: GROUP.into(),
+            message_id_hex: "44".repeat(32),
+            source_message_id_hex: Some("45".repeat(32)),
+            source_epoch: Some(3),
+            direction: "received".into(),
+            sender: "33".repeat(32),
+            plaintext: String::new(),
+            kind: 9,
+            tags: vec![serde_json::from_value(entry.slot.clone()).unwrap()],
+            recorded_at: 10,
+            received_at: 10,
+            origin_commit_id: None,
+            moderation_grant: false,
+        })
+        .unwrap();
+    // Create the demand without caching a source-epoch secret, so
+    // preparation fails for every candidate.
+    assert!(
+        client
+            .prepare_background_attachment_download(&GroupId::new(vec![0xab; 16]), reference, 1024)
+            .unwrap()
+            .is_none()
+    );
+    let now = crate::unix_now_seconds();
+    while admit_demands(&storage.app_storage(), now, false).unwrap() {}
+    let shared = RuntimeSharedServices::default();
+    let (http, _completions) = context();
+    let mut admission = Admission::default();
+    schedule(&client, &shared, &http, &mut admission).unwrap();
+    // After the worker's one resume of leases (first pass): the first
+    // message's job holds a lease that has expired, still due, ordered first.
+    let connection = retention_fault_connection(&client.app);
+    let leased = connection
+        .execute(
+            "UPDATE attachment_acquisition SET state=1,attempt=randomblob(16),due=?1,priority_at=?2
+             WHERE message_id_hex=?3",
+            rusqlite::params![now as i64 - 1, now as i64 + 1000, "11".repeat(32)],
+        )
+        .unwrap();
+    assert_eq!(leased, 1);
+    admission.ready().await;
+    assert!(
+        !schedule(&client, &shared, &http, &mut admission).unwrap(),
+        "a candidate that stayed due asked for another pass"
+    );
+    let state: i64 = connection
+        .query_row(
+            "SELECT state FROM attachment_acquisition WHERE message_id_hex=?1 AND due<=?2",
+            rusqlite::params!["11".repeat(32), now as i64],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(state, 1, "the stuck candidate is still due");
 }

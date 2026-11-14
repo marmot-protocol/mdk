@@ -884,7 +884,17 @@ pub(super) fn schedule(
         shared.attachment_updates.state_changed();
     }
     let more = more || readmitted == ATTACHMENT_ACQUISITION_BATCH_LIMIT;
-    let free = free.unwrap_or(0);
+    // Transfers already holding a global permit may not have written their
+    // bodies yet: reserve what each may still write, so passes that run back
+    // to back cannot all admit against the same free bytes.
+    let in_flight = crate::runtime::ATTACHMENT_TRANSFER_LIMIT
+        .saturating_sub(shared.attachment_transfer.available_permits())
+        .saturating_sub(usize::from(held_permit.is_some()));
+    let free =
+        free.unwrap_or(0)
+            .saturating_sub((in_flight as u64).saturating_mul(
+                media_store::DiskPolicy::download_need(policy.transfer_limit, 0),
+            ));
     let candidates =
         storage
             .app_storage()
@@ -902,11 +912,13 @@ pub(super) fn schedule(
     let Ok(permit) = http.permits.clone().try_acquire_owned() else {
         return Ok(more);
     };
-    // Each pass starts one transfer; another candidate asks the worker for
-    // another pass, which admits it while global and HTTP capacity remain.
+    // Each pass starts one transfer. Once it is claimed (off the due page),
+    // a later candidate asks the worker for another pass, which admits it
+    // while global and HTTP capacity remain. A candidate that stays due must
+    // not ask, or the next pass would select it again at once.
     let count = candidates.len();
     for (position, candidate) in candidates.into_iter().enumerate() {
-        let more = more || position + 1 < count;
+        let started = more || position + 1 < count;
         let explicit = storage
             .app_storage()
             .attachment_request_is_explicit(&candidate)?;
@@ -1009,7 +1021,7 @@ pub(super) fn schedule(
                 },
                 |completion| completion,
             );
-            return Ok(more);
+            return Ok(started);
         }
         // References do not declare a trustworthy size. Reserve the configured
         // automatic-sized object even for explicit work, then enforce actual
@@ -1151,7 +1163,7 @@ pub(super) fn schedule(
             },
             |completion| completion,
         );
-        return Ok(more);
+        return Ok(started);
     }
     Ok(more)
 }

@@ -164,8 +164,9 @@ Explicit-removal suppression, ready bytes, backoff and terminal failures survive
 
 Automatic work uses the existing cancellable media executor. A FIFO semaphore permits
 four transfers across all accounts in a runtime; each account has at most one pending
-permit request, and each worker pass starts one transfer and asks for another pass while
-candidates remain. A permit remains held through queued plaintext publication. One of the
+permit request, and each worker pass starts one transfer and, once it has claimed it, asks
+for another pass while candidates remain. A candidate that stays due (its deferral changed
+nothing) does not ask, so it cannot be selected again at once. A permit remains held through queued plaintext publication. One of the
 five per-account media slots is reserved for foreground work, so one account may run all
 four transfers.
 Preparation reads projected group policy and retained source-epoch secrets; it never
@@ -193,7 +194,10 @@ downloads retain their 512 MiB ciphertext cap. Admission reserves the configured
 transfer limit (64 MiB by default) against quota, including explicit queued requests whose
 references have no declared size. This avoids requiring 512 MiB of unused quota for tiny
 explicit files. Checkpoint and publication checks enforce actual quota and disk use as files
-grow; a final remainder below the admission reservation can still stay unused.
+grow; a final remainder below the admission reservation can still stay unused. Free space
+for admission first sets aside one download's need for every transfer already holding a
+global permit, which may not have written its body yet, so back-to-back passes cannot all
+admit against the same free bytes.
 Unknown free space fails closed. These are resource limits, not an OS background-execution
 entitlement or mobile throughput evidence.
 
