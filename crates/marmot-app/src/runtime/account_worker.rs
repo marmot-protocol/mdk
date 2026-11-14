@@ -1,7 +1,7 @@
 //! Per-account worker: command surface, the worker loop, reconnect backoff,
 //! and the runtime-event publishing helpers the loop drives.
 
-mod attachments;
+pub(super) mod attachments;
 mod read_queue;
 pub(crate) mod recovery_credits;
 

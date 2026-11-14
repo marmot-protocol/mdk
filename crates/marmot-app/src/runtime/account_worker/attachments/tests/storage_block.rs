@@ -1562,10 +1562,7 @@ async fn readmission_sets_aside_what_admitted_transfers_reserved() {
             .clone()
             .try_acquire_owned()
             .unwrap(),
-        _reserved: Some(DiskReservation::new(
-            &fixture.shared.attachment_reserved_bytes,
-            headroom,
-        )),
+        _reserved: Some(fixture.shared.attachment_reservations.reserve(headroom)),
     };
     let parked_requests = requests.load(Ordering::SeqCst);
     for _ in 0..3 {

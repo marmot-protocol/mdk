@@ -776,10 +776,7 @@ async fn download_without_engine_and_retain(
         );
     }
     assert!(
-        shared
-            .attachment_reserved_bytes
-            .load(std::sync::atomic::Ordering::Acquire)
-            > 0,
+        shared.attachment_reservations.total() > 0,
         "an admitted download reserves disk until its body is stored"
     );
     complete_and_settle(&mut client, done, &shared, &http, &mut completions).await;
@@ -788,9 +785,7 @@ async fn download_without_engine_and_retain(
         crate::runtime::ATTACHMENT_TRANSFER_LIMIT
     );
     assert_eq!(
-        shared
-            .attachment_reserved_bytes
-            .load(std::sync::atomic::Ordering::Acquire),
+        shared.attachment_reservations.total(),
         0,
         "storing the body releases its reservation"
     );
@@ -2805,7 +2800,8 @@ async fn a_file_left_behind_mid_pass_is_reached_by_a_restarted_sweep() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn attachment_worker_runs_the_transfer_limit_concurrently() {
     let limit = crate::runtime::ATTACHMENT_TRANSFER_LIMIT;
-    let (shared, http) = drive_held_backlog(None, None, limit).await;
+    let (shared, http, still_due) = drive_held_backlog(None, None, limit).await;
+    assert_eq!(still_due, 1);
     assert_eq!(shared.attachment_transfer.available_permits(), 0);
     assert_eq!(
         http.permits.available_permits(),
@@ -2824,7 +2820,12 @@ async fn attachment_worker_reserves_disk_for_transfers_in_flight() {
     let one =
         policy.disk_reserve + media_store::DiskPolicy::download_need(policy.transfer_limit, 0);
     assert!(capacity(&policy, policy.transfer_limit, None, one));
-    let (shared, _http) = drive_held_backlog(Some(one), None, 1).await;
+    let (shared, _http, still_due) = drive_held_backlog(Some(one), None, 1).await;
+    assert_eq!(
+        still_due,
+        crate::runtime::ATTACHMENT_TRANSFER_LIMIT,
+        "the rest wait queued for the in-flight reservation, not a 15-second retry"
+    );
     assert_eq!(
         shared.attachment_transfer.available_permits(),
         crate::runtime::ATTACHMENT_TRANSFER_LIMIT - 1
@@ -2843,7 +2844,9 @@ async fn attachment_worker_reserves_other_accounts_transfer_needs() {
     assert!(foreign > 2 * own);
     // No transfer starts: free space covers this account's download only if
     // the foreign transfer is priced at this account's limit.
-    drive_held_backlog(Some(policy.disk_reserve + 2 * own), Some(foreign), 0).await;
+    let (_, _, still_due) =
+        drive_held_backlog(Some(policy.disk_reserve + 2 * own), Some(foreign), 0).await;
+    assert_eq!(still_due, crate::runtime::ATTACHMENT_TRANSFER_LIMIT + 1);
 }
 
 /// Seed one more attachment than the transfer limit against a server that
@@ -2853,7 +2856,7 @@ async fn drive_held_backlog(
     free: Option<u64>,
     foreign_reservation: Option<u64>,
     expected: usize,
-) -> (RuntimeSharedServices, MediaHttpContext) {
+) -> (RuntimeSharedServices, MediaHttpContext, usize) {
     use tokio::io::AsyncReadExt;
     let limit = crate::runtime::ATTACHMENT_TRANSFER_LIMIT;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2941,10 +2944,7 @@ async fn drive_held_backlog(
             .clone()
             .try_acquire_owned()
             .unwrap(),
-        _reserved: Some(DiskReservation::new(
-            &shared.attachment_reserved_bytes,
-            bytes,
-        )),
+        _reserved: Some(shared.attachment_reservations.reserve(bytes)),
     });
     let (mut http, _completions) = context();
     http.permits = Arc::new(Semaphore::new(super::super::MEDIA_HTTP_IN_FLIGHT_LIMIT));
@@ -2976,11 +2976,18 @@ async fn drive_held_backlog(
             .is_err(),
         "a transfer past {expected} started"
     );
+    // Candidates that did not start stay queued and due, in order: a
+    // reservation that only waits for transfers in flight defers nothing.
+    let still_due = storage
+        .app_storage()
+        .due_attachment_acquisitions(crate::unix_now_seconds(), 32)
+        .unwrap()
+        .len();
     if free.is_some() {
         crate::media::attachment_resume::test_free_space::clear(dir.path());
     }
     server.abort();
-    (shared, http)
+    (shared, http, still_due)
 }
 
 /// A pass whose candidate stays due must not ask for another pass. Deferral
@@ -3054,32 +3061,60 @@ async fn attachment_pass_does_not_repeat_a_candidate_that_stays_due() {
     assert_eq!(state, 1, "the stuck candidate is still due");
 }
 
-/// Account workers admit concurrently: an admission that lands between
-/// another's capacity check and its reservation makes that check run again
-/// against the new total, so room for one download admits one, not both.
+/// Account workers admit concurrently. Measuring free space, checking it and
+/// reserving are one step under the reservations' lock, and a release takes
+/// that lock too: an admission or a release from another account cannot land
+/// between a measurement and the reservation it funds.
 #[test]
-fn disk_reservation_rechecks_capacity_against_a_concurrent_admission() {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    let total = Arc::new(AtomicU64::new(0));
-    let room = 10;
-    let mut other = None;
-    let first = DiskReservation::try_new(&total, 10, |held| {
-        // Another account's worker admits while this check runs.
-        if other.is_none() {
-            other = DiskReservation::try_new(&total, 10, |held| held + 10 <= room);
-        }
-        held + 10 <= room
+fn disk_reservation_measures_and_reserves_as_one_step() {
+    let reservations = DiskReservations::default();
+    let other = reservations.reserve(10);
+    // Another account's transfer finishes and releases while this admission
+    // measures. The release waits for the admission, so the measurement
+    // (which already shows that transfer's written body) is checked with its
+    // reservation still held: counted twice, never missed.
+    let (measuring, measured) = std::sync::mpsc::channel();
+    let releaser = std::thread::spawn(move || {
+        measured.recv().unwrap();
+        let started = std::time::Instant::now();
+        drop(other);
+        started.elapsed()
     });
-    assert!(other.is_some(), "the concurrent admission took the room");
+    let admitted = reservations.try_reserve(
+        10,
+        || {
+            measuring.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(50));
+            Some(10)
+        },
+        |free| free >= 10,
+    );
     assert!(
-        first.is_none(),
-        "the slower admission rechecked and refused"
+        admitted.is_err(),
+        "a measurement is checked against the reservations held when it was taken"
     );
-    assert_eq!(total.load(Ordering::Acquire), 10);
-    drop(other);
+    assert!(
+        releaser.join().unwrap() >= Duration::from_millis(40),
+        "a release waited for the admission measuring beside it"
+    );
+    assert_eq!(reservations.total(), 0, "the release then took effect");
+    let admitted = reservations.try_reserve(10, || Some(10), |free| free >= 10);
+    assert!(admitted.is_ok());
+    assert_eq!(reservations.total(), 10);
     assert_eq!(
-        total.load(Ordering::Acquire),
-        0,
-        "a dropped reservation releases"
+        reservations
+            .try_reserve(10, || Some(10), |free| free >= 10)
+            .err(),
+        Some(DiskRefusal::InFlight),
+        "room for one admits one; the next fits once that one releases"
     );
+    assert_eq!(
+        reservations
+            .try_reserve(10, || Some(5), |free| free >= 10)
+            .err(),
+        Some(DiskRefusal::NoRoom),
+        "no room even with nothing reserved"
+    );
+    drop(admitted);
+    assert_eq!(reservations.total(), 0, "a dropped reservation releases");
 }
