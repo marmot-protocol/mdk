@@ -4,6 +4,13 @@
 
 ### Breaking changes
 
+- A download the worker cannot start for lack of free disk now parks as
+  `StorageBlocked` with what it needs as its target, instead of retrying
+  every 15 seconds as `RetryScheduled`; it is readmitted once free space
+  covers that target. Readmission releases parked downloads only while free
+  space funds them together, in priority order, so the rest stay
+  `StorageBlocked` instead of falling back to a retry timer (#3414). Hosts
+  already render `StorageBlocked` as a storage prompt.
 - Remove the legacy v4 whole-file audit upload, whose only receiver (the
   retired Goggles service) no longer exists. `post_audit_log_file`,
   `AuditLogUploadResult`, `AuditLogTrackerConfig`,

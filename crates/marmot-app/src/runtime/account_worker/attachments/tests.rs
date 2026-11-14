@@ -1386,7 +1386,8 @@ mod storage_block;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn attachment_worker_disk_pause_does_not_consume_attempts() {
-    let (_dir, mut client, store, _reference) = offline_fixture().await;
+    let (dir, mut client, store, _reference) = offline_fixture().await;
+    crate::media::attachment_resume::test_free_space::set(dir.path(), 1 << 40);
     let now = crate::unix_now_seconds();
     admit_demands(&store.app_storage(), now, false).unwrap();
     let asset = store
@@ -1414,7 +1415,9 @@ async fn attachment_worker_disk_pause_does_not_consume_attempts() {
         .unwrap()
         .unwrap();
     assert_eq!(status.attempts, 0);
-    assert!(status.due.unwrap() > now);
+    // A disk refusal parks the job for storage, with no timer: readmission
+    // releases it once free space covers its target (mdk#3414).
+    assert_eq!(status.due, None);
     let progress = store
         .app_storage()
         .attachment_transfer_status(GROUP, &"11".repeat(32), &"22".repeat(32), 0, now, true)
@@ -1422,13 +1425,42 @@ async fn attachment_worker_disk_pause_does_not_consume_attempts() {
         .unwrap();
     assert_eq!(
         progress.state,
-        storage_sqlite::AttachmentTransferState::RetryScheduled
+        storage_sqlite::AttachmentTransferState::StorageBlocked
     );
-    assert_eq!(progress.retry_at, status.due);
     assert_eq!(
         shared.attachment_transfer.available_permits(),
         crate::runtime::ATTACHMENT_TRANSFER_LIMIT
     );
+    // Its target is what admission needs, so it is released exactly when the
+    // device can fund it: once the reserve comes back within reach.
+    let policy = super::super::super::attachment_controls::default_policy(&client.app.config);
+    let target: i64 = retention_fault_connection(&client.app)
+        .query_row(
+            "SELECT storage_blocked_headroom FROM attachment_acquisition WHERE state=4",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(target as u64, admission_need(policy.transfer_limit, None));
+    client
+        .app
+        .config
+        .attachment_acquisition
+        .as_mut()
+        .unwrap()
+        .minimum_free_disk_bytes = 0;
+    schedule(&client, &shared, &http, &mut admission).unwrap();
+    assert_ne!(
+        store
+            .app_storage()
+            .attachment_transfer_status(GROUP, &"11".repeat(32), &"22".repeat(32), 0, now, true)
+            .unwrap()
+            .unwrap()
+            .state,
+        storage_sqlite::AttachmentTransferState::StorageBlocked,
+        "readmitted once free space covers its target"
+    );
+    crate::media::attachment_resume::test_free_space::clear(dir.path());
 }
 
 // A single thread lets the watch-loop proof freeze time after real database setup.

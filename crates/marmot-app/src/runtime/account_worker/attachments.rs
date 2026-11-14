@@ -647,11 +647,18 @@ fn capacity(
     let disk = media_store::DiskPolicy {
         reserve_bytes: policy.disk_reserve,
     };
+    admissible_limit(max)
+        && disk.admit(free, admission_need(max, recorded)) == media_store::Admission::Admitted
+}
+
+/// What a download of up to `max` body bytes may still write, beyond the
+/// reserve, crediting a recorded checkpoint with one unrecorded append (see
+/// [`capacity`]). A job admission refuses parks with this as its target.
+fn admission_need(max: u64, recorded: Option<u64>) -> u64 {
     let on_disk = recorded.map_or(0, |recorded| {
         recorded.saturating_add(media_store::CHECKPOINT_APPEND_MAX as u64)
     });
-    let needed = media_store::DiskPolicy::download_need(max, on_disk);
-    admissible_limit(max) && disk.admit(free, needed) == media_store::Admission::Admitted
+    media_store::DiskPolicy::download_need(max, on_disk)
 }
 
 /// Whether free space covers every transfer the runtime may run at once
@@ -900,7 +907,7 @@ pub(super) fn schedule(
             policy.disk_reserve,
             free,
             policy.automatic,
-            readmit_admission(&policy, free),
+            |free| readmit_admission(&policy, free),
         )?,
         None => 0,
     };
@@ -1077,11 +1084,17 @@ pub(super) fn schedule(
             .app_storage()
             .attachment_checkpoint_recorded(&candidate)?;
         if !capacity(&policy, reservation, recorded, free) {
-            storage.app_storage().finish_attachment_preparation(
+            // Park it storage-blocked with what admission needs, rather than
+            // a timer: readmission releases it once the device can fund it,
+            // and it keeps its place meanwhile (mdk#3414).
+            if storage.app_storage().park_attachment_admission(
                 &candidate,
+                admission_need(reservation, recorded),
                 now,
-                Some(now.saturating_add(15)),
-            )?;
+            )? {
+                // The row is now StorageBlocked.
+                shared.attachment_updates.state_changed();
+            }
             continue;
         }
         // Free disk is the only gate (mdk#2314): retained media has no byte

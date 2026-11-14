@@ -2518,13 +2518,9 @@ async fn attachment_disk_pressure_parks_before_receipt_and_readmits_when_space_f
     assert_eq!(
         store
             .app_storage()
-            .readmit_storage_blocked_attachments(
-                now,
-                unavailable_reserve,
-                free,
-                true,
-                storage_sqlite::ReadmitAdmission::NONE,
-            )
+            .readmit_storage_blocked_attachments(now, unavailable_reserve, free, true, |_| {
+                storage_sqlite::ReadmitAdmission::NONE
+            },)
             .unwrap(),
         0,
         "still parked while the reserve stays out of reach"
@@ -2532,16 +2528,12 @@ async fn attachment_disk_pressure_parks_before_receipt_and_readmits_when_space_f
     assert_eq!(
         store
             .app_storage()
-            .readmit_storage_blocked_attachments(
-                now,
-                0,
-                free,
-                true,
+            .readmit_storage_blocked_attachments(now, 0, free, true, |_| {
                 storage_sqlite::ReadmitAdmission {
                     checkpointed_at_least: 0,
                     uncheckpointed: true,
-                },
-            )
+                }
+            },)
             .unwrap(),
         1
     );

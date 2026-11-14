@@ -374,10 +374,14 @@ stalled server retaining a slot indefinitely. Raising the automatic cap readmits
 failures, while integrity failures still require explicit retry. Invalid zero/over-ceiling policy
 values, including a quota smaller than the admission reservation, are rejected before mutation,
 and invalid Rust policy is rejected at runtime start. Disk reserves may intentionally exceed
-current free space; retained-quota pressure is exposed as RetryScheduled with a retry time,
-without spending a transfer attempt or evicting existing bytes, while a body the device cannot
-publish parks as StorageBlocked with its checkpoint until free space covers its recorded
-target or the user retries (see the native attachment access contract).
+current free space. A job worker admission refuses for disk space parks as StorageBlocked,
+with what admission needs as its target, without spending a transfer attempt or evicting
+existing bytes; a body the device cannot publish parks the same way with its checkpoint.
+Either waits until free space covers its recorded target or the user retries (see the native
+attachment access contract). Readmission releases parked jobs in priority order only while
+free space funds them together: each readmitted target comes out of what is left for the
+next, admission is asked about that remainder, and the first job that does not fit ends the
+batch, so the rest stay parked with their targets instead of failing admission (mdk#3414).
 
 Release/binding publication, app cache adoption and device benchmarks remain C9. Local tests do
 not establish mobile throughput or background execution entitlement. See the native usage guide.
