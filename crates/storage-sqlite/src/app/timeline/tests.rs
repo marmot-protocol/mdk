@@ -1317,6 +1317,257 @@ fn rerecording_an_origin_commit_invalidated_row_keeps_its_tombstone() {
 }
 
 #[test]
+fn batch_withdrawal_triggers() {
+    for path in ["origin", "revival", "terminal"] {
+        for targets in [["a", "b"], ["b", "a"]] {
+            let app = SqliteAccountStorage::in_memory().unwrap().app_storage();
+            for (id, at) in [("a", 10), ("b", 11)] {
+                app.record_app_event(&chat(id, "alice", at, id)).unwrap();
+                app.record_app_event(&reply(&format!("reply-{id}"), "bob", id, at + 10, "quote"))
+                    .unwrap();
+            }
+            for (id, target, at) in [("first", targets[0], 12), ("second", targets[1], 13)] {
+                let mut event = delete(id, "alice", target, at);
+                event.origin_commit_id = Some("commit".to_owned());
+                if path == "terminal" {
+                    event.direction = "sent".to_owned();
+                    event.source_message_id_hex = None;
+                }
+                app.record_app_event(&event).unwrap();
+            }
+            if path == "revival" {
+                app.invalidate_app_events_by_origin_commit(
+                    "commit",
+                    BRANCH_SELECTION_WITHDRAWAL_REASON,
+                )
+                .unwrap();
+            }
+            let update = match path {
+                "origin" => app.invalidate_app_events_by_origin_commit("commit", "LosingBranch"),
+                "revival" => app.clear_branch_selection_withdrawal_by_origin_commit("commit"),
+                "terminal" => app.invalidate_pending_sent_app_events_for_group(
+                    &"11".repeat(32),
+                    LOCAL_PUBLISH_FAILED_REASON,
+                ),
+                _ => unreachable!(),
+            }
+            .unwrap()
+            .unwrap();
+            let mut changes = update
+                .changes
+                .iter()
+                .map(|change| match change {
+                    TimelineMessageChange::Upsert { message, trigger } => (
+                        message.message_id_hex.as_str(),
+                        message.deleted,
+                        trigger.clone(),
+                    ),
+                    TimelineMessageChange::Remove { .. } => panic!("{path}: unexpected removal"),
+                })
+                .collect::<Vec<_>>();
+            changes.sort_by_key(|(id, ..)| *id);
+            assert_eq!(
+                changes,
+                [
+                    (
+                        "a",
+                        path == "revival",
+                        TimelineUpdateTrigger::MessageEditedOrReprojected
+                    ),
+                    (
+                        "b",
+                        path == "revival",
+                        TimelineUpdateTrigger::MessageEditedOrReprojected
+                    ),
+                    ("reply-a", false, TimelineUpdateTrigger::ReplyPreviewChanged),
+                    ("reply-b", false, TimelineUpdateTrigger::ReplyPreviewChanged),
+                ],
+                "{path}, {targets:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn batch_overlap_triggers() {
+    for path in ["origin", "revival", "terminal"] {
+        for ids in [["a-event", "z-event"], ["z-event", "a-event"]] {
+            for (first, second, target, damaged) in [
+                (
+                    edit(ids[0], "alice", "parent", 12, "edited"),
+                    reply(ids[1], "alice", "parent", 13, "quote"),
+                    ids[1],
+                    None,
+                ),
+                (
+                    delete(ids[0], "alice", "reaction", 12),
+                    delete(ids[1], "alice", "parent", 13),
+                    "parent",
+                    None,
+                ),
+                (
+                    reaction(ids[0], "alice", "parent", 12, "-"),
+                    delete(ids[1], "alice", "parent", 13),
+                    "parent",
+                    None,
+                ),
+                (
+                    edit(ids[0], "alice", "parent", 12, "edited"),
+                    reaction(ids[1], "alice", "parent", 13, "-"),
+                    "parent",
+                    Some(ids[0]),
+                ),
+                (
+                    reaction(ids[0], "alice", "quoted", 12, "-"),
+                    delete(ids[1], "alice", "parent", 13),
+                    "quoted",
+                    None,
+                ),
+                (
+                    delete(ids[0], "alice", "live-edit", 12),
+                    reaction(ids[1], "alice", "parent", 13, "-"),
+                    "parent",
+                    None,
+                ),
+                (
+                    edit(ids[0], "alice", "parent", 12, "edited"),
+                    reaction(ids[1], "alice", "quoted", 13, "-"),
+                    "quoted",
+                    None,
+                ),
+            ] {
+                let app = SqliteAccountStorage::in_memory().unwrap().app_storage();
+                app.record_app_event(&chat("parent", "alice", 10, "original"))
+                    .unwrap();
+                app.record_app_event(&reaction("reaction", "alice", "parent", 11, "+"))
+                    .unwrap();
+                app.record_app_event(&edit("live-edit", "alice", "parent", 11, "live edit"))
+                    .unwrap();
+                app.record_app_event(&reply("quoted", "alice", "parent", 11, "quote"))
+                    .unwrap();
+                let events = if ids[0] < ids[1] {
+                    [first, second]
+                } else {
+                    [second, first]
+                };
+                for mut event in events {
+                    event.origin_commit_id = Some("commit".to_owned());
+                    if path == "terminal" {
+                        event.direction = "sent".to_owned();
+                        event.source_message_id_hex = None;
+                    }
+                    app.record_app_event(&event).unwrap();
+                }
+                if path == "revival" {
+                    app.invalidate_app_events_by_origin_commit(
+                        "commit",
+                        BRANCH_SELECTION_WITHDRAWAL_REASON,
+                    )
+                    .unwrap();
+                }
+                if let Some(id) = damaged {
+                    app.lock().unwrap().execute(
+                        "UPDATE app_events SET tags_json = 'not-json' WHERE message_id_hex = ?1",
+                        params![id],
+                    ).unwrap();
+                }
+                let update = match path {
+                    "origin" => {
+                        app.invalidate_app_events_by_origin_commit("commit", "LosingBranch")
+                    }
+                    "revival" => app.clear_branch_selection_withdrawal_by_origin_commit("commit"),
+                    "terminal" => app.invalidate_pending_sent_app_events_for_group(
+                        &"11".repeat(32),
+                        LOCAL_PUBLISH_FAILED_REASON,
+                    ),
+                    _ => unreachable!(),
+                }
+                .unwrap()
+                .unwrap();
+                let triggers = update
+                    .changes
+                    .iter()
+                    .filter_map(|change| match change {
+                        TimelineMessageChange::Upsert { message, trigger }
+                            if message.message_id_hex == target =>
+                        {
+                            Some(trigger.clone())
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    triggers,
+                    [TimelineUpdateTrigger::MessageEditedOrReprojected],
+                    "{path}, {ids:?}, {target}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn batch_confirmation_triggers() {
+    for ids in [["a-delete", "z-delete"], ["z-delete", "a-delete"]] {
+        let app = SqliteAccountStorage::in_memory().unwrap().app_storage();
+        let group = "11".repeat(32);
+        app.record_app_event(&own_send("mine", 1)).unwrap();
+        app.invalidate_app_event_by_message_id(&group, "mine", LOCAL_PUBLISH_FAILED_REASON)
+            .unwrap();
+        app.record_app_event(&reaction("seen", "peer", "mine", 2, "+"))
+            .unwrap();
+        app.record_app_event(&reply("answer", "peer", "mine", 3, "ok"))
+            .unwrap();
+        let mut deletes = [(ids[0], "seen", 4), (ids[1], "answer", 5)];
+        if ids[0] > ids[1] {
+            deletes.reverse();
+        }
+        for (id, target, at) in deletes {
+            let mut event = delete(id, "peer", target, at);
+            event.direction = "sent".to_owned();
+            event.source_message_id_hex = None;
+            app.record_app_event(&event).unwrap();
+        }
+        assert!(
+            !app.timeline_message(&group, "mine")
+                .unwrap()
+                .unwrap()
+                .recipient_confirmed
+        );
+        assert!(
+            app.timeline_message(&group, "answer")
+                .unwrap()
+                .unwrap()
+                .deleted
+        );
+        let update = app
+            .invalidate_pending_sent_app_events_for_group(&group, LOCAL_PUBLISH_FAILED_REASON)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            trigger_for(&update, "mine"),
+            Some(TimelineUpdateTrigger::DeliveryOrSendStateChanged)
+        );
+        assert_eq!(
+            trigger_for(&update, "answer"),
+            Some(TimelineUpdateTrigger::MessageEditedOrReprojected)
+        );
+        assert!(
+            app.timeline_message(&group, "mine")
+                .unwrap()
+                .unwrap()
+                .recipient_confirmed
+        );
+        assert!(
+            !app.timeline_message(&group, "answer")
+                .unwrap()
+                .unwrap()
+                .deleted
+        );
+    }
+}
+
+#[test]
 fn revalidating_an_origin_commit_revives_only_branch_selection_withdrawals() {
     // A convergence pass parks a losing commit and the app tombstones every
     // kind-1210 row it synthesized. A later pass holding deeper evidence
