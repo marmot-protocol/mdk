@@ -2073,6 +2073,32 @@ impl PublishRelayCache {
     }
 }
 
+/// A connect that reached no relay, so sent nothing: retryable, with
+/// `timed_out` telling a handshake that outlived the connect budget from an
+/// immediate dial error, for audit. The reason never embeds the nostr-sdk
+/// error Display: it commonly carries the relay URL, and these reasons flow
+/// into `TransportAdapterError::Publish` Display (see
+/// `finish_publish_outcome`), which upper layers may log. The endpoint stays
+/// available on the structured failure record.
+fn publish_connect_failure(
+    endpoint: TransportEndpoint,
+    timed_out: bool,
+) -> TransportEndpointFailure {
+    TransportEndpointFailure {
+        pre_send: true,
+        size_class: None,
+        endpoint,
+        reason: if timed_out {
+            "connect relay timed out"
+        } else {
+            "connect relay failed"
+        }
+        .to_owned(),
+        kind: TransportEndpointFailureKind::RetryableUnavailable,
+        rejection_category: None,
+    }
+}
+
 struct ScopedPublishRelayLease {
     owner: NostrSdkRelayClient,
     endpoints: Vec<RelayUrl>,
@@ -4795,24 +4821,44 @@ impl NostrSdkRelayClient {
         };
         match connected {
             Ok(()) => Ok(endpoint),
-            // Failure reasons never embed the nostr-sdk error Display: it
-            // commonly carries the relay URL, and these reasons flow into
-            // `TransportAdapterError::Publish` Display (see
-            // `finish_publish_outcome`), which upper layers may log. The
-            // endpoint stays available on the structured failure record.
-            Err(timed_out) => Err(TransportEndpointFailure {
-                pre_send: true,
-                size_class: None,
-                endpoint: transport_endpoint,
-                reason: if timed_out {
-                    "connect relay timed out"
-                } else {
-                    "connect relay failed"
+            Err(timed_out) => Err(publish_connect_failure(transport_endpoint, timed_out)),
+        }
+    }
+
+    /// Wait until `endpoint`'s socket is `Connected`, up to `deadline`.
+    /// `try_connect` returns at once for a relay another operation is already
+    /// connecting or reconnecting, without that handshake's result, so its
+    /// success alone does not show the relay was reached (mdk#2332). A
+    /// handshake that fails or outlives the deadline is the same pre-send
+    /// failure as a connect of its own.
+    async fn await_publish_connection(
+        &self,
+        endpoint: &RelayUrl,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), TransportEndpointFailure> {
+        let transport_endpoint = TransportEndpoint(endpoint.to_string());
+        let Ok(Some(relay)) = self.client.relay(endpoint.clone()).await else {
+            return Err(publish_connect_failure(transport_endpoint, false));
+        };
+        // Subscribe before reading the status, so no change is missed.
+        let mut updates = relay.notifications_with_gaps();
+        let connected = timeout_at(deadline, async {
+            loop {
+                match relay.status() {
+                    RelayStatus::Connected => return true,
+                    RelayStatus::Pending | RelayStatus::Connecting | RelayStatus::Disconnected => {}
+                    _ => return false,
                 }
-                .to_owned(),
-                kind: TransportEndpointFailureKind::RetryableUnavailable,
-                rejection_category: None,
-            }),
+                if updates.next().await.is_none() {
+                    return false;
+                }
+            }
+        })
+        .await;
+        match connected {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(publish_connect_failure(transport_endpoint, false)),
+            Err(_) => Err(publish_connect_failure(transport_endpoint, true)),
         }
     }
 
@@ -6161,10 +6207,15 @@ impl NostrRelayClient for NostrSdkRelayClient {
             return Err(unreachable());
         };
         // The same lease and bounded connect a publish takes, so the socket
-        // the next publish to this relay uses is the one judged here.
+        // the next publish to this relay uses is the one judged here. The
+        // relay counts as reached only once that socket is connected.
+        let deadline = tokio::time::Instant::now() + SDK_RELAY_CONNECT_WAIT;
         let mut lease = ScopedPublishRelayLease::new(self.clone());
         let connected = match lease.retain(&relay).await {
-            Ok(()) => self.connect_publish_relay(relay).await.map(drop),
+            Ok(()) => match self.connect_publish_relay(relay.clone()).await {
+                Ok(_) => self.await_publish_connection(&relay, deadline).await,
+                Err(failure) => Err(failure),
+            },
             Err(failure) => Err(failure),
         };
         lease.release().await;
@@ -13457,6 +13508,74 @@ mod tests {
         );
         assert!(failure.pre_send);
         assert!(failure.proves_nothing_sent());
+    }
+
+    /// mdk#2332: a probe that finds the relay's socket already connecting,
+    /// another operation's handshake in flight, waits for that handshake
+    /// rather than reading the relay as reached. A handshake that completes
+    /// connects the waiting probe; one that fails holds it, retryable and
+    /// pre-send, so the size floor never refuses a commit at a relay the
+    /// probe never reached.
+    #[tokio::test]
+    async fn a_publish_connection_probe_waits_for_a_handshake_in_flight() {
+        for completes in [true, false] {
+            let (endpoint, accepted, finish) = stalled_handshake_relay().await;
+            let sdk = NostrSdkRelayClient::from_builder(Client::builder());
+            let probe = || {
+                let sdk = sdk.clone();
+                let endpoint = endpoint.clone();
+                tokio::spawn(async move { sdk.connect_for_publish(&endpoint).await })
+            };
+            let first = probe();
+            accepted.await.unwrap();
+            let mut second = probe();
+            assert!(
+                timeout(Duration::from_millis(200), &mut second)
+                    .await
+                    .is_err(),
+                "the second probe waits while the socket is connecting"
+            );
+            finish.send(completes).unwrap();
+            let outcomes = [first.await.unwrap(), second.await.unwrap()];
+            for outcome in outcomes {
+                if completes {
+                    outcome.expect("the finished handshake connects every probe");
+                } else {
+                    let failure = outcome.expect_err("the handshake failed");
+                    assert_eq!(failure.endpoint, endpoint);
+                    assert_eq!(
+                        failure.kind,
+                        TransportEndpointFailureKind::RetryableUnavailable
+                    );
+                    assert!(failure.proves_nothing_sent());
+                }
+            }
+            sdk.client().shutdown().await;
+        }
+    }
+
+    /// A relay that accepts one TCP connection and leaves its WebSocket
+    /// handshake unfinished until `finish` says to complete it (`true`) or
+    /// drop the socket (`false`). `accepted` fires once the connection is in.
+    async fn stalled_handshake_relay() -> (
+        TransportEndpoint,
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<bool>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = TransportEndpoint(format!("ws://{}", listener.local_addr().unwrap()));
+        let (accepted_tx, accepted) = tokio::sync::oneshot::channel();
+        let (finish, finish_rx) = tokio::sync::oneshot::channel::<bool>();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let _ = accepted_tx.send(());
+            if finish_rx.await.unwrap_or(false)
+                && let Ok(mut socket) = tokio_tungstenite::accept_async(stream).await
+            {
+                while let Some(Ok(_)) = socket.next().await {}
+            }
+        });
+        (endpoint, accepted, finish)
     }
 
     #[tokio::test]
