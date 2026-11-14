@@ -25,11 +25,11 @@ pub(in crate::client) fn relay() -> String {
 }
 
 pub(in crate::client) struct Fixture {
-    pub(in crate::client) _dir: tempfile::TempDir,
-    pub(in crate::client) relay: Arc<ScriptedPushRelayClient>,
+    pub(in crate::client::history_recovery) _dir: tempfile::TempDir,
+    pub(in crate::client::history_recovery) relay: Arc<ScriptedPushRelayClient>,
     pub(in crate::client) client: AppClient,
     pub(in crate::client) storage: SqliteAccountStorage,
-    pub(in crate::client) group: cgka_traits::GroupId,
+    pub(in crate::client::history_recovery) group: cgka_traits::GroupId,
 }
 
 /// One account with one group and a checkpointed cursor whose live
@@ -46,7 +46,7 @@ pub(super) async fn fixture_with_stored(stored: Option<u64>) -> Fixture {
     fixture_on(vec![RELAY.into()], stored, None).await
 }
 
-pub(in crate::client) async fn fixture_on(
+pub(in crate::client::history_recovery) async fn fixture_on(
     relays: Vec<String>,
     stored: Option<u64>,
     lookback: Option<std::time::Duration>,
@@ -118,7 +118,7 @@ pub(in crate::client) async fn fixture_on(
 /// the runner's fence turn does, and the boundaries that frees are recorded,
 /// as its next read of the live tails does. A counted live REQ is held until
 /// then.
-pub(in crate::client) async fn release_held_live_frames(client: &AppClient) {
+pub(in crate::client::history_recovery) async fn release_held_live_frames(client: &AppClient) {
     let read = client.recovery_runner_live_counts().await;
     if read.held.is_empty() {
         return;
@@ -130,7 +130,9 @@ pub(in crate::client) async fn release_held_live_frames(client: &AppClient) {
 
 /// A second connection to the account's database, only to inject write
 /// faults or set up durable state no seam writes.
-pub(in crate::client) fn fault_connection(client: &AppClient) -> rusqlite::Connection {
+pub(in crate::client::history_recovery) fn fault_connection(
+    client: &AppClient,
+) -> rusqlite::Connection {
     let app = &client.app;
     let label = &client.state.label;
     let path = app.account_storage_path(label);
@@ -153,7 +155,7 @@ pub(in crate::client) fn fault_connection(client: &AppClient) -> rusqlite::Conne
 /// from its REQ window as soon as the fixture's subscriptions are admitted;
 /// a test of the first goal some other seam writes starts from none, as an
 /// account opened from before the ledger did.
-pub(in crate::client) fn clear_coverage_goals(client: &AppClient) {
+pub(in crate::client::history_recovery) fn clear_coverage_goals(client: &AppClient) {
     fault_connection(client)
         .execute("DELETE FROM account_recovery_coverage_goals", [])
         .unwrap();
@@ -167,7 +169,7 @@ pub(super) async fn reactivate(fixture: &mut Fixture) {
     release_held_live_frames(&fixture.client).await;
 }
 
-pub(in crate::client) async fn reactivate_client(client: &mut AppClient) {
+pub(in crate::client::history_recovery) async fn reactivate_client(client: &mut AppClient) {
     client.prepare_transport().await.unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {

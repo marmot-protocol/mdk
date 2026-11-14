@@ -913,7 +913,12 @@ async fn a_join_from_the_stash_tells_the_host_of_the_offers_it_retires() {
     let mut record = storage.get_group(&chat).unwrap();
     record.unrecoverable = true;
     storage.put_group(&record).unwrap();
-    devices.phone.pending_recovery_status_updates.clear();
+    devices
+        .phone
+        .history_recovery
+        .test_state()
+        .pending_recovery_status_updates
+        .clear();
     devices.phone.run_due_maintenance().await.unwrap();
     assert_eq!(stashed(&devices.phone), 0);
     assert!(!key_package_issued(&devices.phone, &again));
@@ -928,6 +933,8 @@ async fn a_join_from_the_stash_tells_the_host_of_the_offers_it_retires() {
     assert!(
         devices
             .phone
+            .history_recovery
+            .test_state()
             .pending_recovery_status_updates
             .contains(&chat)
     );

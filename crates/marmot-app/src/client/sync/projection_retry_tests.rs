@@ -1213,7 +1213,10 @@ async fn early_bookkeeping_failure_retains_native_effects() {
         events: vec![rename(&group, &account.account_id_hex, 0x76)],
         ..Default::default()
     };
-    client.released_backfill_reload_pending = true;
+    client
+        .history_recovery
+        .test_state()
+        .released_backfill_reload_pending = true;
     client.fail_next_released_backfill_reload = true;
     assert!(
         client

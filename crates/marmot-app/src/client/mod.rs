@@ -114,7 +114,6 @@ mod sync;
 #[cfg(test)]
 pub(crate) mod upload_cleanup_tests;
 
-use history_recovery::epoch_stall::EpochStallDetector;
 pub(crate) use history_recovery::recovery_coverage::LiveCoverage;
 pub(crate) use push::PushFetchClock;
 use push::notification_trigger_for_intent;
@@ -763,14 +762,9 @@ pub struct AppClient {
     #[cfg(all(test, feature = "unreleased-device-pairing"))]
     pub(crate) test_fail_roster_read: bool,
     pub(crate) recovery_owner: recovery::AccountRecoveryOwner,
-    /// The process credits recovery jobs share. A managed worker installs
-    /// its runtime's pool; a directly owned client uses the process pool.
-    pub(crate) recovery_credits:
-        Arc<crate::runtime::account_worker::recovery_credits::RecoveryCreditPool>,
-    /// A directly owned client's in-place recovery runner (mdk#2660 phase 4).
-    /// A worker account's runner is the worker's own task, so its client's
-    /// seat stays empty.
-    pub(crate) recovery_runner: history_recovery::recovery_runner::host::RunnerSeat,
+    /// Recovery's ledger side (mdk#2782): the runner's host state, the
+    /// coverage recorder, epoch-gap evidence, and history notices and status.
+    pub(crate) history_recovery: history_recovery::HistoryRecovery,
     pub(crate) conversation_captures: Vec<std::sync::Weak<crate::runtime::SendCapture>>,
     pub(crate) runtime_telemetry: Option<PerformanceRecorder>,
     pub(crate) send_telemetry: Option<PerformanceRecorder>,
@@ -816,22 +810,11 @@ pub struct AppClient {
     /// Live saves replace only these groups; full snapshot replacement is
     /// reserved for import/rebuild paths outside the account worker.
     pub(crate) pending_group_projection_updates: HashSet<String>,
-    /// Recovery status has its own notification queue; saving a projection must not consume it.
-    pub(crate) pending_recovery_status_updates: HashSet<GroupId>,
     /// Groups whose convergence pass hosts were last told is parked (mdk#2684).
     /// A park or an un-park against this set owes the host a group-state notice.
     pub(crate) announced_convergence_parks: HashSet<GroupId>,
     /// Groups owed that notice; the account worker publishes them each turn.
     pub(crate) pending_convergence_park_notices: HashSet<GroupId>,
-    /// The parked recovery set as last announced to hosts ("history may be
-    /// incomplete"): one small entry per parked occurrence, compared at each
-    /// publication seam so a change raises `HistoryNoticesChanged`.
-    pub(crate) history_notice_baseline:
-        Option<history_recovery::history_notices::HistoryNoticeBaseline>,
-    /// The recovery runner's survey changed what is catching up since hosts
-    /// last heard; the worker's account-level seam drains it into one
-    /// `RecoveryStatusChanged` (mdk#2660 phase 4). Only a runner sets it.
-    pub(crate) recovery_status_owed: bool,
     /// The linked devices may have changed since hosts last heard: a hidden
     /// device-group event, a change of trust, or an open, which cannot know
     /// what hosts last read. The worker's account-level and applied-summary
@@ -952,17 +935,6 @@ pub struct AppClient {
     /// Native checkpoints already committed; retained across drain cancellation.
     pub(super) pending_native_sync_summary: crate::SyncSummary,
     pub(super) native_sync_deliveries: u64,
-    /// The coverage ledger's live-boundary recorder state (mdk#2660).
-    pub(crate) live_coverage: tokio::sync::Mutex<history_recovery::recovery_coverage::LiveCoverage>,
-    /// Epoch-stall escalations the detector has raised but no caller has been
-    /// handed yet.
-    ///
-    /// The detector latches `escalated` one-shot per unrecovered run, so an
-    /// escalation dropped by a later `?` on the recording pass is never raised
-    /// again. Escalations therefore land here and move onto either a successful
-    /// summary or a partial-progress failure before a managed client is rebuilt
-    /// (see `Self::drain_epoch_stall_escalations`).
-    pub(crate) pending_epoch_stall_escalations: Vec<crate::EpochStallEscalation>,
     pub(crate) pending_convergence_groups: HashSet<GroupId>,
     /// Groups whose epoch-gap hold the user explicitly accepted, with the
     /// local epoch they accepted it at (mdk#2258). An acknowledgement admits
@@ -994,31 +966,6 @@ pub struct AppClient {
     /// background retry instead of turning the already-applied ingest into an
     /// apparent receive failure.
     pub(crate) pending_runtime_group_subscription_refresh: bool,
-    /// The recovery runner's ownership preparation failed and none has
-    /// succeeded since. While it is owed the worker starts no runner; the
-    /// paced subscription-refresh retry prepares again.
-    pub(crate) runner_preparation_owed: bool,
-    /// The retention floor the recovery runner's debt turns last pruned the
-    /// ledger to in this process, if any did.
-    pub(crate) runner_pruned_floor: Option<u64>,
-    /// Each group's local copy (its install epoch) the recovery runner's debt
-    /// turns settled in this process, with the relays its routes carried then
-    /// (mdk#2660 row 11), so a turn reads the durable copy only for a group
-    /// whose copy or carried relays changed since. At most one entry per group
-    /// with a current route: each settle drops the rest, and forgetting a
-    /// group drops its entry. A missing entry costs one durable read.
-    pub(crate) settled_recovery_copies: std::collections::HashMap<Vec<u8>, (u64, CarriedRoutes)>,
-    /// A debt turn settled a changed copy, which raises or clears a rejoin
-    /// notice, since the account worker last published account-level
-    /// changes. The runner's survey may not change with it (a group already
-    /// catching up stays so), so the worker publishes after that turn.
-    pub(crate) recovery_copy_settled: bool,
-    /// The clock (Unix seconds) the runner's next prune takes its retention
-    /// floor from: its previous debt turn's, or before its first, the one the
-    /// open seeded standing goals with. It moves only past a prune that
-    /// succeeded, so the seconds of a goal seeded since at its own floor wait
-    /// for a debt turn to sweep them instead of being parked before one could.
-    pub(crate) runner_prune_clock: u64,
     /// One-shot failure of the recovery runner's ownership preparation.
     #[cfg(test)]
     pub(crate) fail_next_runner_preparation: bool,
@@ -1103,17 +1050,6 @@ pub struct AppClient {
     /// Canonical create/invite work whose Welcome fanout has not run yet.
     /// The managed account worker replies first, then drives this delivery.
     pub(crate) unpublished_welcome_delivery: Option<UnpublishedWelcomeDelivery>,
-    /// Per-group detector for the epoch-gap backfill (commit-loss recovery): it
-    /// counts the distinct undecryptable messages a group accumulates at a
-    /// stalled epoch. Ephemeral session state, like the pending sets above.
-    pub(crate) epoch_stall: EpochStallDetector,
-    /// Detector observations whose SQL write failed. At most one epoch per
-    /// group; this buffer owns no dispatch, completion or retry policy.
-    pub(crate) pending_recovery_arm_writes: HashMap<GroupId, u64>,
-    /// Initial account open or release consumption requires a backfill reload.
-    /// Keep this armed after a failed read even if the journal is already empty;
-    /// the next synchronized receipt access retries on this same client.
-    pub(crate) released_backfill_reload_pending: bool,
     /// One-shot storage-read failure after durable release consumption.
     #[cfg(test)]
     pub(crate) fail_next_released_backfill_reload: bool,
@@ -1125,8 +1061,6 @@ pub struct AppClient {
     /// retry re-armed the pass and before any attempt could park it again.
     #[cfg(test)]
     pub(crate) fail_next_convergence_retry_advance: bool,
-    pub(crate) runner_post_join:
-        HashMap<GroupId, history_recovery::recovery_runner::post_join::Collection>,
     /// Per-group (in-memory) epoch at which the warm pass last confirmed the
     /// authoritative encrypted-media component is NOT required. A group's
     /// signed component can only change with a commit, and a commit always
@@ -1846,7 +1780,7 @@ impl AppClient {
         if self.app.cursor_persistence() == crate::CursorPersistence::Frozen
             || self.runtime.maintenance_is_paused()
         {
-            self.runner_post_join.clear();
+            self.history_recovery.clear_post_join_collections();
             return Ok(());
         }
         self.advance_runner_post_join().await
@@ -3818,7 +3752,8 @@ impl AppClient {
         self.pending_group_projection_updates.remove(&group_hex);
         self.pending_local_group_deletion_frontier_clears
             .remove(&group_hex);
-        self.pending_recovery_status_updates.remove(group_id);
+        self.history_recovery
+            .forget_recovery_status_update(group_id);
         self.announced_convergence_parks.remove(group_id);
         self.pending_convergence_park_notices.remove(group_id);
         self.pending_projection_updates
@@ -3834,10 +3769,7 @@ impl AppClient {
         {
             self.unpublished_welcome_delivery = None;
         }
-        self.pending_epoch_stall_escalations
-            .retain(|event| &event.group_id != group_id);
-        self.epoch_stall.clear_recovered_group(group_id);
-        self.pending_recovery_arm_writes.remove(group_id);
+        self.history_recovery.forget_epoch_gap(group_id);
         self.encrypted_media_not_required_epochs.remove(&group_hex);
         self.pending_convergence_groups.remove(group_id);
         self.forget_pending_effect_projections(group_id);
@@ -3845,7 +3777,7 @@ impl AppClient {
         self.pending_member_add_push_shares.remove(group_id);
         self.pending_own_add_push_snapshots.remove(group_id);
         self.accepted_push_announces.remove(group_id);
-        self.settled_recovery_copies.remove(group_id.as_slice());
+        self.history_recovery.forget_settled_recovery_copy(group_id);
         self.push_repairs.forget_group(group_id);
         self.app.presentation_signals.wake();
         // Deletion already committed. A failed transport refresh must not make

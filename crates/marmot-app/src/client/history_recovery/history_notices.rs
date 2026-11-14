@@ -122,7 +122,7 @@ impl AppClient {
     /// survey change counts, even one a later survey undid, so a host never
     /// keeps a state it read in between.
     pub(crate) fn take_recovery_status_changed(&mut self, notices_changed: bool) -> bool {
-        let owed = std::mem::take(&mut self.recovery_status_owed);
+        let owed = std::mem::take(&mut self.history_recovery.state.recovery_status_owed);
         owed || notices_changed
     }
 
@@ -302,13 +302,25 @@ impl AppClient {
             );
         }
         let announce_all = converted.is_some();
-        let previous = self.history_notice_baseline.replace(current)?;
-        let current = self.history_notice_baseline.as_ref()?;
+        let previous = self
+            .history_recovery
+            .state
+            .history_notice_baseline
+            .replace(current)?;
+        let current = self
+            .history_recovery
+            .state
+            .history_notice_baseline
+            .as_ref()?;
         if previous == *current && !announce_all {
             return None;
         }
         self.record_history_notice_changes(&previous, &causes);
-        let current = self.history_notice_baseline.as_ref()?;
+        let current = self
+            .history_recovery
+            .state
+            .history_notice_baseline
+            .as_ref()?;
         let mut groups = previous
             .iter()
             .filter(|entry| announce_all || !current.contains(entry))
@@ -344,7 +356,7 @@ impl AppClient {
         if !self.audit_v5_enabled() {
             return;
         }
-        let Some(current) = self.history_notice_baseline.as_ref() else {
+        let Some(current) = self.history_recovery.state.history_notice_baseline.as_ref() else {
             return;
         };
         for (id, revision, group) in current.iter().filter(|entry| !previous.contains(entry)) {

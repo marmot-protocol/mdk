@@ -766,7 +766,11 @@ async fn runner_owned_history_releases_post_join_maintenance() {
         "reopen does not restart grace"
     );
     assert!(
-        receiver.runner_post_join.is_empty(),
+        receiver
+            .history_recovery
+            .test_state()
+            .runner_post_join
+            .is_empty(),
         "a fetched copy in grace does not re-arm history on reopen"
     );
 }

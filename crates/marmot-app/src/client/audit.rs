@@ -384,7 +384,7 @@ impl AppClient {
             Some(context.clone()),
             AuditEventKind::EpochStallBackfillArmed {
                 stalled_epoch,
-                threshold: self.epoch_stall.threshold() as u64,
+                threshold: self.history_recovery.epoch_stall_threshold() as u64,
                 trigger: Some(trigger),
             },
         );
@@ -412,7 +412,9 @@ impl AppClient {
             AuditEventKind::EpochStallBackfillEscalated {
                 stalled_epoch,
                 arms: u64::from(arms),
-                arm_threshold: u64::from(self.epoch_stall.escalation_arm_threshold()),
+                arm_threshold: u64::from(
+                    self.history_recovery.epoch_stall_escalation_arm_threshold(),
+                ),
             },
         );
     }

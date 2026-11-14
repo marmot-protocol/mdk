@@ -470,7 +470,7 @@ impl AppClient {
         let (runner, handle) = RecoveryRunner::waking_on(
             Arc::new(host),
             policy,
-            self.recovery_credits.clone(),
+            self.history_recovery.state.recovery_credits.clone(),
             self.routing.recovery_runner_wake(),
         );
         let refund = OpenAttemptRefund {
@@ -493,7 +493,7 @@ impl AppClient {
     /// failure never spins the worker, and other work that refresh still owes
     /// never keeps the runner out.
     pub(crate) fn recovery_runner_due(&self) -> bool {
-        !self.runner_preparation_owed
+        !self.history_recovery.state.runner_preparation_owed
     }
 
     /// Spawn the account's runner, for the account worker to serve.
@@ -529,9 +529,9 @@ impl AppClient {
     }
 
     async fn seat_in_place(&mut self) {
-        self.recovery_runner = RunnerSeat::InPlace(Box::new(Some(InPlaceRunner::from(
-            self.build_recovery_runner().await,
-        ))));
+        self.history_recovery.state.recovery_runner = RunnerSeat::InPlace(Box::new(Some(
+            InPlaceRunner::from(self.build_recovery_runner().await),
+        )));
     }
 
     /// One explicit pass of a directly owned client's runner, within the
@@ -561,7 +561,7 @@ impl AppClient {
                     }
                 }
             };
-            self.recovery_runner = RunnerSeat::InPlace(Box::new(Some(seat)));
+            self.history_recovery.state.recovery_runner = RunnerSeat::InPlace(Box::new(Some(seat)));
             Some(report)
         })
     }
@@ -569,7 +569,7 @@ impl AppClient {
     /// This client's in-place runner, out of its seat while it runs. `None`
     /// without one.
     async fn take_in_place_runner(&mut self) -> Option<InPlaceRunner> {
-        match &mut self.recovery_runner {
+        match &mut self.history_recovery.state.recovery_runner {
             RunnerSeat::Absent => None,
             RunnerSeat::InPlace(seat) => match seat.take() {
                 Some(seat) => Some(seat),
@@ -617,7 +617,8 @@ impl AppClient {
                 // refunds the attempt it left open; the next pass builds a
                 // fresh one.
                 if served.answered {
-                    self.recovery_runner = RunnerSeat::InPlace(Box::new(Some(seat)));
+                    self.history_recovery.state.recovery_runner =
+                        RunnerSeat::InPlace(Box::new(Some(seat)));
                 }
                 served.end
             }
@@ -626,7 +627,10 @@ impl AppClient {
 
     /// Whether this directly owned client runs a recovery runner in place.
     pub(crate) fn has_in_place_recovery_runner(&self) -> bool {
-        matches!(self.recovery_runner, RunnerSeat::InPlace(_))
+        matches!(
+            self.history_recovery.state.recovery_runner,
+            RunnerSeat::InPlace(_)
+        )
     }
 
     /// Wake the account's runner: its debt or retry state may have changed.

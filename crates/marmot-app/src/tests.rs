@@ -211,12 +211,22 @@ async fn rejoin_decline_does_not_require_live_mls_state() {
             .unwrap()
             .is_empty()
     );
-    client.pending_recovery_status_updates.clear();
+    client
+        .history_recovery
+        .test_state()
+        .pending_recovery_status_updates
+        .clear();
     client.decline_group_rejoin(&welcome_id).unwrap();
     assert!(storage.list_welcomes().unwrap().is_empty());
     assert!(storage.has_ingress_dedup_marker(&welcome_id).unwrap());
     assert!(storage.has_ingress_dedup_marker(&content_id).unwrap());
-    assert!(client.pending_recovery_status_updates.contains(&group_id));
+    assert!(
+        client
+            .history_recovery
+            .test_state()
+            .pending_recovery_status_updates
+            .contains(&group_id)
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -18849,7 +18859,10 @@ async fn an_escalation_recorded_before_a_failing_sync_is_reported_by_the_next_sy
     // ...and a later fallible step in that same pass errors, so the summary the
     // pass was building never reaches a caller: here, the receipt reload
     // before its recovery selection.
-    client.released_backfill_reload_pending = true;
+    client
+        .history_recovery
+        .test_state()
+        .released_backfill_reload_pending = true;
     client.fail_next_released_backfill_reload = true;
     let failed = client.sync().await;
     assert!(
@@ -20375,19 +20388,27 @@ async fn a_convergence_reorg_ends_the_unrecovered_arm_run() {
 
     // Two arms of one run, at two epochs the device armed at.
     assert_eq!(
-        client.epoch_stall.observe_resource_refusal(
-            group_id.clone(),
-            cgka_traits::EpochId(10),
-            epoch_stall_test_now_ms()
-        ),
+        client
+            .history_recovery
+            .test_state()
+            .epoch_stall
+            .observe_resource_refusal(
+                group_id.clone(),
+                cgka_traits::EpochId(10),
+                epoch_stall_test_now_ms()
+            ),
         crate::client::history_recovery::epoch_stall::BackfillDecision::Arm
     );
     assert_eq!(
-        client.epoch_stall.observe_resource_refusal(
-            group_id.clone(),
-            cgka_traits::EpochId(11),
-            epoch_stall_test_now_ms()
-        ),
+        client
+            .history_recovery
+            .test_state()
+            .epoch_stall
+            .observe_resource_refusal(
+                group_id.clone(),
+                cgka_traits::EpochId(11),
+                epoch_stall_test_now_ms()
+            ),
         crate::client::history_recovery::epoch_stall::BackfillDecision::Arm
     );
 
@@ -20402,11 +20423,15 @@ async fn a_convergence_reorg_ends_the_unrecovered_arm_run() {
     // pins that shape). With it, the arms before the reorg are not one
     // unrecovered run.
     assert_eq!(
-        client.epoch_stall.observe_resource_refusal(
-            group_id,
-            cgka_traits::EpochId(12),
-            epoch_stall_test_now_ms()
-        ),
+        client
+            .history_recovery
+            .test_state()
+            .epoch_stall
+            .observe_resource_refusal(
+                group_id,
+                cgka_traits::EpochId(12),
+                epoch_stall_test_now_ms()
+            ),
         crate::client::history_recovery::epoch_stall::BackfillDecision::Arm,
         "a group whose fork convergence just adjudicated is alive; the arms it took to get there are not evidence that a replay is failing to recover it"
     );
@@ -20439,11 +20464,15 @@ async fn a_maintenance_tick_reports_its_own_epoch_passage_to_the_stall_detector(
 
     // The group is stuck and arms once, at epoch 10.
     assert_eq!(
-        client.epoch_stall.observe_resource_refusal(
-            group_id.clone(),
-            cgka_traits::EpochId(10),
-            epoch_stall_test_now_ms()
-        ),
+        client
+            .history_recovery
+            .test_state()
+            .epoch_stall
+            .observe_resource_refusal(
+                group_id.clone(),
+                cgka_traits::EpochId(10),
+                epoch_stall_test_now_ms()
+            ),
         crate::client::history_recovery::epoch_stall::BackfillDecision::Arm
     );
 
@@ -20455,28 +20484,40 @@ async fn a_maintenance_tick_reports_its_own_epoch_passage_to_the_stall_detector(
 
     // A peer fold carries the device on to 12. Only a detector that heard the
     // maintenance passage is sitting at 11 to have this one leave it.
-    client.epoch_stall.observe_epoch_passage(
-        &group_id,
-        cgka_traits::EpochId(11),
-        cgka_traits::EpochId(12),
-    );
+    client
+        .history_recovery
+        .test_state()
+        .epoch_stall
+        .observe_epoch_passage(
+            &group_id,
+            cgka_traits::EpochId(11),
+            cgka_traits::EpochId(12),
+        );
 
     // So the stalls that follow are a new run: without the maintenance report
     // the second of these is the run's escalating third arm.
     assert_eq!(
-        client.epoch_stall.observe_resource_refusal(
-            group_id.clone(),
-            cgka_traits::EpochId(12),
-            epoch_stall_test_now_ms()
-        ),
+        client
+            .history_recovery
+            .test_state()
+            .epoch_stall
+            .observe_resource_refusal(
+                group_id.clone(),
+                cgka_traits::EpochId(12),
+                epoch_stall_test_now_ms()
+            ),
         crate::client::history_recovery::epoch_stall::BackfillDecision::Arm
     );
     assert_eq!(
-        client.epoch_stall.observe_resource_refusal(
-            group_id,
-            cgka_traits::EpochId(13),
-            epoch_stall_test_now_ms()
-        ),
+        client
+            .history_recovery
+            .test_state()
+            .epoch_stall
+            .observe_resource_refusal(
+                group_id,
+                cgka_traits::EpochId(13),
+                epoch_stall_test_now_ms()
+            ),
         crate::client::history_recovery::epoch_stall::BackfillDecision::Arm,
         "the maintenance passage must have ended the run, so this is only its second arm"
     );
@@ -20512,11 +20553,15 @@ async fn a_confirmed_local_publish_reports_its_epoch_passage_through_the_publish
 
     // The group is stuck and arms once, at epoch 10.
     assert_eq!(
-        client.epoch_stall.observe_resource_refusal(
-            group_id.clone(),
-            cgka_traits::EpochId(10),
-            epoch_stall_test_now_ms()
-        ),
+        client
+            .history_recovery
+            .test_state()
+            .epoch_stall
+            .observe_resource_refusal(
+                group_id.clone(),
+                cgka_traits::EpochId(10),
+                epoch_stall_test_now_ms()
+            ),
         crate::client::history_recovery::epoch_stall::BackfillDecision::Arm
     );
 
@@ -20528,26 +20573,38 @@ async fn a_confirmed_local_publish_reports_its_epoch_passage_through_the_publish
 
     // One epoch per arm is a limp, so that confirm alone does not end the run —
     // the movement after it does.
-    client.epoch_stall.observe_epoch_passage(
-        &group_id,
-        cgka_traits::EpochId(11),
-        cgka_traits::EpochId(12),
-    );
+    client
+        .history_recovery
+        .test_state()
+        .epoch_stall
+        .observe_epoch_passage(
+            &group_id,
+            cgka_traits::EpochId(11),
+            cgka_traits::EpochId(12),
+        );
 
     assert_eq!(
-        client.epoch_stall.observe_resource_refusal(
-            group_id.clone(),
-            cgka_traits::EpochId(12),
-            epoch_stall_test_now_ms()
-        ),
+        client
+            .history_recovery
+            .test_state()
+            .epoch_stall
+            .observe_resource_refusal(
+                group_id.clone(),
+                cgka_traits::EpochId(12),
+                epoch_stall_test_now_ms()
+            ),
         crate::client::history_recovery::epoch_stall::BackfillDecision::Arm
     );
     assert_eq!(
-        client.epoch_stall.observe_resource_refusal(
-            group_id,
-            cgka_traits::EpochId(13),
-            epoch_stall_test_now_ms()
-        ),
+        client
+            .history_recovery
+            .test_state()
+            .epoch_stall
+            .observe_resource_refusal(
+                group_id,
+                cgka_traits::EpochId(13),
+                epoch_stall_test_now_ms()
+            ),
         crate::client::history_recovery::epoch_stall::BackfillDecision::Arm,
         "the confirm must have been observed, so this is only the new run's second arm"
     );
