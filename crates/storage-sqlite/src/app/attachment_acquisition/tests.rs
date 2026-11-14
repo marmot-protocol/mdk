@@ -4327,3 +4327,48 @@ fn readmit_funded(store: &SqliteAppStorage, free: u64, need: impl Fn(Option<u64>
         )
         .unwrap()
 }
+
+/// A readmitted job's need keeps counting after it records progress, which
+/// clears its park streak: while it is in flight, and once it falls back to a
+/// retry holding its checkpoint. A second job is not released into space the
+/// first still needs.
+#[test]
+fn storage_readmission_counts_a_readmitted_job_through_checkpoint_progress() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
+    let floor = STORAGE_READMIT_MARGIN_BYTES;
+    let first = park_with_priority(&store, "first", 1000, 30);
+    let second = park_with_priority(&store, "second", 1000, 20);
+    assert_eq!(readmit_funded(&app, floor + 1500, |_| 1000), 1);
+    let job = app
+        .claim_attachment_acquisition(&first, 13, 100)
+        .unwrap()
+        .unwrap();
+    let identity = partial_identity(4096);
+    assert!(checkpoint(&app, &job, &identity, 0, &[7; 64], 13).unwrap());
+    let streak: i64 = store
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT storage_park_count FROM attachment_acquisition WHERE token=?1",
+            [&first.token],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(streak, 0, "progress clears the park streak");
+    assert_eq!(
+        readmit_funded(&app, floor + 1500, |_| 1000),
+        0,
+        "in flight, it still counts"
+    );
+    sql(
+        &store,
+        "UPDATE attachment_acquisition SET state=2,attempt=NULL,due=0 WHERE message_id_hex='first'",
+    );
+    assert_eq!(
+        readmit_funded(&app, floor + 1500, |_| 1000),
+        0,
+        "retrying with its checkpoint, it still counts"
+    );
+    assert_eq!(parked_target(&store, &second), Some(1000));
+}

@@ -380,10 +380,11 @@ existing bytes; a body the device cannot publish parks the same way with its che
 Either waits until free space covers its recorded target or the user retries (see the native
 attachment access contract). Readmission releases parked jobs in the order the worker starts
 them (explicit first, then priority) only while free space funds them together. Each is
-charged the larger of its target and what admission needs for its checkpoint now; jobs
-readmitted earlier that have not finished still count against free space, since their writes
-may not show yet; and the first job that does not fit ends the batch, so the rest stay parked
-with their targets instead of failing admission (mdk#3414).
+charged the larger of its target and what admission needs for its checkpoint now; the need of
+every job whose writes may not show in free space yet still counts against it (jobs in
+flight, and queued or retrying jobs that were readmitted or hold a checkpoint); and the first
+job that does not fit ends the batch, so the rest stay parked with their targets instead of
+failing admission (mdk#3414).
 
 Release/binding publication, app cache adoption and device benchmarks remain C9. Local tests do
 not establish mobile throughput or background execution entitlement. See the native usage guide.

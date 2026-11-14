@@ -816,12 +816,13 @@ impl SqliteAppStorage {
     /// cannot take the space an earlier one is waiting for. Jobs left out
     /// stay parked with their targets.
     ///
-    /// What is left starts below `free` by the need of every job readmitted
-    /// earlier that has not finished (queued, in flight or retrying), since
-    /// its writes may not show in `free` yet; a job in flight may be counted
-    /// twice, never missed. Those are the unfinished jobs with a park streak
-    /// (finishing clears the streak) that can still run: automatic ones only
-    /// while automatic acquisition is enabled.
+    /// What is left starts below `free` by the need of every job whose
+    /// writes may not show in `free` yet: each job in flight, and each queued
+    /// or retrying job that was readmitted (it keeps its park streak until it
+    /// records progress) or holds a checkpoint (as one that progressed does),
+    /// the queued ones only if they can run (automatic ones while automatic
+    /// acquisition is enabled). A need shrinks as its checkpoint grows, so
+    /// bytes already written are not counted again.
     ///
     /// The page is filtered by what fits `free` and `admission` (worker
     /// admission at `free`) before it is limited, so rows that cannot fit at
@@ -872,9 +873,10 @@ impl SqliteAppStorage {
             let pending: u64 = conn
                 .prepare(
                     "SELECT (SELECT p.received FROM attachment_partial p WHERE p.token=q.token)
-                    FROM attachment_acquisition q
-                    WHERE state IN (0,1,2) AND cancelled=0 AND storage_park_count>0
-                    AND (explicit_request=1 OR ?1)",
+                    FROM attachment_acquisition q WHERE cancelled=0 AND (state=1
+                        OR (state IN (0,2) AND (explicit_request=1 OR ?1)
+                            AND (storage_park_count>0
+                                OR EXISTS(SELECT 1 FROM attachment_partial p WHERE p.token=q.token))))",
                 )
                 .storage()?
                 .query_map([automatic], |row| row.get::<_, Option<i64>>(0))
