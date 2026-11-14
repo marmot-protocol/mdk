@@ -243,6 +243,7 @@ async fn reads_from_published_state(
     .unwrap()
     .expect("the worker is running");
     answers!("group_roster", accounts.group_roster(account, group)).unwrap();
+    answers!("group_co_members", accounts.group_co_members(account)).unwrap();
     answers!(
         "group_app_component",
         accounts.group_app_component(

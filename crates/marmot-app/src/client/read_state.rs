@@ -36,7 +36,7 @@
 //! serves an exact copy of a failure it can rebuild ([`reissue`]); any other
 //! published failure is answered by the worker, as before.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -397,6 +397,70 @@ impl ReadState {
             .collect()
     }
 
+    /// Whether this version holds every group in `group_ids` or lists it
+    /// quarantined. Every stored group is in the mirror, so a group whose
+    /// chat-list row has committed is held by the first version published
+    /// after it (mdk#3273 PR 4; the oracle checks it at every publish).
+    pub(crate) fn holds(&self, group_ids: &[GroupId]) -> bool {
+        group_ids.iter().all(|group_id| {
+            self.groups.contains_key(group_id)
+                || self
+                    .account
+                    .quarantined_groups
+                    .iter()
+                    .any(|group| group.group_id_hex == hex::encode(group_id.as_slice()))
+        })
+    }
+
+    /// The groups [`Self::co_members`] counts, in id order: those the local
+    /// account is still a member of, by the stored self membership where
+    /// this version read it. A read hydrates the ones awaiting hydration
+    /// first, as each member read hydrated its group.
+    pub(crate) fn co_member_groups(&self) -> Vec<GroupId> {
+        let mut groups = self
+            .groups
+            .iter()
+            .filter(|(_, group)| {
+                let self_membership = match &group.self_membership {
+                    Ok(Some(stored)) => *stored,
+                    _ => group.record.self_membership,
+                };
+                crate::runtime::contributes_co_members(&group.record, self_membership)
+            })
+            .map(|(group_id, _)| group_id.clone())
+            .collect::<Vec<_>>();
+        groups.sort_by(|a, b| a.as_slice().cmp(b.as_slice()));
+        groups
+    }
+
+    /// `GroupCoMembers`: every other account that shares one of
+    /// [`Self::co_member_groups`] with `local_account_id_hex`, from this
+    /// version alone (mdk#3273 PR 4). A group this version doesn't hold yet
+    /// counts from the version that does. A failed stored self membership
+    /// fails the read, as it failed the stored group listing; otherwise the
+    /// first contributing group in id order whose members failed gives the
+    /// failure.
+    pub(crate) fn co_members(&self, local_account_id_hex: &str) -> ReadAnswer<Vec<String>> {
+        for group in self.groups.values() {
+            group.self_membership.as_ref().map_err(Arc::clone)?;
+        }
+        let mut co_members = BTreeSet::new();
+        for group_id in self.co_member_groups() {
+            let members = self
+                .group(&group_id)?
+                .members
+                .as_ref()
+                .map_err(Arc::clone)?;
+            for (member_id, _) in members {
+                let member_id_hex = hex::encode(member_id.as_slice());
+                if member_id_hex != local_account_id_hex {
+                    co_members.insert(member_id_hex);
+                }
+            }
+        }
+        Ok(co_members.into_iter().collect())
+    }
+
     /// `PreparedGroupImageStatus`.
     #[cfg_attr(not(test), allow(dead_code))] // Account reads answer from A (mdk#3273 PR 5).
     pub(crate) fn prepared_group_image_status(
@@ -576,6 +640,41 @@ impl ReadStateReader {
     #[cfg(test)]
     pub(crate) fn subscribe(&self) -> watch::Receiver<Arc<ReadState>> {
         self.receiver.clone()
+    }
+
+    /// Resolves once a version [`ReadState::holds`] every group in
+    /// `group_ids` still stored, or before the worker's first publish (the
+    /// reads then go to the worker). When a version does not hold them,
+    /// `still_stored` narrows them to the ones whose stored rows remain: a
+    /// group forgotten or deleted since the caller read its row is in no
+    /// later version, so it is not waited for. Waits on the caller's task;
+    /// the caller bounds it. Fails as [`Self::version`] does, or as
+    /// `still_stored` does.
+    pub(crate) async fn holding(
+        &self,
+        storage_closed: &AtomicBool,
+        group_ids: &[GroupId],
+        mut still_stored: impl FnMut(Vec<GroupId>) -> Result<Vec<GroupId>, AppError>,
+    ) -> Result<(), AppError> {
+        let mut waiting = group_ids.to_vec();
+        let mut receiver = self.receiver.clone();
+        loop {
+            let state = Arc::clone(&receiver.borrow_and_update());
+            if storage_closed.load(Ordering::Acquire) {
+                return Err(storage_closed_error());
+            }
+            if state.version == 0 || state.holds(&waiting) {
+                return Ok(());
+            }
+            waiting = still_stored(waiting)?;
+            if state.holds(&waiting) {
+                return Ok(());
+            }
+            receiver
+                .changed()
+                .await
+                .map_err(|_| AppError::TransportClosed)?;
+        }
     }
 
     /// The version a moved read answers from, or `None` before the worker's
@@ -1670,6 +1769,45 @@ pub(crate) mod oracle {
             &client.chat_history_imports(),
         );
 
+        // Every stored group is in this version or listed quarantined: a
+        // read whose groups come from stored rows waits for the first
+        // version published after its rows commit (mdk#3273 PR 4).
+        if let Ok(storage) = client.app.account_storage(&client.state.label)
+            && let Ok(stored) = storage.app_storage().account_groups(None)
+        {
+            for row in stored {
+                let group_id = GroupId::new(hex::decode(&row.group_id_hex).expect("stored hex"));
+                assert!(
+                    state.holds(std::slice::from_ref(&group_id)),
+                    "a stored group is outside the read state"
+                );
+            }
+        }
+        // Co-members: this version's groups, records and members against
+        // the stored listing and the live member reads.
+        if let Ok(local) = client.app.account_home().account(&client.state.label) {
+            same(
+                window,
+                "co members",
+                &state.co_members(&local.account_id_hex),
+                &client
+                    .co_member_groups()
+                    .and_then(|groups| client.co_members(&groups)),
+            );
+            if let Ok(live) = client.co_member_groups()
+                && state
+                    .groups
+                    .values()
+                    .all(|group| group.self_membership.is_ok())
+            {
+                assert_eq!(
+                    state.co_member_groups(),
+                    live,
+                    "read state differs from the live read for co-member groups"
+                );
+            }
+        }
+
         // Group answers: every group in the mirror, every group the engine
         // or the device-group table knows (hidden, unhydrated, quarantined,
         // a failed rewind restore), and an id no one holds.
@@ -2008,5 +2146,66 @@ mod tests {
         let mut watch = state.watch_backup_restore();
         assert!(watch.receiver.has_changed().unwrap());
         assert_eq!(watch.changed().await.unwrap(), later);
+    }
+
+    /// A read whose groups come from stored rows waits for a version that
+    /// holds them, here by listing them quarantined, and for no group whose
+    /// stored row is gone: resolving at once before the first publish and
+    /// for a forgotten group, and on the publish that holds a stored one.
+    #[tokio::test]
+    async fn a_wait_for_stored_groups_ends_on_the_version_that_holds_them() {
+        use futures::FutureExt as _;
+        let open = AtomicBool::new(false);
+        let group = GroupId::new(vec![0x31; 16]);
+        let quarantined = |account: &mut AccountAnswers| {
+            account.quarantined_groups = vec![AppQuarantinedGroup {
+                group_id_hex: hex::encode(group.as_slice()),
+                reason: crate::AppGroupHydrationQuarantineReason::OpenMlsGroupMissing,
+            }];
+        };
+        let (publisher, reader) = read_state_channel();
+        let group_ids = std::slice::from_ref(&group);
+        let unexpected = |_: Vec<GroupId>| -> Result<Vec<GroupId>, AppError> {
+            panic!("a held group needs no storage read")
+        };
+        reader
+            .holding(&open, group_ids, unexpected)
+            .now_or_never()
+            .expect("no wait before the first publish")
+            .expect("before the first publish the reads go to the worker");
+
+        publisher.publish_for_test(|_| {});
+        reader
+            .holding(&open, group_ids, |_| Ok(Vec::new()))
+            .now_or_never()
+            .expect("no wait for a group whose stored row is gone")
+            .expect("a group whose stored row is gone is not waited for");
+
+        let mut waiting = Box::pin(reader.holding(&open, group_ids, Ok));
+        assert!(
+            futures::poll!(&mut waiting).is_pending(),
+            "a stored group not yet in A is waited for"
+        );
+        publisher.publish_for_test(|_| {});
+        assert!(futures::poll!(&mut waiting).is_pending());
+        publisher.publish_for_test(quarantined);
+        tokio::time::timeout(std::time::Duration::from_secs(5), waiting)
+            .await
+            .expect("the version that holds it ends the wait")
+            .unwrap();
+        reader
+            .holding(&open, group_ids, unexpected)
+            .now_or_never()
+            .expect("no wait for a held group")
+            .expect("a quarantined group is held");
+
+        let closed = AtomicBool::new(true);
+        assert!(matches!(
+            reader
+                .holding(&closed, group_ids, unexpected)
+                .now_or_never()
+                .expect("no wait once storage closes"),
+            Err(AppError::Storage(StorageError::Closed(_)))
+        ));
     }
 }

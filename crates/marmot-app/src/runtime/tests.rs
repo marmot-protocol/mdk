@@ -3438,9 +3438,13 @@ mod co_member_eligibility {
         )
     }
 
+    fn contributes(group: &AppGroupRecord) -> bool {
+        contributes_co_members(group, group.self_membership)
+    }
+
     #[test]
     fn an_active_membership_contributes() {
-        assert!(group_contributes_co_members(&group()));
+        assert!(contributes(&group()));
     }
 
     #[test]
@@ -3448,14 +3452,14 @@ mod co_member_eligibility {
         // Archival is a presentation choice, not a change in who you know.
         let mut archived = group();
         archived.archived = true;
-        assert!(group_contributes_co_members(&archived));
+        assert!(contributes(&archived));
     }
 
     #[test]
     fn an_unaccepted_invite_contributes_nobody() {
         let mut pending = group();
         pending.pending_confirmation = true;
-        assert!(!group_contributes_co_members(&pending));
+        assert!(!contributes(&pending));
     }
 
     #[test]
@@ -3463,7 +3467,7 @@ mod co_member_eligibility {
         for membership in [SelfMembership::Left, SelfMembership::Removed] {
             let mut departed = group();
             departed.self_membership = membership;
-            assert!(!group_contributes_co_members(&departed));
+            assert!(!contributes(&departed));
         }
     }
 
@@ -3471,7 +3475,7 @@ mod co_member_eligibility {
     fn a_frozen_group_contributes_nobody() {
         let mut frozen = group();
         frozen.unrecoverable = true;
-        assert!(!group_contributes_co_members(&frozen));
+        assert!(!contributes(&frozen));
     }
 }
 

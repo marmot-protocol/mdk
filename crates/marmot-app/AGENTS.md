@@ -1185,6 +1185,16 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   there (`acknowledge_from_published`), else defers it in order. A delete still waits for the hydration phase to end:
   its route changes need the account active in the transport, which startup sync makes it. A group that quarantined or
   is gone by then answers `UnknownGroup` from that version.
+- A read that combines groups answers from one version of A, never one joined with live rows. `group_co_members`
+  takes its groups, records and members from one version (`ReadState::co_members`), so a group not yet published is
+  not in its radius yet. The direct-conversation lookup's candidates are stored peer-index rows, so before it reads
+  their members from A it waits on the caller's task, within a diagnosed read's wait, for a version that holds every
+  candidate whose stored row remains or lists it quarantined (`AccountManager::wait_for_published_groups`). Every
+  stored group is in the first version published after its row commits: the account state loads every
+  `account_groups` row, rows are inserted only by saving that state, forget and delete drop the row with the group,
+  and `MarmotRootRuntimeLease` keeps any second writer out. The oracle checks at each publish that every stored row
+  is held. A candidate forgotten or deleted since it was read is not waited for, and a wait that runs out fails with
+  `AccountWorkerResponseTimedOut`, never a miss.
 - A read answered from A waits for no worker unit, so it fences nothing. Tests here and in the host crates fence the
   worker through `src/worker_fences.rs` (startup finished, startup sync took the queued commands, a worker round
   trip), never a read they pick; wn-cli's socket tests mirror the startup fence in `wait_for_daemon_worker_startup`.

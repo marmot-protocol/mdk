@@ -2636,6 +2636,46 @@ impl AppClient {
         self.members_with_profiles(group_id, &profiles)
     }
 
+    /// The groups `GroupCoMembers` counts, read live from what A mirrors:
+    /// the account state's records, each with its stored self membership
+    /// overlaid as the roster read overlays it, in id order (mdk#3273 PR 4).
+    pub(crate) fn co_member_groups(&self) -> Result<Vec<GroupId>, AppError> {
+        let mut groups = Vec::new();
+        for record in &self.state.groups {
+            let self_membership = self
+                .app
+                .stored_group_self_membership(&self.state.label, &record.group_id_hex)?
+                .unwrap_or(record.self_membership);
+            if crate::runtime::contributes_co_members(record, self_membership) {
+                groups.push(GroupId::new(hex::decode(&record.group_id_hex)?));
+            }
+        }
+        groups.sort_by(|a, b| a.as_slice().cmp(b.as_slice()));
+        Ok(groups)
+    }
+
+    /// `GroupCoMembers` read live: every other account in `groups`, each
+    /// read as the member read reads it. The worker hydrates the groups
+    /// first; the oracle compares this with A's answer.
+    pub(crate) fn co_members(&self, groups: &[GroupId]) -> Result<Vec<String>, AppError> {
+        let local_account_id_hex = self
+            .app
+            .account_home()
+            .account(&self.state.label)?
+            .account_id_hex;
+        let mut co_members = std::collections::BTreeSet::new();
+        for group_id in groups {
+            self.ensure_group(group_id)?;
+            for (member_id, _) in crate::groups::member_accounts(&self.runtime.members(group_id)?) {
+                let member_id_hex = hex::encode(member_id.as_slice());
+                if member_id_hex != local_account_id_hex {
+                    co_members.insert(member_id_hex);
+                }
+            }
+        }
+        Ok(co_members.into_iter().collect())
+    }
+
     pub(crate) fn member_ids_page(
         &self,
         group_ids: &[GroupId],

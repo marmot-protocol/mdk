@@ -410,6 +410,11 @@ pub(crate) enum AccountWorkerCommand {
         group_id: GroupId,
         respond: ReadReply<Result<Vec<AppGroupMemberRecord>, AppError>>,
     },
+    /// `group_co_members` read live, for a read A can't answer exactly
+    /// (before the first publish, or a failure with no exact copy).
+    GroupCoMembers {
+        respond: ReadReply<Result<Vec<String>, AppError>>,
+    },
     MemberIdsPage {
         group_ids: Vec<GroupId>,
         respond: ReadReply<Result<Vec<crate::AppGroupMemberIds>, AppError>>,
@@ -3696,6 +3701,10 @@ async fn handle_startup_hydration_command(
             let _ = client.runtime.ensure_group_hydrated(&group_id);
             let _ = reply(respond, client.members(&group_id), client);
         }
+        AccountWorkerCommand::GroupCoMembers { mut respond } => {
+            respond.dispatched();
+            let _ = reply(respond, co_members_after_hydration(client), client);
+        }
         AccountWorkerCommand::MemberIdsPage {
             group_ids,
             mut respond,
@@ -5268,6 +5277,11 @@ fn account_worker_command_future<'a>(
             // read instead of surfacing GroupHydrationPending forever.
             let _ = client.runtime.ensure_group_hydrated(&group_id);
             let result = client.members(&group_id);
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result, client);
+            true
+        }),
+        AccountWorkerCommand::GroupCoMembers { respond } => Box::pin(async move {
+            let result = co_members_after_hydration(client);
             let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result, client);
             true
         }),
@@ -7138,6 +7152,17 @@ pub(super) fn group_roster_after_hydration(
 ) -> Result<crate::groups::AppGroupRosterSession, AppError> {
     client.runtime.ensure_group_hydrated(group_id)?;
     client.group_roster_session(group_id)
+}
+
+/// `GroupCoMembers` on the worker, as `group_co_members` read it before it
+/// answered from A: each contributing group promotes on demand first, as its
+/// member read did, and the read answers whatever promotion left.
+fn co_members_after_hydration(client: &mut AppClient) -> Result<Vec<String>, AppError> {
+    let groups = client.co_member_groups()?;
+    for group_id in &groups {
+        let _ = client.runtime.ensure_group_hydrated(group_id);
+    }
+    client.co_members(&groups)
 }
 
 fn member_ids_page_after_hydration(

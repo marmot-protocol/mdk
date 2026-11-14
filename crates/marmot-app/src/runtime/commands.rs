@@ -5,7 +5,6 @@
 use crate::RuntimePerformanceOperation as RuntimeOp;
 use zeroize::Zeroizing;
 
-use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -16,9 +15,8 @@ use tokio::sync::{mpsc, oneshot};
 use super::account_worker::GroupCreationRequest;
 use super::{
     AccountManager, AccountWorkerCommand, Emit, ReadClass, ReadReply, Unpublished, WorkerLane,
-    account_worker_response, group_contributes_co_members, local_account_worker_response,
-    long_account_worker_catch_up_response, long_account_worker_response,
-    publish_app_runtime_group_state_updated,
+    account_worker_response, local_account_worker_response, long_account_worker_catch_up_response,
+    long_account_worker_response, publish_app_runtime_group_state_updated,
 };
 use crate::client::read_state::{ReadAnswer, ReadState, reissue};
 use crate::messages::AppMessageIntent;
@@ -207,6 +205,47 @@ impl AccountManager {
             }
             _ => Ok(Some(state)),
         }
+    }
+
+    /// Wait on the caller's task, within a diagnosed read's wait, for a
+    /// version of A that holds every group in `group_ids` whose stored row
+    /// remains, or lists it quarantined (mdk#3273 PR 4). A read whose groups
+    /// come from stored rows waits here before it reads them from A: every
+    /// stored group is in the first version published after its row
+    /// commits, so a group whose row committed before the read began
+    /// answers from A rather than as unknown. A group forgotten or deleted
+    /// since is not waited for; the read then answers it as unknown, as the
+    /// worker would. Resolves at once before the worker's first publish,
+    /// when the reads go to the worker. A wait that runs out fails with
+    /// [`AppError::AccountWorkerResponseTimedOut`].
+    pub(crate) async fn wait_for_published_groups(
+        &self,
+        account_ref: &str,
+        group_ids: &[GroupId],
+    ) -> Result<(), AppError> {
+        let account = self.resolve(account_ref)?;
+        let lane = self.worker_lane(account_ref).await?;
+        let still_stored = |waiting: Vec<GroupId>| {
+            let storage = self.app.account_storage(&account.label)?;
+            let mut stored = Vec::with_capacity(waiting.len());
+            for group_id in waiting {
+                if !storage
+                    .app_storage()
+                    .account_groups(Some(&hex::encode(group_id.as_slice())))?
+                    .is_empty()
+                {
+                    stored.push(group_id);
+                }
+            }
+            Ok(stored)
+        };
+        tokio::time::timeout(
+            crate::APP_RUNTIME_WORKER_RESPONSE_WAIT,
+            lane.read_state
+                .holding(&self.app.storage_closed, group_ids, still_stored),
+        )
+        .await
+        .map_err(|_| AppError::AccountWorkerResponseTimedOut)?
     }
 
     /// Send `command` to the worker and wait for its answer, within the
@@ -788,19 +827,36 @@ impl AccountManager {
     /// worker-backed reads rather than in the directory.
     pub async fn group_co_members(&self, account_ref: &str) -> Result<Vec<String>, AppError> {
         let account = self.resolve(account_ref)?;
-        let mut co_members = BTreeSet::new();
-        for group in self.app.groups(&account.label)? {
-            if !group_contributes_co_members(&group) {
-                continue;
-            }
-            let group_id = GroupId::new(hex::decode(&group.group_id_hex)?);
-            for member in self.group_members(account_ref, &group_id).await? {
-                if member.member_id_hex != account.account_id_hex {
-                    co_members.insert(member.member_id_hex);
+        let lane = self.worker_lane(account_ref).await?;
+        // The groups the hydration request names come from the current
+        // version; the answer reads its groups, records and members from the
+        // one version the read settles on (mdk#3273 PR 4).
+        let groups = match lane.read_state.version(&self.app.storage_closed) {
+            Ok(Some(state)) => state.co_member_groups(),
+            Ok(None) | Err(_) => Vec::new(),
+        };
+        self.read_group_from_state(
+            &lane,
+            ReadClass::R3,
+            StateRead::DiagnosedLocal,
+            Admission::Queue,
+            &groups,
+            HydrationFailure::Ignored,
+            |state| async move {
+                // A group that came to await hydration after `groups` was
+                // taken goes to the worker, which hydrates it first, as
+                // each member read did.
+                if !state
+                    .awaiting_hydration(&state.co_member_groups())
+                    .is_empty()
+                {
+                    return None;
                 }
-            }
-        }
-        Ok(co_members.into_iter().collect())
+                reissue(state.co_members(&account.account_id_hex))
+            },
+            |respond| AccountWorkerCommand::GroupCoMembers { respond },
+        )
+        .await
     }
 
     pub async fn group_members(

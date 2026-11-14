@@ -326,6 +326,7 @@ host_reads!(
     ChatHistoryImports,
     HistoryImportProvenance,
     Members,
+    GroupCoMembers,
     MemberIdsPage,
     GroupRoster,
     HydrateGroups,
