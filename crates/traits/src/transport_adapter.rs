@@ -1666,9 +1666,11 @@ pub trait TransportAdapter: Send + Sync {
     /// ([`TransportEndpointFailure::proves_nothing_sent`]) and names its
     /// endpoint as `target` does.
     ///
-    /// A publication owner asks this before marking any target `Attempting`,
-    /// so a refused target never carries an attempt that might have left. An
-    /// endpoint left out is sent to. The default refuses nothing.
+    /// A publication owner asks this for a target before marking it
+    /// `Attempting`, so a refused target never carries an attempt that might
+    /// have left. It asks for each target on its own, since a check can wait
+    /// on a connection, and one target's check must not hold back another's
+    /// send. An endpoint left out is sent to. The default refuses nothing.
     async fn commit_size_refusals(
         &self,
         _commit: &TransportMessage,

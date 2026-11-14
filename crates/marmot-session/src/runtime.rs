@@ -5802,11 +5802,13 @@ where
             .collect::<Vec<_>>();
         let attempted_any = !due.is_empty();
         if !due.is_empty() {
-            // A commit too large for a relay is refused there before any
+            // A commit too large for a relay is refused there before that
             // target is marked, so the refusal leaves no attempt that might
             // have left. A target already left `Attempting` by an interrupted
             // attempt is not exempt: the refusal ends it possibly exposed
-            // (mdk#2332).
+            // (mdk#2332). Each target is checked on its own and sent once its
+            // check passes, so a slow check, such as a connection probe to a
+            // relay of unknown limit, holds back no other target's send.
             let commit = matches!(
                 fanout.pending_kind(),
                 Some(FanoutPendingKind::GroupEvolution | FanoutPendingKind::Disband)
@@ -5814,40 +5816,13 @@ where
                 fanout.request().message.envelope,
                 TransportEnvelope::GroupMessage { .. }
             );
-            let mut refused_before_send = Vec::new();
             let mut pass_failed = Vec::new();
-            if commit {
-                let checked = publish_target_with_endpoints(
-                    &fanout.request().target,
-                    due.iter().map(|&index| endpoints[index].clone()).collect(),
-                );
-                for failure in self
-                    .adapter
-                    .commit_size_refusals(&fanout.request().message, &checked)
-                    .await
-                {
-                    if let Some(&index) = due.iter().find(|&&index| {
-                        endpoints[index] == failure.endpoint
-                            && !refused_before_send.contains(&index)
-                    }) {
-                        pass_failed.push(PublishRelayFailure {
-                            relay_url: failure.endpoint.0.clone(),
-                            reason: failure.reason.clone(),
-                        });
-                        fanout.record_refusal_before_attempt(index, failure, now_ms)?;
-                        refused_before_send.push(index);
-                    }
+            if !commit {
+                for &index in &due {
+                    fanout.mark_attempt_started_at(index, now_ms)?;
                 }
+                self.session.put_outbound_fanout(&fanout)?;
             }
-            let due = due
-                .iter()
-                .copied()
-                .filter(|index| !refused_before_send.contains(index))
-                .collect::<Vec<_>>();
-            for &index in &due {
-                fanout.mark_attempt_started_at(index, now_ms)?;
-            }
-            self.session.put_outbound_fanout(&fanout)?;
             // Every pass is audited, including secondary retries after the
             // first acknowledgement confirmed the pending MLS state (mdk#2255).
             self.record_audit_event(
@@ -5858,9 +5833,8 @@ where
                     artifact_kind: None,
                     target_kind: "frozen_group_fanout".into(),
                     relay_url: None,
-                    relay_urls: refused_before_send
+                    relay_urls: due
                         .iter()
-                        .chain(&due)
                         .map(|&index| endpoints[index].0.clone())
                         .collect(),
                     required_acks: fanout.request().required_acks as u64,
@@ -5880,33 +5854,46 @@ where
             // one-awaited-ack-at-a-time serialization.
             let adapter = &self.adapter;
             let account_id = fanout.request().account_id.clone();
+            let message = fanout.request().message.clone();
+            let target = fanout.request().target.clone();
             let mut accepted = fanout.outcome().accepted_targets;
             let ack_goal = fanout.request().required_acks.max(1);
             // An already-met quorum alone must not cancel every retry. Only
             // explicit foreground pressure may interrupt this secondary tail.
             let finish_retries = accepted >= ack_goal;
             let mut pass_accepted = Vec::new();
-            let mut attempts = due
-                .iter()
-                .map(|&index| {
+            // A commit's target is first checked for size, then, once marked,
+            // sent; any other target is sent at once, marked above.
+            let step = |index: usize, checked: bool| {
+                let message = message.clone();
+                let target = publish_target_with_endpoints(&target, vec![endpoints[index].clone()]);
+                let account_id = account_id.clone();
+                async move {
+                    if !checked {
+                        let refusal = adapter
+                            .commit_size_refusals(&message, &target)
+                            .await
+                            .into_iter()
+                            .find(|failure| target.endpoints().contains(&failure.endpoint));
+                        return FanoutStep::Checked { index, refusal };
+                    }
                     let attempt = TransportPublishRequest {
-                        account_id: account_id.clone(),
-                        message: fanout.request().message.clone(),
-                        target: publish_target_with_endpoints(
-                            &fanout.request().target,
-                            vec![endpoints[index].clone()],
-                        ),
+                        account_id,
+                        message,
+                        target,
                         required_acks: 1,
                     };
-                    async move {
-                        let result = if commit {
-                            adapter.publish_commit(attempt).await
-                        } else {
-                            adapter.publish(attempt).await
-                        };
-                        (index, result)
-                    }
-                })
+                    let result = if commit {
+                        adapter.publish_commit(attempt).await
+                    } else {
+                        adapter.publish(attempt).await
+                    };
+                    FanoutStep::Sent { index, result }
+                }
+            };
+            let mut attempts = due
+                .iter()
+                .map(|&index| step(index, !commit))
                 .collect::<FuturesUnordered<_>>();
             loop {
                 // Drain immediately ready receipts after reaching quorum, but
@@ -5928,8 +5915,35 @@ where
                 } else {
                     attempts.next().await
                 };
-                let Some((index, result)) = next else {
-                    break;
+                let (index, result) = match next {
+                    None => break,
+                    Some(FanoutStep::Checked {
+                        index,
+                        refusal: Some(failure),
+                    }) => {
+                        pass_failed.push(PublishRelayFailure {
+                            relay_url: failure.endpoint.0.clone(),
+                            reason: failure.reason.clone(),
+                        });
+                        fanout.record_refusal_before_attempt(index, failure, now_ms)?;
+                        self.session.put_outbound_fanout(&fanout)?;
+                        continue;
+                    }
+                    Some(FanoutStep::Checked {
+                        index,
+                        refusal: None,
+                    }) => {
+                        // Past quorum, a send started now would be cancelled
+                        // before it could finish; the target stays unmarked
+                        // for the next pass.
+                        if accepted < ack_goal || finish_retries {
+                            fanout.mark_attempt_started_at(index, now_ms)?;
+                            self.session.put_outbound_fanout(&fanout)?;
+                            attempts.push(step(index, true));
+                        }
+                        continue;
+                    }
+                    Some(FanoutStep::Sent { index, result }) => (index, result),
                 };
                 let endpoint = endpoints[index].clone();
                 let failure = match result {
@@ -6888,6 +6902,20 @@ fn publish_target_with_endpoints(
             endpoints,
         },
     }
+}
+
+/// One step of a frozen fanout pass for one target (mdk#2332): a commit's
+/// size check, then the send.
+enum FanoutStep {
+    /// The commit's size check, with the target's refusal if it has one.
+    Checked {
+        index: usize,
+        refusal: Option<TransportEndpointFailure>,
+    },
+    Sent {
+        index: usize,
+        result: Result<TransportPublishReport, TransportAdapterError>,
+    },
 }
 
 fn ambiguous_endpoint_failure(endpoint: TransportEndpoint) -> TransportEndpointFailure {

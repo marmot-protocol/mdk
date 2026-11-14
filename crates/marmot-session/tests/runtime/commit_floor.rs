@@ -2,8 +2,9 @@
 //
 // A commit over a relay's known limit, or over the 64 KiB floor where the
 // relay's limit is unknown, is refused there before anything is sent. The
-// session asks before it marks any target `Attempting`, so a refusal leaves no
-// attempt behind, and a commit every relay refused rolls back typed. A refusal
+// session asks for each target before it marks that target `Attempting`, so a
+// refusal leaves no attempt behind, and one relay's check holds back no other
+// relay's send. A commit every relay refused rolls back typed. A refusal
 // recorded on a target that may already hold the commit never lets it roll
 // back (mdk#1577).
 
@@ -205,6 +206,98 @@ async fn a_commit_one_relay_refuses_for_size_confirms_on_the_other() {
     assert_eq!(adapter.publishes().len(), 3, "one publish per relay");
     assert_eq!(adapter.commit_size_checks().len(), checks);
     assert_eq!(adapter.commit_publishes().len(), 1);
+}
+
+/// Each relay's size check runs on its own: a check that stalls, as a
+/// connection probe to a relay of unknown limit can, holds back no other
+/// relay's send. The commit confirms on the relay whose check finished, and
+/// the stalled relay stays unmarked until a later pass checks it again and
+/// sends to it.
+#[tokio::test]
+async fn a_stalled_size_check_holds_back_no_other_relay() {
+    let stalled = TransportEndpoint("wss://floor-stalled-check.example".into());
+    let ready = TransportEndpoint("wss://floor-ready-check.example".into());
+    let (fixture, alice) = FloorFixture::new("floor-stalled-check", &[&stalled, &ready]).await;
+    let adapter = RecordingAdapter::default();
+    let gate = adapter.gate_commit_size_checks_at(stalled.clone());
+    let mut runtime = fixture.runtime(alice, &adapter);
+
+    let effects = tokio::time::timeout(Duration::from_secs(5), runtime.send(fixture.rename()))
+        .await
+        .expect("the ready relay's send waits for no other relay's check")
+        .unwrap();
+
+    assert!(matches!(
+        effects.pending.as_slice(),
+        [PendingResolution::Confirmed { .. }]
+    ));
+    let commit_targets = || {
+        adapter
+            .commit_publishes()
+            .iter()
+            .map(|request| request.target.endpoints().to_vec())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(commit_targets(), vec![vec![ready.clone()]]);
+    let stored = runtime.session().outbound_fanouts().unwrap();
+    assert_eq!(stored.len(), 1);
+    let index = stored[0]
+        .request()
+        .target
+        .endpoints()
+        .iter()
+        .position(|target| *target == stalled)
+        .unwrap();
+    assert_eq!(
+        stored[0].target_status(index),
+        Some(FanoutTargetStatus::NotAttempted)
+    );
+    assert_eq!(stored[0].target_attempt_count(index), 0);
+
+    gate.add_permits(1);
+    runtime.resume_outbound_fanouts().await.unwrap();
+    assert_eq!(commit_targets(), vec![vec![ready], vec![stalled]]);
+
+    // A check that finishes only once the commit met its acknowledgements
+    // starts no send: the pass would cancel it unfinished, leaving the relay
+    // possibly exposed for nothing. The relay waits, unmarked, for the next
+    // pass.
+    let late = TransportEndpoint("wss://floor-late-check.example".into());
+    let ready = TransportEndpoint("wss://floor-before-late.example".into());
+    let (fixture, alice) = FloorFixture::new("floor-late-check", &[&late, &ready]).await;
+    let adapter = RecordingAdapter::default();
+    let check = adapter.gate_commit_size_checks_at(late.clone());
+    *adapter.inner.publish_releases.lock().unwrap() = Some((ready.clone(), check));
+    *adapter.inner.endpoint_gate.lock().unwrap() =
+        Some((late.clone(), Arc::new(tokio::sync::Semaphore::new(0))));
+    let mut runtime = fixture.runtime(alice, &adapter);
+
+    let effects = runtime.send(fixture.rename()).await.unwrap();
+
+    assert!(matches!(
+        effects.pending.as_slice(),
+        [PendingResolution::Confirmed { .. }]
+    ));
+    assert_eq!(adapter.commit_size_checks().len(), 2);
+    assert!(
+        adapter
+            .commit_publishes()
+            .iter()
+            .all(|request| request.target.endpoints() == [ready.clone()]),
+        "no send to the relay checked late"
+    );
+    let stored = runtime.session().outbound_fanouts().unwrap();
+    let index = stored[0]
+        .request()
+        .target
+        .endpoints()
+        .iter()
+        .position(|target| *target == late)
+        .unwrap();
+    assert_eq!(
+        stored[0].target_status(index),
+        Some(FanoutTargetStatus::NotAttempted)
+    );
 }
 
 /// A refusal before marking leaves no attempt on the refused target: when the

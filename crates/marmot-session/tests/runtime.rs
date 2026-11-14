@@ -413,12 +413,17 @@ struct RecordingAdapterInner {
     reported_message_ids: Mutex<VecDeque<MessageId>>,
     welcome_gate: Mutex<Option<Arc<WelcomePublishGate>>>,
     endpoint_gate: Mutex<Option<(TransportEndpoint, Arc<tokio::sync::Semaphore>)>>,
+    /// Each publish to the endpoint adds a permit to the semaphore.
+    publish_releases: Mutex<Option<(TransportEndpoint, Arc<tokio::sync::Semaphore>)>>,
     /// Endpoints that refuse every commit for its size, unsent: over a known
     /// limit, or over the commit size floor (mdk#2332).
     commit_too_large: Mutex<Vec<TransportEndpoint>>,
     /// Each commit size check's target endpoints, in order.
     commit_size_checks: Mutex<Vec<Vec<TransportEndpoint>>>,
     commit_size_check_gate: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
+    /// Holds each commit size check that covers the endpoint.
+    commit_size_check_endpoint_gate:
+        Mutex<Option<(TransportEndpoint, Arc<tokio::sync::Semaphore>)>>,
     /// Every request the commit entry point received, sent or refused.
     commit_publishes: Mutex<Vec<TransportPublishRequest>>,
     /// Exact failures each endpoint answers its next publishes with, in order.
@@ -538,6 +543,19 @@ impl RecordingAdapter {
         gate
     }
 
+    /// Hold every commit size check that covers `endpoint` until the returned
+    /// gate gets a permit, as a connection probe to a relay of unknown limit
+    /// can stall.
+    fn gate_commit_size_checks_at(
+        &self,
+        endpoint: TransportEndpoint,
+    ) -> Arc<tokio::sync::Semaphore> {
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        *self.inner.commit_size_check_endpoint_gate.lock().unwrap() =
+            Some((endpoint, gate.clone()));
+        gate
+    }
+
     fn commit_size_checks(&self) -> Vec<Vec<TransportEndpoint>> {
         self.inner.commit_size_checks.lock().unwrap().clone()
     }
@@ -596,6 +614,12 @@ impl TransportAdapter for RecordingAdapter {
         request: TransportPublishRequest,
     ) -> Result<TransportPublishReport, TransportAdapterError> {
         self.inner.publishes.lock().unwrap().push(request.clone());
+        let release = self.inner.publish_releases.lock().unwrap().clone();
+        if let Some((endpoint, gate)) = release
+            && request.target.endpoints().contains(&endpoint)
+        {
+            gate.add_permits(1);
+        }
         let endpoint_gate = self.inner.endpoint_gate.lock().unwrap().clone();
         if let Some((endpoint, gate)) = endpoint_gate
             && request.target.endpoints().contains(&endpoint)
@@ -787,6 +811,17 @@ impl TransportAdapter for RecordingAdapter {
             .push(target.endpoints().to_vec());
         let gate = self.inner.commit_size_check_gate.lock().unwrap().clone();
         if let Some(gate) = gate {
+            gate.acquire().await.unwrap().forget();
+        }
+        let endpoint_gate = self
+            .inner
+            .commit_size_check_endpoint_gate
+            .lock()
+            .unwrap()
+            .clone();
+        if let Some((endpoint, gate)) = endpoint_gate
+            && target.endpoints().contains(&endpoint)
+        {
             gate.acquire().await.unwrap().forget();
         }
         let too_large = self.inner.commit_too_large.lock().unwrap().clone();
