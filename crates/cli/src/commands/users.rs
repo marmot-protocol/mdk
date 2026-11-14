@@ -259,8 +259,7 @@ mod tests {
         let app = MarmotApp::with_relay_and_config(alice_dir.path(), url.clone(), config);
         let runtime = app.runtime();
         runtime.start().await.unwrap();
-        runtime
-            .key_package_maintenance_status(&alice.account_id_hex)
+        marmot_app::worker_fences::worker_startup_finished(&runtime, &alice.account_id_hex)
             .await
             .unwrap();
         runtime

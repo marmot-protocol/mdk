@@ -1173,6 +1173,11 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   class. A storage read counts its failure as the worker's
   `respond_diagnosed` would. Moving a read to A moves its row in `read_queue_tests.rs` and in
   `runtime-latency-telemetry.md`'s "Host read classes"; don't move a multi-device read (mdk#2628) without Jeff.
+- A read answered from A waits for no worker unit, so it fences nothing. Tests here and in the host crates fence the
+  worker through `src/worker_fences.rs` (startup finished, startup sync took the queued commands, a worker round
+  trip), never a read they pick; wn-cli's socket tests mirror the startup fence in `wait_for_daemon_worker_startup`.
+  Moving a read to A, or retiring startup's snapshot reads, updates those helpers; `each_fence_waits_for_what_it_names`
+  fails until it does.
 
 ## Code map (modules not covered above)
 
@@ -1206,7 +1211,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   (`MarmotApp`'s usage-diagnostics consent persistence and the headless-host analytics configuration; it reaches the
   product collector only through `marmot_observability::wiring`, consent lock before state lock), `projection.rs` (legacy account
   projection import), `messages/` (`AppMessageIntent` and custom-event intents), `local_open_test_gate.rs` and
-  `test_support.rs` (test-only gates/helpers).
+  `test_support.rs` (test-only gates/helpers), `worker_fences.rs` (named account-worker fences for tests, under
+  `test-support`).
 - `src/runtime/`: `worker_startup.rs` (per-account startup admission and retry backoff),
   `account_worker/recovery_credits.rs` (process-wide recovery credit pool), `account_worker/read_queue.rs` (host-read
   queue-wait telemetry: `ReadReply`, the read classes, the worker-unit gauge and the lane's A reader, mdk#3273;
@@ -1247,8 +1253,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
 - `product-analytics-export`: product analytics export path; forwards to `marmot-observability/product-analytics-export`.
 - `media-benchmarks`: internal surface for the media transport benchmarks.
 - `test-support`: makes `AppClient` and `MarmotApp::client` public for tests that drive a directly owned client
-  (mdk#2782), exposes `error_kind_table` to the host crates' tests and turns on `marmot-observability/test-support`
-  (the diagnostics test fixtures and hooks). Enable it only as a dev-dependency. This crate's own dev-dependency on
+  (mdk#2782), exposes `error_kind_table` and `worker_fences` to the host crates' tests and turns on
+  `marmot-observability/test-support` (the diagnostics test fixtures and hooks). Enable it only as a dev-dependency. This crate's own dev-dependency on
   itself turns it on, so `-p marmot-app` test runs build every integration test. Hosts reach accounts through
   `MarmotAppRuntime`; `wn sync` runs its one pass through `MarmotApp::sync_account`, whose outer error is the open and
   whose inner `SyncFailure` is the pass. `AppClient` methods only tests call carry

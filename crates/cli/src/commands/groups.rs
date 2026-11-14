@@ -1976,9 +1976,9 @@ mod tests {
             .expect("creator-only group created");
         let bob = bob_app.runtime();
         bob.start().await.unwrap();
-        // This read, queued on the worker, drains startup before the acceptance
-        // request. A read answered from the published read state would not.
-        bob.pending_welcome_deliveries("bob").await.unwrap();
+        marmot_app::worker_fences::worker_startup_finished(&bob, "bob")
+            .await
+            .unwrap();
         assert!(
             bob_app
                 .group("bob", &hex::encode(group.as_slice()))
@@ -1998,7 +1998,9 @@ mod tests {
             Poll::Ready(())
         })
         .await;
-        bob.pending_welcome_deliveries("bob").await.unwrap();
+        marmot_app::worker_fences::worker_round_trip(&bob, "bob")
+            .await
+            .unwrap();
         poll_fn(|cx| {
             assert!(
                 acceptance.as_mut().poll(cx).is_pending(),

@@ -1651,10 +1651,9 @@ mod tests {
             .unwrap()
             .account
             .account_id_hex;
-        // A worker command publishes the read state before it replies. This
-        // read still queues on the worker; one answered from the published
-        // read state would not (mdk#3273).
-        kit.pending_welcome_deliveries(account).await.unwrap();
+        marmot_app::worker_fences::worker_round_trip(&kit.runtime, &account)
+            .await
+            .unwrap();
         assert_eq!(marmot_app::read_state_oracle_checks(), 0);
     }
 

@@ -665,9 +665,9 @@ async fn late_activation_liveness() {
     })
     .await
     .expect("the subscription retry activates transport after preparation recovers");
-    // A read queued on the worker, deferred until its startup ends. A read
-    // answered from the published read state would not wait (mdk#3273).
-    runtime.pending_welcome_deliveries("alice").await.unwrap();
+    crate::worker_fences::worker_startup_finished(&runtime, "alice")
+        .await
+        .unwrap();
     let event = EventBuilder::new(Kind::MlsGroupMessage, "late activation")
         .tag(Tag::custom("h", ["ab".repeat(32)]))
         .finalize(&Keys::generate())

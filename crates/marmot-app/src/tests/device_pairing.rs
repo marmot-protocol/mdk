@@ -2023,11 +2023,10 @@ async fn startup_never_publishes_an_expired_links_welcome() {
             .is_err(),
         "a maintenance pass waits for initial sync"
     );
-    // Startup serves this membership page from its snapshot, behind the
-    // queued pass, so that pass is deferred before initial sync is released.
-    // A read answered from the published read state would not queue behind
-    // it (mdk#3273).
-    runtime.group_member_ids_page("alice", &[]).await.unwrap();
+    // The pass is deferred before initial sync is released.
+    crate::worker_fences::startup_sync_took_queued_commands(&runtime, "alice")
+        .await
+        .unwrap();
     startup.wait().await;
     maintenance.await.unwrap();
     runtime.drain_in_flight_work().await.unwrap();

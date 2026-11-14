@@ -153,6 +153,11 @@ pub use startup_diagnostics::{
 mod stickers;
 #[cfg(feature = "test-policy-overrides")]
 mod test_support;
+/// Named account-worker fences for tests: the host crates' tests and this
+/// crate's own (mdk#3273).
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod worker_fences;
 
 pub use cgka_traits::EventSizeClass;
 pub use cgka_traits::engine::{
