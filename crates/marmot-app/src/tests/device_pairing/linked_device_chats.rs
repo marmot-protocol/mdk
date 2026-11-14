@@ -3023,6 +3023,198 @@ async fn a_new_chat_founds_with_its_linked_sibling_even_with_old_chats_off() {
     );
 }
 
+/// The phone on a runtime, linked to the laptop and holding its private
+/// KeyPackages, with a chat it shares with Bob made before the hand-off and
+/// another of Bob's KeyPackages published. The phone's next create commits
+/// its chat-list row, then sends its founding sibling Welcome before the
+/// worker publishes the group in A (mdk#3273 PR 4).
+struct SiblingWelcomeWindow {
+    relay: Arc<ScriptedPushRelayClient>,
+    runtime: MarmotAppRuntime,
+    app: MarmotApp,
+    bob_id: String,
+    _keep: (tempfile::TempDir, Device, tempfile::TempDir, AppClient),
+}
+
+async fn sibling_welcome_window() -> SiblingWelcomeWindow {
+    let (relay, [mut phone, mut laptop]) = alice_devices::<2>().await;
+    link_with(
+        &relay,
+        &mut phone,
+        &mut laptop,
+        DeviceLinkChoices {
+            add_to_all_chats: false,
+            ..DeviceLinkChoices::new("Laptop")
+        },
+    )
+    .await;
+    let bob_dir = tempfile::tempdir().unwrap();
+    let bob_id = AccountHome::open(bob_dir.path())
+        .create_account("bob")
+        .unwrap()
+        .account_id_hex;
+    let bob_app = crate::tests::canonical_membership::app_at(&bob_dir, relay.clone());
+    let mut bob = bob_app.client("bob").await.unwrap();
+    remember_test_member_inbox(&phone.app, &bob_id, "wss://relay.example");
+    published_key_package(&mut bob, &relay).await;
+    phone
+        .client
+        .create_group("shared with bob", &[bob_id.as_str()])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
+    published_key_package(&mut bob, &relay).await;
+    hold_key_packages(&relay, &mut phone, &mut laptop).await;
+    let Device {
+        _dir, app, client, ..
+    } = phone;
+    drop(client);
+    let runtime = MarmotAppRuntime::new(app.clone());
+    runtime.reconcile_accounts().await.unwrap();
+    // The worker is up and A holds the shared chat.
+    assert_eq!(
+        runtime.group_co_members("alice").await.unwrap(),
+        vec![bob_id.clone()]
+    );
+    SiblingWelcomeWindow {
+        relay,
+        runtime,
+        app,
+        bob_id,
+        _keep: (_dir, laptop, bob_dir, bob),
+    }
+}
+
+impl SiblingWelcomeWindow {
+    /// Start `create` with the next publish held, and return once it holds
+    /// its founding sibling Welcome: the new group's chat-list row has
+    /// committed and the create has not returned. The account worker sends
+    /// every publish, so while one is held nothing else on the worker moves:
+    /// a publish held before the row commits is startup's, and is let go
+    /// with the next one held in its place. Once the row has committed, the
+    /// held publish is the create's, which sends nothing else before it
+    /// returns.
+    async fn open<T: Send + 'static>(
+        &self,
+        create: impl Future<Output = T> + Send + 'static,
+    ) -> (tokio::task::JoinHandle<T>, GroupId) {
+        let before: std::collections::HashSet<String> = self
+            .app
+            .groups("alice")
+            .unwrap()
+            .into_iter()
+            .map(|group| group.group_id_hex)
+            .collect();
+        self.relay.block_next_publish();
+        let creating = tokio::spawn(create);
+        let created = loop {
+            tokio::time::timeout(
+                Duration::from_secs(30),
+                self.relay.wait_for_blocked_publish(),
+            )
+            .await
+            .expect("the create sends its founding sibling Welcome");
+            if let Some(created) = self
+                .app
+                .groups("alice")
+                .unwrap()
+                .into_iter()
+                .find(|group| !before.contains(&group.group_id_hex))
+            {
+                break created;
+            }
+            self.relay.block_next_publish();
+            self.relay.release_publish();
+        };
+        assert!(
+            !creating.is_finished(),
+            "the create waits on its sibling Welcome"
+        );
+        (
+            creating,
+            GroupId::new(hex::decode(&created.group_id_hex).unwrap()),
+        )
+    }
+}
+
+/// Co-members answer from one version of A: a group whose chat-list row
+/// has committed while its create sends the founding sibling Welcome is not
+/// in A yet, and the read answers the accounts the published groups hold
+/// rather than failing on the unpublished one (mdk#3273 PR 4).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn co_members_answer_while_a_create_sends_its_sibling_welcome() {
+    let window = sibling_welcome_window().await;
+    let runtime = window.runtime.clone();
+    let (creating, _) = window
+        .open(async move {
+            runtime
+                .create_group("alice", "in the window", &[], None)
+                .await
+        })
+        .await;
+    let co_members = tokio::time::timeout(
+        Duration::from_secs(5),
+        window.runtime.group_co_members("alice"),
+    )
+    .await
+    .expect("co-members answer while the create holds the worker");
+    assert_eq!(co_members.unwrap(), vec![window.bob_id.clone()]);
+    window.relay.release_publish();
+    creating.await.unwrap().unwrap();
+    window.runtime.shutdown_and_close().await.unwrap();
+}
+
+/// The direct-conversation lookup waits for a version of A that holds every
+/// candidate: a direct conversation whose chat-list row has committed while
+/// its create sends the founding sibling Welcome neither fails the lookup
+/// as unknown nor is missed, and is found once the worker publishes it
+/// (mdk#3273 PR 4).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_direct_lookup_waits_for_a_created_direct_conversation() {
+    let window = sibling_welcome_window().await;
+    let runtime = window.runtime.clone();
+    let bob_id = window.bob_id.clone();
+    let (creating, created) = window
+        .open(async move { runtime.start_direct_conversation("alice", &bob_id).await })
+        .await;
+    let created_hex = hex::encode(created.as_slice());
+    assert!(
+        window
+            .app
+            .direct_conversation_candidates("alice", &window.bob_id)
+            .unwrap()
+            .iter()
+            .any(|row| row.group_id_hex == created_hex),
+        "the peer index holds the new direct conversation"
+    );
+    // The lookup reads only the stored candidates and A, so with the worker
+    // held it runs straight to its answer, or to the wait for A.
+    let mut looking = Box::pin(
+        window
+            .runtime
+            .existing_direct_conversation("alice", &window.bob_id),
+    );
+    for _ in 0..100 {
+        tokio::select! {
+            biased;
+            answer = &mut looking => {
+                panic!("the lookup answered before A held its candidate: {answer:?}")
+            }
+            () = tokio::task::yield_now() => {}
+        }
+    }
+    window.relay.release_publish();
+    assert_eq!(creating.await.unwrap().unwrap(), created);
+    let found = tokio::time::timeout(Duration::from_secs(30), looking)
+        .await
+        .expect("the lookup answers once the create publishes")
+        .unwrap()
+        .expect("the lookup finds the new direct conversation");
+    assert_eq!(found.group_id_hex, created_hex);
+    window.runtime.shutdown_and_close().await.unwrap();
+}
+
 /// Missing private stock never falls back to the sibling's public slot or
 /// blocks creation. Active and inactive linked entries qualify once stock
 /// exists; leaving and keyless entries do not consume it.

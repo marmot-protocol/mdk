@@ -53,7 +53,7 @@ pub use app::account_projection::{
     AccountStoredPushRegistration, AppEventReplayCursor, DeleteLocalGroupDataResult,
     SelfMembership, StoredAccountGroup, StoredAccountGroupComponent, StoredAccountState,
     StoredAppMessageQuery, StoredAppMessageRecord, StoredEpochBackfillIntent,
-    StoredEpochStallEvidence, StoredNostrRoute, clamp_to_max_future_skew,
+    StoredEpochStallEvidence, StoredGroupStanding, StoredNostrRoute, clamp_to_max_future_skew,
 };
 pub use app::attachment_acquisition::{
     ATTACHMENT_ACQUISITION_BATCH_LIMIT, ATTACHMENT_CHECKPOINT_BYTES, ATTACHMENT_REMOVAL_BATCH,

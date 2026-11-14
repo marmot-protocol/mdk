@@ -5,9 +5,11 @@
 //! the worker to reach a point call one of these instead of picking a read
 //! themselves. Each names its contract and picks, in this one place, a call
 //! that still provides it; a change that moves that call to the read state or
-//! retires startup's snapshot reads updates the helper here, and this
-//! module's test fails until it does. No host surface signals the end of
-//! startup, so the fences are calls the worker still queues.
+//! changes how startup answers it updates the helper here, and this module's
+//! test fails until it does. No host surface signals the end of startup, so
+//! the fences are calls the worker still queues.
+
+use cgka_traits::GroupId;
 
 use crate::{AppError, MarmotAppRuntime};
 
@@ -29,17 +31,23 @@ pub async fn worker_startup_finished(
 /// dependency), wait until the worker has taken every command queued before
 /// this call.
 ///
-/// Startup sync answers this read from its snapshot, in the worker's FIFO
-/// order, without waiting for startup to end: today an empty membership page.
-/// Use it only while startup sync is held; it says nothing about later units.
+/// Startup sync answers this call in the worker's FIFO order, without
+/// waiting for startup to end: today accepting an invite to a group no one
+/// has, which startup sync refuses as busy at once. Any other answer is an
+/// error. Use it only while startup sync is held; it says nothing about
+/// later units.
 pub async fn startup_sync_took_queued_commands(
     runtime: &MarmotAppRuntime,
     account_ref: &str,
 ) -> Result<(), AppError> {
-    runtime
-        .group_member_ids_page(account_ref, &[])
-        .await
-        .map(drop)
+    let unknown = GroupId::new(vec![0xfe; 16]);
+    match runtime.accept_group_invite(account_ref, &unknown).await {
+        Err(AppError::AccountWorkerBusy) => Ok(()),
+        Err(error) => Err(error),
+        Ok(_) => Err(AppError::BlockingTask(
+            "an invite to an unknown group was accepted".into(),
+        )),
+    }
 }
 
 /// Send one command through the worker after startup and wait for its reply.
@@ -64,8 +72,6 @@ mod tests {
     use std::sync::Arc;
     use std::task::Poll;
     use std::time::Duration;
-
-    use cgka_traits::GroupId;
 
     use super::*;
     use crate::tests::ScriptedPushRelayClient;
@@ -114,8 +120,8 @@ mod tests {
         )));
         assert!(still_waiting(&mut finished).await);
         assert!(still_waiting(&mut round_trip).await);
-        // The worker has not run since these polls: an answer here would come
-        // from the read state, not from startup sync behind those commands.
+        // The worker has not run since these polls: an answer here would not
+        // come from startup sync behind those commands.
         let mut took = Box::pin(tokio::task::unconstrained(
             startup_sync_took_queued_commands(&runtime, "alice"),
         ));

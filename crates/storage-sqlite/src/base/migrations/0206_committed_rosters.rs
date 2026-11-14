@@ -1,4 +1,4 @@
-//! Migration 0205: each group's committed roster (mdk#3273 B).
+//! Migration 0206: each group's committed roster (mdk#3273 B).
 //!
 //! - `cgka_committed_rosters`: one row per group with a known committed
 //!   roster, holding its revision.
@@ -59,13 +59,13 @@ mod tests {
     fn seeds_no_roster_and_drops_a_roster_with_its_group() {
         let mut conn = Connection::open_in_memory().unwrap();
         conn.pragma_update(None, "foreign_keys", true).unwrap();
-        run_through(&mut conn, 204).unwrap();
+        run_through(&mut conn, 205).unwrap();
         conn.execute(
             "INSERT INTO cgka_groups(id, epoch, record) VALUES (?1, 7, x'00')",
             params![vec![1u8; 16]],
         )
         .unwrap();
-        run_through(&mut conn, 205).unwrap();
+        run_through(&mut conn, 206).unwrap();
         assert_eq!(
             count(&conn, "SELECT count(*) FROM cgka_committed_rosters"),
             0

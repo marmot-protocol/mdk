@@ -823,7 +823,7 @@ fn inbound(route: [u8; 32], id: &[u8]) -> TransportMessage {
 }
 
 /// Full hydration records the committed roster (mdk#3273 B) of a group
-/// stored before rosters existed, which migration 0205 leaves without one,
+/// stored before rosters existed, which migration 0206 leaves without one,
 /// and replaces a roster that disagrees with the group's merged membership.
 /// Seeding alone writes none: a stored record can hold a staged commit's
 /// projected members. When the write fails, a missing roster stays missing
@@ -959,7 +959,7 @@ async fn cheap_pass_records_a_settled_disbands_roster_from_its_tombstone() {
             .map(|roster| roster.members)
     };
 
-    // Stored before migration 0205, which records no roster.
+    // Stored before migration 0206, which records no roster.
     let raw = rusqlite::Connection::open(&path).unwrap();
     open_hardened_sqlcipher(&raw, &key, SqlCipherHardening::live_cache()).unwrap();
     raw.execute(

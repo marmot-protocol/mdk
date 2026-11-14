@@ -702,7 +702,7 @@ impl SqliteAppStorage {
                 .storage()?;
             }
             conn.execute(
-                "UPDATE attachment_acquisition SET state=3,due=NULL,attempt=NULL,storage_blocked_headroom=NULL,storage_park_count=0 WHERE token=?1",
+                "UPDATE attachment_acquisition SET state=3,due=NULL,attempt=NULL,storage_blocked_headroom=NULL,storage_park_count=0,storage_readmitted=0 WHERE token=?1",
                 [&job.reference.token],
             )
             .storage()?;
@@ -793,7 +793,7 @@ impl SqliteAppStorage {
             let parked = partial::storage_parked(&conn, &reference.token)?;
             let retried = conn
                 .execute(
-                    "UPDATE attachment_acquisition SET state=0,due=?2,attempt=NULL,cancelled=0,size_blocked_max=NULL,storage_blocked_headroom=NULL,storage_park_count=0,permission_paused=0,retry_not_before=0,network_attempts=0,acquisition_attempts=0,body_completed=0,preparation_deferrals=0
+                    "UPDATE attachment_acquisition SET state=0,due=?2,attempt=NULL,cancelled=0,size_blocked_max=NULL,storage_blocked_headroom=NULL,storage_park_count=0,storage_readmitted=0,permission_paused=0,retry_not_before=0,network_attempts=0,acquisition_attempts=0,body_completed=0,preparation_deferrals=0
                  WHERE token=?1 AND state IN (2,4,5)",
                     params![reference.token, u64_to_i64(now)?],
                 )

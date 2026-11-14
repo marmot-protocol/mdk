@@ -86,11 +86,15 @@ async fn run_case(case: &str, existing_chats: usize) {
     }
     let fixture = fixture_started.elapsed();
 
-    // Cold start, then prove command readiness with a worker round trip.
+    // Cold start, then prove command readiness with a worker round trip:
+    // group reads answer from the published read state, so the round trip
+    // is the named fence.
     let runtime = MarmotAppRuntime::new(open_store(&dir_bench, &url));
     let ready_started = Instant::now();
     runtime.start().await.unwrap();
-    runtime.group_co_members(BENCH_ACCOUNT).await.unwrap();
+    marmot_app::worker_fences::worker_round_trip(&runtime, BENCH_ACCOUNT)
+        .await
+        .unwrap();
     let ready = ready_started.elapsed();
 
     // A user starts a DM well after launch: let startup recovery settle so
@@ -98,9 +102,10 @@ async fn run_case(case: &str, existing_chats: usize) {
     tokio::time::sleep(STARTUP_SETTLE).await;
     runtime.drain_in_flight_work().await.unwrap();
 
-    // `create` is the caller-visible return; `open` is the next worker round
-    // trip (the host opening the new chat), which queues behind any
-    // post-create work the worker still runs.
+    // `create` is the caller-visible return; `open` adds the host opening the
+    // new chat: its member read, which answers from the published read state
+    // without waiting on the post-create work the worker still runs
+    // (mdk#3273).
     let mut timings = Vec::with_capacity(TIMED_DMS);
     let mut opens = Vec::with_capacity(TIMED_DMS);
     for peer in fresh_peers {

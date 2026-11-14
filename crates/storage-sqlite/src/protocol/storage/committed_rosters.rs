@@ -1,5 +1,5 @@
 //! Each group's committed roster and its revision (mdk#3273 B). See migration
-//! 0205. The tables are outside every snapshot, so rolling a group back keeps
+//! 0206. The tables are outside every snapshot, so rolling a group back keeps
 //! its roster; deleting the group's record deletes it.
 
 use crate::base::connection::CachedSql;

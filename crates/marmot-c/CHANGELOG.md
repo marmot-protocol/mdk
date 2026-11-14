@@ -9,6 +9,12 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ### Breaking changes
 
+- `MarmotAppPerformanceSnapshot` drops `account_group_read_snapshot`: group reads
+  answer from the published read state, so the startup group-read snapshot it timed no
+  longer exists. The struct's layout changed: remove any read of the field and rebuild
+  clients with the matching header and library. `account_profile_load` stays and now
+  times the profile load each member read takes.
+
 - Remove the legacy v4 whole-file audit upload; v5 OTLP delivery is the only
   remote audit path. Replace `marmot_set_audit_log_tracker_config` and
   `marmot_set_audit_log_tracker_config_v4` with `marmot_set_audit_log_source`,

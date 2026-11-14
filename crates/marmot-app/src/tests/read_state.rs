@@ -844,28 +844,170 @@ async fn a_clock_moved_back_rebuilds_the_time_dependent_entry() {
     assert!(!window.contains(client.runtime.wall_clock_now()));
 }
 
-/// A snapshot answers reads while a long unit holds the client, so it never
-/// leads A: capturing one publishes what it describes first.
-#[tokio::test]
-async fn a_snapshot_never_leads_a() {
+/// Fails a save that writes a group's row while the group has none.
+#[cfg(feature = "test-policy-overrides")]
+const FAIL_NEW_GROUP_ROW: &str = "CREATE TRIGGER fail_new_group_row BEFORE INSERT ON account_groups
+     WHEN NOT EXISTS (SELECT 1 FROM account_groups WHERE group_id_hex = NEW.group_id_hex)
+     BEGIN SELECT RAISE(ABORT, 'injected group row failure'); END;";
+
+/// Fails a save that changes a saved row's `pending_confirmation`.
+#[cfg(feature = "test-policy-overrides")]
+const FAIL_PENDING_CHANGE: &str = "CREATE TRIGGER fail_pending_change
+     BEFORE UPDATE OF pending_confirmation ON account_groups
+     WHEN OLD.pending_confirmation IS NOT NEW.pending_confirmation
+     BEGIN SELECT RAISE(ABORT, 'injected pending change failure'); END;";
+
+#[cfg(feature = "test-policy-overrides")]
+fn co_members(state: &watch::Receiver<Arc<ReadState>>, local_account_id_hex: &str) -> Vec<String> {
+    state.borrow().co_members(local_account_id_hex).unwrap()
+}
+
+/// Co-members judge a group by its saved row, and the save that writes the
+/// row rebuilds the group's entry (mdk#3273 PR 4). A create whose save of
+/// the group's row fails leaves the group in the account state but out of
+/// co-members. The later save that writes the row changes neither the
+/// group's record nor its engine state. It moves the group's write count,
+/// so the next publish counts the group.
+#[cfg(feature = "test-policy-overrides")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_created_group_counts_toward_co_members_from_the_save_of_its_row() {
     let dir = tempfile::tempdir().unwrap();
-    AccountHome::open(dir.path())
-        .create_account("alice")
-        .unwrap();
+    let home = AccountHome::open(dir.path());
+    let relay = Arc::new(ScriptedPushRelayClient::default());
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
-        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
-    let mut client = app.client("alice").await.unwrap();
-    client.start_read_state(read_state_channel().0, UploadsInFlight::default());
-    let state = client.subscribe_read_state().unwrap();
-    let group = client
-        .create_group("snapshotted", &[])
+        .with_test_relay_client(relay.clone());
+    let mut alice = Device::create(&home, &app, "alice").await;
+    let alice_id = alice.account_id_hex.clone();
+    let bob = Device::create(&home, &app, "bob").await;
+    alice
+        .client
+        .start_read_state(read_state_channel().0, UploadsInFlight::default());
+    let state = alice.client.subscribe_read_state().unwrap();
+    let faults = app.account_storage("alice").unwrap().app_storage();
+    faults.execute_batch_for_test(FAIL_NEW_GROUP_ROW).unwrap();
+
+    let group = alice
+        .client
+        .create_group("lost", &[&bob.account_id_hex])
+        .await
+        .expect("the engine's group is canonical when its row fails to save")
+        .operation
+        .unwrap();
+    alice.client.publish_read_state();
+    assert!(
+        state.borrow().groups.contains_key(&group),
+        "the account state holds the group whose row failed to save"
+    );
+    assert_eq!(
+        co_members(&state, &alice_id),
+        Vec::<String>::new(),
+        "a group with no saved row counts nobody"
+    );
+
+    faults
+        .execute_batch_for_test("DROP TRIGGER fail_new_group_row")
+        .unwrap();
+    alice
+        .client
+        .save_state_with_pending_local_group_deletion_frontier_clears()
+        .unwrap();
+    alice.client.publish_read_state();
+    assert_eq!(
+        co_members(&state, &alice_id),
+        vec![bob.account_id_hex.clone()],
+        "the publish after the save of its row counts the group"
+    );
+}
+
+/// Co-members judge a group by its saved row, so an accepted invite counts
+/// from the save that clears it (mdk#3273 PR 4). The device-group admission
+/// path (`note_invitation_admission`) clears the account state's
+/// `pending_confirmation` and leaves the save to its batch; this test makes
+/// that clear itself. While the save fails, the group counts nobody, and a
+/// restart, whose account state reads the saved row, answers the same. The
+/// save that later writes the clear changes neither the group's record nor
+/// its engine state. It moves the group's write count, so the next publish
+/// counts the group.
+#[cfg(feature = "test-policy-overrides")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cleared_invite_counts_toward_co_members_from_the_save_that_writes_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    let mut alice = Device::create(&home, &app, "alice").await;
+    let alice_id = alice.account_id_hex.clone();
+    let mut bob = Device::create(&home, &app, "bob").await;
+    let group = bob
+        .client
+        .create_group("invite", &[&alice.account_id_hex])
         .await
         .unwrap()
         .operation
         .unwrap();
-    assert!(!state.borrow().groups.contains_key(&group));
+    alice.receive(&relay).await;
+    let group_hex = hex::encode(group.as_slice());
+    let faults = app.account_storage("alice").unwrap().app_storage();
+    assert!(
+        faults
+            .group_standing(&group_hex)
+            .unwrap()
+            .expect("the invite's row is saved")
+            .pending_confirmation,
+        "the invite awaits alice's confirmation"
+    );
+    faults.execute_batch_for_test(FAIL_PENDING_CHANGE).unwrap();
+    let clear_and_fail_to_save = |client: &mut AppClient| {
+        client
+            .state
+            .groups
+            .iter_mut()
+            .find(|record| record.group_id_hex == group_hex)
+            .expect("the invite's record")
+            .pending_confirmation = false;
+        client.mark_group_projection_dirty(&group);
+        assert!(
+            client
+                .save_state_with_pending_local_group_deletion_frontier_clears()
+                .is_err(),
+            "the injected fault fails the save"
+        );
+    };
 
-    let snapshot = client.group_read_snapshot().unwrap();
-    assert!(snapshot.group_mls_state(&group).is_ok());
-    assert!(state.borrow().groups.contains_key(&group));
+    let mut client = alice.client;
+    clear_and_fail_to_save(&mut client);
+    client.start_read_state(read_state_channel().0, UploadsInFlight::default());
+    let state = client.subscribe_read_state().unwrap();
+    assert_eq!(
+        co_members(&state, &alice_id),
+        Vec::<String>::new(),
+        "a clear its save lost counts nobody"
+    );
+
+    drop(client);
+    let mut client = app.client("alice").await.unwrap();
+    client.start_read_state(read_state_channel().0, UploadsInFlight::default());
+    let state = client.subscribe_read_state().unwrap();
+    assert_eq!(
+        co_members(&state, &alice_id),
+        Vec::<String>::new(),
+        "after a restart the read answers as before it"
+    );
+
+    clear_and_fail_to_save(&mut client);
+    client.publish_read_state();
+    assert_eq!(co_members(&state, &alice_id), Vec::<String>::new());
+    faults
+        .execute_batch_for_test("DROP TRIGGER fail_pending_change")
+        .unwrap();
+    client
+        .save_state_with_pending_local_group_deletion_frontier_clears()
+        .unwrap();
+    client.publish_read_state();
+    assert_eq!(
+        co_members(&state, &alice_id),
+        vec![bob.account_id_hex.clone()],
+        "the publish after the save of the clear counts the group"
+    );
 }
