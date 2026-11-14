@@ -901,6 +901,112 @@ async fn full_hydration_records_a_missing_committed_roster_and_repairs_a_wrong_o
     assert!(repaired.revision > wrong_revision);
 }
 
+/// The session-open cheap pass restores a settled disband and never queues
+/// it for full hydration, so the cheap pass is where a disbanded group stored
+/// before committed rosters existed gets one: the members its tombstone
+/// records. A wrong roster the write cannot replace fails the group closed
+/// there, as full hydration does, until an open can replace it.
+#[tokio::test]
+async fn cheap_pass_records_a_settled_disbands_roster_from_its_tombstone() {
+    use cgka_engine::ManualConvergenceClock;
+    use cgka_traits::group::ProtocolProfile;
+    use cgka_traits::storage::{CommittedMembers, CommittedRosterStorage, DisbandTombstoneStorage};
+    use storage_sqlite::{SqlCipherHardening, SqlCipherKey, open_hardened_sqlcipher};
+    use support::disband::{found_and_join, published_disband};
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("bob.sqlite");
+    let key = SqlCipherKey::raw([0x32; 32]);
+    let storage = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    let clock = ManualConvergenceClock::new(0, 10_000);
+    let mut alice = EngineBuilder::new(SqliteAccountStorage::in_memory_for_test().unwrap())
+        .identity(pad32(b"cheap-pass-disband-alice"))
+        .account_identity_proof_signer(proof_signer(b"cheap-pass-disband-alice"))
+        .protocol_profile(ProtocolProfile::Current)
+        .convergence_clock(std::sync::Arc::new(clock.clone()))
+        .peeler(Box::new(MockPeeler))
+        .build()
+        .unwrap();
+    let bob_engine = |storage: SqliteAccountStorage| {
+        EngineBuilder::new(storage)
+            .identity(pad32(b"cheap-pass-disband-bob"))
+            .account_identity_proof_signer(proof_signer(b"cheap-pass-disband-bob"))
+            .protocol_profile(ProtocolProfile::Current)
+            .peeler(Box::new(MockPeeler))
+            .build()
+            .unwrap()
+    };
+    let mut bob = bob_engine(storage.clone());
+    let group = found_and_join(&mut alice, &mut bob).await;
+    let disband = published_disband(&mut alice, &clock, &group).await;
+    bob.buffer_openmls_convergence_message_at(&group, disband, 1_000)
+        .unwrap();
+    for now in [1_000_000, 2_000_000, 3_000_000] {
+        bob.converge_stored_openmls_messages_at(&group, now)
+            .unwrap();
+    }
+    let tombstone = storage
+        .disband_tombstone(&group)
+        .unwrap()
+        .expect("the disband settles");
+    let former = CommittedMembers::of_members(&tombstone.former_members);
+    assert_eq!(former.ids().len(), 2);
+    drop(bob);
+    let roster_members = |storage: &SqliteAccountStorage| {
+        storage
+            .committed_roster(&group)
+            .unwrap()
+            .map(|roster| roster.members)
+    };
+
+    // Stored before migration 0205, which records no roster.
+    let raw = rusqlite::Connection::open(&path).unwrap();
+    open_hardened_sqlcipher(&raw, &key, SqlCipherHardening::live_cache()).unwrap();
+    raw.execute(
+        "DELETE FROM cgka_committed_rosters WHERE group_id = ?1",
+        [group.as_slice()],
+    )
+    .unwrap();
+    assert_eq!(roster_members(&storage), None);
+    let mut upgraded = bob_engine(storage.clone());
+    upgraded.hydrate_stable_groups_from_storage().unwrap();
+    assert!(!upgraded.unhydrated_group_ids().contains(&group));
+    assert_eq!(
+        roster_members(&storage),
+        Some(former.clone()),
+        "the first open records the members the tombstone holds"
+    );
+    drop(upgraded);
+
+    let stranger = CommittedMembers::from_ids([MemberId::new(pad32(b"stranger"))]);
+    storage.put_committed_roster(&group, &stranger).unwrap();
+    raw.execute_batch(
+        "CREATE TRIGGER refuse_roster_member BEFORE INSERT ON cgka_committed_roster_members
+         BEGIN SELECT RAISE(ABORT, 'roster member refused'); END;",
+    )
+    .unwrap();
+    let mut refused = bob_engine(storage.clone());
+    refused.hydrate_stable_groups_from_storage().unwrap();
+    assert_eq!(
+        refused.quarantined_groups(),
+        vec![(
+            group.clone(),
+            GroupHydrationQuarantineReason::GroupRecordLoadFailed
+        )],
+        "a wrong roster the cheap pass cannot replace fails its group closed"
+    );
+    assert_eq!(roster_members(&storage), Some(stranger));
+    drop(refused);
+    raw.execute_batch("DROP TRIGGER refuse_roster_member;")
+        .unwrap();
+    drop(raw);
+
+    let mut reopened = bob_engine(storage.clone());
+    reopened.hydrate_stable_groups_from_storage().unwrap();
+    assert!(reopened.quarantined_groups().is_empty());
+    assert_eq!(roster_members(&storage), Some(former));
+}
+
 #[tokio::test]
 async fn hydrate_all_fully_hydrates_unrecoverable_groups() {
     let storage = SqliteAccountStorage::in_memory_for_test().expect("storage");

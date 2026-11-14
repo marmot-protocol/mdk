@@ -6,16 +6,17 @@
 
 - The engine keeps each group's committed roster (mdk#3273). Every record write that merges, clears or re-derives
   membership writes the distinct member account ids of the merged state in the same transaction, never a staged
-  commit's projection, and a rewind leaves it as it was. Full hydration records the roster of a group stored before
-  rosters existed and replaces one that disagrees, with a warning that carries only a count. A wrong roster it cannot
-  replace quarantines the group (`GroupRecordLoadFailed`) until an open replaces it; a missing one it cannot record
-  stays missing, which never reads as a known membership.
+  commit's projection, and a rewind leaves it as it was. A disbanded group's roster is the members its disband
+  ended, from the disband's own evidence. Hydration records the roster of a group stored before rosters existed and
+  replaces one that disagrees, with a warning that carries only a count; for a settled disband the session-open
+  cheap pass does this from its tombstone. A wrong roster it cannot replace quarantines the group
+  (`GroupRecordLoadFailed`) until an open replaces it; a missing one it cannot record stays missing, which never
+  reads as a known membership.
 
 ### Fixed
 
-- A member that applies another member's disband keeps, on its group record, the members the disband ended until the
-  disband settles, as the disbander's own confirmation does (mdk#3273). The record held only the disbander in that
-  window, which a crash between the apply and the settle could leave until the next pass.
+- An own disband records the members it ends from the group's tree, not from its stored record (mdk#3273), so a
+  record that disagreed with the tree no longer reaches the disband's tombstone.
 - A contained rewind window on a storage provider without atomic group savepoints writes one snapshot, not two
   (mdk#3278). It used to run inside the snapshot fallback, so a crash left that snapshot beside the guard's and the
   next open quarantined the group. It now runs on the guard's snapshot alone, which the next open restores. A failed

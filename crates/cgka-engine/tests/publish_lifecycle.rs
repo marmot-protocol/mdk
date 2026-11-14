@@ -502,6 +502,91 @@ async fn active_rival_rearms_disband_then_terminal_retry_keeps_authenticated_ros
     );
 }
 
+/// An own disband's committed roster is the members it ends, read from the
+/// tree it is staged on, never from the group record: confirmation leaves the
+/// committer alone in the tree, and a record that disagrees with the tree (a
+/// set an older release stripped, or a staged commit's projection) reaches
+/// neither the roster its confirmation writes nor the candidate and
+/// tombstone the settle writes it from.
+#[tokio::test]
+async fn own_disband_roster_comes_from_the_tree_it_ends_not_the_record() {
+    let clock = ManualConvergenceClock::new(1_000, 10_000);
+    let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
+    let mut alice = current_client(b"own-disband-roster-alice", storage.clone(), &clock);
+    let mut bob = current_client(
+        b"own-disband-roster-bob",
+        SqliteAccountStorage::in_memory_for_test().unwrap(),
+        &clock,
+    );
+    let (gid, created) = alice
+        .create_group(CreateGroupRequest {
+            name: "own disband roster".into(),
+            description: String::new(),
+            members: vec![bob.fresh_key_package().await.unwrap()],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let SendResult::FoundingGroupCreated { mut welcomes } = created else {
+        panic!("founding create")
+    };
+    bob.join_welcome(welcomes.remove(0)).await.unwrap();
+    let joined = checked_committed_roster(&alice, &storage, &gid);
+    assert_eq!(joined.members.ids().len(), 2);
+    let mut stripped = storage.get_group(&gid).unwrap();
+    stripped
+        .members
+        .retain(|member| member.id == alice.self_id());
+    storage.put_group_keeping_roster(&stripped).unwrap();
+
+    alice
+        .send(SendIntent::Disband {
+            group_id: gid.clone(),
+        })
+        .await
+        .unwrap();
+    let prepared = alice
+        .converge_and_drain_queued_outbound_intents(&gid, clock.now().monotonic_ms)
+        .await
+        .unwrap();
+    let (_, pending) = evolution(prepared.into_iter().next().expect("prepared disband"));
+    let candidates = storage.list_disband_candidates(&gid).unwrap();
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(
+        CommittedMembers::of_members(&candidates[0].former_members),
+        joined.members,
+        "the candidate holds the members the disband ends"
+    );
+    alice.confirm_published(pending).await.unwrap();
+    assert!(storage.disband_tombstone(&gid).unwrap().is_none());
+    assert_eq!(
+        storage.committed_roster(&gid).unwrap().as_ref(),
+        Some(&joined),
+        "confirmation writes the members the disband ends"
+    );
+
+    // Confirmation schedules the terminal pass; its first advance opens the
+    // collection window, and the next settles it.
+    for _ in 0..2 {
+        clock.advance_ms(1_000);
+        alice
+            .converge_and_drain_queued_outbound_intents(&gid, clock.now().monotonic_ms)
+            .await
+            .unwrap();
+    }
+    let tombstone = storage
+        .disband_tombstone(&gid)
+        .unwrap()
+        .expect("the disband settles");
+    assert_eq!(
+        CommittedMembers::of_members(&tombstone.former_members),
+        joined.members
+    );
+    assert_eq!(storage.committed_roster(&gid).unwrap(), Some(joined));
+}
+
 #[tokio::test]
 async fn demoted_disband_request_fails_durably_and_is_acknowledged_once() {
     use cgka_traits::app_components::{

@@ -2534,21 +2534,17 @@ pub(crate) fn committed_members(group: &MlsGroup) -> cgka_traits::storage::Commi
     cgka_traits::storage::CommittedMembers::of_members(&marmot_members(group))
 }
 
-/// What a group's committed roster holds, given its record and its merged
-/// OpenMLS state: the merged tree's distinct ids, except once the group's
-/// lifecycle is Disbanded and before the disband settles. Then the record's
-/// members are the roster (an own disband's confirmation and a canonical
-/// apply that merges one both keep the members the disband ended, as
-/// `members()` answers them), as they are for the tombstone that follows.
+/// What a group's committed roster holds, given its merged OpenMLS state: the
+/// merged tree's distinct ids. `None` once the group's lifecycle is Disbanded:
+/// the disband's merge left its committer alone in the tree, so the roster is
+/// the members the disband ended, which only its evidence holds
+/// (`disband::former_members_of`, then its tombstone).
 pub(crate) fn committed_membership(
-    record: &cgka_traits::group::Group,
     group: &MlsGroup,
-) -> cgka_traits::storage::CommittedMembers {
+) -> Option<cgka_traits::storage::CommittedMembers> {
     match crate::app_components::lifecycle_of_group(group) {
-        Ok(Some(cgka_traits::app_components::GroupLifecycleV1::Disbanded)) => {
-            cgka_traits::storage::CommittedMembers::of_members(&record.members)
-        }
-        _ => committed_members(group),
+        Ok(Some(cgka_traits::app_components::GroupLifecycleV1::Disbanded)) => None,
+        _ => Some(committed_members(group)),
     }
 }
 

@@ -909,8 +909,9 @@ impl<S: StorageProvider> Engine<S> {
     ///
     /// The membership is read from stored state, not from the record a write
     /// path left: the merged OpenMLS tree, a pending commit's changes
-    /// excluded (the record's members only once the group's lifecycle is
-    /// Disbanded, and a tombstone's former members). A group with no record
+    /// excluded, or for a Disbanded group the members its disband ended, from
+    /// its tombstone or, before it settles, its candidate for that epoch.
+    /// A group with no record
     /// has no roster. A quarantined group is skipped: the app never trusts
     /// its roster, and its stored state can be a retained anchor's (a failed
     /// rewind restore) or unreadable. Test-only and read-only; the answer
@@ -926,13 +927,13 @@ impl<S: StorageProvider> Engine<S> {
         let roster = self.storage.committed_roster(group_id)?;
         // The oracle reads the stored state it checks (see clippy.toml).
         #[allow(clippy::disallowed_methods)]
-        let record = match self.storage.get_group(group_id) {
-            Ok(record) => record,
+        match self.storage.get_group(group_id) {
+            Ok(_) => {}
             Err(cgka_traits::storage::StorageError::NotFound) => {
                 return Ok(roster.map(|_| "a group with no record holds a committed roster".into()));
             }
             Err(error) => return Err(error.into()),
-        };
+        }
         let expected = if let Some(tombstone) = self.storage.disband_tombstone(group_id)? {
             cgka_traits::storage::CommittedMembers::of_members(&tombstone.former_members)
         } else {
@@ -943,7 +944,28 @@ impl<S: StorageProvider> Engine<S> {
             let Some(mls_group) = loaded else {
                 return Ok(Some("group record has no OpenMLS state".into()));
             };
-            crate::group_lifecycle::committed_membership(&record, &mls_group)
+            match crate::group_lifecycle::committed_membership(&mls_group) {
+                Some(expected) => expected,
+                None => {
+                    // Disbanded, not settled: the roster is the members the
+                    // disband ended, which its candidates for this epoch hold.
+                    // Rival disbands of one epoch each count as evidence.
+                    let mut evidence = crate::disband::unsettled_disband_evidence(
+                        &self.storage,
+                        group_id,
+                        EpochId(mls_group.epoch().as_u64()),
+                    )?;
+                    if evidence.is_empty() {
+                        return Ok(Some("a Disbanded group holds no disband evidence".into()));
+                    }
+                    let held = roster.as_ref().map(|roster| &roster.members);
+                    let index = evidence
+                        .iter()
+                        .position(|members| Some(members) == held)
+                        .unwrap_or(0);
+                    evidence.swap_remove(index)
+                }
+            }
         };
         Ok(match roster {
             None => Some(format!(
@@ -1881,6 +1903,18 @@ impl<S: StorageProvider> Engine<S> {
                 .remove(&group.id)
                 .or_else(|| group.disbanded.clone());
             if let Some(tombstone) = tombstone {
+                // A settled disband never reaches full hydration, so this is
+                // where one stored before committed rosters existed gets its
+                // roster: the members its tombstone records. Before the
+                // restore, which may replay `GroupDisbanded`, and failing
+                // closed as full hydration does.
+                if let Err(reason) = self.backfill_committed_roster(
+                    &group.id,
+                    &cgka_traits::storage::CommittedMembers::of_members(&tombstone.former_members),
+                ) {
+                    self.quarantine_stored_group_on_hydrate(&group.id, reason);
+                    continue;
+                }
                 // Reconcile the single deterministic system row after a crash.
                 // The replay is idempotent (the application projection
                 // canonicalizes it) *and* announced-once, so an already
@@ -2595,13 +2629,26 @@ impl<S: StorageProvider> Engine<S> {
         let has_deferred_peels = stored_message_records
             .iter()
             .any(|record| record.state == MessageState::PeelDeferred);
-        // The record and MLS state are final here, and nothing below changes
-        // their membership; the roster can still fail closed before any
-        // recovered state is exposed.
-        self.backfill_committed_roster(
-            group_id,
-            &crate::group_lifecycle::committed_membership(&group, &mls_group),
-        )?;
+        // The MLS state is final here, and nothing below changes its
+        // membership; the roster can still fail closed before any recovered
+        // state is exposed. A Disbanded group that has not settled takes its
+        // roster from its disband's evidence, the candidates for this epoch,
+        // when they agree; with none, or rivals that disagree, it keeps the
+        // one the apply wrote, and the settle writes the tombstone's.
+        match crate::group_lifecycle::committed_membership(&mls_group) {
+            Some(committed) => self.backfill_committed_roster(group_id, &committed)?,
+            None => {
+                let evidence = crate::disband::unsettled_disband_evidence(
+                    &self.storage,
+                    group_id,
+                    EpochId(mls_group.epoch().as_u64()),
+                )
+                .map_err(|_| GroupHydrationQuarantineReason::GroupRecordLoadFailed)?;
+                if let [committed] = evidence.as_slice() {
+                    self.backfill_committed_roster(group_id, committed)?;
+                }
+            }
+        }
 
         // Same distinction the cheap pass draws: promoting a copy this device
         // was removed from is not a live group's promotion. The `unrecoverable`

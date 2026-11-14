@@ -344,6 +344,11 @@ struct OpenMlsReplayOutput {
     group_changes: Vec<AppliedGroupChanges>,
     final_epoch: u64,
     final_members: Vec<Member>,
+    /// The members the disband this canonical apply merged ended
+    /// (`disband::former_members_of` its parent tree): the committed roster
+    /// of a Disbanded result. `None` when it merged no disband, and for a
+    /// candidate probe.
+    disband_former_members: Option<Vec<Member>>,
     epoch_authenticators: BTreeMap<u64, String>,
     /// The tag signature keys each roster state a canonical apply reached
     /// listed, in the order it reached them, for the caller to record in the
@@ -3456,6 +3461,7 @@ fn update_group_record_from_replay<S: StorageProvider>(
         .self_removed_sibling_slots
         .clone_from(current_departures);
     group.epoch = EpochId(output.final_epoch);
+    group.members = output.final_members.clone();
 
     // The replay just merged any GCE/AppData commits on the canonical path, so
     // the live MlsGroup carries the post-canonical RequiredCapabilities and
@@ -3465,23 +3471,13 @@ fn update_group_record_from_replay<S: StorageProvider>(
     let crypto = RustCrypto::default();
     let provider = EngineOpenMlsProvider::<S>::new(&crypto, storage.mls_storage());
     let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
-    let mls_group = MlsGroup::load(provider.storage(), &mls_gid)
-        .map_err(|e| OpenMlsProjectionError::Storage(format!("load post-replay group: {e:?}")))?;
-    // A disband's merge leaves only its committer in the tree. Its record
-    // keeps the members it ended until the disband settles, as an own
-    // disband's confirmation does, so the committed roster holds them too.
-    let disbanded = match &mls_group {
-        Some(mls_group) => {
-            crate::app_components::lifecycle_of_group(mls_group)
-                .map_err(|error| OpenMlsProjectionError::Replay(error.to_string()))?
-                == Some(cgka_traits::app_components::GroupLifecycleV1::Disbanded)
-        }
-        None => false,
-    };
-    if !disbanded {
-        group.members = output.final_members.clone();
-    }
-    if let Some(mls_group) = mls_group {
+    let mut disbanded = false;
+    if let Some(mls_group) = MlsGroup::load(provider.storage(), &mls_gid)
+        .map_err(|e| OpenMlsProjectionError::Storage(format!("load post-replay group: {e:?}")))?
+    {
+        disbanded = crate::app_components::lifecycle_of_group(&mls_group)
+            .map_err(|error| OpenMlsProjectionError::Replay(error.to_string()))?
+            == Some(cgka_traits::app_components::GroupLifecycleV1::Disbanded);
         group.required_capabilities = required_capabilities_from_group(&mls_group);
         crate::group_lifecycle::mirror_app_components_into_record(&mls_group, &mut group);
         // Intermediate retained anchors keep the accumulator intact; only the
@@ -3496,9 +3492,24 @@ fn update_group_record_from_replay<S: StorageProvider>(
         })?;
     }
 
-    match replayed {
-        ReplayedRecord::Intermediate => storage.put_group_keeping_roster(&group),
-        ReplayedRecord::Final => storage.put_group_with_roster(
+    // A disband's merge leaves only its committer in the tree, so a Disbanded
+    // result's committed roster is the members the disband ended, from its own
+    // evidence, never the record. A replay that ends Disbanded without merging
+    // a disband started from that state (nothing follows a disband), so the
+    // roster stays the one the apply that merged it wrote.
+    match (
+        replayed,
+        disbanded,
+        output.disband_former_members.as_deref(),
+    ) {
+        (ReplayedRecord::Intermediate, ..) | (ReplayedRecord::Final, true, None) => {
+            storage.put_group_keeping_roster(&group)
+        }
+        (ReplayedRecord::Final, true, Some(former_members)) => storage.put_group_with_roster(
+            &group,
+            &cgka_traits::storage::CommittedMembers::of_members(former_members),
+        ),
+        (ReplayedRecord::Final, false, _) => storage.put_group_with_roster(
             &group,
             &cgka_traits::storage::CommittedMembers::of_members(&group.members),
         ),
@@ -3963,6 +3974,7 @@ fn process_openmls_messages_inner<S: StorageProvider>(
     let mut observations = Vec::new();
     let mut group_changes = Vec::new();
     let mut roster_tag_keys = Vec::new();
+    let mut disband_former_members = None;
     let mut epoch_authenticators = BTreeMap::from([(
         mls_group.epoch().as_u64(),
         own_commit_post_merge_epoch_authenticator(&mls_group),
@@ -4060,6 +4072,11 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                 }
                 self_removed_slots.extend(context.proposal_slots(&mls_group, consumed));
             }
+            // The parent tree is gone once the checkpoint is installed. Should
+            // this own commit be a disband, these are the members it ends.
+            let parent_former_members = retain_replayed_anchors
+                .is_some()
+                .then(|| crate::disband::former_members_of(&mls_group));
             if let Some(max_rewind) = retain_replayed_anchors {
                 // Keep applications and referenced proposals replayed at the
                 // source epoch before installing its post-commit checkpoint.
@@ -4084,6 +4101,13 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                 return Err(OpenMlsProjectionError::CheckpointStateMismatch);
             }
             epoch_authenticators.insert(mls_group.epoch().as_u64(), actual_authenticator);
+            if parent_former_members.is_some()
+                && crate::app_components::lifecycle_of_group(&mls_group)
+                    .map_err(|error| OpenMlsProjectionError::Replay(error.to_string()))?
+                    == Some(cgka_traits::app_components::GroupLifecycleV1::Disbanded)
+            {
+                disband_former_members = parent_former_members;
+            }
             observations.push(OpenMlsReplayObservation::CommitStaged {
                 message_id,
                 source_epoch,
@@ -4101,6 +4125,7 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                     group_changes: Vec::new(),
                     final_epoch: resulting_epoch,
                     final_members: marmot_members(&mls_group),
+                    disband_former_members: None,
                     epoch_authenticators: BTreeMap::new(),
                     roster_tag_keys: Vec::new(),
                 };
@@ -4387,6 +4412,9 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                     // terminal evidence while applying the selected branch,
                     // before merge removes the former roster. Candidate probes
                     // must not persist it; this write shares the apply transaction.
+                    // The final record write takes the committed roster from
+                    // the same set.
+                    let former_members = crate::disband::former_members_of(&mls_group);
                     storage.put_disband_candidate(&cgka_traits::storage::DisbandCandidate {
                         group_id: group_id.clone(),
                         source_epoch: EpochId(source_epoch),
@@ -4397,10 +4425,9 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                         commit_digest: projection.message_digest,
                         actor: sender.clone(),
                         local_was_committer_leaf: committer_index == mls_group.own_leaf_index(),
-                        former_members: crate::disband::deduplicated_roster(&marmot_members(
-                            &mls_group,
-                        )),
+                        former_members: former_members.clone(),
                     })?;
+                    disband_former_members = Some(former_members);
                 }
                 let resulting_epoch = mls_group.epoch().as_u64().saturating_add(1);
                 let mut consumed_proposal_refs = staged
@@ -4505,6 +4532,7 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                         group_changes: Vec::new(),
                         final_epoch: mls_group.epoch().as_u64(),
                         final_members: marmot_members(&mls_group),
+                        disband_former_members: None,
                         epoch_authenticators: BTreeMap::new(),
                         roster_tag_keys: Vec::new(),
                     };
@@ -4629,6 +4657,7 @@ fn process_openmls_messages_inner<S: StorageProvider>(
         group_changes,
         final_epoch: mls_group.epoch().as_u64(),
         final_members: marmot_members(&mls_group),
+        disband_former_members,
         epoch_authenticators,
         roster_tag_keys,
     };
