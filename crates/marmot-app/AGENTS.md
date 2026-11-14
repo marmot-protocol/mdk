@@ -892,7 +892,12 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   read (`None`) is never evidence. Window hints come from the live conversation captures
   (`open_conversation_groups`). The breaker's pauses and late findings are process counters
   (`recovery_runner_counts`) carried only by the v5 `recovery_runner_paused` row, written through the turn's audit
-  sink (`WorkerTurn::audit`). Logs carry aggregates only.
+  sink (`WorkerTurn::audit`). The runner's other v5 rows (`recovery_runner/audit.rs`) go through the same hook
+  (`WorkerTurn::audit`, `DebtTurn::audit`, which take the MLS group a row is about): one `recovery_runner_fetched` per
+  quantum that began, one `recovery_runner_changed` per unit or route transition, raced begins coalesced per route
+  (`audit::Races`). Never write one per survey, idle step or catching-up flip, never await to write one, and keep
+  audit-only storage reads infallible for the runner (a failed read loses the row, not the step). Logs carry
+  aggregates only.
 - The configured audit OTLP/HTTP sender is `marmot-observability`'s `src/audit_otlp_sender.rs`, which hosts name as
   `marmot_app::audit_otlp_sender`. It accepts an owned local-delivery batch,
   checks the prepared destination, preserves each original v5 JSON body inside the restricted OTLP JSON envelope,

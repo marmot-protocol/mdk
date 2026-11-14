@@ -954,7 +954,11 @@ hydrate, so that drop is forgotten. A gone relay that the routes carry again owe
 goal again; nothing else re-arms a unit when a route gains a relay. Pending drops are not kept
 across a restart, which leaves their debt inert. The account breaker reports each pause once:
 a warning, a process count, and a v5 `recovery_runner_paused` audit row with the cap, the
-hour's usage and the process totals of pauses and late findings.
+hour's usage and the process totals of pauses and late findings. The v5 audit also records each
+quantum the runner settles, per group (`recovery_runner_fetched`), the begins it abandons as
+raced, coalesced per route (`recovery_runner_raced`), and each break, failed probe, re-arm,
+suspension, retirement and retention remainder (`recovery_runner_changed`); surveys write
+nothing.
 
 A unit compares instead of sweeping when its relay's recorded caps show NIP-77 and the device
 already holds events in the owed range: its retained inventory and anything staged. With

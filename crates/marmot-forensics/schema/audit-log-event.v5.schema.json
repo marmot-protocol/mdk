@@ -2579,6 +2579,15 @@
         },
         {
           "$ref": "#/$defs/OperationalEvent_recovery_runner_paused"
+        },
+        {
+          "$ref": "#/$defs/OperationalEvent_recovery_runner_fetched"
+        },
+        {
+          "$ref": "#/$defs/OperationalEvent_recovery_runner_raced"
+        },
+        {
+          "$ref": "#/$defs/OperationalEvent_recovery_runner_changed"
         }
       ]
     },
@@ -3302,6 +3311,80 @@
         "attempts",
         "event_bytes",
         "both"
+      ]
+    },
+    "Operational_recoveryRunnerRoute": {
+      "enum": [
+        "inbox",
+        "group"
+      ]
+    },
+    "Operational_recoveryRunnerFetch": {
+      "enum": [
+        "sweep",
+        "compare"
+      ]
+    },
+    "Operational_recoveryRunnerPurpose": {
+      "enum": [
+        "recheck",
+        "repair",
+        "post_join_collection",
+        "epoch_gap_visit",
+        "fenced",
+        "debt"
+      ]
+    },
+    "Operational_recoveryRunnerOutcome": {
+      "enum": [
+        "advanced",
+        "nothing_owed",
+        "no_progress",
+        "unreachable",
+        "rate_limited",
+        "refused",
+        "unanswered",
+        "local_failure"
+      ]
+    },
+    "Operational_recoveryRunnerFetchEnd": {
+      "enum": [
+        "finished",
+        "deadline",
+        "cancelled",
+        "budget_spent",
+        "withheld",
+        "saturated_second",
+        "saturated_window",
+        "inconclusive_second",
+        "rate_limited",
+        "refused",
+        "unsupported",
+        "timed_out",
+        "disconnected",
+        "sink_failed",
+        "store_failed"
+      ]
+    },
+    "Operational_recoveryRunnerChange": {
+      "enum": [
+        "broken",
+        "probe_failed",
+        "rearmed",
+        "caps_rearmed",
+        "repair_rearmed",
+        "retired_gone",
+        "reopened",
+        "suspended",
+        "resumed",
+        "remainder_parked",
+        "remainder_widened"
+      ]
+    },
+    "Operational_recoveryRunnerBreak": {
+      "enum": [
+        "no_progress",
+        "refused"
       ]
     },
     "Operational_subscriptionRefusalRoute": {
@@ -5202,6 +5285,191 @@
           "minimum": 1
         },
         "late_findings": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "record_context": {
+          "$ref": "#/$defs/Operational_auditEventContext"
+        }
+      }
+    },
+    "OperationalEvent_recovery_runner_fetched": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "route_kind",
+        "obligation_ref",
+        "retained_route",
+        "endpoint_ref",
+        "best_effort",
+        "fetch",
+        "purpose",
+        "probe",
+        "ranges",
+        "owed_secs",
+        "owed_since_secs",
+        "owed_until_secs",
+        "outcome",
+        "end",
+        "duration_ms",
+        "requests",
+        "answers",
+        "newly_covered_secs",
+        "proved_secs",
+        "events_fetched",
+        "events_staged",
+        "late_findings",
+        "raced"
+      ],
+      "properties": {
+        "type": {
+          "const": "recovery_runner_fetched"
+        },
+        "route_kind": {
+          "$ref": "#/$defs/Operational_recoveryRunnerRoute"
+        },
+        "obligation_ref": {
+          "$ref": "#/$defs/OperationalDiagnosticRef"
+        },
+        "retained_route": {
+          "type": "boolean"
+        },
+        "endpoint_ref": {
+          "$ref": "#/$defs/EndpointRef"
+        },
+        "best_effort": {
+          "type": "boolean"
+        },
+        "fetch": {
+          "$ref": "#/$defs/Operational_recoveryRunnerFetch"
+        },
+        "purpose": {
+          "$ref": "#/$defs/Operational_recoveryRunnerPurpose"
+        },
+        "probe": {
+          "type": "boolean"
+        },
+        "ranges": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "owed_secs": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "owed_since_secs": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "owed_until_secs": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "outcome": {
+          "$ref": "#/$defs/Operational_recoveryRunnerOutcome"
+        },
+        "end": {
+          "$ref": "#/$defs/Operational_recoveryRunnerFetchEnd"
+        },
+        "duration_ms": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "requests": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "answers": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "newly_covered_secs": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "proved_secs": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "events_fetched": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "events_staged": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "late_findings": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "raced": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "record_context": {
+          "$ref": "#/$defs/Operational_auditEventContext"
+        }
+      }
+    },
+    "OperationalEvent_recovery_runner_raced": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "route_kind",
+        "obligation_ref",
+        "raced",
+        "window_secs"
+      ],
+      "properties": {
+        "type": {
+          "const": "recovery_runner_raced"
+        },
+        "route_kind": {
+          "$ref": "#/$defs/Operational_recoveryRunnerRoute"
+        },
+        "obligation_ref": {
+          "$ref": "#/$defs/OperationalDiagnosticRef"
+        },
+        "raced": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "window_secs": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "record_context": {
+          "$ref": "#/$defs/Operational_auditEventContext"
+        }
+      }
+    },
+    "OperationalEvent_recovery_runner_changed": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "change"
+      ],
+      "properties": {
+        "type": {
+          "const": "recovery_runner_changed"
+        },
+        "change": {
+          "$ref": "#/$defs/Operational_recoveryRunnerChange"
+        },
+        "route_kind": {
+          "$ref": "#/$defs/Operational_recoveryRunnerRoute"
+        },
+        "obligation_ref": {
+          "$ref": "#/$defs/OperationalDiagnosticRef"
+        },
+        "endpoint_ref": {
+          "$ref": "#/$defs/EndpointRef"
+        },
+        "break_reason": {
+          "$ref": "#/$defs/Operational_recoveryRunnerBreak"
+        },
+        "park_revision": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "units": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "remainder_since_secs": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "remainder_until_secs": {
           "$ref": "#/$defs/Operational_u64"
         },
         "record_context": {
