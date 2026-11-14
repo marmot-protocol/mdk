@@ -8,9 +8,9 @@ status: implemented-first-slice
 
 # Marmot App Runtime Shape
 
-`marmot-app` is the runtime boundary for client applications. A daemon, TUI, or native app opens a `MarmotApp` over
-its account home, starts a `MarmotAppRuntime` from it, and sends the runtime intents. The runtime owns accounts, shared
-directory state, relay subscriptions, projections, and typed event streams.
+`marmot-app` is the runtime boundary for client applications. A daemon or native app opens a `MarmotApp` over its
+account home, starts a `MarmotAppRuntime` from it, and sends the runtime intents; the TUI is a client of the daemon.
+The runtime owns accounts, shared directory state, relay subscriptions, projections, and typed event streams.
 
 The lower crates already point in this direction. `cgka-engine` owns convergence and engine state. `marmot-session` owns
 one account-device session and the runtime that coordinates it with transport and publish confirmation.
@@ -138,9 +138,9 @@ per-worker runtimes: they cannot be aborted, and an earlier attempt to do so was
 graceful cleanup.
 
 `marmot-app`'s integration suites (`crates/marmot-app/tests/`, including `relay_runtime`) drive whole runtimes on a
-two-worker multi-thread test runtime, so ordering that only holds on one thread fails in CI. A test that needs one
-thread stays on the current-thread flavor and says why. Async tests under `src/` default to the same two-worker
-runtime; a few still use Tokio's current-thread default.
+multi-thread test runtime, two workers unless a test asks for more, so ordering that only holds on one thread fails
+in CI. A test that needs one thread stays on the current-thread flavor and says why. Async tests under `src/` default
+to the same two-worker runtime; a few still use Tokio's current-thread default.
 `transport-nostr`'s suite runs on the same two-worker multi-thread runtime, apart from a few current-thread and
 paused-clock tests.
 
@@ -339,7 +339,9 @@ The remaining work is narrower than the original refactor, but still real:
   those watch workers' lifecycle;
 - `sync` remains as a diagnostic/repair command and some internal function names still say `sync` for catch-up/replay
   work;
-- production apps still need lifecycle hooks for mobile/desktop foregrounding, backgrounding, and shutdown.
+- hosts can shut the runtime down (`shutdown`), close storage before a suspension (`shutdown_and_close`), report
+  backup background conditions and pause an account's maintenance, but there is no general foreground/background
+  hook yet.
 
 ## Crate Responsibility After The Refactor
 
