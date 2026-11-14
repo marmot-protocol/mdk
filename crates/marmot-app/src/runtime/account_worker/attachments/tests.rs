@@ -2922,6 +2922,8 @@ struct HeldBacklog {
     _completions: mpsc::UnboundedReceiver<MediaHttpDone>,
     admission: Admission,
     requests: mpsc::UnboundedReceiver<()>,
+    /// Transfers the test has seen start so far.
+    started: usize,
     server: tokio::task::JoinHandle<()>,
 }
 
@@ -3023,12 +3025,14 @@ impl HeldBacklog {
             _completions: completions,
             admission: Admission::default(),
             requests,
+            started: 0,
             server,
         }
     }
 
     /// Drive the worker loop: run a pass while one is asked for, and take
-    /// the next permits when a pass parked on global capacity. Returns the
+    /// the next permits when a pass parked on global capacity and they are
+    /// free now (a wait still pending is the loop going idle). Returns the
     /// passes run.
     async fn drive(&mut self) -> usize {
         let mut due = true;
@@ -3039,10 +3043,9 @@ impl HeldBacklog {
                 due =
                     schedule(&self.client, &self.shared, &self.http, &mut self.admission).unwrap();
             } else if self.admission.is_waiting() {
-                match tokio::time::timeout(Duration::from_millis(200), self.admission.ready()).await
-                {
-                    Ok(more) => due = more,
-                    Err(_) => break,
+                match futures::FutureExt::now_or_never(self.admission.ready()) {
+                    Some(more) => due = more,
+                    None => break,
                 }
             } else {
                 break;
@@ -3051,7 +3054,9 @@ impl HeldBacklog {
         passes
     }
 
-    /// Exactly `expected` more transfers start.
+    /// Exactly `expected` more transfers start: their requests reach the
+    /// server, and the worker has claimed no transfer beyond them (claims
+    /// happen inside the pass, before any request is sent).
     async fn expect_started(&mut self, expected: usize) {
         for started in 0..expected {
             tokio::time::timeout(Duration::from_secs(5), self.requests.recv())
@@ -3059,10 +3064,16 @@ impl HeldBacklog {
                 .unwrap_or_else(|_| panic!("transfer {} of {expected} never started", started + 1))
                 .unwrap();
         }
-        assert!(
-            tokio::time::timeout(Duration::from_millis(300), self.requests.recv())
-                .await
-                .is_err(),
+        self.started += expected;
+        let claimed: i64 = retention_fault_connection(&self.client.app)
+            .query_row(
+                "SELECT count(*) FROM attachment_acquisition WHERE state=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            claimed as usize, self.started,
             "a transfer past {expected} started"
         );
     }
