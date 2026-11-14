@@ -112,17 +112,17 @@ impl TransportPeeler for BenchPeeler {
 
     async fn peel_group_message(
         &self,
-        msg: &TransportMessage,
+        msg: &cgka_traits::peeler::PreparedGroupMessage<'_>,
         _ctx: &GroupContextSnapshot,
     ) -> Result<PeeledMessage, PeelerError> {
         Ok(PeeledMessage {
-            id: msg.id.clone(),
+            id: msg.message.id.clone(),
             group_id: None,
             sender: None,
             content: PeeledContent::MlsMessage {
-                bytes: msg.payload.clone(),
+                bytes: msg.message.payload.clone(),
             },
-            origin: msg.clone(),
+            origin: msg.message.clone(),
         })
     }
 
@@ -221,10 +221,10 @@ impl TransportPeeler for DeferredBenchPeeler {
 
     async fn peel_group_message(
         &self,
-        msg: &TransportMessage,
+        msg: &cgka_traits::peeler::PreparedGroupMessage<'_>,
         ctx: &GroupContextSnapshot,
     ) -> Result<PeeledMessage, PeelerError> {
-        if msg.payload.starts_with(b"deferred:") {
+        if msg.message.payload.starts_with(b"deferred:") {
             let attempt = self.attempts.fetch_add(1, Ordering::SeqCst) + 1;
             if self.block.load(Ordering::SeqCst)
                 && attempt >= self.block_on_attempt.load(Ordering::SeqCst)

@@ -201,10 +201,14 @@ peel runs. `Engine::retry_deferred_peels` offers those contexts to every retaine
 - One host background advance shares a 64-row allowance and cooperative 500-ms budget. Explicit-time entry points keep
   the row allowance without a wall deadline; foreground preflight and send budgets keep their own semantics. Return
   pending only at complete operation boundaries; never cancel a snapshot guard or advance a partially tried generation.
-- Historical anchor peel contexts live lazily in `DeferredPeelGroupState::past_peel_contexts`, shared by the sweep and
-  `replay_buffered_messages`, fetched per row, and dropped with the candidate cache (every canonical change and every
-  candidate-generation turnover — read that field's doc). Restore live state before awaiting a peeler. Never persist
-  this secret-bearing cache or extend epoch retention.
+- Historical anchor peel contexts live in `DeferredPeelGroupState::past_peel_contexts`, shared by live ingest, the
+  sweep and `replay_buffered_messages`. Canonical changes drop them; candidate-generation turnover alone does not.
+  Reuse requires `StorageProvider::past_peel_context_generation`, covering MLS writes and snapshot replacement/pruning;
+  opted-in backends capture and restore each missing anchor under an exclusive transaction/savepoint and stamp the
+  cache before releasing it. Untracked backends keep uncached committing peels. Candidate replay may rebase existing
+  entries only after coherent, equal pre/post content observations; never absorb another writer's generation.
+  Restore live state before awaiting a peeler. Never persist this secret-bearing cache or extend epoch retention.
+  Prepare an envelope once per ingest; reuse its prepared bytes across candidate keys.
 - Readiness queries all deferred rows via the storage state filter; never limit it to an already-attempted prefix.
 - `message_processor/application_replay.rs` spends the remaining allowance on retained canonical applications after
   selection and deferred peeling settle. Its signal is independent of branch ambiguity (no app-only pass, no
@@ -312,9 +316,10 @@ peel runs. `Engine::retry_deferred_peels` offers those contexts to every retaine
   Welcome, both of which schedule retained input for replay, except `RewindRestoreFailed`, which only the next open
   clears (below).
 - **A failed committing-window restore quarantines the group until the next open** (mdk#3272). The pass, the
-  deferred-peel sweep, their resumable slices and past-epoch peel rewind live state onto a retained anchor outside any
-  transaction (`SnapshotRollbackGuard::rewind`); every other window is `contained` in a group savepoint, so its failed
-  restore undoes the whole window. When a committing window's restore fails after its rewind, the guard keeps its
+  deferred-peel sweep, their resumable slices and uncached peels on nontracking backends rewind live state onto a
+  retained anchor outside any transaction (`SnapshotRollbackGuard::rewind`). Tracking backends contain historical
+  context capture in a short transaction/savepoint; a failed restore undoes that whole window without quarantine.
+  When a committing window's restore fails after its rewind, the guard keeps its
   snapshot, the only copy of the live state, and records the group in `Engine::rewinds`; so does a committing guard
   whose snapshot survives a failed release, since the next open restores it. From then on
   `Engine::quarantined_reason`, which every gate and `quarantined_groups` read, answers `RewindRestoreFailed`, and the

@@ -89,6 +89,17 @@ without a readable sibling tag establishes no new hold; later repair does not pr
 
 ## Background recovery
 
+**Historical envelope recovery.** Live ingest, deferred sweeps, and confirmation replay share each group's
+retained-anchor exporter contexts. Fresh undecryptable envelopes derive each eligible context once while
+tracked state remains unchanged; every candidate still requires its own outer AEAD attempt. Canonical changes,
+snapshot replacement/pruning, and restart invalidate the memory-only cache. Cache size is bounded by retained
+anchors, and backends without `past_peel_context_generation` tracking do not reuse contexts across inputs.
+Tracking backends derive each missing context in a short exclusive transaction, restore live state, and publish
+the cache entry before another writer can change its source. A failed restore rolls that operation back without
+quarantining the group. Nontracking backends retain the uncached committing recovery path.
+An unchanged sweep or a changed candidate graph alone does not discard historical contexts. A decryption miss
+still permits future-epoch recovery; it does not establish a terminal verdict or bypass deferred-capacity limits.
+
 **Experimental sibling Welcome delivery.** A retained sibling Welcome records the exact confirmed Add that produced
 it, or canonical creation for a founding sibling (mdk#2628 3.5d).
 Before a new carrier is created, owed-work and carrier transitions check

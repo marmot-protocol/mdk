@@ -16,7 +16,7 @@ use cgka_traits::error::PeelerError;
 use cgka_traits::group_context::GroupContextSnapshot;
 use cgka_traits::group_recovery::{AuthenticatedGroupRecovery, GroupRecoveryMessage};
 use cgka_traits::ingest::{PeeledContent, PeeledMessage};
-use cgka_traits::peeler::{GroupMessageMetadata, TransportPeeler};
+use cgka_traits::peeler::{GroupMessageMetadata, PreparedGroupMessage, TransportPeeler};
 use cgka_traits::transport::{EncryptedPayload, TransportEnvelope, TransportMessage};
 use cgka_traits::types::{GroupId, MemberId, MessageId};
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
@@ -370,11 +370,10 @@ impl Default for NostrMlsPeeler {
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 impl TransportPeeler for NostrMlsPeeler {
-    async fn peel_group_message(
+    fn prepare_group_message<'a>(
         &self,
-        msg: &TransportMessage,
-        ctx: &GroupContextSnapshot,
-    ) -> Result<PeeledMessage, PeelerError> {
+        msg: &'a TransportMessage,
+    ) -> Result<PreparedGroupMessage<'a>, PeelerError> {
         let event = NostrTransportEvent::from_transport_message(msg).map_err(to_peeler_error)?;
         if event.kind != KIND_MARMOT_GROUP_MESSAGE {
             return Err(PeelerError::Malformed(format!(
@@ -399,7 +398,24 @@ impl TransportPeeler for NostrMlsPeeler {
                 decoded.len()
             )));
         }
-        let (nonce, ciphertext) = decoded.split_at(NONCE_LEN);
+        Ok(PreparedGroupMessage {
+            message: msg,
+            content: decoded.into(),
+        })
+    }
+
+    async fn peel_group_message(
+        &self,
+        prepared: &PreparedGroupMessage<'_>,
+        ctx: &GroupContextSnapshot,
+    ) -> Result<PeeledMessage, PeelerError> {
+        // Prepared bytes belong to this operation, not a cross-input cache.
+        let Some((nonce, ciphertext)) = prepared.content.split_at_checked(NONCE_LEN) else {
+            return Err(PeelerError::Malformed(
+                "prepared content is too short".into(),
+            ));
+        };
+        let msg = prepared.message;
 
         let key = self.group_key(ctx)?;
         let cipher =
@@ -727,8 +743,18 @@ mod tests {
             .expect("content is standard base64");
         assert!(decoded.len() >= NOSTR_GROUP_CONTENT_MIN_LEN);
 
+        let prepared = peeler.prepare_group_message(&wrapped).unwrap();
+        let wrong_context = GroupContextSnapshot::new(
+            EpochId(10),
+            HashMap::from([(DEFAULT_EXPORTER_LABEL.to_string(), vec![0x7b; 32])]),
+            Some(group_id),
+        );
+        assert!(matches!(
+            peeler.peel_group_message(&prepared, &wrong_context).await,
+            Err(PeelerError::DecryptFailed)
+        ));
         let peeled = peeler
-            .peel_group_message(&wrapped, &ctx)
+            .peel_group_message(&prepared, &ctx)
             .await
             .expect("peel succeeds");
 
@@ -768,7 +794,7 @@ mod tests {
         tampered.payload = serde_json::to_vec(&event).unwrap();
 
         assert!(matches!(
-            peeler.peel_group_message(&tampered, &ctx).await,
+            peeler.prepare_group_message(&tampered),
             Err(PeelerError::InvalidSignature)
         ));
     }
@@ -781,14 +807,6 @@ mod tests {
             HashMap::from([(
                 DEFAULT_EXPORTER_LABEL.to_string(),
                 vec![0x7a; NOSTR_GROUP_KEY_LEN],
-            )]),
-            Some(group_id.clone()),
-        );
-        let wrong_secret_ctx = GroupContextSnapshot::new(
-            EpochId(9),
-            HashMap::from([(
-                DEFAULT_EXPORTER_LABEL.to_string(),
-                vec![0x7b; NOSTR_GROUP_KEY_LEN],
             )]),
             Some(group_id.clone()),
         );
@@ -817,8 +835,7 @@ mod tests {
         tampered.payload = unrelated.payload;
 
         let err = peeler
-            .peel_group_message(&tampered, &wrong_secret_ctx)
-            .await
+            .prepare_group_message(&tampered)
             .expect_err("different event identity must fail before decryption");
 
         assert!(matches!(err, PeelerError::InvalidSignature));
@@ -848,18 +865,8 @@ mod tests {
                 transport_group_id: group_id.clone(),
             },
         };
-        let wrong_secret_ctx = GroupContextSnapshot::new(
-            EpochId(9),
-            HashMap::from([(
-                DEFAULT_EXPORTER_LABEL.to_string(),
-                vec![0x7b; NOSTR_GROUP_KEY_LEN],
-            )]),
-            Some(group_id),
-        );
-
         let err = NostrMlsPeeler::default()
-            .peel_group_message(&msg, &wrong_secret_ctx)
-            .await
+            .prepare_group_message(&msg)
             .expect_err("extra tag must fail before ciphertext decryption");
 
         assert!(matches!(err, PeelerError::Malformed(_)));
@@ -1004,7 +1011,12 @@ mod tests {
                 .expect("wrap succeeds");
 
             NostrMlsPeeler::default()
-                .peel_group_message(&wrapped, &ctx)
+                .peel_group_message(
+                    &NostrMlsPeeler::default()
+                        .prepare_group_message(&wrapped)
+                        .unwrap(),
+                    &ctx,
+                )
                 .await
                 .unwrap_or_else(|err| panic!("{label} event should peel: {err}"));
         }
@@ -1131,19 +1143,13 @@ mod tests {
 
     #[tokio::test]
     async fn group_peel_rejects_non_base64_and_short_content() {
-        let secret = vec![0x7a; 32];
         let group_id = vec![0x99; 32];
-        let ctx = GroupContextSnapshot::new(
-            EpochId(9),
-            HashMap::from([(DEFAULT_EXPORTER_LABEL.to_string(), secret)]),
-            Some(group_id.clone()),
-        );
         let peeler = NostrMlsPeeler::default();
 
         // Not valid base64.
         let bad_msg = signed_group_transport_message(&group_id, "!!! not base64 !!!");
         assert!(matches!(
-            peeler.peel_group_message(&bad_msg, &ctx).await,
+            peeler.prepare_group_message(&bad_msg),
             Err(PeelerError::Malformed(_))
         ));
 
@@ -1151,7 +1157,7 @@ mod tests {
         let short_msg =
             signed_group_transport_message(&group_id, &BASE64_STANDARD.encode([0u8; 10]));
         assert!(matches!(
-            peeler.peel_group_message(&short_msg, &ctx).await,
+            peeler.prepare_group_message(&short_msg),
             Err(PeelerError::Malformed(_))
         ));
     }
@@ -1182,7 +1188,7 @@ mod tests {
             .expect("wrap succeeds");
 
         let err = peeler
-            .peel_group_message(&wrapped, &peel_ctx)
+            .peel_group_message(&peeler.prepare_group_message(&wrapped).unwrap(), &peel_ctx)
             .await
             .expect_err("wrong secret should not decrypt");
 
@@ -1195,11 +1201,6 @@ mod tests {
             EpochId(9),
             HashMap::from([(DEFAULT_EXPORTER_LABEL.to_string(), vec![0x7a; 32])]),
             Some(vec![0x99; 32]),
-        );
-        let peel_ctx = GroupContextSnapshot::new(
-            EpochId(9),
-            HashMap::from([(DEFAULT_EXPORTER_LABEL.to_string(), vec![0x7a; 32])]),
-            None,
         );
         let peeler = NostrMlsPeeler::default();
         let mut wrapped = peeler
@@ -1217,8 +1218,7 @@ mod tests {
         };
 
         let err = peeler
-            .peel_group_message(&wrapped, &peel_ctx)
-            .await
+            .prepare_group_message(&wrapped)
             .expect_err("mismatched route should not peel");
 
         assert!(matches!(err, PeelerError::WrongRecipient));

@@ -397,9 +397,16 @@ impl TransportPeeler for ClaimlessPeeler {
         self.0.wrap_group_recovery(message, recipient).await
     }
 
+    fn prepare_group_message<'a>(
+        &self,
+        msg: &'a TransportMessage,
+    ) -> Result<cgka_traits::peeler::PreparedGroupMessage<'a>, PeelerError> {
+        self.0.prepare_group_message(msg)
+    }
+
     async fn peel_group_message(
         &self,
-        msg: &TransportMessage,
+        msg: &cgka_traits::peeler::PreparedGroupMessage<'_>,
         ctx: &GroupContextSnapshot,
     ) -> Result<PeeledMessage, PeelerError> {
         self.0.peel_group_message(msg, ctx).await

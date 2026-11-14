@@ -68,7 +68,7 @@ impl TransportPeeler for StubPeeler {
 
     async fn peel_group_message(
         &self,
-        _msg: &TransportMessage,
+        _msg: &cgka_traits::peeler::PreparedGroupMessage<'_>,
         _ctx: &GroupContextSnapshot,
     ) -> Result<PeeledMessage, PeelerError> {
         Err(PeelerError::Backend("test peeler".into()))
@@ -122,7 +122,7 @@ impl TransportPeeler for ParkingPeeler {
 
     async fn peel_group_message(
         &self,
-        _msg: &TransportMessage,
+        _msg: &cgka_traits::peeler::PreparedGroupMessage<'_>,
         _ctx: &GroupContextSnapshot,
     ) -> Result<PeeledMessage, PeelerError> {
         Err(PeelerError::Backend("test peeler".into()))

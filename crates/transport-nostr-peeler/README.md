@@ -59,8 +59,10 @@ for SDK events and verifies events supplied through its public DTO boundary. Oth
 source or call `to_verified_nostr_event` before ingesting a DTO; `to_transport_message` checks the hash and routing
 shape but does not verify signatures. A public `NostrTransportEvent` is not proof of authenticity.
 
-Group peeling checks the payload's event hash against both the event id and `TransportMessage.id`, enforces the
-strict routing tags, and decrypts the envelope without rebuilding an SDK event or verifying Schnorr signatures.
+`prepare_group_message` checks the payload's event hash against both the event id and `TransportMessage.id`,
+enforces strict routing tags, and base64-decodes the envelope once per ingest operation. Each
+`peel_group_message` call tries a candidate exporter key against those same prepared bytes, without parsing,
+hashing, decoding, or verifying Schnorr signatures again. Prepared bytes are not cached across inputs.
 Welcome peeling still decodes an SDK event for NIP-59, whose unwrap verifies the outer event and encrypted seal.
 
 Inbound:

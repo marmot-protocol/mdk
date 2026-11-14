@@ -68,11 +68,11 @@ impl SqliteOpenMlsStorage {
     }
 
     pub(crate) fn delete_stored_key_package_bundle(&self, storage_key: &[u8]) -> StorageResult<()> {
-        self.connection.note_openmls_write();
         use openmls_traits::storage::CURRENT_VERSION;
         use rusqlite::params;
 
         let connection = self.connection.lock()?;
+        self.connection.note_openmls_write();
         connection
             .execute_cached(
                 "DELETE FROM openmls_values

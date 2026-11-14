@@ -51,8 +51,9 @@ pub(super) fn release(
     group_id: &GroupId,
     name: &str,
 ) -> StorageResult<()> {
-    let changed = store
-        .lock()?
+    let conn = store.lock()?;
+    store.connection.note_openmls_write();
+    let changed = conn
         .execute_cached(
             "DELETE FROM cgka_group_snapshots
                  WHERE group_id = ?1 AND name = ?2",

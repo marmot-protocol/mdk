@@ -84,17 +84,17 @@ impl TransportPeeler for PassthroughPeeler {
 
     async fn peel_group_message(
         &self,
-        msg: &TransportMessage,
+        msg: &cgka_traits::peeler::PreparedGroupMessage<'_>,
         _ctx: &GroupContextSnapshot,
     ) -> Result<PeeledMessage, PeelerError> {
         Ok(PeeledMessage {
-            id: msg.id.clone(),
+            id: msg.message.id.clone(),
             group_id: None,
             sender: None,
             content: PeeledContent::MlsMessage {
-                bytes: msg.payload.clone(),
+                bytes: msg.message.payload.clone(),
             },
-            origin: msg.clone(),
+            origin: msg.message.clone(),
         })
     }
 
@@ -158,6 +158,29 @@ fn client(seed: &[u8]) -> (Engine<SqliteAccountStorage>, SqliteAccountStorage) {
         .build()
         .unwrap();
     (engine, storage)
+}
+
+#[tokio::test]
+async fn unknown_routes_do_not_cache() {
+    let (mut engine, _) = client(b"unknown-route-cache");
+    for route in 0..32u8 {
+        let message = carried(
+            &[route],
+            TransportEnvelope::GroupMessage {
+                transport_group_id: vec![route; 32],
+            },
+        );
+        assert!(matches!(
+            engine.ingest(message).await.unwrap(),
+            cgka_traits::IngestOutcome::Ignored {
+                category: cgka_traits::InputRejectionCategory::UnknownGroup,
+            }
+        ));
+        assert!(
+            engine.deferred_peel.is_empty(),
+            "unknown routing ids must not allocate per-group recovery state"
+        );
+    }
 }
 
 #[tokio::test]

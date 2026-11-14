@@ -15,6 +15,7 @@ pub(super) fn create_group_state_checkpoint(
 ) -> StorageResult<()> {
     if store.connection.is_current_thread_transaction_owner() {
         let conn = store.lock()?;
+        store.connection.note_openmls_write();
         return create_on_connection(&conn, group_id, checkpoint);
     }
     retry_on_busy(|| {
@@ -22,6 +23,7 @@ pub(super) fn create_group_state_checkpoint(
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .storage()?;
+        store.connection.note_openmls_write();
         create_on_connection(&tx, group_id, checkpoint)?;
         tx.commit().storage()
     })
@@ -77,9 +79,9 @@ pub(super) fn restore_group_state_checkpoint(
     group_id: &GroupId,
     checkpoint_id: &str,
 ) -> StorageResult<()> {
-    store.connection.note_openmls_write();
     if store.connection.is_current_thread_transaction_owner() {
         let conn = store.lock()?;
+        store.connection.note_openmls_write();
         return restore_on_connection(&conn, group_id, checkpoint_id);
     }
     retry_on_busy(|| {
@@ -87,6 +89,7 @@ pub(super) fn restore_group_state_checkpoint(
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .storage()?;
+        store.connection.note_openmls_write();
         restore_on_connection(&tx, group_id, checkpoint_id)?;
         tx.commit().storage()
     })
@@ -149,8 +152,9 @@ pub(super) fn release_group_state_checkpoint(
     checkpoint_id: &str,
 ) -> StorageResult<()> {
     let delete = || {
-        let deleted = store
-            .lock()?
+        let conn = store.lock()?;
+        store.connection.note_openmls_write();
+        let deleted = conn
             .execute_cached(
                 "DELETE FROM cgka_group_state_checkpoints
                  WHERE group_id = ?1 AND checkpoint_id = ?2",

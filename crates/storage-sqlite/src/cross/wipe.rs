@@ -194,6 +194,7 @@ impl SqliteAccountStorage {
                     delete_recovery_copy_tx(&tx, &group_id)?;
                 }
                 if let Some(at) = forgotten_at {
+                    self.connection.note_openmls_write();
                     deleted += tx.execute_cached(
                         "INSERT INTO locally_forgotten_groups(group_id, forgotten_at, awaiting_welcome)
                          VALUES (?1, ?2, 1) ON CONFLICT(group_id) DO UPDATE SET
@@ -238,7 +239,6 @@ impl SqliteAccountStorage {
                     if reset_device_sync {
                         retire_device_sync_preparations(&tx, at)?;
                     }
-                    self.connection.note_openmls_write();
                 }
                 if deleted > 0 {
                     merge_local_group_delete_intent_tx(&tx, group_id_hex, deleted)?;

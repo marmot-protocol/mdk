@@ -139,16 +139,16 @@ impl TransportPeeler for EpochSealedPeeler {
 
     async fn peel_group_message(
         &self,
-        msg: &TransportMessage,
+        msg: &cgka_traits::peeler::PreparedGroupMessage<'_>,
         ctx: &GroupContextSnapshot,
     ) -> Result<PeeledMessage, PeelerError> {
-        let bytes = unseal_group_payload(&msg.payload, ctx)?;
+        let bytes = unseal_group_payload(&msg.message.payload, ctx)?;
         Ok(PeeledMessage {
-            id: msg.id.clone(),
+            id: msg.message.id.clone(),
             group_id: None,
             sender: None,
             content: PeeledContent::MlsMessage { bytes },
-            origin: msg.clone(),
+            origin: msg.message.clone(),
         })
     }
 
