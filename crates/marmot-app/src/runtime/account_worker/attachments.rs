@@ -907,7 +907,8 @@ pub(super) fn schedule(
             policy.disk_reserve,
             free,
             policy.automatic,
-            |free| readmit_admission(&policy, free),
+            readmit_admission(&policy, free),
+            |recorded| admission_need(policy.transfer_limit, recorded),
         )?,
         None => 0,
     };

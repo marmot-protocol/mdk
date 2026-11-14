@@ -806,44 +806,51 @@ impl SqliteAppStorage {
     }
 
     /// Readmit, from at most one bounded page of storage-parked jobs, those
-    /// that free space can fund together. In priority order, a job is
-    /// readmitted while its recorded headroom fits what is left of `free`,
-    /// beyond the policy reserve and a fixed margin, after the headroom of
-    /// the jobs readmitted before it, and while worker admission at that
-    /// remaining free space (`admission`) would let it start. The first job
-    /// that does not fit ends the batch, so a later, smaller one cannot take
-    /// the space a higher-priority job is waiting for. Jobs left out stay
-    /// parked with their targets.
+    /// that free space can fund together, in the order the worker starts
+    /// them (explicit first, then priority). Each is charged the larger of
+    /// its recorded headroom and what admission needs for its checkpoint now
+    /// (`need`: a pruned prefix or a raised limit can make that larger), and
+    /// is readmitted while its charge fits what is left of `free`, beyond the
+    /// policy reserve and a fixed margin, after the charges readmitted before
+    /// it. The first job that does not fit ends the batch, so a later one
+    /// cannot take the space an earlier one is waiting for. Jobs left out
+    /// stay parked with their targets.
     ///
-    /// The page is filtered by what fits `free` alone before it is limited,
-    /// so rows that cannot fit at all cannot hide later ones that can. A
-    /// readmitted row is then not bounced back to a timer. The margin keeps
-    /// measurement noise from flipping a row every tick, and a job that
-    /// parked more than once waits out its park streak (15 s doubling to an
-    /// hour) before it is due again, so free space that oscillates around a
-    /// target cannot drive a hot loop. Checkpoints get a fresh idle expiry;
-    /// cancelled work, size-policy blocks and, while automatic acquisition
-    /// is disabled, automatic rows stay parked. Nothing is written when no
-    /// row fits.
+    /// What is left starts below `free` by the need of every job readmitted
+    /// earlier that has not finished (queued, in flight or retrying), since
+    /// its writes may not show in `free` yet; a job in flight may be counted
+    /// twice, never missed. Those are the unfinished jobs with a park streak
+    /// (finishing clears the streak) that can still run: automatic ones only
+    /// while automatic acquisition is enabled.
+    ///
+    /// The page is filtered by what fits `free` and `admission` (worker
+    /// admission at `free`) before it is limited, so rows that cannot fit at
+    /// all cannot hide later ones that can. The margin keeps measurement
+    /// noise from flipping a row every tick, and a job that parked more than
+    /// once waits out its park streak (15 s doubling to an hour) before it is
+    /// due again, so free space that oscillates around a target cannot drive
+    /// a hot loop. Checkpoints get a fresh idle expiry; cancelled work,
+    /// size-policy blocks and, while automatic acquisition is disabled,
+    /// automatic rows stay parked. Nothing is written when no row fits.
     pub fn readmit_storage_blocked_attachments(
         &self,
         now: u64,
         disk_reserve: u64,
         free: u64,
         automatic: bool,
-        admission: impl Fn(u64) -> ReadmitAdmission,
+        admission: ReadmitAdmission,
+        need: impl Fn(Option<u64>) -> u64,
     ) -> StorageResult<usize> {
         let floor = disk_reserve.saturating_add(STORAGE_READMIT_MARGIN_BYTES);
         let Some(headroom) = free.checked_sub(floor) else {
             return Ok(0);
         };
-        let first = admission(free);
         let headroom = u64_to_i64(headroom.min(i64::MAX as u64))?;
-        let checkpointed = u64_to_i64(first.checkpointed_at_least.min(i64::MAX as u64))?;
+        let checkpointed = u64_to_i64(admission.checkpointed_at_least.min(i64::MAX as u64))?;
         let params = params![
             automatic,
             headroom,
-            first.uncheckpointed,
+            admission.uncheckpointed,
             checkpointed,
             ATTACHMENT_ACQUISITION_BATCH_LIMIT as i64
         ];
@@ -859,35 +866,45 @@ impl SqliteAppStorage {
         if !fits {
             return Ok(0);
         }
+        let recorded = |received: Option<i64>| received.and_then(|r| u64::try_from(r).ok());
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
+            let pending: u64 = conn
+                .prepare(
+                    "SELECT (SELECT p.received FROM attachment_partial p WHERE p.token=q.token)
+                    FROM attachment_acquisition q
+                    WHERE state IN (0,1,2) AND cancelled=0 AND storage_park_count>0
+                    AND (explicit_request=1 OR ?1)",
+                )
+                .storage()?
+                .query_map([automatic], |row| row.get::<_, Option<i64>>(0))
+                .storage()?
+                .map(|received| received.map(|received| need(recorded(received))))
+                .try_fold(0u64, |sum, charge| charge.map(|charge| sum.saturating_add(charge)))
+                .storage()?;
             let page: Vec<(Vec<u8>, i64, Option<i64>)> = conn
                 .prepare(&format!(
                     "SELECT token,storage_blocked_headroom,
                         (SELECT p.received FROM attachment_partial p WHERE p.token=q.token)
                     FROM attachment_acquisition q WHERE {READMITTABLE}
-                    ORDER BY priority_at DESC,token LIMIT ?5"
+                    ORDER BY explicit_request DESC,priority_at DESC,token LIMIT ?5"
                 ))
                 .storage()?
                 .query_map(params, |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
                 .storage()?
                 .collect::<Result<_, _>>()
                 .storage()?;
-            // Free space left for the next job once those before it write
-            // what their targets say they may.
-            let mut remaining = free;
+            // Free space left beyond the floor for the next job.
+            let mut available = free.saturating_sub(floor).saturating_sub(pending);
             let mut readmitted = 0;
             for (token, target, received) in page {
-                let target = u64::try_from(target).unwrap_or(u64::MAX);
-                let recorded = received.and_then(|received| u64::try_from(received).ok());
-                let funded = remaining
-                    .checked_sub(floor)
-                    .is_some_and(|available| target <= available)
-                    && admission(remaining).admits(recorded);
-                if !funded {
+                let charge = u64::try_from(target)
+                    .unwrap_or(u64::MAX)
+                    .max(need(recorded(received)));
+                if charge > available {
                     break;
                 }
-                remaining = remaining.saturating_sub(target);
+                available -= charge;
                 conn.execute(
                     "UPDATE attachment_acquisition SET state=0,storage_blocked_headroom=NULL,
                     due=?2+CASE WHEN storage_park_count<=1 THEN 0 ELSE min(15*(1<<min(storage_park_count-2,8)),3600) END

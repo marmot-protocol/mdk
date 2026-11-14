@@ -378,10 +378,12 @@ current free space. A job worker admission refuses for disk space parks as Stora
 with what admission needs as its target, without spending a transfer attempt or evicting
 existing bytes; a body the device cannot publish parks the same way with its checkpoint.
 Either waits until free space covers its recorded target or the user retries (see the native
-attachment access contract). Readmission releases parked jobs in priority order only while
-free space funds them together: each readmitted target comes out of what is left for the
-next, admission is asked about that remainder, and the first job that does not fit ends the
-batch, so the rest stay parked with their targets instead of failing admission (mdk#3414).
+attachment access contract). Readmission releases parked jobs in the order the worker starts
+them (explicit first, then priority) only while free space funds them together. Each is
+charged the larger of its target and what admission needs for its checkpoint now; jobs
+readmitted earlier that have not finished still count against free space, since their writes
+may not show yet; and the first job that does not fit ends the batch, so the rest stay parked
+with their targets instead of failing admission (mdk#3414).
 
 Release/binding publication, app cache adoption and device benchmarks remain C9. Local tests do
 not establish mobile throughput or background execution entitlement. See the native usage guide.
