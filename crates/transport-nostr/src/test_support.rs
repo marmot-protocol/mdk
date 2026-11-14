@@ -42,6 +42,7 @@ fn refused(endpoints: &[TransportEndpoint]) -> Vec<TransportEndpointFailure> {
     endpoints
         .iter()
         .map(|endpoint| TransportEndpointFailure {
+            pre_send: false,
             endpoint: endpoint.clone(),
             reason: "blocked".to_owned(),
             kind: TransportEndpointFailureKind::TerminalRejected,

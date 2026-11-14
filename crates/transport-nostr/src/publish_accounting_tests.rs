@@ -40,6 +40,7 @@ fn receipt(endpoint: &TransportEndpoint) -> TransportEndpointReceipt {
 
 fn failure(endpoint: &TransportEndpoint) -> TransportEndpointFailure {
     TransportEndpointFailure {
+        pre_send: false,
         size_class: None,
         endpoint: endpoint.clone(),
         reason: "rejected".to_owned(),

@@ -1034,6 +1034,19 @@ pub trait NostrRelayClient: Send + Sync {
         event: &NostrTransportEvent,
         required_acks: usize,
     ) -> Result<NostrPublishOutcome, TransportAdapterError>;
+    /// Open, or reuse, the connection [`Self::publish_event`] would send to
+    /// `endpoint` on, and send nothing (mdk#2332). A relay that cannot be
+    /// reached fails as a publish does before sending: a retryable failure
+    /// that proves nothing was sent
+    /// ([`TransportEndpointFailure::proves_nothing_sent`]). The default
+    /// reports a connection: a client that cannot tell must not hold
+    /// publishes back as unreachable.
+    async fn connect_for_publish(
+        &self,
+        _endpoint: &TransportEndpoint,
+    ) -> Result<(), TransportEndpointFailure> {
+        Ok(())
+    }
 
     /// Publish using the immutable authentication context selected by the
     /// operation's account identity. An implementation without account

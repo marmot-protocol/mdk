@@ -46,6 +46,7 @@ pub(crate) const REFUSED_BY_SAFETY_RULE_REASON: &str =
 /// sent there, and the same event can never be sent there.
 fn refused_by_safety_rule(endpoint: TransportEndpoint) -> TransportEndpointFailure {
     TransportEndpointFailure {
+        pre_send: false,
         endpoint,
         reason: REFUSED_BY_SAFETY_RULE_REASON.to_owned(),
         kind: TransportEndpointFailureKind::NotExposed,
@@ -332,31 +333,42 @@ impl RelaySafetyPolicy {
     ) -> Vec<TransportEndpoint> {
         let mut reachable: Vec<TransportEndpoint> = Vec::new();
         for endpoint in target.endpoints() {
-            let one = match target {
-                TransportPublishTarget::Group {
-                    group_id,
-                    transport_group_id,
-                    ..
-                } => TransportPublishTarget::Group {
-                    group_id: group_id.clone(),
-                    transport_group_id: transport_group_id.clone(),
-                    endpoints: vec![endpoint.clone()],
-                },
-                TransportPublishTarget::Inbox { recipient, .. } => TransportPublishTarget::Inbox {
-                    recipient: recipient.clone(),
-                    endpoints: vec![endpoint.clone()],
-                },
-            };
-            let Ok(one) = self.sanitize_publish_target(one) else {
-                continue;
-            };
-            for endpoint in one.endpoints() {
-                if !reachable.contains(endpoint) {
-                    reachable.push(endpoint.clone());
-                }
+            if let Some(endpoint) = self.reachable_publish_endpoint(target, endpoint)
+                && !reachable.contains(&endpoint)
+            {
+                reachable.push(endpoint);
             }
         }
         reachable
+    }
+
+    /// The endpoint a one-endpoint publish request to `target`'s `endpoint`
+    /// sends to, as admission spells it, or `None` when it sends nowhere.
+    pub(crate) fn reachable_publish_endpoint(
+        &self,
+        target: &TransportPublishTarget,
+        endpoint: &TransportEndpoint,
+    ) -> Option<TransportEndpoint> {
+        let one = match target {
+            TransportPublishTarget::Group {
+                group_id,
+                transport_group_id,
+                ..
+            } => TransportPublishTarget::Group {
+                group_id: group_id.clone(),
+                transport_group_id: transport_group_id.clone(),
+                endpoints: vec![endpoint.clone()],
+            },
+            TransportPublishTarget::Inbox { recipient, .. } => TransportPublishTarget::Inbox {
+                recipient: recipient.clone(),
+                endpoints: vec![endpoint.clone()],
+            },
+        };
+        self.sanitize_publish_target(one)
+            .ok()?
+            .endpoints()
+            .first()
+            .cloned()
     }
 
     /// Keep the endpoints that pass the host-safety rule and drop the rest.
@@ -1090,6 +1102,7 @@ mod tests {
                     .iter()
                     .cloned()
                     .map(|endpoint| TransportEndpointFailure {
+                        pre_send: false,
                         endpoint,
                         reason: REFUSED_BY_SAFETY_RULE_REASON.to_owned(),
                         kind: TransportEndpointFailureKind::NotExposed,

@@ -2073,6 +2073,32 @@ impl PublishRelayCache {
     }
 }
 
+/// A connect that reached no relay, so sent nothing: retryable, with
+/// `timed_out` telling a handshake that outlived the connect budget from an
+/// immediate dial error, for audit. The reason never embeds the nostr-sdk
+/// error Display: it commonly carries the relay URL, and these reasons flow
+/// into `TransportAdapterError::Publish` Display (see
+/// `finish_publish_outcome`), which upper layers may log. The endpoint stays
+/// available on the structured failure record.
+fn publish_connect_failure(
+    endpoint: TransportEndpoint,
+    timed_out: bool,
+) -> TransportEndpointFailure {
+    TransportEndpointFailure {
+        pre_send: true,
+        size_class: None,
+        endpoint,
+        reason: if timed_out {
+            "connect relay timed out"
+        } else {
+            "connect relay failed"
+        }
+        .to_owned(),
+        kind: TransportEndpointFailureKind::RetryableUnavailable,
+        rejection_category: None,
+    }
+}
+
 struct ScopedPublishRelayLease {
     owner: NostrSdkRelayClient,
     endpoints: Vec<RelayUrl>,
@@ -4795,23 +4821,44 @@ impl NostrSdkRelayClient {
         };
         match connected {
             Ok(()) => Ok(endpoint),
-            // Failure reasons never embed the nostr-sdk error Display: it
-            // commonly carries the relay URL, and these reasons flow into
-            // `TransportAdapterError::Publish` Display (see
-            // `finish_publish_outcome`), which upper layers may log. The
-            // endpoint stays available on the structured failure record.
-            Err(timed_out) => Err(TransportEndpointFailure {
-                size_class: None,
-                endpoint: transport_endpoint,
-                reason: if timed_out {
-                    "connect relay timed out"
-                } else {
-                    "connect relay failed"
+            Err(timed_out) => Err(publish_connect_failure(transport_endpoint, timed_out)),
+        }
+    }
+
+    /// Wait until `endpoint`'s socket is `Connected`, up to `deadline`.
+    /// `try_connect` returns at once for a relay another operation is already
+    /// connecting or reconnecting, without that handshake's result, so its
+    /// success alone does not show the relay was reached (mdk#2332). A
+    /// handshake that fails or outlives the deadline is the same pre-send
+    /// failure as a connect of its own.
+    async fn await_publish_connection(
+        &self,
+        endpoint: &RelayUrl,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), TransportEndpointFailure> {
+        let transport_endpoint = TransportEndpoint(endpoint.to_string());
+        let Ok(Some(relay)) = self.client.relay(endpoint.clone()).await else {
+            return Err(publish_connect_failure(transport_endpoint, false));
+        };
+        // Subscribe before reading the status, so no change is missed.
+        let mut updates = relay.notifications_with_gaps();
+        let connected = timeout_at(deadline, async {
+            loop {
+                match relay.status() {
+                    RelayStatus::Connected => return true,
+                    RelayStatus::Pending | RelayStatus::Connecting | RelayStatus::Disconnected => {}
+                    _ => return false,
                 }
-                .to_owned(),
-                kind: TransportEndpointFailureKind::RetryableUnavailable,
-                rejection_category: None,
-            }),
+                if updates.next().await.is_none() {
+                    return false;
+                }
+            }
+        })
+        .await;
+        match connected {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(publish_connect_failure(transport_endpoint, false)),
+            Err(_) => Err(publish_connect_failure(transport_endpoint, true)),
         }
     }
 
@@ -4822,6 +4869,7 @@ impl NostrSdkRelayClient {
         transport_endpoint: &TransportEndpoint,
     ) -> Result<Option<TransportEndpointAckKind>, TransportEndpointFailure> {
         let local_failure = |reason: &str| TransportEndpointFailure {
+            pre_send: false,
             size_class: None,
             endpoint: transport_endpoint.clone(),
             reason: reason.to_owned(),
@@ -4899,6 +4947,7 @@ impl NostrSdkRelayClient {
     ) -> Result<TransportEndpointReceipt, TransportEndpointFailure> {
         let transport_endpoint = TransportEndpoint(endpoint.to_string());
         let mut last_failure = TransportEndpointFailure {
+            pre_send: false,
             size_class: None,
             endpoint: transport_endpoint.clone(),
             reason: "send event failed".to_owned(),
@@ -4906,6 +4955,7 @@ impl NostrSdkRelayClient {
             rejection_category: None,
         };
         let mut earlier_ambiguous_attempt = false;
+        let mut earlier_retryable_answer = false;
         for attempt in 1..=SDK_RELAY_PUBLISH_ATTEMPTS {
             match timeout(
                 SDK_RELAY_PUBLISH_WAIT,
@@ -4930,11 +4980,17 @@ impl NostrSdkRelayClient {
                         failure.kind == TransportEndpointFailureKind::PossiblyExposed;
                     // A later refusal describes only that attempt: preserve
                     // earlier uncertainty for the owner, and withhold size
-                    // proof even when this reply stops internal retries.
-                    if earlier_ambiguous_attempt {
+                    // proof even when this reply stops internal retries. A
+                    // relay that answered an earlier attempt `rate-limited:`
+                    // or `auth-required:` received that event, so its later
+                    // definitive refusal cannot prove it unseen (mdk#2332).
+                    if earlier_ambiguous_attempt || (earlier_retryable_answer && terminal_rejection)
+                    {
                         failure.kind = TransportEndpointFailureKind::PossiblyExposed;
                         failure.size_class = None;
                     }
+                    earlier_retryable_answer |=
+                        failure.kind == TransportEndpointFailureKind::RetryableUnavailable;
                     // An anonymous connection cannot satisfy NIP-42 by waiting
                     // and resending. Return its explicit rejection so the
                     // account owner can perform its authenticated fallback.
@@ -5520,6 +5576,7 @@ impl NostrSdkRelayClient {
                         return Ok(());
                     }
                     return Err(TransportEndpointFailure {
+                        pre_send: true,
                         size_class: None,
                         endpoint: transport_endpoint,
                         reason: "configure publish relay failed".to_owned(),
@@ -5539,6 +5596,7 @@ impl NostrSdkRelayClient {
                 Ok(())
             }
             Err(_) => Err(TransportEndpointFailure {
+                pre_send: true,
                 size_class: None,
                 endpoint: transport_endpoint,
                 reason: "add publish relay failed".to_owned(),
@@ -6127,6 +6185,46 @@ impl NostrRelayClient for NostrSdkRelayClient {
             .expect("single-event batch returns one outcome")
     }
 
+    async fn connect_for_publish(
+        &self,
+        endpoint: &TransportEndpoint,
+    ) -> Result<(), TransportEndpointFailure> {
+        let unreachable = || TransportEndpointFailure {
+            pre_send: true,
+            size_class: None,
+            endpoint: endpoint.clone(),
+            reason: "connect relay failed".to_owned(),
+            kind: TransportEndpointFailureKind::RetryableUnavailable,
+            rejection_category: None,
+        };
+        if self.validate_publish_context().await.is_err() {
+            return Err(unreachable());
+        }
+        let Some(relay) = parse_endpoints(std::slice::from_ref(endpoint), "publish")
+            .ok()
+            .and_then(|mut relays| relays.pop())
+        else {
+            return Err(unreachable());
+        };
+        // The same lease and bounded connect a publish takes, so the socket
+        // the next publish to this relay uses is the one judged here. The
+        // relay counts as reached only once that socket is connected.
+        let deadline = tokio::time::Instant::now() + SDK_RELAY_CONNECT_WAIT;
+        let mut lease = ScopedPublishRelayLease::new(self.clone());
+        let connected = match lease.retain(&relay).await {
+            Ok(()) => match self.connect_publish_relay(relay.clone()).await {
+                Ok(_) => self.await_publish_connection(&relay, deadline).await,
+                Err(failure) => Err(failure),
+            },
+            Err(failure) => Err(failure),
+        };
+        lease.release().await;
+        connected.map_err(|failure| TransportEndpointFailure {
+            endpoint: endpoint.clone(),
+            ..failure
+        })
+    }
+
     async fn publish_event_for_account(
         &self,
         account_id: &MemberId,
@@ -6449,6 +6547,7 @@ fn append_missing_publish_failures(
             continue;
         }
         failed.push(TransportEndpointFailure {
+            pre_send: false,
             size_class: None,
             endpoint: endpoint.clone(),
             reason: "publish acknowledgement unknown".into(),
@@ -6780,6 +6879,7 @@ fn relay_rejection_endpoint_failure(
             format!("relay rejected event ({})", category.as_str())
         };
         return TransportEndpointFailure {
+            pre_send: false,
             size_class: None,
             endpoint,
             reason,
@@ -6794,6 +6894,7 @@ fn relay_rejection_endpoint_failure(
     // the durable send queued and retry it after connectivity returns. Keep
     // the SDK string out of the reason: it can contain relay URLs.
     TransportEndpointFailure {
+        pre_send: false,
         size_class: None,
         endpoint,
         reason: "publish acknowledgement unknown".to_owned(),
@@ -11547,6 +11648,7 @@ mod tests {
         let b = TransportEndpoint("wss://second.example".into());
         let targets = vec![a.clone(), b.clone()];
         let failure = |endpoint: &TransportEndpoint| TransportEndpointFailure {
+            pre_send: false,
             endpoint: endpoint.clone(),
             reason: "relay rejected event (too-large)".into(),
             kind: TransportEndpointFailureKind::TerminalRejected,
@@ -11617,6 +11719,7 @@ mod tests {
             Vec::new(),
             vec![
                 TransportEndpointFailure {
+                    pre_send: false,
                     size_class: None,
                     endpoint: TransportEndpoint("wss://first.example".into()),
                     reason: "relay rejected event (blocked)".to_owned(),
@@ -11624,6 +11727,7 @@ mod tests {
                     rejection_category: Some(TransportEndpointRejectionCategory::Blocked),
                 },
                 TransportEndpointFailure {
+                    pre_send: false,
                     size_class: None,
                     endpoint: TransportEndpoint("wss://second.example".into()),
                     reason: "relay rejected event (blocked)".to_owned(),
@@ -11664,6 +11768,7 @@ mod tests {
             ack_kind: None,
         }];
         let failed = vec![TransportEndpointFailure {
+            pre_send: false,
             size_class: None,
             endpoint: TransportEndpoint("wss://bad.example".into()),
             reason: "relay rejected event (auth-required)".to_owned(),
@@ -11729,6 +11834,7 @@ mod tests {
             cgka_traits::MessageId::new(vec![0xD4; 32]),
             Vec::new(),
             vec![TransportEndpointFailure {
+                pre_send: false,
                 size_class: None,
                 endpoint: endpoint.clone(),
                 reason: "connect relay failed".to_owned(),
@@ -12540,6 +12646,7 @@ mod tests {
             TransportEndpointFailureKind::RetryableUnavailable,
             "a failed connection proves the event was never exposed to the relay",
         );
+        assert!(failures[0].pre_send, "and says so (mdk#2332)");
         assert_eq!(failures[0].reason, "connect relay failed");
         assert_eq!(sdk.relay_health().await.total_relays, 0);
     }
@@ -12568,6 +12675,7 @@ mod tests {
             TransportEndpointFailureKind::RetryableUnavailable,
             "a connect timeout proves the event was never sent",
         );
+        assert!(failures[0].pre_send, "and says so (mdk#2332)");
         drop(silent);
     }
 
@@ -13335,6 +13443,142 @@ mod tests {
         }
     }
 
+    /// mdk#2332: a relay that answered an earlier attempt `rate-limited:`
+    /// received that event. Its later definitive refusal speaks only for the
+    /// later attempt, so the publish reports the relay possibly exposed.
+    #[tokio::test]
+    async fn a_refusal_after_a_retryable_answer_cannot_prove_the_event_unseen() {
+        let (endpoint, _, attempts) = counting_publish_relay_rejection_sequence(
+            Arc::new(AtomicBool::new(true)),
+            vec!["rate-limited: slow down", "invalid: event too large: 70000"],
+        )
+        .await;
+        let sdk = NostrSdkRelayClient::from_builder(Client::builder());
+        let error = sdk
+            .publish_event(
+                std::slice::from_ref(&endpoint),
+                &signed_group_event_dto(),
+                1,
+            )
+            .await
+            .expect_err("both attempts were refused");
+        assert_eq!(attempts.lock().await.len(), 2);
+        let failures = error.publish_endpoint_failures();
+        assert_eq!(failures.len(), 1);
+        assert_eq!(
+            failures[0].kind,
+            TransportEndpointFailureKind::PossiblyExposed
+        );
+        assert_eq!(
+            failures[0].rejection_category,
+            Some(TransportEndpointRejectionCategory::TooLarge)
+        );
+        assert_eq!(failures[0].size_class, None, "no size proof");
+        assert!(!failures[0].pre_send);
+        sdk.client().shutdown().await;
+    }
+
+    /// mdk#2332: a connect-only probe opens the publish connection and sends
+    /// nothing. A relay it cannot reach fails as a publish would before
+    /// sending: retryable and pre-send, under the endpoint's own spelling.
+    #[tokio::test]
+    async fn a_publish_connection_probe_sends_nothing() {
+        let (endpoint, connections, attempts) =
+            counting_publish_relay(Arc::new(AtomicBool::new(false))).await;
+        let sdk = NostrSdkRelayClient::from_builder(Client::builder());
+        sdk.connect_for_publish(&endpoint)
+            .await
+            .expect("the relay accepts connections");
+        assert_eq!(connections.load(Ordering::Relaxed), 1);
+        assert!(attempts.lock().await.is_empty(), "no EVENT was sent");
+        sdk.client().shutdown().await;
+
+        let reservation = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let closed = TransportEndpoint(format!("ws://{}/", reservation.local_addr().unwrap()));
+        drop(reservation);
+        let sdk = NostrSdkRelayClient::from_builder(Client::builder());
+        let failure = timeout(Duration::from_secs(3), sdk.connect_for_publish(&closed))
+            .await
+            .expect("a refused connection fails promptly")
+            .expect_err("nothing listens there");
+        assert_eq!(failure.endpoint, closed);
+        assert_eq!(
+            failure.kind,
+            TransportEndpointFailureKind::RetryableUnavailable
+        );
+        assert!(failure.pre_send);
+        assert!(failure.proves_nothing_sent());
+    }
+
+    /// mdk#2332: a probe that finds the relay's socket already connecting,
+    /// another operation's handshake in flight, waits for that handshake
+    /// rather than reading the relay as reached. A handshake that completes
+    /// connects the waiting probe; one that fails holds it, retryable and
+    /// pre-send, so the size floor never refuses a commit at a relay the
+    /// probe never reached.
+    #[tokio::test]
+    async fn a_publish_connection_probe_waits_for_a_handshake_in_flight() {
+        for completes in [true, false] {
+            let (endpoint, accepted, finish) = stalled_handshake_relay().await;
+            let sdk = NostrSdkRelayClient::from_builder(Client::builder());
+            let probe = || {
+                let sdk = sdk.clone();
+                let endpoint = endpoint.clone();
+                tokio::spawn(async move { sdk.connect_for_publish(&endpoint).await })
+            };
+            let first = probe();
+            accepted.await.unwrap();
+            // The first probe's handshake is in flight and cannot finish
+            // until `finish`, so a second probe that reads the relay as
+            // reached would complete on its first poll.
+            let mut second = Box::pin(sdk.connect_for_publish(&endpoint));
+            assert!(
+                futures::poll!(second.as_mut()).is_pending(),
+                "the second probe waits while the socket is connecting"
+            );
+            finish.send(completes).unwrap();
+            let outcomes = [first.await.unwrap(), second.await];
+            for outcome in outcomes {
+                if completes {
+                    outcome.expect("the finished handshake connects every probe");
+                } else {
+                    let failure = outcome.expect_err("the handshake failed");
+                    assert_eq!(failure.endpoint, endpoint);
+                    assert_eq!(
+                        failure.kind,
+                        TransportEndpointFailureKind::RetryableUnavailable
+                    );
+                    assert!(failure.proves_nothing_sent());
+                }
+            }
+            sdk.client().shutdown().await;
+        }
+    }
+
+    /// A relay that accepts one TCP connection and leaves its WebSocket
+    /// handshake unfinished until `finish` says to complete it (`true`) or
+    /// drop the socket (`false`). `accepted` fires once the connection is in.
+    async fn stalled_handshake_relay() -> (
+        TransportEndpoint,
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<bool>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = TransportEndpoint(format!("ws://{}", listener.local_addr().unwrap()));
+        let (accepted_tx, accepted) = tokio::sync::oneshot::channel();
+        let (finish, finish_rx) = tokio::sync::oneshot::channel::<bool>();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let _ = accepted_tx.send(());
+            if finish_rx.await.unwrap_or(false)
+                && let Ok(mut socket) = tokio_tungstenite::accept_async(stream).await
+            {
+                while let Some(Ok(_)) = socket.next().await {}
+            }
+        });
+        (endpoint, accepted, finish)
+    }
+
     #[tokio::test]
     async fn a_size_reply_after_an_ambiguous_attempt_keeps_size_proof_unknown() {
         let (endpoint, _, attempts) = counting_publish_relay_rejection_sequence(
@@ -13393,6 +13637,10 @@ mod tests {
         assert_eq!(
             failures[0].rejection_category,
             Some(TransportEndpointRejectionCategory::RateLimited)
+        );
+        assert!(
+            !failures[0].pre_send,
+            "the relay answered, so it received the event (mdk#2332)"
         );
         let times = attempts.lock().await;
         assert_eq!(times.len(), SDK_RELAY_PUBLISH_ATTEMPTS);
