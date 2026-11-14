@@ -119,12 +119,77 @@ impl Marmot {
     /// kind-7/kind-5 events remain available through `messages(...)` for
     /// diagnostics.
     ///
-    /// This call is **synchronous** and runs the store read on the calling
-    /// thread; clients should not use it for scroll-back. Prefer
-    /// [`subscribe_timeline_messages`](Self::subscribe_timeline_messages) plus
-    /// `TimelineMessagesSubscription::paginate_backwards` /
-    /// `paginate_forwards`, which own a bounded window and run off the caller
-    /// thread. Retained for one-shot diagnostics/tooling only.
+    /// Pages always return `messages` in ascending display order, including
+    /// when selecting the latest tail or paging backwards. With no cursor,
+    /// the query selects the last `limit` matching rows (default 50, cap 200).
+    /// `before` selects the nearest preceding rows; `after` selects the nearest
+    /// following rows. Both boundaries are exclusive in MarmotKit.
+    ///
+    /// To load older rows, copy the first row's `timeline_at` and `message_id_hex`
+    /// into `before` and `before_message_id`. To load newer rows, copy the last
+    /// row into `after` and `after_message_id`. Each pair is required together;
+    /// supplying both directions is an error. Keep the query scope and filters.
+    ///
+    /// Group queries use canonical display order unless `search_wall_clock` is
+    /// true: epoch boundaries precede their authenticated application rows,
+    /// even when timestamps run backwards between epochs. Storage resolves the
+    /// cursor row's canonical key by message id; do not sort by `timeline_at`
+    /// or manufacture a timestamp-only cursor. A cursor row no longer retained
+    /// causes an error; restart without a cursor. Account-wide and wall-clock
+    /// queries order by `(timeline_at, message_id_hex)`. Equal timestamps still
+    /// require the id tie-breaker. Account-wide `search_wall_clock` queries add
+    /// `group_id_hex` as the final tie-breaker and require that row's group in
+    /// `cursor_group_id` when paging.
+    ///
+    /// `has_more_before` reports overflow toward older matching rows for an
+    /// initial or Before query; `has_more_after` reports overflow toward newer
+    /// matching rows for an After query. The initial tail has no more after.
+    /// Before queries set `has_more_after = true`; After queries set
+    /// `has_more_before = true`, even for empty pages. These cursor-side flags
+    /// describe navigation context, not a separate existence check. Flags refer
+    /// to locally stored matching rows, not remote history completeness.
+    ///
+    /// This supported lower-level read is **synchronous**; run it off the UI
+    /// thread. Complete chat screens start from
+    /// [`open_conversation_window`](Self::open_conversation_window).
+    /// Custom live timelines can use
+    /// [`subscribe_timeline_messages`](Self::subscribe_timeline_messages) with
+    /// [`paginate_backwards`](crate::subscriptions::TimelineMessagesSubscription::paginate_backwards)
+    /// and [`paginate_forwards`](crate::subscriptions::TimelineMessagesSubscription::paginate_forwards),
+    /// which own a bounded replacement window and run off the caller thread.
+    ///
+    /// # Example
+    ///
+    /// Initial tail, then an older page and the page following it. Each result
+    /// stays in display order; the boundary row is not repeated.
+    ///
+    /// ```no_run
+    /// # use marmot_uniffi::{Marmot, MarmotKitError, TimelineMessageQueryFfi};
+    /// # fn pages(kit: &Marmot, account: String, group: String) -> Result<(), MarmotKitError> {
+    /// let query = TimelineMessageQueryFfi {
+    ///     group_id_hex: Some(group),
+    ///     limit: Some(50),
+    ///     ..Default::default()
+    /// };
+    /// let initial = kit.timeline_messages(account.clone(), query.clone())?;
+    /// if !initial.has_more_before {
+    ///     return Ok(());
+    /// }
+    /// let Some(first) = initial.messages.first() else { return Ok(()); };
+    /// let older = kit.timeline_messages(account.clone(), TimelineMessageQueryFfi {
+    ///     before: Some(first.timeline_at),
+    ///     before_message_id: Some(first.message_id_hex.clone()),
+    ///     ..query.clone()
+    /// })?;
+    /// let Some(last) = older.messages.last() else { return Ok(()); };
+    /// let newer = kit.timeline_messages(account, TimelineMessageQueryFfi {
+    ///     after: Some(last.timeline_at),
+    ///     after_message_id: Some(last.message_id_hex.clone()),
+    ///     ..query
+    /// })?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn timeline_messages(
         &self,
         account_ref: String,
