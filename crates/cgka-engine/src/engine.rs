@@ -3064,6 +3064,7 @@ impl<S: StorageProvider> Engine<S> {
             let digest = hasher.finalize();
             let processed = crate::snapshot_guard::SnapshotRollbackGuard::contained(
                 &self.storage,
+                &self.rewinds,
                 group_id,
                 crate::snapshot_guard::RewindSite::HydrateSelfRemove,
                 &hex::encode(&digest[..8]),
@@ -4426,6 +4427,7 @@ impl<S: StorageProvider> Engine<S> {
         // included, if the restore fails.
         crate::openmls_projection::with_retained_anchor_group(
             &self.storage,
+            &self.rewinds,
             &self.crypto,
             group_id,
             epoch,

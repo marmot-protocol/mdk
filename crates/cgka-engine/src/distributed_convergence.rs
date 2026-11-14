@@ -2417,6 +2417,7 @@ impl<S: StorageProvider> Engine<S> {
             .with_transaction(|storage| {
                 let output = apply_openmls_canonicalization_result_with_profile_policy(
                     storage,
+                    &self.rewinds,
                     group_id,
                     &result,
                     max_retained_anchor_rewind,

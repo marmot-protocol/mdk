@@ -1904,6 +1904,7 @@ impl<S: StorageProvider> Engine<S> {
                 };
                 crate::app_payload::historical_source(
                     &self.storage,
+                    &self.rewinds,
                     &self.crypto,
                     &request,
                     &snapshot,
@@ -2887,9 +2888,7 @@ impl<S: StorageProvider> Engine<S> {
         };
         if self.storage.past_peel_context_generation().is_none() {
             // Without the generation no cached context can be validated, so
-            // never cache this one. Run it in a committing window, whose
-            // failed restore quarantines the group for the session; a
-            // contained one on a backend without atomic savepoints would not.
+            // capture this one in a committing window and never cache it.
             if let Some(cache) = cache {
                 cache.synchronize_generation(None)?;
             }
@@ -2915,6 +2914,7 @@ impl<S: StorageProvider> Engine<S> {
                 .transpose()?;
             let context = SnapshotRollbackGuard::contained(
                 storage,
+                &self.rewinds,
                 group_id,
                 RewindSite::PastPeelContext,
                 &suffix,
@@ -2972,6 +2972,7 @@ impl<S: StorageProvider> Engine<S> {
         hasher.update(current_epoch.0.to_be_bytes());
         crate::openmls_projection::with_retained_anchor_group(
             &self.storage,
+            &self.rewinds,
             &self.crypto,
             group_id,
             source_epoch,
@@ -3010,6 +3011,7 @@ impl<S: StorageProvider> Engine<S> {
         self.ensure_group_live(group_id)?;
         crate::openmls_projection::retained_anchor_media_secret(
             &self.storage,
+            &self.rewinds,
             &self.crypto,
             group_id,
             epoch,

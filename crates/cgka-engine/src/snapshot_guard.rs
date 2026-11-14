@@ -20,12 +20,12 @@
 //!   contain the window, so it commits as it goes and writes only the guard's
 //!   own snapshot, the one open-time recovery restores after a crash: the
 //!   savepoint's fallback snapshot would be a second, and recovery refuses to
-//!   choose between two (mdk#3278). A restore that fails there keeps the
-//!   snapshot for the next open when it is the only copy of the live state,
-//!   and releases it inside an enclosing committing window, whose own snapshot
-//!   holds that state. No session registry reaches every contained window, so
-//!   the group is not quarantined meanwhile; the kept snapshot refuses every
-//!   later window whose own snapshot recovery could not resolve beside it.
+//!   choose between two (mdk#3278). Such a window fails as a committing one
+//!   does: a restore that fails keeps the snapshot, the only copy of the live
+//!   state, and records the group in the session's [`Rewinds`], and so does a
+//!   release that fails. Inside an enclosing committing window the enclosing
+//!   snapshot holds that state instead, so the nested one is released and the
+//!   enclosing window answers for the group.
 //! - **Committing** ([`SnapshotRollbackGuard::rewind`]): the window opens with
 //!   a rewind onto a retained anchor outside any transaction, so its writes
 //!   commit as they happen. The convergence pass and the deferred-peel sweep
@@ -41,7 +41,10 @@
 //!   (`openmls_projection::recover_interrupted_rewind_guards_at_open`). A snapshot
 //!   that survives because its release failed is recorded too: it refuses
 //!   every later committing window and the next open restores it, so the
-//!   group must not advance past it meanwhile.
+//!   group must not advance past it meanwhile. Without atomic group savepoints
+//!   a committing window also releases the snapshots its nested windows left
+//!   before its own, and keeps its own when it cannot: the next open must not
+//!   find a nested snapshot alone and restore it as if it held live state.
 //!
 //! Process termination inside a committing window leaves the same evidence: the
 //! surviving snapshot is the only copy of the live state, so it must be
@@ -236,9 +239,10 @@ impl Rewinds {
 /// and releases the nested ones inside it, so the only snapshot this window
 /// may join is one enclosing window's, and only as the nesting site.
 ///
-/// This also keeps a snapshot an earlier failed restore kept: a second window
-/// of its site would overwrite it, and a window of another site would be
-/// restored over it, and either loses the only copy of the live state.
+/// This also keeps a snapshot an earlier failed restore kept, where no
+/// session registry recorded it: a second window of its site would overwrite
+/// it, and a window of another site would be restored over it, and either
+/// loses the only copy of the live state.
 fn refuse_unrecoverable_snapshot<S: StorageProvider>(
     storage: &S,
     group_id: &GroupId,
@@ -272,8 +276,9 @@ enum Window<'a> {
     /// A group savepoint, which a failed restore fails, undoing the window.
     Savepoint,
     /// Nothing: a contained window on a backend without atomic group
-    /// savepoints commits as it goes, out of reach of the session registry.
-    Uncontained,
+    /// savepoints commits as it goes, and records a failure it cannot leave
+    /// to an enclosing window in the session registry.
+    Uncontained(&'a Rewinds),
     /// Nothing: a committing window, which records a failed restore in the
     /// session registry.
     Committing(&'a Rewinds),
@@ -287,8 +292,8 @@ enum Window<'a> {
 /// [`Self::commit`] restores the snapshot and releases it; `Drop` does the same
 /// on a panic or early return. A committing window's guard keeps the snapshot
 /// instead when its restore fails, and records the group when the snapshot
-/// survives either way; an uncontained window's keeps it when it is the only
-/// copy of the live state (see the module docs).
+/// survives either way; an uncontained window's does the same unless an
+/// enclosing window's snapshot holds the live state (see the module docs).
 pub(crate) struct SnapshotRollbackGuard<'a, S: StorageProvider> {
     storage: &'a S,
     group_id: GroupId,
@@ -318,12 +323,15 @@ impl<'a, S: StorageProvider> SnapshotRollbackGuard<'a, S> {
     ///
     /// This rests on `with_group_savepoint`'s undo contract, as canonical
     /// apply does, so it holds only on a backend with atomic group savepoints,
-    /// such as SQLite. Elsewhere the window commits as it goes behind the
-    /// guard's snapshot alone, which open-time recovery restores after a
-    /// crash, and a failed restore keeps that snapshot for the next open when
-    /// no enclosing window holds the live state (mdk#3278).
+    /// such as SQLite, where `rewinds` goes unread. Elsewhere the window
+    /// commits as it goes behind the guard's snapshot alone, which open-time
+    /// recovery restores after a crash, and a failed restore keeps that
+    /// snapshot and records the group in `rewinds`, the session's registry,
+    /// when no enclosing window holds the live state (mdk#3278). There it is
+    /// refused, as a committing window is, on a group recorded in `rewinds`.
     pub(crate) fn contained<T, E>(
         storage: &S,
+        rewinds: &Rewinds,
         group_id: &GroupId,
         site: RewindSite,
         suffix: &str,
@@ -336,12 +344,18 @@ impl<'a, S: StorageProvider> SnapshotRollbackGuard<'a, S> {
         if !storage.has_atomic_group_savepoints() {
             // The savepoint's fallback snapshot would survive a crash beside
             // the guard's, and open-time recovery cannot choose between them.
+            if rewinds.failed(group_id) {
+                return Err(StorageError::Backend(
+                    "contained window refused: an earlier restore of this group failed".into(),
+                )
+                .into());
+            }
             refuse_unrecoverable_snapshot(storage, group_id, site)?;
             let guard = SnapshotRollbackGuard::create(
                 storage,
                 group_id.clone(),
                 name,
-                Window::Uncontained,
+                Window::Uncontained(rewinds),
             )?;
             let result = window(storage);
             guard.commit()?;
@@ -440,13 +454,15 @@ impl<'a, S: StorageProvider> SnapshotRollbackGuard<'a, S> {
             name,
             armed: true,
             window,
-            changed: matches!(window, Window::Uncontained),
+            changed: matches!(window, Window::Uncontained(_)),
         })
     }
 
     /// Whether another guard snapshot of the group survives beside this one,
     /// such as an enclosing window's. A failed listing answers `false`, so
-    /// the guard keeps a snapshot that may be the only copy of live state.
+    /// the guard keeps a snapshot that may be the only copy of live state and
+    /// records the group; an enclosing committing window then keeps its own
+    /// too (see [`Self::release`]).
     fn another_guard_snapshot_survives(&self) -> bool {
         self.storage
             .list_group_snapshots(&self.group_id)
@@ -463,14 +479,39 @@ impl<'a, S: StorageProvider> SnapshotRollbackGuard<'a, S> {
     pub(crate) fn commit(mut self) -> StorageResult<()> {
         self.storage
             .rollback_group_state_to_snapshot(&self.group_id, &self.name)?;
+        self.release()?;
+        self.armed = false;
+        Ok(())
+    }
+
+    /// Release this guard's snapshot once the live state is restored.
+    ///
+    /// Without atomic group savepoints a committing window first releases the
+    /// guard snapshots its nested windows left behind a failed restore or
+    /// release. Its own release would otherwise leave one alone, and the next
+    /// open would restore it as if it held live state. When it cannot, it
+    /// keeps its own, so the next open finds the enclosing snapshot, restores
+    /// it, and releases the nested ones inside it. Nothing else can be there:
+    /// a committing window opens only on a group with no guard snapshot.
+    fn release(&self) -> StorageResult<()> {
+        if matches!(self.window, Window::Committing(_))
+            && !self.storage.has_atomic_group_savepoints()
+        {
+            for name in self.storage.list_group_snapshots(&self.group_id)? {
+                if name == self.name || RewindSite::classify(&name).is_none() {
+                    continue;
+                }
+                match self.storage.release_group_snapshot(&self.group_id, &name) {
+                    Ok(()) | Err(StorageError::SnapshotMissing(_)) => {}
+                    Err(e) => return Err(e),
+                }
+            }
+        }
         match self
             .storage
             .release_group_snapshot(&self.group_id, &self.name)
         {
-            Ok(()) | Err(StorageError::SnapshotMissing(_)) => {
-                self.armed = false;
-                Ok(())
-            }
+            Ok(()) | Err(StorageError::SnapshotMissing(_)) => Ok(()),
             Err(e) => Err(e),
         }
     }
@@ -505,20 +546,21 @@ impl<'a, S: StorageProvider> Drop for SnapshotRollbackGuard<'a, S> {
                     );
                     return;
                 }
-                // The window committed as it went too, and no registry can
-                // refuse the group. Keep the snapshot for the next open
-                // unless an enclosing window's holds the live state: its own
-                // restore brings that back, and this one, kept beside it,
-                // would outlive it and be restored over newer live state.
-                Window::Uncontained if !self.another_guard_snapshot_survives() => {
+                // The window committed as it went too. Keep the snapshot and
+                // refuse the group the same way, unless an enclosing window's
+                // snapshot holds the live state: its restore brings that back
+                // and it answers for the group, and this one, kept beside it,
+                // would be restored over newer live state.
+                Window::Uncontained(rewinds) if !self.another_guard_snapshot_survives() => {
+                    rewinds.fail(&self.group_id);
                     tracing::warn!(
                         target: TRACE_TARGET,
                         method = "drop",
-                        "contained restore failed without a savepoint; snapshot kept for the next open"
+                        "contained restore failed without a savepoint; snapshot kept and group refused until the next open"
                     );
                     return;
                 }
-                Window::Committing(_) | Window::Uncontained | Window::Savepoint => {}
+                Window::Committing(_) | Window::Uncontained(_) | Window::Savepoint => {}
             }
         }
         // Either restored, or nothing here committed past state: a contained
@@ -527,23 +569,26 @@ impl<'a, S: StorageProvider> Drop for SnapshotRollbackGuard<'a, S> {
         // uncontained one nested in it changed. A snapshot kept over such
         // state would be stale once the group advances, and open-time recovery
         // would restore it over newer live state.
-        match self
-            .storage
-            .release_group_snapshot(&self.group_id, &self.name)
-        {
-            Ok(()) | Err(StorageError::SnapshotMissing(_)) => {}
+        match self.release() {
+            Ok(()) => {}
             Err(_e) => {
                 tracing::warn!(
                     target: TRACE_TARGET,
                     method = "drop",
                     "snapshot release on panic-unwind failed"
                 );
-                // A committing window's snapshot that survives refuses every
-                // later committing window, and the next open restores it. It
-                // matches the live state now, so refuse the group until then,
-                // before anything advances past it.
-                if let Window::Committing(rewinds) = self.window {
-                    rewinds.fail(&self.group_id);
+                // A surviving snapshot refuses every later committing window,
+                // and the next open restores it. It matches the live state
+                // now, so refuse the group until then, before anything
+                // advances past it. A nested uncontained window leaves that
+                // to its enclosing window, whose release clears this one or
+                // keeps its own.
+                match self.window {
+                    Window::Committing(rewinds) => rewinds.fail(&self.group_id),
+                    Window::Uncontained(rewinds) if !self.another_guard_snapshot_survives() => {
+                        rewinds.fail(&self.group_id);
+                    }
+                    Window::Uncontained(_) | Window::Savepoint => {}
                 }
             }
         }
@@ -622,6 +667,7 @@ mod tests {
         for site in RewindSite::ALL {
             let classified = SnapshotRollbackGuard::contained(
                 &storage,
+                &Rewinds::default(),
                 &group_id,
                 site,
                 "0011223344556677",
@@ -706,6 +752,7 @@ mod tests {
         let live_queued = queued(&group_id, 12);
         SnapshotRollbackGuard::contained(
             &storage,
+            &Rewinds::default(),
             &group_id,
             RewindSite::Replay,
             "temporary-probe",
