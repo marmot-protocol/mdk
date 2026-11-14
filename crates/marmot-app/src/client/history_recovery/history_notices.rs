@@ -7,7 +7,7 @@
 //! up (mdk#2660 phase 4). What the coverage ledger parks raises none: a
 //! notice needs evidence that messages are missing or an action that helps,
 //! and the runner probes its broken units quietly (mdk#3308).
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use cgka_traits::GroupId;
 use storage_sqlite::{RecoveryDemandTicket, SqliteAppStorage, TransportReconciliationRoute};
@@ -43,6 +43,25 @@ impl RejoinNotice {
 /// revision, with its group for group-scoped demand.
 pub(crate) type HistoryNoticeBaseline = Vec<([u8; 16], u64, Option<Vec<u8>>)>;
 
+/// Every group's notice ids at one moment
+/// ([`AppClient::every_group_history_notice_ids`]). A compares a group's ids
+/// with those its published entry was built at at every publish, so a group
+/// whose notices changed is rebuilt even when nothing it holds was written:
+/// a dismissed rejoin notice, a route suspended or gone, a change of
+/// device-group trust (mdk#3273). Not `Debug`: it carries groups and notice
+/// ids.
+#[cfg_attr(not(test), allow(dead_code))] // A compares them at every publish (mdk#3273 PR 8).
+pub(crate) struct GroupNoticeIds(HashMap<Vec<u8>, Vec<String>>);
+
+#[cfg_attr(not(test), allow(dead_code))] // A compares them at every publish (mdk#3273 PR 8).
+impl GroupNoticeIds {
+    /// The group's notice ids, oldest parked first, then its rejoin's; none
+    /// for a group without a notice.
+    pub(crate) fn of(&self, group_id: &GroupId) -> &[String] {
+        self.0.get(group_id.as_slice()).map_or(&[], Vec::as_slice)
+    }
+}
+
 impl AppClient {
     /// Every current occurrence: parked obligations oldest first, then
     /// rejoins oldest first.
@@ -59,22 +78,29 @@ impl AppClient {
     }
 
     /// Each rejoin's notice not yet dismissed, oldest first, for a group with
-    /// a current route that is not suspended and that the host may see.
+    /// a current route that is not suspended (its copy is not Unrecoverable,
+    /// as the runner's routes say) and that the host may see. The routes are
+    /// read only when there is a notice to filter, and a group's suspension
+    /// only for a group with a notice: A reads the notices at every publish
+    /// (mdk#3273), and the runner's routes read every group's record.
     pub(crate) fn rejoin_notices(
         &self,
         app: &SqliteAppStorage,
     ) -> Result<Vec<RejoinNotice>, AppError> {
-        let groups = self
-            .recovery_runner_routes()
+        let notices = app.recovery_rejoin_notices()?;
+        if notices.is_empty() {
+            return Ok(Vec::new());
+        }
+        let routed = self
+            .current_route_groups()
             .into_iter()
-            .filter(|route| !route.suspended())
-            .filter_map(|route| route.group_id)
+            .filter_map(|(_, group_id)| group_id)
             .collect::<BTreeSet<_>>();
-        Ok(app
-            .recovery_rejoin_notices()?
+        Ok(notices
             .into_iter()
             .filter(|notice| {
-                groups.contains(&notice.group_id)
+                routed.contains(&notice.group_id)
+                    && !self.group_unrecoverable(&notice.group_id)
                     && self.host_may_see_parked(Some(&notice.group_id))
             })
             .map(|notice| RejoinNotice {
@@ -90,18 +116,22 @@ impl AppClient {
 
     /// The account's recovery status: the groups and inbox the runner's last
     /// survey found catching up. Until a runner has surveyed, nothing is.
+    /// The routes are read only while something is catching up.
     pub(crate) fn account_recovery_status(&self) -> Result<AccountRecoveryStatus, AppError> {
         let mut status = AccountRecoveryStatus {
             notices: self.history_notices()?,
             ..AccountRecoveryStatus::default()
         };
-        let Some(units) = self.routing.recovery_runner_catching_up_now() else {
+        let Some(units) = self
+            .routing
+            .recovery_runner_catching_up_now()
+            .filter(|units| !units.is_empty())
+        else {
             return Ok(status);
         };
         let groups = self
-            .recovery_runner_routes()
+            .current_route_groups()
             .into_iter()
-            .map(|route| (route.route, route.group_id))
             .collect::<BTreeMap<_, _>>();
         let mut catching_up = BTreeSet::new();
         for unit in units {
@@ -150,6 +180,28 @@ impl AppClient {
                 .map(|notice| encode_notice_id(notice.ticket)),
         );
         Ok(ids)
+    }
+
+    /// Every group's notice ids, each list as
+    /// [`Self::group_history_notice_ids`] gives it, from one read of the
+    /// parked set and one of the rejoins.
+    #[cfg_attr(not(test), allow(dead_code))] // A compares them at every publish (mdk#3273 PR 8).
+    pub(crate) fn every_group_history_notice_ids(&self) -> Result<GroupNoticeIds, AppError> {
+        let app = self.app.account_storage(&self.state.label)?.app_storage();
+        let mut ids = HashMap::<Vec<u8>, Vec<String>>::new();
+        for parked in app.parked_recovery_obligations()? {
+            if let Some(group_id) = parked.group_id {
+                ids.entry(group_id)
+                    .or_default()
+                    .push(encode_notice_id(parked.ticket));
+            }
+        }
+        for notice in self.rejoin_notices(&app)? {
+            ids.entry(notice.group_id)
+                .or_default()
+                .push(encode_notice_id(notice.ticket));
+        }
+        Ok(GroupNoticeIds(ids))
     }
 
     /// Retire exactly the dismissed occurrence as "history may be incomplete".

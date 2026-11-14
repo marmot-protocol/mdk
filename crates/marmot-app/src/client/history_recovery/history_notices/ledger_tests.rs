@@ -5,7 +5,7 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use cgka_traits::GroupId;
+use cgka_traits::{GroupId, GroupStorage};
 use storage_sqlite::{
     RecoveryDemandTicket, RecoveryUnitOutcome, RecoveryUnitState, SqliteAppStorage,
     TransportReconciliationRoute,
@@ -279,4 +279,139 @@ async fn a_conversion_that_changed_the_notices_is_announced_once() {
     assert_eq!(client.take_history_notice_changes(), Some(Vec::new()));
     assert!(!app.recovery_conversion_notices_changed().unwrap());
     assert_eq!(client.take_history_notice_changes(), None);
+}
+
+/// Raise `group`'s rejoin notice the way a debt turn settles a replaced
+/// copy, over its current `route`.
+fn rejoin(app: &SqliteAppStorage, group: &GroupId, route: &TransportReconciliationRoute) {
+    let now = crate::unix_now_seconds();
+    assert!(
+        app.settle_recovery_rejoin(&storage_sqlite::RecoveryRejoin {
+            group_id: group.as_slice(),
+            install_epoch: 99,
+            routes: &[(route.clone(), vec![RELAY.to_owned()])],
+            floor_seconds: now - DAY,
+            now_seconds: now,
+        })
+        .unwrap()
+    );
+}
+
+/// Every group's notice ids, read at once, are each group's own as its
+/// recovery status lists them, through every change that moves them:
+/// parking, an account-wide occurrence (no group's), a rejoin, a copy turned
+/// Unrecoverable, a group turned device group, a route gone and a dismissal.
+/// The routes are read without any group's record, and list what the
+/// runner's routes list.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_groups_notice_ids_are_each_groups_own() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut client, app, group, route) = fixture(&dir).await;
+    let other = client
+        .create_group("other notices", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
+    let other_route = client
+        .recovery_runner_routes()
+        .into_iter()
+        .find(|route| route.group_id.as_deref() == Some(other.as_slice()))
+        .unwrap()
+        .route;
+    let storage = client.app.account_storage("alice").unwrap();
+    let unknown = GroupId::new(vec![0xa5; 16]);
+    let check = |client: &AppClient| {
+        assert_eq!(
+            client.current_route_groups(),
+            client
+                .recovery_runner_routes()
+                .into_iter()
+                .map(|route| (route.route, route.group_id))
+                .collect::<Vec<_>>()
+        );
+        let every = client.every_group_history_notice_ids().unwrap();
+        for id in [&group, &other, &unknown] {
+            assert_eq!(
+                every.of(id),
+                client.group_history_notice_ids(id).unwrap().as_slice()
+            );
+        }
+        every
+    };
+    assert!(check(&client).of(&group).is_empty());
+
+    let intents = [&group, &other]
+        .into_iter()
+        .map(|id| storage_sqlite::StoredEpochBackfillIntent {
+            group_id_hex: hex::encode(id.as_slice()),
+            stalled_epoch: client.group_mls_state(id).unwrap().epoch,
+        })
+        .collect::<Vec<_>>();
+    app.arm_epoch_backfill_intents(&intents).unwrap();
+    for demand in app.pending_recovery_demands().unwrap() {
+        super::park_recovery_for_test(&storage, demand.ticket.id);
+    }
+    let now = crate::unix_now_seconds();
+    app.execute_batch_for_test(&format!(
+        "INSERT INTO account_recovery_obligations (id, demand_key, cause, account_label,
+             marker_token, pending_since, dropped_count, created_at_ms, updated_at_ms,
+             eligibility, parked_at_ms)
+         VALUES (x'{id}', 'overflow:alice', 0, 'alice', 42, {now}, 1, {ms}, {ms}, 4, {ms});",
+        id = "42".repeat(16),
+        ms = now * 1000,
+    ))
+    .unwrap();
+    assert_eq!(check(&client).of(&group).len(), 1);
+
+    rejoin(&app, &group, &route);
+    rejoin(&app, &other, &other_route);
+    let every = check(&client);
+    assert_eq!((every.of(&group).len(), every.of(&other).len()), (2, 2));
+
+    let mut halted = storage.get_group(&other).unwrap();
+    halted.unrecoverable = true;
+    storage.put_group(&halted).unwrap();
+    assert_eq!(
+        check(&client).of(&other).len(),
+        1,
+        "an Unrecoverable copy's rejoin notice waits; its parked one stays"
+    );
+
+    assert!(
+        app.insert_device_group(&storage_sqlite::DeviceGroupRecord {
+            group_id_hex: hex::encode(group.as_slice()),
+            trust: storage_sqlite::DeviceGroupTrust::Untrusted,
+            key_package_ref_hex: None,
+            recorded_at: now,
+        })
+        .unwrap()
+    );
+    assert_eq!(
+        check(&client).of(&group).len(),
+        1,
+        "a hidden group's rejoin notice goes; its parked one stays"
+    );
+    app.execute_batch_for_test("DELETE FROM device_groups")
+        .unwrap();
+    let rejoin_id = check(&client).of(&group)[1].clone();
+
+    let routes = client
+        .routing
+        .snapshot()
+        .group_routes
+        .into_iter()
+        .filter(|route| route.group_id == group)
+        .collect::<Vec<_>>();
+    client.routing.replace_group_routes(&group, Vec::new());
+    assert_eq!(
+        check(&client).of(&group).len(),
+        1,
+        "a rejoin notice shows only while its group is routed"
+    );
+    client.routing.replace_group_routes(&group, routes);
+    assert_eq!(check(&client).of(&group).len(), 2);
+
+    assert!(client.dismiss_history_notice(&rejoin_id).unwrap());
+    assert_eq!(check(&client).of(&group).len(), 1);
 }

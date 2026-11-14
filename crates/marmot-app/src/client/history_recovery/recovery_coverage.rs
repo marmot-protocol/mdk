@@ -469,6 +469,39 @@ struct CurrentRoute {
     goal_until: Option<u64>,
 }
 
+/// Each current route in `routing`, with the group it carries, its endpoints
+/// and a retained prior route's goal end: the inbox first, then each group
+/// route once, by its transport id, in routing order.
+fn current_routes(
+    routing: &crate::AppRoutingState,
+) -> impl Iterator<
+    Item = (
+        TransportReconciliationRoute,
+        Option<Vec<u8>>,
+        &[cgka_traits::TransportEndpoint],
+        Option<u64>,
+    ),
+> {
+    let mut seen = HashSet::new();
+    std::iter::once((
+        TransportReconciliationRoute::Inbox,
+        None,
+        routing.local_inbox_endpoints.as_slice(),
+        None,
+    ))
+    .chain(routing.group_routes.iter().filter_map(move |entry| {
+        let id = <[u8; 32]>::try_from(entry.transport_group_id.as_slice()).ok()?;
+        seen.insert(id).then(|| {
+            (
+                TransportReconciliationRoute::Group(id),
+                Some(entry.group_id.as_slice().to_vec()),
+                entry.endpoints.as_slice(),
+                entry.retained_since.map(crate::retained_route_goal_until),
+            )
+        })
+    }))
+}
+
 /// The ledger keys relays by one spelling: the adapter and the scope plans
 /// spell the same relay differently.
 fn relays(endpoints: &[String]) -> Vec<String> {
@@ -627,6 +660,19 @@ impl AppClient {
         Ok(())
     }
 
+    /// The account's current routes and the group each carries, as
+    /// [`Self::recovery_runner_routes`] lists them, without reading a group
+    /// record or the relays' admission: for reads that need only which route
+    /// carries which group. Both list routes through [`current_routes`].
+    pub(crate) fn current_route_groups(
+        &self,
+    ) -> Vec<(TransportReconciliationRoute, Option<Vec<u8>>)> {
+        let routing = self.routing.snapshot();
+        current_routes(&routing)
+            .map(|(route, group_id, _, _)| (route, group_id))
+            .collect()
+    }
+
     fn current_coverage_routes(&self) -> Vec<CurrentRoute> {
         let routing = self.routing.snapshot();
         let operated = &self.app.config.deployment.recovery_operated_relays;
@@ -648,27 +694,11 @@ impl AppClient {
                     goal_until,
                 }
             };
-        let mut routes = vec![current(
-            TransportReconciliationRoute::Inbox,
-            None,
-            &routing.local_inbox_endpoints,
-            None,
-        )];
-        let mut seen = HashSet::new();
-        for entry in &routing.group_routes {
-            let Ok(id) = <[u8; 32]>::try_from(entry.transport_group_id.as_slice()) else {
-                continue;
-            };
-            if seen.insert(id) {
-                routes.push(current(
-                    TransportReconciliationRoute::Group(id),
-                    Some(entry.group_id.as_slice().to_vec()),
-                    &entry.endpoints,
-                    entry.retained_since.map(crate::retained_route_goal_until),
-                ));
-            }
-        }
-        routes
+        current_routes(&routing)
+            .map(|(route, group_id, endpoints, goal_until)| {
+                current(route, group_id, endpoints, goal_until)
+            })
+            .collect()
     }
 
     /// The account's current routes as its recovery runner reads them, once

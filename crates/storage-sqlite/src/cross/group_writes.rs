@@ -825,6 +825,12 @@ const WHOLE_ROW_TABLES: &[(&str, &str, i64, i64)] = &[
     ("cgka_group_evolutions", "group_id", RAW_ID, STATE),
     ("cgka_transport_fanout", "group_id", RAW_ID, STATE),
     ("device_groups", "group_id_hex", HEX_ID, STATE),
+    // Invitation recovery, which a group's recovery status reads: rejoin
+    // offers, fresh-material reinvites, rejoin progress and the failure flag.
+    ("cgka_welcomes", "group_id", RAW_ID, STATE),
+    ("cgka_own_commit_intents", "group_id", RAW_ID, STATE),
+    ("cgka_group_rejoin", "group_id", RAW_ID, STATE),
+    ("app_group_recovery_failures", "group_id", RAW_ID, STATE),
 ];
 
 fn trigger_sql() -> String {
@@ -1064,6 +1070,47 @@ mod tests {
         let after = generation(&storage, &group);
         assert!(after.state > before.state);
         assert_eq!(after.committed, before.committed);
+    }
+
+    /// Invitation recovery's rows, which a group's recovery status reads
+    /// (rejoin offers, fresh-material reinvites, rejoin progress and the
+    /// failure flag), move their group's state scope on every write, and
+    /// neither its committed scope nor another group.
+    #[test]
+    fn invitation_recovery_rows_move_only_their_groups_state_scope() {
+        let storage = SqliteAccountStorage::in_memory().unwrap();
+        let group = GroupId::new(vec![11; 16]);
+        let other = GroupId::new(vec![12; 16]);
+        insert_group(&storage, &group);
+        insert_group(&storage, &other);
+        for sql in [
+            "INSERT INTO cgka_welcomes (message_id, group_id, record) VALUES (x'01', ?1, x'00')",
+            "UPDATE cgka_welcomes SET record = x'01' WHERE group_id = ?1",
+            "DELETE FROM cgka_welcomes WHERE group_id = ?1",
+            "INSERT INTO cgka_own_commit_intents (commit_id, group_id, insert_order, record)
+             VALUES (x'02', ?1, 1, x'00')",
+            "UPDATE cgka_own_commit_intents SET record = x'01' WHERE group_id = ?1",
+            "DELETE FROM cgka_own_commit_intents WHERE group_id = ?1",
+            "INSERT INTO cgka_group_rejoin (group_id, role, request_id, record)
+             VALUES (?1, 0, zeroblob(32), x'00')",
+            "UPDATE cgka_group_rejoin SET record = x'01' WHERE group_id = ?1",
+            "DELETE FROM cgka_group_rejoin WHERE group_id = ?1",
+            "INSERT INTO app_group_recovery_failures (group_id) VALUES (?1)",
+            "DELETE FROM app_group_recovery_failures WHERE group_id = ?1",
+        ] {
+            let before = generation(&storage, &group);
+            let other_before = generation(&storage, &other);
+            let written = storage
+                .lock()
+                .unwrap()
+                .execute(sql, [group.as_slice()])
+                .unwrap();
+            assert_eq!(written, 1, "{sql}");
+            let after = generation(&storage, &group);
+            assert!(after.state > before.state, "{sql}");
+            assert_eq!(after.committed, before.committed, "{sql}");
+            assert_eq!(generation(&storage, &other), other_before, "{sql}");
+        }
     }
 
     /// Every connection this process opens on a database file counts into
