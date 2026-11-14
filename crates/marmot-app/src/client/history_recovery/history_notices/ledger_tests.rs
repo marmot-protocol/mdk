@@ -203,7 +203,7 @@ async fn the_status_reports_what_the_runner_catches_up() {
     );
     assert!(status.inbox_catching_up);
     assert!(status.notices.is_empty());
-    client.recovery_status_owed = true;
+    client.history_recovery.state.recovery_status_owed = true;
     assert!(client.take_recovery_status_changed(false));
     assert!(
         !client.take_recovery_status_changed(false),

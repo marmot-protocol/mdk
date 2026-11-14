@@ -7032,7 +7032,13 @@ mod tests {
             "the refusal's arm begins the runner's first visit"
         );
         assert_eq!(wakes(), before + 1);
-        assert!(client.pending_recovery_arm_writes.is_empty());
+        assert!(
+            client
+                .history_recovery
+                .test_state()
+                .pending_recovery_arm_writes
+                .is_empty()
+        );
 
         // The cap stays full, so every further message is refused too: first
         // skipped, then paced into a local reassessment on every refusal.
@@ -7048,8 +7054,9 @@ mod tests {
             refuse(&mut client, index);
         }
         client.pending_convergence_groups.clear();
-        client.epoch_stall =
-            std::mem::take(&mut client.epoch_stall).with_wedge_rearm_interval_ms(0);
+        client.history_recovery.test_state().epoch_stall =
+            std::mem::take(&mut client.history_recovery.test_state().epoch_stall)
+                .with_wedge_rearm_interval_ms(0);
         for index in 10..20 {
             refuse(&mut client, index);
         }
@@ -7063,7 +7070,13 @@ mod tests {
             before + 1,
             "repeated refusals never wake the runner"
         );
-        assert!(client.pending_recovery_arm_writes.is_empty());
+        assert!(
+            client
+                .history_recovery
+                .test_state()
+                .pending_recovery_arm_writes
+                .is_empty()
+        );
     }
 
     /// A commit or retry can release several retained messages in one effects batch.
@@ -7374,6 +7387,8 @@ mod tests {
             .arm_epoch_backfill_intents(&[intent(&first, 5), intent(&second, 7)])
             .unwrap();
         client
+            .history_recovery
+            .test_state()
             .pending_recovery_arm_writes
             .insert(buffered.clone(), 8);
         storage
@@ -7382,7 +7397,14 @@ mod tests {
         client.restore_persisted_epoch_backfill_intents(
             storage.pending_epoch_backfill_intents().unwrap(),
         );
-        assert_eq!(client.pending_recovery_arm_writes.get(&buffered), Some(&8));
+        assert_eq!(
+            client
+                .history_recovery
+                .test_state()
+                .pending_recovery_arm_writes
+                .get(&buffered),
+            Some(&8)
+        );
         // Older observations cannot regress epochs; a new observation joins
         // the existing row.
         storage
@@ -7392,7 +7414,13 @@ mod tests {
             client.refresh_pending_recovery().await.unwrap(),
             super::EpochBackfillRunOutcome::Deferred
         );
-        assert!(client.pending_recovery_arm_writes.is_empty());
+        assert!(
+            client
+                .history_recovery
+                .test_state()
+                .pending_recovery_arm_writes
+                .is_empty()
+        );
         let epochs = storage
             .pending_epoch_backfill_intents()
             .unwrap()
@@ -7449,7 +7477,12 @@ mod tests {
                 cgka_traits::storage::StorageError::Busy(_)
             ))
         ));
-        assert!(client.released_backfill_reload_pending);
+        assert!(
+            client
+                .history_recovery
+                .test_state()
+                .released_backfill_reload_pending
+        );
         assert!(!client.seen_events_index.contains(&id_hex));
         assert!(!client.state.seen_events.contains(&id_hex));
         assert!(
@@ -7480,7 +7513,12 @@ mod tests {
                 .is_empty()
         );
         assert!(client.has_pending_epoch_backfill());
-        assert!(!client.released_backfill_reload_pending);
+        assert!(
+            !client
+                .history_recovery
+                .test_state()
+                .released_backfill_reload_pending
+        );
         let pending = storage
             .app_storage()
             .pending_epoch_backfill_intents()
@@ -7692,6 +7730,8 @@ mod tests {
             .persist_epoch_backfill_intent(&armed_backfill(&departed, 5))
             .unwrap();
         client
+            .history_recovery
+            .test_state()
             .pending_recovery_arm_writes
             .insert(departed.clone(), 5);
         // A later durable observation supersedes an older failed-write fact.
@@ -7738,11 +7778,15 @@ mod tests {
 
         // The detector opens the run; `apply_backfill_decision` only consumes
         // the decision it returns.
-        let decision = client.epoch_stall.observe_resource_refusal(
-            departed.clone(),
-            cgka_traits::EpochId(epoch),
-            crate::client::sync::epoch_stall_now_ms(),
-        );
+        let decision = client
+            .history_recovery
+            .test_state()
+            .epoch_stall
+            .observe_resource_refusal(
+                departed.clone(),
+                cgka_traits::EpochId(epoch),
+                crate::client::sync::epoch_stall_now_ms(),
+            );
         client.apply_backfill_decision(
             &departed,
             epoch,
@@ -7750,7 +7794,12 @@ mod tests {
             EpochStallBackfillTrigger::ResourceRefusal,
         );
         assert!(
-            client.epoch_stall.wedge_evidence(&departed).is_some(),
+            client
+                .history_recovery
+                .test_state()
+                .epoch_stall
+                .wedge_evidence(&departed)
+                .is_some(),
             "the arm must open a recovery run to retire"
         );
         assert_eq!(
@@ -7764,7 +7813,12 @@ mod tests {
         assert!(!client.has_pending_epoch_backfill());
 
         assert!(
-            client.epoch_stall.wedge_evidence(&departed).is_none(),
+            client
+                .history_recovery
+                .test_state()
+                .epoch_stall
+                .wedge_evidence(&departed)
+                .is_none(),
             "the in-memory recovery run must be retired with the intent"
         );
         assert!(
@@ -7793,11 +7847,15 @@ mod tests {
             let group = route.group_id.clone();
             let epoch = client.group_mls_state(&group).unwrap().epoch;
             let storage = app.account_storage("alice").unwrap().app_storage();
-            let _ = client.epoch_stall.observe_resource_refusal(
-                group.clone(),
-                cgka_traits::EpochId(epoch),
-                super::epoch_stall_now_ms(),
-            );
+            let _ = client
+                .history_recovery
+                .test_state()
+                .epoch_stall
+                .observe_resource_refusal(
+                    group.clone(),
+                    cgka_traits::EpochId(epoch),
+                    super::epoch_stall_now_ms(),
+                );
             client.apply_backfill_decision(
                 &group,
                 epoch,
@@ -7818,8 +7876,21 @@ mod tests {
             };
             make_group_terminal(&client, &group, disbanded);
             client.drop_settled_epoch_backfill_intents();
-            assert!(client.pending_epoch_stall_escalations.is_empty());
-            assert!(client.epoch_stall.wedge_evidence(&group).is_none());
+            assert!(
+                client
+                    .history_recovery
+                    .test_state()
+                    .pending_epoch_stall_escalations
+                    .is_empty()
+            );
+            assert!(
+                client
+                    .history_recovery
+                    .test_state()
+                    .epoch_stall
+                    .wedge_evidence(&group)
+                    .is_none()
+            );
             assert!(storage.epoch_stall_evidence().unwrap().is_empty());
             assert!(storage.pending_epoch_backfill_intents().unwrap().is_empty());
             if let Some(id) = admitted_id {
@@ -7855,11 +7926,15 @@ mod tests {
         let storage = app.account_storage("alice").unwrap().app_storage();
         let epoch = client.group_mls_state(&departed).unwrap().epoch;
 
-        let decision = client.epoch_stall.observe_resource_refusal(
-            departed.clone(),
-            cgka_traits::EpochId(epoch),
-            crate::client::sync::epoch_stall_now_ms(),
-        );
+        let decision = client
+            .history_recovery
+            .test_state()
+            .epoch_stall
+            .observe_resource_refusal(
+                departed.clone(),
+                cgka_traits::EpochId(epoch),
+                crate::client::sync::epoch_stall_now_ms(),
+            );
         client.apply_backfill_decision(
             &departed,
             epoch,
@@ -7902,7 +7977,12 @@ mod tests {
             "the retried pass retires the durable evidence row"
         );
         assert!(
-            client.epoch_stall.wedge_evidence(&departed).is_none(),
+            client
+                .history_recovery
+                .test_state()
+                .epoch_stall
+                .wedge_evidence(&departed)
+                .is_none(),
             "the retried pass retires the in-memory run"
         );
     }

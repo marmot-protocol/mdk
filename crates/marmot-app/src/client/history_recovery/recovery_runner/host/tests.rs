@@ -115,7 +115,7 @@ fn cover_inbox(client: &AppClient, storage: &SqliteAppStorage) {
 }
 
 fn passes(client: &AppClient) -> u32 {
-    match &client.recovery_runner {
+    match &client.history_recovery.state.recovery_runner {
         RunnerSeat::InPlace(seat) => seat.as_ref().as_ref().map_or(0, |seat| seat.passes),
         RunnerSeat::Absent => 0,
     }
@@ -1605,7 +1605,9 @@ async fn a_dropped_in_place_pass_refunds_its_attempt() {
 
     drop(pass);
     assert_eq!(charged(&storage), before, "the dropped pass refunded it");
-    assert!(matches!(&client.recovery_runner, RunnerSeat::InPlace(seat) if seat.is_none()));
+    assert!(
+        matches!(&client.history_recovery.state.recovery_runner, RunnerSeat::InPlace(seat) if seat.is_none())
+    );
     hold.release.notify_waiters();
 }
 
@@ -2410,6 +2412,8 @@ async fn an_upgraded_accounts_certified_epoch_gap_is_visited_only_while_its_grou
     assert!(!storage.recovery_conversion_pending().unwrap());
     assert!(
         client
+            .history_recovery
+            .state
             .epoch_stall
             .has_signalled_at(&stalled, cgka_traits::EpochId(stalled_epoch)),
         "the restored evidence leaves no arm at the stalled epoch"
@@ -2491,6 +2495,8 @@ async fn the_runner_sweeps_rather_than_parks_what_the_open_seeded() {
     client.prune_runner_retention(&storage, later).unwrap();
     assert!(
         client
+            .history_recovery
+            .state
             .runner_pruned_floor
             .is_some_and(|floor| floor >= later - 30 * DAY)
     );

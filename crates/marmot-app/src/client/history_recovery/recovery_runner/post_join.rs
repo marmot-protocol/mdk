@@ -92,6 +92,8 @@ impl AppClient {
                 }
                 waiting.insert(group_id.clone());
                 if self
+                    .history_recovery
+                    .state
                     .runner_post_join
                     .get(&group_id)
                     .is_some_and(|collection| {
@@ -114,7 +116,7 @@ impl AppClient {
                     floor,
                     storage_sqlite::CopyFloorReason::Clamp,
                 )?;
-                self.runner_post_join.insert(
+                self.history_recovery.state.runner_post_join.insert(
                     group_id,
                     Collection {
                         copy,
@@ -129,12 +131,16 @@ impl AppClient {
                     },
                 );
             }
-            self.runner_post_join
+            self.history_recovery
+                .state
+                .runner_post_join
                 .retain(|group, _| waiting.contains(group));
-            if self.runner_post_join.is_empty() {
+            if self.history_recovery.state.runner_post_join.is_empty() {
                 return Ok(());
             }
             if self
+                .history_recovery
+                .state
                 .runner_post_join
                 .values()
                 .any(|collection| !collection.active)
@@ -145,7 +151,7 @@ impl AppClient {
                 self.record_native_coverage(&app).await;
                 self.adapter.require_fresh_activation().await;
                 self.prepare_transport().await?;
-                for collection in self.runner_post_join.values_mut() {
+                for collection in self.history_recovery.state.runner_post_join.values_mut() {
                     collection.active = true;
                 }
                 self.routing.wake_recovery_runner();
@@ -153,7 +159,7 @@ impl AppClient {
             // Installation is the engine's collection-start hook. Under this
             // owner it means the fresh ordinary activation and its runnable debt,
             // rather than a grant-owned temporary subscription.
-            for group_id in self.runner_post_join.keys() {
+            for group_id in self.history_recovery.state.runner_post_join.keys() {
                 if self
                     .runtime
                     .post_join_history_fetch(group_id)?
@@ -169,7 +175,7 @@ impl AppClient {
             self.record_native_coverage(&app).await;
             let observation = self.adapter.replay_admission().await;
             let staged = app.staged_recovery_routes()?;
-            for (group_id, collection) in &mut self.runner_post_join {
+            for (group_id, collection) in &mut self.history_recovery.state.runner_post_join {
                 let Some(route) = routes.iter().find(|route| route.route == collection.route)
                 else {
                     continue;

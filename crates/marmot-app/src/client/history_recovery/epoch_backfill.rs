@@ -81,7 +81,10 @@ impl AppClient {
             }
             match event {
                 cgka_traits::engine::GroupEvent::EpochChanged { group_id, from, to } => {
-                    self.epoch_stall.observe_epoch_passage(group_id, *from, *to);
+                    self.history_recovery
+                        .state
+                        .epoch_stall
+                        .observe_epoch_passage(group_id, *from, *to);
                 }
                 cgka_traits::engine::GroupEvent::TransportObjectResourceRefused {
                     group_id,
@@ -103,11 +106,15 @@ impl AppClient {
                     // same unrecovered run as a deferred-delivery arm, and the
                     // detector raises the run's escalation only once, at
                     // whichever path happens to arm third.
-                    let decision = self.epoch_stall.observe_resource_refusal(
-                        group_id.clone(),
-                        record.epoch,
-                        epoch_stall_now_ms(),
-                    );
+                    let decision = self
+                        .history_recovery
+                        .state
+                        .epoch_stall
+                        .observe_resource_refusal(
+                            group_id.clone(),
+                            record.epoch,
+                            epoch_stall_now_ms(),
+                        );
                     self.apply_backfill_decision(
                         group_id,
                         record.epoch.0,
@@ -141,7 +148,10 @@ impl AppClient {
                     // observed epoch only ever moves forward, and handing it a
                     // backward position would walk the per-epoch suppression
                     // back with it.
-                    self.epoch_stall.observe_convergence_reorg(group_id);
+                    self.history_recovery
+                        .state
+                        .epoch_stall
+                        .observe_convergence_reorg(group_id);
                 }
                 _ => {}
             }
@@ -195,7 +205,9 @@ impl AppClient {
         if crate::client::history_recovery::epoch_stall::backfill_trigger_for(outcome)
             == EpochStallBackfillTrigger::ContestedForkDeferral
         {
-            self.epoch_stall
+            self.history_recovery
+                .state
+                .epoch_stall
                 .observe_group_epoch(&group_id, record.epoch);
             self.pending_convergence_groups.insert(group_id);
             return;
@@ -216,20 +228,27 @@ impl AppClient {
             IngestOutcome::TransportDeferred { .. }
                 if record.transport_message_predates_local_copy(transport_at) =>
             {
-                self.epoch_stall
+                self.history_recovery
+                    .state
+                    .epoch_stall
                     .observe_group_epoch(&group_id, record.epoch);
                 BackfillDecision::Skip
             }
-            IngestOutcome::TransportDeferred { .. } => self.epoch_stall.observe_undecryptable(
-                group_id.clone(),
-                message_id_hex.to_owned(),
-                record.epoch,
-                now_ms,
-            ),
-            IngestOutcome::ResourceRefused { .. } => {
-                self.epoch_stall
-                    .observe_resource_refusal(group_id.clone(), record.epoch, now_ms)
-            }
+            IngestOutcome::TransportDeferred { .. } => self
+                .history_recovery
+                .state
+                .epoch_stall
+                .observe_undecryptable(
+                    group_id.clone(),
+                    message_id_hex.to_owned(),
+                    record.epoch,
+                    now_ms,
+                ),
+            IngestOutcome::ResourceRefused { .. } => self
+                .history_recovery
+                .state
+                .epoch_stall
+                .observe_resource_refusal(group_id.clone(), record.epoch, now_ms),
             // Any other outcome carries no stall evidence, but it does tell the
             // detector where this device now sits. This is a landing position
             // only: the epochs a folded commit carried the device *through* reach
@@ -241,7 +260,9 @@ impl AppClient {
             // different epochs can end a run on their own. Where both fire they
             // agree, since observing an epoch already recorded is a no-op.
             _ => {
-                self.epoch_stall
+                self.history_recovery
+                    .state
+                    .epoch_stall
                     .observe_group_epoch(&group_id, record.epoch);
                 BackfillDecision::Skip
             }
@@ -270,7 +291,7 @@ impl AppClient {
         if self.app.cursor_persistence() != CursorPersistence::Advance {
             return;
         }
-        let limit = self.epoch_stall.threshold();
+        let limit = self.history_recovery.state.epoch_stall.threshold();
         let groups = self
             .state
             .groups
@@ -287,7 +308,11 @@ impl AppClient {
             // restored before hydration, rows replayed on every later open are
             // not fresh traffic and must not pace re-arms or end the run.
             if evidence.rows.is_empty()
-                || self.epoch_stall.has_signalled_at(&group_id, evidence.epoch)
+                || self
+                    .history_recovery
+                    .state
+                    .epoch_stall
+                    .has_signalled_at(&group_id, evidence.epoch)
             {
                 continue;
             }
@@ -347,7 +372,12 @@ impl AppClient {
                     .map(|demand| demand.ticket)
             };
             let before = demand_ticket(self);
-            let buffered_before = self.pending_recovery_arm_writes.get(group_id).copied();
+            let buffered_before = self
+                .history_recovery
+                .state
+                .pending_recovery_arm_writes
+                .get(group_id)
+                .copied();
             let durable_intent = storage_sqlite::StoredEpochBackfillIntent {
                 group_id_hex: hex::encode(group_id.as_slice()),
                 stalled_epoch,
@@ -355,10 +385,15 @@ impl AppClient {
             let result = self.arm_epoch_gap_recovery(std::slice::from_ref(&durable_intent));
             match result {
                 Ok(()) => {
-                    self.pending_recovery_arm_writes.remove(group_id);
+                    self.history_recovery
+                        .state
+                        .pending_recovery_arm_writes
+                        .remove(group_id);
                 }
                 Err(error) => {
-                    self.pending_recovery_arm_writes
+                    self.history_recovery
+                        .state
+                        .pending_recovery_arm_writes
                         .entry(group_id.clone())
                         .and_modify(|epoch| *epoch = (*epoch).max(stalled_epoch))
                         .or_insert(stalled_epoch);
@@ -368,7 +403,13 @@ impl AppClient {
             }
             let after = demand_ticket(self);
             if before != after
-                || buffered_before != self.pending_recovery_arm_writes.get(group_id).copied()
+                || buffered_before
+                    != self
+                        .history_recovery
+                        .state
+                        .pending_recovery_arm_writes
+                        .get(group_id)
+                        .copied()
             {
                 let context = AuditEventContext {
                     operation_id: Some(hex::encode(
@@ -394,7 +435,10 @@ impl AppClient {
                 group_id,
                 stalled_epoch,
                 arms,
-                self.epoch_stall.escalation_arm_threshold(),
+                self.history_recovery
+                    .state
+                    .epoch_stall
+                    .escalation_arm_threshold(),
                 "apply_backfill_decision",
             );
         }
@@ -430,7 +474,9 @@ impl AppClient {
         );
         self.record_epoch_stall_backfill_escalated(group_id, stalled_epoch, arms);
         if self.host_may_see_group(group_id) {
-            self.pending_epoch_stall_escalations
+            self.history_recovery
+                .state
+                .pending_epoch_stall_escalations
                 .push(crate::EpochStallEscalation {
                     group_id: group_id.clone(),
                     stalled_epoch,
@@ -470,7 +516,11 @@ impl AppClient {
         let evidence = groups
             .into_iter()
             .filter_map(|group_id| {
-                let evidence = self.epoch_stall.wedge_evidence(group_id)?;
+                let evidence = self
+                    .history_recovery
+                    .state
+                    .epoch_stall
+                    .wedge_evidence(group_id)?;
                 Some(storage_sqlite::StoredEpochStallEvidence {
                     group_id_hex: hex::encode(group_id.as_slice()),
                     stalled_epoch: evidence.stalled_epoch,
@@ -483,7 +533,10 @@ impl AppClient {
         match self.app.record_epoch_stall_evidence(
             &self.state.label,
             &evidence,
-            self.epoch_stall.fruitless_completion_threshold(),
+            self.history_recovery
+                .state
+                .epoch_stall
+                .fruitless_completion_threshold(),
         ) {
             Ok(changed) => {
                 for group_id in changed {
@@ -530,7 +583,10 @@ impl AppClient {
                 "ignored malformed durable frozen-epoch recovery evidence"
             );
         }
-        self.epoch_stall.restore_wedge_evidence(restored);
+        self.history_recovery
+            .state
+            .epoch_stall
+            .restore_wedge_evidence(restored);
     }
 
     #[cfg(test)]
@@ -580,7 +636,10 @@ impl AppClient {
                     .retire_terminal_group_recovery(group_id)?)
             }) {
             Ok(changed) => {
-                self.epoch_stall.clear_recovered_group(group_id);
+                self.history_recovery
+                    .state
+                    .epoch_stall
+                    .clear_recovered_group(group_id);
                 if changed {
                     self.mark_recovery_status_changed(group_id);
                 }
@@ -661,6 +720,8 @@ impl AppClient {
                 error_kind=error.privacy_safe_kind(), "could not retire resolved epoch-gap demand");
         }
         let mut terminal = self
+            .history_recovery
+            .state
             .pending_recovery_arm_writes
             .keys()
             .cloned()
@@ -673,7 +734,10 @@ impl AppClient {
         terminal.retain(|group| crate::client::group_is_terminal(&self.runtime, group));
         for group in terminal {
             if self.retire_terminal_group_recovery(&group) {
-                self.pending_recovery_arm_writes.remove(&group);
+                self.history_recovery
+                    .state
+                    .pending_recovery_arm_writes
+                    .remove(&group);
             }
         }
     }
@@ -704,14 +768,18 @@ impl AppClient {
     pub(crate) fn drain_epoch_stall_escalations(&mut self, summary: &mut SyncSummary) {
         summary
             .epoch_stall_escalations
-            .append(&mut self.pending_epoch_stall_escalations);
+            .append(&mut self.history_recovery.state.pending_epoch_stall_escalations);
     }
 
     /// Whether an epoch-gap backfill is armed and awaiting its replay. Read by
     /// the account worker to schedule a forensic audit-tracker upload for the
     /// just-recorded `epoch_stall_backfill_armed` row without poking the field.
     pub(crate) fn has_pending_epoch_backfill(&self) -> bool {
-        !self.pending_recovery_arm_writes.is_empty()
+        !self
+            .history_recovery
+            .state
+            .pending_recovery_arm_writes
+            .is_empty()
             || self
                 .app
                 .account_storage(&self.state.label)
@@ -750,7 +818,11 @@ impl AppClient {
     /// Whether recovery debt or a buffered recovery observation is pending.
     fn recovery_pending(&self) -> Result<bool, AppError> {
         let storage = self.app.account_storage(&self.state.label)?.app_storage();
-        Ok(!self.pending_recovery_arm_writes.is_empty()
+        Ok(!self
+            .history_recovery
+            .state
+            .pending_recovery_arm_writes
+            .is_empty()
             || !storage.pending_recovery_demands()?.is_empty())
     }
 

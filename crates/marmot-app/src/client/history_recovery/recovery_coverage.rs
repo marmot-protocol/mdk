@@ -512,12 +512,14 @@ impl AppClient {
         app: &SqliteAppStorage,
         now: u64,
     ) -> cgka_traits::storage::StorageResult<()> {
-        let floor = retention_floor(self.runner_prune_clock.min(now));
+        let floor = retention_floor(self.history_recovery.state.runner_prune_clock.min(now));
         if self
+            .history_recovery
+            .state
             .runner_pruned_floor
             .is_some_and(|pruned| floor < pruned.saturating_add(RUNNER_RETENTION_PRUNE_STEP_SECS))
         {
-            self.runner_prune_clock = now;
+            self.history_recovery.state.runner_prune_clock = now;
             return Ok(());
         }
         let certifying = self
@@ -526,8 +528,8 @@ impl AppClient {
             .map(|current| (current.route, current.required))
             .collect::<Vec<_>>();
         app.prune_recovery_coverage(floor, &certifying)?;
-        self.runner_pruned_floor = Some(floor);
-        self.runner_prune_clock = now;
+        self.history_recovery.state.runner_pruned_floor = Some(floor);
+        self.history_recovery.state.runner_prune_clock = now;
         Ok(())
     }
 }
@@ -587,7 +589,7 @@ impl AppClient {
         let prepared = self.prepare_runner_ownership_once().await;
         // Owed until a preparation succeeds: only then may the worker start
         // a runner it lacks, whatever else the refresh still owes.
-        self.runner_preparation_owed = prepared.is_err();
+        self.history_recovery.state.runner_preparation_owed = prepared.is_err();
         prepared
     }
 
@@ -776,7 +778,9 @@ impl AppClient {
         // The cache only saves reads. A group with no current route (deleted,
         // or no longer routed) drops its entry and rereads its durable copy if
         // it comes back.
-        self.settled_recovery_copies
+        self.history_recovery
+            .state
+            .settled_recovery_copies
             .retain(|group_id, _| groups.contains_key(group_id.as_slice()));
         for (group_id, routes) in groups {
             let carried = routes
@@ -798,6 +802,8 @@ impl AppClient {
             let install = group.local_copy_install_epoch.0;
             if group.is_terminal()
                 || self
+                    .history_recovery
+                    .state
                     .settled_recovery_copies
                     .get(group_id)
                     .is_some_and(|settled| settled.0 == install && settled.1 == carried)
@@ -824,7 +830,7 @@ impl AppClient {
                         floor_seconds: floor,
                         now_seconds: now,
                     })? {
-                        self.recovery_copy_settled = true;
+                        self.history_recovery.state.recovery_copy_settled = true;
                         tracing::info!(target: TARGET, method = "settle_recovery_rejoins",
                             routes = carried.len(),
                             "rejoined group's history before its new copy retired");
@@ -832,10 +838,12 @@ impl AppClient {
                 }
                 _ => {
                     app.record_recovery_copy(group_id, install)?;
-                    self.recovery_copy_settled = true;
+                    self.history_recovery.state.recovery_copy_settled = true;
                 }
             }
-            self.settled_recovery_copies
+            self.history_recovery
+                .state
+                .settled_recovery_copies
                 .insert(group_id.to_vec(), (install, carried));
         }
         Ok(())
@@ -1004,7 +1012,7 @@ impl AppClient {
     /// rather than parked.
     pub(crate) fn record_open_coverage_goals(&mut self) {
         let now = unix_now_seconds();
-        self.runner_prune_clock = now;
+        self.history_recovery.state.runner_prune_clock = now;
         let current = self.current_coverage_routes();
         let result = self.coverage_storage().and_then(|storage| {
             self.widen_standing_goals(
@@ -1034,7 +1042,7 @@ impl AppClient {
     }
 
     pub(crate) async fn record_native_coverage_at(&self, app: &SqliteAppStorage, now: u64) {
-        let mut live = self.live_coverage.lock().await;
+        let mut live = self.history_recovery.state.live_coverage.lock().await;
         live.tails = LiveTails::default();
         // Before the adapter: whatever this observation sees for the first
         // time began after this mark.
@@ -1130,7 +1138,13 @@ impl AppClient {
     /// [`Self::record_native_coverage_at`] does, then returns what it found.
     pub(crate) async fn live_tails(&self, app: &SqliteAppStorage, now: u64) -> LiveTails {
         self.record_native_coverage_at(app, now).await;
-        self.live_coverage.lock().await.tails.clone()
+        self.history_recovery
+            .state
+            .live_coverage
+            .lock()
+            .await
+            .tails
+            .clone()
     }
 }
 

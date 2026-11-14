@@ -52,8 +52,9 @@ impl AppClient {
         storage: &SqliteAccountStorage,
     ) -> Result<HashSet<String>, AppError> {
         let released = storage.consume_released_transport_receipts()?;
-        self.released_backfill_reload_pending |= !released.is_empty();
-        if !self.released_backfill_reload_pending {
+        self.history_recovery
+            .note_released_receipts(!released.is_empty());
+        if !self.history_recovery.released_backfill_reload_pending() {
             return Ok(HashSet::new());
         }
         let released = released
@@ -95,7 +96,7 @@ impl AppClient {
         self.restore_persisted_epoch_backfill_intents(
             storage.app_storage().pending_epoch_backfill_intents()?,
         );
-        self.released_backfill_reload_pending = false;
+        self.history_recovery.finish_released_backfill_reload();
         Ok(released)
     }
 
@@ -240,7 +241,12 @@ mod tests {
                 ));
                 assert!(!client.seen_events_index.contains(&id));
                 assert!(!client.state.seen_events.contains(&id));
-                assert!(client.released_backfill_reload_pending);
+                assert!(
+                    client
+                        .history_recovery
+                        .test_state()
+                        .released_backfill_reload_pending
+                );
                 assert!(
                     storage
                         .consume_released_transport_receipts()
@@ -269,7 +275,12 @@ mod tests {
             }
             assert!(!client.state.seen_events.contains(&id));
             assert!(client.has_pending_epoch_backfill());
-            assert!(!client.released_backfill_reload_pending);
+            assert!(
+                !client
+                    .history_recovery
+                    .test_state()
+                    .released_backfill_reload_pending
+            );
             client
                 .save_state_with_pending_local_group_deletion_frontier_clears()
                 .unwrap();

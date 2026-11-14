@@ -507,7 +507,10 @@ mod tests {
             .seq;
 
         client.delivery_spill.in_flight = Some((seq, hex::encode([3_u8; 32])));
-        client.released_backfill_reload_pending = true;
+        client
+            .history_recovery
+            .test_state()
+            .released_backfill_reload_pending = true;
         client.fail_next_released_backfill_reload = true;
         client.settle_spilled_delivery();
         assert_eq!(
