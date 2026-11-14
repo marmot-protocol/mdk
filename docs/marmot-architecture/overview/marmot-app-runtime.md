@@ -1,16 +1,16 @@
 ---
 title: "Marmot App Runtime Shape"
 created: 2026-05-19
-updated: 2026-11-12
+updated: 2026-11-14
 tags: [marmot, overview, app-runtime, daemon, tui]
 status: implemented-first-slice
 ---
 
 # Marmot App Runtime Shape
 
-`marmot-app` should become the runtime boundary for client applications. A daemon, TUI, Flutter app, or desktop app
-should create a `MarmotAppRuntime` and send it intents. The runtime owns accounts, shared directory state, relay
-subscriptions, projections, and typed event streams.
+`marmot-app` is the runtime boundary for client applications. A daemon, TUI, or native app opens a `MarmotApp` over
+its account home, starts a `MarmotAppRuntime` from it, and sends the runtime intents. The runtime owns accounts, shared
+directory state, relay subscriptions, projections, and typed event streams.
 
 The lower crates already point in this direction. `cgka-engine` owns convergence and engine state. `marmot-session` owns
 one account-device session and the runtime that coordinates it with transport and publish confirmation.
@@ -20,27 +20,38 @@ one account-device session and the runtime that coordinates it with transport an
 ## Shape
 
 ```text
-MarmotAppRuntime
-  SharedServices
-    account home
-    shared directory cache
+MarmotAppRuntime                  the host API and its typed event stream
+  RuntimeSharedServices           shared by every account's worker
     Nostr relay plane (transport-nostr)
-    app event hubs
-    projection stores
-    background maintenance tasks
-  AccountManager
-    MarmotAccountSession(account A)
-    MarmotAccountSession(account B)
+    recovery credits, local submission queue
+    attachment transfers and permissions, backup conditions
+    observer, relay telemetry and audit export
+    agent stream watches
+  AccountManager                  the account workers
+    account worker(account A)  →  AppClient
+    account worker(account B)  →  AppClient
     ...
+  account setup                   interactive onboarding and generated setup
+MarmotApp                         account home, storage handles, directory, config; every layer holds a clone
 ```
 
-`MarmotAccountSession` should wrap the current account-device stack:
+Hosts reach account setup through `runtime.account_setup()`. Setup's state lives in `runtime/onboarding/`, and it
+reaches the workers only through `AccountManager`.
 
-- account identity and secret access;
-- `AccountDeviceSession`;
-- per-account app projection state;
-- account-scoped group, message, profile, key-package, and stream operations;
-- account inbox subscription state.
+Each account's worker task owns that account's writer, `AppClient`. `AppClient` is crate-private; the `test-support`
+feature makes it public for tests that drive one directly, and `wn sync` runs its one pass through
+`MarmotApp::sync_account`. It holds:
+
+- **the writer core:** the engine runtime, the account projection and its checkpoint bookkeeping, and the product
+  state that commands change;
+- **the writer's ingest:** live sync (`client/sync.rs`), native replay ingress (`client/recovery.rs` and
+  `client/sync/native_ingress.rs`), the delivery spill and the overflow marker. Ingest seals the transport cursor and
+  moves the projection checkpoint, so it is part of the writer core, not of recovery;
+- **history recovery's ledger side:** one component held as one field, `HistoryRecovery` in `client/history_recovery/`.
+  It holds the recovery runner's host state, the coverage-ledger recorder, epoch-gap evidence, and history notices and
+  status. Its state is private to that module tree: the rest of the writer records a fact or drains an output through
+  one of its methods. The recovery runner schedules every history fetch. Its decisions and storage writes run as
+  short turns on the worker, and its network work runs off the worker.
 
 ## Startup Readiness Contract
 
@@ -90,14 +101,6 @@ New setup skips signed-out and unlinked journals, leaving their accounts intact.
 Teardown rechecks the captured public key after waiting for its fence. If a label
 was reused during that wait, the replacement account is not signed out or removed.
 
-`SharedServices` should hold runtime state shared by every account:
-
-- directory/user cache;
-- relay-list and KeyPackage lookup state;
-- app-wide stream hubs;
-- app settings and runtime config;
-- the Nostr relay plane.
-
 ## Threading Model
 
 `marmot-app` never builds a Tokio runtime. It spawns account workers, relay-plane tasks, subscription forwarders and
@@ -132,8 +135,7 @@ graceful cleanup.
 
 `marmot-app`'s integration suites (`crates/marmot-app/tests/`, including `relay_runtime`) drive whole runtimes on a
 two-worker multi-thread test runtime, so ordering that only holds on one thread fails in CI. A test that needs one
-thread stays on the current-thread flavor and says why. The unit-level suites under `src/runtime/` still run on one
-thread: many of them build exact interleavings, and they have not yet been made independent of scheduling.
+thread stays on the current-thread flavor and says why. The unit-level suites under `src/` follow the same rule.
 `transport-nostr`'s suite runs on the same two-worker multi-thread runtime, apart from a few current-thread and
 paused-clock tests.
 
@@ -149,11 +151,10 @@ owner for Nostr subscriptions and relay policy:
 - keep discovery and directory subscriptions coalesced across accounts;
 - keep account inbox subscriptions for signed-in accounts;
 - keep group subscriptions for account/group routes;
-- route inbound relay events to the right `MarmotAccountSession`;
-- apply reconnect, catch-up, replay-window, and relay-safety policy;
-- emit typed runtime events after account sessions ingest deliveries.
+- hand each account's inbound relay events to that account's worker;
+- apply reconnect, catch-up, replay-window, and relay-safety policy.
 
-The adapter is transport plumbing. The relay plane is the shared orchestration above it, and the app drives it per
+`marmot-app` emits the typed runtime events once a worker has ingested a delivery. The adapter is transport plumbing. The relay plane is the shared orchestration above it, and the app drives it per
 account.
 
 ## Inbound / Convergence Boundary Contracts
@@ -341,7 +342,10 @@ The remaining work is narrower than the original refactor, but still real:
 - `crates/marmot-session`: one encrypted account-device session, and the account/session coordinator for
   publish-before-apply and transport activation.
 - `crates/marmot-account`: account identity, files and secrets.
-- `crates/marmot-app`: multi-account runtime, shared services, projections, app events.
+- `crates/marmot-app`: multi-account runtime, shared services, each account's writer, projections, app events.
+- `crates/nostr-directory`: the user directory: lookups, search, KeyPackage resolution and the directory cache schema.
+- `crates/media-store`: the encrypted per-file media store.
+- `crates/marmot-observability`: diagnostics exporters (relay telemetry over OTLP, product analytics, audit delivery).
 - `crates/transport-nostr`: the shared Nostr relay plane.
 - `crates/transport-nostr-adapter`: reusable Nostr transport adapter and SDK bridge.
 - `crates/transport-nostr-peeler`: Nostr event peeling and wrapping.
