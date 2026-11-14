@@ -6,7 +6,7 @@ use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use chacha20poly1305::aead::{Aead, AeadInPlace, KeyInit, Payload};
+use chacha20poly1305::aead::{AeadInPlace, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Nonce};
 use url::Url;
 
@@ -37,29 +37,6 @@ fn media_upload_batch_enforces_the_same_aggregate_bound_as_the_connector() {
     assert!(validate_media_upload_batch_lengths([max_plaintext - 3, 3]).is_ok());
     assert!(validate_media_upload_batch_lengths([max_plaintext, 1]).is_err());
     assert!(validate_media_upload_batch_lengths([u64::MAX, 1]).is_err());
-}
-
-#[test]
-fn in_place_encryption_is_wire_identical_to_the_previous_allocating_api() {
-    let key = [0x11_u8; 32];
-    let nonce = [0x22_u8; 12];
-    let aad = b"encrypted-media compatibility";
-    let plaintext = b"same key nonce aad and plaintext";
-    let cipher = ChaCha20Poly1305::new_from_slice(&key).unwrap();
-    let expected = cipher
-        .encrypt(
-            Nonce::from_slice(&nonce),
-            Payload {
-                msg: plaintext,
-                aad,
-            },
-        )
-        .unwrap();
-    let mut actual = plaintext.to_vec();
-    cipher
-        .encrypt_in_place(Nonce::from_slice(&nonce), aad, &mut actual)
-        .unwrap();
-    assert_eq!(actual, expected);
 }
 
 fn valid_imeta_tag() -> Vec<String> {

@@ -153,6 +153,9 @@ struct CachedReader {
     used: Instant,
 }
 
+#[cfg(test)]
+type CheckpointWaitHook = Box<dyn FnOnce() + Send>;
+
 struct Inner<C> {
     root: PathBuf,
     catalog: C,
@@ -163,6 +166,8 @@ struct Inner<C> {
     /// Keys of checkpoints an operation holds; see [`CheckpointLock`].
     checkpoints: Mutex<Vec<Vec<u8>>>,
     checkpoint_released: Condvar,
+    #[cfg(test)]
+    before_checkpoint_wait_for_test: Mutex<Option<CheckpointWaitHook>>,
     /// A best-effort unlink or wire truncate failed, so a file may be left
     /// that only [`MediaStore::sweep`] removes (mdk#2923).
     sweep_owed: AtomicBool,
@@ -291,6 +296,8 @@ impl<C: MediaCatalog> MediaStore<C> {
                 readers: Mutex::new(Vec::new()),
                 checkpoints: Mutex::new(Vec::new()),
                 checkpoint_released: Condvar::new(),
+                #[cfg(test)]
+                before_checkpoint_wait_for_test: Mutex::new(None),
                 sweep_owed: AtomicBool::new(false),
                 #[cfg(any(test, feature = "test-support"))]
                 full_disk_for_test: AtomicBool::new(false),
@@ -954,6 +961,10 @@ impl<C: MediaCatalog> MediaStore<C> {
     fn lock_checkpoint(&self, key: &[u8]) -> CheckpointLock<'_, C> {
         let mut held = lock(&self.inner.checkpoints);
         while held.iter().any(|other| other.as_slice() == key) {
+            #[cfg(test)]
+            if let Some(hook) = lock(&self.inner.before_checkpoint_wait_for_test).take() {
+                hook();
+            }
             held = self
                 .inner
                 .checkpoint_released

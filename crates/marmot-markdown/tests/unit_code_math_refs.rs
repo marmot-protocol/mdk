@@ -203,9 +203,15 @@ fn refdef_bracketed_destination() {
 
 #[test]
 fn refdef_first_label_wins_on_duplicate() {
-    // Both defs are parsed; the second is ignored. We can't easily inspect
-    // the ref map from outside, but both should yield no paragraph blocks.
+    // Both definitions are parsed and emit no blocks; the first is retained.
     assert_eq!(parse_blocks("[a]: /1\n[a]: /2"), vec![]);
+
+    let blocks = parse_blocks("[a]: /1\n[a]: /2\n\n[a]");
+    assert_eq!(blocks.len(), 1);
+    let Block::Paragraph { inlines } = &blocks[0] else {
+        panic!("expected reference link paragraph");
+    };
+    assert!(matches!(inlines.as_slice(), [Inline::Link { dest, .. }] if dest == "/1"));
 }
 
 #[test]

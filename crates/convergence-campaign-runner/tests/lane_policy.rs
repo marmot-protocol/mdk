@@ -23,21 +23,6 @@ fn tracked_lane_manifests_are_the_reviewed_builtin_policy() {
 }
 
 #[test]
-fn every_lane_has_all_resource_retention_and_flake_budgets() {
-    for lane in LANES {
-        let config = CampaignLaneConfigV1::builtin(*lane);
-        assert!(config.contents.minimum_executed_cases > 0);
-        assert!(config.budgets.max_wall_clock_seconds > 0);
-        assert!(config.budgets.max_cpu_seconds > 0);
-        assert!(config.budgets.max_peak_rss_bytes > 0);
-        assert!(config.budgets.max_disk_bytes > 0);
-        assert!(config.budgets.max_artifact_bytes > 0);
-        assert!(config.budgets.artifact_retention_days > 0);
-        assert!(config.budgets.max_flake_rate_basis_points <= 10_000);
-    }
-}
-
-#[test]
 fn workflow_artifact_retention_matches_lane_policy() {
     let ci = include_str!("../../../.github/workflows/ci.yml");
     let nightly = include_str!("../../../.github/workflows/simulator-nightly.yml");

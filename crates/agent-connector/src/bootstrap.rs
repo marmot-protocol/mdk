@@ -1010,11 +1010,11 @@ mod tests {
 
         let mut options = test_options(socket_path);
         options.relays = vec!["wss://relay.one".to_owned()];
-        options.quic_candidates = vec![
-            "quic://one".to_owned(),
-            "quic://two".to_owned(),
-            "quic://three".to_owned(),
-        ];
+        options.quic_candidates = resolve_bootstrap_quic_candidates(
+            vec!["quic://one".to_owned()],
+            Some("quic://two,quic://three".to_owned()),
+            false,
+        );
         let result = run_bootstrap(options).await.unwrap();
         server.abort();
 
