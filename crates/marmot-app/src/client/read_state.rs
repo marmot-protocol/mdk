@@ -412,11 +412,12 @@ impl ReadState {
         })
     }
 
-    /// The groups [`Self::co_members`] counts, in id order: those the local
+    /// The groups [`Self::co_members`] reads, in id order: those the local
     /// account is still a member of, by the stored self membership where
-    /// this version read it. A read hydrates the ones awaiting hydration
-    /// first, as each member read hydrated its group.
-    pub(crate) fn co_member_groups(&self) -> Vec<GroupId> {
+    /// this version read it ([`crate::runtime::co_member_candidate`]). A
+    /// read hydrates the ones awaiting hydration first, as each member read
+    /// hydrated its group.
+    pub(crate) fn co_member_candidates(&self) -> Vec<GroupId> {
         let mut groups = self
             .groups
             .iter()
@@ -425,7 +426,7 @@ impl ReadState {
                     Ok(Some(stored)) => *stored,
                     _ => group.record.self_membership,
                 };
-                crate::runtime::contributes_co_members(&group.record, self_membership)
+                crate::runtime::co_member_candidate(&group.record, self_membership)
             })
             .map(|(group_id, _)| group_id.clone())
             .collect::<Vec<_>>();
@@ -433,24 +434,27 @@ impl ReadState {
         groups
     }
 
-    /// `GroupCoMembers`: every other account that shares one of
-    /// [`Self::co_member_groups`] with `local_account_id_hex`, from this
-    /// version alone (mdk#3273 PR 4). A group this version doesn't hold yet
-    /// counts from the version that does. A failed stored self membership
-    /// fails the read, as it failed the stored group listing; otherwise the
-    /// first contributing group in id order whose members failed gives the
-    /// failure.
+    /// `GroupCoMembers`: every other account that shares with
+    /// `local_account_id_hex` one of [`Self::co_member_candidates`] the
+    /// engine has not frozen, from this version alone (mdk#3273 PR 4). A
+    /// group this version doesn't hold yet counts from the version that
+    /// does. Whether the engine froze a group is its MLS state's
+    /// `unrecoverable`, the engine's saved flag, not the record's mark,
+    /// which a lost save can revert ([`crate::runtime::contributes_co_members`]).
+    /// A failed stored self membership fails the read, as it failed the
+    /// stored group listing; otherwise the first candidate in id order whose
+    /// MLS state or members failed gives the failure.
     pub(crate) fn co_members(&self, local_account_id_hex: &str) -> ReadAnswer<Vec<String>> {
         for group in self.groups.values() {
             group.self_membership.as_ref().map_err(Arc::clone)?;
         }
         let mut co_members = BTreeSet::new();
-        for group_id in self.co_member_groups() {
-            let members = self
-                .group(&group_id)?
-                .members
-                .as_ref()
-                .map_err(Arc::clone)?;
+        for group_id in self.co_member_candidates() {
+            let group = self.group(&group_id)?;
+            if group.mls_state.as_ref().map_err(Arc::clone)?.unrecoverable {
+                continue;
+            }
+            let members = group.members.as_ref().map_err(Arc::clone)?;
             for (member_id, _) in members {
                 let member_id_hex = hex::encode(member_id.as_slice());
                 if member_id_hex != local_account_id_hex {
@@ -1783,27 +1787,28 @@ pub(crate) mod oracle {
                 );
             }
         }
-        // Co-members: this version's groups, records and members against
-        // the stored listing and the live member reads.
+        // Co-members: this version's candidates, engine flags and members
+        // against the account state's records, the stored self memberships
+        // and the live engine reads.
         if let Ok(local) = client.app.account_home().account(&client.state.label) {
             same(
                 window,
                 "co members",
                 &state.co_members(&local.account_id_hex),
                 &client
-                    .co_member_groups()
-                    .and_then(|groups| client.co_members(&groups)),
+                    .co_member_candidates()
+                    .and_then(|candidates| client.co_members(&candidates)),
             );
-            if let Ok(live) = client.co_member_groups()
+            if let Ok(live) = client.co_member_candidates()
                 && state
                     .groups
                     .values()
                     .all(|group| group.self_membership.is_ok())
             {
                 assert_eq!(
-                    state.co_member_groups(),
+                    state.co_member_candidates(),
                     live,
-                    "read state differs from the live read for co-member groups"
+                    "read state differs from the live read for co-member candidates"
                 );
             }
         }

@@ -828,11 +828,13 @@ impl AccountManager {
     pub async fn group_co_members(&self, account_ref: &str) -> Result<Vec<String>, AppError> {
         let account = self.resolve(account_ref)?;
         let lane = self.worker_lane(account_ref).await?;
-        // The groups the hydration request names come from the current
-        // version; the answer reads its groups, records and members from the
-        // one version the read settles on (mdk#3273 PR 4).
+        // The candidates the hydration request names come from the current
+        // version; the answer reads its candidates, their engine flags and
+        // members from the one version the read settles on (mdk#3273 PR 4).
+        // A candidate the engine froze is hydrated too: only its hydrated
+        // MLS state says whether it was frozen.
         let groups = match lane.read_state.version(&self.app.storage_closed) {
-            Ok(Some(state)) => state.co_member_groups(),
+            Ok(Some(state)) => state.co_member_candidates(),
             Ok(None) | Err(_) => Vec::new(),
         };
         self.read_group_from_state(
@@ -843,11 +845,11 @@ impl AccountManager {
             &groups,
             HydrationFailure::Ignored,
             |state| async move {
-                // A group that came to await hydration after `groups` was
-                // taken goes to the worker, which hydrates it first, as
+                // A candidate that came to await hydration after `groups`
+                // was taken goes to the worker, which hydrates it first, as
                 // each member read did.
                 if !state
-                    .awaiting_hydration(&state.co_member_groups())
+                    .awaiting_hydration(&state.co_member_candidates())
                     .is_empty()
                 {
                     return None;

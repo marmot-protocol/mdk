@@ -2636,17 +2636,19 @@ impl AppClient {
         self.members_with_profiles(group_id, &profiles)
     }
 
-    /// The groups `GroupCoMembers` counts, read live from what A mirrors:
-    /// the account state's records, each with its stored self membership
-    /// overlaid as the roster read overlays it, in id order (mdk#3273 PR 4).
-    pub(crate) fn co_member_groups(&self) -> Result<Vec<GroupId>, AppError> {
+    /// The groups `GroupCoMembers` reads, live from what A mirrors: the
+    /// account state's records, each with its stored self membership
+    /// overlaid as the roster read overlays it, that
+    /// [`crate::runtime::co_member_candidate`] admits, in id order
+    /// (mdk#3273 PR 4).
+    pub(crate) fn co_member_candidates(&self) -> Result<Vec<GroupId>, AppError> {
         let mut groups = Vec::new();
         for record in &self.state.groups {
             let self_membership = self
                 .app
                 .stored_group_self_membership(&self.state.label, &record.group_id_hex)?
                 .unwrap_or(record.self_membership);
-            if crate::runtime::contributes_co_members(record, self_membership) {
+            if crate::runtime::co_member_candidate(record, self_membership) {
                 groups.push(GroupId::new(hex::decode(&record.group_id_hex)?));
             }
         }
@@ -2654,17 +2656,22 @@ impl AppClient {
         Ok(groups)
     }
 
-    /// `GroupCoMembers` read live: every other account in `groups`, each
-    /// read as the member read reads it. The worker hydrates the groups
-    /// first; the oracle compares this with A's answer.
-    pub(crate) fn co_members(&self, groups: &[GroupId]) -> Result<Vec<String>, AppError> {
+    /// `GroupCoMembers` read live: every other account in a candidate the
+    /// engine has not frozen, by the `unrecoverable` flag of the group's MLS
+    /// state, as A reads it, then its members as the member read reads them.
+    /// The worker hydrates the candidates first; the oracle compares this
+    /// with A's answer.
+    pub(crate) fn co_members(&self, candidates: &[GroupId]) -> Result<Vec<String>, AppError> {
         let local_account_id_hex = self
             .app
             .account_home()
             .account(&self.state.label)?
             .account_id_hex;
         let mut co_members = std::collections::BTreeSet::new();
-        for group_id in groups {
+        for group_id in candidates {
+            if self.group_mls_state_unchecked(group_id)?.unrecoverable {
+                continue;
+            }
             self.ensure_group(group_id)?;
             for (member_id, _) in crate::groups::member_accounts(&self.runtime.members(group_id)?) {
                 let member_id_hex = hex::encode(member_id.as_slice());

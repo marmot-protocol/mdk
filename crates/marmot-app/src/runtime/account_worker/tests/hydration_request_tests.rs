@@ -554,3 +554,106 @@ async fn a_delete_during_startup_hydration_waits_for_the_phase_to_end() {
     );
     runtime.shutdown().await;
 }
+
+/// Co-members leave out a group the engine froze by the engine's saved
+/// flag, not by the app's mark (mdk#3273 PR 4). The engine saves the flag
+/// before the app marks its record, and a failed save of that mark
+/// followed by an exit leaves the app row saying the group is
+/// recoverable. After the restart the mirror record says so too, until the
+/// engine's re-emitted `GroupUnrecoverable` is projected. The read through A
+/// and the worker's fallback both leave the group out from their first
+/// answer, so the host never sees a frozen group come back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn co_members_go_by_the_engine_flag_after_a_lost_app_save() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let fixture = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    // Each member has a home of their own, so the runtime runs only Alice's
+    // worker.
+    let mut members = Vec::new();
+    let mut groups = Vec::new();
+    let mut alice = fixture.client("alice").await.unwrap();
+    for (name, member) in [("healthy", "bob"), ("frozen", "carol")] {
+        let member_dir = tempfile::tempdir().unwrap();
+        let member_id = AccountHome::open(member_dir.path())
+            .create_account(member)
+            .unwrap()
+            .account_id_hex;
+        crate::tests::remember_test_member_inbox(&fixture, &member_id, "wss://relay.example");
+        MarmotApp::with_relay(member_dir.path(), "wss://relay.example")
+            .with_test_relay_client(relay.clone())
+            .client(member)
+            .await
+            .unwrap()
+            .publish_key_package()
+            .await
+            .unwrap();
+        groups.push(
+            alice
+                .create_group(name, &[member_id.as_str()])
+                .await
+                .unwrap()
+                .operation
+                .expect("eligible fixture members"),
+        );
+        members.push(member_id);
+    }
+    drop(alice);
+    let [bob, _carol] = members.try_into().unwrap();
+    let [_healthy, frozen] = groups.try_into().unwrap();
+
+    // What a crash after a failed save of the mark leaves: the engine's
+    // flag saved, the app row still recoverable.
+    let lose_the_app_save = || {
+        let storage = fixture.account_storage("alice").unwrap();
+        let mut halted = storage.get_group(&frozen).unwrap();
+        halted.unrecoverable = true;
+        storage.put_group(&halted).unwrap();
+        let mut state = fixture.load_state("alice").unwrap();
+        state
+            .groups
+            .iter_mut()
+            .find(|group| group.group_id_hex == hex::encode(frozen.as_slice()))
+            .expect("the frozen group's row")
+            .unrecoverable = false;
+        fixture.save_state(&state).unwrap();
+    };
+
+    lose_the_app_save();
+    let runtime = crate::MarmotAppRuntime::new(held_app(&dir, relay.clone()));
+    runtime.reconcile_accounts().await.unwrap();
+    let through_a = within_hold("co-members through A", runtime.group_co_members("alice"))
+        .await
+        .unwrap();
+    assert_eq!(
+        through_a,
+        vec![bob.clone()],
+        "the read through A leaves out the group the engine froze"
+    );
+    runtime.shutdown().await;
+    drop(runtime);
+
+    lose_the_app_save();
+    let runtime = crate::MarmotAppRuntime::new(held_app(&dir, relay));
+    runtime.reconcile_accounts().await.unwrap();
+    let commands = runtime.accounts().worker_commands("alice").await.unwrap();
+    let (respond, answer) = ReadReply::unobserved();
+    commands
+        .send(AccountWorkerCommand::GroupCoMembers { respond })
+        .await
+        .unwrap();
+    let fallback = within_hold("co-members on the worker", answer)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        fallback,
+        vec![bob],
+        "the worker's fallback leaves out the group the engine froze"
+    );
+    runtime.shutdown().await;
+}

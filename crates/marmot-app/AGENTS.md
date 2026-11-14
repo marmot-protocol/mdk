@@ -1187,7 +1187,10 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   is gone by then answers `UnknownGroup` from that version.
 - A read that combines groups answers from one version of A, never one joined with live rows. `group_co_members`
   takes its groups, records and members from one version (`ReadState::co_members`), so a group not yet published is
-  not in its radius yet. The direct-conversation lookup's candidates are stored peer-index rows, so before it reads
+  not in its radius yet. It judges a frozen group by the engine's saved `unrecoverable` flag in that version's MLS
+  state, never by the record's mark: the engine saves the flag before the app marks the record, so a lost save of
+  the mark can't bring a frozen group back after a restart. Its candidates include groups the mark calls frozen, since
+  only their hydrated MLS state says whether they are. The direct-conversation lookup's candidates are stored peer-index rows, so before it reads
   their members from A it waits on the caller's task, within a diagnosed read's wait, for a version that holds every
   candidate whose stored row remains or lists it quarantined (`AccountManager::wait_for_published_groups`). Every
   stored group is in the first version published after its row commits: the account state loads every
