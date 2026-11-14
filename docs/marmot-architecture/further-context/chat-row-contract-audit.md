@@ -98,7 +98,7 @@ for eligible accepted conversations, with native progress, cancellation,
 retry/remove/download-again and policy controls. Pending invitations still defer
 automatic attachment acquisition; avatars may download before acceptance.
 Defaults remain 2 GiB/account, 256 MiB free-disk reserve plus write headroom,
-one automatic transfer and a 64 MiB automatic ciphertext cap. Keep acquired bytes
+four concurrent transfers per runtime and a 64 MiB automatic ciphertext cap. Keep acquired bytes
 until source deletion/expiry or explicit local removal; do not evict to make room.
 
 The release includes migration 86. Preserve the normal migration/downgrade gate;

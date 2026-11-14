@@ -672,7 +672,9 @@ async fn manual_backup_restore_cancels_and_closes_while_a_blob_is_held() {
     let mut watch = runtime.watch_backup_restore("alice").await.unwrap();
     let mut media_holds = Vec::new();
     let mut downloads = Vec::new();
-    for _ in 0..3 {
+    // Every media slot but the one background admission keeps free.
+    let ordinary = crate::runtime::account_worker::MEDIA_HTTP_IN_FLIGHT_LIMIT - 1;
+    for _ in 0..ordinary {
         let mut held = blossom.hold_get(&media_reference.ciphertext_sha256);
         let download_runtime = runtime.clone();
         let group = media_chat.clone();
@@ -697,7 +699,7 @@ async fn manual_backup_restore_cancels_and_closes_while_a_blob_is_held() {
     assert_eq!(
         runtime.backup_restore_status("alice").await.unwrap().phase,
         BackupRestorePhase::Discovering,
-        "three ordinary transfers reserve the background lane"
+        "ordinary transfers in every unreserved slot hold back the background lane"
     );
     media_holds.remove(0).release();
     assert_eq!(

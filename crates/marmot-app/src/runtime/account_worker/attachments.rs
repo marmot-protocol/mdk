@@ -654,6 +654,22 @@ fn capacity(
     admissible_limit(max) && disk.admit(free, needed) == media_store::Admission::Admitted
 }
 
+/// Whether free space covers every transfer the runtime may run at once
+/// ([`crate::runtime::ATTACHMENT_TRANSFER_LIMIT`]) each writing the most the
+/// largest account limit (`limit_bound`) allows, above the reserve.
+fn concurrent_admission_fits(
+    policy: &storage_sqlite::AttachmentDownloadPolicy,
+    free: u64,
+    limit_bound: u64,
+) -> bool {
+    let disk = media_store::DiskPolicy {
+        reserve_bytes: policy.disk_reserve,
+    };
+    let need = (crate::runtime::ATTACHMENT_TRANSFER_LIMIT as u64)
+        .saturating_mul(media_store::DiskPolicy::download_need(limit_bound, 0));
+    disk.admit(free, need) == media_store::Admission::Admitted
+}
+
 fn admissible_limit(max: u64) -> bool {
     max > 0 && max <= crate::media::MAX_ENCRYPTED_MEDIA_BLOB_BYTES
 }
@@ -862,10 +878,19 @@ pub(super) fn schedule(
         admission.waiting = None;
         return Ok(more);
     }
+    // Publish this account's limit before measuring, and read the bound
+    // after: an admission concurrent with another account's then always has
+    // the later of the two checks covering both transfers.
+    shared
+        .attachment_limit_bound
+        .fetch_max(policy.transfer_limit, std::sync::atomic::Ordering::AcqRel);
     let free = crate::media::attachment_resume::available_space(
         &client.app.account_dir(&client.state.label),
     )
     .ok();
+    let limit_bound = shared
+        .attachment_limit_bound
+        .load(std::sync::atomic::Ordering::Acquire);
     // Jobs parked for disk space rejoin the due page only once the device can
     // publish them; their checkpoints make the readmitted attempt local work.
     // Unknown free space readmits nothing, as it admits nothing below.
@@ -893,16 +918,23 @@ pub(super) fn schedule(
         admission.waiting = None;
         return Ok(more);
     }
-    let Some(background_permit) = held_permit else {
+    let Some(mut background_permit) = held_permit else {
         if admission.waiting.is_none() {
             admission.waiting = Some(Box::pin(shared.attachment_transfer.clone().acquire_owned()));
         }
         return Ok(more);
     };
+    let limit = crate::runtime::ATTACHMENT_TRANSFER_LIMIT;
     let Ok(permit) = http.permits.clone().try_acquire_owned() else {
         return Ok(more);
     };
-    for candidate in candidates {
+    // Each pass starts one transfer. Once it is claimed (off the due page),
+    // a later candidate asks the worker for another pass, which admits it
+    // while global and HTTP capacity remain. A candidate that stays due must
+    // not ask, or the next pass would select it again at once.
+    let count = candidates.len();
+    for (position, candidate) in candidates.into_iter().enumerate() {
+        let started = more || position + 1 < count;
         let explicit = storage
             .app_storage()
             .attachment_request_is_explicit(&candidate)?;
@@ -1005,7 +1037,37 @@ pub(super) fn schedule(
                 },
                 |completion| completion,
             );
-            return Ok(more);
+            return Ok(started);
+        }
+        // Downloads run concurrently only while free space covers every one
+        // the runtime may run writing the most any account's automatic limit
+        // allows: none of them then needs to know what the others still
+        // write. An explicit download may be far larger than that limit, so it
+        // always runs alone, as a tap did with the single slot. Running alone
+        // holds every global permit, and admission measures free space with
+        // nothing else in flight. When others are in flight, wait for all of
+        // them in the semaphore's FIFO queue: candidates stay queued and due,
+        // and the wait ends the moment the last one finishes, in any account.
+        if background_permit.num_permits() < limit
+            && (explicit || !concurrent_admission_fits(&policy, free, limit_bound))
+        {
+            match shared
+                .attachment_transfer
+                .clone()
+                .try_acquire_many_owned((limit - background_permit.num_permits()) as u32)
+            {
+                Ok(rest) => background_permit.merge(rest),
+                Err(_) => {
+                    drop(background_permit);
+                    admission.waiting = Some(Box::pin(
+                        shared
+                            .attachment_transfer
+                            .clone()
+                            .acquire_many_owned(limit as u32),
+                    ));
+                    return Ok(more);
+                }
+            }
         }
         // References do not declare a trustworthy size. Reserve the configured
         // automatic-sized object even for explicit work, then enforce actual
@@ -1147,7 +1209,7 @@ pub(super) fn schedule(
             },
             |completion| completion,
         );
-        return Ok(more);
+        return Ok(started);
     }
     Ok(more)
 }

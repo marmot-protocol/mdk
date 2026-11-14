@@ -1965,7 +1965,10 @@ async fn attachment_controls_interrupt_http_and_release_capacity_without_publish
             .unwrap()
             .unwrap();
         complete_and_settle(&mut client, done, &shared, &http, &mut completions).await;
-        assert_eq!(shared.attachment_transfer.available_permits(), 1);
+        assert_eq!(
+            shared.attachment_transfer.available_permits(),
+            crate::runtime::ATTACHMENT_TRANSFER_LIMIT
+        );
         assert!(
             read_retained(
                 &store,
@@ -2042,7 +2045,10 @@ async fn attachment_body_idle_deadline_releases_global_capacity_and_retries() {
         _ => panic!("attachment completion"),
     };
     complete_and_settle(&mut client, done, &shared, &http, &mut completions).await;
-    assert_eq!(shared.attachment_transfer.available_permits(), 1);
+    assert_eq!(
+        shared.attachment_transfer.available_permits(),
+        crate::runtime::ATTACHMENT_TRANSFER_LIMIT
+    );
     assert_eq!(
         store
             .app_storage()

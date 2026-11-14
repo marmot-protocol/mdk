@@ -193,7 +193,10 @@ impl Fixture {
             "a parked job must not refetch in the background"
         );
         assert_eq!(self.state(), AttachmentTransferState::StorageBlocked);
-        assert_eq!(self.shared.attachment_transfer.available_permits(), 1);
+        assert_eq!(
+            self.shared.attachment_transfer.available_permits(),
+            crate::runtime::ATTACHMENT_TRANSFER_LIMIT
+        );
         headroom
     }
     /// Drive a file-sink completion through retention to `Ready`.

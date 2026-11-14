@@ -1553,7 +1553,7 @@ fn a_lost_media_file_is_unavailable_until_an_explicit_retry() {
         transfer_limit: 1 << 20,
     };
     for _ in 0..3 {
-        let (status, queued) = app
+        let (status, queued, _) = app
             .request_automatic_attachment(GROUP, &entry, digest(&content), NOW, (&policy, true))
             .unwrap();
         assert!(!queued);
