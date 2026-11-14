@@ -239,12 +239,12 @@ impl SqliteAppStorage {
     /// background backlog. Explicit work keeps its tap time and stays ahead.
     /// Only the ordering changes: state, backoff and budgets are untouched.
     ///
-    /// Clock seconds alone would tie a fling's requests, so the request takes
-    /// one past the highest other queued automatic priority. That can run
-    /// ahead of the clock only while the queue holds such requests; work that
-    /// already leads keeps its value, so repeating a request never climbs.
-    /// Returns whether the order changed, so the caller wakes the worker only
-    /// then.
+    /// Work that already leads every other queued automatic row is left as
+    /// it is, so a screen repeating its request writes and wakes nothing.
+    /// Otherwise it takes the later of now and one past the highest other
+    /// queued automatic priority: clock seconds alone would tie a fling's
+    /// requests. Returns whether the order changed, so the caller wakes the
+    /// worker only then.
     fn prioritize_queued_automatic(
         &self,
         status: Option<&AttachmentTransferStatus>,
@@ -257,24 +257,31 @@ impl SqliteAppStorage {
             return Ok(false);
         };
         let conn = self.lock()?;
-        let target: i64 = conn
+        let Some((own, highest_other)) = conn
             .query_row(
-                "SELECT max(?2,COALESCE((SELECT max(o.priority_at)+1 FROM attachment_acquisition AS o
-                    WHERE o.token<>?1 AND o.explicit_request=0 AND o.cancelled=0
-                    AND o.due IS NOT NULL),0))",
-                params![reference.token, u64_to_i64(now)?],
-                |row| row.get(0),
+                "SELECT q.priority_at,(SELECT max(o.priority_at) FROM attachment_acquisition AS o
+                    WHERE o.token<>q.token AND o.explicit_request=0 AND o.cancelled=0
+                    AND o.due IS NOT NULL)
+                FROM attachment_acquisition AS q
+                WHERE q.token=?1 AND q.explicit_request=0 AND q.cancelled=0 AND q.due IS NOT NULL",
+                [&reference.token],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?)),
             )
-            .storage()?;
-        Ok(conn
-            .execute(
-                "UPDATE attachment_acquisition SET priority_at=?2
-                WHERE token=?1 AND explicit_request=0 AND cancelled=0 AND due IS NOT NULL
-                AND priority_at<?2",
-                params![reference.token, target],
-            )
+            .optional()
             .storage()?
-            > 0)
+        else {
+            return Ok(false);
+        };
+        let Some(highest_other) = highest_other.filter(|other| own <= *other) else {
+            return Ok(false);
+        };
+        let target = u64_to_i64(now)?.max(highest_other.saturating_add(1));
+        conn.execute(
+            "UPDATE attachment_acquisition SET priority_at=?2 WHERE token=?1",
+            params![reference.token, target],
+        )
+        .storage()?;
+        Ok(true)
     }
 
     /// Policy, source validation, idempotent demand and returned status share a

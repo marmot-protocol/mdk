@@ -4173,4 +4173,11 @@ fn automatic_request_moves_queued_work_ahead_of_newer_backlog_but_not_taps() {
     app.request_automatic_attachment(GROUP, &shown, digest(), 30, (&policy, true))
         .unwrap();
     assert_eq!(order(30), ["tapped", "shown", "newer"]);
+    // Repeating the leading request seconds later leaves it where it is.
+    let leading = priority("shown");
+    let (_, _, moved) = app
+        .request_automatic_attachment(GROUP, &shown, digest(), 45, (&policy, true))
+        .unwrap();
+    assert!(!moved, "the leader does not climb with the clock");
+    assert_eq!(priority("shown"), leading);
 }

@@ -361,9 +361,10 @@ to 30 seconds to appear while idle. Every byte read still revalidates source/exp
 Explicit requests precede automatic work. Among automatic work, a host's
 `request_automatic_attachment` for queued work (an image on screen) moves it to the
 front, most recent request first; otherwise recent incoming sources precede older
-backfill. That request changes only ordering, never state, backoff or budgets. A request
-that changes the order wakes the account's worker, without reporting a state change; one
-that changes nothing wakes nothing.
+backfill. That request changes only ordering, never state, backoff or budgets. Work that
+already leads the other queued automatic work is left as it is. A request that changes the
+order wakes the account's worker, without reporting a state change; one that changes
+nothing writes and wakes nothing.
 Candidate queries seek the due range before sorting eligible jobs by priority, so future
 backoff and active leases are not scanned. The explicit-only path also seeks past disabled
 automatic work. Priority sorting still visits currently eligible jobs; this is not a claim
