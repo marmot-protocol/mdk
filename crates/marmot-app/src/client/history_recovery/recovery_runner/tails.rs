@@ -51,6 +51,8 @@ impl AppClient {
         Box::new(PostJoinTails {
             live,
             collecting: self
+                .history_recovery
+                .state
                 .runner_post_join
                 .values()
                 .filter(|collection| collection.active && collection.collecting)

@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Fixed
+
+- A contained rewind window on a storage provider without atomic group savepoints writes one snapshot, not two
+  (mdk#3278). It used to run inside the snapshot fallback, so a crash left that snapshot beside the guard's and the
+  next open quarantined the group. It now runs on the guard's snapshot alone, which the next open restores. A failed
+  restore or release keeps that snapshot and quarantines the group for the session (`RewindRestoreFailed`), as a
+  committing window's does, unless an enclosing committing window answers for it; that window keeps its own snapshot
+  when it cannot release the nested one. SQLite is unchanged.
+
 ## 0.16.0 - 2026-11-12
 
 ### Breaking changes

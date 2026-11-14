@@ -99,6 +99,7 @@ impl CandidateSearch {
     pub(super) fn advance<S: StorageProvider>(
         &mut self,
         storage: &S,
+        rewinds: &Rewinds,
         group_id: &GroupId,
         own_commits: &PrevalidatedOwnCommits,
         profile_policy: ReplayProfilePolicy,
@@ -135,6 +136,7 @@ impl CandidateSearch {
                 messages.push(commit.message.clone());
                 let candidate = match probe_candidate_path(
                     storage,
+                    rewinds,
                     group_id,
                     messages.clone(),
                     &digests,
@@ -458,6 +460,7 @@ pub(crate) fn canonicalize_stored_slice<S: StorageProvider>(
         if let Some(search) = &mut work.search {
             if !search.advance(
                 storage,
+                rewinds,
                 group,
                 &work.source.graph.own_commits,
                 work.profile_policy,
@@ -490,6 +493,7 @@ pub(crate) fn canonicalize_stored_slice<S: StorageProvider>(
             work.materialized
                 .extend(materialize_openmls_candidate_paths_budgeted(
                     storage,
+                    rewinds,
                     group,
                     std::slice::from_ref(&work.replay_paths[work.next_path]),
                     &work.source.graph.own_commits,
@@ -664,6 +668,7 @@ pub(crate) fn candidate_peel_slice<S: StorageProvider>(
         if let Some(search) = &mut work.search {
             if !search.advance(
                 storage,
+                rewinds,
                 group,
                 &work.source.graph.own_commits,
                 work.profile_policy,
@@ -688,6 +693,7 @@ pub(crate) fn candidate_peel_slice<S: StorageProvider>(
             }
             match candidate_path_peel_context(
                 storage,
+                rewinds,
                 group,
                 &work.ranked[work.next_path],
                 &work.pending_proposals,

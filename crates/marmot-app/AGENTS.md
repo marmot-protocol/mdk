@@ -1218,12 +1218,16 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   (runtime-only network approval; never restore it from disk).
 - `src/client/`: `read_state.rs` (A, the account's published read state: its publisher and the test oracle,
   mdk#3273), `recovery.rs` (native replay ingress and the recovery seams), `history_recovery.rs` (history
-  recovery's ledger side under one parent, mdk#2782: `history_recovery/recovery_coverage.rs` (the
+  recovery's ledger side as one component, mdk#2782: `HistoryRecovery` is one `AppClient` field whose state is
+  private to the subtree, so code outside it records a fact or drains an output through one of its methods, and a
+  test outside it reaches the state through `test_state`; `history_recovery/recovery_coverage.rs` (the
   coverage-ledger recorder, mdk#2660), `history_recovery/recovery_runner.rs` (the per-account recovery
   runner, mdk#2660; `history_recovery/recovery_runner/host.rs` seats it on the worker or
   a direct client; `history_recovery/recovery_runner/post_join.rs` gives each joined copy a bounded collection on the same runner,
   using fresh ordinary boundary facts for grace and admitted ledger coverage for fetched completion),
-  `history_recovery/epoch_stall.rs` (epoch-gap backfill detection) and `history_recovery/history_notices.rs`),
+  `history_recovery/epoch_stall.rs` (epoch-gap backfill detection), `history_recovery/epoch_backfill.rs` (the client's
+  epoch-gap evidence: feeding the detector, arming and escalating backfill, retiring a terminal group's recovery)
+  and `history_recovery/history_notices.rs`),
   `invite_recovery.rs` (durable invitation recovery), `delivery_spill.rs` (worker side of the durable delivery spill),
   `audit_v5_app_update.rs` (bounded app-boundary audit rows), `sync/native_ingress.rs` (ordered native replay
   admission).

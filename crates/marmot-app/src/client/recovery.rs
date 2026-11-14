@@ -340,16 +340,9 @@ impl AppClient {
         self.synchronize_recovery_loss(&storage.app_storage())?;
         // Failed detector persistence is retried here. These observations
         // carry demand only; SQL remains the retry authority.
-        let arms = self
-            .pending_recovery_arm_writes
-            .iter()
-            .map(|(group, epoch)| storage_sqlite::StoredEpochBackfillIntent {
-                group_id_hex: hex::encode(group.as_slice()),
-                stalled_epoch: *epoch,
-            })
-            .collect::<Vec<_>>();
+        let arms = self.history_recovery.buffered_epoch_gap_arms();
         self.arm_epoch_gap_recovery(&arms)?;
-        self.pending_recovery_arm_writes.clear();
+        self.history_recovery.clear_buffered_epoch_gap_arms();
         drop(self.transport_receipts()?);
         Ok(())
     }

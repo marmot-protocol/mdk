@@ -6,6 +6,10 @@
 //! quarantined for `RewindRestoreFailed` for the rest of the session, with its
 //! input retained, and the next open restores the live image the window
 //! snapshotted. Historical peel uses a contained transaction instead.
+//!
+//! A backend without atomic group savepoints commits a contained window as it
+//! goes too, so the window must leave only what that open restores, and fail
+//! as a committing window does (mdk#3278).
 
 use super::*;
 use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MarmotAppEvent};
@@ -1250,13 +1254,11 @@ async fn a_rewind_that_fails_leaves_the_group_live() {
         .expect("the next pass runs");
 }
 
-// A contained window's restore runs inside its savepoint, so a failed restore
-// undoes the whole window: alone on live state, or nested in a pass.
-#[tokio::test]
-async fn a_failed_contained_restore_leaves_live_state_unchanged() {
-    // Alone: Carol holds both rival commits unsettled at epoch 1, so the
-    // sweep replays candidate paths from the live epoch with no outer guard.
-    let mut fork = rival_invites().await;
+/// Carol holds both rival commits unsettled at epoch 1 and a row no live
+/// context reads, so the sweep replays candidate paths from the live epoch,
+/// each in a contained window with no outer guard.
+async fn carol_with_unsettled_rivals(storage: SqliteAccountStorage) -> Fork {
+    let mut fork = rival_invites_with_storage(storage).await;
     fork.carol
         .buffer_openmls_convergence_message_at(&fork.group, fork.alice_commit.clone(), 1_000)
         .expect("buffer alice");
@@ -1264,6 +1266,16 @@ async fn a_failed_contained_restore_leaves_live_state_unchanged() {
         .buffer_openmls_convergence_message_at(&fork.group, fork.bob_commit.clone(), 1_100)
         .expect("buffer bob");
     defer_unreadable_row(&fork);
+    fork
+}
+
+// A contained window's restore runs inside its savepoint, so a failed restore
+// undoes the whole window: alone on live state, or nested in a pass.
+#[tokio::test]
+async fn a_failed_contained_restore_leaves_live_state_unchanged() {
+    // Alone.
+    let mut fork =
+        carol_with_unsettled_rivals(SqliteAccountStorage::in_memory_for_test().unwrap()).await;
     let before = image(&fork.storage, &fork.group);
     fail_restores(&fork.storage, "openmls-probe-", true);
     let _ = fork.carol.retry_deferred_peels(&fork.group).await;
@@ -1291,4 +1303,234 @@ async fn a_failed_contained_restore_leaves_live_state_unchanged() {
     );
     fork.storage.fail_snapshot_restores_for_test(None);
     assert_live_and_unchanged(&fork, &before, "nested");
+}
+
+/// Carol reopened on a backend without atomic group savepoints, where every
+/// write commits as it is made, with the pass due as in [`Window::fixture`].
+/// Not hydrated.
+fn carol_without_savepoints(
+    storage: SqliteAccountStorage,
+) -> (Engine<FlakyGroupRecordStorage>, FlakyGroupRecordStorage) {
+    let flaky = FlakyGroupRecordStorage::new(storage);
+    let carol = EngineBuilder::new(flaky.clone())
+        .legacy_compatibility_profile()
+        .identity(pad32(CAROL))
+        .account_identity_proof_signer(proof_signer(CAROL))
+        .peeler(Box::new(MockPeeler))
+        .convergence_clock(Arc::new(
+            cgka_engine::convergence_clock::ManualConvergenceClock::new(
+                3_000_000,
+                1_800_000_000_000,
+            ),
+        ))
+        .build()
+        .expect("open carol without savepoints");
+    (carol, flaky)
+}
+
+fn one_replay_snapshot(storage: &SqliteAccountStorage, group: &GroupId, label: &str) {
+    let left = guard_snapshots(storage, group);
+    assert!(
+        matches!(left.as_slice(), [name] if name.starts_with("openmls-probe-")),
+        "{label}: one guard snapshot, the replay's, holds the live state: {left:?}"
+    );
+}
+
+// Without atomic group savepoints a contained window commits as it goes, so a
+// process that dies inside one leaves the group on a candidate's state. It
+// must leave one guard snapshot beside it, which the next open restores; a
+// second would make that open refuse to guess and quarantine the group
+// (mdk#3278).
+#[tokio::test]
+async fn a_crash_inside_a_contained_window_without_savepoints_is_restored_at_the_next_open() {
+    use storage_sqlite::SqlCipherKey;
+
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("contained-without-savepoints.sqlite");
+    let key = SqlCipherKey::raw([0x78; 32]);
+    let fork =
+        carol_with_unsettled_rivals(SqliteAccountStorage::open_encrypted(&database, &key).unwrap())
+            .await;
+    let group = fork.group.clone();
+    let (mut carol, flaky) = carol_without_savepoints(fork.storage.clone());
+    carol.hydrate_all_stored_groups().expect("hydrate");
+    let before = image(&fork.storage, &group);
+
+    flaky.crash_at_restore_of("openmls-probe-");
+    let _ = carol.retry_deferred_peels(&group).await;
+    assert!(
+        flaky.crashed(),
+        "the sweep reached a contained replay's restore"
+    );
+    drop((carol, fork));
+
+    let storage =
+        SqliteAccountStorage::open_encrypted(&database, &key).expect("open after the crash");
+    one_replay_snapshot(&storage, &group, "after the crash");
+    assert!(
+        recovery_observation(&storage, &group).native_epoch > 1,
+        "the process died inside the window, on a candidate's state"
+    );
+    let (mut reopened, _) = carol_without_savepoints(storage.clone());
+    assert!(
+        reopened.quarantined_groups().is_empty(),
+        "the open restored the window's snapshot"
+    );
+    reopened
+        .hydrate_all_stored_groups()
+        .expect("hydrate after the crash");
+    assert!(reopened.quarantined_groups().is_empty());
+    assert!(guard_snapshots(&storage, &group).is_empty());
+    let after = image(&storage, &group);
+    assert_eq!(after.group, before.group, "live group record");
+    assert_eq!(
+        after.state, before.state,
+        "live OpenMLS state and snapshots"
+    );
+    assert_eq!(reopened.epoch(&group).unwrap(), EpochId(1));
+}
+
+/// Carol on a backend without atomic group savepoints, hydrated, with both
+/// rivals unsettled at her live epoch, so the sweep replays candidate paths
+/// in contained windows with no outer guard. Returns her live image.
+async fn alone_without_savepoints() -> (Fork, Engine<FlakyGroupRecordStorage>, Image) {
+    let fork =
+        carol_with_unsettled_rivals(SqliteAccountStorage::in_memory_for_test().unwrap()).await;
+    let (mut carol, _) = carol_without_savepoints(fork.storage.clone());
+    carol.hydrate_all_stored_groups().expect("hydrate");
+    let before = image(&fork.storage, &fork.group);
+    (fork, carol, before)
+}
+
+fn fail_releases(storage: &SqliteAccountStorage, prefix: &'static str) {
+    storage.fail_snapshot_releases_for_test(Some(Arc::new(move |_, name, _| {
+        if name.starts_with(prefix) {
+            return Err(StorageError::Busy("injected release fault".into()));
+        }
+        Ok(())
+    })));
+}
+
+/// The session refuses the group, as it does after a committing window's
+/// failed restore.
+fn refused_until_the_next_open(
+    carol: &mut Engine<FlakyGroupRecordStorage>,
+    group: &GroupId,
+    label: &str,
+) {
+    assert_eq!(
+        carol.quarantined_groups(),
+        vec![(
+            group.clone(),
+            GroupHydrationQuarantineReason::RewindRestoreFailed
+        )],
+        "{label}"
+    );
+    unknown(carol.epoch(group), "epoch", group);
+    unknown(carol.group_context(group).map(drop), "group_context", group);
+}
+
+/// The next open on the same storage restores `before` and leaves no guard
+/// snapshot or quarantine behind.
+fn reopen_restores_without_savepoints(fork: &Fork, before: &Image, label: &str) {
+    let (mut reopened, _) = carol_without_savepoints(fork.storage.clone());
+    assert!(reopened.quarantined_groups().is_empty(), "{label}");
+    reopened.hydrate_all_stored_groups().expect("hydrate");
+    assert!(
+        guard_snapshots(&fork.storage, &fork.group).is_empty(),
+        "{label}"
+    );
+    let after = image(&fork.storage, &fork.group);
+    assert_eq!(after.group, before.group, "{label}");
+    assert_eq!(after.state, before.state, "{label}");
+}
+
+// Without atomic group savepoints nothing undoes a contained window whose
+// restore fails, and with no enclosing window its snapshot is the only copy of
+// the live state. It fails as a committing window does: the snapshot stays,
+// the session refuses the group and every window that would write over the
+// snapshot, and the next open restores it (mdk#3278).
+#[tokio::test]
+async fn a_failed_contained_restore_without_savepoints_refuses_the_group_until_the_next_open() {
+    let (fork, mut carol, before) = alone_without_savepoints().await;
+    fail_restores(&fork.storage, "openmls-probe-", false);
+    assert!(carol.retry_deferred_peels(&fork.group).await.is_err());
+    fork.storage.fail_snapshot_restores_for_test(None);
+    one_replay_snapshot(&fork.storage, &fork.group, "restore");
+    refused_until_the_next_open(&mut carol, &fork.group, "restore");
+    // The same sweep would write the same replay snapshot over the kept one,
+    // from the candidate's state.
+    let _ = carol.retry_deferred_peels(&fork.group).await;
+    one_replay_snapshot(&fork.storage, &fork.group, "swept again");
+    reopen_restores_without_savepoints(&fork, &before, "restore");
+}
+
+// A restored window whose snapshot cannot be released leaves a copy of the
+// live state that the next open restores. The session refuses the group
+// meanwhile, or the next open would undo whatever it did after the window.
+#[tokio::test]
+async fn a_failed_contained_release_without_savepoints_refuses_the_group_until_the_next_open() {
+    let (fork, mut carol, before) = alone_without_savepoints().await;
+    fail_releases(&fork.storage, "openmls-probe-");
+    let _ = carol.retry_deferred_peels(&fork.group).await;
+    fork.storage.fail_snapshot_releases_for_test(None);
+    one_replay_snapshot(&fork.storage, &fork.group, "release");
+    let live = image(&fork.storage, &fork.group);
+    assert_eq!(live.group, before.group, "the restore succeeded");
+    refused_until_the_next_open(&mut carol, &fork.group, "release");
+    reopen_restores_without_savepoints(&fork, &before, "release");
+}
+
+// Nested in the pass's committing window, the pass's snapshot holds the live
+// state: a replay whose restore fails releases its own, and the pass's restore
+// brings the live state back with nothing left over. When the replay's
+// snapshot cannot be released, the pass keeps its own beside it, because the
+// next open would otherwise find the replay's alone and restore a candidate's
+// state; with both, it restores the pass's (mdk#3278).
+#[tokio::test]
+async fn a_failed_nested_restore_without_savepoints_is_answered_by_the_enclosing_pass() {
+    // The replay's snapshot goes.
+    let fork = carol_with_a_late_rival().await;
+    let (mut carol, _) = carol_without_savepoints(fork.storage.clone());
+    carol.hydrate_all_stored_groups().expect("hydrate");
+    let before = image(&fork.storage, &fork.group);
+    fail_restores(&fork.storage, "openmls-probe-", false);
+    assert!(
+        carol
+            .converge_stored_openmls_messages_at(&fork.group, 3_000_000)
+            .is_err()
+    );
+    fork.storage.fail_snapshot_restores_for_test(None);
+    assert!(
+        guard_snapshots(&fork.storage, &fork.group).is_empty(),
+        "released"
+    );
+    assert_eq!(image(&fork.storage, &fork.group), before, "released");
+    assert!(carol.quarantined_groups().is_empty(), "released");
+    assert_eq!(carol.epoch(&fork.group).unwrap(), EpochId(2), "released");
+
+    // The replay's snapshot stays.
+    let fork = carol_with_a_late_rival().await;
+    let (mut carol, _) = carol_without_savepoints(fork.storage.clone());
+    carol.hydrate_all_stored_groups().expect("hydrate");
+    let before = image(&fork.storage, &fork.group);
+    fail_restores(&fork.storage, "openmls-probe-", false);
+    fail_releases(&fork.storage, "openmls-probe-");
+    assert!(
+        carol
+            .converge_stored_openmls_messages_at(&fork.group, 3_000_000)
+            .is_err()
+    );
+    fork.storage.fail_snapshot_restores_for_test(None);
+    fork.storage.fail_snapshot_releases_for_test(None);
+    let mut kept = guard_snapshots(&fork.storage, &fork.group);
+    kept.sort();
+    assert!(
+        matches!(kept.as_slice(), [replay, pass]
+            if replay.starts_with("openmls-probe-")
+                && pass.starts_with("openmls-retained-probe-")),
+        "the pass kept its snapshot beside the replay's: {kept:?}"
+    );
+    refused_until_the_next_open(&mut carol, &fork.group, "kept");
+    reopen_restores_without_savepoints(&fork, &before, "kept");
 }

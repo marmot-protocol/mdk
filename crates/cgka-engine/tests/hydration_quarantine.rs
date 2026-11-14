@@ -663,6 +663,11 @@ struct SnapshotRefusal {
 /// becomes readable. OpenMLS state is left intact, so once `get_group`
 /// succeeds the group is fully recoverable — exactly the partial-restore case
 /// the retry path targets.
+///
+/// It keeps the trait's default transaction and group savepoint, so every
+/// write commits when it is made and a group savepoint is the snapshot
+/// fallback: a backend without either. Its read snapshot is the default too,
+/// unless [`Self::with_sqlite_reads`] hands it to SQLite.
 #[derive(Clone)]
 struct FlakyGroupRecordStorage {
     inner: SqliteAccountStorage,
@@ -676,6 +681,7 @@ struct FlakyGroupRecordStorage {
     before_key_package_scan: Arc<Mutex<Option<ForeignWrite>>>,
     sqlite_reads: Arc<AtomicBool>,
     snapshot_refusal: Arc<Mutex<Option<SnapshotRefusal>>>,
+    crash_at_restore: Arc<Mutex<Option<&'static str>>>,
 }
 
 /// A write made on another connection while a read is under way.
@@ -695,6 +701,7 @@ impl FlakyGroupRecordStorage {
             before_key_package_scan: Arc::new(Mutex::new(None)),
             sqlite_reads: Arc::new(AtomicBool::new(false)),
             snapshot_refusal: Arc::new(Mutex::new(None)),
+            crash_at_restore: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -709,6 +716,19 @@ impl FlakyGroupRecordStorage {
     /// Run `write` once, just before the next KeyPackage scan reads its rows.
     fn before_next_key_package_scan(&self, write: impl FnOnce() + Send + 'static) {
         *self.before_key_package_scan.lock().unwrap() = Some(Box::new(write));
+    }
+
+    /// The process dies when it starts restoring a snapshot whose name starts
+    /// with `prefix`: the database closes there, so nothing written after it
+    /// reaches disk. Every earlier write has already committed, so the file is
+    /// what a kill at that point leaves.
+    fn crash_at_restore_of(&self, prefix: &'static str) {
+        *self.crash_at_restore.lock().unwrap() = Some(prefix);
+    }
+
+    /// Whether the selected crash point was reached.
+    fn crashed(&self) -> bool {
+        self.inner.is_closed()
     }
 
     /// Close the database once the next KeyPackage scan has read its rows,
@@ -912,6 +932,15 @@ impl MessageStorage for FlakyGroupRecordStorage {
         self.inner.list_group_snapshots(group_id)
     }
     fn rollback_group_to_snapshot(&self, group_id: &GroupId, name: &str) -> StorageResult<()> {
+        let crash = self
+            .crash_at_restore
+            .lock()
+            .unwrap()
+            .take_if(|prefix| name.starts_with(*prefix));
+        if crash.is_some() {
+            self.inner.close()?;
+            return Err(StorageError::Backend("the test process died here".into()));
+        }
         self.check_snapshot_operation(SnapshotOperation::Restore, name)?;
         self.inner.rollback_group_to_snapshot(group_id, name)
     }

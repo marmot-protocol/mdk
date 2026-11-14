@@ -1005,8 +1005,16 @@ async fn the_host_never_learns_of_the_device_group() {
         .expect("eligible fixture members");
     let chat_hex = hex::encode(chat.as_slice());
 
-    phone.pending_epoch_stall_escalations.clear();
-    phone.pending_recovery_status_updates.clear();
+    phone
+        .history_recovery
+        .test_state()
+        .pending_epoch_stall_escalations
+        .clear();
+    phone
+        .history_recovery
+        .test_state()
+        .pending_recovery_status_updates
+        .clear();
     phone.pending_superseded_change_events.clear();
     let mut effects = marmot_session::AccountDeviceEffects::default();
     for id in [&group, &chat] {
@@ -1024,12 +1032,16 @@ async fn the_host_never_learns_of_the_device_group() {
     }
     phone.note_superseded_intent_reports(&effects);
     let escalated: Vec<_> = phone
+        .history_recovery
+        .test_state()
         .pending_epoch_stall_escalations
         .iter()
         .map(|escalation| escalation.group_id.clone())
         .collect();
     assert_eq!(escalated, vec![chat.clone()]);
     let status: Vec<_> = phone
+        .history_recovery
+        .test_state()
         .pending_recovery_status_updates
         .iter()
         .cloned()

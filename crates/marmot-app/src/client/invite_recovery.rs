@@ -15,8 +15,7 @@ impl AppClient {
     pub(crate) fn mark_recovery_status_changed(&mut self, group_id: &GroupId) {
         self.mark_group_projection_dirty(group_id);
         if self.host_may_see_group(group_id) {
-            self.pending_recovery_status_updates
-                .insert(group_id.clone());
+            self.history_recovery.note_recovery_status_update(group_id);
         }
     }
 
@@ -186,7 +185,7 @@ impl AppClient {
                     .account_storage(&self.state.label)?
                     .app_storage()
                     .clear_recovery_failure(group_id)?;
-                self.epoch_stall.clear_recovered_group(group_id);
+                self.history_recovery.clear_recovered_group(group_id);
                 if changed {
                     self.mark_recovery_status_changed(group_id);
                 }
@@ -564,7 +563,11 @@ mod tests {
                 record.message.expires_at = 0;
                 storage.put_group_recovery(record).unwrap();
             }
-            client.pending_recovery_status_updates.clear();
+            client
+                .history_recovery
+                .test_state()
+                .pending_recovery_status_updates
+                .clear();
 
             let path = app.account_storage_path("alice");
             let keys = app.account_home().load_signing_keys("alice").unwrap();
@@ -640,7 +643,10 @@ mod tests {
                 &groups[..1]
             };
             assert_eq!(
-                client.pending_recovery_status_updates,
+                client
+                    .history_recovery
+                    .test_state()
+                    .pending_recovery_status_updates,
                 notified.iter().cloned().collect()
             );
         }

@@ -2254,14 +2254,34 @@ impl MarmotApp {
             #[cfg(all(test, feature = "unreleased-device-pairing"))]
             test_fail_roster_read: false,
             recovery_owner,
-            // Unit tests run many directly owned clients in one process; each
-            // gets its own pool so one test's held job cannot stall another.
-            #[cfg(not(test))]
-            recovery_credits:
-                crate::runtime::account_worker::recovery_credits::shared_recovery_credit_pool(),
-            #[cfg(test)]
-            recovery_credits: crate::runtime::account_worker::recovery_credits::private_recovery_credit_pool_for_test(),
-            recovery_runner: Default::default(),
+            history_recovery: client::history_recovery::HistoryRecovery::new(
+                client::history_recovery::HistoryRecoveryState {
+                    // Unit tests run many directly owned clients in one process; each
+                    // gets its own pool so one test's held job cannot stall another.
+                    #[cfg(not(test))]
+                    recovery_credits:
+                        crate::runtime::account_worker::recovery_credits::shared_recovery_credit_pool(),
+                    #[cfg(test)]
+                    recovery_credits: crate::runtime::account_worker::recovery_credits::private_recovery_credit_pool_for_test(),
+                    recovery_runner: Default::default(),
+                    pending_recovery_status_updates: std::collections::HashSet::new(),
+                    history_notice_baseline: None,
+                    recovery_status_owed: false,
+                    live_coverage: tokio::sync::Mutex::new(live_coverage),
+                    pending_epoch_stall_escalations: Vec::new(),
+                    runner_preparation_owed: false,
+                    runner_pruned_floor: None,
+                    settled_recovery_copies: std::collections::HashMap::new(),
+                    recovery_copy_settled: false,
+                    // Set with the open's goals, just below.
+                    runner_prune_clock: unix_now_seconds(),
+                    epoch_stall: crate::client::history_recovery::epoch_stall::EpochStallDetector::default()
+                        .with_wedge_rearm_interval_ms(wedge_rearm_interval_ms),
+                    pending_recovery_arm_writes: HashMap::new(),
+                    released_backfill_reload_pending: true,
+                    runner_post_join: HashMap::new(),
+                },
+            ),
             conversation_captures: Vec::new(),
             runtime_telemetry: None,
             send_telemetry: None,
@@ -2283,11 +2303,8 @@ impl MarmotApp {
             seen_events_index,
             pending_seen_event_count: 0,
             pending_group_projection_updates: std::collections::HashSet::new(),
-            pending_recovery_status_updates: std::collections::HashSet::new(),
             announced_convergence_parks: std::collections::HashSet::new(),
             pending_convergence_park_notices: std::collections::HashSet::new(),
-            history_notice_baseline: None,
-            recovery_status_owed: false,
             // A fresh client cannot know what hosts last read.
             linked_devices_changed: true,
             device_labels_refresh_due: true,
@@ -2324,8 +2341,6 @@ impl MarmotApp {
             pending_failed_sync_summary: SyncSummary::default(),
             pending_native_sync_summary: SyncSummary::default(),
             native_sync_deliveries: 0,
-            live_coverage: tokio::sync::Mutex::new(live_coverage),
-            pending_epoch_stall_escalations: Vec::new(),
             pending_convergence_groups: std::collections::HashSet::new(),
             stale_commit_acknowledgements: std::collections::HashMap::new(),
             undelivered_commit_acknowledgements: std::collections::HashMap::new(),
@@ -2338,12 +2353,6 @@ impl MarmotApp {
                 .config
                 .dev_fail_published_app_message_acknowledgement,
             pending_runtime_group_subscription_refresh: false,
-            runner_preparation_owed: false,
-            runner_pruned_floor: None,
-            settled_recovery_copies: std::collections::HashMap::new(),
-            recovery_copy_settled: false,
-            // Set with the open's goals, just below.
-            runner_prune_clock: unix_now_seconds(),
             #[cfg(test)]
             fail_next_runner_preparation: self
                 .test_fail_runner_preparation
@@ -2378,17 +2387,12 @@ impl MarmotApp {
             pending_superseded_change_events: Vec::new(),
             maintenance_failed_backlog: 0,
             unpublished_welcome_delivery: None,
-            epoch_stall: crate::client::history_recovery::epoch_stall::EpochStallDetector::default()
-                .with_wedge_rearm_interval_ms(wedge_rearm_interval_ms),
-            pending_recovery_arm_writes: HashMap::new(),
-            released_backfill_reload_pending: true,
             #[cfg(test)]
             fail_next_released_backfill_reload: false,
             #[cfg(test)]
             fail_next_terminal_recovery_retire: false,
             #[cfg(test)]
             fail_next_convergence_retry_advance: false,
-            runner_post_join: HashMap::new(),
             encrypted_media_not_required_epochs: HashMap::new(),
             checkpoint_route_refresh_recomputes: 0,
             #[cfg(feature = "unreleased-device-pairing")]

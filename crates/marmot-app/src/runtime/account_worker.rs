@@ -1221,7 +1221,9 @@ async fn run_app_runtime_account_worker(
     };
     install_storage_telemetry(&client, shared.observer.performance());
     client.runtime_telemetry = Some(shared.observer.performance().clone());
-    client.recovery_credits = shared.recovery_credit_pool();
+    client
+        .history_recovery
+        .set_recovery_credits(shared.recovery_credit_pool());
     // A, the published read state, starts before readiness: a host that saw
     // the account ready reads at least the opened state (mdk#3273).
     let prepared_group_image_uploads = UploadsInFlight::default();
@@ -2608,7 +2610,7 @@ async fn run_app_runtime_account_worker(
                                 Ok(mut reopened) => {
                                     install_storage_telemetry(&reopened, shared.observer.performance());
                                     reopened.runtime_telemetry = Some(shared.observer.performance().clone());
-                                    reopened.recovery_credits = shared.recovery_credit_pool();
+                                    reopened.history_recovery.set_recovery_credits(shared.recovery_credit_pool());
                                     reopened.resume_read_state(read_state.take());
                                     // A reconnect open is deferred like the
                                     // startup open; drain the hydration
@@ -2751,7 +2753,7 @@ async fn run_app_runtime_account_worker(
                 publish_settled_recovery_copies(&mut client, &events, &account_id_hex, &account_label);
             }
             Ok(()) = recovery_catching_up.changed() => {
-                client.recovery_status_owed = true;
+                client.history_recovery.owe_recovery_status();
                 publish_account_level_changes(&mut client, &events, &account_id_hex, &account_label);
             }
             _ = tokio::task::yield_now(), if avatar_due && !lifecycle.is_stopping() => {
@@ -8396,7 +8398,7 @@ fn publish_client_pending_projection_updates(
         publication,
     );
     publish_account_level_changes(client, events, account_id_hex, account_label);
-    for group_id in std::mem::take(&mut client.pending_recovery_status_updates) {
+    for group_id in client.history_recovery.take_recovery_status_updates() {
         publish_app_runtime_group_state_updated(
             Emit::Quiescent(client),
             events,
@@ -8458,7 +8460,7 @@ fn publish_settled_recovery_copies(
     account_id_hex: &str,
     account_label: &str,
 ) {
-    if std::mem::take(&mut client.recovery_copy_settled) {
+    if client.history_recovery.take_recovery_copy_settled() {
         publish_account_level_changes(client, events, account_id_hex, account_label);
     }
 }
@@ -9269,6 +9271,8 @@ mod tests {
         while received.try_recv().is_ok() {}
         assert_eq!(
             client
+                .history_recovery
+                .test_state()
                 .epoch_stall
                 .observe_resource_refusal(group_id.clone(), epoch, 1),
             BackfillDecision::Arm
@@ -9276,15 +9280,19 @@ mod tests {
         // This test exercises notification delivery from a durable warning,
         // not qualification. Actual evidence counting is covered by the
         // qualified local-evaluation and storage certificate tests.
-        client.epoch_stall.restore_wedge_evidence([(
-            group_id.clone(),
-            crate::client::history_recovery::epoch_stall::EpochStallEvidence {
-                stalled_epoch: epoch.0,
-                fruitless_completions: 3,
-                fruitless_reported: true,
-                last_arm_at_ms: 1,
-            },
-        )]);
+        client
+            .history_recovery
+            .test_state()
+            .epoch_stall
+            .restore_wedge_evidence([(
+                group_id.clone(),
+                crate::client::history_recovery::epoch_stall::EpochStallEvidence {
+                    stalled_epoch: epoch.0,
+                    fruitless_completions: 3,
+                    fruitless_reported: true,
+                    last_arm_at_ms: 1,
+                },
+            )]);
         client.persist_epoch_stall_evidence([&group_id]);
         client
             .finish_scheduled_convergence_effects(

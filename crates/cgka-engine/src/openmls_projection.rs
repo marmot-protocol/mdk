@@ -954,6 +954,9 @@ pub(crate) fn decode_openmls_wire_projection(
     Some((message, projection))
 }
 
+/// Standalone callers hold no engine session: on a backend without atomic
+/// group savepoints, a replay window whose restore fails keeps its snapshot
+/// for the next open, and nothing refuses the group meanwhile.
 pub fn replay_openmls_messages<S: StorageProvider>(
     storage: &S,
     group_id: &GroupId,
@@ -961,6 +964,7 @@ pub fn replay_openmls_messages<S: StorageProvider>(
 ) -> Result<Vec<OpenMlsReplayObservation>, OpenMlsProjectionError> {
     replay_openmls_messages_prevalidated(
         storage,
+        &Rewinds::default(),
         group_id,
         messages,
         &PrevalidatedOwnCommits::default(),
@@ -970,6 +974,7 @@ pub fn replay_openmls_messages<S: StorageProvider>(
 
 fn replay_openmls_messages_prevalidated<S: StorageProvider>(
     storage: &S,
+    rewinds: &Rewinds,
     group_id: &GroupId,
     messages: &[TransportMessage],
     own_commits: &PrevalidatedOwnCommits,
@@ -977,6 +982,7 @@ fn replay_openmls_messages_prevalidated<S: StorageProvider>(
 ) -> Result<Vec<OpenMlsReplayObservation>, OpenMlsProjectionError> {
     replay_openmls_messages_prevalidated_output(
         storage,
+        rewinds,
         group_id,
         messages,
         own_commits,
@@ -987,6 +993,7 @@ fn replay_openmls_messages_prevalidated<S: StorageProvider>(
 
 fn replay_openmls_messages_prevalidated_output<S: StorageProvider>(
     storage: &S,
+    rewinds: &Rewinds,
     group_id: &GroupId,
     messages: &[TransportMessage],
     own_commits: &PrevalidatedOwnCommits,
@@ -999,6 +1006,7 @@ fn replay_openmls_messages_prevalidated_output<S: StorageProvider>(
     // window, so they are unwound with everything else.
     let output = SnapshotRollbackGuard::contained(
         storage,
+        rewinds,
         group_id,
         RewindSite::Replay,
         &replay_snapshot_suffix(group_id, messages),
@@ -1075,6 +1083,9 @@ fn replay_openmls_messages_probe<S: StorageProvider>(
     result
 }
 
+/// Standalone callers hold no engine session: on a backend without atomic
+/// group savepoints, a replay window whose restore fails keeps its snapshot
+/// for the next open, and nothing refuses the group meanwhile.
 pub fn materialize_openmls_candidate_paths<S: StorageProvider>(
     storage: &S,
     group_id: &GroupId,
@@ -1082,6 +1093,7 @@ pub fn materialize_openmls_candidate_paths<S: StorageProvider>(
 ) -> Result<Vec<OpenMlsMaterializedCandidate>, OpenMlsProjectionError> {
     materialize_openmls_candidate_paths_budgeted(
         storage,
+        &Rewinds::default(),
         group_id,
         paths,
         &PrevalidatedOwnCommits::default(),
@@ -1092,6 +1104,7 @@ pub fn materialize_openmls_candidate_paths<S: StorageProvider>(
 
 fn materialize_openmls_candidate_paths_budgeted<S: StorageProvider>(
     storage: &S,
+    rewinds: &Rewinds,
     group_id: &GroupId,
     paths: &[OpenMlsCandidatePath],
     own_commits: &PrevalidatedOwnCommits,
@@ -1110,6 +1123,7 @@ fn materialize_openmls_candidate_paths_budgeted<S: StorageProvider>(
         let probe_started = std::time::Instant::now();
         let replay = replay_openmls_messages_prevalidated_output(
             storage,
+            rewinds,
             group_id,
             &path.messages,
             own_commits,
@@ -1184,6 +1198,9 @@ fn materialize_openmls_candidate_paths_budgeted<S: StorageProvider>(
     Ok(candidates)
 }
 
+/// Standalone callers hold no engine session: on a backend without atomic
+/// group savepoints, a replay window whose restore fails keeps its snapshot
+/// for the next open, and nothing refuses the group meanwhile.
 pub fn canonicalize_openmls_batch<S: StorageProvider>(
     storage: &S,
     group_id: &GroupId,
@@ -1192,6 +1209,7 @@ pub fn canonicalize_openmls_batch<S: StorageProvider>(
     let mut replay_budget = ReplayBudget::unlimited();
     canonicalize_openmls_batch_prevalidated(
         storage,
+        &Rewinds::default(),
         group_id,
         SharedSeenBatch {
             batch,
@@ -1212,8 +1230,10 @@ struct SharedSeenBatch {
     shared_seen_message_ids: Option<std::sync::Arc<BTreeSet<String>>>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn canonicalize_openmls_batch_prevalidated<S: StorageProvider>(
     storage: &S,
+    rewinds: &Rewinds,
     group_id: &GroupId,
     batch: SharedSeenBatch,
     own_commits: &PrevalidatedOwnCommits,
@@ -1227,6 +1247,7 @@ fn canonicalize_openmls_batch_prevalidated<S: StorageProvider>(
     )?;
     let materialized = materialize_openmls_candidate_paths_budgeted(
         storage,
+        rewinds,
         group_id,
         &candidate_paths,
         own_commits,
@@ -1366,6 +1387,7 @@ pub(crate) fn canonicalize_stored_openmls_messages_with_profile_policy<S: Storag
 
     let mut result = canonicalize_stored_openmls_messages_from_current(
         storage,
+        rewinds,
         group_id,
         StoredOpenMlsCanonicalizationWork {
             state,
@@ -1684,7 +1706,8 @@ fn canonicalize_stored_openmls_messages_from_retained_anchor<S: StorageProvider>
         Err(e) => return Err(OpenMlsProjectionError::Snapshot(format!("{e:?}"))),
     };
     crate::test_crash_hooks::pause_if_requested("retained-anchor-after-rewind");
-    let result = canonicalize_stored_openmls_messages_from_current(storage, group_id, work);
+    let result =
+        canonicalize_stored_openmls_messages_from_current(storage, rewinds, group_id, work);
 
     guard
         .commit()
@@ -1850,6 +1873,7 @@ fn can_reuse_bfs_materialization(
 
 fn canonicalize_stored_openmls_messages_from_current<S: StorageProvider>(
     storage: &S,
+    rewinds: &Rewinds,
     group_id: &GroupId,
     work: StoredOpenMlsCanonicalizationWork,
 ) -> Result<CanonicalizationResult, OpenMlsProjectionError> {
@@ -1864,6 +1888,7 @@ fn canonicalize_stored_openmls_messages_from_current<S: StorageProvider>(
     );
     let path_result = match build_stored_openmls_candidate_paths(
         storage,
+        rewinds,
         group_id,
         work.commit_messages,
         &work.pending_messages,
@@ -1919,6 +1944,7 @@ fn canonicalize_stored_openmls_messages_from_current<S: StorageProvider>(
     } else {
         canonicalize_openmls_batch_prevalidated(
             storage,
+            rewinds,
             group_id,
             batch,
             &work.own_commits,
@@ -2122,6 +2148,7 @@ pub(crate) fn candidate_branch_peel<S: StorageProvider>(
     if inputs.replay_start_epoch >= inputs.current_epoch {
         return candidate_branch_peel_contexts_from_current(
             storage,
+            rewinds,
             group_id,
             inputs,
             max_rewind_commits,
@@ -2164,6 +2191,7 @@ pub(crate) fn candidate_branch_peel<S: StorageProvider>(
     crate::test_crash_hooks::pause_if_requested("candidate-branch-after-rewind");
     let contexts = candidate_branch_peel_contexts_from_current(
         storage,
+        rewinds,
         group_id,
         inputs,
         max_rewind_commits,
@@ -2232,6 +2260,7 @@ fn commits_share_a_source_epoch(commits: &[StoredCommitMessage]) -> bool {
 /// stamps `contested` on whatever comes back.
 fn candidate_branch_peel_contexts_from_current<S: StorageProvider>(
     storage: &S,
+    rewinds: &Rewinds,
     group_id: &GroupId,
     inputs: StoredOpenMlsGraphInputs,
     max_rewind_commits: u64,
@@ -2241,6 +2270,7 @@ fn candidate_branch_peel_contexts_from_current<S: StorageProvider>(
     let mut budget = ReplayBudget::for_pass(inputs.commit_messages.len(), max_rewind_commits);
     let path_result = match build_stored_openmls_candidate_paths(
         storage,
+        rewinds,
         group_id,
         inputs.commit_messages,
         &inputs.pending_messages,
@@ -2294,6 +2324,7 @@ fn candidate_branch_peel_contexts_from_current<S: StorageProvider>(
     for path in ranked.into_iter().take(max_contexts) {
         match candidate_path_peel_context(
             storage,
+            rewinds,
             group_id,
             path,
             &pending_proposals,
@@ -2371,6 +2402,7 @@ fn candidate_branch_enumeration_halt_reason(err: &OpenMlsProjectionError) -> &'s
 #[allow(clippy::too_many_arguments)]
 fn candidate_path_peel_context<S: StorageProvider>(
     storage: &S,
+    rewinds: &Rewinds,
     group_id: &GroupId,
     path: &OpenMlsCandidatePath,
     pending_proposals: &[TransportMessage],
@@ -2394,6 +2426,7 @@ fn candidate_path_peel_context<S: StorageProvider>(
     // state with no outer guard.
     let captured = SnapshotRollbackGuard::contained(
         storage,
+        rewinds,
         group_id,
         RewindSite::Replay,
         &replay_snapshot_suffix(group_id, &replay_path.messages),
@@ -2483,6 +2516,7 @@ fn capture_candidate_tip_context<S: StorageProvider>(
 #[allow(clippy::too_many_arguments)]
 fn build_stored_openmls_candidate_paths<S: StorageProvider>(
     storage: &S,
+    rewinds: &Rewinds,
     group_id: &GroupId,
     commits: Vec<StoredCommitMessage>,
     pending_messages: &[TransportMessage],
@@ -2494,6 +2528,7 @@ fn build_stored_openmls_candidate_paths<S: StorageProvider>(
     let mut search = resumable::CandidateSearch::new(commits, pending_messages, starting_epoch)?;
     let complete = search.advance(
         storage,
+        rewinds,
         group_id,
         own_commits,
         profile_policy,
@@ -2567,6 +2602,7 @@ fn build_stored_openmls_candidate_paths_reference<S: StorageProvider>(
 
                 let candidate = match probe_candidate_path(
                     storage,
+                    &Rewinds::default(),
                     group_id,
                     messages.clone(),
                     &digests,
@@ -2704,6 +2740,7 @@ fn pending_proposal_messages(
 #[allow(clippy::too_many_arguments)]
 fn probe_candidate_path<S: StorageProvider>(
     storage: &S,
+    rewinds: &Rewinds,
     group_id: &GroupId,
     messages: Vec<TransportMessage>,
     digests: &[[u8; 32]],
@@ -2719,6 +2756,7 @@ fn probe_candidate_path<S: StorageProvider>(
     let replay_paths = candidate_paths_with_pending_replay_messages(&[path], pending_proposals)?;
     match materialize_openmls_candidate_paths_budgeted(
         storage,
+        rewinds,
         group_id,
         &replay_paths,
         own_commits,
@@ -2761,7 +2799,10 @@ fn probe_candidate_path<S: StorageProvider>(
 /// Apply the selected stored branch with rollback protection and retain replay anchors.
 /// Returns the stable public replay observations; engine presentation deltas stay internal.
 /// The roster tag keys the apply collects are dropped too: only the engine's
-/// convergence pass records them (`roster_tag_keys.rs`).
+/// convergence pass records them (`roster_tag_keys.rs`). Standalone callers
+/// hold no engine session: on a backend without atomic group savepoints, a
+/// retained-anchor read whose restore fails keeps its snapshot for the next
+/// open, and nothing refuses the group meanwhile.
 pub fn apply_openmls_canonicalization_result<S: StorageProvider>(
     storage: &S,
     group_id: &GroupId,
@@ -2770,6 +2811,7 @@ pub fn apply_openmls_canonicalization_result<S: StorageProvider>(
 ) -> Result<Vec<OpenMlsReplayObservation>, OpenMlsProjectionError> {
     apply_openmls_canonicalization_result_with_profile_policy(
         storage,
+        &Rewinds::default(),
         group_id,
         result,
         max_retained_anchor_rewind,
@@ -2785,6 +2827,7 @@ pub fn apply_openmls_canonicalization_result<S: StorageProvider>(
 #[allow(clippy::disallowed_methods)]
 pub(crate) fn apply_openmls_canonicalization_result_with_profile_policy<S: StorageProvider>(
     storage: &S,
+    rewinds: &Rewinds,
     group_id: &GroupId,
     result: &CanonicalizationResult,
     max_retained_anchor_rewind: u64,
@@ -2820,7 +2863,13 @@ pub(crate) fn apply_openmls_canonicalization_result_with_profile_policy<S: Stora
     // app projects the message (receiver at E+3, late media from E+1, four
     // new commits: the pass keeps E+2..E+7). Derive the key first.
     let late_media_secrets = if has_new_commits {
-        late_application_media_secrets(storage, group_id, &replay_messages, apply_start_epoch)?
+        late_application_media_secrets(
+            storage,
+            rewinds,
+            group_id,
+            &replay_messages,
+            apply_start_epoch,
+        )?
     } else {
         BTreeMap::new()
     };
@@ -2879,6 +2928,7 @@ pub(crate) fn apply_openmls_canonicalization_result_with_profile_policy<S: Stora
 /// the epoch is derived even if its applications carry no attachment.
 fn late_application_media_secrets<S: StorageProvider>(
     storage: &S,
+    rewinds: &Rewinds,
     group_id: &GroupId,
     replay_messages: &[TransportMessage],
     apply_start_epoch: u64,
@@ -2899,8 +2949,9 @@ fn late_application_media_secrets<S: StorageProvider>(
     let crypto = RustCrypto::default();
     let mut secrets = BTreeMap::new();
     for epoch in late_epochs {
-        let secret = retained_anchor_media_secret(storage, &crypto, group_id, EpochId(epoch))
-            .map_err(|e| OpenMlsProjectionError::Snapshot(e.to_string()))?;
+        let secret =
+            retained_anchor_media_secret(storage, rewinds, &crypto, group_id, EpochId(epoch))
+                .map_err(|e| OpenMlsProjectionError::Snapshot(e.to_string()))?;
         if let Some(secret) = secret {
             secrets.insert(epoch, secret);
         }
@@ -4699,8 +4750,10 @@ pub(crate) fn retained_anchor_epoch_from_snapshot_name(name: &str) -> Option<u64
 /// contained rewind window, then restore live state. `Ok(None)` when no anchor
 /// is retained for `epoch`, it vanished before the rewind, or it restores a
 /// different epoch.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn with_retained_anchor_group<S: StorageProvider, T>(
     storage: &S,
+    rewinds: &Rewinds,
     crypto: &RustCrypto,
     group_id: &GroupId,
     epoch: EpochId,
@@ -4717,6 +4770,7 @@ pub(crate) fn with_retained_anchor_group<S: StorageProvider, T>(
     };
     crate::snapshot_guard::SnapshotRollbackGuard::contained(
         storage,
+        rewinds,
         group_id,
         site,
         guard_suffix,
@@ -4758,6 +4812,7 @@ fn read_retained_anchor_group<S: StorageProvider, T>(
 /// anchor; `Ok(None)` when no usable anchor remains.
 pub(crate) fn retained_anchor_media_secret<S: StorageProvider>(
     storage: &S,
+    rewinds: &Rewinds,
     crypto: &RustCrypto,
     group_id: &GroupId,
     epoch: EpochId,
@@ -4768,6 +4823,7 @@ pub(crate) fn retained_anchor_media_secret<S: StorageProvider>(
     hasher.update(epoch.0.to_be_bytes());
     with_retained_anchor_group(
         storage,
+        rewinds,
         crypto,
         group_id,
         epoch,

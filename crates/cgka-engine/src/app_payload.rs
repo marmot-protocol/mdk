@@ -148,6 +148,7 @@ pub(crate) fn retained_source_snapshot<S: cgka_traits::StorageProvider>(
 /// The guard restores live state and ratchets on every return path.
 pub(crate) fn historical_source<S: cgka_traits::StorageProvider>(
     storage: &S,
+    rewinds: &crate::snapshot_guard::Rewinds,
     crypto: &openmls_rust_crypto::RustCrypto,
     request: &cgka_traits::app_event::PendingAppMessageAuthority,
     snapshot: &str,
@@ -158,6 +159,7 @@ pub(crate) fn historical_source<S: cgka_traits::StorageProvider>(
     use openmls_traits::OpenMlsProvider;
     crate::snapshot_guard::SnapshotRollbackGuard::contained(
         storage,
+        rewinds,
         &request.group_id,
         crate::snapshot_guard::RewindSite::ModerationSource,
         &format!("{:032x}", rand::random::<u128>()),
@@ -276,6 +278,7 @@ impl<S: cgka_traits::StorageProvider> crate::engine::Engine<S> {
             };
             if let Some(source) = historical_source(
                 &self.storage,
+                &self.rewinds,
                 &self.crypto,
                 &request,
                 &snapshot,
@@ -362,6 +365,7 @@ mod tests {
         assert!(
             super::historical_source(
                 &storage,
+                &crate::snapshot_guard::Rewinds::default(),
                 &openmls_rust_crypto::RustCrypto::default(),
                 &request,
                 "pruned-after-listing",

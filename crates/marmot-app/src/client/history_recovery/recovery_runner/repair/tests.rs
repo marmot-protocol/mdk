@@ -558,8 +558,8 @@ async fn a_repair_behind_a_step_waiting_on_a_credit_meets_its_deadline() {
             storage_sqlite::CopyFloorReason::Clamp,
         )
         .unwrap();
-    client.recovery_credits = private_recovery_credit_pool_for_test();
-    let _held = hold_all_credits_for_test(&client.recovery_credits);
+    client.history_recovery.state.recovery_credits = private_recovery_credit_pool_for_test();
+    let _held = hold_all_credits_for_test(&client.history_recovery.state.recovery_credits);
     let mut spawned = client.spawn_recovery_runner().await.unwrap();
     // Its turns until it waits on a credit, after which it sends none.
     while let Ok(turn) = tokio::time::timeout(Duration::from_millis(500), spawned.next_turn()).await
