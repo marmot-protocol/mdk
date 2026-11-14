@@ -3468,6 +3468,7 @@ async fn run_startup_hydration_pipeline(
                                 events,
                                 account_id_hex,
                                 account_label,
+                                shared,
                                 setup_key_package_result,
                             )
                             .await;
@@ -3489,6 +3490,7 @@ async fn run_startup_hydration_pipeline(
                         events,
                         account_id_hex,
                         account_label,
+                        shared,
                         setup_key_package_result,
                     )
                     .await;
@@ -3636,8 +3638,9 @@ pub(crate) async fn drain_deferred_hydration(client: &mut AppClient) -> Result<(
 /// they name first, so a read "waits for that group only". The quarantine
 /// list answers the incrementally-growing set; later additions reach
 /// subscribers through their `GroupHydrationQuarantined` events. Invite
-/// acceptance also runs live; everything else joins the startup deferral in
-/// arrival order.
+/// acceptance and a local forget also run live; everything else joins the
+/// startup deferral in arrival order.
+#[allow(clippy::too_many_arguments)]
 async fn handle_startup_hydration_command(
     client: &mut AppClient,
     command: AccountWorkerCommand,
@@ -3645,6 +3648,7 @@ async fn handle_startup_hydration_command(
     events: &broadcast::Sender<MarmotAppEvent>,
     account_id_hex: &str,
     account_label: &str,
+    shared: &RuntimeSharedServices,
     setup_key_package_result: &mut Option<Result<usize, AppError>>,
 ) {
     match command {
@@ -3757,10 +3761,35 @@ async fn handle_startup_hydration_command(
         } => {
             // A group read's hydration request runs at its position, as the
             // group reads did before they answered from A, ahead of the
-            // commands the pipeline defers (a forget included).
+            // commands the pipeline defers and behind a forget accepted
+            // before it.
             respond.dispatched();
             let failure = hydrate_named_groups(client, &group_ids);
             acknowledge_hydration(client, respond, failure);
+        }
+        // A forget runs at its position, as it does once startup ends, so
+        // one accepted before its group's batch drops the group before
+        // hydration recovers anything of it for the host (mdk#3273 PR 4).
+        // The engine commits the forget before it touches memory, so a
+        // failed one leaves its group whole and still awaiting its batch.
+        // Its subscription refresh is best-effort and, before startup sync
+        // activates the account, stays owed to that activation. Convergence
+        // is scheduled only after startup sync, so no pass waits to be noted
+        // done; the forget drops the group's buffered convergence request
+        // with the rest of its state.
+        AccountWorkerCommand::ForgetGroupLocal { group_id, respond } => {
+            let storage_permit = shared.observer.product().permit();
+            let result = client.forget_group_local(&group_id).await;
+            if matches!(result, Ok(true)) {
+                publish_app_runtime_group_state_updated(
+                    Emit::Quiescent(client),
+                    events,
+                    account_id_hex,
+                    account_label,
+                    &group_id,
+                );
+            }
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result, client);
         }
         AccountWorkerCommand::GroupPushDebugInfo {
             group_id,
@@ -9450,6 +9479,7 @@ mod tests {
             &events,
             "",
             "alice",
+            &RuntimeSharedServices::default(),
             &mut setup,
         )
         .await;
@@ -9470,6 +9500,7 @@ mod tests {
             &events,
             "",
             "alice",
+            &RuntimeSharedServices::default(),
             &mut setup,
         )
         .await;

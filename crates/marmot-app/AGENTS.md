@@ -1179,9 +1179,11 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   hydration pipeline), the read sends `HydrateGroups` for those groups and answers from the version the worker
   acknowledges with (`HydrationAck`), so it waits as long as the worker read did, and only for an unhydrated group.
   The request takes the queue position of a command accepted at that moment, deferred commands included, so it
-  never runs ahead of an accepted forget: the main loop runs it in order, the hydration phase runs it at its
-  position, and a unit that holds the client acknowledges it from the version published before the unit when no
-  named group awaits hydration there (`acknowledge_from_published`), else defers it in order. A group that
+  never runs ahead of an accepted forget: the main loop runs both in order, the hydration phase runs both at their
+  positions (so a forget there drops its group before its batch hydrates it), and a unit that holds the client
+  acknowledges it from the version published before the unit when no named group awaits hydration there
+  (`acknowledge_from_published`), else defers it in order. A delete still waits for the hydration phase to end: its
+  route changes need the account active in the transport, which startup sync makes it. A group that
   quarantined or is gone by then answers `UnknownGroup` from that version.
 - A read answered from A waits for no worker unit, so it fences nothing. Tests here and in the host crates fence the
   worker through `src/worker_fences.rs` (startup finished, startup sync took the queued commands, a worker round
