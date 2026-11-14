@@ -9970,8 +9970,11 @@ fn groups_recovery_quarantine_welcome_and_management_inspection_have_stable_cont
     );
     assert_eq!(bad_token["code"], "invalid_rejoin_token");
     // Decline rejects startup catch-up as busy before it validates the offer.
-    // Keep one real actor and wait for its deferred read to finish startup.
-    // A CLI sync would restart that actor; the hosted key-status read does not.
+    // Keep one real actor and wait for a read it defers until startup ends:
+    // the hosted pending-Welcome read, which still waits on the worker. Reads
+    // that answer from the published read state, such as the KeyPackage
+    // status, answer at once (mdk#3273), and a CLI sync would restart the
+    // actor.
     let socket = wn_cli::daemon::default_socket_path(home.path());
     let socket_arg = socket.to_str().expect("socket path");
     let daemon = DaemonGuard::start(&socket, |wnd| {
@@ -9994,12 +9997,11 @@ fn groups_recovery_quarantine_welcome_and_management_inspection_have_stable_cont
             socket_arg,
             "--account",
             &alice,
-            "keys",
-            "maintenance-status",
+            "groups",
+            "pending-welcomes",
         ],
     );
-    assert_eq!(ready["account_id"], alice);
-    assert!(ready["key_package_maintenance"].is_object());
+    assert_eq!(ready["pending_welcome_deliveries"], serde_json::json!([]));
     let declined = run_json_error(
         home.path(),
         &[
