@@ -197,8 +197,10 @@ explicit files. Checkpoint and publication checks enforce actual quota and disk 
 grow; a final remainder below the admission reservation can still stay unused. Each admitted
 download reserves its own need, under its account's limit, in a runtime-wide total until
 its body is stored or the attempt ends; admission sets that total aside from free space,
-since a transfer in flight may not have written its body yet. Back-to-back passes, in any
-account, therefore cannot all admit against the same free bytes.
+since a transfer in flight may not have written its body yet. The capacity check and the
+reservation are one atomic step (an admission landing in between makes the check run
+again), so passes in any account, back to back or concurrent, cannot all admit against the
+same free bytes. Storage-blocked readmission decides on the same remainder.
 Unknown free space fails closed. These are resource limits, not an OS background-execution
 entitlement or mobile throughput evidence.
 

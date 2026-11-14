@@ -3053,3 +3053,33 @@ async fn attachment_pass_does_not_repeat_a_candidate_that_stays_due() {
         .unwrap();
     assert_eq!(state, 1, "the stuck candidate is still due");
 }
+
+/// Account workers admit concurrently: an admission that lands between
+/// another's capacity check and its reservation makes that check run again
+/// against the new total, so room for one download admits one, not both.
+#[test]
+fn disk_reservation_rechecks_capacity_against_a_concurrent_admission() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let total = Arc::new(AtomicU64::new(0));
+    let room = 10;
+    let mut other = None;
+    let first = DiskReservation::try_new(&total, 10, |held| {
+        // Another account's worker admits while this check runs.
+        if other.is_none() {
+            other = DiskReservation::try_new(&total, 10, |held| held + 10 <= room);
+        }
+        held + 10 <= room
+    });
+    assert!(other.is_some(), "the concurrent admission took the room");
+    assert!(
+        first.is_none(),
+        "the slower admission rechecked and refused"
+    );
+    assert_eq!(total.load(Ordering::Acquire), 10);
+    drop(other);
+    assert_eq!(
+        total.load(Ordering::Acquire),
+        0,
+        "a dropped reservation releases"
+    );
+}

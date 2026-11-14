@@ -56,11 +56,44 @@ struct DiskReservation {
 }
 
 impl DiskReservation {
+    #[cfg(test)]
     fn new(total: &Arc<std::sync::atomic::AtomicU64>, bytes: u64) -> Self {
         total.fetch_add(bytes, std::sync::atomic::Ordering::AcqRel);
         Self {
             bytes,
             total: total.clone(),
+        }
+    }
+
+    /// Reserves `bytes` only while `fits` accepts the total other admissions
+    /// hold, as one atomic step: account workers admit concurrently, and an
+    /// admission that lands between this check and the reservation makes the
+    /// check run again against the new total.
+    fn try_new(
+        total: &Arc<std::sync::atomic::AtomicU64>,
+        bytes: u64,
+        mut fits: impl FnMut(u64) -> bool,
+    ) -> Option<Self> {
+        use std::sync::atomic::Ordering;
+        let mut held = total.load(Ordering::Acquire);
+        loop {
+            if !fits(held) {
+                return None;
+            }
+            match total.compare_exchange_weak(
+                held,
+                held.saturating_add(bytes),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    return Some(Self {
+                        bytes,
+                        total: total.clone(),
+                    });
+                }
+                Err(current) => held = current,
+            }
         }
     }
 }
@@ -904,16 +937,19 @@ pub(super) fn schedule(
     }
     // Transfers already admitted, in any account, may not have written their
     // bodies yet: set aside what each reserved, so passes that run back to
-    // back cannot all admit against the same free bytes. Readmission and
-    // admission decide on this same figure.
-    let reserved = shared
-        .attachment_reserved_bytes
-        .load(std::sync::atomic::Ordering::Acquire);
-    let free = crate::media::attachment_resume::available_space(
+    // back cannot all admit against the same free bytes. Readmission decides
+    // on that remainder; admission reserves against it atomically below.
+    let measured = crate::media::attachment_resume::available_space(
         &client.app.account_dir(&client.state.label),
     )
-    .ok()
-    .map(|free| free.saturating_sub(reserved));
+    .ok();
+    let free = measured.map(|free| {
+        free.saturating_sub(
+            shared
+                .attachment_reserved_bytes
+                .load(std::sync::atomic::Ordering::Acquire),
+        )
+    });
     // Jobs parked for disk space rejoin the due page only once the device can
     // publish them; their checkpoints make the readmitted attempt local work.
     // Unknown free space readmits nothing, as it admits nothing below.
@@ -932,7 +968,7 @@ pub(super) fn schedule(
         shared.attachment_updates.state_changed();
     }
     let more = more || readmitted == ATTACHMENT_ACQUISITION_BATCH_LIMIT;
-    let free = free.unwrap_or(0);
+    let measured = measured.unwrap_or(0);
     let candidates =
         storage
             .app_storage()
@@ -1072,14 +1108,28 @@ pub(super) fn schedule(
         let recorded = storage
             .app_storage()
             .attachment_checkpoint_recorded(&candidate)?;
-        if !capacity(&policy, reservation, recorded, free) {
+        // Reserve before preparing: a later skip of this candidate drops the
+        // reservation, and another account's admission cannot slip between
+        // this capacity check and the reservation.
+        let Some(reserved) = DiskReservation::try_new(
+            &shared.attachment_reserved_bytes,
+            admission_need(reservation, recorded),
+            |held| {
+                capacity(
+                    &policy,
+                    reservation,
+                    recorded,
+                    measured.saturating_sub(held),
+                )
+            },
+        ) else {
             storage.app_storage().finish_attachment_preparation(
                 &candidate,
                 now,
                 Some(now.saturating_add(15)),
             )?;
             continue;
-        }
+        };
         // Free disk is the only gate (mdk#2314): retained media has no byte
         // budget, so a full budget can no longer stall downloads.
         let group = match hex::decode(&source.group_id_hex) {
@@ -1154,10 +1204,7 @@ pub(super) fn schedule(
         };
         let background_permit = TransferSlot {
             _permit: background_permit,
-            _reserved: Some(DiskReservation::new(
-                &shared.attachment_reserved_bytes,
-                admission_need(reservation, recorded),
-            )),
+            _reserved: Some(reserved),
         };
         let media = client
             .app
