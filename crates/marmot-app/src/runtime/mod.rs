@@ -2306,13 +2306,9 @@ impl MarmotAppRuntime {
     /// groups do contribute: archival is a presentation choice, not a change
     /// in who you know.
     ///
-    /// A group the engine froze brings nobody. It leaves the answer once the
-    /// engine has saved that the group is unrecoverable, and a restart never
-    /// brings it back.
-    ///
-    /// The groups, their records, their engine state and their members come
-    /// from one version of the worker's published read state, so a group
-    /// created since that version is not counted until the next one.
+    /// The groups' saved rows and their members come from one version of the
+    /// worker's published read state, so a group whose row was saved since
+    /// that version is not counted until the next one.
     pub async fn group_co_members(&self, account_ref: &str) -> Result<Vec<String>, AppError> {
         self.accounts.group_co_members(account_ref).await
     }
@@ -10275,26 +10271,16 @@ fn merge_user_profile_update(
 #[cfg(test)]
 mod tests;
 
-/// Whether a group's membership may count as social proximity for user
-/// search: the groups a co-member read hydrates and reads.
+/// Whether a group's membership counts as social proximity for user search.
 ///
 /// A group only speaks for who you know while you are actually in it: an
 /// invite you have not accepted is not a relationship yet, and one you left or
-/// were removed from has stopped being one. `self_membership` is the stored
-/// one, which the reads overlay on the account state's record, as the roster
-/// does.
-///
-/// A candidate the engine froze cannot answer for its membership at all, so
-/// it contributes nobody. The reads judge that by the engine's flag, the
-/// `unrecoverable` of the group's MLS state, never by the record's mark, so
-/// hydrating a candidate comes first. The engine saves the flag before the
-/// app marks the record, so a restart after a lost save of the mark never
-/// counts a frozen group again (mdk#3273 PR 4).
-pub(crate) fn co_member_candidate(
-    group: &AppGroupRecord,
-    self_membership: crate::SelfMembership,
-) -> bool {
-    !group.pending_confirmation && matches!(self_membership, crate::SelfMembership::Member)
+/// were removed from has stopped being one. A group the engine froze cannot
+/// answer for its membership at all.
+pub(crate) fn group_contributes_co_members(group: &AppGroupRecord) -> bool {
+    !group.pending_confirmation
+        && !group.unrecoverable
+        && matches!(group.self_membership, crate::SelfMembership::Member)
 }
 
 mod moderation;

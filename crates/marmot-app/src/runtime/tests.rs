@@ -3416,8 +3416,7 @@ async fn broker_resolve_dev_opt_in_admits_loopback_only() {
 /// state here excludes membership for a different reason, and getting any of
 /// them wrong leaks the wrong people into search: an unaccepted invite is not
 /// a relationship yet, a group you left has stopped being one, and a frozen
-/// group cannot answer for its membership at all. Whether a group is frozen
-/// is the engine's flag, not the record's mark.
+/// group cannot answer for its membership at all.
 mod co_member_eligibility {
     use super::*;
     use crate::groups::{AppGroupAdminPolicyComponent, AppGroupMessageRetentionComponent};
@@ -3439,13 +3438,9 @@ mod co_member_eligibility {
         )
     }
 
-    fn contributes(group: &AppGroupRecord) -> bool {
-        co_member_candidate(group, group.self_membership)
-    }
-
     #[test]
     fn an_active_membership_contributes() {
-        assert!(contributes(&group()));
+        assert!(group_contributes_co_members(&group()));
     }
 
     #[test]
@@ -3453,14 +3448,14 @@ mod co_member_eligibility {
         // Archival is a presentation choice, not a change in who you know.
         let mut archived = group();
         archived.archived = true;
-        assert!(contributes(&archived));
+        assert!(group_contributes_co_members(&archived));
     }
 
     #[test]
     fn an_unaccepted_invite_contributes_nobody() {
         let mut pending = group();
         pending.pending_confirmation = true;
-        assert!(!contributes(&pending));
+        assert!(!group_contributes_co_members(&pending));
     }
 
     #[test]
@@ -3468,19 +3463,15 @@ mod co_member_eligibility {
         for membership in [SelfMembership::Left, SelfMembership::Removed] {
             let mut departed = group();
             departed.self_membership = membership;
-            assert!(!contributes(&departed));
+            assert!(!group_contributes_co_members(&departed));
         }
     }
 
     #[test]
-    fn the_record_mark_does_not_decide_a_frozen_group() {
-        // The engine's flag in the group's MLS state decides, after the read
-        // hydrates the candidate (`co_members_go_by_the_engine_flag_after_a_lost_app_save`):
-        // the mark may be one the engine has since cleared, or one whose save
-        // was lost.
-        let mut marked = group();
-        marked.unrecoverable = true;
-        assert!(contributes(&marked));
+    fn a_frozen_group_contributes_nobody() {
+        let mut frozen = group();
+        frozen.unrecoverable = true;
+        assert!(!group_contributes_co_members(&frozen));
     }
 }
 

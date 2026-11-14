@@ -51,7 +51,7 @@ use cgka_traits::{
     Timestamp,
 };
 use marmot_session::{GroupChangeGeneration, GroupMaintenanceRows, WallClockWindow};
-use storage_sqlite::SelfMembership;
+use storage_sqlite::{SelfMembership, StoredGroupStanding};
 use tokio::sync::watch;
 
 use super::AppClient;
@@ -213,8 +213,10 @@ pub(crate) struct GroupAnswers {
     pub(crate) awaits_hydration: bool,
     /// Member accounts and their device counts, without profiles.
     pub(crate) members: ReadAnswer<Vec<(MemberId, u32)>>,
-    /// The stored self membership the roster overlays on the mirror record.
-    pub(crate) self_membership: ReadAnswer<Option<SelfMembership>>,
+    /// The saved row's standing, `None` when the group has no saved row:
+    /// the roster overlays its self membership on the mirror record, and
+    /// co-members judge the group by it alone.
+    pub(crate) standing: ReadAnswer<Option<StoredGroupStanding>>,
     pub(crate) mls_state: ReadAnswer<AppGroupMlsState>,
     pub(crate) commit_delivery: ReadAnswer<Option<GroupCommitDelivery>>,
     pub(crate) maintenance_status: ReadAnswer<GroupMaintenanceStatus>,
@@ -232,7 +234,7 @@ impl GroupAnswers {
             host_may_see,
             awaits_hydration,
             members,
-            self_membership,
+            standing,
             mls_state,
             commit_delivery,
             maintenance_status,
@@ -242,12 +244,31 @@ impl GroupAnswers {
             && *host_may_see == other.host_may_see
             && *awaits_hydration == other.awaits_hydration
             && same_answer(members, &other.members, PartialEq::eq)
-            && same_answer(self_membership, &other.self_membership, PartialEq::eq)
+            && same_answer(standing, &other.standing, PartialEq::eq)
             && same_answer(mls_state, &other.mls_state, PartialEq::eq)
             && same_answer(commit_delivery, &other.commit_delivery, PartialEq::eq)
             && same_answer(maintenance_status, &other.maintenance_status, PartialEq::eq)
             && same_answer(app_components, &other.app_components, PartialEq::eq)
     }
+}
+
+/// Whether `group` counts toward co-members, by its saved row alone: the
+/// local account is a member and no invite awaits its confirmation, as
+/// [`crate::runtime::group_contributes_co_members`] judges a saved row
+/// (mdk#3273 PR 4). A group with no saved row counts nobody. The saved row
+/// keeps no `unrecoverable` mark, so that term of the judgement never
+/// excludes a saved row, and there is nothing here to read for it. No fact
+/// of the mirror decides, so a crash after a failed save cannot take an
+/// answer back.
+fn counts_toward_co_members(group: &GroupAnswers) -> ReadAnswer<bool> {
+    Ok(group
+        .standing
+        .as_ref()
+        .map_err(Arc::clone)?
+        .is_some_and(|standing| {
+            !standing.pending_confirmation
+                && matches!(standing.self_membership, SelfMembership::Member)
+        }))
 }
 
 fn unknown_group(group_id: &GroupId) -> Arc<AppError> {
@@ -324,8 +345,8 @@ impl ReadState {
         let profiles = profiles().map_err(Arc::new)?;
         let members = with_profiles(group.members.as_ref().map_err(Arc::clone)?, &profiles);
         let mut group_record = group.record.clone();
-        if let Some(membership) = group.self_membership.as_ref().map_err(Arc::clone)? {
-            group_record.self_membership = *membership;
+        if let Some(standing) = group.standing.as_ref().map_err(Arc::clone)? {
+            group_record.self_membership = standing.self_membership;
         }
         let mls_state = group.mls_state.clone()?;
         Ok(AppGroupRosterSession {
@@ -412,22 +433,14 @@ impl ReadState {
         })
     }
 
-    /// The groups [`Self::co_members`] reads, in id order: those the local
-    /// account is still a member of, by the stored self membership where
-    /// this version read it ([`crate::runtime::co_member_candidate`]). A
-    /// read hydrates the ones awaiting hydration first, as each member read
-    /// hydrated its group.
-    pub(crate) fn co_member_candidates(&self) -> Vec<GroupId> {
+    /// The groups [`Self::co_members`] reads, in id order: those whose saved
+    /// row [`counts_toward_co_members`]. A read hydrates the ones awaiting
+    /// hydration first, as each member read hydrated its group.
+    pub(crate) fn co_member_groups(&self) -> Vec<GroupId> {
         let mut groups = self
             .groups
             .iter()
-            .filter(|(_, group)| {
-                let self_membership = match &group.self_membership {
-                    Ok(Some(stored)) => *stored,
-                    _ => group.record.self_membership,
-                };
-                crate::runtime::co_member_candidate(&group.record, self_membership)
-            })
+            .filter(|(_, group)| matches!(counts_toward_co_members(group), Ok(true)))
             .map(|(group_id, _)| group_id.clone())
             .collect::<Vec<_>>();
         groups.sort_by(|a, b| a.as_slice().cmp(b.as_slice()));
@@ -435,26 +448,22 @@ impl ReadState {
     }
 
     /// `GroupCoMembers`: every other account that shares with
-    /// `local_account_id_hex` one of [`Self::co_member_candidates`] the
-    /// engine has not frozen, from this version alone (mdk#3273 PR 4). A
-    /// group this version doesn't hold yet counts from the version that
-    /// does. Whether the engine froze a group is its MLS state's
-    /// `unrecoverable`, the engine's saved flag, not the record's mark,
-    /// which a lost save can revert ([`crate::runtime::contributes_co_members`]).
-    /// A failed stored self membership fails the read, as it failed the
-    /// stored group listing; otherwise the first candidate in id order whose
-    /// MLS state or members failed gives the failure.
+    /// `local_account_id_hex` one of [`Self::co_member_groups`], from
+    /// this version alone (mdk#3273 PR 4). A group this version doesn't hold
+    /// yet counts from the version that does. A failed read of a saved row
+    /// fails the read, as it failed the saved group listing; otherwise the
+    /// first group in id order whose members failed gives the failure.
     pub(crate) fn co_members(&self, local_account_id_hex: &str) -> ReadAnswer<Vec<String>> {
         for group in self.groups.values() {
-            group.self_membership.as_ref().map_err(Arc::clone)?;
+            group.standing.as_ref().map_err(Arc::clone)?;
         }
         let mut co_members = BTreeSet::new();
-        for group_id in self.co_member_candidates() {
-            let group = self.group(&group_id)?;
-            if group.mls_state.as_ref().map_err(Arc::clone)?.unrecoverable {
-                continue;
-            }
-            let members = group.members.as_ref().map_err(Arc::clone)?;
+        for group_id in self.co_member_groups() {
+            let members = self
+                .group(&group_id)?
+                .members
+                .as_ref()
+                .map_err(Arc::clone)?;
             for (member_id, _) in members {
                 let member_id_hex = hex::encode(member_id.as_slice());
                 if member_id_hex != local_account_id_hex {
@@ -1250,10 +1259,10 @@ fn group_entry(
             .members(group_id)
             .map(|members| crate::groups::member_accounts(&members))
             .map_err(|error| Arc::new(AppError::from(error))),
-        self_membership: arc_err(
+        standing: arc_err(
             client
                 .app
-                .stored_group_self_membership(&client.state.label, &record.group_id_hex),
+                .stored_group_standing(&client.state.label, &record.group_id_hex),
         ),
         mls_state: arc_err(client.group_mls_state_unchecked(group_id)),
         commit_delivery,
@@ -1266,7 +1275,7 @@ fn group_entry(
     };
     let reusable = device_group.is_ok()
         && settled(&answers.members)
-        && settled(&answers.self_membership)
+        && settled(&answers.standing)
         && settled(&answers.mls_state)
         && settled(&answers.commit_delivery)
         && settled(&answers.maintenance_status)
@@ -1787,28 +1796,25 @@ pub(crate) mod oracle {
                 );
             }
         }
-        // Co-members: this version's candidates, engine flags and members
-        // against the account state's records, the stored self memberships
-        // and the live engine reads.
+        // Co-members: this version's saved-row standings and members against
+        // the saved group listing, judged as `group_co_members` judged it
+        // before it answered from A, and the live engine reads.
         if let Ok(local) = client.app.account_home().account(&client.state.label) {
             same(
                 window,
                 "co members",
                 &state.co_members(&local.account_id_hex),
                 &client
-                    .co_member_candidates()
-                    .and_then(|candidates| client.co_members(&candidates)),
+                    .co_member_groups()
+                    .and_then(|groups| client.co_members(&groups)),
             );
-            if let Ok(live) = client.co_member_candidates()
-                && state
-                    .groups
-                    .values()
-                    .all(|group| group.self_membership.is_ok())
+            if let Ok(live) = client.co_member_groups()
+                && state.groups.values().all(|group| group.standing.is_ok())
             {
                 assert_eq!(
-                    state.co_member_candidates(),
+                    state.co_member_groups(),
                     live,
-                    "read state differs from the live read for co-member candidates"
+                    "read state differs from the live read for co-member groups"
                 );
             }
         }

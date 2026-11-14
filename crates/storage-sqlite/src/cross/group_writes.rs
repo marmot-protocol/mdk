@@ -47,6 +47,7 @@
 //! attribute (an uncounted writer, a `VACUUM`) moves it too.
 
 use crate::SqliteResultExt;
+use crate::app::account_projection::GROUP_STANDING_COLUMNS;
 use crate::base::codec::message_state_to_i64;
 use crate::base::connection::{
     ConnectionHooks, HooklessMove, SharedConnection, WeakSharedConnection,
@@ -950,8 +951,9 @@ fn trigger_sql() -> String {
         }
     }
 
-    // The roster read overlays the stored self membership; the rest of the
-    // row is the in-memory mirror's.
+    // A published answer reads the saved row's standing (`group_standing`):
+    // the roster overlays its self membership, and co-members judge the
+    // group by it. The rest of the row is the in-memory mirror's.
     let new = call(STATE, HEX_ID, "NEW.group_id_hex");
     let old = call(STATE, HEX_ID, "OLD.group_id_hex");
     trigger(
@@ -961,12 +963,16 @@ fn trigger_sql() -> String {
         "",
         std::slice::from_ref(&new),
     );
+    let moved = std::iter::once("group_id_hex")
+        .chain(GROUP_STANDING_COLUMNS)
+        .map(|column| format!("OLD.{column} IS NOT NEW.{column}"))
+        .collect::<Vec<_>>()
+        .join(" OR ");
     trigger(
         "account_groups_update",
         "UPDATE",
         "account_groups",
-        "OLD.self_membership IS NOT NEW.self_membership \
-         OR OLD.group_id_hex IS NOT NEW.group_id_hex",
+        &moved,
         &[old.clone(), new],
     );
     trigger(
@@ -1064,6 +1070,70 @@ mod tests {
         let after = generation(&storage, &group);
         assert!(after.state > before.state);
         assert_eq!(after.committed, before.committed);
+    }
+
+    /// A published answer reads a group's saved row only through its
+    /// standing (`group_standing`), so a change to any fact of the standing
+    /// moves the group's state count, and the group's entry rebuilds at the
+    /// next publish (mdk#3273 PR 4). A write to the rest of the row, which
+    /// answers take from the in-memory mirror, moves nothing. A new fact of
+    /// the standing fails to compile here until it has its write.
+    #[test]
+    fn every_fact_of_a_saved_group_standing_moves_its_group() {
+        use crate::{SelfMembership, StoredGroupStanding};
+
+        let storage = SqliteAccountStorage::in_memory().unwrap();
+        let app = storage.app_storage();
+        let group = GroupId::new(vec![4; 16]);
+        let group_hex = hex::encode(group.as_slice());
+        let execute = |sql: &str| {
+            storage.lock().unwrap().execute(sql, [&group_hex]).unwrap();
+        };
+        let standing = || app.group_standing(&group_hex).unwrap();
+        let moved = |seen: &mut GroupWriteGeneration, write: &str| {
+            let now = generation(&storage, &group);
+            assert!(now.state > seen.state, "{write} moved no count");
+            assert_eq!(
+                now.committed, seen.committed,
+                "{write} moved the committed scope"
+            );
+            *seen = now;
+        };
+        let mut seen = generation(&storage, &group);
+
+        execute(
+            "INSERT INTO account_groups (group_id_hex, endpoint, updated_at) VALUES (?1, '', 0)",
+        );
+        moved(&mut seen, "the row's insert");
+        let StoredGroupStanding {
+            self_membership,
+            pending_confirmation,
+        } = standing().expect("the row is saved");
+        assert_eq!(self_membership, SelfMembership::Member);
+        assert!(!pending_confirmation);
+
+        app.set_group_self_membership(&group_hex, SelfMembership::Left)
+            .unwrap();
+        assert_eq!(standing().unwrap().self_membership, SelfMembership::Left);
+        moved(&mut seen, "a self membership change");
+
+        execute("UPDATE account_groups SET pending_confirmation = 1 WHERE group_id_hex = ?1");
+        assert!(standing().unwrap().pending_confirmation);
+        moved(&mut seen, "a pending confirmation change");
+
+        execute(
+            "UPDATE account_groups SET profile_name = 'renamed', archived = 1, updated_at = 1
+             WHERE group_id_hex = ?1",
+        );
+        assert_eq!(
+            generation(&storage, &group),
+            seen,
+            "a write outside the standing moved the group"
+        );
+
+        execute("DELETE FROM account_groups WHERE group_id_hex = ?1");
+        assert_eq!(standing(), None);
+        moved(&mut seen, "the row's delete");
     }
 
     /// Every connection this process opens on a database file counts into

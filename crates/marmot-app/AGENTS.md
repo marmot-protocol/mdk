@@ -1186,14 +1186,15 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   its route changes need the account active in the transport, which startup sync makes it. A group that quarantined or
   is gone by then answers `UnknownGroup` from that version.
 - A read that combines groups answers from one version of A, never one joined with live rows. `group_co_members`
-  takes its groups, records and members from one version (`ReadState::co_members`), so a group not yet published is
-  not in its radius yet. It judges a frozen group by the engine's saved `unrecoverable` flag in that version's MLS
-  state, never by the record's mark: the engine saves the flag before the app marks the record, so a lost save of
-  the mark can't bring a frozen group back after a restart. Its candidates include groups the mark calls frozen, since
-  only their hydrated MLS state says whether they are. The direct-conversation lookup's candidates are stored peer-index rows, so before it reads
-  their members from A it waits on the caller's task, within a diagnosed read's wait, for a version that holds every
-  candidate whose stored row remains or lists it quarantined (`AccountManager::wait_for_published_groups`). Every
-  stored group is in the first version published after its row commits: the account state loads every
+  takes its groups' saved-row standings and members from one version (`ReadState::co_members`), so a group not yet
+  published is not in its radius yet. It judges a group by its saved `account_groups` row alone (`group_standing`),
+  never by the account state's record, which a failed save leaves ahead of the row, so no answer counts a group that
+  a crash after a failed save takes back. Every column the standing reads is in the row's group-write trigger
+  (`cross/group_writes.rs`), so the save that changes it rebuilds the group's entry at the next publish. The
+  direct-conversation lookup's candidates are stored peer-index rows, so before it reads their members from A it waits
+  on the caller's task, within a diagnosed read's wait, for a version that holds every candidate whose stored row
+  remains or lists it quarantined (`AccountManager::wait_for_published_groups`). Every stored group is in the first
+  version published after its row commits: the account state loads every
   `account_groups` row, rows are inserted only by saving that state, forget and delete drop the row with the group,
   and `MarmotRootRuntimeLease` keeps any second writer out. The oracle checks at each publish that every stored row
   is held. A candidate forgotten or deleted since it was read is not waited for, and a wait that runs out fails with

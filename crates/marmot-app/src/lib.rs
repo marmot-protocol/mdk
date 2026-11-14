@@ -4740,6 +4740,20 @@ impl MarmotApp {
             .group_self_membership(group_id_hex)?)
     }
 
+    /// The saved `account_groups` row's standing a co-member read judges the
+    /// group by, or `None` when the group has no saved row (mdk#3273 PR 4).
+    pub(crate) fn stored_group_standing(
+        &self,
+        label: &str,
+        group_id_hex: &str,
+    ) -> Result<Option<storage_sqlite::StoredGroupStanding>, AppError> {
+        self.ensure_account_state(label)?;
+        Ok(self
+            .account_storage(label)?
+            .app_storage()
+            .group_standing(group_id_hex)?)
+    }
+
     pub(crate) fn arm_epoch_backfill_intents(
         &self,
         label: &str,

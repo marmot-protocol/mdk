@@ -555,29 +555,45 @@ async fn a_delete_during_startup_hydration_waits_for_the_phase_to_end() {
     runtime.shutdown().await;
 }
 
-/// Co-members leave out a group the engine froze by the engine's saved
-/// flag, not by the app's mark (mdk#3273 PR 4). The engine saves the flag
-/// before the app marks its record, and a failed save of that mark
-/// followed by an exit leaves the app row saying the group is
-/// recoverable. After the restart the mirror record says so too, until the
-/// engine's re-emitted `GroupUnrecoverable` is projected. The read through A
-/// and the worker's fallback both leave the group out from their first
-/// answer, so the host never sees a frozen group come back.
+/// `GroupCoMembers` sent to alice's worker, the fallback for a read A
+/// can't answer.
+async fn co_members_on_the_worker(runtime: &crate::MarmotAppRuntime) -> Vec<String> {
+    let commands = runtime.accounts().worker_commands("alice").await.unwrap();
+    let (respond, answer) = ReadReply::unobserved();
+    commands
+        .send(AccountWorkerCommand::GroupCoMembers { respond })
+        .await
+        .unwrap();
+    within_hold("co-members on the worker", answer)
+        .await
+        .unwrap()
+        .unwrap()
+}
+
+/// Co-members judge a group by its saved row alone, so they never count a
+/// group a crash takes back (mdk#3273 PR 4). A create whose save of the
+/// group's row fails still returns the group, and the account state holds
+/// it. After a restart the state has no record of it until the reconcile
+/// that follows startup hydration re-adds it from the engine. Before the
+/// crash and in the restart's hold, the read through A and the worker's
+/// fallback both leave its member out. The reconcile's save writes the row,
+/// and the group counts from then on.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn co_members_go_by_the_engine_flag_after_a_lost_app_save() {
+async fn co_members_leave_out_a_group_whose_row_save_failed_across_a_restart() {
     let dir = tempfile::tempdir().unwrap();
     AccountHome::open(dir.path())
         .create_account("alice")
         .unwrap();
     let relay = Arc::new(ScriptedPushRelayClient::default());
-    let fixture = MarmotApp::with_relay(dir.path(), "wss://relay.example")
-        .with_test_relay_client(relay.clone());
+    let app = || {
+        MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(relay.clone())
+    };
+    let fixture = app();
     // Each member has a home of their own, so the runtime runs only Alice's
     // worker.
     let mut members = Vec::new();
-    let mut groups = Vec::new();
-    let mut alice = fixture.client("alice").await.unwrap();
-    for (name, member) in [("healthy", "bob"), ("frozen", "carol")] {
+    for member in ["bob", "carol"] {
         let member_dir = tempfile::tempdir().unwrap();
         let member_id = AccountHome::open(member_dir.path())
             .create_account(member)
@@ -592,68 +608,84 @@ async fn co_members_go_by_the_engine_flag_after_a_lost_app_save() {
             .publish_key_package()
             .await
             .unwrap();
-        groups.push(
-            alice
-                .create_group(name, &[member_id.as_str()])
-                .await
-                .unwrap()
-                .operation
-                .expect("eligible fixture members"),
-        );
         members.push(member_id);
     }
-    drop(alice);
-    let [bob, _carol] = members.try_into().unwrap();
-    let [_healthy, frozen] = groups.try_into().unwrap();
-
-    // What a crash after a failed save of the mark leaves: the engine's
-    // flag saved, the app row still recoverable.
-    let lose_the_app_save = || {
-        let storage = fixture.account_storage("alice").unwrap();
-        let mut halted = storage.get_group(&frozen).unwrap();
-        halted.unrecoverable = true;
-        storage.put_group(&halted).unwrap();
-        let mut state = fixture.load_state("alice").unwrap();
-        state
-            .groups
-            .iter_mut()
-            .find(|group| group.group_id_hex == hex::encode(frozen.as_slice()))
-            .expect("the frozen group's row")
-            .unrecoverable = false;
-        fixture.save_state(&state).unwrap();
-    };
-
-    lose_the_app_save();
-    let runtime = crate::MarmotAppRuntime::new(held_app(&dir, relay.clone()));
-    runtime.reconcile_accounts().await.unwrap();
-    let through_a = within_hold("co-members through A", runtime.group_co_members("alice"))
+    let [bob, carol] = members.try_into().unwrap();
+    fixture
+        .client("alice")
         .await
+        .unwrap()
+        .create_group("saved", &[bob.as_str()])
+        .await
+        .unwrap()
+        .operation
+        .expect("an eligible fixture member");
+    let faults = fixture.account_storage("alice").unwrap().app_storage();
+    faults
+        .execute_batch_for_test(
+            "CREATE TRIGGER fail_new_group_row BEFORE INSERT ON account_groups
+             WHEN NOT EXISTS (SELECT 1 FROM account_groups WHERE group_id_hex = NEW.group_id_hex)
+             BEGIN SELECT RAISE(ABORT, 'injected group row failure'); END;",
+        )
         .unwrap();
+
+    let runtime = crate::MarmotAppRuntime::new(app());
+    runtime.reconcile_accounts().await.unwrap();
+    let lost = runtime
+        .create_group("alice", "lost", std::slice::from_ref(&carol), None)
+        .await
+        .expect("the engine's group is canonical when its row fails to save")
+        .operation
+        .expect("an eligible fixture member");
+    assert!(
+        published_read_state(&runtime)
+            .await
+            .groups
+            .contains_key(&lost),
+        "the account state holds the group whose row failed to save"
+    );
     assert_eq!(
-        through_a,
+        runtime.group_co_members("alice").await.unwrap(),
         vec![bob.clone()],
-        "the read through A leaves out the group the engine froze"
+        "the read through A leaves out the group with no saved row"
+    );
+    assert_eq!(
+        co_members_on_the_worker(&runtime).await,
+        vec![bob.clone()],
+        "the worker's fallback leaves it out too"
     );
     runtime.shutdown().await;
     drop(runtime);
 
-    lose_the_app_save();
-    let runtime = crate::MarmotAppRuntime::new(held_app(&dir, relay));
+    let runtime = crate::MarmotAppRuntime::new(held_app(&dir, relay.clone()));
     runtime.reconcile_accounts().await.unwrap();
-    let commands = runtime.accounts().worker_commands("alice").await.unwrap();
-    let (respond, answer) = ReadReply::unobserved();
-    commands
-        .send(AccountWorkerCommand::GroupCoMembers { respond })
-        .await
+    assert_eq!(
+        within_hold("co-members through A", runtime.group_co_members("alice"))
+            .await
+            .unwrap(),
+        vec![bob.clone()],
+        "after the restart the read through A answers as before it"
+    );
+    assert_eq!(
+        co_members_on_the_worker(&runtime).await,
+        vec![bob.clone()],
+        "and so does the worker's fallback"
+    );
+    runtime.shutdown().await;
+    drop(runtime);
+
+    faults
+        .execute_batch_for_test("DROP TRIGGER fail_new_group_row")
         .unwrap();
-    let fallback = within_hold("co-members on the worker", answer)
+    let runtime = crate::MarmotAppRuntime::new(app());
+    runtime.reconcile_accounts().await.unwrap();
+    crate::worker_fences::worker_startup_finished(&runtime, "alice")
         .await
-        .unwrap()
         .unwrap();
     assert_eq!(
-        fallback,
-        vec![bob],
-        "the worker's fallback leaves out the group the engine froze"
+        runtime.group_co_members("alice").await.unwrap(),
+        vec![bob, carol],
+        "once the reconcile saves its row, the group counts"
     );
     runtime.shutdown().await;
 }

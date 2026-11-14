@@ -7154,14 +7154,15 @@ pub(super) fn group_roster_after_hydration(
     client.group_roster_session(group_id)
 }
 
-/// `GroupCoMembers` on the worker, for a read A can't answer: its candidates
-/// hydrate as a read's hydration request hydrates them
-/// ([`hydrate_named_groups`]), so the engine's flag is readable for each,
-/// and the read answers whatever hydration left (mdk#3273 PR 4).
+/// `GroupCoMembers` on the worker, as `group_co_members` read it before it
+/// answered from A: each contributing group promotes on demand first, as its
+/// member read did, and the read answers whatever promotion left.
 fn co_members_after_hydration(client: &mut AppClient) -> Result<Vec<String>, AppError> {
-    let candidates = client.co_member_candidates()?;
-    let _ = hydrate_named_groups(client, &candidates);
-    client.co_members(&candidates)
+    let groups = client.co_member_groups()?;
+    for group_id in &groups {
+        let _ = client.runtime.ensure_group_hydrated(group_id);
+    }
+    client.co_members(&groups)
 }
 
 fn member_ids_page_after_hydration(
