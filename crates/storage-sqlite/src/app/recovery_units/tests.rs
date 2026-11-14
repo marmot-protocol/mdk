@@ -2026,6 +2026,33 @@ fn a_gone_relay_retires_what_it_owes_and_parks() {
     assert_eq!(unit(&app, &route, OTHER).no_progress, 1);
 }
 
+/// A settlement retried after a later write failed retires a gone relay
+/// again, newly owed seconds included, without counting the unit twice.
+#[test]
+fn retiring_a_gone_relay_again_counts_nothing() {
+    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let app = storage.app_storage();
+    let route = group(1);
+    owing(&app, &route, NOW - 1_000, (NOW - 1_000, NOW - 701));
+    break_unit(&app, &route, NOW - 600);
+    let relays = [RELAY.to_owned()];
+    assert_eq!(
+        app.retire_gone_recovery_units(&route, Some(&relays), NOW)
+            .unwrap(),
+        1
+    );
+
+    assert_eq!(
+        app.retire_gone_recovery_units(&route, Some(&relays), NOW + 100)
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        app.recovery_unit_spans(&route, RELAY).unwrap(),
+        vec![gone(range(NOW - 700, NOW + 100))]
+    );
+}
+
 /// New loss reopens nothing a gone relay retired: it raises no probe or
 /// notice for a route that no longer carries it.
 #[test]

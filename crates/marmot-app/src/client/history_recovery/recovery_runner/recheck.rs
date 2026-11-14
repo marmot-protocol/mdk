@@ -138,6 +138,7 @@ pub(super) fn survey(
                 stalled.holds(route) || admission.backpressured(&key, &policy.staging, false)?;
             candidates.push(Candidate {
                 key,
+                group_id: route.group_id.clone(),
                 best_effort: false,
                 owed_seconds: to_check,
                 position: start(now, pass),
@@ -278,7 +279,13 @@ pub(super) fn begin(
         return Ok(None);
     };
     if let Some(read) = caps.map(recovery_caps) {
-        app.record_recovery_relay_caps(&key.relay, Some(read), now)?;
+        let rearmed = app.record_recovery_relay_caps(&key.relay, Some(read), now)?;
+        super::audit::rearmed(
+            turn.audit,
+            marmot_forensics::RecoveryRunnerChange::CapsRearmed,
+            Some(&key.relay),
+            rearmed as u64,
+        );
     }
     if app
         .recovery_account_paused_until(&policy.unit, now)?

@@ -751,7 +751,10 @@ fn rearm_tx(
 /// to the route's relays, so the relay's return owes none of it (mdk#2660 row
 /// 11). Debt and parked spans below the floor, which only loss, repair or
 /// evidence can reopen there, still become route gone, so the return owes
-/// them again. Returns whether it held any other span or owed anything.
+/// them again. Returns whether it newly retired the unit as route gone: it
+/// held any other span or owed anything, and was not already retired as
+/// route gone (a retried settlement retires it again, newly owed seconds
+/// included, but does not count it twice).
 fn retire_gone_unit_tx(
     conn: &Connection,
     unit: &RecoveryUnit,
@@ -767,7 +770,12 @@ fn retire_gone_unit_tx(
     let floor = copy_floor_tx(conn, &unit.route, CopyFloorReason::Clamp)?;
     let mut retired = Vec::new();
     let mut gone = unit_debt_tx(conn, &unit.route, &unit.relay, now_seconds)?;
-    for span in spans_tx(conn, &unit.route, &unit.relay, RETIRED_SPAN)? {
+    let held = spans_tx(conn, &unit.route, &unit.relay, RETIRED_SPAN)?;
+    let already_gone = unit.state == RecoveryUnitState::Retired
+        && held
+            .iter()
+            .any(|span| span.retired == Some(RecoverySpanRetirement::RouteGone));
+    for span in held {
         let range = span.range;
         if span.retired == Some(RecoverySpanRetirement::BeforeThisCopy)
             || range.until_seconds < floor
@@ -812,7 +820,7 @@ fn retire_gone_unit_tx(
         params![kind, id, unit.relay, RETIRED],
     )
     .storage()?;
-    Ok(true)
+    Ok(!already_gone)
 }
 
 /// Retire as before this copy what each unit on `route` owes in `gap`
@@ -1933,7 +1941,8 @@ impl SqliteAppStorage {
     /// stays; it retires with a fresh budget and drops its fences. An ended
     /// route's remainder goes too. So none of it raises a notice, and loss
     /// reopens none of it, while the relay stays gone. Returns the units
-    /// retired.
+    /// newly retired: one already retired as route gone, as a retried
+    /// settlement finds it, is not counted again.
     pub fn retire_gone_recovery_units(
         &self,
         route: &TransportReconciliationRoute,

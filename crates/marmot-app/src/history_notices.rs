@@ -125,7 +125,6 @@ const NOTICE_ID_BYTES: usize = 24;
 /// A domain-separated hash of a coverage-ledger route, so an id never names
 /// it. Ledger-parked routes' notice ids carried it before mdk#3308; the
 /// recovery runner's audit rows reference it as a route's `obligation_ref`.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn ledger_route_tag(route: &TransportReconciliationRoute) -> [u8; 16] {
     let mut hash = Sha256::new();
     hash.update(b"marmot-app/history-notice/ledger-route/v1");
