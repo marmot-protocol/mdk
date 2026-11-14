@@ -743,6 +743,15 @@ pub(crate) type CursorSealProbe = Box<dyn FnMut(CursorSeal) + Send>;
 /// Each of a group's routes with the relays the recovery runner carries on it.
 pub(crate) type CarriedRoutes = Vec<(storage_sqlite::TransportReconciliationRoute, Vec<String>)>;
 
+/// What decides whether an account's backups are configured (mdk#2923):
+/// the trusted roster's group and epoch, or with no roster whether this
+/// device keeps a recovery key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum BackupEligibility {
+    Roster { group_id: GroupId, epoch: u64 },
+    KeptKey(bool),
+}
+
 pub struct AppClient {
     /// Runs once right after the next projection checkpoint's save, before
     /// anything else reads storage.
@@ -1083,6 +1092,10 @@ pub struct AppClient {
     /// A history delivery was owed or parked since the worker last looked
     /// (mdk#2923).
     pub(crate) history_dispatch_changed: std::sync::atomic::AtomicBool,
+    /// Whether the backup pass last found backups configured, and what
+    /// decided it then. History dispatch counts backup deadlines only while
+    /// they may be (mdk#2923).
+    pub(crate) backups_configured: Option<(BackupEligibility, bool)>,
     /// Per-group (in-memory) epoch at which the warm pass last confirmed the
     /// authoritative encrypted-media component is NOT required. A group's
     /// signed component can only change with a commit, and a commit always

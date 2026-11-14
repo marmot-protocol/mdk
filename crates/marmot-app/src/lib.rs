@@ -2399,6 +2399,7 @@ impl MarmotApp {
             post_join_advanced: false,
             key_package_lifecycle_changed: false,
             history_dispatch_changed: Default::default(),
+            backups_configured: None,
             encrypted_media_not_required_epochs: HashMap::new(),
             checkpoint_route_refresh_recomputes: 0,
             #[cfg(feature = "unreleased-device-pairing")]

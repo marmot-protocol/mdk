@@ -1841,6 +1841,8 @@ async fn run_app_runtime_account_worker(
         if client
             .history_dispatch_changed
             .swap(false, std::sync::atomic::Ordering::AcqRel)
+            || (!schedule.pending(schedule::Job::HistoryDispatch)
+                && client.backup_eligibility_changed())
         {
             schedule.wake(schedule::Job::HistoryDispatch);
         }
@@ -4478,9 +4480,13 @@ fn dispatch_history_blobs(client: &mut AppClient, media_http: &MediaHttpContext)
 /// Admit new background backup work only under currently reported host
 /// facts. Once admitted, the whole pass and its settlement finish unchanged.
 fn dispatch_backup_pass(client: &mut AppClient, media_http: &MediaHttpContext) {
-    if !client.app.device_groups_enabled()
-        || !media_http.backup_background_conditions.borrow().allowed()
-    {
+    if !client.app.device_groups_enabled() {
+        return;
+    }
+    if !media_http.backup_background_conditions.borrow().allowed() {
+        // No pass now, but dispatch's deadline still needs to know whether
+        // backups are configured at all (mdk#2923).
+        client.refresh_backups_configured();
         return;
     }
     let permit = || {

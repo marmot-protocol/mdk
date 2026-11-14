@@ -84,8 +84,10 @@
   windows and announce/repair retries, and history dispatch. Each runs when an event wakes it and at the deadline
   its data gives; the sweeps that finish (backfill, promotion) run batch after batch until done; pairing runs every
   15 s only while pairing state exists, and push only while a join window is open, an announce is owed or a repair
-  ask is held. A slot withdrawal, a sign-in check that finds the slot superseded or emptied, and every maintenance
-  pass wake the KeyPackage catch-up. The tick runs session maintenance and the watchdog, which counts a missed wake
+  ask is held. History dispatch counts backup deadlines only while backups are configured, so with device groups on
+  and no recovery key it runs once at startup and then rests until a history transfer, a restore, or a change to
+  backup eligibility (a kept recovery key or a commit to the trusted device group) wakes it. A slot withdrawal, a
+  sign-in check that finds the slot superseded or emptied, and every maintenance pass wake the KeyPackage catch-up. The tick runs session maintenance and the watchdog, which counts a missed wake
   for each job (`watchdog_missed_wake_*`).
 
 - The attachment, avatar and presentation passes no longer run on every maintenance tick (mdk#2923 step B). Each

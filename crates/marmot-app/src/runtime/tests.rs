@@ -4275,7 +4275,87 @@ async fn work_created_without_a_wake_is_counted_and_run_by_the_watchdog() {
 #[tokio::test(flavor = "current_thread")]
 async fn idle_ticks_take_no_writer_and_spawn_no_housekeeping() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let app = MarmotApp::with_relays(dir.path(), vec![]);
+    let idle = idle_ticks_run_nothing(MarmotApp::with_relays(dir.path(), vec![])).await;
+    idle.runtime.shutdown().await;
+    assert_eq!(
+        idle.app_writes, 0,
+        "an idle tick takes no app-storage writer transaction"
+    );
+    assert_eq!(
+        idle.session_writes, 0,
+        "an idle tick takes no session-storage writer transaction"
+    );
+}
+
+/// The same with device groups on and backups off (mdk#2923, review C1): no
+/// recovery key is kept, so no backup pass or condemned-blob delete can run,
+/// and history dispatch runs once at startup, then stops. Before, an absent
+/// backup schedule counted as due at once and dispatch retried every 15 s.
+/// The tick's session maintenance still runs device-group upkeep, which
+/// writes, so this does not check writers.
+#[cfg(feature = "test-policy-overrides")]
+#[tokio::test(flavor = "current_thread")]
+async fn idle_ticks_with_device_groups_and_no_backups_stop_history_dispatch() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let app = MarmotApp::with_relays_and_config(
+        dir.path(),
+        vec![],
+        crate::MarmotAppConfig::white_noise()
+            .with_allow_loopback_relay_endpoints(true)
+            .with_open_ranking_provider(None, Vec::new())
+            .with_dev_device_groups(true),
+    );
+    assert!(app.device_groups_enabled());
+    let idle = idle_ticks_run_nothing(app.clone()).await;
+    assert!(
+        idle.dispatched_at_startup > 0,
+        "history dispatch ran at startup, before it knew backups were off"
+    );
+
+    // Keeping a recovery key configures backups: the next worker turn sees
+    // the change and wakes history dispatch.
+    let count = |operation| startup_stage_snapshot(&idle.runtime, operation).completed;
+    let dispatched = count(RuntimeOp::WorkerMaintenanceHistoryDispatch);
+    app.account_storage("alice")
+        .expect("storage")
+        .app_storage()
+        .keep_recovery_key(&[7; 32])
+        .expect("keep key");
+    let ticks = count(RuntimeOp::WorkerMaintenance);
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(15)).await;
+    tokio::time::resume();
+    timeout(ACCOUNT_OPEN_TEST_DEADLINE, async {
+        while count(RuntimeOp::WorkerMaintenance) == ticks
+            || count(RuntimeOp::WorkerMaintenanceHistoryDispatch) == dispatched
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("a kept recovery key wakes history dispatch");
+    assert_eq!(
+        count(RuntimeOp::WatchdogMissedWakeHistoryDispatch),
+        0,
+        "the worker woke it, not the watchdog"
+    );
+    idle.runtime.shutdown().await;
+}
+
+/// What [`idle_ticks_run_nothing`] saw: history dispatch runs before its
+/// three idle ticks, and the writer transactions those ticks took.
+struct IdleTicks {
+    runtime: MarmotAppRuntime,
+    // Read only by the device-groups variant, which needs the feature.
+    #[cfg_attr(not(feature = "test-policy-overrides"), allow(dead_code))]
+    dispatched_at_startup: u64,
+    app_writes: u64,
+    session_writes: u64,
+}
+
+/// Runs a fresh account's worker until its startup work settles, then checks
+/// three idle ticks run no job, spawn no housekeeping and miss no wake.
+async fn idle_ticks_run_nothing(app: MarmotApp) -> IdleTicks {
     app.account_home()
         .create_account("alice")
         .expect("create alice");
@@ -4408,6 +4488,7 @@ async fn idle_ticks_take_no_writer_and_spawn_no_housekeeping() {
     };
     let runs_before = housekeeping_runs().len();
     let moved_before: Vec<u64> = moved.iter().map(|operation| count(*operation)).collect();
+    let dispatched_at_startup = count(RuntimeOp::WorkerMaintenanceHistoryDispatch);
     for _ in 0..3 {
         tick().await;
     }
@@ -4440,16 +4521,6 @@ async fn idle_ticks_take_no_writer_and_spawn_no_housekeeping() {
         Vec::<(&str, u64)>::new(),
         "no missed wake from the first tick"
     );
-    assert_eq!(
-        delta(1),
-        0,
-        "an idle tick takes no app-storage writer transaction"
-    );
-    assert_eq!(
-        delta(7),
-        0,
-        "an idle tick takes no session-storage writer transaction"
-    );
     assert_eq!(delta(2), 0, "nothing owed spawns no housekeeping batch");
     assert_eq!(
         (delta(8), delta(9)),
@@ -4471,7 +4542,12 @@ async fn idle_ticks_take_no_writer_and_spawn_no_housekeeping() {
     // has none due (mdk#2923 step B).
     assert_eq!(delta(5), 0, "an idle tick runs no attachment pass");
     assert_eq!(delta(6), 0, "an idle tick runs no presentation pass");
-    runtime.shutdown().await;
+    IdleTicks {
+        runtime: runtime.clone(),
+        dispatched_at_startup,
+        app_writes: delta(1),
+        session_writes: delta(7),
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -926,6 +926,27 @@ impl AppClient {
         Ok(Some(group_id))
     }
 
+    /// What decides whether backups are configured: the trusted roster's
+    /// group and epoch (a roster changes only with a commit), or with none
+    /// whether this device keeps a recovery key. `None` when a read fails.
+    pub(crate) fn backup_eligibility(&self) -> Option<super::BackupEligibility> {
+        match self.rostered_device_group().ok()? {
+            Some(group_id) => {
+                let epoch = self.stored_group(&group_id).ok()??.epoch.0;
+                Some(super::BackupEligibility::Roster { group_id, epoch })
+            }
+            None => Some(super::BackupEligibility::KeptKey(
+                self.app
+                    .account_storage(&self.state.label)
+                    .ok()?
+                    .app_storage()
+                    .kept_recovery_key()
+                    .ok()?
+                    .is_some(),
+            )),
+        }
+    }
+
     /// The device group this device trusts and its roster: the one way to
     /// read the roster. None when device groups are off, when this device
     /// trusts none, or when that group is terminal. A roster that cannot be

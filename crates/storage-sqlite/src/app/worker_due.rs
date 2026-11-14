@@ -36,12 +36,13 @@ impl SqliteAppStorage {
     }
 
     /// The earliest second history dispatch has work: an owed history
-    /// upload's or a parked fetch's retry, the next backup pass (at once
-    /// when none was scheduled), or a condemned backup blob's next delete.
-    /// The delivery columns have no index; their tables hold one row per
-    /// group and sibling at most. An index may be needed once device groups
-    /// ship.
-    pub fn history_dispatch_next_at(&self) -> StorageResult<Option<u64>> {
+    /// upload's or a parked fetch's retry, and with `backups` the next backup
+    /// pass (at once when none was scheduled) or a condemned backup blob's
+    /// next delete. Without a recovery key no backup pass or delete runs, so
+    /// those deadlines count only when backups are configured. The delivery
+    /// columns have no index; their tables hold one row per group and sibling
+    /// at most. An index may be needed once device groups ship.
+    pub fn history_dispatch_next_at(&self, backups: bool) -> StorageResult<Option<u64>> {
         let next: Option<i64> = self
             .lock()?
             .query_row_cached(
@@ -50,9 +51,12 @@ impl SqliteAppStorage {
                                WHERE sent_at IS NULL AND blossom_due_at IS NOT NULL), 9223372036854775807),
                      coalesce((SELECT min(fetch_due_at) FROM history_deliveries_parked
                                WHERE fetch_due_at IS NOT NULL), 9223372036854775807),
-                     coalesce((SELECT next_pass_at FROM backup_schedule WHERE id = 1), 0),
-                     coalesce((SELECT min(next_try_at) FROM backup_condemned_blobs), 9223372036854775807))",
-                [],
+                     CASE WHEN ?1 THEN coalesce((SELECT next_pass_at FROM backup_schedule WHERE id = 1), 0)
+                          ELSE 9223372036854775807 END,
+                     CASE WHEN ?1 THEN coalesce((SELECT min(next_try_at) FROM backup_condemned_blobs),
+                                                9223372036854775807)
+                          ELSE 9223372036854775807 END)",
+                [backups],
                 |row| row.get(0),
             )
             .storage()?;
@@ -66,14 +70,16 @@ impl SqliteAppStorage {
 mod tests {
     use crate::SqliteAccountStorage;
 
-    /// A fresh account has no pairing state and no push timing owed, and
-    /// its first backup pass is due at once (mdk#2923).
+    /// A fresh account has no pairing state and no push timing owed. With
+    /// backups configured its first backup pass is due at once; without,
+    /// history dispatch owes nothing (mdk#2923).
     #[test]
     fn a_fresh_account_owes_no_pairing_or_push_timing() {
         let store = SqliteAccountStorage::in_memory().unwrap();
         let app = store.app_storage();
         assert!(!app.device_pairing_state_exists().unwrap());
         assert!(!app.push_gossip_timing_pending().unwrap());
-        assert_eq!(app.history_dispatch_next_at().unwrap(), Some(0));
+        assert_eq!(app.history_dispatch_next_at(true).unwrap(), Some(0));
+        assert_eq!(app.history_dispatch_next_at(false).unwrap(), None);
     }
 }

@@ -53,8 +53,9 @@
 ### Changed
 
 - New reads for the account worker's job deadlines (mdk#2923): `device_pairing_state_exists`,
-  `push_gossip_timing_pending` and `history_dispatch_next_at`. The history delivery due columns have no index; one
-  may be needed once device groups ship.
+  `push_gossip_timing_pending` and `history_dispatch_next_at`, which counts the backup pass and condemned blob
+  deadlines only when its `backups` argument says backups are configured. The history delivery due columns have no
+  index; one may be needed once device groups ship.
 
 - New reads for the account worker's pass deadlines (mdk#2923): `SqliteAppStorage::attachment_work_schedule`
   (`AttachmentWorkSchedule`: the earliest timed candidate, acquisition or partial, whether polled work exists, and
