@@ -21,8 +21,9 @@ use cgka_traits::storage::{
     DisbandCandidate, DisbandCandidateStorage, DisbandRequest, DisbandRequestStorage,
     DisbandTombstoneStorage, GroupStateCheckpointRef, GroupStorage, KeyPackageBundleStorage,
     LeaveRequest, LeaveRequestStorage, MaintenanceStorage, MemberValidationCacheStorage,
-    MessageStorage, OutboundFanoutStorage, OutboundIntentStorage, QueuedOutboundIntent,
-    StorageError, StorageProvider, StorageResult, StoredKeyPackageBundle, WelcomeStorage,
+    MessageStorage, OutboundFanoutStorage, OutboundIntentStorage, PrivateKeyPackageStorage,
+    QueuedOutboundIntent, StorageError, StorageProvider, StorageResult, StoredKeyPackageBundle,
+    WelcomeStorage,
 };
 use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
@@ -672,8 +673,13 @@ struct FlakyGroupRecordStorage {
     fail_list_queued_outbound_intents: Arc<AtomicBool>,
     fail_disband_request: Arc<AtomicBool>,
     close_after_key_package_scan: Arc<AtomicBool>,
+    before_key_package_scan: Arc<Mutex<Option<ForeignWrite>>>,
+    sqlite_reads: Arc<AtomicBool>,
     snapshot_refusal: Arc<Mutex<Option<SnapshotRefusal>>>,
 }
+
+/// A write made on another connection while a read is under way.
+type ForeignWrite = Box<dyn FnOnce() + Send>;
 
 impl FlakyGroupRecordStorage {
     fn new(inner: SqliteAccountStorage) -> Self {
@@ -686,8 +692,23 @@ impl FlakyGroupRecordStorage {
             fail_list_queued_outbound_intents: Arc::new(AtomicBool::new(false)),
             fail_disband_request: Arc::new(AtomicBool::new(false)),
             close_after_key_package_scan: Arc::new(AtomicBool::new(false)),
+            before_key_package_scan: Arc::new(Mutex::new(None)),
+            sqlite_reads: Arc::new(AtomicBool::new(false)),
             snapshot_refusal: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Serve read snapshots and the private KeyPackage records from the inner
+    /// storage, as the SQLite provider does, instead of the provider
+    /// defaults (no snapshot, no private records).
+    fn with_sqlite_reads(self) -> Self {
+        self.sqlite_reads.store(true, Ordering::SeqCst);
+        self
+    }
+
+    /// Run `write` once, just before the next KeyPackage scan reads its rows.
+    fn before_next_key_package_scan(&self, write: impl FnOnce() + Send + 'static) {
+        *self.before_key_package_scan.lock().unwrap() = Some(Box::new(write));
     }
 
     /// Close the database once the next KeyPackage scan has read its rows,
@@ -1174,6 +1195,10 @@ impl DeviceGroupWelcomeStorage for FlakyGroupRecordStorage {
 
 impl KeyPackageBundleStorage for FlakyGroupRecordStorage {
     fn stored_key_package_bundles(&self) -> StorageResult<Vec<StoredKeyPackageBundle>> {
+        let write = self.before_key_package_scan.lock().unwrap().take();
+        if let Some(write) = write {
+            write();
+        }
         let bundles = self.inner.stored_key_package_bundles()?;
         if self
             .close_after_key_package_scan
@@ -1255,6 +1280,27 @@ impl StorageProvider for FlakyGroupRecordStorage {
     // fault harness; without it that path short-circuits on missing storage.
     fn maintenance_storage(&self) -> Option<&dyn MaintenanceStorage> {
         self.inner.maintenance_storage()
+    }
+
+    fn with_read_snapshot<T, E, F>(&self, f: F) -> Result<T, E>
+    where
+        Self: Sized,
+        E: From<StorageError>,
+        F: FnOnce(&Self) -> Result<T, E>,
+    {
+        if self.sqlite_reads.load(Ordering::SeqCst) {
+            self.inner.with_read_snapshot(|_| f(self))
+        } else {
+            f(self)
+        }
+    }
+
+    fn private_key_package_storage(&self) -> Option<&dyn PrivateKeyPackageStorage> {
+        if self.sqlite_reads.load(Ordering::SeqCst) {
+            self.inner.private_key_package_storage()
+        } else {
+            None
+        }
     }
 
     fn backend(&self) -> Backend {
@@ -1486,6 +1532,40 @@ async fn a_failed_key_package_lookup_fails_the_ownership_read() {
         matches!(failed, Err(EngineError::Storage(StorageError::Closed(_)))),
         "{failed:?}"
     );
+}
+
+/// The ownership read sees one snapshot (mdk#3273). A private KeyPackage
+/// issued on another connection after the read listed the private records,
+/// and before it scanned the bundles, is in neither, so it is never listed as
+/// a KeyPackage this device publishes.
+#[tokio::test]
+async fn a_private_key_package_issued_during_the_ownership_read_is_never_listed() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("owned.sqlite");
+    let key = storage_sqlite::SqlCipherKey::raw([0x42; 32]);
+    let open = || SqliteAccountStorage::open_encrypted(&path, &key).expect("storage");
+    let storage = FlakyGroupRecordStorage::new(open()).with_sqlite_reads();
+    let name = b"alice-owned-snapshot";
+    let mut engine = build_current_flaky_engine(storage.clone(), name);
+    engine.fresh_key_package().await.expect("key package");
+    let owned = engine.durably_owned_key_packages().unwrap();
+    assert_eq!(owned.len(), 1);
+    let mut issuer = EngineBuilder::new(open())
+        .identity(pad32(name))
+        .account_identity_proof_signer(proof_signer(name))
+        .protocol_profile(cgka_traits::group::ProtocolProfile::Current)
+        .peeler(Box::new(MockPeeler))
+        .build()
+        .expect("build the issuing engine");
+
+    storage.before_next_key_package_scan(move || {
+        let issued = issuer.issue_private_key_packages(&[7; 32], 1, None, 1_000);
+        assert_eq!(issued.unwrap(), 1);
+    });
+    assert_eq!(engine.durably_owned_key_packages().unwrap(), owned);
+
+    assert_eq!(storage.stored_key_package_bundles().unwrap().len(), 2);
+    assert_eq!(engine.durably_owned_key_packages().unwrap(), owned);
 }
 
 #[tokio::test]

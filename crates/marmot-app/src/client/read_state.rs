@@ -405,12 +405,13 @@ impl ReadState {
         self.account.backup_restore_status.clone()
     }
 
-    /// `WatchBackupRestore`: a new receiver of the client's progress channel
-    /// that has seen its current value, as subscribing to it gives.
+    /// `WatchBackupRestore`: a receiver of the client's progress channel
+    /// that has seen the status published here, as subscribing at this
+    /// publish gave. A change sent since then is still news to it.
     pub(crate) fn watch_backup_restore(&self) -> BackupRestoreWatch {
-        let mut receiver = self.account.backup_restore_updates.clone();
-        receiver.mark_unchanged();
-        BackupRestoreWatch { receiver }
+        BackupRestoreWatch {
+            receiver: self.account.backup_restore_updates.clone(),
+        }
     }
 }
 
@@ -426,23 +427,31 @@ pub(crate) fn reissue<T>(answer: ReadAnswer<T>) -> Option<Result<T, AppError>> {
 /// An exact copy of `error`, for the failures the moved reads give whose
 /// payloads can be copied: an unknown group in the mirror or the engine, a
 /// group not hydrated yet, and a storage failure, from the app or the engine.
-/// Any other failure (SQLite, I/O, JSON, the rest of the engine's) has no
-/// copy, so it is never rebuilt into a different error.
+/// An engine failure keeps its wrapping, whether the account or its session
+/// raised it. Any other failure (SQLite, I/O, JSON, the rest of the engine's)
+/// has no copy, so it is never rebuilt into a different error.
 pub(crate) fn reissue_error(error: &AppError) -> Option<AppError> {
-    use marmot_session::AccountError;
+    use marmot_session::{AccountError, SessionError};
+    fn copy_engine(engine: &EngineError) -> Option<EngineError> {
+        match engine {
+            EngineError::UnknownGroup(group) => Some(EngineError::UnknownGroup(group.clone())),
+            EngineError::GroupNotHydrated(group) => {
+                Some(EngineError::GroupNotHydrated(group.clone()))
+            }
+            EngineError::Storage(storage) => Some(EngineError::Storage(storage.clone())),
+            _ => None,
+        }
+    }
     match error {
         AppError::UnknownGroup(group) => Some(AppError::UnknownGroup(group.clone())),
         AppError::Storage(storage) => Some(AppError::Storage(storage.clone())),
         AppError::Account(AccountError::Engine(engine)) => {
-            let engine = match engine {
-                EngineError::UnknownGroup(group) => EngineError::UnknownGroup(group.clone()),
-                EngineError::GroupNotHydrated(group) => {
-                    EngineError::GroupNotHydrated(group.clone())
-                }
-                EngineError::Storage(storage) => EngineError::Storage(storage.clone()),
-                _ => return None,
-            };
-            Some(AppError::Account(AccountError::Engine(engine)))
+            copy_engine(engine).map(|engine| AppError::Account(AccountError::Engine(engine)))
+        }
+        AppError::Account(AccountError::Session(SessionError::Engine(engine))) => {
+            copy_engine(engine).map(|engine| {
+                AppError::Account(AccountError::Session(SessionError::Engine(engine)))
+            })
         }
         _ => None,
     }
@@ -1812,12 +1821,24 @@ mod tests {
     #[test]
     fn a_reissued_failure_is_an_exact_copy_or_none() {
         let group = GroupId::new(vec![0x11; 16]);
-        let engine = |error| AppError::Account(AccountError::Engine(error));
+        let account = |error| AppError::Account(AccountError::Engine(error));
+        // The session's wrapping, which the account reads' engine failures
+        // carry.
+        let session = |error| {
+            AppError::Account(AccountError::Session(marmot_session::SessionError::Engine(
+                error,
+            )))
+        };
         let copied = [
             AppError::UnknownGroup("11".to_owned()),
             AppError::Storage(StorageError::Closed("closed".to_owned())),
-            engine(EngineError::UnknownGroup(group.clone())),
-            engine(EngineError::GroupNotHydrated(group)),
+            account(EngineError::UnknownGroup(group.clone())),
+            account(EngineError::GroupNotHydrated(group.clone())),
+            session(EngineError::UnknownGroup(group.clone())),
+            session(EngineError::GroupNotHydrated(group)),
+            session(EngineError::Storage(StorageError::Closed(
+                "closed".to_owned(),
+            ))),
             closed_storage(),
         ];
         for error in copied {
@@ -1826,7 +1847,8 @@ mod tests {
         }
         let uncopied = [
             AppError::Sqlite(rusqlite::Error::InvalidQuery),
-            engine(EngineError::UnknownPending),
+            account(EngineError::UnknownPending),
+            session(EngineError::UnknownPending),
             AppError::TransportClosed,
         ];
         for error in uncopied {
@@ -1910,5 +1932,46 @@ mod tests {
             reader.version(&open),
             Err(AppError::TransportClosed)
         ));
+    }
+
+    /// A watch handed out from A has seen the status published there and no
+    /// more, as a subscription made at that publish would have: a change sent
+    /// since that publish wakes it.
+    #[tokio::test]
+    async fn a_backup_restore_watch_wakes_for_a_change_since_its_publish() {
+        let published = BackupRestoreStatus {
+            revision: 1,
+            ..Default::default()
+        };
+        let (updates, _) = watch::channel(published.clone());
+        let state = ReadState {
+            version: 1,
+            valid_until: None,
+            account: Arc::new(AccountAnswers {
+                quarantined_groups: Vec::new(),
+                key_package_maintenance_status: Ok(None),
+                durably_owned_key_packages: Ok(Vec::new()),
+                periodic_maintenance_policy: Ok(PeriodicMaintenancePolicy::default()),
+                maintenance_paused: false,
+                backup_restore_status: published.clone(),
+                backup_restore_updates: updates.subscribe(),
+                prepared_group_images: Ok(Vec::new()),
+                started_fresh: Ok(false),
+                chat_history_imports: Ok(Vec::new()),
+            }),
+            groups: Arc::default(),
+        };
+        assert!(!state.watch_backup_restore().receiver.has_changed().unwrap());
+
+        let later = BackupRestoreStatus {
+            phase: crate::BackupRestorePhase::Discovering,
+            revision: 2,
+            ..Default::default()
+        };
+        updates.send_replace(later.clone());
+        assert_eq!(state.backup_restore_status(), published);
+        let mut watch = state.watch_backup_restore();
+        assert!(watch.receiver.has_changed().unwrap());
+        assert_eq!(watch.changed().await.unwrap(), later);
     }
 }
