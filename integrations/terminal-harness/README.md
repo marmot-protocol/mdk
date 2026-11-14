@@ -20,6 +20,7 @@ storage, QUIC previews, or backend-specific CLI semantics.
 - [Execution Profiles](#execution-profiles)
 - [Shared Behavior](#shared-behavior)
 - [Chat Commands](#chat-commands)
+- [Agent Routing](#agent-routing)
 - [Organize Your Task Groups](#organize-your-task-groups)
 - [Development](#development)
 
@@ -344,6 +345,7 @@ never reaches the backend:
 | `/retry-last` | Retry the durable recovery record that currently blocks this chat. |
 | `/discard-last` | Discard the durable recovery record without replay. |
 | `/goal <text>` | Store a standing instruction for this chat. `/goal` shows it; `/goal clear` removes it. |
+| `/agent [name]` | With routing enabled, show which agent answers this chat, or hand the chat to `name`. See [Agent Routing](#agent-routing). |
 
 A reserved name used with arguments it does not accept, such as
 `/new right now`, returns a usage reply instead of being forwarded as a prompt.
@@ -396,6 +398,83 @@ and backend contracts:
 - [`integrations/opencode/marmot/README.md`](../opencode/marmot/README.md)
 - [`integrations/pi/marmot/README.md`](../pi/marmot/README.md)
 - [`integrations/goose/marmot/README.md`](../goose/marmot/README.md)
+
+## Agent Routing
+
+Several connectors can share one group: add the Claude, Codex, and opencode
+agent accounts to the same chat and let a shared routing file decide which one
+answers. Routing is off unless `MARMOT_HARNESS_ROUTING_FILE` is set to an
+absolute path. Set the same path for every co-resident connector and run them
+as the same Unix user, because each connector rewrites the file.
+
+```json
+{
+  "schema": 1,
+  "agents": ["claude", "codex", "opencode"],
+  "default": "claude",
+  "groups": { "<group id hex>": "codex" },
+  "pinned": { "<group id hex>": "claude" }
+}
+```
+
+- `agents` lists the route names that may answer. A connector's route name
+  defaults to its reply prefix without `wn-` (`claude`, `codex`, `opencode`,
+  `pi`, `goose`) and can be overridden with `<PREFIX>_ROUTE_NAME`.
+- `groups` assigns a chat to one agent. `default` applies to chats not listed;
+  without a default, every connector answers an unlisted chat as before.
+- `pinned` fixes a chat to one agent. `/agent` cannot move a pinned chat, which
+  keeps a troubleshooting room stable while other rooms are switched.
+- Group ids are matched case-insensitively.
+- Unknown fields, a schema other than `1`, or a route that names an agent
+  missing from `agents` make the file invalid. A connector keeps the last valid
+  routing it read while the file is invalid, and warns. A missing file, or an
+  invalid one at startup, disables routing, so every connector answers rather
+  than none.
+- `switches` is written by the connectors to record recent `/agent` commands
+  per chat. Leave it alone when editing by hand.
+
+Each message belongs to the agent that was active when it was sent, judged by
+its timestamp. A message from the same second as a switch counts as sent
+after it. A message sent before a switch is still answered by the previous
+agent, even if a connector receives it after the switch was saved. The last
+eight switches per chat are kept for this; an older message goes to the oldest
+kept agent. Each connector receives the chat at its own speed, so a connector
+can answer a message before any connector has saved an earlier switch, and
+that message can then be answered twice. Timestamps come from the sender's
+device, so a device whose clock runs behind still reaches the previous agent
+until its clock passes the switch. A connector that is not the message's agent
+drops it before queueing or deduplication.
+
+`/agent` alone makes the active agent reply with the current route and the
+available names. In a chat with no route, the first listed agent replies, so
+exactly one status answer is sent. `/agent codex` is saved by every connector
+that sees it, under an exclusive lock, before any later message in the chat is
+routed. The switch therefore takes effect even when the target is offline.
+The target confirms in the chat when it handles the command. If a prompt
+reaches the target first, for example because it was offline and the command
+was not replayed, the target starts the fresh session before that prompt, and
+any later reply to the command only announces it. For each chat the newest
+command wins by timestamp and then message id, and a replayed command never
+overrides a newer switch or a later hand edit of `groups`. A command that
+loses to a newer switch is ignored without a reply; `/agent` shows the
+result. A command stamped more than ten minutes ahead of the connector's
+clock is refused, so one wrong clock cannot lock a chat. If no connector can
+write the file, or its lock stays held for about two seconds, the target says
+so and routing stays as it was. Rewrites keep
+the file mode (new files are `0600`) and follow a symlink to the real file.
+Hand edits should be made while no switch is in flight; a connector that saves
+a switch at the same moment can overwrite a concurrent hand edit.
+
+The first prompt after a takeover starts a fresh backend session and is
+prefixed with a short handoff: who took over from whom, followed by up to 20
+messages sent before that prompt, oldest first and labelled by sender (newest
+kept within 12 KB). Set `MARMOT_HARNESS_HANDOFF_PROMPT_FILE` to an absolute
+path to replace the built-in handoff instructions; `{agent}` and `{previous}`
+are substituted. The file is read on every handoff and is capped at 16 KB.
+
+Limitations: when routing is enabled but the file is missing, every connector
+answers `/agent` that routing is unavailable. A status request waits behind a
+running turn of the active agent.
 
 ## Organize Your Task Groups
 
