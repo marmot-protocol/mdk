@@ -51,6 +51,7 @@ impl Marmot {
             .await?)
     }
     /// Idempotent automatic demand for the current authoritative source slot.
+    /// Queued work moves ahead of other automatic work, most recent call first.
     pub async fn request_automatic_attachment(
         &self,
         account_ref: String,

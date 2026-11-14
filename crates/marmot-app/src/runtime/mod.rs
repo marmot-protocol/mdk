@@ -64,6 +64,8 @@ use nostr::prelude::PublicKey;
 use nostr_directory::DirectorySyncHandle;
 
 const MEDIA_COMMAND_QUEUE_LIMIT: usize = 8;
+/// Attachment downloads in flight at once across every account of a runtime.
+pub(crate) const ATTACHMENT_TRANSFER_LIMIT: usize = 4;
 
 pub(crate) mod account_worker;
 mod agent_publisher;
@@ -486,7 +488,7 @@ impl Default for RuntimeSharedServices {
             ordinary_drop_witness: Arc::new(StdMutex::new(None)),
             #[cfg(test)]
             ordinary_delivery_dropped: Arc::new(Notify::new()),
-            attachment_transfer: Arc::new(tokio::sync::Semaphore::new(1)),
+            attachment_transfer: Arc::new(tokio::sync::Semaphore::new(ATTACHMENT_TRANSFER_LIMIT)),
             local_submission_wakeups: watch::channel(()).0,
             local_submission_queue: Arc::new(StdMutex::new(Default::default())),
             attachment_updates: Default::default(),
@@ -591,7 +593,7 @@ impl RuntimeSharedServices {
             ordinary_drop_witness: Arc::new(StdMutex::new(None)),
             #[cfg(test)]
             ordinary_delivery_dropped: Arc::new(Notify::new()),
-            attachment_transfer: Arc::new(tokio::sync::Semaphore::new(1)),
+            attachment_transfer: Arc::new(tokio::sync::Semaphore::new(ATTACHMENT_TRANSFER_LIMIT)),
             attachment_updates: Default::default(),
             local_submission_wakeups: watch::channel(()).0,
             local_submission_queue: Arc::new(StdMutex::new(Default::default())),

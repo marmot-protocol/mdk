@@ -902,7 +902,11 @@ pub(super) fn schedule(
     let Ok(permit) = http.permits.clone().try_acquire_owned() else {
         return Ok(more);
     };
-    for candidate in candidates {
+    // Each pass starts one transfer; another candidate asks the worker for
+    // another pass, which admits it while global and HTTP capacity remain.
+    let count = candidates.len();
+    for (position, candidate) in candidates.into_iter().enumerate() {
+        let more = more || position + 1 < count;
         let explicit = storage
             .app_storage()
             .attachment_request_is_explicit(&candidate)?;

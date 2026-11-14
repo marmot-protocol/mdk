@@ -70,11 +70,8 @@ mod white_noise {
         "wss://relay.ditto.pub",
         "wss://relay.primal.net",
     ];
-    pub(super) const MEDIA_SERVERS: &[&str] = &[
-        "https://blossom.divine.video",
-        "https://blossom.ditto.pub",
-        "https://cdn.hzrd149.com",
-    ];
+    pub(super) const MEDIA_SERVERS: &[&str] =
+        &["https://blossom.divine.video", "https://blossom.ditto.pub"];
     pub(super) const PROFILE_IMAGE_SERVER: &str = "https://blossom.primal.net";
     pub(super) const OPEN_RANKING_SEARCH: &str = "https://ranking.vertexlab.io/search/pubkeys";
     pub(super) const MODERATION_LABEL_NAMESPACE: &str = "chat.whitenoise.report";
@@ -105,8 +102,9 @@ impl MarmotDeployment {
         }
     }
 
-    /// White Noise's deployment, byte for byte what MDK compiled in before
-    /// these became configuration, plus its operated relays' event limit.
+    /// White Noise's deployment: what MDK compiled in before these became
+    /// configuration, less `cdn.hzrd149.com` (it now refuses uploads from
+    /// unlisted pubkeys), plus its operated relays' event limit.
     pub fn white_noise() -> Self {
         Self {
             recovery_operated_relays: owned(white_noise::OPERATED_RELAYS),
@@ -272,11 +270,7 @@ mod tests {
         );
         assert_eq!(
             deployment.new_group_media_endpoints,
-            [
-                "https://blossom.divine.video",
-                "https://blossom.ditto.pub",
-                "https://cdn.hzrd149.com",
-            ]
+            ["https://blossom.divine.video", "https://blossom.ditto.pub",]
         );
         assert_eq!(
             deployment.group_image_endpoint.as_deref(),

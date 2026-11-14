@@ -4081,3 +4081,60 @@ mod outgoing;
 mod outgoing_files;
 mod outgoing_media;
 mod promotion;
+
+#[test]
+fn automatic_request_moves_queued_work_ahead_of_newer_backlog_but_not_taps() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
+    for (message, received_at) in [("shown", 10), ("newer", 20), ("tapped", 5)] {
+        store.lock().unwrap().execute("INSERT INTO account_groups(group_id_hex,endpoint,updated_at) VALUES(?1,'',0) ON CONFLICT DO NOTHING",[GROUP]).unwrap();
+        app.record_app_event(&StoredAppEvent {
+            received_at,
+            ..source(message)
+        })
+        .unwrap();
+        request(&app, message);
+    }
+    let order = |now| -> Vec<String> {
+        app.attachment_transfer_candidates(now, 32, true)
+            .unwrap()
+            .iter()
+            .map(|r| {
+                store
+                    .lock()
+                    .unwrap()
+                    .query_row(
+                        "SELECT message_id_hex FROM attachment_acquisition WHERE token=?1",
+                        [&r.token],
+                        |row| row.get(0),
+                    )
+                    .unwrap()
+            })
+            .collect()
+    };
+    // Background demand follows message recency.
+    assert_eq!(order(30), ["newer", "shown", "tapped"]);
+    let tapped = app
+        .attachment_control_entry(GROUP, "tapped", "source-tapped", 0, 25)
+        .unwrap()
+        .unwrap();
+    app.request_explicit_attachment(GROUP, &tapped, digest(), 25)
+        .unwrap();
+    let policy = AttachmentDownloadPolicy {
+        automatic: true,
+        retained_bytes: 10000,
+        disk_reserve: 0,
+        transfer_limit: 100,
+    };
+    let shown = app
+        .attachment_control_entry(GROUP, "shown", "source-shown", 0, 30)
+        .unwrap()
+        .unwrap();
+    let (status, newly_queued) = app
+        .request_automatic_attachment(GROUP, &shown, digest(), 30, (&policy, true))
+        .unwrap();
+    assert!(!newly_queued, "already queued work is not queued again");
+    assert_eq!(status.unwrap().state, AttachmentTransferState::Queued);
+    // The shown image overtakes newer background work; a tap stays first.
+    assert_eq!(order(30), ["tapped", "shown", "newer"]);
+}

@@ -213,7 +213,8 @@ impl MarmotAppRuntime {
     }
 
     /// Idempotent automatic demand. Never clears suppression, resets backoff or
-    /// retry budgets, or reacquires a source whose bytes have been lost.
+    /// retry budgets, or reacquires a source whose bytes have been lost. Queued
+    /// work moves ahead of other automatic work, most recent request first.
     pub async fn request_automatic_attachment(
         &self,
         account_ref: &str,

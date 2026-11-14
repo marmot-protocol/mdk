@@ -742,7 +742,10 @@ async fn download_without_engine_and_retain(
     }
     admission.ready().await;
     schedule(&client, &shared, &http, &mut admission).unwrap();
-    assert_eq!(shared.attachment_transfer.available_permits(), 0);
+    assert_eq!(
+        shared.attachment_transfer.available_permits(),
+        crate::runtime::ATTACHMENT_TRANSFER_LIMIT - 1
+    );
     assert_eq!(http.permits.available_permits(), 3);
     let done = tokio::time::timeout(Duration::from_secs(5), completions.recv())
         .await
@@ -750,7 +753,7 @@ async fn download_without_engine_and_retain(
         .unwrap();
     assert_eq!(
         shared.attachment_transfer.available_permits(),
-        0,
+        crate::runtime::ATTACHMENT_TRANSFER_LIMIT - 1,
         "queued plaintext still owns global capacity"
     );
     let asset = match &done.completion {
@@ -773,7 +776,10 @@ async fn download_without_engine_and_retain(
         );
     }
     complete_and_settle(&mut client, done, &shared, &http, &mut completions).await;
-    assert_eq!(shared.attachment_transfer.available_permits(), 1);
+    assert_eq!(
+        shared.attachment_transfer.available_permits(),
+        crate::runtime::ATTACHMENT_TRANSFER_LIMIT
+    );
     assert_eq!(
         &*read_retained(
             &storage,
@@ -852,7 +858,10 @@ async fn attachment_worker_exit_cancels_transfer_and_releases_global_capacity() 
         |completion| completion,
     );
     ready.await.unwrap();
-    assert_eq!(shared.attachment_transfer.available_permits(), 0);
+    assert_eq!(
+        shared.attachment_transfer.available_permits(),
+        crate::runtime::ATTACHMENT_TRANSFER_LIMIT - 1
+    );
     drop(http);
     assert!(
         tokio::time::timeout(Duration::from_secs(1), completions.recv())
@@ -864,12 +873,19 @@ async fn attachment_worker_exit_cancels_transfer_and_releases_global_capacity() 
     // ends, in no promised order, so wait for the capacity to come back
     // before counting it. The bound only catches a hang.
     tokio::time::timeout(Duration::from_secs(10), async {
-        let _global = shared.attachment_transfer.acquire().await.unwrap();
+        let _global = shared
+            .attachment_transfer
+            .acquire_many(crate::runtime::ATTACHMENT_TRANSFER_LIMIT as u32)
+            .await
+            .unwrap();
         let _http = permits.acquire_many(4).await.unwrap();
     })
     .await
     .expect("the cancelled transfer releases global and HTTP capacity");
-    assert_eq!(shared.attachment_transfer.available_permits(), 1);
+    assert_eq!(
+        shared.attachment_transfer.available_permits(),
+        crate::runtime::ATTACHMENT_TRANSFER_LIMIT
+    );
     assert_eq!(permits.available_permits(), 4);
 }
 
@@ -941,7 +957,10 @@ async fn attachment_missing_secret_does_not_claim_or_back_off_a_page_of_siblings
         );
     }
     assert!(completions.try_recv().is_err());
-    assert_eq!(shared.attachment_transfer.available_permits(), 1);
+    assert_eq!(
+        shared.attachment_transfer.available_permits(),
+        crate::runtime::ATTACHMENT_TRANSFER_LIMIT
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1397,7 +1416,10 @@ async fn attachment_worker_disk_pause_does_not_consume_attempts() {
         storage_sqlite::AttachmentTransferState::RetryScheduled
     );
     assert_eq!(progress.retry_at, status.due);
-    assert_eq!(shared.attachment_transfer.available_permits(), 1);
+    assert_eq!(
+        shared.attachment_transfer.available_permits(),
+        crate::runtime::ATTACHMENT_TRANSFER_LIMIT
+    );
 }
 
 // A single thread lets the watch-loop proof freeze time after real database setup.
@@ -2760,4 +2782,126 @@ async fn a_file_left_behind_mid_pass_is_reached_by_a_restarted_sweep() {
         !media.path(&left).exists(),
         "the restarted pass reached the file behind the old cursor"
     );
+}
+
+/// One account's backlog runs [`crate::runtime::ATTACHMENT_TRANSFER_LIMIT`]
+/// downloads at once: each pass starts one and asks for another while
+/// candidates remain, the global permits bound the total, and the per-account
+/// HTTP slot reserved for foreground work stays free.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn attachment_worker_runs_the_transfer_limit_concurrently() {
+    use tokio::io::AsyncReadExt;
+    let limit = crate::runtime::ATTACHMENT_TRANSFER_LIMIT;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (requested, mut requests) = mpsc::unbounded_channel::<()>();
+    // Hold every request open, so each admitted transfer stays in flight.
+    let server = tokio::spawn(async move {
+        let mut held = Vec::new();
+        loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            assert!(socket.read(&mut request).await.unwrap() > 0);
+            requested.send(()).unwrap();
+            held.push(socket);
+        }
+    });
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay_and_config(
+        dir.path(),
+        "wss://relay.example",
+        MarmotAppConfig {
+            attachment_acquisition: Some(crate::AttachmentAcquisitionPolicy::default()),
+            allow_loopback_blob_endpoints: true,
+            ..MarmotAppConfig::white_noise()
+        },
+    )
+    .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+    let mut client = app.client("alice").await.unwrap();
+    let storage = app.account_storage("alice").unwrap();
+    let mut first = None;
+    for message in 0..=limit {
+        let (mut reference, _) =
+            crate::media::tests::attachment_worker_fixture(format!("image {message}").as_bytes());
+        reference.locators = vec![crate::MediaLocator {
+            kind: "blossom-v1".into(),
+            value: format!("http://{address}/{}", reference.ciphertext_sha256),
+        }];
+        if message == 0 {
+            // The accepted group plus its first attachment message.
+            seed_direction(&storage.app_storage(), &reference, false, "received");
+            first = Some(reference);
+            continue;
+        }
+        let id = format!("{:02x}", 0x40 + message).repeat(32);
+        storage
+            .app_storage()
+            .record_app_event(&StoredAppEvent {
+                group_id_hex: GROUP.into(),
+                message_id_hex: id.clone(),
+                source_message_id_hex: Some(id),
+                source_epoch: Some(3),
+                direction: "received".into(),
+                sender: "33".repeat(32),
+                plaintext: String::new(),
+                kind: 9,
+                tags: vec![reference.imeta_tag()],
+                recorded_at: 10,
+                received_at: 10 + message as u64,
+                origin_commit_id: None,
+                moderation_grant: false,
+            })
+            .unwrap();
+    }
+    client.state.groups.push(projection(&first.unwrap()));
+    storage
+        .app_storage()
+        .remember_encrypted_media_epoch_secret(
+            GROUP,
+            crate::GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
+            3,
+            &[7; 32],
+        )
+        .unwrap();
+    let shared = RuntimeSharedServices::default();
+    let (mut http, _completions) = context();
+    http.permits = Arc::new(Semaphore::new(super::super::MEDIA_HTTP_IN_FLIGHT_LIMIT));
+    let mut admission = Admission::default();
+    // Drive the worker loop: run a pass while one is asked for, and take the
+    // next permit when a pass parked on global capacity.
+    let mut due = true;
+    for _ in 0..64 {
+        if due {
+            due = schedule(&client, &shared, &http, &mut admission).unwrap();
+        } else if admission.is_waiting() {
+            match tokio::time::timeout(Duration::from_millis(200), admission.ready()).await {
+                Ok(more) => due = more,
+                Err(_) => break,
+            }
+        } else {
+            break;
+        }
+    }
+    for started in 0..limit {
+        tokio::time::timeout(Duration::from_secs(5), requests.recv())
+            .await
+            .unwrap_or_else(|_| panic!("transfer {} of {limit} never started", started + 1))
+            .unwrap();
+    }
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), requests.recv())
+            .await
+            .is_err(),
+        "a transfer past the limit started"
+    );
+    assert_eq!(shared.attachment_transfer.available_permits(), 0);
+    assert_eq!(
+        http.permits.available_permits(),
+        1,
+        "the foreground slot stays free"
+    );
+    server.abort();
 }

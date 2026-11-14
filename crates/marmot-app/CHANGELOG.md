@@ -41,6 +41,17 @@
 
 ### Changed
 
+- Attachment downloads run four at a time across a runtime's accounts instead
+  of one, and each account's media HTTP lane grows from four slots to five so
+  one slot stays free for foreground work. A screen of images no longer
+  downloads one by one behind a single slot.
+- `request_automatic_attachment` for queued work moves it ahead of other
+  automatic downloads, most recent request first, so what a screen shows
+  downloads before background backlog. Taps still go first; state, backoff
+  and budgets are unchanged.
+- The White Noise deployment drops `https://cdn.hzrd149.com` from new groups'
+  media endpoints: it now refuses uploads from unlisted pubkeys. Existing
+  groups keep their signed endpoint list until an admin replaces it.
 - The coverage ledger no longer raises "history may be incomplete" notices (mdk#3308). Users see a notice only when
   MDK has evidence that messages are missing (an epoch gap the runner's visits exhausted, a maintenance or known-event
   park an upgrade kept) or after a rejoin. `HistoryNoticeCause::UnprovenHistory` stays in the enum for compatibility
