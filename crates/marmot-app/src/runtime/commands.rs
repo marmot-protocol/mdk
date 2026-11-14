@@ -3301,4 +3301,132 @@ mod tests {
         assert_eq!(runtime.reconcile_invocation_count().await, 0);
         runtime.shutdown().await;
     }
+
+    /// A failure in A that `reissue` copies reaches the host as the answer
+    /// the worker gives for it, compared by debug form as the oracle's
+    /// `same_answer` compares failures, with no queue wait. One with no exact
+    /// copy is answered by the worker's own command instead, its wait
+    /// recorded under the read's class (mdk#3273).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_published_failure_is_reissued_exactly_or_answered_by_the_worker() {
+        use super::super::{ManagedAccountWorker, MarmotAppRuntime};
+        use crate::client::read_state::read_state_channel;
+        use cgka_traits::PeriodicMaintenancePolicy;
+        use cgka_traits::error::EngineError;
+        use marmot_session::{AccountError, SessionError};
+
+        /// The read as the host makes it, answered by the fake worker with
+        /// `answer` if it goes to the worker.
+        async fn read(
+            manager: &AccountManager,
+            account: &str,
+            received: &mut mpsc::Receiver<AccountWorkerCommand>,
+            answer: Option<AppError>,
+        ) -> Result<PeriodicMaintenancePolicy, AppError> {
+            let Some(answer) = answer else {
+                return tokio::select! {
+                    biased;
+                    read = manager.periodic_maintenance_policy(account) => read,
+                    _ = received.recv() => panic!("the read went to the worker"),
+                };
+            };
+            let pending = manager.periodic_maintenance_policy(account);
+            tokio::pin!(pending);
+            let respond = tokio::select! {
+                biased;
+                command = received.recv() => match command {
+                    Some(AccountWorkerCommand::PeriodicMaintenancePolicy { respond }) => respond,
+                    _ => panic!("the read goes to the worker"),
+                },
+                read = &mut pending => panic!("the read answered without the worker: {read:?}"),
+            };
+            let _ = respond.send(Err(answer));
+            pending.await
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let account = marmot_account::AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let runtime = MarmotAppRuntime::new(crate::MarmotApp::with_relay(
+            dir.path(),
+            "wss://relay.example",
+        ));
+        let manager = runtime.accounts();
+        let (commands, mut received) = mpsc::channel(1);
+        let (publisher, read_state) = read_state_channel();
+        let (shutdown, stopped) = oneshot::channel();
+        let handle = tokio::spawn(async move {
+            let _ = stopped.await;
+        });
+        manager.workers.lock().await.insert(
+            account.account_id_hex.clone(),
+            ManagedAccountWorker {
+                ready: true,
+                media_admission: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                    super::super::MEDIA_COMMAND_QUEUE_LIMIT,
+                )),
+                handle,
+                commands,
+                shutdown,
+                unit: Default::default(),
+                read_state,
+            },
+        );
+        let telemetry = runtime.shared_services().observer.performance().clone();
+        let waits = || {
+            telemetry
+                .snapshot()
+                .runtime_operations
+                .into_iter()
+                .find(|sample| sample.operation == crate::RuntimePerformanceOperation::ReadQueueR3)
+                .map_or(0, |sample| sample.successes)
+        };
+        let publish = |failure: AppError| {
+            publisher.publish_for_test(|account| {
+                account.periodic_maintenance_policy = Err(std::sync::Arc::new(failure));
+            });
+        };
+
+        let group = GroupId::new(vec![0x11; 16]);
+        let storage = || cgka_traits::StorageError::Backend("disk".into());
+        let account_engine = |engine| AppError::Account(AccountError::Engine(engine));
+        let session_engine =
+            |engine| AppError::Account(AccountError::Session(SessionError::Engine(engine)));
+        let copyable: [&dyn Fn() -> AppError; 8] = [
+            &|| AppError::UnknownGroup("11".to_owned()),
+            &|| AppError::Storage(storage()),
+            &|| account_engine(EngineError::UnknownGroup(group.clone())),
+            &|| account_engine(EngineError::GroupNotHydrated(group.clone())),
+            &|| account_engine(EngineError::Storage(storage())),
+            &|| session_engine(EngineError::UnknownGroup(group.clone())),
+            &|| session_engine(EngineError::GroupNotHydrated(group.clone())),
+            &|| session_engine(EngineError::Storage(storage())),
+        ];
+        let uncopyable: [&dyn Fn() -> AppError; 3] = [
+            &|| AppError::Sqlite(rusqlite::Error::InvalidQuery),
+            &|| account_engine(EngineError::UnknownPending),
+            &|| session_engine(EngineError::UnknownPending),
+        ];
+        for (index, failure) in copyable.iter().enumerate() {
+            // A failure with no exact copy sends the read to the worker, whose
+            // answer the host gets, and whose wait counts under R3.
+            publish(uncopyable[index % uncopyable.len()]());
+            let before = waits();
+            let worker = read(&manager, &account.label, &mut received, Some(failure()))
+                .await
+                .unwrap_err();
+            assert_eq!(waits(), before + 1);
+
+            // The same failure in A answers on the caller's task, the same
+            // answer by debug form, and waits on no queue.
+            publish(failure());
+            let served = read(&manager, &account.label, &mut received, None)
+                .await
+                .unwrap_err();
+            assert_eq!(format!("{served:?}"), format!("{worker:?}"));
+            assert_eq!(waits(), before + 1);
+        }
+        runtime.shutdown().await;
+    }
 }

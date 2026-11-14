@@ -1168,8 +1168,9 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   `ReadStateReader`, paired with the worker's `ReadStateSender` at spawn. The reader checks
   `MarmotApp::storage_closed` after taking the version and before reading it (`close_storage` sets the flag before it
   closes any database), and answers `TransportClosed` once the worker's publisher is gone. A published failure is
-  served only as an exact copy (`read_state::reissue`); one with no copy, and any read before the first publish,
-  goes to the worker's command, which stays as that fallback. A storage read counts its failure as the worker's
+  served only as an exact copy (`read_state::reissue`), never a lossy one; one with no copy, and any read before the
+  first publish, goes to the worker's command, which stays as that fallback and records its wait under the read's
+  class. A storage read counts its failure as the worker's
   `respond_diagnosed` would. Moving a read to A moves its row in `read_queue_tests.rs` and in
   `runtime-latency-telemetry.md`'s "Host read classes"; don't move a multi-device read (mdk#2628) without Jeff.
 

@@ -479,21 +479,43 @@ pub(crate) fn read_state_channel() -> (ReadStateSender, ReadStateReader) {
     let (sender, receiver) = watch::channel(Arc::new(ReadState {
         version: 0,
         valid_until: None,
-        account: Arc::new(AccountAnswers {
-            quarantined_groups: Vec::new(),
-            key_package_maintenance_status: Ok(None),
-            durably_owned_key_packages: Ok(Vec::new()),
-            periodic_maintenance_policy: Ok(PeriodicMaintenancePolicy::default()),
-            maintenance_paused: false,
-            backup_restore_status: BackupRestoreStatus::default(),
-            backup_restore_updates: watch::channel(BackupRestoreStatus::default()).1,
-            prepared_group_images: Ok(Vec::new()),
-            started_fresh: Ok(false),
-            chat_history_imports: Ok(Vec::new()),
-        }),
+        account: Arc::new(empty_account_answers()),
         groups: Arc::new(HashMap::new()),
     }));
     (ReadStateSender(sender), ReadStateReader { receiver })
+}
+
+/// The account answers of version 0, before the worker's first publish.
+fn empty_account_answers() -> AccountAnswers {
+    AccountAnswers {
+        quarantined_groups: Vec::new(),
+        key_package_maintenance_status: Ok(None),
+        durably_owned_key_packages: Ok(Vec::new()),
+        periodic_maintenance_policy: Ok(PeriodicMaintenancePolicy::default()),
+        maintenance_paused: false,
+        backup_restore_status: BackupRestoreStatus::default(),
+        backup_restore_updates: watch::channel(BackupRestoreStatus::default()).1,
+        prepared_group_images: Ok(Vec::new()),
+        started_fresh: Ok(false),
+        chat_history_imports: Ok(Vec::new()),
+    }
+}
+
+#[cfg(test)]
+impl ReadStateSender {
+    /// Publish the next version, holding the empty account answers as `edit`
+    /// leaves them and no groups: for tests that hand-build a worker's lane.
+    pub(crate) fn publish_for_test(&self, edit: impl FnOnce(&mut AccountAnswers)) {
+        let mut account = empty_account_answers();
+        edit(&mut account);
+        let version = self.0.borrow().version + 1;
+        self.0.send_replace(Arc::new(ReadState {
+            version,
+            valid_until: None,
+            account: Arc::new(account),
+            groups: Arc::default(),
+        }));
+    }
 }
 
 /// A reader whose worker never publishes, so every read is sent to the
@@ -1816,48 +1838,6 @@ mod tests {
         assert!(rejects(true, false, Ok(1), Err(closed_storage())));
     }
 
-    /// A published failure reaches the host as an exact copy, or not at all:
-    /// a failure with no copy is left for the worker to answer.
-    #[test]
-    fn a_reissued_failure_is_an_exact_copy_or_none() {
-        let group = GroupId::new(vec![0x11; 16]);
-        let account = |error| AppError::Account(AccountError::Engine(error));
-        // The session's wrapping, which the account reads' engine failures
-        // carry.
-        let session = |error| {
-            AppError::Account(AccountError::Session(marmot_session::SessionError::Engine(
-                error,
-            )))
-        };
-        let copied = [
-            AppError::UnknownGroup("11".to_owned()),
-            AppError::Storage(StorageError::Closed("closed".to_owned())),
-            account(EngineError::UnknownGroup(group.clone())),
-            account(EngineError::GroupNotHydrated(group.clone())),
-            session(EngineError::UnknownGroup(group.clone())),
-            session(EngineError::GroupNotHydrated(group)),
-            session(EngineError::Storage(StorageError::Closed(
-                "closed".to_owned(),
-            ))),
-            closed_storage(),
-        ];
-        for error in copied {
-            let copy = reissue_error(&error).expect("a copyable failure");
-            assert_eq!(format!("{copy:?}"), format!("{error:?}"));
-        }
-        let uncopied = [
-            AppError::Sqlite(rusqlite::Error::InvalidQuery),
-            account(EngineError::UnknownPending),
-            session(EngineError::UnknownPending),
-            AppError::TransportClosed,
-        ];
-        for error in uncopied {
-            assert!(reissue_error(&error).is_none(), "{error:?} has no copy");
-        }
-        assert_eq!(reissue::<u8>(Ok(7)).unwrap().unwrap(), 7);
-        assert!(reissue::<u8>(Err(Arc::new(AppError::TransportClosed))).is_none());
-    }
-
     /// The worker wakes when the first time-bound answer can change, each
     /// bound measured on its own clock, and never sooner than a second.
     #[test]
@@ -1948,16 +1928,9 @@ mod tests {
             version: 1,
             valid_until: None,
             account: Arc::new(AccountAnswers {
-                quarantined_groups: Vec::new(),
-                key_package_maintenance_status: Ok(None),
-                durably_owned_key_packages: Ok(Vec::new()),
-                periodic_maintenance_policy: Ok(PeriodicMaintenancePolicy::default()),
-                maintenance_paused: false,
                 backup_restore_status: published.clone(),
                 backup_restore_updates: updates.subscribe(),
-                prepared_group_images: Ok(Vec::new()),
-                started_fresh: Ok(false),
-                chat_history_imports: Ok(Vec::new()),
+                ..empty_account_answers()
             }),
             groups: Arc::default(),
         };
