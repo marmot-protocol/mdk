@@ -14,11 +14,12 @@ use tokio::sync::{mpsc, oneshot};
 
 use super::account_worker::GroupCreationRequest;
 use super::{
-    AccountManager, AccountWorkerCommand, Emit, ReadClass, Unpublished, account_worker_response,
-    group_contributes_co_members, local_account_worker_response,
+    AccountManager, AccountWorkerCommand, Emit, ReadClass, ReadReply, Unpublished, WorkerLane,
+    account_worker_response, group_contributes_co_members, local_account_worker_response,
     long_account_worker_catch_up_response, long_account_worker_response,
     publish_app_runtime_group_state_updated,
 };
+use crate::client::read_state::{ReadAnswer, ReadState, reissue};
 use crate::messages::AppMessageIntent;
 use crate::{
     AgentOperationEventRequest, AgentTextStreamFinishRequest, AppBlobEndpoint,
@@ -32,7 +33,69 @@ use crate::{
 };
 use marmot_observability::AppPerformanceOperation;
 
+/// How a read answered from A behaves where its worker command differs: the
+/// wait a fallback to the worker takes, and whether a failure is counted.
+#[derive(Clone, Copy)]
+enum StateRead {
+    /// An in-memory read the worker answers through `reply`, within the
+    /// local wait.
+    Local,
+    /// A storage read the worker answers through `respond_diagnosed`,
+    /// within the app wait: a failure is counted as a storage failure.
+    Diagnosed,
+}
+
 impl AccountManager {
+    /// One account read answered from the worker's published read state, A
+    /// (mdk#3273). Admission is the worker lane's, as for a read the worker
+    /// answers; the answer then comes from one version on the caller's task,
+    /// with no queue wait. The worker answers instead, through `command`,
+    /// before its first publish and for a published failure that has no
+    /// exact copy ([`reissue`]).
+    async fn read_from_state<T>(
+        &self,
+        account_ref: &str,
+        class: ReadClass,
+        read: StateRead,
+        answer: impl FnOnce(&ReadState) -> ReadAnswer<T>,
+        command: impl FnOnce(ReadReply<Result<T, AppError>>) -> AccountWorkerCommand,
+    ) -> Result<T, AppError> {
+        let lane = self.worker_lane(account_ref).await?;
+        if let Some(answer) = self.answer_from_state(&lane, read, answer) {
+            return answer;
+        }
+        let (respond, response) = lane.read_reply(self.shared.observer.performance(), class);
+        lane.commands
+            .send(command(respond))
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        match read {
+            StateRead::Local => local_account_worker_response(response).await,
+            StateRead::Diagnosed => account_worker_response(response).await,
+        }
+    }
+
+    /// `answer` from `lane`'s current version of A, or `None` when the
+    /// worker must answer: before its first publish, or for a published
+    /// failure [`reissue`] cannot copy exactly.
+    fn answer_from_state<T>(
+        &self,
+        lane: &WorkerLane,
+        read: StateRead,
+        answer: impl FnOnce(&ReadState) -> ReadAnswer<T>,
+    ) -> Option<Result<T, AppError>> {
+        let result = match lane.read_state.version(&self.app.storage_closed) {
+            Ok(Some(state)) => reissue(answer(&state))?,
+            Ok(None) => return None,
+            Err(error) => Err(error),
+        };
+        if let (StateRead::Diagnosed, Err(error)) = (read, &result) {
+            let product = self.shared.observer.product();
+            product.storage_failure(product.permit().as_ref(), error);
+        }
+        Some(result)
+    }
+
     #[cfg(test)]
     pub(super) async fn unlink_device_for_test(&self, account_ref: &str) -> Result<(), AppError> {
         let commands = self.worker_commands(account_ref).await?;
@@ -802,12 +865,14 @@ impl AccountManager {
         &self,
         account_ref: &str,
     ) -> Result<Vec<AppQuarantinedGroup>, AppError> {
-        let (command, respond, response) = self.read_command(account_ref, ReadClass::R3).await?;
-        command
-            .send(AccountWorkerCommand::QuarantinedGroups { respond })
-            .await
-            .map_err(|_| AppError::TransportClosed)?;
-        local_account_worker_response(response).await
+        self.read_from_state(
+            account_ref,
+            ReadClass::R3,
+            StateRead::Local,
+            |state| Ok(state.quarantined_groups()),
+            |respond| AccountWorkerCommand::QuarantinedGroups { respond },
+        )
+        .await
     }
 
     /// Re-attempt hydration of a single quarantined group (mdk#426).
@@ -1544,24 +1609,28 @@ impl AccountManager {
         &self,
         account_ref: &str,
     ) -> Result<crate::BackupRestoreStatus, AppError> {
-        let (command, respond, response) = self.read_command(account_ref, ReadClass::R7).await?;
-        command
-            .send(AccountWorkerCommand::BackupRestoreStatus { respond })
-            .await
-            .map_err(|_| AppError::TransportClosed)?;
-        local_account_worker_response(response).await
+        self.read_from_state(
+            account_ref,
+            ReadClass::R7,
+            StateRead::Local,
+            |state| Ok(state.backup_restore_status()),
+            |respond| AccountWorkerCommand::BackupRestoreStatus { respond },
+        )
+        .await
     }
 
     pub async fn watch_backup_restore(
         &self,
         account_ref: &str,
     ) -> Result<crate::BackupRestoreWatch, AppError> {
-        let (command, respond, response) = self.read_command(account_ref, ReadClass::R7).await?;
-        command
-            .send(AccountWorkerCommand::WatchBackupRestore { respond })
-            .await
-            .map_err(|_| AppError::TransportClosed)?;
-        local_account_worker_response(response).await
+        self.read_from_state(
+            account_ref,
+            ReadClass::R7,
+            StateRead::Local,
+            |state| Ok(state.watch_backup_restore()),
+            |respond| AccountWorkerCommand::WatchBackupRestore { respond },
+        )
+        .await
     }
 
     pub async fn history_import_provenance(
@@ -1649,15 +1718,17 @@ impl AccountManager {
         account_ref: &str,
         group_id: &GroupId,
     ) -> Result<Option<crate::GroupCommitDelivery>, AppError> {
-        let (command, respond, response) = self.read_command(account_ref, ReadClass::R3).await?;
-        command
-            .send(AccountWorkerCommand::GroupCommitDelivery {
+        self.read_from_state(
+            account_ref,
+            ReadClass::R3,
+            StateRead::Diagnosed,
+            |state| state.group_commit_delivery(group_id),
+            |respond| AccountWorkerCommand::GroupCommitDelivery {
                 group_id: group_id.clone(),
                 respond,
-            })
-            .await
-            .map_err(|_| AppError::TransportClosed)?;
-        account_worker_response(response).await
+            },
+        )
+        .await
     }
 
     pub async fn dismiss_history_notice(
@@ -2802,12 +2873,14 @@ impl AccountManager {
         &self,
         account_ref: &str,
     ) -> Result<Option<cgka_traits::KeyPackageLifecycleState>, AppError> {
-        let (command, respond, response) = self.read_command(account_ref, ReadClass::R3).await?;
-        command
-            .send(AccountWorkerCommand::KeyPackageMaintenanceStatus { respond })
-            .await
-            .map_err(|_| AppError::TransportClosed)?;
-        account_worker_response(response).await
+        self.read_from_state(
+            account_ref,
+            ReadClass::R3,
+            StateRead::Diagnosed,
+            ReadState::key_package_maintenance_status,
+            |respond| AccountWorkerCommand::KeyPackageMaintenanceStatus { respond },
+        )
+        .await
     }
 
     pub async fn diagnostic_key_package_maintenance_status(
@@ -2817,6 +2890,13 @@ impl AccountManager {
         let Some(lane) = self.existing_worker_commands(account_ref).await? else {
             return Ok(None);
         };
+        if let Some(answer) = self.answer_from_state(
+            &lane,
+            StateRead::Diagnosed,
+            ReadState::key_package_maintenance_status,
+        ) {
+            return answer.map(Some);
+        }
         let (respond, response) =
             lane.read_reply(self.shared.observer.performance(), ReadClass::R3);
         lane.commands
@@ -2858,12 +2938,14 @@ impl AccountManager {
         &self,
         account_ref: &str,
     ) -> Result<Vec<cgka_traits::engine::KeyPackage>, AppError> {
-        let (command, respond, response) = self.read_command(account_ref, ReadClass::R3).await?;
-        command
-            .send(AccountWorkerCommand::DurablyOwnedKeyPackages { respond })
-            .await
-            .map_err(|_| AppError::TransportClosed)?;
-        account_worker_response(response).await
+        self.read_from_state(
+            account_ref,
+            ReadClass::R3,
+            StateRead::Diagnosed,
+            ReadState::durably_owned_key_packages,
+            |respond| AccountWorkerCommand::DurablyOwnedKeyPackages { respond },
+        )
+        .await
     }
 
     pub async fn maintenance_status(
@@ -2871,15 +2953,17 @@ impl AccountManager {
         account_ref: &str,
         group_id: &GroupId,
     ) -> Result<cgka_traits::GroupMaintenanceStatus, AppError> {
-        let (command, respond, response) = self.read_command(account_ref, ReadClass::R3).await?;
-        command
-            .send(AccountWorkerCommand::MaintenanceStatus {
+        self.read_from_state(
+            account_ref,
+            ReadClass::R3,
+            StateRead::Diagnosed,
+            |state| state.maintenance_status(group_id),
+            |respond| AccountWorkerCommand::MaintenanceStatus {
                 group_id: group_id.clone(),
                 respond,
-            })
-            .await
-            .map_err(|_| AppError::TransportClosed)?;
-        account_worker_response(response).await
+            },
+        )
+        .await
     }
 
     pub async fn schedule_manual_self_update(
@@ -2924,12 +3008,14 @@ impl AccountManager {
         &self,
         account_ref: &str,
     ) -> Result<cgka_traits::PeriodicMaintenancePolicy, AppError> {
-        let (command, respond, response) = self.read_command(account_ref, ReadClass::R3).await?;
-        command
-            .send(AccountWorkerCommand::PeriodicMaintenancePolicy { respond })
-            .await
-            .map_err(|_| AppError::TransportClosed)?;
-        account_worker_response(response).await
+        self.read_from_state(
+            account_ref,
+            ReadClass::R3,
+            StateRead::Diagnosed,
+            ReadState::periodic_maintenance_policy,
+            |respond| AccountWorkerCommand::PeriodicMaintenancePolicy { respond },
+        )
+        .await
     }
 
     pub async fn set_periodic_maintenance_policy(
@@ -3028,6 +3114,7 @@ mod tests {
                 commands,
                 shutdown,
                 unit: Default::default(),
+                read_state: Default::default(),
             },
         );
         let error = manager
@@ -3109,6 +3196,7 @@ mod tests {
                 commands,
                 shutdown,
                 unit: Default::default(),
+                read_state: Default::default(),
             },
         );
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
@@ -3192,6 +3280,7 @@ mod tests {
                 commands,
                 shutdown,
                 unit: Default::default(),
+                read_state: Default::default(),
             },
         );
         assert!(
@@ -3210,6 +3299,134 @@ mod tests {
                 .contains("unknown local group")
         );
         assert_eq!(runtime.reconcile_invocation_count().await, 0);
+        runtime.shutdown().await;
+    }
+
+    /// A failure in A that `reissue` copies reaches the host as the answer
+    /// the worker gives for it, compared by debug form as the oracle's
+    /// `same_answer` compares failures, with no queue wait. One with no exact
+    /// copy is answered by the worker's own command instead, its wait
+    /// recorded under the read's class (mdk#3273).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_published_failure_is_reissued_exactly_or_answered_by_the_worker() {
+        use super::super::{ManagedAccountWorker, MarmotAppRuntime};
+        use crate::client::read_state::read_state_channel;
+        use cgka_traits::PeriodicMaintenancePolicy;
+        use cgka_traits::error::EngineError;
+        use marmot_session::{AccountError, SessionError};
+
+        /// The read as the host makes it, answered by the fake worker with
+        /// `answer` if it goes to the worker.
+        async fn read(
+            manager: &AccountManager,
+            account: &str,
+            received: &mut mpsc::Receiver<AccountWorkerCommand>,
+            answer: Option<AppError>,
+        ) -> Result<PeriodicMaintenancePolicy, AppError> {
+            let Some(answer) = answer else {
+                return tokio::select! {
+                    biased;
+                    read = manager.periodic_maintenance_policy(account) => read,
+                    _ = received.recv() => panic!("the read went to the worker"),
+                };
+            };
+            let pending = manager.periodic_maintenance_policy(account);
+            tokio::pin!(pending);
+            let respond = tokio::select! {
+                biased;
+                command = received.recv() => match command {
+                    Some(AccountWorkerCommand::PeriodicMaintenancePolicy { respond }) => respond,
+                    _ => panic!("the read goes to the worker"),
+                },
+                read = &mut pending => panic!("the read answered without the worker: {read:?}"),
+            };
+            let _ = respond.send(Err(answer));
+            pending.await
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let account = marmot_account::AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let runtime = MarmotAppRuntime::new(crate::MarmotApp::with_relay(
+            dir.path(),
+            "wss://relay.example",
+        ));
+        let manager = runtime.accounts();
+        let (commands, mut received) = mpsc::channel(1);
+        let (publisher, read_state) = read_state_channel();
+        let (shutdown, stopped) = oneshot::channel();
+        let handle = tokio::spawn(async move {
+            let _ = stopped.await;
+        });
+        manager.workers.lock().await.insert(
+            account.account_id_hex.clone(),
+            ManagedAccountWorker {
+                ready: true,
+                media_admission: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                    super::super::MEDIA_COMMAND_QUEUE_LIMIT,
+                )),
+                handle,
+                commands,
+                shutdown,
+                unit: Default::default(),
+                read_state,
+            },
+        );
+        let telemetry = runtime.shared_services().observer.performance().clone();
+        let waits = || {
+            telemetry
+                .snapshot()
+                .runtime_operations
+                .into_iter()
+                .find(|sample| sample.operation == crate::RuntimePerformanceOperation::ReadQueueR3)
+                .map_or(0, |sample| sample.successes)
+        };
+        let publish = |failure: AppError| {
+            publisher.publish_for_test(|account| {
+                account.periodic_maintenance_policy = Err(std::sync::Arc::new(failure));
+            });
+        };
+
+        let group = GroupId::new(vec![0x11; 16]);
+        let storage = || cgka_traits::StorageError::Backend("disk".into());
+        let account_engine = |engine| AppError::Account(AccountError::Engine(engine));
+        let session_engine =
+            |engine| AppError::Account(AccountError::Session(SessionError::Engine(engine)));
+        let copyable: [&dyn Fn() -> AppError; 8] = [
+            &|| AppError::UnknownGroup("11".to_owned()),
+            &|| AppError::Storage(storage()),
+            &|| account_engine(EngineError::UnknownGroup(group.clone())),
+            &|| account_engine(EngineError::GroupNotHydrated(group.clone())),
+            &|| account_engine(EngineError::Storage(storage())),
+            &|| session_engine(EngineError::UnknownGroup(group.clone())),
+            &|| session_engine(EngineError::GroupNotHydrated(group.clone())),
+            &|| session_engine(EngineError::Storage(storage())),
+        ];
+        let uncopyable: [&dyn Fn() -> AppError; 3] = [
+            &|| AppError::Sqlite(rusqlite::Error::InvalidQuery),
+            &|| account_engine(EngineError::UnknownPending),
+            &|| session_engine(EngineError::UnknownPending),
+        ];
+        for (index, failure) in copyable.iter().enumerate() {
+            // A failure with no exact copy sends the read to the worker, whose
+            // answer the host gets, and whose wait counts under R3.
+            publish(uncopyable[index % uncopyable.len()]());
+            let before = waits();
+            let worker = read(&manager, &account.label, &mut received, Some(failure()))
+                .await
+                .unwrap_err();
+            assert_eq!(waits(), before + 1);
+
+            // The same failure in A answers on the caller's task, the same
+            // answer by debug form, and waits on no queue.
+            publish(failure());
+            let served = read(&manager, &account.label, &mut received, None)
+                .await
+                .unwrap_err();
+            assert_eq!(format!("{served:?}"), format!("{worker:?}"));
+            assert_eq!(waits(), before + 1);
+        }
         runtime.shutdown().await;
     }
 }

@@ -3294,16 +3294,13 @@ async fn account_local_ready_before_subscribe_body() {
         .expect("account reconciliation task must finish")
         .unwrap();
     assert_eq!(runtime.accounts().managed_accounts().unwrap().len(), 1);
-    assert!(
-        tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            runtime.quarantined_groups("alice"),
-        )
-        .await
-        .expect("worker-routed local reads must be served during registration")
-        .unwrap()
-        .is_empty()
-    );
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        crate::worker_fences::startup_sync_took_queued_commands(&runtime, "alice"),
+    )
+    .await
+    .expect("startup sync must serve local reads while registration is held")
+    .unwrap();
 
     let telemetry = runtime
         .shared_services()

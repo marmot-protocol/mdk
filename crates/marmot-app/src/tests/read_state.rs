@@ -1,5 +1,8 @@
 //! What A reuses across versions (mdk#3273 PR 2): group entries and the owned
-//! KeyPackage list, each until its validity stops holding.
+//! KeyPackage list, each until its validity stops holding. A rebuild that
+//! finds the published answers keeps them and the version, and the worker
+//! publishes an answer that changes with no write when its bound passes
+//! (PR 3).
 
 #[cfg(feature = "test-policy-overrides")]
 use super::canonical_membership::deliver_new;
@@ -9,7 +12,9 @@ use super::*;
 use crate::client::read_state::oracle::{
     KeyPackageInputs, LifetimeBound, check_reused_key_packages,
 };
-use crate::client::read_state::{GroupAnswers, ReadState, ReadStatePublisher, UploadsInFlight};
+use crate::client::read_state::{
+    GroupAnswers, ReadState, ReadStatePublisher, UploadsInFlight, read_state_channel,
+};
 use tokio::sync::watch;
 
 fn entry(state: &watch::Receiver<Arc<ReadState>>, group: &GroupId) -> (u64, Arc<GroupAnswers>) {
@@ -38,7 +43,8 @@ async fn an_application_message_keeps_the_group_entry_and_a_commit_replaces_it()
         .operation
         .unwrap();
     bob.join(&relay, &group).await;
-    bob.client.start_read_state(UploadsInFlight::default());
+    bob.client
+        .start_read_state(read_state_channel().0, UploadsInFlight::default());
     let state = bob.client.subscribe_read_state().unwrap();
     let (version, joined) = entry(&state, &group);
 
@@ -92,7 +98,7 @@ async fn a_fanout_write_alone_rebuilds_the_group_entry() {
         .update_group_profile(&group, Some("owed"), None)
         .await
         .unwrap();
-    client.start_read_state(UploadsInFlight::default());
+    client.start_read_state(read_state_channel().0, UploadsInFlight::default());
     let state = client.subscribe_read_state().unwrap();
     let (_, owed) = entry(&state, &group);
     assert!(
@@ -111,6 +117,65 @@ async fn a_fanout_write_alone_rebuilds_the_group_entry() {
     let (_, retired) = entry(&state, &group);
     assert!(!Arc::ptr_eq(&owed, &retired));
     assert_eq!(state.borrow().group_commit_delivery(&group).unwrap(), None);
+}
+
+/// A write the group's change generation counts makes the next publish
+/// rebuild the group's entry; when the rebuild finds the published answers,
+/// it keeps the published entry and the version, so hosts see no change and
+/// the oracle no changed publish to check.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_rebuild_that_finds_the_published_answers_keeps_the_version() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relays(
+        dir.path(),
+        vec![
+            "wss://relay-a.example".to_owned(),
+            "wss://relay-b.example".to_owned(),
+        ],
+    )
+    .with_test_relay_client(relay.clone());
+    let mut client = app.client("alice").await.unwrap();
+    let group = client
+        .create_group("rewritten", &[])
+        .await
+        .unwrap()
+        .operation
+        .unwrap();
+    relay.make_endpoints_unavailable(&["wss://relay-b.example"]);
+    client
+        .update_group_profile(&group, Some("owed"), None)
+        .await
+        .unwrap();
+    client.start_read_state(read_state_channel().0, UploadsInFlight::default());
+    let state = client.subscribe_read_state().unwrap();
+    let (version, owed) = entry(&state, &group);
+    let generation = |client: &AppClient| {
+        client
+            .runtime
+            .group_change_generations([&group])
+            .pop()
+            .unwrap()
+    };
+    let before = generation(&client);
+
+    // Rewrites every fanout row as it was.
+    app.account_storage("alice")
+        .unwrap()
+        .app_storage()
+        .execute_batch_for_test("UPDATE cgka_outbound_fanout SET record = record")
+        .unwrap();
+    assert!(
+        !generation(&client).state.unchanged_since(&before.state),
+        "the rewrite is a write the group's generation counts"
+    );
+    client.publish_read_state();
+    let (unchanged, kept) = entry(&state, &group);
+    assert_eq!(unchanged, version);
+    assert!(Arc::ptr_eq(&owed, &kept));
 }
 
 /// One unkeyed delete that retires fanouts of two groups, as a bulk path
@@ -153,7 +218,7 @@ async fn a_bulk_delete_rebuilds_every_group_entry_it_touches() {
             .await
             .unwrap();
     }
-    client.start_read_state(UploadsInFlight::default());
+    client.start_read_state(read_state_channel().0, UploadsInFlight::default());
     let state = client.subscribe_read_state().unwrap();
     let owed: Vec<_> = groups.iter().map(|group| entry(&state, group).1).collect();
     for group in &groups {
@@ -192,7 +257,7 @@ async fn a_failed_account_read_recovers_without_a_write() {
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
         .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
     let mut client = app.client("alice").await.unwrap();
-    client.start_read_state(UploadsInFlight::default());
+    client.start_read_state(read_state_channel().0, UploadsInFlight::default());
     let state = client.subscribe_read_state().unwrap();
     let storage = app.account_storage("alice").unwrap().app_storage();
 
@@ -238,7 +303,7 @@ async fn the_owned_key_package_list_is_reused_until_a_key_package_input_is_writt
         .unwrap()
         .operation
         .unwrap();
-    client.start_read_state(UploadsInFlight::default());
+    client.start_read_state(read_state_channel().0, UploadsInFlight::default());
     let state = client.subscribe_read_state().unwrap();
     let owned = state
         .borrow()
@@ -338,7 +403,7 @@ async fn an_uncounted_key_package_write_ends_the_lists_reuse() {
         .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
     let mut client = app.client("alice").await.unwrap();
     client.publish_key_package().await.unwrap();
-    client.start_read_state(UploadsInFlight::default());
+    client.start_read_state(read_state_channel().0, UploadsInFlight::default());
     client.publish_read_state();
     assert!(client.read_state_reused_key_packages());
 
@@ -377,7 +442,7 @@ async fn a_bundle_not_valid_yet_bounds_the_list_it_stays_out_of() {
         .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
     let mut client = app.client("alice").await.unwrap();
     client.publish_key_package().await.unwrap();
-    client.start_read_state(UploadsInFlight::default());
+    client.start_read_state(read_state_channel().0, UploadsInFlight::default());
     let state = client.subscribe_read_state().unwrap();
     let (version, published) = {
         let state = state.borrow();
@@ -397,6 +462,60 @@ async fn a_bundle_not_valid_yet_bounds_the_list_it_stays_out_of() {
     );
     assert_eq!(state.valid_until, Some(Timestamp(not_before)));
     assert!(state.version > version);
+}
+
+/// An owned KeyPackage not valid yet joins the list when its `not_before`
+/// passes, with no write: the account worker publishes then, with no
+/// command, delivery or write to prompt it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_worker_publishes_a_time_bound_answer_when_its_bound_passes() {
+    use std::sync::atomic::AtomicBool;
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+    let runtime = crate::MarmotAppRuntime::new(app.clone());
+    runtime.reconcile_accounts().await.unwrap();
+    runtime.publish_key_package("alice").await.unwrap();
+    let accounts = runtime.accounts();
+    let published = accounts.durably_owned_key_packages("alice").await.unwrap();
+
+    let not_before = crate::unix_now_seconds() + 2;
+    store_own_bundle_valid_from(&app, &published[0], not_before);
+    // A reply publishes the write first.
+    accounts.started_fresh("alice").await.unwrap();
+    let lane = accounts.worker_lane("alice").await.unwrap();
+    let open = AtomicBool::new(false);
+    let bounded = lane.read_state.version(&open).unwrap().unwrap();
+    assert_eq!(bounded.valid_until, Some(Timestamp(not_before)));
+    assert_eq!(
+        bounded.account.durably_owned_key_packages.as_ref().unwrap(),
+        &published
+    );
+
+    let mut versions = lane.read_state.subscribe();
+    let joined = tokio::time::timeout(
+        Duration::from_secs(6),
+        versions.wait_for(|state| {
+            state
+                .account
+                .durably_owned_key_packages
+                .as_ref()
+                .unwrap()
+                .len()
+                > published.len()
+        }),
+    )
+    .await
+    .expect("the worker publishes the list once the bundle is valid")
+    .unwrap()
+    .clone();
+    assert!(crate::unix_now_seconds() >= not_before);
+    assert!(joined.version > bounded.version);
+    assert_ne!(joined.valid_until, Some(Timestamp(not_before)));
+    runtime.shutdown_and_close().await.unwrap();
 }
 
 /// The oracle skips its fresh read of a reused KeyPackage list only while
@@ -420,7 +539,8 @@ async fn the_oracle_rereads_a_reused_key_package_list_once_an_input_or_the_clock
     // A read state before any build lists no KeyPackage, so a fresh read
     // differs from it: a check of it panics exactly when it reads the list
     // afresh.
-    let stale = ReadStatePublisher::new(UploadsInFlight::default()).current();
+    let stale =
+        ReadStatePublisher::new(read_state_channel().0, UploadsInFlight::default()).current();
     assert!(
         stale
             .account
@@ -594,7 +714,7 @@ async fn a_group_hidden_by_a_failed_device_group_check_is_read_again() {
     storage
         .execute_batch_for_test("CREATE TEMP TABLE device_groups (shadow INTEGER)")
         .unwrap();
-    client.start_read_state(UploadsInFlight::default());
+    client.start_read_state(read_state_channel().0, UploadsInFlight::default());
     let state = client.subscribe_read_state().unwrap();
     assert_eq!(state.borrow().host_may_see(&group), Some(false));
 
@@ -697,7 +817,7 @@ async fn a_clock_moved_back_rebuilds_the_time_dependent_entry() {
             bounded_until: Some(Timestamp(1_100)),
         })
         .unwrap();
-    client.start_read_state(UploadsInFlight::default());
+    client.start_read_state(read_state_channel().0, UploadsInFlight::default());
     let state = client.subscribe_read_state().unwrap();
     let (_, expired) = entry(&state, &group);
     assert_eq!(state.borrow().group_commit_delivery(&group).unwrap(), None);
@@ -735,7 +855,7 @@ async fn a_snapshot_never_leads_a() {
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
         .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
     let mut client = app.client("alice").await.unwrap();
-    client.start_read_state(UploadsInFlight::default());
+    client.start_read_state(read_state_channel().0, UploadsInFlight::default());
     let state = client.subscribe_read_state().unwrap();
     let group = client
         .create_group("snapshotted", &[])

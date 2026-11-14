@@ -6773,6 +6773,7 @@ fn controlled_reap_worker() -> (
             shutdown,
             commands,
             unit: Default::default(),
+            read_state: Default::default(),
         },
         release,
         dropped,

@@ -665,7 +665,9 @@ async fn late_activation_liveness() {
     })
     .await
     .expect("the subscription retry activates transport after preparation recovers");
-    runtime.periodic_maintenance_policy("alice").await.unwrap();
+    crate::worker_fences::worker_startup_finished(&runtime, "alice")
+        .await
+        .unwrap();
     let event = EventBuilder::new(Kind::MlsGroupMessage, "late activation")
         .tag(Tag::custom("h", ["ab".repeat(32)]))
         .finalize(&Keys::generate())

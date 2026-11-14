@@ -3,14 +3,18 @@
 //! today's behaviour: a change of the read-path plan that moves a read changes
 //! its row here on purpose.
 //!
-//! Every read the plan classifies goes down the account's real lane, in one
-//! FIFO, while a barrier or a held relay publish keeps the worker inside the
-//! unit. The unit's `read_queue_behind_<unit>` series must count each of them.
+//! Every read the worker still answers goes down the account's real lane, in
+//! one FIFO, while a barrier or a held relay publish keeps the worker inside
+//! the unit. The unit's `read_queue_behind_<unit>` series must count each of
+//! them. The reads that answer from A, the published read state (PR 3), go
+//! through their host wrappers instead: each must answer while the unit is
+//! still held, and none may count in a queue series.
 
 use futures::future::{BoxFuture, join_all};
 use marmot_observability::{PerformanceRecorder, RuntimePerformanceSnapshot};
 
 use super::*;
+use crate::AccountManager;
 
 const SETTLE: Duration = Duration::from_secs(10);
 
@@ -71,7 +75,7 @@ impl<T: Send + 'static> Pending for PendingResponse<T> {
     }
 }
 
-/// One command per read the plan classifies, each replying through `lane`.
+/// One command per read the worker answers, each replying through `lane`.
 /// The probes all record under one class: the class a host wrapper picks is
 /// not what these tests pin, the unit series is.
 fn host_reads(
@@ -100,7 +104,6 @@ fn host_reads(
         Snapshot MemberIdsPage { group_ids: vec![group_id()] }
         Snapshot GroupMlsState { group_id: group_id() }
         Snapshot GroupRoster { group_id: group_id() }
-        Snapshot QuarantinedGroups {}
         NotReady CaptureConversation {
             queued: None,
             group_id: group_id(),
@@ -113,11 +116,6 @@ fn host_reads(
         Waits StartedFresh {}
         Waits ChatHistoryImports {}
         Waits HistoryImportProvenance { group_id: group_id(), event_id: "00".repeat(32) }
-        Waits GroupCommitDelivery { group_id: group_id() }
-        Waits KeyPackageMaintenanceStatus {}
-        Waits DurablyOwnedKeyPackages {}
-        Waits PeriodicMaintenancePolicy {}
-        Waits MaintenanceStatus { group_id: group_id() }
         Waits PendingWelcomeDeliveries {}
         Waits AccountDevicesActivation { group_id: group_id() }
         Waits GroupAppComponent { group_id: group_id(), component_id: 0 }
@@ -132,8 +130,6 @@ fn host_reads(
         Waits BackupSettings {}
         Waits ChatsClosedToLinkedDevices {}
         Waits BackupHistoryAvailability { group_id: group_id() }
-        Waits BackupRestoreStatus {}
-        Waits WatchBackupRestore {}
         Waits BuildMediaImetaTag {
             group_id: group_id(),
             reference: MediaAttachmentReference {
@@ -154,6 +150,48 @@ fn host_reads(
         Waits GroupRecoveryStatus { group_id: group_id() }
         Waits AccountRecoveryStatus {}
     }
+}
+
+/// The reads that answer from A (mdk#3273 PR 3), each through its host
+/// wrapper while `behind` holds the worker: every one answers before the unit
+/// ends, and none queues on the worker, so neither its class's series nor the
+/// unit's counts it.
+async fn reads_from_published_state(
+    accounts: &AccountManager,
+    account: &str,
+    telemetry: &PerformanceRecorder,
+    group: &GroupId,
+    behind: RuntimeOp,
+) {
+    let queued = || {
+        [behind, RuntimeOp::ReadQueueR3, RuntimeOp::ReadQueueR7]
+            .map(|operation| sample(telemetry, operation).started)
+    };
+    let before = queued();
+    timeout(SETTLE, async {
+        accounts.quarantined_groups(account).await.unwrap();
+        accounts
+            .group_commit_delivery(account, group)
+            .await
+            .unwrap();
+        accounts.maintenance_status(account, group).await.unwrap();
+        accounts
+            .key_package_maintenance_status(account)
+            .await
+            .unwrap();
+        accounts
+            .diagnostic_key_package_maintenance_status(account)
+            .await
+            .unwrap()
+            .expect("the worker is running");
+        accounts.durably_owned_key_packages(account).await.unwrap();
+        accounts.periodic_maintenance_policy(account).await.unwrap();
+        accounts.backup_restore_status(account).await.unwrap();
+        accounts.watch_backup_restore(account).await.unwrap();
+    })
+    .await
+    .unwrap_or_else(|_| panic!("a held {behind:?} keeps a read of A waiting"));
+    assert_eq!(queued(), before, "a read of A queued on the worker");
 }
 
 fn sample(telemetry: &PerformanceRecorder, operation: RuntimeOp) -> RuntimePerformanceSnapshot {
@@ -208,7 +246,10 @@ async fn probe_held_snapshot_unit(
     }
     let (respond, fence) = ReadReply::unobserved();
     lane.commands
-        .send(AccountWorkerCommand::QuarantinedGroups { respond })
+        .send(AccountWorkerCommand::Members {
+            group_id: group.clone(),
+            respond,
+        })
         .await
         .unwrap();
     timeout(SETTLE, fence)
@@ -242,11 +283,11 @@ async fn probe_held_snapshot_unit(
 }
 
 /// Startup sync, an explicit catch-up and a send, each held in turn on one
-/// account. Startup sync and the catch-up answer five reads from their
+/// account. Startup sync and the catch-up answer four reads from their
 /// snapshot and the conversation capture with `NotReady`; every other read
-/// waits for the unit to end. A send answers nothing: the worker takes no
-/// command until its relays answer, so the lane fills and a ninth read cannot
-/// even be admitted.
+/// the worker answers waits for the unit to end. A send answers nothing: the
+/// worker takes no command until its relays answer, so the lane fills and a
+/// ninth read cannot even be admitted. The reads of A answer through each.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn host_reads_wait_behind_held_worker_units() {
     let dir = tempfile::tempdir().unwrap();
@@ -284,6 +325,14 @@ async fn host_reads_wait_behind_held_worker_units() {
         RuntimeOp::ReadQueueBehindStartupSync,
     )
     .await;
+    reads_from_published_state(
+        &runtime.accounts(),
+        "alice",
+        &telemetry,
+        &group,
+        RuntimeOp::ReadQueueBehindStartupSync,
+    )
+    .await;
     startup.wait().await;
     held.all_answered(&telemetry).await;
 
@@ -312,6 +361,14 @@ async fn host_reads_wait_behind_held_worker_units() {
     let held =
         probe_held_snapshot_unit(&lane, &telemetry, &group, RuntimeOp::ReadQueueBehindCatchUp)
             .await;
+    reads_from_published_state(
+        &runtime.accounts(),
+        "alice",
+        &telemetry,
+        &group,
+        RuntimeOp::ReadQueueBehindCatchUp,
+    )
+    .await;
     catch_up.wait().await;
     timeout(SETTLE, catching_up)
         .await
@@ -358,6 +415,15 @@ async fn host_reads_wait_behind_held_worker_units() {
     let held = sample(&telemetry, RuntimeOp::ReadQueueBehindSend);
     assert_eq!(held.started - before.started, probes.len() as u64);
     assert_eq!(held.in_flight - before.in_flight, probes.len() as u64);
+    // The reads of A answer although the lane is full.
+    reads_from_published_state(
+        &runtime.accounts(),
+        "alice",
+        &telemetry,
+        &group,
+        RuntimeOp::ReadQueueBehindSend,
+    )
+    .await;
     // The rest wait for a slot, as a host read would.
     let admitting = tokio::spawn({
         let commands = lane.commands.clone();
@@ -385,8 +451,8 @@ async fn host_reads_wait_behind_held_worker_units() {
 }
 
 /// A scheduled convergence pass answers the same reads from its snapshot as
-/// startup sync and an explicit catch-up; every other read waits for the
-/// pass to end.
+/// startup sync and an explicit catch-up; every other read the worker answers
+/// waits for the pass to end, and the reads of A answer through it.
 // Pauses the clock, which needs the current-thread runtime.
 #[tokio::test(flavor = "current_thread")]
 #[cfg(feature = "test-policy-overrides")]
@@ -457,6 +523,14 @@ async fn host_reads_wait_behind_a_held_convergence_pass() {
         .expect("the due pass reaches its hold");
     let held = probe_held_snapshot_unit(
         &lane,
+        &telemetry,
+        &group,
+        RuntimeOp::ReadQueueBehindConvergence,
+    )
+    .await;
+    reads_from_published_state(
+        &runtime.accounts(),
+        "bob",
         &telemetry,
         &group,
         RuntimeOp::ReadQueueBehindConvergence,

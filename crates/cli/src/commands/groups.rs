@@ -1976,8 +1976,9 @@ mod tests {
             .expect("creator-only group created");
         let bob = bob_app.runtime();
         bob.start().await.unwrap();
-        // This real worker read drains startup before the acceptance request.
-        bob.key_package_maintenance_status("bob").await.unwrap();
+        marmot_app::worker_fences::worker_startup_finished(&bob, "bob")
+            .await
+            .unwrap();
         assert!(
             bob_app
                 .group("bob", &hex::encode(group.as_slice()))
@@ -1997,7 +1998,9 @@ mod tests {
             Poll::Ready(())
         })
         .await;
-        bob.key_package_maintenance_status("bob").await.unwrap();
+        marmot_app::worker_fences::worker_round_trip(&bob, "bob")
+            .await
+            .unwrap();
         poll_fn(|cx| {
             assert!(
                 acceptance.as_mut().poll(cx).is_pending(),

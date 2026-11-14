@@ -5,12 +5,12 @@
 //! the worker goes through one of them or names why it does not.
 
 use super::*;
-use crate::client::read_state::{ReadState, UploadsInFlight};
+use crate::client::read_state::{ReadState, UploadsInFlight, read_state_channel};
 
 /// A client that publishes A, with the receiver a host would read.
 async fn publishing_client(app: &MarmotApp) -> (AppClient, watch::Receiver<Arc<ReadState>>) {
     let mut client = app.client("alice").await.unwrap();
-    client.start_read_state(UploadsInFlight::default());
+    client.start_read_state(read_state_channel().0, UploadsInFlight::default());
     let state = client
         .subscribe_read_state()
         .expect("the client publishes A");

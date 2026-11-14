@@ -124,6 +124,7 @@ impl Fixture {
                 media_admission: Arc::new(Semaphore::new(1)),
                 shutdown,
                 unit: Default::default(),
+                read_state: Default::default(),
             },
         );
         let f = Self {
@@ -1802,6 +1803,7 @@ async fn closing_window_cannot_abandon_reconcile_worker_teardown() {
             shutdown,
             media_admission: Arc::new(Semaphore::new(1)),
             unit: Default::default(),
+            read_state: Default::default(),
         },
     );
     let mut sub = f

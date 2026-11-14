@@ -1153,13 +1153,31 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   window from the one reading its lifetimes are judged at to its next lifetime bound (a listed `not_after` or a
   pending bundle's `not_before`), and the read fully succeeded, with no bundle skipped as undecodable and no lifetime
   check that disagrees with that reading. `ReadState::valid_until` is the earliest window end;
-  a change of it alone publishes a version. A new input of a reused answer must be in its validity or move one of
+  a change of it alone publishes a version, and the worker loop wakes when it passes
+  (`AppClient::read_state_deadline`, each bound on its own clock) and publishes at the loop top. A rebuilt entry
+  whose answers equal the published ones (`GroupAnswers::same_as`, which destructures every field) keeps the
+  published entry and the version. A new input of a reused answer must be in its validity or move one of
   its counts (a new table needs a `storage-sqlite` `cross/group_writes.rs` trigger). In this crate's own tests,
   every publish that changed something, and every reused KeyPackage list, is checked against today's live reads
   (`read_state::oracle`); the only pair let through unequal is one where a terminal storage close landed between
   the publish and the check and one side is that close's `Closed` error. The oracle runs in this crate's unit tests
   and, through the runner's `CARGO_PKG_NAME`, its integration tests; downstream crates' tests link `test-support`
   too (feature unification) and run without it (`oracle::enabled`). Keep its proof in this crate's suites.
+- The account reads in `runtime/commands.rs` that answer from A (`read_from_state`) take the worker lane's
+  admission, then answer from one version on the caller's task: no I/O, no queue wait. The lane carries a
+  `ReadStateReader`, paired with the worker's `ReadStateSender` at spawn. The reader checks
+  `MarmotApp::storage_closed` after taking the version and before reading it (`close_storage` sets the flag before it
+  closes any database), and answers `TransportClosed` once the worker's publisher is gone. A published failure is
+  served only as an exact copy (`read_state::reissue`), never a lossy one; one with no copy, and any read before the
+  first publish, goes to the worker's command, which stays as that fallback and records its wait under the read's
+  class. A storage read counts its failure as the worker's
+  `respond_diagnosed` would. Moving a read to A moves its row in `read_queue_tests.rs` and in
+  `runtime-latency-telemetry.md`'s "Host read classes"; don't move a multi-device read (mdk#2628) without Jeff.
+- A read answered from A waits for no worker unit, so it fences nothing. Tests here and in the host crates fence the
+  worker through `src/worker_fences.rs` (startup finished, startup sync took the queued commands, a worker round
+  trip), never a read they pick; wn-cli's socket tests mirror the startup fence in `wait_for_daemon_worker_startup`.
+  Moving a read to A, or retiring startup's snapshot reads, updates those helpers; `each_fence_waits_for_what_it_names`
+  fails until it does.
 
 ## Code map (modules not covered above)
 
@@ -1193,11 +1211,12 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   (`MarmotApp`'s usage-diagnostics consent persistence and the headless-host analytics configuration; it reaches the
   product collector only through `marmot_observability::wiring`, consent lock before state lock), `projection.rs` (legacy account
   projection import), `messages/` (`AppMessageIntent` and custom-event intents), `local_open_test_gate.rs` and
-  `test_support.rs` (test-only gates/helpers).
+  `test_support.rs` (test-only gates/helpers), `worker_fences.rs` (named account-worker fences for tests, under
+  `test-support`).
 - `src/runtime/`: `worker_startup.rs` (per-account startup admission and retry backoff),
   `account_worker/recovery_credits.rs` (process-wide recovery credit pool), `account_worker/read_queue.rs` (host-read
-  queue-wait telemetry: `ReadReply`, the read classes and the worker-unit gauge, mdk#3273; observes only, never
-  reorders), `conversation_window.rs`, `chat_list_window.rs`,
+  queue-wait telemetry: `ReadReply`, the read classes, the worker-unit gauge and the lane's A reader, mdk#3273;
+  observes only, never reorders), `conversation_window.rs`, `chat_list_window.rs`,
   `presentation.rs`, `presented_chat_list.rs`, `account_attention.rs` (presentation windows and account-switcher
   attention), `chat_list_selection.rs` (select-all IDs and revalidation), `user_blocks.rs`, `moderation.rs` (reports, admin labels and operator moderation reports),
   `local_submissions.rs`,
@@ -1234,8 +1253,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
 - `product-analytics-export`: product analytics export path; forwards to `marmot-observability/product-analytics-export`.
 - `media-benchmarks`: internal surface for the media transport benchmarks.
 - `test-support`: makes `AppClient` and `MarmotApp::client` public for tests that drive a directly owned client
-  (mdk#2782), exposes `error_kind_table` to the host crates' tests and turns on `marmot-observability/test-support`
-  (the diagnostics test fixtures and hooks). Enable it only as a dev-dependency. This crate's own dev-dependency on
+  (mdk#2782), exposes `error_kind_table` and `worker_fences` to the host crates' tests and turns on
+  `marmot-observability/test-support` (the diagnostics test fixtures and hooks). Enable it only as a dev-dependency. This crate's own dev-dependency on
   itself turns it on, so `-p marmot-app` test runs build every integration test. Hosts reach accounts through
   `MarmotAppRuntime`; `wn sync` runs its one pass through `MarmotApp::sync_account`, whose outer error is the open and
   whose inner `SyncFailure` is the pass. `AppClient` methods only tests call carry

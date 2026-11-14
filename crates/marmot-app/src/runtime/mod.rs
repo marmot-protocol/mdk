@@ -29,6 +29,7 @@ use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{sleep, timeout};
 
 use crate::agent_streams::AgentStreamWatchManager;
+use crate::client::read_state::read_state_channel;
 use crate::client::sign_out::{SiblingSignOut, SignOutAdminLeave, SignOutLeave};
 use crate::directory_resources::directory_account;
 use crate::ids::{account_id_hex_from_ref, normalize_group_id_hex_app};
@@ -7901,6 +7902,7 @@ impl AccountManager {
                     let (shutdown_tx, shutdown_rx) = oneshot::channel();
                     let (command_tx, command_rx) = mpsc::channel(8);
                     let unit = Arc::new(WorkerUnitGauge::default());
+                    let (read_state_tx, read_state) = read_state_channel();
                     let (unlinked_tx, unlinked_rx) = oneshot::channel();
                     self.deactivate_when_unlinked(
                         account.account_id_hex.clone(),
@@ -7918,6 +7920,7 @@ impl AccountManager {
                             shared: self.shared.clone(),
                             unlinked: unlinked_tx,
                             unit: unit.clone(),
+                            read_state: read_state_tx,
                         },
                         command_tx.clone(),
                         command_rx,
@@ -7934,6 +7937,7 @@ impl AccountManager {
                             media_admission: Arc::new(Semaphore::new(MEDIA_COMMAND_QUEUE_LIMIT)),
                             shutdown: shutdown_tx,
                             unit,
+                            read_state,
                         },
                     );
                     ready_receivers.push((account_id, Instant::now(), ready_rx, startup_progress));

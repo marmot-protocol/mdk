@@ -666,6 +666,28 @@ fn run_json_with_relay(home: &std::path::Path, relay: &str, args: &[&str]) -> Va
     value["result"].clone()
 }
 
+/// Wait until the daemon's worker for `account` has finished startup.
+///
+/// The daemon's surface for `marmot_app::worker_fences::worker_startup_finished`
+/// and the same call: a hosted read every startup phase defers until startup
+/// ends, today the pending Welcome deliveries. A read answered from the
+/// published read state answers at once and fences nothing (mdk#3273), and
+/// `wn sync` restarts the worker. Change this with that helper.
+fn wait_for_daemon_worker_startup(home: &std::path::Path, socket: &str, account: &str) {
+    let pending = run_json(
+        home,
+        &[
+            "--socket",
+            socket,
+            "--account",
+            account,
+            "groups",
+            "pending-welcomes",
+        ],
+    );
+    assert!(pending["pending_welcome_deliveries"].is_array());
+}
+
 fn run_json_error(home: &std::path::Path, args: &[&str]) -> Value {
     let output = wn(home)
         .args(args)
@@ -9970,8 +9992,8 @@ fn groups_recovery_quarantine_welcome_and_management_inspection_have_stable_cont
     );
     assert_eq!(bad_token["code"], "invalid_rejoin_token");
     // Decline rejects startup catch-up as busy before it validates the offer.
-    // Keep one real actor and wait for its deferred read to finish startup.
-    // A CLI sync would restart that actor; the hosted key-status read does not.
+    // Keep one real actor and wait for its startup to end; a CLI sync would
+    // restart the actor.
     let socket = wn_cli::daemon::default_socket_path(home.path());
     let socket_arg = socket.to_str().expect("socket path");
     let daemon = DaemonGuard::start(&socket, |wnd| {
@@ -9987,19 +10009,7 @@ fn groups_recovery_quarantine_welcome_and_management_inspection_have_stable_cont
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
     });
-    let ready = run_json(
-        home.path(),
-        &[
-            "--socket",
-            socket_arg,
-            "--account",
-            &alice,
-            "keys",
-            "maintenance-status",
-        ],
-    );
-    assert_eq!(ready["account_id"], alice);
-    assert!(ready["key_package_maintenance"].is_object());
+    wait_for_daemon_worker_startup(home.path(), socket_arg, &alice);
     let declined = run_json_error(
         home.path(),
         &[

@@ -1740,9 +1740,7 @@ async fn read_state_oracle_runs_in_marmot_app_integration_tests() {
     .await
     .account
     .account_id_hex;
-    // A worker command publishes the read state before it replies.
-    runtime
-        .key_package_maintenance_status(&account)
+    marmot_app::worker_fences::worker_round_trip(&runtime, &account)
         .await
         .unwrap();
     assert!(marmot_app::read_state_oracle_checks() > 0);

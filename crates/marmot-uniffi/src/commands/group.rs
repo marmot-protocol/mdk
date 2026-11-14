@@ -1651,8 +1651,9 @@ mod tests {
             .unwrap()
             .account
             .account_id_hex;
-        // A worker command publishes the read state before it replies.
-        kit.key_package_maintenance_status(account).await.unwrap();
+        marmot_app::worker_fences::worker_round_trip(&kit.runtime, &account)
+            .await
+            .unwrap();
         assert_eq!(marmot_app::read_state_oracle_checks(), 0);
     }
 
