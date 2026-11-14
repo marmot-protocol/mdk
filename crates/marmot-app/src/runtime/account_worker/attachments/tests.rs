@@ -775,19 +775,10 @@ async fn download_without_engine_and_retain(
             "a deliberately retried outgoing receipt remains single-body; pure explicit received work keeps its existing contract"
         );
     }
-    assert!(
-        shared.attachment_reservations.total() > 0,
-        "an admitted download reserves disk until its body is stored"
-    );
     complete_and_settle(&mut client, done, &shared, &http, &mut completions).await;
     assert_eq!(
         shared.attachment_transfer.available_permits(),
         crate::runtime::ATTACHMENT_TRANSFER_LIMIT
-    );
-    assert_eq!(
-        shared.attachment_reservations.total(),
-        0,
-        "storing the body releases its reservation"
     );
     assert_eq!(
         &*read_retained(
@@ -2793,201 +2784,259 @@ async fn a_file_left_behind_mid_pass_is_reached_by_a_restarted_sweep() {
     );
 }
 
+/// The default policy's disk figures: the reserve, and what one download at
+/// the automatic limit may write.
+fn default_disk() -> (storage_sqlite::AttachmentDownloadPolicy, u64) {
+    let policy =
+        super::super::super::attachment_controls::default_policy(&MarmotAppConfig::white_noise());
+    let need = media_store::DiskPolicy::download_need(policy.transfer_limit, 0);
+    (policy, need)
+}
+
 /// One account's backlog runs [`crate::runtime::ATTACHMENT_TRANSFER_LIMIT`]
-/// downloads at once: each pass starts one and asks for another while
-/// candidates remain, the global permits bound the total, and the per-account
-/// HTTP slot reserved for foreground work stays free.
+/// downloads at once when free space covers them all: each pass starts one
+/// and asks for another while candidates remain, the global permits bound the
+/// total, and the per-account HTTP slot reserved for foreground work stays
+/// free.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn attachment_worker_runs_the_transfer_limit_concurrently() {
     let limit = crate::runtime::ATTACHMENT_TRANSFER_LIMIT;
-    let (shared, http, still_due) = drive_held_backlog(None, None, limit).await;
-    assert_eq!(still_due, 1);
-    assert_eq!(shared.attachment_transfer.available_permits(), 0);
+    let (policy, need) = default_disk();
+    let mut backlog = HeldBacklog::new(policy.disk_reserve + limit as u64 * need).await;
+    backlog.drive().await;
+    backlog.expect_started(limit).await;
+    assert_eq!(backlog.shared.attachment_transfer.available_permits(), 0);
     assert_eq!(
-        http.permits.available_permits(),
+        backlog.http.permits.available_permits(),
         1,
         "the foreground slot stays free"
     );
+    assert_eq!(backlog.still_due(), 1);
 }
 
-/// Transfers in flight have not written their bodies yet, so a pass reserves
-/// what each may still write: free space for one download admits one, not
-/// one per back-to-back pass.
+/// Below room for every concurrent transfer, the worker runs one at a time,
+/// as with a single slot: that transfer holds every global permit, and the
+/// rest stay queued and due rather than taking a retry.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn attachment_worker_reserves_disk_for_transfers_in_flight() {
-    let policy =
-        super::super::super::attachment_controls::default_policy(&MarmotAppConfig::white_noise());
-    let one =
-        policy.disk_reserve + media_store::DiskPolicy::download_need(policy.transfer_limit, 0);
-    assert!(capacity(&policy, policy.transfer_limit, None, one));
-    let (shared, _http, still_due) = drive_held_backlog(Some(one), None, 1).await;
-    assert_eq!(
-        still_due,
-        crate::runtime::ATTACHMENT_TRANSFER_LIMIT,
-        "the rest wait queued for the in-flight reservation, not a 15-second retry"
-    );
-    assert_eq!(
-        shared.attachment_transfer.available_permits(),
-        crate::runtime::ATTACHMENT_TRANSFER_LIMIT - 1
-    );
-}
-
-/// Another account's admitted download reserves what its own limit needs,
-/// not this account's: a 512 MiB-limit transfer in flight leaves no room for
-/// this account's download where pricing it at this account's limit would.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn attachment_worker_reserves_other_accounts_transfer_needs() {
-    let policy =
-        super::super::super::attachment_controls::default_policy(&MarmotAppConfig::white_noise());
-    let own = media_store::DiskPolicy::download_need(policy.transfer_limit, 0);
-    let foreign = media_store::DiskPolicy::download_need(512 * 1024 * 1024, 0);
-    assert!(foreign > 2 * own);
-    // No transfer starts: free space covers this account's download only if
-    // the foreign transfer is priced at this account's limit.
-    let (_, _, still_due) =
-        drive_held_backlog(Some(policy.disk_reserve + 2 * own), Some(foreign), 0).await;
-    assert_eq!(still_due, crate::runtime::ATTACHMENT_TRANSFER_LIMIT + 1);
-}
-
-/// Seed one more attachment than the transfer limit against a server that
-/// holds every request open, drive the worker's attachment passes, and check
-/// that exactly `expected` transfers start.
-async fn drive_held_backlog(
-    free: Option<u64>,
-    foreign_reservation: Option<u64>,
-    expected: usize,
-) -> (RuntimeSharedServices, MediaHttpContext, usize) {
-    use tokio::io::AsyncReadExt;
+async fn attachment_worker_runs_one_transfer_at_a_time_on_a_tight_disk() {
     let limit = crate::runtime::ATTACHMENT_TRANSFER_LIMIT;
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    let (requested, mut requests) = mpsc::unbounded_channel::<()>();
-    // Hold every request open, so each admitted transfer stays in flight.
-    let server = tokio::spawn(async move {
-        let mut held = Vec::new();
-        loop {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let mut request = [0; 4096];
-            assert!(socket.read(&mut request).await.unwrap() > 0);
-            requested.send(()).unwrap();
-            held.push(socket);
-        }
-    });
-    let dir = tempfile::tempdir().unwrap();
-    if let Some(free) = free {
-        crate::media::attachment_resume::test_free_space::set(dir.path(), free);
-    }
-    AccountHome::open(dir.path())
-        .create_account("alice")
+    let (policy, need) = default_disk();
+    let mut backlog = HeldBacklog::new(policy.disk_reserve + limit as u64 * need - 1).await;
+    backlog.drive().await;
+    backlog.expect_started(1).await;
+    assert_eq!(backlog.shared.attachment_transfer.available_permits(), 0);
+    assert_eq!(backlog.still_due(), limit, "the rest wait queued and due");
+}
+
+/// On a tight disk, a transfer in flight elsewhere (another account's) is
+/// waited for in the semaphore's queue, with every candidate left queued and
+/// due; the next starts alone as soon as it finishes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tight_disk_waits_for_transfers_in_flight_then_runs_alone() {
+    let limit = crate::runtime::ATTACHMENT_TRANSFER_LIMIT;
+    let (policy, need) = default_disk();
+    let mut backlog = HeldBacklog::new(policy.disk_reserve + need).await;
+    let other = backlog
+        .shared
+        .attachment_transfer
+        .clone()
+        .try_acquire_owned()
         .unwrap();
-    let app = MarmotApp::with_relay_and_config(
-        dir.path(),
-        "wss://relay.example",
-        MarmotAppConfig {
-            attachment_acquisition: Some(crate::AttachmentAcquisitionPolicy::default()),
-            allow_loopback_blob_endpoints: true,
-            ..MarmotAppConfig::white_noise()
-        },
-    )
-    .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
-    let mut client = app.client("alice").await.unwrap();
-    let storage = app.account_storage("alice").unwrap();
-    let mut first = None;
-    for message in 0..=limit {
-        let (mut reference, _) =
-            crate::media::tests::attachment_worker_fixture(format!("image {message}").as_bytes());
-        reference.locators = vec![crate::MediaLocator {
-            kind: "blossom-v1".into(),
-            value: format!("http://{address}/{}", reference.ciphertext_sha256),
-        }];
-        if message == 0 {
-            // The accepted group plus its first attachment message.
-            seed_direction(&storage.app_storage(), &reference, false, "received");
-            first = Some(reference);
-            continue;
+    assert!(
+        backlog.drive().await <= 2,
+        "it waits in the queue instead of passing again"
+    );
+    backlog.expect_started(0).await;
+    assert!(backlog.admission.is_waiting(), "it waits for every permit");
+    assert_eq!(backlog.still_due(), limit + 1);
+    drop(other);
+    backlog.drive().await;
+    backlog.expect_started(1).await;
+    assert_eq!(backlog.shared.attachment_transfer.available_permits(), 0);
+}
+
+/// The concurrent-room rule prices transfers at the largest limit any account
+/// admitted under: another account's larger limit makes this one's disk
+/// tight where its own limit alone would not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_room_uses_the_largest_account_limit() {
+    let limit = crate::runtime::ATTACHMENT_TRANSFER_LIMIT;
+    let (policy, need) = default_disk();
+    let mut backlog = HeldBacklog::new(policy.disk_reserve + limit as u64 * need).await;
+    backlog.shared.attachment_limit_bound.store(
+        4 * policy.transfer_limit,
+        std::sync::atomic::Ordering::Release,
+    );
+    backlog.drive().await;
+    backlog.expect_started(1).await;
+    assert_eq!(backlog.still_due(), limit);
+}
+
+/// One more attachment than the transfer limit, against a server that holds
+/// every request open so each admitted transfer stays in flight, with free
+/// space pinned for the account.
+struct HeldBacklog {
+    dir: tempfile::TempDir,
+    client: AppClient,
+    storage: SqliteAccountStorage,
+    shared: RuntimeSharedServices,
+    http: MediaHttpContext,
+    _completions: mpsc::UnboundedReceiver<MediaHttpDone>,
+    admission: Admission,
+    requests: mpsc::UnboundedReceiver<()>,
+    server: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for HeldBacklog {
+    fn drop(&mut self) {
+        crate::media::attachment_resume::test_free_space::clear(self.dir.path());
+        self.server.abort();
+    }
+}
+
+impl HeldBacklog {
+    async fn new(free: u64) -> Self {
+        use tokio::io::AsyncReadExt;
+        let limit = crate::runtime::ATTACHMENT_TRANSFER_LIMIT;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (requested, requests) = mpsc::unbounded_channel::<()>();
+        // Hold every request open, so each admitted transfer stays in flight.
+        let server = tokio::spawn(async move {
+            let mut held = Vec::new();
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0; 4096];
+                assert!(socket.read(&mut request).await.unwrap() > 0);
+                requested.send(()).unwrap();
+                held.push(socket);
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        crate::media::attachment_resume::test_free_space::set(dir.path(), free);
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let app = MarmotApp::with_relay_and_config(
+            dir.path(),
+            "wss://relay.example",
+            MarmotAppConfig {
+                attachment_acquisition: Some(crate::AttachmentAcquisitionPolicy::default()),
+                allow_loopback_blob_endpoints: true,
+                ..MarmotAppConfig::white_noise()
+            },
+        )
+        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+        let mut client = app.client("alice").await.unwrap();
+        let storage = app.account_storage("alice").unwrap();
+        let mut first = None;
+        for message in 0..=limit {
+            let (mut reference, _) = crate::media::tests::attachment_worker_fixture(
+                format!("image {message}").as_bytes(),
+            );
+            reference.locators = vec![crate::MediaLocator {
+                kind: "blossom-v1".into(),
+                value: format!("http://{address}/{}", reference.ciphertext_sha256),
+            }];
+            if message == 0 {
+                // The accepted group plus its first attachment message.
+                seed_direction(&storage.app_storage(), &reference, false, "received");
+                first = Some(reference);
+                continue;
+            }
+            let id = format!("{:02x}", 0x40 + message).repeat(32);
+            storage
+                .app_storage()
+                .record_app_event(&StoredAppEvent {
+                    group_id_hex: GROUP.into(),
+                    message_id_hex: id.clone(),
+                    source_message_id_hex: Some(id),
+                    source_epoch: Some(3),
+                    direction: "received".into(),
+                    sender: "33".repeat(32),
+                    plaintext: String::new(),
+                    kind: 9,
+                    tags: vec![reference.imeta_tag()],
+                    recorded_at: 10,
+                    received_at: 10 + message as u64,
+                    origin_commit_id: None,
+                    moderation_grant: false,
+                })
+                .unwrap();
         }
-        let id = format!("{:02x}", 0x40 + message).repeat(32);
+        client.state.groups.push(projection(&first.unwrap()));
         storage
             .app_storage()
-            .record_app_event(&StoredAppEvent {
-                group_id_hex: GROUP.into(),
-                message_id_hex: id.clone(),
-                source_message_id_hex: Some(id),
-                source_epoch: Some(3),
-                direction: "received".into(),
-                sender: "33".repeat(32),
-                plaintext: String::new(),
-                kind: 9,
-                tags: vec![reference.imeta_tag()],
-                recorded_at: 10,
-                received_at: 10 + message as u64,
-                origin_commit_id: None,
-                moderation_grant: false,
-            })
+            .remember_encrypted_media_epoch_secret(
+                GROUP,
+                crate::GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
+                3,
+                &[7; 32],
+            )
             .unwrap();
-    }
-    client.state.groups.push(projection(&first.unwrap()));
-    storage
-        .app_storage()
-        .remember_encrypted_media_epoch_secret(
-            GROUP,
-            crate::GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
-            3,
-            &[7; 32],
-        )
-        .unwrap();
-    let shared = RuntimeSharedServices::default();
-    // Another account's admitted transfer: a global permit and its reservation.
-    let _foreign = foreign_reservation.map(|bytes| TransferSlot {
-        _permit: shared
-            .attachment_transfer
-            .clone()
-            .try_acquire_owned()
-            .unwrap(),
-        _reserved: Some(shared.attachment_reservations.reserve(bytes)),
-    });
-    let (mut http, _completions) = context();
-    http.permits = Arc::new(Semaphore::new(super::super::MEDIA_HTTP_IN_FLIGHT_LIMIT));
-    let mut admission = Admission::default();
-    // Drive the worker loop: run a pass while one is asked for, and take the
-    // next permit when a pass parked on global capacity.
-    let mut due = true;
-    for _ in 0..64 {
-        if due {
-            due = schedule(&client, &shared, &http, &mut admission).unwrap();
-        } else if admission.is_waiting() {
-            match tokio::time::timeout(Duration::from_millis(200), admission.ready()).await {
-                Ok(more) => due = more,
-                Err(_) => break,
-            }
-        } else {
-            break;
+        let (mut http, completions) = context();
+        http.permits = Arc::new(Semaphore::new(super::super::MEDIA_HTTP_IN_FLIGHT_LIMIT));
+        Self {
+            dir,
+            client,
+            storage,
+            shared: RuntimeSharedServices::default(),
+            http,
+            _completions: completions,
+            admission: Admission::default(),
+            requests,
+            server,
         }
     }
-    for started in 0..expected {
-        tokio::time::timeout(Duration::from_secs(5), requests.recv())
-            .await
-            .unwrap_or_else(|_| panic!("transfer {} of {expected} never started", started + 1))
-            .unwrap();
+
+    /// Drive the worker loop: run a pass while one is asked for, and take
+    /// the next permits when a pass parked on global capacity. Returns the
+    /// passes run.
+    async fn drive(&mut self) -> usize {
+        let mut due = true;
+        let mut passes = 0;
+        for _ in 0..64 {
+            if due {
+                passes += 1;
+                due =
+                    schedule(&self.client, &self.shared, &self.http, &mut self.admission).unwrap();
+            } else if self.admission.is_waiting() {
+                match tokio::time::timeout(Duration::from_millis(200), self.admission.ready()).await
+                {
+                    Ok(more) => due = more,
+                    Err(_) => break,
+                }
+            } else {
+                break;
+            }
+        }
+        passes
     }
-    assert!(
-        tokio::time::timeout(Duration::from_millis(300), requests.recv())
-            .await
-            .is_err(),
-        "a transfer past {expected} started"
-    );
-    // Candidates that did not start stay queued and due, in order: a
-    // reservation that only waits for transfers in flight defers nothing.
-    let still_due = storage
-        .app_storage()
-        .due_attachment_acquisitions(crate::unix_now_seconds(), 32)
-        .unwrap()
-        .len();
-    if free.is_some() {
-        crate::media::attachment_resume::test_free_space::clear(dir.path());
+
+    /// Exactly `expected` more transfers start.
+    async fn expect_started(&mut self, expected: usize) {
+        for started in 0..expected {
+            tokio::time::timeout(Duration::from_secs(5), self.requests.recv())
+                .await
+                .unwrap_or_else(|_| panic!("transfer {} of {expected} never started", started + 1))
+                .unwrap();
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), self.requests.recv())
+                .await
+                .is_err(),
+            "a transfer past {expected} started"
+        );
     }
-    server.abort();
-    (shared, http, still_due)
+
+    /// Candidates still queued and due: none took a retry.
+    fn still_due(&self) -> usize {
+        self.storage
+            .app_storage()
+            .due_attachment_acquisitions(crate::unix_now_seconds(), 32)
+            .unwrap()
+            .len()
+    }
 }
 
 /// A pass whose candidate stays due must not ask for another pass. Deferral
@@ -3059,62 +3108,4 @@ async fn attachment_pass_does_not_repeat_a_candidate_that_stays_due() {
         )
         .unwrap();
     assert_eq!(state, 1, "the stuck candidate is still due");
-}
-
-/// Account workers admit concurrently. Measuring free space, checking it and
-/// reserving are one step under the reservations' lock, and a release takes
-/// that lock too: an admission or a release from another account cannot land
-/// between a measurement and the reservation it funds.
-#[test]
-fn disk_reservation_measures_and_reserves_as_one_step() {
-    let reservations = DiskReservations::default();
-    let other = reservations.reserve(10);
-    // Another account's transfer finishes and releases while this admission
-    // measures. The release waits for the admission, so the measurement
-    // (which already shows that transfer's written body) is checked with its
-    // reservation still held: counted twice, never missed.
-    let (measuring, measured) = std::sync::mpsc::channel();
-    let releaser = std::thread::spawn(move || {
-        measured.recv().unwrap();
-        let started = std::time::Instant::now();
-        drop(other);
-        started.elapsed()
-    });
-    let admitted = reservations.try_reserve(
-        10,
-        || {
-            measuring.send(()).unwrap();
-            std::thread::sleep(Duration::from_millis(50));
-            Some(10)
-        },
-        |free| free >= 10,
-    );
-    assert!(
-        admitted.is_err(),
-        "a measurement is checked against the reservations held when it was taken"
-    );
-    assert!(
-        releaser.join().unwrap() >= Duration::from_millis(40),
-        "a release waited for the admission measuring beside it"
-    );
-    assert_eq!(reservations.total(), 0, "the release then took effect");
-    let admitted = reservations.try_reserve(10, || Some(10), |free| free >= 10);
-    assert!(admitted.is_ok());
-    assert_eq!(reservations.total(), 10);
-    assert_eq!(
-        reservations
-            .try_reserve(10, || Some(10), |free| free >= 10)
-            .err(),
-        Some(DiskRefusal::InFlight),
-        "room for one admits one; the next fits once that one releases"
-    );
-    assert_eq!(
-        reservations
-            .try_reserve(10, || Some(5), |free| free >= 10)
-            .err(),
-        Some(DiskRefusal::NoRoom),
-        "no room even with nothing reserved"
-    );
-    drop(admitted);
-    assert_eq!(reservations.total(), 0, "a dropped reservation releases");
 }

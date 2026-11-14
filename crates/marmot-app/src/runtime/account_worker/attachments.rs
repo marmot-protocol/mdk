@@ -38,97 +38,6 @@ type PermitWait = std::pin::Pin<
     >,
 >;
 
-/// One admitted attachment transfer's hold on runtime capacity: its global
-/// permit, and the disk its download may still write. Both are held until the
-/// transfer's result is stored (or it ends without one), then released together.
-pub(super) struct TransferSlot {
-    _permit: OwnedSemaphorePermit,
-    _reserved: Option<DiskReservation>,
-}
-
-/// The disk the runtime's admitted attachment downloads may still write, in
-/// every account. Admission sets it aside from measured free space: a transfer
-/// in flight may not have written its body yet, and other accounts' transfers
-/// may have different limits.
-///
-/// One lock covers measuring free space, checking it and reserving, and every
-/// release takes it too. Account workers admit concurrently, so no other
-/// admission can land between one's check and its reservation, and no release
-/// (which follows that transfer's writes) can land between a measurement and
-/// the reservation it funds. A release racing a measurement is at worst
-/// counted twice, never missed.
-#[derive(Clone, Default)]
-pub(crate) struct DiskReservations(Arc<std::sync::Mutex<u64>>);
-
-impl DiskReservations {
-    fn held(&self) -> std::sync::MutexGuard<'_, u64> {
-        self.0
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    /// What admitted downloads still hold.
-    pub(crate) fn total(&self) -> u64 {
-        *self.held()
-    }
-
-    /// Measures free space and reserves `bytes` if `fits` accepts free space
-    /// less what other admissions hold, as one step.
-    fn try_reserve(
-        &self,
-        bytes: u64,
-        measure: impl FnOnce() -> Option<u64>,
-        fits: impl Fn(u64) -> bool,
-    ) -> Result<DiskReservation, DiskRefusal> {
-        let mut held = self.held();
-        let Some(free) = measure() else {
-            return Err(DiskRefusal::NoRoom);
-        };
-        if !fits(free.saturating_sub(*held)) {
-            return Err(if *held > 0 && fits(free) {
-                DiskRefusal::InFlight
-            } else {
-                DiskRefusal::NoRoom
-            });
-        }
-        *held = held.saturating_add(bytes);
-        Ok(DiskReservation {
-            bytes,
-            reservations: self.clone(),
-        })
-    }
-
-    #[cfg(test)]
-    fn reserve(&self, bytes: u64) -> DiskReservation {
-        self.try_reserve(bytes, || Some(u64::MAX), |_| true)
-            .ok()
-            .unwrap()
-    }
-}
-
-/// Why [`DiskReservations::try_reserve`] reserved nothing.
-#[derive(Debug, PartialEq, Eq)]
-enum DiskRefusal {
-    /// Free space is unknown, or too small even with nothing reserved.
-    NoRoom,
-    /// It fits once transfers in flight store their bodies or end: their
-    /// reservations price a whole transfer, a stored body far less.
-    InFlight,
-}
-
-/// One admitted download's share of [`DiskReservations`], released on drop.
-struct DiskReservation {
-    bytes: u64,
-    reservations: DiskReservations,
-}
-
-impl Drop for DiskReservation {
-    fn drop(&mut self) {
-        let mut held = self.reservations.held();
-        *held = held.saturating_sub(self.bytes);
-    }
-}
-
 /// At most one queued permit request per active account. Keeping the future
 /// across worker select turns preserves Tokio semaphore FIFO fairness.
 #[derive(Default)]
@@ -738,17 +647,27 @@ fn capacity(
     let disk = media_store::DiskPolicy {
         reserve_bytes: policy.disk_reserve,
     };
-    admissible_limit(max)
-        && disk.admit(free, admission_need(max, recorded)) == media_store::Admission::Admitted
-}
-
-/// What a download of up to `max` body bytes may still write, crediting a
-/// recorded checkpoint with one unrecorded append (see [`capacity`]).
-fn admission_need(max: u64, recorded: Option<u64>) -> u64 {
     let on_disk = recorded.map_or(0, |recorded| {
         recorded.saturating_add(media_store::CHECKPOINT_APPEND_MAX as u64)
     });
-    media_store::DiskPolicy::download_need(max, on_disk)
+    let needed = media_store::DiskPolicy::download_need(max, on_disk);
+    admissible_limit(max) && disk.admit(free, needed) == media_store::Admission::Admitted
+}
+
+/// Whether free space covers every transfer the runtime may run at once
+/// ([`crate::runtime::ATTACHMENT_TRANSFER_LIMIT`]) each writing the most the
+/// largest account limit (`limit_bound`) allows, above the reserve.
+fn concurrent_admission_fits(
+    policy: &storage_sqlite::AttachmentDownloadPolicy,
+    free: u64,
+    limit_bound: u64,
+) -> bool {
+    let disk = media_store::DiskPolicy {
+        reserve_bytes: policy.disk_reserve,
+    };
+    let need = (crate::runtime::ATTACHMENT_TRANSFER_LIMIT as u64)
+        .saturating_mul(media_store::DiskPolicy::download_need(limit_bound, 0));
+    disk.admit(free, need) == media_store::Admission::Admitted
 }
 
 fn admissible_limit(max: u64) -> bool {
@@ -959,13 +878,19 @@ pub(super) fn schedule(
         admission.waiting = None;
         return Ok(more);
     }
-    // Transfers already admitted, in any account, may not have written their
-    // bodies yet: set aside what each reserved, so passes that run back to
-    // back cannot all admit against the same free bytes. Readmission decides
-    // on that remainder; admission measures and reserves again, as one step.
-    let account_dir = client.app.account_dir(&client.state.label);
-    let measure = || crate::media::attachment_resume::available_space(&account_dir).ok();
-    let free = measure().map(|free| free.saturating_sub(shared.attachment_reservations.total()));
+    // Publish this account's limit before measuring, and read the bound
+    // after: an admission concurrent with another account's then always has
+    // the later of the two checks covering both transfers.
+    shared
+        .attachment_limit_bound
+        .fetch_max(policy.transfer_limit, std::sync::atomic::Ordering::AcqRel);
+    let free = crate::media::attachment_resume::available_space(
+        &client.app.account_dir(&client.state.label),
+    )
+    .ok();
+    let limit_bound = shared
+        .attachment_limit_bound
+        .load(std::sync::atomic::Ordering::Acquire);
     // Jobs parked for disk space rejoin the due page only once the device can
     // publish them; their checkpoints make the readmitted attempt local work.
     // Unknown free space readmits nothing, as it admits nothing below.
@@ -984,6 +909,7 @@ pub(super) fn schedule(
         shared.attachment_updates.state_changed();
     }
     let more = more || readmitted == ATTACHMENT_ACQUISITION_BATCH_LIMIT;
+    let free = free.unwrap_or(0);
     let candidates =
         storage
             .app_storage()
@@ -992,12 +918,42 @@ pub(super) fn schedule(
         admission.waiting = None;
         return Ok(more);
     }
-    let Some(background_permit) = held_permit else {
+    let Some(mut background_permit) = held_permit else {
         if admission.waiting.is_none() {
             admission.waiting = Some(Box::pin(shared.attachment_transfer.clone().acquire_owned()));
         }
         return Ok(more);
     };
+    // Transfers run concurrently only while free space covers every one the
+    // runtime may run writing the most any account's limit allows: none of
+    // them then needs to know what the others still write. Otherwise a
+    // transfer holds every global permit, one at a time as with a single
+    // slot, and admission measures free space with nothing else in flight.
+    // When others are in flight, wait for all of them in the semaphore's
+    // FIFO queue: candidates stay queued and due, and the wait ends the
+    // moment the last one finishes, in any account.
+    let limit = crate::runtime::ATTACHMENT_TRANSFER_LIMIT;
+    if background_permit.num_permits() < limit
+        && !concurrent_admission_fits(&policy, free, limit_bound)
+    {
+        match shared
+            .attachment_transfer
+            .clone()
+            .try_acquire_many_owned((limit - background_permit.num_permits()) as u32)
+        {
+            Ok(rest) => background_permit.merge(rest),
+            Err(_) => {
+                drop(background_permit);
+                admission.waiting = Some(Box::pin(
+                    shared
+                        .attachment_transfer
+                        .clone()
+                        .acquire_many_owned(limit as u32),
+                ));
+                return Ok(more);
+            }
+        }
+    }
     let Ok(permit) = http.permits.clone().try_acquire_owned() else {
         return Ok(more);
     };
@@ -1074,10 +1030,6 @@ pub(super) fn schedule(
             else {
                 continue;
             };
-            let background_permit = TransferSlot {
-                _permit: background_permit,
-                _reserved: None,
-            };
             let media = client
                 .app
                 .account_media_store(&client.state.label, &storage)?;
@@ -1123,30 +1075,14 @@ pub(super) fn schedule(
         let recorded = storage
             .app_storage()
             .attachment_checkpoint_recorded(&candidate)?;
-        // Reserve before preparing: a later skip of this candidate drops the
-        // reservation. Measurement, check and reservation are one step, so no
-        // other account's admission or release lands between them.
-        let reserved = match shared.attachment_reservations.try_reserve(
-            admission_need(reservation, recorded),
-            measure,
-            |free| capacity(&policy, reservation, recorded, free),
-        ) {
-            Ok(reserved) => reserved,
-            // Room returns when a transfer in flight stores its body or ends;
-            // this account's completion runs the next pass (another account's
-            // at the next maintenance tick). Leave this and every later
-            // candidate queued and due, keeping their order, rather than
-            // deferring a page of them behind a reservation.
-            Err(DiskRefusal::InFlight) => return Ok(more),
-            Err(DiskRefusal::NoRoom) => {
-                storage.app_storage().finish_attachment_preparation(
-                    &candidate,
-                    now,
-                    Some(now.saturating_add(15)),
-                )?;
-                continue;
-            }
-        };
+        if !capacity(&policy, reservation, recorded, free) {
+            storage.app_storage().finish_attachment_preparation(
+                &candidate,
+                now,
+                Some(now.saturating_add(15)),
+            )?;
+            continue;
+        }
         // Free disk is the only gate (mdk#2314): retained media has no byte
         // budget, so a full budget can no longer stall downloads.
         let group = match hex::decode(&source.group_id_hex) {
@@ -1218,10 +1154,6 @@ pub(super) fn schedule(
                 .claim_attachment_acquisition(&candidate, now, lease_until)?
         else {
             continue;
-        };
-        let background_permit = TransferSlot {
-            _permit: background_permit,
-            _reserved: Some(reserved),
         };
         let media = client
             .app

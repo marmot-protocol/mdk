@@ -194,18 +194,15 @@ downloads retain their 512 MiB ciphertext cap. Admission reserves the configured
 transfer limit (64 MiB by default) against quota, including explicit queued requests whose
 references have no declared size. This avoids requiring 512 MiB of unused quota for tiny
 explicit files. Checkpoint and publication checks enforce actual quota and disk use as files
-grow; a final remainder below the admission reservation can still stay unused. Each admitted
-download reserves its own need, under its account's limit, in a runtime-wide total until
-its body is stored or the attempt ends; admission sets that total aside from free space,
-since a transfer in flight may not have written its body yet. Measuring free space, the
-capacity check and the reservation happen under one lock that every release also takes, so
-no other account's admission or release lands between a measurement and the reservation it
-funds; passes in any account, back to back or concurrent, cannot all admit against the same
-free bytes. A reservation prices a whole transfer, far more than a typical image body, so
-a candidate that fits once transfers in flight release theirs is not deferred: the pass
-ends and it stays queued and due, in order, for the pass that a transfer's completion runs
-(another account's completion reaches it at the next maintenance tick). Only a candidate
-that does not fit with nothing reserved takes the 15-second retry. Storage-blocked readmission decides on the same remainder.
+grow; a final remainder below the admission reservation can still stay unused.
+
+Transfers run concurrently only while free space, above the reserve, covers all four
+writing the most the largest account limit seen in the runtime allows, so none needs to
+know what the others still write. Below that, a transfer holds all four global permits and
+runs alone, exactly as with a single slot, and admission measures free space with nothing
+else in flight. A pass that finds others still in flight waits for all four permits in the
+semaphore's FIFO queue: its candidates stay queued and due, and the wait ends as soon as
+the last transfer finishes, in any account.
 Unknown free space fails closed. These are resource limits, not an OS background-execution
 entitlement or mobile throughput evidence.
 

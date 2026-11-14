@@ -1,7 +1,7 @@
 //! Per-account worker: command surface, the worker loop, reconnect backoff,
 //! and the runtime-event publishing helpers the loop drives.
 
-pub(super) mod attachments;
+mod attachments;
 mod read_queue;
 pub(crate) mod recovery_credits;
 
@@ -4176,12 +4176,12 @@ fn store_acquired_avatar(
 enum MediaHttpCompletion {
     AttachmentRetained {
         result: Result<(), AppError>,
-        background_permit: attachments::TransferSlot,
+        background_permit: OwnedSemaphorePermit,
     },
     Attachment {
         job: storage_sqlite::AttachmentAcquisition,
         result: Result<crate::client::AcquiredMediaBody, crate::media::AttachmentDownloadFailure>,
-        background_permit: attachments::TransferSlot,
+        background_permit: OwnedSemaphorePermit,
     },
     Avatar {
         job: storage_sqlite::AvatarAcquisition,

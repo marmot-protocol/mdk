@@ -44,7 +44,9 @@
 - Attachment downloads run four at a time across a runtime's accounts instead
   of one, and each account's media HTTP lane grows from four slots to five so
   one slot stays free for foreground work. A screen of images no longer
-  downloads one by one behind a single slot.
+  downloads one by one behind a single slot. While free space cannot cover
+  four transfers at the largest account limit, they run one at a time as
+  before, with the rest left queued.
 - `request_automatic_attachment` for queued work moves it ahead of other
   automatic downloads, most recent request first, so what a screen shows
   downloads before background backlog. Taps still go first; state, backoff
