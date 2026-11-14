@@ -30,10 +30,11 @@ On a hydrated account open or a live audit enable, at most 64 stored groups rece
 eligible, selected, omitted by that cap, and unreadable; these are read counts, not durable-write
 claims. A failed group enumeration leaves all four counts unknown.
 
-Account recovery, transport-cursor, subscription-refusal and recovery-runner pause rows exist only in v5 (see
+Account recovery, transport-cursor, subscription-refusal and recovery-runner rows exist only in v5 (see
 [Account recovery owner rows](#account-recovery-owner-rows-v5-only),
-[`subscription_refused`](#subscription_refused-v5-only) and
-[`recovery_runner_paused`](#recovery_runner_paused-v5-only)); a v4 recorder drops them.
+[`subscription_refused`](#subscription_refused-v5-only),
+[`recovery_runner_paused`](#recovery_runner_paused-v5-only) and
+[Recovery runner rows](#recovery-runner-rows-v5-only)); a v4 recorder drops them.
 
 The host can configure a dedicated v5 OTLP `/v1/logs` sender in memory through
 `MarmotAppRuntime::set_audit_otlp_sender(Some(sender))`, or through the additive
@@ -297,8 +298,9 @@ This catalogue is not yet complete. These event kinds have no section here yet â
 `epoch_stall_backfill_failed` are historical: the backfill bracket that wrote them went with the old recovery
 owner (#2660 phase 4). The v5-only recovery kinds are written up under
 [Account recovery owner rows](#account-recovery-owner-rows-v5-only), the v5-only refusal row under
-[`subscription_refused`](#subscription_refused-v5-only), and the runner's pause row under
-[`recovery_runner_paused`](#recovery_runner_paused-v5-only).
+[`subscription_refused`](#subscription_refused-v5-only), the runner's pause row under
+[`recovery_runner_paused`](#recovery_runner_paused-v5-only), and its fetch, race and state-change rows under
+[Recovery runner rows](#recovery-runner-rows-v5-only).
 
 The authoritative catalogue is the `AuditEventKind` enum together with
 [`audit-log-event.v4.schema.json`](../../crates/marmot-forensics/schema/audit-log-event.v4.schema.json); the
@@ -1026,8 +1028,9 @@ row.
 
 `recovery_attempt_started`, `recovery_attempt_finished` and `recovery_obligation_reassessed` are historical. The old
 owner's grant wrote them; it was deleted in #2660 phase 4, and with the recovery runner on by default since PR 5g no
-production build had written them since. Readers keep decoding them for older logs. A runner pass is not yet
-represented beyond [`recovery_runner_paused`](#recovery_runner_paused-v5-only).
+production build had written them since. Readers keep decoding them for older logs. The recovery runner writes its own
+rows: [`recovery_runner_paused`](#recovery_runner_paused-v5-only) and the
+[Recovery runner rows](#recovery-runner-rows-v5-only).
 
 Producers live in [`client/audit_recovery.rs`](../../crates/marmot-app/src/client/audit_recovery.rs); storage reports
 the transitions ([`account_recovery/observe.rs`](../../crates/storage-sqlite/src/account_recovery/observe.rs)).
@@ -1295,8 +1298,7 @@ Notes:
 ### `recovery_runner_paused` (v5 only)
 
 The phase 4 recovery runner's account breaker paused this account's history fetches at a rolling-hour cap (mdk#2660).
-The runner records it in a worker turn once per pause. Nothing writes it until the runner owns recovery debt, which
-an internal gate keeps off. Account-scoped, so `group_ref` is `None`.
+The runner records it in a worker turn once per pause. Account-scoped, so `group_ref` is `None`.
 
 | Field | Meaning |
 | --- | --- |
@@ -1309,6 +1311,86 @@ an internal gate keeps off. Account-scoped, so `group_ref` is `None`.
 
 A pause is a bug signal: the per-unit backoff and per-relay cooldowns should stop a misbehaving relay or route long
 before the account's caps. The pause changes no unit; units stay due and run once the hour rolls.
+
+### Recovery runner rows (v5 only)
+
+What the recovery runner (`client/history_recovery/recovery_runner/`, mdk#2660 phase 4) did for each group over time: every fetch it
+settled, the begins it abandoned, and each unit or route state change. The runner writes them through its turns' audit
+hook (`WorkerTurn::audit`, `DebtTurn::audit`); the account host writes the route-change and retention-prune rows from
+its debt-turn preparation. Producers: [`recovery_runner/audit.rs`](../../crates/marmot-app/src/client/history_recovery/recovery_runner/audit.rs).
+
+A group route's rows carry the group's `group_ref`; the inbox's and the aggregate rows are account-scoped. Where a row
+names its route, `obligation_ref` is the hash of the route's one-way ledger tag, so every row about one route joins
+on it, and so does any `recovery_need_changed` `unproven_history` notice row an older producer wrote for that route.
+`endpoint_ref` is the unit's relay. No group, route or relay id, event id or payload is recorded.
+
+Volume follows real work, not the scheduler: one `recovery_runner_fetched` row per quantum that began, one
+`recovery_runner_changed` row per transition, and abandoned begins coalesced into at most one `recovery_runner_raced`
+row per route per 60 seconds. Surveys (about once a second while busy), idle steps and catching-up flips write none.
+A group whose live edge keeps reopening debt shows as a run of `recovery_runner_fetched` rows, which is the point.
+
+#### `recovery_runner_fetched`
+
+One debt or re-check quantum on one (route, relay) unit, written in its settle turn.
+
+| Field | Meaning |
+| --- | --- |
+| `route_kind` | `inbox` or `group`. |
+| `obligation_ref` | The route's ledger tag, hashed (see above). |
+| `retained_route` | The route is a group's retained prior route, owed only through its switch. |
+| `endpoint_ref` | The unit's relay, hashed. |
+| `best_effort` | The relay is best effort for the route: one uncharged attempt per new debt. |
+| `fetch` | `sweep` (sliced `REQ`s) or `compare` (NIP-77, fetching the difference by id). |
+| `purpose` | Most specific first: `recheck` (late input on covered history), `repair` (explicit full-history repair), `post_join_collection` (a joined copy's history), `epoch_gap_visit` (a return visit an unresolved epoch gap authorized), `fenced` (debt of a group whose live frames a capture fence holds), `debt` (anything else: loss, cold start, a widened goal). |
+| `probe` | The quantum is a broken unit's probe: timed, or earned by new loss over its park. |
+| `ranges` | Owed ranges the begin turn planned. |
+| `owed_secs` | Seconds those ranges hold: what the unit owed after its live tail as the quantum began (for a re-check, what it still checks). |
+| `owed_since_secs` / `owed_until_secs` | The first and last planned second: the debt window. |
+| `outcome` | The runner's settlement: `advanced`, `nothing_owed`, `no_progress`, `unreachable`, `rate_limited`, `refused`, `unanswered` (preempted), `local_failure`. |
+| `end` | How the last relay call ended: `finished`, `deadline`, `cancelled`, `budget_spent`, `withheld`, `saturated_second`, `saturated_window`, `inconclusive_second`, `rate_limited`, `refused`, `unsupported`, `timed_out`, `disconnected`, `sink_failed`, `store_failed`. |
+| `duration_ms` | From the end of the begin turn to the end of the fetch, before settlement. |
+| `requests` / `answers` | Requests sent and answers the relay gave. |
+| `newly_covered_secs` | Seconds this quantum newly covered on the unit's own relay: the runner's measure of progress. |
+| `proved_secs` | Seconds in the slices or windows it proved, newly or not. |
+| `events_fetched` | Events in the relay answers the runner read (answered slices, proved seconds, fetches by id), whether or not they were then staged; a capped answer the sweep asks again in halves counts too. A second the relay cannot prove hands over no events, so what it read there shows only in the account's charged bytes. |
+| `events_staged` | Of those, events newly staged for admission (not already held or staged). Admission into the engine is the ingest rows'. |
+| `late_findings` | Events a re-check found inside history already covered. Zero for debt. |
+| `raced` | Begins on this route abandoned as raced since its previous runner row (see `recovery_runner_raced`). |
+
+#### `recovery_runner_raced`
+
+Begins abandoned because the unit the runner picked owed nothing, or was no longer eligible, once it began (nothing
+was charged or fetched). Counted per route; the race that finds the route's open window at least 60 seconds old writes
+one row for the window. Whatever a window holds when the route's next fetch row is written goes on that row's `raced`
+instead, so each race is counted once. A window no later race or fetch closes is lost at shutdown.
+
+| Field | Meaning |
+| --- | --- |
+| `route_kind` / `obligation_ref` | The route, as above. |
+| `raced` | Begins abandoned in the window, at least one. |
+| `window_secs` | Seconds from the window's first race to the race that wrote it. |
+
+#### `recovery_runner_changed`
+
+A unit or route changed state. Transition-driven: each appears once per change.
+
+| `change` | When | Carries |
+| --- | --- | --- |
+| `broken` | An active or retired unit broke: its remaining debt is parked, and it is retried only by a timed probe (an hour after it breaks, doubling to a day) or when new evidence re-arms it. | route, `endpoint_ref`, `break_reason` (`no_progress`, `refused`), `park_revision` |
+| `probe_failed` | A broken unit's probe made no progress or was refused; it stays parked under the same park and waits longer for its next timed probe. | as `broken` |
+| `rearmed` | A broken unit is active again after a quantum (often its probe) advanced or found nothing owed. | route, `endpoint_ref` |
+| `caps_rearmed` | A relay's recorded NIP-11 caps changed and re-armed its broken units planned with other caps. | `endpoint_ref`, `units` |
+| `repair_rearmed` | An explicit repair re-armed every broken and retired unit. | `units` |
+| `retired_gone` | A route no longer carries some relays, or ended: their units' debt and parks retired as route gone. | route, `units` |
+| `reopened` | Relays the routes carry again owe their whole goal again. | `units` |
+| `suspended` | The route's group copy is Unrecoverable: its units are no longer scheduled, charged or broken while its debt accrues. Each process records every suspended route it finds once. | route |
+| `resumed` | A suspended route is scheduled again. | route |
+| `remainder_parked` | The retention floor overtook debt nothing had proved yet: the route gained a parked remainder, which only a rejoin or the route ending clears. | route, `park_revision`, `remainder_since_secs`, `remainder_until_secs` |
+| `remainder_widened` | A later prune widened the route's remainder. | as `remainder_parked` |
+
+"Route" is `route_kind` with `obligation_ref`; `units` counts the units changed and is at least one. The account-wide
+pause stays [`recovery_runner_paused`](#recovery_runner_paused-v5-only); notice rows stay `recovery_need_changed`, and
+the coverage ledger no longer raises any.
 
 ### `auto_commit_decision`
 
@@ -1722,7 +1804,8 @@ let server-side tooling collate multiple devices into group-level analytics.
 | Which obligations did one recovery attempt serve, over which relays, within which budgets? | Not represented for the recovery runner. Older logs: `recovery_attempt_started`, joined to its other rows by `record_context.operation_ref`. |
 | What did the relays return, and what did processing keep? | Not represented for the recovery runner. Older logs: `recovery_attempt_finished`: routes compared and certified, events retrieved / duplicate / rejected / retained / refused, relay counts, and the pass `outcome`. Engine application stays on `ingest_outcome`. |
 | Why did history recovery fail on a relay? | Not represented for the recovery runner. Older logs: `recovery_attempt_finished.relay_outcomes`: per failed relay, the failure class (NEG-ERR and its category, the negentropy-cap NOTICE, a timeout, a relay outside the pool or not usable, a refused fetch) and how many routes it failed. |
-| Why did recovery stop, retry, wait or park, and is another attempt permitted? | For the recovery runner, `recovery_runner_paused` and the "history may be incomplete" rows below. Older logs: `recovery_obligation_reassessed` per settled obligation: `verdict`, `next_attempt`, progress, certified scopes and the quiet streak against the parking budget. |
+| Is a group continually trying to catch up, and what does it think it owes? | `recovery_runner_fetched` per quantum, by `group_ref`: its `purpose` and `fetch`, the owed window and seconds, and what it covered, fetched and staged; `recovery_runner_raced` for begins that found nothing owed. |
+| Why did recovery stop, retry, wait or park, and is another attempt permitted? | For the recovery runner, `recovery_runner_fetched` `outcome` and `end`, `recovery_runner_changed` (break, failed probe, re-arm, suspension, retirement, retention remainder), `recovery_runner_paused`, and the "history may be incomplete" rows below. Older logs: `recovery_obligation_reassessed` per settled obligation: `verdict`, `next_attempt`, progress, certified scopes and the quiet streak against the parking budget. |
 | When was "history may be incomplete" shown, dismissed or resolved? | `recovery_need_changed` with `notice_shown`, `notice_dismissed`, `resumed`, or `closed`, joined by `obligation_ref`. |
 | Why did the transport cursor move, and did live promotion push arrivals into the spill? | `transport_cursor_advanced`: trigger, before/after cursor, lookback, and spill and queue-loss placement counts. `sync_drain` keeps per-drain cursors. |
 | Did a notification gap or incomplete native replay require recovery? | Current sessions use owner rows with `notification_loss` or `subscription_replay`; limited native admission is not a history certificate or loss acknowledgment. `subscription_eose_repaired` describes historical repair passes only. |

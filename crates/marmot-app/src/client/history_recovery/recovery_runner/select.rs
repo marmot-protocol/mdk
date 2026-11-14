@@ -15,8 +15,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use cgka_traits::storage::StorageResult;
+use marmot_forensics::RecoveryRunnerChange;
 use storage_sqlite::{
-    RecoveryCoverageMark, RecoveryRelayCaps, RecoveryUnitState, SqliteAppStorage,
+    RecoveryCoverageMark, RecoveryRelayCaps, RecoveryUnit, RecoveryUnitState, SqliteAppStorage,
     TransportReconciliationRoute,
 };
 use transport_nostr_adapter::sweep::{RelayCaps, SweepRange, SweepRoute};
@@ -34,6 +35,8 @@ use storage_sqlite::RecoveryUnitOutcome;
 #[derive(Clone)]
 pub(super) struct Candidate {
     pub(super) key: UnitKey,
+    /// The MLS group its route carries, for the audit.
+    pub(super) group_id: Option<Vec<u8>>,
     pub(super) best_effort: bool,
     /// Seconds owed after the live tail.
     pub(super) owed_seconds: u64,
@@ -299,6 +302,7 @@ pub(super) fn survey(
             }
             candidates.push(Candidate {
                 key,
+                group_id: route.group_id.clone(),
                 best_effort,
                 owed_seconds,
                 position: first.since_seconds,
@@ -507,6 +511,10 @@ pub(super) struct SweepPlan {
     /// compares and the account holds events there (`compare::plan_debt`).
     /// Always for the inbox, which is never swept (`compare::plan_inbox`).
     pub(super) compare: Option<ComparePlan>,
+    /// The unit as the begin turn read it, before its attempt: what its
+    /// settlement's audit row compares against. `None` for a unit storage has
+    /// no row for yet.
+    pub(super) prior: Option<RecoveryUnit>,
 }
 
 /// Plan the quantum on `key` and record the attempt, or `None` when it no
@@ -536,7 +544,13 @@ pub(super) fn begin(
         return Ok(None);
     };
     if let Some(read) = caps {
-        app.record_recovery_relay_caps(&key.relay, Some(recovery_caps(read)), now)?;
+        let rearmed = app.record_recovery_relay_caps(&key.relay, Some(recovery_caps(read)), now)?;
+        super::audit::rearmed(
+            turn.audit,
+            RecoveryRunnerChange::CapsRearmed,
+            Some(&key.relay),
+            rearmed as u64,
+        );
     }
     if app
         .recovery_account_paused_until(&policy.unit, now)?
@@ -628,5 +642,6 @@ pub(super) fn begin(
         observed_cap: unit.as_ref().and_then(|unit| unit.observed_cap),
         mark,
         compare,
+        prior: unit,
     }))
 }

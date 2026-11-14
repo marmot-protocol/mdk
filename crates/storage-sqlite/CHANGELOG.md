@@ -33,6 +33,12 @@
   passed a probe, so its debt includes its park again; `pending_recovery_probes()` lists the broken units still
   waiting for one.
 
+### Changed
+
+- `SqliteAppStorage::retire_gone_recovery_units` counts a unit only when it newly retires it as route gone. A unit
+  already retired as route gone, as a retried route settlement finds it, still retires its newly owed seconds but is
+  not counted again, so the recovery runner's `retired_gone` audit row is written once.
+
 ### Fixed
 
 - Withdrawing a delete of an edit reports `MessageEditedOrReprojected` for the edited message and

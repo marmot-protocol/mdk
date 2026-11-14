@@ -45,6 +45,7 @@ use crate::runtime::account_worker::recovery_credits::{
     self, RecoveryCreditPool, available_credits, hold_all_credits_for_test,
 };
 
+mod audit_rows;
 mod comparison;
 mod epoch_gap;
 mod inbox;
@@ -1003,11 +1004,19 @@ struct TestHost {
     caps_unknown: AtomicBool,
     /// Worker turns still to fail, against `closed`.
     failing_turns: AtomicUsize,
+    /// Debt turns to let through, then debt turns whose preparation fails
+    /// against `closed` before their closure runs.
+    failing_preparations: Mutex<(usize, usize)>,
+    /// Debt turns to let through, then one that fails after its closure
+    /// succeeds.
+    failing_fence: Mutex<Option<usize>>,
+    /// Whether the recorder keeps v5 rows, as debt turns say.
+    audits: AtomicBool,
     closed: OnceLock<Account>,
     /// The relay pool's connection generations, by relay.
     connections: watch::Sender<BTreeMap<String, u64>>,
-    /// Audit rows the runner's worker turns recorded.
-    audited: Mutex<Vec<AuditEventKind>>,
+    /// Audit rows the runner's turns recorded, each with its group.
+    audited: Mutex<Vec<(Option<Vec<u8>>, AuditEventKind)>>,
     /// What the last survey found catching up.
     catching_up: Mutex<Option<BTreeSet<UnitKey>>>,
 }
@@ -1081,6 +1090,9 @@ impl TestHost {
             caps_latency: Mutex::new(Duration::ZERO),
             caps_unknown: AtomicBool::new(false),
             failing_turns: AtomicUsize::new(0),
+            failing_preparations: Mutex::default(),
+            failing_fence: Mutex::default(),
+            audits: AtomicBool::new(true),
             closed: OnceLock::new(),
             connections: watch::channel(BTreeMap::new()).0,
             audited: Mutex::default(),
@@ -1126,6 +1138,22 @@ impl TestHost {
         });
     }
 
+    /// Keeps the row, unless the recorder keeps none ([`Self::audits`]).
+    fn record_audit(&self, group: Option<&[u8]>, kind: AuditEventKind) {
+        if !self.audits.load(Ordering::SeqCst) {
+            return;
+        }
+        self.audited
+            .lock()
+            .unwrap()
+            .push((group.map(<[u8]>::to_vec), kind));
+    }
+
+    /// The audit rows recorded so far, each with its group, taken.
+    fn take_audited(&self) -> Vec<(Option<Vec<u8>>, AuditEventKind)> {
+        std::mem::take(&mut *self.audited.lock().unwrap())
+    }
+
     /// The next `turns` worker turns (not debt turns) run on a closed
     /// database, so every storage call in them fails.
     fn fail_next_turns(&self, turns: usize) {
@@ -1135,6 +1163,29 @@ impl TestHost {
             closed
         });
         self.failing_turns.store(turns, Ordering::SeqCst);
+    }
+
+    /// After `skip` debt turns, the next `turns` fail in their preparation,
+    /// as the account host's does when a write before the turn's closure
+    /// fails.
+    fn fail_debt_preparations(&self, skip: usize, turns: usize) {
+        self.closed.get_or_init(|| {
+            let closed = account();
+            closed._storage.close().unwrap();
+            closed
+        });
+        *self.failing_preparations.lock().unwrap() = (skip, turns);
+    }
+
+    /// After `skip` debt turns, the next fails after its closure succeeds,
+    /// as the account host's does when its fence read fails.
+    fn fail_fence_read(&self, skip: usize) {
+        self.closed.get_or_init(|| {
+            let closed = account();
+            closed._storage.close().unwrap();
+            closed
+        });
+        *self.failing_fence.lock().unwrap() = Some(skip);
     }
 }
 
@@ -1156,7 +1207,7 @@ impl RunnerHost for TestHost {
         } else {
             &self.app
         };
-        let audit = |kind| self.audited.lock().unwrap().push(kind);
+        let audit = |group: Option<&[u8]>, kind| self.record_audit(group, kind);
         Some(turn(&WorkerTurn {
             app,
             now: self.clock.now(),
@@ -1170,7 +1221,26 @@ impl RunnerHost for TestHost {
         T: Send + 'static,
     {
         let now = self.clock.now();
-        if let Err(error) = self.app.arm_due_recovery_probes(now) {
+        let failing = {
+            let mut failing = self.failing_preparations.lock().unwrap();
+            match &mut *failing {
+                (0, 0) => false,
+                (0, turns) => {
+                    *turns -= 1;
+                    true
+                }
+                (skip, _) => {
+                    *skip -= 1;
+                    false
+                }
+            }
+        };
+        let app = if failing {
+            &self.closed.get().expect("a closed database").app
+        } else {
+            &self.app
+        };
+        if let Err(error) = app.arm_due_recovery_probes(now) {
             return Some(Err(error));
         }
         let tails: Box<dyn LiveTailRead> = match &self.client {
@@ -1179,6 +1249,7 @@ impl RunnerHost for TestHost {
         };
         let routes = self.routes.lock().unwrap().clone();
         let counts = self.counts.lock().unwrap().clone();
+        let audit = |group: Option<&[u8]>, kind| self.record_audit(group, kind);
         let answer = turn(&DebtTurn {
             app: &self.app,
             routes: &routes,
@@ -1186,7 +1257,29 @@ impl RunnerHost for TestHost {
             tails: &*tails,
             live_counts: &counts,
             inbox: INBOX_KEY,
+            audit: &audit,
+            audits: self.audits.load(Ordering::SeqCst),
         });
+        let fence_fails = {
+            let mut failing = self.failing_fence.lock().unwrap();
+            match &mut *failing {
+                Some(0) => failing.take().is_some(),
+                Some(skip) => {
+                    *skip -= 1;
+                    false
+                }
+                None => false,
+            }
+        };
+        let answer = match answer {
+            Ok(_) if fence_fails => {
+                let closed = &self.closed.get().expect("a closed database").app;
+                Err(closed
+                    .arm_due_recovery_probes(now)
+                    .expect_err("a closed database fails"))
+            }
+            answer => answer,
+        };
         self.debt_turns.fetch_add(1, Ordering::SeqCst);
         self.clock
             .advance(self.debt_turn_seconds.load(Ordering::SeqCst));
@@ -2264,7 +2357,12 @@ async fn recovery_runner_pauses_the_account_at_its_hourly_cap() {
     assert_eq!(relay.requests(), requests);
     // Once per pause: the next step while paused records nothing more.
     assert_eq!(idle(runner.step().await), Some(until));
-    let audited = std::mem::take(&mut *host.audited.lock().unwrap());
+    let audited = host
+        .take_audited()
+        .into_iter()
+        .map(|(_, kind)| kind)
+        .filter(|kind| matches!(kind, AuditEventKind::RecoveryRunnerPaused { .. }))
+        .collect::<Vec<_>>();
     let [
         AuditEventKind::RecoveryRunnerPaused {
             cap,
@@ -2804,6 +2902,7 @@ fn recovery_runner_sizes_a_route_last_seen_empty_by_its_span() {
     let (quiet, busy) = (group(1), group(2));
     let candidate = |route: &Route, owed_seconds: u64| select::Candidate {
         key: unit_key(route, RELAY),
+        group_id: None,
         best_effort: false,
         owed_seconds,
         position: 0,
@@ -2824,6 +2923,8 @@ fn recovery_runner_sizes_a_route_last_seen_empty_by_its_span() {
         newly_covered_seconds: HOUR,
         proved_seconds: HOUR,
         proved_events: 0,
+        events_fetched: 0,
+        events_staged: 0,
         delta: HOUR,
         observed_cap: None,
         stop: None,
