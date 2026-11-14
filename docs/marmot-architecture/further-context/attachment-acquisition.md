@@ -382,7 +382,8 @@ attachment access contract). Readmission releases parked jobs in the order the w
 them (explicit first, then priority) only while free space funds them together. Each is
 charged the larger of its target and what admission needs for its checkpoint now; the need of
 every job whose writes may not show in free space yet still counts against it (jobs in
-flight, and queued or retrying jobs that were readmitted or hold a checkpoint); and the first
+flight, and queued or retrying jobs readmission released, marked by `storage_readmitted`
+until they finish or the user retries, cancels or resets them); and the first
 job that does not fit ends the batch, so the rest stay parked with their targets instead of
 failing admission (mdk#3414).
 

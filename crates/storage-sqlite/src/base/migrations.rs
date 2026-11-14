@@ -387,6 +387,8 @@ mod migration_0202_sticker_pack_relays;
 mod migration_0203_prepared_group_member_outcomes;
 #[path = "migrations/0204_deleted_failed_sends.rs"]
 mod migration_0204_deleted_failed_sends;
+#[path = "migrations/0205_attachment_storage_readmitted.rs"]
+mod migration_0205_attachment_storage_readmitted;
 
 const MIGRATIONS: &[Migration] = &[
     Migration {
@@ -1465,6 +1467,12 @@ const MIGRATIONS: &[Migration] = &[
         name: "0204_deleted_failed_sends",
         suspend_foreign_keys: &[],
         apply: migration_0204_deleted_failed_sends::apply,
+    },
+    Migration {
+        version: 205,
+        name: "0205_attachment_storage_readmitted",
+        suspend_foreign_keys: &[],
+        apply: migration_0205_attachment_storage_readmitted::apply,
     },
 ];
 

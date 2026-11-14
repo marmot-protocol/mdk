@@ -470,7 +470,7 @@ impl SqliteAppStorage {
         }
         // Cancelling clears the storage-park marker and streak, so the kept
         // prefix expires and is pruned like any other cancelled checkpoint.
-        Ok(conn.execute("UPDATE attachment_acquisition SET cancelled=1,state=4,due=NULL,attempt=NULL,explicit_request=0,storage_blocked_headroom=NULL,storage_park_count=0
+        Ok(conn.execute("UPDATE attachment_acquisition SET cancelled=1,state=4,due=NULL,attempt=NULL,explicit_request=0,storage_blocked_headroom=NULL,storage_park_count=0,storage_readmitted=0
             WHERE token=?1 AND state<>3",[&reference.token]).storage()?==1)
     }
 
@@ -589,7 +589,7 @@ impl SqliteAppStorage {
             let conn=self.lock()?;
             if !matches_store(&conn,reference)? {return Ok(false);}
             let parked = partial::storage_parked(&conn, &reference.token)?;
-            let retried = conn.execute(&format!("UPDATE attachment_acquisition AS q SET cancelled=0,state=CASE WHEN state=1 THEN 1 ELSE 0 END,due=CASE WHEN state=1 THEN due ELSE ?2 END,attempt=CASE WHEN state=1 THEN attempt ELSE NULL END,explicit_request=1,keep_from=?2,size_blocked_max=NULL,storage_blocked_headroom=NULL,storage_park_count=0,permission_paused=0,retry_not_before=0,preparation_deferrals=0,acquisition_attempts=CASE WHEN state=1 THEN acquisition_attempts ELSE 0 END,network_attempts=CASE WHEN state=1 THEN network_attempts ELSE 0 END,body_completed=CASE WHEN state=1 THEN body_completed ELSE 0 END
+            let retried = conn.execute(&format!("UPDATE attachment_acquisition AS q SET cancelled=0,state=CASE WHEN state=1 THEN 1 ELSE 0 END,due=CASE WHEN state=1 THEN due ELSE ?2 END,attempt=CASE WHEN state=1 THEN attempt ELSE NULL END,explicit_request=1,keep_from=?2,size_blocked_max=NULL,storage_blocked_headroom=NULL,storage_park_count=0,storage_readmitted=0,permission_paused=0,retry_not_before=0,preparation_deferrals=0,acquisition_attempts=CASE WHEN state=1 THEN acquisition_attempts ELSE 0 END,network_attempts=CASE WHEN state=1 THEN network_attempts ELSE 0 END,body_completed=CASE WHEN state=1 THEN body_completed ELSE 0 END
                 WHERE token=?1 AND (state IN(0,1,2,4,5) OR (state=3 AND NOT {RETAINED_BODY})) AND {SOURCE_MATCH} AND {ACCEPTED} AND (expires_at IS NULL OR expires_at>?2)"),
                 params![reference.token,u64_to_i64(now)?]).storage()?==1;
             if retried && parked {
@@ -818,11 +818,13 @@ impl SqliteAppStorage {
     ///
     /// What is left starts below `free` by the need of every job whose
     /// writes may not show in `free` yet: each job in flight, and each queued
-    /// or retrying job that was readmitted (it keeps its park streak until it
-    /// records progress) or holds a checkpoint (as one that progressed does),
-    /// the queued ones only if they can run (automatic ones while automatic
-    /// acquisition is enabled). A need shrinks as its checkpoint grows, so
-    /// bytes already written are not counted again.
+    /// or retrying job that readmission released (`storage_readmitted`, kept
+    /// through checkpoint progress and retries until it finishes or the user
+    /// retries, cancels or resets it), the queued ones only if they can run
+    /// (automatic ones while automatic acquisition is enabled). Other
+    /// retrying jobs reserve nothing: the worker's admission check parks one
+    /// that no longer fits. A need shrinks as its checkpoint grows, so bytes
+    /// already written are not counted again.
     ///
     /// The page is filtered by what fits `free` and `admission` (worker
     /// admission at `free`) before it is limited, so rows that cannot fit at
@@ -874,9 +876,8 @@ impl SqliteAppStorage {
                 .prepare(
                     "SELECT (SELECT p.received FROM attachment_partial p WHERE p.token=q.token)
                     FROM attachment_acquisition q WHERE cancelled=0 AND (state=1
-                        OR (state IN (0,2) AND (explicit_request=1 OR ?1)
-                            AND (storage_park_count>0
-                                OR EXISTS(SELECT 1 FROM attachment_partial p WHERE p.token=q.token))))",
+                        OR (state IN (0,2) AND storage_readmitted=1
+                            AND (explicit_request=1 OR ?1)))",
                 )
                 .storage()?
                 .query_map([automatic], |row| row.get::<_, Option<i64>>(0))
@@ -909,7 +910,7 @@ impl SqliteAppStorage {
                 available -= charge;
                 conn.execute(
                     "UPDATE attachment_acquisition SET state=0,storage_blocked_headroom=NULL,
-                    due=?2+CASE WHEN storage_park_count<=1 THEN 0 ELSE min(15*(1<<min(storage_park_count-2,8)),3600) END
+                    storage_readmitted=1,due=?2+CASE WHEN storage_park_count<=1 THEN 0 ELSE min(15*(1<<min(storage_park_count-2,8)),3600) END
                     WHERE token=?1",
                     params![token, u64_to_i64(now)?],
                 )

@@ -4372,3 +4372,29 @@ fn storage_readmission_counts_a_readmitted_job_through_checkpoint_progress() {
     );
     assert_eq!(parked_target(&store, &second), Some(1000));
 }
+
+/// Only jobs readmission released reserve space while queued or retrying: an
+/// unrelated download in network backoff with a checkpoint reserves nothing,
+/// so it cannot keep a parked job blocked while the worker could start it.
+#[test]
+fn storage_readmission_ignores_retrying_jobs_it_did_not_release() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
+    seed(&store, "backoff");
+    let busy = request(&app, "backoff");
+    let job = app
+        .claim_attachment_acquisition(&busy, 12, 100)
+        .unwrap()
+        .unwrap();
+    assert!(checkpoint(&app, &job, &partial_identity(4096), 0, &[7; 64], 12).unwrap());
+    sql(
+        &store,
+        "UPDATE attachment_acquisition SET state=2,attempt=NULL,due=100000 WHERE message_id_hex='backoff'",
+    );
+    let image = park_with_priority(&store, "image", 1000, 20);
+    assert_eq!(
+        readmit_funded(&app, STORAGE_READMIT_MARGIN_BYTES + 1500, |_| 1000),
+        1
+    );
+    assert_eq!(parked_target(&store, &image), None);
+}
