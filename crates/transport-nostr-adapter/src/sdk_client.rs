@@ -13528,15 +13528,16 @@ mod tests {
             };
             let first = probe();
             accepted.await.unwrap();
-            let mut second = probe();
+            // The first probe's handshake is in flight and cannot finish
+            // until `finish`, so a second probe that reads the relay as
+            // reached would complete on its first poll.
+            let mut second = Box::pin(sdk.connect_for_publish(&endpoint));
             assert!(
-                timeout(Duration::from_millis(200), &mut second)
-                    .await
-                    .is_err(),
+                futures::poll!(second.as_mut()).is_pending(),
                 "the second probe waits while the socket is connecting"
             );
             finish.send(completes).unwrap();
-            let outcomes = [first.await.unwrap(), second.await.unwrap()];
+            let outcomes = [first.await.unwrap(), second.await];
             for outcome in outcomes {
                 if completes {
                     outcome.expect("the finished handshake connects every probe");
