@@ -948,13 +948,17 @@ impl AccountManager {
                 HydrationFailure::Returned,
                 |state| async move {
                     // The profiles load once the group is known, as for the
-                    // worker's read.
+                    // worker's read. Their failure is the caller's, not A's,
+                    // so it answers here, as for `group_members`.
                     let profiles = if state.groups.contains_key(group_id) {
-                        self.member_profiles().await
+                        match self.member_profiles().await {
+                            Ok(profiles) => profiles,
+                            Err(error) => return Some(Err(error)),
+                        }
                     } else {
-                        Ok(Default::default())
+                        Default::default()
                     };
-                    match state.group_roster(group_id, move || profiles) {
+                    match state.group_roster(group_id, move || Ok(profiles)) {
                         Ok(session) => Some(Ok(session)),
                         Err(error) => reissue(Err(error)),
                     }

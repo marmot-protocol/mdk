@@ -262,6 +262,64 @@ async fn reads_from_published_state(
     assert_eq!(queued(), before, "a read of A queued on the worker");
 }
 
+/// A member read whose profile load fails answers that failure on the
+/// caller's task while `behind` holds the worker: the failure is the
+/// caller's, not A's, so it never falls back to the worker's command.
+/// A corrupt directory profile fails the load with a JSON error, one that
+/// `reissue` has no copy of; the profile is put back before this returns.
+async fn profile_failures_answer_from_published_state(
+    app: &MarmotApp,
+    accounts: &AccountManager,
+    account: &marmot_account::AccountSummary,
+    telemetry: &PerformanceRecorder,
+    group: &GroupId,
+    behind: RuntimeOp,
+) {
+    let put_profile = |profile_json: Option<&str>| {
+        app.shared_storage()
+            .unwrap()
+            .put_public_directory_user(&storage_sqlite::PublicDirectoryUserRecord {
+                account_id_hex: account.account_id_hex.clone(),
+                npub: String::new(),
+                profile_json: profile_json.map(Into::into),
+                relay_lists_json: serde_json::to_string(&crate::AccountRelayListStatus::empty())
+                    .unwrap(),
+                key_package_json: None,
+                event_id_hex: None,
+                event_kind: None,
+                event_created_at: None,
+                follows: Vec::new(),
+            })
+            .unwrap();
+    };
+    put_profile(Some("{"));
+    assert!(app.profiles_by_id().is_err(), "the profile load fails");
+    let queued =
+        || [behind, RuntimeOp::ReadQueueR3].map(|operation| sample(telemetry, operation).started);
+    let before = queued();
+    let members = timeout(SETTLE, accounts.group_members(&account.label, group))
+        .await
+        .unwrap_or_else(|_| panic!("a held {behind:?} keeps a failed member read waiting"));
+    assert!(
+        matches!(members, Err(AppError::Json(_))),
+        "group_members answers the profile failure: {members:?}"
+    );
+    let roster = timeout(SETTLE, accounts.group_roster(&account.label, group))
+        .await
+        .unwrap_or_else(|_| panic!("a held {behind:?} keeps a failed roster read waiting"));
+    assert!(
+        matches!(roster, Err(AppError::Json(_))),
+        "group_roster answers the profile failure: {roster:?}"
+    );
+    assert_eq!(
+        queued(),
+        before,
+        "a failed member read queued on the worker"
+    );
+    put_profile(None);
+    assert!(app.profiles_by_id().is_ok(), "the profile load recovers");
+}
+
 fn sample(telemetry: &PerformanceRecorder, operation: RuntimeOp) -> RuntimePerformanceSnapshot {
     telemetry
         .snapshot()
@@ -489,10 +547,20 @@ async fn host_reads_wait_behind_held_worker_units() {
     let held = sample(&telemetry, RuntimeOp::ReadQueueBehindSend);
     assert_eq!(held.started - before.started, probes.len() as u64);
     assert_eq!(held.in_flight - before.in_flight, probes.len() as u64);
-    // The reads of A answer although the lane is full.
+    // The reads of A answer although the lane is full, and so does a member
+    // read whose profile load fails.
     reads_from_published_state(
         &runtime.accounts(),
         "alice",
+        &telemetry,
+        &group,
+        RuntimeOp::ReadQueueBehindSend,
+    )
+    .await;
+    profile_failures_answer_from_published_state(
+        &app,
+        &runtime.accounts(),
+        &account,
         &telemetry,
         &group,
         RuntimeOp::ReadQueueBehindSend,
