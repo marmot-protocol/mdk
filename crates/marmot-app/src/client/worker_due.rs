@@ -59,8 +59,9 @@ impl AppClient {
 
     /// When history dispatch next has work, in unix seconds: a restore
     /// waiting for a slot now; with device groups on and maintenance
-    /// running, the earliest history upload, fetch, backup pass or condemned
-    /// blob deadline. `None` when nothing is owed.
+    /// running, the earliest history upload or fetch deadline, and while
+    /// backups may be configured the backup pass's and condemned blobs'.
+    /// `None` when nothing is owed.
     pub(crate) fn history_dispatch_next_at(&self) -> Option<u64> {
         if self.backup_restore.waiting() {
             return Some(0);
@@ -70,8 +71,31 @@ impl AppClient {
         }
         self.app
             .account_storage(&self.state.label)
-            .and_then(|storage| Ok(storage.app_storage().history_dispatch_next_at()?))
+            .and_then(|storage| {
+                Ok(storage
+                    .app_storage()
+                    .history_dispatch_next_at(self.backups_may_be_configured())?)
+            })
             .unwrap_or(Some(0))
+    }
+
+    /// Whether backups may be configured: unless the backup pass last found
+    /// none, under the same trusted roster epoch or kept-key state as now.
+    /// Unknown counts as configured, so a configured account's first pass
+    /// is due at once.
+    fn backups_may_be_configured(&self) -> bool {
+        match &self.backups_configured {
+            Some((eligibility, false)) => self.backup_eligibility().as_ref() != Some(eligibility),
+            _ => true,
+        }
+    }
+
+    /// Whether the backup pass found backups off and what decides that has
+    /// changed since: a recovery key kept or forgotten, or a commit to the
+    /// trusted device group, whose roster carries the account's key. The
+    /// worker then wakes history dispatch to read its deadline again.
+    pub(crate) fn backup_eligibility_changed(&self) -> bool {
+        matches!(self.backups_configured, Some((_, false))) && self.backups_may_be_configured()
     }
 
     /// A history delivery was owed, parked or backed off: the worker
