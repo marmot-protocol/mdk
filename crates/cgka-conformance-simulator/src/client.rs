@@ -441,6 +441,219 @@ mod tests {
     use cgka_traits::engine_state::GroupLifecycleState;
     use cgka_traits::storage::GroupStorage;
 
+    struct CountedNostrPeeler {
+        inner: transport_nostr_peeler::NostrMlsPeeler,
+        preparations: std::sync::Arc<std::sync::atomic::AtomicU64>,
+        decryptions: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    }
+
+    #[async_trait::async_trait]
+    impl TransportPeeler for CountedNostrPeeler {
+        fn prepare_group_message<'a>(
+            &self,
+            msg: &'a TransportMessage,
+        ) -> Result<cgka_traits::peeler::PreparedGroupMessage<'a>, cgka_traits::PeelerError>
+        {
+            self.preparations
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // Alternate direct-engine admission must verify signatures too.
+            transport_nostr_peeler::NostrTransportEvent::from_transport_message(msg)
+                .and_then(|event| event.to_verified_nostr_event())
+                .map_err(|_| cgka_traits::PeelerError::InvalidSignature)?;
+            self.inner.prepare_group_message(msg)
+        }
+
+        async fn peel_group_message(
+            &self,
+            prepared: &cgka_traits::peeler::PreparedGroupMessage<'_>,
+            ctx: &GroupContextSnapshot,
+        ) -> Result<cgka_traits::PeeledMessage, cgka_traits::PeelerError> {
+            self.decryptions
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.inner.peel_group_message(prepared, ctx).await
+        }
+
+        async fn peel_welcome(
+            &self,
+            msg: &TransportMessage,
+        ) -> Result<cgka_traits::PeeledMessage, cgka_traits::PeelerError> {
+            self.inner.peel_welcome(msg).await
+        }
+
+        async fn wrap_group_recovery(
+            &self,
+            msg: &cgka_traits::GroupRecoveryMessage,
+            recipient: &MemberId,
+        ) -> Result<TransportMessage, cgka_traits::PeelerError> {
+            self.inner.wrap_group_recovery(msg, recipient).await
+        }
+
+        async fn wrap_group_message(
+            &self,
+            payload: &EncryptedPayload,
+            ctx: &GroupContextSnapshot,
+        ) -> Result<TransportMessage, cgka_traits::PeelerError> {
+            self.inner.wrap_group_message(payload, ctx).await
+        }
+
+        async fn wrap_welcome(
+            &self,
+            payload: &EncryptedPayload,
+            recipient: &MemberId,
+        ) -> Result<TransportMessage, cgka_traits::PeelerError> {
+            self.inner.wrap_welcome(payload, recipient).await
+        }
+    }
+
+    #[tokio::test]
+    async fn signed_live_peel_work_bounds() {
+        use cgka_traits::engine::{GroupEvent, SendIntent, SendResult};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicU64, Ordering},
+        };
+
+        let bus = TransportBus::ordered();
+        let mut alice = ClientBuilder::new(b"alice".to_vec())
+            .protocol_profile(ProtocolProfile::Current)
+            .attach(&bus);
+        let mut bob = ClientBuilder::new(b"bob".to_vec())
+            .protocol_profile(ProtocolProfile::Current)
+            .attach(&bus);
+        let bob_kp = bob.fresh_key_package().await;
+        let (group_id, pending) = alice
+            .create_group_with_admins_maybe_pending("live-peel-reuse", vec![bob_kp], vec![], vec![])
+            .await;
+        assert!(pending.is_none());
+        bus.deliver_all();
+        assert!(bob.tick().await.iter().all(Result::is_ok));
+        let delayed = alice
+            .send_app_capture(b"delayed before updates".to_vec())
+            .await;
+        // Keep the application out of Bob's receive ratchet until historical recovery.
+        assert!(bus.drop_queued(0));
+        for _ in 0..5 {
+            let pending = alice.self_update().await;
+            alice.confirm(pending).await;
+            bus.deliver_all();
+            assert!(bob.tick().await.iter().all(Result::is_ok));
+        }
+        let preparations = Arc::new(AtomicU64::new(0));
+        let decryptions = Arc::new(AtomicU64::new(0));
+        let clock = cgka_engine::ManualConvergenceClock::new(0, 10_000);
+        let mut receiver = cgka_engine::EngineBuilder::new(bob.storage().clone())
+            .identity(bob.member_id().as_slice().to_vec())
+            .account_identity_proof_signer(Arc::new(NostrAccountIdentityProofSigner {
+                keys: bob.signer.clone(),
+            }))
+            .convergence_clock(Arc::new(clock.clone()))
+            .peeler(Box::new(CountedNostrPeeler {
+                inner: transport_nostr_peeler::NostrMlsPeeler::default(),
+                preparations: preparations.clone(),
+                decryptions: decryptions.clone(),
+            }))
+            .build()
+            .unwrap();
+        receiver.hydrate_all_stored_groups().unwrap();
+        let epoch = receiver.epoch(&group_id).unwrap();
+        let unrelated = GroupContextSnapshot::new(
+            epoch,
+            std::collections::HashMap::from([(
+                transport_nostr_peeler::DEFAULT_EXPORTER_LABEL.to_string(),
+                vec![0xa7; 32],
+            )]),
+            Some(match &delayed.envelope {
+                TransportEnvelope::GroupMessage { transport_group_id } => {
+                    transport_group_id.clone()
+                }
+                _ => panic!("expected group envelope"),
+            }),
+        );
+        let before = receiver.engine_metrics().past_peel_context_derivations;
+        let mut first_derivations = 0;
+        for index in 0..16 {
+            let message = transport_nostr_peeler::NostrMlsPeeler::default()
+                .wrap_group_message(
+                    &EncryptedPayload {
+                        ciphertext: vec![index; 32],
+                        aad: vec![],
+                    },
+                    &unrelated,
+                )
+                .await
+                .unwrap();
+            assert!(matches!(
+                receiver.ingest(message).await.unwrap(),
+                IngestOutcome::TransportDeferred { .. }
+            ));
+            let derived = receiver.engine_metrics().past_peel_context_derivations - before;
+            if index == 0 {
+                first_derivations = derived;
+                assert_eq!(first_derivations, 5);
+            }
+            assert_eq!(
+                derived, first_derivations,
+                "fresh inputs cannot reconstruct the same anchors"
+            );
+        }
+        assert_eq!(
+            preparations.load(Ordering::Relaxed),
+            16,
+            "verification and decoding run once per ingest"
+        );
+        assert_eq!(
+            decryptions.load(Ordering::Relaxed),
+            16 * 6,
+            "every context still gets its own AEAD attempt"
+        );
+        assert_eq!(receiver.retry_deferred_peels(&group_id).await.unwrap(), 0);
+        assert!(matches!(
+            receiver.ingest(delayed).await.unwrap(),
+            IngestOutcome::Processed
+        ));
+        assert!(receiver.drain_events().iter().any(|event| matches!(event,
+    GroupEvent::MessageReceived { payload, .. }
+        if serde_json::from_slice::<cgka_traits::MarmotAppEvent>(payload).unwrap().content == "delayed before updates"
+        )));
+
+        let SendResult::GroupEvolution {
+            msg: missing_commit,
+            pending,
+            ..
+        } = alice
+            .engine_mut()
+            .send(SendIntent::SelfUpdate {
+                group_id: group_id.clone(),
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("expected self-update");
+        };
+        alice.engine_mut().confirm_published(pending).await.unwrap();
+        let future = alice
+            .send_app_capture(b"future after missing commit".to_vec())
+            .await;
+        assert!(matches!(
+            receiver.ingest(future).await.unwrap(),
+            IngestOutcome::TransportDeferred { .. }
+        ));
+        assert!(matches!(
+            receiver.ingest(missing_commit).await.unwrap(),
+            IngestOutcome::Processed | IngestOutcome::Buffered { .. }
+        ));
+        for _ in 0..8 {
+            clock.advance_ms(1_000);
+            receiver.advance_convergence(&group_id).await.unwrap();
+        }
+        assert_eq!(receiver.epoch(&group_id).unwrap(), alice.epoch());
+        let events = receiver.drain_events();
+        assert_eq!(events.iter().filter(|event| matches!(event,
+    GroupEvent::MessageReceived { payload, .. }
+        if serde_json::from_slice::<cgka_traits::MarmotAppEvent>(payload).unwrap().content == "future after missing commit"
+        )).count(), 1);
+    }
+
     /// Builds a single-bucket histogram fixture.
     fn histogram(upper_bound: u64, count: u64, overflow_count: u64) -> HistogramSnapshot {
         HistogramSnapshot {
@@ -615,7 +828,7 @@ mod tests {
             }
             async fn peel_group_message(
                 &self,
-                _: &TransportMessage,
+                _: &cgka_traits::peeler::PreparedGroupMessage<'_>,
                 _: &GroupContextSnapshot,
             ) -> Result<PeeledMessage, PeelerError> {
                 Err(PeelerError::DecryptFailed)
@@ -1696,9 +1909,16 @@ impl TransportPeeler for WelcomeWrapRefusalPeeler {
     ) -> Result<TransportMessage, PeelerError> {
         self.inner.wrap_group_recovery(message, recipient).await
     }
+    fn prepare_group_message<'a>(
+        &self,
+        msg: &'a TransportMessage,
+    ) -> Result<cgka_traits::peeler::PreparedGroupMessage<'a>, PeelerError> {
+        self.inner.prepare_group_message(msg)
+    }
+
     async fn peel_group_message(
         &self,
-        msg: &TransportMessage,
+        msg: &cgka_traits::peeler::PreparedGroupMessage<'_>,
         ctx: &GroupContextSnapshot,
     ) -> Result<PeeledMessage, PeelerError> {
         self.inner.peel_group_message(msg, ctx).await
@@ -3717,8 +3937,12 @@ impl HarnessClient {
             ctx.as_ref(),
             &[transport_nostr_peeler::DEFAULT_EXPORTER_LABEL],
         );
-        let peeled = NostrMlsPeeler::default()
-            .peel_group_message(msg, &snapshot)
+        let peeler = NostrMlsPeeler::default();
+        let prepared = peeler
+            .prepare_group_message(msg)
+            .map_err(|e| format!("peel group message: {e}"))?;
+        let peeled = peeler
+            .peel_group_message(&prepared, &snapshot)
             .await
             .map_err(|e| format!("peel group message: {e}"))?;
         match peeled.content {

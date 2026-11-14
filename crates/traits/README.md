@@ -6,7 +6,7 @@ between engine, peeler, transport adapter, storage, and caller imports from here
 ## What lives in here
 
 - `CgkaEngine` — the engine trait the rest of the system depends on.
-- `TransportPeeler` — async crypto-boundary trait: `peel_group_message`, `peel_welcome`, `wrap_group_message`,
+- `TransportPeeler` — crypto-boundary trait: `prepare_group_message`, `peel_group_message`, `peel_welcome`, `wrap_group_message`,
   `wrap_welcome`, plus `wrap_group_message_with_metadata` / `wrap_welcome_with_metadata` (default to the plain wraps).
 - `TransportAdapter` — account-aware network boundary for activation, subscription refresh, publish receipts, and
   inbound deliveries.
@@ -46,6 +46,20 @@ The rustdoc on each trait in `src/` is the reference for method responsibilities
 ordering guarantees.
 
 ## Key contracts
+
+**Group envelope preparation.** Call `prepare_group_message` once per ingest, then pass its
+`PreparedGroupMessage` to `peel_group_message` for each candidate context. Custom peelers move
+context-independent validation and decoding into preparation; peeling performs only key-dependent work.
+Raw transports can use the default preparation, which borrows the original payload. Wrappers must
+delegate preparation to the same inner peeler that decrypts the prepared content.
+
+**Historical-context caching.** `StorageProvider::past_peel_context_generation` optionally enables
+cross-input reuse of retained exporter contexts. Its generation must track live MLS writes, rollbacks,
+snapshot replacement and pruning, including external writers. The default `None` disables reuse;
+backends that track only live MLS writes must leave this hook disabled. Opting in also requires exclusive
+writer transactions and atomic group savepoints, so a context's source cannot change during capture.
+Mutation generations must advance under the acquired writer boundary, never before a writer blocks on it.
+No cache is persisted.
 
 **Committed-state observations.** `StorageProvider::after_commit` lets a backend release best-effort observers only
 after the owning outer transaction commits, discarding them when a transaction or savepoint rolls back. SQLite

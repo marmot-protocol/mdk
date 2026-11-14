@@ -473,17 +473,17 @@ impl TransportPeeler for MockPeeler {
 
     async fn peel_group_message(
         &self,
-        msg: &TransportMessage,
+        msg: &cgka_traits::peeler::PreparedGroupMessage<'_>,
         _ctx: &GroupContextSnapshot,
     ) -> Result<PeeledMessage, PeelerError> {
         Ok(PeeledMessage {
-            id: msg.id.clone(),
+            id: msg.message.id.clone(),
             group_id: None,
             sender: None,
             content: PeeledContent::MlsMessage {
-                bytes: msg.payload.clone(),
+                bytes: msg.message.payload.clone(),
             },
-            origin: msg.clone(),
+            origin: msg.message.clone(),
         })
     }
 
@@ -561,9 +561,16 @@ impl TransportPeeler for BlockingWelcomePeeler {
         ))
     }
 
+    fn prepare_group_message<'a>(
+        &self,
+        msg: &'a TransportMessage,
+    ) -> Result<cgka_traits::peeler::PreparedGroupMessage<'a>, PeelerError> {
+        self.inner.prepare_group_message(msg)
+    }
+
     async fn peel_group_message(
         &self,
-        msg: &TransportMessage,
+        msg: &cgka_traits::peeler::PreparedGroupMessage<'_>,
         ctx: &GroupContextSnapshot,
     ) -> Result<PeeledMessage, PeelerError> {
         self.inner.peel_group_message(msg, ctx).await
@@ -1940,9 +1947,16 @@ async fn legacy_create_whose_welcome_cannot_be_wrapped_writes_no_group() {
             self.0.wrap_group_recovery(message, recipient).await
         }
 
+        fn prepare_group_message<'a>(
+            &self,
+            msg: &'a TransportMessage,
+        ) -> Result<cgka_traits::peeler::PreparedGroupMessage<'a>, PeelerError> {
+            self.0.prepare_group_message(msg)
+        }
+
         async fn peel_group_message(
             &self,
-            msg: &TransportMessage,
+            msg: &cgka_traits::peeler::PreparedGroupMessage<'_>,
             ctx: &GroupContextSnapshot,
         ) -> Result<PeeledMessage, PeelerError> {
             self.0.peel_group_message(msg, ctx).await

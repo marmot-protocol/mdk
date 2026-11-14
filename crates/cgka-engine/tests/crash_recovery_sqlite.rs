@@ -70,6 +70,7 @@ const H5_POINT: &str = "historical-apply-before-commit";
 const H6_POINT: &str = "retained-anchor-after-rewind";
 const CANDIDATE_BRANCH_POINT: &str = "candidate-branch-after-rewind";
 const PAST_PEEL_POINT: &str = "past-peel-after-rewind";
+const LEGACY_PAST_PEEL_POINT: &str = "legacy-past-peel-after-rewind";
 const DURABLE_TRANSITION_POINTS: &[&str] = &[
     "convergence-pass-collecting-durable",
     "convergence-pass-frozen-durable",
@@ -95,17 +96,17 @@ impl TransportPeeler for MockPeeler {
 
     async fn peel_group_message(
         &self,
-        msg: &TransportMessage,
+        msg: &cgka_traits::peeler::PreparedGroupMessage<'_>,
         _ctx: &GroupContextSnapshot,
     ) -> Result<PeeledMessage, PeelerError> {
         Ok(PeeledMessage {
-            id: msg.id.clone(),
+            id: msg.message.id.clone(),
             group_id: None,
             sender: None,
             content: PeeledContent::MlsMessage {
-                bytes: msg.payload.clone(),
+                bytes: msg.message.payload.clone(),
             },
-            origin: msg.clone(),
+            origin: msg.message.clone(),
         })
     }
 
@@ -177,7 +178,7 @@ impl TransportPeeler for UnreadablePeeler {
 
     async fn peel_group_message(
         &self,
-        _msg: &TransportMessage,
+        _msg: &cgka_traits::peeler::PreparedGroupMessage<'_>,
         _ctx: &GroupContextSnapshot,
     ) -> Result<PeeledMessage, PeelerError> {
         Err(PeelerError::DecryptFailed)
@@ -226,14 +227,16 @@ fn candidate_branch_kill_after_rewind_recovers_live_state_and_work_rows() {
     );
 }
 
-// The deferred-peel sweep rewinds live state onto a retained anchor once per
-// anchor to derive the exporter context that reads a late message. A kill
-// inside that window leaves the anchor's epoch as this device's durable state
-// while the guard snapshot holds the real tip, so reopening must restore the
-// tip instead of accepting the rollback as its own.
+// Historical context derivation is contained: process death rolls the whole
+// rewind back, including its temporary guard snapshot.
 #[test]
 fn past_peel_kill_after_rewind_recovers_the_committed_tip() {
-    run_parent_case(PAST_PEEL_POINT, EpochId(1), Some("peel-restore-"));
+    run_parent_case(PAST_PEEL_POINT, EpochId(2), None);
+}
+
+#[test]
+fn legacy_peel_guard_recovers() {
+    run_parent_case(LEGACY_PAST_PEEL_POINT, EpochId(1), Some("peel-restore-"));
 }
 
 #[test]
@@ -460,7 +463,13 @@ fn run_parent_case(point: &str, stranded_epoch: EpochId, stranded_snapshot: Opti
     let group_id = group_ids[0].clone();
     let stranded_group = storage.get_group(&group_id).expect("stranded group");
     assert_eq!(stranded_group.epoch, stranded_epoch);
-    if matches!(point, H6_POINT | CANDIDATE_BRANCH_POINT | PAST_PEEL_POINT) {
+    if point == PAST_PEEL_POINT {
+        assert_past_expected(&storage, &group_id);
+    }
+    if matches!(
+        point,
+        H6_POINT | CANDIDATE_BRANCH_POINT | LEGACY_PAST_PEEL_POINT
+    ) {
         assert!(
             !stranded_group
                 .members
@@ -469,7 +478,11 @@ fn run_parent_case(point: &str, stranded_epoch: EpochId, stranded_snapshot: Opti
             "retained-anchor crash must expose the historical membership before hydration"
         );
     }
-    let snapshot_prefix = stranded_snapshot.unwrap_or("openmls-apply-");
+    let snapshot_prefix = stranded_snapshot.unwrap_or(if point == PAST_PEEL_POINT {
+        "peel-restore-"
+    } else {
+        "openmls-apply-"
+    });
     assert_eq!(
         storage
             .list_group_snapshots(&group_id)
@@ -479,7 +492,10 @@ fn run_parent_case(point: &str, stranded_epoch: EpochId, stranded_snapshot: Opti
         stranded_snapshot.is_some(),
         "stranded snapshot with prefix {snapshot_prefix}"
     );
-    if matches!(point, H5_POINT | CANDIDATE_BRANCH_POINT | PAST_PEEL_POINT) {
+    if matches!(
+        point,
+        H5_POINT | CANDIDATE_BRANCH_POINT | PAST_PEEL_POINT | LEGACY_PAST_PEEL_POINT
+    ) {
         assert_eq!(
             storage
                 .list_queued_outbound_intents(&group_id)
@@ -499,6 +515,11 @@ fn run_parent_case(point: &str, stranded_epoch: EpochId, stranded_snapshot: Opti
     }
 
     let mut reopened = build_client_with_storage(CAROL_SEED, storage.clone());
+    if point == LEGACY_PAST_PEEL_POINT {
+        // Construction restores an old committing guard before hydration can
+        // refresh validation metadata in the recovered live state.
+        assert_past_expected(&storage, &group_id);
+    }
     reopened
         .hydrate_all_stored_groups()
         .expect("hydrate killed database");
@@ -841,6 +862,23 @@ async fn run_child_case(database: &Path) {
             policy.convergence.max_rewind_commits,
         )
         .expect("historical apply reaches selected crash point");
+    } else if crash_point.as_deref() == Some(LEGACY_PAST_PEEL_POINT) {
+        // Persist the old committing implementation's interrupted storage shape.
+        store_past_expected(&carol_storage, &group_id);
+        carol_storage
+            .create_group_state_snapshot(&group_id, "peel-restore-legacy-crash")
+            .unwrap();
+        carol_storage
+            .rollback_group_state_keeping_live_records(&group_id, "openmls-retained-anchor-1")
+            .unwrap();
+        use std::io::Write as _;
+        let mut stdout = std::io::stdout().lock();
+        writeln!(stdout, "{READY_PREFIX}{LEGACY_PAST_PEEL_POINT}").unwrap();
+        stdout.flush().unwrap();
+        drop(stdout);
+        loop {
+            std::thread::park();
+        }
     } else if let Some(point @ (CANDIDATE_BRANCH_POINT | PAST_PEEL_POINT)) = crash_point.as_deref()
     {
         let deferred = TransportMessage {
@@ -877,6 +915,7 @@ async fn run_child_case(database: &Path) {
             carol
                 .hydrate_all_stored_groups()
                 .expect("hydrate before the past-peel sweep");
+            store_past_expected(&carol_storage, &group_id);
         }
         carol
             .retry_deferred_peels(&group_id)
@@ -891,6 +930,36 @@ async fn run_child_case(database: &Path) {
             .converge_stored_openmls_messages_at(&group_id, 3_000_000)
             .expect("late branch convergence reaches selected crash point");
     }
+}
+
+fn store_past_expected(storage: &SqliteAccountStorage, group: &GroupId) {
+    storage
+        .create_group_state_snapshot(group, "past-peel-expected-live")
+        .unwrap();
+}
+
+fn assert_past_expected(storage: &SqliteAccountStorage, group: &GroupId) {
+    storage
+        .create_group_state_snapshot(group, "past-peel-actual-live")
+        .unwrap();
+    let expected = storage
+        .group_snapshot_fingerprint(group, "past-peel-expected-live")
+        .unwrap()
+        .expect("expected snapshot exists");
+    let actual = storage
+        .group_snapshot_fingerprint(group, "past-peel-actual-live")
+        .unwrap()
+        .expect("actual snapshot exists");
+    assert!(
+        expected == actual,
+        "the encrypted expected snapshot must match the complete live native/group state"
+    );
+    storage
+        .release_group_snapshot(group, "past-peel-actual-live")
+        .unwrap();
+    storage
+        .release_group_snapshot(group, "past-peel-expected-live")
+        .unwrap();
 }
 
 fn build_memory_client(seed: &[u8]) -> (Engine<SqliteAccountStorage>, SqliteAccountStorage) {

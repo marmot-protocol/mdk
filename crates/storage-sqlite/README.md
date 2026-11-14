@@ -229,6 +229,12 @@ outbound, and app-projection rows, which the engine validates separately. The fi
 is never logged or persisted. It lets resumable reconstruction ignore unrelated writes through another app connection;
 the `mls_write_generation` contract for cached `MlsGroup` objects is unchanged.
 
+**Historical peel contexts.** `past_peel_context_generation` combines the local mutation counter with SQLite's
+external-commit data version. MLS, snapshot, checkpoint and rollback mutations advance the counter under the
+acquired connection/transaction boundary, before changing rows. A blocked writer cannot preannounce a generation
+that another operation might mistake for completed work. The engine captures a missing historical context in one
+short exclusive transaction and restores live state before releasing it or awaiting transport decryption.
+
 **Group savepoints.** Nested `with_transaction` calls join the outermost transaction and roll back only there.
 `StorageProvider::with_group_savepoint` is the nested unit that rolls back on its own: on `Err` or panic a SQLite
 `SAVEPOINT` undoes every write the unit made, drops the after-commit wakeups it registered and moves

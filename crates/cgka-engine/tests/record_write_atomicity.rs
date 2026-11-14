@@ -106,17 +106,17 @@ impl TransportPeeler for MockPeeler {
 
     async fn peel_group_message(
         &self,
-        msg: &TransportMessage,
+        msg: &cgka_traits::peeler::PreparedGroupMessage<'_>,
         _ctx: &GroupContextSnapshot,
     ) -> Result<PeeledMessage, PeelerError> {
         Ok(PeeledMessage {
-            id: msg.id.clone(),
+            id: msg.message.id.clone(),
             group_id: None,
             sender: None,
             content: PeeledContent::MlsMessage {
-                bytes: msg.payload.clone(),
+                bytes: msg.message.payload.clone(),
             },
-            origin: msg.clone(),
+            origin: msg.message.clone(),
         })
     }
 
@@ -187,7 +187,7 @@ impl TransportPeeler for ContentIdPeeler {
 
     async fn peel_group_message(
         &self,
-        msg: &TransportMessage,
+        msg: &cgka_traits::peeler::PreparedGroupMessage<'_>,
         ctx: &GroupContextSnapshot,
     ) -> Result<PeeledMessage, PeelerError> {
         MockPeeler.peel_group_message(msg, ctx).await
@@ -1000,6 +1000,10 @@ impl StorageProvider for FaultStorage {
 
     fn mls_storage(&self) -> &Self::Mls {
         self.inner.mls_storage()
+    }
+
+    fn past_peel_context_generation(&self) -> Option<u64> {
+        self.inner.past_peel_context_generation()
     }
 
     fn pending_ref_high_water(&self) -> StorageResult<u64> {
@@ -2920,7 +2924,7 @@ impl TransportPeeler for OpaquePeeler {
 
     async fn peel_group_message(
         &self,
-        _msg: &TransportMessage,
+        _msg: &cgka_traits::peeler::PreparedGroupMessage<'_>,
         _ctx: &GroupContextSnapshot,
     ) -> Result<PeeledMessage, PeelerError> {
         Err(PeelerError::DecryptFailed)
@@ -3119,9 +3123,11 @@ async fn a_past_peel_context_is_derived_once_per_generation_not_once_per_slice()
     // open after the second one and no completion convergence rewinds on its
     // own account.
     let (mut bob, storage, group_id, ids, rewinds) = past_peel_backlog_case(ANCHORS, 200).await;
-    // Live ingest deliberately keeps no cross-message context cache; measure
-    // only what the sweeps add.
     let before_sweeps = rewinds.count();
+    assert_eq!(
+        before_sweeps, ANCHORS,
+        "live ingest derives each anchor once"
+    );
 
     bob.converge_and_drain_queued_outbound_intents(&group_id, 1_000_000)
         .await
@@ -3129,8 +3135,8 @@ async fn a_past_peel_context_is_derived_once_per_generation_not_once_per_slice()
     let first_slice_rewinds = rewinds.count() - before_sweeps;
     let attempts_after_first_slice = deferred_attempts(&storage, &ids);
     assert_eq!(
-        first_slice_rewinds, ANCHORS,
-        "the first slice must derive each historical peel context exactly once"
+        first_slice_rewinds, 0,
+        "the first slice must reuse the contexts warmed by live ingest"
     );
 
     bob.converge_and_drain_queued_outbound_intents(&group_id, 1_000_001)
@@ -4045,10 +4051,10 @@ impl TransportPeeler for MarkerOpaquePeeler {
 
     async fn peel_group_message(
         &self,
-        msg: &TransportMessage,
+        msg: &cgka_traits::peeler::PreparedGroupMessage<'_>,
         ctx: &GroupContextSnapshot,
     ) -> Result<PeeledMessage, PeelerError> {
-        if msg.payload.starts_with(OPAQUE_MARKER) {
+        if msg.message.payload.starts_with(OPAQUE_MARKER) {
             if self.backend_unavailable.load(Ordering::SeqCst) {
                 return Err(PeelerError::Backend(
                     "injected marker peeler unavailable".into(),

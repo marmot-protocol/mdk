@@ -180,6 +180,23 @@ mod tests {
         let store = SqliteAccountStorage::in_memory().unwrap();
         let group = sample_group(gid(1), 1, 1);
         store.put_group(&group).unwrap();
+        let before_capture = store.past_peel_context_generation();
+        store
+            .create_group_state_snapshot(&group.id, "anchor")
+            .unwrap();
+        let captured = store.past_peel_context_generation();
+        assert!(captured.is_some());
+        assert_ne!(before_capture, captured);
+        store
+            .create_group_state_snapshot(&group.id, "anchor")
+            .unwrap();
+        let replaced = store.past_peel_context_generation();
+        assert_ne!(
+            captured, replaced,
+            "same-name replacement invalidates peel contexts"
+        );
+        store.release_group_snapshot(&group.id, "anchor").unwrap();
+        assert_ne!(replaced, store.past_peel_context_generation());
         store
             .create_group_state_snapshot(&group.id, "anchor")
             .unwrap();

@@ -132,10 +132,10 @@ impl GroupStorage for SqliteAccountStorage {
     }
 
     fn delete_group(&self, id: &GroupId) -> StorageResult<()> {
-        self.connection.note_openmls_write();
         // Joins a caller's `with_transaction` rather than beginning its own.
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
+            self.connection.note_openmls_write();
             if delete_group_tx(&conn, id)? == 0 {
                 return Err(StorageError::NotFound);
             }

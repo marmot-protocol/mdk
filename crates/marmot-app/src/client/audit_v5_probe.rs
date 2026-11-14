@@ -122,9 +122,16 @@ impl ProbePeeler {
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 impl TransportPeeler for ProbePeeler {
+    fn prepare_group_message<'a>(
+        &self,
+        msg: &'a TransportMessage,
+    ) -> Result<cgka_traits::peeler::PreparedGroupMessage<'a>, PeelerError> {
+        self.inner.prepare_group_message(msg)
+    }
+
     async fn peel_group_message(
         &self,
-        msg: &TransportMessage,
+        msg: &cgka_traits::peeler::PreparedGroupMessage<'_>,
         ctx: &GroupContextSnapshot,
     ) -> Result<PeeledMessage, PeelerError> {
         self.inner.peel_group_message(msg, ctx).await

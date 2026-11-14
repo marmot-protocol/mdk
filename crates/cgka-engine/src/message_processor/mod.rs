@@ -361,32 +361,14 @@ pub(crate) struct DeferredPeelGroupState {
     /// logged, or copied into durable generation state, and process restart
     /// drops it naturally.
     candidate_cache: Option<DeferredPeelCandidateCacheEntry>,
-    /// Retained-anchor peel contexts, shared by every retry over this group's
-    /// backlog: the deferred-peel sweep and the publish-cycle replay. Deriving
-    /// one costs a durable rewind of live group state, which a long backlog
-    /// would otherwise pay per retained anchor per row. Exporter-bearing, held
-    /// in engine memory on the same terms as `candidate_cache`, and dropped
-    /// with it: on every canonical change, and whenever a sweep turns its
-    /// candidate generation over.
-    ///
-    /// Entries are keyed by anchor NAME, and `create_group_state_snapshot` is
-    /// INSERT OR REPLACE — so an anchor can be rewritten under an unchanged
-    /// name. Two facts make that safe, and both must hold for this cache to
-    /// stay correct:
-    ///
-    /// - Every rewrite of an anchor whose epoch is already in the past happens
-    ///   inside a canonical apply that selected a tip, and that same apply
-    ///   calls `invalidate_deferred_peel_candidate_cache`, dropping these
-    ///   contexts along with the candidate ones.
-    /// - The one anchor refresh not gated on a selected tip
-    ///   (`openmls_projection::apply_openmls_canonicalization_result`, the
-    ///   `apply_start_epoch == current_epoch` arm) only ever rewrites the
-    ///   CURRENT-epoch anchor, which is never a peel source:
-    ///   `try_peel_group_message_from_available_snapshots` skips every
-    ///   snapshot whose `source_epoch >= current_epoch`.
-    ///
-    /// Do not close the gap by folding anchor content into the fingerprint —
-    /// that reads every anchor blob on every fingerprint.
+    /// Retained-anchor contexts shared by live ingest, sweeps and confirmation
+    /// replay. Unlike candidate contexts these survive an unchanged sweep or
+    /// commit-graph turnover. Canonical changes explicitly drop them; reuse
+    /// additionally requires the storage write generation, covering same-name
+    /// anchor replacement and pruning without reading anchor blobs. Untracked
+    /// storage never reuses entries. Successful temporary rewinds update only
+    /// a matching generation after restoring live state, before any await.
+    /// Entries cannot outgrow retained anchors, and are never persisted.
     past_peel_contexts: Option<Arc<crate::message_processor::ingest::PastPeelContextCache>>,
     /// Per-row verdicts backing `stored_convergence_commit_edges`: the
     /// stored payload's hash, plus the commit's `(source_epoch, digest)` or
@@ -2785,7 +2767,7 @@ impl<S: StorageProvider> Engine<S> {
             if let Some(state) = self.deferred_peel.get_mut(group_id) {
                 state.yield_for_transport_redelivery = false;
             }
-            self.invalidate_deferred_peel_candidate_cache(group_id);
+            self.clear_peel_candidates(group_id);
             if self.storage.deferred_peel_generation(group_id)?.is_some() {
                 self.storage.delete_deferred_peel_generation(group_id)?;
                 self.converge_stored_openmls_messages_with_deadline(
@@ -2827,7 +2809,7 @@ impl<S: StorageProvider> Engine<S> {
             .cloned()
             .collect::<Vec<_>>();
         if unattempted.is_empty() {
-            self.invalidate_deferred_peel_candidate_cache(group_id);
+            self.clear_peel_candidates(group_id);
             if self.storage.deferred_peel_generation(group_id)?.is_some() {
                 self.storage.delete_deferred_peel_generation(group_id)?;
                 self.converge_stored_openmls_messages_with_deadline(
@@ -2905,11 +2887,37 @@ impl<S: StorageProvider> Engine<S> {
             self.engine_metrics
                 .note_deferred_peel_candidate_cache_miss();
             let candidate_enumeration_started = Instant::now();
+            let past_contexts = self
+                .deferred_peel
+                .get(group_id)
+                .and_then(|state| state.past_peel_contexts.as_ref())
+                .map(Arc::clone);
+            let before_enumeration = past_contexts
+                .as_ref()
+                .map(|_| ingest::PastPeelContextCache::replay_state(&self.storage, group_id))
+                .transpose()?
+                .flatten();
             let enumerated =
                 self.candidate_branch_peel_with_deadline(group_id, execution.replay_deadline());
             // A candidate replay whose restore failed quarantines the group
             // now (mdk#3272).
             self.quarantine_failed_rewinds();
+            if let Some(contexts) = past_contexts {
+                let after_enumeration = if matches!(&enumerated, Ok(Some(_))) {
+                    ingest::PastPeelContextCache::replay_state(&self.storage, group_id)?
+                } else {
+                    None
+                };
+                // Candidate enumeration commits between replay windows. Only
+                // equal, coherently observed content proves preexisting anchor
+                // contexts survived those writes; never stamp a later sample.
+                let rebased = contexts.advance_after_restore(before_enumeration, after_enumeration);
+                if matches!(&enumerated, Ok(Some(_))) {
+                    rebased?;
+                }
+                // Otherwise preserve the enumeration's failure or pending
+                // result. A poisoned cache already refuses every later read.
+            }
             let enumerated = match enumerated {
                 Ok(Some(peel)) => peel,
                 Ok(None) => {
@@ -3002,7 +3010,7 @@ impl<S: StorageProvider> Engine<S> {
         );
         let past_contexts = self.past_peel_contexts(group_id);
         let sweep = crate::message_processor::ingest::DeferredPeelSweep::over_branches(&peel)
-            .with_past_contexts(&past_contexts);
+            .with_past_contexts(past_contexts.as_deref());
         let preparation_ms = sweep_started.elapsed().as_millis() as u64;
 
         let mut progressed = 0usize;
@@ -3105,7 +3113,7 @@ impl<S: StorageProvider> Engine<S> {
 
         let final_fingerprint = self.deferred_peel_context(group_id)?.full;
         if final_fingerprint != context.full {
-            self.invalidate_deferred_peel_candidate_cache(group_id);
+            self.clear_peel_candidates(group_id);
         }
         let remaining = self
             .storage
@@ -3127,7 +3135,7 @@ impl<S: StorageProvider> Engine<S> {
                 // content rows are durable, so a crash in between simply lets
                 // the next normal convergence wake process the complete set.
                 self.storage.delete_deferred_peel_generation(group_id)?;
-                self.invalidate_deferred_peel_candidate_cache(group_id);
+                self.clear_peel_candidates(group_id);
                 // Reingest records admission time while the async sweep runs.
                 // Its completion cannot settle with the pre-sweep instant:
                 // even a zero-quiescence pass would then appear not yet due.
@@ -3565,10 +3573,8 @@ impl<S: StorageProvider> Engine<S> {
     /// Both halves of a deferred peel's context, from one storage walk.
     ///
     /// Anchors enter this by NAME, not by content — reading every anchor blob
-    /// per fingerprint would cost more than the peels it saves. What makes a
-    /// name sufficient is documented at
-    /// `DeferredPeelGroupState::past_peel_contexts`, whose cached contexts
-    /// are the consumer that depends on it; change one and re-read the other.
+    /// per fingerprint would cost more than the peels it saves. Historical
+    /// context cache reuse separately checks storage's write generation.
     fn deferred_peel_context(
         &mut self,
         group_id: &GroupId,
@@ -3957,6 +3963,13 @@ impl<S: StorageProvider> Engine<S> {
     /// group, fingerprint, generation, and branch identities never leave
     /// engine memory.
     pub(crate) fn invalidate_deferred_peel_candidate_cache(&mut self, group_id: &GroupId) {
+        if let Some(state) = self.deferred_peel.get_mut(group_id) {
+            state.past_peel_contexts = None;
+        }
+        self.clear_peel_candidates(group_id);
+    }
+
+    fn clear_peel_candidates(&mut self, group_id: &GroupId) {
         let canonical_pending = self.canonical_replays.contains_key(group_id);
         let peel_pending = self.peel_replays.contains_key(group_id);
         if canonical_pending || peel_pending {
@@ -3974,10 +3987,10 @@ impl<S: StorageProvider> Engine<S> {
     }
 
     fn clear_completed_candidate_cache(&mut self, group_id: &GroupId) {
-        let invalidated = self.deferred_peel.get_mut(group_id).is_some_and(|state| {
-            state.past_peel_contexts = None;
-            state.candidate_cache.take().is_some()
-        });
+        let invalidated = self
+            .deferred_peel
+            .get_mut(group_id)
+            .is_some_and(|state| state.candidate_cache.take().is_some());
         if invalidated {
             self.engine_metrics
                 .note_deferred_peel_candidate_cache_invalidation();
@@ -3993,9 +4006,15 @@ impl<S: StorageProvider> Engine<S> {
     fn past_peel_contexts(
         &mut self,
         group_id: &GroupId,
-    ) -> Arc<crate::message_processor::ingest::PastPeelContextCache> {
+    ) -> Option<Arc<crate::message_processor::ingest::PastPeelContextCache>> {
+        if self.storage.past_peel_context_generation().is_none() {
+            if let Some(state) = self.deferred_peel.get_mut(group_id) {
+                state.past_peel_contexts = None;
+            }
+            return None;
+        }
         let state = self.deferred_peel.entry(group_id.clone()).or_default();
-        Arc::clone(state.past_peel_contexts.get_or_insert_default())
+        Some(Arc::clone(state.past_peel_contexts.get_or_insert_default()))
     }
 
     /// Bookkeeping for a row leaving `PeelDeferred` (applied, reclassified,
@@ -4362,7 +4381,7 @@ impl<S: StorageProvider> Engine<S> {
                 .ingest_group_message_from_sweep(
                     &msg,
                     group_id.as_slice().to_vec(),
-                    ingest::DeferredPeelSweep::LIVE.with_past_contexts(&past_contexts),
+                    ingest::DeferredPeelSweep::LIVE.with_past_contexts(past_contexts.as_deref()),
                 )
                 .await
             {
@@ -4763,7 +4782,7 @@ mod deferred_peel_accounting_tests {
 
             async fn peel_group_message(
                 &self,
-                _: &TransportMessage,
+                _: &cgka_traits::peeler::PreparedGroupMessage<'_>,
                 _: &GroupContextSnapshot,
             ) -> Result<PeeledMessage, PeelerError> {
                 Err(PeelerError::DecryptFailed)

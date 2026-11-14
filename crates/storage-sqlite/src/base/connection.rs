@@ -786,8 +786,8 @@ impl SharedConnection {
         self.inner.transaction_released.notify_all();
     }
 
-    /// Record a write to the OpenMLS store. Called before the write so a
-    /// partial failure invalidates cached objects too.
+    /// Record a write to the OpenMLS store while holding the connection lock,
+    /// before mutation so a partial failure invalidates cached objects too.
     pub(crate) fn note_openmls_write(&self) {
         self.inner.openmls_writes.fetch_add(1, Ordering::Relaxed);
     }
@@ -1084,8 +1084,6 @@ impl SharedConnection {
     /// of committing. A closed connection already rolled everything back, and
     /// so did SQLite when no transaction is open: the savepoint went with it.
     fn rollback_to_savepoint(&self, wakeups: usize) -> StorageResult<()> {
-        // `ROLLBACK TO` discards OpenMLS writes, like `ROLLBACK`.
-        self.note_openmls_write();
         self.inner
             .post_commit
             .lock()
@@ -1172,7 +1170,6 @@ impl SharedConnection {
     /// the transaction, [`Self::lock`] and nested transactions refuse the
     /// rest of it, whose writes would otherwise commit one by one.
     fn rollback_boundary_with_retry(&self) -> StorageResult<()> {
-        self.note_openmls_write();
         self.execute_transaction_boundary_with_retry("ROLLBACK")
             .or_else(|error| {
                 if self.transaction_is_open() {
@@ -1197,6 +1194,9 @@ impl SharedConnection {
             let Ok(conn) = self.inner.connection.lock() else {
                 return Err(BoundaryOutcome::Closed);
             };
+            if matches!(sql, "ROLLBACK" | "ROLLBACK TO mdk_savepoint") {
+                self.note_openmls_write();
+            }
             conn.execute_cached(sql, [])
                 .map(|_| ())
                 .map_err(BoundaryOutcome::Sqlite)
@@ -2691,6 +2691,109 @@ mod tests {
             .recv_timeout(Duration::from_secs(1))
             .expect("connection lock should proceed after the transaction owner clears");
         worker.join().unwrap();
+    }
+
+    #[test]
+    fn cloned_writer_generation() {
+        use crate::base::test_support::{TestGroupState, gid, sample_group};
+        use cgka_traits::storage::{GroupStateCheckpointRef, GroupStorage, MessageStorage};
+        use cgka_traits::types::EpochId;
+        use openmls_traits::storage::StorageProvider as OpenMlsStorageProvider;
+
+        type Mutation = fn(&SqliteAccountStorage) -> StorageResult<()>;
+        let cases: &[(&str, Mutation)] = &[
+            ("write OpenMLS value", |s| {
+                s.mls_storage()
+                    .write_group_state(
+                        &openmls::group::GroupId::from_slice(gid(1).as_slice()),
+                        &TestGroupState(b"updated".to_vec()),
+                    )
+                    .map_err(|e| StorageError::Backend(e.to_string()))
+            }),
+            ("append OpenMLS list", |s| {
+                s.mls_storage()
+                    .append_own_leaf_node(
+                        &openmls::group::GroupId::from_slice(gid(1).as_slice()),
+                        &TestLeafNode(b"leaf".to_vec()),
+                    )
+                    .map_err(|e| StorageError::Backend(e.to_string()))
+            }),
+            ("delete OpenMLS value", |s| {
+                s.mls_storage()
+                    .delete_group_state(&openmls::group::GroupId::from_slice(gid(1).as_slice()))
+                    .map_err(|e| StorageError::Backend(e.to_string()))
+            }),
+            ("delete key package", |s| {
+                s.mls_storage().delete_stored_key_package_bundle(b"key")
+            }),
+            ("delete group", |s| s.delete_group(&gid(1))),
+            ("create full snapshot", |s| {
+                s.create_group_snapshot(&gid(1), "new-full")
+            }),
+            ("create group-state snapshot", |s| {
+                s.create_group_state_snapshot(&gid(1), "new-state")
+            }),
+            ("release snapshot", |s| {
+                s.release_group_snapshot(&gid(1), "full")
+            }),
+            ("restore full snapshot", |s| {
+                s.rollback_group_to_snapshot(&gid(1), "full")
+            }),
+            ("restore group-state snapshot", |s| {
+                s.rollback_group_state_to_snapshot(&gid(1), "state")
+            }),
+            ("create checkpoint", |s| {
+                s.create_group_state_checkpoint(
+                    &gid(1),
+                    &GroupStateCheckpointRef {
+                        id: "new-checkpoint".into(),
+                        resulting_epoch: EpochId(1),
+                    },
+                )
+            }),
+            ("release checkpoint", |s| {
+                s.release_group_state_checkpoint(&gid(1), "checkpoint")
+            }),
+            ("restore checkpoint", |s| {
+                s.restore_group_state_checkpoint(&gid(1), "checkpoint")
+            }),
+        ];
+
+        for &(name, mutate) in cases {
+            let store = SqliteAccountStorage::in_memory().unwrap();
+            store.put_group(&sample_group(gid(1), 1, 1)).unwrap();
+            store.create_group_snapshot(&gid(1), "full").unwrap();
+            store.create_group_state_snapshot(&gid(1), "state").unwrap();
+            store
+                .create_group_state_checkpoint(
+                    &gid(1),
+                    &GroupStateCheckpointRef {
+                        id: "checkpoint".into(),
+                        resulting_epoch: EpochId(1),
+                    },
+                )
+                .unwrap();
+            let generation = store.connection.openmls_write_generation();
+            let worker = store
+                .with_transaction(|owner| -> StorageResult<_> {
+                    let clone = owner.clone();
+                    let worker = std::thread::spawn(move || mutate(&clone));
+                    wait_until_parked(&owner.connection, 1);
+                    assert_eq!(
+                        owner.connection.openmls_write_generation(),
+                        generation,
+                        "{name} must not announce a write while waiting for the transaction"
+                    );
+                    Ok(worker)
+                })
+                .unwrap();
+            worker.join().unwrap().unwrap();
+            assert_ne!(
+                store.connection.openmls_write_generation(),
+                generation,
+                "{name} must invalidate a generation captured before it acquired the transaction"
+            );
+        }
     }
 
     /// A transaction another thread asks for while this one owns the slot
