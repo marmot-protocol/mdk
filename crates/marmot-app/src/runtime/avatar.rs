@@ -23,7 +23,8 @@ impl MarmotApp {
         let before = storage.avatar_identity_reference(group, &member)?;
         let reference =
             storage.request_identity_avatar_acquisition(group, &member, &selected, &version)?;
-        self.presentation_signals.wake();
+        // The account's own label, which its worker listens under.
+        self.presentation_signals.wake_account(&account.label);
         if before != storage.avatar_identity_reference(group, &member)? {
             let _ = self.presentation_signals.avatars.send(label.to_owned());
         }

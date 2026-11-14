@@ -113,12 +113,15 @@ mod small_state;
 mod sync;
 #[cfg(test)]
 pub(crate) mod upload_cleanup_tests;
+mod worker_due;
 
 pub(crate) use history_recovery::recovery_coverage::LiveCoverage;
 pub(crate) use push::PushFetchClock;
 use push::notification_trigger_for_intent;
 #[cfg(all(test, feature = "test-policy-overrides"))]
 pub(crate) use push::{AcceptedPushAnnounce, PushAnnounceTiming};
+#[cfg(test)]
+pub(crate) use push::{TestPushOverride, TestPushOverrideGuard};
 #[cfg(test)]
 pub(crate) use sync::epoch_stall_now_ms;
 pub(crate) use sync::{
@@ -740,6 +743,15 @@ pub(crate) type CursorSealProbe = Box<dyn FnMut(CursorSeal) + Send>;
 /// Each of a group's routes with the relays the recovery runner carries on it.
 pub(crate) type CarriedRoutes = Vec<(storage_sqlite::TransportReconciliationRoute, Vec<String>)>;
 
+/// What decides whether an account's backups are configured (mdk#2923):
+/// the trusted roster's group and epoch, or with no roster whether this
+/// device keeps a recovery key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum BackupEligibility {
+    Roster { group_id: GroupId, epoch: u64 },
+    KeptKey(bool),
+}
+
 pub struct AppClient {
     /// Runs once right after the next projection checkpoint's save, before
     /// anything else reads storage.
@@ -1026,6 +1038,10 @@ pub struct AppClient {
     /// EOSE. `None` reads the relays.
     #[cfg(test)]
     pub(crate) test_push_device_can_fetch: Option<bool>,
+    /// The time the push fetch clock reads, for tests that step it instead
+    /// of waiting real time. `None` reads the wall clock.
+    #[cfg(test)]
+    pub(crate) test_push_now_ms: Option<i64>,
     /// Tests fail every write of an owed push announce.
     #[cfg(test)]
     pub(crate) test_fail_push_announce_owed_write: bool,
@@ -1061,6 +1077,25 @@ pub struct AppClient {
     /// retry re-armed the pass and before any attempt could park it again.
     #[cfg(test)]
     pub(crate) fail_next_convergence_retry_advance: bool,
+    /// The full recovery seam ran, from any path, since the account worker
+    /// last looked, and whether it left work; the worker's schedule re-arms
+    /// from it (mdk#2923). The seam answers from the reads it already made.
+    pub(crate) recovery_seam_owed: Option<bool>,
+    /// Post-join collection advanced, from any path, since the account
+    /// worker last looked (mdk#2923).
+    pub(crate) post_join_advanced: bool,
+    /// Something that can make the KeyPackage catch-up due without time
+    /// passing changed since the worker last looked: a maintenance pass (a
+    /// capability or device-tag change), a sign-in check that found the
+    /// slot superseded or emptied, or the slot's withdrawal (mdk#2923).
+    pub(crate) key_package_lifecycle_changed: bool,
+    /// A history delivery was owed or parked since the worker last looked
+    /// (mdk#2923).
+    pub(crate) history_dispatch_changed: std::sync::atomic::AtomicBool,
+    /// Whether the backup pass last found backups configured, and what
+    /// decided it then. History dispatch counts backup deadlines only while
+    /// they may be (mdk#2923).
+    pub(crate) backups_configured: Option<(BackupEligibility, bool)>,
     /// Per-group (in-memory) epoch at which the warm pass last confirmed the
     /// authoritative encrypted-media component is NOT required. A group's
     /// signed component can only change with a commit, and a commit always
@@ -1717,6 +1752,9 @@ impl AppClient {
                 },
             );
         }
+        // Maintenance may change what the KeyPackage catch-up owes: a device
+        // tag or capability change, or a sign-in check (mdk#2923).
+        self.key_package_lifecycle_changed = true;
         let effects = effects?;
         boxed(|| self.finish_maintenance_effects(&effects)).await
     }
@@ -1777,6 +1815,7 @@ impl AppClient {
     pub(crate) async fn advance_post_join_maintenance_subscriptions(
         &mut self,
     ) -> Result<(), AppError> {
+        self.post_join_advanced = true;
         if self.app.cursor_persistence() == crate::CursorPersistence::Frozen
             || self.runtime.maintenance_is_paused()
         {
@@ -1820,9 +1859,12 @@ impl AppClient {
         // The slot's deletion is a step of a sign-out, which may go out
         // after a removal held the rest back (mdk#2628 D67).
         let sign_out_step = self.sign_out_step_permit()?;
-        Ok(sign_out_step
+        let withdrawn = sign_out_step
             .run(self.runtime.withdraw_key_package_slot())
-            .await?)
+            .await?;
+        // A withdrawn slot makes the KeyPackage catch-up due (mdk#2923).
+        self.key_package_lifecycle_changed = true;
+        Ok(withdrawn)
     }
 
     /// Validate and encrypt a founding image, then durably stage its exact
@@ -3779,7 +3821,9 @@ impl AppClient {
         self.accepted_push_announces.remove(group_id);
         self.history_recovery.forget_settled_recovery_copy(group_id);
         self.push_repairs.forget_group(group_id);
-        self.app.presentation_signals.wake();
+        self.app
+            .presentation_signals
+            .wake_account(&self.state.label);
         // Deletion already committed. A failed transport refresh must not make
         // the caller believe the group still exists; ordinary maintenance retries.
         if self.sync_runtime_groups().await.is_err() {

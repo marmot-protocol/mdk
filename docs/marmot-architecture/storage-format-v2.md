@@ -190,10 +190,12 @@ out.
 The retained legacy `record` column is a compatibility read path, not an
 ongoing second authority. The storage primitive accepts a caller-selected
 limit of at most 256 rows in one atomic, idempotent batch and reports only
-aggregate progress. The production host deliberately selects 32 rows and
-schedules one transaction per 15-second steady-state maintenance tick after
-account readiness. Removing format-1 reads requires a later migration and
-release decision.
+aggregate progress. The production host deliberately selects 32 rows and,
+after account readiness, runs one transaction per account worker turn until
+the sweep completes (mdk#2923 step B). Each batch is its own short
+transaction that releases the write lock, and the worker serves commands,
+inbound delivery, convergence and its passes before the next batch.
+Removing format-1 reads requires a later migration and release decision.
 Reclaiming freed SQLCipher pages is an explicit maintenance operation; opening
 an account never runs `VACUUM` implicitly.
 
@@ -360,11 +362,12 @@ the obsolete pre-#1406 claim that retained anchors still contain messages.
   proportional to message-history size. It performs no per-row payload decode
   or format-2 promotion. Account readiness therefore pays table-copy I/O, but
   not history-wide JSON decoding.
-- After readiness, `marmot-app` schedules one 32-row promotion transaction per
-  15-second steady-state maintenance tick. It emits aggregate counts and
-  duration only. Transient contention retries on a later tick; a durable decode
-  failure halts the optional sweep until restart while legacy reads remain
-  available. Each transaction is idempotent, and crash-kill tests prove a
+- After readiness, `marmot-app` runs one 32-row promotion transaction per
+  account worker turn, behind the worker's commands, inbound delivery,
+  convergence and passes, until the sweep completes (mdk#2923 step B). It
+  emits aggregate counts and duration only. Transient contention retries 15 s
+  later; a durable decode failure halts the optional sweep until restart
+  while legacy reads remain available. Each transaction is idempotent, and crash-kill tests prove a
   partially executed batch rolls back and converges on retry.
 - `VACUUM` is opt-in maintenance on an already keyed connection and is never
   part of automatic session open.

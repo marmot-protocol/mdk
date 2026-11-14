@@ -642,16 +642,28 @@ impl<S: StorageProvider> Engine<S> {
 
     /// Delete private KeyPackages with their keys: those expired at `now`,
     /// and with `recipient`, every one issued to that sibling. Returns how
-    /// many went.
+    /// many went. With none to discard it reads only and opens no writer
+    /// transaction, so a maintenance pass that finds nothing costs no write
+    /// (mdk#2923).
     pub fn discard_private_key_packages(
         &mut self,
         now: u64,
         recipient: Option<&DeviceSlotId>,
     ) -> Result<usize, EngineError> {
+        let discards = |record: &IssuedPrivateKeyPackage| {
+            record.not_after <= now || recipient == Some(&record.recipient_slot)
+        };
+        if !private_storage(&self.storage)?
+            .list_issued_private_key_packages()?
+            .iter()
+            .any(discards)
+        {
+            return Ok(0);
+        }
         self.storage.with_transaction(|storage| {
             let mut discarded = 0;
             for record in private_storage(storage)?.list_issued_private_key_packages()? {
-                if record.not_after <= now || recipient == Some(&record.recipient_slot) {
+                if discards(&record) {
                     delete_issued(storage, &record)?;
                     discarded += 1;
                 }

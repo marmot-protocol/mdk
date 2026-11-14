@@ -201,6 +201,12 @@ impl Default for BackupRestore {
 }
 
 impl BackupRestore {
+    /// Whether a restore was requested and waits for a dispatch slot
+    /// (mdk#2923).
+    pub(crate) fn waiting(&self) -> bool {
+        self.job.is_some()
+    }
+
     fn publish(&mut self) {
         self.status.revision = self.status.revision.wrapping_add(1);
         self.updates.send_replace(self.status.clone());

@@ -2165,6 +2165,23 @@ where
         })
     }
 
+    /// When the current KeyPackage's refresh next comes due by time alone:
+    /// its `refresh_at`, or a week after its publication, whichever is
+    /// first. `None` with no lifecycle or no timed refresh. The other reasons
+    /// for a catch-up (supersession, a generator or capability change, no
+    /// KeyPackage) are not timed; the caller is woken for those (mdk#2923).
+    pub fn key_package_maintenance_next_due(&self) -> AccountResult<Option<Timestamp>> {
+        Ok(self.session.key_package_lifecycle()?.and_then(|lifecycle| {
+            let weekly = lifecycle.authored_event_created_at.map(|published| {
+                Timestamp(published.0.saturating_add(KEY_PACKAGE_REFRESH_MAX_SECS))
+            });
+            [lifecycle.refresh_at, weekly]
+                .into_iter()
+                .flatten()
+                .min_by_key(|at| at.0)
+        }))
+    }
+
     /// Delete expired private init-key material even when network maintenance
     /// is paused or transport cursor persistence is frozen.
     pub fn sweep_expired_key_package_private_material(&mut self) -> AccountResult<usize> {

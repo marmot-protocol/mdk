@@ -50,6 +50,22 @@
   affected it, rather than the first event in the batch. Every cause participates: conflicting or unmatched causes
   use the generic reprojection trigger, including simultaneous reaction and reply-preview changes (mdk#2843).
 
+### Changed
+
+- New reads for the account worker's job deadlines (mdk#2923): `device_pairing_state_exists`,
+  `push_gossip_timing_pending` and `history_dispatch_next_at`, which counts the backup pass and condemned blob
+  deadlines only when its `backups` argument says backups are configured. The history delivery due columns have no
+  index; one may be needed once device groups ship.
+
+- New reads for the account worker's pass deadlines (mdk#2923): `SqliteAppStorage::attachment_work_schedule`
+  (`AttachmentWorkSchedule`: the earliest timed candidate, acquisition or partial, whether polled work exists, and
+  whether an admission demand waits), `avatar_work_schedule` and `chat_presentation_work_pending`.
+
+- New `SqliteAccountStorage::post_join_work_owed`: whether any group has a post-join history fetch without a
+  completion, or a post-join obligation in catch-up or its EOSE timeout, in one read (mdk#2923).
+
+- `delete_expired_received_private_key_packages` only reads when nothing has expired (mdk#2923).
+
 ## 0.16.0 - 2026-11-12
 
 ### Breaking changes

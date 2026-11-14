@@ -96,8 +96,9 @@ async fn the_maintenance_tick_compacts_the_database_once() {
 }
 
 /// A compaction that rolls back (here: another connection holds the write
-/// lock) leaves the database as it was and is tried again on a later tick,
-/// where it completes. It does not use up the worker's one attempt.
+/// lock) leaves the database as it was and is not tried again on the next
+/// tick, only once its spacing has passed, where it completes. It does not
+/// use up the worker's one attempt.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_rolled_back_compaction_is_tried_again_later() {
     let (dir, client, storage, _reference) = offline_fixture().await;
@@ -125,6 +126,14 @@ async fn a_rolled_back_compaction_is_tried_again_later() {
     assert!(!storage.app_storage().database_space().unwrap().incremental);
 
     writer.execute_batch("COMMIT").unwrap();
+    maintenance_tick(&client, &shared, &mut admission).await;
+    assert!(
+        !storage.app_storage().database_space().unwrap().incremental,
+        "not before its spacing has passed"
+    );
+    let past = tokio::time::Instant::now() - Duration::from_secs(1);
+    admission.compaction_retry_at = Some(past);
+    admission.latches.recheck_due = Some(past);
     maintenance_tick(&client, &shared, &mut admission).await;
     assert!(admission.compaction_attempted);
     assert!(storage.app_storage().database_space().unwrap().incremental);
@@ -173,7 +182,7 @@ async fn the_tick_that_finishes_the_migration_flags_the_compaction() {
         admission
             .latches
             .recheck_due
-            .is_some_and(|due| due > std::time::Instant::now()),
+            .is_some_and(|due| due > tokio::time::Instant::now()),
         "the hourly recheck is not due on the next tick"
     );
 
@@ -184,6 +193,32 @@ async fn the_tick_that_finishes_the_migration_flags_the_compaction() {
     assert!(admission.compaction_attempted, "flagged and compacted");
     assert!(app_storage.database_space().unwrap().incremental);
     test_free_space::clear(dir.path());
+}
+
+/// A rolled-back compaction waits 1 minute before its next attempt, then 10
+/// minutes; the third rollback ends the attempts for this worker (mdk#2923).
+#[test]
+fn compaction_rollbacks_are_spaced_1_min_then_10_min() {
+    use crate::media::storage_compaction::CompactionAttempt;
+    let mut admission = Admission::default();
+    let waits = |admission: &Admission| {
+        admission
+            .compaction_retry_at
+            .unwrap()
+            .duration_since(tokio::time::Instant::now())
+    };
+    admission.record_compaction(CompactionAttempt::RolledBack);
+    assert!((Duration::from_secs(59)..=Duration::from_secs(60)).contains(&waits(&admission)));
+    assert_eq!(admission.latches.recheck_due, admission.compaction_retry_at);
+    admission.record_compaction(CompactionAttempt::RolledBack);
+    assert!((Duration::from_secs(599)..=Duration::from_secs(600)).contains(&waits(&admission)));
+    let last = admission.compaction_retry_at;
+    admission.record_compaction(CompactionAttempt::RolledBack);
+    assert!(
+        admission.compaction_attempted,
+        "the third ends the attempts"
+    );
+    assert_eq!(admission.compaction_retry_at, last);
 }
 
 /// Repeated rollbacks stop after the cap, so a failure that keeps happening
@@ -276,4 +311,63 @@ async fn the_worker_compacts_only_when_the_maintenance_task_flags_it() {
     assert!(storage.app_storage().database_space().unwrap().incremental);
     assert!(admission.compaction_attempted);
     test_free_space::clear(dir.path());
+}
+
+/// The housekeeping job's schedule and the watchdog read one answer: owed on
+/// a fresh worker, and nothing at all with cursors frozen, where the batch
+/// never runs, so a frozen worker's watchdog counts no miss on every tick
+/// (mdk#2923 step B).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn housekeeping_owes_nothing_where_its_batch_cannot_run() {
+    let (_dir, mut client, _storage, _reference) = offline_fixture().await;
+    let admission = Admission::default();
+    assert!(housekeeping_owed_now(&client, &admission));
+    assert!(next_housekeeping_at(&client, &admission).is_some());
+
+    client.app.config.cursor_persistence = crate::CursorPersistence::Frozen;
+    assert!(!housekeeping_owed_now(&client, &admission));
+    assert_eq!(next_housekeeping_at(&client, &admission), None);
+}
+
+/// A media row deleted outside the attachment pass, here an abandoned
+/// upload, wakes no job. The housekeeping schedule still owes reclaim a look
+/// within 15 s, not at its hourly recheck.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_media_deletion_outside_the_pass_brings_housekeeping_back_within_15_s() {
+    use crate::runtime::account_worker::schedule::RETRY_WHILE_OWED;
+    use media_store::MediaCatalog as _;
+    use std::sync::atomic::Ordering;
+    let (_dir, client, storage, _reference) = offline_fixture().await;
+    let mut admission = Admission::default();
+    let latches = &mut admission.latches;
+    latches.legacy_bodies_done.store(true, Ordering::Release);
+    latches.database_avatars_done.store(true, Ordering::Release);
+    admission.startup_wal_settled.store(true, Ordering::Release);
+    let later = TokioInstant::now() + Duration::from_secs(3600);
+    admission.keep_media_due = Some(later);
+    admission.latches.recheck_due = Some(later);
+    admission.latches.batch_cleanup_seen =
+        Some(storage.app_storage().media_cleanup_epoch().unwrap());
+    assert!(!housekeeping_owed_now(&client, &admission), "settled");
+    assert_eq!(next_housekeeping_at(&client, &admission), Some(later));
+
+    let catalog = storage_sqlite::SqliteMediaCatalog::new(storage.app_storage());
+    let id = media_store::FileId([9; 16]);
+    catalog
+        .insert_pending(&media_store::NewFile {
+            id,
+            key: media_store::FileKey::from_bytes([1; 32]),
+            category: Category::Retained,
+            byte_len: 1,
+            digest: [2; 32],
+            created_at: 1,
+        })
+        .unwrap();
+    assert!(catalog.abandon_pending(id).unwrap());
+    assert!(housekeeping_owed_now(&client, &admission), "reclaim owed");
+    let at = next_housekeeping_at(&client, &admission).expect("scheduled");
+    assert!(
+        at <= TokioInstant::now() + RETRY_WHILE_OWED,
+        "a look within 15 s"
+    );
 }

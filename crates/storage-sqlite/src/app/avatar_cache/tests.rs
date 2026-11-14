@@ -1885,3 +1885,26 @@ fn queued_avatar_descriptors_keep_their_persisted_envelope() {
             }
     );
 }
+
+/// The avatar pass's schedule is the earliest acquisition `due`: a request
+/// at once, a claim at its lease end, a published image at its refresh, and
+/// a failure at its retry (mdk#2923).
+#[test]
+fn avatar_work_schedule_is_the_earliest_acquisition_due() {
+    let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
+    assert_eq!(store.avatar_work_schedule().unwrap(), (None, false));
+    store
+        .request_avatar_acquisition("owner", &selected_url("key"), false)
+        .unwrap()
+        .unwrap();
+    assert_eq!(store.avatar_work_schedule().unwrap(), (Some(0), false));
+    let job = store.claim_avatar_acquisition(100).unwrap().unwrap();
+    assert_eq!(store.avatar_work_schedule().unwrap(), (Some(220), false));
+    store
+        .complete_avatar_acquisition(&job, &image(42, 16), Some(500))
+        .unwrap();
+    assert_eq!(store.avatar_work_schedule().unwrap(), (Some(500), false));
+    let refresh = store.claim_avatar_acquisition(500).unwrap().unwrap();
+    store.fail_avatar_acquisition(&refresh, 500, true).unwrap();
+    assert_eq!(store.avatar_work_schedule().unwrap(), (Some(560), false));
+}

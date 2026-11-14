@@ -76,6 +76,45 @@
   raises a notice. After the upgrade to the coverage ledger, nearly every chat showed "history may be incomplete" for
   this alone, and busy groups flashed the notice about once a second as live input moved their live edge.
 
+### Changed
+
+- Every job the 15 s maintenance tick ran, other than session maintenance (`run_due_maintenance`), now runs on the
+  account worker's own schedule (mdk#2923 step B): local-submission retries, the content-report backfill, legacy
+  message promotion, device pairing timers, the compaction and housekeeping batch, the KeyPackage catch-up, push join
+  windows and announce/repair retries, and history dispatch. Each runs when an event wakes it and at the deadline
+  its data gives; the sweeps that finish (backfill, promotion) run batch after batch until done; pairing runs every
+  15 s only while pairing state exists, and push only while a join window is open, an announce is owed or a repair
+  ask is held. History dispatch counts backup deadlines only while backups are configured, so with device groups on
+  and no recovery key it runs once at startup and then rests until a history transfer, a restore, or a change to
+  backup eligibility (a kept recovery key or a commit to the trusted device group) wakes it. A slot withdrawal, a
+  sign-in check that finds the slot superseded or emptied, and every maintenance pass wake the KeyPackage catch-up. The tick runs session maintenance and the watchdog, which counts a missed wake
+  for each job (`watchdog_missed_wake_*`).
+
+- The attachment, avatar and presentation passes no longer run on every maintenance tick (mdk#2923 step B). Each
+  runs when an event wakes it and at the deadline its data gives: the attachment pass at the earliest acquisition
+  `due` among its candidates (a request, a lease end, a retry, a deferral or a readmission backoff), an acquisition
+  or partial expiry, and at least hourly; the avatar pass at the earliest avatar acquisition `due`. Work no column
+  announces is still polled every 15 s while it exists: a staged upload, a row parked for free disk space, a running
+  media sweep batch, and presentation rows that cannot be applied yet. An idle account runs none of them. The
+  tick's watchdog also checks the passes (`watchdog_missed_wake_attachment_pass`, `_avatar_pass`,
+  `_presentation_pass`).
+
+- Recovery and post-join work run on the account worker's own schedule, not on every maintenance tick (mdk#2923
+  step B). Each runs once when the worker opens, then when an event wakes it (a receive, a convergence pass, a new
+  replay generation, a join, maintenance pausing or resuming) and again 15 s later while it still has work. An
+  account with nothing owed runs neither. While the adapter is inactive (offline, or no relays) the replay generation
+  never authorizes, so recovery keeps its 15 s cadence; since mdk#3238 a repeat pass writes nothing. The tick checks as a
+  watchdog that no job with work lacks a wake or deadline; a miss is counted as `watchdog_missed_wake_recovery` or
+  `watchdog_missed_wake_post_join`, logged once per job per worker, and the job runs. A rolled-back compaction now
+  waits 1 minute, then 10 minutes, before its next attempt, instead of retrying on the next tick.
+
+- Account-scoped work wakes only that account's worker (mdk#2923 step B). A chat-list, message, avatar or attachment
+  change for one account no longer runs every other account's presentation, avatar and attachment passes; shared
+  profile and directory changes and attachment controls still wake every account. The 15 s maintenance tick still
+  sets every pass due. The expired private KeyPackage discard reads first and opens no writer transaction when
+  nothing has expired, so an idle tick no longer writes the session database. New runtime operation
+  `storage_session_write_begin` counts writer transactions on the engine's session connection.
+
 ## 0.16.0 - 2026-11-12
 
 ### Breaking changes

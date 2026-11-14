@@ -4,6 +4,7 @@
 mod attachments;
 mod read_queue;
 pub(crate) mod recovery_credits;
+mod schedule;
 
 pub(crate) use read_queue::{
     ReadClass, ReadReply, WorkerLane, WorkerReply, WorkerUnit, WorkerUnitGauge,
@@ -1098,6 +1099,25 @@ fn install_storage_telemetry(
             );
         })));
     }
+    // The engine has its own connection to the session database. Only its
+    // writer transactions are recorded, under their own operation, so the
+    // app database's timings keep their meaning (mdk#2923).
+    let telemetry = telemetry.clone();
+    client.engine_storage.set_timing_observer(Some(Arc::new(
+        move |operation, duration, success| {
+            if operation == storage_sqlite::SqliteTimingOperation::WriteBegin {
+                telemetry.record_runtime(
+                    RuntimeOp::StorageSessionWriteBegin,
+                    duration,
+                    if success {
+                        TelemetryOutcome::Success
+                    } else {
+                        TelemetryOutcome::Failure
+                    },
+                );
+            }
+        },
+    )));
 }
 
 pub(crate) fn spawn_app_runtime_account_worker(
@@ -1751,10 +1771,19 @@ async fn run_app_runtime_account_worker(
     let mut presentation_maintenance = super::presentation::PresentationMaintenance::default();
     let mut presentation_wakeups = app.presentation_signals.subscribe_work();
     let mut relay_config_work = RelayConfigWork::Ready;
+    let mut account_wakeups = app
+        .presentation_signals
+        .subscribe_account_work(&account_label);
     let mut presentation_due = true;
     let mut avatar_due = true;
     let mut attachment_due = true;
     let mut attachment_admission = attachments::Admission::default();
+    // Recovery and post-join work run on their own wakes and deadlines;
+    // the tick only checks that none was missed (mdk#2923 step B).
+    let mut schedule = schedule::Schedule::opened();
+    #[cfg(test)]
+    let started = (TokioInstant::now(), std::time::Instant::now());
+    let mut maintenance_paused = client.runtime.maintenance_is_paused();
     let mut avatar_resumed = false;
     let mut avatar_identities = super::avatar::IdentityAvatarMaintenance::default();
 
@@ -1788,6 +1817,45 @@ async fn run_app_runtime_account_worker(
             stop_recovery_runner(&mut recovery_runner, &mut client).await;
             stop_unlinked_worker(&mut client, unlinked).await;
             break 'worker;
+        }
+        // Re-arm the schedule from whichever path ran the recovery seam or
+        // the post-join advance since the last turn. Pausing or resuming
+        // maintenance wakes post-join and history dispatch: neither has a
+        // deadline while paused, so a resume must re-read both.
+        let now = TokioInstant::now();
+        if client.runtime.maintenance_is_paused() != maintenance_paused {
+            maintenance_paused = !maintenance_paused;
+            schedule.wake(schedule::Job::PostJoin);
+            schedule.wake(schedule::Job::HistoryDispatch);
+        }
+        if let Some(owed) = client.recovery_seam_owed.take() {
+            schedule.ran(schedule::Job::Recovery, owed, now);
+        }
+        if std::mem::take(&mut client.post_join_advanced) {
+            schedule.ran(schedule::Job::PostJoin, client.post_join_owed(), now);
+        }
+        // Wake the jobs whose work arrives without time passing.
+        if std::mem::take(&mut client.key_package_lifecycle_changed) {
+            schedule.wake(schedule::Job::KeyPackageCatchUp);
+        }
+        if client
+            .history_dispatch_changed
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+            || (!schedule.pending(schedule::Job::HistoryDispatch)
+                && client.backup_eligibility_changed())
+        {
+            schedule.wake(schedule::Job::HistoryDispatch);
+        }
+        // Tests turn this wake off to show the watchdog finds owed timing.
+        #[cfg(test)]
+        let push_turn_wake = client.test_push_turn_wake();
+        #[cfg(not(test))]
+        let push_turn_wake = true;
+        if push_turn_wake && !schedule.pending(schedule::Job::Push) && client.push_timing_owed() {
+            schedule.wake(schedule::Job::Push);
+        }
+        if !schedule.pending(schedule::Job::DevicePairing) && client.device_pairing_owed() {
+            schedule.wake(schedule::Job::DevicePairing);
         }
         if recovery_runner.is_none() && client.recovery_runner_due() {
             // A successful paced preparation retry starts the runner here,
@@ -1912,6 +1980,7 @@ async fn run_app_runtime_account_worker(
             );
         }
         let ready_command = ready_command_index(&pending, &media_http);
+        let scheduled_at = schedule.next_at(TokioInstant::now(), crate::unix_now_seconds());
         #[cfg(test)]
         tests::secondary_retry_scheduler_tests::record_turn(
             &account_id_hex,
@@ -2002,7 +2071,8 @@ async fn run_app_runtime_account_worker(
             done = media_http_rx.recv() => {
                 match done {
                     Some(done) => {
-                        complete_media_http(&mut client, done, &shared, &media_http).await;
+                        let history_unsettled =
+                            complete_media_http(&mut client, done, &shared, &media_http).await;
                         // Ordinary transfers return the same credits used by
                         // restore; resume only after completion released one.
                         dispatch_backup_restore(&mut client, &media_http);
@@ -2024,6 +2094,20 @@ async fn run_app_runtime_account_worker(
                         );
                         avatar_due = true;
                         attachment_due = true;
+                        // A slot freed, and a history transfer may have
+                        // finished or backed off. One that failed and could
+                        // not record its deferral is still due now: retry it
+                        // in 15 s, never in a tight loop. A later completion
+                        // wakes dispatch and may retry it sooner; it is still
+                        // never more than once per completion.
+                        if history_unsettled {
+                            schedule.arm(
+                                schedule::Job::HistoryDispatch,
+                                Some(TokioInstant::now() + schedule::RETRY_WHILE_OWED),
+                            );
+                        } else {
+                            schedule.wake(schedule::Job::HistoryDispatch);
+                        }
                         schedule_pending_convergence_groups(
                             &mut scheduled_convergence,
                             &mut client,
@@ -2354,6 +2438,12 @@ async fn run_app_runtime_account_worker(
                         account_error_message("native replay synchronization failed", &error),
                     );
                 }
+                // The watch moves on every replay change: a new generation,
+                // native progress, a fence armed or pruned, an EOSE. Each can
+                // change what the recovery seam owes, and only the seam
+                // imports replay loss, so each runs it once. A repeat pass on
+                // an inactive adapter returns early (mdk#3238).
+                schedule.wake(schedule::Job::Recovery);
                 publish_account_level_changes(
                     &mut client, &events, &account_id_hex, &account_label,
                 );
@@ -2725,6 +2815,11 @@ async fn run_app_runtime_account_worker(
                         recovery_runner = client.spawn_recovery_runner().await;
                         recovery_catching_up =
                             client.routing.subscribe_recovery_runner_catching_up();
+                        // The new client owes what a fresh open owes: run
+                        // every job once, as at startup, so none waits for
+                        // the watchdog or counts as a missed wake.
+                        schedule = schedule::Schedule::opened();
+                        maintenance_paused = client.runtime.maintenance_is_paused();
                         schedule_pending_convergence_groups(
                             &mut scheduled_convergence,
                             &mut client,
@@ -2755,9 +2850,20 @@ async fn run_app_runtime_account_worker(
                 });
                 avatar_due |= identities.as_ref().is_ok_and(|more| *more)
                     || acquisition.as_ref().is_ok_and(|more| *more);
-                if identities.is_err() || acquisition.is_err() {
+                let failed = identities.is_err() || acquisition.is_err();
+                if failed {
                     tracing::warn!(target: "marmot_app::runtime", method = "avatar_acquisition",
-                        "avatar maintenance failed; retrying on the next tick");
+                        "avatar maintenance failed; retrying in 15 s");
+                }
+                if !avatar_due {
+                    let (retry, wall) = avatar_pass_next_at(&client, failed);
+                    schedule.arm_timed(
+                        schedule::Job::AvatarPass,
+                        retry,
+                        wall,
+                        crate::unix_now_seconds(),
+                        TokioInstant::now(),
+                    );
                 }
             }
             _ = local_submission_wakeups.changed() => { local_submission_due = true; }
@@ -2778,20 +2884,30 @@ async fn run_app_runtime_account_worker(
             result = presentation_wakeups.changed() => {
                 if result.is_ok() { presentation_due = true; avatar_due = true; attachment_due = true; }
             }
+            result = account_wakeups.changed() => {
+                if result.is_ok() { presentation_due = true; avatar_due = true; attachment_due = true; }
+            }
             _ = tokio::task::yield_now(), if presentation_due => {
                 if lifecycle.is_stopping() { continue 'worker; }
                 avatar_due = true;
                 let step = shared.observer.performance().observe(RuntimeOp::WorkerPresentationPass);
                 let presentation = presentation_maintenance.run(&client, &account_id_hex);
                 step.finish_app(&presentation);
+                let failed = presentation.is_err();
                 presentation_due = match presentation {
                     Ok(more) => more,
                     Err(_) => {
                         tracing::warn!(target: "marmot_app::runtime", method = "chat_presentation_maintenance",
-                            "local chat presentation maintenance failed; retrying on the next wakeup or maintenance tick");
+                            "local chat presentation maintenance failed; retrying on the next wakeup or in 15 s");
                         false
                     }
                 };
+                if !presentation_due {
+                    schedule.arm(
+                        schedule::Job::PresentationPass,
+                        presentation_pass_next_at(&client, failed),
+                    );
+                }
             }
             more = attachment_admission.ready(), if attachment_admission.is_waiting() => {
                 attachment_due |= more;
@@ -2801,14 +2917,31 @@ async fn run_app_runtime_account_worker(
                 let step = shared.observer.performance().observe(RuntimeOp::WorkerAttachmentPass);
                 let attachment = attachments::schedule(&client, &shared, &media_http, &mut attachment_admission);
                 step.finish_app(&attachment);
+                let failed = attachment.is_err();
                 attachment_due = match attachment {
                     Ok(more) => more,
                     Err(_) => {
                         tracing::warn!(target: "marmot_app::runtime", method = "attachment_acquisition",
-                            "attachment maintenance failed; retrying on next wakeup or tick");
+                            "attachment maintenance failed; retrying on next wakeup or in 15 s");
                         false
                     }
                 };
+                // A pass may have deleted media rows, which frees pages.
+                schedule.wake(schedule::Job::Housekeeping);
+                if !attachment_due {
+                    let (next, wall) = attachments::next_pass_at(&client, &attachment_admission);
+                    schedule.arm_timed(
+                        schedule::Job::AttachmentPass,
+                        Some(if failed {
+                            next.min(TokioInstant::now() + schedule::RETRY_WHILE_OWED)
+                        } else {
+                            next
+                        }),
+                        wall,
+                        crate::unix_now_seconds(),
+                        TokioInstant::now(),
+                    );
+                }
             }
             // Native input still being admitted takes its next turn as soon as
             // commands and live input have had theirs, instead of waiting for
@@ -2817,179 +2950,221 @@ async fn run_app_runtime_account_worker(
             _ = tokio::task::yield_now(), if admission_retry.ready() && native_progress => {
                 continue 'worker;
             }
+            () = sleep_until_scheduled(scheduled_at), if scheduled_at.is_some() && !lifecycle.is_stopping() => {
+                // These jobs ran inside the tick before, so reads queued behind
+                // them still count as waiting behind maintenance.
+                let _unit = unit.enter(WorkerUnit::Maintenance);
+                let now = TokioInstant::now();
+                let now_wall = crate::unix_now_seconds();
+                let context = EpochBackfillReportContext {
+                    events: &events,
+                    account_id_hex: &account_id_hex,
+                    account_label: &account_label,
+                    shared: &shared,
+                };
+                if schedule.due(schedule::Job::Recovery, now, now_wall) {
+                    let owed = run_scheduled_recovery(&mut client, context).await;
+                    schedule.ran(schedule::Job::Recovery, owed, TokioInstant::now());
+                }
+                if schedule.due(schedule::Job::PostJoin, now, now_wall) {
+                    let owed = run_scheduled_post_join(&mut client, context).await;
+                    client.post_join_advanced = false;
+                    schedule.ran(schedule::Job::PostJoin, owed, TokioInstant::now());
+                }
+                // A pass's deadline sets it due; the pass arms its next one
+                // when it runs.
+                for (job, due) in [
+                    (schedule::Job::AttachmentPass, &mut attachment_due),
+                    (schedule::Job::AvatarPass, &mut avatar_due),
+                    (schedule::Job::PresentationPass, &mut presentation_due),
+                    (schedule::Job::LocalSubmission, &mut local_submission_due),
+                ] {
+                    if schedule.due(job, now, now_wall) {
+                        schedule.arm(job, None);
+                        *due = true;
+                    }
+                }
+                // The jobs the maintenance tick used to run, in its order.
+                let telemetry = shared.observer.performance().clone();
+                let retry = || Some(TokioInstant::now() + schedule::RETRY_WHILE_OWED);
+                if schedule.due(schedule::Job::ContentBackfill, now, now_wall) {
+                    let step = telemetry.observe(RuntimeOp::WorkerMaintenanceContentBackfill);
+                    let backfill = client.backfill_content_reports();
+                    step.finish_app(&backfill);
+                    let next = if backfill.is_err() {
+                        tracing::warn!(target: "marmot_app::account_worker",
+                            method = "report_backfill", "report backfill deferred");
+                        retry()
+                    } else {
+                        // The next batch on a later turn, until done. A
+                        // deadline at now waits for a timer turn, so every
+                        // ready arm above this one, and the tick, go first.
+                        client.content_report_backfill_owed().then(TokioInstant::now)
+                    };
+                    schedule.arm(schedule::Job::ContentBackfill, next);
+                }
+                if schedule.due(schedule::Job::LegacyPromotion, now, now_wall) {
+                    let step = telemetry.observe(RuntimeOp::WorkerMaintenanceLegacyPromotion);
+                    let outcome =
+                        run_legacy_message_promotion_batch(&client, &mut legacy_message_promotion);
+                    step.finish(outcome);
+                    let next = match legacy_message_promotion.status {
+                        LegacyMessagePromotionStatus::Pending
+                            if outcome == TelemetryOutcome::Failure => retry(),
+                        // The next batch on a later turn, behind every ready
+                        // arm above this one and the tick: a deadline at now
+                        // still waits for a timer turn.
+                        LegacyMessagePromotionStatus::Pending => Some(TokioInstant::now()),
+                        LegacyMessagePromotionStatus::Complete
+                        | LegacyMessagePromotionStatus::Halted => None,
+                    };
+                    schedule.arm(schedule::Job::LegacyPromotion, next);
+                }
+                if schedule.due(schedule::Job::DevicePairing, now, now_wall) {
+                    // Pairing timers, KeyPackage retries and link settlement.
+                    client.drive_device_pairing().await;
+                    if client.device_unlinked() {
+                        // Nothing more goes out; the next turn stops the worker.
+                        continue 'worker;
+                    }
+                    schedule.arm(
+                        schedule::Job::DevicePairing,
+                        if client.device_pairing_owed() { retry() } else { None },
+                    );
+                }
+                if schedule.due(schedule::Job::Housekeeping, now, now_wall) {
+                    #[cfg(test)]
+                    record_housekeeping_run(
+                        &account_id_hex,
+                        format!(
+                            "held +{:?} real +{:?} trigger={} {}",
+                            TokioInstant::now() - started.0,
+                            started.1.elapsed(),
+                            if schedule.woken(schedule::Job::Housekeeping) {
+                                "wake"
+                            } else {
+                                "deadline"
+                            },
+                            attachments::housekeeping_reason(&client, &attachment_admission),
+                        ),
+                    );
+                    let step = telemetry.observe(RuntimeOp::WorkerMaintenanceCompaction);
+                    attachments::compact_if_due(&client, &shared, &mut attachment_admission).await;
+                    step.finish(TelemetryOutcome::Success);
+                    attachments::spawn_legacy_migration(&client, &shared, &mut attachment_admission);
+                    schedule.arm(
+                        schedule::Job::Housekeeping,
+                        attachments::next_housekeeping_at(&client, &attachment_admission),
+                    );
+                }
+                if schedule.due(schedule::Job::KeyPackageCatchUp, now, now_wall) {
+                    if client.key_package_maintenance_requires_catch_up() {
+                        run_key_package_catch_up(
+                            &mut client,
+                            &shared,
+                            &mut scheduled_convergence,
+                            context,
+                        )
+                        .await;
+                        if client.device_unlinked() {
+                            // The catch-up applied this device's removal:
+                            // nothing more goes out (D67).
+                            continue 'worker;
+                        }
+                    }
+                    if client.key_package_maintenance_requires_catch_up() {
+                        schedule.arm(schedule::Job::KeyPackageCatchUp, retry());
+                    } else {
+                        let now_wall = crate::unix_now_seconds();
+                        schedule.arm_wall(
+                            schedule::Job::KeyPackageCatchUp,
+                            client.key_package_catch_up_next_at().filter(|at| *at > now_wall),
+                            now_wall,
+                            TokioInstant::now(),
+                        );
+                    }
+                }
+                if schedule.due(schedule::Job::Push, now, now_wall) {
+                    // A join window ends once T has been counted since its
+                    // join completed, which only sampling fetch time shows.
+                    // Repair asks wait for the same clock, and replies for
+                    // their rank's slots.
+                    let step = telemetry.observe(RuntimeOp::WorkerMaintenancePush);
+                    client.advance_push_join_windows().await;
+                    if client.has_due_push_announce() || client.has_due_push_repair() {
+                        scheduled_push_retry.observe_pending(true, &command_tx);
+                    }
+                    step.finish(TelemetryOutcome::Success);
+                    schedule.arm(
+                        schedule::Job::Push,
+                        if client.push_timing_owed() { retry() } else { None },
+                    );
+                }
+                if schedule.due(schedule::Job::HistoryDispatch, now, now_wall) {
+                    let step = telemetry.observe(RuntimeOp::WorkerMaintenanceHistoryDispatch);
+                    dispatch_history_blobs(&mut client, &media_http);
+                    step.finish(TelemetryOutcome::Success);
+                    schedule.arm_wall(
+                        schedule::Job::HistoryDispatch,
+                        client.history_dispatch_next_at(),
+                        crate::unix_now_seconds(),
+                        TokioInstant::now(),
+                    );
+                }
+            }
             _ = maintenance_tick.tick() => {
-                local_submission_due = true;
-                attachment_due = true;
-                presentation_due = true;
-                avatar_due = true;
+                // Every scheduled job runs on its own wakes and deadlines; the
+                // tick runs session maintenance (until it gets its own
+                // deadlines), the relay-config retry and the watchdog below,
+                // which checks that no job missed a wake.
                 if relay_config_work == RelayConfigWork::RetryOnTick {
                     relay_config_work = RelayConfigWork::Ready;
                 }
-                // Periodic maintenance is never urgent, and its longest leg
-                // runs past the whole shutdown budget: the key-package
-                // catch-up below is capped at 15s. Skip the tick outright once
-                // shutdown is requested rather than starting work the drain
-                // would then have to wait out.
+                // Periodic maintenance is never urgent: skip the tick
+                // outright once shutdown is requested rather than starting
+                // work the drain would then have to wait out.
                 if lifecycle.is_stopping() {
                     continue 'worker;
                 }
                 let phase = shared.observer.performance().observe(RuntimeOp::WorkerMaintenance);
                 let _unit = unit.enter(WorkerUnit::Maintenance);
-                // Each phase below is also timed on its own, so a profile can
-                // name the one an idle tick spends its time in (mdk#2923).
                 let telemetry = shared.observer.performance().clone();
-                let step = telemetry.observe(RuntimeOp::WorkerMaintenanceContentBackfill);
-                let backfill = client.backfill_content_reports();
-                step.finish_app(&backfill);
-                if backfill.is_err() {
-                    tracing::warn!(
-                        target: "marmot_app::account_worker",
-                        method = "maintenance_tick",
-                        "report backfill deferred"
-                    );
-                }
-                let step = telemetry.observe(RuntimeOp::WorkerMaintenanceLegacyPromotion);
-                step.finish(run_legacy_message_promotion_batch(
-                    &client,
-                    &mut legacy_message_promotion,
-                ));
-                // Pairing timers, KeyPackage retries and link settlement.
-                client.drive_device_pairing().await;
-                if client.device_unlinked() {
-                    // Nothing more goes out; the next turn stops the worker.
-                    phase.finish(TelemetryOutcome::Success);
-                    continue 'worker;
-                }
-                let step = telemetry.observe(RuntimeOp::WorkerMaintenanceCompaction);
-                attachments::compact_if_due(&client, &shared, &mut attachment_admission).await;
-                step.finish(TelemetryOutcome::Success);
-                attachments::spawn_legacy_migration(
-                    &client,
-                    &shared,
-                    &mut attachment_admission,
-                );
-                if client.key_package_maintenance_requires_catch_up() {
-                    let step = telemetry.observe(RuntimeOp::WorkerMaintenanceKeyPackageCatchUp);
-                    let observation = shared.observer.product().begin(
-                        crate::ProductFamily::Maintenance, "catch_up", crate::ProductUnit::Attempt,
-                    );
-                    let catch_up = timeout(
-                        Duration::from_secs(15), client.sync_automatically_with_partial_progress(),
-                    ).await;
-                    let outcome = match &catch_up {
-                        Ok(Ok(_)) => KeyPackageMaintenanceCatchUpOutcome::Completed,
-                        Ok(Err(_)) => KeyPackageMaintenanceCatchUpOutcome::Failed,
-                        Err(_) => KeyPackageMaintenanceCatchUpOutcome::TimedOut,
+                // The watchdog: a job with work but no wake or deadline
+                // pending was missed. Count it; it runs on the next turn.
+                let owed_jobs = {
+                    let flags = WatchdogFlags {
+                        attachment_due,
+                        avatar_due,
+                        presentation_due,
+                        local_submission_due,
+                        legacy_promotion_pending: legacy_message_promotion.status
+                            == LegacyMessagePromotionStatus::Pending,
+                        admission: &attachment_admission,
                     };
-                    step.finish(match outcome {
-                        KeyPackageMaintenanceCatchUpOutcome::Completed => TelemetryOutcome::Success,
-                        KeyPackageMaintenanceCatchUpOutcome::Failed => TelemetryOutcome::Failure,
-                        KeyPackageMaintenanceCatchUpOutcome::TimedOut => TelemetryOutcome::Timeout,
-                    });
-                    if let Some(observation) = observation {
-                        observation.finish(outcome.as_str());
-                    }
-                    if client.device_unlinked() {
-                        // The catch-up applied this device's removal:
-                        // nothing more goes out (D67).
-                        phase.finish(TelemetryOutcome::Success);
-                        continue 'worker;
-                    }
-                    match catch_up {
-                        Ok(Ok(summary)) => {
-                            publish_app_runtime_summary_with_v5(&client,
-                                &events,
-                                &account_id_hex,
-                                &account_label,
-                                &summary,
-                            );
-                            start_post_join_history_after_visibility(
-                                &mut client,
-                                &summary,
-                                &events,
-                                &account_id_hex,
-                                &account_label,
-                            )
-                            .await;
-                            publish_client_pending_projection_updates(
-                                &mut client,
-                                &events,
-                                &account_id_hex,
-                                &account_label,
-                            );
-                            schedule_pending_convergence_groups(
-                                &mut scheduled_convergence,
-                                &mut client,
-                            );
-                        }
-                        Ok(Err(failure)) => {
-                            publish_sync_summary_with_audit(&client,
-                                &events,
-                                &account_id_hex,
-                                &account_label,
-                                &failure.partial_summary,
-                                &shared,
-                                "key_package_maintenance_catch_up",
-                            );
-                            start_post_join_history_after_visibility(
-                                &mut client,
-                                &failure.partial_summary,
-                                &events,
-                                &account_id_hex,
-                                &account_label,
-                            )
-                            .await;
-                            publish_app_runtime_account_error(
-                                Emit::Quiescent(&client),
-                                &events,
-                                &account_id_hex,
-                                &account_label,
-                                account_error_message(
-                                    "key package maintenance catch-up failed",
-                                    &failure.source,
-                                ),
-                            );
-                        }
-                        Err(_) => {
-                            tracing::warn!(
-                                target: "marmot_app::runtime",
-                                method = "key_package_maintenance_catch_up",
-                                "key package maintenance catch-up reached its time cap"
-                            );
-                        }
-                    }
-                }
-                // A join window ends once T has been counted since its join
-                // completed, which only time passing shows; the tick counts
-                // it and notices joins that completed. Repair asks wait for
-                // the same clock, and replies for their rank's slots.
-                let step = telemetry.observe(RuntimeOp::WorkerMaintenancePush);
-                client.advance_push_join_windows().await;
-                if client.has_due_push_announce() || client.has_due_push_repair() {
-                    scheduled_push_retry.observe_pending(true, &command_tx);
-                }
-                step.finish(TelemetryOutcome::Success);
-                scheduled_runtime_group_subscription_refresh.observe_pending(
-                    client.has_pending_runtime_group_subscription_refresh(),
-                    &command_tx,
-                );
-                let step = telemetry.observe(RuntimeOp::WorkerMaintenanceRecovery);
-                let selection = match refresh_recovery_at_seam(
-                    &mut client,
-                    EpochBackfillReportContext {
-                        events: &events,
-                        account_id_hex: &account_id_hex,
-                        account_label: &account_label,
-                        shared: &shared,
-                    },
-                )
-                .await
-                {
-                    Ok(()) => TelemetryOutcome::Success,
-                    Err(_) => TelemetryOutcome::Failure,
+                    schedule::Job::ALL.map(|job| job_owed_now(job, &client, &flags))
                 };
-                step.finish(selection);
-                finish_periodic_maintenance_after_recovery(
+                for (job, owed) in schedule::Job::ALL.into_iter().zip(owed_jobs) {
+                    let Some(first) = schedule.missed(job, owed, TokioInstant::now(), crate::unix_now_seconds()) else {
+                        continue;
+                    };
+                    telemetry.record_runtime(
+                        watchdog_missed_wake_op(job),
+                        Duration::ZERO,
+                        TelemetryOutcome::Success,
+                    );
+                    if first {
+                        tracing::warn!(target: "marmot_app::runtime", method = "maintenance_watchdog",
+                            job = job.as_str(), "scheduled job had work with no wake pending");
+                    }
+                    match job {
+                        schedule::Job::AttachmentPass => attachment_due = true,
+                        schedule::Job::AvatarPass => avatar_due = true,
+                        schedule::Job::PresentationPass => presentation_due = true,
+                        schedule::Job::LocalSubmission => local_submission_due = true,
+                        _ => schedule.wake(job),
+                    }
+                }
+                finish_periodic_maintenance(
                     &mut client,
                     &events,
                     &account_id_hex,
@@ -2999,10 +3174,6 @@ async fn run_app_runtime_account_worker(
                     &mut scheduled_convergence,
                 )
                 .await;
-                let step = telemetry.observe(RuntimeOp::WorkerMaintenanceHistoryDispatch);
-                dispatch_history_blobs(&mut client, &media_http);
-                step.finish(TelemetryOutcome::Success);
-
                 phase.finish(TelemetryOutcome::Success);
             }
         }
@@ -3043,8 +3214,282 @@ async fn refresh_recovery_at_seam(
     report_pending_epoch_backfill_result(client, result, backfill_armed, observation, context)
 }
 
-/// Keep the domain maintenance continuation after the recovery outcome.
-async fn finish_periodic_maintenance_after_recovery(
+/// Run the recovery seam for the worker's schedule, timed as
+/// `worker_maintenance_recovery`. Whether it still has work afterwards; a
+/// failure counts as work, so it retries (mdk#2923).
+async fn run_scheduled_recovery(
+    client: &mut AppClient,
+    context: EpochBackfillReportContext<'_>,
+) -> bool {
+    let step = context
+        .shared
+        .observer
+        .performance()
+        .observe(RuntimeOp::WorkerMaintenanceRecovery);
+    let result = refresh_recovery_at_seam(client, context).await;
+    step.finish(if result.is_ok() {
+        TelemetryOutcome::Success
+    } else {
+        TelemetryOutcome::Failure
+    });
+    // The seam's own answer, from the reads it already made.
+    let owed = client.recovery_seam_owed.take();
+    result.is_err() || owed.unwrap_or_else(|| client.recovery_owed())
+}
+
+/// Advance post-join history collection for the worker's schedule, timed as
+/// `worker_maintenance_post_join`. Whether it still has work afterwards; a
+/// failure counts as work, so it retries (mdk#2923).
+async fn run_scheduled_post_join(
+    client: &mut AppClient,
+    context: EpochBackfillReportContext<'_>,
+) -> bool {
+    let step = context
+        .shared
+        .observer
+        .performance()
+        .observe(RuntimeOp::WorkerMaintenancePostJoin);
+    let post_join = client.advance_post_join_maintenance_subscriptions().await;
+    step.finish_app(&post_join);
+    let failed = post_join.is_err();
+    if let Err(err) = post_join {
+        publish_app_runtime_account_error(
+            Emit::Quiescent(client),
+            context.events,
+            context.account_id_hex,
+            context.account_label,
+            account_error_message("post-join maintenance subscription failed", &err),
+        );
+    }
+    failed || client.post_join_owed()
+}
+
+/// When the avatar pass next runs on its own: by the worker's clock, in 15 s
+/// after a failure or while the bootstrap still has rows; by wall time, at
+/// the earliest acquisition `due`, which the schedule turns into 15 s for one
+/// already due that waits for a free slot; otherwise only on a wake (mdk#2923
+/// step B).
+fn avatar_pass_next_at(client: &AppClient, failed: bool) -> (Option<TokioInstant>, Option<u64>) {
+    let retry = TokioInstant::now() + schedule::RETRY_WHILE_OWED;
+    let Ok((due, bootstrap)) = client
+        .app
+        .account_storage(&client.state.label)
+        .and_then(|storage| Ok(storage.app_storage().avatar_work_schedule()?))
+    else {
+        return (Some(retry), None);
+    };
+    if failed || bootstrap {
+        return (Some(retry), None);
+    }
+    // A wall-clock `due`; the schedule runs one already past in 15 s.
+    (None, due)
+}
+
+/// The watchdog's read: whether the avatar pass has work due now.
+fn avatar_pass_owed_now(client: &AppClient) -> bool {
+    client
+        .app
+        .account_storage(&client.state.label)
+        .and_then(|storage| Ok(storage.app_storage().avatar_work_schedule()?))
+        .map_or(true, |(due, bootstrap)| {
+            bootstrap || due.is_some_and(|at| at <= crate::unix_now_seconds())
+        })
+}
+
+/// When the presentation pass next runs on its own. It has no timed work:
+/// only rows it could not apply yet, or a failure, retry every 15 s, as the
+/// tick retried them (mdk#2923 step B).
+fn presentation_pass_next_at(client: &AppClient, failed: bool) -> Option<TokioInstant> {
+    (failed || presentation_pass_owed_now(client))
+        .then(|| TokioInstant::now() + schedule::RETRY_WHILE_OWED)
+}
+
+/// The watchdog's read: whether the presentation pass has rows left.
+fn presentation_pass_owed_now(client: &AppClient) -> bool {
+    client
+        .app
+        .account_storage(&client.state.label)
+        .and_then(|storage| Ok(storage.app_storage().chat_presentation_work_pending()?))
+        .unwrap_or(true)
+}
+
+/// The KeyPackage maintenance catch-up, capped at 15 s, and what it found.
+/// Moved off the maintenance tick unchanged; the worker's schedule runs it
+/// when it is due (mdk#2923 step B).
+async fn run_key_package_catch_up(
+    client: &mut AppClient,
+    shared: &RuntimeSharedServices,
+    scheduled_convergence: &mut ScheduledConvergence,
+    context: EpochBackfillReportContext<'_>,
+) {
+    let EpochBackfillReportContext {
+        events,
+        account_id_hex,
+        account_label,
+        ..
+    } = context;
+    let step = shared
+        .observer
+        .performance()
+        .observe(RuntimeOp::WorkerMaintenanceKeyPackageCatchUp);
+    let observation = shared.observer.product().begin(
+        crate::ProductFamily::Maintenance,
+        "catch_up",
+        crate::ProductUnit::Attempt,
+    );
+    let catch_up = timeout(
+        Duration::from_secs(15),
+        client.sync_automatically_with_partial_progress(),
+    )
+    .await;
+    let outcome = match &catch_up {
+        Ok(Ok(_)) => KeyPackageMaintenanceCatchUpOutcome::Completed,
+        Ok(Err(_)) => KeyPackageMaintenanceCatchUpOutcome::Failed,
+        Err(_) => KeyPackageMaintenanceCatchUpOutcome::TimedOut,
+    };
+    step.finish(match outcome {
+        KeyPackageMaintenanceCatchUpOutcome::Completed => TelemetryOutcome::Success,
+        KeyPackageMaintenanceCatchUpOutcome::Failed => TelemetryOutcome::Failure,
+        KeyPackageMaintenanceCatchUpOutcome::TimedOut => TelemetryOutcome::Timeout,
+    });
+    if let Some(observation) = observation {
+        observation.finish(outcome.as_str());
+    }
+    if client.device_unlinked() {
+        return;
+    }
+    match catch_up {
+        Ok(Ok(summary)) => {
+            publish_app_runtime_summary_with_v5(
+                client,
+                events,
+                account_id_hex,
+                account_label,
+                &summary,
+            );
+            start_post_join_history_after_visibility(
+                client,
+                &summary,
+                events,
+                account_id_hex,
+                account_label,
+            )
+            .await;
+            publish_client_pending_projection_updates(
+                client,
+                events,
+                account_id_hex,
+                account_label,
+            );
+            schedule_pending_convergence_groups(scheduled_convergence, client);
+        }
+        Ok(Err(failure)) => {
+            publish_sync_summary_with_audit(
+                client,
+                events,
+                account_id_hex,
+                account_label,
+                &failure.partial_summary,
+                shared,
+                "key_package_maintenance_catch_up",
+            );
+            start_post_join_history_after_visibility(
+                client,
+                &failure.partial_summary,
+                events,
+                account_id_hex,
+                account_label,
+            )
+            .await;
+            publish_app_runtime_account_error(
+                Emit::Quiescent(client),
+                events,
+                account_id_hex,
+                account_label,
+                account_error_message("key package maintenance catch-up failed", &failure.source),
+            );
+        }
+        Err(_) => {
+            tracing::warn!(
+                target: "marmot_app::runtime",
+                method = "key_package_maintenance_catch_up",
+                "key package maintenance catch-up reached its time cap"
+            );
+        }
+    }
+}
+
+/// What the watchdog's owed read needs besides the client: the due flags
+/// the worker keeps for its passes and local submissions, legacy
+/// promotion's state, and the attachment admission.
+struct WatchdogFlags<'a> {
+    attachment_due: bool,
+    avatar_due: bool,
+    presentation_due: bool,
+    local_submission_due: bool,
+    legacy_promotion_pending: bool,
+    admission: &'a attachments::Admission,
+}
+
+/// The watchdog's read of whether `job` has work due now (mdk#2923 step B).
+/// A pass or submission already set due is not owed: it runs on the next
+/// turn anyway.
+fn job_owed_now(job: schedule::Job, client: &AppClient, flags: &WatchdogFlags<'_>) -> bool {
+    match job {
+        schedule::Job::Recovery => client.recovery_owed(),
+        schedule::Job::PostJoin => client.post_join_owed(),
+        schedule::Job::AttachmentPass => {
+            !flags.attachment_due && attachments::pass_owed_now(client, flags.admission)
+        }
+        schedule::Job::AvatarPass => !flags.avatar_due && avatar_pass_owed_now(client),
+        schedule::Job::PresentationPass => {
+            !flags.presentation_due && presentation_pass_owed_now(client)
+        }
+        schedule::Job::LocalSubmission => {
+            !flags.local_submission_due && client.local_submission_pending()
+        }
+        schedule::Job::ContentBackfill => client.content_report_backfill_owed(),
+        schedule::Job::LegacyPromotion => flags.legacy_promotion_pending,
+        schedule::Job::DevicePairing => client.device_pairing_owed(),
+        schedule::Job::Housekeeping => attachments::housekeeping_owed_now(client, flags.admission),
+        schedule::Job::KeyPackageCatchUp => client.key_package_maintenance_requires_catch_up(),
+        schedule::Job::Push => client.push_timing_owed(),
+        schedule::Job::HistoryDispatch => client
+            .history_dispatch_next_at()
+            .is_some_and(|at| at <= crate::unix_now_seconds()),
+    }
+}
+
+/// The runtime operation that counts `job`'s missed wakes.
+fn watchdog_missed_wake_op(job: schedule::Job) -> RuntimeOp {
+    use schedule::Job;
+    match job {
+        Job::Recovery => RuntimeOp::WatchdogMissedWakeRecovery,
+        Job::PostJoin => RuntimeOp::WatchdogMissedWakePostJoin,
+        Job::AttachmentPass => RuntimeOp::WatchdogMissedWakeAttachmentPass,
+        Job::AvatarPass => RuntimeOp::WatchdogMissedWakeAvatarPass,
+        Job::PresentationPass => RuntimeOp::WatchdogMissedWakePresentationPass,
+        Job::LocalSubmission => RuntimeOp::WatchdogMissedWakeLocalSubmission,
+        Job::ContentBackfill => RuntimeOp::WatchdogMissedWakeContentBackfill,
+        Job::LegacyPromotion => RuntimeOp::WatchdogMissedWakeLegacyPromotion,
+        Job::DevicePairing => RuntimeOp::WatchdogMissedWakeDevicePairing,
+        Job::Housekeeping => RuntimeOp::WatchdogMissedWakeHousekeeping,
+        Job::KeyPackageCatchUp => RuntimeOp::WatchdogMissedWakeKeyPackageCatchUp,
+        Job::Push => RuntimeOp::WatchdogMissedWakePush,
+        Job::HistoryDispatch => RuntimeOp::WatchdogMissedWakeHistoryDispatch,
+    }
+}
+
+/// Sleeps until the schedule's next job, or forever when every job rests.
+async fn sleep_until_scheduled(at: Option<TokioInstant>) {
+    match at {
+        Some(at) => tokio::time::sleep_until(at).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// The periodic tick's session and app maintenance (`run_due_maintenance`).
+async fn finish_periodic_maintenance(
     client: &mut AppClient,
     events: &broadcast::Sender<MarmotAppEvent>,
     account_id_hex: &str,
@@ -3054,18 +3499,6 @@ async fn finish_periodic_maintenance_after_recovery(
     scheduled_convergence: &mut ScheduledConvergence,
 ) {
     let telemetry = shared.observer.performance();
-    let step = telemetry.observe(RuntimeOp::WorkerMaintenancePostJoin);
-    let post_join = client.advance_post_join_maintenance_subscriptions().await;
-    step.finish_app(&post_join);
-    if let Err(err) = post_join {
-        publish_app_runtime_account_error(
-            Emit::Quiescent(client),
-            events,
-            account_id_hex,
-            account_label,
-            account_error_message("post-join maintenance subscription failed", &err),
-        );
-    }
     let backlog_permit = shared.observer.product().permit();
     let step = telemetry.observe(RuntimeOp::WorkerMaintenanceDue);
     let due = client.run_due_maintenance().await;
@@ -3447,7 +3880,7 @@ fn run_legacy_message_promotion_batch(
 }
 
 /// One promotion batch through `promote`: a failed batch is a failure,
-/// whether it retries next tick or halts the sweep, and a sweep that is
+/// whether it retries 15 s later or halts the sweep, and a sweep that is
 /// complete or halted has nothing to do.
 fn run_legacy_message_promotion_batch_with(
     schedule: &mut LegacyMessagePromotionSchedule,
@@ -4047,9 +4480,13 @@ fn dispatch_history_blobs(client: &mut AppClient, media_http: &MediaHttpContext)
 /// Admit new background backup work only under currently reported host
 /// facts. Once admitted, the whole pass and its settlement finish unchanged.
 fn dispatch_backup_pass(client: &mut AppClient, media_http: &MediaHttpContext) {
-    if !client.app.device_groups_enabled()
-        || !media_http.backup_background_conditions.borrow().allowed()
-    {
+    if !client.app.device_groups_enabled() {
+        return;
+    }
+    if !media_http.backup_background_conditions.borrow().allowed() {
+        // No pass now, but dispatch's deadline still needs to know whether
+        // backups are configured at all (mdk#2923).
+        client.refresh_backups_configured();
         return;
     }
     let permit = || {
@@ -4374,12 +4811,16 @@ fn prepared_group_image_upload_is_in_flight(
         .unwrap_or(false)
 }
 
+/// Settle one media completion on the worker. Returns whether it was a
+/// history upload or fetch that failed without settling: its deferral was not
+/// written, so it is still due now, and the caller retries it later rather
+/// than at once (mdk#2923).
 async fn complete_media_http(
     client: &mut AppClient,
     done: MediaHttpDone,
     shared: &RuntimeSharedServices,
     media_http: &MediaHttpContext,
-) {
+) -> bool {
     let MediaHttpDone {
         permit,
         completion,
@@ -4396,12 +4837,12 @@ async fn complete_media_http(
                 .history_blobs
                 .upload
                 .store(false, std::sync::atomic::Ordering::Relaxed);
-            // A failure waits for the next maintenance pass, so a deferral
+            // A failure waits for the retry the caller arms, so a deferral
             // that could not be written never turns into a tight retry loop.
             if settled {
                 dispatch_history_blobs(client, media_http);
             }
-            return;
+            return !settled;
         }
         MediaHttpCompletion::HistoryFetch(outcome) => {
             let settled = client.finish_history_fetch(outcome);
@@ -4410,12 +4851,12 @@ async fn complete_media_http(
                 .history_blobs
                 .fetch
                 .store(false, std::sync::atomic::Ordering::Relaxed);
-            // A failure waits for the next maintenance pass, so a deferral
+            // A failure waits for the retry the caller arms, so a deferral
             // that could not be written never turns into a tight retry loop.
             if settled {
                 dispatch_history_blobs(client, media_http);
             }
-            return;
+            return !settled;
         }
         MediaHttpCompletion::BackupRestore(outcome) => {
             client.finish_backup_restore(outcome);
@@ -4425,7 +4866,7 @@ async fn complete_media_http(
                 .restore
                 .store(false, std::sync::atomic::Ordering::Relaxed);
             dispatch_backup_restore(client, media_http);
-            return;
+            return false;
         }
         MediaHttpCompletion::BackupPass(outcome) => {
             client.finish_backup_pass(outcome).await;
@@ -4434,7 +4875,7 @@ async fn complete_media_http(
             if let Some(completion) = completion {
                 completion.send_replace(true);
             }
-            return;
+            return false;
         }
         MediaHttpCompletion::Attachment {
             job,
@@ -4477,7 +4918,7 @@ async fn complete_media_http(
                         cancellation: None,
                     });
                 });
-                return;
+                return false;
             }
             if attachments::complete_acquired(client, &job, result).is_err() {
                 tracing::warn!(target: "marmot_app::runtime", method = "attachment_acquisition",
@@ -4515,7 +4956,7 @@ async fn complete_media_http(
                             cancellation: None,
                         });
                     });
-                    return;
+                    return false;
                 }
                 Err(error) => {
                     if let Ok(storage) = client.app.account_storage(&client.state.label) {
@@ -4632,6 +5073,7 @@ async fn complete_media_http(
         }
     }
     drop(permit);
+    false
 }
 
 fn capture_group_read_snapshot(
@@ -7099,8 +7541,17 @@ async fn publish_next_local_submission(
         let Ok(_admission) = gate.try_lock() else {
             return Some(Duration::from_millis(100));
         };
-        let storage = app.account_storage(account_label).ok()?;
-        let submission = storage.app_storage().next_local_submission().ok()??;
+        // A failed read retries in 15 s, as the maintenance tick retried it,
+        // rather than leaving the queue to the next wake (mdk#2923).
+        let read_failed = Some(schedule::RETRY_WHILE_OWED);
+        let Ok(storage) = app.account_storage(account_label) else {
+            return read_failed;
+        };
+        let submission = match storage.app_storage().next_local_submission() {
+            Ok(Some(submission)) => submission,
+            Ok(None) => return None,
+            Err(_) => return read_failed,
+        };
         let queued = shared
             .local_submission_queue
             .lock()
@@ -7527,6 +7978,24 @@ const CONVERGENCE_RETRY_MAX_DELAY: Duration = Duration::from_secs(60);
 /// After this many unsettled re-arms, fall back to error-style backoff so a
 /// never-settling input cannot keep the worker waking every ~1.1s indefinitely.
 const CONVERGENCE_UNSETTLED_MAX_REARMS: u32 = 10;
+
+/// Why each housekeeping run started, per account, for the idle test's
+/// failure message: the trigger, and the held and real times since the
+/// worker opened.
+#[cfg(test)]
+pub(crate) static HOUSEKEEPING_RUNS: std::sync::LazyLock<
+    Mutex<std::collections::HashMap<String, Vec<String>>>,
+> = std::sync::LazyLock::new(Default::default);
+
+#[cfg(test)]
+fn record_housekeeping_run(account_id_hex: &str, run: String) {
+    HOUSEKEEPING_RUNS
+        .lock()
+        .unwrap()
+        .entry(account_id_hex.to_owned())
+        .or_default()
+        .push(run);
+}
 
 #[cfg(test)]
 pub(crate) static HELD_SCHEDULED_CONVERGENCE_ACCOUNTS: std::sync::LazyLock<Mutex<HashSet<String>>> =
@@ -8050,6 +8519,7 @@ impl KeyPackageMaintenanceCatchUpOutcome {
     }
 }
 
+#[derive(Clone, Copy)]
 struct EpochBackfillReportContext<'a> {
     events: &'a broadcast::Sender<MarmotAppEvent>,
     account_id_hex: &'a str,
@@ -10509,6 +10979,44 @@ mod tests {
                 .is_some()
         );
         assert!(!client.has_due_push_announce());
+    }
+
+    /// The watchdog reads push timing as owed while an announce is owed,
+    /// which the tick needs for timing that appears without a worker turn
+    /// (mdk#2923 step B).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_watchdog_reads_owed_push_timing() {
+        let dir = tempfile::tempdir().unwrap();
+        let account = AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let app =
+            MarmotApp::with_relay(dir.path(), "wss://relay.example").with_test_relay_client(relay);
+        let mut client = app.client(&account.label).await.unwrap();
+        let group = client
+            .create_group("push watchdog", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("no members to resolve");
+        let admission = attachments::Admission::default();
+        let flags = WatchdogFlags {
+            attachment_due: false,
+            avatar_due: false,
+            presentation_due: false,
+            local_submission_due: false,
+            legacy_promotion_pending: false,
+            admission: &admission,
+        };
+        assert!(!job_owed_now(schedule::Job::Push, &client, &flags));
+        app.record_group_push_announce_owed(
+            &account.label,
+            &hex::encode(group.as_slice()),
+            crate::notifications::unix_now_ms(),
+        )
+        .unwrap();
+        assert!(job_owed_now(schedule::Job::Push, &client, &flags));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

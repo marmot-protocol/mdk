@@ -18,6 +18,13 @@ const LEASE_SECONDS: u64 = 3 * 60;
 const EXPLICIT_LEASE_SECONDS: u64 = 20 * 60;
 /// Compaction attempts that may roll back under one worker ownership.
 const MAX_COMPACTION_ROLLBACKS: u32 = 3;
+/// How long a rolled-back compaction waits before the next attempt, after
+/// the first and the second rollback; the third ends the attempts for this
+/// ownership. A cause that persists, such as another connection holding the
+/// database or a full volume, no longer spends every attempt 15 s apart
+/// (mdk#2923).
+const COMPACTION_RETRY_SPACING: [Duration; 2] =
+    [Duration::from_secs(60), Duration::from_secs(10 * 60)];
 /// Rows, then file names, per media sweep batch.
 const MEDIA_SWEEP_BATCH: usize = 256;
 /// How often the "Keep media" sweep runs after worker start. Its windows are
@@ -70,13 +77,15 @@ pub(super) struct Admission {
     /// worker ownership, so a failure that repeats cannot rebuild the
     /// in-memory copy every tick.
     compaction_rollbacks: u32,
+    /// A rolled-back compaction is not attempted again before this.
+    compaction_retry_at: Option<TokioInstant>,
     /// This worker settled the WAL truncate an earlier process may have left
     /// owed (recorded nowhere): set only once a maintenance pass tried it,
     /// so a pass that failed before that leaves it for the next one.
     startup_wal_settled: Arc<std::sync::atomic::AtomicBool>,
     /// When the "Keep media" sweep (mdk#2314 step 10) next runs: `None` at
     /// worker start, then hourly.
-    keep_media_due: Option<std::time::Instant>,
+    keep_media_due: Option<TokioInstant>,
     /// A sweep stopped at its time budget with attachments still past the
     /// window, or failed: the next tick runs it again.
     keep_media_more: Arc<std::sync::atomic::AtomicBool>,
@@ -103,7 +112,7 @@ pub(super) struct HousekeepingLatches {
     /// When deferred housekeeping (reclaim, an owed WAL truncate, a
     /// compaction not yet worthwhile, too large or too tight) is checked
     /// again. `None` means now.
-    recheck_due: Option<std::time::Instant>,
+    recheck_due: Option<TokioInstant>,
     /// The deletion count the last housekeeping batch saw: a deletion frees
     /// pages, so reclaim checks again.
     batch_cleanup_seen: Option<i64>,
@@ -120,7 +129,7 @@ pub(super) struct HousekeepingLatches {
     /// When the owed rescan runs: one housekeeping recheck after the
     /// failure, so a failure that persists costs one pass per recheck, not
     /// one per tick.
-    sweep_rescan_due: Option<std::time::Instant>,
+    sweep_rescan_due: Option<TokioInstant>,
 }
 
 impl HousekeepingLatches {
@@ -173,7 +182,7 @@ fn spawn_media_sweep(
     // A failed batch owes a rescan from the start on the next recheck.
     let mut rescan_now = false;
     if latches.sweep_rescan.load(Ordering::Acquire) {
-        let now = std::time::Instant::now();
+        let now = TokioInstant::now();
         match latches.sweep_rescan_due {
             None => latches.sweep_rescan_due = Some(now + HOUSEKEEPING_RECHECK_INTERVAL),
             Some(due) if now >= due => rescan_now = true,
@@ -308,8 +317,8 @@ fn spawn_upload_promotion(
 /// WAL truncate is retried hourly or after a deletion. The compaction check
 /// (not worthwhile, too large or too tight) runs on every batch while a
 /// migration is owed, otherwise hourly or after a deletion. The startup
-/// truncate runs on the first batch. A batch that pauses for free space, resumes, finishes,
-/// or drops a corrupt body wakes attachment observers.
+/// truncate runs on the first batch. A batch that pauses for free space,
+/// resumes, finishes, or drops a corrupt body wakes attachment observers.
 pub(super) fn spawn_legacy_migration(
     client: &AppClient,
     shared: &RuntimeSharedServices,
@@ -329,7 +338,7 @@ pub(super) fn spawn_legacy_migration(
     };
     let app_storage = storage.app_storage();
     admission.latches.bind(&app_storage);
-    let now = std::time::Instant::now();
+    let now = TokioInstant::now();
     let sweep_keep_media = admission.keep_media_more.load(Ordering::Acquire)
         || admission.keep_media_due.is_none_or(|due| now >= due);
     let latches = &mut admission.latches;
@@ -457,7 +466,7 @@ pub(super) fn spawn_legacy_migration(
         // (mdk#2314 step 9), so compaction can return their pages.
         if avatars_owed {
             if crate::media::avatar_files::run_batch(&app_storage, &media, reserve, &free) {
-                app.presentation_signals.wake();
+                app.presentation_signals.wake_account(&label);
                 let _ = app.presentation_signals.avatars.send(label.clone());
             }
             if matches!(app_storage.has_database_held_avatars(), Ok(false)) {
@@ -500,6 +509,9 @@ pub(super) async fn compact_if_due(
 ) {
     if client.app.config.cursor_persistence == crate::CursorPersistence::Frozen
         || admission.compaction_attempted
+        || admission
+            .compaction_retry_at
+            .is_some_and(|at| TokioInstant::now() < at)
         || !admission
             .compaction_due
             .load(std::sync::atomic::Ordering::Acquire)
@@ -556,9 +568,17 @@ impl Admission {
             CompactionAttempt::RolledBack => {
                 self.compaction_rollbacks += 1;
                 self.compaction_attempted = self.compaction_rollbacks >= MAX_COMPACTION_ROLLBACKS;
-                // A rollback is not the idle path: check again on the next
-                // tick, not after the hourly recheck.
-                self.latches.recheck_due = None;
+                // Check again once the spacing has passed, not on the next
+                // tick and not only at the hourly recheck.
+                if let Some(spacing) = COMPACTION_RETRY_SPACING
+                    .get(self.compaction_rollbacks as usize - 1)
+                    .filter(|_| !self.compaction_attempted)
+                {
+                    let at = TokioInstant::now() + *spacing;
+                    self.compaction_retry_at = Some(at);
+                    self.latches.recheck_due =
+                        Some(self.latches.recheck_due.map_or(at, |due| due.min(at)));
+                }
             }
             CompactionAttempt::NotDue => {}
         }
@@ -729,6 +749,228 @@ fn retry_at(storage: &SqliteAppStorage, job: &AttachmentAcquisition, now: u64) -
             .saturating_mul(1_u64 << attempts.saturating_sub(1).min(8))
             .min(3600),
     )
+}
+
+/// What the attachment pass next owes (mdk#2923 step B): the earliest timed
+/// row, whether some work has to be polled for, and whether event-created
+/// work waits now. A failed read counts as work to poll for.
+fn pass_work(client: &AppClient, admission: &Admission) -> PassWork {
+    use std::sync::atomic::Ordering;
+    let read = (|| {
+        let storage = client.app.account_storage(&client.state.label)?;
+        let app_storage = storage.app_storage();
+        let automatic = app_storage
+            .attachment_download_policy(&super::super::attachment_controls::default_policy(
+                &client.app.config,
+            ))?
+            .automatic;
+        let mut work = app_storage.attachment_work_schedule(automatic)?;
+        // The pass admits demands only for automatic, app-managed downloads;
+        // otherwise they wait for the host and are not owed here.
+        work.pending_now &= automatic
+            && client.app.config.attachment_acquisition_mode
+                != crate::AttachmentAcquisitionMode::HostManaged;
+        Ok::<_, AppError>(work)
+    })();
+    let Ok(work) = read else {
+        return PassWork {
+            now: scheduler_now(client),
+            next_at: None,
+            polling: true,
+            pending_now: false,
+            rescan_at: None,
+        };
+    };
+    let running = |task: &Option<tokio::task::JoinHandle<()>>| {
+        task.as_ref().is_some_and(|task| !task.is_finished())
+    };
+    let latches = &admission.latches;
+    // A media sweep batch wakes nothing when it ends, and a failed sweep
+    // batch owes a rescan the next pass schedules: poll for those. An upload
+    // promotion's completion wakes the worker itself (#3374).
+    let polling = work.polling
+        || running(&admission.media_sweep)
+        || latches.sweep_unfinished.load(Ordering::Acquire)
+        || (latches.sweep_rescan.load(Ordering::Acquire) && latches.sweep_rescan_due.is_none());
+    PassWork {
+        now: scheduler_now(client),
+        next_at: work.next_at,
+        polling,
+        pending_now: work.pending_now,
+        rescan_at: latches.sweep_rescan_due,
+    }
+}
+
+struct PassWork {
+    now: u64,
+    next_at: Option<u64>,
+    polling: bool,
+    pending_now: bool,
+    rescan_at: Option<TokioInstant>,
+}
+
+/// When the attachment pass should next run on its own, after a run that
+/// left nothing to repeat at once. A timed row is due at its second; one
+/// already due that the pass could not take (no permit or slot free) waits
+/// for the completion that frees one, or 15 s; polled work also runs every
+/// 15 s, as the tick ran it; and the pass runs at least hourly, for what only
+/// it notices, such as another connection's commits for the media sweep.
+pub(super) fn next_pass_at(
+    client: &AppClient,
+    admission: &Admission,
+) -> (TokioInstant, Option<u64>) {
+    let work = pass_work(client, admission);
+    let now = TokioInstant::now();
+    let retry = now + super::schedule::RETRY_WHILE_OWED;
+    let by_clock = [
+        work.polling.then_some(retry),
+        work.rescan_at,
+        Some(now + HOUSEKEEPING_RECHECK_INTERVAL),
+    ]
+    .into_iter()
+    .flatten()
+    .min()
+    .unwrap_or(retry);
+    // A timed row's second is wall time on the scheduler's clock, which
+    // tests may pin; carry its distance from now onto the wall clock the
+    // schedule reads. The schedule turns one already due into a 15 s retry.
+    let wall = work.next_at.map(|at| {
+        if at <= work.now {
+            0
+        } else {
+            crate::unix_now_seconds().saturating_add(at - work.now)
+        }
+    });
+    (by_clock, wall)
+}
+
+/// The watchdog's read: whether the attachment pass has work due now.
+pub(super) fn pass_owed_now(client: &AppClient, admission: &Admission) -> bool {
+    let work = pass_work(client, admission);
+    work.pending_now
+        || work.polling
+        || work.next_at.is_some_and(|at| at <= work.now)
+        || work.rescan_at.is_some_and(|at| at <= TokioInstant::now())
+}
+
+/// What the housekeeping job (the compaction and the housekeeping batch)
+/// owes (mdk#2923 step B), which both its schedule and the watchdog read:
+/// `poll` while a migration, the startup truncate, keep-media `more`, a
+/// flagged compaction or a running batch needs the next look in 15 s, as the
+/// tick gave it; `at` for the earliest deadline (the keep-media sweep, the
+/// hourly recheck, a compaction retry), due now when not yet set (a fresh
+/// worker); and `cleanup_changed` when this connection deleted media rows
+/// since the last batch. `None` when the batch cannot run: cursors frozen,
+/// or the account's storage unreadable.
+struct HousekeepingWork {
+    poll: bool,
+    at: Option<TokioInstant>,
+    cleanup_changed: bool,
+}
+
+fn housekeeping_work(client: &AppClient, admission: &Admission) -> Option<HousekeepingWork> {
+    use std::sync::atomic::Ordering;
+    if client.app.config.cursor_persistence == crate::CursorPersistence::Frozen {
+        return None;
+    }
+    let storage = client.app.account_storage(&client.state.label).ok()?;
+    let now = TokioInstant::now();
+    let latches = &admission.latches;
+    let compaction_flagged =
+        !admission.compaction_attempted && admission.compaction_due.load(Ordering::Acquire);
+    let poll = admission
+        .legacy_migration
+        .as_ref()
+        .is_some_and(|task| !task.is_finished())
+        || admission.keep_media_more.load(Ordering::Acquire)
+        || !HousekeepingLatches::done(&latches.legacy_bodies_done)
+        || !HousekeepingLatches::done(&latches.database_avatars_done)
+        || !admission.startup_wal_settled.load(Ordering::Acquire)
+        || (compaction_flagged && admission.compaction_retry_at.is_none());
+    let at = [
+        Some(admission.keep_media_due.unwrap_or(now)),
+        Some(latches.recheck_due.unwrap_or(now)),
+        admission.compaction_retry_at.filter(|_| compaction_flagged),
+    ]
+    .into_iter()
+    .flatten()
+    .min();
+    // A failed read counts as a change, as the batch counts it.
+    let cleanup_changed =
+        storage.app_storage().media_cleanup_epoch().ok() != latches.batch_cleanup_seen;
+    Some(HousekeepingWork {
+        poll,
+        at,
+        cleanup_changed,
+    })
+}
+
+/// Why the housekeeping job is due, for a test's failure message: which
+/// poll flag holds, and its deadlines relative to now on the worker's clock.
+#[cfg(test)]
+pub(super) fn housekeeping_reason(client: &AppClient, admission: &Admission) -> String {
+    use std::sync::atomic::Ordering;
+    let now = TokioInstant::now();
+    let until = |at: Option<TokioInstant>| {
+        at.map(|at| {
+            if at <= now {
+                format!("-{:?}", now - at)
+            } else {
+                format!("+{:?}", at - now)
+            }
+        })
+    };
+    let latches = &admission.latches;
+    format!(
+        "migration_running={} keep_media_more={} legacy_bodies_owed={} \
+         database_avatars_owed={} startup_wal_owed={} compaction_flagged={} \
+         keep_media_due={:?} recheck_due={:?} compaction_retry={:?} \
+         cleanup_epoch_changed={}",
+        admission
+            .legacy_migration
+            .as_ref()
+            .is_some_and(|task| !task.is_finished()),
+        admission.keep_media_more.load(Ordering::Acquire),
+        !HousekeepingLatches::done(&latches.legacy_bodies_done),
+        !HousekeepingLatches::done(&latches.database_avatars_done),
+        !admission.startup_wal_settled.load(Ordering::Acquire),
+        !admission.compaction_attempted && admission.compaction_due.load(Ordering::Acquire),
+        until(admission.keep_media_due),
+        until(latches.recheck_due),
+        until(admission.compaction_retry_at),
+        client
+            .app
+            .account_storage(&client.state.label)
+            .map_or(true, |storage| {
+                storage.app_storage().media_cleanup_epoch().ok() != latches.batch_cleanup_seen
+            }),
+    )
+}
+
+/// When the housekeeping job should next run on its own: in 15 s while it
+/// polls or a deletion waits for a batch, else at its earliest deadline.
+pub(super) fn next_housekeeping_at(
+    client: &AppClient,
+    admission: &Admission,
+) -> Option<TokioInstant> {
+    let work = housekeeping_work(client, admission)?;
+    let now = TokioInstant::now();
+    let retry = now + super::schedule::RETRY_WHILE_OWED;
+    [
+        (work.poll || work.cleanup_changed).then_some(retry),
+        work.at.map(|at| if at <= now { retry } else { at }),
+    ]
+    .into_iter()
+    .flatten()
+    .min()
+}
+
+/// The watchdog's read, from the same [`housekeeping_work`] its schedule
+/// reads: whether the housekeeping job has work due now.
+pub(super) fn housekeeping_owed_now(client: &AppClient, admission: &Admission) -> bool {
+    housekeeping_work(client, admission).is_some_and(|work| {
+        work.poll || work.cleanup_changed || work.at.is_some_and(|at| at <= TokioInstant::now())
+    })
 }
 
 /// The scheduler's clock. Tests may pin it per account directory to cross

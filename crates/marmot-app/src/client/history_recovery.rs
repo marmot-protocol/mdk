@@ -148,6 +148,17 @@ impl HistoryRecovery {
         self.state.epoch_stall.clear_recovered_group(group_id);
     }
 
+    /// Whether a detector observation's SQL write failed and waits to be
+    /// retried, which keeps the recovery seam owed (mdk#2923).
+    pub(crate) fn has_buffered_epoch_gap_arms(&self) -> bool {
+        !self.state.pending_recovery_arm_writes.is_empty()
+    }
+
+    /// Whether a post-join collection is in progress (mdk#2923).
+    pub(crate) fn has_post_join_collections(&self) -> bool {
+        !self.state.runner_post_join.is_empty()
+    }
+
     /// Drop every post-join collection: frozen cursors and paused maintenance
     /// hold none.
     pub(crate) fn clear_post_join_collections(&mut self) {

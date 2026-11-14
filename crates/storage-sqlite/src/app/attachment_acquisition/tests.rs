@@ -4081,3 +4081,45 @@ mod outgoing;
 mod outgoing_files;
 mod outgoing_media;
 mod promotion;
+
+/// The attachment pass's schedule names the earliest timed row among its
+/// candidates: a request due now, a claim's lease end, a failure's retry,
+/// and none once the body is published; an explicit-only policy skips
+/// automatic rows (mdk#2923).
+#[test]
+fn attachment_work_schedule_names_the_earliest_timed_candidate() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
+    let next = |automatic| app.attachment_work_schedule(automatic).unwrap().next_at;
+    assert_eq!(
+        app.attachment_work_schedule(true).unwrap(),
+        crate::AttachmentWorkSchedule::default()
+    );
+    seed(&store, "one");
+    let one = request(&app, "one");
+    assert_eq!(next(true), Some(11), "requested");
+    assert_eq!(
+        next(false),
+        None,
+        "an automatic row is no explicit candidate"
+    );
+    assert!(
+        app.attachment_work_schedule(true).unwrap().pending_now,
+        "its demand"
+    );
+    let job = app
+        .claim_attachment_acquisition(&one, 11, 100)
+        .unwrap()
+        .unwrap();
+    assert_eq!(next(true), Some(100), "the lease end");
+    assert!(app.fail_attachment_acquisition(&job, Some(50)).unwrap());
+    assert_eq!(next(true), Some(50), "the retry");
+    let job = app
+        .claim_attachment_acquisition(&one, 50, 100)
+        .unwrap()
+        .unwrap();
+    app.complete_attachment_acquisition(&job, BODY, 50, 10000)
+        .unwrap();
+    assert_eq!(next(true), None, "published");
+    assert!(!app.attachment_work_schedule(true).unwrap().polling);
+}

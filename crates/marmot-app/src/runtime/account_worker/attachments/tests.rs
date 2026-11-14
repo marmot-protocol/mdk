@@ -2282,7 +2282,7 @@ async fn the_maintenance_batch_cleans_past_the_keep_media_window() {
     );
     assert!(
         admission.keep_media_due.unwrap()
-            > std::time::Instant::now() + KEEP_MEDIA_SWEEP_INTERVAL - Duration::from_secs(60)
+            > tokio::time::Instant::now() + KEEP_MEDIA_SWEEP_INTERVAL - Duration::from_secs(60)
     );
     assert!(
         !admission
@@ -2455,7 +2455,7 @@ async fn the_housekeeping_batch_runs_only_while_a_part_is_owed() {
     run(&mut admission).await;
     assert_eq!(batches(), 2, "keep-media more owes one batch");
 
-    admission.latches.recheck_due = Some(std::time::Instant::now() - Duration::from_secs(1));
+    admission.latches.recheck_due = Some(tokio::time::Instant::now() - Duration::from_secs(1));
     run(&mut admission).await;
     run(&mut admission).await;
     assert_eq!(batches(), 3, "the deferred recheck owes one batch");
@@ -2507,7 +2507,7 @@ async fn the_housekeeping_batch_runs_only_while_a_part_is_owed() {
     assert_eq!(batches(), 4, "an owed truncate alone owes no batch");
 
     reader.execute_batch("COMMIT").unwrap();
-    admission.latches.recheck_due = Some(std::time::Instant::now() - Duration::from_secs(1));
+    admission.latches.recheck_due = Some(tokio::time::Instant::now() - Duration::from_secs(1));
     run(&mut admission).await;
     assert_eq!(batches(), 5, "the recheck retries it");
     assert!(!app_storage.wal_truncate_pending(), "and it truncates");
@@ -2563,7 +2563,7 @@ async fn a_failed_sweep_row_is_revisited_by_the_hourly_rescan_not_every_tick() {
     };
     let recheck_now = |admission: &mut Admission| {
         admission.latches.sweep_rescan_due =
-            Some(std::time::Instant::now() - Duration::from_secs(1));
+            Some(tokio::time::Instant::now() - Duration::from_secs(1));
     };
 
     sweep(&mut admission, true).await;
