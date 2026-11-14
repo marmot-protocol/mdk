@@ -386,3 +386,27 @@ async fn clients_fail_closed_until_the_first_builder_policy_is_installed() {
         "the isolated policy test must actually execute"
     );
 }
+
+#[test]
+fn retired_hosts_match_exactly_ignoring_case_and_trailing_dots() {
+    let retired = retired_relay_hosts()
+        .into_iter()
+        .next()
+        .expect("centralized retired host list");
+    for host in [
+        retired.clone(),
+        retired.to_ascii_uppercase(),
+        format!("{retired}."),
+        format!("{}.", retired.to_ascii_uppercase()),
+    ] {
+        assert!(host_is_retired(&host), "{host}");
+    }
+    for host in [
+        format!("sub.{retired}"),
+        format!("{retired}.example"),
+        "collector.example".to_owned(),
+        String::new(),
+    ] {
+        assert!(!host_is_retired(&host), "{host}");
+    }
+}

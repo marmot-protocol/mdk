@@ -18,8 +18,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   `AccountManager` command-RPC wrappers that send a worker command and await its oneshot reply), `agent_stream_watch.rs`
   (agent-text-stream discovery and the brokered-QUIC watch machinery), `onboarding.rs` and `onboarding/` (account
   setup: durable preflight, cancellation, advisory installation detection, generated setup's procedures in
-  `onboarding/generated_setup.rs`, and its background tasks and teardown fence in `onboarding/generated_setup_tasks.rs`), `audit_tracker.rs` (the forensic audit-log tracker
-  upload worker), `audit_otlp_delivery.rs` (the explicit one-account v5 OTLP attempt), `event_routing.rs` (pure
+  `onboarding/generated_setup.rs`, and its background tasks and teardown fence in `onboarding/generated_setup_tasks.rs`), `audit_tracker.rs` (the forensic audit-log tracker's
+  v5 delivery worker), `audit_otlp_delivery.rs` (the explicit one-account v5 OTLP attempt), `event_routing.rs` (pure
   `MarmotAppEvent` classification/routing helpers), `avatar.rs` (local identity-avatar demand and bounded maintenance),
   `avatar_access.rs` (bounded local native batches), `attachment_history.rs` (bounded local attachment discovery and
   shared-parser presentation), `attachment_access.rs` (read-only source-slot availability and verified local byte
@@ -33,10 +33,11 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   generated setup's procedures stay `MarmotAppRuntime` methods in that module tree. Hosts reach onboarding through
   `MarmotAppRuntime::account_setup()`; `AccountManager` exposes no onboarding methods.
   Helpers that only return another future return it directly: extra async wrappers hit the simulator's layout-depth limit.
-  `AccountManager` holds one `SetupState` for four hooks only, each where it is called: reconcile (worker transaction
+  `AccountManager` holds one `SetupState` for five hooks only, each where it is called: reconcile (worker transaction
   held; it never takes it again), the teardown fence (removal and sign-out, before the worker transaction), removal
-  (under the transaction, after the removal commit point) and shutdown's two phases (before the invite catch-up drain;
-  after the first reaper drain). A generated setup background task continues only the account it was scheduled for
+  (under the transaction, after the removal commit point), the direct-write check (under the transaction, before
+  `write_without_worker` writes) and shutdown's two phases (before the invite catch-up drain; after the first reaper
+  drain). A generated setup background task continues only the account it was scheduled for
   and ends once that account is removed, signed out or set up; it never resumes or creates another identity
   (whitenoise-ios#1302). Every teardown takes the fence before it touches the account, and the runtime's `sign_out`
   and `sign_out_and_wipe` take it before their first stage. The fence cancels the attempt in flight (an attempt
@@ -60,6 +61,14 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   transaction, generated local preparation admission (removal only), the worker transaction, then the worker map.
   Local preparation never waits for the onboarding transaction. The cancellation registry precedes the per-account
   state lock.
+- Write an account's groups through its worker whenever it signs on one (`AccountManager::signs_on_worker`: an active
+  local signer, or a signed-in external signer whose signer is registered). The worker keeps the account's state in
+  memory and saves each dirty group's whole record, so a storage write beside it is undone at its next save and leaves
+  its reads stale (mdk#178, mdk#3318). A worker that cannot start or answer fails the call; never fall back to a
+  direct write. Archive, forget and delete write storage directly only for an account that signs on no worker, through
+  `write_without_worker`, which holds the worker transaction so no worker starts during the write, reaps any worker
+  still retiring in `worker_reapers` first, and fails with nothing written while one onboarding took out of the map
+  is still retiring.
 - Keep app-client commands and query methods in the `src/client/` module; the crate root should construct clients but
   not absorb their behavior again. The `AppClient` inherent impl is split across the module along these seams: `mod.rs`
   (the `AppClient` struct plus the broadly-shared command/query API — key-package, group lifecycle, message/media/agent
@@ -73,7 +82,7 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   notification-trigger publishing),
   `retention.rs` (the engine-owned retention sweep policy, the
   storage-answered expiry/unread scan, per-group outcome orchestration, and decision tests), `chat_history.rs` (a
-  chat's history exported as sealed bundles and a sibling's bundle imported with its attachment keys, never for a device group), `history_delivery.rs` (owing from the engine's sibling adds, sending inline or through Blossom, parking, fetching and importing sealed history deliveries), `backup_writer.rs` (the backup pass: the pointer fetch, the archive upload, retention, condemned-blob deletes and takeover), `history_imports.rs` (the host surface of imported history: the per-chat state query and the device names storage resolves rows' sources against), `history_notices.rs` ("history may be incomplete"
+  chat's history exported as sealed bundles and a sibling's bundle imported with its attachment keys, never for a device group), `history_delivery.rs` (owing from the engine's sibling adds, sending inline or through Blossom, parking, fetching and importing sealed history deliveries), `backup_writer.rs` (the backup pass: the pointer fetch, the archive upload, retention, condemned-blob deletes and takeover), `history_imports.rs` (the host surface of imported history: the per-chat state query and the device names storage resolves rows' sources against), `history_recovery/history_notices.rs` ("history may be incomplete"
   notices, their worker-owned dismissal and the notice-change baseline; the public DTOs and opaque id codec live
   in the crate-root `src/history_notices.rs`), and `audit.rs` (audit-context construction, the local/observed
   `human_action` recorders, and the `ObservedHumanActionAudit` descriptor). Private items referenced across these files
@@ -692,17 +701,10 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
 - Keep the mechanical `storage_sqlite` `Stored*` <-> app-DTO mapper free functions (account state, groups, components,
   messages, app events, push registrations, telemetry/audit settings) in `src/conversions.rs`. They hold no `MarmotApp`
   state.
-- Keep the forensic audit-log feature in `src/audit_log.rs`: the `AuditLog*` DTOs, salted-hash identity derivation,
-  the per-account upload checkpoint file (`audit-upload-checkpoint.json`), and the `MarmotApp` methods for audit
-  settings, recorder open/build, file enumeration, path validation/resolution/removal, and upload. Audit-log unit tests
-  live in its own `#[cfg(test)] mod tests`.
-- The v4 upload's HTTP half is `marmot-observability`'s `src/audit_upload.rs`: snapshot capture, the checkpoint record,
-  endpoint validation with its retired-host check, the per-attempt pinned request and the response handling. It opens
-  no files:
-  `audit_log.rs` validates and opens each audit file and reads and writes the checkpoint file, then hands it the open
-  file or the record. It returns `AuditUploadError`; `From<AuditUploadError> for AppError` in `src/error.rs` restores
-  the variant, message and `privacy_safe_kind` the upload reported before it had its own type, and
-  `error::audit_upload_error_tests` covers every failure.
+- Keep the forensic audit-log feature in `src/audit_log.rs`: the `AuditLog*` DTOs, the host-supplied
+  `AuditLogSource` metadata, salted-hash identity derivation, and the `MarmotApp` methods for audit settings,
+  recorder open/build, file enumeration, and path validation/resolution/removal. Audit-log unit tests live in its own
+  `#[cfg(test)] mod tests`. Recorded rows leave the device only through v5 OTLP delivery; there is no file upload.
 - Keep the bounded live v5 Welcome capture in `src/client/audit_v5_probe.rs`. It records actual retained founding
   preparation, receipt/peel, app join/checkpoint, and bounded stored-group snapshots through the installed recorder;
   tests retain an in-memory probe for focused product-boundary assertions. Do not infer ACKs, recipient joins, or
@@ -715,12 +717,12 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   Never add a row per scheduler evaluation, per live ingest, or on the router path; the router only counts
   placements. Rows are best effort: an audit-only read that fails skips the row, never the recovery step. The
   account owner's native input goal uses cause `subscription_replay` in those existing rows, without loss
-  charges or history certificates. Ledger notices record `notice_shown` and
-  `notice_dismissed` with cause `unproven_history`, the route tag as the obligation id. `subscription_eose_repaired` remains historical decoding only. The publication seam drains the
+  charges or history certificates. The coverage ledger raises no notice (mdk#3308), so no `notice_shown` or
+  `notice_dismissed` row carries `unproven_history` any more. `subscription_eose_repaired` remains historical decoding only. The publication seam drains the
   adapter's queued subscription refusals (`take_subscription_refusals`) into one `subscription_refused` row. Scenario
   tests live in
   `src/client/audit_recovery/scenario_tests.rs`.
-- Keep the coverage-ledger recorder in `src/client/recovery_coverage.rs` (mdk#2660). It records at owner seams only:
+- Keep the coverage-ledger recorder in `src/client/history_recovery/recovery_coverage.rs` (mdk#2660). It records at owner seams only:
   account open (`record_open_coverage_goals`), the runner's routing-change settlement, loss imports
   (`synchronize_recovery_loss`; storage un-covers the ledger inside the import transaction, and inside each receipt
   release) and native synchronization (`synchronize_native_replay`). Conversion and new loss imports are
@@ -760,7 +762,7 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   `LiveTails::owed_until`, refreshed by `AppClient::live_tails`; without it an idle connected account owes its own
   live frames. Storage keeps a released receipt's second out of every live boundary, and a tail starts past the
   newest one on its route; only a fetch proof covers it, on its own relay. Live-boundary tests live in
-  `recovery_coverage/live_boundary_tests.rs`. The runner's debt turns age the ledger out of the retention window
+  `history_recovery/recovery_coverage/live_boundary_tests.rs`. The runner's debt turns age the ledger out of the retention window
   (`prune_runner_retention`), passing the current routes and their required relays, so what they still owe below the
   floor is parked as each route's remainder and goals rise to the floor. Standing goals
   (startup history, epoch gaps) start at `standing_floor`: a group copy's Welcome time less the allowance, never below
@@ -769,7 +771,7 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   them as a missing hint; validate all standing floors before widening goals. That time is only a hint: never use it to retire,
   un-cover or drop debt by itself. The one exception is a rejoin (a replacement install, mdk#2660 row 11): it decides
   the retirement, and the copy's standing floor only bounds it (`settle_recovery_rejoins`). It logs aggregate counts only.
-- Keep the recovery runner in `src/client/recovery_runner.rs` and its `admission`, `select`, `quantum`, `compare`,
+- Keep the recovery runner in `src/client/history_recovery/recovery_runner.rs` and its `admission`, `select`, `quantum`, `compare`,
   `recheck`, `epoch_gap`, `repair`, `policy`, `tails` and `host` modules (mdk#2660 phase 4). It owns every history
   fetch for every account; there is no other owner and no switch back. `prepare_runner_ownership` converts and
   imports loss and enables live fences before any subscription activates. A
@@ -871,12 +873,15 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   judged: no covered window without a non-suspended route, each with a required relay. A verdict waits for a re-check
   only where `recheck::owed`, the survey's own predicate, owes one. Each survey publishes the required units still catching up
   (`RunnerHost::surveyed`) into `AppTransportRouting`'s catching-up watch: the only source of the account recovery
-  status, the worker's `RecoveryStatusChanged` cue, and the condition for a remainder's notice. Ledger notices
-  (`HistoryNoticeCause::UnprovenHistory`, ids from `ledger_route_tag` and the park revision) skip a suspended group's
-  routes (`RunnerRoute::suspended`) and a broken unit on a relay its route no longer requires. A notice's revision and
-  its dismissal (`dismiss_recovery_route_park_on`) cover exactly what it shows.
+  status and the worker's `RecoveryStatusChanged` cue. A broken unit, probing or not, is never catching up. The
+  coverage ledger raises no notice: neither a broken unit's park nor a route's remainder is evidence that messages
+  are missing (decided with Jeff, 2026-11-13; mdk#3308). Keep `HistoryNoticeCause::UnprovenHistory` for
+  compatibility, never emitted. A broken unit probes quietly instead: every debt turn first arms the probes whose
+  time passed (`arm_due_recovery_probes`, in each host's `debt_turn`), a failed probe re-parks under the same
+  revision on a doubling interval (`RUNNER_PROBE_BASE_SECS` to `RUNNER_PROBE_CAP_SECS`), and the survey's
+  `probe_due` wakes an idle runner for the next one. `ledger_route_tag` stays for the runner's audit rows.
   An Unrecoverable group's routes are suspended (`RunnerRoute.unrecoverable`, read from the engine's group record
-  each debt turn): never scheduled, charged, broken or noticed, left out of admission so what they staged is given
+  each debt turn): never scheduled, charged, broken or probed, left out of admission so what they staged is given
   back as an unlisted route's is. A
   retained route's ceiling (`retained_route_goal_until`) caps every debt and re-check read through
   `DebtTurn::owed_until`/`checked_until`; never store it. Route-gone retirement runs only in the runner's debt turn
@@ -887,7 +892,12 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   read (`None`) is never evidence. Window hints come from the live conversation captures
   (`open_conversation_groups`). The breaker's pauses and late findings are process counters
   (`recovery_runner_counts`) carried only by the v5 `recovery_runner_paused` row, written through the turn's audit
-  sink (`WorkerTurn::audit`). Logs carry aggregates only.
+  sink (`WorkerTurn::audit`). The runner's other v5 rows (`recovery_runner/audit.rs`) go through the same hook
+  (`WorkerTurn::audit`, `DebtTurn::audit`, which take the MLS group a row is about): one `recovery_runner_fetched` per
+  quantum that began, one `recovery_runner_changed` per unit or route transition, raced begins coalesced per route
+  (`audit::Races`). Never write one per survey, idle step or catching-up flip, never await to write one, and keep
+  audit-only storage reads infallible for the runner (a failed read loses the row, not the step). Logs carry
+  aggregates only.
 - The configured audit OTLP/HTTP sender is `marmot-observability`'s `src/audit_otlp_sender.rs`, which hosts name as
   `marmot_app::audit_otlp_sender`. It accepts an owned local-delivery batch,
   checks the prepared destination, preserves each original v5 JSON body inside the restricted OTLP JSON envelope,
@@ -904,35 +914,23 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   local admission under `storage_lifecycle`, and cancellation on consent, deletion, account removal, destination change,
   or close. Never hold local guards across HTTP or wait for HTTP before releasing the root lease on terminal close.
 - Record new opt-in sessions into distinct v5 files and deliver strictly validated v5 JSONL through OTLP. Historical
-  v4 files retain their separate legacy v4-only whole-file upload path. Never migrate or send v1-v3
-  or key-reveal files. Reject removed/unknown fields and duplicate keys before HTTP; cache ineligible file verdicts
-  by size and mtime without retry cooldowns. On exclusive-root startup, `audit_log/legacy_cleanup.rs` deletes
-  reserved v1-v3 filenames and their segments from `accounts/` and failed-wipe `.wipe-tombstones/` remnants
-  without reading payloads, even when recording is disabled. Match the frozen 32-lowercase-hex legacy engine ID,
+  v4 files are never sent anywhere; they stay listable and deletable until retention expires them. Never migrate or
+  send v1-v3 or key-reveal files. On exclusive-root startup, `audit_log/legacy_cleanup.rs` deletes
+  reserved v1-v3 filenames and their segments, and the retired v4 upload's `audit-upload-checkpoint.json` sidecar,
+  from `accounts/` and failed-wipe `.wipe-tombstones/` remnants without reading payloads, even when recording is
+  disabled. Match the frozen 32-lowercase-hex legacy engine ID,
   not the current audit ID width; pin the live layout through AccountHome-backed tests.
   Keep this after lease acquisition and before exposing the app; never traverse symlinks or delete v4/future
   filenames, names outside the reserved legacy forms, or the separate key-reveal log. Unexpected containers
   and other cleanup errors are reported with aggregate counts, are nonfatal, and retry on next open.
-  Account/device names are forbidden in rows and headers; hardware model is system-sourced, never a label.
-- Keep audit uploads incremental (mdk#1181). An audit file whose size and mtime still match its checkpoint entry is
-  never re-read or re-posted; only the growing active file re-transfers, bounded by the recorder's segment threshold.
-  Checkpoint only complete immutable upload snapshots after successful upload.
-  Defer an unfinished trailing JSONL row and preserve it for a later upload; an HTTP length limit alone is insufficient.
-  Automatic triggers use a fixed 30-second window and the size-1 coalescing queue in `runtime/audit_tracker.rs`.
-  Later triggers cannot postpone that window or shorten a failure cooldown. Manual upload APIs remain immediate.
-  Incomplete snapshots wait for the next trigger. Automatic failures retry after 60 seconds, doubling up to five
-  minutes; authentication failures wait at least five minutes, and Retry-After can extend the delay up to five minutes.
-  Stop automatic passes on endpoint-wide failures
-  (authentication, rate limits, server/transport failures); file-specific failures and oversized files must not block
-  the files behind them.
-  Treat a `413` with no `Retry-After` as the endpoint's verdict on that file (RFC 9110 15.5.14 has a server send the
-  header when the refusal is temporary): acknowledge it as too-large so it is reported once and never re-posted. Unlike
-  the local ceiling this verdict is escapable: it is keyed on the file's size and mtime, deleting the sidecar clears it,
-  and a manual per-file upload never consults it. A `413` carrying any `Retry-After`, parseable or not, is a cooldown
-  and retries like any other rejection.
-  Shutdown cancels pending or in-flight automatic work; unacknowledged files remain on disk.
+  Account/device names are forbidden in rows; hardware model is system-sourced, never a label.
+- Automatic v5 delivery triggers use a fixed 30-second window and the size-1 coalescing queue in
+  `runtime/audit_tracker.rs`. Later triggers cannot postpone that window or shorten a failure cooldown. The manual
+  tracker pass is immediate. Automatic failures retry after 60 seconds, doubling up to five minutes. Without a
+  configured OTLP sender no pass is scheduled. Shutdown cancels pending or in-flight automatic work; unacknowledged
+  data remains on disk.
   Tests may shorten the window per runtime via `test-policy-overrides`; paused-clock tests pin the production default.
-  `audit_log/retention.rs` owns the local forensic retention policy, independently of uploads and consent: a
+- `audit_log/retention.rs` owns the local forensic retention policy, independently of uploads and consent: a
   host-configured maximum age (1-30 days, default 30) and per-account size budget (default 256 MiB, at least 16 MiB),
   persisted in shared storage. The budget evicts the oldest sealed segments only when no delivery cursor still owes
   them (mdk#3300); undelivered data leaves only by age, recording an `ExpiredUndelivered` gap, or by explicit clear.
@@ -942,14 +940,6 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   reservations for that directory. Other uploads must remain valid; never globally fence orphan/tombstone cleanup;
   never rewrite rows or unlink the actual live inode. Serialize the weak registry with writer creation and let the
   recorder recheck metadata and protect its canonical/actual backing paths under its own lock.
-- Keep the upload checkpoint's cost proportional to the account's *live* audit files, not to its history. `retain_present`
-  prunes entries for files that are gone, so the sidecar is O(live `audit-*.jsonl` files). Retention deletes expired
-  segments, and each tracker run stats every file and
-  rewrites the whole sidecar. Do not add a per-upload or per-line entry, and do not treat the sidecar as durable state:
-  losing it costs one repeat transfer per file and nothing else.
-- A file above `AUDIT_LOG_UPLOAD_MAX_BYTES` has no app-level transfer path. `post_audit_log_file` enforces the same
-  ceiling, so the tracker's skip is the whole story: the file stays on disk for manual handling. Do not document an
-  escape hatch that does not exist, and do not widen the ceiling to invent one.
 - Keep SQLCipher key derivation, per-database salt persistence, legacy-key migration/recovery, and the in-process
   v2-open probe-verdict cache (mdk#1439) in `src/sqlcipher.rs`. The verdict cache is advisory only: a durable
   migration marker or a missing verdict always re-runs the recovery probe, so the mdk#568 crash windows keep their
@@ -1012,14 +1002,14 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   which imports new loss into the ledger and wakes the runner; a directly owned client then runs one runner pass
   in place. A discarded spill row records loss evidence and the client imports it, as overflow observation does. Nothing re-subscribes to recover history, and only startup, a frozen
   wake or an unactivated client installs live subscriptions. Explicit full-history repair is one request the
-  account's runner serves (`recovery_runner/repair.rs`). It never reports complete: history below the retained
+  account's runner serves (`history_recovery/recovery_runner/repair.rs`). It never reports complete: history below the retained
   window is unsearched (`BelowRetentionWindow` when the window is covered), so never certify explicit history from a
-  window. Repair tests live in `src/client/recovery_runner/repair/tests.rs`. See the README for the
+  window. Repair tests live in `src/client/history_recovery/recovery_runner/repair/tests.rs`. See the README for the
   automatic-recovery and send-fairness limits.
 - A dismissed "history may be incomplete" notice is the one user-authorized ending for parked recovery debt
-  besides qualified completion, and never counts as coverage or a recovery success. A ledger notice retires its
-  route's parked spans (`dismiss_recovery_route_park_on`); a parked epoch-gap obligation retires through
-  `retire_parked_recovery_obligation`, its own outcome. Loss is ledger debt, so no dismissal releases the
+  besides qualified completion, and never counts as coverage or a recovery success. A parked epoch-gap obligation
+  retires through `retire_parked_recovery_obligation`, its own outcome; a dismissal of a ledger notice id an earlier
+  release showed returns `false` and retires nothing. Loss is ledger debt, so no dismissal releases the
   delivery-loss fence: the loss import does. Notice ids are opaque and must not be logged.
 - Keep an account's delivery route open when its relay notification consumer lags: charge the lag as notification
   loss with the REQ floors its SDK context reported at the lag (per route when known; record them through
@@ -1075,7 +1065,7 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   adapter reads the lead as the route that resumes from the cursor. A locally deleted group lists its current route
   first too, never its frontier copy. See `docs/marmot-architecture/further-context/account-recovery.md` section 5.
 - Keep the post-join history fetch's lifetime apart from the PostJoin obligation's phase (mdk#2626). The runner's
-  post-join collection (`src/client/recovery_runner/post_join.rs`, advanced by
+  post-join collection (`src/client/history_recovery/recovery_runner/post_join.rs`, advanced by
   `advance_post_join_maintenance_subscriptions`) keeps a copy's collection while its fetch is owed, whatever phase
   commits moved the obligation to. It ends the fetch as `Fetched` only once the coverage ledger covers the copy's
   whole requested range on its required relays, nothing of the route is staged and every source is placed; the
@@ -1129,7 +1119,7 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   direct `nostr_sdk`/`reqwest` constructors. Allow that lint only where a fresh reqwest builder goes straight into
   `http_builder()` or in local test fixtures. Only exact `localhost` or a
   loopback IP literal is a local-test endpoint, and all its addresses must be loopback. The default build includes this
-  helper so forensic audit uploads share it; do not feature-gate the module or introduce a second uploader. Relay
+  helper so the audit OTLP sender shares it; do not feature-gate the module or introduce a second uploader. Relay
   NIP-11 fetches (`relay_caps.rs`) pin through its `pin_with` too, after the relay gate (`RelaySafetyPolicy`). See
   `docs/marmot-architecture/relay-observability.md`, `audit-logging.md`, and `overview/dial-safety.md`.
 - The diagnostics exporters live in [`marmot-observability`](../marmot-observability/AGENTS.md) (mdk#2627). Its
@@ -1214,12 +1204,14 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   `agent_publisher.rs` (host-driven agent publishing), `attachment_controls.rs`, `attachment_permission.rs`
   (runtime-only network approval; never restore it from disk).
 - `src/client/`: `read_state.rs` (A, the account's published read state: its publisher and the test oracle,
-  mdk#3273), `recovery.rs` (native replay ingress and the recovery seams), `recovery_coverage.rs` (the
-  coverage-ledger recorder, mdk#2660), `recovery_runner.rs` (the per-account recovery
-  runner, mdk#2660; `recovery_runner/host.rs` seats it on the worker or
-  a direct client; `recovery_runner/post_join.rs` gives each joined copy a bounded collection on the same runner,
-  using fresh ordinary boundary facts for grace and admitted ledger coverage for fetched completion), `invite_recovery.rs` (durable invitation recovery),
-  `epoch_stall.rs` (epoch-gap backfill detection), `delivery_spill.rs` (worker side of the durable delivery spill),
+  mdk#3273), `recovery.rs` (native replay ingress and the recovery seams), `history_recovery.rs` (history
+  recovery's ledger side under one parent, mdk#2782: `history_recovery/recovery_coverage.rs` (the
+  coverage-ledger recorder, mdk#2660), `history_recovery/recovery_runner.rs` (the per-account recovery
+  runner, mdk#2660; `history_recovery/recovery_runner/host.rs` seats it on the worker or
+  a direct client; `history_recovery/recovery_runner/post_join.rs` gives each joined copy a bounded collection on the same runner,
+  using fresh ordinary boundary facts for grace and admitted ledger coverage for fetched completion),
+  `history_recovery/epoch_stall.rs` (epoch-gap backfill detection) and `history_recovery/history_notices.rs`),
+  `invite_recovery.rs` (durable invitation recovery), `delivery_spill.rs` (worker side of the durable delivery spill),
   `audit_v5_app_update.rs` (bounded app-boundary audit rows), `sync/native_ingress.rs` (ordered native replay
   admission).
 - The shared relay plane is the [`transport-nostr`](../transport-nostr/AGENTS.md) crate; name its items as

@@ -114,28 +114,28 @@
     "crates/marmot-app/src/client/audit_v5_probe/tests.rs": {
       "short_timeout": 1
     },
+    "crates/marmot-app/src/client/history_recovery/recovery_coverage/live_boundary_tests.rs": {
+      "sleep": 2
+    },
+    "crates/marmot-app/src/client/history_recovery/recovery_runner/host/tests.rs": {
+      "sleep": 3
+    },
+    "crates/marmot-app/src/client/history_recovery/recovery_runner/host/tests/rejoin.rs": {
+      "sleep": 1
+    },
+    "crates/marmot-app/src/client/history_recovery/recovery_runner/repair/tests.rs": {
+      "sleep": 1,
+      "short_timeout": 2
+    },
+    "crates/marmot-app/src/client/history_recovery/recovery_runner/tests.rs": {
+      "sleep": 5
+    },
     "crates/marmot-app/src/client/mod.rs": {
       "sleep": 1,
       "short_timeout": 1
     },
     "crates/marmot-app/src/client/push/tests.rs": {
       "sleep": 2
-    },
-    "crates/marmot-app/src/client/recovery_coverage/live_boundary_tests.rs": {
-      "sleep": 2
-    },
-    "crates/marmot-app/src/client/recovery_runner/host/tests.rs": {
-      "sleep": 3
-    },
-    "crates/marmot-app/src/client/recovery_runner/host/tests/rejoin.rs": {
-      "sleep": 1
-    },
-    "crates/marmot-app/src/client/recovery_runner/repair/tests.rs": {
-      "sleep": 1,
-      "short_timeout": 2
-    },
-    "crates/marmot-app/src/client/recovery_runner/tests.rs": {
-      "sleep": 5
     },
     "crates/marmot-app/src/client/sync/native_comparison_tests/live_rejoin_tests.rs": {
       "short_timeout": 2
@@ -224,9 +224,6 @@
     },
     "crates/marmot-app/src/runtime/attachment_access/tests.rs": {
       "sleep": 9
-    },
-    "crates/marmot-app/src/runtime/audit_tracker_tests.rs": {
-      "short_timeout": 1
     },
     "crates/marmot-app/src/runtime/chat_list_window/tests.rs": {
       "sleep": 1,
@@ -340,8 +337,7 @@
       "short_timeout": 1
     },
     "crates/marmot-app/tests/audit_logs.rs": {
-      "sleep": 5,
-      "short_timeout": 5
+      "sleep": 5
     },
     "crates/marmot-app/tests/catch_up_snapshot_failure.rs": {
       "sleep": 1
@@ -430,9 +426,6 @@
       "sleep": 1
     },
     "crates/marmot-uniffi/tests/smoke.rs": {
-      "sleep": 1
-    },
-    "crates/media-store/src/store_tests.rs": {
       "sleep": 1
     },
     "crates/storage-sqlite/src/app/attachment_acquisition/tests/outgoing_files.rs": {

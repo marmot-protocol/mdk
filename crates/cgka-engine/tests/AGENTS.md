@@ -91,7 +91,7 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     and restarted-committer shapes) plus the missing-anchor fail-closed halt
 
 - **File:** `deferred_peel_lifecycle.rs`
-  - **Owns:** Durable deferred retry lifecycles, generation barriers, capacity limits, context-cache invalidation,
+  - **Owns:** Durable deferred retry lifecycles, generation barriers, capacity limits, live historical-context reuse and invalidation,
     foreground budgets, and background work/time budgets with restart and eventual-completion checks. Also the
     publish-cycle replay's cost: rows it keeps parked are not lineage-classified, and each retained anchor's context
     is derived once per replay rather than once per row. A retry that re-defers a row at a new epoch records no
@@ -236,13 +236,17 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     refused; `hydration_recovers_the_outermost_of_two_nested_interrupted_guards` refuses outer restoration when nested
     cleanup fails, retaining both images and live work. Both fixtures check the `RewindRestoreFailed` quarantine, a
     refused public retry after the private refusal is disarmed, and recovery at a same-storage rebuild.
-    `hydration_quarantine/rewind_restore_fault.rs` owns mdk#3272: a committing window (pass, pass slice, sweep,
-    past-epoch peel) whose restore fails on `commit` or on `Drop` after an unwind quarantines the group for the session
+    `hydration_quarantine/rewind_restore_fault.rs` owns mdk#3272: a committing window (pass, pass slice, sweep)
+    whose restore fails on `commit` or on `Drop` after an unwind quarantines the group for the session
     as `RewindRestoreFailed`, announced once (reads, sends, the settle API, the pass and the sweep refused, retry and a
     re-join refused, a stored rejoin offer hidden and its confirm refused, ingest retained whatever the anchor record reads, nothing committed), and the next open restores
     the live image and replays the input; a failed rewind and a failed contained restore leave the group live. After a
     failed restore or a crash inside a committing window, an engine reopened without hydration ingests and answers a
     Welcome on live state, not on an anchor record that reads removed.
+
+  Historical context capture on SQLite is contained: a restore failure rolls back exact native/group state and
+  leaves the group live. The same owner coordinates a foreign writer through SQLite's busy handler, then checks
+  that replacing an anchor invalidates the warmed context. Nontracking backends keep committing peels.
 
 - **File:** `two_phase_hydration.rs`
   - **Owns:** mdk#1161 two-phase hydration — cheap-pass seeding vs `GroupNotHydrated` gating, `ensure_hydrated`
@@ -259,8 +263,9 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
 - **File:** `crash_recovery_sqlite.rs`
   - **Owns:** Debug-feature-gated subprocess-kill coverage at retained-anchor rewind and historical-apply transaction
     boundaries. Reopens encrypted SQLite, observes the stranded pre-hydration state, then verifies hydration restores
-    live state and releases convergence snapshots. The historical apply is one savepoint, so its kill strands no
-    snapshot. Candidate replay kills after temporary processing and restoration
+    live state and releases convergence snapshots. Historical apply and historical peel-context capture are
+    contained, so their kills strand no snapshot. A separate legacy peel-guard fixture preserves recovery of an
+    interrupted older committing capture. Candidate replay kills after temporary processing and restoration
     also verify exact pre-probe group state, epoch authenticator, snapshots, input ledger and queued work before
     hydration, both standalone and inside an outer transaction.
     Resumable selection and peeling also kill after historical rewind and after a restored slice; reopening must

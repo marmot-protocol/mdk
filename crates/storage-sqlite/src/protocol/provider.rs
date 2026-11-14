@@ -52,6 +52,12 @@ impl StorageProvider for SqliteAccountStorage {
         (!self.connection.is_closed()).then(|| self.group_writes.generation(group_id))
     }
 
+    fn past_peel_context_generation(&self) -> Option<u64> {
+        // Snapshot capture/replacement/release also bump this counter; foreign
+        // commits are covered by the packed SQLite data version.
+        self.mls_write_generation()
+    }
+
     fn with_read_snapshot<T, E, F>(&self, f: F) -> Result<T, E>
     where
         E: From<StorageError>,

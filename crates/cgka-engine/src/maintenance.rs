@@ -544,11 +544,7 @@ impl<S: StorageProvider> Engine<S> {
         device_key_hash: &[u8; 32],
     ) -> Result<GroupRecoverySource, EngineError> {
         self.ensure_group_live(group_id)?;
-        let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
-        let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
-        let group = openmls::group::MlsGroup::load(provider.storage(), &mls_gid)
-            .map_err(|error| EngineError::Backend(format!("load: {error:?}")))?
-            .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;
+        let group = self.load_mls_group(group_id)?;
         self.recovery_source_for_group(group_id, &group, member, device_key_hash)
     }
 
@@ -615,11 +611,7 @@ impl<S: StorageProvider> Engine<S> {
         recovery: &cgka_traits::group_recovery::GroupMemberRecovery,
     ) -> Result<(), EngineError> {
         self.ensure_group_live(group_id)?;
-        let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
-        let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
-        let group = openmls::group::MlsGroup::load(provider.storage(), &mls_gid)
-            .map_err(|error| EngineError::Backend(format!("load: {error:?}")))?
-            .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;
+        let group = self.load_mls_group(group_id)?;
         let record = self.live_group_record(group_id)?;
         let mut required = record.required_capabilities.clone();
         crate::capability_manager::merge_capabilities(
@@ -716,11 +708,7 @@ impl<S: StorageProvider> Engine<S> {
 
     pub fn own_leaf_hash(&self, group_id: &GroupId) -> Result<Vec<u8>, EngineError> {
         self.ensure_group_live(group_id)?;
-        let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
-        let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
-        let mls_group = openmls::group::MlsGroup::load(provider.storage(), &mls_gid)
-            .map_err(|error| EngineError::Backend(format!("load: {error:?}")))?
-            .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;
+        let mls_group = self.load_mls_group(group_id)?;
         let leaf = mls_group
             .own_leaf_node()
             .ok_or_else(|| EngineError::Backend("group has no local leaf".into()))?
@@ -733,7 +721,7 @@ impl<S: StorageProvider> Engine<S> {
 /// Compensate an evolution whose exact bytes have never left the engine.
 /// Hydration may call this only for Preparing; a live send guard also owns a
 /// Prepared row until the pending handle is handed to its caller.
-// Pending-commit recovery: hydration and the pending-commit guard roll a recovery stage back before the group is live (see clippy.toml).
+// Pending-commit recovery: hydration and the pending-commit guard roll a recovery stage back, reading its record and OpenMLS state, before the group is live (see clippy.toml).
 #[allow(clippy::disallowed_methods)]
 pub(crate) fn rollback_recovery_stage<S: StorageProvider>(
     storage: &S,

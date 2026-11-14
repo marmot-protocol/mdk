@@ -18,6 +18,8 @@
 //! read as the sweep end that settles alike ([`verdict`]), so the outcome
 //! table stays `quantum::classify` alone.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use async_trait::async_trait;
 use cgka_traits::TransportDelivery;
 use cgka_traits::storage::StorageResult;
@@ -29,7 +31,8 @@ use storage_sqlite::{
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use transport_nostr_adapter::compare::{
-    CompareEnd, ComparePolicy, CompareRequest, CompareSink, LocalItem, run_comparison,
+    CompareEnd, ComparePolicy, CompareRelay, CompareReply, CompareRequest, CompareSink, IdsReply,
+    LocalItem, run_comparison,
 };
 use transport_nostr_adapter::sweep::{
     ClosedReason, RelayCaps, SweepEnd, SweepRange, SweepRoute, SweepSinkError, UnreachableKind,
@@ -215,6 +218,47 @@ fn verdict(end: CompareEnd, first_unproven: u64, sweeps_otherwise: bool) -> Swee
     }
 }
 
+/// The unit's relay, counting the events in every fetch it answers, for the
+/// audit: those the comparison then drops as not asked for count too.
+struct Counted<'a> {
+    relay: &'a dyn CompareRelay,
+    events: AtomicU64,
+}
+
+#[async_trait]
+impl CompareRelay for Counted<'_> {
+    fn caps(&self) -> RelayCaps {
+        self.relay.caps()
+    }
+
+    async fn compare(
+        &self,
+        route: SweepRoute,
+        window: SweepRange,
+        local: &[LocalItem],
+        limit: usize,
+    ) -> CompareReply {
+        self.relay.compare(route, window, local, limit).await
+    }
+
+    async fn fetch_ids(&self, route: SweepRoute, window: SweepRange, ids: &[EventId]) -> IdsReply {
+        let reply = self.relay.fetch_ids(route, window, ids).await;
+        if let IdsReply::Answered(events) = &reply {
+            self.events
+                .fetch_add(events.len() as u64, Ordering::Relaxed);
+        }
+        reply
+    }
+
+    fn take_fetched_bytes(&self) -> u64 {
+        self.relay.take_fetched_bytes()
+    }
+
+    fn interrupt(&self) -> bool {
+        self.relay.interrupt()
+    }
+}
+
 /// Stages each batch the comparison hands over in its own worker turn.
 struct CompareStage<'a, H> {
     host: &'a H,
@@ -223,6 +267,8 @@ struct CompareStage<'a, H> {
     covered: bool,
     newly_covered_seconds: u64,
     late: u64,
+    /// Events newly staged, for the audit.
+    staged_events: u64,
     /// Bytes charged to staged batches.
     staged_bytes: u64,
     /// Bytes of batches that never reached storage, for settlement.
@@ -273,17 +319,24 @@ impl<H: RunnerHost> CompareSink for CompareStage<'_, H> {
                 SinkStop::Local
             }
             // The transaction committed, bytes and events included.
-            Some(Ok(None)) => {
+            Some(Ok(Staged {
+                newly: None,
+                events,
+            })) => {
                 self.staged_bytes = self.staged_bytes.saturating_add(fetched_bytes);
+                self.staged_events = self.staged_events.saturating_add(events);
                 SinkStop::StaleMark
             }
-            Some(Ok(Some(staged))) => {
+            Some(Ok(Staged {
+                newly: Some(newly),
+                events,
+            })) => {
                 self.staged_bytes = self.staged_bytes.saturating_add(fetched_bytes);
-                self.newly_covered_seconds =
-                    self.newly_covered_seconds.saturating_add(staged.newly);
+                self.newly_covered_seconds = self.newly_covered_seconds.saturating_add(newly);
                 if self.covered {
-                    self.late = self.late.saturating_add(staged.events);
+                    self.late = self.late.saturating_add(events);
                 }
+                self.staged_events = self.staged_events.saturating_add(events);
                 return Ok(());
             }
         };
@@ -298,15 +351,16 @@ impl<H: RunnerHost> CompareSink for CompareStage<'_, H> {
 
 /// What staging one batch did.
 struct Staged {
-    /// Seconds it newly covered on the unit's (route, relay).
-    newly: u64,
+    /// Seconds it newly covered on the unit's (route, relay); `None` when the
+    /// mark was too old to record the coverage.
+    newly: Option<u64>,
     /// Events newly staged.
     events: u64,
 }
 
 /// Stage one batch: its events, and `covered` through `mark` when the window
-/// was certified. `None` when the mark is too old to record the coverage; the
-/// events stay staged.
+/// was certified. The events stay staged even when the mark is too old to
+/// record the coverage.
 fn stage(
     turn: &WorkerTurn<'_>,
     key: &UnitKey,
@@ -315,7 +369,7 @@ fn stage(
     covered: Option<RecoveryCoverageRange>,
     proof: RecoveryCoverageProof,
     mark: RecoveryCoverageMark,
-) -> StorageResult<Option<Staged>> {
+) -> StorageResult<Staged> {
     let before = covered
         .map(|range| uncovered_seconds(turn.app, key, range))
         .transpose()?;
@@ -332,19 +386,22 @@ fn stage(
         turn.now,
     )?;
     let (Some(range), Some(before)) = (covered, before) else {
-        return Ok(Some(Staged {
-            newly: 0,
+        return Ok(Staged {
+            newly: Some(0),
             events: staged.staged as u64,
-        }));
+        });
     };
     if !staged.covered {
-        return Ok(None);
+        return Ok(Staged {
+            newly: None,
+            events: staged.staged as u64,
+        });
     }
     let after = uncovered_seconds(turn.app, key, range)?;
-    Ok(Some(Staged {
-        newly: before.saturating_sub(after),
+    Ok(Staged {
+        newly: Some(before.saturating_sub(after)),
         events: staged.staged as u64,
-    }))
+    })
 }
 
 /// Run the quantum: each planned range in turn, until one does not finish,
@@ -365,6 +422,8 @@ pub(super) async fn run<H: RunnerHost>(
         newly_covered_seconds: 0,
         proved_seconds: 0,
         proved_events: 0,
+        events_fetched: 0,
+        events_staged: 0,
         delta: 0,
         observed_cap: None,
         stop: None,
@@ -379,6 +438,10 @@ pub(super) async fn run<H: RunnerHost>(
         report.end = SweepEnd::Unreachable(UnreachableKind::Disconnected);
         return (report, facts);
     };
+    let relay = Counted {
+        relay: &*relay,
+        events: AtomicU64::new(0),
+    };
     let route = plan.route;
     let sweeps_otherwise = plan.sweeps_otherwise();
     let limits = policy.compare();
@@ -390,6 +453,7 @@ pub(super) async fn run<H: RunnerHost>(
         covered: false,
         newly_covered_seconds: 0,
         late: 0,
+        staged_events: 0,
         staged_bytes: 0,
         unstaged_bytes: 0,
         stop: None,
@@ -414,7 +478,7 @@ pub(super) async fn run<H: RunnerHost>(
                     ..limits
                 },
             },
-            &*relay,
+            &relay,
             &mut sink,
             cancel,
         )
@@ -452,6 +516,8 @@ pub(super) async fn run<H: RunnerHost>(
         }
     }
     report.newly_covered_seconds = sink.newly_covered_seconds;
+    report.events_fetched = relay.events.into_inner();
+    report.events_staged = sink.staged_events;
     report.stop = sink.stop;
     facts.late = sink.late;
     if !plan.best_effort {

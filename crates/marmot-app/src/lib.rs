@@ -236,7 +236,7 @@ pub use audit_log::{
     AUDIT_LOG_DEFAULT_MAX_BYTES_PER_ACCOUNT, AUDIT_LOG_MAX_AGE_DAYS,
     AUDIT_LOG_MIN_MAX_BYTES_PER_ACCOUNT, AuditDeliveryBacklog, AuditDeliveryFailure,
     AuditDeliveryFailureKind, AuditDeliveryStatus, AuditLogDeleteOutcome, AuditLogFile,
-    AuditLogRetention, AuditLogSettings, AuditLogTrackerUpdateResult, AuditLogUploadResult,
+    AuditLogRetention, AuditLogSettings, AuditLogSource, AuditLogTrackerUpdateResult,
     AuditOtlpTrackerResult,
 };
 pub use cgka_traits::{
@@ -281,8 +281,8 @@ pub use client::history_imports::{ChatHistoryImport, ChatHistoryImportState};
 pub use client::sign_ins::{SignInResponse, UnrecognizedSignIn, UnrecognizedSignInState};
 pub(crate) use client::{ConvergenceScheduleState, EpochBackfillRunOutcome};
 pub use config::{
-    AttachmentAcquisitionMode, AttachmentAcquisitionPolicy, AuditLogTrackerConfig,
-    CursorPersistence, MarmotAppConfig, MarmotServiceEndpoints, RelayTelemetrySettings,
+    AttachmentAcquisitionMode, AttachmentAcquisitionPolicy, CursorPersistence, MarmotAppConfig,
+    MarmotServiceEndpoints, RelayTelemetrySettings,
 };
 pub use drafts::{
     ChatListDraftVersion, MessageDraft, MessageDraftAttachment, MessageDraftAttachmentSummary,
@@ -310,8 +310,8 @@ pub use ids::{
 };
 pub use marmot_observability::{
     AppPerformanceOperationSnapshot, AppPerformanceSnapshot, AppPerformanceTelemetry,
-    AuditLogUploadSource, DiagnosticsExporterStatus, DiagnosticsPermit, ExportHistogram,
-    ExportMetricPoint, ExportMetricValue, HostPerformanceOperation, HostPerformanceOutcome,
+    DiagnosticsExporterStatus, DiagnosticsPermit, ExportHistogram, ExportMetricPoint,
+    ExportMetricValue, HostPerformanceOperation, HostPerformanceOutcome,
     PRODUCT_DURATION_BOUNDS_MS, PRODUCT_OUTCOMES, PRODUCT_REGISTRY_VERSION, ProductAnalytics,
     ProductAnalyticsActivity, ProductAnalyticsError, ProductAnalyticsMetadata,
     ProductAnalyticsRuntimeConfig, ProductEvent, ProductEventMode, ProductEventSchema,
@@ -710,7 +710,7 @@ pub struct MarmotApp {
     account_state_ready: Arc<Mutex<HashSet<String>>>,
     chat_list_projection_warmed: Arc<Mutex<HashSet<String>>>,
     chat_list_projection_stale: Arc<Mutex<ChatListStaleness>>,
-    audit_log_tracker_config: Arc<Mutex<AuditLogTrackerConfig>>,
+    audit_log_source: Arc<Mutex<AuditLogSource>>,
     audit_recorders: Arc<Mutex<HashMap<String, audit_log::AuditRecorderSlot>>>,
     product_analytics: marmot_observability::ProductRecorder,
     startup_diagnostics: startup_diagnostics::NativeStartupDiagnostics,
@@ -1870,7 +1870,7 @@ impl MarmotApp {
             account_state_ready: Arc::new(Mutex::new(HashSet::new())),
             chat_list_projection_warmed: Arc::new(Mutex::new(HashSet::new())),
             chat_list_projection_stale: Arc::default(),
-            audit_log_tracker_config: Arc::new(Mutex::new(AuditLogTrackerConfig::default())),
+            audit_log_source: Arc::default(),
             audit_recorders: Arc::default(),
             product_analytics,
             startup_diagnostics: Default::default(),
@@ -1997,7 +1997,7 @@ impl MarmotApp {
             account_state_ready: Arc::new(Mutex::new(HashSet::new())),
             chat_list_projection_warmed: Arc::new(Mutex::new(HashSet::new())),
             chat_list_projection_stale: Arc::default(),
-            audit_log_tracker_config: Arc::new(Mutex::new(AuditLogTrackerConfig::default())),
+            audit_log_source: Arc::default(),
             audit_recorders: Arc::default(),
             product_analytics,
             startup_diagnostics: Default::default(),
@@ -2227,7 +2227,7 @@ impl MarmotApp {
         {
             ms
         } else {
-            crate::client::epoch_stall::EPOCH_STALL_WEDGE_REARM_INTERVAL_MS
+            crate::client::history_recovery::epoch_stall::EPOCH_STALL_WEDGE_REARM_INTERVAL_MS
         };
         let _ = open.runtime.take_maintenance_activity();
         let recovery_owner = client::recovery::AccountRecoveryOwner::open();
@@ -2378,7 +2378,7 @@ impl MarmotApp {
             pending_superseded_change_events: Vec::new(),
             maintenance_failed_backlog: 0,
             unpublished_welcome_delivery: None,
-            epoch_stall: crate::client::epoch_stall::EpochStallDetector::default()
+            epoch_stall: crate::client::history_recovery::epoch_stall::EpochStallDetector::default()
                 .with_wedge_rearm_interval_ms(wedge_rearm_interval_ms),
             pending_recovery_arm_writes: HashMap::new(),
             released_backfill_reload_pending: true,
@@ -5083,6 +5083,10 @@ impl MarmotApp {
         Ok(Some(group))
     }
 
+    /// Write a group's `archived` flag to storage directly. A running account
+    /// worker would undo it at its next save of that group's record, so the
+    /// runtime calls this only for an account that runs no worker and
+    /// otherwise archives through the worker (mdk#178, mdk#3318).
     pub fn set_group_archived(
         &self,
         label: &str,
@@ -5240,7 +5244,7 @@ impl MarmotApp {
         };
         // Optional forensic audit log. Enable `AuditLogSettings` before opening
         // an account session to record per-account/device JSONL at
-        // `<account_dir>/audit-<engine_id>-v4.jsonl`. The v4 schema contains
+        // `<account_dir>/audit-<engine_id>-v5.jsonl`. The v5 schema contains
         // privacy-safe derived values only: obfuscated identifiers, digests,
         // lengths, counts, reduced convergence data, and typed outcomes.
         let mut session_config = SessionConfig::with_storage(
@@ -8517,7 +8521,7 @@ struct SharedAppRouting {
     /// What the account's recovery runner last found catching up; `None`
     /// until one has surveyed.
     recovery_runner_catching_up: tokio::sync::watch::Sender<
-        Option<std::collections::BTreeSet<client::recovery_runner::UnitKey>>,
+        Option<std::collections::BTreeSet<client::history_recovery::recovery_runner::UnitKey>>,
     >,
 }
 
@@ -8650,7 +8654,7 @@ impl AppTransportRouting {
     fn recovery_runner_catching_up(
         &self,
     ) -> tokio::sync::watch::Sender<
-        Option<std::collections::BTreeSet<client::recovery_runner::UnitKey>>,
+        Option<std::collections::BTreeSet<client::history_recovery::recovery_runner::UnitKey>>,
     > {
         self.inner.recovery_runner_catching_up.clone()
     }
@@ -8659,7 +8663,8 @@ impl AppTransportRouting {
     /// until one has surveyed.
     fn recovery_runner_catching_up_now(
         &self,
-    ) -> Option<std::collections::BTreeSet<client::recovery_runner::UnitKey>> {
+    ) -> Option<std::collections::BTreeSet<client::history_recovery::recovery_runner::UnitKey>>
+    {
         self.inner.recovery_runner_catching_up.borrow().clone()
     }
 
@@ -8668,7 +8673,7 @@ impl AppTransportRouting {
     fn subscribe_recovery_runner_catching_up(
         &self,
     ) -> tokio::sync::watch::Receiver<
-        Option<std::collections::BTreeSet<client::recovery_runner::UnitKey>>,
+        Option<std::collections::BTreeSet<client::history_recovery::recovery_runner::UnitKey>>,
     > {
         self.inner.recovery_runner_catching_up.subscribe()
     }

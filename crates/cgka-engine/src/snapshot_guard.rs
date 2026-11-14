@@ -13,13 +13,13 @@
 //!   inside a group savepoint that also holds the snapshot, so nothing it
 //!   writes commits before its restore. A failed restore fails the savepoint,
 //!   which undoes the whole window and leaves live state as it was, wherever
-//!   the caller's transaction boundary is.
+//!   the caller's transaction boundary is. Tracking backends use this boundary
+//!   for short historical peel-context captures, before any async peeler runs.
 //! - **Committing** ([`SnapshotRollbackGuard::rewind`]): the window opens with
 //!   a rewind onto a retained anchor outside any transaction, so its writes
 //!   commit as they happen. The convergence pass and the deferred-peel sweep
 //!   replay whole commit graphs in these windows, too long to hold one write
-//!   transaction; past-epoch peel shares their shape and their crash
-//!   recovery. A rewind that fails commits nothing, so the guard releases
+//!   transaction. A rewind that fails commits nothing, so the guard releases
 //!   its snapshot and the group stays live. Once the rewind has succeeded, a
 //!   restore that fails leaves the group on anchor state: the guard keeps its
 //!   snapshot, the only copy of the live state, and records the group in the
@@ -59,7 +59,9 @@ const TRACE_TARGET: &str = "cgka_engine::snapshot_guard";
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum RewindSite {
     /// Ingest rewinds onto a retained anchor to derive the exporter context
-    /// that reads a message from a past epoch.
+    /// that reads a message from a past epoch. Tracking backends contain this
+    /// window. Its prefix also recovers committing windows on other backends
+    /// and windows stranded by earlier builds.
     PastPeelContext,
     /// Ingest rewinds onto a retained anchor to read the retention policy that
     /// was authenticated at a delayed message's source epoch.

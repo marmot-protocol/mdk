@@ -4,16 +4,13 @@ use marmot_session::MaintenanceTiming;
 
 use crate::deployment::{MarmotDeployment, OpenRankingProvider};
 use marmot_observability::{
-    AuditLogUploadSource, DEFAULT_EXPORT_INTERVAL, RelayTelemetryExportConfig,
-    RelayTelemetryRuntimeConfig, endpoint_transport_allowed, trim_optional,
+    DEFAULT_EXPORT_INTERVAL, RelayTelemetryExportConfig, RelayTelemetryRuntimeConfig, trim_optional,
 };
 use serde::{Deserialize, Serialize};
 
 const DEFAULT_DIRECTORY_MAX_FUTURE_SKEW: Duration = Duration::from_secs(5 * 60);
 const COMPILED_RELAY_TELEMETRY_OTLP_ENDPOINT: Option<&str> =
     option_env!("MARMOT_RELAY_TELEMETRY_OTLP_ENDPOINT");
-const COMPILED_AUDIT_LOG_TRACKER_ENDPOINT: Option<&str> =
-    option_env!("MARMOT_AUDIT_LOG_TRACKER_ENDPOINT");
 
 /// Policy for advancing the account's durable transport cursor
 /// (`last_transport_timestamp`) from ingested deliveries.
@@ -192,7 +189,7 @@ pub struct MarmotAppConfig {
     pub dev_fail_invite_local_refresh: bool,
     /// Dev/test-only override for how long a group wedged at one stalled epoch
     /// must wait between paced re-arms
-    /// ([`crate::client::epoch_stall::EPOCH_STALL_WEDGE_REARM_INTERVAL_MS`]).
+    /// ([`crate::client::history_recovery::epoch_stall::EPOCH_STALL_WEDGE_REARM_INTERVAL_MS`]).
     /// Honored only with `test-policy-overrides`; the production interval is an
     /// hour, so this is the only way a test can reach the second and third
     /// re-arm of a frozen device without sleeping through them.
@@ -242,22 +239,20 @@ pub struct MarmotAppConfig {
     pub directory_search_fallback_seeds: Vec<String>,
 }
 
-/// Compiled or app-level default collector URLs for product analytics,
-/// production telemetry export and forensic audit-log tracker uploads.
-/// Deployment services such as media servers and Open Ranking live on
-/// [`MarmotDeployment`].
+/// Compiled or app-level default collector URLs for product analytics and
+/// production telemetry export. Deployment services such as media servers
+/// and Open Ranking live on [`MarmotDeployment`]. Audit delivery has no
+/// default destination; hosts configure it at runtime.
 ///
 /// Defaults are intentionally separate from bearer tokens. Host apps supply
 /// credentials at runtime, while the MDK/Marmot build owns stable
 /// first-party URLs. `MarmotAppConfig::default()` reads these from
-/// `MARMOT_PRODUCT_ANALYTICS_EVENTS_ENDPOINT`,
-/// `MARMOT_RELAY_TELEMETRY_OTLP_ENDPOINT` and
-/// `MARMOT_AUDIT_LOG_TRACKER_ENDPOINT` at compile time.
+/// `MARMOT_PRODUCT_ANALYTICS_EVENTS_ENDPOINT` and
+/// `MARMOT_RELAY_TELEMETRY_OTLP_ENDPOINT` at compile time.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MarmotServiceEndpoints {
     pub product_analytics_events_endpoint: Option<String>,
     pub relay_telemetry_otlp_endpoint: Option<String>,
-    pub audit_log_tracker_endpoint: Option<String>,
 }
 
 impl Default for MarmotAppConfig {
@@ -519,7 +514,6 @@ impl MarmotServiceEndpoints {
             .map(str::to_owned),
             relay_telemetry_otlp_endpoint: COMPILED_RELAY_TELEMETRY_OTLP_ENDPOINT
                 .map(str::to_owned),
-            audit_log_tracker_endpoint: COMPILED_AUDIT_LOG_TRACKER_ENDPOINT.map(str::to_owned),
         }
         .normalize()
     }
@@ -528,7 +522,6 @@ impl MarmotServiceEndpoints {
         self.product_analytics_events_endpoint =
             trim_optional(self.product_analytics_events_endpoint);
         self.relay_telemetry_otlp_endpoint = trim_optional(self.relay_telemetry_otlp_endpoint);
-        self.audit_log_tracker_endpoint = trim_optional(self.audit_log_tracker_endpoint);
         self
     }
 }
@@ -540,71 +533,6 @@ const MAX_EXPORT_INTERVAL: Duration = Duration::from_secs(60 * 60);
 pub struct RelayTelemetrySettings {
     pub export_enabled: bool,
     pub export_interval_seconds: u64,
-}
-
-/// Hand-written `Debug` below redacts `authorization_bearer_token` (the audit
-/// upload credential) so a `{:?}` never prints it.
-#[derive(Clone, Default, PartialEq, Eq)]
-pub struct AuditLogTrackerConfig {
-    pub endpoint: Option<String>,
-    pub authorization_bearer_token: Option<String>,
-    pub source: AuditLogUploadSource,
-}
-
-impl std::fmt::Debug for AuditLogTrackerConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AuditLogTrackerConfig")
-            .field("endpoint", &self.endpoint)
-            .field(
-                "authorization_bearer_token",
-                &self
-                    .authorization_bearer_token
-                    .as_ref()
-                    .map(|_| "<redacted>"),
-            )
-            .field("source", &self.source)
-            .finish()
-    }
-}
-
-impl AuditLogTrackerConfig {
-    pub(crate) fn normalize(mut self) -> Result<Self, String> {
-        self.endpoint = trim_optional(self.endpoint);
-        self.authorization_bearer_token = trim_optional(self.authorization_bearer_token);
-        self.source = AuditLogUploadSource {
-            hardware_model: trim_optional(self.source.hardware_model),
-            platform: trim_optional(self.source.platform),
-            app_version: trim_optional(self.source.app_version),
-        };
-        if self
-            .endpoint
-            .as_deref()
-            .is_some_and(|endpoint| !endpoint_transport_allowed(endpoint))
-        {
-            return Err(
-                "audit log tracker endpoint must be https, or loopback http for local testing"
-                    .to_owned(),
-            );
-        }
-        Ok(self)
-    }
-
-    pub(crate) fn resolved_endpoint(&self, endpoints: &MarmotServiceEndpoints) -> Option<String> {
-        self.endpoint
-            .clone()
-            .or_else(|| endpoints.audit_log_tracker_endpoint.clone())
-            .and_then(|endpoint| trim_optional(Some(endpoint)))
-    }
-
-    pub(crate) fn upload_allowed_with_endpoints(&self, endpoints: &MarmotServiceEndpoints) -> bool {
-        self.resolved_endpoint(endpoints)
-            .as_deref()
-            .is_some_and(endpoint_transport_allowed)
-            && self
-                .authorization_bearer_token
-                .as_deref()
-                .is_some_and(|token| !token.trim().is_empty())
-    }
 }
 
 impl Default for RelayTelemetrySettings {

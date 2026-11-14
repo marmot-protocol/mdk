@@ -15,6 +15,16 @@ use crate::ingest::PeeledMessage;
 use crate::transport::{EncryptedPayload, TransportMessage};
 use crate::types::MemberId;
 use async_trait::async_trait;
+use std::borrow::Cow;
+
+/// One transport envelope after context-independent validation and decoding.
+/// Keep this value within one ingest operation and reuse it for every candidate
+/// context. Preparation does not authenticate MLS content or an epoch claim.
+#[derive(Debug)]
+pub struct PreparedGroupMessage<'a> {
+    pub message: &'a TransportMessage,
+    pub content: Cow<'a, [u8]>,
+}
 
 /// MLS group-message payload metadata the engine knows before transport wrap.
 ///
@@ -113,9 +123,23 @@ impl GroupMessageMetadata {
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 pub trait TransportPeeler: Send + Sync {
+    /// Validate and decode the transport envelope before trying any group key.
+    /// Raw transports need no decoding and borrow their admitted payload.
+    fn prepare_group_message<'a>(
+        &self,
+        msg: &'a TransportMessage,
+    ) -> Result<PreparedGroupMessage<'a>, PeelerError> {
+        Ok(PreparedGroupMessage {
+            message: msg,
+            content: Cow::Borrowed(&msg.payload),
+        })
+    }
+
+    /// Try one group key against bytes returned by this peeler's preparation.
+    /// Callers must not substitute another message or transport's prepared bytes.
     async fn peel_group_message(
         &self,
-        msg: &TransportMessage,
+        msg: &PreparedGroupMessage<'_>,
         ctx: &GroupContextSnapshot,
     ) -> Result<PeeledMessage, PeelerError>;
 

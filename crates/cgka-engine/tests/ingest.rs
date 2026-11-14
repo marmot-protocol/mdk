@@ -1,5 +1,8 @@
 //! Ingest tests for stale classifications and application-message round trips.
 
+// Tests load OpenMLS state directly (see the crate clippy.toml).
+#![allow(clippy::disallowed_methods)]
+
 use async_trait::async_trait;
 use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_engine::{Engine, EngineBuilder};
@@ -132,17 +135,17 @@ impl TransportPeeler for MockPeeler {
 
     async fn peel_group_message(
         &self,
-        msg: &TransportMessage,
+        msg: &cgka_traits::peeler::PreparedGroupMessage<'_>,
         _ctx: &GroupContextSnapshot,
     ) -> Result<PeeledMessage, PeelerError> {
         Ok(PeeledMessage {
-            id: msg.id.clone(),
+            id: msg.message.id.clone(),
             group_id: None,
             sender: None,
             content: PeeledContent::MlsMessage {
-                bytes: msg.payload.clone(),
+                bytes: msg.message.payload.clone(),
             },
-            origin: msg.clone(),
+            origin: msg.message.clone(),
         })
     }
 
@@ -209,7 +212,7 @@ impl TransportPeeler for RecordingPeeler {
 
     async fn peel_group_message(
         &self,
-        msg: &TransportMessage,
+        msg: &cgka_traits::peeler::PreparedGroupMessage<'_>,
         ctx: &GroupContextSnapshot,
     ) -> Result<PeeledMessage, PeelerError> {
         MockPeeler.peel_group_message(msg, ctx).await
@@ -260,12 +263,12 @@ impl TransportPeeler for FailOncePeeler {
 
     async fn peel_group_message(
         &self,
-        msg: &TransportMessage,
+        msg: &cgka_traits::peeler::PreparedGroupMessage<'_>,
         ctx: &GroupContextSnapshot,
     ) -> Result<PeeledMessage, PeelerError> {
         let should_fail = {
             let mut failed = self.failed.lock().unwrap();
-            failed.insert(msg.id.clone())
+            failed.insert(msg.message.id.clone())
         };
         if should_fail {
             return Err(PeelerError::DecryptFailed);
@@ -308,10 +311,10 @@ impl TransportPeeler for MalformedShortPayloadPeeler {
 
     async fn peel_group_message(
         &self,
-        msg: &TransportMessage,
+        msg: &cgka_traits::peeler::PreparedGroupMessage<'_>,
         ctx: &GroupContextSnapshot,
     ) -> Result<PeeledMessage, PeelerError> {
-        if msg.payload.len() < STRUCTURAL_MIN_PAYLOAD_LEN {
+        if msg.message.payload.len() < STRUCTURAL_MIN_PAYLOAD_LEN {
             return Err(PeelerError::Malformed(
                 "content too short for nonce-prefixed ciphertext".into(),
             ));
@@ -354,10 +357,10 @@ impl TransportPeeler for BoundaryRejectionPeeler {
 
     async fn peel_group_message(
         &self,
-        msg: &TransportMessage,
+        msg: &cgka_traits::peeler::PreparedGroupMessage<'_>,
         ctx: &GroupContextSnapshot,
     ) -> Result<PeeledMessage, PeelerError> {
-        if msg.payload != BOUNDARY_REJECTION_PAYLOAD {
+        if msg.message.payload != BOUNDARY_REJECTION_PAYLOAD {
             return MockPeeler.peel_group_message(msg, ctx).await;
         }
 
@@ -431,10 +434,10 @@ impl TransportPeeler for SnapshotFallbackMalformedPeeler {
 
     async fn peel_group_message(
         &self,
-        msg: &TransportMessage,
+        msg: &cgka_traits::peeler::PreparedGroupMessage<'_>,
         ctx: &GroupContextSnapshot,
     ) -> Result<PeeledMessage, PeelerError> {
-        if msg.payload == SNAPSHOT_FALLBACK_GARBAGE {
+        if msg.message.payload == SNAPSHOT_FALLBACK_GARBAGE {
             return if ctx.epoch().0 < self.malformed_below_epoch {
                 Err(PeelerError::Malformed(
                     "malformed only against an older snapshot context".into(),
@@ -488,7 +491,7 @@ impl TransportPeeler for CountingPeeler {
 
     async fn peel_group_message(
         &self,
-        msg: &TransportMessage,
+        msg: &cgka_traits::peeler::PreparedGroupMessage<'_>,
         ctx: &GroupContextSnapshot,
     ) -> Result<PeeledMessage, PeelerError> {
         *self.peels.lock().unwrap() += 1;

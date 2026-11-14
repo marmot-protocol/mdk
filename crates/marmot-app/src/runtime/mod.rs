@@ -43,11 +43,10 @@ use crate::{
     AgentTextStreamFinishRequest, AppBlobEndpoint, AppCreateGroupOptions, AppDisbandRequest,
     AppError, AppGroupConversationSnapshot, AppGroupMemberRecord, AppGroupMlsState, AppGroupRecord,
     AppGroupRoster, AppMessageQuery, AppMessageRecord, AppProjectionUpdate, AppQuarantinedGroup,
-    AuditLogDeleteOutcome, AuditLogFile, AuditLogRetention, AuditLogSettings,
-    AuditLogTrackerConfig, AuditLogTrackerUpdateResult, AuditLogUploadResult,
-    BackgroundNotificationCollection, BackupSettings, ChatListRow, ChatNotificationSettings,
-    ChatPinState, ExistingDirectConversation, GroupInviteDeclineResult, GroupPushDebugInfo,
-    MAX_SEEN_EVENT_IDS, MarmotApp, MarmotRelayPlane, MarmotServiceEndpoints,
+    AuditLogDeleteOutcome, AuditLogFile, AuditLogRetention, AuditLogSettings, AuditLogSource,
+    AuditLogTrackerUpdateResult, BackgroundNotificationCollection, BackupSettings, ChatListRow,
+    ChatNotificationSettings, ChatPinState, ExistingDirectConversation, GroupInviteDeclineResult,
+    GroupPushDebugInfo, MAX_SEEN_EVENT_IDS, MarmotApp, MarmotRelayPlane, MarmotServiceEndpoints,
     MediaAttachmentReference, MediaDownloadResult, MediaUploadRequest, MediaUploadResult,
     MessageDraft, MessageDraftAttachment, MessageDraftSummary, NotificationCollectionStatus,
     NotificationSettings, NotificationUpdate, NotificationWakeSource, PendingWelcomeDelivery,
@@ -393,7 +392,6 @@ pub struct RuntimeSharedServices {
     lifecycle: RuntimeLifecycle,
     relay_telemetry_exporter: Arc<StdMutex<Option<JoinHandle<()>>>>,
     relay_telemetry_runtime_config: Arc<StdMutex<RelayTelemetryRuntimeConfig>>,
-    audit_log_tracker_config: Arc<StdMutex<AuditLogTrackerConfig>>,
     audit_otlp_sender: Arc<StdMutex<Option<Arc<marmot_observability::AuditOtlpSender>>>>,
     service_endpoints: MarmotServiceEndpoints,
     audit_log_tracker_uploader: Option<AuditLogTrackerUploader>,
@@ -505,7 +503,6 @@ impl Default for RuntimeSharedServices {
             relay_telemetry_runtime_config: Arc::new(StdMutex::new(
                 RelayTelemetryRuntimeConfig::default(),
             )),
-            audit_log_tracker_config: Arc::new(StdMutex::new(AuditLogTrackerConfig::default())),
             audit_otlp_sender: Arc::new(StdMutex::new(None)),
             service_endpoints: MarmotServiceEndpoints::default(),
             audit_log_tracker_uploader: None,
@@ -576,12 +573,10 @@ impl RuntimeSharedServices {
                 || app.config.cursor_persistence == crate::CursorPersistence::Frozen,
         );
         let lifecycle = RuntimeLifecycle::new();
-        let audit_log_tracker_config = app.audit_log_tracker_config.clone();
         let audit_otlp_sender = Arc::new(StdMutex::new(None));
         let audit_retention = crate::audit_log::AuditRetentionWorker::new(app.clone());
         let audit_log_tracker_uploader = AuditLogTrackerUploader::new(
             app.clone(),
-            audit_log_tracker_config.clone(),
             audit_otlp_sender.clone(),
             lifecycle.clone(),
             audit_retention.clone(),
@@ -613,7 +608,6 @@ impl RuntimeSharedServices {
             relay_telemetry_runtime_config: Arc::new(StdMutex::new(
                 RelayTelemetryRuntimeConfig::default(),
             )),
-            audit_log_tracker_config,
             audit_otlp_sender,
             service_endpoints: app.service_endpoints().clone(),
             audit_log_tracker_uploader: Some(audit_log_tracker_uploader),
@@ -786,13 +780,6 @@ impl RuntimeSharedServices {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = config;
     }
 
-    fn audit_log_tracker_config(&self) -> AuditLogTrackerConfig {
-        self.audit_log_tracker_config
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
-    }
-
     fn audit_otlp_sender(&self) -> Option<Arc<marmot_observability::AuditOtlpSender>> {
         self.audit_otlp_sender
             .lock()
@@ -826,43 +813,13 @@ impl RuntimeSharedServices {
         if let Some(retention) = &self.audit_retention {
             retention.request_budget_check();
         }
-        let config = self.audit_log_tracker_config();
-        if self.audit_otlp_sender().is_some() {
-            if let Some(uploader) = &self.audit_log_tracker_uploader {
-                uploader.schedule(trigger);
-            }
-            return;
-        }
-        if config.resolved_endpoint(self.service_endpoints()).is_none() {
+        // Delivery runs only toward a configured v5 OTLP destination.
+        if self.audit_otlp_sender().is_none() {
             tracing::debug!(
                 target: "marmot_app::audit_log",
                 method = "schedule_audit_log_tracker_update",
                 trigger,
-                skipped_reason = "audit_log_tracker_endpoint_missing",
-                "skipped forensic audit log tracker update"
-            );
-            return;
-        }
-        if config
-            .authorization_bearer_token
-            .as_deref()
-            .is_none_or(|token| token.trim().is_empty())
-        {
-            tracing::debug!(
-                target: "marmot_app::audit_log",
-                method = "schedule_audit_log_tracker_update",
-                trigger,
-                skipped_reason = "audit_log_tracker_authorization_token_missing",
-                "skipped forensic audit log tracker update"
-            );
-            return;
-        }
-        if !config.upload_allowed_with_endpoints(self.service_endpoints()) {
-            tracing::debug!(
-                target: "marmot_app::audit_log",
-                method = "schedule_audit_log_tracker_update",
-                trigger,
-                skipped_reason = "audit_log_tracker_not_configured",
+                skipped_reason = "audit_otlp_destination_missing",
                 "skipped forensic audit log tracker update"
             );
             return;
@@ -3915,19 +3872,18 @@ impl MarmotAppRuntime {
         self.accounts.app.audit_log_files()
     }
 
-    pub async fn post_audit_log_file(
-        &self,
-        path: &str,
-        endpoint: &str,
-    ) -> Result<AuditLogUploadResult, AppError> {
-        self.accounts.app.post_audit_log_file(path, endpoint).await
+    /// Set the non-persisted source metadata (system hardware model,
+    /// platform, app version) recorded in each audit recorder opened after
+    /// this call, and return the stored, trimmed value. Set it before account
+    /// sessions open; already-running recorders keep the source they opened
+    /// with.
+    pub fn set_audit_log_source(&self, source: AuditLogSource) -> Result<AuditLogSource, AppError> {
+        self.accounts.app.set_audit_log_source(source)
     }
 
-    pub fn set_audit_log_tracker_config(
-        &self,
-        config: AuditLogTrackerConfig,
-    ) -> Result<AuditLogTrackerConfig, AppError> {
-        self.accounts.app.set_audit_log_tracker_config(config)
+    /// The audit source metadata later recorder opens will record.
+    pub fn audit_log_source(&self) -> AuditLogSource {
+        self.accounts.app.audit_log_source()
     }
 
     /// Configure a dedicated v5 OTLP audit destination in memory. Recording
@@ -3948,14 +3904,15 @@ impl MarmotAppRuntime {
         Ok(())
     }
 
+    /// Run one manual v5 OTLP delivery pass now. `enabled` reports the audit
+    /// switch; `v5` is `None` when no destination is configured. A manual
+    /// pass also retries accounts whose automatic delivery is paused.
     pub async fn post_audit_log_tracker_update(
         &self,
     ) -> Result<AuditLogTrackerUpdateResult, AppError> {
-        let config = self.shared.audit_log_tracker_config();
         let sender = self.shared.audit_otlp_sender();
         let result = post_audit_log_tracker_update_for_runtime(
             &self.accounts.app,
-            config,
             sender.as_deref(),
             &self.shared.audit_otlp_sender,
             &self.shared.lifecycle(),
@@ -6265,14 +6222,12 @@ impl MarmotAppRuntime {
         let account = self.accounts.resolve(account_ref)?;
         let group_id_hex = normalize_group_id_hex_app(group_id_hex)?;
         let group_id = GroupId::new(hex::decode(&group_id_hex)?);
-        // Route the archive toggle through the account worker so the
-        // long-lived in-memory `AccountState` is updated in place. A direct
-        // `MarmotApp::set_group_archived` would only touch the database; the
-        // worker's stale snapshot (archived = false) would then silently revert
-        // it on the next inbound delivery's `save_state`. See mdk#178.
-        let group = self
+        // An account that signs on a worker archives through it, so the
+        // worker's in-memory `AccountState` changes in place (mdk#178,
+        // mdk#3318); only an account that runs none writes storage directly.
+        let (group, unpublished) = self
             .accounts
-            .set_group_archived(account_ref, &group_id, archived)
+            .set_group_archived_on_worker(account_ref, &group_id, archived)
             .await?;
         let chat_list_row = self
             .accounts
@@ -6286,7 +6241,7 @@ impl MarmotAppRuntime {
             ChatListUpdateTrigger::ArchiveChanged,
         );
         publish_app_runtime_group_state_updated(
-            Emit::Unpublished(Unpublished::AfterReply),
+            Emit::Unpublished(unpublished),
             &self.events,
             &account.account_id_hex,
             &account.label,
@@ -7743,16 +7698,65 @@ impl AccountManager {
     /// command permission. An eligible account's temporary startup failure
     /// must not mean it has no worker.
     fn account_worker_eligible(&self, account: &AccountSummary) -> Result<bool, AppError> {
-        if self.account_is_tearing_down(&account.account_id_hex)
-            || !(account.is_active_local_signing()
-                || (account.external_signing
-                    && !account.signed_out
-                    && self.app.has_external_signer(&account.account_id_hex)))
-        {
+        if self.account_is_tearing_down(&account.account_id_hex) || !self.signs_on_worker(account) {
             return Ok(false);
         }
         self.setup_records()
             .onboarding_worker_allowed(&account.label)
+    }
+
+    /// Whether `account` signs on a worker: an active local signer, or a
+    /// signed-in external signer whose signer is registered. Its group writes
+    /// go through that worker, which keeps the account's state in memory and
+    /// saves each dirty group's whole record (mdk#178, mdk#3318).
+    pub(super) fn signs_on_worker(&self, account: &AccountSummary) -> bool {
+        account.is_active_local_signing()
+            || (account.external_signing
+                && !account.signed_out
+                && self.app.has_external_signer(&account.account_id_hex))
+    }
+
+    /// Run `write` on the storage of an account that signs on no worker, with
+    /// the worker transaction held, and hand back the account it read. `None`,
+    /// with nothing written, if the account signs on a worker by then: the
+    /// caller goes through that worker instead.
+    ///
+    /// A write beside a running, starting or retiring worker is undone by
+    /// that worker's next save and leaves its reads stale (mdk#178,
+    /// mdk#3318). Every worker start, sign-in and sign-out takes the worker
+    /// transaction, so no worker starts during `write`. A worker kept from
+    /// before the account stopped signing on one is retired first, as
+    /// reconcile would, and any worker still retiring is reaped first; one
+    /// onboarding is still reaping fails the call with nothing written.
+    pub(super) async fn write_without_worker<T>(
+        &self,
+        account_ref: &str,
+        write: impl FnOnce(&AccountSummary) -> Result<T, AppError>,
+    ) -> Result<Option<(AccountSummary, T)>, AppError> {
+        let lock_wait = self
+            .shared
+            .observer
+            .performance()
+            .observe(RuntimeOp::LifecycleLockWait);
+        let _worker_transaction = self.worker_transactions.lock().await;
+        lock_wait.finish(TelemetryOutcome::Success);
+        self.shared.lifecycle().ensure_running()?;
+        let account = self.resolve(account_ref)?;
+        if self.signs_on_worker(&account) {
+            return Ok(None);
+        }
+        if let Some(worker) = self.take_worker_locked(&account.account_id_hex).await {
+            self.register_worker_reapers(vec![(account.account_id_hex.clone(), worker)]);
+        }
+        self.ensure_worker_reaped(&account.account_id_hex).await?;
+        self.setup
+            .ensure_worker_reap_settled(self, &account.account_id_hex)
+            .await
+            .map_err(|_| {
+                AppError::BlockingTask("account worker cleanup still in progress".into())
+            })?;
+        let written = write(&account)?;
+        Ok(Some((account, written)))
     }
 
     /// Assumes the worker transaction is held.

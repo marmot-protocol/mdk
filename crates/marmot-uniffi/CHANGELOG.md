@@ -4,6 +4,16 @@
 
 ### Breaking changes
 
+- Remove the legacy v4 whole-file audit upload; v5 OTLP delivery is the only
+  remote audit path. Replace `setAuditLogTrackerConfig(AuditLogTrackerConfigV4Ffi)`
+  with `setAuditLogSource(AuditLogSourceFfi)`, which takes the same
+  `hardwareModel`, `platform` and `appVersion` and must run on every launch
+  before opening accounts. `postAuditLogFile`, `postAuditLogTrackerUpdate`,
+  `AuditLogUploadResultFfi`, `AuditLogTrackerUpdateResultFfi` and
+  `AuditLogUploadSourceV4Ffi` are removed; keep calling
+  `postAuditLogTrackerUpdateV5`, whose result no longer has `v4Uploaded` or
+  `v4SkippedReason`. Builds no longer embed `MARMOT_AUDIT_LOG_TRACKER_ENDPOINT`.
+  Local v4 files stay listable and deletable until retention expires them.
 - Group creation and invitation methods return concrete partial-member result
   records. Creation's `groupIdHex` or `created`, and invitation's `summary`, are
   optional. Inspect ordered `memberOutcomes` for unavailable accounts, including
@@ -21,6 +31,12 @@
   to check delivery and same-root reopening without production credentials (mdk#2947).
 - `sticker_pack_share_link(account_ref, coordinate)` builds a canonical Sonar pack link locally with retained
   relay hints, falling back to current account outbox candidates for packs without hints (mdk#3283).
+
+### Changed
+
+- `HistoryNoticeCauseFfi::UnprovenHistory` is no longer emitted (mdk#3308): the recovery runner retries a relay that
+  could not prove a route's history quietly, and a notice needs evidence that messages are missing. The variant stays;
+  keep exhaustive switches.
 
 ### Fixed
 

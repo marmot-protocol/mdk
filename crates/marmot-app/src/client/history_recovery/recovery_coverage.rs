@@ -22,9 +22,9 @@ use transport_nostr_adapter::{
     ReplaySourceGeneration,
 };
 
-use super::AppClient;
-use super::recovery_runner::{LiveCount, LiveFence};
+use super::recovery_runner::{self, LiveCount, LiveFence};
 use crate::AppError;
+use crate::client::AppClient;
 use crate::notifications::unix_now_seconds;
 
 const TARGET: &str = "marmot_app::recovery_coverage";
@@ -520,14 +520,35 @@ impl AppClient {
             self.runner_prune_clock = now;
             return Ok(());
         }
-        let certifying = self
-            .current_coverage_routes()
-            .into_iter()
-            .map(|current| (current.route, current.required))
+        let current = self.current_coverage_routes();
+        let certifying = current
+            .iter()
+            .map(|current| (current.route.clone(), current.required.clone()))
             .collect::<Vec<_>>();
+        // Audit-only reads: a failed one loses the remainder rows, never the
+        // prune.
+        let before = self
+            .audit_v5_enabled()
+            .then(|| app.recovery_coverage_remainders().ok())
+            .flatten();
         app.prune_recovery_coverage(floor, &certifying)?;
         self.runner_pruned_floor = Some(floor);
         self.runner_prune_clock = now;
+        if let Some(before) = before
+            && let Ok(after) = app.recovery_coverage_remainders()
+        {
+            recovery_runner::audit::remainders_changed(
+                &|group: Option<&[u8]>, kind| self.record_runner_audit(group, kind),
+                |route| {
+                    current
+                        .iter()
+                        .find(|current| current.route == *route)
+                        .and_then(|current| current.group_id.clone())
+                },
+                &before,
+                &after,
+            );
+        }
         Ok(())
     }
 }
@@ -706,7 +727,7 @@ impl AppClient {
             let confirmed = match group {
                 Some(group) => {
                     let group = cgka_traits::GroupId::new(group.clone());
-                    super::group_is_terminal(&self.runtime, &group)
+                    crate::client::group_is_terminal(&self.runtime, &group)
                         || routing
                             .group_routes
                             .iter()
@@ -729,13 +750,36 @@ impl AppClient {
                     storage_sqlite::CopyFloorReason::Clamp,
                 )?;
             }
+            let audit = |group: Option<&[u8]>, kind| self.record_runner_audit(group, kind);
             for (route, relays) in &gone {
                 let ended = !carried.iter().any(|(carried, _)| carried == *route);
-                app.retire_gone_recovery_units(route, (!ended).then_some(relays), now)?;
+                let retired =
+                    app.retire_gone_recovery_units(route, (!ended).then_some(relays), now)?;
+                if retired > 0 {
+                    let group = changes
+                        .dropped
+                        .iter()
+                        .find(|(_, dropped, _)| dropped == *route)
+                        .and_then(|(group, _, _)| group.as_deref());
+                    audit(
+                        group,
+                        recovery_runner::audit::route_change(
+                            route,
+                            marmot_forensics::RecoveryRunnerChange::RetiredGone,
+                            Some(retired),
+                        ),
+                    );
+                }
             }
-            app.reopen_returned_recovery_units(|route, relay| {
+            let reopened = app.reopen_returned_recovery_units(|route, relay| {
                 carried.contains(&(route.clone(), relay.to_owned()))
             })?;
+            recovery_runner::audit::rearmed(
+                &audit,
+                marmot_forensics::RecoveryRunnerChange::Reopened,
+                None,
+                reopened,
+            );
             Ok::<_, cgka_traits::storage::StorageError>(())
         })();
         if settled.is_err() {
@@ -889,7 +933,7 @@ impl AppClient {
     /// The last second of `group_id`'s history that a parked remainder on one
     /// of its current routes still owes: debt the retention floor overtook,
     /// which [`Self::group_history_proved`] does not read, since it lasts
-    /// until a user dismisses it.
+    /// until a rejoin or the route's end clears it.
     pub(crate) fn group_parked_until(&self, group_id: &[u8]) -> Result<Option<u64>, AppError> {
         let routes = self
             .current_coverage_routes()

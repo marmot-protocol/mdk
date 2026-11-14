@@ -10,10 +10,11 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+use crate::audit_log::system_time_ms;
 use marmot_forensics::local_delivery::{
     DeliveryBacklog, LocalDeliveryFailure, classify_local_failure,
 };
-use marmot_observability::{AuditOtlpSender, system_time_ms};
+use marmot_observability::AuditOtlpSender;
 use serde::{Deserialize, Serialize};
 
 use crate::{

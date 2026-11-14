@@ -12,7 +12,7 @@
 //!   Shorter gaps count as running time. Every clock also restarts when a
 //!   parked remainder, history the retention floor overtook unproved, reaches
 //!   past the last restart; older remainders cannot hold a heartbeat that
-//!   would move any clock, and they last until a user dismisses them. A sibling's clock runs from the
+//!   would move any clock, and they last until a rejoin or the route's end clears them. A sibling's clock runs from the
 //!   latest of when this device first found its entry, its last activity,
 //!   when this device read the heartbeat that showed it (D95), when this
 //!   device saw it clear its own mark, and the last restart. It never starts

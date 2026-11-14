@@ -19,6 +19,8 @@ const POLICY: RecoveryUnitPolicy = RecoveryUnitPolicy {
     max_attempts_per_hour: 720,
     max_event_bytes_per_hour: 256 << 20,
     recheck_after_cooldown_seconds: 3_600,
+    probe_base_seconds: 3_600,
+    probe_cap_seconds: 86_400,
 };
 
 fn group(byte: u8) -> TransportReconciliationRoute {
@@ -111,7 +113,7 @@ fn unit(app: &SqliteAppStorage, route: &TransportReconciliationRoute, relay: &st
 /// way. Progress rearms the unit and ends the relay's streak; nothing owed
 /// refunds the attempt and resets an active unit; a rate limit cools the
 /// relay without charging the unit; a refusal breaks the unit at once
-/// without spending its budget; a preempted call and a local failure change
+/// without spending its budget and schedules its first probe; a preempted call and a local failure change
 /// nothing and refund the attempt.
 #[test]
 fn each_outcome_settles_the_unit_its_relay_and_the_budget() {
@@ -166,7 +168,7 @@ fn each_outcome_settles_the_unit_its_relay_and_the_budget() {
                 RecoveryUnitState::Broken(RecoveryUnitBreak::Refused),
                 1,
                 1,
-                NOW + 30,
+                NOW + POLICY.probe_base_seconds,
                 true,
                 Some(NOW),
             ),
@@ -279,11 +281,8 @@ fn units_and_spans_store_their_codes_by_value() {
     }
     break_unit(&app, &routes[0], NOW);
     settle(&app, &routes[1], RELAY, RecoveryUnitOutcome::Refused, NOW);
-    let revision = break_unit(&app, &routes[2], NOW).park.unwrap().revision;
-    assert!(
-        app.dismiss_recovery_route_park(&routes[2], revision)
-            .unwrap()
-    );
+    break_unit(&app, &routes[2], NOW);
+    app.retire_route_park_as_converted(&routes[2]);
     break_unit(&app, &routes[3], NOW);
     app.retire_gone_recovery_units(&routes[3], None, NOW)
         .unwrap();
@@ -736,8 +735,7 @@ fn explicit_repair_rearms_everything() {
         app.record_recovery_recheck(route, RELAY, 0, 0, true, NOW)
             .unwrap();
     }
-    let revision = unit(&app, &retired, RELAY).park.unwrap().revision;
-    assert!(app.dismiss_recovery_route_park(&retired, revision).unwrap());
+    app.retire_route_park_as_converted(&retired);
     owing(&app, &backing_off, NOW - 1_000, (NOW - 1_000, NOW - 501));
     let before = settle(
         &app,
@@ -794,92 +792,6 @@ fn explicit_repair_rearms_everything() {
             vec![range(NOW - 500, NOW)]
         );
     }
-}
-
-/// A dismissal scoped to some relays checks its revision against their parks
-/// and the remainder only, and leaves a broken unit on any other relay as it
-/// is.
-#[test]
-fn a_dismissal_on_some_relays_leaves_the_others_broken() {
-    let storage = SqliteAccountStorage::in_memory().unwrap();
-    let app = storage.app_storage();
-    let route = group(1);
-    owing(&app, &route, NOW - 1_000, (NOW - 1_000, NOW - 501));
-    let first = break_unit(&app, &route, NOW).park.unwrap().revision;
-    let second = settle(&app, &route, OTHER, RecoveryUnitOutcome::Refused, NOW + 5)
-        .park
-        .unwrap()
-        .revision;
-    let relay = [RELAY.to_owned()];
-    assert!(
-        !app.dismiss_recovery_route_park_on(&route, &relay, second)
-            .unwrap()
-    );
-    assert!(
-        app.dismiss_recovery_route_park_on(&route, &relay, first)
-            .unwrap()
-    );
-    assert_eq!(unit(&app, &route, RELAY).state, RecoveryUnitState::Retired);
-    assert!(matches!(
-        unit(&app, &route, OTHER).state,
-        RecoveryUnitState::Broken(_)
-    ));
-    let notices = app.parked_recovery_routes().unwrap();
-    assert_eq!(notices.len(), 1);
-    assert_eq!(notices[0].relays, vec![OTHER.to_owned()]);
-}
-
-/// Dismissal checks the route's newest park: a stale revision does nothing.
-/// The current one retires the route's broken units and their parked spans,
-/// which never become coverage.
-#[test]
-fn a_stale_dismissal_returns_false() {
-    let storage = SqliteAccountStorage::in_memory().unwrap();
-    let app = storage.app_storage();
-    let route = group(1);
-    owing(&app, &route, NOW - 1_000, (NOW - 1_000, NOW - 501));
-    let first = break_unit(&app, &route, NOW).park.unwrap().revision;
-    let second = settle(&app, &route, OTHER, RecoveryUnitOutcome::Refused, NOW + 5)
-        .park
-        .unwrap()
-        .revision;
-    let notices = app.parked_recovery_routes().unwrap();
-    assert_eq!(notices.len(), 1, "one notice per route");
-    assert_eq!(
-        (notices[0].revision, notices[0].parked_at_seconds),
-        (second, NOW)
-    );
-    assert_eq!(notices[0].relays, vec![RELAY.to_owned(), OTHER.to_owned()]);
-    assert!(!app.dismiss_recovery_route_park(&route, first).unwrap());
-    assert!(matches!(
-        unit(&app, &route, RELAY).state,
-        RecoveryUnitState::Broken(_)
-    ));
-    assert!(app.dismiss_recovery_route_park(&route, second).unwrap());
-    assert!(!app.dismiss_recovery_route_park(&route, second).unwrap());
-    assert!(app.parked_recovery_routes().unwrap().is_empty());
-    let retired = unit(&app, &route, RELAY);
-    assert_eq!(
-        (retired.state, retired.park),
-        (RecoveryUnitState::Retired, None)
-    );
-    assert_eq!(
-        app.recovery_unit_spans(&route, RELAY).unwrap(),
-        vec![RecoveryUnitSpan {
-            range: range(NOW - 500, NOW),
-            retired: Some(RecoverySpanRetirement::Dismissed),
-        }]
-    );
-    assert!(
-        app.recovery_unit_debt(&route, RELAY, NOW)
-            .unwrap()
-            .is_empty()
-    );
-    assert!(
-        !app.recovery_coverage_covers(&route, &[RELAY.to_owned()], NOW - 500, NOW)
-            .unwrap(),
-        "a retired span is not coverage"
-    );
 }
 
 /// The breaker pauses at either cap until enough of the rolling hour has
@@ -1028,10 +940,7 @@ fn state_survives_a_reopen() {
             owing(&app, route, NOW - 1_000, (NOW - 1_000, NOW - 501));
             revisions.push(break_unit(&app, route, NOW).park.unwrap().revision);
         }
-        assert!(
-            app.dismiss_recovery_route_park(&dismissed, revisions[0])
-                .unwrap()
-        );
+        app.retire_route_park_as_converted(&dismissed);
         app.retire_gone_recovery_units(&gone, None, NOW).unwrap();
         owing(&app, &route, NOW - 1_000, (NOW - 1_000, NOW - 501));
         app.set_recovery_unit_fences(&route, RELAY, &[range(NOW - 1_000, NOW - 900)])
@@ -1180,8 +1089,7 @@ fn the_retention_prune_trims_spans_at_its_floor() {
         owing(&app, route, NOW - 1_000, (NOW - 1_000, NOW - 501));
         break_unit(&app, route, NOW);
     }
-    let revision = unit(&app, &retired, RELAY).park.unwrap().revision;
-    assert!(app.dismiss_recovery_route_park(&retired, revision).unwrap());
+    app.retire_route_park_as_converted(&retired);
     app.set_recovery_unit_fences(
         &parked,
         OTHER,
@@ -1353,8 +1261,8 @@ fn a_release_below_the_window_reopens_no_span() {
     let app = storage.app_storage();
     let route = group(1);
     owing(&app, &route, NOW - 1_000, (NOW - 1_000, NOW - 501));
-    let revision = break_unit(&app, &route, NOW).park.unwrap().revision;
-    assert!(app.dismiss_recovery_route_park(&route, revision).unwrap());
+    break_unit(&app, &route, NOW);
+    app.retire_route_park_as_converted(&route);
     let retired = app.recovery_unit_spans(&route, RELAY).unwrap();
     storage
         .connection
@@ -1370,65 +1278,6 @@ fn a_release_below_the_window_reopens_no_span() {
     assert_eq!(
         app.recovery_coverage_goal(&route).unwrap(),
         Some(NOW - 1_000)
-    );
-}
-
-/// A route's notice covers its broken units and its remainder under the
-/// newest revision among them; dismissing it with that revision clears
-/// both, and a stale revision, or another route's, clears nothing.
-#[test]
-fn dismissal_clears_the_remainder_under_the_routes_newest_park() {
-    let storage = SqliteAccountStorage::in_memory().unwrap();
-    let app = storage.app_storage();
-    let (alone, both) = (group(1), group(2));
-    for route in [&alone, &both] {
-        app.widen_recovery_coverage_goals(
-            std::slice::from_ref(route),
-            NOW - 1_000,
-            crate::CopyFloorReason::Clamp,
-        )
-        .unwrap();
-    }
-    owing(&app, &both, NOW - 1_000, (NOW - 1_000, NOW - 501));
-    let park = break_unit(&app, &both, NOW).park.unwrap().revision;
-    let routes = [
-        (alone.clone(), vec![RELAY.to_owned()]),
-        (both.clone(), vec![RELAY.to_owned()]),
-    ];
-    // `both` owes nothing below the floor until new loss lands there.
-    app.uncover_recovery_coverage(
-        std::slice::from_ref(&both),
-        NOW - 900,
-        crate::CopyFloorReason::Loss,
-    )
-    .unwrap();
-    app.prune_recovery_coverage(NOW - 800, &routes).unwrap();
-    let alone_revision = remainder(&app, &alone).unwrap().revision;
-    let both_revision = remainder(&app, &both).unwrap().revision;
-    assert!(both_revision > park);
-    let parked = app.parked_recovery_routes().unwrap();
-    assert_eq!(parked.len(), 1);
-    assert_eq!(parked[0].revision, both_revision);
-
-    assert!(!app.dismiss_recovery_route_park(&both, park).unwrap());
-    assert!(!app.dismiss_recovery_route_park(&alone, park).unwrap());
-    assert!(
-        app.dismiss_recovery_route_park(&both, both_revision)
-            .unwrap()
-    );
-    assert!(remainder(&app, &both).is_none());
-    assert!(matches!(
-        unit(&app, &both, RELAY).state,
-        RecoveryUnitState::Retired
-    ));
-    assert!(
-        app.dismiss_recovery_route_park(&alone, alone_revision)
-            .unwrap()
-    );
-    assert!(remainder(&app, &alone).is_none());
-    assert!(
-        !app.dismiss_recovery_route_park(&alone, alone_revision)
-            .unwrap()
     );
 }
 
@@ -1477,10 +1326,7 @@ fn a_goal_widened_back_below_the_settled_floor_parks_nothing_twice() {
         );
     }
 
-    assert!(
-        app.dismiss_recovery_route_park(&partial, first.revision)
-            .unwrap()
-    );
+    app.retire_route_park_as_converted(&partial);
     app.widen_recovery_coverage_goals(
         std::slice::from_ref(&partial),
         NOW - 1_000,
@@ -1575,7 +1421,7 @@ fn a_retired_unit_is_served_like_an_active_one() {
     let route = group(1);
     owing(&app, &route, NOW - 1_000, (NOW - 1_000, NOW - 501));
     let revision = break_unit(&app, &route, NOW).park.unwrap().revision;
-    assert!(app.dismiss_recovery_route_park(&route, revision).unwrap());
+    app.retire_route_park_as_converted(&route);
     let retired = unit(&app, &route, RELAY);
     assert_eq!((retired.no_progress, retired.backoff_step), (0, 0));
     assert_eq!(
@@ -1637,16 +1483,13 @@ fn new_loss_reopens_retired_spans_in_any_state() {
     let (active, broken, retired) = (group(1), group(2), group(3));
     for route in [&active, &broken] {
         owing(&app, route, NOW - 1_000, (NOW - 1_000, NOW - 501));
-        let revision = break_unit(&app, route, NOW).park.unwrap().revision;
-        assert!(app.dismiss_recovery_route_park(route, revision).unwrap());
+        break_unit(&app, route, NOW);
+        app.retire_route_park_as_converted(route);
         settle(&app, route, RELAY, RecoveryUnitOutcome::Advanced, NOW + 10);
     }
     owing(&app, &retired, NOW - 1_000, (NOW - 1_000, NOW - 501));
     let dismissed = break_unit(&app, &retired, NOW).park.unwrap().revision;
-    assert!(
-        app.dismiss_recovery_route_park(&retired, dismissed)
-            .unwrap()
-    );
+    app.retire_route_park_as_converted(&retired);
     let revision = break_unit(&app, &broken, NOW + 20).park.unwrap().revision;
     for route in [&active, &broken, &retired] {
         app.uncover_recovery_coverage(
@@ -1708,10 +1551,10 @@ fn new_loss_reopens_retired_spans_in_any_state() {
     );
 }
 
-/// A failed or refused probe re-parks under the same notice, keeping its
+/// A failed or refused probe re-parks under the same revision, keeping its
 /// park and adding what else is owed now.
 #[test]
-fn a_failed_probe_re_parks_under_the_same_notice() {
+fn a_failed_probe_re_parks_under_the_same_revision() {
     let storage = SqliteAccountStorage::in_memory().unwrap();
     let app = storage.app_storage();
     for (byte, outcome) in [
@@ -1730,7 +1573,7 @@ fn a_failed_probe_re_parks_under_the_same_notice() {
         assert!(unit(&app, &route, RELAY).probe);
         let reparked = settle(&app, &route, RELAY, outcome, NOW + 10);
         assert!(!reparked.probe);
-        assert_eq!(reparked.park, Some(park), "the same notice");
+        assert_eq!(reparked.park, Some(park), "the same revision");
         assert_eq!(
             app.recovery_unit_spans(&route, RELAY).unwrap(),
             vec![RecoveryUnitSpan {
@@ -1739,6 +1582,112 @@ fn a_failed_probe_re_parks_under_the_same_notice() {
             }]
         );
     }
+}
+
+/// A broken unit probes on a timer, not only on new evidence: a new park's
+/// first probe falls due after the policy's base, each probe that fails
+/// re-parks under the same revision and doubles the wait up to the cap, and
+/// one that advances re-arms the unit (mdk#3308).
+#[test]
+fn a_broken_unit_probes_on_a_growing_interval() {
+    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let app = storage.app_storage();
+    let route = group(1);
+    owing(&app, &route, NOW - 1_000, (NOW - 1_000, NOW - 501));
+    let broken = settle(&app, &route, RELAY, RecoveryUnitOutcome::Refused, NOW);
+    let park = broken.park.unwrap();
+    let base = POLICY.probe_base_seconds;
+    assert_eq!(
+        (broken.probe, broken.next_attempt_at_seconds),
+        (false, NOW + base)
+    );
+    assert!(
+        app.recovery_unit_debt(&route, RELAY, NOW)
+            .unwrap()
+            .is_empty(),
+        "the park is not owed between probes"
+    );
+
+    let mut at = NOW + base;
+    let mut waits = Vec::new();
+    for outcome in [
+        RecoveryUnitOutcome::Refused,
+        RecoveryUnitOutcome::NoProgress,
+        RecoveryUnitOutcome::Refused,
+        RecoveryUnitOutcome::Refused,
+        RecoveryUnitOutcome::Refused,
+        RecoveryUnitOutcome::Refused,
+    ] {
+        assert_eq!(app.arm_due_recovery_probes(at - 1).unwrap(), 0, "early");
+        assert_eq!(app.arm_due_recovery_probes(at).unwrap(), 1);
+        assert!(unit(&app, &route, RELAY).probe);
+        assert_eq!(
+            app.recovery_unit_debt(&route, RELAY, at).unwrap(),
+            vec![range(NOW - 500, at)],
+            "a probe owes the park"
+        );
+        let reparked = settle(&app, &route, RELAY, outcome, at);
+        assert!(!reparked.probe);
+        assert_eq!(reparked.park, Some(park), "{outcome:?} kept the revision");
+        waits.push(reparked.next_attempt_at_seconds - at);
+        at = reparked.next_attempt_at_seconds;
+    }
+    assert_eq!(
+        waits,
+        [2, 4, 8, 16, 24, 24].map(|hours| hours * 3_600),
+        "doubling from the base to the cap"
+    );
+
+    assert_eq!(app.arm_due_recovery_probes(at).unwrap(), 1);
+    let rearmed = settle(&app, &route, RELAY, RecoveryUnitOutcome::Advanced, at);
+    assert_eq!(
+        (
+            rearmed.state,
+            rearmed.park,
+            rearmed.backoff_step,
+            rearmed.next_attempt_at_seconds
+        ),
+        (RecoveryUnitState::Active, None, 0, 0)
+    );
+}
+
+/// Arming touches only broken units whose probe time has passed and that do
+/// not already hold a probe: an active unit backing off, a broken unit not
+/// yet due and one probing for new loss are left as they are.
+#[test]
+fn arming_probes_touches_only_due_broken_units() {
+    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let app = storage.app_storage();
+    let (due, early, probing, active) = (group(1), group(2), group(3), group(4));
+    for route in [&due, &early, &probing, &active] {
+        owing(&app, route, NOW - 1_000, (NOW - 1_000, NOW - 501));
+    }
+    let base = POLICY.probe_base_seconds;
+    settle(&app, &due, RELAY, RecoveryUnitOutcome::Refused, NOW);
+    settle(&app, &early, RELAY, RecoveryUnitOutcome::Refused, NOW + 1);
+    settle(&app, &probing, RELAY, RecoveryUnitOutcome::Refused, NOW);
+    app.uncover_recovery_coverage(
+        std::slice::from_ref(&probing),
+        NOW - 100,
+        crate::CopyFloorReason::Loss,
+    )
+    .unwrap();
+    assert!(unit(&app, &probing, RELAY).probe, "new loss earned a probe");
+    settle(&app, &active, RELAY, RecoveryUnitOutcome::NoProgress, NOW);
+    assert!(unit(&app, &active, RELAY).next_attempt_at_seconds <= NOW + base);
+
+    assert_eq!(app.arm_due_recovery_probes(NOW + base).unwrap(), 1);
+    assert!(unit(&app, &due, RELAY).probe);
+    assert!(!unit(&app, &early, RELAY).probe);
+    assert!(!unit(&app, &active, RELAY).probe);
+    assert_eq!(
+        app.pending_recovery_probes()
+            .unwrap()
+            .into_iter()
+            .map(|unit| (unit.route, unit.next_attempt_at_seconds))
+            .collect::<Vec<_>>(),
+        vec![(early, NOW + 1 + base)]
+    );
 }
 
 /// An unreachable or rate-limited probe was not answered, so it keeps its
@@ -1820,7 +1769,7 @@ fn nothing_owed_keeps_a_retired_unit_retired() {
     let route = group(1);
     owing(&app, &route, NOW - 1_000, (NOW - 1_000, NOW - 501));
     let revision = break_unit(&app, &route, NOW).park.unwrap().revision;
-    assert!(app.dismiss_recovery_route_park(&route, revision).unwrap());
+    app.retire_route_park_as_converted(&route);
     settle(
         &app,
         &route,
@@ -1866,8 +1815,8 @@ fn a_granted_probe_does_not_wait_out_an_old_backoff() {
     break_unit(&app, &broken, NOW);
     settle(&app, &broken, RELAY, RecoveryUnitOutcome::Unreachable, NOW);
     assert_eq!(unit(&app, &broken, RELAY).next_attempt_at_seconds, NOW + 30);
-    let revision = break_unit(&app, &retired, NOW).park.unwrap().revision;
-    assert!(app.dismiss_recovery_route_park(&retired, revision).unwrap());
+    break_unit(&app, &retired, NOW);
+    app.retire_route_park_as_converted(&retired);
     settle(&app, &retired, RELAY, RecoveryUnitOutcome::NoProgress, NOW);
     assert_eq!(
         unit(&app, &retired, RELAY).next_attempt_at_seconds,
@@ -2043,8 +1992,8 @@ fn a_gone_relay_retires_what_it_owes_and_parks() {
     let app = storage.app_storage();
     let route = group(1);
     owing(&app, &route, NOW - 1_000, (NOW - 1_000, NOW - 701));
-    let revision = break_unit(&app, &route, NOW - 600).park.unwrap().revision;
-    assert!(app.dismiss_recovery_route_park(&route, revision).unwrap());
+    break_unit(&app, &route, NOW - 600);
+    app.retire_route_park_as_converted(&route);
     break_unit(&app, &route, NOW - 100);
     settle(&app, &route, OTHER, RecoveryUnitOutcome::NoProgress, NOW);
     app.set_recovery_unit_fences(&route, RELAY, &[range(NOW - 50, NOW - 40)])
@@ -2075,6 +2024,33 @@ fn a_gone_relay_retires_what_it_owes_and_parks() {
     assert!(app.parked_recovery_routes().unwrap().is_empty());
     assert!(fences(&app).is_empty());
     assert_eq!(unit(&app, &route, OTHER).no_progress, 1);
+}
+
+/// A settlement retried after a later write failed retires a gone relay
+/// again, newly owed seconds included, without counting the unit twice.
+#[test]
+fn retiring_a_gone_relay_again_counts_nothing() {
+    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let app = storage.app_storage();
+    let route = group(1);
+    owing(&app, &route, NOW - 1_000, (NOW - 1_000, NOW - 701));
+    break_unit(&app, &route, NOW - 600);
+    let relays = [RELAY.to_owned()];
+    assert_eq!(
+        app.retire_gone_recovery_units(&route, Some(&relays), NOW)
+            .unwrap(),
+        1
+    );
+
+    assert_eq!(
+        app.retire_gone_recovery_units(&route, Some(&relays), NOW + 100)
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        app.recovery_unit_spans(&route, RELAY).unwrap(),
+        vec![gone(range(NOW - 700, NOW + 100))]
+    );
 }
 
 /// New loss reopens nothing a gone relay retired: it raises no probe or

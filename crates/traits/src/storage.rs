@@ -1354,6 +1354,29 @@ pub trait StorageProvider:
         None
     }
 
+    /// Optional write generation for reusing retained-anchor peel contexts.
+    /// A tracking backend must change this value on every OpenMLS state write,
+    /// rollback or restore, and every snapshot creation, replacement (including
+    /// under an unchanged name), or release. Writes through other connections
+    /// or processes must also invalidate it. Conservative extra bumps are safe.
+    ///
+    /// Opting in also requires an exclusive writer boundary for
+    /// `with_transaction` and atomic rollback through `with_group_savepoint`.
+    /// From the transaction callback's first generation read through its
+    /// completion, other writers must not change live state or snapshots.
+    /// The engine captures a historical context, restores live state, and
+    /// stamps its cache before releasing that boundary. Failed units, including
+    /// commit failures and panic cleanup, must invalidate their generations.
+    /// A snapshot-backed, committing fallback alone cannot meet this contract.
+    ///
+    /// `None` disables historical context caching. Implementing
+    /// `mls_write_generation` alone does not opt a backend into this stronger
+    /// snapshot-lifetime contract. Keep this value in memory; never persist or
+    /// log it as part of a peel-context identity.
+    fn past_peel_context_generation(&self) -> Option<u64> {
+        None
+    }
+
     /// Optional cryptographic content fingerprint for resumable group replay.
     /// Covers live canonical/OpenMLS state (including secret ratchets), member
     /// validation/capabilities/policy, and every retained snapshot/checkpoint

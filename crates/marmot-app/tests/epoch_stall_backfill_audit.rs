@@ -53,7 +53,7 @@ use tokio::time::{sleep, timeout};
 use transport_nostr_adapter::{NostrRelayClient, NostrSdkRelayClient};
 use transport_nostr_peeler::{NOSTR_GROUP_CONTENT_MIN_LEN, NostrTransportEvent};
 
-/// Mirrors `marmot_app::client::epoch_stall::EPOCH_STALL_BACKFILL_THRESHOLD`
+/// Mirrors `marmot_app::client::history_recovery::epoch_stall::EPOCH_STALL_BACKFILL_THRESHOLD`
 /// (crate-private, hence mirrored): the number of distinct undecryptable
 /// messages a group must accumulate at one stalled epoch before the runtime
 /// arms a full-history epoch-gap backfill.
@@ -67,7 +67,7 @@ const NEXT_EVENT_DEADLINE: Duration = Duration::from_secs(10);
 /// Deadline for bob's welcome to arrive and the group to become live.
 const JOIN_DEADLINE: Duration = Duration::from_secs(10);
 
-/// Mirrors `marmot_app::client::epoch_stall::EPOCH_STALL_ESCALATION_ARM_THRESHOLD`
+/// Mirrors `marmot_app::client::history_recovery::epoch_stall::EPOCH_STALL_ESCALATION_ARM_THRESHOLD`
 /// (crate-private, hence mirrored): backfills one group may arm in an
 /// unrecovered run before the runtime escalates.
 const ESCALATION_ARM_THRESHOLD: usize = 3;

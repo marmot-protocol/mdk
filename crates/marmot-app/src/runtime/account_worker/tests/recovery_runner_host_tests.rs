@@ -205,7 +205,10 @@ impl RunnerWorker {
     }
 
     /// Ask the worker's runner for one pass, off the worker.
-    async fn pass(&self) -> oneshot::Receiver<Option<crate::client::recovery_runner::PassReport>> {
+    async fn pass(
+        &self,
+    ) -> oneshot::Receiver<Option<crate::client::history_recovery::recovery_runner::PassReport>>
+    {
         let (respond, report) = oneshot::channel();
         self.runtime
             .accounts()
@@ -423,11 +426,11 @@ async fn the_workers_runner_serves_an_explicit_repair() {
 
 /// A repair queued while the worker's initial catch-up runs replays after it
 /// through the worker's runner, spawned before the replay: it re-arms the
-/// group's retired unit, which today's comparison job would leave retired.
+/// group's broken unit, whose next timed probe is an hour away.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_repair_queued_during_startup_goes_through_the_runner() {
-    use crate::client::recovery_runner::RecoveryRunnerPolicy;
-    use storage_sqlite::{RecoveryUnitOutcome, RecoveryUnitState};
+    use crate::client::history_recovery::recovery_runner::RecoveryRunnerPolicy;
+    use storage_sqlite::{RecoveryUnitBreak, RecoveryUnitOutcome, RecoveryUnitState};
 
     let _serial = BOUNDED_WORKER_FIXTURE_LOCK.lock().await;
     let relay = LocalRelay::new(RelayBuilder::default());
@@ -438,7 +441,7 @@ async fn a_repair_queued_during_startup_goes_through_the_runner() {
     worker.served_after(started).await;
     worker.runtime.shutdown_and_close().await.unwrap();
 
-    // Retire the group's unit, as a dismissed notice does.
+    // Break the group's unit, as a refusing relay does.
     let app = MarmotApp::with_relay_and_config(
         worker._dir.path(),
         url.clone(),
@@ -465,18 +468,6 @@ async fn a_repair_queued_during_startup_goes_through_the_runner() {
             now,
         )
         .unwrap();
-    let revision = storage
-        .parked_recovery_routes()
-        .unwrap()
-        .into_iter()
-        .find(|parked| parked.route == worker.route)
-        .unwrap()
-        .revision;
-    assert!(
-        storage
-            .dismiss_recovery_route_park(&worker.route, revision)
-            .unwrap()
-    );
     let state = || {
         storage
             .recovery_unit(&worker.route, &relay_url)
@@ -484,7 +475,10 @@ async fn a_repair_queued_during_startup_goes_through_the_runner() {
             .unwrap()
             .state
     };
-    assert_eq!(state(), RecoveryUnitState::Retired);
+    assert_eq!(
+        state(),
+        RecoveryUnitState::Broken(RecoveryUnitBreak::Refused)
+    );
 
     let runtime = super::super::super::MarmotAppRuntime::new(app.clone());
     let _credits = runtime
@@ -532,7 +526,7 @@ async fn a_repair_queued_during_startup_goes_through_the_runner() {
     assert_eq!(
         state(),
         RecoveryUnitState::Active,
-        "the runner re-armed the retired unit"
+        "the runner re-armed the broken unit"
     );
     runtime.shutdown_and_close().await.unwrap();
 }
@@ -976,7 +970,7 @@ async fn a_rejoin_the_survey_does_not_show_is_still_announced() {
             &worker.route,
             &transport_nostr::canonical_relay(&url),
             storage_sqlite::RecoveryUnitOutcome::RateLimited,
-            &crate::client::recovery_runner::RecoveryRunnerPolicy::default().unit,
+            &crate::client::history_recovery::recovery_runner::RecoveryRunnerPolicy::default().unit,
             crate::unix_now_seconds(),
         )
         .unwrap();

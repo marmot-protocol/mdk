@@ -1,4 +1,5 @@
-//! Retire the app's v1-v3 forensic files after acquiring exclusive root ownership.
+//! Retire the app's v1-v3 forensic files, and the retired v4 upload's checkpoint
+//! sidecar, after acquiring exclusive root ownership.
 
 use std::fs;
 use std::io;
@@ -8,6 +9,13 @@ use std::path::Path;
 // or audit ID changes. Never redirect cleanup outside the exclusively leased root.
 const LEGACY_CONTAINERS: [&str; 2] = ["accounts", ".wipe-tombstones"];
 const LEGACY_ENGINE_ID_HEX_LEN: usize = 32;
+/// Upload bookkeeping the removed v4 whole-file upload kept per account, and the
+/// staging sibling a crash could leave behind. They name files that were
+/// already sent, never forensic evidence, and nothing reads them any more.
+const RETIRED_UPLOAD_CHECKPOINT_FILES: [&str; 2] = [
+    "audit-upload-checkpoint.json",
+    "audit-upload-checkpoint.json.tmp",
+];
 
 #[derive(Default)]
 struct CleanupCounts {
@@ -78,7 +86,7 @@ fn clean_account(account: &Path, counts: &mut CleanupCounts) -> io::Result<()> {
         let result = (|| {
             let entry = entry?;
             let name = entry.file_name();
-            if !name.to_str().is_some_and(is_legacy_audit_file_name)
+            if !name.to_str().is_some_and(is_retired_audit_file_name)
                 || !entry.file_type()?.is_file()
             {
                 return Ok(());
@@ -97,7 +105,12 @@ fn clean_account(account: &Path, counts: &mut CleanupCounts) -> io::Result<()> {
     Ok(())
 }
 
-/// The app's reserved filename convention, not the broad upload/listing glob.
+/// A v1-v3 forensic log or a retired upload checkpoint sidecar.
+fn is_retired_audit_file_name(name: &str) -> bool {
+    is_legacy_audit_file_name(name) || RETIRED_UPLOAD_CHECKPOINT_FILES.contains(&name)
+}
+
+/// The app's reserved filename convention, not the broad listing glob.
 /// This also removes empty, corrupt, or truncated legacy logs without reading
 /// their sensitive contents. Names outside the reserved forms stay put; a
 /// custom file that collides with a reserved legacy name is still deleted.
@@ -179,6 +192,22 @@ mod classifier_tests {
             assert!(!is_legacy_audit_file_name(&name), "{name}");
         }
     }
+
+    #[test]
+    fn retired_upload_checkpoint_names_match_exactly() {
+        for name in RETIRED_UPLOAD_CHECKPOINT_FILES {
+            assert!(is_retired_audit_file_name(name), "{name}");
+        }
+        for name in [
+            "audit-upload-checkpoint.json.bak",
+            "audit-upload-checkpoint.jsonl",
+            "Audit-upload-checkpoint.json",
+            "audit-device-id",
+            "audit-key-reveal.jsonl",
+        ] {
+            assert!(!is_retired_audit_file_name(name), "{name}");
+        }
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -206,14 +235,15 @@ mod tests {
         home.create_account("alice").unwrap();
         // Use AccountHome's actual layout so drift cannot leave the test green.
         let account = home.account_dir("alice");
-        let old_files = ["", "-v2", "-v3", "-v3-seg000001"]
-            .map(|suffix| format!("audit-{ENGINE}{suffix}.jsonl"));
+        let mut old_files = ["", "-v2", "-v3", "-v3-seg000001"]
+            .map(|suffix| format!("audit-{ENGINE}{suffix}.jsonl"))
+            .to_vec();
+        old_files.extend(RETIRED_UPLOAD_CHECKPOINT_FILES.map(str::to_owned));
         for name in &old_files {
             fs::write(account.join(name), b"PRIVATE_OLD_CONTENT\n{truncated").unwrap();
         }
         let preserved = [
             "audit-key-reveal.jsonl".to_owned(),
-            "audit-upload-checkpoint.json".to_owned(),
             "audit-device-id".to_owned(),
             "session.db".to_owned(),
             "audit-custom-v3.jsonl".to_owned(),

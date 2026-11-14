@@ -559,11 +559,15 @@ fn account_home_rejects_path_like_labels() {
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());
     let nsec = "nsec1j4c6269y9w0q2er2xjw8sv2ehyrtfxq3jwgdlxj6qfn8z4gjsq5qfvfk99";
+    let secret_hex = nostr::prelude::Keys::generate()
+        .secret_key()
+        .to_secret_hex();
 
     assert!(matches!(
-        home.add_public_account("../alice"),
-        Err(AccountHomeError::InvalidPublicKey)
+        home.import_account("../alice", &secret_hex),
+        Err(AccountHomeError::InvalidAccountLabel(label)) if label == "../alice"
     ));
+    assert!(!dir.path().join("accounts").join("../alice").exists());
     home.import_nostr_account(nsec).unwrap();
     assert!(matches!(
         home.import_nostr_account(nsec),

@@ -9,6 +9,18 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ### Breaking changes
 
+- Remove the legacy v4 whole-file audit upload; v5 OTLP delivery is the only
+  remote audit path. Replace `marmot_set_audit_log_tracker_config` and
+  `marmot_set_audit_log_tracker_config_v4` with `marmot_set_audit_log_source`,
+  which takes a borrowed `MarmotAuditLogSource` (`hardware_model`, `platform`,
+  `app_version`) on every launch before opening accounts and returns a copy
+  freed with `marmot_audit_log_source_free`. `marmot_post_audit_log_file`,
+  `marmot_post_audit_log_tracker_update`, their result types and frees, and
+  the tracker config types and frees are removed.
+  `MarmotAuditLogTrackerUpdateResultV5` drops `v4_uploaded`,
+  `v4_uploaded_len` and `v4_skipped_reason`, so its layout changed: rebuild
+  clients with the matching header and library.
+
 - Group create outputs are `MarmotGroupCreationResult` or
   `MarmotDetailedGroupCreationResult`; invite outputs are `MarmotInviteMembersResult`
   or `MarmotGroupInviteResult`. Inspect the optional operation and ordered
@@ -31,6 +43,12 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   generated header and library.
 - `marmot_sticker_pack_share_link` synchronously builds a canonical Sonar pack link with local relay hints
   (mdk#3283). Inputs are borrowed; free the returned owned string with `marmot_string_free`.
+
+### Changed
+
+- `MARMOT_HISTORY_NOTICE_CAUSE_UNPROVEN_HISTORY` is no longer emitted (mdk#3308): the recovery runner retries a relay
+  that could not prove a route's history quietly, and a notice needs evidence that messages are missing. The value
+  stays; keep exhaustive switches.
 
 ## [0.16.0] - 2026-11-12
 

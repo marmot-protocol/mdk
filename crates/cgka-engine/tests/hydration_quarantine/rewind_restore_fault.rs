@@ -1,11 +1,11 @@
 //! A committing rewind whose restore fails (mdk#3272).
 //!
-//! The pass, the deferred-peel sweep, their resumable slices and past-epoch
-//! peel each rewind live group state onto a retained anchor outside any
-//! transaction. When the restore after such a window fails, the group is
+//! The pass, the deferred-peel sweep and their resumable slices rewind live
+//! group state onto a retained anchor outside any transaction. When their
+//! restore fails, the group is
 //! quarantined for `RewindRestoreFailed` for the rest of the session, with its
 //! input retained, and the next open restores the live image the window
-//! snapshotted.
+//! snapshotted. Historical peel uses a contained transaction instead.
 
 use super::*;
 use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MarmotAppEvent};
@@ -45,7 +45,10 @@ fn build_carol(storage: SqliteAccountStorage) -> Engine<SqliteAccountStorage> {
 
 /// Reads no group message with any context: only past-epoch peel can try
 /// a row, so a sweep reaches its rewind.
-struct UnreadablePeeler;
+#[derive(Default)]
+struct UnreadablePeeler {
+    epochs: Option<Arc<Mutex<Vec<EpochId>>>>,
+}
 
 #[async_trait]
 impl TransportPeeler for UnreadablePeeler {
@@ -59,9 +62,12 @@ impl TransportPeeler for UnreadablePeeler {
 
     async fn peel_group_message(
         &self,
-        _msg: &TransportMessage,
-        _ctx: &GroupContextSnapshot,
+        _msg: &cgka_traits::peeler::PreparedGroupMessage<'_>,
+        ctx: &GroupContextSnapshot,
     ) -> Result<PeeledMessage, PeelerError> {
+        if let Some(epochs) = &self.epochs {
+            epochs.lock().unwrap().push(ctx.epoch());
+        }
         Err(PeelerError::DecryptFailed)
     }
 
@@ -111,9 +117,13 @@ async fn invite(
 
 /// Alice and Bob each invite someone from epoch 1; Carol holds neither yet.
 async fn rival_invites() -> Fork {
+    rival_invites_with_storage(SqliteAccountStorage::in_memory_for_test().expect("carol storage"))
+        .await
+}
+
+async fn rival_invites_with_storage(storage: SqliteAccountStorage) -> Fork {
     let (mut alice, _) = build_named_client(b"alice-rewind-fault");
     let (mut bob, _) = build_named_client(b"bob-rewind-fault");
-    let storage = SqliteAccountStorage::in_memory_for_test().expect("carol storage");
     let mut carol = build_carol(storage.clone());
     let bob_kp = bob.fresh_key_package().await.expect("bob key package");
     let carol_kp = carol.fresh_key_package().await.expect("carol key package");
@@ -206,7 +216,20 @@ fn defer_unreadable_row(fork: &Fork) {
         .unwrap();
 }
 
-/// A committing window and the entry point that opens it.
+fn opaque_input(group: &GroupId, id: &[u8]) -> TransportMessage {
+    TransportMessage {
+        id: MessageId::new(id.to_vec()),
+        payload: b"opaque historical traffic".to_vec(),
+        timestamp: Timestamp(2_200),
+        causal_deps: vec![],
+        source: TransportSource("rewind-fault".into()),
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group.as_slice().to_vec(),
+        },
+    }
+}
+
+/// A rewind window and the entry point that opens it.
 #[derive(Clone, Copy, Debug)]
 enum Window {
     /// The convergence pass, whole.
@@ -239,7 +262,7 @@ impl Window {
         }
         let builder = carol_builder(fork.storage.clone());
         let builder = match self {
-            Self::PastPeel => builder.peeler(Box::new(UnreadablePeeler)),
+            Self::PastPeel => builder.peeler(Box::new(UnreadablePeeler::default())),
             _ => builder.peeler(Box::new(MockPeeler)),
         };
         // A reopen rebases the pass's monotonic cutoff onto the new engine's
@@ -637,11 +660,202 @@ async fn a_failed_sweep_restore_quarantines_the_group_until_the_next_open() {
     }
 }
 
-// Past-epoch peel nests no replay window, so only `commit` exits it; the
-// unwind path is the guard's own and `snapshot_guard`'s unit tests own it.
 #[tokio::test]
-async fn a_failed_past_peel_restore_quarantines_the_group_until_the_next_open() {
-    fail_refuse_and_reopen(Window::PastPeel, Exit::Commit).await;
+async fn past_peel_failure_is_atomic() {
+    let mut fork = Window::PastPeel.fixture().await;
+    let before = image(&fork.storage, &fork.group);
+    let hits = Arc::new(AtomicUsize::new(0));
+    let counted = hits.clone();
+    fork.storage
+        .fail_snapshot_restores_for_test(Some(Arc::new(move |_, name, in_transaction| {
+            if name.starts_with(Window::PastPeel.prefix()) {
+                assert!(
+                    in_transaction,
+                    "historical context derivation must be contained"
+                );
+                counted.fetch_add(1, Ordering::SeqCst);
+                return Err(StorageError::Busy(
+                    "injected contained peel restore fault".into(),
+                ));
+            }
+            Ok(())
+        })));
+    for _ in 0..2 {
+        let result = fork.carol.retry_deferred_peels(&fork.group).await;
+        if hits.load(Ordering::SeqCst) > 0 {
+            assert!(
+                matches!(&result, Err(EngineError::Storage(StorageError::Busy(detail)))
+            if detail == "injected contained peel restore fault"),
+                "surface the contained restore fault, got {result:?}"
+            );
+            break;
+        }
+    }
+    fork.storage.fail_snapshot_restores_for_test(None);
+    assert!(
+        hits.load(Ordering::SeqCst) > 0,
+        "the contained restore was reached"
+    );
+    let after = image(&fork.storage, &fork.group);
+    assert_eq!(after.group, before.group, "exact live group record");
+    assert_eq!(
+        after.state, before.state,
+        "exact native state and retained snapshots"
+    );
+    assert!(guard_snapshots(&fork.storage, &fork.group).is_empty());
+    assert!(fork.carol.quarantined_groups().is_empty());
+    assert_eq!(fork.carol.epoch(&fork.group).unwrap(), EpochId(2));
+
+    // A healed derive must run again, rather than reuse a context from the rolled-back window.
+    let retries = Arc::new(AtomicUsize::new(0));
+    let counted = retries.clone();
+    fork.storage
+        .fail_snapshot_restores_for_test(Some(Arc::new(move |_, name, in_transaction| {
+            if name.starts_with(Window::PastPeel.prefix()) {
+                assert!(in_transaction);
+                counted.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(())
+        })));
+    fork.carol
+        .ingest(opaque_input(&fork.group, b"healed-past-peel"))
+        .await
+        .expect("retry historical peel");
+    fork.storage.fail_snapshot_restores_for_test(None);
+    assert!(retries.load(Ordering::SeqCst) > 0);
+    assert!(guard_snapshots(&fork.storage, &fork.group).is_empty());
+    fork.carol = build_carol(fork.storage.clone());
+    fork.carol
+        .hydrate_all_stored_groups()
+        .expect("reopen contained failure");
+    let app = alice_app_message(&mut fork).await;
+    assert!(matches!(
+        fork.carol.ingest(app).await.unwrap(),
+        IngestOutcome::Processed
+    ));
+}
+
+#[tokio::test]
+async fn past_peel_excludes_writers() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+    use storage_sqlite::{SqlCipherHardening, SqlCipherKey, open_hardened_sqlcipher};
+
+    static BUSY_CALLS: AtomicUsize = AtomicUsize::new(0);
+    fn on_busy(_: i32) -> bool {
+        BUSY_CALLS.fetch_add(1, Ordering::SeqCst);
+        false
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("atomic-historical-peel.sqlite");
+    let key = SqlCipherKey::raw([0x49; 32]);
+    let storage = SqliteAccountStorage::open_encrypted(&database, &key).unwrap();
+    let mut fork = rival_invites_with_storage(storage).await;
+    fork.carol
+        .buffer_openmls_convergence_message_at(&fork.group, fork.alice_commit.clone(), 1_000)
+        .unwrap();
+    fork.carol
+        .converge_stored_openmls_messages_at(&fork.group, 1_000_000)
+        .unwrap();
+    let epochs = Arc::new(Mutex::new(Vec::new()));
+    fork.carol = carol_builder(fork.storage.clone())
+        .peeler(Box::new(UnreadablePeeler {
+            epochs: Some(epochs.clone()),
+        }))
+        .build()
+        .unwrap();
+    fork.carol.hydrate_all_stored_groups().unwrap();
+    let before = image(&fork.storage, &fork.group);
+    let writer = SqliteAccountStorage::open_encrypted(&database, &key).unwrap();
+    let observer = rusqlite::Connection::open(&database).unwrap();
+    open_hardened_sqlcipher(&observer, &key, SqlCipherHardening::live_cache()).unwrap();
+    observer.busy_handler(Some(on_busy)).unwrap();
+    let (attempt, start) = mpsc::channel();
+    let (completed, completion) = mpsc::channel();
+    let completion = Mutex::new(completion);
+    let group = fork.group.clone();
+    let worker = std::thread::spawn(move || {
+        start
+            .recv_timeout(Duration::from_secs(30))
+            .expect("derive reaches its restore");
+        for sql in [
+            "UPDATE openmls_values SET value = zeroblob(length(value))",
+            "UPDATE cgka_group_snapshots SET snapshot = zeroblob(length(snapshot)) WHERE group_id = ?1",
+        ] {
+            let result = if sql.contains("?1") {
+                observer.execute(sql, [group.as_slice()])
+            } else {
+                observer.execute(sql, [])
+            };
+            assert!(
+                matches!(&result, Err(rusqlite::Error::SqliteFailure(error, _))
+            if error.code == rusqlite::ErrorCode::DatabaseBusy),
+                "foreign writes must contend, got {result:?}"
+            );
+        }
+        assert_eq!(
+            BUSY_CALLS.load(Ordering::SeqCst),
+            2,
+            "both writes reached SQLite's busy handler"
+        );
+        completed.send(()).unwrap();
+    });
+    let armed = AtomicBool::new(true);
+    let derives = Arc::new(AtomicUsize::new(0));
+    let counted = derives.clone();
+    fork.storage
+        .fail_snapshot_restores_for_test(Some(Arc::new(move |_, name, in_transaction| {
+            if name.starts_with(Window::PastPeel.prefix()) {
+                assert!(in_transaction, "rewind and restore share the write lock");
+                counted.fetch_add(1, Ordering::SeqCst);
+                if armed.swap(false, Ordering::SeqCst) {
+                    attempt.send(()).unwrap();
+                    completion
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(30))
+                        .expect("foreign writes finish while the restore is paused");
+                }
+            }
+            Ok(())
+        })));
+
+    fork.carol
+        .ingest(opaque_input(&fork.group, b"atomic-cache-fill"))
+        .await
+        .unwrap();
+    worker.join().unwrap();
+    assert_eq!(*epochs.lock().unwrap(), vec![EpochId(2), EpochId(1)]);
+    assert_eq!(derives.load(Ordering::SeqCst), 1);
+    assert_eq!(image(&fork.storage, &fork.group).state, before.state);
+    assert_eq!(fork.storage.get_group(&fork.group).unwrap(), before.group);
+    epochs.lock().unwrap().clear();
+    fork.carol
+        .ingest(opaque_input(&fork.group, b"atomic-cache-hit"))
+        .await
+        .unwrap();
+    assert_eq!(*epochs.lock().unwrap(), vec![EpochId(2), EpochId(1)]);
+    assert_eq!(
+        derives.load(Ordering::SeqCst),
+        1,
+        "the retained context is warm"
+    );
+
+    // Replacement from a second connection must invalidate the old epoch-1 context.
+    writer
+        .create_group_state_snapshot(&fork.group, "openmls-retained-anchor-1")
+        .unwrap();
+    epochs.lock().unwrap().clear();
+    fork.carol
+        .ingest(opaque_input(&fork.group, b"atomic-cache-replaced"))
+        .await
+        .unwrap();
+    fork.storage.fail_snapshot_restores_for_test(None);
+    assert_eq!(*epochs.lock().unwrap(), vec![EpochId(2), EpochId(2)]);
+    assert_eq!(derives.load(Ordering::SeqCst), 2);
+    assert!(fork.carol.quarantined_groups().is_empty());
+    assert!(guard_snapshots(&fork.storage, &fork.group).is_empty());
 }
 
 /// Fail the pass's restore and leave the fault disarmed.

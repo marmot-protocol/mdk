@@ -1,7 +1,7 @@
 ---
 title: "Observability & Privacy"
 created: 2026-05-09
-updated: 2026-09-10
+updated: 2026-11-13
 tags: [marmot, overview, observability, tracing, privacy]
 status: overview
 ---
@@ -117,7 +117,7 @@ rare-event or timing risks; preserve existing relay dashboard safeguards. Audit
 logging retains its separate consent. Native UI adoption and deployed logging and
 retention verification are separate from MDK implementation evidence.
 
-Forensic audit v4 excludes account labels and free-form device labels/names in both JSONL and upload headers.
-Platform, app version and optional system hardware model remain; model metadata must never be a hostname,
+Forensic audit records exclude account labels and free-form device labels/names. Platform, app version and optional
+system hardware model appear only in the `source_context` row; model metadata must never be a hostname,
 serial number or user-assigned name. Deterministic account/member hashes and existing forensic identifiers remain
 linkable sensitive data, distinct from aggregate-only telemetry. See [audit logging](../audit-logging.md).

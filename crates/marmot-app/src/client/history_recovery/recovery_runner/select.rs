@@ -15,8 +15,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use cgka_traits::storage::StorageResult;
+use marmot_forensics::RecoveryRunnerChange;
 use storage_sqlite::{
-    RecoveryCoverageMark, RecoveryRelayCaps, RecoveryUnitState, SqliteAppStorage,
+    RecoveryCoverageMark, RecoveryRelayCaps, RecoveryUnit, RecoveryUnitState, SqliteAppStorage,
     TransportReconciliationRoute,
 };
 use transport_nostr_adapter::sweep::{RelayCaps, SweepRange, SweepRoute};
@@ -34,6 +35,8 @@ use storage_sqlite::RecoveryUnitOutcome;
 #[derive(Clone)]
 pub(super) struct Candidate {
     pub(super) key: UnitKey,
+    /// The MLS group its route carries, for the audit.
+    pub(super) group_id: Option<Vec<u8>>,
     pub(super) best_effort: bool,
     /// Seconds owed after the live tail.
     pub(super) owed_seconds: u64,
@@ -64,9 +67,13 @@ pub(super) struct Survey {
     /// The routes whose group has a conversation window open.
     pub(super) window: BTreeSet<TransportReconciliationRoute>,
     /// The required units still catching up: they owe history after their
-    /// live tails and are neither broken nor suspended
+    /// live tails and are neither broken (even while probing) nor suspended
     /// ([`RunnerHost::surveyed`](super::RunnerHost)).
     pub(super) catching_up: BTreeSet<UnitKey>,
+    /// When the earliest timed probe of a broken unit on a relay a current,
+    /// unsuspended route requires falls due. Its unit is blocked until a debt
+    /// turn arms it, so an idle runner wakes for it.
+    pub(super) probe_due: Option<u64>,
 }
 
 pub(super) enum Pick {
@@ -270,13 +277,13 @@ pub(super) fn survey(
                 .map(|range| range.until_seconds - range.since_seconds + 1)
                 .fold(0u64, u64::saturating_add);
             let unit = app.recovery_unit(&route.route, relay)?;
-            let (retry_at, broken) = match (&unit, best_effort) {
+            let (retry_at, parked, broken) = match (&unit, best_effort) {
                 // A best-effort relay keeps no retry state.
-                (_, true) | (None, false) => (0, false),
-                (Some(unit), false) => (
-                    unit.next_attempt_at_seconds,
-                    matches!(unit.state, RecoveryUnitState::Broken(_)) && !unit.probe,
-                ),
+                (_, true) | (None, false) => (0, false, false),
+                (Some(unit), false) => {
+                    let parked = matches!(unit.state, RecoveryUnitState::Broken(_));
+                    (unit.next_attempt_at_seconds, parked, parked && !unit.probe)
+                }
             };
             let cooldown = cooldown_until(app, &mut cooldowns, relay, now)?;
             let key = UnitKey {
@@ -288,11 +295,14 @@ pub(super) fn survey(
             // leaves the admission frontier.
             let held_back =
                 stalled.holds(route) || admission.backpressured(&key, &policy.staging, true)?;
-            if !best_effort && !broken && !suspended(route) {
+            // A probe is quiet: one quantum that re-parks or re-arms, never
+            // a catch-up the account's status shows.
+            if !best_effort && !parked && !suspended(route) {
                 catching_up.insert(key.clone());
             }
             candidates.push(Candidate {
                 key,
+                group_id: route.group_id.clone(),
                 best_effort,
                 owed_seconds,
                 position: first.since_seconds,
@@ -303,6 +313,18 @@ pub(super) fn survey(
             });
         }
     }
+    let probe_due = app
+        .pending_recovery_probes()?
+        .into_iter()
+        .filter(|unit| {
+            turn.routes.iter().any(|route| {
+                route.route == unit.route
+                    && !suspended(route)
+                    && route.required.contains(&unit.relay)
+            })
+        })
+        .map(|unit| unit.next_attempt_at_seconds)
+        .min();
     Ok(Survey {
         candidates,
         rechecks: recheck::survey(turn, policy, stalled, &mut admission)?,
@@ -315,6 +337,7 @@ pub(super) fn survey(
             .map(|route| route.route.clone())
             .collect(),
         catching_up,
+        probe_due,
     })
 }
 
@@ -348,7 +371,8 @@ pub(super) fn pick(
             next_due: Some(until),
         };
     }
-    let mut next_due: Option<u64> = None;
+    // A pending probe's unit is blocked until a debt turn arms it.
+    let mut next_due = survey.probe_due;
     let mut eligible = Vec::new();
     let rechecks = survey.rechecks;
     for candidate in survey.candidates {
@@ -487,6 +511,10 @@ pub(super) struct SweepPlan {
     /// compares and the account holds events there (`compare::plan_debt`).
     /// Always for the inbox, which is never swept (`compare::plan_inbox`).
     pub(super) compare: Option<ComparePlan>,
+    /// The unit as the begin turn read it, before its attempt: what its
+    /// settlement's audit row compares against. `None` for a unit storage has
+    /// no row for yet.
+    pub(super) prior: Option<RecoveryUnit>,
 }
 
 /// Plan the quantum on `key` and record the attempt, or `None` when it no
@@ -516,7 +544,13 @@ pub(super) fn begin(
         return Ok(None);
     };
     if let Some(read) = caps {
-        app.record_recovery_relay_caps(&key.relay, Some(recovery_caps(read)), now)?;
+        let rearmed = app.record_recovery_relay_caps(&key.relay, Some(recovery_caps(read)), now)?;
+        super::audit::rearmed(
+            turn.audit,
+            RecoveryRunnerChange::CapsRearmed,
+            Some(&key.relay),
+            rearmed as u64,
+        );
     }
     if app
         .recovery_account_paused_until(&policy.unit, now)?
@@ -608,5 +642,6 @@ pub(super) fn begin(
         observed_cap: unit.as_ref().and_then(|unit| unit.observed_cap),
         mark,
         compare,
+        prior: unit,
     }))
 }

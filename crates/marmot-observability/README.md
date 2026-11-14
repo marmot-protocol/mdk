@@ -9,7 +9,7 @@ The code that ships a Marmot app's diagnostics off the device, all of it opt-in 
   delivery.
 - **App performance.** The recorder for aggregate operation timings and outcomes, whose snapshots the relay-telemetry
   exporter ships.
-- **Audit delivery.** The audit OTLP sender and the HTTP half of the v4 audit upload.
+- **Audit delivery.** The audit OTLP sender, which delivers recorded v5 audit batches to an OTLP/HTTP receiver.
 - **Collector dial safety.** The one helper every collector connection goes through: it validates and pins every
   resolved address, disables redirects and system proxies, and builds clients with the host's proxy policy.
 

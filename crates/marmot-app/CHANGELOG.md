@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Breaking changes
+
+- Remove the legacy v4 whole-file audit upload, whose only receiver (the
+  retired Goggles service) no longer exists. `post_audit_log_file`,
+  `AuditLogUploadResult`, `AuditLogTrackerConfig`,
+  `MarmotServiceEndpoints::audit_log_tracker_endpoint` and the upload
+  checkpoint are removed. Set recorder source metadata with
+  `MarmotAppRuntime::set_audit_log_source(AuditLogSource)`.
+  `post_audit_log_tracker_update` now runs only the v5 OTLP pass, and
+  `AuditLogTrackerUpdateResult` keeps only `enabled` and `v5`. Startup cleanup
+  deletes the orphaned `audit-upload-checkpoint.json`.
+
 ### Added
 
 - `MarmotAppRuntime::discard_failed_send(account_ref, group_id, message_id_hex)`
@@ -14,6 +26,33 @@
   sharing apply the current relay safety policy. Packs without usable
   hints use account relays. Hints that exceed the parser's link size limit
   are omitted (mdk#3283).
+- The v5 forensic audit log records what the recovery runner does for each group (mdk#2660 phase 4), so an exported
+  log shows whether a group keeps trying to catch up, what it thinks it owes, and whether it stopped trying.
+  `recovery_runner_fetched` is one row per fetch the runner settles: the group, route and relay (hashed), sweep or
+  NIP-77 comparison, its purpose (debt, held capture, epoch-gap visit, post-join collection, repair, re-check), the
+  owed window and seconds, the outcome and how the relay call ended, its duration, and what it covered, fetched and
+  staged. `recovery_runner_raced` coalesces begins that found nothing owed to at most one row per route per minute,
+  and `recovery_runner_changed` records each unit break, failed probe and re-arm, a route suspended or resumed,
+  relays retired as gone or reopened, and each remainder the retention floor parks or widens. marmot-forensics adds
+  the three v5-only `AuditEventKind` variants, their closed vocabularies (`RecoveryRunnerRoute`,
+  `RecoveryRunnerFetch`, `RecoveryRunnerPurpose`, `RecoveryRunnerOutcome`, `RecoveryRunnerFetchEnd`,
+  `RecoveryRunnerChange`, `RecoveryRunnerBreak`), `RECOVERY_RUNNER_RACED_WINDOW_SECS`, and their v5 schema and
+  validation. Surveys write no rows, and the runner's behavior is unchanged.
+
+### Changed
+
+- The coverage ledger no longer raises "history may be incomplete" notices (mdk#3308). Users see a notice only when
+  MDK has evidence that messages are missing (an epoch gap the runner's visits exhausted, a maintenance or known-event
+  park an upgrade kept) or after a rejoin. `HistoryNoticeCause::UnprovenHistory` stays in the enum for compatibility
+  but is no longer emitted; keep exhaustive matches. Notices shown for it before the upgrade leave the list, and
+  `dismiss_history_notice` with one of their ids returns `false` and changes nothing. No `recovery_need_changed`
+  audit row carries `unproven_history` any more.
+- A broken recovery unit (a relay that refused the runner or could not prove a route's history) now probes quietly
+  on a timer instead of waiting for the user to dismiss its notice: an hour after it breaks, then on an interval that
+  doubles to a day. A probe goes through the runner's ordinary scheduling, budgets, relay cooldowns and account
+  breaker, raises no notice and never shows as catching up. Units broken before the upgrade have a probe time in the
+  past, so each probes once right after the upgrade; one whose probe fails then waits the full day, since its stored
+  backoff step predates the schedule.
 
 ### Fixed
 
@@ -29,6 +68,13 @@
   reporting recipients as `Incomplete` in a successful result (#1813).
   Incomplete relay reads still use per-member recovery. Over-budget published
   member routes stay account-local and do not renew prewarm readiness.
+- An inbox relay that refuses NIP-77 comparison (`auth-required` or no NIP-77 support) no longer brings back a
+  "history may be incomplete" notice about a second after every dismissal and on every app open (mdk#3308). The inbox
+  owes history up to the current second on such a relay, so each quantum after a dismissal was refused again and
+  parked under a new revision.
+- History the 30-day retention window passed before the runner proved it (a route's parked remainder) no longer
+  raises a notice. After the upgrade to the coverage ledger, nearly every chat showed "history may be incomplete" for
+  this alone, and busy groups flashed the notice about once a second as live input moved their live edge.
 
 ## 0.16.0 - 2026-11-12
 

@@ -49,6 +49,7 @@
 #![cfg_attr(not(test), allow(dead_code))]
 
 mod admission;
+pub(crate) mod audit;
 mod compare;
 mod epoch_gap;
 pub(crate) mod host;
@@ -65,13 +66,13 @@ mod tests;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use cgka_traits::TransportDelivery;
 use cgka_traits::storage::{StorageError, StorageResult};
-use marmot_forensics::{AuditEventKind, RecoveryRunnerCap};
+use marmot_forensics::{AuditEventKind, RecoveryRunnerCap, RecoveryRunnerChange};
 use nostr::prelude::Event;
 use storage_sqlite::{
     RecoveryRelayCaps, RecoveryUnitOutcome, SqliteAppStorage, TransportReconciliationRoute,
@@ -169,9 +170,9 @@ pub(crate) struct WorkerTurn<'a> {
     pub(crate) app: &'a SqliteAppStorage,
     /// Unix seconds, as of this turn.
     pub(crate) now: u64,
-    /// Records one account-scoped row into the account's audit recorder,
-    /// which drops it unless it records v5.
-    pub(crate) audit: &'a dyn Fn(AuditEventKind),
+    /// Records one row into the account's audit recorder, which drops it
+    /// unless it records v5: about the MLS group given, or account-scoped.
+    pub(crate) audit: audit::AuditHook<'a>,
 }
 
 /// What a turn that reads debt sees: the account's current routes, and the
@@ -187,19 +188,27 @@ pub(crate) struct DebtTurn<'a> {
     pub(crate) tails: &'a dyn LiveTailRead,
     /// The open live REQs' counts, for the fence.
     pub(crate) live_counts: &'a [LiveCount],
+    /// As [`WorkerTurn::audit`]. The host may still fail the turn after its
+    /// closure returns (its fence read), and the runner then runs it again,
+    /// so a row is written where what it records is committed or stored,
+    /// never left for the runner to store once the turn answers.
+    pub(crate) audit: audit::AuditHook<'a>,
+    /// Whether the recorder keeps v5 rows, so a fetch's row is worth the
+    /// reads that describe it.
+    pub(crate) audits: bool,
 }
 
 impl DebtTurn<'_> {
     /// The last second `relay` owes `route` this turn: the second before its
     /// live tail, and never past a retained route's goal.
-    pub(super) fn owed_until(&self, route: &RunnerRoute, relay: &str) -> u64 {
+    pub(in crate::client) fn owed_until(&self, route: &RunnerRoute, relay: &str) -> u64 {
         self.checked_until(route)
             .min(self.tails.owed_until(&route.route, relay, self.now))
     }
 
     /// The last second a re-check of `route` passes over: now, or a retained
     /// route's goal end.
-    pub(super) fn checked_until(&self, route: &RunnerRoute) -> u64 {
+    pub(in crate::client) fn checked_until(&self, route: &RunnerRoute) -> u64 {
         route
             .goal_until
             .map_or(self.now, |until| until.min(self.now))
@@ -537,6 +546,9 @@ impl RecoveryRunnerHandle {
     }
 }
 
+/// An audit row and the MLS group it is about, if any.
+type AuditRow = (Option<Vec<u8>>, AuditEventKind);
+
 /// One account's runner.
 pub(crate) struct RecoveryRunner<H> {
     host: Arc<H>,
@@ -559,6 +571,17 @@ pub(crate) struct RecoveryRunner<H> {
     reported_pause: Option<u64>,
     /// Attempts begun and not settled, for its owner to refund on a stop.
     open: OpenAttempts,
+    /// Begins abandoned as raced, coalesced per route for the audit.
+    races: audit::Races,
+    /// Raced rows whose window closed, for the next survey turn to write: no
+    /// turn is awaited only to write a row. The survey drains them inside its
+    /// turn, so a turn whose preparation fails leaves them for the retry.
+    unwritten_races: Arc<Mutex<Vec<AuditRow>>>,
+    /// The routes the last survey found suspended, for the audit; `None`
+    /// before the first, and while the recorder keeps no rows. The survey
+    /// updates it inside its turn, where it writes the rows for the change,
+    /// so a turn that fails after them writes none of them again.
+    suspended: Arc<Mutex<Option<BTreeSet<TransportReconciliationRoute>>>>,
 }
 
 impl<H: RunnerHost> RecoveryRunner<H> {
@@ -598,6 +621,9 @@ impl<H: RunnerHost> RecoveryRunner<H> {
             connections: None,
             reported_pause: None,
             open: OpenAttempts::default(),
+            races: audit::Races::default(),
+            unwritten_races: Arc::default(),
+            suspended: Arc::default(),
         };
         let handle = RecoveryRunnerHandle {
             wake,
@@ -737,17 +763,35 @@ impl<H: RunnerHost> RecoveryRunner<H> {
             Err(step) => return step,
         };
         let policy = self.policy;
+        let suspended = Arc::clone(&self.suspended);
+        let races = Arc::clone(&self.unwritten_races);
         let (mut survey, epoch_gap_due) = match self
             .debt_turn(pass, move |turn| {
+                // Each row is written where what it records is: whatever
+                // fails later in the turn, none of them is written again.
+                let races =
+                    std::mem::take(&mut *races.lock().unwrap_or_else(PoisonError::into_inner));
+                let mut suspended = suspended.lock().unwrap_or_else(PoisonError::into_inner);
+                if turn.audits {
+                    for (group, row) in races {
+                        (turn.audit)(group.as_deref(), row);
+                    }
+                    audit::suspensions(turn, &mut suspended);
+                } else {
+                    // The recorder keeps no rows: the first survey once it
+                    // does records every route it finds suspended.
+                    *suspended = None;
+                }
                 let due = epoch_gap::advance(turn, &policy, &stalled)?.next_due;
-                Ok((select::survey(turn, &policy, &stalled)?, due))
+                let survey = select::survey(turn, &policy, &stalled)?;
+                Ok((survey, due))
             })
             .await
         {
             None => return Step::Stopped,
-            Some(Ok(survey)) => {
+            Some(Ok(surveyed)) => {
                 self.survey_failures = 0;
-                survey
+                surveyed
             }
             Some(Err(error)) => {
                 self.survey_failures = self.survey_failures.saturating_add(1);
@@ -795,14 +839,20 @@ impl<H: RunnerHost> RecoveryRunner<H> {
             () = pass_end(pass) => return Step::Idle { next_due: None },
             credit = recovery_credits::acquire_recovery_credit(&self.credits) => credit,
         };
-        let step = self.quantum(candidate, pass).await;
+        let fenced = hints.held.contains(&candidate.key.route);
+        let step = self.quantum(candidate, pass, fenced).await;
         drop(credit);
         step
     }
 
     /// Begin, run, stage and settle one quantum on `candidate`, holding a
-    /// credit.
-    async fn quantum(&mut self, candidate: Candidate, pass: Option<&PassBound>) -> Step {
+    /// credit. `fenced` says a fence holds its group's live frames.
+    async fn quantum(
+        &mut self,
+        candidate: Candidate,
+        pass: Option<&PassBound>,
+        fenced: bool,
+    ) -> Step {
         if candidate.recheck {
             return self.recheck(candidate, pass).await;
         }
@@ -818,7 +868,8 @@ impl<H: RunnerHost> RecoveryRunner<H> {
         let best_effort = candidate.best_effort;
         let compares = self.memory.compares(&key.relay);
         let open = self.open.clone();
-        let plan = match self
+        let repair = pass.is_some_and(|bound| bound.repair_until.is_some());
+        let (plan, fetch_audit) = match self
             .debt_turn(pass, move |turn| {
                 let plan = select::begin(turn, &key, best_effort, caps, compares, &policy);
                 // A best-effort relay is charged nothing.
@@ -827,13 +878,30 @@ impl<H: RunnerHost> RecoveryRunner<H> {
                 {
                     open.begun(&plan.key, AttemptKind::Debt);
                 }
-                plan
+                Ok(plan?.map(|plan| {
+                    let fetch_audit = turn
+                        .routes
+                        .iter()
+                        .find(|route| turn.audits && route.route == key.route)
+                        .and_then(|route| {
+                            audit::FetchAudit::new(
+                                route,
+                                &key.relay,
+                                best_effort,
+                                plan.compare.is_some(),
+                                audit::debt_purpose(turn, route, repair, fenced),
+                                !best_effort && audit::probing(plan.prior.as_ref()),
+                                &plan.ranges,
+                            )
+                        });
+                    (plan, fetch_audit)
+                }))
             })
             .await
         {
             None => return Step::Stopped,
-            Some(Ok(Some(plan))) => plan,
-            Some(Ok(None)) => return Step::Raced,
+            Some(Ok(Some(begun))) => begun,
+            Some(Ok(None)) => return self.raced(&candidate),
             Some(Err(error)) => {
                 log_failure("begin", error);
                 let outcome = RecoveryUnitOutcome::LocalFailure;
@@ -848,7 +916,8 @@ impl<H: RunnerHost> RecoveryRunner<H> {
                 });
             }
         };
-        let deadline = Instant::now() + policy.quantum;
+        let started = Instant::now();
+        let deadline = started + policy.quantum;
         let ranges = plan.ranges.len();
         tracing::debug!(target: TARGET, method = "attempt_started",
             recheck = false, best_effort, ranges);
@@ -890,15 +959,37 @@ impl<H: RunnerHost> RecoveryRunner<H> {
             self.memory.would_not_compare(&candidate.key.relay);
         }
         let open = self.open.clone();
+        let fetched = audit::FetchResult {
+            outcome: RecoveryUnitOutcome::LocalFailure,
+            end: facts.map_or(audit::sweep_end(report.end), |facts| {
+                audit::compare_end(facts.end)
+            }),
+            duration_ms: elapsed_ms(started),
+            late_findings: 0,
+            raced: self.races.take(&candidate.key.route),
+        };
+        let group = candidate.group_id.clone();
         let outcome = match self
             .host
             .turn(move |turn| {
-                let outcome = quantum::settle(turn, &plan, &report, &policy);
+                let settled = quantum::settle(turn, &plan, &report, &policy);
                 // A settle that failed left its charge for a stop to refund.
-                if outcome.is_ok() {
+                if settled.is_ok() {
                     open.settled(&plan.key);
                 }
-                outcome
+                let outcome = settled.as_ref().ok().map(|(outcome, _)| *outcome);
+                if let Some(fetch_audit) = fetch_audit {
+                    let outcome = outcome.unwrap_or(fetched.outcome);
+                    fetch_audit.record(
+                        turn.audit,
+                        &report,
+                        audit::FetchResult { outcome, ..fetched },
+                    );
+                }
+                if let Ok((_, Some(after))) = &settled {
+                    audit::unit_changed(turn.audit, group.as_deref(), plan.prior.as_ref(), after);
+                }
+                settled.map(|(outcome, _)| outcome)
             })
             .await
         {
@@ -946,19 +1037,42 @@ impl<H: RunnerHost> RecoveryRunner<H> {
         };
         let key = candidate.key.clone();
         let open = self.open.clone();
-        let plan = match self
+        let (plan, fetch_audit) = match self
             .debt_turn(pass, move |turn| {
                 let plan = recheck::begin(turn, &key, caps, &policy);
                 if let Ok(Some(plan)) = &plan {
                     open.begun(&plan.compare.key, AttemptKind::Recheck);
                 }
-                plan
+                Ok(plan?.map(|plan| {
+                    let ranges = plan
+                        .compare
+                        .ranges
+                        .iter()
+                        .map(|planned| planned.range)
+                        .collect::<Vec<_>>();
+                    let fetch_audit = turn
+                        .routes
+                        .iter()
+                        .find(|route| route.route == key.route)
+                        .and_then(|route| {
+                            audit::FetchAudit::new(
+                                route,
+                                &key.relay,
+                                false,
+                                true,
+                                marmot_forensics::RecoveryRunnerPurpose::Recheck,
+                                false,
+                                &ranges,
+                            )
+                        });
+                    (plan, fetch_audit)
+                }))
             })
             .await
         {
             None => return Step::Stopped,
-            Some(Ok(Some(plan))) => plan,
-            Some(Ok(None)) => return Step::Raced,
+            Some(Ok(Some(begun))) => begun,
+            Some(Ok(None)) => return self.raced(&candidate),
             Some(Err(error)) => {
                 log_failure("recheck_begin", error);
                 let outcome = RecoveryUnitOutcome::LocalFailure;
@@ -973,7 +1087,8 @@ impl<H: RunnerHost> RecoveryRunner<H> {
                 });
             }
         };
-        let deadline = Instant::now() + policy.quantum;
+        let started = Instant::now();
+        let deadline = started + policy.quantum;
         let ranges = plan.compare.ranges.len();
         tracing::debug!(target: TARGET, method = "attempt_started",
             recheck = true, best_effort = false, ranges);
@@ -995,6 +1110,13 @@ impl<H: RunnerHost> RecoveryRunner<H> {
             self.memory.would_not_compare(&candidate.key.relay);
         }
         let open = self.open.clone();
+        let fetched = audit::FetchResult {
+            outcome: RecoveryUnitOutcome::LocalFailure,
+            end: audit::compare_end(facts.end),
+            duration_ms: elapsed_ms(started),
+            late_findings: facts.late,
+            raced: self.races.take(&candidate.key.route),
+        };
         let settled = match self
             .host
             .turn(move |turn| {
@@ -1004,6 +1126,16 @@ impl<H: RunnerHost> RecoveryRunner<H> {
                 // changes nothing.
                 if settled.is_ok() {
                     open.settled(&plan.compare.key);
+                }
+                if let Some(fetch_audit) = fetch_audit {
+                    let outcome = settled
+                        .as_ref()
+                        .map_or(fetched.outcome, |settled| settled.outcome);
+                    fetch_audit.record(
+                        turn.audit,
+                        &report,
+                        audit::FetchResult { outcome, ..fetched },
+                    );
                 }
                 settled
             })
@@ -1052,6 +1184,21 @@ impl<H: RunnerHost> RecoveryRunner<H> {
         })
     }
 
+    /// The begin turn found `candidate` owing nothing, or no longer eligible:
+    /// count the race on its route. When this race ends the route's window
+    /// ([`audit::Races`]), the coalesced row waits for the next survey turn;
+    /// a row a stop loses changes nothing else.
+    fn raced(&mut self, candidate: &Candidate) -> Step {
+        let route = &candidate.key.route;
+        if let Some(row) = self.races.raced(route, self.host.now_seconds()) {
+            self.unwritten_races
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push((candidate.group_id.clone(), row));
+        }
+        Step::Raced
+    }
+
     /// Handle relay reconnects: each one's cooldown ends and its caps are read
     /// again (a known change re-arms the units planned with other caps). The
     /// survey that follows reads fresh tails, so a reconnect's new tail, which
@@ -1077,8 +1224,15 @@ impl<H: RunnerHost> RecoveryRunner<H> {
                     turn.app
                         .record_recovery_relay_reconnected(&written, &policy.unit, turn.now)?;
                     if caps.is_some() {
-                        turn.app
+                        let rearmed = turn
+                            .app
                             .record_recovery_relay_caps(&written, caps, turn.now)?;
+                        audit::rearmed(
+                            turn.audit,
+                            RecoveryRunnerChange::CapsRearmed,
+                            Some(&written),
+                            rearmed as u64,
+                        );
                     }
                     Ok::<_, cgka_traits::storage::StorageError>(())
                 })
@@ -1199,14 +1353,17 @@ impl<H: RunnerHost> RecoveryRunner<H> {
                     // A refund since the survey lifted the pause already.
                     (false, false) => return Ok(()),
                 };
-                (turn.audit)(AuditEventKind::RecoveryRunnerPaused {
-                    cap,
-                    attempts: usage.attempts,
-                    event_bytes: usage.event_bytes,
-                    paused_for_secs,
-                    pauses,
-                    late_findings: LATE_FINDINGS.load(Ordering::Relaxed),
-                });
+                (turn.audit)(
+                    None,
+                    AuditEventKind::RecoveryRunnerPaused {
+                        cap,
+                        attempts: usage.attempts,
+                        event_bytes: usage.event_bytes,
+                        paused_for_secs,
+                        pauses,
+                        late_findings: LATE_FINDINGS.load(Ordering::Relaxed),
+                    },
+                );
                 Ok::<_, StorageError>(())
             })
             .await;
@@ -1252,6 +1409,11 @@ async fn sleep_for(duration: Option<Duration>) {
         Some(duration) => tokio::time::sleep(duration).await,
         None => std::future::pending().await,
     }
+}
+
+/// Milliseconds since `started`, for an audit row.
+fn elapsed_ms(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 /// Once `pass` ends; never without one.

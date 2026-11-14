@@ -160,7 +160,7 @@ impl RunnerHost for AccountRunnerHost {
         self.on_client(false, move |client| {
             Box::pin(async move {
                 let app = runner_storage(client)?;
-                let audit = |kind| client.record_audit_event(None, None, kind);
+                let audit = |group: Option<&[u8]>, kind| client.record_runner_audit(group, kind);
                 Some(turn(&WorkerTurn {
                     app: &app,
                     now: unix_now(),
@@ -196,23 +196,35 @@ impl RunnerHost for AccountRunnerHost {
                 if let Err(error) = client.prune_runner_retention(&app, now) {
                     return Some(Err(error));
                 }
+                // Broken units whose probe time passed owe their park again.
+                if let Err(error) = app.arm_due_recovery_probes(now) {
+                    return Some(Err(error));
+                }
                 let tails = client.recovery_runner_live_tails(&app, now).await;
                 let mut routes = client.recovery_runner_routes();
                 if inbox.is_none() {
                     routes.retain(|route| route.route != TransportReconciliationRoute::Inbox);
                 }
                 let live = client.recovery_runner_live_counts().await;
-                let debt = DebtTurn {
-                    app: &app,
-                    routes: &routes,
-                    now,
-                    tails: &*tails,
-                    live_counts: &live.counts,
-                    inbox: inbox.unwrap_or_default(),
+                let (result, fences) = {
+                    let audit =
+                        |group: Option<&[u8]>, kind| client.record_runner_audit(group, kind);
+                    let debt = DebtTurn {
+                        app: &app,
+                        routes: &routes,
+                        now,
+                        tails: &*tails,
+                        live_counts: &live.counts,
+                        inbox: inbox.unwrap_or_default(),
+                        audit: &audit,
+                        audits: client.audit_v5_enabled(),
+                    };
+                    let result = turn(&debt);
+                    let fences = result.is_ok().then(|| super::admission::live_fences(&debt));
+                    (result, fences)
                 };
-                let result = turn(&debt);
-                if result.is_ok() {
-                    let fences = match super::admission::live_fences(&debt) {
+                if let Some(fences) = fences {
+                    let fences = match fences {
                         Ok(fences) => fences,
                         Err(error) => return Some(Err(error)),
                     };

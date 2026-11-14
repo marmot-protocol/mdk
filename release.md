@@ -312,11 +312,10 @@ available:
 ```
 
 The binding build scripts source `crates/marmot-uniffi/marmotkit-endpoints.env` from the workflow builder checkout so
-production MarmotKit artifacts embed one platform-consistent set of public audit-log and OTLP route defaults. The
+production MarmotKit artifacts embed one platform-consistent set of public OTLP and analytics route defaults. The
 canonical Rust release profile comes from that builder checkout as well; API-coupled inputs such as the Cargo
 workspace, UniFFI configuration, and Kotlin support files come from the packaged source checkout. Override
-`MARMOT_AUDIT_LOG_TRACKER_ENDPOINT` or `MARMOT_RELAY_TELEMETRY_OTLP_ENDPOINT` in the environment only for staging or
-local collector builds. Bearer tokens are not compiled into MarmotKit; apps supply them at runtime.
+`MARMOT_RELAY_TELEMETRY_OTLP_ENDPOINT` in the environment only for staging or local collector builds. Bearer tokens are not compiled into MarmotKit; apps supply them at runtime.
 
 The GitHub workflow repeats the release builds on clean runners. Local builds catch drift earlier.
 

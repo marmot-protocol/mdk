@@ -178,7 +178,7 @@ async fn an_applied_sibling_self_remove_holds_private_adds() {
         .await
         .unwrap_err();
     assert!(
-        matches!(error, EngineError::Backend(ref message) if message.starts_with("load device group:")),
+        matches!(error, EngineError::Backend(ref message) if message.starts_with("load group:")),
         "{error}"
     );
     assert_eq!(load_group(&phone, &gid).epoch().as_u64(), epoch);

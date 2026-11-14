@@ -26,6 +26,7 @@ use cgka_traits::ingest::{
     ProposalRejectionCategory, StaleReason,
 };
 use cgka_traits::message::{MessageState, StoredMessagePayload};
+use cgka_traits::peeler::PreparedGroupMessage;
 use cgka_traits::storage::{StorageError, StorageProvider};
 use cgka_traits::transport::{EncryptedPayload, TransportMessage};
 use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
@@ -79,7 +80,34 @@ pub(super) struct PastPeelContextCache {
 }
 
 /// Contexts by anchor snapshot name; `None` marks an anchor found inactive.
-type PastPeelContexts = HashMap<String, Option<Arc<PastPeelContext>>>;
+#[derive(Default)]
+struct PastPeelContexts {
+    generation: Option<u64>,
+    by_snapshot: HashMap<String, Option<Arc<PastPeelContext>>>,
+}
+
+type PastPeelReplayState = (u64, Option<[u8; 32]>);
+
+/// Holds a cache update through its storage commit. An error or panic at that
+/// boundary must not leave contexts stamped with a rolled-back generation.
+struct PastPeelContextUpdate<'a> {
+    cache: &'a PastPeelContextCache,
+    committed: bool,
+}
+
+impl Drop for PastPeelContextUpdate<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            let mut contexts = self
+                .cache
+                .contexts
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            contexts.by_snapshot.clear();
+            contexts.generation = None;
+        }
+    }
+}
 
 struct PastPeelContext {
     context: cgka_traits::group_context::GroupContextSnapshot,
@@ -87,20 +115,92 @@ struct PastPeelContext {
 }
 
 impl PastPeelContextCache {
+    fn synchronize_generation(&self, generation: Option<u64>) -> Result<(), EngineError> {
+        let mut contexts = self.contexts()?;
+        if generation.is_none() || contexts.generation != generation {
+            contexts.by_snapshot.clear();
+            contexts.generation = generation;
+        }
+        Ok(())
+    }
+
     /// `None` on a miss; `Some(None)` for an anchor already found inactive.
     fn get(
         &self,
         snapshot_name: &str,
+        generation: Option<u64>,
     ) -> Result<Option<Option<Arc<PastPeelContext>>>, EngineError> {
-        Ok(self.contexts()?.get(snapshot_name).cloned())
+        let mut contexts = self.contexts()?;
+        if generation.is_none() || contexts.generation != generation {
+            contexts.by_snapshot.clear();
+            contexts.generation = generation;
+        }
+        Ok(contexts.by_snapshot.get(snapshot_name).cloned())
+    }
+
+    fn begin_update(
+        &self,
+        generation: Option<u64>,
+    ) -> Result<PastPeelContextUpdate<'_>, EngineError> {
+        self.synchronize_generation(generation)?;
+        Ok(PastPeelContextUpdate {
+            cache: self,
+            committed: false,
+        })
     }
 
     fn insert(
         &self,
         snapshot_name: &str,
         context: Option<Arc<PastPeelContext>>,
+        generation: Option<u64>,
     ) -> Result<(), EngineError> {
-        self.contexts()?.insert(snapshot_name.to_owned(), context);
+        let mut contexts = self.contexts()?;
+        contexts.generation = generation;
+        if generation.is_some() {
+            contexts
+                .by_snapshot
+                .insert(snapshot_name.to_owned(), context);
+        } else {
+            contexts.by_snapshot.clear();
+        }
+        Ok(())
+    }
+
+    /// Observe the content and generation together only at replay boundaries,
+    /// never on the ordinary cached-context path.
+    pub(super) fn replay_state(
+        storage: &impl StorageProvider,
+        group_id: &GroupId,
+    ) -> Result<Option<PastPeelReplayState>, EngineError> {
+        let Some(before) = storage.past_peel_context_generation() else {
+            return Ok(None);
+        };
+        let fingerprint = storage.group_replay_state_fingerprint(group_id)?;
+        let after = storage.past_peel_context_generation();
+        Ok((Some(before) == after).then_some((before, fingerprint)))
+    }
+
+    pub(super) fn advance_after_restore(
+        &self,
+        before: Option<PastPeelReplayState>,
+        after: Option<PastPeelReplayState>,
+    ) -> Result<(), EngineError> {
+        let mut contexts = self.contexts()?;
+        if let (Some((before_generation, before_state)), Some((after_generation, after_state))) =
+            (before, after)
+        {
+            let unchanged = before_generation == after_generation
+                || before_state
+                    .zip(after_state)
+                    .is_some_and(|(before, after)| before == after);
+            if contexts.generation == Some(before_generation) && unchanged {
+                contexts.generation = Some(after_generation);
+                return Ok(());
+            }
+        }
+        contexts.by_snapshot.clear();
+        contexts.generation = None;
         Ok(())
     }
 
@@ -135,8 +235,8 @@ impl<'a> DeferredPeelSweep<'a> {
         }
     }
 
-    pub(super) fn with_past_contexts(mut self, contexts: &'a PastPeelContextCache) -> Self {
-        self.past_contexts = Some(contexts);
+    pub(super) fn with_past_contexts(mut self, contexts: Option<&'a PastPeelContextCache>) -> Self {
+        self.past_contexts = contexts;
         self
     }
 
@@ -649,7 +749,6 @@ impl<S: StorageProvider> Engine<S> {
         let _ = self.sync_unrecoverable_halt_from_storage(&group_id)?;
 
         // Load MlsGroup from storage.
-        let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
         let mut mls_group = match self.take_mls_group(&group_id) {
             Ok(Some(g)) => g,
             Ok(None) => {
@@ -743,11 +842,29 @@ impl<S: StorageProvider> Engine<S> {
             });
         }
 
-        // Peel.
+        let live_past_contexts = if sweep.past_contexts.is_none() {
+            self.past_peel_contexts(&group_id)
+        } else {
+            None
+        };
+        let sweep = DeferredPeelSweep {
+            drain: sweep.drain,
+            branch_contexts: sweep.branch_contexts,
+            past_contexts: sweep.past_contexts.or(live_past_contexts.as_deref()),
+        };
+
+        // Peel only after the group and its ingest gate have been checked.
+        let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
         let ctx = group_lifecycle::build_group_context_snapshot(&mls_group, &provider)?;
         let raw_msg_id = msg.id.clone();
         let msg_id_hex = hex::encode(raw_msg_id.as_slice());
-        let peel_result = self.peeler.peel_group_message(msg, &ctx).await;
+        let (prepared, peel_result) = match self.peeler.prepare_group_message(msg) {
+            Ok(prepared) => {
+                let result = self.peeler.peel_group_message(&prepared, &ctx).await;
+                (Some(prepared), result)
+            }
+            Err(error) => (None, Err(error)),
+        };
         // Plain decrypt misses are expected for future epochs, pre-join
         // messages, and retained-snapshot fallback. The terminal state
         // transition below is the useful audit breadcrumb for no-snapshot
@@ -799,7 +916,7 @@ impl<S: StorageProvider> Engine<S> {
             Err(PeelerError::DecryptFailed) => {
                 let recovered = match self
                     .try_peel_group_message_from_recovery_contexts(
-                        msg,
+                        prepared.as_ref(),
                         &group_id,
                         current_epoch,
                         sweep,
@@ -934,7 +1051,7 @@ impl<S: StorageProvider> Engine<S> {
             }) => {
                 let recovered = match self
                     .try_peel_group_message_from_recovery_contexts(
-                        msg,
+                        prepared.as_ref(),
                         &group_id,
                         current_epoch,
                         sweep,
@@ -1943,17 +2060,7 @@ impl<S: StorageProvider> Engine<S> {
         }
 
         let mut mls_group = {
-            let provider =
-                EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
-            let mls_gid = openmls::group::GroupId::from_slice(schedule.group_id.as_slice());
-            let mls_group = MlsGroup::load(
-                <EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(
-                    &provider,
-                ),
-                &mls_gid,
-            )
-            .map_err(|e| EngineError::Backend(format!("load auto-commit replay: {e:?}")))?
-            .ok_or_else(|| EngineError::UnknownGroup(schedule.group_id.clone()))?;
+            let mls_group = self.load_mls_group(&schedule.group_id)?;
             if EpochId(mls_group.epoch().as_u64()) != schedule.source_epoch {
                 return Ok(ScheduledAutoCommitReplay::NotApplicable);
             }
@@ -2527,7 +2634,9 @@ impl<S: StorageProvider> Engine<S> {
     /// MLS load failure keeps the id pending because full hydration owns that
     /// failure — every backfill-pending group is also in `unhydrated_groups`,
     /// so `ensure_hydrated` will either index its route or quarantine it.
-    // Routing resolves a quarantined group too, so its input reaches the retaining gate (see clippy.toml).
+    // Routing resolves a quarantined group too, so its input reaches the retaining gate; the probe reads
+    // only a route-pending group's OpenMLS route, and such a group is unhydrated, so no rewind of it has
+    // failed (see clippy.toml).
     #[allow(clippy::disallowed_methods)]
     fn resolve_or_backfill_group_id_for_transport(
         &mut self,
@@ -2655,14 +2764,20 @@ impl<S: StorageProvider> Engine<S> {
     /// candidate state was materialized. A sweep or a publish-cycle replay
     /// passes the group's cache, so each historical anchor is materialized
     /// once, live state restored, and the owned context reused until canonical
-    /// state changes. Live ingest has no cross-message cache.
+    /// state changes. Ordinary live inputs share the same group-owned cache.
     async fn try_peel_group_message_from_recovery_contexts(
         &self,
-        msg: &TransportMessage,
+        prepared: Option<&PreparedGroupMessage<'_>>,
         group_id: &GroupId,
         current_epoch: EpochId,
         sweep: DeferredPeelSweep<'_>,
     ) -> Result<RecoveryPeel, EngineError> {
+        let Some(msg) = prepared else {
+            return Ok(RecoveryPeel {
+                recovery: None,
+                derived_contexts: 0,
+            });
+        };
         for (index, branch) in sweep.branch_contexts().iter().enumerate() {
             match self.peeler.peel_group_message(msg, &branch.context).await {
                 Ok(peeled) => {
@@ -2693,12 +2808,15 @@ impl<S: StorageProvider> Engine<S> {
 
     async fn try_peel_group_message_from_available_snapshots(
         &self,
-        msg: &TransportMessage,
+        msg: &PreparedGroupMessage<'_>,
         group_id: &GroupId,
         current_epoch: EpochId,
         cache: Option<&PastPeelContextCache>,
     ) -> Result<RecoveryPeel, EngineError> {
         let snapshots = self.available_past_peel_snapshots(group_id)?;
+        if let Some(cache) = cache {
+            cache.synchronize_generation(self.storage.past_peel_context_generation())?;
+        }
         let mut attempt_count = 0_u64;
         let mut derived_contexts = 0_u64;
         for (source_epoch, snapshot_name) in snapshots {
@@ -2707,18 +2825,16 @@ impl<S: StorageProvider> Engine<S> {
             }
             attempt_count = attempt_count.saturating_add(1);
             let cached = match cache {
-                Some(cache) => cache.get(&snapshot_name)?,
+                Some(cache) => {
+                    cache.get(&snapshot_name, self.storage.past_peel_context_generation())?
+                }
                 None => None,
             };
             let context = match cached {
                 Some(context) => context,
                 None => {
                     derived_contexts = derived_contexts.saturating_add(1);
-                    let context = self.derive_past_peel_context(group_id, &snapshot_name)?;
-                    if let Some(cache) = cache {
-                        cache.insert(&snapshot_name, context.clone())?;
-                    }
-                    context
+                    self.derive_past_peel_context(group_id, &snapshot_name, cache)?
                 }
             };
             let Some(context) = context else {
@@ -2754,6 +2870,7 @@ impl<S: StorageProvider> Engine<S> {
         &self,
         group_id: &GroupId,
         snapshot_name: &str,
+        cache: Option<&PastPeelContextCache>,
     ) -> Result<Option<Arc<PastPeelContext>>, EngineError> {
         // Restore live state before calling an async peeler. Contexts own only
         // the exporter material and authenticated retention policy they need.
@@ -2761,23 +2878,67 @@ impl<S: StorageProvider> Engine<S> {
         hasher.update(b"cgka-engine-peel-restore/v2");
         hasher.update(group_id.as_slice());
         hasher.update(snapshot_name.as_bytes());
-        let guard = SnapshotRollbackGuard::rewind(
-            &self.storage,
-            &self.rewinds,
-            group_id.clone(),
-            RewindSite::PastPeelContext,
-            &hex::encode(&hasher.finalize()[..8]),
-            snapshot_name,
-        )??;
-        crate::test_crash_hooks::pause_if_requested("past-peel-after-rewind");
-        let context = self.context_from_rewound_group(group_id);
-        guard.commit()?;
-        Ok(context?.map(|(context, message_retention_seconds)| {
+        let suffix = hex::encode(&hasher.finalize()[..8]);
+        let own_context = |(context, message_retention_seconds)| {
             Arc::new(PastPeelContext {
                 context,
                 message_retention_seconds,
             })
-        }))
+        };
+        if self.storage.past_peel_context_generation().is_none() {
+            // The generic savepoint fallback commits a second undo snapshot.
+            // Keep the existing recoverable committing window on backends that
+            // have not opted into atomic capture, and never cache its result.
+            if let Some(cache) = cache {
+                cache.synchronize_generation(None)?;
+            }
+            let guard = SnapshotRollbackGuard::rewind(
+                &self.storage,
+                &self.rewinds,
+                group_id.clone(),
+                RewindSite::PastPeelContext,
+                &suffix,
+                snapshot_name,
+            )??;
+            crate::test_crash_hooks::pause_if_requested("past-peel-after-rewind");
+            let context = self.context_from_rewound_group(group_id);
+            guard.commit()?;
+            return Ok(context?.map(own_context));
+        }
+        let (context, mut update) = self.storage.with_transaction(|storage| {
+            // Recheck under the writer lock: a foreign replacement before this
+            // transaction invalidates existing entries, even if our own restore
+            // would otherwise hide its generation change.
+            let update = cache
+                .map(|cache| cache.begin_update(storage.past_peel_context_generation()))
+                .transpose()?;
+            let context = SnapshotRollbackGuard::contained(
+                storage,
+                group_id,
+                RewindSite::PastPeelContext,
+                &suffix,
+                |storage| {
+                    storage.rollback_group_state_keeping_live_records(group_id, snapshot_name)?;
+                    crate::test_crash_hooks::pause_if_requested("past-peel-after-rewind");
+                    self.context_from_rewound_group(group_id)
+                },
+            )?
+            .map(own_context);
+            if let Some(update) = &update {
+                // The guard has restored and released its snapshot, but no
+                // other writer can run before this exact generation is stamped.
+                update.cache.insert(
+                    snapshot_name,
+                    context.clone(),
+                    storage.past_peel_context_generation(),
+                )?;
+            }
+            Ok::<_, EngineError>((context, update))
+        })?;
+        if let Some(update) = &mut update {
+            update.committed = true;
+        }
+        Ok(context)
     }
 
     fn has_retained_anchor_snapshot(
@@ -2891,13 +3052,7 @@ impl<S: StorageProvider> Engine<S> {
         EngineError,
     > {
         let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
-        let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
-        let mls_group = MlsGroup::load(
-            <EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(&provider),
-            &mls_gid,
-        )
-        .map_err(|e| EngineError::Backend(format!("load snapshot group: {e:?}")))?
-        .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;
+        let mls_group = self.load_mls_group(group_id)?;
         if !mls_group.is_active() {
             return Ok(None);
         }

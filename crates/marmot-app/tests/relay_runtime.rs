@@ -6948,8 +6948,8 @@ async fn app_runtime_archive_survives_subsequent_inbound_delivery() {
 // fall back to a direct `MarmotApp::set_group_archived` write when the account
 // worker is unavailable (e.g. a startup/reconcile failure). The direct write
 // can race a freshly spawned worker holding the pre-archive snapshot and revert
-// the flag again. Only non-local-signing accounts (which can never own a
-// worker) are allowed the direct-write path. Here we make the worker
+// the flag again. Only an account that signs on no worker is allowed the
+// direct-write path (mdk#3318). Here we make the worker
 // unavailable by stopping the runtime and assert the toggle surfaces the error
 // instead of silently persisting through the bypass.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -7025,6 +7025,238 @@ async fn app_runtime_archive_does_not_direct_write_when_worker_unavailable() {
             .archived,
         "archive must not be persisted via the direct-write bypass for a local-signing account"
     );
+}
+
+/// Log in an external-signer account, whose registered signer gives it a
+/// running account worker.
+async fn login_external_signer_with_worker(
+    runtime: &MarmotAppRuntime,
+    url: &str,
+) -> AccountSetupResult {
+    let keys = Keys::generate();
+    let created = runtime
+        .login_external_signer(
+            keys.public_key().to_hex(),
+            TestExternalAccountSigner { keys },
+            AccountSetupRequest {
+                default_relays: vec![endpoint(url)],
+                bootstrap_relays: vec![endpoint(url)],
+                inbox_relays: Vec::new(),
+                discovery_relays: vec![endpoint(url)],
+                publish_missing_relay_lists: true,
+                publish_initial_key_package: true,
+                ..AccountSetupRequest::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(created.account.external_signing && !created.account.local_signing);
+    created
+}
+
+/// mdk#3318: archiving an external-signer account's chat goes through its
+/// running worker, as for a local signer (mdk#178). A direct storage write
+/// left the worker's in-memory record unarchived, and the worker's next save
+/// of that group's record, here for an inbound rename commit, wrote
+/// `archived = false` back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn external_signer_archive_survives_an_inbound_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, url) = mock_app(&dir).await;
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let alice = create_network_ready_identity(
+        &runtime,
+        AccountSetupRequest {
+            default_relays: vec![endpoint(&url)],
+            bootstrap_relays: vec![endpoint(&url)],
+            publish_initial_key_package: true,
+            ..AccountSetupRequest::default()
+        },
+    )
+    .await;
+    let alice_id = alice.account.account_id_hex.clone();
+    let bob = login_external_signer_with_worker(&runtime, &url).await;
+    let bob_id = bob.account.account_id_hex.clone();
+    let bob_label = bob.account.label.clone();
+    let mut events = runtime.subscribe();
+
+    let group_id = runtime
+        .create_group(
+            &alice_id,
+            "external signer archive",
+            std::slice::from_ref(&bob_id),
+            None,
+        )
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
+    wait_for_event(&mut events, |event| {
+        matches!(
+            event,
+            MarmotAppEvent::GroupJoined { account_id_hex, group_id: joined_group, .. }
+                if account_id_hex == &bob_id && joined_group == &group_id
+        )
+    })
+    .await;
+    let group_id_hex = hex::encode(group_id.as_slice());
+
+    let archived = runtime
+        .set_group_archived(&bob_id, &group_id_hex, true)
+        .await
+        .unwrap();
+    assert!(archived.archived);
+
+    // Bob's worker applies Alice's rename and saves the group's whole record.
+    let mut bob_group = runtime
+        .subscribe_group_state(&bob_id, &group_id_hex)
+        .await
+        .unwrap();
+    runtime
+        .update_group_profile(
+            &alice_id,
+            &group_id,
+            Some("renamed after archive".to_owned()),
+            None,
+        )
+        .await
+        .unwrap();
+    wait_for_group_state_update(&mut bob_group, |group| {
+        group.profile.name == "renamed after archive"
+    })
+    .await;
+
+    let stored = app.group(&bob_label, &group_id_hex).unwrap().unwrap();
+    assert_eq!(stored.profile.name, "renamed after archive");
+    assert!(
+        stored.archived,
+        "the worker's save of the renamed record must not unarchive the chat"
+    );
+    assert!(
+        runtime
+            .group_conversation_snapshot(&bob_id, &group_id)
+            .await
+            .unwrap()
+            .group
+            .archived,
+        "the worker's own record must carry the archive"
+    );
+    runtime.shutdown().await;
+}
+
+/// mdk#3318: forgetting or deleting an external-signer account's group goes
+/// through its running worker, as for a local signer. The worker drops the
+/// group from its own state before the host hears of it. A direct storage
+/// write left the worker holding the group's record: after a delete it kept
+/// answering for the group, and after a forget it read the record and failed
+/// in storage instead of not knowing the group.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn external_signer_forget_and_delete_go_through_the_accounts_worker() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, url) = mock_app(&dir).await;
+    let runtime = MarmotAppRuntime::new(app);
+    let account = login_external_signer_with_worker(&runtime, &url).await;
+    let account_id = account.account.account_id_hex;
+
+    for forget in [true, false] {
+        let group = runtime
+            .create_group(&account_id, "local only", &[], None)
+            .await
+            .unwrap()
+            .operation
+            .expect("a group with no other members");
+        let group_hex = hex::encode(group.as_slice());
+        runtime.group_mls_state(&account_id, &group).await.unwrap();
+        let removed = if forget {
+            runtime.forget_group_local(&account_id, &group).await
+        } else {
+            runtime.delete_group_local(&account_id, &group).await
+        };
+        assert!(removed.unwrap());
+        let mls_state = runtime.group_mls_state(&account_id, &group).await;
+        assert!(
+            matches!(&mls_state, Err(AppError::UnknownGroup(id)) if *id == group_hex),
+            "forget={forget}: the worker must not know the removed group: {mls_state:?}"
+        );
+        let snapshot = runtime
+            .group_conversation_snapshot(&account_id, &group)
+            .await
+            .map(|_| ());
+        assert!(
+            matches!(&snapshot, Err(AppError::UnknownGroup(id)) if *id == group_hex),
+            "forget={forget}: the worker must not know the removed group: {snapshot:?}"
+        );
+    }
+
+    runtime.shutdown().await;
+}
+
+/// mdk#3318: an account that signs on no worker, here a signed-out external
+/// signer, archives, forgets and deletes its chats in storage directly, and
+/// the worker it signs back in with starts from those writes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn signed_out_account_archives_forgets_and_deletes_without_a_worker() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, url) = mock_app(&dir).await;
+    let runtime = MarmotAppRuntime::new(app);
+    let account = login_external_signer_with_worker(&runtime, &url).await;
+    let account_id = account.account.account_id_hex;
+    let mut groups = Vec::new();
+    for name in ["archived", "forgotten", "deleted"] {
+        groups.push(
+            runtime
+                .create_group(&account_id, name, &[], None)
+                .await
+                .unwrap()
+                .operation
+                .expect("a group with no other members"),
+        );
+    }
+    let [archived, forgotten, deleted] = groups.try_into().unwrap();
+    runtime
+        .sign_out(&account_id, SignOutOptions::default())
+        .await
+        .unwrap();
+
+    let record = runtime
+        .set_group_archived(&account_id, &hex::encode(archived.as_slice()), true)
+        .await
+        .unwrap();
+    assert!(record.archived);
+    assert!(
+        runtime
+            .forget_group_local(&account_id, &forgotten)
+            .await
+            .unwrap()
+    );
+    assert!(
+        runtime
+            .delete_group_local(&account_id, &deleted)
+            .await
+            .unwrap()
+    );
+
+    assert!(runtime.sign_in_account(&account_id).await.unwrap().running);
+    assert!(
+        runtime
+            .group_conversation_snapshot(&account_id, &archived)
+            .await
+            .unwrap()
+            .group
+            .archived
+    );
+    for removed in [forgotten, deleted] {
+        let snapshot = runtime
+            .group_conversation_snapshot(&account_id, &removed)
+            .await
+            .map(|_| ());
+        assert!(
+            matches!(&snapshot, Err(AppError::UnknownGroup(id))
+                if *id == hex::encode(removed.as_slice())),
+            "the new worker must start without the removed group: {snapshot:?}"
+        );
+    }
+    runtime.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

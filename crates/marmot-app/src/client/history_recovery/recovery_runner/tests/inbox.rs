@@ -66,8 +66,8 @@ async fn recovery_runner_compares_the_inbox_never_sweeps_it_and_admits_its_wraps
 }
 
 /// An inbox relay that does not speak NIP-77 refuses the inbox's unit, which
-/// has no sweep to fall back on, so the route parks for a notice. A group on
-/// the same relay is swept as before.
+/// has no sweep to fall back on, so the route parks. A group on the same
+/// relay is swept as before.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn recovery_runner_breaks_an_inbox_unit_whose_relay_will_not_compare() {
     let account = account();
@@ -112,6 +112,58 @@ async fn recovery_runner_breaks_an_inbox_unit_whose_relay_will_not_compare() {
             .collect::<Vec<_>>(),
         [Route::Inbox]
     );
+}
+
+/// mdk#3308: an inbox relay that will not compare leaves the inbox owing up
+/// to the current second, so its broken unit always has more debt. Its later
+/// quanta wait instead of parking anew: the runner idles until the unit's
+/// probe time, probes once, and re-parks under the same revision for twice as
+/// long. No new park revision means no new notice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovery_runner_probes_a_refusing_inbox_relay_on_a_growing_interval() {
+    const BASE: u64 = RUNNER_PROBE_BASE_SECS;
+    let account = account();
+    let clock = Clock::new();
+    let t0 = clock.now();
+    let relay = ModelRelay::new(RELAY, caps(500, false))
+        .with_events(wraps(t0 - DAY, t0, HOUR))
+        .build();
+    let host = TestHost::new(
+        &account,
+        &clock,
+        vec![required(&Route::Inbox, &[RELAY])],
+        &[&relay],
+    );
+    account.goal(&Route::Inbox, t0 - DAY);
+    let (mut runner, _handle) = runner(&host, test_policy());
+
+    assert_eq!(ran(runner.step().await).outcome, Outcome::Refused);
+    let broken = account.unit(&Route::Inbox, RELAY);
+    let park = broken.park.expect("the refusal parked the inbox");
+    let due = broken.next_attempt_at_seconds;
+    assert_eq!(due, park.parked_at_seconds + BASE);
+
+    // Every second still owes the inbox more, and the runner waits for the
+    // probe rather than asking again.
+    for _ in 0..3 {
+        clock.advance(60);
+        assert_eq!(idle(runner.step().await), Some(due));
+    }
+    assert_eq!(account.unit(&Route::Inbox, RELAY).park, Some(park));
+
+    clock.advance_to(due);
+    let probe = ran(runner.step().await);
+    assert_eq!(
+        (probe.key.route, probe.outcome),
+        (Route::Inbox, Outcome::Refused)
+    );
+    let reparked = account.unit(&Route::Inbox, RELAY);
+    assert_eq!(reparked.park, Some(park), "the same revision");
+    assert!(!reparked.probe);
+    assert_eq!(reparked.next_attempt_at_seconds, due + 2 * BASE);
+    assert_eq!(idle(runner.step().await), Some(due + 2 * BASE));
+    assert_eq!(account.app.parked_recovery_routes().unwrap().len(), 1);
+    assert!(relay.fetched_ids().is_empty());
 }
 
 /// A relay that restricts the inbox's gift wraps refuses only the inbox's

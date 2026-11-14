@@ -99,6 +99,7 @@ pub(super) fn create(
 ) -> StorageResult<()> {
     if store.connection.is_current_thread_transaction_owner() {
         let conn = store.lock()?;
+        store.connection.note_openmls_write();
         return create_on_connection(&conn, group_id, name, scope);
     }
 
@@ -107,6 +108,7 @@ pub(super) fn create(
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .storage()?;
+        store.connection.note_openmls_write();
         create_on_connection(&tx, group_id, name, scope)?;
         tx.commit().storage()?;
         Ok(())

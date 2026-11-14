@@ -20,14 +20,12 @@ sha2.workspace = true
 libc.workspace = true
 marmot-account.workspace = true
 marmot-app.workspace = true
-marmot-markdown.workspace = true
 rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "time"] }
 tracing.workspace = true
-transport-quic-broker.workspace = true
 transport-quic-stream.workspace = true
 url.workspace = true
 zeroize.workspace = true

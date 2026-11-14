@@ -182,16 +182,16 @@ impl TransportPeeler for CountingEpochGatePeeler {
 
     async fn peel_group_message(
         &self,
-        msg: &TransportMessage,
+        msg: &cgka_traits::peeler::PreparedGroupMessage<'_>,
         ctx: &GroupContextSnapshot,
     ) -> Result<PeeledMessage, PeelerError> {
         *self
             .peel_attempts
             .lock()
             .unwrap()
-            .entry(msg.id.clone())
+            .entry(msg.message.id.clone())
             .or_insert(0) += 1;
-        epoch_gated_group_message(msg, ctx)
+        epoch_gated_group_message(msg.message, ctx)
     }
 
     async fn peel_welcome(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
@@ -238,13 +238,13 @@ impl TransportPeeler for UnavailableEpochGatePeeler {
 
     async fn peel_group_message(
         &self,
-        msg: &TransportMessage,
+        msg: &cgka_traits::peeler::PreparedGroupMessage<'_>,
         ctx: &GroupContextSnapshot,
     ) -> Result<PeeledMessage, PeelerError> {
         if self.unavailable.load(Ordering::SeqCst) {
             return Err(PeelerError::Backend("injected peeler unavailable".into()));
         }
-        epoch_gated_group_message(msg, ctx)
+        epoch_gated_group_message(msg.message, ctx)
     }
 
     async fn peel_welcome(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
@@ -325,7 +325,7 @@ impl TransportPeeler for CancellableEpochSealedPeeler {
 
     async fn peel_group_message(
         &self,
-        msg: &TransportMessage,
+        msg: &cgka_traits::peeler::PreparedGroupMessage<'_>,
         ctx: &GroupContextSnapshot,
     ) -> Result<PeeledMessage, PeelerError> {
         if self.blocked.load(Ordering::SeqCst) {
@@ -398,7 +398,7 @@ impl TransportPeeler for NotifyEpochGatePeeler {
 
     async fn peel_group_message(
         &self,
-        msg: &TransportMessage,
+        msg: &cgka_traits::peeler::PreparedGroupMessage<'_>,
         ctx: &GroupContextSnapshot,
     ) -> Result<PeeledMessage, PeelerError> {
         if self.gated.load(Ordering::SeqCst) {
@@ -407,7 +407,7 @@ impl TransportPeeler for NotifyEpochGatePeeler {
                 std::future::pending::<()>().await;
             }
         }
-        epoch_gated_group_message(msg, ctx)
+        epoch_gated_group_message(msg.message, ctx)
     }
 
     async fn peel_welcome(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
@@ -2848,6 +2848,79 @@ async fn publish_cycle_replay_derives_each_anchor_context_once() {
     );
 }
 
+/// Fresh unreadable live input pays one rewind per retained anchor, not per
+/// input or unchanged sweep. Snapshot mutations invalidate those secrets even
+/// when the live epoch and an overwritten anchor's name remain unchanged.
+#[tokio::test]
+async fn live_peel_cache_invalidation() {
+    let (mut carol, storage, group_id, parked) = carol_parked_behind_retained_anchors(1).await;
+    let epoch = carol.epoch(&group_id).unwrap();
+    let anchors: Vec<_> = storage
+        .list_group_snapshots(&group_id)
+        .unwrap()
+        .into_iter()
+        .filter(|name| {
+            name.strip_prefix("openmls-retained-anchor-")
+                .and_then(|suffix| suffix.parse::<u64>().ok())
+                .is_some_and(|anchor_epoch| anchor_epoch < epoch.0)
+        })
+        .collect();
+    assert!(!anchors.is_empty());
+    let warmed = carol.engine_metrics().past_peel_context_derivations;
+    assert!(warmed >= anchors.len() as u64);
+
+    for index in 0..4 {
+        let mut fresh = parked[0].clone();
+        fresh.id = hash_id(format!("fresh live cache input {index}").as_bytes());
+        assert!(matches!(
+            carol.ingest(fresh.clone()).await.unwrap(),
+            IngestOutcome::TransportDeferred { .. }
+        ));
+        carol.retry_deferred_peels(&group_id).await.unwrap();
+        carol.retry_deferred_peels(&group_id).await.unwrap();
+        assert_eq!(
+            carol.engine_metrics().past_peel_context_derivations,
+            warmed,
+            "fresh ids and unchanged sweeps must not rederive retained contexts"
+        );
+        assert_eq!(
+            storage.get_message(&fresh.id).unwrap().state,
+            MessageState::PeelDeferred
+        );
+    }
+
+    // Replacing an existing name changes its identity even though neither the
+    // canonical epoch nor the anchor-name set moves.
+    storage
+        .create_group_state_snapshot(&group_id, &anchors[0])
+        .unwrap();
+    let mut after_replacement = parked[0].clone();
+    after_replacement.id = hash_id(b"after same-name anchor replacement");
+    assert!(matches!(
+        carol.ingest(after_replacement).await.unwrap(),
+        IngestOutcome::TransportDeferred { .. }
+    ));
+    let replaced = carol.engine_metrics().past_peel_context_derivations;
+    assert_eq!(replaced - warmed, anchors.len() as u64);
+
+    storage
+        .release_group_snapshot(&group_id, &anchors[0])
+        .unwrap();
+    let mut after_pruning = parked[0].clone();
+    after_pruning.id = hash_id(b"after retained anchor pruning");
+    assert!(matches!(
+        carol.ingest(after_pruning).await.unwrap(),
+        IngestOutcome::TransportDeferred { .. }
+    ));
+    assert_eq!(
+        carol.engine_metrics().past_peel_context_derivations - replaced,
+        (anchors.len() - 1) as u64,
+        "pruning invalidates the old cache without restoring the released anchor"
+    );
+    assert_eq!(carol.epoch(&group_id).unwrap(), epoch);
+    assert_eq!(carol.group_context(&group_id).unwrap().epoch(), epoch);
+}
+
 /// If account accounting was initialized by group A, a later deferral in
 /// group B is charged incrementally. Group B's first sweep must reconcile that
 /// contribution rather than adding the same durable bytes again.
@@ -4420,8 +4493,8 @@ async fn explicit_time_advance_ignores_wall_budget_but_keeps_row_bound() {
     panic!("deterministic slices must finish retained work");
 }
 
-/// Opaque future messages all try the same retained past anchor. Snapshot
-/// materialization must be proportional to anchors in the sweep, not rows.
+/// Opaque future messages warm retained-anchor contexts during live ingest.
+/// A later sweep reuses those contexts without another durable rewind.
 #[tokio::test]
 async fn historical_peel_context_materialization_is_amortized_within_a_sweep() {
     use cgka_traits::storage::{GroupStorage, StorageProvider};
@@ -4452,9 +4525,9 @@ async fn historical_peel_context_materialization_is_amortized_within_a_sweep() {
         let before = storage.mls_write_generation().unwrap();
         carol.retry_deferred_peels(&group_id).await.unwrap();
         let writes = storage.mls_write_generation().unwrap() - before;
-        assert!(
-            writes > 0,
-            "the sweep must actually materialize a historical anchor"
+        assert_eq!(
+            writes, 0,
+            "the sweep reuses contexts derived by live ingest"
         );
         for (id, attempts) in ids {
             assert!(
@@ -4480,7 +4553,7 @@ async fn historical_peel_context_materialization_is_amortized_within_a_sweep() {
     }
     assert_eq!(
         write_counts[0], write_counts[1],
-        "32 failed peels must materialize the same anchor only once, like one failed peel"
+        "sweep reuse must not depend on backlog length"
     );
 }
 

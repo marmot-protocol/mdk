@@ -12,15 +12,12 @@ use std::sync::{Arc, Once};
 
 use marmot_account::AccountHome;
 use marmot_uniffi::{
-    AuditLogSettingsFfi, AuditLogTrackerConfigV4Ffi, AuditLogUploadSourceV4Ffi,
-    CursorPersistenceFfi, Marmot, MarmotKitError, MediaAttachmentReferenceFfi, MediaLocatorFfi,
-    MediaUploadAttachmentRequestFfi, MediaUploadRequestFfi, MessageDraftAttachmentFfi,
-    MessageTagFfi, NotificationWakeSourceFfi, PushPlatformFfi, RelayEndpointPolicyFfi,
-    RelayTelemetrySettingsFfi, TimelineMessageQueryFfi, parse_media_imeta_tag,
+    AuditLogSettingsFfi, AuditLogSourceFfi, CursorPersistenceFfi, Marmot, MarmotKitError,
+    MediaAttachmentReferenceFfi, MediaLocatorFfi, MediaUploadAttachmentRequestFfi,
+    MediaUploadRequestFfi, MessageDraftAttachmentFfi, MessageTagFfi, NotificationWakeSourceFfi,
+    PushPlatformFfi, RelayEndpointPolicyFfi, RelayTelemetrySettingsFfi, TimelineMessageQueryFfi,
+    parse_media_imeta_tag,
 };
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
-use tokio::sync::oneshot;
 
 include!(concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -41,93 +38,6 @@ fn install_mock_keyring() {
             keyring_core::set_default_store(store);
         }
     });
-}
-
-struct CapturedAuditUpload {
-    method: String,
-    path: String,
-    authorization: Option<String>,
-    content_type: Option<String>,
-    hardware_model: Option<String>,
-    platform: Option<String>,
-    app_version: Option<String>,
-    body: Vec<u8>,
-}
-
-fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .position(|window| window == needle)
-}
-
-fn header_value(headers: &str, name: &str) -> Option<String> {
-    headers.lines().find_map(|line| {
-        let (candidate, value) = line.split_once(':')?;
-        candidate
-            .eq_ignore_ascii_case(name)
-            .then(|| value.trim().to_owned())
-    })
-}
-
-async fn capture_audit_upload(listener: TcpListener, tx: oneshot::Sender<CapturedAuditUpload>) {
-    let Ok((mut stream, _)) = listener.accept().await else {
-        return;
-    };
-    let mut buf = Vec::new();
-    let mut chunk = [0_u8; 4096];
-    loop {
-        let read = match stream.read(&mut chunk).await {
-            Ok(0) | Err(_) => return,
-            Ok(read) => read,
-        };
-        buf.extend_from_slice(&chunk[..read]);
-
-        let Some(header_end) = find_subsequence(&buf, b"\r\n\r\n").map(|pos| pos + 4) else {
-            continue;
-        };
-        let headers = String::from_utf8_lossy(&buf[..header_end]).to_string();
-        let content_length = headers
-            .lines()
-            .find_map(|line| {
-                line.to_ascii_lowercase()
-                    .strip_prefix("content-length:")
-                    .and_then(|value| value.trim().parse::<usize>().ok())
-            })
-            .unwrap_or(0);
-        while buf.len() < header_end + content_length {
-            match stream.read(&mut chunk).await {
-                Ok(0) | Err(_) => break,
-                Ok(read) => buf.extend_from_slice(&chunk[..read]),
-            }
-        }
-
-        let request_line = headers.lines().next().unwrap_or_default();
-        let mut parts = request_line.split_whitespace();
-        let method = parts.next().unwrap_or_default().to_owned();
-        let path = parts.next().unwrap_or_default().to_owned();
-        let authorization = header_value(&headers, "authorization");
-        let content_type = header_value(&headers, "content-type");
-        let hardware_model = header_value(&headers, "x-goggles-hardware-model");
-        let platform = header_value(&headers, "x-goggles-platform");
-        let app_version = header_value(&headers, "x-goggles-app-version");
-        let body = buf[header_end..header_end + content_length].to_vec();
-
-        let _ = stream
-            .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
-            .await;
-        let _ = stream.shutdown().await;
-        let _ = tx.send(CapturedAuditUpload {
-            method,
-            path,
-            authorization,
-            content_type,
-            hardware_model,
-            platform,
-            app_version,
-            body,
-        });
-        return;
-    }
 }
 
 #[tokio::test]
@@ -1098,7 +1008,7 @@ fn audit_log_binding_lists_local_jsonl_logs() {
 }
 
 #[tokio::test]
-async fn audit_log_binding_posts_jsonl_file() {
+async fn audit_log_binding_sets_source_and_reports_tracker_update_without_destination() {
     install_mock_keyring();
     let tmp = tempfile::tempdir().expect("tempdir");
     let kit = Marmot::new(
@@ -1107,137 +1017,27 @@ async fn audit_log_binding_posts_jsonl_file() {
         marmot_uniffi::marmot_deployment_white_noise(),
     )
     .expect("open marmot kit");
-    let account = AccountHome::open_with_keychain(
-        tmp.path(),
-        marmot_uniffi::marmot_deployment_white_noise().keychain_service,
-    )
-    .expect("open account home")
-    .create_nostr_account()
-    .expect("create local account");
-    let audit_body = b"{\"schema_version\":\"marmot-forensics-audit/v4\",\"wall_time_ms\":0,\"engine_id\":\"test-engine\",\"kind\":{\"type\":\"recorder_started\",\"recorder\":\"test\"},\"seq\":1}\n{\"schema_version\":\"marmot-forensics-audit/v4\",\"wall_time_ms\":0,\"engine_id\":\"test-engine\",\"kind\":{\"type\":\"recorder_started\",\"recorder\":\"test\"},\"seq\":2}\n";
-    let audit_path = AccountHome::open_with_keychain(
-        tmp.path(),
-        marmot_uniffi::marmot_deployment_white_noise().keychain_service,
-    )
-    .expect("reopen account home")
-    .account_dir(&account.label)
-    .join("audit-binding-upload.jsonl");
-    std::fs::write(&audit_path, audit_body).expect("write audit log");
 
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let (tx, rx) = oneshot::channel();
-    let server = tokio::spawn(capture_audit_upload(listener, tx));
-
-    let result = kit
-        .post_audit_log_file(
-            audit_path.to_string_lossy().into_owned(),
-            format!("http://{addr}/ingest"),
-        )
-        .await
-        .expect("post audit log through binding");
-
-    assert_eq!(
-        std::fs::canonicalize(&result.path).expect("canonical result path"),
-        std::fs::canonicalize(&audit_path).expect("canonical audit path")
-    );
-    assert_eq!(result.status, 204);
-    assert_eq!(result.bytes_sent, audit_body.len() as u64);
-    let captured = rx.await.expect("captured upload");
-    assert_eq!(captured.method, "POST");
-    assert_eq!(captured.path, "/ingest");
-    assert_eq!(
-        captured.content_type.as_deref(),
-        Some("application/x-ndjson")
-    );
-    assert_eq!(captured.body, audit_body);
-
-    server.await.unwrap();
-}
-
-#[tokio::test]
-async fn audit_log_binding_posts_tracker_update() {
-    install_mock_keyring();
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let kit = Marmot::new(
-        tmp.path().to_string_lossy().into_owned(),
-        vec!["wss://relay.invalid.test".to_string()],
-        marmot_uniffi::marmot_deployment_white_noise(),
-    )
-    .expect("open marmot kit");
-    let account = AccountHome::open_with_keychain(
-        tmp.path(),
-        marmot_uniffi::marmot_deployment_white_noise().keychain_service,
-    )
-    .expect("open account home")
-    .create_nostr_account()
-    .expect("create local account");
-    let audit_body = b"{\"schema_version\":\"marmot-forensics-audit/v4\",\"wall_time_ms\":0,\"engine_id\":\"test-engine\",\"kind\":{\"type\":\"recorder_started\",\"recorder\":\"test\"},\"seq\":1}\n{\"schema_version\":\"marmot-forensics-audit/v4\",\"wall_time_ms\":0,\"engine_id\":\"test-engine\",\"kind\":{\"type\":\"recorder_started\",\"recorder\":\"test\"},\"seq\":2}\n";
-    let audit_path = AccountHome::open_with_keychain(
-        tmp.path(),
-        marmot_uniffi::marmot_deployment_white_noise().keychain_service,
-    )
-    .expect("reopen account home")
-    .account_dir(&account.label)
-    .join("audit-binding-tracker.jsonl");
-    std::fs::write(&audit_path, audit_body).expect("write audit log");
-
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let (tx, rx) = oneshot::channel();
-    let server = tokio::spawn(capture_audit_upload(listener, tx));
+    let returned = kit
+        .set_audit_log_source(AuditLogSourceFfi {
+            hardware_model: Some(" iPhone17,3 ".to_owned()),
+            platform: Some("ios".to_owned()),
+            app_version: Some("   ".to_owned()),
+        })
+        .expect("set audit source");
+    assert_eq!(returned.hardware_model.as_deref(), Some("iPhone17,3"));
+    assert_eq!(returned.platform.as_deref(), Some("ios"));
+    assert_eq!(returned.app_version, None, "blank fields are cleared");
 
     kit.set_audit_log_settings(AuditLogSettingsFfi { enabled: true })
         .await
         .expect("enable audit logs");
-    let returned = kit
-        .set_audit_log_tracker_config(AuditLogTrackerConfigV4Ffi {
-            endpoint: Some(format!("http://{addr}/api/v1/audit-logs/")),
-            authorization_bearer_token: Some("goggles_binding_secret".to_owned()),
-            source: AuditLogUploadSourceV4Ffi {
-                hardware_model: Some("iPhone17,3".to_owned()),
-                platform: Some("ios".to_owned()),
-                app_version: Some("2026.6.8".to_owned()),
-            },
-        })
-        .expect("configure audit tracker");
-    assert!(
-        returned.authorization_bearer_token.is_none(),
-        "tracker credentials are write-only"
-    );
-    assert_eq!(
-        returned.endpoint.as_deref(),
-        Some(format!("http://{addr}/api/v1/audit-logs/").as_str())
-    );
-    assert_eq!(returned.source.platform.as_deref(), Some("ios"));
-
     let result = kit
-        .post_audit_log_tracker_update()
+        .post_audit_log_tracker_update_v5()
         .await
-        .expect("post tracker update");
-
+        .expect("manual tracker pass");
     assert!(result.enabled);
-    assert_eq!(result.skipped_reason, None);
-    assert_eq!(result.uploaded.len(), 1);
-    assert_eq!(result.uploaded[0].status, 204);
-    assert_eq!(result.uploaded[0].bytes_sent, audit_body.len() as u64);
-    let captured = rx.await.expect("captured upload");
-    assert_eq!(captured.method, "POST");
-    assert_eq!(captured.path, "/api/v1/audit-logs/");
-    assert_eq!(
-        captured.authorization.as_deref(),
-        Some("Bearer goggles_binding_secret")
-    );
-    assert_eq!(
-        captured.content_type.as_deref(),
-        Some("application/x-ndjson")
-    );
-    assert_eq!(captured.hardware_model.as_deref(), Some("iPhone17,3"));
-    assert_eq!(captured.platform.as_deref(), Some("ios"));
-    assert_eq!(captured.app_version.as_deref(), Some("2026.6.8"));
-    assert_eq!(captured.body, audit_body);
-
-    server.await.unwrap();
+    assert!(result.v5.is_none(), "no destination, no delivery result");
 }
 
 #[tokio::test]

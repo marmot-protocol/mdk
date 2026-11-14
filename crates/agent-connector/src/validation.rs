@@ -11,8 +11,6 @@ use crate::{
     AGENT_SOCKET_DIR_MODE, AGENT_SOCKET_MODE, AgentConnectorConfig, MAX_PROFILE_FIELD_CHARS,
     MAX_PROFILE_NAME_CHARS,
 };
-#[cfg(test)]
-use crate::{INVITE_POLICY_RETRY_BASE, INVITE_POLICY_RETRY_MAX};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct InvitePolicyKey {
@@ -78,22 +76,9 @@ impl InvitePolicyRetryState {
             .min()
     }
 
-    /// Record a failure on the production backoff constants. The worker uses
-    /// [`Self::record_failure_with`] (its schedule is injectable for tests);
-    /// this convenience remains for tests that pin the production constants.
-    #[cfg(test)]
-    pub(crate) fn record_failure(
-        &mut self,
-        key: InvitePolicyKey,
-        now: tokio::time::Instant,
-    ) -> (u32, Duration) {
-        self.record_failure_with(key, now, INVITE_POLICY_RETRY_BASE, INVITE_POLICY_RETRY_MAX)
-    }
-
-    /// Record a failure with an explicit backoff schedule. Production callers
-    /// use [`Self::record_failure`] (the crate constants); the worker passes
-    /// its [`crate::invite_policy::InvitePolicySchedule`] through so tests can
-    /// compress the schedule.
+    /// Record a failure with an explicit backoff schedule. The worker passes its
+    /// [`crate::invite_policy::InvitePolicySchedule`] through so tests can compress
+    /// the schedule.
     pub(crate) fn record_failure_with(
         &mut self,
         key: InvitePolicyKey,

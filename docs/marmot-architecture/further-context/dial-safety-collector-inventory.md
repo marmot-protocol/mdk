@@ -1,7 +1,7 @@
 ---
 title: "Dial Safety Collector Inventory"
 created: 2026-09-15
-updated: 2026-10-27
+updated: 2026-11-13
 tags: [marmot, security, network, ssrf, collector, audit]
 status: current-implementation
 ---
@@ -10,13 +10,13 @@ status: current-implementation
 
 This is the implementation inventory behind the
 [Dial Safety](../overview/dial-safety.md) overview for the shared collector helper and
-the forensic audit uploader that reuses it. It is not an assurance that every other
+the audit OTLP sender that reuses it. It is not an assurance that every other
 workspace HTTP client has been audited.
 
 ## Shared helper
 
 `crates/marmot-observability/src/collector_host_safety.rs` is the default-build chokepoint for
-OTLP export, product analytics, and forensic audit-log POST uploads.
+OTLP export, product analytics, and v5 audit OTLP delivery.
 
 - Parse the configured URL with `export_config::parse_relay_telemetry_endpoint` before DNS.
   Reject missing hosts, unusable ports, userinfo, fragments, unsupported schemes, and
@@ -44,35 +44,32 @@ OTLP export, product analytics, and forensic audit-log POST uploads.
 - DNS and connect are bounded at 10 seconds. The helper's request timeout is 30
   seconds. It does not wrap resolve-plus-send in an enclosing attempt deadline.
 
-## Forensic audit upload
+## Audit OTLP delivery
 
-`crates/marmot-observability/src/audit_upload.rs` uses the same helper after snapshot capture and
-v4 eligibility. It adds:
+`crates/marmot-observability/src/audit_otlp_sender.rs` uses the same helper for the host-configured v5
+audit destination. It adds:
 
-- retired-host rejection at the configured-URL gate, including case and trailing-root-dot
-  equivalents, without copying endpoint literals;
-- a 60-second request-level override and enclosing network-attempt deadline so explicit
-  DNS cannot outlive the audit budget;
-- bearer auth and the existing source headers only after validation and pinning;
-- context-free `AuditLogUpload` messages or a numeric HTTP status, without endpoint,
-  address, auth, header, or body material; `marmot-app` reports them as
-  `AppError::AuditLogUpload`.
+- retired-host rejection at the configured-URL gate (`collector_host_safety::host_is_retired`),
+  including case and trailing-root-dot equivalents, without copying endpoint literals;
+- loopback only under the host's explicit `allow_loopback_dev` flag;
+- an enclosing deadline equal to the helper's 30-second request timeout around resolve-plus-send;
+- the bearer token only after validation and pinning.
 
-See [Forensic Audit Logging Inventory](../audit-logging.md) for the upload contract,
-checkpointing, and header set.
+See [Forensic Audit Logging Inventory](../audit-logging.md#v5-recording-and-delivery) for the delivery
+contract.
 
 ## Timeouts
 
 The shared helper supplies DNS/connect and request bounds only. Enclosing
 attempt deadlines belong to callers.
 
-| Budget | Shared helper | OTLP export | Product analytics | Audit upload |
+| Budget | Shared helper | OTLP export | Product analytics | Audit OTLP |
 | --- | --- | --- | --- | --- |
 | DNS / connect | 10s | 10s (helper) | 10s (helper) | 10s (helper) |
-| Request | 30s | 30s (helper) | 30s (helper) | 60s request override |
-| Enclosing attempt | none | 30s resolve+send wrapper | none on send; 2s explicit-flush wrapper | 60s network-attempt deadline |
+| Request | 30s | 30s (helper) | 30s (helper) | 30s (helper) |
+| Enclosing attempt | none | 30s resolve+send wrapper | none on send; 2s explicit-flush wrapper | 30s resolve+send wrapper |
 
 ## Residual
 
-This inventory documents the collector helper and the audit uploader that shares it.
+This inventory documents the collector helper and the audit OTLP sender that shares it.
 Other workspace HTTP clients keep their own chokepoints on the overview page.

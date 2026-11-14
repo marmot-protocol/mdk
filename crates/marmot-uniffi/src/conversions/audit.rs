@@ -1,10 +1,9 @@
-//! Audit-log file, settings, upload, and tracker FFI conversions.
+//! Audit-log file, settings, source, and tracker FFI conversions.
 
 use marmot_app::{
     AuditDeliveryBacklog, AuditDeliveryFailure, AuditDeliveryFailureKind, AuditDeliveryStatus,
-    AuditLogDeleteOutcome, AuditLogFile, AuditLogRetention, AuditLogSettings,
-    AuditLogTrackerConfig, AuditLogTrackerUpdateResult, AuditLogUploadResult, AuditLogUploadSource,
-    AuditOtlpTrackerResult,
+    AuditLogDeleteOutcome, AuditLogFile, AuditLogRetention, AuditLogSettings, AuditLogSource,
+    AuditLogTrackerUpdateResult, AuditOtlpTrackerResult,
 };
 
 #[derive(Clone, Debug, uniffi::Record)]
@@ -29,23 +28,6 @@ impl From<AuditLogFile> for AuditLogFileFfi {
 }
 
 #[derive(Clone, Debug, uniffi::Record)]
-pub struct AuditLogUploadResultFfi {
-    pub path: String,
-    pub status: u16,
-    pub bytes_sent: u64,
-}
-
-impl From<AuditLogUploadResult> for AuditLogUploadResultFfi {
-    fn from(value: AuditLogUploadResult) -> Self {
-        Self {
-            path: value.path,
-            status: value.status,
-            bytes_sent: value.bytes_sent,
-        }
-    }
-}
-
-#[derive(Clone, Debug, uniffi::Record)]
 pub struct AuditLogDeleteResultFfi {
     /// `true` when a live recorder was rotated and is already recording to a
     /// fresh file; `false` when the file was simply removed (no live recorder,
@@ -61,30 +43,12 @@ impl From<AuditLogDeleteOutcome> for AuditLogDeleteResultFfi {
     }
 }
 
-#[derive(Clone, Debug, uniffi::Record)]
-pub struct AuditLogTrackerUpdateResultFfi {
-    pub enabled: bool,
-    pub uploaded: Vec<AuditLogUploadResultFfi>,
-    pub skipped_reason: Option<String>,
-}
-
-impl From<AuditLogTrackerUpdateResult> for AuditLogTrackerUpdateResultFfi {
-    fn from(value: AuditLogTrackerUpdateResult) -> Self {
-        Self {
-            enabled: value.enabled,
-            uploaded: value.uploaded.into_iter().map(Into::into).collect(),
-            skipped_reason: value.skipped_reason,
-        }
-    }
-}
-
-/// Additive result for v5-aware hosts; the historical result and C layout stay
-/// unchanged while the new result reports the OTLP path independently.
+/// Result of one manual tracker pass.
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct AuditLogTrackerUpdateResultV5Ffi {
+    /// Whether audit logging is enabled.
     pub enabled: bool,
-    pub v4_uploaded: Vec<AuditLogUploadResultFfi>,
-    pub v4_skipped_reason: Option<String>,
+    /// The v5 OTLP delivery pass; `None` when no destination is configured.
     pub v5: Option<AuditOtlpTrackerResultV5Ffi>,
 }
 
@@ -92,8 +56,6 @@ impl From<AuditLogTrackerUpdateResult> for AuditLogTrackerUpdateResultV5Ffi {
     fn from(value: AuditLogTrackerUpdateResult) -> Self {
         Self {
             enabled: value.enabled,
-            v4_uploaded: value.uploaded.into_iter().map(Into::into).collect(),
-            v4_skipped_reason: value.skipped_reason,
             v5: value.v5.map(Into::into),
         }
     }
@@ -317,16 +279,19 @@ impl From<AuditLogRetentionFfi> for AuditLogRetention {
     }
 }
 
+/// Source metadata recorded in each new audit recorder's `source_context`
+/// row. Every field is optional and trimmed; blank becomes `None`.
 #[derive(Clone, Debug, uniffi::Record)]
-pub struct AuditLogUploadSourceV4Ffi {
-    /// System model identifier; never a user-assigned device name, hostname, or serial number.
+pub struct AuditLogSourceFfi {
+    /// System model identifier (for example `iPhone17,3`); never a
+    /// user-assigned device name, hostname, or serial number.
     pub hardware_model: Option<String>,
     pub platform: Option<String>,
     pub app_version: Option<String>,
 }
 
-impl From<AuditLogUploadSourceV4Ffi> for AuditLogUploadSource {
-    fn from(value: AuditLogUploadSourceV4Ffi) -> Self {
+impl From<AuditLogSourceFfi> for AuditLogSource {
+    fn from(value: AuditLogSourceFfi) -> Self {
         Self {
             hardware_model: value.hardware_model,
             platform: value.platform,
@@ -335,63 +300,12 @@ impl From<AuditLogUploadSourceV4Ffi> for AuditLogUploadSource {
     }
 }
 
-impl From<AuditLogUploadSource> for AuditLogUploadSourceV4Ffi {
-    fn from(value: AuditLogUploadSource) -> Self {
+impl From<AuditLogSource> for AuditLogSourceFfi {
+    fn from(value: AuditLogSource) -> Self {
         Self {
             hardware_model: value.hardware_model,
             platform: value.platform,
             app_version: value.app_version,
-        }
-    }
-}
-
-/// V4 tracker config. The versioned type name changes the UniFFI method checksum
-/// so old generated bindings cannot reinterpret device labels as hardware models.
-/// Write-only across FFI:
-/// `authorization_bearer_token` is accepted here but never returned back to
-/// the host — [`redacted`](Self::redacted) strips it — and the hand-written
-/// `Debug` impl below never prints it.
-#[derive(Clone, uniffi::Record)]
-pub struct AuditLogTrackerConfigV4Ffi {
-    pub endpoint: Option<String>,
-    pub authorization_bearer_token: Option<String>,
-    pub source: AuditLogUploadSourceV4Ffi,
-}
-
-impl std::fmt::Debug for AuditLogTrackerConfigV4Ffi {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AuditLogTrackerConfigV4Ffi")
-            .field("endpoint", &self.endpoint)
-            .field(
-                "authorization_bearer_token",
-                &self
-                    .authorization_bearer_token
-                    .as_ref()
-                    .map(|_| "<redacted>"),
-            )
-            .field("source", &self.source)
-            .finish()
-    }
-}
-
-impl From<AuditLogTrackerConfigV4Ffi> for AuditLogTrackerConfig {
-    fn from(value: AuditLogTrackerConfigV4Ffi) -> Self {
-        Self {
-            endpoint: value.endpoint,
-            authorization_bearer_token: value.authorization_bearer_token,
-            source: value.source.into(),
-        }
-    }
-}
-
-impl AuditLogTrackerConfigV4Ffi {
-    /// The stored config with the bearer token stripped, for returning across
-    /// FFI: secrets flow in through setters but are never handed back out.
-    pub(crate) fn redacted(value: AuditLogTrackerConfig) -> Self {
-        Self {
-            endpoint: value.endpoint,
-            authorization_bearer_token: None,
-            source: value.source.into(),
         }
     }
 }
@@ -401,38 +315,6 @@ mod tests {
     use super::*;
 
     const TOKEN: &str = "super-secret-bearer-token";
-
-    fn config_with_token() -> AuditLogTrackerConfigV4Ffi {
-        AuditLogTrackerConfigV4Ffi {
-            endpoint: Some("https://goggles.example/upload".to_owned()),
-            authorization_bearer_token: Some(TOKEN.to_owned()),
-            source: AuditLogUploadSourceV4Ffi {
-                hardware_model: Some("TestModel".to_owned()),
-                platform: None,
-                app_version: None,
-            },
-        }
-    }
-
-    #[test]
-    fn audit_tracker_config_debug_redacts_bearer_token() {
-        let rendered = format!("{:?}", config_with_token());
-        assert!(!rendered.contains(TOKEN), "{rendered}");
-        assert!(rendered.contains("<redacted>"), "{rendered}");
-        // Non-secret fields stay visible for diagnostics.
-        assert!(rendered.contains("goggles.example"), "{rendered}");
-    }
-
-    #[test]
-    fn audit_tracker_config_redacted_strips_bearer_token() {
-        let stored: AuditLogTrackerConfig = config_with_token().into();
-        let returned = AuditLogTrackerConfigV4Ffi::redacted(stored);
-        assert_eq!(returned.authorization_bearer_token, None);
-        assert_eq!(
-            returned.endpoint.as_deref(),
-            Some("https://goggles.example/upload")
-        );
-    }
 
     #[test]
     fn v5_otlp_config_debug_and_result_never_echo_token() {
@@ -447,40 +329,5 @@ mod tests {
         let returned = config.redacted();
         assert!(returned.authorization_bearer_token.is_none());
         assert!(returned.enabled);
-    }
-
-    #[test]
-    fn legacy_tracker_result_keeps_v4_reason_regardless_of_v5_outcome() {
-        for v5 in [
-            AuditOtlpTrackerResult {
-                accepted_batches: 1,
-                ..Default::default()
-            },
-            AuditOtlpTrackerResult {
-                pending_accounts: 1,
-                ..Default::default()
-            },
-            AuditOtlpTrackerResult {
-                blocked_accounts: 1,
-                ..Default::default()
-            },
-        ] {
-            let result = AuditLogTrackerUpdateResult {
-                enabled: true,
-                uploaded: vec![],
-                skipped_reason: Some("audit log tracker authorization token missing".to_owned()),
-                v5: Some(v5.clone()),
-            };
-            let legacy: AuditLogTrackerUpdateResultFfi = result.clone().into();
-            assert_eq!(
-                legacy.skipped_reason.as_deref(),
-                Some("audit log tracker authorization token missing")
-            );
-            let versioned: AuditLogTrackerUpdateResultV5Ffi = result.into();
-            let versioned_v5 = versioned.v5.unwrap();
-            assert_eq!(versioned_v5.accepted_batches, v5.accepted_batches);
-            assert_eq!(versioned_v5.pending_accounts, v5.pending_accounts);
-            assert_eq!(versioned_v5.blocked_accounts, v5.blocked_accounts);
-        }
     }
 }

@@ -14,6 +14,13 @@
   older binaries refuse the upgraded database. Downgrade is unsupported.
 - `PreparedGroupImageUploadRecord` carries the optional report, written through
   `SqliteAppStorage::save_prepared_image_members` before canonical creation.
+- `RecoveryUnitPolicy` gains `probe_base_seconds` and `probe_cap_seconds` (mdk#3308); struct literals must set them.
+  Every park now schedules the broken unit's next timed probe: a new park waits the base, and a failed probe
+  re-parks under the same revision and waits the base doubled once per failed probe, up to the cap. The upgrade
+  conversion's parks are due at once. Units broken before this release keep their past `next_attempt_at_seconds`, so
+  their first probe is due as soon as the runner arms it.
+- `SqliteAppStorage::dismiss_recovery_route_park` and `dismiss_recovery_route_park_on` are removed: nothing dismisses a
+  coverage-ledger park any more. A route's remainder lasts until a rejoin or the route's end.
 
 ### Added
 
@@ -22,6 +29,24 @@
 - `SqliteAppStorage::sticker_pack_relays` and `set_sticker_pack_relays` retain sticker-pack relay hints independently
   of NIP-01 replacement metadata (mdk#3283). Account migration 0202 adds `relays_json`, defaulting existing packs to
   an empty list. Pack replacement preserves retained hints.
+- `SqliteAppStorage::arm_due_recovery_probes(now)` gives every broken unit without a probe whose next probe time has
+  passed a probe, so its debt includes its park again; `pending_recovery_probes()` lists the broken units still
+  waiting for one.
+
+### Changed
+
+- `SqliteAppStorage::retire_gone_recovery_units` counts a unit only when it newly retires it as route gone. A unit
+  already retired as route gone, as a retried route settlement finds it, still retires its newly owed seconds but is
+  not counted again, so the recovery runner's `retired_gone` audit row is written once.
+
+### Fixed
+
+- Withdrawing a delete of an edit reports `MessageEditedOrReprojected` for the edited message and
+  `ReplyPreviewChanged` for replies quoting it, instead of `ReactionAdded`. Restored poll responses also use the
+  reprojection trigger; restored reactions keep `ReactionAdded` (mdk#3377).
+- Batch timeline withdrawals and branch-selection revivals attribute each changed row's trigger to an event that
+  affected it, rather than the first event in the batch. Every cause participates: conflicting or unmatched causes
+  use the generic reprojection trigger, including simultaneous reaction and reply-preview changes (mdk#2843).
 
 ## 0.16.0 - 2026-11-12
 

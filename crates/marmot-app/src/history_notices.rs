@@ -10,11 +10,10 @@ use storage_sqlite::{
 use crate::AppError;
 
 /// Why recovery parked. Hosts choose wording from this; it carries no
-/// identities. Current epoch-gap exhaustion emits `EpochGap`; coverage-ledger
-/// parks emit `UnprovenHistory` without attributing the original reason history
-/// was owed; a rejoin emits `BeforeRejoin`. Other labels preserve
-/// compatibility; `KnownEvent` and `MaintenanceBoundary` remain reserved for
-/// parking policy.
+/// identities. Current epoch-gap exhaustion emits `EpochGap`; a rejoin emits
+/// `BeforeRejoin`. Other labels preserve compatibility, so keep exhaustive
+/// matches: `UnprovenHistory` is no longer produced, and `KnownEvent` and
+/// `MaintenanceBoundary` remain reserved for parking policy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HistoryNoticeCause {
@@ -36,9 +35,12 @@ pub enum HistoryNoticeCause {
     KnownEvent,
     /// A post-join maintenance boundary was never observed.
     MaintenanceBoundary,
-    /// The recovery runner could not prove this history on a route's relays
-    /// and stopped retrying them: a group's (`group_id_hex` names it) or the
-    /// account inbox's. The runner does not know why the history was owed.
+    /// No longer produced (mdk#3308); kept so hosts' exhaustive matches and
+    /// stored values still decode. Earlier releases raised it when the
+    /// recovery runner could not prove history on a route's relays: a
+    /// group's or the account inbox's. The runner now probes such relays
+    /// quietly, and no notice shows without evidence that messages are
+    /// missing.
     UnprovenHistory,
     /// The device rejoined the group (`group_id_hex` names it): a Welcome
     /// installed a new copy in place of its old one. That is an automatic
@@ -120,9 +122,9 @@ pub struct AccountRecoveryStatus {
 
 const NOTICE_ID_BYTES: usize = 24;
 
-/// What a ledger-parked route's notice ids carry in place of an obligation
-/// id: a domain-separated hash of the route, so the id never names it. With
-/// the route's park revision it is the notice's ticket.
+/// A domain-separated hash of a coverage-ledger route, so an id never names
+/// it. Ledger-parked routes' notice ids carried it before mdk#3308; the
+/// recovery runner's audit rows reference it as a route's `obligation_ref`.
 pub(crate) fn ledger_route_tag(route: &TransportReconciliationRoute) -> [u8; 16] {
     let mut hash = Sha256::new();
     hash.update(b"marmot-app/history-notice/ledger-route/v1");

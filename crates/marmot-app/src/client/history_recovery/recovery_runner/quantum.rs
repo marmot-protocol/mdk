@@ -35,7 +35,7 @@ use cgka_traits::transport_adapter::TransportEndpointRejectionCategory;
 use nostr::prelude::Event;
 use storage_sqlite::{
     RecoveryCoverageMark, RecoveryCoverageProof, RecoveryCoverageRange, RecoveryStagedSlice,
-    RecoveryUnitOutcome, SqliteAppStorage,
+    RecoveryUnit, RecoveryUnitOutcome, SqliteAppStorage,
 };
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -94,6 +94,13 @@ pub(super) struct QuantumReport {
     /// Seconds and events in the slices it proved: the route's rate.
     pub(super) proved_seconds: u64,
     pub(super) proved_events: u64,
+    /// Events in the relay's answers the runner read (answered slices,
+    /// proved seconds, fetched ids), whatever became of them; and those of
+    /// them newly staged (not seen or staged before). For the audit. A second
+    /// the relay could not prove hands over no events, so its reads count
+    /// only in the bytes charged.
+    pub(super) events_fetched: u64,
+    pub(super) events_staged: u64,
     /// The slice width and observed cap it ended with.
     pub(super) delta: u64,
     pub(super) observed_cap: Option<u32>,
@@ -133,6 +140,9 @@ impl SweepCursorStore for PlannedCursor {
 struct Meter {
     /// Event bytes read that no staged slice has charged yet.
     bytes: AtomicU64,
+    /// Events in the answers read, for the audit: a capped answer the sweep
+    /// asks again in halves counts too.
+    events: AtomicU64,
     /// The last reply was a `rate-limited:` CLOSED.
     rate_limited: AtomicBool,
     /// The sweep cut the request in flight: what it returns is no answer.
@@ -151,6 +161,9 @@ impl Metered<'_> {
     fn read(&self, kept: &[Event], rate_limited: bool) {
         let bytes = self.relay.take_fetched_bytes().max(event_bytes(kept));
         self.meter.bytes.fetch_add(bytes, Ordering::Relaxed);
+        self.meter
+            .events
+            .fetch_add(kept.len() as u64, Ordering::Relaxed);
         if !self.meter.interrupted.load(Ordering::Relaxed) {
             self.meter
                 .rate_limited
@@ -211,6 +224,7 @@ struct StageSink<'a, H> {
     plan: &'a SweepPlan,
     meter: &'a Meter,
     newly_covered_seconds: u64,
+    staged_events: u64,
     stop: Option<SinkStop>,
 }
 
@@ -248,10 +262,14 @@ impl<H: RunnerHost> SweepSink for StageSink<'_, H> {
                 super::log_failure("stage", error);
                 SinkStop::Local
             }
-            // The transaction committed, bytes included.
-            Some(Ok(None)) => SinkStop::StaleMark,
-            Some(Ok(Some(newly))) => {
+            // The transaction committed, bytes and events included.
+            Some(Ok((None, staged))) => {
+                self.staged_events = self.staged_events.saturating_add(staged);
+                SinkStop::StaleMark
+            }
+            Some(Ok((Some(newly), staged))) => {
                 self.newly_covered_seconds = self.newly_covered_seconds.saturating_add(newly);
+                self.staged_events = self.staged_events.saturating_add(staged);
                 return Ok(());
             }
         };
@@ -265,7 +283,8 @@ impl<H: RunnerHost> SweepSink for StageSink<'_, H> {
 }
 
 /// Stage one proven slice and return the seconds it newly covered on its
-/// (route, relay), or `None` when the mark is too old to record it.
+/// (route, relay), `None` when the mark is too old to record the coverage,
+/// and the events it newly staged, which stay staged either way.
 fn stage(
     turn: &WorkerTurn<'_>,
     key: &UnitKey,
@@ -273,7 +292,7 @@ fn stage(
     fetched_bytes: u64,
     range: RecoveryCoverageRange,
     mark: RecoveryCoverageMark,
-) -> StorageResult<Option<u64>> {
+) -> StorageResult<(Option<u64>, u64)> {
     let before = uncovered_seconds(turn.app, key, range)?;
     let staged = turn.app.stage_recovery_slice(
         &RecoveryStagedSlice {
@@ -287,11 +306,12 @@ fn stage(
         },
         turn.now,
     )?;
+    let events = staged.staged as u64;
     if !staged.covered {
-        return Ok(None);
+        return Ok((None, events));
     }
     let after = uncovered_seconds(turn.app, key, range)?;
-    Ok(Some(before.saturating_sub(after)))
+    Ok((Some(before.saturating_sub(after)), events))
 }
 
 /// Seconds of `range` the ledger does not cover on the unit's relay.
@@ -343,6 +363,8 @@ pub(super) async fn run<H: RunnerHost>(
         newly_covered_seconds: 0,
         proved_seconds: 0,
         proved_events: 0,
+        events_fetched: 0,
+        events_staged: 0,
         delta: plan.delta,
         observed_cap: plan.observed_cap,
         stop: None,
@@ -362,6 +384,7 @@ pub(super) async fn run<H: RunnerHost>(
         plan,
         meter: &meter,
         newly_covered_seconds: 0,
+        staged_events: 0,
         stop: None,
     };
     for range in &plan.ranges {
@@ -406,6 +429,8 @@ pub(super) async fn run<H: RunnerHost>(
         .bytes
         .fetch_add(relay.relay.take_fetched_bytes(), Ordering::Relaxed);
     report.newly_covered_seconds = sink.newly_covered_seconds;
+    report.events_fetched = meter.events.load(Ordering::Relaxed);
+    report.events_staged = sink.staged_events;
     report.stop = sink.stop;
     report.rate_limited = meter.rate_limited.into_inner();
     if !plan.best_effort {
@@ -464,14 +489,15 @@ pub(super) fn classify(
 }
 
 /// Settle the quantum: charge the bytes no staged slice charged, apply its
-/// outcome to the unit's retry state, and record its slicing. A best-effort
-/// relay keeps no retry state.
+/// outcome to the unit's retry state, and record its slicing. Returns the
+/// outcome and the unit as it now stands. A best-effort relay keeps no retry
+/// state, so it has none.
 pub(super) fn settle(
     turn: &WorkerTurn<'_>,
     plan: &SweepPlan,
     report: &QuantumReport,
     policy: &RecoveryRunnerPolicy,
-) -> StorageResult<RecoveryUnitOutcome> {
+) -> StorageResult<(RecoveryUnitOutcome, Option<RecoveryUnit>)> {
     let still_owed = if report.newly_covered_seconds == 0 && report.end == SweepEnd::Finished {
         planned_ranges_owe(turn.app, plan)?
     } else {
@@ -498,7 +524,7 @@ pub(super) fn settle(
         )
     };
     if plan.best_effort {
-        return Ok(outcome);
+        return Ok((outcome, None));
     }
     let key = &plan.key;
     if report.unstaged_bytes > 0 {
@@ -527,7 +553,7 @@ pub(super) fn settle(
         }
         _ => None,
     };
-    turn.app.settle_recovery_unit_saturated(
+    let unit = turn.app.settle_recovery_unit_saturated(
         &key.route,
         &key.relay,
         outcome,
@@ -549,7 +575,7 @@ pub(super) fn settle(
     {
         super::log_failure("slicing", error);
     }
-    Ok(outcome)
+    Ok((outcome, Some(unit)))
 }
 
 /// Whether the unit's durable debt still overlaps any planned range.

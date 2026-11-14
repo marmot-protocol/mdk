@@ -23,6 +23,8 @@ const POLICY: RecoveryUnitPolicy = RecoveryUnitPolicy {
     max_attempts_per_hour: 720,
     max_event_bytes_per_hour: 256 << 20,
     recheck_after_cooldown_seconds: 3_600,
+    probe_base_seconds: 3_600,
+    probe_cap_seconds: 86_400,
 };
 
 fn route(byte: u8) -> TransportReconciliationRoute {
@@ -105,8 +107,8 @@ fn a_rejoin_retires_what_lay_before_its_copy() {
     )
     .unwrap();
     cover(&app, &current, (NOW - 1_000, NOW - 801));
-    let parked = park(&app, &current);
-    assert!(app.dismiss_recovery_route_park(&current, parked).unwrap());
+    park(&app, &current);
+    app.retire_route_park_as_converted(&current);
     app.uncover_recovery_coverage(
         std::slice::from_ref(&current),
         NOW - 600,
@@ -366,8 +368,8 @@ fn a_rejoins_retirement_outlasts_its_relay_leaving_and_returning() {
     // lost what lay after NOW - 600, and `current`'s dismissal straddles the
     // floor.
     for route in [&current, &ended] {
-        let parked = park(&app, route);
-        assert!(app.dismiss_recovery_route_park(route, parked).unwrap());
+        park(&app, route);
+        app.retire_route_park_as_converted(route);
     }
     app.uncover_recovery_coverage(
         std::slice::from_ref(&ended),

@@ -121,7 +121,11 @@ impl<S: StorageProvider> Drop for PendingCommitCleanupGuard<S> {
         // Clear the staged OpenMLS pending commit best-effort. A failure is
         // logged but must not panic in Drop.
         let mls_gid = openmls::group::GroupId::from_slice(self.group_id.as_slice());
-        let mut loaded_group = match MlsGroup::load(mls_storage, &mls_gid) {
+        // Clears the commit this guard's own send staged on a live group; the
+        // guard holds no engine to ask (see clippy.toml).
+        #[allow(clippy::disallowed_methods)]
+        let loaded = MlsGroup::load(mls_storage, &mls_gid);
+        let mut loaded_group = match loaded {
             Ok(Some(mls_group)) => Some(mls_group),
             Ok(None) => {
                 tracing::warn!(

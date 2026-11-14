@@ -29,7 +29,6 @@ pub(super) fn rollback(
     group_id: &GroupId,
     name: &str,
 ) -> StorageResult<()> {
-    store.connection.note_openmls_write();
     rollback_with_scope(store, group_id, name, RestoreScope::Full)
 }
 
@@ -38,7 +37,6 @@ pub(super) fn rollback_group_state(
     group_id: &GroupId,
     name: &str,
 ) -> StorageResult<()> {
-    store.connection.note_openmls_write();
     rollback_with_scope(store, group_id, name, RestoreScope::GroupState)
 }
 
@@ -52,6 +50,7 @@ fn rollback_with_scope(
     store.connection.snapshot_restore_fault(group_id, name)?;
     if store.connection.is_current_thread_transaction_owner() {
         let conn = store.lock()?;
+        store.connection.note_openmls_write();
         return rollback_on_connection(&conn, group_id, name, scope);
     }
 
@@ -61,6 +60,7 @@ fn rollback_with_scope(
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .storage()?;
+        store.connection.note_openmls_write();
         rollback_snapshot(&tx, group_id, name, &mls_group_key, scope)?;
         tx.commit().storage()?;
         Ok(())
@@ -105,7 +105,6 @@ pub(super) fn import(
     group_id: &GroupId,
     snapshot_blob: &[u8],
 ) -> StorageResult<()> {
-    store.connection.note_openmls_write();
     let snapshot: ReplaySnapshot = deserialize(snapshot_blob)?;
     if snapshot.version != REPLAY_SNAPSHOT_VERSION {
         return Err(StorageError::Serialization(format!(
@@ -124,6 +123,7 @@ pub(super) fn import(
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .storage()?;
+        store.connection.note_openmls_write();
         restore_snapshot(
             &tx,
             group_id,

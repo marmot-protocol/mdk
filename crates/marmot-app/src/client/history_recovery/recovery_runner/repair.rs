@@ -127,6 +127,8 @@ impl AppClient {
                 now,
                 tails: &*tails,
                 live_counts: &[],
+                audit: &|_, _| {},
+                audits: false,
             },
             requested,
         )
@@ -227,6 +229,12 @@ fn rearm(turn: &DebtTurn<'_>) -> StorageResult<u64> {
         storage_sqlite::CopyFloorReason::Repair,
     )?;
     let rearmed = turn.app.rearm_all_recovery_units()?;
+    super::audit::rearmed(
+        turn.audit,
+        marmot_forensics::RecoveryRunnerChange::RepairRearmed,
+        None,
+        rearmed as u64,
+    );
     tracing::debug!(
         target: TARGET,
         method = "repair",

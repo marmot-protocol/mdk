@@ -611,21 +611,39 @@ fn encrypted_media_policy_decode_rejects_non_normalized_endpoint_url() {
     );
 }
 
-/// Decode rejects a non-canonical locator kind (uppercase) rather than
-/// lowercasing it.
+/// Decode rejects uppercase locator kinds in each field without lowercasing.
 #[test]
 fn encrypted_media_policy_decode_rejects_non_canonical_locator_kind() {
-    let mut allowed = Vec::new();
-    encode_var_bytes(b"Blossom-V1", &mut allowed);
-    let mut endpoints = Vec::new();
-    encode_var_bytes(b"Blossom-V1", &mut endpoints);
-    encode_var_bytes(b"https://blossom.primal.net/", &mut endpoints);
-    let bytes = encode_component_vectors(&[
-        ENCRYPTED_MEDIA_FORMAT_V1.as_bytes(),
-        allowed.as_slice(),
-        endpoints.as_slice(),
-    ]);
-    assert!(decode_encrypted_media_policy_v1(&bytes).is_err());
+    for (allowed_kinds, endpoint_kind, expected_error) in [
+        (
+            // The malformed entry is unused, so endpoint checks cannot reject it.
+            &[BLOSSOM_LOCATOR_KIND_V1, "Blossom-V1"][..],
+            BLOSSOM_LOCATOR_KIND_V1,
+            "allowed locator kind must contain only lowercase ASCII letters, digits, and '-'",
+        ),
+        (
+            &[BLOSSOM_LOCATOR_KIND_V1][..],
+            "Blossom-V1",
+            "endpoint locator kind must contain only lowercase ASCII letters, digits, and '-'",
+        ),
+    ] {
+        let mut allowed = Vec::new();
+        for kind in allowed_kinds {
+            encode_var_bytes(kind.as_bytes(), &mut allowed);
+        }
+        let mut endpoints = Vec::new();
+        encode_var_bytes(endpoint_kind.as_bytes(), &mut endpoints);
+        encode_var_bytes(b"https://blossom.primal.net/", &mut endpoints);
+        let bytes = encode_component_vectors(&[
+            ENCRYPTED_MEDIA_FORMAT_V1.as_bytes(),
+            allowed.as_slice(),
+            endpoints.as_slice(),
+        ]);
+        assert_eq!(
+            decode_encrypted_media_policy_v1(&bytes),
+            Err(expected_error.into())
+        );
+    }
 }
 
 /// Decode rejects a non-canonical `media_format` (e.g. with surrounding

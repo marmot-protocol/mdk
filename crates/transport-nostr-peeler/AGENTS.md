@@ -43,7 +43,7 @@ skips content validation is a contract violation, not a style choice.
 - **No self-reported identifier is trusted before verification.** `to_transport_message` verifies the event `id`
   against the recomputed NIP-01 event hash before it becomes `TransportMessage.id` (which keys routing metrics,
   telemetry, and the forensic `wire_id`); a mismatch fails closed on every ingest path, including telemetry-only
-  observation. Group peeling also binds the payload hash to `TransportMessage.id`, but does not verify signatures:
+  observation. Group preparation also binds the payload hash to `TransportMessage.id`, but does not verify signatures:
   callers must authenticate inbound events before engine admission. Public DTO construction and hash validation
   alone do not establish authenticity. The adapter verifies non-SDK inputs; alternate ingest paths must provide
   the same guarantee. Welcome peeling delegates outer-event and seal verification to NIP-59 unwrap.
@@ -58,6 +58,8 @@ skips content validation is a contract violation, not a style choice.
 - Kind `445` content is `base64(nonce || ciphertext)` of a single ChaCha20-Poly1305 sealing under the empty AAD. Do not
   add a source-epoch hint: an undecryptable message returns `DecryptFailed`, and the engine falls back to retained-epoch
   snapshots / deferred-peel retry.
+- Prepare routing validation, event-hash binding and base64 decoding once per ingest. Candidate-context peeling uses
+  the prepared bytes for AEAD only; it must not repeat envelope preparation or retain bytes across inputs.
 - Build every outbound NIP-59 wrap with `gift_wrap_rumor`; do not add a second wrap implementation.
 - Welcomes wrap/peel through NIP-59 only with a caller-injected signer/decrypter; this crate must not decide where that
   signer comes from. The kind `444` rumor carries base64 content plus the required `["e", <keypackage event id>]` and

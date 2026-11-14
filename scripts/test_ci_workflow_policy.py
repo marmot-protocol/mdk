@@ -618,16 +618,6 @@ class OdinArchiveCacheTests(unittest.TestCase):
             self.assertFalse((tmp / "odin-install").exists())
 
 
-def semver_key(version: str):
-    """Semver 2.0 precedence key for X.Y.Z[-pre] (no build metadata)."""
-    core, _, pre = version.partition("-")
-    numbers = tuple(int(part) for part in core.split("."))
-    if not pre:
-        return numbers, (1,)
-    fields = tuple((0, int(f), "") if f.isdigit() else (1, 0, f) for f in pre.split("."))
-    return numbers, (0, fields)
-
-
 class NightlyReleasePolicyTests(unittest.TestCase):
     DAY = dt.date(2026, 10, 20)
 
@@ -649,12 +639,6 @@ class NightlyReleasePolicyTests(unittest.TestCase):
         self.assertEqual(choose("0.14.0", self.DAY, taken), "0.14.0-nightly.20261020.1")
         taken += ["wn-agent-v0.14.0-nightly.20261020.1"]
         self.assertEqual(choose("0.14.0", self.DAY, taken), "0.14.0-nightly.20261020.2")
-
-    def test_nightly_versions_sort_between_releases_by_date_and_counter(self):
-        ordered = ["0.13.0", "0.14.0-nightly.20261019", "0.14.0-nightly.20261020",
-                   "0.14.0-nightly.20261020.1", "0.14.0-nightly.20261020.2",
-                   "0.14.0-nightly.20261021", "0.14.0", "0.15.0-nightly.20261102"]
-        self.assertEqual(sorted(reversed(ordered), key=semver_key), ordered)
 
     def test_source_is_the_newest_green_commit_and_never_older_than_the_last_nightly(self):
         shas = ["d", "c", "b", "a"]

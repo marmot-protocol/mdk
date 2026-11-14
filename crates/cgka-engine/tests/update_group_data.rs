@@ -9,7 +9,7 @@
 //! - Validation: empty intent (no fields) errors with `EngineError::Other`.
 //! - State guard: not allowed during PendingPublish.
 
-// Tests read stored records directly (see the crate clippy.toml).
+// Tests read stored records and OpenMLS state directly (see the crate clippy.toml).
 #![allow(clippy::disallowed_methods)]
 
 use async_trait::async_trait;
@@ -128,9 +128,10 @@ impl TransportPeeler for MockPeeler {
 
     async fn peel_group_message(
         &self,
-        msg: &TransportMessage,
+        prepared: &cgka_traits::peeler::PreparedGroupMessage<'_>,
         _ctx: &GroupContextSnapshot,
     ) -> Result<PeeledMessage, PeelerError> {
+        let msg = prepared.message;
         Ok(PeeledMessage {
             id: msg.id.clone(),
             group_id: None,
@@ -229,9 +230,10 @@ impl TransportPeeler for EphemeralIdPeeler {
 
     async fn peel_group_message(
         &self,
-        msg: &TransportMessage,
+        prepared: &cgka_traits::peeler::PreparedGroupMessage<'_>,
         _ctx: &GroupContextSnapshot,
     ) -> Result<PeeledMessage, PeelerError> {
+        let msg = prepared.message;
         Ok(PeeledMessage {
             id: msg.id.clone(),
             group_id: None,

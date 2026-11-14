@@ -1117,23 +1117,31 @@ async fn stream_store_evicts_idle() {
             )
             .await
             .unwrap();
-        store.insert(
-            hex::encode([id; 32]),
-            ActiveStreamSession {
-                publisher,
-                stream_capability: [0x77; 32],
-                last_activity: Instant::now() - Duration::from_secs(age),
-            },
-        );
+        store
+            .insert_new(
+                hex::encode([id; 32]),
+                ActiveStreamSession {
+                    publisher,
+                    stream_capability: [0x77; 32],
+                    last_activity: Instant::now() - Duration::from_secs(age),
+                },
+            )
+            .unwrap();
     }
     assert_eq!(store.sweep_idle(Duration::from_secs(300)).await, 1);
-    assert!(store.get(&"AA".repeat(32)).is_err());
+    assert!(
+        store
+            .get_authorized(&"AA".repeat(32), &"77".repeat(32))
+            .is_err()
+    );
     assert!(
         store
             .get_authorized(&"BB".repeat(32), &"77".repeat(32))
             .is_ok()
     );
-    let active = store.remove(&"BB".repeat(32)).unwrap();
+    let active = store
+        .remove_authorized(&"BB".repeat(32), &"77".repeat(32))
+        .unwrap();
     active.publisher.cancel().await;
     assert!(!active.publisher.is_idle_evictable());
     runtime.shutdown_and_close().await.unwrap();
@@ -1195,16 +1203,20 @@ async fn stream_store_sweep_spares_sealed_session() {
         Err(marmot_app::AppError::AgentStreamSendFailed(_))
     ));
     let store = StreamSessionStore::default();
-    store.insert(
-        hex::encode([0xcc; 32]),
-        ActiveStreamSession {
-            publisher,
-            stream_capability: [0x77; 32],
-            last_activity: Instant::now() - Duration::from_secs(3600),
-        },
-    );
+    store
+        .insert_new(
+            hex::encode([0xcc; 32]),
+            ActiveStreamSession {
+                publisher,
+                stream_capability: [0x77; 32],
+                last_activity: Instant::now() - Duration::from_secs(3600),
+            },
+        )
+        .unwrap();
     assert_eq!(store.sweep_idle(Duration::from_secs(300)).await, 0);
-    let sealed = store.remove(&"CC".repeat(32)).unwrap();
+    let sealed = store
+        .remove_authorized(&"CC".repeat(32), &"77".repeat(32))
+        .unwrap();
     assert!(!sealed.publisher.is_idle_evictable());
     sealed.publisher.cancel().await;
     runtime.shutdown_and_close().await.unwrap();
@@ -3280,13 +3292,23 @@ fn invite_policy_retry_state_uses_capped_backoff_and_prunes_non_pending() {
     let now = tokio::time::Instant::now();
 
     assert!(retry_state.is_due(&key, now));
-    let (attempts, delay) = retry_state.record_failure(key.clone(), now);
+    let (attempts, delay) = retry_state.record_failure_with(
+        key.clone(),
+        now,
+        crate::INVITE_POLICY_RETRY_BASE,
+        crate::INVITE_POLICY_RETRY_MAX,
+    );
     assert_eq!(attempts, 1);
     assert_eq!(delay, crate::INVITE_POLICY_RETRY_BASE);
     assert!(!retry_state.is_due(&key, now + delay - Duration::from_millis(1)));
     assert!(retry_state.is_due(&key, now + delay));
 
-    let (attempts, delay) = retry_state.record_failure(key.clone(), now + delay);
+    let (attempts, delay) = retry_state.record_failure_with(
+        key.clone(),
+        now + delay,
+        crate::INVITE_POLICY_RETRY_BASE,
+        crate::INVITE_POLICY_RETRY_MAX,
+    );
     assert_eq!(attempts, 2);
     assert_eq!(delay, crate::INVITE_POLICY_RETRY_BASE * 2);
 
@@ -3294,14 +3316,24 @@ fn invite_policy_retry_state_uses_capped_backoff_and_prunes_non_pending() {
     let mut capped_delay = delay;
     for expected_attempt in 3..=20 {
         current += capped_delay;
-        let (attempts, delay) = retry_state.record_failure(key.clone(), current);
+        let (attempts, delay) = retry_state.record_failure_with(
+            key.clone(),
+            current,
+            crate::INVITE_POLICY_RETRY_BASE,
+            crate::INVITE_POLICY_RETRY_MAX,
+        );
         assert_eq!(attempts, expected_attempt);
         assert!(delay <= crate::INVITE_POLICY_RETRY_MAX);
         capped_delay = delay;
     }
     assert_eq!(capped_delay, crate::INVITE_POLICY_RETRY_MAX);
 
-    retry_state.record_failure(other_key.clone(), now);
+    retry_state.record_failure_with(
+        other_key.clone(),
+        now,
+        crate::INVITE_POLICY_RETRY_BASE,
+        crate::INVITE_POLICY_RETRY_MAX,
+    );
     retry_state.retain_pending(&HashSet::from([key.clone()]));
     assert!(retry_state.failures.contains_key(&key));
     assert!(!retry_state.failures.contains_key(&other_key));
@@ -3320,7 +3352,12 @@ fn invite_policy_retry_state_reports_next_due_wake() {
     assert!(!retry_state.has_pending());
     assert_eq!(retry_state.next_due(), None);
 
-    retry_state.record_failure(key_a.clone(), now);
+    retry_state.record_failure_with(
+        key_a.clone(),
+        now,
+        crate::INVITE_POLICY_RETRY_BASE,
+        crate::INVITE_POLICY_RETRY_MAX,
+    );
     assert!(retry_state.has_pending());
     assert_eq!(
         retry_state.next_due(),
@@ -3328,13 +3365,23 @@ fn invite_policy_retry_state_reports_next_due_wake() {
     );
 
     // A second, later failure must not move the earliest wake earlier.
-    retry_state.record_failure(key_b.clone(), now + Duration::from_millis(500));
+    retry_state.record_failure_with(
+        key_b.clone(),
+        now + Duration::from_millis(500),
+        crate::INVITE_POLICY_RETRY_BASE,
+        crate::INVITE_POLICY_RETRY_MAX,
+    );
     assert_eq!(
         retry_state.next_due(),
         Some(now + crate::INVITE_POLICY_RETRY_BASE)
     );
 
-    retry_state.record_failure(key_a.clone(), now + Duration::from_millis(500));
+    retry_state.record_failure_with(
+        key_a.clone(),
+        now + Duration::from_millis(500),
+        crate::INVITE_POLICY_RETRY_BASE,
+        crate::INVITE_POLICY_RETRY_MAX,
+    );
     assert_eq!(
         retry_state.next_due(),
         Some(now + Duration::from_millis(500) + crate::INVITE_POLICY_RETRY_BASE)
@@ -4905,7 +4952,10 @@ async fn connector_finish_reuses_receipt() {
     // Model a successful publisher finish whose control response was lost.
     // The retained publisher must return its receipt without a second send.
     let stream_id_norm = normalize_hex(&stream_id_hex).unwrap();
-    let session = connector.streams.get(&stream_id_norm).unwrap();
+    let session = connector
+        .streams
+        .get_authorized(&stream_id_norm, &stream_capability)
+        .unwrap();
     session
         .publisher
         .append(
@@ -4936,7 +4986,10 @@ async fn connector_finish_reuses_receipt() {
     );
     assert_eq!(mismatch.unwrap_err().code(), "stream_finalize_mismatch");
     assert!(
-        connector.streams.get(&stream_id_norm).is_ok(),
+        connector
+            .streams
+            .get_authorized(&stream_id_norm, &stream_capability)
+            .is_ok(),
         "a rejected retry must not drop the session"
     );
 
@@ -4990,7 +5043,10 @@ async fn connector_finish_reuses_receipt() {
         "a concurrent stream finalize must reuse the leader message ids"
     );
     assert!(
-        connector.streams.get(&stream_id_norm).is_err(),
+        connector
+            .streams
+            .get_authorized(&stream_id_norm, &stream_capability)
+            .is_err(),
         "a successful durable finish must remove the session"
     );
 

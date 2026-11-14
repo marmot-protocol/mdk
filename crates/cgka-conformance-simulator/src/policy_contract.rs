@@ -243,9 +243,9 @@ pub const CONSTANT_DECISIONS: [ConstantDecision; 42] = [
     ),
     // A19 also bounds durable epoch-gap return visits and admission before retry
     // selection, using the same values.
-    // The recovery runner's retry, breaker, quantum and interrupt-grace values
-    // pace which history it fetches and when; they certify nothing a fetch did
-    // not prove.
+    // The recovery runner's retry, breaker, probe, quantum and interrupt-grace
+    // values pace which history it fetches and when; they certify nothing a
+    // fetch did not prove.
     decision(
         "A19",
         ConstantInfluence::InputAcquisition,

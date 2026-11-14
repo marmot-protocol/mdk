@@ -1,7 +1,7 @@
 //! The code that ships Marmot diagnostics off the device: the relay-telemetry OTLP exporter,
 //! product analytics with its usage-diagnostics consent state, the app-performance recorder, the
-//! audit OTLP sender and the audit upload's HTTP half, the collector dial-safety helper they share,
-//! and the exporters' resolved configuration (mdk#2627).
+//! audit OTLP sender, the collector dial-safety helper they share, and the exporters' resolved
+//! configuration (mdk#2627).
 //!
 //! `marmot-app` records through [`Observer`], runs the collectors through [`wiring`], and
 //! re-exports the types hosts name at their `marmot_app::` paths.
@@ -12,7 +12,6 @@
 
 mod app_telemetry;
 pub mod audit_otlp_sender;
-mod audit_upload;
 mod collector_host_safety;
 mod export_config;
 mod observer;
@@ -29,19 +28,13 @@ pub use app_telemetry::{
     hand_in_sqlcipher_probe_counters,
 };
 pub use audit_otlp_sender::{AuditOtlpSendResult, AuditOtlpSender, AuditOtlpSenderConfigError};
-pub use audit_upload::{
-    AUDIT_LOG_UPLOAD_MAX_BYTES, AuditSnapshotPost, AuditSnapshotReceipt, AuditUploadCheckpoint,
-    AuditUploadError, AuditUploadOutcome, AuditUploadSnapshot, ListedAuditFile,
-    invalid_audit_upload, post_audit_upload_snapshot, system_time_ms,
-    validate_audit_upload_endpoint,
-};
 pub use collector_host_safety::{
     CollectorRequestError, HttpClientBuilder, PinnedCollector, hand_in_http_builder, pin_with,
     system_resolve,
 };
 pub use export_config::{
-    AuditLogUploadSource, DEFAULT_EXPORT_INTERVAL, RelayTelemetryExportConfig,
-    RelayTelemetryResource, RelayTelemetryRuntimeConfig, endpoint_transport_allowed, trim_optional,
+    DEFAULT_EXPORT_INTERVAL, RelayTelemetryExportConfig, RelayTelemetryResource,
+    RelayTelemetryRuntimeConfig, endpoint_transport_allowed, trim_optional,
 };
 pub use observer::{
     ObservedOperation, Observer, PerformanceRecorder, ProductBacklogSource, ProductOperation,

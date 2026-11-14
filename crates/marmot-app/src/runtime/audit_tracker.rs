@@ -1,4 +1,5 @@
-//! Forensic audit-log tracker upload worker and one-shot tracker update.
+//! The forensic audit-log tracker: the activity-triggered worker and the
+//! one-shot manual pass, both of which run v5 OTLP delivery.
 
 use std::future::Future;
 use std::sync::{Arc, Mutex as StdMutex};
@@ -11,15 +12,11 @@ use tokio::task::JoinHandle;
 use super::audit_delivery_status::{audit_delivery_paused, classify_attempt_error};
 use super::{AttemptStatus, AuditOtlpAttemptOutcome, attempt_audit_otlp_once};
 use super::{RuntimeLifecycle, runtime_shutdown_requested, wait_for_runtime_shutdown};
-use crate::audit_log::{AuditOtlpTrackerResult, AuditRetentionWorker, AuditUploadAttempt};
-use crate::{
-    AppError, AuditDeliveryFailureKind, AuditLogFile, AuditLogTrackerConfig,
-    AuditLogTrackerUpdateResult, MarmotApp,
-};
+use crate::audit_log::{AuditOtlpTrackerResult, AuditRetentionWorker};
+use crate::{AppError, AuditDeliveryFailureKind, AuditLogTrackerUpdateResult, MarmotApp};
 use marmot_forensics::local_delivery::DeliveryStep;
 use marmot_observability::AuditOtlpSendResult;
 use marmot_observability::AuditOtlpSender;
-use marmot_observability::{AUDIT_LOG_UPLOAD_MAX_BYTES, AuditUploadOutcome};
 
 /// Only one follow-up batch is queued while a pass is in flight.
 const APP_RUNTIME_AUDIT_TRACKER_QUEUE: usize = 1;
@@ -27,14 +24,15 @@ const AUDIT_BATCH_WINDOW: Duration = Duration::from_secs(30);
 const AUDIT_RETRY_INITIAL: Duration = Duration::from_secs(60);
 const AUDIT_RETRY_MAX: Duration = Duration::from_secs(300);
 
+/// What a finished pass asks of the scheduler: `retry` arms the backoff timer.
 #[derive(Default)]
 struct AuditPassSchedule {
-    retry_after: Option<Duration>,
+    retry: bool,
 }
 
 impl AuditPassSchedule {
-    fn failed(&mut self, minimum: Duration) {
-        self.retry_after = Some(self.retry_after.unwrap_or_default().max(minimum));
+    fn failed(&mut self) {
+        self.retry = true;
     }
 }
 
@@ -57,7 +55,6 @@ impl AuditBatchWindow {
 #[derive(Clone)]
 pub(crate) struct AuditLogTrackerUploader {
     app: MarmotApp,
-    config: Arc<StdMutex<AuditLogTrackerConfig>>,
     otlp_sender: Arc<StdMutex<Option<Arc<AuditOtlpSender>>>>,
     lifecycle: RuntimeLifecycle,
     retention: AuditRetentionWorker,
@@ -73,14 +70,12 @@ struct AuditLogTrackerWorker {
 impl AuditLogTrackerUploader {
     pub(crate) fn new(
         app: MarmotApp,
-        config: Arc<StdMutex<AuditLogTrackerConfig>>,
         otlp_sender: Arc<StdMutex<Option<Arc<AuditOtlpSender>>>>,
         lifecycle: RuntimeLifecycle,
         retention: AuditRetentionWorker,
     ) -> Self {
         Self {
             app,
-            config,
             otlp_sender,
             lifecycle,
             retention,
@@ -107,7 +102,6 @@ impl AuditLogTrackerUploader {
             let stopping = self.lifecycle.subscribe_shutdown();
             let handle = tokio::spawn(run_audit_log_tracker_uploader(
                 self.app.clone(),
-                self.config.clone(),
                 self.otlp_sender.clone(),
                 self.lifecycle.clone(),
                 self.retention.clone(),
@@ -162,10 +156,8 @@ impl AuditLogTrackerUploader {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn run_audit_log_tracker_uploader(
     app: MarmotApp,
-    config: Arc<StdMutex<AuditLogTrackerConfig>>,
     otlp_sender: Arc<StdMutex<Option<Arc<AuditOtlpSender>>>>,
     lifecycle: RuntimeLifecycle,
     retention: AuditRetentionWorker,
@@ -175,10 +167,6 @@ async fn run_audit_log_tracker_uploader(
 ) {
     run_batched_audit_uploads(commands, stopping, window, |trigger| {
         let app = &app;
-        let config = config
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone();
         let otlp_sender_config = otlp_sender.clone();
         let otlp_sender = otlp_sender
             .lock()
@@ -188,9 +176,8 @@ async fn run_audit_log_tracker_uploader(
         let retention = retention.clone();
         async move {
             let mut schedule = AuditPassSchedule::default();
-            match post_audit_log_tracker_update_with_v5(
+            match post_audit_log_tracker_update(
                 app,
-                config,
                 otlp_sender.as_deref(),
                 Some(&otlp_sender_config),
                 &lifecycle,
@@ -200,13 +187,14 @@ async fn run_audit_log_tracker_uploader(
             .await
             {
                 Ok(result) => {
+                    let v5 = result.v5.unwrap_or_default();
                     tracing::debug!(
                         target: "marmot_app::audit_log",
                         method = "schedule_audit_log_tracker_update",
                         trigger,
-                        skipped_reason = result.skipped_reason.as_deref(),
-                        uploaded = result.uploaded.len(),
-                        "completed automatic audit upload pass"
+                        skipped_reason = v5.skipped_reason.as_deref(),
+                        accepted_batches = v5.accepted_batches,
+                        "completed automatic audit delivery pass"
                     );
                 }
                 Err(_) => {
@@ -215,9 +203,9 @@ async fn run_audit_log_tracker_uploader(
                         method = "schedule_audit_log_tracker_update",
                         trigger,
                         error_kind = "audit_log_tracker_update_failed",
-                        "automatic audit upload pass failed"
+                        "automatic audit delivery pass failed"
                     );
-                    schedule.failed(Duration::ZERO);
+                    schedule.failed();
                 }
             }
             // Delivered segments are now evictable under the size budget.
@@ -271,9 +259,9 @@ async fn run_batched_audit_uploads<F, Fut>(
             _ = wait_for_runtime_shutdown(&mut stopping) => return,
             result = upload(trigger) => result,
         };
-        deadline = if let Some(minimum) = schedule.retry_after {
+        deadline = if schedule.retry {
             trigger = "retry";
-            let delay = retry_delay.max(minimum);
+            let delay = retry_delay;
             retry_delay = (retry_delay * 2).min(AUDIT_RETRY_MAX);
             Some(Instant::now() + delay)
         } else {
@@ -290,34 +278,14 @@ async fn run_batched_audit_uploads<F, Fut>(
     }
 }
 
-fn audit_upload_stops_batch(attempt: &Result<AuditUploadAttempt, AppError>) -> bool {
-    matches!(
-        attempt,
-        Ok(AuditUploadAttempt::Rejected {
-            status: 401 | 403 | 429 | 500..=599,
-            ..
-        }) | Err(AppError::AuditLogUpload(_))
-    )
-}
-
-#[cfg(test)]
-pub(crate) async fn post_audit_log_tracker_update_for_app(
-    app: &MarmotApp,
-    config: AuditLogTrackerConfig,
-) -> Result<AuditLogTrackerUpdateResult, AppError> {
-    post_audit_log_tracker_update(app, config, false, &mut AuditPassSchedule::default()).await
-}
-
 pub(crate) async fn post_audit_log_tracker_update_for_runtime(
     app: &MarmotApp,
-    config: AuditLogTrackerConfig,
     sender: Option<&AuditOtlpSender>,
     configured_sender: &Arc<StdMutex<Option<Arc<AuditOtlpSender>>>>,
     lifecycle: &RuntimeLifecycle,
 ) -> Result<AuditLogTrackerUpdateResult, AppError> {
-    post_audit_log_tracker_update_with_v5(
+    post_audit_log_tracker_update(
         app,
-        config,
         sender,
         Some(configured_sender),
         lifecycle,
@@ -327,18 +295,19 @@ pub(crate) async fn post_audit_log_tracker_update_for_runtime(
     .await
 }
 
-async fn post_audit_log_tracker_update_with_v5(
+/// One tracker pass: v5 OTLP delivery when a sender is configured. A failed
+/// pass is reported as skipped and arms the retry timer.
+async fn post_audit_log_tracker_update(
     app: &MarmotApp,
-    config: AuditLogTrackerConfig,
     sender: Option<&AuditOtlpSender>,
     configured_sender: Option<&Arc<StdMutex<Option<Arc<AuditOtlpSender>>>>>,
     lifecycle: &RuntimeLifecycle,
     automatic: bool,
     schedule: &mut AuditPassSchedule,
 ) -> Result<AuditLogTrackerUpdateResult, AppError> {
-    let legacy = post_audit_log_tracker_update(app, config, automatic, schedule).await;
+    let enabled = app.audit_log_settings()?.enabled;
     let Some(sender) = sender else {
-        return legacy;
+        return Ok(AuditLogTrackerUpdateResult { enabled, v5: None });
     };
     let v5 = match post_v5_audit_tracker_update(
         app,
@@ -352,27 +321,17 @@ async fn post_audit_log_tracker_update_with_v5(
     {
         Ok(result) => result,
         Err(_) => {
-            schedule.failed(Duration::ZERO);
+            schedule.failed();
             AuditOtlpTrackerResult {
                 skipped_reason: Some("v5 delivery pass failed".to_owned()),
                 ..Default::default()
             }
         }
     };
-    let mut result = match legacy {
-        Ok(result) => result,
-        Err(_) => {
-            schedule.failed(Duration::ZERO);
-            AuditLogTrackerUpdateResult {
-                enabled: app.audit_log_settings()?.enabled,
-                uploaded: Vec::new(),
-                skipped_reason: Some("v4 whole-file upload failed".to_owned()),
-                v5: None,
-            }
-        }
-    };
-    result.v5 = Some(v5);
-    Ok(result)
+    Ok(AuditLogTrackerUpdateResult {
+        enabled,
+        v5: Some(v5),
+    })
 }
 
 /// Automatic passes skip an account whose delivery is paused after a receiver
@@ -419,7 +378,7 @@ async fn post_v5_audit_tracker_update(
                 Err(error) => {
                     log_v5_delivery_failure(automatic, classify_attempt_error(&error), None);
                     summary.blocked_accounts += 1;
-                    schedule.failed(Duration::ZERO);
+                    schedule.failed();
                     reached_limit = false;
                     break;
                 }
@@ -469,7 +428,7 @@ async fn post_v5_audit_tracker_update(
                 }
                 _ => {
                     summary.pending_accounts += 1;
-                    schedule.failed(Duration::ZERO);
+                    schedule.failed();
                     reached_limit = false;
                     break;
                 }
@@ -477,7 +436,7 @@ async fn post_v5_audit_tracker_update(
         }
         if reached_limit {
             summary.pending_accounts += 1;
-            schedule.failed(Duration::ZERO);
+            schedule.failed();
         }
     }
     Ok(summary)
@@ -496,319 +455,6 @@ fn log_v5_delivery_failure(
         http_status,
         "v5 audit delivery attempt failed"
     );
-}
-
-async fn post_audit_log_tracker_update(
-    app: &MarmotApp,
-    config: AuditLogTrackerConfig,
-    automatic: bool,
-    schedule: &mut AuditPassSchedule,
-) -> Result<AuditLogTrackerUpdateResult, AppError> {
-    if !app.audit_log_settings()?.enabled {
-        return Ok(AuditLogTrackerUpdateResult {
-            enabled: false,
-            uploaded: Vec::new(),
-            skipped_reason: Some("audit logging disabled".to_owned()),
-            v5: None,
-        });
-    }
-
-    if config.resolved_endpoint(app.service_endpoints()).is_none() {
-        return Ok(AuditLogTrackerUpdateResult {
-            enabled: true,
-            uploaded: Vec::new(),
-            skipped_reason: Some("audit log tracker endpoint missing".to_owned()),
-            v5: None,
-        });
-    }
-    if config.authorization_bearer_token.is_none() {
-        return Ok(AuditLogTrackerUpdateResult {
-            enabled: true,
-            uploaded: Vec::new(),
-            skipped_reason: Some("audit log tracker authorization token missing".to_owned()),
-            v5: None,
-        });
-    }
-    if !config.upload_allowed_with_endpoints(app.service_endpoints()) {
-        return Ok(AuditLogTrackerUpdateResult {
-            enabled: true,
-            uploaded: Vec::new(),
-            skipped_reason: Some("audit log tracker not configured".to_owned()),
-            v5: None,
-        });
-    }
-
-    // v5 segments use the byte-range OTLP cursor. Never hand them to the
-    // historical whole-file endpoint or classify them as v4-ineligible.
-    let files: Vec<_> = app
-        .audit_log_files()?
-        .into_iter()
-        .filter(|file| !is_v5_recorder_file(&file.file_name))
-        .collect();
-    if files.is_empty() {
-        return Ok(AuditLogTrackerUpdateResult {
-            enabled: true,
-            uploaded: Vec::new(),
-            skipped_reason: Some("audit log files missing".to_owned()),
-            v5: None,
-        });
-    }
-
-    let mut stop_batch = false;
-    let mut uploaded = Vec::new();
-    let mut failed = 0_usize;
-    let mut acknowledged = 0_usize;
-    let mut too_large_recorded = 0_usize;
-    let mut too_large_known = 0_usize;
-    let mut ineligible_recorded = 0_usize;
-    let mut ineligible_known = 0_usize;
-    // `audit_log_files` sorts by account first, so each account's files arrive
-    // as one contiguous run and its checkpoint is loaded and stored once.
-    for account_files in group_by_account(files) {
-        let account_ref = account_files[0].account_ref.clone();
-        let mut checkpoint = app.audit_upload_checkpoint(&account_ref);
-        let mut checkpoint_changed =
-            checkpoint.retain_present(account_files.iter().map(|file| file.file_name.as_str()));
-        for (file_index, file) in account_files.iter().enumerate() {
-            if file.size_bytes == 0 {
-                continue;
-            }
-            // An acknowledged file is never re-read or re-posted. Sealed
-            // segments normally stop growing; the metadata check also covers a
-            // recorder appending after failed rotation compensation. A successful
-            // complete snapshot acknowledges their whole content; the active file changes on
-            // every append and therefore re-transfers in full each trigger.
-            // That residual is accepted by design and is bounded by the
-            // recorder's segment threshold — a byte-offset acknowledgment
-            // protocol was considered and rejected as overkill (mdk#1181).
-            // Both outcomes skip the file, but they are not the same fact: one
-            // means the endpoint has the content, the other means it never
-            // will. Keep them apart in the aggregates so an operator reading
-            // the counts is not told a permanently untransferable file was
-            // delivered.
-            match checkpoint.acknowledged(file) {
-                Some(AuditUploadOutcome::Uploaded) => {
-                    acknowledged += 1;
-                    continue;
-                }
-                Some(AuditUploadOutcome::TooLargeToUpload) => {
-                    too_large_known += 1;
-                    continue;
-                }
-                Some(AuditUploadOutcome::IneligibleSchema) => {
-                    ineligible_known += 1;
-                    continue;
-                }
-                None => {}
-            }
-            if file.size_bytes > AUDIT_LOG_UPLOAD_MAX_BYTES {
-                // Upgrade path: a file grown past the per-request ceiling by a
-                // build without segment rotation. Rotation keeps new files well
-                // under the ceiling, so this can only be a legacy artifact.
-                // Splitting it is out of scope; record the verdict so it
-                // surfaces once instead of failing silently on every trigger,
-                // and keep going so it never wedges the other files.
-                //
-                // There is no app-level escape hatch: `post_audit_log_file`
-                // enforces the same ceiling before it reads a body
-                // (`AuditUploadSnapshot::capture` in `audit_upload.rs`),
-                // so a file this size is not transferable through any app API.
-                // It stays on disk for manual handling, and deleting it belongs
-                // to mdk#1014.
-                too_large_recorded += 1;
-                checkpoint.acknowledge(file, file.size_bytes, AuditUploadOutcome::TooLargeToUpload);
-                checkpoint_changed = true;
-                tracing::warn!(
-                    target: "marmot_app::audit_log",
-                    method = "post_audit_log_tracker_update",
-                    file_index,
-                    size_bytes = file.size_bytes,
-                    limit_bytes = AUDIT_LOG_UPLOAD_MAX_BYTES,
-                    "skipped forensic audit log file larger than the tracker request limit"
-                );
-                continue;
-            }
-            let attempt = app.post_audit_log_snapshot(&file.path, &config).await;
-            stop_batch = automatic && audit_upload_stops_batch(&attempt);
-            match attempt {
-                Ok(AuditUploadAttempt::Uploaded(receipt)) => {
-                    if receipt.complete
-                        && receipt.observed_bytes == file.size_bytes
-                        && receipt.modified_at_ms == file.modified_at_ms
-                    {
-                        checkpoint.acknowledge(
-                            file,
-                            receipt.result.bytes_sent,
-                            AuditUploadOutcome::Uploaded,
-                        );
-                        checkpoint_changed = true;
-                    }
-                    uploaded.push(receipt.result);
-                }
-                // No complete row yet: no request, checkpoint, or failure warning.
-                Ok(AuditUploadAttempt::Deferred) => {}
-                Ok(AuditUploadAttempt::Ineligible {
-                    observed_bytes,
-                    modified_at_ms,
-                }) => {
-                    ineligible_recorded += 1;
-                    // Cache only the enumerated snapshot's verdict. A changed
-                    // file must be reconsidered; ineligible files never arm retry.
-                    if observed_bytes == file.size_bytes && modified_at_ms == file.modified_at_ms {
-                        checkpoint.acknowledge(
-                            file,
-                            observed_bytes,
-                            AuditUploadOutcome::IneligibleSchema,
-                        );
-                        checkpoint_changed = true;
-                    }
-                    tracing::warn!(
-                        target: "marmot_app::audit_log",
-                        method = "post_audit_log_tracker_update",
-                        file_index,
-                        size_bytes = observed_bytes,
-                        "skipped forensic audit log file that does not conform to the v4 schema"
-                    );
-                }
-                // The endpoint refused this content outright. RFC 9110 15.5.14
-                // has a server send Retry-After when a 413 is temporary, so its
-                // absence is read as a verdict on this file, not a cooldown:
-                // take the same acknowledgment as the local ceiling above, which
-                // is what stops the retry timer from re-posting identical bytes
-                // forever. Unlike the ceiling, the verdict is escapable — the
-                // sidecar is not durable state, and a manual per-file upload
-                // never consults it. A 413 *with* Retry-After, parseable or
-                // not, is a request to try later and stays a generic rejection.
-                Ok(AuditUploadAttempt::Rejected {
-                    status: status @ 413,
-                    retry_after: None,
-                }) => {
-                    too_large_recorded += 1;
-                    checkpoint.acknowledge(
-                        file,
-                        file.size_bytes,
-                        AuditUploadOutcome::TooLargeToUpload,
-                    );
-                    checkpoint_changed = true;
-                    tracing::warn!(
-                        target: "marmot_app::audit_log",
-                        method = "post_audit_log_tracker_update",
-                        http_status = status,
-                        file_index,
-                        size_bytes = file.size_bytes,
-                        "forensic audit log file refused as too large by the tracker endpoint"
-                    );
-                }
-                Ok(AuditUploadAttempt::Rejected {
-                    status,
-                    retry_after: minimum,
-                }) => {
-                    failed += 1;
-                    let delay = minimum
-                        .unwrap_or_default()
-                        .max(if matches!(status, 401 | 403) {
-                            AUDIT_RETRY_MAX
-                        } else {
-                            Duration::ZERO
-                        });
-                    schedule.failed(delay);
-                    tracing::warn!(target: "marmot_app::audit_log", method = "post_audit_log_tracker_update", http_status = status,
-                        "forensic audit upload rejected");
-                }
-                Ok(AuditUploadAttempt::FileFailure(_err)) | Err(_err) => {
-                    schedule.failed(Duration::ZERO);
-                    // Unacknowledged: left out of the checkpoint so the next
-                    // trigger retries it.
-                    failed += 1;
-                    tracing::warn!(
-                        target: "marmot_app::audit_log",
-                        method = "post_audit_log_tracker_update",
-                        file_index,
-                        "failed to post forensic audit log file to tracker"
-                    );
-                }
-            }
-            if stop_batch {
-                break;
-            }
-        }
-        // Recorded after the effects it mirrors, so a crash before this point
-        // costs one repeat transfer rather than dropping forensic data.
-        if checkpoint_changed
-            && let Err(err) = app.store_audit_upload_checkpoint(&account_ref, &checkpoint)
-        {
-            schedule.failed(Duration::ZERO);
-            tracing::warn!(
-                target: "marmot_app::audit_log",
-                method = "post_audit_log_tracker_update",
-                error_kind = err.privacy_safe_kind(),
-                "failed to persist forensic audit log upload checkpoint"
-            );
-        }
-        if stop_batch {
-            break;
-        }
-    }
-    // Only a newly recorded oversized or ineligible file warrants a warning: one already
-    // in the checkpoint has been reported, and re-warning every trigger is the
-    // noise this contract removes. Counts only — no file names or paths.
-    if failed > 0 || too_large_recorded > 0 || ineligible_recorded > 0 {
-        tracing::warn!(
-            target: "marmot_app::audit_log",
-            method = "post_audit_log_tracker_update",
-            uploaded = uploaded.len(),
-            uploaded_bytes = uploaded.iter().map(|upload| upload.bytes_sent).sum::<u64>(),
-            acknowledged,
-            too_large_recorded,
-            too_large_known,
-            ineligible_recorded,
-            ineligible_known,
-            failed,
-            "completed forensic audit log tracker update with file upload failures"
-        );
-    } else {
-        tracing::debug!(
-            target: "marmot_app::audit_log",
-            method = "post_audit_log_tracker_update",
-            uploaded = uploaded.len(),
-            uploaded_bytes = uploaded.iter().map(|upload| upload.bytes_sent).sum::<u64>(),
-            acknowledged,
-            too_large_known,
-            ineligible_known,
-            "completed forensic audit log tracker update"
-        );
-    }
-    Ok(AuditLogTrackerUpdateResult {
-        enabled: true,
-        uploaded,
-        skipped_reason: None,
-        v5: None,
-    })
-}
-
-fn is_v5_recorder_file(name: &str) -> bool {
-    let Some(stem) = name
-        .strip_prefix("audit-")
-        .and_then(|s| s.strip_suffix(".jsonl"))
-    else {
-        return false;
-    };
-    stem.ends_with("-v5")
-        || stem.rsplit_once("-v5-seg").is_some_and(|(_, index)| {
-            index.len() >= 6 && index.bytes().all(|byte| byte.is_ascii_digit())
-        })
-}
-
-/// Split the account-sorted enumeration into one non-empty run per account.
-fn group_by_account(files: Vec<AuditLogFile>) -> Vec<Vec<AuditLogFile>> {
-    let mut grouped: Vec<Vec<AuditLogFile>> = Vec::new();
-    for file in files {
-        match grouped.last_mut() {
-            Some(run) if run[0].account_ref == file.account_ref => run.push(file),
-            _ => grouped.push(vec![file]),
-        }
-    }
-    grouped
 }
 
 #[cfg(test)]

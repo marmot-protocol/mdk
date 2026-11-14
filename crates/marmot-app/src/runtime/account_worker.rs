@@ -37,8 +37,8 @@ use super::{
     RuntimeLifecycle, RuntimeMessageReceived, RuntimeProjectionUpdate, RuntimeSharedServices,
     runtime_shutdown_requested, wait_for_runtime_shutdown,
 };
+use crate::client::history_recovery::recovery_runner::host::{SpawnedRunner, next_runner_turn};
 use crate::client::read_state::UploadsInFlight;
-use crate::client::recovery_runner::host::{SpawnedRunner, next_runner_turn};
 use crate::client::{
     CommittedSyncProgress, CompletedWelcomeDeliveryRecovery, EncryptedMediaUploadFinish,
     PreparedGroupImageUploadStart, RetainedSendWake,
@@ -906,7 +906,8 @@ pub(crate) enum AccountWorkerCommand {
     #[cfg(test)]
     RecoveryRunnerPassForTest {
         budget: Duration,
-        respond: oneshot::Sender<Option<crate::client::recovery_runner::PassReport>>,
+        respond:
+            oneshot::Sender<Option<crate::client::history_recovery::recovery_runner::PassReport>>,
     },
     /// A receiver on the account's published read state (mdk#3273), `None`
     /// before the worker starts publishing it.
@@ -8821,7 +8822,7 @@ mod tests {
     use marmot_account::AccountHome;
 
     use crate::MarmotApp;
-    use crate::client::epoch_stall::BackfillDecision;
+    use crate::client::history_recovery::epoch_stall::BackfillDecision;
     use crate::tests::{ScriptedPushRelayClient, client_on_app_relay_plane};
 
     fn setup_state(kind: AccountSetupKind, phase: AccountSetupPhase) -> AccountSetupState {
@@ -9261,7 +9262,7 @@ mod tests {
         // qualified local-evaluation and storage certificate tests.
         client.epoch_stall.restore_wedge_evidence([(
             group_id.clone(),
-            crate::client::epoch_stall::EpochStallEvidence {
+            crate::client::history_recovery::epoch_stall::EpochStallEvidence {
                 stalled_epoch: epoch.0,
                 fruitless_completions: 3,
                 fruitless_reported: true,
@@ -9334,7 +9335,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn history_notice_changes_publish_once_per_transition() {
-        use crate::client::history_notices::park_recovery_for_test;
+        use crate::client::history_recovery::history_notices::park_recovery_for_test;
         let dir = tempfile::tempdir().unwrap();
         let account = AccountHome::open(dir.path())
             .create_account("alice")

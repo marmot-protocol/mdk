@@ -194,11 +194,11 @@ impl SqliteOpenMlsStorage {
         group_key: Option<Vec<u8>>,
         value: &SerializedBuffer,
     ) -> Result<(), SqliteOpenMlsStorageError> {
-        self.connection.note_openmls_write();
         let storage_key = build_key(label.as_bytes(), key.clone());
         let legacy_storage_key = build_key_legacy(label.as_bytes(), key);
         if self.connection.is_current_thread_transaction_owner() {
             let conn = self.lock()?;
+            self.connection.note_openmls_write();
             write_value_on_connection(
                 &conn,
                 label,
@@ -215,6 +215,7 @@ impl SqliteOpenMlsStorage {
             retry_on_busy(|| {
                 let mut conn = self.lock()?;
                 let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                self.connection.note_openmls_write();
                 write_value_on_connection(
                     &tx,
                     label,
@@ -282,7 +283,6 @@ impl SqliteOpenMlsStorage {
         group_key: Option<Vec<u8>>,
         value: &T,
     ) -> Result<(), SqliteOpenMlsStorageError> {
-        self.connection.note_openmls_write();
         let storage_key = build_key(label.as_bytes(), key.clone());
         let legacy_storage_key = build_key_legacy(label.as_bytes(), key);
         if self.connection.is_current_thread_transaction_owner() {
@@ -290,6 +290,7 @@ impl SqliteOpenMlsStorage {
             // and let the owning transaction handle retry/rollback. Retrying a
             // single statement inside someone else's transaction would corrupt it.
             let conn = self.lock()?;
+            self.connection.note_openmls_write();
             append_entity_on_connection(
                 &conn,
                 label,
@@ -305,6 +306,7 @@ impl SqliteOpenMlsStorage {
             retry_on_busy(|| {
                 let mut conn = self.lock()?;
                 let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                self.connection.note_openmls_write();
                 append_entity_on_connection(
                     &tx,
                     label,
@@ -326,7 +328,6 @@ impl SqliteOpenMlsStorage {
         group_key: Option<Vec<u8>>,
         value: &T,
     ) -> Result<(), SqliteOpenMlsStorageError> {
-        self.connection.note_openmls_write();
         let encoded = [
             serialize_buffer(label, value)?,
             encode_legacy_json(label, value)?,
@@ -336,6 +337,7 @@ impl SqliteOpenMlsStorage {
         if self.connection.is_current_thread_transaction_owner() {
             // Inside a broader engine-owned OpenMLS transaction: see append_entity.
             let conn = self.lock()?;
+            self.connection.note_openmls_write();
             remove_entity_on_connection(
                 &conn,
                 label,
@@ -349,6 +351,7 @@ impl SqliteOpenMlsStorage {
             retry_on_busy(|| {
                 let mut conn = self.lock()?;
                 let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                self.connection.note_openmls_write();
                 remove_entity_on_connection(
                     &tx,
                     label,
@@ -436,11 +439,11 @@ impl SqliteOpenMlsStorage {
         label: OpenMlsValueLabel,
         key: Vec<u8>,
     ) -> Result<(), SqliteOpenMlsStorageError> {
-        self.connection.note_openmls_write();
         let storage_key = build_key(label.as_bytes(), key.clone());
         let legacy_storage_key = build_key_legacy(label.as_bytes(), key);
         if self.connection.is_current_thread_transaction_owner() {
             let conn = self.lock()?;
+            self.connection.note_openmls_write();
             delete_value_on_connection(&conn, storage_key.as_slice())?;
             delete_value_on_connection(&conn, legacy_storage_key.as_slice())?;
             Ok(())
@@ -451,6 +454,7 @@ impl SqliteOpenMlsStorage {
             retry_on_busy(|| {
                 let mut conn = self.lock()?;
                 let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                self.connection.note_openmls_write();
                 delete_value_on_connection(&tx, storage_key.as_slice())?;
                 delete_value_on_connection(&tx, legacy_storage_key.as_slice())?;
                 tx.commit()?;
@@ -476,7 +480,6 @@ impl SqliteOpenMlsStorage {
         group_id: &GroupId,
         labels: &[OpenMlsValueLabel],
     ) -> Result<(), SqliteOpenMlsStorageError> {
-        self.connection.note_openmls_write();
         let group_key = Self::group_key(group_id)?;
         // Wrap every label delete in a single transaction so the operation is
         // atomic. clear_proposal_queue deletes QUEUED_PROPOSAL_LABEL and
@@ -488,6 +491,7 @@ impl SqliteOpenMlsStorage {
         // of starting a nested SQLite transaction.
         if self.connection.is_current_thread_transaction_owner() {
             let conn = self.lock()?;
+            self.connection.note_openmls_write();
             delete_group_labels_on_connection(&conn, group_key.as_slice(), labels)?;
             Ok(())
         } else {
@@ -496,6 +500,7 @@ impl SqliteOpenMlsStorage {
             retry_on_busy(|| {
                 let mut conn = self.lock()?;
                 let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                self.connection.note_openmls_write();
                 delete_group_labels_on_connection(&tx, group_key.as_slice(), labels)?;
                 tx.commit()?;
                 Ok(())

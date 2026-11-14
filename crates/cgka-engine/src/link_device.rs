@@ -56,7 +56,6 @@ use cgka_traits::transport::{EncryptedPayload, Timestamp};
 use cgka_traits::types::{EpochId, GroupId};
 use openmls::group::MlsGroup;
 use openmls::messages::proposals::{AppDataUpdateProposal, Proposal};
-use openmls_traits::OpenMlsProvider as _;
 use tls_codec::Serialize as _;
 
 const INTENT: &str = "LinkDevice";
@@ -72,12 +71,7 @@ impl<S: StorageProvider> Engine<S> {
     ) -> Result<SendResult, EngineError> {
         self.epoch_manager.ensure_pending_space()?;
         let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
-        let mut mls_group = MlsGroup::load(
-            provider.storage(),
-            &openmls::group::GroupId::from_slice(group_id.as_slice()),
-        )
-        .map_err(|e| EngineError::Backend(format!("load: {e:?}")))?
-        .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;
+        let mut mls_group = self.load_mls_group(&group_id)?;
         // A Commit in flight: refused like unsettled convergence, never
         // queued. The terminal states were refused before this.
         if self
@@ -225,12 +219,7 @@ impl<S: StorageProvider> Engine<S> {
     ) -> Result<SendResult, EngineError> {
         self.epoch_manager.ensure_pending_space()?;
         let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
-        let mut mls_group = MlsGroup::load(
-            provider.storage(),
-            &openmls::group::GroupId::from_slice(group_id.as_slice()),
-        )
-        .map_err(|e| EngineError::Backend(format!("load: {e:?}")))?
-        .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;
+        let mut mls_group = self.load_mls_group(&group_id)?;
         if self
             .epoch_manager
             .state(&group_id)
