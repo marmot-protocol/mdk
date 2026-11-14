@@ -267,7 +267,7 @@ The bounded transport comparison was:
 | --- | --- | --- |
 | `opencode run --format json` with stdin | Preserves durable session ids, process isolation, completed-event filtering, timeouts, cancellation, cleanup, and future `run` permission flags while removing prompt argv exposure. | Selected. |
 | [`opencode acp`](https://opencode.ai/docs/acp/) | Moves prompts to stdio, but adds a stateful JSON-RPC connection, initialize/load/prompt/cancel framing, and permission-request replies. | Not selected; no benefit over `run` stdin for this harness. |
-| [`opencode serve`](https://opencode.ai/docs/server/) | Provides a local OpenAPI HTTP interface, but adds server startup/readiness, authentication, port ownership, event-stream, and crash-recovery obligations. | Not selected; it weakens the current process-per-message boundary. |
+| [`opencode serve`](https://opencode.ai/docs/server/) | Provides a local OpenAPI HTTP interface, but adds server startup/readiness, authentication, port ownership, event-stream, and crash-recovery obligations. | Opt-in through `WN_OPENCODE_TRANSPORT=native` for active-turn steering; `run` remains the default. |
 
 This ACP decision concerns only the OpenCode backend below the shared `Backend`
 trait. It does not change `marmot.agent-control.v2` and does not imply an ACP
@@ -383,3 +383,42 @@ OpenCode build, such as the 1.18.18 minimum:
 ```sh
 cargo test -p wn-opencode real_opencode_run_file_contract -- --ignored --nocapture
 ```
+
+## Active-turn steering (opt-in native transport)
+
+`WN_OPENCODE_TRANSPORT=native` lets a follow-up join the running turn of its
+group. Unset or `cli` keeps the default `opencode run` transport. Any other
+value fails configuration.
+
+Each native turn starts its own `opencode serve` in the turn's working
+directory, bound to a free `127.0.0.1` port, with a random password
+created for that turn. The prompt is sent through OpenCode's session API. Once
+OpenCode has stored the prompt, a follow-up from the same group is stored in
+the same session with `noReply`, and the running loop reads it at its next
+step, after any running tool finishes. The server stops when the turn ends.
+
+A follow-up is accepted only after OpenCode returns the stored message with
+the same text and attachments. The harness submits each follow-up once. When
+the request fails or its result is unclear, the sender is told delivery is
+uncertain. Follow-ups that arrive after the turn has ended run as the next
+turn. If one is stored just as OpenCode finishes, the reply asks the sender to
+send another message.
+
+The reply is sent when the turn finishes: the completed text of every
+assistant message in the turn, in order. Reasoning and tool output stay
+private. Autonomous and unrestricted profiles answer OpenCode permission
+requests once, so hard denies in OpenCode configuration still apply. With the
+inherited profile, a permission request fails the turn. Questions are
+rejected, so the model asks in its reply.
+
+Requirements and limits:
+
+- OpenCode 1.18.32 through 1.19.x. Other versions fail the turn with a
+  configuration error, because the `noReply` behaviour is not a documented
+  contract.
+- The `opencode` executable must not replace `OPENCODE_SERVER_USERNAME` or
+  `OPENCODE_SERVER_PASSWORD`, since the harness authenticates with them.
+- Tools run as the service user and can read the server password, so this
+  protects the server from other local users, not from the model's own tools.
+- A response may be at most 4 MiB plus the configured attachment limit after
+  base64 encoding. A larger response fails the turn.
