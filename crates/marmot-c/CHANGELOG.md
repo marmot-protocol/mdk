@@ -7,6 +7,8 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-11-15
+
 ### Breaking changes
 
 - `MarmotAppPerformanceSnapshot` drops `account_group_read_snapshot`: group reads
@@ -1230,7 +1232,8 @@ downgrade is unsupported. See the [cohort upgrade notes](../cli/CHANGELOG.md#092
   just a local account's. Both return `MarmotAccountRelayLists`.
   ([#1605](https://github.com/marmot-protocol/mdk/pull/1605))
 
-[Unreleased]: https://github.com/marmot-protocol/mdk/compare/marmotc-v0.16.0...HEAD
+[Unreleased]: https://github.com/marmot-protocol/mdk/compare/marmotc-v0.17.0...HEAD
+[0.17.0]: https://github.com/marmot-protocol/mdk/compare/marmotc-v0.16.0...marmotc-v0.17.0
 [0.16.0]: https://github.com/marmot-protocol/mdk/compare/marmotc-v0.15.0...marmotc-v0.16.0
 [0.15.0]: https://github.com/marmot-protocol/mdk/compare/marmotc-v0.14.0...marmotc-v0.15.0
 [0.14.0]: https://github.com/marmot-protocol/mdk/compare/marmotc-v0.13.0...marmotc-v0.14.0

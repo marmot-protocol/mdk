@@ -31,7 +31,7 @@ Read the documentation at the tag matching your binaries; `master` can describe 
 - Messages and moderation: [deletion provenance and custom events](#deletion-provenance-and-custom-events),
   [group-system previews](#group-system-previews),
   [device-local membership events](#device-local-membership-events), [members are accounts](#members-are-accounts),
-  [undelivered Welcomes](#undelivered-welcomes),
+  [discarding a failed send](#discarding-a-failed-send), [undelivered Welcomes](#undelivered-welcomes),
   [turning on account devices](#turning-on-account-devices),
   [backup recovery and background conditions](#backup-recovery-and-background-conditions),
   [group reporting](#group-reporting),
@@ -1155,6 +1155,18 @@ may try again. `reason` is a stable tag such as `not_group_admin`. With
 `event_too_large`, the send's commit or an invitee's Welcome fits none of its
 relays' known size limits, or every relay refused it for size: `artifact` names
 that event and `size_class` its coarse size. Both are `nil` for other reasons.
+
+## Discarding a failed send
+
+Offer `discardFailedSend(accountRef, groupIdHex, messageIdHex)` instead of `deleteMessage` on a row whose
+`invalidationStatus` is `local_publish_failed`. It removes the send from this device and publishes nothing; a
+delete would tell the group about a message nobody received. `DiscardFailedSendResultFfi.outcome` is `Discarded`,
+`StillSending` (the group has a send the engine may still publish, which could be this one; nothing changed, try
+again later) or `NotFailedSend` (the row is not a failed own send; nothing changed). A discarded send's row, edits
+and media references are securely deleted, and timeline subscribers receive the removal with reason `Cleared`.
+Purge any decrypted-media cache entries named by `mediaCiphertextSha256`. `erasurePending` means the send is gone
+but secure WAL truncation is still pending; the next secure delete in the group retries it. A failed send the user
+deletes with `deleteMessage` also leaves the timeline rather than staying as a deleted row.
 
 ## Undelivered Welcomes
 

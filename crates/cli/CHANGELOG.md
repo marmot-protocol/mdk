@@ -9,6 +9,8 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-11-15
+
 ### Changed
 
 - `groups commit-delivery` reports the group relays that refused a change of yours for good: JSON `commit_delivery`
@@ -20,6 +22,13 @@ versioning through the workspace version in the root `Cargo.toml`.
   JSON includes `member_outcomes` with each canonical account's status and selected device count. A selected member is not proof of delivery.
   Creation returns `group_id: null` when no requested member is eligible. Invites return `summary: null` and nullable publication fields when no mutation occurs.
   Text output reports resolution outcomes rather than claiming all requested members were invited.
+
+
+### Fixed
+
+- One-shot commands (`messages`, `chats`, `keys`, `media`, `profile`, `relays`, `follows`, `stream` and account
+  setup) shut their runtime down before exiting, as `groups` already did (#3381). An exit that cut another
+  account's recovery sweep no longer leaves that account's next messages waiting 30 seconds.
 
 ## [0.16.0] - 2026-11-12
 
@@ -3361,7 +3370,8 @@ Initial release of the `dm` command-line app, the `dmd` background daemon, and t
 - Local installation docs for `cargo install --path crates/cli --locked --bins`.
 - Homebrew release checklist and namespaced tap packaging path for `marmot-protocol/tap/darkmatter`.
 
-[Unreleased]: https://github.com/marmot-protocol/mdk/compare/v0.16.0...HEAD
+[Unreleased]: https://github.com/marmot-protocol/mdk/compare/v0.17.0...HEAD
+[0.17.0]: https://github.com/marmot-protocol/mdk/compare/v0.16.0...v0.17.0
 [0.16.0]: https://github.com/marmot-protocol/mdk/compare/v0.15.0...v0.16.0
 [0.15.0]: https://github.com/marmot-protocol/mdk/compare/v0.14.0...v0.15.0
 [0.14.0]: https://github.com/marmot-protocol/mdk/compare/v0.13.0...v0.14.0

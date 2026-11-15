@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.17.0 - 2026-11-15
+
 ### Added
 
 - The engine keeps each group's committed roster (mdk#3273). Every record write that merges, clears or re-derives
@@ -25,6 +27,12 @@
   restore or release keeps that snapshot and quarantines the group for the session (`RewindRestoreFailed`), as a
   committing window's does, unless an enclosing committing window answers for it; that window keeps its own snapshot
   when it cannot release the nested one. SQLite is unchanged.
+- Live ingest reuses the historical peel contexts that deferred sweeps and publish replay cache, and prepares each
+  envelope once per ingest (#2492, #3406). A fresh, correctly signed envelope that misses the live key no longer
+  makes the engine rebuild past group state again.
+- Every OpenMLS load, fresh or cached, goes through one loader that refuses a group whose rewind restore failed
+  (#3280, #3395). No entry path reached that state; the loader stops the next one that would. The crate's clippy
+  configuration bans `MlsGroup::load` outside it.
 
 ## 0.16.0 - 2026-11-12
 
