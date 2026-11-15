@@ -57,6 +57,8 @@ use storage_sqlite::{
 mod support;
 use support::proof_signer;
 
+#[path = "crash_recovery_sqlite/disband_settle.rs"]
+mod disband_settle;
 #[path = "crash_recovery_sqlite/orphan_pending.rs"]
 mod orphan_pending;
 
@@ -253,7 +255,9 @@ async fn crash_child_runs_late_commit_convergence() {
         return;
     }
     let path = PathBuf::from(std::env::var_os(DATABASE_ENV).expect("child database path"));
-    if std::env::var(CRASH_POINT_ENV).as_deref() == Ok(orphan_pending::POINT) {
+    if std::env::var(disband_settle::SCENARIO_ENV).is_ok() {
+        disband_settle::run_child(&path).await;
+    } else if std::env::var(CRASH_POINT_ENV).as_deref() == Ok(orphan_pending::POINT) {
         orphan_pending::run_child(&path).await;
     } else if std::env::var(CRASH_POINT_ENV).is_ok_and(|point| point.starts_with("recovery_")) {
         run_recovery_child(&path).await;

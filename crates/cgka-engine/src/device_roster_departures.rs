@@ -76,6 +76,6 @@ pub(crate) fn record<S: StorageProvider>(
         );
     }
     group.device_roster_departures = causes.into_values().collect();
-    storage.put_group(&group)?;
+    storage.put_group_keeping_roster(&group)?;
     Ok(())
 }

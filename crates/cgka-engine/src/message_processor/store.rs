@@ -435,7 +435,7 @@ impl<S: StorageProvider> Engine<S> {
             let content_id = self.persist_sent_openmls_message_with_application_stamp(
                 msg, mls_bytes, &group.id, epoch, None,
             )?;
-            storage.put_group(group)?;
+            storage.put_group_keeping_roster(group)?;
             Ok::<_, EngineError>(content_id)
         })?;
         self.sent_message_ids.insert(msg.id.clone());

@@ -242,7 +242,7 @@ impl<S: StorageProvider> Engine<S> {
                 // record independently of whether membership actually changed.
                 if record.removed {
                     record.removed = false;
-                    storage.put_group(&record)?;
+                    storage.put_group_keeping_roster(&record)?;
                 }
                 if before.record_removed || !before.local_active {
                     events.push(GroupEvent::LocalGroupCopyRestored {

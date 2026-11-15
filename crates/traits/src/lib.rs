@@ -114,11 +114,13 @@ pub use polls::{
     validate_poll_selection,
 };
 pub use storage::{
-    CapabilityStorage, ConvergencePassStorage, DisbandCandidate, DisbandCandidateStorage,
+    CapabilityStorage, CommittedMembers, CommittedRoster, CommittedRosterStorage,
+    CommittedRosterWrite, ConvergencePassStorage, DisbandCandidate, DisbandCandidateStorage,
     DisbandFailureReason, DisbandRequest, DisbandRequestStatus, DisbandRequestStorage,
     DisbandTombstoneStorage, GroupStorage, LeaveRequest, LeaveRequestStorage, MaintenanceStorage,
     MessageStorage, OpenMlsContentFilter, OutboundFanoutStorage, OutboundIntentStorage,
-    QueuedOutboundIntent, StorageError, StorageProvider, StorageResult, WelcomeStorage,
+    QueuedOutboundIntent, RosterRevision, StorageError, StorageProvider, StorageResult,
+    WelcomeStorage,
 };
 pub use transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,

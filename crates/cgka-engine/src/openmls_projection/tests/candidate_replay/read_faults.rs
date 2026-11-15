@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::openmls_projection::{
-    OpenMlsProjectionError, PrevalidatedOwnCommits, process_openmls_messages_inner,
+    OpenMlsProjectionError, PrevalidatedOwnCommits, ReplayedRecord, process_openmls_messages_inner,
     project_mls_message, retained_anchor_snapshot_name, update_group_record_from_replay,
 };
 use rusqlite::{Connection, types::Value};
@@ -150,16 +150,29 @@ async fn read_wrapper(site: ReadSite) {
             let after_replay = protocol_rows(&sql);
             let (context_key, bytes) = native_context(&sql, &group);
             replace_context(&sql, &context_key, &[0xff]);
-            let failed =
-                update_group_record_from_replay(&storage, &group, &output, &BTreeSet::new(), None);
+            let failed = update_group_record_from_replay(
+                &storage,
+                &group,
+                &output,
+                &BTreeSet::new(),
+                None,
+                ReplayedRecord::Final,
+            );
             replace_context(&sql, &context_key, &bytes);
             assert_storage(&failed, "load post-replay group:");
             assert!(
                 protocol_rows(&sql) == after_replay,
                 "the failed mirror cannot alter its real post-replay state"
             );
-            update_group_record_from_replay(&storage, &group, &output, &BTreeSet::new(), None)
-                .unwrap();
+            update_group_record_from_replay(
+                &storage,
+                &group,
+                &output,
+                &BTreeSet::new(),
+                None,
+                ReplayedRecord::Final,
+            )
+            .unwrap();
             assert_eq!(
                 storage.get_group(&group).unwrap().epoch.0,
                 source_epoch.0 + 1

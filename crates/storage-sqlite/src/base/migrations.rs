@@ -389,8 +389,10 @@ mod migration_0203_prepared_group_member_outcomes;
 mod migration_0204_deleted_failed_sends;
 #[path = "migrations/0205_attachment_storage_readmitted.rs"]
 mod migration_0205_attachment_storage_readmitted;
-#[path = "migrations/0206_commit_refusals.rs"]
-mod migration_0206_commit_refusals;
+#[path = "migrations/0206_committed_rosters.rs"]
+mod migration_0206_committed_rosters;
+#[path = "migrations/0207_commit_refusals.rs"]
+mod migration_0207_commit_refusals;
 
 const MIGRATIONS: &[Migration] = &[
     Migration {
@@ -1478,9 +1480,15 @@ const MIGRATIONS: &[Migration] = &[
     },
     Migration {
         version: 206,
-        name: "0206_commit_refusals",
+        name: "0206_committed_rosters",
         suspend_foreign_keys: &[],
-        apply: migration_0206_commit_refusals::apply,
+        apply: migration_0206_committed_rosters::apply,
+    },
+    Migration {
+        version: 207,
+        name: "0207_commit_refusals",
+        suspend_foreign_keys: &[],
+        apply: migration_0207_commit_refusals::apply,
     },
 ];
 

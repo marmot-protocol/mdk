@@ -413,7 +413,7 @@ impl<S: StorageProvider> Engine<S> {
                     pre_commit_epoch,
                 )?;
             }
-            storage.put_group(&group_record)?;
+            storage.put_group_keeping_roster(&group_record)?;
             Ok::<_, EngineError>(content_id)
         })?;
         self.sent_message_ids.insert(commit_msg.id.clone());

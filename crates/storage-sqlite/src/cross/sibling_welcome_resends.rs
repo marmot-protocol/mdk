@@ -111,7 +111,7 @@ impl SqliteAppStorage {
 mod tests {
     use super::*;
     use crate::base::test_support::{gid, mid, sample_group};
-    use cgka_traits::storage::{GroupStorage, MessageStorage};
+    use cgka_traits::storage::MessageStorage;
     use cgka_traits::{
         FanoutTargetStatus, MemberId, OutboundFanout, Timestamp, TransportEndpoint,
         TransportEnvelope, TransportMessage, TransportPublishRequest, TransportPublishTarget,

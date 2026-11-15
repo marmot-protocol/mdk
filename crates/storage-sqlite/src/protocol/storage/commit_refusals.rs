@@ -1,5 +1,5 @@
 //! The relays that refused this device's confirmed commits (mdk#2333). See
-//! migration 0206. The table is outside every snapshot, so rewinding a group
+//! migration 0207. The table is outside every snapshot, so rewinding a group
 //! neither drops nor restores a refusal; its rows go with the group's
 //! `cgka_groups` row.
 //!

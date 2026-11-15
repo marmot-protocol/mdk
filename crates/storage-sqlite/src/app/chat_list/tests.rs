@@ -17,7 +17,7 @@ use cgka_traits::app_event::{
     GROUP_SYSTEM_TYPE_MEMBER_REMOVED, GROUP_SYSTEM_TYPE_TAG, MARMOT_APP_EVENT_KIND_CHAT,
     MARMOT_APP_EVENT_KIND_GROUP_SYSTEM, MARMOT_APP_EVENT_KIND_REACTION,
 };
-use cgka_traits::storage::{GroupStorage, LeaveRequest, LeaveRequestStorage};
+use cgka_traits::storage::{LeaveRequest, LeaveRequestStorage};
 use cgka_traits::types::{EpochId, GroupId};
 
 const LOCAL: &str = "aa";

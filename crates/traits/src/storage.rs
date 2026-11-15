@@ -146,7 +146,21 @@ pub trait GroupStorage {
         admission: Option<&crate::group::InvitationAdmission>,
     ) -> StorageResult<()>;
 
-    fn put_group(&self, group: &Group) -> StorageResult<()>;
+    /// Write `group` as merged (committed) state, and make its committed
+    /// roster hold exactly `committed` in the same transaction (see
+    /// [`CommittedRosterStorage`]). Every record write that merges, clears or
+    /// re-derives membership uses this; staging and writes that change no
+    /// committed membership use [`Self::put_group_keeping_roster`]. The two
+    /// are separate methods so the compiler lists every site that chooses.
+    fn put_group_with_roster(
+        &self,
+        group: &Group,
+        committed: &CommittedMembers,
+    ) -> StorageResult<()>;
+    /// Write `group` and leave its committed roster as it is: a staged
+    /// commit's projected members, or a change to anything but committed
+    /// membership.
+    fn put_group_keeping_roster(&self, group: &Group) -> StorageResult<()>;
     fn get_group(&self, id: &GroupId) -> StorageResult<Group>;
     fn delete_group(&self, id: &GroupId) -> StorageResult<()>;
 
@@ -242,6 +256,97 @@ pub trait GroupStorage {
         let _ = group_id;
         Ok(())
     }
+}
+
+// ── CommittedRosterStorage ──────────────────────────────────────────────────
+
+/// A committed roster's revision (mdk#3273 B). Each change to any group's
+/// committed roster takes a value no earlier roster of this account-device
+/// held, so a `(group, revision)` pair never comes back: not after the group
+/// is forgotten, deleted or joined again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RosterRevision(pub u64);
+
+/// The distinct member account ids of a group's committed membership, in
+/// byte order. An account with several devices holds several leaves and
+/// appears once.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CommittedMembers(Vec<MemberId>);
+
+impl CommittedMembers {
+    /// The distinct ids among `ids`.
+    pub fn from_ids(ids: impl IntoIterator<Item = MemberId>) -> Self {
+        let mut ids: Vec<MemberId> = ids.into_iter().collect();
+        ids.sort_by(|left, right| left.as_slice().cmp(right.as_slice()));
+        ids.dedup();
+        Self(ids)
+    }
+
+    /// The distinct ids of `members`.
+    pub fn of_members<'a>(members: impl IntoIterator<Item = &'a crate::group::Member>) -> Self {
+        Self::from_ids(members.into_iter().map(|member| member.id.clone()))
+    }
+
+    /// The ids, in byte order.
+    pub fn ids(&self) -> &[MemberId] {
+        &self.0
+    }
+}
+
+/// A group's committed roster and its revision.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommittedRoster {
+    pub revision: RosterRevision,
+    pub members: CommittedMembers,
+}
+
+/// What [`CommittedRosterStorage::put_committed_roster`] did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CommittedRosterWrite {
+    /// The roster already held these members; nothing was written.
+    Unchanged(RosterRevision),
+    /// The group had no roster; it now holds one at this revision.
+    Recorded(RosterRevision),
+    /// The roster held other members; it now holds these at this revision.
+    Replaced(RosterRevision),
+}
+
+/// Each group's committed roster (mdk#3273 B): the distinct member account
+/// ids of its merged MLS state, and a revision that moves in the same
+/// transaction as any change to them. A pending local commit's projection
+/// never reaches it. Only [`GroupStorage::put_group_with_roster`] and the
+/// engine's hydration backfill ([`Self::put_committed_roster`]) write it.
+/// Probes and staging never do.
+///
+/// It is outside every group snapshot, so rewinding a group onto a retained
+/// anchor and restoring it leaves the roster as it was, and deleting the
+/// group deletes it. A group that has no roster yet (written before this
+/// store existed and not hydrated since) has an unknown membership, which a
+/// reader must never treat as empty.
+///
+/// The roster alone does not say the group is live. The app trusts a roster
+/// only while its published read state says the group is live in this
+/// session and recorded this revision.
+pub trait CommittedRosterStorage {
+    /// `group_id`'s committed roster, or `None` when it has none.
+    fn committed_roster(&self, group_id: &GroupId) -> StorageResult<Option<CommittedRoster>>;
+
+    /// `group_id`'s committed roster revision, or `None` when it has none.
+    fn committed_roster_revision(
+        &self,
+        group_id: &GroupId,
+    ) -> StorageResult<Option<RosterRevision>>;
+
+    /// Make `group_id`'s committed roster hold exactly `members`, writing
+    /// nothing when it already does. The group's record must exist. For the
+    /// engine's backfill at hydration only: every record write goes through
+    /// [`GroupStorage::put_group_with_roster`] or
+    /// [`GroupStorage::put_group_keeping_roster`].
+    fn put_committed_roster(
+        &self,
+        group_id: &GroupId,
+        members: &CommittedMembers,
+    ) -> StorageResult<CommittedRosterWrite>;
 }
 
 /// One durable transport-route row; see
@@ -1281,6 +1386,7 @@ pub struct GroupWriteGeneration {
 /// bundle without hand-forwarding every OpenMLS storage method.
 pub trait StorageProvider:
     GroupStorage
+    + CommittedRosterStorage
     + MessageStorage
     + OutboundIntentStorage
     + OutboundFanoutStorage

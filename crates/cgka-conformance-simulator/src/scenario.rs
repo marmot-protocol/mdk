@@ -1489,6 +1489,9 @@ async fn run_scenario_report_inner(
     let mut outputs = ScenarioStepOutputs::default();
     let mut step_log = Vec::new();
     let mut sampled_max_queue_depth = 0_usize;
+    // The first action after which a committed roster disagreed with its
+    // group's committed membership (mdk#3273 B).
+    let mut roster_divergence: Option<(usize, Vec<String>)> = None;
 
     for action in &compiled.actions {
         let step_started = std::time::Instant::now();
@@ -1534,6 +1537,13 @@ async fn run_scenario_report_inner(
                     .saturating_add(progress.transport_delayed_messages)
                     .saturating_add(progress.transport_mailbox_messages),
             );
+        }
+        if roster_divergence.is_none() {
+            match subject.committed_roster_divergences() {
+                Ok(found) if found.is_empty() => {}
+                Ok(found) => roster_divergence = Some((step_index, found)),
+                Err(error) => roster_divergence = Some((step_index, vec![error.to_string()])),
+            }
         }
         if let Err(error) = step_result {
             step_log.push(ScenarioStepLogEntry {
@@ -1632,6 +1642,17 @@ async fn run_scenario_report_inner(
             expected: serde_json::json!("all requested runtime stimuli exercised"),
             actual: serde_json::to_value(&stimulus_observations)
                 .expect("stimulus evidence serializes"),
+        });
+    }
+    if let Some((step_index, divergences)) = roster_divergence {
+        expectation_failures.push(ExpectationFailure {
+            kind: "committed_roster_divergence".into(),
+            message: format!(
+                "after step {step_index}, a committed roster disagreed with its group's committed membership: {}",
+                divergences.join("; ")
+            ),
+            expected: serde_json::json!("every committed roster holds its group's committed membership"),
+            actual: serde_json::json!(divergences),
         });
     }
     let invariant_failures = invariant_failures(&expectation_failures);

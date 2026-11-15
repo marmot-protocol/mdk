@@ -1,4 +1,4 @@
-//! Migration 0206: the relays that refused this device's confirmed commits
+//! Migration 0207: the relays that refused this device's confirmed commits
 //! (mdk#2333).
 //!
 //! One row per refused commit, keyed by the commit's frozen fanout id: the

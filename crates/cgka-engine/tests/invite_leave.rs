@@ -42,6 +42,7 @@ use storage_sqlite::SqliteAccountStorage;
 use tls_codec::{Deserialize as _, Serialize as _};
 
 mod support;
+use support::committed_roster::checked_committed_roster;
 use support::proof_signer;
 
 #[path = "invite_leave/admin_leave.rs"]
@@ -2829,9 +2830,9 @@ async fn removing_an_account_removes_every_device_leaf_in_one_commit() {
 
 #[tokio::test]
 async fn invite_adds_third_member_and_advances_epoch() {
-    let mut alice = build_client(b"alice");
-    let mut bob = build_client(b"bob");
-    let mut carol = build_client(b"carol");
+    let (mut alice, alice_storage) = build_with_storage(b"alice");
+    let (mut bob, bob_storage) = build_with_storage(b"bob");
+    let (mut carol, carol_storage) = build_with_storage(b"carol");
 
     // Create a(lice)+b(ob) group.
     let bob_kp = bob.fresh_key_package().await.unwrap();
@@ -2857,6 +2858,8 @@ async fn invite_adds_third_member_and_advances_epoch() {
         _ => unreachable!(),
     };
     bob.join_welcome(welcome_for_bob).await.unwrap();
+    let joined = checked_committed_roster(&bob, &bob_storage, &group_id);
+    assert_eq!(joined.members.ids().len(), 2);
 
     // Now alice invites carol.
     let carol_kp = carol.fresh_key_package().await.unwrap();
@@ -2897,6 +2900,8 @@ async fn invite_adds_third_member_and_advances_epoch() {
     assert!(matches!(outcome, IngestOutcome::Buffered { .. }));
     converge_buffered_commit(&mut bob, &group_id);
     assert_eq!(bob.epoch(&group_id).unwrap().0, 2);
+    let applied = checked_committed_roster(&bob, &bob_storage, &group_id);
+    assert!(applied.revision > joined.revision);
 
     let events = bob.drain_events();
     let has_epoch_change = events.iter().any(|e| {
@@ -2918,6 +2923,14 @@ async fn invite_adds_third_member_and_advances_epoch() {
     assert_eq!(alice.members(&group_id).unwrap().len(), 3);
     assert_eq!(bob.members(&group_id).unwrap().len(), 3);
     assert_eq!(carol.members(&group_id).unwrap().len(), 3);
+    for (engine, storage) in [
+        (&alice, &alice_storage),
+        (&bob, &bob_storage),
+        (&carol, &carol_storage),
+    ] {
+        let roster = checked_committed_roster(engine, storage, &group_id);
+        assert_eq!(roster.members.ids().len(), 3);
+    }
 }
 
 /// Inviting several devices of one account projects one roster entry per added
@@ -3639,6 +3652,8 @@ async fn removed_member_applying_removal_commit_marks_local_copy_removed() {
         record.removed,
         "applying the removal commit must mark the local group copy removed"
     );
+    let roster = checked_committed_roster(&bob, &bob_storage, &group_id);
+    assert!(!roster.members.ids().contains(&bob.self_id()));
 }
 
 /// A copy this device was removed from must stay hydratable — the re-add path
@@ -3817,6 +3832,8 @@ async fn post_eviction_message_realizes_self_removal_and_returns_self_evicted() 
          presenting self as a member; got {:?}",
         record.members
     );
+    let roster = checked_committed_roster(&bob, &bob_storage, &group_id);
+    assert!(!roster.members.ids().contains(&bob.self_id()));
 }
 
 /// #376 attribution: OpenMLS's Inactive state does not record WHY the local
@@ -4284,7 +4301,7 @@ async fn remove_co_admin_couples_admin_policy_update_in_same_commit() {
 #[tokio::test]
 async fn readd_after_remove_produces_fresh_welcome_join() {
     let mut alice = build_client(b"alice");
-    let mut bob = build_client(b"bob");
+    let (mut bob, bob_storage) = build_with_storage(b"bob");
 
     // 1. Alice creates an alice+bob group; bob joins via the first Welcome.
     let bob_kp = bob.fresh_key_package().await.unwrap();
@@ -4369,6 +4386,8 @@ async fn readd_after_remove_produces_fresh_welcome_join() {
             .any(|member| member.id == bob.self_id()),
         "bob should no longer be a member of his retained record; got {bob_after_remove:?}"
     );
+    let removed = checked_committed_roster(&bob, &bob_storage, &group_id);
+    assert!(!removed.members.ids().contains(&bob.self_id()));
 
     // 3. Alice re-adds bob with a brand-new KeyPackage (never reuse the first).
     let bob_kp_2 = bob.fresh_key_package().await.unwrap();
@@ -4418,6 +4437,9 @@ async fn readd_after_remove_produces_fresh_welcome_join() {
         bob_members.len(),
         "alice and bob should agree on the re-added group's membership"
     );
+    let rejoined = checked_committed_roster(&bob, &bob_storage, &group_id);
+    assert!(rejoined.members.ids().contains(&bob.self_id()));
+    assert!(rejoined.revision > removed.revision);
 }
 
 /// A delayed Welcome can install an apparently active local view after the

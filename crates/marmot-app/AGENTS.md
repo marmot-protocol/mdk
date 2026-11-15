@@ -1199,6 +1199,7 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   and `MarmotRootRuntimeLease` keeps any second writer out. The oracle checks at each publish that every stored row
   is held. A candidate forgotten or deleted since it was read is not waited for, and a wait that runs out fails with
   `AccountWorkerResponseTimedOut`, never a miss.
+- A trusts a group's committed roster (mdk#3273 PR 6) only at the revision it recorded (`GroupAnswers::roster_revision`) and only while the version shows the group served (`serves_reads`: neither quarantined nor awaiting hydration) and visible to the host (`ReadState::trusted_rosters`). A SQL read joins the engine's roster tables only on those pairs (`ReadState::trusted_roster_members`, through storage-sqlite's `trusted_roster_members`), never on live revisions, so a roster written since the version was published does not match until the next publish records it. A roster write moves the group's state count (`cgka_committed_rosters` is in `cross/group_writes.rs`), and the oracle checks the recorded revision and `serves_reads` against the live reads.
 - A read answered from A waits for no worker unit, so it fences nothing. Tests here and in the host crates fence the
   worker through `src/worker_fences.rs` (startup finished, startup sync took the queued commands, a worker round
   trip), never a read they pick; wn-cli's socket tests mirror the startup fence in `wait_for_daemon_worker_startup`.

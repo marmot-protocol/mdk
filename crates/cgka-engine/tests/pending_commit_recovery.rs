@@ -25,7 +25,7 @@ use cgka_traits::group_context::GroupContextSnapshot;
 use cgka_traits::ingest::{PeeledContent, PeeledMessage};
 use cgka_traits::message::{MessageState, StoredMessagePayload};
 use cgka_traits::peeler::TransportPeeler;
-use cgka_traits::storage::{GroupStorage, MessageStorage};
+use cgka_traits::storage::{CommittedRosterStorage, GroupStorage, MessageStorage};
 use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
 };
@@ -33,6 +33,7 @@ use cgka_traits::types::{EpochId, MemberId, MessageId};
 use storage_sqlite::{SqlCipherKey, SqliteAccountStorage};
 
 mod support;
+use support::committed_roster::checked_committed_roster;
 use support::proof_signer;
 
 #[path = "pending_commit_recovery/recovery_mirror.rs"]
@@ -201,6 +202,7 @@ async fn reopen_after_crash_during_publish_recovers_stranded_pending_commit() {
 
     let group_id;
     let stranded_welcome_id;
+    let created;
 
     // ── Phase 1: create + confirm a group, then stage an invite and "crash"
     //    before resolving the publish. ───────────────────────────────────────
@@ -208,7 +210,7 @@ async fn reopen_after_crash_during_publish_recovers_stranded_pending_commit() {
         let alice_store = SqliteAccountStorage::open_encrypted(&alice_path, &key).unwrap();
         let bob_store = SqliteAccountStorage::in_memory_for_test().unwrap();
         let carol_store = SqliteAccountStorage::in_memory_for_test().unwrap();
-        let mut alice = build_client(alice_store, b"alice-pcr");
+        let mut alice = build_client(alice_store.clone(), b"alice-pcr");
         let mut bob = build_client(bob_store, b"bob-pcr");
         let mut carol = build_client(carol_store, b"carol-pcr");
 
@@ -232,6 +234,7 @@ async fn reopen_after_crash_during_publish_recovers_stranded_pending_commit() {
         alice.confirm_published(pending).await.unwrap();
         assert_eq!(alice.epoch(&group_id).unwrap(), EpochId(1));
         assert_eq!(alice.members(&group_id).unwrap().len(), 2);
+        created = checked_committed_roster(&alice, &alice_store, &group_id);
 
         // Stage an invite of carol. This persists the staged commit to MLS
         // storage but does NOT merge it; the projection puts carol in the
@@ -258,6 +261,10 @@ async fn reopen_after_crash_during_publish_recovers_stranded_pending_commit() {
             3,
             "carol projected pre-confirm"
         );
+        assert_eq!(
+            checked_committed_roster(&alice, &alice_store, &group_id),
+            created
+        );
 
         // "Crash": drop the engine without calling confirm_published /
         // publish_failed. The pending commit is now stranded on disk.
@@ -272,6 +279,11 @@ async fn reopen_after_crash_during_publish_recovers_stranded_pending_commit() {
         reopened_store.get_group(&group_id).unwrap().members.len(),
         3,
         "stranded projection persisted across the crash"
+    );
+    assert_eq!(
+        reopened_store.committed_roster(&group_id).unwrap().as_ref(),
+        Some(&created),
+        "the stranded projection never reached the committed roster"
     );
 
     let reopened_store_probe = reopened_store.clone();
@@ -301,6 +313,11 @@ async fn reopen_after_crash_during_publish_recovers_stranded_pending_commit() {
         alice.members(&group_id).unwrap().len(),
         2,
         "carol dropped after recovery"
+    );
+    assert_eq!(
+        checked_committed_roster(&alice, &reopened_store_probe, &group_id),
+        created,
+        "clearing the stranded commit leaves the committed roster and its revision"
     );
     let retired_welcome = reopened_store_probe
         .get_message(&stranded_welcome_id)
@@ -355,6 +372,9 @@ async fn reopen_after_crash_during_publish_recovers_stranded_pending_commit() {
     alice.confirm_published(retry_pending).await.unwrap();
     assert_eq!(alice.epoch(&group_id).unwrap(), EpochId(2));
     assert_eq!(alice.members(&group_id).unwrap().len(), 3);
+    let confirmed = checked_committed_roster(&alice, &reopened_store_probe, &group_id);
+    assert_eq!(confirmed.members.ids().len(), 3);
+    assert!(confirmed.revision > created.revision);
 }
 
 /// Regression for the auto-commit leave path (mdk#150 follow-up).

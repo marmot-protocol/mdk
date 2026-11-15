@@ -9,7 +9,7 @@ use super::{
 use crate::SqliteAccountStorage;
 use crate::base::test_support::{gid, sample_group};
 use cgka_traits::message::{MessageRecord, MessageState, StoredMessagePayload};
-use cgka_traits::storage::{GroupStorage, MessageStorage, OpenMlsContentFilter};
+use cgka_traits::storage::{MessageStorage, OpenMlsContentFilter};
 use cgka_traits::transport::{Timestamp, TransportEnvelope, TransportMessage, TransportSource};
 use cgka_traits::types::{EpochId, MessageId};
 use rusqlite::params;

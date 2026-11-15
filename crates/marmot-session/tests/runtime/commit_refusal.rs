@@ -703,7 +703,9 @@ async fn a_disband_request_records_refusals_first_and_a_settled_disband_ends_the
     // it: the terminal guard, the group record marked disbanded, the request
     // cleared. The settle itself is the engine's (its own tests drive it).
     {
-        use cgka_traits::storage::{DisbandRequestStorage, DisbandTombstoneStorage, GroupStorage};
+        use cgka_traits::storage::{
+            CommittedMembers, DisbandRequestStorage, DisbandTombstoneStorage, GroupStorage,
+        };
         let storage = SqliteAccountStorage::open_encrypted(
             &fixture.alice_path,
             &SqlCipherKey::new(FLOOR_KEY).unwrap(),
@@ -720,8 +722,10 @@ async fn a_disband_request_records_refusals_first_and_a_settled_disband_ends_the
             announced: false,
         };
         storage.put_disband_tombstone(&fixture.group_id, &tombstone).unwrap();
-        group.disbanded = Some(tombstone);
-        storage.put_group(&group).unwrap();
+        group.disbanded = Some(tombstone.clone());
+        storage
+            .put_group_with_roster(&group, &CommittedMembers::of_members(&tombstone.former_members))
+            .unwrap();
         storage.clear_disband_request(&fixture.group_id).unwrap();
     }
     let runtime = fixture.runtime(fixture.reopen(), &adapter);
