@@ -88,10 +88,11 @@ pub(crate) fn nostr_builder() -> nostr_sdk::prelude::ClientBuilder {
 
 pub use delivery_spill::{AccountDeliverySpillStore, DeliverySpillDisposition};
 pub use directory::{
-    DirectoryEventQuery, DirectoryFetchOutcome, DirectoryFetchRequest, DirectoryInspectionError,
-    DirectoryRelayEventRecord, DirectoryRelayFetcher, DirectoryRelayPlane, DirectoryRelayStats,
-    DirectorySubscriptionFilter, DirectorySubscriptionSyncSummary, DirectorySyncBatch,
-    DirectorySyncPlan, NostrSdkDirectoryRelayFetcher,
+    DIRECTORY_INSPECTION_WAIT, DirectoryEventQuery, DirectoryFetchOutcome, DirectoryFetchRequest,
+    DirectoryInspectionError, DirectoryRelayEventRecord, DirectoryRelayFetcher,
+    DirectoryRelayPlane, DirectoryRelayStats, DirectorySubscriptionFilter,
+    DirectorySubscriptionSyncSummary, DirectorySyncBatch, DirectorySyncPlan,
+    NostrSdkDirectoryRelayFetcher,
 };
 pub use safety::{RelaySafetyPolicy, canonical_relay, recovery_required_endpoints, same_relay};
 pub use telemetry::rollup_from_snapshots;

@@ -1274,8 +1274,10 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   `test-support`).
 - `src/runtime/`: `worker_startup.rs` (per-account startup admission and retry backoff),
   `account_worker/recovery_credits.rs` (process-wide recovery credit pool), `account_worker/read_queue.rs` (host-read
-  queue-wait telemetry: `ReadReply`, the read classes, the worker-unit gauge and the lane's A reader, mdk#3273;
-  observes only, never reorders), `conversation_window.rs`, `chat_list_window.rs`,
+  and mutation queue-wait telemetry: `ReadReply`, the read classes, the worker-unit gauge with its unit durations and
+  over-budget counts, and the lane's A reader, mdk#3273; observes only, never reorders;
+  `account_worker/tests/writer_hold_tests.rs` pins the writer holds that step 3 of the runtime-concurrency pass
+  removes; its module doc lists the holds pinned elsewhere or not at all), `conversation_window.rs`, `chat_list_window.rs`,
   `presentation.rs`, `presented_chat_list.rs`, `account_attention.rs` (presentation windows and account-switcher
   attention), `chat_list_selection.rs` (select-all IDs and revalidation), `user_blocks.rs`, `moderation.rs` (reports, admin labels and operator moderation reports),
   `local_submissions.rs`,

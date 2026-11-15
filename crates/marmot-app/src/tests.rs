@@ -681,6 +681,13 @@ pub(crate) struct ScriptedPushRelayClient {
     refuse_group_subscribes: std::sync::atomic::AtomicBool,
     block_next_unsubscribe: std::sync::atomic::AtomicBool,
     block_next_publish: std::sync::atomic::AtomicBool,
+    /// Park the next publish of this kind as `block_next_publish` parks the
+    /// next publish of any kind.
+    block_next_publish_of_kind: std::sync::Mutex<Option<u64>>,
+    /// Hold the next directory read of a KeyPackage slot, a sign-in check's
+    /// read, until released: the notifiers it enters and waits on.
+    hold_next_slot_read:
+        std::sync::Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
     block_publish_count: std::sync::atomic::AtomicUsize,
     blocked_publish_count: std::sync::atomic::AtomicUsize,
     block_account_subscribe: std::sync::Mutex<Option<Vec<u8>>>,
@@ -1210,6 +1217,24 @@ impl ScriptedPushRelayClient {
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
+    /// Park the next publish of `kind` until [`Self::release_publish`];
+    /// publishes of other kinds pass.
+    pub(crate) fn block_next_publish_of_kind(&self, kind: u64) {
+        *self.block_next_publish_of_kind.lock().unwrap() = Some(kind);
+    }
+
+    /// Hold the next directory read that asks for a KeyPackage slot, as a
+    /// sign-in check's read does: it notifies the first notifier once it
+    /// waits, and answers once the second is notified.
+    pub(crate) fn hold_next_slot_read(
+        &self,
+    ) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        *self.hold_next_slot_read.lock().unwrap() = Some((entered.clone(), release.clone()));
+        (entered, release)
+    }
+
     fn block_account_inbox_subscribe(&self, account_id: Vec<u8>) {
         *self.block_account_subscribe.lock().unwrap() = Some(account_id);
     }
@@ -1448,6 +1473,20 @@ impl transport_nostr::DirectoryRelayFetcher for ScriptedPushRelayClient {
         &self,
         request: transport_nostr::DirectoryFetchRequest,
     ) -> Result<Vec<transport_nostr::DirectoryRelayEventRecord>, String> {
+        let slot_read = request.queries.iter().any(|query| {
+            query.kind == KIND_MARMOT_KEY_PACKAGE
+                && query
+                    .reference
+                    .as_ref()
+                    .is_some_and(|(name, _)| *name == 'd')
+        });
+        let held = slot_read
+            .then(|| self.hold_next_slot_read.lock().unwrap().take())
+            .flatten();
+        if let Some((entered, release)) = held {
+            entered.notify_one();
+            release.notified().await;
+        }
         Ok(self
             .published_events
             .lock()
@@ -1789,7 +1828,14 @@ impl NostrRelayClient for ScriptedPushRelayClient {
                 |remaining| remaining.checked_sub(1),
             )
             .is_ok();
+        let block_this_kind = self
+            .block_next_publish_of_kind
+            .lock()
+            .unwrap()
+            .take_if(|kind| *kind == event.kind)
+            .is_some();
         if block_counted_publish
+            || block_this_kind
             || self
                 .block_next_publish
                 .swap(false, std::sync::atomic::Ordering::SeqCst)
@@ -12856,7 +12902,7 @@ fn full_account_queue_spills_durably_and_admits_every_delivery_without_loss() {
         let mut client = client_on_app_relay_plane(&app, "alice").await;
         relay.replies_handled().await;
         for _ in 0..=spilled_before_reopen {
-            if !client.admit_native_turn().await.unwrap() {
+            if !client.admit_native_turn(None).await.unwrap() {
                 break;
             }
         }
@@ -17935,7 +17981,7 @@ async fn a_deferred_open_never_subscribes_a_departed_groups_route() {
         .await
         .unwrap();
     relay.replies_handled().await;
-    while bob_client.admit_native_turn().await.unwrap() {}
+    while bob_client.admit_native_turn(None).await.unwrap() {}
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     while !bob_client
         .runtime
@@ -18198,7 +18244,7 @@ async fn an_admin_removal_clears_the_removed_devices_group_routes() {
     // boundary before admitting the real locally published removal commit.
     // It lands in bob's current epoch and buffers for convergence.
     relay.replies_handled().await;
-    while bob_client.admit_native_turn().await.unwrap() {}
+    while bob_client.admit_native_turn(None).await.unwrap() {}
     // The scheduled-convergence path the account worker drives. This is the
     // field case: the removal was adopted through convergence, not inline.
     // Adoption cannot freeze until the settlement quiescence window closes, so
@@ -18306,7 +18352,7 @@ async fn a_routing_rebuild_after_a_removal_does_not_resubscribe_the_removed_grou
         .await
         .unwrap();
     relay.replies_handled().await;
-    while bob_client.admit_native_turn().await.unwrap() {}
+    while bob_client.admit_native_turn(None).await.unwrap() {}
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     while !bob_client
         .runtime
@@ -18404,7 +18450,7 @@ async fn a_removed_device_fails_a_composer_send_before_projecting_a_row() {
         .await
         .unwrap();
     relay.replies_handled().await;
-    while bob_client.admit_native_turn().await.unwrap() {}
+    while bob_client.admit_native_turn(None).await.unwrap() {}
     // The removal lands in the epoch bob still holds, so convergence adopts it
     // rather than the inline commit-apply path.
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
@@ -20950,7 +20996,7 @@ async fn assert_failed_cursor_pin(recovery: FailedDeliveryRecovery) {
         "bob must join before the failing application message",
     );
     relay.replies_handled().await;
-    while bob_client.admit_native_turn().await.unwrap() {}
+    while bob_client.admit_native_turn(None).await.unwrap() {}
     bob_client.take_pending_projection_updates();
     bob_client.take_pending_applied_sync_summary();
 
@@ -20982,7 +21028,7 @@ async fn assert_failed_cursor_pin(recovery: FailedDeliveryRecovery) {
             .dev_fail_ingest_after_application_event_ack = true;
     }
     bob_client
-        .admit_native_turn()
+        .admit_native_turn(None)
         .await
         .expect_err("the injected ingest failure must surface");
     assert!(
@@ -21007,7 +21053,7 @@ async fn assert_failed_cursor_pin(recovery: FailedDeliveryRecovery) {
             .expect("quiet retry must complete the retained projection");
         assert!(!bob_client.has_pending_effect_projections());
         relay.replies_handled().await;
-        assert!(bob_client.admit_native_turn().await.unwrap());
+        assert!(bob_client.admit_native_turn(None).await.unwrap());
         assert_eq!(
             decided_transport_cursor_seal(&bob_client, later_cursor).await,
             later_cursor,
@@ -21034,7 +21080,7 @@ async fn assert_failed_cursor_pin(recovery: FailedDeliveryRecovery) {
         relay.replies_handled().await;
         assert!(
             bob_client
-                .admit_native_turn()
+                .admit_native_turn(None)
                 .await
                 .expect("the retry must ingest the retained native frame")
         );
@@ -24346,7 +24392,7 @@ fn released_transport_is_replayed_after_lost_effect_and_reopen() {
                     if handling == "sdk drain" {
                         client.sync().await.unwrap();
                     } else {
-                        assert!(client.admit_native_turn().await.unwrap());
+                        assert!(client.admit_native_turn(None).await.unwrap());
                     }
                 }
                 assert_eq!(

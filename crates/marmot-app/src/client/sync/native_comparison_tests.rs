@@ -215,7 +215,7 @@ async fn slow_peer_keeps_plaintext() {
         assert!(!adapter.account_subscription_eose(&account).await.complete());
         for _ in 0..3 {
             assert!(
-                !fixture.receiver.admit_native_turn().await.unwrap(),
+                !fixture.receiver.admit_native_turn(None).await.unwrap(),
                 "a complete newer subset must not advance MLS while an in-deadline peer still owes its first payload"
             );
         }
@@ -237,10 +237,10 @@ async fn slow_peer_keeps_plaintext() {
             adapter.handle_group_relay_copy(event, Some(&account)).await.unwrap();
         }
         assert!(started.elapsed() < Duration::from_secs(30), "the older prefix arrives inside the production service lease");
-        assert!(!fixture.receiver.admit_native_turn().await.unwrap(), "payload arrival alone does not settle the older source");
+        assert!(!fixture.receiver.admit_native_turn(None).await.unwrap(), "payload arrival alone does not settle the older source");
         adapter.handle_relay_eose(slow, id).await;
         for turn in 0..=TEXTS {
-            if !fixture.receiver.admit_native_turn().await.unwrap() {
+            if !fixture.receiver.admit_native_turn(None).await.unwrap() {
                 break;
             }
             assert!(turn < TEXTS, "settled replay drains in bounded native turns");

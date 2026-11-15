@@ -7175,7 +7175,7 @@ fn controlled_reap_worker() -> (
 ) {
     let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel();
     let (release, exit) = tokio::sync::oneshot::channel();
-    let (commands, _) = tokio::sync::mpsc::channel(1);
+    let (commands, _) = crate::runtime::test_worker_channel(1);
     let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let guard = WorkerDropProbe(dropped.clone());
     let handle = tokio::spawn(async move {

@@ -107,7 +107,7 @@ async fn native_cursor_save_retry() {
             .last_transport_timestamp
             .is_some_and(|cursor| cursor >= event.event.created_at)
     );
-    fixture.receiver.admit_native_turn().await.unwrap();
+    fixture.receiver.admit_native_turn(None).await.unwrap();
     assert!(
         fixture
             .receiver
@@ -153,7 +153,7 @@ async fn held_native_restores_cursor() {
     // later turns save it without another delivery.
     timeout(Duration::from_secs(10), async {
         loop {
-            fixture.receiver.admit_native_turn().await.unwrap();
+            fixture.receiver.admit_native_turn(None).await.unwrap();
             if app
                 .load_state("receiver")
                 .unwrap()
@@ -260,7 +260,7 @@ async fn native_spill_ack_is_durable() {
             .deliveries
             .is_empty()
     );
-    fixture.receiver.admit_native_turn().await.unwrap();
+    fixture.receiver.admit_native_turn(None).await.unwrap();
     assert!(
         fixture
             .receiver
@@ -295,7 +295,7 @@ async fn native_error_stays_visible() {
         expected.get(&message.message_id_hex),
         Some(&message.plaintext)
     );
-    fixture.receiver.admit_native_turn().await.unwrap();
+    fixture.receiver.admit_native_turn(None).await.unwrap();
     assert!(
         fixture
             .receiver
@@ -333,7 +333,7 @@ async fn native_receipts_yield() {
     fixture.receiver.take_pending_applied_sync_summary();
     lease_native(&mut fixture.receiver, &fixture.group, events).await;
     for _ in 0..3 {
-        assert!(fixture.receiver.admit_native_turn().await.unwrap());
+        assert!(fixture.receiver.admit_native_turn(None).await.unwrap());
         assert!(
             fixture
                 .receiver
@@ -346,7 +346,7 @@ async fn native_receipts_yield() {
             held
         );
     }
-    assert!(fixture.receiver.admit_native_turn().await.unwrap());
+    assert!(fixture.receiver.admit_native_turn(None).await.unwrap());
     assert_eq!(
         fixture
             .receiver
@@ -355,7 +355,7 @@ async fn native_receipts_yield() {
             .len(),
         MAX_NATIVE_ADMISSION_PER_TURN
     );
-    assert!(fixture.receiver.admit_native_turn().await.unwrap());
+    assert!(fixture.receiver.admit_native_turn(None).await.unwrap());
     assert_eq!(
         fixture
             .receiver
@@ -364,7 +364,7 @@ async fn native_receipts_yield() {
             .len(),
         1
     );
-    fixture.receiver.admit_native_turn().await.unwrap();
+    fixture.receiver.admit_native_turn(None).await.unwrap();
     assert!(
         fixture
             .receiver

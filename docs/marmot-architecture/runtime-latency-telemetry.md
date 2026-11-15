@@ -1,7 +1,7 @@
 ---
 title: "Conversation readiness and runtime latency telemetry"
 created: 2026-09-18
-updated: 2026-11-10
+updated: 2026-11-15
 status: implementation
 tags: [marmot, runtime, telemetry, performance]
 ---
@@ -73,6 +73,17 @@ Names below omit `app_runtime_` and the suffix. Durations nest and overlap: **do
 | `worker_acquire` | General worker lookup/reconciliation, across callers |
 | `read_queue_r1` … `read_queue_r9` | One per [host read class](#host-read-classes): a host read's wait on its account worker, from just before channel admission until the worker takes it up, acknowledges a hydration request from the version published before its unit, or answers `not_ready` because the current phase cannot serve it. Includes waiting for a channel slot; excludes worker acquisition and the read's own work. A read dropped unanswered, or whose caller has gone when the worker takes it up, ends as cancelled |
 | `read_queue_behind_startup_sync`, `read_queue_behind_catch_up`, `read_queue_behind_convergence`, `read_queue_behind_welcome_fanout`, `read_queue_behind_repair`, `read_queue_behind_send`, `read_queue_behind_invite_or_create`, `read_queue_behind_maintenance` | The same wait recorded again for a read that arrived while its worker was inside that unit: startup sync, an explicit catch-up, a convergence pass (scheduled or retried), a Welcome fanout, a full-history repair, a send awaiting its relays, a create or invite including KeyPackage resolution, a periodic maintenance tick. The unit is sampled once, when the read is created, and is the innermost one: a fanout inside a create counts as the fanout |
+| `mutation_queue_behind_startup_sync`, `mutation_queue_behind_catch_up`, `mutation_queue_behind_convergence`, `mutation_queue_behind_welcome_fanout`, `mutation_queue_behind_repair`, `mutation_queue_behind_send`, `mutation_queue_behind_invite_or_create`, `mutation_queue_behind_maintenance` | The twin of `read_queue_behind_<unit>` for host mutations: a command's wait from just before channel admission until the worker takes it up, for one enqueued while its worker was inside that unit. A unit that defers commands keeps the wait running until it serves or refuses the command, a busy refusal included. Host reads and catch-up requests record none here: reads have their own series, and `catch_up_requested` and `catch_up_coalesced` time catch-ups. A command dropped before take-up ends as cancelled. See [Writer units and lane steps](#writer-units-and-lane-steps) |
+| `worker_unit_startup_sync`, `worker_unit_catch_up`, `worker_unit_convergence`, `worker_unit_welcome_fanout`, `worker_unit_repair`, `worker_unit_send`, `worker_unit_invite_or_create`, `worker_unit_maintenance`, `worker_unit_delivery`, `worker_unit_runner_turn` | How long the account worker stays in one unit of each kind. The first eight are the units the `read_queue_behind_*` series name. `delivery` is one received delivery or overflow from its receive to the end of its handling (ingest, projection, and the follow-ups after them: post-join history, the recovery refresh, push work), or one native admission turn at the top of the worker's loop from its first ready frame to the turn's end (a turn with nothing ready records none). A drain's native turns, in a catch-up or a repair, are part of the unit that runs the drain and record no delivery unit. A failed receive records none, and a failed ingest's unit ends before the reconnect that follows. `runner_turn` is one recovery runner turn served on the worker. A create's unit ends where its Welcome fanout's begins, so the two don't overlap |
+| `worker_unit_<kind>_over_budget` | Completed-only count of the units of that kind that outlasted the engine's budget, with their durations: 250 ms for `send` and `invite_or_create`, which a host call waits on, and 500 ms for every other kind (`FOREGROUND_DEFERRED_PEEL_BUDGET_MS` and `BACKGROUND_CONVERGENCE_BUDGET_MS`) |
+| `send_publication` | Completed-only: a send's relay wait, as the session timed its publish. Success when the message reached its relays, failure otherwise. `send_execution` contains it |
+| `key_package_resolution` | A create's, invite's or invite recovery's lookup of its members' KeyPackages from the directory relays, on the account worker |
+| `sign_in_slot_read` | The sign-in check's read of the account's KeyPackage slots from its relays |
+| `relay_limit_lookup` | A size check on the account worker's task waiting for a relay's advertised message limit. Only events over 64 KiB look it up; the relay limit cache can answer without a fetch |
+| `route_refresh` | Applying the account's group subscription routes to the relay plane: each runtime group sync, and a create's founding Welcome registering the new group's routes |
+| `relay_reconnect` | A manual relay reconnect until the next connection attempt starts, or its 5 s wait ends |
+| `group_image_upload` | A group image upload to the media server, on create or on an image update |
+| `worker_remote_signer_call` | Each remote-signer call (NIP-46 or a host signer) made on the account worker's task, which waits for it. Failure when the signer returned an error |
 | `read_state_publish` | One per new version of an account's published read state (mdk#3273): the account worker rebuilding the answers whose inputs moved and swapping the version in, at the end of a worker unit or on a catch-up drain turn. A check that finds nothing changed records nothing |
 | `lifecycle_lock_wait` | Wait for the account manager's lifecycle transaction lock |
 | `account_startup`, `worker_reopen` | Initial/reconnect runtime client open; existing account stage metrics provide additional subdivision |
@@ -186,6 +197,50 @@ retry, a create or invite until its Welcome fanout, and a maintenance tick. Whil
 account's eight-slot lane fills and later reads wait for a slot. The reads from A answer through
 every unit, a full lane included. `src/runtime/account_worker/tests/read_queue_tests.rs` in
 `marmot-app` pins this for startup sync, a catch-up, a scheduled pass and a send.
+
+### Writer units and lane steps
+
+The `worker_unit_*`, `mutation_queue_behind_*` and lane step series measure the account worker as
+a writer. The worker runs one unit at a time: during a unit no other unit or delivery runs on that
+account, and commands wait. A unit that holds the client (startup sync, catch-up, a convergence
+pass, a Welcome fanout, a repair) still ends some waits at once, as the read queue section above
+describes: it answers a capture as not ready and a hydration request from the published read
+state. Startup sync and catch-up also refuse a group rejoin or an invite acceptance as busy, and
+every one but startup sync answers the subscription retry. A unit that awaits a relay holds the
+account for that wait.
+The over-budget counts name the units that held it longest; read their `duration_ms` beside the
+unit's own.
+
+The lane step spans (`send_publication` to `group_image_upload`) time the network waits the
+worker awaits today. Most sit inside the unit that awaits them: a send's `send_publication` inside
+`worker_unit_send`, a create's `key_package_resolution` and `group_image_upload` inside
+`worker_unit_invite_or_create`, the maintenance tick's `sign_in_slot_read` inside
+`worker_unit_maintenance`. Three run in a command that enters no unit, so they hold the worker with
+a lane span and no unit span: an image update's `group_image_upload`, a manual reconnect's
+`relay_reconnect`, and a host-requested sign-in check's `sign_in_slot_read`. When a wait moves off
+the worker, its span keeps the wait visible, and the duration of the unit that held it, if any,
+falls by it. Spans record only on an account worker's client; a client opened directly records
+none.
+
+`relay_limit_lookup` times every size check's limit lookup, a commit fanout's included. Only an
+event over 64 KiB starts one, and a cache hit or a lookup that finds no document counts too.
+
+Some network waits have no span of their own yet: a commit fanout's per-relay read-backs and
+sends; Welcome and legacy-row batches outside a create's stage timings; and KeyPackage and
+account-event publishes and slot deletions. They count in the duration of the unit that awaits
+them.
+
+A unit's span always finishes as a success. It measures how long the worker stayed in the unit;
+the work's own series (`worker_receive`, `send_execution`, the create and invite stages) carry its
+result.
+
+`src/runtime/account_worker/tests/writer_hold_tests.rs` in `marmot-app` pins the holds these
+series measure: a send waiting on its relays holds another group's send, a change to that group,
+a KeyPackage publish and a delivery; a create's KeyPackage lookup, and an invite's relay limit
+lookup, hold every command; a held Welcome fanout holds a send to another group; a held
+subscription refresh holds the media imeta tag read; and a sign-in check's slot read holds every
+command and a delivery. `full_media_capacity_queues` pins a media command parked behind a full
+set of transfer permits.
 
 ### Reading account startup stages
 

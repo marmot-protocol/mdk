@@ -21,6 +21,23 @@ use transport_nostr_peeler::{NostrTransportEvent, SdkSigner};
 use super::DIRECTORY_RELAY_CONNECT_WAIT;
 
 const DIRECTORY_RELAY_FETCH_WAIT: Duration = Duration::from_secs(3);
+
+/// How long an onboarding inspection waits, once connected, for its REQs to
+/// reach EOSE, including a retry after NIP-42 authentication. Longer than the
+/// pooled directory reads: an inspection is onboarding's only proof that a
+/// declared route works, and a healthy relay has been measured taking over
+/// 7 s to finish a gift-wrap query with a handful of matching events
+/// (mdk#3439).
+const DIRECTORY_INSPECTION_EOSE_WAIT: Duration = Duration::from_secs(8);
+
+/// The longest one onboarding inspection takes: its connect wait, then its
+/// EOSE window. A caller's per-relay budget must be longer, or it reports a
+/// slow healthy relay as timed out before the inspection does.
+pub const DIRECTORY_INSPECTION_WAIT: Duration =
+    match DIRECTORY_RELAY_CONNECT_WAIT.checked_add(DIRECTORY_INSPECTION_EOSE_WAIT) {
+        Some(wait) => wait,
+        None => panic!("directory inspection wait overflows"),
+    };
 const DIRECTORY_QUERY_CONCURRENCY: usize = 4;
 
 /// The most filters one strict directory REQ carries. strfry allows 3 per
@@ -974,6 +991,7 @@ impl DirectoryRelayFetcher for NostrSdkDirectoryRelayFetcher {
         // The signer belongs to this request only, never to a shared mutable
         // directory client that could authenticate as another account.
         let builder = super::nostr_builder();
+        let authenticates = signer.is_some();
         let client = ScopedInspectionClient(match signer {
             Some(signer) => builder
                 .authenticator(nostr_sdk::authenticator::SignerAuthenticator::new(
@@ -992,40 +1010,91 @@ impl DirectoryRelayFetcher for NostrSdkDirectoryRelayFetcher {
             .add_relay(url.clone())
             .await
             .map_err(|_| Unreachable)?;
-        timeout(
+        // Subscribed before connecting, so an authentication the SDK finishes
+        // at any point of this inspection is still in the stream.
+        let mut auth_notifications = if authenticates {
+            Some(
+                client
+                    .relay(url.clone())
+                    .await
+                    .map_err(|_| Unreachable)?
+                    .ok_or(Unreachable)?
+                    .notifications_with_gaps(),
+            )
+        } else {
+            None
+        };
+        // `connect_relay` only queues the dial. Await the handshake, so the
+        // EOSE window below is the relay's answer time alone.
+        match timeout(
             DIRECTORY_RELAY_CONNECT_WAIT,
-            client.connect_relay(url.clone()),
+            client.try_connect_relay(url.clone(), DIRECTORY_RELAY_CONNECT_WAIT),
         )
         .await
-        .map_err(|_| TimedOut)?
-        .map_err(|_| Unreachable)?;
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) if error.kind() == nostr_sdk::prelude::ErrorKind::Timeout => {
+                return Err(TimedOut);
+            }
+            Ok(Err(_)) => return Err(Unreachable),
+            Err(_) => return Err(TimedOut),
+        }
         client
             .relay(url.clone())
             .await
             .map_err(|_| Unreachable)?
             .ok_or(Unreachable)?;
+        let deadline = tokio::time::Instant::now() + DIRECTORY_INSPECTION_EOSE_WAIT;
         let mut records = Vec::new();
         for query in request.queries {
             let filter =
                 directory_query_filter(&query, query.kind == 1059).map_err(|_| InvalidRequest)?;
-            // A successful empty fetch can hide a CLOSED terminal. The bounded
-            // SDK acquisition retains that typed outcome and its wire reason.
-            let report = client
-                .acquire_events(
-                    ReqTarget::single(&url, [filter]),
-                    AcquisitionLimits::new(
-                        1,
-                        query.limit.saturating_add(1).max(1),
-                        16 * 1024 * 1024,
-                        DIRECTORY_RELAY_FETCH_WAIT,
-                    ),
-                )
-                .await;
-            let report = report
-                .map_err(|_| Unreachable)?
-                .finish()
-                .await
-                .map_err(|_| Unreachable)?;
+            let report = loop {
+                // The SDK refuses a zero acquisition timeout.
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    return Err(TimedOut);
+                }
+                // A successful empty fetch can hide a CLOSED terminal. The
+                // bounded SDK acquisition retains that typed outcome and its
+                // wire reason.
+                let report = client
+                    .acquire_events(
+                        ReqTarget::single(&url, [filter.clone()]),
+                        AcquisitionLimits::new(
+                            1,
+                            query.limit.saturating_add(1).max(1),
+                            16 * 1024 * 1024,
+                            remaining,
+                        ),
+                    )
+                    .await
+                    .map_err(|_| Unreachable)?
+                    .finish()
+                    .await
+                    .map_err(|_| Unreachable)?;
+                // With a signer, the SDK itself re-sends a REQ after NIP-42
+                // authentication only for a reason that starts with
+                // `auth-required:`, and ends the read on a wrapped one
+                // (mdk#3439). Retry that once, authenticated.
+                let auth_required_close = report.relays.get(&url).is_some_and(|result| {
+                    matches!(
+                        &result.end,
+                        AcquisitionEnd::Rejected(reason) | AcquisitionEnd::RelayClosed(reason)
+                            if directory_closed_reason(reason) == AuthenticationRequired
+                    )
+                });
+                // One retry per inspection: the next close is final.
+                match auth_notifications.take() {
+                    Some(mut notifications) if auth_required_close => {
+                        relay_authenticated_by(deadline, &mut notifications).await?;
+                    }
+                    notifications => {
+                        auth_notifications = notifications;
+                        break report;
+                    }
+                }
+            };
             let result = report.relays.get(&url).ok_or(Unreachable)?;
             match &result.end {
                 AcquisitionEnd::Completed => {}
@@ -1101,8 +1170,42 @@ impl DirectoryRelayFetcher for NostrSdkDirectoryRelayFetcher {
     }
 }
 
+/// Waits until `deadline` for the SDK to authenticate to the relay whose
+/// notifications these are. Ok when it did, or when lost notifications may
+/// have hidden it. An authentication that failed, or that cannot happen any
+/// more, leaves the route requiring it; one still running at the deadline
+/// leaves the check undecided.
+async fn relay_authenticated_by(
+    deadline: tokio::time::Instant,
+    notifications: &mut (impl futures::Stream<Item = NotificationUpdate<RelayNotification>> + Unpin),
+) -> Result<(), DirectoryInspectionError> {
+    use DirectoryInspectionError::*;
+    tokio::time::timeout_at(deadline, async {
+        while let Some(update) = notifications.next().await {
+            match update {
+                NotificationUpdate::Notification(RelayNotification::Authenticated)
+                | NotificationUpdate::Lagged { .. } => return Ok(()),
+                NotificationUpdate::Notification(RelayNotification::AuthenticationFailed) => {
+                    return Err(AuthenticationRequired);
+                }
+                _ => {}
+            }
+        }
+        Err(AuthenticationRequired)
+    })
+    .await
+    .unwrap_or(Err(TimedOut))
+}
+
+/// Classifies a relay's CLOSED reason by its NIP-01 machine-readable prefix.
+/// Some relays put that prefix behind one `error:` wrapper (`ERROR:
+/// auth-required: ...`, mdk#3439); that wrapper alone is looked through.
 fn directory_closed_reason(reason: &str) -> DirectoryInspectionError {
     use DirectoryInspectionError::*;
+    let reason = reason
+        .get(..6)
+        .filter(|wrapper| wrapper.eq_ignore_ascii_case("error:"))
+        .map_or(reason, |_| reason[6..].trim_start());
     if reason.starts_with("auth-required:") {
         AuthenticationRequired
     } else if reason.starts_with("payment-required:") {
@@ -1569,6 +1672,28 @@ mod tests {
                 "payment-required: pay",
                 DirectoryInspectionError::PaymentRequired,
             ),
+            // mdk#3439: a public relay wraps the NIP-01 prefix in `ERROR: `.
+            (
+                "ERROR: auth-required: requested filter requires auth",
+                DirectoryInspectionError::AuthenticationRequired,
+            ),
+            (
+                "error: payment-required: pay",
+                DirectoryInspectionError::PaymentRequired,
+            ),
+            // Only that one wrapper is looked through.
+            (
+                "error: internal failure",
+                DirectoryInspectionError::Restricted,
+            ),
+            (
+                "blocked: auth-required: sign in",
+                DirectoryInspectionError::Restricted,
+            ),
+            (
+                "error: error: auth-required: sign in",
+                DirectoryInspectionError::Restricted,
+            ),
         ] {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let endpoint = TransportEndpoint(format!("ws://{}", listener.local_addr().unwrap()));
@@ -1604,6 +1729,168 @@ mod tests {
             server.abort();
             assert_eq!(result, Err(expected));
         }
+    }
+
+    /// How [`spawn_inspection_relay`] answers each REQ.
+    #[derive(Clone, Copy)]
+    enum InspectionRelay {
+        /// Close every REQ until the client authenticates, the way a relay
+        /// that wraps the NIP-01 prefix does, sending its challenge (if
+        /// `challenge`) after the CLOSED. Answer EOSE once authenticated.
+        WrappedAuthRequired { challenge: bool },
+        /// Accept the WebSocket handshake after the first delay, then answer
+        /// each REQ's EOSE after the second.
+        Slow { handshake: Duration, eose: Duration },
+    }
+
+    /// A loopback relay for one inspection. Returns its endpoint and the
+    /// number of REQs it received.
+    async fn spawn_inspection_relay(
+        script: InspectionRelay,
+    ) -> (
+        TransportEndpoint,
+        Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use futures::{SinkExt, StreamExt};
+        use std::sync::atomic::Ordering;
+        use tokio::net::TcpListener;
+        use tokio_tungstenite::{accept_async, tungstenite::Message};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = TransportEndpoint(format!("ws://{}", listener.local_addr().unwrap()));
+        let reqs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = reqs.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            if let InspectionRelay::Slow { handshake, .. } = script {
+                tokio::time::sleep(handshake).await;
+            }
+            let mut socket = accept_async(stream).await.unwrap();
+            let mut authenticated = false;
+            while let Some(Ok(message)) = socket.next().await {
+                let Message::Text(text) = message else {
+                    continue;
+                };
+                let request: serde_json::Value = serde_json::from_str(&text).unwrap();
+                let replies = match (request[0].as_str(), script) {
+                    (Some("AUTH"), _) => {
+                        authenticated = true;
+                        vec![serde_json::json!(["OK", request[1]["id"], true, ""])]
+                    }
+                    (Some("REQ"), InspectionRelay::WrappedAuthRequired { challenge })
+                        if !authenticated =>
+                    {
+                        counted.fetch_add(1, Ordering::SeqCst);
+                        let mut replies = vec![serde_json::json!([
+                            "CLOSED",
+                            request[1],
+                            "ERROR: auth-required: requested filter requires auth"
+                        ])];
+                        if challenge {
+                            replies.push(serde_json::json!(["AUTH", "inspection-challenge"]));
+                        }
+                        replies
+                    }
+                    (Some("REQ"), script) => {
+                        counted.fetch_add(1, Ordering::SeqCst);
+                        if let InspectionRelay::Slow { eose, .. } = script {
+                            tokio::time::sleep(eose).await;
+                        }
+                        vec![serde_json::json!(["EOSE", request[1]])]
+                    }
+                    _ => continue,
+                };
+                for reply in replies {
+                    if socket
+                        .send(Message::Text(reply.to_string().into()))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            }
+        });
+        (endpoint, reqs, server)
+    }
+
+    async fn inspect_inbox(
+        endpoint: TransportEndpoint,
+        signer: Option<Arc<dyn transport_nostr_peeler::MarmotNostrSigner>>,
+    ) -> Result<Vec<DirectoryRelayEventRecord>, DirectoryInspectionError> {
+        let recipient = nostr::prelude::Keys::generate().public_key().to_hex();
+        let request = DirectoryFetchRequest::new(
+            vec![endpoint],
+            vec![DirectoryEventQuery::new(1059, vec![recipient], 32)],
+        )
+        .unwrap();
+        timeout(
+            DIRECTORY_INSPECTION_WAIT + Duration::from_secs(1),
+            NostrSdkDirectoryRelayFetcher::standalone().inspect_directory_events(request, signer),
+        )
+        .await
+        .expect("inspection ends within its own budget")
+    }
+
+    // mdk#3439: the SDK re-sends a REQ after NIP-42 only for a CLOSED whose
+    // reason starts with `auth-required:`. The inspection must authenticate
+    // and retry a wrapped one itself.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn signed_inspection_retries_a_wrapped_auth_required_close_after_authenticating() {
+        let (endpoint, reqs, server) =
+            spawn_inspection_relay(InspectionRelay::WrappedAuthRequired { challenge: true }).await;
+        let signer: Arc<dyn transport_nostr_peeler::MarmotNostrSigner> =
+            Arc::new(nostr::prelude::Keys::generate());
+        let result = inspect_inbox(endpoint.clone(), Some(signer)).await;
+        server.abort();
+        assert_eq!(result, Ok(Vec::new()));
+        assert_eq!(reqs.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+        // Without a signer there is nothing to retry with.
+        let (endpoint, reqs, server) =
+            spawn_inspection_relay(InspectionRelay::WrappedAuthRequired { challenge: true }).await;
+        let result = inspect_inbox(endpoint, None).await;
+        server.abort();
+        assert_eq!(
+            result,
+            Err(DirectoryInspectionError::AuthenticationRequired)
+        );
+        assert_eq!(reqs.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    // An authentication still outstanding when the window ends leaves the
+    // route undecided, not refused. Real time, as for the slow-EOSE test.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn signed_inspection_times_out_when_authentication_never_completes() {
+        let (endpoint, reqs, server) =
+            spawn_inspection_relay(InspectionRelay::WrappedAuthRequired { challenge: false }).await;
+        let signer: Arc<dyn transport_nostr_peeler::MarmotNostrSigner> =
+            Arc::new(nostr::prelude::Keys::generate());
+        let result = inspect_inbox(endpoint, Some(signer)).await;
+        server.abort();
+        assert_eq!(result, Err(DirectoryInspectionError::TimedOut));
+        assert_eq!(reqs.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    // mdk#3439: a healthy relay can take several seconds to finish a gift-wrap
+    // query. Onboarding inspection waits longer than the pooled directory
+    // reads, and its EOSE window starts once the slow handshake is done.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn inspection_waits_past_the_directory_read_window_for_a_slow_eose() {
+        // Real time: paused time auto-advances past the connect wait while
+        // the loopback handshake is still in flight. Each bound keeps a
+        // second or more of slack for a loaded machine.
+        let handshake = (DIRECTORY_INSPECTION_EOSE_WAIT - DIRECTORY_RELAY_FETCH_WAIT) * 2 / 5;
+        let eose = DIRECTORY_INSPECTION_EOSE_WAIT - handshake / 2;
+        assert!(handshake < DIRECTORY_RELAY_CONNECT_WAIT);
+        assert!(eose > DIRECTORY_RELAY_FETCH_WAIT);
+        assert!(handshake + eose > DIRECTORY_INSPECTION_EOSE_WAIT);
+        let (endpoint, _, server) =
+            spawn_inspection_relay(InspectionRelay::Slow { handshake, eose }).await;
+        let result = inspect_inbox(endpoint, None).await;
+        server.abort();
+        assert_eq!(result, Ok(Vec::new()));
     }
 
     /// A loopback relay that enforces strfry's REQ shape: it refuses a REQ

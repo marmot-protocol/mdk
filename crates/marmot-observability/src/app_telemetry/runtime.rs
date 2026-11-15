@@ -81,6 +81,52 @@ operations! {
     ReadQueueBehindSend => "read_queue_behind_send",
     ReadQueueBehindInviteOrCreate => "read_queue_behind_invite_or_create",
     ReadQueueBehindMaintenance => "read_queue_behind_maintenance",
+    // The same wait for a host mutation (step 3 of the runtime-concurrency
+    // review): from just before channel admission until the worker takes it
+    // up, for one enqueued while the worker was inside that unit.
+    MutationQueueBehindStartupSync => "mutation_queue_behind_startup_sync",
+    MutationQueueBehindCatchUp => "mutation_queue_behind_catch_up",
+    MutationQueueBehindConvergence => "mutation_queue_behind_convergence",
+    MutationQueueBehindWelcomeFanout => "mutation_queue_behind_welcome_fanout",
+    MutationQueueBehindRepair => "mutation_queue_behind_repair",
+    MutationQueueBehindSend => "mutation_queue_behind_send",
+    MutationQueueBehindInviteOrCreate => "mutation_queue_behind_invite_or_create",
+    MutationQueueBehindMaintenance => "mutation_queue_behind_maintenance",
+    // One per kind of account-worker unit: how long the worker stays in it,
+    // and, in `_over_budget`, each one that outlasted the engine's budget for
+    // its kind (250 ms foreground, 500 ms background).
+    WorkerUnitStartupSync => "worker_unit_startup_sync",
+    WorkerUnitStartupSyncOverBudget => "worker_unit_startup_sync_over_budget",
+    WorkerUnitCatchUp => "worker_unit_catch_up",
+    WorkerUnitCatchUpOverBudget => "worker_unit_catch_up_over_budget",
+    WorkerUnitConvergence => "worker_unit_convergence",
+    WorkerUnitConvergenceOverBudget => "worker_unit_convergence_over_budget",
+    WorkerUnitWelcomeFanout => "worker_unit_welcome_fanout",
+    WorkerUnitWelcomeFanoutOverBudget => "worker_unit_welcome_fanout_over_budget",
+    WorkerUnitRepair => "worker_unit_repair",
+    WorkerUnitRepairOverBudget => "worker_unit_repair_over_budget",
+    WorkerUnitSend => "worker_unit_send",
+    WorkerUnitSendOverBudget => "worker_unit_send_over_budget",
+    WorkerUnitInviteOrCreate => "worker_unit_invite_or_create",
+    WorkerUnitInviteOrCreateOverBudget => "worker_unit_invite_or_create_over_budget",
+    WorkerUnitMaintenance => "worker_unit_maintenance",
+    WorkerUnitMaintenanceOverBudget => "worker_unit_maintenance_over_budget",
+    WorkerUnitDelivery => "worker_unit_delivery",
+    WorkerUnitDeliveryOverBudget => "worker_unit_delivery_over_budget",
+    WorkerUnitRunnerTurn => "worker_unit_runner_turn",
+    WorkerUnitRunnerTurnOverBudget => "worker_unit_runner_turn_over_budget",
+    // One per network step the account worker awaits today that a later
+    // step-3 PR moves to a lane, so its wait stays visible once it moves.
+    SendPublication => "send_publication",
+    KeyPackageResolution => "key_package_resolution",
+    SignInSlotRead => "sign_in_slot_read",
+    RelayLimitLookup => "relay_limit_lookup",
+    RouteRefresh => "route_refresh",
+    RelayReconnect => "relay_reconnect",
+    GroupImageUpload => "group_image_upload",
+    // Each call to a remote signer (NIP-46 or a host signer) made inside
+    // the account worker, which waits for it.
+    WorkerRemoteSignerCall => "worker_remote_signer_call",
     // One per version of the account's published read state (mdk#3273): the
     // worker building and swapping it in at a quiescent point.
     ReadStatePublish => "read_state_publish",
@@ -347,9 +393,19 @@ pub(crate) struct RuntimeTelemetry(
 );
 impl Default for RuntimeTelemetry {
     fn default() -> Self {
-        Self(Arc::new(std::array::from_fn(|_| {
-            OperationTelemetry::default()
-        })))
+        // Build each operation's record in its heap slot. The whole array is
+        // hundreds of KiB, and built by value an unoptimized build keeps it,
+        // and its copies, on the caller's stack: a host thread with a small
+        // stack, when a host opens the runtime from one.
+        let operations: Arc<[OperationTelemetry]> = RuntimePerformanceOperation::ALL
+            .iter()
+            .map(|_| OperationTelemetry::default())
+            .collect();
+        Self(
+            operations
+                .try_into()
+                .expect("one record per runtime operation"),
+        )
     }
 }
 impl RuntimeTelemetry {
@@ -698,6 +754,20 @@ mod tests {
             (0, 0)
         );
         assert_eq!(sample(&t).started, sample(&t).completed);
+    }
+    /// A host opens the runtime on its own thread, which can have a small
+    /// stack (a Swift cooperative thread has 512 KiB). Building the per-series
+    /// records by value took about 490 KiB of it in a debug build and
+    /// overflowed once the series list grew (mdk#3452).
+    #[test]
+    fn the_series_records_build_on_a_small_host_stack() {
+        let built = std::thread::Builder::new()
+            .stack_size(128 * 1024)
+            .spawn(|| RuntimeTelemetry::default().snapshot().len())
+            .unwrap()
+            .join()
+            .unwrap();
+        assert_eq!(built, RuntimePerformanceOperation::ALL.len());
     }
     #[test]
     fn every_series_exists_before_its_first_observation() {

@@ -299,6 +299,12 @@ const ONBOARDING_V2: u32 = 2;
 const STEP_COUNT: usize = 6;
 const MAX_RELAYS: usize = 16;
 const CHECK_WAIT: Duration = Duration::from_secs(15);
+// A relay inspection must end on its own terms (EOSE, CLOSED, its timeout)
+// before this per-relay budget cuts it off as `TimedOut`.
+const _: () = assert!(
+    CHECK_WAIT.as_millis() > transport_nostr::DIRECTORY_INSPECTION_WAIT.as_millis(),
+    "CHECK_WAIT must outlast one relay inspection"
+);
 const ONBOARDING_CANCELLATION_WAIT: Duration = Duration::from_secs(15);
 const CHECK_MAX_AGE: u64 = 300;
 const FUTURE_CLOCK_SKEW: u64 = 300;
