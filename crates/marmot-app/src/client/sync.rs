@@ -2442,8 +2442,7 @@ impl AppClient {
                     return Ok(transport_nostr::AccountDeliveryReceive::Overflow(overflow));
                 }
             };
-            let event_id = hex::encode(delivery.message.id.as_slice());
-            if self.transport_receipts()?.contains(&event_id) {
+            if self.transport_receipts()?.skips(&delivery)? {
                 self.record_durable_transport_reconciliation_delivery(&delivery);
                 self.adapter.release_account_delivery(&delivery.message.id);
                 self.settle_spilled_delivery();
@@ -2485,8 +2484,7 @@ impl AppClient {
         delivery: &cgka_traits::TransportDelivery,
         inventory_write: InventoryWrite,
     ) -> Result<(SyncSummary, RecoveredDelivery, Option<InventoryRecord>), AppError> {
-        let event_id = hex::encode(delivery.message.id.as_slice());
-        if self.transport_receipts()?.contains(&event_id) {
+        if self.transport_receipts()?.skips(delivery)? {
             let inventory_record = match inventory_write {
                 InventoryWrite::Immediate => {
                     self.record_durable_transport_reconciliation_delivery(delivery);
@@ -2826,8 +2824,11 @@ impl AppClient {
                     .dev_fail_sync_before_delivery
                     .is_some_and(|limit| counts.deliveries >= limit);
             std::mem::swap(&mut self.pending_applied_sync_summary, &mut summary);
-            let receipts = match self.transport_receipts() {
-                Ok(receipts) => receipts,
+            let (receipts, skipped) = match self.transport_receipts().and_then(|mut receipts| {
+                let skipped = receipts.skips(&delivery)?;
+                Ok((receipts, skipped))
+            }) {
+                Ok(checked) => checked,
                 Err(error) => {
                     self.prepend_pending_applied_summary(&mut summary);
                     return Err(self
@@ -2842,8 +2843,7 @@ impl AppClient {
                         .await);
                 }
             };
-            let event_id = hex::encode(delivery.message.id.as_slice());
-            if receipts.contains(&event_id) {
+            if skipped {
                 self.record_durable_transport_reconciliation_delivery(&delivery);
                 self.adapter.release_account_delivery(&delivery.message.id);
                 counts.skipped = counts.skipped.saturating_add(1);
@@ -2914,7 +2914,7 @@ impl AppClient {
             // durable trace of must stay fetchable, so the relay re-serves it on
             // a later drain instead of this one skipping it as already seen.
             if !ingested.must_stay_fetchable {
-                self.remember_seen_event(event_id);
+                self.remember_seen_event(hex::encode(message_id.as_slice()));
             }
             counts.deliveries = counts.deliveries.saturating_add(1);
             if summary == SyncSummary::default() {
@@ -8235,6 +8235,9 @@ mod tests {
         assert_eq!(buffered, ingested);
     }
 }
+
+#[cfg(test)]
+mod own_echo_tests;
 
 #[cfg(test)]
 mod queued_outbound_schedule_tests;

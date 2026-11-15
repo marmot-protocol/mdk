@@ -4,7 +4,9 @@
 // one of the commit's relays shows that relay holds it, whatever the relay
 // answered the publish. The relay counts as having acknowledged the commit,
 // and the commit confirms. A copy under another event id, or from a relay that
-// is not a target, shows nothing.
+// is not a target, shows nothing. The account already holds the event, so a
+// host that skips held events before ingest asks `takes_own_echo` first, which
+// passes exactly the copies that acknowledge a relay.
 
 /// `message` as the account's group subscription receives it from `endpoint`.
 fn group_delivery(
@@ -71,6 +73,8 @@ async fn an_own_echo_from_a_target_relay_confirms_a_pending_commit() {
         (&commit, None, "no relay"),
     ] {
         let delivery = group_delivery(&runtime, &fixture, message, endpoint);
+        // A host that skips held events may skip this copy: it acknowledges nothing.
+        assert!(!runtime.takes_own_echo(&delivery).unwrap(), "{case}");
         let ingested = runtime.ingest_delivery(&delivery).await.unwrap();
         assert!(ingested.effects.pending.is_empty(), "{case}");
         assert_eq!(
@@ -85,6 +89,8 @@ async fn an_own_echo_from_a_target_relay_confirms_a_pending_commit() {
     }
 
     let delivery = group_delivery(&runtime, &fixture, &commit, Some("wss://ECHO-B.example:443/"));
+    // The account holds this event too, but a host must still pass this copy.
+    assert!(runtime.takes_own_echo(&delivery).unwrap());
     let ingested = runtime.ingest_delivery(&delivery).await.unwrap();
 
     assert_eq!(
@@ -109,4 +115,8 @@ async fn an_own_echo_from_a_target_relay_confirms_a_pending_commit() {
         stored_status(&runtime, &ambiguous),
         Some(FanoutTargetStatus::PossiblyExposed)
     );
+    // Once the commit confirms, no copy of it acknowledges anything more.
+    assert!(!runtime.takes_own_echo(&delivery).unwrap());
+    let ambiguous_copy = group_delivery(&runtime, &fixture, &commit, Some("wss://echo-a.example"));
+    assert!(!runtime.takes_own_echo(&ambiguous_copy).unwrap());
 }
