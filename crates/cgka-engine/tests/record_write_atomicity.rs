@@ -4135,7 +4135,8 @@ async fn a_queued_intent_whose_commit_reached_no_relay_is_retired_with_its_rollb
 /// intent: given up as `not_delivered`, confirmed, or refused for size. The
 /// next drain then stages nothing. A fanout staged before the name existed
 /// cannot say which intent it carries: its rollback keeps the intent, which
-/// the drain stages once more, named this time.
+/// the drain stages once more, named this time. A fanout naming an intent that
+/// is no longer queued still confirms: deleting the missing row would fail.
 #[tokio::test]
 async fn a_drained_commit_retires_its_queued_intent_after_a_restart() {
     use cgka_traits::{
@@ -4149,12 +4150,14 @@ async fn a_drained_commit_retires_its_queued_intent_after_a_restart() {
         Confirmed,
         TooLarge,
         StagedBeforeTheName,
+        ConfirmedAfterTheIntentWent,
     }
     for resolution in [
         Resolution::NotDelivered,
         Resolution::Confirmed,
         Resolution::TooLarge,
         Resolution::StagedBeforeTheName,
+        Resolution::ConfirmedAfterTheIntentWent,
     ] {
         let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
         let build = || {
@@ -4233,6 +4236,9 @@ async fn a_drained_commit_retires_its_queued_intent_after_a_restart() {
             fanout.set_queued_intent(intent_id.clone()).unwrap();
         }
         engine.put_outbound_fanout(&fanout).unwrap();
+        if resolution == Resolution::ConfirmedAfterTheIntentWent {
+            storage.delete_queued_outbound_intent(&intent_id).unwrap();
+        }
         drop(engine);
 
         let mut engine = build();
@@ -4287,7 +4293,7 @@ async fn a_drained_commit_retires_its_queued_intent_after_a_restart() {
                     .await
                     .unwrap();
             }
-            Resolution::Confirmed => {
+            Resolution::Confirmed | Resolution::ConfirmedAfterTheIntentWent => {
                 fanout.mark_attempt_started_at(0, 100).unwrap();
                 engine.put_outbound_fanout(&fanout).unwrap();
                 fanout.mark_target_accepted(0).unwrap();
@@ -4345,7 +4351,7 @@ async fn a_drained_commit_retires_its_queued_intent_after_a_restart() {
                 assert!(queued.is_empty(), "{resolution:?}");
                 assert!(next.is_empty(), "{resolution:?}: {next:?}");
             }
-            Resolution::Confirmed => {
+            Resolution::Confirmed | Resolution::ConfirmedAfterTheIntentWent => {
                 assert!(refusals.is_empty(), "{refusals:?}");
                 assert!(queued.is_empty(), "the confirmed intent is retired");
                 assert!(next.is_empty(), "{next:?}");
