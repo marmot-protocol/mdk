@@ -13,6 +13,8 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   `MarmotAttachmentStorageUsage` gains `draft_bytes` (#3431). Both layouts
   changed, and draft attachments are read as an array: rebuild clients with the
   matching header and library.
+- `MarmotOnboardingRepairProposal` gains `inconclusive` (#3441), so its
+  layout changed: rebuild clients with the matching header and library.
 
 ### Added
 
@@ -28,6 +30,12 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   `marmot_upload_message_draft_attachments` and
   `marmot_save_message_draft_inputs_if_revision` with
   `MarmotMessageDraftAttachmentSaveInput`.
+- Onboarding relay steps offer `EditRelays` and `UseRecommendedRelays` when
+  their check was inconclusive, and `MarmotOnboardingRepairProposal.inconclusive`
+  marks a proposal built on such a check. Confirm it at the user's own risk
+  before approving. See the
+  [shared guidance](../marmot-uniffi/README.md#interactive-account-onboarding)
+  (#3441).
 
 ## [0.17.0] - 2026-11-15
 

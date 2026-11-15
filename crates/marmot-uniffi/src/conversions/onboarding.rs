@@ -450,6 +450,11 @@ pub struct OnboardingRepairProposalFfi {
     pub profile: Option<UserProfileMetadataFfi>,
     pub follows: Option<Vec<String>>,
     pub relay_repair: Option<OnboardingRelayRepairFfi>,
+    /// The check this proposal was built on was inconclusive: a lookup source
+    /// failed, or no declared route answered. Confirm explicitly, at the
+    /// user's own risk, before approving.
+    #[uniffi(default = false)]
+    pub inconclusive: bool,
 }
 impl From<marmot_app::OnboardingRepairProposal> for OnboardingRepairProposalFfi {
     fn from(value: marmot_app::OnboardingRepairProposal) -> Self {
@@ -462,6 +467,7 @@ impl From<marmot_app::OnboardingRepairProposal> for OnboardingRepairProposalFfi 
             profile: value.profile.map(Into::into),
             follows: value.follows,
             relay_repair: value.relay_repair.map(Into::into),
+            inconclusive: value.inconclusive,
         }
     }
 }

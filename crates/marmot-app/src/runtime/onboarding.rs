@@ -541,6 +541,12 @@ pub struct OnboardingRepairProposal {
     pub follows: Option<Vec<String>>,
     #[serde(default)]
     pub relay_repair: Option<OnboardingRelayRepair>,
+    /// The check this proposal was built on was inconclusive: a record lookup
+    /// source failed, or no declared route answered. A newer record may sit on
+    /// a source that did not answer, and the declared relays may work for
+    /// other clients. Hosts confirm at the user's own risk before approving.
+    #[serde(default)]
+    pub inconclusive: bool,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct OnboardingSnapshot {
@@ -727,6 +733,54 @@ impl OnboardingCheckpoint {
             inherited.contains(&key) && !writes.contains(&key)
         })
     }
+    /// A relay step whose check could not conclude in a way the user can fix
+    /// by editing the list: no declared route answered, or the lookup found no
+    /// record while a source that vouches for the account's records answered
+    /// and another failed (`DiscoveryIncomplete`). An interruption is not
+    /// evidence either way.
+    fn relay_check_failed_editably(
+        &self,
+        step: OnboardingStep,
+        status: OnboardingStatus,
+        findings: &[OnboardingFinding],
+    ) -> bool {
+        step.relay()
+            && status == OnboardingStatus::RetryableFailure
+            && !findings
+                .iter()
+                .any(|finding| finding.issue == OnboardingIssue::Interrupted)
+            && findings.iter().any(|finding| {
+                (finding.context == OnboardingFindingContext::DeclaredRoute
+                    && finding.issue == OnboardingIssue::NoUsableRoute)
+                    || (finding.context == OnboardingFindingContext::RecordDiscovery
+                        && finding.issue == OnboardingIssue::DiscoveryIncomplete
+                        && self.records[step.index()].is_none())
+            })
+    }
+    /// Whether appending the recommended defaults can change this step's list.
+    fn recommended_relays_apply(&self, step: OnboardingStep, status: OnboardingStatus) -> bool {
+        // Appending cannot change an inherited role to create an outbox.
+        if step == OnboardingStep::Relays && self.defaults_need_edit() {
+            return false;
+        }
+        // After a failed check, appending only defaults the list already
+        // declares cannot add the route that failed.
+        status == OnboardingStatus::NeedsInput
+            || self.records[step.index()].as_ref().is_none_or(|event| {
+                let inherited = raw_relay_keys(event);
+                self.options
+                    .defaults_for(step)
+                    .iter()
+                    .any(|relay| !inherited.contains(&relay_key(relay)))
+            })
+    }
+    /// A relay step the user may edit now, with or without defaults.
+    fn relay_step_editable(&self, step: OnboardingStep) -> bool {
+        let state = &self.snapshot.steps[step.index()];
+        step.relay()
+            && (state.status == OnboardingStatus::NeedsInput
+                || self.relay_check_failed_editably(step, state.status, &state.findings))
+    }
     fn attempt(&self) -> OnboardingAttempt {
         use sha2::{Digest, Sha256};
         OnboardingAttempt {
@@ -767,10 +821,13 @@ impl OnboardingCheckpoint {
                         });
                     }
                 }
-                // No replacement may be proposed from inconclusive discovery.
-                if step.relay() && status == OnboardingStatus::NeedsInput {
-                    // Appending cannot change an inherited role to create an outbox.
-                    if step != OnboardingStep::Relays || !self.defaults_need_edit() {
+                // Inconclusive discovery never proposes a replacement by
+                // itself; the user may still edit after one (see below).
+                if step.relay()
+                    && (status == OnboardingStatus::NeedsInput
+                        || self.relay_check_failed_editably(step, status, &findings))
+                {
+                    if self.recommended_relays_apply(step, status) {
                         actions.push(OnboardingAction::UseRecommendedRelays);
                     }
                     actions.push(OnboardingAction::EditRelays);
@@ -924,6 +981,20 @@ fn refresh_finding_actions(snapshot: &mut OnboardingSnapshot) {
                         OnboardingAction::ContinueWithout,
                     ]
                 }
+                // An incomplete lookup the user may edit past (the step
+                // offers the edit only when it applies).
+                OnboardingFindingContext::RecordDiscovery
+                    if finding.issue == OnboardingIssue::DiscoveryIncomplete =>
+                {
+                    &[
+                        OnboardingAction::Retry,
+                        OnboardingAction::EditDiscoveryRelays,
+                        OnboardingAction::EditRelays,
+                        OnboardingAction::UseRecommendedRelays,
+                        OnboardingAction::ContinueWithout,
+                        OnboardingAction::ReconnectSigner,
+                    ]
+                }
                 OnboardingFindingContext::RecordDiscovery
                 | OnboardingFindingContext::RepairApproval => &[
                     OnboardingAction::Retry,
@@ -941,6 +1012,17 @@ fn refresh_finding_actions(snapshot: &mut OnboardingSnapshot) {
                     OnboardingAction::CancelRepair,
                     OnboardingAction::ContinueWithout,
                 ],
+                // No declared route answered: the list itself may need editing.
+                OnboardingFindingContext::DeclaredRoute
+                    if finding.issue == OnboardingIssue::NoUsableRoute =>
+                {
+                    &[
+                        OnboardingAction::Retry,
+                        OnboardingAction::EditRelays,
+                        OnboardingAction::UseRecommendedRelays,
+                        OnboardingAction::ReconnectSigner,
+                    ]
+                }
                 // A failed read query does not nominate a route for removal.
                 OnboardingFindingContext::DeclaredRoute => {
                     &[OnboardingAction::Retry, OnboardingAction::ReconnectSigner]
@@ -984,6 +1066,18 @@ fn evaluated_onboarding_status(
     } else {
         OnboardingStatus::NeedsInput
     }
+}
+/// Whether a step's last check was inconclusive: a record lookup source
+/// failed, or no declared route answered. `Missing` is a completed lookup.
+fn check_inconclusive(findings: &[OnboardingFinding]) -> bool {
+    findings.iter().any(|finding| match finding.context {
+        OnboardingFindingContext::RecordDiscovery => {
+            finding.outcome != OnboardingCheckOutcome::Success
+                && finding.issue != OnboardingIssue::Missing
+        }
+        OnboardingFindingContext::DeclaredRoute => finding.issue == OnboardingIssue::NoUsableRoute,
+        _ => false,
+    })
 }
 fn onboarding_error() -> AppError {
     AppError::OnboardingActionUnavailable
@@ -2342,6 +2436,36 @@ impl AccountSetup<'_> {
             .collect();
         (records, failures, completed)
     }
+    /// Whether a lookup source that answered vouches for the account's own
+    /// records. The host's discovery relays are its own relays, which rarely
+    /// hold an imported account's lists (see `append_public_indexers`), so
+    /// they vouch only when no public indexer was searched: a host-selected
+    /// or hermetic discovery set.
+    fn authoritative_answered(
+        &self,
+        c: &OnboardingCheckpoint,
+        sources: &[String],
+        completed: &HashMap<String, String>,
+    ) -> bool {
+        let indexers: HashSet<String> = self
+            .app()
+            .discovery_indexer_relays()
+            .iter()
+            .map(|endpoint| relay_key(&endpoint.0))
+            .collect();
+        let indexer_searched = sources
+            .iter()
+            .any(|source| indexers.contains(&relay_key(source)));
+        let host: HashSet<String> = c
+            .options
+            .discovery_relays
+            .iter()
+            .map(|relay| relay_key(relay))
+            .collect();
+        completed
+            .keys()
+            .any(|key| !indexer_searched || !host.contains(key))
+    }
     async fn onboarding_sources(
         &self,
         c: &OnboardingCheckpoint,
@@ -2421,11 +2545,21 @@ impl AccountSetup<'_> {
             );
         }
         let sources = self.onboarding_sources(c, step).await;
-        let (records, failures, completed) = self
-            .inspect_onboarding_relays(&c.snapshot.account_id_hex, step.kind(), sources)
+        let (records, mut failures, completed) = self
+            .inspect_onboarding_relays(&c.snapshot.account_id_hex, step.kind(), sources.clone())
             .await;
         let Some(event) = records.into_iter().next() else {
             return if completed.is_empty() || !failures.is_empty() {
+                if !failures.is_empty() && self.authoritative_answered(c, &sources, &completed) {
+                    // Absent where it answered, unknown where it failed.
+                    failures.insert(
+                        0,
+                        finding(OnboardingIssue::DiscoveryIncomplete).in_context(
+                            OnboardingFindingContext::RecordDiscovery,
+                            OnboardingCheckPurpose::RecordLookup,
+                        ),
+                    );
+                }
                 (
                     OnboardingStatus::RetryableFailure,
                     if failures.is_empty() {
@@ -2658,9 +2792,12 @@ impl AccountSetup<'_> {
             .onboarding_checkpoint(account_ref)?
             .ok_or_else(onboarding_error)?;
         self.require_captured_attempt(&c, attempt)?;
-        if !step.relay()
-            || c.approved
-            || c.snapshot.steps[step.index()].status != OnboardingStatus::NeedsInput
+        let status = c.snapshot.steps[step.index()].status;
+        if c.approved
+            || !c.relay_step_editable(step)
+            || (selection.is_none()
+                && status != OnboardingStatus::NeedsInput
+                && !c.recommended_relays_apply(step, status))
         {
             return Err(onboarding_error());
         }
@@ -2739,6 +2876,7 @@ impl AccountSetup<'_> {
             profile: None,
             follows: None,
             relay_repair,
+            inconclusive: check_inconclusive(&c.snapshot.steps[step.index()].findings),
         });
         c.snapshot.steps[step.index()].actions = if manual_review {
             vec![OnboardingAction::EditRelays, OnboardingAction::CancelRepair]
@@ -2854,6 +2992,7 @@ impl AccountSetup<'_> {
             profile,
             follows,
             relay_repair: None,
+            inconclusive: false,
         });
         c.snapshot.steps[step.index()].actions = vec![
             OnboardingAction::ApproveRepair,
@@ -2878,9 +3017,10 @@ impl AccountSetup<'_> {
             return Err(onboarding_error());
         }
         let proposal = c.snapshot.proposal.take().ok_or_else(onboarding_error)?;
-        // A typed preview changes actions, not the retained inspection result.
-        // Preserve the existing cancellation contract for other proposal kinds.
-        let status = if proposal.relay_repair.is_some() {
+        // A relay proposal changes actions, not the retained inspection result,
+        // which may be an inconclusive failure. Profile and follow proposals
+        // keep their existing cancellation contract.
+        let status = if proposal.step.relay() {
             c.snapshot.steps[proposal.step.index()].status
         } else {
             OnboardingStatus::NeedsInput
@@ -2955,12 +3095,20 @@ impl AccountSetup<'_> {
         self.require_live_onboarding_attempt(&c)?;
         // Every source, including declared relays and public indexers, must
         // finish: a timeout may hide a newer record even if another source answers.
-        if completed.is_empty()
-            || sources
+        let complete = !completed.is_empty()
+            && sources
                 .iter()
-                .any(|endpoint| !completed.contains_key(&relay_key(endpoint)))
-            || (records.is_empty() && !failures.is_empty())
-        {
+                .all(|endpoint| completed.contains_key(&relay_key(endpoint)))
+            && !(records.is_empty() && !failures.is_empty());
+        // Unless the user approves a proposal displayed as inconclusive. Then a
+        // source that vouches for the account's records must answer, and the
+        // proposal's record must still be the newest that any answering source
+        // holds; a record only an unanswered source holds is the accepted risk.
+        let accepted_risk = !complete
+            && proposal.inconclusive
+            && self.authoritative_answered(&c, &sources, &completed)
+            && (proposal.previous_event_id.is_none() || !records.is_empty());
+        if !complete && !accepted_risk {
             let failures = if failures.is_empty() {
                 vec![finding(OnboardingIssue::DiscoveryIncomplete)]
             } else {
@@ -2993,7 +3141,20 @@ impl AccountSetup<'_> {
             );
         } else {
             c.approved = true;
-            c.set(proposal.step, OnboardingStatus::Checking, Vec::new());
+            // The sources this approval went past stay visible.
+            c.set(
+                proposal.step,
+                OnboardingStatus::Checking,
+                failures
+                    .into_iter()
+                    .map(|failure| {
+                        failure.in_context(
+                            OnboardingFindingContext::RepairApproval,
+                            OnboardingCheckPurpose::SourceFreshness,
+                        )
+                    })
+                    .collect(),
+            );
             // All route-dependent checks must be repeated after publication.
             c.set(
                 OnboardingStep::KeyPackage,

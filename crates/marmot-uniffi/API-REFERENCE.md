@@ -3522,7 +3522,9 @@ pub async fn propose_onboarding_recommended_relays( &self, account_ref: String, 
 Append missing recommended relays while preserving all original relay tags and
 NIP-65 roles, including declarations this runtime cannot use. Dial policy filters
 connection attempts without deleting published entries. A policy-allowed outbox
-or inbox route is required; proposal alone is not publication.
+or inbox route is required; proposal alone is not publication. After an
+inconclusive check, call it only while the step offers `UseRecommendedRelays`; the
+proposal then has `inconclusive` set.
 
 [Source](src/commands/onboarding.rs#L213)
 
@@ -3534,7 +3536,7 @@ or inbox route is required; proposal alone is not publication.
 pub async fn propose_onboarding_relays( &self, account_ref: String, step: OnboardingStepFfi, read_relays: Vec<String>, write_relays: Vec<String>, ) -> Result<OnboardingSnapshotFfi, MarmotKitError>
 ```
 
-Prepare explicit relay changes for approval.
+Prepare explicit relay changes for approval. Accepted while the step offers `EditRelays`, including a `RetryableFailure` whose check was inconclusive; such a proposal has `inconclusive` set and needs an explicit at-your-own-risk confirmation before approval.
 
 [Source](src/commands/onboarding.rs#L225)
 

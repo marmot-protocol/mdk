@@ -617,11 +617,29 @@ Imported identities can use the durable preflight API instead of `login`:
    reachability is checked after publication. Explicit relay selections edit known
    endpoint roles, preserving retained tag occurrences and unrelated fields in a
    typed preview, and require every selected endpoint to pass dial policy. Approval
-   requires every configured discovery source to complete; failures from additional
-   user-declared sources are tolerated only when the previous record is found.
+   re-fetches the record and requires every lookup source to complete, unless the
+   proposal has `inconclusive` set (below).
    This bounded check cannot rule out newer records on unreachable or unqueried sources.
    A missing discovery result is not global proof of absence: hosts must
    not automatically approve publication for imported identities.
+
+   A general or inbox relay step whose check was inconclusive also offers `EditRelays`
+   and, when appending the defaults can change the list, `UseRecommendedRelays`. That
+   covers two `RetryableFailure` states: no declared route answered (`NoUsableRoute`
+   in the `DeclaredRoute` context), or no record was found while one lookup source
+   failed and another answered (`DiscoveryIncomplete` in the `RecordDiscovery`
+   context). Only the account's declared relays and the public indexers count as
+   answering sources there. The host's discovery relays count only when no indexer
+   was searched (explicit discovery relays). The propose methods, including
+   `propose_onboarding_relay_repair`, accept those states. A proposal built on any
+   inconclusive check, including a `NeedsInput` or `Passed` step that retains
+   lookup-source failures, has `inconclusive` set. Before approving one, show an
+   explicit at-your-own-risk confirmation: a newer record may sit on a source that did
+   not answer, and the declared relays may work for other clients. Its approval goes
+   past failed sources, but at least one source that counts must answer, and the
+   proposal's record must still be the newest any answering source holds. Otherwise it
+   fails with `RecordChanged` or the source failures, as before. Cancelling a relay
+   proposal keeps the step's status.
    Profile fields left unset preserve their current values; an
    explicit empty string clears a field. Display the proposed edits, then pass the returned
    snapshot revision to `approve_onboarding_repair`. For an inbox proposal use
