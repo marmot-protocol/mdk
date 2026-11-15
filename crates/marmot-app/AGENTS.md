@@ -17,7 +17,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   `subscriptions.rs` (the `Runtime*Subscription` handles and the materialized-timeline window), `commands.rs` (the
   `AccountManager` command-RPC wrappers that send a worker command and await its oneshot reply), `agent_stream_watch.rs`
   (agent-text-stream discovery and the brokered-QUIC watch machinery), `onboarding.rs` and `onboarding/` (account
-  setup: durable preflight, cancellation, advisory installation detection, generated setup's procedures in
+  setup: durable preflight, cancellation, advisory installation detection, the usage-diagnostics pause
+  observation in `onboarding/analytics.rs`, generated setup's procedures in
   `onboarding/generated_setup.rs`, and its background tasks and teardown fence in `onboarding/generated_setup_tasks.rs`), `audit_tracker.rs` (the forensic audit-log tracker's
   v5 delivery worker), `audit_otlp_delivery.rs` (the explicit one-account v5 OTLP attempt), `event_routing.rs` (pure
   `MarmotAppEvent` classification/routing helpers), `avatar.rs` (local identity-avatar demand and bounded maintenance),

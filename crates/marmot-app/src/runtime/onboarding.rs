@@ -7,6 +7,7 @@ use std::future::Future;
 use transport_nostr::{DirectoryEventQuery, DirectoryRelayEventRecord, RelayEndpointPolicy};
 use transport_nostr_peeler::NostrTransportEvent;
 
+mod analytics;
 mod cancellation;
 mod generated_setup;
 mod generated_setup_tasks;
@@ -610,6 +611,9 @@ struct OnboardingCheckpoint {
     // so a host can still look past an unreachable indexer.
     #[serde(default)]
     explicit_discovery: bool,
+    // The pauses this attempt has counted in usage diagnostics (mdk#3440).
+    #[serde(default)]
+    reported_pauses: Vec<analytics::OnboardingPauseKey>,
 }
 
 /// A device notice the user acknowledged, with the findings shown beside it.
@@ -733,6 +737,7 @@ impl OnboardingCheckpoint {
             setup_cleanup_pending: false,
             attempt_start_revision: 0,
             explicit_discovery: false,
+            reported_pauses: Vec::new(),
         }
     }
     fn new_attempt(
@@ -1555,7 +1560,7 @@ impl AccountSetup<'_> {
             .records()
             .read_onboarding_checkpoint(&checkpoint.snapshot.account_id_hex)?;
         match mode {
-            OnboardingPersist::Update => match existing {
+            OnboardingPersist::Update => match &existing {
                 Some(existing) if existing.attempt() != checkpoint.attempt() => {
                     return Err(onboarding_error());
                 }
@@ -1627,10 +1632,34 @@ impl AccountSetup<'_> {
             .checked_add(1)
             .ok_or_else(onboarding_error)?;
         refresh_finding_actions(&mut checkpoint.snapshot);
-        self.app().account_home().set_account_onboarding(
-            &checkpoint.snapshot.account_id_hex,
-            &serde_json::to_vec(checkpoint)?,
-        )?;
+        // Mark pauses reported only while the collector counts them, so a
+        // grant or configuration later in the attempt still sees the pause.
+        let product = self.shared().observer.product();
+        let permit = product.collection_permit();
+        let reported = checkpoint.reported_pauses.len();
+        let pauses = if permit.is_some() {
+            // An update's stored checkpoint is this attempt's previous save.
+            checkpoint.take_unreported_pauses(existing.as_ref())
+        } else {
+            Vec::new()
+        };
+        let saved = serde_json::to_vec(checkpoint)
+            .map_err(AppError::from)
+            .and_then(|bytes| {
+                Ok(self
+                    .app()
+                    .account_home()
+                    .set_account_onboarding(&checkpoint.snapshot.account_id_hex, &bytes)?)
+            });
+        if let Err(error) = saved {
+            checkpoint.reported_pauses.truncate(reported);
+            return Err(error);
+        }
+        if let Some(permit) = &permit {
+            for pause in pauses {
+                product.onboarding_pause(permit, pause);
+            }
+        }
         self.app().presentation_signals.catalog_changed();
         tracing::debug!(target: "marmot_app::onboarding", method = "save_onboarding",
             ready = checkpoint.snapshot.ready, cancellation_pending = checkpoint.snapshot.cancellation_pending,

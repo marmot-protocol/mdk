@@ -18,6 +18,7 @@ pub enum ProductFamily {
     Storage,
     Agent,
     Stream,
+    Onboarding,
 }
 impl ProductFamily {
     pub const ALL: &'static [Self] = &[
@@ -38,6 +39,7 @@ impl ProductFamily {
         Self::Storage,
         Self::Agent,
         Self::Stream,
+        Self::Onboarding,
     ];
     pub fn as_str(self) -> &'static str {
         match self {
@@ -58,6 +60,7 @@ impl ProductFamily {
             Self::Storage => "mdk_storage_summary",
             Self::Agent => "mdk_agent_summary",
             Self::Stream => "mdk_stream_summary",
+            Self::Onboarding => "mdk_onboarding_summary",
         }
     }
     pub fn operations(self) -> &'static [&'static str] {
@@ -213,6 +216,15 @@ impl ProductFamily {
                 "overflow",
                 "integrity",
             ],
+            // The interactive onboarding steps; see `ONBOARDING_PAUSE_STATUSES`.
+            Self::Onboarding => &[
+                "profile",
+                "follows",
+                "relays",
+                "inbox_relays",
+                "single_device",
+                "key_package",
+            ],
         }
     }
 }
@@ -261,4 +273,45 @@ pub const PRODUCT_OUTCOMES: &[&str] = &[
     "absent",
     "expired",
     "unavailable",
+];
+
+/// The blocking statuses an onboarding pause reports, with the outcome each is counted under.
+pub(crate) const ONBOARDING_PAUSE_STATUSES: &[(&str, &str)] = &[
+    ("needs_input", "pending"),
+    ("retryable_failure", "failure"),
+    ("waiting_for_signer", "unavailable"),
+];
+/// Onboarding finding issues. `none` is a pause without a finding.
+pub(crate) const ONBOARDING_PAUSE_ISSUES: &[&str] = &[
+    "none",
+    "missing",
+    "malformed",
+    "future_dated",
+    "invalid_relay",
+    "retired_relay",
+    "unsafe_relay",
+    "unreachable",
+    "timed_out",
+    "authentication_required",
+    "payment_required",
+    "access_restricted",
+    "no_usable_route",
+    "publication_failed",
+    "signer_unavailable",
+    "signer_rejected",
+    "record_changed",
+    "interrupted",
+    "too_many_relays",
+    "multi_device_unsupported",
+    "other_installation_possible",
+    "discovery_incomplete",
+];
+/// The relay operation behind an onboarding pause's primary finding.
+pub(crate) const ONBOARDING_PAUSE_CONTEXTS: &[&str] = &[
+    "unknown",
+    "record_discovery",
+    "published_declaration",
+    "declared_route",
+    "repair_approval",
+    "repair_publication",
 ];

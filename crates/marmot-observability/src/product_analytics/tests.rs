@@ -229,6 +229,113 @@ fn observation_count_and_backlog_producers_reject_unsupported_labels_before_seal
 
 #[cfg(feature = "product-analytics-export")]
 #[test]
+fn onboarding_pauses_count_closed_labels_under_the_current_grant() {
+    let (collector, _) = configured();
+    grant(&collector);
+    let pause = recording::OnboardingPause {
+        step: "relays",
+        status: "needs_input",
+        issue: "no_usable_route",
+        source_issue: "timed_out",
+        context: "declared_route",
+        failing_sources: 4,
+    };
+    let stale = collector.permit().unwrap();
+    grant(&collector);
+    collector.onboarding_pause(&stale, pause);
+    let permit = collector.permit().unwrap();
+    for rejected in [
+        recording::OnboardingPause {
+            step: "wss://relay.example",
+            ..pause
+        },
+        recording::OnboardingPause {
+            status: "checking",
+            ..pause
+        },
+        recording::OnboardingPause {
+            issue: "inspection_completed",
+            ..pause
+        },
+        recording::OnboardingPause {
+            source_issue: "free text",
+            ..pause
+        },
+        recording::OnboardingPause {
+            context: "relay_url",
+            ..pause
+        },
+    ] {
+        collector.onboarding_pause(&permit, rejected);
+    }
+    assert!(collector.lock().cells.is_empty());
+    collector.onboarding_pause(&permit, pause);
+    collector.onboarding_pause(&permit, pause);
+    collector.onboarding_pause(
+        &permit,
+        recording::OnboardingPause {
+            step: "key_package",
+            status: "waiting_for_signer",
+            issue: "signer_unavailable",
+            source_issue: "none",
+            context: "unknown",
+            failing_sources: 0,
+        },
+    );
+    let rows = collector.test_payloads();
+    let mut observed: Vec<_> = rows
+        .iter()
+        .filter(|row| row["eventName"] == "mdk_onboarding_summary")
+        .map(|row| {
+            assert!(collector.valid_payload(&collector.lock().config, row));
+            let props = &row["props"];
+            [
+                "operation",
+                "outcome",
+                "unit",
+                "status",
+                "issue",
+                "source_issue",
+                "context",
+                "failing_sources",
+                "count_bucket",
+            ]
+            .map(|key| props[key].as_str().unwrap().to_owned())
+        })
+        .collect();
+    observed.sort_unstable();
+    assert_eq!(
+        observed,
+        [
+            [
+                "key_package",
+                "unavailable",
+                "transition",
+                "waiting_for_signer",
+                "signer_unavailable",
+                "none",
+                "unknown",
+                "0",
+                "1",
+            ],
+            [
+                "relays",
+                "pending",
+                "transition",
+                "needs_input",
+                "no_usable_route",
+                "timed_out",
+                "declared_route",
+                "3_5",
+                "2",
+            ],
+        ]
+        .map(|row| row.map(str::to_owned))
+    );
+}
+
+#[cfg(feature = "product-analytics-export")]
+#[test]
 fn no_preconsent_backlog_and_idempotent_background() {
     let (c, clock) = configured();
     c.observe(
@@ -792,6 +899,30 @@ fn machine_catalogue_matches_builtins_and_buckets() {
             serde_json::json!(PRODUCT_OUTCOMES)
         );
     }
+    let onboarding = &events
+        .iter()
+        .find(|e| e["name"] == ProductFamily::Onboarding.as_str())
+        .unwrap()["properties"];
+    assert_eq!(
+        onboarding["status"],
+        serde_json::json!(
+            ONBOARDING_PAUSE_STATUSES
+                .iter()
+                .map(|(status, _)| status)
+                .collect::<Vec<_>>()
+        )
+    );
+    for property in ["issue", "source_issue"] {
+        assert_eq!(
+            onboarding[property],
+            serde_json::json!(ONBOARDING_PAUSE_ISSUES)
+        );
+    }
+    assert_eq!(
+        onboarding["context"],
+        serde_json::json!(ONBOARDING_PAUSE_CONTEXTS)
+    );
+    assert_eq!(onboarding["failing_sources"], catalogue["count_buckets"]);
     for schema in approved_host_product_schemas() {
         let event = events.iter().find(|e| e["name"] == schema.name).unwrap();
         for property in &schema.properties {

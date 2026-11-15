@@ -4,6 +4,11 @@
 
 ### Added
 
+- Interactive onboarding records an `mdk_onboarding_summary` usage-diagnostics aggregate when a saved checkpoint
+  leaves a step in a blocking status (#3440). `ProductFamily::Onboarding` is the new family. Its rows carry only the
+  step, status, issue classes, finding context and a bucketed failing-source count. Each attempt counts a distinct
+  step, status and issue once, durably and only under consent. The registry revision changes, so a granted receipt
+  requires acceptance again.
 - `MarmotAppRuntime::start_direct_conversation_with_options` takes `DirectConversationOptions` with a founding
   `disappearing_message_secs`. A new direct conversation carries it in its founding MLS state and Welcome; reuse,
   retry and same-account concurrent starts keep the existing group's duration and roles. `start_direct_conversation`

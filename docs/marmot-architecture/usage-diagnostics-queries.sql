@@ -19,6 +19,23 @@ WHERE app_id = {app:String} AND timestamp >= {from:DateTime} AND timestamp < {un
   AND event_name = 'mdk_onboarding_step'
 GROUP BY step, path, outcome ORDER BY step, path, outcome;
 
+-- Where interactive onboarding pauses, and why. Each distinct step, status and
+-- issue counts once per attempt; count_bucket bounds the paused attempts in a window.
+SELECT JSONExtractString(string_props, 'operation') AS step,
+       JSONExtractString(string_props, 'status') AS status,
+       JSONExtractString(string_props, 'issue') AS issue,
+       JSONExtractString(string_props, 'source_issue') AS source_issue,
+       JSONExtractString(string_props, 'context') AS context,
+       JSONExtractString(string_props, 'failing_sources') AS failing_sources,
+       JSONExtractString(string_props, 'count_bucket') AS count_bucket,
+       JSONExtractString(string_props, 'partial') AS partial,
+       count() AS reporting_cells
+FROM events
+WHERE app_id = {app:String} AND timestamp >= {from:DateTime} AND timestamp < {until:DateTime}
+  AND event_name = 'mdk_onboarding_summary'
+GROUP BY step, status, issue, source_issue, context, failing_sources, count_bucket, partial
+ORDER BY step, status, issue, source_issue, context, failing_sources, count_bucket, partial;
+
 -- Feature, publication, media, maintenance, recovery, storage and preview distributions.
 -- Rows are reporting cells, NOT exact activity counts. Bucket bounds define intervals.
 -- Keep attempts, transitions and backlog separate, and split partial windows.

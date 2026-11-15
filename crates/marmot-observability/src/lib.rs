@@ -37,9 +37,9 @@ pub use export_config::{
     RelayTelemetryRuntimeConfig, endpoint_transport_allowed, trim_optional,
 };
 pub use observer::{
-    ObservedOperation, Observer, PerformanceRecorder, ProductBacklogSource, ProductOperation,
-    ProductRecorder, StorageFailureKind, confirmed_or_failure, permit_valid, send_outcome,
-    success_or_failure,
+    ObservedOperation, Observer, OnboardingPause, PerformanceRecorder, ProductBacklogSource,
+    ProductOperation, ProductRecorder, StorageFailureKind, confirmed_or_failure, permit_valid,
+    send_outcome, success_or_failure,
 };
 pub use product_analytics::*;
 pub use relay_telemetry_export::{
