@@ -2201,15 +2201,10 @@ where
     /// for a catch-up (supersession, a generator or capability change, no
     /// KeyPackage) are not timed; the caller is woken for those (mdk#2923).
     pub fn key_package_maintenance_next_due(&self) -> AccountResult<Option<Timestamp>> {
-        Ok(self.session.key_package_lifecycle()?.and_then(|lifecycle| {
-            let weekly = lifecycle.authored_event_created_at.map(|published| {
-                Timestamp(published.0.saturating_add(KEY_PACKAGE_REFRESH_MAX_SECS))
-            });
-            [lifecycle.refresh_at, weekly]
-                .into_iter()
-                .flatten()
-                .min_by_key(|at| at.0)
-        }))
+        Ok(self
+            .session
+            .key_package_lifecycle()?
+            .and_then(|lifecycle| key_package_refresh_next_due(&lifecycle)))
     }
 
     /// Delete expired private init-key material even when network maintenance
@@ -7629,13 +7624,21 @@ fn withdrawn_with_slot(lifecycle: &KeyPackageLifecycleState, created_at: Timesta
         .is_some_and(|withdrawn_at| created_at <= withdrawn_at)
 }
 
+/// When the current KeyPackage's refresh comes due by time alone: its
+/// `refresh_at`, or a week after its publication, whichever is first. The one
+/// source for both the due check and the worker's deadline (mdk#2923).
+fn key_package_refresh_next_due(lifecycle: &KeyPackageLifecycleState) -> Option<Timestamp> {
+    let weekly = lifecycle
+        .authored_event_created_at
+        .map(|published| Timestamp(published.0.saturating_add(KEY_PACKAGE_REFRESH_MAX_SECS)));
+    [lifecycle.refresh_at, weekly]
+        .into_iter()
+        .flatten()
+        .min_by_key(|at| at.0)
+}
+
 fn key_package_refresh_due(lifecycle: &KeyPackageLifecycleState, now: Timestamp) -> bool {
-    lifecycle.refresh_at.is_some_and(|deadline| deadline <= now)
-        || lifecycle
-            .authored_event_created_at
-            .is_some_and(|published| {
-                published.0.saturating_add(KEY_PACKAGE_REFRESH_MAX_SECS) <= now.0
-            })
+    key_package_refresh_next_due(lifecycle).is_some_and(|at| at.0 <= now.0)
 }
 
 fn current_key_package_republish_blocker(
