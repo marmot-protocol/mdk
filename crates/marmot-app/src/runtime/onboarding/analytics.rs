@@ -41,27 +41,31 @@ pub(super) fn onboarding_pause(
         .filter(failing)
         .filter(|finding| finding.endpoint.is_some())
         .collect();
-    // The most common issue among the failing sources; the earliest wins a tie.
-    let mut source_issue: Option<(OnboardingIssue, usize)> = None;
-    for finding in &sources {
-        let count = sources.iter().filter(|f| f.issue == finding.issue).count();
-        if source_issue.is_none_or(|(_, best)| count > best) {
-            source_issue = Some((finding.issue, count));
-        }
-    }
-    let source_issue = source_issue.map(|(issue, _)| issue);
-    // A step-level finding is the step's verdict; checks append advisory
-    // discovery findings after it. Without one, the sources explain the pause.
+    // Sources answer concurrently, so their findings arrive in any order. Every
+    // choice ranks by catalogue order instead, keeping a pause's key stable
+    // across retries: the most common source issue, catalogue order breaking a
+    // tie; then the step-level finding earliest in catalogue order, which puts
+    // advisory discovery findings last; else a finding with the source issue.
+    let source_issue = sources
+        .iter()
+        .map(|finding| finding.issue)
+        .max_by_key(|issue| {
+            let count = sources.iter().filter(|f| f.issue == *issue).count();
+            (count, std::cmp::Reverse(*issue as u8))
+        });
+    let rank = |finding: &&OnboardingFinding| (finding.issue as u8, finding.context as u8);
     let primary = state
         .findings
         .iter()
         .filter(failing)
-        .find(|finding| finding.endpoint.is_none())
+        .filter(|finding| finding.endpoint.is_none())
+        .min_by_key(rank)
         .or_else(|| {
             sources
                 .iter()
                 .copied()
-                .find(|finding| Some(finding.issue) == source_issue)
+                .filter(|finding| Some(finding.issue) == source_issue)
+                .min_by_key(rank)
         });
     let failing_sources = sources
         .iter()
@@ -140,10 +144,8 @@ fn context_label(context: OnboardingFindingContext) -> &'static str {
 impl OnboardingCheckpoint {
     /// The pauses this snapshot shows that its attempt has not reported, recorded as reported.
     /// The caller records them once the checkpoint is saved, or forgets them if the save fails.
+    /// A cancelling save still counts the step it was stopped at.
     pub(super) fn take_unreported_pauses(&mut self) -> Vec<OnboardingPause> {
-        if self.snapshot.cancellation_pending {
-            return Vec::new();
-        }
         let mut pauses = Vec::new();
         for (key, pause) in self.snapshot.steps.iter().filter_map(onboarding_pause) {
             if !self.reported_pauses.contains(&key) {
@@ -213,7 +215,7 @@ mod tests {
     }
 
     #[test]
-    fn without_a_step_verdict_the_first_most_common_source_issue_is_primary() {
+    fn without_a_step_verdict_the_most_common_source_issue_is_primary() {
         use OnboardingIssue::*;
         let (_, pause) = onboarding_pause(&state(
             OnboardingStatus::RetryableFailure,
@@ -234,6 +236,47 @@ mod tests {
         assert_eq!(
             (pause.issue, pause.source_issue, pause.context),
             ("unreachable", "unreachable", "record_discovery")
+        );
+    }
+
+    #[test]
+    fn the_order_sources_answer_in_does_not_change_the_pause() {
+        use OnboardingFindingContext::{DeclaredRoute, RecordDiscovery};
+        use OnboardingIssue::*;
+        let findings = vec![
+            at(AuthenticationRequired, "wss://a.example", DeclaredRoute),
+            at(Unreachable, "wss://b.example", RecordDiscovery),
+            at(Unreachable, "wss://c.example", DeclaredRoute),
+            at(AuthenticationRequired, "wss://d.example", RecordDiscovery),
+            finding(DiscoveryIncomplete)
+                .in_context(RecordDiscovery, OnboardingCheckPurpose::RecordLookup),
+            finding(TooManyRelays),
+        ];
+        let forward =
+            onboarding_pause(&state(OnboardingStatus::RetryableFailure, findings.clone()));
+        let mut reversed = findings;
+        reversed.reverse();
+        assert_eq!(
+            onboarding_pause(&state(OnboardingStatus::RetryableFailure, reversed)),
+            forward
+        );
+        let (_, pause) = forward.unwrap();
+        assert_eq!(
+            (pause.issue, pause.source_issue, pause.context),
+            ("too_many_relays", "unreachable", "unknown")
+        );
+        let (_, sources_only) = onboarding_pause(&state(
+            OnboardingStatus::RetryableFailure,
+            vec![
+                at(AuthenticationRequired, "wss://a.example", DeclaredRoute),
+                at(Unreachable, "wss://b.example", DeclaredRoute),
+                at(Unreachable, "wss://c.example", RecordDiscovery),
+            ],
+        ))
+        .unwrap();
+        assert_eq!(
+            (sources_only.issue, sources_only.context),
+            ("unreachable", "record_discovery")
         );
     }
 

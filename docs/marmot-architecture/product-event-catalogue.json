@@ -1861,7 +1861,7 @@
           "1001_plus"
         ]
       },
-      "purpose": "Understand which onboarding step and blocking reason opted-in users stop at, without relay endpoints, identity or free text. Outcome is pending for needs_input, failure for retryable_failure and unavailable for waiting_for_signer. Issue is the first step-level finding, else the most common failing-source issue; failing_sources buckets the distinct failing sources.",
+      "purpose": "Understand which onboarding step and blocking reason opted-in users stop at, without relay endpoints, identity or free text. Outcome is pending for needs_input, failure for retryable_failure and unavailable for waiting_for_signer. Source_issue is the most common failing-source issue and issue is the step-level finding first in catalogue order, else source_issue; catalogue order breaks ties. Failing_sources buckets the distinct failing sources.",
       "mode": "aggregate"
     },
     {

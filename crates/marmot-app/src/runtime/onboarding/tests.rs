@@ -9403,97 +9403,149 @@ async fn a_task_scheduled_under_a_fence_waits_for_it_to_drop() {
     );
 }
 
-/// Usage diagnostics see where an attempt stops, once per distinct pause and
-/// only under consent (mdk#3440).
+/// Usage diagnostics see where an attempt stops (mdk#3440). The module name
+/// puts it under CI's `product_analytics::` diagnostics run.
 #[cfg(feature = "product-analytics-export")]
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn onboarding_pauses_are_counted_once_per_attempt_under_consent() {
-    let dir = tempfile::tempdir().unwrap();
-    let network = Arc::new(Network::default());
-    let (collector, _) = marmot_observability::configured();
-    let mut app = MarmotApp::with_relay(dir.path(), "wss://default.example")
-        .with_test_relay_client(network.clone());
-    app.relay_plane = MarmotRelayPlane::new_with_directory_fetcher_for_test(
-        Some(Duration::from_secs(120)),
-        network.clone(),
-        network.clone(),
-        false,
-    );
-    app.product_analytics = collector.clone().into();
-    let runtime = MarmotAppRuntime::new(app);
-    let keys = nostr::prelude::Keys::generate();
-    let id = keys.public_key().to_hex();
-    let setup = runtime.account_setup();
-    setup
-        .begin_onboarding(
-            Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
-            options(),
+mod product_analytics {
+    use super::*;
+
+    /// Once per distinct pause, and only while the collector is collecting.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn onboarding_pauses_are_counted_once_per_attempt_under_consent() {
+        let dir = tempfile::tempdir().unwrap();
+        let network = Arc::new(Network::default());
+        let (collector, _) = marmot_observability::configured();
+        let mut app = MarmotApp::with_relay(dir.path(), "wss://default.example")
+            .with_test_relay_client(network.clone());
+        app.relay_plane = MarmotRelayPlane::new_with_directory_fetcher_for_test(
+            Some(Duration::from_secs(120)),
+            network.clone(),
+            network.clone(),
+            false,
+        );
+        app.product_analytics = collector.clone().into();
+        let runtime = MarmotAppRuntime::new(app);
+        let keys = nostr::prelude::Keys::generate();
+        let id = keys.public_key().to_hex();
+        let setup = runtime.account_setup();
+        setup
+            .begin_onboarding(
+                Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
+                options(),
+            )
+            .await
+            .unwrap();
+        let pauses = || {
+            collector
+                .test_payloads()
+                .into_iter()
+                .filter(|row| row["eventName"] == "mdk_onboarding_summary")
+                .collect::<Vec<_>>()
+        };
+
+        // Without consent the pause is neither counted nor marked reported.
+        let paused = setup.run_onboarding(&id).await.unwrap();
+        let profile = &paused.steps[OnboardingStep::Profile.index()];
+        assert_eq!(profile.status, OnboardingStatus::NeedsInput);
+        assert!(pauses().is_empty());
+
+        // Granted without a complete configuration, nothing is collected, so the
+        // pause stays unreported.
+        marmot_observability::grant(&collector);
+        let config = collector.config_for_test();
+        let scope = "http://127.0.0.1:9876".to_owned();
+        marmot_observability::wiring::configure(
+            &collector,
+            crate::ProductAnalyticsRuntimeConfig {
+                app_key: None,
+                ..config.clone()
+            },
+            scope.clone(),
         )
-        .await
         .unwrap();
-    let pauses = || {
-        collector
-            .test_payloads()
-            .into_iter()
-            .filter(|row| row["eventName"] == "mdk_onboarding_summary")
-            .collect::<Vec<_>>()
-    };
-
-    // Without consent the pause is neither counted nor marked reported.
-    let paused = setup.run_onboarding(&id).await.unwrap();
-    let profile = &paused.steps[OnboardingStep::Profile.index()];
-    assert_eq!(profile.status, OnboardingStatus::NeedsInput);
-    assert!(pauses().is_empty());
-
-    // Under consent, the same pause is counted once however often it recurs.
-    marmot_observability::grant(&collector);
-    for _ in 0..2 {
         setup
             .retry_onboarding_step(&id, OnboardingStep::Profile)
             .await
             .unwrap();
-    }
-    let rows = pauses();
-    assert_eq!(rows.len(), 1);
-    let props = &rows[0]["props"];
-    for (key, value) in [
-        ("operation", "profile"),
-        ("outcome", "pending"),
-        ("unit", "transition"),
-        ("status", "needs_input"),
-        ("issue", "missing"),
-        ("source_issue", "none"),
-        ("context", "record_discovery"),
-        ("failing_sources", "0"),
-        ("count_bucket", "1"),
-    ] {
-        assert_eq!(props[key], value, "{key}");
-    }
+        assert!(pauses().is_empty());
 
-    // A different reason at the same step is a new pause; its sources leave
-    // only as a count.
-    network.fail_reads.store(true, Ordering::SeqCst);
-    for _ in 0..2 {
-        let failed = setup
+        // Collecting, the same pause is counted once however often it recurs.
+        marmot_observability::wiring::configure(&collector, config.clone(), scope.clone()).unwrap();
+        for _ in 0..2 {
+            setup
+                .retry_onboarding_step(&id, OnboardingStep::Profile)
+                .await
+                .unwrap();
+        }
+        let rows = pauses();
+        assert_eq!(rows.len(), 1);
+        let props = &rows[0]["props"];
+        for (key, value) in [
+            ("operation", "profile"),
+            ("outcome", "pending"),
+            ("unit", "transition"),
+            ("status", "needs_input"),
+            ("issue", "missing"),
+            ("source_issue", "none"),
+            ("context", "record_discovery"),
+            ("failing_sources", "0"),
+            ("count_bucket", "1"),
+        ] {
+            assert_eq!(props[key], value, "{key}");
+        }
+
+        // A different reason at the same step is a new pause; its sources leave
+        // only as a count.
+        network.fail_reads.store(true, Ordering::SeqCst);
+        for _ in 0..2 {
+            let failed = setup
+                .retry_onboarding_step(&id, OnboardingStep::Profile)
+                .await
+                .unwrap();
+            assert_eq!(
+                failed.steps[OnboardingStep::Profile.index()].status,
+                OnboardingStatus::RetryableFailure
+            );
+        }
+        let rows = pauses();
+        assert_eq!(rows.len(), 2);
+        let failure = rows
+            .iter()
+            .find(|row| row["props"]["status"] == "retryable_failure")
+            .unwrap();
+        assert_eq!(failure["props"]["issue"], "timed_out");
+        assert_eq!(failure["props"]["source_issue"], "timed_out");
+        assert_ne!(failure["props"]["failing_sources"], "0");
+        assert!(rows.iter().all(|row| collector.valid_payload_for_test(row)));
+        let serialized = serde_json::to_string(&rows).unwrap();
+        assert!(!serialized.contains("example") && !serialized.contains(&id));
+
+        // A pause reached while nothing is collected is counted by the save
+        // that cancels the attempt. Reconfiguring drops queued rows.
+        marmot_observability::wiring::configure(
+            &collector,
+            crate::ProductAnalyticsRuntimeConfig {
+                app_key: None,
+                ..config.clone()
+            },
+            scope.clone(),
+        )
+        .unwrap();
+        network.fail_reads.store(false, Ordering::SeqCst);
+        network.inspection_errors.lock().insert(
+            "wss://".into(),
+            transport_nostr::DirectoryInspectionError::AuthenticationRequired,
+        );
+        setup
             .retry_onboarding_step(&id, OnboardingStep::Profile)
             .await
             .unwrap();
-        assert_eq!(
-            failed.steps[OnboardingStep::Profile.index()].status,
-            OnboardingStatus::RetryableFailure
-        );
+        marmot_observability::wiring::configure(&collector, config, scope).unwrap();
+        assert!(pauses().is_empty());
+        setup.cancel_onboarding(&id).await.unwrap();
+        let rows = pauses();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["props"]["issue"], "authentication_required");
+        runtime.shutdown_and_close().await.unwrap();
     }
-    let rows = pauses();
-    assert_eq!(rows.len(), 2);
-    let failure = rows
-        .iter()
-        .find(|row| row["props"]["status"] == "retryable_failure")
-        .unwrap();
-    assert_eq!(failure["props"]["issue"], "timed_out");
-    assert_eq!(failure["props"]["source_issue"], "timed_out");
-    assert_ne!(failure["props"]["failing_sources"], "0");
-    assert!(rows.iter().all(|row| collector.valid_payload_for_test(row)));
-    let serialized = serde_json::to_string(&rows).unwrap();
-    assert!(!serialized.contains("example") && !serialized.contains(&id));
-    runtime.shutdown_and_close().await.unwrap();
 }

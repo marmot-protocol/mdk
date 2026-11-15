@@ -108,8 +108,14 @@ impl ProductRecorder {
         self.0.backlog_source()
     }
 
-    /// Count one onboarding step that stopped in a blocking status, under the permit the caller
-    /// checked before it recorded the pause as reported.
+    /// A permit only while product events are collected, for a caller that records an
+    /// observation as done once it counts it.
+    pub fn collection_permit(&self) -> Option<DiagnosticsPermit> {
+        self.0.collection_permit()
+    }
+
+    /// Count one onboarding step that stopped in a blocking status, under the collection permit
+    /// the caller held when it recorded the pause as reported.
     pub fn onboarding_pause(&self, permit: &DiagnosticsPermit, pause: OnboardingPause) {
         self.0.onboarding_pause(permit, pause);
     }

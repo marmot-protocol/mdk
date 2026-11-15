@@ -1595,10 +1595,10 @@ impl AccountSetup<'_> {
             .checked_add(1)
             .ok_or_else(onboarding_error)?;
         refresh_finding_actions(&mut checkpoint.snapshot);
-        // Mark pauses reported only while diagnostics may count them, so a
-        // grant later in the attempt still sees the pause it is stopped at.
+        // Mark pauses reported only while the collector counts them, so a
+        // grant or configuration later in the attempt still sees the pause.
         let product = self.shared().observer.product();
-        let permit = product.permit();
+        let permit = product.collection_permit();
         let reported = checkpoint.reported_pauses.len();
         let pauses = if permit.is_some() {
             checkpoint.take_unreported_pauses()

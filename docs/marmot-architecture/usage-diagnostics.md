@@ -119,13 +119,16 @@ MDK records `mdk_onboarding_summary` itself, so hosts add nothing. Each row is
 one interactive onboarding step that a persisted checkpoint left in a blocking
 status: `needs_input`, `retryable_failure`, or `waiting_for_signer` with a
 finding (a signer request that is only in flight is not counted). The operation
-is the step. `issue` is the step's first step-level finding, or else the most
-common failing-source issue. `source_issue` is that most common failing-source
-issue, and `context` is the relay operation behind the primary finding.
-`failing_sources` is a count bucket of distinct failing endpoints. No endpoint
-leaves the device. Each attempt counts a distinct step, status and issue once,
-across retries and restarts. A pause saved without consent is not marked
-counted, so the next save under consent counts it. Cancelling ends an attempt.
+is the step. `source_issue` is the most common issue among the failing
+sources. `issue` is the step-level finding that comes first in catalogue
+order, or else `source_issue`. Catalogue order also breaks ties, so the order
+in which sources answer does not change a pause. `context` is the relay
+operation behind the primary finding, and `failing_sources` is a count bucket
+of distinct failing endpoints. No endpoint leaves the device. Each attempt
+counts a distinct step, status and issue once, across retries and restarts. A
+pause is marked counted only while the collector is collecting (consent
+granted, exporter configured and accepted), so a later save counts a pause
+reached before that. The save that cancels an attempt also counts it.
 Rows count paused attempts, not users.
 Message acceptance and relay publication are distinct from recipient receipt,
 decryption, display, and reading. Provisional preview success is separate from

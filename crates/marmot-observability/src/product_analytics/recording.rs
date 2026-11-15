@@ -20,9 +20,11 @@ pub struct OnboardingPause {
     pub step: &'static str,
     /// The blocking status.
     pub status: &'static str,
-    /// The step's primary issue: its first step-level finding, else `source_issue`.
+    /// The step's primary issue: its step-level finding earliest in catalogue order, else
+    /// `source_issue`.
     pub issue: &'static str,
-    /// The most common issue among the step's failing sources, `none` without one.
+    /// The most common issue among the step's failing sources, catalogue order breaking a tie;
+    /// `none` without one.
     pub source_issue: &'static str,
     /// The relay operation behind the primary finding.
     pub context: &'static str,
@@ -101,6 +103,13 @@ impl ProductAnalytics {
 }
 
 impl ProductAnalytics {
+    /// A permit only while product events are collected: granted, configured and accepted by the
+    /// collector. A caller that marks an observation done holds this, not a bare permit.
+    pub(crate) fn collection_permit(&self) -> Option<DiagnosticsPermit> {
+        let permit = self.permit()?;
+        Self::enabled(&self.lock()).then_some(permit)
+    }
+
     /// Count one onboarding pause as a transition of `mdk_onboarding_summary`.
     pub(crate) fn onboarding_pause(&self, permit: &DiagnosticsPermit, pause: OnboardingPause) {
         let Some((_, outcome)) = ONBOARDING_PAUSE_STATUSES
