@@ -530,11 +530,17 @@ impl NostrSdkRelayHealth {
 
 fn acquisition_filter(request: &NostrAcquisitionRequest) -> Result<Filter, NostrAcquisitionError> {
     Ok(match &request.scope {
-        // An id names at most one event, so the limit drops no match; it
-        // tells the relay the REQ wants no more (mdk#2332).
-        NostrAcquisitionScope::KnownEventIds(ids) => Filter::new()
-            .ids(ids.iter().copied().map(EventId::from_byte_array))
-            .limit(ids.len()),
+        // A one-id REQ asks for at most one event, which no relay's limit can
+        // cut (mdk#2332). A batch carries no limit: a relay that clamps an
+        // explicit limit below the batch would drop some of its ids.
+        NostrAcquisitionScope::KnownEventIds(ids) => {
+            let filter = Filter::new().ids(ids.iter().copied().map(EventId::from_byte_array));
+            if ids.len() == 1 {
+                filter.limit(1)
+            } else {
+                filter
+            }
+        }
         NostrAcquisitionScope::AccountInboxWindow { since, until } => {
             let recipient = PublicKey::from_slice(request.account_id.as_slice())
                 .map_err(|_| NostrAcquisitionError::InvalidRequest)?;
