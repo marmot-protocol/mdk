@@ -1309,3 +1309,157 @@ async fn a_group_stored_before_rosters_is_trusted_after_its_backfill_and_one_pub
         vec![(group, vec![alice_account.account_id_hex.clone()])]
     );
 }
+
+/// A group A trusts that a failed rewind restore quarantines in the middle of
+/// the session (mdk#3272) is no longer trusted at the same publisher's next
+/// publish, while its committed roster and revision stay what they were
+/// (mdk#3273 PR 6). Carol applies alice's commit, then receives bob's rival
+/// from the same epoch, so her pass rewinds onto the retained anchor to probe
+/// it; every restore of that window's guard snapshot fails.
+#[cfg(feature = "test-policy-overrides")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_rewind_restore_withdraws_trust_in_an_unchanged_roster() {
+    use cgka_traits::storage::CommittedRosterStorage;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let accounts = ["alice", "bob", "carol"].map(|label| home.create_account(label).unwrap());
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay_and_config(
+        dir.path(),
+        "wss://relay.example",
+        MarmotAppConfig::white_noise()
+            .with_dev_settlement_quiescence_ms(0)
+            .with_dev_scheduled_convergence_delay_ms(0),
+    )
+    .with_test_relay_client(relay.clone());
+    for account in &accounts {
+        remember_test_member_inbox(&app, &account.account_id_hex, "wss://relay.example");
+    }
+    let mut alice = app.client("alice").await.unwrap();
+    let mut bob = app.client("bob").await.unwrap();
+    let mut carol = app.client("carol").await.unwrap();
+    bob.publish_key_package().await.unwrap();
+    carol.publish_key_package().await.unwrap();
+    let group = alice
+        .create_group_with_options(
+            "restore fault",
+            &[&accounts[1].account_id_hex, &accounts[2].account_id_hex],
+            crate::AppCreateGroupOptions {
+                initial_admins: vec![accounts[1].account_id_hex.clone()],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+        .operation
+        .unwrap();
+    let (mut bob_cursor, mut carol_cursor) = (0, 0);
+    deliver_new(&mut bob, &relay, &mut bob_cursor).await;
+    deliver_new(&mut carol, &relay, &mut carol_cursor).await;
+    bob.accept_group_invite(&group).unwrap();
+    carol.accept_group_invite(&group).unwrap();
+    async fn settle(client: &mut AppClient, group: &GroupId) {
+        for _ in 0..4 {
+            let effects = client.runtime.advance_convergence(group).await.unwrap();
+            client
+                .observe_drained_session_events(&effects)
+                .await
+                .unwrap();
+        }
+    }
+    // One more canonical advance, so the fork's source epoch keeps an anchor.
+    alice
+        .update_group_profile(&group, Some("before the fork"), None)
+        .await
+        .unwrap();
+    deliver_new(&mut bob, &relay, &mut bob_cursor).await;
+    settle(&mut bob, &group).await;
+    deliver_new(&mut carol, &relay, &mut carol_cursor).await;
+    settle(&mut carol, &group).await;
+
+    // Carol applies alice's branch before she sees bob's rival.
+    alice
+        .update_group_profile(&group, Some("alice's branch"), None)
+        .await
+        .unwrap();
+    deliver_new(&mut carol, &relay, &mut carol_cursor).await;
+    settle(&mut carol, &group).await;
+    carol.start_read_state(read_state_channel().0, UploadsInFlight::default());
+    let state = carol.subscribe_read_state().unwrap();
+    let storage = app.account_storage("carol").unwrap();
+    let second = storage.app_storage();
+    let roster = storage.committed_roster(&group).unwrap().unwrap();
+    assert_eq!(roster.members.ids().len(), 3);
+    assert_eq!(
+        state.borrow().trusted_rosters(),
+        vec![(group.clone(), roster.revision)]
+    );
+    assert_eq!(trusted_members(&state, &second).len(), 1);
+
+    let rival_from = relay.published_events.lock().unwrap().len();
+    bob.update_group_profile(&group, Some("bob's branch"), None)
+        .await
+        .unwrap();
+    assert!(relay.published_events.lock().unwrap().len() > rival_from);
+    let hits = Arc::new(AtomicUsize::new(0));
+    let counted = hits.clone();
+    carol
+        .engine_storage
+        .fail_snapshot_restores_for_test(Some(Arc::new(move |_, name, in_transaction| {
+            if !in_transaction && name.starts_with("openmls-retained-probe-") {
+                counted.fetch_add(1, Ordering::SeqCst);
+                return Err(cgka_traits::StorageError::Busy(
+                    "injected restore fault".into(),
+                ));
+            }
+            Ok(())
+        })));
+    // The restore fails inside the rival's delivery, which reports it.
+    let carol_id = MemberId::new(hex::decode(&accounts[2].account_id_hex).unwrap());
+    let rival: Vec<_> = relay.published_events.lock().unwrap()[carol_cursor..]
+        .iter()
+        .filter(|event| event.kind == transport_nostr_peeler::KIND_MARMOT_GROUP_MESSAGE)
+        .cloned()
+        .collect();
+    for event in rival {
+        let _ = carol
+            .ingest_received_delivery(cgka_traits::TransportDelivery {
+                account_id: carol_id.clone(),
+                group_id_hint: None,
+                message: event.to_transport_message().unwrap(),
+                received_at: cgka_traits::Timestamp(unix_now_seconds()),
+                source: cgka_traits::TransportDeliverySource {
+                    transport: cgka_traits::transport::TransportSource("nostr".into()),
+                    plane: cgka_traits::TransportDeliveryPlane::Group,
+                    endpoint: None,
+                    subscription_id: None,
+                    wire: None,
+                },
+            })
+            .await;
+    }
+    for _ in 0..4 {
+        if hits.load(Ordering::SeqCst) > 0 {
+            break;
+        }
+        let _ = carol.runtime.advance_convergence(&group).await;
+    }
+    carol.engine_storage.fail_snapshot_restores_for_test(None);
+    assert!(hits.load(Ordering::SeqCst) > 0, "no guard restore ran");
+    assert!(
+        carol
+            .runtime
+            .quarantined_groups()
+            .iter()
+            .any(|(quarantined, _)| *quarantined == group),
+        "the failed restore quarantines the group"
+    );
+
+    carol.publish_read_state();
+    assert!(!state.borrow().groups[&group].serves_reads);
+    assert!(state.borrow().trusted_rosters().is_empty());
+    assert!(trusted_members(&state, &second).is_empty());
+    assert_eq!(storage.committed_roster(&group).unwrap(), Some(roster));
+}
