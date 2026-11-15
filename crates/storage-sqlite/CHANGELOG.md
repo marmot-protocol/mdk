@@ -6,6 +6,13 @@
 
 ### Breaking changes
 
+- Account migration 0207 adds `cgka_commit_refusals`: one row per confirmed own commit a group relay refused for
+  good, kept until the user acknowledges it and deleted with its group (mdk#2333, #3426). Account schema advances
+  from 206 to 207; older binaries refuse the upgraded database. Downgrade is unsupported.
+- `SqliteAppStorage::list_prepared_group_image_uploads` is replaced by `list_prepared_group_image_upload_statuses`,
+  which returns `PreparedGroupImageUploadStatus` without image data or secrets; read one full record with
+  `prepared_group_image_upload(upload_id)`. `account_group_self_memberships` is replaced by the per-group
+  `group_standing(group_id_hex)`.
 - Account migration 0206 adds each group's committed roster (`cgka_committed_rosters`,
   `cgka_committed_roster_members`) and the account-wide revision counter (`cgka_committed_roster_revision`)
   (mdk#3273). It seeds no roster, because a stored record can hold a staged commit's projected members; the engine

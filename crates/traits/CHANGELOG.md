@@ -21,6 +21,8 @@
 
 ### Added
 
+- `maintenance::CommitRefusal`, `CommitRefusalCause` and `transport_adapter::RefusedTarget` record the group
+  relays that refused a confirmed own commit for good (mdk#2333, #3426).
 - `StorageProvider::has_atomic_group_savepoints` says whether `with_group_savepoint` is a real savepoint, which writes
   no snapshot and leaves none of its unit's writes after a crash (mdk#3278). It defaults to `false`, matching the
   snapshot fallback, so existing providers build unchanged; a provider that overrides `with_group_savepoint` with a

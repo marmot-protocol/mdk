@@ -42,9 +42,10 @@
 - A download the worker cannot start for lack of free disk now parks as
   `StorageBlocked` instead of retrying every 15 seconds as `RetryScheduled`,
   and is readmitted only while free space funds it (#3414, #3419).
-- Account databases migrate from schema 201 to 206 (migrations 0202 to 0206:
+- Account databases migrate from schema 201 to 207 (migrations 0202 to 0207:
   sticker-pack relay hints, prepared-image member reports, deleted failed
-  sends, storage-readmitted downloads and committed rosters). Older binaries
+  sends, storage-readmitted downloads, committed rosters and commit
+  refusals). Older binaries
   refuse the upgraded database; downgrade is unsupported.
 - Rust hosts: a custom `TransportPeeler` takes a `PreparedGroupMessage` in
   `peel_group_message` (#3406); `GroupStorage::put_group` is replaced by
@@ -91,6 +92,13 @@
 
 ### Changed
 
+- A group relay that refuses a confirmed own change for good (too large, or
+  any other final answer) now warns until the user acknowledges it, across
+  restarts (mdk#2333, #3426). Group commit delivery lists `refused_relays`
+  with a cause, a refusal makes group changes fail with
+  `GroupCommitUndelivered` at once, and acknowledging dismisses the group's
+  refusals for good. A relay's size answer after an attempt that may have
+  reached it now ends its retries once the change is confirmed.
 - Account and group reads answer from the read state the account worker
   publishes at each quiescent point, on the caller's task, instead of waiting
   in the worker's queue behind a send, catch-up or convergence pass (mdk#3273,
