@@ -300,6 +300,8 @@ impl AccountSetup<'_> {
                 .into_iter()
                 .filter(|classified| classified.policy == RelayEndpointPolicy::Allowed)
                 .map(|classified| classified.endpoint.trim().to_owned())
+                // Never put back a route this preview treats as unusable.
+                .filter(|endpoint| !unusable.contains_key(&relay_key(endpoint)))
                 .collect::<Vec<_>>();
             let candidate = allowed_defaults
                 .iter()

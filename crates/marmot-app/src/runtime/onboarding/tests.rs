@@ -10450,6 +10450,29 @@ async fn a_removal_only_cleanup_keeps_the_last_route_of_each_role() {
     assert_eq!(removed(&replaced), vec!["wss://members.example"]);
     assert_eq!(read, vec!["wss://default.example"]);
     assert_eq!(write, vec!["wss://write.example"]);
+    // A default the preview treats as unusable is never put back: the next
+    // eligible default replaces it, and with none left the list needs review.
+    let unusable_first = [
+        "wss://members.example".to_owned(),
+        "wss://default.example".to_owned(),
+    ];
+    let (replaced, read, _) = setup.minimal_relay_repair(
+        OnboardingStep::Relays,
+        Some(&only_read),
+        &unusable_first,
+        &unusable,
+        false,
+    );
+    assert_eq!(replaced.mode, OnboardingRelayRepairMode::RemovalAndAdditive);
+    assert_eq!(read, vec!["wss://default.example"]);
+    let (stuck, _, _) = setup.minimal_relay_repair(
+        OnboardingStep::Relays,
+        Some(&only_read),
+        &unusable_first[..1],
+        &unusable,
+        false,
+    );
+    assert_eq!(stuck.mode, OnboardingRelayRepairMode::ManualReview);
 
     let spare_read = signed(
         &keys,
