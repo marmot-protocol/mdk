@@ -2524,6 +2524,83 @@ mod tests {
             publisher.deadline(Timestamp(0), Timestamp(50_010)),
             Some(Duration::from_secs(20))
         );
+        // A recovery status's KeyPackage bound is on the system clock too.
+        publisher.groups_key_packages_until = Some(Timestamp(50_015));
+        assert_eq!(
+            publisher.deadline(Timestamp(50_014), Timestamp(50_010)),
+            Some(Duration::from_secs(5))
+        );
+    }
+
+    /// A group entry holds only while the system clock is inside the window
+    /// its recovery status's reinvite KeyPackages leave it in: from the
+    /// reading they were judged at until the first `not_after`, exclusive.
+    /// Nothing else about the group moves here, so the window alone decides
+    /// (mdk#3273 PR 8).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_entry_holds_only_inside_its_key_package_window() {
+        let dir = tempfile::tempdir().unwrap();
+        marmot_account::AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let app = crate::MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(std::sync::Arc::new(
+                crate::tests::ScriptedPushRelayClient::default(),
+            ));
+        let mut client = app.client("alice").await.unwrap();
+        let group = client
+            .create_group("windowed", &[])
+            .await
+            .unwrap()
+            .operation
+            .unwrap();
+        let record = client
+            .state
+            .groups
+            .iter()
+            .find(|record| record.group_id_hex == hex::encode(group.as_slice()))
+            .unwrap()
+            .clone();
+        let generation = client
+            .runtime
+            .group_change_generations(std::iter::once(&group))
+            .remove(0);
+        let settled = |value| Fact {
+            value,
+            settled: true,
+        };
+        let validity = EntryValidity {
+            generation: generation.clone(),
+            record: record.clone(),
+            maintenance_paused: false,
+            window: WallClockWindow::ALWAYS,
+            key_packages: WallClockWindow {
+                from: Timestamp(1_000),
+                until: Some(Timestamp(2_000)),
+            },
+            notices: None,
+            recovery_facts: OwnFacts {
+                host_may_see: settled(true),
+                unrecoverable: settled(false),
+            },
+            reusable: true,
+        };
+        let holds_at = |system_now| {
+            validity.holds(
+                &generation,
+                &record,
+                false,
+                Timestamp(0),
+                Timestamp(system_now),
+            )
+        };
+        assert!(holds_at(1_000));
+        assert!(holds_at(1_999), "just before not_after");
+        assert!(!holds_at(2_000), "at not_after");
+        assert!(
+            !holds_at(999),
+            "a system clock moved back before the reading"
+        );
     }
 
     /// Before the worker's first publish a read is sent to the worker; once

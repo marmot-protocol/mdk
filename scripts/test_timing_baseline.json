@@ -324,9 +324,6 @@
     "crates/marmot-app/src/tests/push_snapshot.rs": {
       "sleep": 1
     },
-    "crates/marmot-app/src/tests/read_state.rs": {
-      "sleep": 1
-    },
     "crates/marmot-app/src/tests/relay_event_limits.rs": {
       "sleep": 2
     },
