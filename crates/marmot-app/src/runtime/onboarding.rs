@@ -9,6 +9,7 @@ use transport_nostr_peeler::NostrTransportEvent;
 
 mod analytics;
 mod cancellation;
+mod client_label;
 mod generated_setup;
 mod generated_setup_tasks;
 mod recovery;
@@ -382,6 +383,16 @@ pub struct OnboardingDevicePackage {
     pub expires_at: Option<u64>,
     #[serde(default)]
     pub usable: bool,
+    /// The app name the record's publisher put in its first `client` tag, for
+    /// wording such as "messaging keys from <client>". Peer-controlled: render
+    /// it as untrusted plain text, and never use it for trust, identity or
+    /// security decisions, since any signer can claim any name. MDK removes
+    /// control, bidirectional and invisible formatting characters, collapses
+    /// whitespace, keeps at most 64 whole grapheme clusters and 1024 bytes, and
+    /// never includes the tag's handler address. `None` when the record has no displayable label. Keep it out of
+    /// logs, telemetry and analytics.
+    #[serde(default)]
+    pub client: Option<String>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct OnboardingSingleDeviceNotice {

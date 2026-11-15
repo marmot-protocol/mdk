@@ -35,7 +35,7 @@ c_mirror! { MarmotOnboardingRepairProposal from OnboardingRepairProposalFfi { co
 c_mirror! { MarmotOnboardingSnapshot from OnboardingSnapshotFfi, free marmot_onboarding_snapshot_free { str account_id_hex, opt_str recovery_epoch, copy revision: u64, copy ready: bool, vec steps/steps_len: MarmotOnboardingStepState, opt_rec proposal: MarmotOnboardingRepairProposal, opt_rec single_device_notice: MarmotOnboardingSingleDeviceNotice, copy cancellation_pending: bool, } }
 
 c_enum! { MarmotOnboardingDeviceDiscovery from OnboardingDeviceDiscoveryFfi { NoneFound, OtherInstallationPossible, Unknown } }
-c_mirror! { MarmotOnboardingDevicePackage from OnboardingDevicePackageFfi { str slot_id, opt_str key_package_ref_hex, str event_id_hex, copy published_at: u64, opt_copy has_expires_at/expires_at: u64, copy usable: bool, } }
+c_mirror! { MarmotOnboardingDevicePackage from OnboardingDevicePackageFfi { str slot_id, opt_str key_package_ref_hex, str event_id_hex, copy published_at: u64, opt_copy has_expires_at/expires_at: u64, copy usable: bool, #[doc = "NULL or a sanitized, peer-controlled app label from the record's first `client` tag. Render as untrusted text; never use it for trust or security decisions."] opt_str client, } }
 c_mirror! { MarmotOnboardingSingleDeviceNotice from OnboardingSingleDeviceNoticeFfi { copy discovery: MarmotOnboardingDeviceDiscovery, vec other_packages/other_packages_len: MarmotOnboardingDevicePackage, copy discovery_complete: bool, opt_copy has_acknowledged_at/acknowledged_at: u64, } }
 
 #[cfg(all(test, feature = "alloc-audit"))]
@@ -77,6 +77,7 @@ mod tests {
                     published_at: 40,
                     expires_at: Some(90),
                     usable: true,
+                    client: Some("Example Chat".into()),
                 }],
                 discovery_complete: false,
                 acknowledged_at: Some(42),

@@ -76,6 +76,7 @@ transport-nostr-peeler.workspace = true
 transport-quic-broker.workspace = true
 agent-stream-compose.workspace = true
 transport-quic-stream.workspace = true
+unicode-segmentation.workspace = true
 url.workspace = true
 zeroize.workspace = true
 

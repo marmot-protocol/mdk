@@ -3603,6 +3603,7 @@ dependencies = [
  "transport-nostr-peeler",
  "transport-quic-broker",
  "transport-quic-stream",
+ "unicode-segmentation",
  "url",
  "zeroize",
 ]

@@ -198,8 +198,11 @@ See the shared [diagnostic evidence limits](../marmot-uniffi/README.md#interacti
 before interpreting query success as relay capability or publication evidence.
 
 The historical `SingleDevice` onboarding step is a sign-in chat/history notice,
-not a blanket claim that multi-device use is unsupported. Its notice, actions,
-acknowledgment calls and publication gate are unchanged; `MultiDeviceUnsupported`
+not a blanket claim that multi-device use is unsupported. Its actions,
+acknowledgment calls and publication gate are unchanged. Each
+`MarmotOnboardingDevicePackage` ends with `client`, a nullable, peer-controlled app
+label that `marmot_onboarding_snapshot_free` releases with the snapshot; render it
+only as untrusted text, as the shared notice copy describes. `MultiDeviceUnsupported`
 is retained for compatibility and omitted from current findings. Adopt the shared
 [notice copy and evidence limits](../marmot-uniffi/README.md#single-device-notice)
 in host localization with a published binding artifact. Continue is still an

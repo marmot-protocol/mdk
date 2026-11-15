@@ -155,6 +155,7 @@ async fn onboarding_older_checkpoint_restores_retry_hints_and_conservative_packa
             published_at: 1,
             expires_at: Some(2),
             usable: true,
+            client: Some("Example Chat".into()),
         }],
         discovery_complete: true,
         acknowledged_at: None,
@@ -178,10 +179,11 @@ async fn onboarding_older_checkpoint_restores_retry_hints_and_conservative_packa
     for index in 0..2 {
         old["snapshot"]["steps"][index]["actions"] = serde_json::json!([]);
     }
-    old["snapshot"]["single_device_notice"]["other_packages"][0]
+    let legacy_package = old["snapshot"]["single_device_notice"]["other_packages"][0]
         .as_object_mut()
-        .unwrap()
-        .remove("usable");
+        .unwrap();
+    legacy_package.remove("usable");
+    legacy_package.remove("client");
     let retained_bytes = serde_json::to_vec(&old).unwrap();
     manager
         .app
@@ -246,7 +248,9 @@ async fn onboarding_older_checkpoint_restores_retry_hints_and_conservative_packa
     assert_eq!(legacy.declared_capability, OnboardingRelayCapability::None);
     assert!(legacy.actions.is_empty());
     assert_eq!(legacy.observed_revision, None);
-    assert!(!snapshot.single_device_notice.unwrap().other_packages[0].usable);
+    let legacy_package = &snapshot.single_device_notice.unwrap().other_packages[0];
+    assert!(!legacy_package.usable);
+    assert_eq!(legacy_package.client, None);
     for step in &snapshot.steps[..2] {
         assert!(step.actions.contains(&OnboardingAction::Retry));
     }
@@ -313,7 +317,16 @@ async fn single_device_ignores_unusable_owned_slots_but_preserves_foreign_eviden
         network.events.lock().push(signed(
             &keys,
             30443,
-            vec![vec!["d".into(), "foreign-slot".into()]],
+            vec![
+                vec!["d".into(), "foreign-slot".into()],
+                // NIP-89 shape: label, then handler address and relay hint.
+                vec![
+                    "client".into(),
+                    " Example\u{202E}\n  Chat ".into(),
+                    "31990:handler:example".into(),
+                    "wss://relay.example".into(),
+                ],
+            ],
             "malformed",
             published_at,
         ));
@@ -329,6 +342,11 @@ async fn single_device_ignores_unusable_owned_slots_but_preserves_foreign_eviden
         );
         assert_eq!(notice.other_packages.len(), 1);
         assert!(!notice.other_packages[0].usable);
+        assert_eq!(
+            notice.other_packages[0].client.as_deref(),
+            Some("Example Chat"),
+            "only the sanitized label, never the handler address"
+        );
     }
     runtime.shutdown_and_close().await.unwrap();
 }

@@ -27,6 +27,11 @@
   the record is unchanged. See
   [Interactive account onboarding](README.md#interactive-account-onboarding).
   Regenerate Swift and Kotlin bindings with the matching native library.
+- `OnboardingDevicePackageFfi` gains `client: String?`, the sanitized app label from an
+  other-installation package's `client` tag, so the sign-in notice can name the app the
+  records report. It is peer-controlled: render it as untrusted text and never use it for
+  trust or security decisions. Code that constructs the record directly must pass it.
+  See [Single-device notice](README.md#single-device-notice) (#3438).
 
 ## 0.17.0 - 2026-11-15
 
