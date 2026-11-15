@@ -12,7 +12,8 @@ use cgka_traits::{
     MemberId, MessageId, TransportAccountActivation, TransportAdapter, TransportAdapterError,
     TransportDelivery, TransportDeliveryPlane, TransportEndpoint, TransportEndpointFailure,
     TransportEndpointFailureKind, TransportEndpointRejectionCategory, TransportGroupSubscription,
-    TransportGroupSync, TransportPublishFailure, TransportPublishReport, TransportPublishRequest,
+    TransportGroupSync, TransportMessage, TransportPublishFailure, TransportPublishReport,
+    TransportPublishRequest, TransportReadBack,
 };
 use futures::{FutureExt, Stream, StreamExt, stream::FuturesUnordered};
 use nostr_sdk::NotificationUpdate;
@@ -47,6 +48,9 @@ mod directory_wire;
 mod known_limits;
 #[cfg(test)]
 pub(crate) mod publish_accounting_tests;
+mod read_back;
+#[cfg(test)]
+mod read_back_tests;
 mod safety;
 mod telemetry;
 #[cfg(any(test, feature = "test-support"))]
@@ -193,6 +197,9 @@ struct MarmotRelayPlaneInner {
     /// account worker share this client so the worker can reuse the same relay
     /// pool instead of constructing another TCP/TLS/WebSocket stack.
     account_publish_clients: std::sync::Mutex<HashMap<String, Arc<dyn NostrRelayClient>>>,
+    /// Each account's read-back REQs to each relay in the last hour, shared
+    /// by every adapter for the account (mdk#2332).
+    read_back_budget: read_back::ReadBackBudget,
 }
 
 /// The router and notification forwarders own clones of `transport` and each waits on a channel only `transport`
@@ -1531,6 +1538,7 @@ impl MarmotRelayPlane {
                 directory: DirectoryRelayPlane::new(directory_fetcher),
                 directory_subscription_sync: Mutex::new(()),
                 account_publish_clients: std::sync::Mutex::new(HashMap::new()),
+                read_back_budget: read_back::ReadBackBudget::default(),
             }),
         };
         this.spawn_router();
@@ -4605,6 +4613,51 @@ impl TransportAdapter for MarmotRelayPlaneAccountAdapter {
         request: TransportPublishRequest,
     ) -> Result<TransportPublishReport, TransportAdapterError> {
         self.publish_request(request, true).await
+    }
+
+    /// Read on the anonymous publish pool, one REQ per relay: no signer
+    /// answers AUTH there, so the read never names the account, and its
+    /// events reach no ingest. Without that pool, as with an injected relay
+    /// client, nothing is read and nothing is answered.
+    async fn read_back(
+        &self,
+        account_id: &MemberId,
+        message: &TransportMessage,
+        endpoints: &[TransportEndpoint],
+    ) -> Vec<TransportReadBack> {
+        let no_answer = || vec![TransportReadBack::NoAnswer; endpoints.len()];
+        let Some(client) = self.anonymous_publish_client.as_ref() else {
+            return no_answer();
+        };
+        if account_id != &self.account_id {
+            return no_answer();
+        }
+        let Ok(event) = NostrTransportEvent::from_transport_message(message) else {
+            return no_answer();
+        };
+        let outcome = read_back::read_back(
+            client,
+            &self.relay_plane.inner.relay_safety,
+            &self.relay_plane.inner.read_back_budget,
+            account_id,
+            &event,
+            endpoints,
+        )
+        .await;
+        self.relay_plane
+            .inner
+            .transport
+            .adapter
+            .record_read_back(outcome.requests, outcome.found)
+            .await;
+        tracing::debug!(
+            target: "marmot_app::relay_plane",
+            method = "read_back",
+            requests = outcome.requests,
+            found = outcome.found,
+            "read a pending commit back"
+        );
+        outcome.answers
     }
 
     async fn commit_size_refusals(

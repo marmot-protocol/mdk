@@ -1,7 +1,7 @@
 ---
 title: "Nostr Bounded Acquisition Interface"
 created: 2026-09-23
-updated: 2026-11-06
+updated: 2026-11-15
 tags: [marmot, nostr, recovery, transport]
 status: overview
 ---
@@ -33,7 +33,8 @@ The production `NostrSdkRelayClient` implements both operations.
 
 The request's `account_id` selects the authentication context and inbox recipient. `NostrAcquisitionScope` is one of:
 
-- `KnownEventIds`: reacquire explicit event IDs. This cannot discover unknown history.
+- `KnownEventIds`: reacquire explicit event IDs. A one-ID REQ carries `limit` 1; a batch carries none, because a
+  relay that clamps an explicit limit below the batch would drop IDs. This cannot discover unknown history.
 - `AccountInboxWindow { since, until }`: kind 1059 filtered by the account's `p` tag.
 - `GroupWindow { transport_group_id, since, until }`: kind 445 filtered by the exact 32-byte `h` tag.
 

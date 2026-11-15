@@ -1,7 +1,7 @@
 ---
 title: "Telemetry, Logging, and Tracing Inventory"
 created: 2026-06-10
-updated: 2026-11-13
+updated: 2026-11-15
 tags: [marmot, architecture, telemetry, logging, tracing, privacy]
 status: current
 ---
@@ -67,6 +67,7 @@ runtime. It complements the policy docs:
 | `reconciliation_remote_items` / `reconciliation_received_items` | Event ids relays reported missing locally, and missing events downloaded. | Aggregate count. |
 | `reconciliation_order_unproven_passes` | Group passes that returned nothing because no time order covered the history they were missing: no relay answered the window probes, the delivery boundary was unknown or excluded everything fetched, or more history was set aside than the relays' comparisons name. A pass waiting one round for an unfinished window search does not count. Repeated, these are the passes that end in a "history may be incomplete" notice. | Aggregate count. |
 | `activations_full` / `activations_degraded` / `activations_failed` | Account activations by outcome: every REQ reached every relay; the activation succeeded while some relay owed a REQ (it was unreachable, so the relay client re-sends the REQ on its next connection) or refused one (it was connected and rejected the REQ while another relay took it; a refusal is not re-sent); or the activation failed and rolled back, because no relay took or owes one of its REQs or the relay client returned an error. | Aggregate count. |
+| `read_back_requests` / `read_back_found` | Read-back REQs sent for a pending commit, one per relay asked, and the relays that returned its exact event. A read past the hourly cap, or of a relay the host-safety rule refuses, sends nothing and counts nothing. | Aggregate count. |
 | `group_syncs_full` / `group_syncs_degraded` / `group_syncs_failed` | Group syncs that issued REQs, by the same outcomes. A failed sync is one whose REQ no relay took or owes, or that hit a relay-client error; it leaves the routes it already committed in place. Syncs that issue no REQs do not count. | Aggregate count. |
 
 Account-scoped publishes and the shared adapter's own `publish` share these counters. They are device-wide and unlabeled. Once every started call has resolved or been dropped, attempts equal successes + failures + cancellations; while calls are in flight, attempts is larger. A future that is never polled, or a request rejected before the client call (wrong account, unsafe endpoint, envelope mismatch, malformed payload), changes nothing. Local fanout runs only after the terminal count and cannot reclassify it.

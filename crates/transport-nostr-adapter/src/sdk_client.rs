@@ -530,8 +530,16 @@ impl NostrSdkRelayHealth {
 
 fn acquisition_filter(request: &NostrAcquisitionRequest) -> Result<Filter, NostrAcquisitionError> {
     Ok(match &request.scope {
+        // A one-id REQ asks for at most one event, which no relay's limit can
+        // cut (mdk#2332). A batch carries no limit: a relay that clamps an
+        // explicit limit below the batch would drop some of its ids.
         NostrAcquisitionScope::KnownEventIds(ids) => {
-            Filter::new().ids(ids.iter().copied().map(EventId::from_byte_array))
+            let filter = Filter::new().ids(ids.iter().copied().map(EventId::from_byte_array));
+            if ids.len() == 1 {
+                filter.limit(1)
+            } else {
+                filter
+            }
         }
         NostrAcquisitionScope::AccountInboxWindow { since, until } => {
             let recipient = PublicKey::from_slice(request.account_id.as_slice())
@@ -6948,6 +6956,27 @@ mod tests {
                 max_duration: Duration::from_secs(3),
             },
         }
+    }
+
+    /// A one-id read asks for at most one event. A batch asks for no limit,
+    /// so a relay that clamps a limit below the batch cuts none of its ids
+    /// (mdk#2332).
+    #[test]
+    fn only_a_one_id_acquisition_carries_a_limit() {
+        let account_id = MemberId::new(vec![7; 32]);
+        let endpoint = RelayUrl::parse("wss://ids.example").unwrap();
+        let one = acquisition_request(
+            account_id.clone(),
+            endpoint.clone(),
+            vec![[1; 32]],
+            1,
+            4_096,
+        );
+        assert_eq!(acquisition_filter(&one).unwrap().limit, Some(1));
+        let batch = acquisition_request(account_id, endpoint, vec![[1; 32], [2; 32]], 2, 4_096);
+        let filter = acquisition_filter(&batch).unwrap();
+        assert_eq!(filter.limit, None);
+        assert_eq!(filter.ids.map(|ids| ids.len()), Some(2));
     }
 
     #[tokio::test(start_paused = true)]

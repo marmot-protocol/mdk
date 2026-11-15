@@ -296,6 +296,11 @@ pub struct OutboundFanout {
     target_attempt_counts: Vec<u32>,
     #[serde(default)]
     target_last_attempt_at_ms: Vec<Option<u64>>,
+    /// When the first attempt on any target started (mdk#2332): written once,
+    /// by the first [`Self::mark_attempt_started_at`], and never moved by a
+    /// retry or a wake. See [`Self::first_attempt_at_ms`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    first_attempt_at_ms: Option<u64>,
     #[serde(default)]
     target_possible_exposure: Vec<bool>,
     /// Per target, the acknowledgement that ended it `Accepted` without a
@@ -458,6 +463,7 @@ impl OutboundFanout {
             target_failures: vec![None; target_count],
             target_attempt_counts: vec![0; target_count],
             target_last_attempt_at_ms: vec![None; target_count],
+            first_attempt_at_ms: None,
             target_possible_exposure: vec![false; target_count],
             target_acknowledgements: Vec::new(),
             post_confirmation_welcomes_pending: !post_confirmation_welcomes.is_empty(),
@@ -583,6 +589,42 @@ impl OutboundFanout {
 
     pub fn target_last_attempt_at_ms(&self, index: usize) -> Option<u64> {
         self.target_last_attempt_at_ms.get(index).copied().flatten()
+    }
+
+    /// When the first attempt on any target started (mdk#2332), none before
+    /// one has. Unlike a target's last attempt, retries and wakes never move
+    /// it, so a bound counted from it starts on time. A record stored before
+    /// this was kept counts from its creation once a status shows a send
+    /// (`Attempting`, `PossiblyExposed` or `Accepted`); a refusal before
+    /// sending is no attempt.
+    pub fn first_attempt_at_ms(&self) -> Option<u64> {
+        self.first_attempt_at_ms.or_else(|| {
+            self.target_statuses
+                .iter()
+                .any(|status| {
+                    matches!(
+                        status,
+                        FanoutTargetStatus::Attempting
+                            | FanoutTargetStatus::PossiblyExposed
+                            | FanoutTargetStatus::Accepted
+                    )
+                })
+                .then_some(self.created_at_ms)
+        })
+    }
+
+    /// Whether the endpoint may hold the event without having acknowledged
+    /// it: its exposure bit is set, or it is `PossiblyExposed` or
+    /// `Attempting` (see [`Self::possible_exposure`]).
+    pub fn target_may_hold_event(&self, index: usize) -> bool {
+        self.target_possible_exposure
+            .get(index)
+            .copied()
+            .unwrap_or(false)
+            || matches!(
+                self.target_status(index),
+                Some(FanoutTargetStatus::PossiblyExposed | FanoutTargetStatus::Attempting)
+            )
     }
 
     /// How the target was acknowledged when it was not by a publish answer.
@@ -773,6 +815,8 @@ impl OutboundFanout {
                 if status == FanoutTargetStatus::Attempting {
                     self.target_possible_exposure[index] = true;
                 }
+                self.first_attempt_at_ms =
+                    Some(self.first_attempt_at_ms().unwrap_or(attempted_at_ms));
                 self.fold_stored_exposure(index);
                 self.target_statuses[index] = FanoutTargetStatus::Attempting;
                 self.target_attempt_counts[index] =
@@ -1123,6 +1167,10 @@ impl OutboundFanout {
                     && previous.target_statuses.get(index) != Some(&FanoutTargetStatus::Accepted)
                     && self.target_statuses.get(index) == Some(&FanoutTargetStatus::Accepted))
         });
+        // The first attempt is written once, and never moves once known.
+        let first_attempt_advances = previous
+            .first_attempt_at_ms()
+            .is_none_or(|first| self.first_attempt_at_ms() == Some(first));
         let published_id_advances =
             match (&previous.published_message_id, &self.published_message_id) {
                 (None, _) => true,
@@ -1142,6 +1190,7 @@ impl OutboundFanout {
         };
         let targets_advance = immutable_matches
             && observation_advances
+            && first_attempt_advances
             && published_id_advances
             && acknowledgements_advance
             && self
@@ -1929,6 +1978,38 @@ pub trait TransportAdapter: Send + Sync {
     ) -> Result<TransportPublishReport, TransportAdapterError> {
         self.publish(request).await
     }
+
+    /// Ask each of `endpoints`, now, for the exact event `message` was frozen
+    /// as (mdk#2332). One answer per endpoint, in order. Only
+    /// [`TransportReadBack::Found`] says anything about the event, and only
+    /// for a copy the transport checked is that exact event; the read's
+    /// events reach no ingest. The read is not made as `account_id` where the
+    /// transport can avoid it, since an authenticated read would link the
+    /// account to the event. The default answers nothing anywhere.
+    async fn read_back(
+        &self,
+        _account_id: &MemberId,
+        _message: &TransportMessage,
+        endpoints: &[TransportEndpoint],
+    ) -> Vec<TransportReadBack> {
+        vec![TransportReadBack::NoAnswer; endpoints.len()]
+    }
+}
+
+/// One endpoint's answer to [`TransportAdapter::read_back`] (mdk#2332).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum TransportReadBack {
+    /// The endpoint returned the exact event: its id, recomputed from what
+    /// it returned, is the one asked for, and its signature verifies. The
+    /// endpoint holds the event.
+    Found,
+    /// The endpoint ended the read without the event. This shows only that
+    /// it answered now, never whether it stored or forwarded the event
+    /// before.
+    NotFound,
+    /// Anything else: a refusal, a timeout, a lost connection, a read over
+    /// budget, or no read at all.
+    NoAnswer,
 }
 
 /// Judges a founding create's Welcomes before the engine writes anything
@@ -2902,6 +2983,87 @@ mod tests {
         assert!(fanout.is_frozen_event(&frozen));
         assert!(fanout.is_frozen_event(&published));
         assert!(!fanout.is_frozen_event(&MessageId::new(vec![0xE8; 32])));
+    }
+
+    /// mdk#2332 proof 16: the first attempt is written once. A refusal before
+    /// sending is no attempt; retries, another target's first attempt and a
+    /// connectivity wake never move it; a record stored before it was kept
+    /// counts from its creation once a status shows a send; and storage
+    /// refuses a successor that moves it.
+    #[test]
+    fn the_first_attempt_is_written_once() {
+        let mut fanout = OutboundFanout::stage(
+            fanout_request(),
+            Some(crate::engine_state::PendingStateRef::new(9)),
+            Some(GroupId::new(vec![0xD4; 16])),
+            55,
+        )
+        .unwrap();
+        let endpoint = |index: usize| fanout_request().target.endpoints()[index].clone();
+        let failure = |index: usize, kind, pre_send| TransportEndpointFailure {
+            endpoint: endpoint(index),
+            reason: "scripted".into(),
+            kind,
+            rejection_category: None,
+            size_class: None,
+            pre_send,
+        };
+        assert_eq!(fanout.first_attempt_at_ms(), None);
+        // A relay held back before sending: an attempt count, but no send.
+        fanout
+            .record_refusal_before_attempt(
+                0,
+                failure(0, TransportEndpointFailureKind::RetryableUnavailable, true),
+                60,
+            )
+            .unwrap();
+        assert_eq!(fanout.first_attempt_at_ms(), None);
+        fanout.mark_attempt_started_at(1, 100).unwrap();
+        assert_eq!(fanout.first_attempt_at_ms(), Some(100));
+        let first = fanout.clone();
+
+        fanout
+            .record_target_failure(
+                1,
+                failure(1, TransportEndpointFailureKind::PossiblyExposed, false),
+            )
+            .unwrap();
+        fanout.mark_attempt_started_at(1, 5_000).unwrap();
+        fanout
+            .record_target_failure(
+                1,
+                failure(1, TransportEndpointFailureKind::PossiblyExposed, false),
+            )
+            .unwrap();
+        fanout.mark_attempt_started_at(2, 7_000).unwrap();
+        fanout.wake_targets_for_restored_connectivity();
+        assert_eq!(fanout.first_attempt_at_ms(), Some(100));
+        fanout.validate_successor_of(&first).unwrap();
+
+        let mut legacy = serde_json::to_value(&first).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("first_attempt_at_ms")
+            .unwrap();
+        let legacy: OutboundFanout = serde_json::from_value(legacy).unwrap();
+        assert_eq!(legacy.first_attempt_at_ms(), Some(55));
+        let mut retried = legacy.clone();
+        retried
+            .record_target_failure(
+                1,
+                failure(1, TransportEndpointFailureKind::PossiblyExposed, false),
+            )
+            .unwrap();
+        retried.mark_attempt_started_at(1, 9_000).unwrap();
+        assert_eq!(retried.first_attempt_at_ms(), Some(55));
+        retried.validate_successor_of(&legacy).unwrap();
+
+        let mut moved = fanout.clone();
+        moved.first_attempt_at_ms = Some(101);
+        assert!(moved.validate_successor_of(&fanout).is_err());
+        moved.first_attempt_at_ms = None;
+        assert!(moved.validate_successor_of(&fanout).is_err());
     }
 
     #[test]

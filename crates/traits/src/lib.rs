@@ -133,8 +133,8 @@ pub use transport_adapter::{
     TransportDeliverySource, TransportEndpoint, TransportEndpointAckKind, TransportEndpointFailure,
     TransportEndpointFailureKind, TransportEndpointReceipt, TransportEndpointRejectionCategory,
     TransportGroupSubscription, TransportGroupSync, TransportPublishFailure,
-    TransportPublishReport, TransportPublishRequest, TransportPublishTarget, TransportWireMetadata,
-    WelcomeSizeCheck, collapse_publish_failure_summaries,
+    TransportPublishReport, TransportPublishRequest, TransportPublishTarget, TransportReadBack,
+    TransportWireMetadata, WelcomeSizeCheck, collapse_publish_failure_summaries,
 };
 pub use types::{Backend, EpochId, GroupId, MemberId, MessageId};
 pub use welcome::PendingWelcome;

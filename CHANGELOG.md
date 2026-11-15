@@ -45,6 +45,13 @@
   relay counts as having accepted it even after it refused a later attempt.
   A copy under another event id, or from a relay outside the group's list,
   confirms nothing.
+- Confirm a group change that is still pending ten minutes after its first
+  send by asking its relays for it (#2332). From then on, each retry of a
+  relay that may hold the change first reads that exact change back from it,
+  and a relay that returns it confirms the change. The read never signs in as
+  the account, sends one request per relay, at most eight an hour, and feeds
+  nothing into message handling. Any other answer changes nothing: the relay
+  is resent to as before, and nothing rolls back on a read.
 
 ## 0.17.0 - 2026-11-15
 
