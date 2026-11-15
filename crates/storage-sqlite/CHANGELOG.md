@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.17.0 - 2026-11-15
+
 ### Breaking changes
 
 - Account migration 0206 adds each group's committed roster (`cgka_committed_rosters`,
@@ -22,8 +24,8 @@
   advances from 204 to 205; older binaries refuse the upgraded database. Downgrade is unsupported. New `park_attachment_admission` parks a due job that
   worker admission refused for disk space as storage-blocked with a target, rather than deferring it on a timer.
 - Account migration 0204 drops timeline rows of own sends that failed and were then deleted; such a send no longer
-  projects a row. The source rows stay. A deleted send a peer reacted to is delivered instead, also when the reaction
-  arrived after the deletion, and keeps its placeholder. Account schema advances from 203 to 204; older binaries
+  projects a row. The source rows stay. A deleted send a peer reacted to, or one with a kept receipt, is delivered
+  instead, also when the reaction arrived after the deletion, and keeps its placeholder. Account schema advances from 203 to 204; older binaries
   refuse the upgraded database. Downgrade is unsupported.
 - Account migration 0203 adds `member_outcomes_json` to prepared group-image
   uploads, retaining the original partial member-resolution report across
@@ -35,7 +37,9 @@
   Every park now schedules the broken unit's next timed probe: a new park waits the base, and a failed probe
   re-parks under the same revision and waits the base doubled once per failed probe, up to the cap. The upgrade
   conversion's parks are due at once. Units broken before this release keep their past `next_attempt_at_seconds`, so
-  their first probe is due as soon as the runner arms it.
+  their first probe is due as soon as the runner arms it; if it fails, its re-park doubles from the unit's stored
+  retry `backoff_step`, which 0.16.0 parks left in place: a no-progress break carries its retry increments and usually
+  waits the cap, while a refusal break or a conversion park is at step 0 and waits the base.
 - `SqliteAppStorage::dismiss_recovery_route_park` and `dismiss_recovery_route_park_on` are removed: nothing dismisses a
   coverage-ledger park any more. A route's remainder lasts until a rejoin or the route's end.
 
@@ -55,6 +59,8 @@
   waiting for one.
 - `SqliteAccountStorage` reports `has_atomic_group_savepoints` (mdk#3278), so the engine keeps running contained
   rewind windows inside its `SAVEPOINT`, as before.
+- The SQLite provider opts into historical peel-context caching through `past_peel_context_generation`, keyed on
+  its MLS write generation (#3406).
 
 ### Changed
 

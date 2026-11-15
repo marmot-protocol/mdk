@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.17.0 - 2026-11-15
+
 ### Breaking changes
 
 - `AppPerformanceSnapshotFfi` drops `accountGroupReadSnapshot`: group reads answer
@@ -25,6 +27,9 @@
   when an operation succeeded. Detailed invites return `GroupInviteResultFfi`;
   other detailed mutations keep `GroupMutationResultFfi`. Regenerate Swift and
   Kotlin bindings with the matching native library.
+- `MarmotKitError` gains `CreatedGroupMemberReportUnavailable { groupIdHex }`. Reusing a consumed prepared-image
+  upload id from before this release finds the group it created but no retained member report; open that group
+  instead of creating another. Exhaustive error switches must add the case.
 
 ### Added
 
@@ -55,6 +60,14 @@
 - `HistoryNoticeCauseFfi::UnprovenHistory` is no longer emitted (mdk#3308): the recovery runner retries a relay that
   could not prove a route's history quietly, and a notice needs evidence that messages are missing. The variant stays;
   keep exhaustive switches.
+- Account and group reads, among them `groupMembers`, `groupMemberIdsPage`, `groupMlsState`,
+  `groupConversationSnapshot`, quarantined groups, KeyPackage status and backup restore status, answer from the
+  account's published read state instead of waiting behind a send, catch-up or convergence pass (mdk#3273).
+- Markdown tokens: a bare `note1`, `nevent1` or `naddr1` reference with a valid bech32 checksum is now a
+  `NostrUri` inline instead of text (#3058). Invalid checksums stay text.
+- Attachment downloads run four at a time, and `requestAutomaticAttachment` moves queued work ahead of background
+  backlog. A download the worker cannot start for lack of free disk parks as `StorageBlocked` instead of retrying
+  as `RetryScheduled` (#3414, #3417).
 
 ### Fixed
 

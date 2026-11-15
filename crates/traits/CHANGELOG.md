@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.17.0 - 2026-11-15
+
 ### Breaking changes
 
 - `GroupStorage::put_group` is replaced by `put_group_with_roster(group, committed)` and
@@ -10,6 +12,12 @@
   keep the stored roster. `StorageProvider` now also requires `CommittedRosterStorage`: each group's committed roster
   (`CommittedMembers`, its distinct member account ids) at a `RosterRevision` no earlier roster of the account-device
   held, so a group forgotten or deleted and joined again never reuses one.
+- `TransportPeeler::peel_group_message` takes `&PreparedGroupMessage<'_>` instead of `&TransportMessage` (#2492,
+  #3406). Move context-independent validation and decoding into the new `prepare_group_message`, whose default
+  borrows the raw payload; a wrapping peeler delegates preparation to the peeler that decrypts.
+- `TransportEndpointFailure` gains `pre_send` (#2332, #3396): true only when no frame can have left (a dial
+  refusal, a DNS failure, a socket that never opened, or the adapter refused the event). A relay's `rate-limited:`
+  or `auth-required:` answer is never pre-send, so the target counts as possibly exposed. Struct literals set it.
 
 ### Added
 
@@ -17,6 +25,13 @@
   no snapshot and leaves none of its unit's writes after a crash (mdk#3278). It defaults to `false`, matching the
   snapshot fallback, so existing providers build unchanged; a provider that overrides `with_group_savepoint` with a
   savepoint overrides this too.
+- `StorageProvider::past_peel_context_generation` lets a backend opt into caching historical peel contexts across
+  live ingest (#3406). The default `None` keeps uncached recovery; opting in requires complete mutation tracking,
+  exclusive writer transactions and atomic group savepoints.
+- `TransportAdapter::commit_size_refusals` and `publish_commit` let an adapter refuse a commit over its size floor at
+  a relay of unknown limit before sending (#2332, #3396). The defaults refuse nothing and publish as `publish` does.
+- `StorageProvider::mls_storage_failure` separates a failed OpenMLS storage read from a stored value that did not
+  decode (mdk#3273). The default treats every error as a failure, so no failed read is skipped.
 
 ### Changed
 

@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+## 0.17.0 - 2026-11-15
+
+### Security
+
+- Bump `quinn-proto` to 0.11.19 and `quinn-udp` to 0.5.16, past
+  RUSTSEC-2026-0523, RUSTSEC-2026-0524 and RUSTSEC-2026-0538 (#3394). Every
+  shipped artifact links them through the QUIC preview transport.
+- Stop fresh undecryptable envelopes from forcing repeated history
+  reconstruction (#2492, #3406). Live ingest re-derived the retained exporter
+  contexts for every envelope that missed the live key, so anyone able to post
+  correctly signed envelopes to a group's route could make the receiver
+  rebuild past group state once per envelope. Live ingest now reuses the
+  contexts that deferred sweeps and publish replay already cache, and each
+  envelope is decoded once per ingest.
+
 ### Breaking changes
 
 - Remove the legacy v4 whole-file audit upload. Its only receiver, the
@@ -12,34 +27,54 @@
   `audit-upload-checkpoint.json`. The tracker config setter is replaced by a
   source-only `set_audit_log_source` across Rust, UniFFI and C, and the v5
   tracker result drops its v4 fields. Local v4 files stay listable and
-  deletable until retention expires them.
+  deletable until retention expires them (#3390).
 - Return optional create/invite operation results with ordered per-account
-  resolution outcomes across Rust, C, UniFFI, and CLI (#1813). Available accounts
-  proceed in one MLS operation; unavailable accounts are reported individually.
-  A nonempty roster with no available account creates no group or commit.
-  Prepared-image retries retain the original report across restart. Stable
-  agent-control v2 creation and invitation remain atomic.
-
-### Fixed
-
-- Archive, forget and delete an external-signer account's chat through its
-  running account worker, as for a local-signing account (#3318). These wrote
-  storage directly while the worker kept its own copy of the account: its next
-  save of the chat's record, for example after another member renamed the
-  chat, unarchived it again, and after a forget or delete it kept answering for
-  the removed group. An account that runs no worker still writes storage
-  directly, now with worker starts held off until the write is done.
+  resolution outcomes across Rust, C, UniFFI, and CLI (#1813, #3375).
+  Available accounts proceed in one MLS operation; unavailable accounts are
+  reported individually. A nonempty roster with no available account creates
+  no group or commit. Prepared-image retries retain the original report across
+  restart. Stable agent-control v2 creation and invitation remain atomic:
+  WN Agent still fails the request when any requested member is unavailable.
+- The app performance snapshot drops `account_group_read_snapshot` (UniFFI
+  `accountGroupReadSnapshot`) (#3421). Group reads answer from the published
+  read state, so the startup group-read snapshot it timed no longer exists. The
+  C struct's layout changed.
+- A download the worker cannot start for lack of free disk now parks as
+  `StorageBlocked` instead of retrying every 15 seconds as `RetryScheduled`,
+  and is readmitted only while free space funds it (#3414, #3419).
+- Account databases migrate from schema 201 to 206 (migrations 0202 to 0206:
+  sticker-pack relay hints, prepared-image member reports, deleted failed
+  sends, storage-readmitted downloads and committed rosters). Older binaries
+  refuse the upgraded database; downgrade is unsupported.
+- Rust hosts: a custom `TransportPeeler` takes a `PreparedGroupMessage` in
+  `peel_group_message` (#3406); `GroupStorage::put_group` is replaced by
+  `put_group_with_roster` and `put_group_keeping_roster`, and
+  `StorageProvider` requires `CommittedRosterStorage` (#3420). See the crate
+  changelogs.
 
 ### Added
 
 - Discard a failed own send locally with `discard_failed_send` (Rust, UniFFI,
   C) instead of publishing a group delete for a message nobody received. A
   failed send the user deletes now leaves the timeline instead of staying as a
-  "deleted" row that still reports failure.
+  "deleted" row that still reports failure (#3392).
+- Add tagged poll and sticker sends in the runtime, UniFFI, and C bindings.
+  Reply, thread, and effect context reaches peers; polls project reply links
+  and previews. Existing send signatures and C ABI remain unchanged (#3408,
+  #3427).
+- Build a canonical Sonar sticker-pack share link offline with
+  `sticker_pack_share_link` (Rust, UniFFI, C), carrying up to eight retained
+  relay hints (#3283, #3373).
+- Message Markdown recognizes a bare `note1`, `nevent1` or `naddr1`
+  reference with a valid bech32 checksum as a `NostrUri` token, so a copied
+  note id can render as an event card. Invalid checksums stay plain text
+  (#3058, #3372).
+- The v5 forensic audit log records what the recovery runner does for each
+  group: `recovery_runner_fetched`, `recovery_runner_raced` and
+  `recovery_runner_changed` (mdk#2660, #3399). The White Noise audit receiver
+  accepts the new kinds.
 - Record `read_state_publish` runtime telemetry: the count and duration of
-  each new version of an account's published read state, which the account
-  worker now builds at its quiescent points for reads that later move off the
-  worker (mdk#3273).
+  each new version of an account's published read state (mdk#3273).
 - Add `durably_owned_key_packages_with_validity` to the engine, session and
   account runtime: the owned KeyPackage list with the one clock reading its
   lifetimes are judged at, the next lifetime bound ahead (a listed bundle's
@@ -49,36 +84,96 @@
   the account database, the clock stays between that reading and the next
   bound, and the read skipped no undecodable bundle and saw no disagreement
   (mdk#3273).
+- The engine keeps each group's committed roster, written in the same
+  transaction as every membership change (mdk#3273, #3420).
+- Add a deterministic native-host MarmotKit test recipe and Swift XCTest
+  smoke against a local MockRelay (mdk#2947, #3376).
+
+### Changed
+
+- Account and group reads answer from the read state the account worker
+  publishes at each quiescent point, on the caller's task, instead of waiting
+  in the worker's queue behind a send, catch-up or convergence pass (mdk#3273,
+  #3315, #3415, #3421). This covers quarantined groups, KeyPackage status and
+  the owned list, maintenance policy and status, commit delivery, backup
+  restore status and watch, group members and member-id pages, group MLS
+  state, roster and conversation snapshots, and group app components.
+- No more "history may be incomplete" notices from the coverage ledger
+  (mdk#3308, #3379). Users see a notice only when MDK has evidence that
+  messages are missing or after a rejoin. A broken recovery unit instead
+  probes quietly an hour after it breaks, then on an interval that doubles to
+  a day. Units broken before the upgrade probe right after it. If that probe
+  fails, a unit that broke for lack of progress usually waits a day, because
+  it keeps its earlier retry step, and one that broke on a relay refusal or in
+  the coverage-ledger conversion waits an hour, then doubles up to a day.
+  `UnprovenHistory` stays in the enums but is no longer emitted.
+- Attachment downloads run four at a time across a runtime's accounts instead
+  of one, and a host's request for an on-screen attachment moves it ahead of
+  background backlog (#3417).
+- The White Noise deployment drops `https://cdn.hzrd149.com` from new groups'
+  media endpoints: it now refuses uploads from unlisted pubkeys. Existing
+  groups keep their signed endpoint list until an admin replaces it (#3417).
 
 ### Fixed
 
+- Stop a large group change from staying pending for good at a relay whose
+  event limit is unknown (#2332, #3396). A commit over 64 KiB is no longer sent
+  to such a relay, whose socket would close on the oversized frame and leave
+  the commit possibly seen: it is refused before sending, and a commit every
+  relay refuses rolls back as too large. A relay the device cannot connect to
+  holds the commit for a retry instead of refusing it. A pending commit now
+  counts as possibly seen at a relay that received it and answered
+  `rate-limited:` or `auth-required:`, so a later refusal there no longer
+  rolls back a commit members may have.
+- The same rule covers every send, not only commits (#2332, #3396). A message
+  a relay answered `rate-limited:` or `auth-required:` and then refused
+  (`invalid:`, `blocked:`) no longer fails: it stays pending and keeps
+  retrying, and while no relay has accepted it, later sends in its group wait
+  behind it, as they already do behind a send that timed out. Such an answer
+  still retries after 5 seconds, as before.
+- Archive, forget and delete an external-signer account's chat through its
+  running account worker, as for a local-signing account (#3318, #3393). These
+  wrote storage directly while the worker kept its own copy of the account:
+  its next save of the chat's record, for example after another member renamed
+  the chat, unarchived it again, and after a forget or delete it kept
+  answering for the removed group. An account that runs no worker still writes
+  storage directly, now with worker starts held off until the write is done.
+- A foreground send no longer waits behind a scheduled retry to an optional
+  relay that withholds its acknowledgement (#3234, #3368). Secondary retries
+  already yielded to durable admissions; they now yield to queued direct
+  sends too.
+- `NotificationUpdate.is_dm` follows the chat-list conversation kind for
+  messages, group-state notices and invitations, including pending DM
+  Welcomes (mdk#2773, #3357).
+- Outgoing attachment promotion resumes when a running batch finishes after
+  an attachment pass skipped it, without waiting for the maintenance tick
+  (mdk#3366, mdk#3378, #3374, #3380).
+- Create and invite abort on directory fetch-resource failures instead of
+  reporting recipients as `Incomplete` in a successful result (#1813).
+- An inbox relay that refuses NIP-77 comparison no longer brings back a
+  "history may be incomplete" notice about a second after every dismissal
+  (mdk#3308), and history the 30-day retention window passed before the
+  runner proved it no longer raises a notice that busy groups flashed about
+  once a second.
 - Fail `durably_owned_key_packages` with the storage error when proving a
   stored bundle fails to read (I/O, busy, closed), instead of returning a
   partial list that reports this device's own KeyPackages as not owned.
   Bundles whose stored value does not decode are still skipped. Storage
   backends classify OpenMLS storage errors through the new
   `StorageProvider::mls_storage_failure` (mdk#3273).
-- Add tagged poll and sticker sends in the runtime, UniFFI, and C bindings.
-  Reply, thread, and effect context reaches peers; polls project reply links
-  and previews. Existing send signatures and C ABI remain unchanged (#3408).
-
-### Fixed
-
-- Stop a large group change from staying pending for good at a relay whose
-  event limit is unknown (#2332). A commit over 64 KiB is no longer sent to
-  such a relay, whose socket would close on the oversized frame and leave the
-  commit possibly seen: it is refused before sending, and a commit every relay
-  refuses rolls back as too large. A relay the device cannot connect to holds
-  the commit for a retry instead of refusing it. A pending commit now counts
-  as possibly seen at a relay that received it and answered `rate-limited:` or
-  `auth-required:`, so a later refusal there no longer rolls back a commit
-  members may have.
-- The same rule covers every send, not only commits (#2332). A message a
-  relay answered `rate-limited:` or `auth-required:` and then refused
-  (`invalid:`, `blocked:`) no longer fails: it stays pending and keeps
-  retrying, and while no relay has accepted it, later sends in its group wait
-  behind it, as they already do behind a send that timed out. Such an answer
-  still retries after 5 seconds, as before.
+- A contained rewind window on a storage provider without atomic group
+  savepoints writes one snapshot, not two, so a crash no longer quarantines
+  the group on the next open (mdk#3278, #3412). SQLite is unchanged.
+- Every engine OpenMLS load goes through one gate that refuses a group whose
+  rewind restore failed (#3280, #3395). No current entry path reached that
+  state; the gate stops the next one that would.
+- Timeline withdrawals report the trigger of the event that changed each row:
+  a withdrawn delete of an edit reports an edit and reply-preview change, not
+  a reaction, and batch withdrawals no longer attribute every row to the
+  batch's first event (mdk#2843, mdk#3377, #3401, #3407).
+- One-shot `wn` commands shut their runtime down before exiting, so a
+  co-hosted account's recovery sweep cut by the exit no longer delays that
+  account's next messages by 30 seconds (#3381).
 
 ## 0.16.0 - 2026-11-12
 

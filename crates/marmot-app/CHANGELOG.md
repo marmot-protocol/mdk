@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.17.0 - 2026-11-15
+
 ### Breaking changes
 
 - A download the worker cannot start for lack of free disk now parks as
@@ -20,6 +22,17 @@
   `post_audit_log_tracker_update` now runs only the v5 OTLP pass, and
   `AuditLogTrackerUpdateResult` keeps only `enabled` and `v5`. Startup cleanup
   deletes the orphaned `audit-upload-checkpoint.json`.
+- Group creates (`create_group`, `create_group_detailed`, `create_group_with_options*` and the initial-image
+  creates) and invites (`invite_members*`) return `GroupMemberResult<T>`: an optional `operation` (the group id,
+  `CreatedGroup` or `SendSummary` they returned before) and ordered `member_outcomes` (#1813, #3375).
+  `invite_members_with_initial_admins` takes a `MemberResolutionPolicy` and `AppCreateGroupOptions` gains
+  `member_resolution`: `Partial`, the default, proceeds with the available members; `Atomic` keeps the
+  all-or-nothing behavior and fails with the directory error when any member is unavailable.
+  `AppError` gains `CreatedGroupMemberReportUnavailable(group_id_hex)` for a prepared-image create retried
+  against an upload consumed before member reports were retained.
+- `AppPerformanceSnapshot` drops `account_group_read_snapshot`, and `MarmotAppConfig` drops
+  `dev_force_group_read_snapshot_failure` and its builder (#3421): group reads answer from the published read
+  state, so the startup group-read snapshot no longer exists.
 
 ### Added
 
@@ -94,8 +107,17 @@
   on a timer instead of waiting for the user to dismiss its notice: an hour after it breaks, then on an interval that
   doubles to a day. A probe goes through the runner's ordinary scheduling, budgets, relay cooldowns and account
   breaker, raises no notice and never shows as catching up. Units broken before the upgrade have a probe time in the
-  past, so each probes once right after the upgrade; one whose probe fails then waits the full day, since its stored
-  backoff step predates the schedule.
+  past, so each probes once right after the upgrade. If that probe fails, the wait follows the unit's stored backoff
+  step: a unit that broke for lack of progress under 0.16.0 keeps its earlier retry step and usually waits the full
+  day, while one that broke on a relay refusal, or a park from the coverage-ledger conversion, starts at step 0 and
+  waits an hour, then doubles up to a day.
+- Account and group reads answer from the read state the account worker publishes at each quiescent point, on the
+  caller's task, instead of waiting in the worker's queue (mdk#3273, #3415, #3421). Each answer is what the worker
+  would have given at that publish. The account reads are quarantined groups, KeyPackage status and the owned list,
+  maintenance policy and per-group status, commit delivery, and backup restore status and watch; the group reads
+  are members, member-id pages, MLS state and its diagnostic form, roster and conversation snapshot, and app
+  components. A group read that names a group still awaiting startup hydration asks the worker to hydrate it and
+  answers once it has. A forget sent during startup hydration now runs at its place in the worker's command order.
 
 ### Fixed
 
@@ -118,6 +140,11 @@
 - History the 30-day retention window passed before the runner proved it (a route's parked remainder) no longer
   raises a notice. After the upgrade to the coverage ledger, nearly every chat showed "history may be incomplete" for
   this alone, and busy groups flashed the notice about once a second as live input moved their live edge.
+- Archive, forget and delete an external-signer account's chat through its running account worker, as for a
+  local-signing account (#3318, #3393). The worker's next save of the chat's record no longer unarchives it, and
+  after a forget or delete it no longer answers for the removed group.
+- A foreground send no longer waits behind a scheduled retry to an optional relay that withholds its
+  acknowledgement: secondary retries now yield to queued direct sends as well as durable admissions (#3368).
 
 ## 0.16.0 - 2026-11-12
 
