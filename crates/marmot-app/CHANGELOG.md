@@ -39,6 +39,9 @@
   minutes. The stale prerequisite checks and device discovery still run again, but the notice returns only when
   discovery shows another slot, a slot newly carrying a usable package, a new finding or a less complete result
   (#3442).
+- Onboarding relay inspections classify a CLOSED `ERROR: auth-required: ...` as `AuthenticationRequired` (not
+  `AccessRestricted`), retry the REQ once after NIP-42 authentication when the account can sign, and wait up to 8 s
+  for EOSE instead of 3 s. `CHECK_WAIT` is checked at compile time to outlast an inspection (#3439).
 - Custom sends of NIP-22 comments (kind 1111 with a numeric lowercase `k` tag) derive mention `p` tags without
   duplicating an existing pubkey tag, including one carrying a relay hint. Author edits of these comments pass
   send admission (#3409).

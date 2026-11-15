@@ -47,6 +47,13 @@
 
 ### Fixed
 
+- Stop onboarding's relay checks from failing healthy relays (#3439). A relay
+  that closes a query with its NIP-01 `auth-required:` reason behind an
+  `ERROR: ` wrapper is reported as needing authentication, not as restricting
+  access, and an account that can sign authenticates to it and asks again
+  instead of failing the check. A check now waits up to 8 seconds, not 3, for
+  a relay to finish answering, so a slow gift-wrap inbox query on a mobile
+  network no longer times out. Other relay reads keep their 3-second wait.
 - Confirm a group change that stayed pending after an unclear relay answer
   once the account's own group subscription receives that exact change from
   one of the group's relays (#2332). The relay holds it, whatever it answered

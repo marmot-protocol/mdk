@@ -16958,8 +16958,10 @@ impl nostr_relay_builder::prelude::QueryPolicy for OnboardingPaymentRequired {
         Box::pin(async { PolicyResult::Reject("payment-required: subscription needed".into()) })
     }
 }
+// The relay builder sends a rejected query's reason behind an `error: `
+// wrapper, as some public relays do (mdk#3439).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn onboarding_access_restricted_query_is_not_a_missing_record() {
+async fn onboarding_payment_required_query_is_not_a_missing_record() {
     use nostr::prelude::ToBech32;
     let dir = tempfile::tempdir().unwrap();
     let relay = LocalRelay::new(RelayBuilder::default().query_policy(OnboardingPaymentRequired));
@@ -16990,7 +16992,7 @@ async fn onboarding_access_restricted_query_is_not_a_missing_record() {
     );
     assert_eq!(
         result.steps[0].findings[0].issue,
-        marmot_app::OnboardingIssue::AccessRestricted
+        marmot_app::OnboardingIssue::PaymentRequired
     );
     runtime.shutdown_and_close().await.unwrap();
 }
