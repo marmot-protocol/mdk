@@ -140,6 +140,15 @@ impl<S: StorageProvider> Engine<S> {
         // `Processed` write ran AFTER the slot was consumed and a lock there
         // left an unrecoverable `UnknownPending` on retry.
         let mut membership_effects = None;
+        // The merge leaves a disband's committer alone in the tree. Its roster
+        // is the members it ends, read from the tree it is staged on before
+        // the merge, as its candidate holds them (`disband::former_members_of`).
+        let disband_roster =
+            (kind == crate::epoch_manager::PendingKind::Disband && has_pending_commit).then(|| {
+                cgka_traits::storage::CommittedMembers::of_members(
+                    &crate::disband::former_members_of(&mls_group),
+                )
+            });
         self.storage
             .with_transaction(|storage| -> Result<(), EngineError> {
                 let mut own_commit_stamp = None;
@@ -268,7 +277,18 @@ impl<S: StorageProvider> Engine<S> {
                 }
                 g.required_capabilities = required_capabilities_from_group(&mls_group);
                 crate::group_lifecycle::mirror_app_components_into_record(&mls_group, &mut g);
-                storage.put_group(&g)?;
+                if kind != crate::epoch_manager::PendingKind::Disband {
+                    storage.put_group_with_roster(
+                        &g,
+                        &cgka_traits::storage::CommittedMembers::of_members(&g.members),
+                    )?;
+                } else if let Some(roster) = disband_roster.as_ref() {
+                    storage.put_group_with_roster(&g, roster)?;
+                } else {
+                    // Nothing was merged here, so the roster already holds
+                    // whatever merged this disband.
+                    storage.put_group_keeping_roster(&g)?;
+                }
                 if kind == crate::epoch_manager::PendingKind::CreateGroup {
                     storage.put_invitation_admission(
                         &group_id,
@@ -581,7 +601,10 @@ impl<S: StorageProvider> Engine<S> {
                 g.members = crate::group_lifecycle::marmot_members(&mls_group);
                 g.required_capabilities = required_capabilities_from_group(&mls_group);
                 crate::group_lifecycle::mirror_app_components_into_record(&mls_group, &mut g);
-                storage.put_group(&g)?;
+                storage.put_group_with_roster(
+                    &g,
+                    &crate::group_lifecycle::committed_members(&mls_group),
+                )?;
                 if let Some(fanout) = rolled_back_fanout.as_ref() {
                     storage.put_outbound_fanout(fanout)?;
                 }

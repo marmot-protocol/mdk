@@ -903,6 +903,91 @@ impl<S: StorageProvider> Engine<S> {
             .map(crate::conformance_snapshot::ConformanceCanonicalStateSnapshot::Live)
     }
 
+    /// Where `group_id`'s committed roster disagrees with its stored
+    /// committed membership (mdk#3273 B), or `None` when it agrees: the
+    /// differential oracle for every write path that commits membership.
+    ///
+    /// The membership is read from stored state, not from the record a write
+    /// path left: the merged OpenMLS tree, a pending commit's changes
+    /// excluded, or for a Disbanded group the members its disband ended, from
+    /// its tombstone or, before it settles, its candidate for that epoch.
+    /// A group with no record
+    /// has no roster. A quarantined group is skipped: the app never trusts
+    /// its roster, and its stored state can be a retained anchor's (a failed
+    /// rewind restore) or unreadable. Test-only and read-only; the answer
+    /// names no ids.
+    #[cfg(feature = "test-conformance-snapshot")]
+    pub fn committed_roster_divergence(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<Option<String>, EngineError> {
+        if self.quarantined_reason(group_id).is_some() {
+            return Ok(None);
+        }
+        let roster = self.storage.committed_roster(group_id)?;
+        // The oracle reads the stored state it checks (see clippy.toml).
+        #[allow(clippy::disallowed_methods)]
+        match self.storage.get_group(group_id) {
+            Ok(_) => {}
+            Err(cgka_traits::storage::StorageError::NotFound) => {
+                return Ok(roster.map(|_| "a group with no record holds a committed roster".into()));
+            }
+            Err(error) => return Err(error.into()),
+        }
+        let expected = if let Some(tombstone) = self.storage.disband_tombstone(group_id)? {
+            cgka_traits::storage::CommittedMembers::of_members(&tombstone.former_members)
+        } else {
+            let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
+            #[allow(clippy::disallowed_methods)]
+            let loaded = openmls::group::MlsGroup::load(self.storage.mls_storage(), &mls_gid)
+                .map_err(|error| EngineError::Backend(format!("load: {error:?}")))?;
+            let Some(mls_group) = loaded else {
+                return Ok(Some("group record has no OpenMLS state".into()));
+            };
+            match crate::group_lifecycle::committed_membership(&mls_group) {
+                Some(expected) => expected,
+                None => {
+                    // Disbanded, not settled: the roster is the members the
+                    // disband ended, which its candidates for this epoch hold.
+                    // Rival disbands of one epoch each count as evidence.
+                    let mut evidence = crate::disband::unsettled_disband_evidence(
+                        &self.storage,
+                        group_id,
+                        EpochId(mls_group.epoch().as_u64()),
+                    )?;
+                    if evidence.is_empty() {
+                        return Ok(Some("a Disbanded group holds no disband evidence".into()));
+                    }
+                    let held = roster.as_ref().map(|roster| &roster.members);
+                    let index = evidence
+                        .iter()
+                        .position(|members| Some(members) == held)
+                        .unwrap_or(0);
+                    evidence.swap_remove(index)
+                }
+            }
+        };
+        Ok(match roster {
+            None => Some(format!(
+                "no committed roster; committed membership holds {} ids",
+                expected.ids().len()
+            )),
+            Some(roster) if roster.members != expected => Some(format!(
+                "committed roster at revision {} holds {} ids; committed membership holds {} ids, {} in common",
+                roster.revision.0,
+                roster.members.ids().len(),
+                expected.ids().len(),
+                roster
+                    .members
+                    .ids()
+                    .iter()
+                    .filter(|id| expected.ids().contains(id))
+                    .count()
+            )),
+            Some(_) => None,
+        })
+    }
+
     /// Capture aggregate outstanding work for the synthetic conformance
     /// simulator. This is an oracle diagnostic only and never affects engine
     /// scheduling or protocol decisions.
@@ -1818,6 +1903,18 @@ impl<S: StorageProvider> Engine<S> {
                 .remove(&group.id)
                 .or_else(|| group.disbanded.clone());
             if let Some(tombstone) = tombstone {
+                // A settled disband never reaches full hydration, so this is
+                // where one stored before committed rosters existed gets its
+                // roster: the members its tombstone records. Before the
+                // restore, which may replay `GroupDisbanded`, and failing
+                // closed as full hydration does.
+                if let Err(reason) = self.backfill_committed_roster(
+                    &group.id,
+                    &cgka_traits::storage::CommittedMembers::of_members(&tombstone.former_members),
+                ) {
+                    self.quarantine_stored_group_on_hydrate(&group.id, reason);
+                    continue;
+                }
                 // Reconcile the single deterministic system row after a crash.
                 // The replay is idempotent (the application projection
                 // canonicalizes it) *and* announced-once, so an already
@@ -2166,6 +2263,12 @@ impl<S: StorageProvider> Engine<S> {
             // Same once-only reconciliation as the cheap pass: idempotent if it
             // does replay, and silent once the guard is marked announced.
             let epoch = tombstone.epoch;
+            // Before the restore, which may replay `GroupDisbanded`: a roster
+            // that fails closed quarantines a group nothing has announced.
+            self.backfill_committed_roster(
+                group_id,
+                &cgka_traits::storage::CommittedMembers::of_members(&tombstone.former_members),
+            )?;
             self.restore_disband_tombstone(group_id.clone(), tombstone)
                 .map_err(|_| GroupHydrationQuarantineReason::GroupRecordLoadFailed)?;
             return Ok(epoch);
@@ -2465,7 +2568,7 @@ impl<S: StorageProvider> Engine<S> {
                     group.required_capabilities =
                         crate::capability_manager::required_capabilities_from_group(&mls_group);
                     crate::group_lifecycle::mirror_app_components_into_record(&mls_group, &mut group);
-                    storage.put_group(&group)?;
+                    storage.put_group_with_roster(&group, &crate::group_lifecycle::committed_members(&mls_group))?;
                     Ok::<_, EngineError>(recovered_epoch)
                 })
                 .map_err(|_| GroupHydrationQuarantineReason::PendingCommitRecoveryFailed)?;
@@ -2526,6 +2629,26 @@ impl<S: StorageProvider> Engine<S> {
         let has_deferred_peels = stored_message_records
             .iter()
             .any(|record| record.state == MessageState::PeelDeferred);
+        // The MLS state is final here, and nothing below changes its
+        // membership; the roster can still fail closed before any recovered
+        // state is exposed. A Disbanded group that has not settled takes its
+        // roster from its disband's evidence, the candidates for this epoch,
+        // when they agree; with none, or rivals that disagree, it keeps the
+        // one the apply wrote, and the settle writes the tombstone's.
+        match crate::group_lifecycle::committed_membership(&mls_group) {
+            Some(committed) => self.backfill_committed_roster(group_id, &committed)?,
+            None => {
+                let evidence = crate::disband::unsettled_disband_evidence(
+                    &self.storage,
+                    group_id,
+                    EpochId(mls_group.epoch().as_u64()),
+                )
+                .map_err(|_| GroupHydrationQuarantineReason::GroupRecordLoadFailed)?;
+                if let [committed] = evidence.as_slice() {
+                    self.backfill_committed_roster(group_id, committed)?;
+                }
+            }
+        }
 
         // Same distinction the cheap pass draws: promoting a copy this device
         // was removed from is not a live group's promotion. The `unrecoverable`
@@ -2643,6 +2766,65 @@ impl<S: StorageProvider> Engine<S> {
             self.schedule_pending_convergence_group(group_id);
         }
         Ok(group.epoch)
+    }
+
+    /// Make a group full hydration just validated hold `committed` as its
+    /// committed roster (mdk#3273 B), writing nothing when it already does.
+    /// This is the backfill for a group stored before committed rosters
+    /// existed, and it repairs a roster that disagrees with the group's
+    /// committed membership, which no write path should leave.
+    ///
+    /// A roster the write cannot record stays missing, an unknown membership
+    /// that never matches a recorded revision, so the group stays live. A
+    /// wrong roster the write cannot replace, or one that cannot be read,
+    /// would stay readable as committed, so the group fails closed: hydration
+    /// quarantines it, and the next open tries again.
+    fn backfill_committed_roster(
+        &self,
+        group_id: &GroupId,
+        committed: &cgka_traits::storage::CommittedMembers,
+    ) -> Result<(), GroupHydrationQuarantineReason> {
+        use cgka_traits::storage::CommittedRosterWrite;
+        let stored = self
+            .storage
+            .committed_roster(group_id)
+            .map_err(|_| GroupHydrationQuarantineReason::GroupRecordLoadFailed)?;
+        if stored
+            .as_ref()
+            .is_some_and(|roster| &roster.members == committed)
+        {
+            return Ok(());
+        }
+        match self.storage.put_committed_roster(group_id, committed) {
+            Ok(CommittedRosterWrite::Unchanged(_) | CommittedRosterWrite::Recorded(_)) => Ok(()),
+            Ok(CommittedRosterWrite::Replaced(_)) => {
+                // Privacy-safe: aggregate signal only, no group or member ids
+                // (observability.md).
+                tracing::warn!(
+                    target: "cgka_engine::engine",
+                    method = "backfill_committed_roster",
+                    repaired_rosters = 1_u64,
+                    "hydration replaced a committed roster that disagreed with the group's committed membership"
+                );
+                Ok(())
+            }
+            Err(error) => {
+                let wrong_roster_kept = stored.is_some();
+                tracing::warn!(
+                    target: "cgka_engine::engine",
+                    method = "backfill_committed_roster",
+                    error_code = "committed_roster_backfill_failed",
+                    transient = error.is_transient(),
+                    wrong_roster_kept,
+                    "hydration could not record the group's committed roster"
+                );
+                if wrong_roster_kept {
+                    Err(GroupHydrationQuarantineReason::GroupRecordLoadFailed)
+                } else {
+                    Ok(())
+                }
+            }
+        }
     }
 
     /// Restore a prepared/attempted evolution from its exact signed transport

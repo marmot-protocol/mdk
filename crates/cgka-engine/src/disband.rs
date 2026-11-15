@@ -282,6 +282,10 @@ impl<S: StorageProvider> Engine<S> {
         }
 
         let source_epoch = EpochId(mls_group.epoch().as_u64());
+        // From the tree this disband is staged on, as a canonical apply takes
+        // a peer's: the evidence its confirmation's roster and its tombstone
+        // carry.
+        let former_members = former_members_of(&mls_group);
         let own_leaf = mls_group.own_leaf_index();
         let removals = mls_group
             .members()
@@ -346,7 +350,6 @@ impl<S: StorageProvider> Engine<S> {
             .await
             .map_err(EngineError::Peeler)?;
         let wrapped = crate::message_processor::route_wrapped_group_message(wrapped, &context);
-        let former_members = deduplicated_roster(&self.live_group_record(group_id)?.members);
         let candidate = DisbandCandidate {
             group_id: group_id.clone(),
             source_epoch,
@@ -486,7 +489,10 @@ impl<S: StorageProvider> Engine<S> {
                 group.removed = false;
                 group.unrecoverable = false;
                 group.disbanded = Some(tombstone.clone());
-                storage.put_group(&group)?;
+                storage.put_group_with_roster(
+                    &group,
+                    &cgka_traits::storage::CommittedMembers::of_members(&tombstone.former_members),
+                )?;
                 storage.clear_disband_request(group_id)?;
                 storage.clear_disband_candidates(group_id)?;
                 storage.clear_leave_request(group_id)?;
@@ -569,6 +575,40 @@ impl<S: StorageProvider> Engine<S> {
         );
         Ok(true)
     }
+}
+
+/// The members a disbanding commit ends: the distinct accounts of the tree it
+/// was staged on, its parent. This is a disband's evidence, and the only
+/// source of a disbanded group's committed roster (mdk#3273 B): the commit's
+/// candidate and then its tombstone carry it, and the apply or confirmation
+/// that merges the disband writes the roster from it, since the merge leaves
+/// only the committer in the tree. Never the group record's members.
+pub(crate) fn former_members_of(
+    parent: &openmls::group::MlsGroup,
+) -> Vec<cgka_traits::group::Member> {
+    deduplicated_roster(&crate::group_lifecycle::marmot_members(parent))
+}
+
+/// The evidence for the roster of a group whose lifecycle is Disbanded at
+/// `epoch` and whose disband has not settled: the distinct former-member sets
+/// of the candidates that disband from the epoch before, any of which can be
+/// the commit that ended it. The settle picks one and writes its tombstone.
+pub(crate) fn unsettled_disband_evidence<S: StorageProvider>(
+    storage: &S,
+    group_id: &GroupId,
+    epoch: EpochId,
+) -> Result<Vec<cgka_traits::storage::CommittedMembers>, cgka_traits::storage::StorageError> {
+    let mut evidence = Vec::new();
+    for candidate in storage.list_disband_candidates(group_id)? {
+        if candidate.source_epoch.0.saturating_add(1) != epoch.0 {
+            continue;
+        }
+        let members = cgka_traits::storage::CommittedMembers::of_members(&candidate.former_members);
+        if !evidence.contains(&members) {
+            evidence.push(members);
+        }
+    }
+    Ok(evidence)
 }
 
 pub(crate) fn deduplicated_roster(

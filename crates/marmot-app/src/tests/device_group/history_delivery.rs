@@ -1811,7 +1811,7 @@ async fn import_while_roster_read_fails(devices: &mut Devices, group: &GroupId, 
     let _ = device_group_seam(&mut devices.laptop);
     assert!(!device_group_seam(&mut devices.laptop));
 
-    cgka_traits::storage::GroupStorage::put_group(&account, &saved_group).unwrap();
+    cgka_traits::storage::GroupStorage::put_group_keeping_roster(&account, &saved_group).unwrap();
 
     // No worker seam or new roster event intervenes: the import itself must
     // retry the failed roster read before returning its new timeline rows.

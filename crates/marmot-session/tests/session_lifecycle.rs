@@ -1482,7 +1482,7 @@ fn group_account_records(
 async fn group_scoped_account_records_answer_only_for_live_groups() {
     use cgka_traits::GroupCapabilities;
     use cgka_traits::group::Group;
-    use cgka_traits::storage::{GroupStorage, MaintenanceStorage};
+    use cgka_traits::storage::MaintenanceStorage;
     use marmot_session::{SessionError, SessionResult};
 
     #[derive(Clone, Copy, Debug)]

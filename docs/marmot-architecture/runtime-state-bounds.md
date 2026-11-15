@@ -1,7 +1,7 @@
 ---
 title: "Long-lived runtime state — bounds and reclamation"
 created: 2026-07-02
-updated: 2026-11-07
+updated: 2026-11-14
 tags: [marmot, architecture, runtime, daemon, broker, memory]
 ---
 
@@ -91,6 +91,14 @@ only telemetry, a closed operation and timing metadata, never a client or storag
 | Structure | Bound | Reclamation |
 | --- | --- | --- |
 | `cgka_roster_tag_keys` | One row per (group, slot, tag signature key) a device-group roster this device applied listed, in a device entry or a `removed` record (`held_as_removed`, kept once set). A slot gets one key per link of it, so it grows only with links; at most 4 per group slot (`ROSTER_TAG_KEYS_PER_SLOT`), plus the slot's newest row held as removed, so at most 5. | A repeat sighting renews a row. Every write prunes rows last seen more than 30 days ago (`ROSTER_TAG_KEY_RETENTION_SECS`) and each slot's rows past its 4 most recently seen, except its newest row held as removed, in the order this device applied the states that listed them (`seen_seq`), not by the clock. Deleting the group cascades. A branch-selection rewind keeps them: they sit outside snapshots on purpose. |
+
+### `cgka-engine` committed rosters (`src/group_lifecycle.rs`, `storage-sqlite` `src/protocol/storage/committed_rosters.rs`)
+
+| Structure | Bound | Reclamation |
+| --- | --- | --- |
+| `cgka_committed_rosters` | One row per stored group whose committed roster is known. | Deleting the group cascades. |
+| `cgka_committed_roster_members` | One row per distinct member account of each group's committed roster: the group's account count, not its leaf count. | A roster write deletes the rows of accounts that left; deleting the group cascades. |
+| `cgka_committed_roster_revision` | One row: the account-wide revision counter. | Never deleted; keeping it is what stops a revision from being handed out twice. |
 
 ### `storage-sqlite` compromise warning (`src/app/compromise_warning.rs`)
 

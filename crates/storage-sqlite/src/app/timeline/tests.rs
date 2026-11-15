@@ -1820,7 +1820,7 @@ fn branch_selection_withdrawal_reason_matches_the_engine_variant() {
 /// Seed a group plus one commit row in `cgka_messages` under `commit_hex`, in
 /// the stored disposition a convergence pass would have left behind.
 fn seed_commit(store: &SqliteAccountStorage, group: u8, commit_hex: &str, state: MessageState) {
-    use cgka_traits::storage::{GroupStorage, MessageStorage};
+    use cgka_traits::storage::MessageStorage;
     let group_id = crate::base::test_support::gid(group);
     let _ = store.put_group(&crate::base::test_support::sample_group(
         group_id.clone(),

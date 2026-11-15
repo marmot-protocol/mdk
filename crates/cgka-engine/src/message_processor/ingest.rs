@@ -2417,8 +2417,12 @@ impl<S: StorageProvider> Engine<S> {
         } else {
             (None, GroupStateChange::MemberRemoved { member })
         };
-        let canonical_members = self.with_mls_group(group_id, |mls_group| {
-            Ok(crate::group_lifecycle::marmot_members(mls_group))
+        let (canonical_members, disbanded) = self.with_mls_group(group_id, |mls_group| {
+            Ok((
+                crate::group_lifecycle::marmot_members(mls_group),
+                crate::app_components::lifecycle_of_group(mls_group)?
+                    == Some(cgka_traits::app_components::GroupLifecycleV1::Disbanded),
+            ))
         })?;
         // Losing this device does not imply its account's sibling leaves left.
         let account_departed = !canonical_members
@@ -2426,7 +2430,18 @@ impl<S: StorageProvider> Engine<S> {
             .any(|active| &active.id == self.identity.self_id());
         group.members = canonical_members;
         let prepared = self.storage.with_transaction(|storage| {
-            storage.put_group(&group)?;
+            if disbanded {
+                // A disband removed this leaf and has not settled yet. Its
+                // committer alone is left in the tree; the roster holds the
+                // members it ended, which the apply that merged it wrote from
+                // its evidence (`disband::former_members_of`).
+                storage.put_group_keeping_roster(&group)?;
+            } else {
+                storage.put_group_with_roster(
+                    &group,
+                    &cgka_traits::storage::CommittedMembers::of_members(&group.members),
+                )?;
+            }
             super::prepare_local_group_termination(storage, group_id)
         })?;
         if account_departed {

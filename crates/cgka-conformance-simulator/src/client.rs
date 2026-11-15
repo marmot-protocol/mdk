@@ -2220,6 +2220,31 @@ impl HarnessClient {
         self.pending_events.clear();
     }
 
+    /// Each stored group whose committed roster disagrees with its stored
+    /// committed membership (mdk#3273 B), as id-free messages. A client
+    /// whose engine is closed reports none.
+    pub(crate) fn committed_roster_divergences(&self) -> Result<Vec<String>, crate::SubjectError> {
+        use cgka_traits::storage::GroupStorage;
+        let (Some(engine), Some(storage)) = (self.engine.as_ref(), self.storage.as_ref()) else {
+            return Ok(Vec::new());
+        };
+        let read_error =
+            |error: String| crate::SubjectError::new("committed_roster_oracle_read_failed", error);
+        let mut divergences = Vec::new();
+        for group in storage
+            .list_groups()
+            .map_err(|error| read_error(error.to_string()))?
+        {
+            if let Some(divergence) = engine
+                .committed_roster_divergence(&group)
+                .map_err(|error| read_error(error.to_string()))?
+            {
+                divergences.push(divergence);
+            }
+        }
+        Ok(divergences)
+    }
+
     pub fn replay_probe_count(&self) -> u64 {
         self.completed_replay_probe_count
             .saturating_add(self.engine().conformance_replay_probe_count())

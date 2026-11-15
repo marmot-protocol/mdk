@@ -213,7 +213,6 @@ mod tests {
     use crate::RecoveryLossCause;
     use crate::app::account_recovery::tests::assert_backend;
     use crate::base::test_support::{gid, sample_group};
-    use cgka_traits::storage::GroupStorage;
 
     fn group_obligations(store: &SqliteAccountStorage) -> i64 {
         store

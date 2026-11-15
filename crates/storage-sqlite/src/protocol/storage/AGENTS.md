@@ -8,7 +8,8 @@ Map for Marmot engine-side SQLite tables (the `cgka_traits` storage traits). App
 | Module | Owns |
 | --- | --- |
 | `mod.rs` | Module wiring and shared helpers. |
-| `groups.rs` | `GroupStorage`: group CRUD, listing, cascade delete; delegates route rows to `transport_routes.rs`. |
+| `groups.rs` | `GroupStorage`: group CRUD, listing, cascade delete; delegates route rows to `transport_routes.rs`. `put_group_with_roster` writes a record and its committed roster in one transaction, `put_group_keeping_roster` the record alone; the inherent `put_group` is a `test-support` fixture that writes the record alone. |
+| `committed_rosters.rs` | `CommittedRosterStorage`: each group's committed roster, its distinct member account ids, at a revision drawn from one account-wide counter that is never reset, so a group forgotten or deleted and joined again never reuses one (mdk#3273). A read takes the revision and the members from one snapshot. A write changes only the member rows that differ and takes a new revision only when the members change. Each write is its own savepoint, so one refused inside a caller's transaction leaves no rows. Outside every snapshot, so a rewind keeps it; group deletion drops it. |
 | `transport_routes.rs` | Durable transport-route index rows (routing id → group id + observing epoch) seeded at session open (mdk#1161). |
 | `account_device_history_key.rs` | `AccountDeviceHistoryKeyStorage`: this device's HPKE history key pair (mdk#2628 4.1). |
 | `account_device_signer.rs` | Marmot identity to MLS signing-key binding. |

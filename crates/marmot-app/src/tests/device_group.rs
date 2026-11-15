@@ -1103,7 +1103,7 @@ async fn the_host_never_learns_of_the_device_group() {
     for id in [&group, &chat] {
         let mut damaged = cgka_traits::storage::GroupStorage::get_group(&storage, id).unwrap();
         damaged.protocol_profile = cgka_traits::group::ProtocolProfile::Legacy;
-        cgka_traits::storage::GroupStorage::put_group(&storage, &damaged).unwrap();
+        cgka_traits::storage::GroupStorage::put_group_keeping_roster(&storage, &damaged).unwrap();
     }
     drop(phone);
     let phone = phone_app.client("alice").await.unwrap();
@@ -1557,7 +1557,7 @@ async fn an_unreadable_roster_never_names_the_group_and_a_terminal_one_lists_not
     // open, then at an eager one.
     let mut damaged = stored();
     damaged.protocol_profile = cgka_traits::group::ProtocolProfile::Legacy;
-    cgka_traits::storage::GroupStorage::put_group(&storage, &damaged).unwrap();
+    cgka_traits::storage::GroupStorage::put_group_keeping_roster(&storage, &damaged).unwrap();
     drop(phone);
     let plane = MarmotRelayPlane::new(None, relay);
     let mut phone = phone_app
@@ -1591,7 +1591,7 @@ async fn an_unreadable_roster_never_names_the_group_and_a_terminal_one_lists_not
 
     let mut removed = stored();
     removed.removed = true;
-    cgka_traits::storage::GroupStorage::put_group(&storage, &removed).unwrap();
+    cgka_traits::storage::GroupStorage::put_group_keeping_roster(&storage, &removed).unwrap();
     assert!(phone.linked_devices().unwrap().is_empty());
 }
 

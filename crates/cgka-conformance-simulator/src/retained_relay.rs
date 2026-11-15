@@ -557,6 +557,10 @@ impl ConvergenceSubject for RetainedRelaySubject {
         self.engine.engine_metrics()
     }
 
+    fn committed_roster_divergences(&self) -> Result<Vec<String>, SubjectError> {
+        self.engine.committed_roster_divergences()
+    }
+
     fn select_scenario_group(
         &mut self,
         group: &str,

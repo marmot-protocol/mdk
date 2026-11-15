@@ -31,12 +31,13 @@ use cgka_traits::message::{MessageRecord, MessageState};
 use cgka_traits::peeler::TransportPeeler;
 use cgka_traits::storage::{
     AccountDeviceHistoryKey, AccountDeviceHistoryKeyStorage, AccountDeviceSignerBinding,
-    AccountDeviceSignerStorage, CapabilityStorage, ConvergencePassStorage,
-    ConvergencePolicyStorage, DeviceGroupWelcomeExpectation, DeviceGroupWelcomeStorage,
-    DisbandCandidate, DisbandCandidateStorage, DisbandRequest, DisbandRequestStorage,
-    DisbandTombstoneStorage, GroupStateCheckpointRef, GroupStorage, KeyPackageBundleStorage,
-    LeaveRequest, LeaveRequestStorage, MemberValidationCacheStorage, MessageStorage,
-    OpenMlsContentFilter, OutboundFanoutStorage, OutboundIntentStorage, QueuedOutboundIntent,
+    AccountDeviceSignerStorage, CapabilityStorage, CommittedMembers, CommittedRoster,
+    CommittedRosterStorage, CommittedRosterWrite, ConvergencePassStorage, ConvergencePolicyStorage,
+    DeviceGroupWelcomeExpectation, DeviceGroupWelcomeStorage, DisbandCandidate,
+    DisbandCandidateStorage, DisbandRequest, DisbandRequestStorage, DisbandTombstoneStorage,
+    GroupStateCheckpointRef, GroupStorage, KeyPackageBundleStorage, LeaveRequest,
+    LeaveRequestStorage, MemberValidationCacheStorage, MessageStorage, OpenMlsContentFilter,
+    OutboundFanoutStorage, OutboundIntentStorage, QueuedOutboundIntent, RosterRevision,
     StorageError, StorageProvider, StorageResult, StoredKeyPackageBundle, WelcomeStorage,
 };
 use cgka_traits::transport::{
@@ -458,6 +459,25 @@ struct FaultStorage {
     message_list_fault: LeaveWriteFault,
 }
 
+impl CommittedRosterStorage for FaultStorage {
+    fn committed_roster(&self, group_id: &GroupId) -> StorageResult<Option<CommittedRoster>> {
+        self.inner.committed_roster(group_id)
+    }
+    fn committed_roster_revision(
+        &self,
+        group_id: &GroupId,
+    ) -> StorageResult<Option<RosterRevision>> {
+        self.inner.committed_roster_revision(group_id)
+    }
+    fn put_committed_roster(
+        &self,
+        group_id: &GroupId,
+        members: &CommittedMembers,
+    ) -> StorageResult<CommittedRosterWrite> {
+        self.inner.put_committed_roster(group_id, members)
+    }
+}
+
 impl GroupStorage for FaultStorage {
     fn invitation_admission(
         &self,
@@ -472,11 +492,21 @@ impl GroupStorage for FaultStorage {
     ) -> StorageResult<()> {
         self.inner.put_invitation_admission(id, admission)
     }
-    fn put_group(&self, group: &Group) -> StorageResult<()> {
+    fn put_group_with_roster(
+        &self,
+        group: &Group,
+        committed: &CommittedMembers,
+    ) -> StorageResult<()> {
         if self.fault.should_fail() {
             return Err(StorageError::Busy("injected put_group failure".into()));
         }
-        self.inner.put_group(group)
+        self.inner.put_group_with_roster(group, committed)
+    }
+    fn put_group_keeping_roster(&self, group: &Group) -> StorageResult<()> {
+        if self.fault.should_fail() {
+            return Err(StorageError::Busy("injected put_group failure".into()));
+        }
+        self.inner.put_group_keeping_roster(group)
     }
     fn get_group(&self, id: &GroupId) -> StorageResult<Group> {
         if self.deferred_release_read_fault.should_fail() {
@@ -4919,6 +4949,8 @@ async fn disband_cleanup_failure_preserves_earlier_canonical_activity_once() {
     };
     bob.join_welcome(welcomes.remove(0)).await.unwrap();
     bob.drain_events();
+    let joined = handle.committed_roster(&group_id).unwrap().unwrap();
+    assert_eq!(joined.members.ids().len(), 2);
     let SendResult::GroupEvolution {
         msg: mut rename,
         pending,
@@ -4972,6 +5004,13 @@ async fn disband_cleanup_failure_preserves_earlier_canonical_activity_once() {
     assert!(format!("{error:?}").contains("injected termination cleanup failure"));
     assert!(handle.disband_tombstone(&group_id).unwrap().is_none());
     assert!(handle.get_group(&group_id).unwrap().disbanded.is_none());
+    // The apply committed before the settle failed: the roster holds the
+    // members the disband ended, as the disbander's own confirmation keeps
+    // them, never the committer alone.
+    assert_eq!(
+        handle.committed_roster(&group_id).unwrap().as_ref(),
+        Some(&joined)
+    );
     let prefix = bob.drain_events();
     let activity: Vec<_> = prefix
         .iter()
@@ -5005,6 +5044,10 @@ async fn disband_cleanup_failure_preserves_earlier_canonical_activity_once() {
     bob.converge_stored_openmls_messages_at(&group_id, 3_000_000)
         .unwrap();
     assert!(handle.disband_tombstone(&group_id).unwrap().is_some());
+    assert_eq!(
+        handle.committed_roster(&group_id).unwrap().as_ref(),
+        Some(&joined)
+    );
     let suffix = bob.drain_events();
     let changes: Vec<_> = suffix
         .iter()

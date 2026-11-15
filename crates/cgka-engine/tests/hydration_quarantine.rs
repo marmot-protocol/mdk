@@ -16,13 +16,14 @@ use cgka_traits::message::{MessageRecord, MessageState};
 use cgka_traits::peeler::TransportPeeler;
 use cgka_traits::storage::{
     AccountDeviceHistoryKey, AccountDeviceHistoryKeyStorage, AccountDeviceSignerBinding,
-    AccountDeviceSignerStorage, CapabilityStorage, ConvergencePassStorage,
-    ConvergencePolicyStorage, DeviceGroupWelcomeExpectation, DeviceGroupWelcomeStorage,
-    DisbandCandidate, DisbandCandidateStorage, DisbandRequest, DisbandRequestStorage,
-    DisbandTombstoneStorage, GroupStateCheckpointRef, GroupStorage, KeyPackageBundleStorage,
-    LeaveRequest, LeaveRequestStorage, MaintenanceStorage, MemberValidationCacheStorage,
-    MessageStorage, OutboundFanoutStorage, OutboundIntentStorage, PrivateKeyPackageStorage,
-    QueuedOutboundIntent, StorageError, StorageProvider, StorageResult, StoredKeyPackageBundle,
+    AccountDeviceSignerStorage, CapabilityStorage, CommittedMembers, CommittedRoster,
+    CommittedRosterStorage, CommittedRosterWrite, ConvergencePassStorage, ConvergencePolicyStorage,
+    DeviceGroupWelcomeExpectation, DeviceGroupWelcomeStorage, DisbandCandidate,
+    DisbandCandidateStorage, DisbandRequest, DisbandRequestStorage, DisbandTombstoneStorage,
+    GroupStateCheckpointRef, GroupStorage, KeyPackageBundleStorage, LeaveRequest,
+    LeaveRequestStorage, MaintenanceStorage, MemberValidationCacheStorage, MessageStorage,
+    OutboundFanoutStorage, OutboundIntentStorage, PrivateKeyPackageStorage, QueuedOutboundIntent,
+    RosterRevision, StorageError, StorageProvider, StorageResult, StoredKeyPackageBundle,
     WelcomeStorage,
 };
 use cgka_traits::transport::{
@@ -809,6 +810,25 @@ impl FlakyGroupRecordStorage {
     }
 }
 
+impl CommittedRosterStorage for FlakyGroupRecordStorage {
+    fn committed_roster(&self, group_id: &GroupId) -> StorageResult<Option<CommittedRoster>> {
+        self.inner.committed_roster(group_id)
+    }
+    fn committed_roster_revision(
+        &self,
+        group_id: &GroupId,
+    ) -> StorageResult<Option<RosterRevision>> {
+        self.inner.committed_roster_revision(group_id)
+    }
+    fn put_committed_roster(
+        &self,
+        group_id: &GroupId,
+        members: &CommittedMembers,
+    ) -> StorageResult<CommittedRosterWrite> {
+        self.inner.put_committed_roster(group_id, members)
+    }
+}
+
 impl GroupStorage for FlakyGroupRecordStorage {
     fn invitation_admission(
         &self,
@@ -823,8 +843,15 @@ impl GroupStorage for FlakyGroupRecordStorage {
     ) -> StorageResult<()> {
         self.inner.put_invitation_admission(id, admission)
     }
-    fn put_group(&self, group: &Group) -> StorageResult<()> {
-        self.inner.put_group(group)
+    fn put_group_with_roster(
+        &self,
+        group: &Group,
+        committed: &CommittedMembers,
+    ) -> StorageResult<()> {
+        self.inner.put_group_with_roster(group, committed)
+    }
+    fn put_group_keeping_roster(&self, group: &Group) -> StorageResult<()> {
+        self.inner.put_group_keeping_roster(group)
     }
     fn get_group(&self, id: &GroupId) -> StorageResult<Group> {
         if self.fail_get_group.load(Ordering::SeqCst) {
@@ -1876,7 +1903,9 @@ async fn retrying_a_quarantined_terminal_group_announces_once_despite_a_stale_mi
         .put_disband_tombstone(&group_id, &guard)
         .expect("write terminal guard");
     record.disbanded = Some(guard);
-    storage.put_group(&record).expect("write mirror");
+    storage
+        .put_group_with_roster(&record, &CommittedMembers::of_members(&record.members))
+        .expect("write mirror");
     drop(initial);
 
     let disband_replays = |engine: &mut Engine<FlakyGroupRecordStorage>| {
