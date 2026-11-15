@@ -1,7 +1,7 @@
 ---
 title: "Nostr Bounded Acquisition Interface"
 created: 2026-09-23
-updated: 2026-11-06
+updated: 2026-11-15
 tags: [marmot, nostr, recovery, transport]
 status: overview
 ---
