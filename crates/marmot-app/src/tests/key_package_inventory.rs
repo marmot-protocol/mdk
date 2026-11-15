@@ -29,7 +29,7 @@ fn endpoint(url: &str) -> TransportEndpoint {
     TransportEndpoint(url.to_owned())
 }
 
-fn key_package_event(
+pub(crate) fn key_package_event(
     account: &AccountSummary,
     key_package: KeyPackage,
     slot_id: &str,

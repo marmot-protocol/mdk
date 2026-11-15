@@ -25,6 +25,10 @@
 
 ### Fixed
 
+- Interactive onboarding keeps a single-device acknowledgment when Continue follows a pause of more than five
+  minutes. The stale prerequisite checks and device discovery still run again, but the notice returns only when
+  discovery shows another slot, a slot newly carrying a usable package, a new finding or a less complete result
+  (#3442).
 - Custom sends of NIP-22 comments (kind 1111 with a numeric lowercase `k` tag) derive mention `p` tags without
   duplicating an existing pubkey tag, including one carrying a relay hint. Author edits of these comments pass
   send admission (#3409).

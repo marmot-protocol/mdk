@@ -15,7 +15,7 @@ mod follow_list_edits;
 mod group_lookup;
 pub(crate) mod invite_recovery;
 mod key_package_client_tag;
-mod key_package_inventory;
+pub(crate) mod key_package_inventory;
 mod key_package_relay_lists;
 mod key_package_selection;
 mod message_journeys;
@@ -7680,7 +7680,7 @@ async fn unpublished_legacy_session_bundle_schedules_replacement_before_open() {
     );
 }
 
-async fn fresh_key_package_for_account(
+pub(crate) async fn fresh_key_package_for_account(
     app: &MarmotApp,
     account: &AccountSummary,
     legacy: bool,
