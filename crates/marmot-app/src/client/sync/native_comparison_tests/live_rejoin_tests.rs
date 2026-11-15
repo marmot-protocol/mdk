@@ -65,11 +65,11 @@ async fn local_publish_keeps_history() {
         assert_eq!(legacy, events[180..].iter().map(|event| event.event.id.clone()).collect::<BTreeSet<_>>());
         assert!(timeout(Duration::from_millis(25), adapter.receive()).await.is_err(), "the native receiver's local fanout never enters the ordinary queue");
         assert!(!adapter.account_subscription_eose(&account).await.complete());
-        assert!(!fixture.receiver.admit_native_turn().await.unwrap(), "new local ciphertext cannot overtake an in-deadline historical prefix");
+        assert!(!fixture.receiver.admit_native_turn(None).await.unwrap(), "new local ciphertext cannot overtake an in-deadline historical prefix");
         assert!(fixture.receiver.take_pending_applied_sync_summary().messages.is_empty());
         adapter.handle_relay_eose(endpoint, id).await;
         for turn in 0..=TEXTS {
-            if !fixture.receiver.admit_native_turn().await.unwrap() {
+            if !fixture.receiver.admit_native_turn(None).await.unwrap() {
                 break;
             }
             assert!(turn < TEXTS, "the combined group lane drains in bounded owner turns");
@@ -203,7 +203,7 @@ async fn queued_live_rejoins() {
                 .is_none(),
             "new peer metadata revokes the unstarted live-prefix loan"
         );
-        assert!(!fixture.receiver.admit_native_turn().await.unwrap());
+        assert!(!fixture.receiver.admit_native_turn(None).await.unwrap());
         for event in events[180..].iter().rev() {
             let mut event = event.clone();
             event.endpoint = b.clone();
@@ -222,13 +222,13 @@ async fn queued_live_rejoins() {
                 .unwrap();
         }
         assert!(
-            !fixture.receiver.admit_native_turn().await.unwrap(),
+            !fixture.receiver.admit_native_turn(None).await.unwrap(),
             "the native lane waits for the current source boundary"
         );
         adapter.handle_relay_eose(b, current.clone()).await;
         adapter.handle_relay_eose(a, current).await;
         for turn in 0..=TEXTS {
-            if !fixture.receiver.admit_native_turn().await.unwrap() {
+            if !fixture.receiver.admit_native_turn(None).await.unwrap() {
                 break;
             }
             assert!(

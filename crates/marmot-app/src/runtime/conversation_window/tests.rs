@@ -75,7 +75,7 @@ impl Fixture {
         let captures = Arc::new(AtomicUsize::new(0));
         let captured = Arc::new(Notify::new());
         let release = Arc::new(Notify::new());
-        let (commands, mut rx) = mpsc::channel(8);
+        let (commands, mut rx) = crate::runtime::test_worker_channel(8);
         let (shutdown, mut stop) = oneshot::channel();
         let m = mode.clone();
         let n = captures.clone();
@@ -1783,7 +1783,7 @@ async fn closing_window_cannot_abandon_reconcile_worker_teardown() {
         .unwrap()
         .shutdown()
         .await;
-    let (commands, _rx) = mpsc::channel(8);
+    let (commands, _rx) = crate::runtime::test_worker_channel(8);
     let (shutdown, stopping) = oneshot::channel();
     let entered = Arc::new(Notify::new());
     let release = Arc::new(Notify::new());

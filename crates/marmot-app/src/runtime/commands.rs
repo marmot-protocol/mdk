@@ -14,9 +14,10 @@ use tokio::sync::{mpsc, oneshot};
 
 use super::account_worker::GroupCreationRequest;
 use super::{
-    AccountManager, AccountWorkerCommand, Emit, ReadClass, ReadReply, Unpublished, WorkerLane,
-    account_worker_response, local_account_worker_response, long_account_worker_catch_up_response,
-    long_account_worker_response, publish_app_runtime_group_state_updated,
+    AccountManager, AccountWorkerCommand, Emit, ReadClass, ReadReply, Unpublished, WorkerCommands,
+    WorkerLane, account_worker_response, local_account_worker_response,
+    long_account_worker_catch_up_response, long_account_worker_response,
+    publish_app_runtime_group_state_updated,
 };
 use crate::client::read_state::{ReadAnswer, ReadState, reissue};
 use crate::messages::AppMessageIntent;
@@ -338,7 +339,7 @@ impl AccountManager {
         }
     }
 
-    pub(super) fn spawn_invite_catch_up(&self, command: mpsc::Sender<AccountWorkerCommand>) {
+    pub(super) fn spawn_invite_catch_up(&self, command: WorkerCommands) {
         let mut tasks = self
             .invite_catch_up_tasks
             .lock()
@@ -372,11 +373,7 @@ impl AccountManager {
     /// changing the mutation's result. Once the command worker has confirmed
     /// a publish, a read-side catch-up fault cannot roll it back; surfacing
     /// that fault would tell the host to retry work already visible to peers.
-    async fn catch_up_committed(
-        &self,
-        command: mpsc::Sender<AccountWorkerCommand>,
-        method: &'static str,
-    ) {
+    async fn catch_up_committed(&self, command: WorkerCommands, method: &'static str) {
         let observation = self
             .shared
             .observer
@@ -394,7 +391,7 @@ impl AccountManager {
         }
     }
 
-    fn spawn_create_catch_up(&self, command: mpsc::Sender<AccountWorkerCommand>) {
+    fn spawn_create_catch_up(&self, command: WorkerCommands) {
         let manager = self.clone();
         tokio::spawn(async move {
             // Test-only barrier (`test-policy-overrides`): lets integration
@@ -3388,7 +3385,7 @@ mod tests {
             "wss://relay.example",
         ));
         let manager = runtime.accounts();
-        let (commands, mut received) = mpsc::channel(1);
+        let (commands, mut received) = crate::runtime::test_worker_channel(1);
         let (shutdown, stopped) = oneshot::channel();
         let handle = tokio::spawn(async move {
             let Some(AccountWorkerCommand::AcceptGroupInvite { respond, .. }) =
@@ -3449,7 +3446,7 @@ mod tests {
             "wss://relay.example",
         ));
         let manager = runtime.accounts();
-        let (command, mut received) = mpsc::channel(1);
+        let (command, mut received) = crate::runtime::test_worker_channel(1);
         let catch_up = manager.catch_up_committed(command, "test");
         let worker = async {
             let Some(AccountWorkerCommand::CatchUp { respond }) = received.recv().await else {
@@ -3477,7 +3474,7 @@ mod tests {
             dir.path(),
             "wss://relay.example",
         ));
-        let (commands, mut received) = mpsc::channel(1);
+        let (commands, mut received) = crate::runtime::test_worker_channel(1);
         let (respond, _response) = ReadReply::unobserved();
         commands
             .try_send(AccountWorkerCommand::KeyPackageMaintenanceStatus { respond })
@@ -3552,7 +3549,7 @@ mod tests {
         assert!(runtime.accounts().workers.lock().await.is_empty());
 
         let manager = runtime.accounts();
-        let (commands, mut received) = mpsc::channel(1);
+        let (commands, mut received) = crate::runtime::test_worker_channel(1);
         let (shutdown, stopped) = oneshot::channel();
         let handle = tokio::spawn(async move {
             while let Some(command) = received.recv().await {
@@ -3621,7 +3618,7 @@ mod tests {
         async fn read(
             manager: &AccountManager,
             account: &str,
-            received: &mut mpsc::Receiver<AccountWorkerCommand>,
+            received: &mut crate::runtime::TestWorkerReceiver,
             answer: Option<AppError>,
         ) -> Result<PeriodicMaintenancePolicy, AppError> {
             let Some(answer) = answer else {
@@ -3654,7 +3651,7 @@ mod tests {
             "wss://relay.example",
         ));
         let manager = runtime.accounts();
-        let (commands, mut received) = mpsc::channel(1);
+        let (commands, mut received) = crate::runtime::test_worker_channel(1);
         let (publisher, read_state) = read_state_channel();
         let (shutdown, stopped) = oneshot::channel();
         let handle = tokio::spawn(async move {

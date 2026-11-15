@@ -1,6 +1,7 @@
 use std::fmt;
 use std::sync::{Arc, RwLock};
 
+use marmot_observability::{Observation, Outcome as TelemetryOutcome};
 use marmot_session::{AccountIdentityProofRequest, AccountIdentityProofSigner};
 use nostr::prelude::{Event, FinalizeEvent, PublicKey, Signature, UnsignedEvent};
 use transport_nostr_peeler::{MarmotNostrSigner, MarmotSignerError, SignerFuture};
@@ -65,6 +66,23 @@ impl AccountIdentityProofSigner for LocalAccountIdentityProofSigner {
             .proof_event()
             .and_then(|event| event.finalize(&self.keys).map_err(|err| err.to_string()))?;
         request.signature_from_signed_event(event)
+    }
+}
+
+/// The span of one remote-signer call, if the account worker's task makes it.
+fn worker_call() -> Option<Observation> {
+    crate::runtime::observe_on_account_worker(
+        crate::RuntimePerformanceOperation::WorkerRemoteSignerCall,
+    )
+}
+
+fn finish_call<T, E>(call: Option<Observation>, result: &Result<T, E>) {
+    if let Some(call) = call {
+        call.finish(if result.is_ok() {
+            TelemetryOutcome::Success
+        } else {
+            TelemetryOutcome::Failure
+        });
     }
 }
 
@@ -151,11 +169,14 @@ impl MarmotNostrSigner for RegisteredExternalSigner {
     ) -> SignerFuture<'_, Result<Event, MarmotSignerError>> {
         let public_key = self.public_key;
         let signer = self.signer();
+        let call = worker_call();
         Box::pin(async move {
             let expected_id = unsigned
                 .id
                 .ok_or_else(|| MarmotSignerError::from("unsigned event id was not set"))?;
-            let event = signer?.sign_event(unsigned).await?;
+            let event = signer?.sign_event(unsigned).await;
+            finish_call(call, &event);
+            let event = event?;
             if event.pubkey != public_key || event.id != expected_id {
                 return Err(MarmotSignerError::from(
                     "external signer returned a different event than requested",
@@ -174,7 +195,12 @@ impl MarmotNostrSigner for RegisteredExternalSigner {
         content: &'a str,
     ) -> SignerFuture<'a, Result<String, MarmotSignerError>> {
         let signer = self.signer();
-        Box::pin(async move { signer?.nip04_encrypt(public_key, content).await })
+        let call = worker_call();
+        Box::pin(async move {
+            let result = signer?.nip04_encrypt(public_key, content).await;
+            finish_call(call, &result);
+            result
+        })
     }
 
     fn nip04_decrypt<'a>(
@@ -183,7 +209,12 @@ impl MarmotNostrSigner for RegisteredExternalSigner {
         encrypted_content: &'a str,
     ) -> SignerFuture<'a, Result<String, MarmotSignerError>> {
         let signer = self.signer();
-        Box::pin(async move { signer?.nip04_decrypt(public_key, encrypted_content).await })
+        let call = worker_call();
+        Box::pin(async move {
+            let result = signer?.nip04_decrypt(public_key, encrypted_content).await;
+            finish_call(call, &result);
+            result
+        })
     }
 
     fn nip44_encrypt<'a>(
@@ -192,7 +223,12 @@ impl MarmotNostrSigner for RegisteredExternalSigner {
         content: &'a str,
     ) -> SignerFuture<'a, Result<String, MarmotSignerError>> {
         let signer = self.signer();
-        Box::pin(async move { signer?.nip44_encrypt(public_key, content).await })
+        let call = worker_call();
+        Box::pin(async move {
+            let result = signer?.nip44_encrypt(public_key, content).await;
+            finish_call(call, &result);
+            result
+        })
     }
 
     fn nip44_decrypt<'a>(
@@ -201,7 +237,12 @@ impl MarmotNostrSigner for RegisteredExternalSigner {
         payload: &'a str,
     ) -> SignerFuture<'a, Result<String, MarmotSignerError>> {
         let signer = self.signer();
-        Box::pin(async move { signer?.nip44_decrypt(public_key, payload).await })
+        let call = worker_call();
+        Box::pin(async move {
+            let result = signer?.nip44_decrypt(public_key, payload).await;
+            finish_call(call, &result);
+            result
+        })
     }
 }
 
@@ -215,7 +256,11 @@ impl AccountIdentityProofSigner for RegisteredExternalSigner {
                 "request account identity does not match registered external signer".into(),
             );
         }
-        let signature = self.signer()?.sign_account_identity_proof(request)?;
+        let signer = self.signer()?;
+        let call = worker_call();
+        let signature = signer.sign_account_identity_proof(request);
+        finish_call(call, &signature);
+        let signature = signature?;
         let proof_event = request.proof_event()?;
         let signature_value = Signature::from_slice(&signature).map_err(|err| err.to_string())?;
         proof_event

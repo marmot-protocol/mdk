@@ -163,9 +163,12 @@ pub use subscriptions::{
 // Bring split-out items the orchestration core references back into scope.
 pub(crate) use account_worker::{
     AccountStartupProgress, AccountWorkerCommand, AccountWorkerRuntime, Emit, ManagedAccountWorker,
-    ReadClass, ReadReply, Unpublished, WorkerLane, WorkerUnitGauge,
-    publish_app_runtime_group_state_updated, spawn_app_runtime_account_worker,
+    ReadClass, ReadReply, Unpublished, WorkerCommands, WorkerLane, WorkerUnitGauge,
+    observe_on_account_worker, publish_app_runtime_group_state_updated,
+    spawn_app_runtime_account_worker,
 };
+#[cfg(test)]
+pub(crate) use account_worker::{TestWorkerReceiver, test_worker_channel};
 pub(crate) use audit_tracker::{
     AuditLogTrackerUploader, post_audit_log_tracker_update_for_runtime,
 };
@@ -6926,9 +6929,9 @@ fn is_transient_account_catch_up_error(error: &AppError) -> bool {
 }
 
 async fn run_account_catch_up_pass(
-    commands: Vec<mpsc::Sender<AccountWorkerCommand>>,
+    commands: Vec<WorkerCommands>,
     response_wait: Duration,
-) -> Vec<(mpsc::Sender<AccountWorkerCommand>, Result<(), AppError>)> {
+) -> Vec<(WorkerCommands, Result<(), AppError>)> {
     let mut responses = Vec::with_capacity(commands.len());
     let mut outcomes = Vec::with_capacity(commands.len());
     for command in commands {
@@ -6962,7 +6965,7 @@ async fn run_account_catch_up_pass(
 }
 
 async fn catch_up_account_commands_with_retry(
-    commands: Vec<mpsc::Sender<AccountWorkerCommand>>,
+    commands: Vec<WorkerCommands>,
     response_wait: Duration,
     retry_delays: &[Duration],
 ) -> Result<(), AppError> {
@@ -8024,7 +8027,9 @@ impl AccountManager {
                     );
                     let (shutdown_tx, shutdown_rx) = oneshot::channel();
                     let (command_tx, command_rx) = mpsc::channel(8);
-                    let unit = Arc::new(WorkerUnitGauge::default());
+                    let unit = Arc::new(WorkerUnitGauge::recording(
+                        self.shared.observer.performance().clone(),
+                    ));
                     let (read_state_tx, read_state) = read_state_channel();
                     let (unlinked_tx, unlinked_rx) = oneshot::channel();
                     self.deactivate_when_unlinked(
@@ -8045,7 +8050,7 @@ impl AccountManager {
                             unit: unit.clone(),
                             read_state: read_state_tx,
                         },
-                        command_tx.clone(),
+                        WorkerCommands::unobserved(command_tx.clone()),
                         command_rx,
                         ready_tx,
                         startup_progress.clone(),
@@ -8056,7 +8061,7 @@ impl AccountManager {
                         ManagedAccountWorker {
                             ready: false,
                             handle,
-                            commands: command_tx,
+                            commands: WorkerCommands::observed(command_tx, unit.clone()),
                             media_admission: Arc::new(Semaphore::new(MEDIA_COMMAND_QUEUE_LIMIT)),
                             shutdown: shutdown_tx,
                             unit,
@@ -8266,7 +8271,7 @@ impl AccountManager {
         Ok(())
     }
 
-    async fn running_account_commands(&self) -> Vec<mpsc::Sender<AccountWorkerCommand>> {
+    async fn running_account_commands(&self) -> Vec<WorkerCommands> {
         self.workers
             .lock()
             .await
@@ -8280,7 +8285,7 @@ impl AccountManager {
 
     async fn catch_up_account_commands(
         &self,
-        commands: Vec<mpsc::Sender<AccountWorkerCommand>>,
+        commands: Vec<WorkerCommands>,
     ) -> Result<(), AppError> {
         self.shared.lifecycle().ensure_running()?;
         catch_up_account_commands_with_retry(
@@ -8458,10 +8463,7 @@ impl AccountManager {
             .await
     }
 
-    async fn worker_commands(
-        &self,
-        account_ref: &str,
-    ) -> Result<mpsc::Sender<AccountWorkerCommand>, AppError> {
+    async fn worker_commands(&self, account_ref: &str) -> Result<WorkerCommands, AppError> {
         self.worker_lane(account_ref)
             .await
             .map(|lane| lane.commands)
@@ -8485,14 +8487,7 @@ impl AccountManager {
         &self,
         account_ref: &str,
         class: ReadClass,
-    ) -> Result<
-        (
-            mpsc::Sender<AccountWorkerCommand>,
-            ReadReply<T>,
-            oneshot::Receiver<T>,
-        ),
-        AppError,
-    > {
+    ) -> Result<(WorkerCommands, ReadReply<T>, oneshot::Receiver<T>), AppError> {
         let lane = self.worker_lane(account_ref).await?;
         let (respond, response) = lane.read_reply(self.shared.observer.performance(), class);
         Ok((lane.commands, respond, response))
@@ -8520,7 +8515,7 @@ impl AccountManager {
     async fn worker_commands_for_setup(
         &self,
         account_ref: &str,
-    ) -> Result<mpsc::Sender<AccountWorkerCommand>, AppError> {
+    ) -> Result<WorkerCommands, AppError> {
         self.shared.lifecycle().ensure_running()?;
         let account = self.resolve(account_ref)?;
         self.worker_commands_for_account(account)
@@ -8531,7 +8526,7 @@ impl AccountManager {
     async fn media_worker_commands(
         &self,
         account_ref: &str,
-    ) -> Result<(mpsc::Sender<AccountWorkerCommand>, OwnedSemaphorePermit), AppError> {
+    ) -> Result<(WorkerCommands, OwnedSemaphorePermit), AppError> {
         self.shared.lifecycle().ensure_running()?;
         let account = self.resolve(account_ref)?;
         self.setup_records()

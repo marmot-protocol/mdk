@@ -1278,6 +1278,34 @@ fn pinned_media_send_error(
     }
 }
 
+/// The span of one network step the account worker awaits inline today, of
+/// a kind a later step-3 PR moves to a lane, so its wait stays visible once
+/// it moves (`docs/marmot-architecture/runtime-latency-telemetry.md`).
+/// Dropping it unfinished records the step as cancelled.
+pub(crate) struct LaneStep(Option<marmot_observability::Observation>);
+
+impl LaneStep {
+    pub(crate) fn finish<T, E>(self, result: &Result<T, E>) {
+        if let Some(step) = self.0 {
+            step.finish(if result.is_ok() {
+                marmot_observability::Outcome::Success
+            } else {
+                marmot_observability::Outcome::Failure
+            });
+        }
+    }
+}
+
+impl AppClient {
+    pub(crate) fn lane_step(&self, operation: crate::RuntimePerformanceOperation) -> LaneStep {
+        LaneStep(
+            self.runtime_telemetry
+                .as_ref()
+                .map(|telemetry| telemetry.observe(operation)),
+        )
+    }
+}
+
 fn record_app_performance(
     telemetry: Option<&PerformanceRecorder>,
     operation: AppPerformanceOperation,
@@ -2325,6 +2353,7 @@ impl AppClient {
             .create_key_package_requirements(&request)
             .map_err(marmot_session::SessionError::from)?;
         let key_package_started_at = Instant::now();
+        let resolution = self.lane_step(crate::RuntimePerformanceOperation::KeyPackageResolution);
         let key_packages = self
             .app
             .directory()
@@ -2338,6 +2367,7 @@ impl AppClient {
                 member_resolution,
             )
             .await;
+        resolution.finish(&key_packages);
         let key_package_elapsed = key_package_started_at.elapsed();
         record_app_performance(
             telemetry,
@@ -2412,13 +2442,20 @@ impl AppClient {
                     Some(GROUP_BLOSSOM_IMAGE_COMPONENT_ID) => {
                         let data = match image {
                             InitialGroupImageSource::Inline(image) => {
+                                let endpoint =
+                                    self.app.deployment().group_image_endpoint_for(None)?;
+                                let step = self.lane_step(
+                                    crate::RuntimePerformanceOperation::GroupImageUpload,
+                                );
                                 let upload = upload_group_image(
                                     &image.plaintext,
                                     &image.media_type,
-                                    &self.app.deployment().group_image_endpoint_for(None)?,
+                                    &endpoint,
                                     &self.blossom_http_transport,
                                 )
-                                .await?;
+                                .await;
+                                step.finish(&upload);
+                                let upload = upload?;
                                 let input = AppGroupImageInput::from(upload);
                                 hex::decode(AppGroupImageComponent::new(input).data_hex)?
                             }
@@ -3043,6 +3080,7 @@ impl AppClient {
             .runtime
             .invite_key_package_requirements(group_id)
             .map_err(marmot_session::SessionError::from)?;
+        let resolution = self.lane_step(crate::RuntimePerformanceOperation::KeyPackageResolution);
         let key_packages = self
             .app
             .directory()
@@ -3056,6 +3094,7 @@ impl AppClient {
                 member_resolution,
             )
             .await;
+        resolution.finish(&key_packages);
         record_app_performance(
             telemetry,
             AppPerformanceOperation::GroupInviteKeyPackageLookup,
@@ -5028,6 +5067,24 @@ impl AppClient {
                     return Err(err);
                 }
             };
+            // The send's relay wait, apart from the writer's own work in
+            // `send_execution`.
+            if let (Some(telemetry), Some(duration)) =
+                (&self.runtime_telemetry, effects.publish_duration)
+            {
+                let published = effects.published_app_messages.iter().any(|message| {
+                    message.group_id == *group_id && message.app_event_id == app_event_id
+                });
+                telemetry.record_runtime(
+                    crate::RuntimePerformanceOperation::SendPublication,
+                    duration,
+                    if published {
+                        marmot_observability::Outcome::Success
+                    } else {
+                        marmot_observability::Outcome::Failure
+                    },
+                );
+            }
             if should_project_locally {
                 if let Some(duration) = effects.local_accept_duration {
                     record_app_performance(
@@ -6137,14 +6194,17 @@ impl AppClient {
             let input = if plaintext.is_empty() {
                 AppGroupImageInput::default()
             } else {
+                let endpoint = self.app.deployment().group_image_endpoint_for(None)?;
+                let step = self.lane_step(crate::RuntimePerformanceOperation::GroupImageUpload);
                 let upload = upload_group_image(
                     &plaintext,
                     media_type,
-                    &self.app.deployment().group_image_endpoint_for(None)?,
+                    &endpoint,
                     &self.blossom_http_transport,
                 )
-                .await?;
-                AppGroupImageInput::from(upload)
+                .await;
+                step.finish(&upload);
+                AppGroupImageInput::from(upload?)
             };
             let data = hex::decode(AppGroupImageComponent::new(input).data_hex)?;
             let effects = self
@@ -7531,12 +7591,14 @@ impl AppClient {
                     since: self.subscription_rebuild_since(),
                 };
                 self.pending_runtime_group_subscription_refresh = true;
+                let step = self.lane_step(crate::RuntimePerformanceOperation::RouteRefresh);
                 let register = async {
                     let started = Instant::now();
                     let result = adapter
                         .sync_account_groups(sync)
                         .await
                         .map_err(AppError::from);
+                    step.finish(&result);
                     record_app_performance(
                         telemetry,
                         AppPerformanceOperation::GroupCreateSubscriptionRefresh,

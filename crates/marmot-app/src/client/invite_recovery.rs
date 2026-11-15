@@ -495,7 +495,9 @@ impl AppClient {
                         }
                         Err(_) => break,
                     };
-                    let resolved = match self
+                    let resolution =
+                        self.lane_step(crate::RuntimePerformanceOperation::KeyPackageResolution);
+                    let resolved = self
                         .app
                         .directory()
                         .resolve_compatible_member_key_packages(
@@ -504,8 +506,9 @@ impl AppClient {
                             nostr_directory::MemberResolutionPurpose::CommitFresh,
                             nostr_directory::MemberResolutionPolicy::Atomic,
                         )
-                        .await
-                    {
+                        .await;
+                    resolution.finish(&resolved);
+                    let resolved = match resolved {
                         Ok(resolved) => resolved.key_packages,
                         Err(_) => break,
                     };
