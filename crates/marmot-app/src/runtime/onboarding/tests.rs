@@ -10474,6 +10474,35 @@ async fn a_removal_only_cleanup_keeps_the_last_route_of_each_role() {
     );
     assert_eq!(stuck.mode, OnboardingRelayRepairMode::ManualReview);
 
+    // Of two refused write routes, the first stays to keep the role and the
+    // second is removed.
+    let two_paid_writes = signed(
+        &keys,
+        10002,
+        vec![
+            vec!["r".into(), "wss://read.example".into(), "read".into()],
+            vec!["r".into(), "wss://members.example".into(), "write".into()],
+            vec!["r".into(), "wss://paid.example".into(), "write".into()],
+        ],
+        "",
+        unix_now_seconds(),
+    );
+    let mut both_refused = unusable.clone();
+    both_refused.insert(
+        relay_key("wss://paid.example"),
+        OnboardingRelayRemovalReason::PaymentRequired,
+    );
+    let (one_kept, _, write) = setup.minimal_relay_repair(
+        OnboardingStep::Relays,
+        Some(&two_paid_writes),
+        &defaults,
+        &both_refused,
+        true,
+    );
+    assert_eq!(one_kept.mode, OnboardingRelayRepairMode::RemovalOnly);
+    assert_eq!(removed(&one_kept), vec!["wss://paid.example"]);
+    assert_eq!(write, vec!["wss://members.example"]);
+
     let spare_read = signed(
         &keys,
         10002,

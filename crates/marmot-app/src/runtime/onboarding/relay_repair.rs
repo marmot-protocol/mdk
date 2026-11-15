@@ -198,19 +198,22 @@ impl AccountSetup<'_> {
                 .then(|| unusable.get(&relay_key(endpoint)).copied())
                 .flatten()
         };
-        // Keep, in a removal-only preview, every unusable entry of a role that
-        // no other allowed entry declares.
+        // A removal-only preview keeps, in tag order, the first unusable
+        // endpoint (with all its tags) that declares a role no allowed entry
+        // left in the list declares, and removes the rest.
         let mut kept = HashSet::new();
         if removal_only {
             let mut covered = (false, false, false);
+            let mut unusable_roles: HashMap<String, (bool, bool, bool)> = HashMap::new();
             for tag in before.iter().filter(|tag| relevant(tag)) {
                 let Some(endpoint) = tag.endpoint.as_deref() else {
                     continue;
                 };
-                if policies.get(endpoint) == Some(&RelayEndpointPolicy::Allowed)
-                    && unusable_reason(endpoint).is_none()
-                {
-                    let (read, write, inbox) = declared_roles(tag.role);
+                let (read, write, inbox) = declared_roles(tag.role);
+                if unusable_reason(endpoint).is_some() {
+                    let roles = unusable_roles.entry(relay_key(endpoint)).or_default();
+                    *roles = (roles.0 || read, roles.1 || write, roles.2 || inbox);
+                } else if policies.get(endpoint) == Some(&RelayEndpointPolicy::Allowed) {
                     covered = (covered.0 || read, covered.1 || write, covered.2 || inbox);
                 }
             }
@@ -218,11 +221,13 @@ impl AccountSetup<'_> {
                 let Some(endpoint) = tag.endpoint.as_deref() else {
                     continue;
                 };
-                let (read, write, inbox) = declared_roles(tag.role);
-                if unusable_reason(endpoint).is_some()
-                    && ((read && !covered.0) || (write && !covered.1) || (inbox && !covered.2))
-                {
-                    kept.insert(relay_key(endpoint));
+                let key = relay_key(endpoint);
+                let Some(&(read, write, inbox)) = unusable_roles.get(&key) else {
+                    continue;
+                };
+                if (read && !covered.0) || (write && !covered.1) || (inbox && !covered.2) {
+                    covered = (covered.0 || read, covered.1 || write, covered.2 || inbox);
+                    kept.insert(key);
                 }
             }
         }
