@@ -691,6 +691,10 @@ pub(crate) struct ScriptedPushRelayClient {
     /// stale socket does once the device drops offline (mdk#2762).
     fail_publish_possibly_exposed: std::sync::atomic::AtomicBool,
     unavailable_endpoints: std::sync::Mutex<Vec<String>>,
+    /// Endpoints whose relay refuses every publish of a kind for good, with
+    /// the answer's category (mdk#2333). The others answer as usual.
+    endpoint_refusals:
+        std::sync::Mutex<Vec<(u64, String, cgka_traits::TransportEndpointRejectionCategory)>>,
     fail_publish_kind: std::sync::Mutex<Option<(u64, bool)>>,
     accept_first_endpoint_only: std::sync::atomic::AtomicBool,
     accepted_publish_routes: std::sync::Mutex<Vec<(u64, Vec<TransportEndpoint>)>>,
@@ -1308,6 +1312,22 @@ impl ScriptedPushRelayClient {
             .collect();
     }
 
+    /// The relay at `endpoint` refuses every publish of `kind` for good with
+    /// a final answer of `category`, as the SDK client classifies one; a
+    /// `TooLarge` answer carries the event's size class. The fanout publishes
+    /// one endpoint at a time, so the other relays still accept.
+    pub(crate) fn refuse_publishes_of_kind_at(
+        &self,
+        kind: u64,
+        endpoint: &str,
+        category: cgka_traits::TransportEndpointRejectionCategory,
+    ) {
+        self.endpoint_refusals
+            .lock()
+            .unwrap()
+            .push((kind, endpoint.to_owned(), category));
+    }
+
     pub(crate) fn fail_publishes_of_kind(&self, kind: u64) {
         *self.fail_publish_kind.lock().unwrap() = Some((kind, false));
     }
@@ -1702,6 +1722,41 @@ impl NostrRelayClient for ScriptedPushRelayClient {
                         .collect(),
                 ),
             ));
+        }
+        let refusals = self.endpoint_refusals.lock().unwrap().clone();
+        let refusal_of = |endpoint: &TransportEndpoint| {
+            refusals
+                .iter()
+                .find(|(kind, refusing, _)| *kind == event.kind && *refusing == endpoint.0)
+                .map(|(_, _, category)| *category)
+        };
+        if !endpoints.is_empty()
+            && endpoints
+                .iter()
+                .all(|endpoint| refusal_of(endpoint).is_some())
+        {
+            let class =
+                cgka_traits::EventSizeClass::of_bytes(serde_json::to_vec(event).unwrap().len());
+            return Ok(NostrPublishOutcome {
+                failed: endpoints
+                    .iter()
+                    .cloned()
+                    .map(|endpoint| {
+                        let category = refusal_of(&endpoint).unwrap();
+                        cgka_traits::TransportEndpointFailure {
+                            pre_send: false,
+                            size_class: (category
+                                == cgka_traits::TransportEndpointRejectionCategory::TooLarge)
+                                .then_some(class),
+                            reason: format!("relay rejected event ({})", category.as_str()),
+                            endpoint,
+                            kind: cgka_traits::TransportEndpointFailureKind::TerminalRejected,
+                            rejection_category: Some(category),
+                        }
+                    })
+                    .collect(),
+                ..Default::default()
+            });
         }
         if self
             .fail_publish_possibly_exposed
@@ -25464,6 +25519,189 @@ async fn both_advisory_gates_can_be_acknowledged_in_turn() {
         .await
         .unwrap();
     assert!(client.runtime.group_record(&group_id).unwrap().epoch.0 > epoch.0);
+}
+
+/// mdk#2333: a relay that refuses a confirmed commit for good will never carry
+/// it. The refusal is reported with its cause and refuses the next group change
+/// at once, with no grace. The acknowledgement dismisses it for good and admits
+/// one attempt; the gate stays lifted after that attempt fails, until a new
+/// commit is refused again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_relay_refusal_refuses_group_changes_at_once_until_acknowledged() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relays(
+        dir.path(),
+        vec![
+            "wss://relay-a.example".to_owned(),
+            "wss://relay-b.example".to_owned(),
+        ],
+    )
+    .with_test_relay_client(relay.clone());
+    let mut client = app.client("alice").await.unwrap();
+    let group_id = client
+        .create_group("refused", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
+    let group_hex = hex::encode(group_id.as_slice());
+    relay.refuse_publishes_of_kind_at(
+        445,
+        "wss://relay-b.example",
+        cgka_traits::TransportEndpointRejectionCategory::TooLarge,
+    );
+    client
+        .update_group_profile(&group_id, Some("first"), None)
+        .await
+        .unwrap();
+
+    let delivery = client
+        .group_commit_delivery(&group_id)
+        .unwrap()
+        .expect("relay B refused the commit");
+    assert!(delivery.owed_relay_urls.is_empty());
+    assert!(
+        matches!(
+            delivery.refused_relays.as_slice(),
+            [crate::GroupCommitRefusedRelay {
+                relay_url,
+                cause: crate::GroupCommitRefusalCause::TooLarge { size_class: Some(_) },
+            }] if relay_url == "wss://relay-b.example"
+        ),
+        "{:?}",
+        delivery.refused_relays
+    );
+    let refused = |result: Result<SendSummary, AppError>, operation: &str| match result {
+        Err(AppError::GroupCommitUndelivered(held)) => assert_eq!(held, group_hex, "{operation}"),
+        other => panic!("{operation} must refuse while a relay refusal stands, got {other:?}"),
+    };
+    let epoch = client.runtime.group_record(&group_id).unwrap().epoch;
+    refused(
+        client
+            .update_group_profile(&group_id, Some("second"), None)
+            .await,
+        "update_group_profile inside the delivery grace",
+    );
+    assert_eq!(client.runtime.group_record(&group_id).unwrap().epoch, epoch);
+
+    assert!(
+        client
+            .acknowledge_group_commit_undelivered(&group_id)
+            .unwrap()
+    );
+    assert_eq!(client.group_commit_delivery(&group_id).unwrap(), None);
+    assert!(matches!(
+        client
+            .update_group_avatar_url(
+                &group_id,
+                Some("http://insecure.example/a.png".into()),
+                None,
+                None
+            )
+            .await,
+        Err(AppError::InvalidGroupAvatarUrl(_))
+    ));
+    client
+        .update_group_profile(&group_id, Some("second"), None)
+        .await
+        .unwrap();
+    assert!(client.runtime.group_record(&group_id).unwrap().epoch.0 > epoch.0);
+
+    // The new commit is refused too, and gates again.
+    refused(
+        client
+            .update_group_profile(&group_id, Some("third"), None)
+            .await,
+        "update_group_profile after a new refusal",
+    );
+}
+
+/// mdk#2333: a refused commit gates at once, and one acknowledgement covers it
+/// and an older commit still owed inside its grace, which gates once the grace
+/// ends: the next attempt is admitted. A commit that starts gating after the
+/// acknowledgement is refused again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn one_acknowledgement_covers_an_owed_and_a_refused_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relays(
+        dir.path(),
+        vec![
+            "wss://relay-a.example".to_owned(),
+            "wss://relay-b.example".to_owned(),
+            "wss://relay-c.example".to_owned(),
+        ],
+    )
+    .with_test_relay_client(relay.clone());
+    let mut client = app.client("alice").await.unwrap();
+    let group_id = client
+        .create_group("mixed", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
+    // The first commit stays owed to B; the second is owed to B and refused
+    // by C. Inside the grace, the owed commit does not hold the second.
+    relay.make_endpoints_unavailable(&["wss://relay-b.example"]);
+    client
+        .update_group_profile(&group_id, Some("owed"), None)
+        .await
+        .unwrap();
+    relay.refuse_publishes_of_kind_at(
+        445,
+        "wss://relay-c.example",
+        cgka_traits::TransportEndpointRejectionCategory::Blocked,
+    );
+    client
+        .update_group_profile(&group_id, Some("refused"), None)
+        .await
+        .unwrap();
+    let delivery = client.group_commit_delivery(&group_id).unwrap().unwrap();
+    assert_eq!(
+        delivery.refused_relays,
+        vec![crate::GroupCommitRefusedRelay {
+            relay_url: "wss://relay-c.example".into(),
+            cause: crate::GroupCommitRefusalCause::Rejected,
+        }],
+        "the refused commit is named ahead of the older owed one"
+    );
+
+    // The refusal gates at once; the owed commit is still inside its grace.
+    assert!(matches!(
+        client
+            .update_group_profile(&group_id, Some("next"), None)
+            .await,
+        Err(AppError::GroupCommitUndelivered(_))
+    ));
+    assert!(
+        client
+            .acknowledge_group_commit_undelivered(&group_id)
+            .unwrap()
+    );
+    // Past the grace the owed commit gates too, and the acknowledgement,
+    // given while it was inside the grace, covers it.
+    client.commit_delivery_gate_grace_secs = 0;
+    let epoch = client.runtime.group_record(&group_id).unwrap().epoch;
+    client
+        .update_group_profile(&group_id, Some("next"), None)
+        .await
+        .unwrap();
+    assert!(client.runtime.group_record(&group_id).unwrap().epoch.0 > epoch.0);
+
+    // That commit is owed to B and refused by C: not covered.
+    assert!(matches!(
+        client
+            .update_group_profile(&group_id, Some("after"), None)
+            .await,
+        Err(AppError::GroupCommitUndelivered(_))
+    ));
 }
 
 /// mdk#2258: gap evidence armed at an epoch the device has since left does not

@@ -5,7 +5,8 @@ use marmot_uniffi::conversions::{
     AppGroupHydrationQuarantineReasonFfi, AppGroupMemberIdsFfi, AppGroupMemberRecordFfi,
     AppGroupMlsStateFfi, AppGroupRecordFfi, AppProtocolProfileFfi, AppQuarantinedGroupFfi,
     CreatedGroupFfi, DisbandFailureReasonFfi, DisbandRequestFfi, EncryptedMediaVersionFfi,
-    GroupAppComponentFfi, GroupCommitDeliveryFfi, GroupConversationSnapshotFfi, GroupDetailsFfi,
+    GroupAppComponentFfi, GroupCommitDeliveryFfi, GroupCommitRefusalCauseFfi,
+    GroupCommitRefusedRelayFfi, GroupConversationSnapshotFfi, GroupDetailsFfi,
     GroupInviteDeclineResultFfi, GroupLifecycleStateFfi, GroupManagementStateFfi,
     GroupMemberActionStateFfi, GroupMemberDetailsFfi, GroupMutationResultFfi,
     GroupRecoveryStatusFfi, GroupRejoinInvitationFfi, GroupRosterFfi, MemberRefFfi,
@@ -116,16 +117,41 @@ c_mirror! {
     }
 }
 
+c_enum! {
+    /// Why a group relay refused a change for good (mdk#2333).
+    MarmotGroupCommitRefusalCause from GroupCommitRefusalCauseFfi {
+        /// Too large for the relay: its own size answer, its known limit, or
+        /// the 64 KiB commit floor at a relay whose limit is unknown.
+        TooLarge,
+        /// Any other final answer from the relay.
+        Rejected,
+    }
+}
+
 c_mirror! {
-    /// The group's oldest change that some group relays have not accepted yet.
-    /// Members who read only those relays cannot follow the group until they do.
-    /// `since` is when the first relay accepted it, in Unix seconds.
+    /// A group relay that refused a change of yours for good. `size_class` is
+    /// read only when `has_size_class` is true: for `TooLarge`, when known.
+    MarmotGroupCommitRefusedRelay from GroupCommitRefusedRelayFfi {
+        str relay_url,
+        copy cause: MarmotGroupCommitRefusalCause,
+        opt_copy has_size_class/size_class: MarmotEventSizeClass,
+    }
+}
+
+c_mirror! {
+    /// A change of yours that some group relays have not accepted yet, or
+    /// that a group relay refused. Members who read only those relays may not
+    /// have it. The change named is the oldest one a relay refused, until the
+    /// refusal is acknowledged, or else the oldest one still owed. `since` is
+    /// when the first relay accepted it, in Unix seconds. `refused_relays`
+    /// lists the relays that refused it, until acknowledged.
     MarmotGroupCommitDelivery from GroupCommitDeliveryFfi,
     free marmot_group_commit_delivery_free {
         str group_id_hex,
         str_vec owed_relay_urls/owed_relay_urls_len,
         copy relay_count: u32,
         copy since: u64,
+        vec refused_relays/refused_relays_len: MarmotGroupCommitRefusedRelay,
     }
 }
 
@@ -578,6 +604,88 @@ mod tests {
         unsafe {
             marmot_pending_welcome_delivery_list_free(std::ptr::null_mut());
         }
+    }
+
+    #[test]
+    fn commit_delivery_maps_each_refusal_cause_and_frees_deeply() {
+        let _guard = crate::memory::audit::test_lock();
+        #[cfg(feature = "alloc-audit")]
+        let before = crate::memory::audit::live_allocations();
+        let delivery: MarmotGroupCommitDelivery = GroupCommitDeliveryFfi {
+            group_id_hex: "12".repeat(16),
+            owed_relay_urls: vec!["wss://owed.example".into()],
+            relay_count: 4,
+            since: 7,
+            refused_relays: vec![
+                GroupCommitRefusedRelayFfi {
+                    relay_url: "wss://small.example".into(),
+                    cause: GroupCommitRefusalCauseFfi::TooLarge,
+                    size_class: Some(marmot_uniffi::EventSizeClassFfi::From64To128Kib),
+                },
+                GroupCommitRefusedRelayFfi {
+                    relay_url: "wss://ambiguous.example".into(),
+                    cause: GroupCommitRefusalCauseFfi::TooLarge,
+                    size_class: None,
+                },
+                GroupCommitRefusedRelayFfi {
+                    relay_url: "wss://blocked.example".into(),
+                    cause: GroupCommitRefusalCauseFfi::Rejected,
+                    size_class: None,
+                },
+            ],
+        }
+        .into();
+        let expected = [
+            (
+                "wss://small.example",
+                MarmotGroupCommitRefusalCause::TooLarge,
+                Some(MarmotEventSizeClass::From64To128Kib),
+            ),
+            (
+                "wss://ambiguous.example",
+                MarmotGroupCommitRefusalCause::TooLarge,
+                None,
+            ),
+            (
+                "wss://blocked.example",
+                MarmotGroupCommitRefusalCause::Rejected,
+                None,
+            ),
+        ];
+        unsafe {
+            assert_eq!(
+                std::ffi::CStr::from_ptr(delivery.group_id_hex)
+                    .to_str()
+                    .unwrap(),
+                "12".repeat(16)
+            );
+            assert_eq!(delivery.owed_relay_urls_len, 1);
+            assert_eq!(
+                std::ffi::CStr::from_ptr(*delivery.owed_relay_urls)
+                    .to_str()
+                    .unwrap(),
+                "wss://owed.example"
+            );
+            assert_eq!((delivery.relay_count, delivery.since), (4, 7));
+            assert_eq!(delivery.refused_relays_len, expected.len());
+            let refused =
+                std::slice::from_raw_parts(delivery.refused_relays, delivery.refused_relays_len);
+            for (relay, (url, cause, size_class)) in refused.iter().zip(expected) {
+                assert_eq!(
+                    std::ffi::CStr::from_ptr(relay.relay_url).to_str().unwrap(),
+                    url
+                );
+                assert_eq!(relay.cause, cause);
+                assert_eq!(relay.has_size_class, size_class.is_some());
+                if let Some(size_class) = size_class {
+                    assert_eq!(relay.size_class, size_class);
+                }
+            }
+            marmot_group_commit_delivery_free(boxed(delivery));
+            marmot_group_commit_delivery_free(std::ptr::null_mut());
+        }
+        #[cfg(feature = "alloc-audit")]
+        assert_eq!(crate::memory::audit::live_allocations(), before);
     }
 
     #[test]

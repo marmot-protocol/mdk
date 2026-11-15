@@ -289,9 +289,12 @@ group changes (membership, admins, profile, image, retention, disbanding) fail w
 **Changes not yet on every relay.** A group change counts as published once one group relay accepts it; MDK keeps
 retrying the others with the same event. Until they accept it, members who read only those relays cannot follow it, so
 once a change has been owed to a relay for two minutes, group changes fail with JSON error code
-`group_commit_undelivered`. `groups commit-delivery <group-hex>` shows the oldest change still owed to a relay, the
-relays owing it and when the first relay accepted it; it reports owed relays immediately, before the two minutes pass. Retry once they accept it, or pass `--accept-undelivered` to make the change anyway;
-scheduled self-updates wait up to an hour.
+`group_commit_undelivered`. A relay that refuses a change for good (too large for it, or any other final answer) will
+never carry it, so group changes fail with the same code at once, until you accept the refusal. `groups commit-delivery
+<group-hex>` shows the oldest change a relay refused, or else the oldest change still owed to a relay, with the relays
+owing it, the relays that refused it (`refused_relays`, each with its `cause`) and when the first relay accepted it; it
+reports owed relays immediately, before the two minutes pass. Retry once they accept it, or pass `--accept-undelivered`
+to make the change anyway, which also dismisses the group's refusals for good; scheduled self-updates wait up to an hour.
 
 **Group identifiers.** Every `<group-hex>` is the canonical MLS group id (`group_id` in JSON; opaque bytes, 16 bytes for
 OpenMLS-created groups). It is not the 32-byte Nostr routing handle shown under `nostr_routing.nostr_group_id_hex`,

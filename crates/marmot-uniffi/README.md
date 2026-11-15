@@ -1845,6 +1845,17 @@ attempt and is not persisted. A change can need both acknowledgements; each surv
 other check refusing the attempt. Scheduled self-updates wait up to an hour for delivery,
 then proceed.
 
+A group relay can also refuse a change for good: too large for it, or any other final
+answer (mdk#2333). MDK never retries that relay with the change, so members who read only
+it may not have the change, and nothing heals it. `group_commit_delivery` then lists the
+relay in `refusedRelays`, with `cause` `TooLarge` (and `sizeClass` when known) or
+`Rejected`, and names that change ahead of any owed one. A refusal makes group changes fail
+with `GroupCommitUndelivered` at once rather than after two minutes, and it keeps warning
+until acknowledged: no later change, and no timer, ends it. The same
+`acknowledge_group_commit_undelivered` call dismisses every refusal in the group for good,
+across restarts too, so hosts can also call it from a "dismiss" action. A host can offer
+to proceed, or to ask an admin to change the group's relays.
+
 ## File-backed media upload
 
 Use `uploadMediaFiles` for private regular-file inputs instead of sending a

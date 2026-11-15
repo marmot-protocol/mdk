@@ -1110,8 +1110,9 @@ async fn groups_command_once(
                 plain: match &delivery {
                     None => format!("commit-delivery group={group_id_hex} delivered=true"),
                     Some(delivery) => format!(
-                        "commit-delivery group={group_id_hex} delivered=false owed_relays={} relay_count={} since={}",
+                        "commit-delivery group={group_id_hex} delivered=false owed_relays={} refused_relays={} relay_count={} since={}",
                         delivery.owed_relay_urls.len(),
+                        delivery.refused_relays.len(),
                         delivery.relay_count,
                         delivery.since
                     ),

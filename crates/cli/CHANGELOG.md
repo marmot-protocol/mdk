@@ -11,6 +11,11 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Changed
 
+- `groups commit-delivery` reports the group relays that refused a change of yours for good: JSON `commit_delivery`
+  gains `refused_relays` (each `relay_url` and `cause`), and text output adds `refused_relays=` (mdk#2333). A refusal
+  fails group changes with `group_commit_undelivered` at once, until accepted; `--accept-undelivered` also dismisses
+  the group's refusals for good.
+
 - Group creation and invites keep eligible members when another requested member has no usable fresh KeyPackage or inbox route.
   JSON includes `member_outcomes` with each canonical account's status and selected device count. A selected member is not proof of delivery.
   Creation returns `group_id: null` when no requested member is eligible. Invites return `summary: null` and nullable publication fields when no mutation occurs.

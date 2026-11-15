@@ -639,6 +639,21 @@ typedef enum MarmotSendMaintenanceDisposition {
 } MarmotSendMaintenanceDisposition;
 
 /**
+ * Why a group relay refused a change for good (mdk#2333).
+ */
+typedef enum MarmotGroupCommitRefusalCause {
+  /**
+   * Too large for the relay: its own size answer, its known limit, or
+   * the 64 KiB commit floor at a relay whose limit is unknown.
+   */
+  MARMOT_GROUP_COMMIT_REFUSAL_CAUSE_TOO_LARGE,
+  /**
+   * Any other final answer from the relay.
+   */
+  MARMOT_GROUP_COMMIT_REFUSAL_CAUSE_REJECTED,
+} MarmotGroupCommitRefusalCause;
+
+/**
  * Coarse serialized event size, not an inferred relay limit. Only read
  * when the corresponding has_size_class flag is true.
  */
@@ -3139,9 +3154,26 @@ typedef struct MarmotGroupAppComponent {
 } MarmotGroupAppComponent;
 
 /**
- * The group's oldest change that some group relays have not accepted yet.
- * Members who read only those relays cannot follow the group until they do.
- * `since` is when the first relay accepted it, in Unix seconds.
+ * A group relay that refused a change of yours for good. `size_class` is
+ * read only when `has_size_class` is true: for `TooLarge`, when known.
+ */
+typedef struct MarmotGroupCommitRefusedRelay {
+  char *relay_url;
+  enum MarmotGroupCommitRefusalCause cause;
+  bool has_size_class;
+  /**
+   *Only meaningful when the matching `has_` flag is set.
+   */
+  enum MarmotEventSizeClass size_class;
+} MarmotGroupCommitRefusedRelay;
+
+/**
+ * A change of yours that some group relays have not accepted yet, or
+ * that a group relay refused. Members who read only those relays may not
+ * have it. The change named is the oldest one a relay refused, until the
+ * refusal is acknowledged, or else the oldest one still owed. `since` is
+ * when the first relay accepted it, in Unix seconds. `refused_relays`
+ * lists the relays that refused it, until acknowledged.
  */
 typedef struct MarmotGroupCommitDelivery {
   char *group_id_hex;
@@ -3149,6 +3181,8 @@ typedef struct MarmotGroupCommitDelivery {
   uintptr_t owed_relay_urls_len;
   uint32_t relay_count;
   uint64_t since;
+  struct MarmotGroupCommitRefusedRelay *refused_relays;
+  uintptr_t refused_relays_len;
 } MarmotGroupCommitDelivery;
 
 /**
@@ -8996,10 +9030,12 @@ MarmotStatus marmot_acknowledge_group_catching_up(const struct MarmotClient *cli
 
 /**
  * After a group change returns `MARMOT_STATUS_GROUP_COMMIT_UNDELIVERED`,
- * record that the user accepts that members on relays still owed the
- * group's last change may not follow, then retry the change. Admits one
- * attempt, consumed even if it fails; not persisted. Writes false when no
- * relay is owed the group's last change.
+ * record that the user accepts that members on relays still owed, or that
+ * refused, the group's changes may not follow, then retry the change.
+ * Dismisses every relay refusal in the group for good, across restarts
+ * too. Admits one attempt, consumed even if it fails and not persisted,
+ * while only the changes owed or refused now gate. Writes false when no
+ * relay is owed or has refused a change of yours.
  *
  * # Safety
  * `client` must be a live handle; string arguments must be valid
@@ -9013,10 +9049,12 @@ MarmotStatus marmot_acknowledge_group_commit_undelivered(const struct MarmotClie
                                                          bool *out);
 
 /**
- * The group's oldest change that some group relays have not accepted yet,
- * or NULL once every relay has accepted or definitively rejected it.
- * Non-NULL is not a refusal: group changes return
- * `MARMOT_STATUS_GROUP_COMMIT_UNDELIVERED` only once `since` is two minutes
+ * The group's oldest change of yours that a group relay refused, until
+ * acknowledged, or else the oldest one some group relays have not accepted
+ * yet; NULL once no relay is owed a change of yours and every relay
+ * refusal has been acknowledged. Group changes return
+ * `MARMOT_STATUS_GROUP_COMMIT_UNDELIVERED` at once while `refused_relays`
+ * is non-empty; with only owed relays, only once `since` is two minutes
  * old. Poll while showing it. Free with `marmot_group_commit_delivery_free`.
  *
  * # Safety

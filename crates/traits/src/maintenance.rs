@@ -282,6 +282,50 @@ pub struct DurableTransportFanout {
     pub bounded_until: Option<Timestamp>,
 }
 
+/// The relays that refused one of this device's confirmed commits (mdk#2333).
+///
+/// A refusal does not heal, so it outlives the commit's frozen fanout: every
+/// pass that sees the confirmed fanout merges its refused targets in before
+/// the fanout can be deleted. It warns until the user acknowledges it, and a
+/// later refusal of the same commit merges into an acknowledged record without
+/// warning again. Outside every snapshot: rewinding group state neither drops
+/// nor restores it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommitRefusal {
+    /// The commit's frozen fanout id, which names it to hosts.
+    pub fanout_id: MessageId,
+    /// The stored commit whose disposition says whether convergence withdrew it.
+    pub commit_id: MessageId,
+    pub group_id: GroupId,
+    /// When the first relay accepted the commit, which confirmed it.
+    pub since: Timestamp,
+    /// Relays the commit was published to.
+    pub relay_count: u32,
+    pub refused: Vec<crate::transport_adapter::RefusedTarget>,
+    pub acknowledged: bool,
+}
+
+impl CommitRefusal {
+    /// Add each refused relay not already listed. Never clears
+    /// `acknowledged`. Returns whether the record changed.
+    pub fn merge(
+        &mut self,
+        refused: impl IntoIterator<Item = crate::transport_adapter::RefusedTarget>,
+    ) -> bool {
+        let before = self.refused.len();
+        for target in refused {
+            if !self
+                .refused
+                .iter()
+                .any(|listed| listed.endpoint == target.endpoint)
+            {
+                self.refused.push(target);
+            }
+        }
+        self.refused.len() != before
+    }
+}
+
 /// Transport-neutral exact signed artifact used for account-scoped
 /// replaceable events such as a KeyPackage publication.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

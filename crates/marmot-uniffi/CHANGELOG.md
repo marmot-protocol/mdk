@@ -28,6 +28,10 @@
 
 ### Added
 
+- `GroupCommitDeliveryFfi.refusedRelays` (default empty) lists the group relays that refused the change for good,
+  each a `GroupCommitRefusedRelayFfi` with `relayUrl`, `cause` (`GroupCommitRefusalCauseFfi.TooLarge` or `Rejected`)
+  and `sizeClass` (`TooLarge` only, when known) (mdk#2333). MDK will not deliver the change there, and members who
+  read only that relay may not have it. Regenerate Swift and Kotlin bindings with the matching native library.
 - `discard_failed_send(account_ref, group_id_hex, message_id_hex)` removes a failed own send from this device without
   publishing and returns `DiscardFailedSendResultFfi`. Offer it instead of `delete_message` on a row whose
   `invalidation_status` is `local_publish_failed`. The removal reaches timeline subscribers with reason `Cleared`.
@@ -38,6 +42,13 @@
   relay hints, falling back to current account outbox candidates for packs without hints (mdk#3283).
 
 ### Changed
+
+- A group relay's refusal of a confirmed own change now warns until acknowledged, across restarts too (mdk#2333).
+  `groupCommitDelivery` names the oldest refused change ahead of any owed one and returns `nil`/`null` only once no
+  relay is owed a change of yours and every refusal has been acknowledged. A refusal makes group changes fail with
+  `GroupCommitUndelivered` at once. `acknowledgeGroupCommitUndelivered` also dismisses the group's refusals for good,
+  so a "dismiss" action can call it. A relay's size answer after an earlier attempt that may have reached it ends its
+  retries once the change is confirmed, reported as `TooLarge` with no `sizeClass`.
 
 - `HistoryNoticeCauseFfi::UnprovenHistory` is no longer emitted (mdk#3308): the recovery runner retries a relay that
   could not prove a route's history quietly, and a notice needs evidence that messages are missing. The variant stays;

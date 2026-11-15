@@ -1026,11 +1026,13 @@ impl Marmot {
     }
 
     /// After a group change fails with `GroupCommitUndelivered`, record that the
-    /// user accepts the risk: the group's last change has not reached every
-    /// relay, so members on those relays may not follow this change either.
-    /// Retry the change afterwards. Admits one change attempt, consumed even if
-    /// it fails, and is not persisted. Returns false when no relay is owed the
-    /// group's last change.
+    /// user accepts the risk: the group's changes have not reached every relay,
+    /// so members on those relays may not follow this change either. Retry the
+    /// change afterwards. Every relay refusal in the group is dismissed for
+    /// good, across restarts too. It also admits one change attempt, consumed
+    /// even if it fails and not persisted, while only the changes owed or
+    /// refused now gate. Returns false when no relay is owed or has refused a
+    /// change of yours.
     pub async fn acknowledge_group_commit_undelivered(
         &self,
         account_ref: String,
@@ -1043,13 +1045,18 @@ impl Marmot {
             .await?)
     }
 
-    /// The group's oldest change that some group relays have not accepted yet,
-    /// or `None` once every relay has accepted or definitively rejected it.
+    /// The group's oldest change of yours that a group relay refused, until
+    /// acknowledged, or else the oldest one some group relays have not accepted
+    /// yet; `None` once no relay is owed a change of yours and every relay
+    /// refusal has been acknowledged. `refusedRelays` lists the relays that
+    /// refused it: MDK will not deliver it there, and members who read only
+    /// those relays may not have it. Group changes fail with
+    /// `GroupCommitUndelivered` at once on a refusal. With only owed relays,
     /// `Some` means show "not delivered to every relay yet"; it does not mean
-    /// the next change fails. Group changes fail with `GroupCommitUndelivered`
-    /// only once `since` is two minutes old, because a healthy relay cut off at
-    /// the first acknowledgement is retried after 30 seconds. No event
-    /// announces delivery completing; poll while showing it.
+    /// the next change fails: group changes fail only once `since` is two
+    /// minutes old, because a healthy relay cut off at the first
+    /// acknowledgement is retried after 30 seconds. No event announces
+    /// delivery completing; poll while showing it.
     pub async fn group_commit_delivery(
         &self,
         account_ref: String,
@@ -1065,6 +1072,11 @@ impl Marmot {
                 owed_relay_urls: delivery.owed_relay_urls,
                 relay_count: delivery.relay_count,
                 since: delivery.since,
+                refused_relays: delivery
+                    .refused_relays
+                    .into_iter()
+                    .map(Into::into)
+                    .collect(),
             }))
     }
 

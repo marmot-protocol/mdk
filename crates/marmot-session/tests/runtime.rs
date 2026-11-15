@@ -31,12 +31,12 @@ use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
 };
 use cgka_traits::{
-    EpochId, FanoutMlsState, FanoutTargetStatus, GroupId, MemberId, MessageId,
-    OutboundApplicationMessage, OutboundFanout, TransportAccountActivation, TransportAdapter,
-    TransportAdapterError, TransportDelivery, TransportDeliveryPlane, TransportDeliverySource,
-    TransportEndpoint, TransportEndpointFailure, TransportEndpointFailureKind,
-    TransportEndpointReceipt, TransportEndpointRejectionCategory, TransportGroupSync,
-    TransportPublishFailure, TransportPublishReport, TransportPublishRequest,
+    CommitRefusalCause, EpochId, FanoutMlsState, FanoutTargetStatus, GroupId, MemberId, MessageId,
+    OutboundApplicationMessage, OutboundFanout, RefusedTarget, TransportAccountActivation,
+    TransportAdapter, TransportAdapterError, TransportDelivery, TransportDeliveryPlane,
+    TransportDeliverySource, TransportEndpoint, TransportEndpointFailure,
+    TransportEndpointFailureKind, TransportEndpointReceipt, TransportEndpointRejectionCategory,
+    TransportGroupSync, TransportPublishFailure, TransportPublishReport, TransportPublishRequest,
     TransportPublishTarget,
 };
 use marmot_session::{
@@ -953,6 +953,7 @@ impl TransportRoutingPolicy for MismatchedPendingGroupRouting {
 include!("runtime/frozen_fanout.rs");
 include!("runtime/interrupted_attempt.rs");
 include!("runtime/commit_floor.rs");
+include!("runtime/commit_refusal.rs");
 include!("runtime/hydrated_welcome.rs");
 include!("support/recovery_challenge.rs");
 include!("runtime/key_package_generation_upgrade.rs");
