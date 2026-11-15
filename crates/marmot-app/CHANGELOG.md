@@ -19,7 +19,8 @@
   when a role is left empty. `OnboardingAction::RemoveUnusableRelays` is offered exactly when that preview is
   approvable and removes an entry, including the existing retired-relay cleanup. Every `Removed`
   `OnboardingRelayTagChange` carries `removal_reason` (`OnboardingRelayRemovalReason`). It is advice:
-  readiness never depends on it, and cancelling keeps the step's status and the action.
+  readiness never depends on it, and cancelling keeps the step's status and the action. A retired-relay preview
+  saved by an earlier build has no reasons and still approves.
 - Interactive onboarding records an `mdk_onboarding_summary` usage-diagnostics aggregate when a saved checkpoint
   leaves a step in a blocking status (#3440). `ProductFamily::Onboarding` is the new family. Its rows carry only the
   step, status, issue classes, finding context and a bucketed failing-source count. Each attempt counts a distinct

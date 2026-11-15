@@ -2034,6 +2034,37 @@ async fn passed_relay_step_with_retired_finding_offers_consent_gated_removal_onl
             .collect::<Vec<_>>(),
         vec![&source.tags[0], &source.tags[1], &source.tags[2]]
     );
+    assert_eq!(
+        repair.changes[3].removal_reason,
+        OnboardingRelayRemovalReason::Retired
+    );
+    // A preview saved before removal reasons existed still approves after
+    // an upgrade (mdk#3449).
+    let mut legacy = serde_json::to_value(
+        manager
+            .setup_records()
+            .onboarding_checkpoint(&id)
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    for change in legacy["snapshot"]["proposal"]["relay_repair"]["changes"]
+        .as_array_mut()
+        .unwrap()
+    {
+        assert!(
+            change
+                .as_object_mut()
+                .unwrap()
+                .remove("removal_reason")
+                .is_some()
+        );
+    }
+    manager
+        .app
+        .account_home()
+        .set_account_onboarding(&id, &serde_json::to_vec(&legacy).unwrap())
+        .unwrap();
     assert!(
         preview.steps[OnboardingStep::Relays.index()]
             .actions

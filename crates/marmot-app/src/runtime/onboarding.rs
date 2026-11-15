@@ -1179,6 +1179,26 @@ fn check_inconclusive(findings: &[OnboardingFinding]) -> bool {
         _ => false,
     })
 }
+/// A preview saved before mdk#3449 has no removal reasons, and could remove
+/// only retired relays. Fill those in from the rebuilt preview so approval
+/// after an upgrade compares like with like; nothing else is filled in.
+fn legacy_removal_reasons(
+    stored: &OnboardingRelayRepair,
+    expected: &OnboardingRelayRepair,
+) -> OnboardingRelayRepair {
+    let mut stored = stored.clone();
+    if stored.changes.len() == expected.changes.len() {
+        for (change, rebuilt) in stored.changes.iter_mut().zip(&expected.changes) {
+            if change.disposition == OnboardingRelayTagDisposition::Removed
+                && change.removal_reason == OnboardingRelayRemovalReason::None
+                && rebuilt.removal_reason == OnboardingRelayRemovalReason::Retired
+            {
+                change.removal_reason = OnboardingRelayRemovalReason::Retired;
+            }
+        }
+    }
+    stored
+}
 fn onboarding_error() -> AppError {
     AppError::OnboardingActionUnavailable
 }
@@ -3399,7 +3419,7 @@ impl AccountSetup<'_> {
                     .iter()
                     .any(|finding| finding.issue == OnboardingIssue::NoUsableRoute))
                 || expected.mode == OnboardingRelayRepairMode::ManualReview
-                || *repair != expected
+                || legacy_removal_reasons(repair, &expected) != expected
                 || proposal.read_relays != read_relays
                 || proposal.write_relays != write_relays
                 || repair.original_event_id != proposal.previous_event_id
