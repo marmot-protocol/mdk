@@ -105,6 +105,10 @@ opt_str dim,
 opt_str thumbhash,
 opt_copy has_duration_seconds/duration_seconds: f64,
 prim_vec waveform_samples/waveform_samples_len: f64,
+/// The body is a staged media-store file: read it with
+/// marmot_read_message_draft_attachment or a handoff, and keep it across
+/// saves by id with marmot_save_message_draft_inputs_if_revision.
+copy file_backed: bool,
 } }
 c_mirror! { MarmotSelectedMessageDraftContent from SelectedMessageDraftContentFfi {
 str group_id_hex,

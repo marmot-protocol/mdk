@@ -679,6 +679,7 @@ fn assert_conversation_debug_redacts(mut draft: SelectedMessageDraftFfi) {
         thumbhash: Some("PRIVATE_THUMBHASH".into()),
         duration_seconds: Some(719.5),
         waveform_samples: vec![0.719],
+        file_backed: true,
     };
     let content = SelectedMessageDraftContentFfi {
         group_id_hex: "PRIVATE_DRAFT_GROUP".into(),

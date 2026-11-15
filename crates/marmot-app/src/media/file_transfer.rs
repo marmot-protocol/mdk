@@ -73,41 +73,88 @@ impl MediaFileUploadRequest {
 
 pub(crate) enum MediaUploadPayload {
     Bytes(super::MediaUploadRequest),
-    Files(MediaFileUploadRequest, Arc<MediaFileTransferControl>),
+    Files(FileUploadSources, Arc<MediaFileTransferControl>),
+}
+
+/// Where a file-backed upload reads its bodies: host files, or attachments
+/// of a composer draft that MDK already holds.
+pub(crate) enum FileUploadSources {
+    Host(MediaFileUploadRequest),
+    Draft(DraftUploadRequest),
+}
+
+/// An upload of draft attachments, in the order given, read from the draft
+/// `revision` selects. Upload only: the host sends the references with the
+/// draft.
+pub(crate) struct DraftUploadRequest {
+    pub(crate) revision: crate::MessageDraftRevision,
+    pub(crate) attachment_ids: Vec<String>,
+    pub(crate) blossom_server: Option<String>,
+}
+
+impl DraftUploadRequest {
+    fn validate(&self) -> Result<(), AppError> {
+        let mut ids = std::collections::HashSet::new();
+        if self.attachment_ids.is_empty()
+            || self.attachment_ids.len() > 64
+            || !self.attachment_ids.iter().all(|id| ids.insert(id))
+        {
+            return Err(AppError::InvalidMessageDraft(
+                "draft uploads take 1 to 64 distinct attachment ids".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl FileUploadSources {
+    pub(crate) fn server(&self) -> &Option<String> {
+        match self {
+            Self::Host(request) => &request.blossom_server,
+            Self::Draft(request) => &request.blossom_server,
+        }
+    }
 }
 
 impl MediaUploadPayload {
     pub(crate) fn validate(&self) -> Result<(), AppError> {
         match self {
             Self::Bytes(request) => super::validate_media_upload_batch(&request.attachments),
-            Self::Files(request, control) => {
+            Self::Files(sources, control) => {
                 control.check()?;
-                request.validate()
+                match sources {
+                    FileUploadSources::Host(request) => request.validate(),
+                    FileUploadSources::Draft(request) => request.validate(),
+                }
             }
         }
     }
     pub(crate) fn server(&self) -> &Option<String> {
         match self {
             Self::Bytes(r) => &r.blossom_server,
-            Self::Files(r, _) => &r.blossom_server,
+            Self::Files(sources, _) => sources.server(),
         }
     }
     pub(crate) fn caption(&self) -> &Option<String> {
+        const NONE: &Option<String> = &None;
         match self {
             Self::Bytes(r) => &r.caption,
-            Self::Files(r, _) => &r.caption,
+            Self::Files(FileUploadSources::Host(r), _) => &r.caption,
+            Self::Files(FileUploadSources::Draft(_), _) => NONE,
         }
     }
     pub(crate) fn tags(&self) -> &[Vec<String>] {
         match self {
             Self::Bytes(r) => &r.message_tags,
-            Self::Files(r, _) => &r.message_tags,
+            Self::Files(FileUploadSources::Host(r), _) => &r.message_tags,
+            Self::Files(FileUploadSources::Draft(_), _) => &[],
         }
     }
     pub(crate) fn send(&self) -> bool {
         match self {
             Self::Bytes(r) => r.send,
-            Self::Files(r, _) => r.send,
+            Self::Files(FileUploadSources::Host(r), _) => r.send,
+            Self::Files(FileUploadSources::Draft(_), _) => false,
         }
     }
 }

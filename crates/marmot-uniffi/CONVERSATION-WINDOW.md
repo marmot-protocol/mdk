@@ -174,6 +174,32 @@ independently delete it when delivery finishes. Later edits and failed acceptanc
 remain intact. The local attachment accessor distinguishes missing bytes from an
 empty attachment and refuses stale revisions.
 
+### File-backed attachments
+
+Large picks (video, audio, documents) go into the draft as files, up to the
+encrypted-media blob limit, so no full-size buffer crosses the binding:
+
+1. `stage_message_draft_attachment_file` copies the host file into the account's
+   encrypted media store and adds it to the draft. Reload with the returned
+   selected draft (or `selected_message_draft`): text saves made during the copy
+   keep it, but their revision is stale afterwards. Clearing or sending the draft
+   during the copy discards the copy (`MessageDraftRevisionConflict`). The host
+   may delete its file.
+2. Selected descriptors mark such attachments `file_backed`. Save edits with
+   `save_message_draft_inputs_if_revision`, keeping each attachment with
+   `Retained { id }`; one left out is deleted with its file.
+3. Read previews with `read_message_draft_attachment` (1 MiB chunks), or lend a
+   real file to the OS with `open_message_draft_attachment_handoff` and
+   `release_attachment_handoff`. `message_draft_attachment_if_revision` refuses
+   file-backed attachments.
+4. Upload with `upload_message_draft_attachments`, then pass the references to
+   `send_message_draft` with the same revision. The references describe the
+   draft's attachments in order, so they match its descriptors; durable
+   acceptance clears the draft and releases its files.
+
+The draft owns its files across restarts. Clearing or deleting the draft releases
+them; storage usage reports them as `draft_bytes`.
+
 ## Validation and limits
 
 For an existing chat screen, replace its separately assembled opening state with

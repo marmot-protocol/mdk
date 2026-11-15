@@ -2,6 +2,40 @@
 
 ## Unreleased
 
+### Breaking changes
+
+- C hosts: `MarmotSelectedMessageDraftAttachment` and
+  `MarmotAttachmentStorageUsage` gain fields for file-backed draft attachments
+  (#3431), so their layouts changed: rebuild with the matching header and
+  library. Rust hosts using `storage-sqlite` directly pass
+  `StoredMessageDraftAttachmentInput`s to `save_message_draft_if_revision`.
+  See the crate changelogs.
+
+### Added
+
+- Keep composer-draft attachments up to the encrypted-media blob limit as
+  files (#3431). `stage_message_draft_attachment_file` (Rust, UniFFI, C) copies
+  a host file into the account's encrypted media store and adds it to the
+  draft; the draft owns the copy across text-only saves and restarts, and
+  saving, clearing or sending the draft releases it. Selected drafts mark such
+  attachments `file_backed`; keep them through edits with
+  `save_message_draft_inputs_if_revision`'s `Retained` inputs, read them with
+  `read_message_draft_attachment` (1 MiB chunks) or
+  `open_message_draft_attachment_handoff`, and upload them with
+  `upload_message_draft_attachments`, whose references carry the staged
+  bodies' descriptors and digests, before `send_message_draft`. No full-size
+  buffer crosses the binding after staging. Storage usage reports the staged
+  bytes as `draft_bytes`. `message_draft_attachment_if_revision` and the
+  legacy whole-draft read refuse a draft with a file-backed attachment.
+
+### Changed
+
+- `send_message_draft` (Rust, UniFFI, C) and captured-media admission match
+  prepared media to the draft's attachments after the normalization an upload
+  applies (#3431): a V1 upload's trimmed file name and either version's
+  canonical media type now match the draft's own strings, so a correct upload
+  of a draft attachment named `" clip.mp4 "` or typed `Video/MP4` sends.
+
 ### Fixed
 
 - Confirm a group change that stayed pending after an unclear relay answer

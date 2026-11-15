@@ -22,6 +22,9 @@ pub struct AttachmentStorageUsage {
     pub legacy_bytes: u64,
     /// Retained attachments that read locally now.
     pub attachment_count: u64,
+    /// Composer draft attachments kept as media-store files. Inline draft
+    /// bytes are part of the database instead.
+    pub draft_bytes: u64,
     /// The account database file, and the part of it that is free pages.
     pub database_bytes: u64,
     pub database_free_bytes: u64,
@@ -243,6 +246,15 @@ impl SqliteAppStorage {
                 |r| r.get(0),
             )
             .storage()?;
+        let draft_bytes: i64 = conn
+            .query_row(
+                "SELECT coalesce(sum(m.byte_len),0) FROM media_files m
+                 WHERE m.id IN (SELECT file_id FROM message_draft_attachments
+                                WHERE file_id IS NOT NULL)",
+                [],
+                |r| r.get(0),
+            )
+            .storage()?;
         let cache_bytes = crate::app::avatar_cache::usage(&conn)?.byte_count;
         let space = crate::app::storage_compaction::database_space_in(&conn)?;
         let remaining = super::legacy_migration::legacy_attachment_bytes_in(&conn)?;
@@ -251,6 +263,7 @@ impl SqliteAppStorage {
             media_bytes: unsigned(media_bytes),
             legacy_bytes: unsigned(legacy_bytes),
             attachment_count: unsigned(attachment_count),
+            draft_bytes: unsigned(draft_bytes),
             database_bytes: space.file_bytes(),
             database_free_bytes: space.free_bytes(),
             cache_bytes,

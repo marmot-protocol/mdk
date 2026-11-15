@@ -23,6 +23,8 @@ c_mirror! {
         copy migration: MarmotAttachmentMigrationState,
         copy migration_bytes: u64,
         copy cache_bytes: u64,
+        /// Composer-draft attachments staged as media-store files.
+        copy draft_bytes: u64,
     }
 }
 

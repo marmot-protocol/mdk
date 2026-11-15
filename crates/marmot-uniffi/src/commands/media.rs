@@ -8,7 +8,7 @@ use crate::Marmot;
 use crate::conversions::{
     MediaAttachmentReferenceFfi, MediaDownloadResultFfi, MediaFileTransferControlFfi,
     MediaFileUploadRequestFfi, MediaRecordFfi, MediaUploadRequestFfi, MediaUploadResultFfi,
-    MessageTagFfi, SendSummaryFfi, group_id_from_hex, media_records_ffi,
+    MessageDraftRevisionFfi, MessageTagFfi, SendSummaryFfi, group_id_from_hex, media_records_ffi,
 };
 use crate::errors::MarmotKitError;
 
@@ -193,6 +193,34 @@ impl Marmot {
                 &account_ref,
                 &group_id,
                 request.into(),
+                control.inner.clone(),
+            )
+            .await
+            .map_err(media_reference_error)?;
+        upload.try_into().map_err(media_reference_error)
+    }
+
+    /// `upload_media_files` for the draft attachments `attachment_ids` names
+    /// (1..=64, in that order), read from the copies the draft holds. Upload
+    /// only: send the returned references, in order, with
+    /// `send_message_draft` and the same revision. `revision` must be
+    /// current when the bodies are read. `blossom_server` overrides the
+    /// group's endpoints. `control` reports progress and cancels.
+    pub async fn upload_message_draft_attachments(
+        &self,
+        account_ref: String,
+        revision: Arc<MessageDraftRevisionFfi>,
+        attachment_ids: Vec<String>,
+        blossom_server: Option<String>,
+        control: Arc<MediaFileTransferControlFfi>,
+    ) -> Result<MediaUploadResultFfi, MarmotKitError> {
+        let upload = self
+            .runtime
+            .upload_message_draft_attachments(
+                &account_ref,
+                revision.inner.clone(),
+                attachment_ids,
+                blossom_server,
                 control.inner.clone(),
             )
             .await

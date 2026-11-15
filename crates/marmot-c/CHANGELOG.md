@@ -7,6 +7,13 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ## [Unreleased]
 
+### Breaking changes
+
+- `MarmotSelectedMessageDraftAttachment` gains `file_backed` and
+  `MarmotAttachmentStorageUsage` gains `draft_bytes` (#3431). Both layouts
+  changed, and draft attachments are read as an array: rebuild clients with the
+  matching header and library.
+
 ### Added
 
 - `marmot_start_direct_chat_with_options` and the borrowed input struct
@@ -14,6 +21,13 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   direct chat with that duration in its founding MLS state and Welcome. Reuse
   and retry keep the existing chat's duration and roles.
   `marmot_start_direct_chat` is unchanged (#3365).
+- File-backed composer-draft attachments (#3431):
+  `marmot_stage_message_draft_attachment_file`,
+  `marmot_read_message_draft_attachment`,
+  `marmot_open_message_draft_attachment_handoff`,
+  `marmot_upload_message_draft_attachments` and
+  `marmot_save_message_draft_inputs_if_revision` with
+  `MarmotMessageDraftAttachmentSaveInput`.
 
 ## [0.17.0] - 2026-11-15
 

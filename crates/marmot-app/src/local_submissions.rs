@@ -40,7 +40,11 @@ fn draft_media_describes_refs(
             .iter()
             .zip(references)
             .all(|(draft, reference)| {
-                draft.file_name == reference.file_name && draft.media_type == reference.media_type
+                crate::media::outgoing::describes_draft_attachment(
+                    &draft.file_name,
+                    &draft.media_type,
+                    reference,
+                )
             })
 }
 

@@ -1600,6 +1600,52 @@ fn outbound_validation_rejects_blossom_reference_when_policy_disallows_blossom()
         .expect("a blossom reference is valid when the policy allows blossom-v1");
 }
 
+/// A draft holds the host's own strings while a reference carries what its
+/// version's upload made of them, so sending matches the two after that
+/// normalization: a V1 upload trims the name, both canonicalize the type.
+#[test]
+fn a_draft_attachment_matches_its_reference_after_upload_normalization() {
+    use super::outgoing::describes_draft_attachment;
+    let mut reference = loopback_reference();
+    reference.file_name = "clip.mp4".to_owned();
+    reference.media_type = "video/mp4".to_owned();
+    for version in [EncryptedMediaVersion::V1, EncryptedMediaVersion::V2] {
+        reference.version = version.as_str().to_owned();
+        assert!(describes_draft_attachment(
+            "clip.mp4",
+            "Video/MP4",
+            &reference
+        ));
+        assert!(!describes_draft_attachment(
+            "other.mp4",
+            "video/mp4",
+            &reference
+        ));
+        assert!(!describes_draft_attachment(
+            "clip.mp4",
+            "video/webm",
+            &reference
+        ));
+    }
+    reference.version = EncryptedMediaVersion::V1.as_str().to_owned();
+    assert!(describes_draft_attachment(
+        " clip.mp4 ",
+        "video/mp4",
+        &reference
+    ));
+    reference.version = EncryptedMediaVersion::V2.as_str().to_owned();
+    assert!(
+        !describes_draft_attachment(" clip.mp4 ", "video/mp4", &reference),
+        "a V2 upload keeps the name as given"
+    );
+    reference.version = "unknown".to_owned();
+    assert!(!describes_draft_attachment(
+        "clip.mp4",
+        "video/mp4",
+        &reference
+    ));
+}
+
 #[test]
 fn canonical_media_type_trims_ascii_whitespace_only() {
     // ASCII whitespace on the edges is stripped per the V1 algorithm.

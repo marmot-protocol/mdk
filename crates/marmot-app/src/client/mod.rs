@@ -345,35 +345,35 @@ impl EncryptedMediaUploadHttp {
             allow_loopback_http: self.allow_loopback_http,
         };
         let mut result = match self.request {
-            crate::media::file_transfer::MediaUploadPayload::Files(request, control) => {
-                request.validate()?;
-                let servers = crate::media::upload_servers(request.blossom_server.clone(), policy)?;
-                let descriptors = request
-                    .attachments
-                    .iter()
-                    .map(|attachment| {
-                        crate::media::outgoing::OutgoingDescriptor::new(
-                            attachment.file_name.clone(),
-                            &attachment.media_type,
-                            attachment.dim.clone(),
-                            attachment.thumbhash.clone(),
-                            self.version,
-                        )
-                    })
-                    .collect::<Result<Vec<_>, AppError>>()?;
-                let (stage, stage_control) = (staging.clone(), control.clone());
+            crate::media::file_transfer::MediaUploadPayload::Files(sources, control) => {
+                let servers = crate::media::upload_servers(sources.server().clone(), policy)?;
+                let (stage, stage_control, version) =
+                    (staging.clone(), control.clone(), self.version);
                 // The blocking task owns the reservations it makes until this
                 // await hands them back; if this future is dropped first, the
                 // task's result drops and releases them.
                 let mut staged = uploads.handoff();
                 let (staged, sources) = tokio::task::spawn_blocking(move || {
-                    let sources = stage_file_sources(
-                        &stage,
-                        staged.tokens_mut(),
-                        request.attachments,
-                        descriptors,
-                        stage_control,
-                    );
+                    let sources = match sources {
+                        crate::media::file_transfer::FileUploadSources::Host(request) => {
+                            stage_file_sources(
+                                &stage,
+                                staged.tokens_mut(),
+                                request.attachments,
+                                version,
+                                stage_control,
+                            )
+                        }
+                        crate::media::file_transfer::FileUploadSources::Draft(request) => {
+                            crate::media::outgoing::stage_draft_sources(
+                                &stage,
+                                staged.tokens_mut(),
+                                request,
+                                version,
+                                &stage_control,
+                            )
+                        }
+                    };
                     (staged, sources)
                 })
                 .await
@@ -449,10 +449,22 @@ fn stage_file_sources(
     staging: &crate::media::outgoing::SendStaging,
     tokens: &mut Vec<Vec<u8>>,
     attachments: Vec<crate::MediaFileUploadAttachmentRequest>,
-    descriptors: Vec<crate::media::outgoing::OutgoingDescriptor>,
+    version: EncryptedMediaVersion,
     control: Arc<crate::MediaFileTransferControl>,
 ) -> Result<Vec<crate::media::outgoing::StagedSource>, AppError> {
     use crate::media::file_transfer::{MAX_FILE_MEDIA_CIPHERTEXT_BYTES, MEDIA_AEAD_TAG_BYTES};
+    let descriptors = attachments
+        .iter()
+        .map(|attachment| {
+            crate::media::outgoing::OutgoingDescriptor::new(
+                attachment.file_name.clone(),
+                &attachment.media_type,
+                attachment.dim.clone(),
+                attachment.thumbhash.clone(),
+                version,
+            )
+        })
+        .collect::<Result<Vec<_>, AppError>>()?;
     let mut total = 0u64;
     let mut sources = Vec::with_capacity(attachments.len());
     for (attachment, descriptor) in attachments.into_iter().zip(descriptors) {
@@ -5533,7 +5545,11 @@ impl AppClient {
             .iter()
             .zip(&attachments)
             .any(|(draft, prepared)| {
-                draft.file_name != prepared.file_name || draft.media_type != prepared.media_type
+                !crate::media::outgoing::describes_draft_attachment(
+                    &draft.file_name,
+                    &draft.media_type,
+                    prepared,
+                )
             })
         {
             return Err(AppError::InvalidMessageDraft(

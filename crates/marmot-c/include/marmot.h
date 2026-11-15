@@ -2338,6 +2338,10 @@ typedef struct MarmotAttachmentStorageUsage {
   enum MarmotAttachmentMigrationState migration;
   uint64_t migration_bytes;
   uint64_t cache_bytes;
+  /**
+   * Composer-draft attachments staged as media-store files.
+   */
+  uint64_t draft_bytes;
 } MarmotAttachmentStorageUsage;
 
 /**
@@ -7614,6 +7618,12 @@ typedef struct MarmotSelectedMessageDraftAttachment {
   double duration_seconds;
   double *waveform_samples;
   uintptr_t waveform_samples_len;
+  /**
+   * The body is a staged media-store file: read it with
+   * marmot_read_message_draft_attachment or a handoff, and keep it across
+   * saves by id with marmot_save_message_draft_inputs_if_revision.
+   */
+  bool file_backed;
 } MarmotSelectedMessageDraftAttachment;
 
 typedef struct MarmotSelectedMessageDraftContent {
@@ -7654,6 +7664,54 @@ typedef struct MarmotConversationWindowSnapshot {
   bool has_more_before;
   bool has_more_after;
 } MarmotConversationWindowSnapshot;
+
+/**
+ * One attachment of `marmot_save_message_draft_inputs_if_revision`.
+ * Borrowed input only. A non-NULL `retained_id` keeps the draft's own
+ * attachment with that id, body untouched, and `attachment` is ignored;
+ * a NULL `retained_id` saves `attachment` as a new inline body. Keep every
+ * file-backed attachment by id: leaving one out deletes its file.
+ */
+typedef struct MarmotMessageDraftAttachmentSaveInput {
+  /**
+   * Nullable.
+   */
+  const char *retained_id;
+  struct MarmotMessageDraftAttachmentInput attachment;
+} MarmotMessageDraftAttachmentSaveInput;
+
+/**
+ * A host file to copy into a draft as attachment `id`. Borrowed input
+ * only; the path is local and never published. `source_path` names a
+ * regular file (not a symlink); a nonzero `has_expected_size` requires it
+ * to hold exactly `expected_size` bytes.
+ */
+typedef struct MarmotMessageDraftAttachmentFileRequest {
+  const char *id;
+  const char *source_path;
+  uint8_t has_expected_size;
+  uint64_t expected_size;
+  const char *file_name;
+  const char *media_type;
+  /**
+   * Nullable.
+   */
+  const char *dim;
+  /**
+   * Nullable.
+   */
+  const char *thumbhash;
+  /**
+   * Playback length for audio/video; set `has_duration_seconds`.
+   */
+  uint8_t has_duration_seconds;
+  double duration_seconds;
+  /**
+   * Waveform preview samples; NULL with length 0 for none.
+   */
+  const double *waveform_samples;
+  uintptr_t waveform_samples_len;
+} MarmotMessageDraftAttachmentFileRequest;
 
 /**
  *Owned list; free the root with its `_free` function only.
@@ -14966,7 +15024,9 @@ MarmotStatus marmot_save_message_draft_if_revision(const struct MarmotClient *cl
 
 /**
  * Read one selected attachment. found=0 distinguishes absence from an empty acquired attachment.
- * Free returned bytes with marmot_bytes_free; revision conflicts return an error.
+ * Free returned bytes with marmot_bytes_free; revision conflicts return an error. A file-backed
+ * attachment is `MARMOT_STATUS_INVALID_MESSAGE_DRAFT`: read it with
+ * `marmot_read_message_draft_attachment`.
  * # Safety
  * client, strings, revision valid; revision's owning draft stays live; all out pointers writable.
  */
@@ -14977,6 +15037,100 @@ MarmotStatus marmot_message_draft_attachment_if_revision(const struct MarmotClie
                                                          uint8_t *out_found,
                                                          uint8_t **out_data,
                                                          uintptr_t *out_len);
+
+/**
+ * Save only if the selected revision still matches, keeping attachments the
+ * draft already holds by id (bodies untouched) and copying new inline ones.
+ * Leaving a file-backed attachment out deletes its file; an id the draft
+ * does not hold is MARMOT_STATUS_INVALID_MESSAGE_DRAFT.
+ * # Safety
+ * As marmot_save_message_draft_if_revision, with inputs pointing to len
+ * readable items (or NULL with zero len).
+ */
+MarmotStatus marmot_save_message_draft_inputs_if_revision(const struct MarmotClient *client,
+                                                          const char *account_ref,
+                                                          const struct MarmotMessageDraftRevision *revision,
+                                                          const char *content,
+                                                          const char *reply,
+                                                          const struct MarmotMessageDraftAttachmentSaveInput *inputs,
+                                                          uintptr_t inputs_len,
+                                                          struct MarmotSelectedMessageDraft **out);
+
+/**
+ * Copy a host file into the encrypted media store and append it to the
+ * draft revision selects, up to the encrypted-media blob limit; out gets the
+ * new selected draft. The host may delete its file once this returns. Text
+ * saves during the copy keep it; the host's next save with an older revision
+ * conflicts and must reload. A draft cleared, deleted or sent during the copy
+ * discards it (MARMOT_STATUS_MESSAGE_DRAFT_REVISION_CONFLICT). Refused before
+ * copying: over the blob limit,
+ * past 64 attachments or one upload batch, a duplicate id, or a copy the disk
+ * cannot hold beyond its reserve (MARMOT_STATUS_STORAGE_FULL). control
+ * reports copied bytes and cancels; a cancelled copy leaves nothing.
+ * Blocking for the whole copy: call off the UI thread.
+ * # Safety
+ * client, control, strings, request and revision valid until return; out writable.
+ */
+MarmotStatus marmot_stage_message_draft_attachment_file(const struct MarmotClient *client,
+                                                        const char *account_ref,
+                                                        const struct MarmotMessageDraftRevision *revision,
+                                                        const struct MarmotMessageDraftAttachmentFileRequest *request,
+                                                        const struct MarmotMediaFileTransferControl *control,
+                                                        struct MarmotSelectedMessageDraft **out);
+
+/**
+ * Read 1..=1048576 bytes at offset from one draft attachment, inline or
+ * file-backed. found=0 means the draft holds no such attachment; found=1 with
+ * zero bytes is the end. Revision conflicts return an error. Free returned
+ * bytes with marmot_bytes_free. Blocking local read.
+ * # Safety
+ * client, strings, revision valid; revision's owning draft stays live; all out pointers writable.
+ */
+MarmotStatus marmot_read_message_draft_attachment(const struct MarmotClient *client,
+                                                  const char *account_ref,
+                                                  const struct MarmotMessageDraftRevision *revision,
+                                                  const char *attachment_id,
+                                                  uint64_t offset,
+                                                  uint32_t limit,
+                                                  uint8_t *out_found,
+                                                  uint8_t **out_data,
+                                                  uintptr_t *out_len);
+
+/**
+ * marmot_open_attachment_handoff for one draft attachment: a plaintext copy
+ * for an OS surface that needs a real file, released with
+ * marmot_release_attachment_handoff. The revision is checked once, before
+ * the copy. out stays NULL when the draft holds no such attachment. Free the
+ * record with marmot_attachment_handoff_free; that does not release the
+ * lease. Blocking for the whole copy; cancel through control.
+ * # Safety
+ * client, control, strings and revision valid until return; out writable.
+ */
+MarmotStatus marmot_open_message_draft_attachment_handoff(const struct MarmotClient *client,
+                                                          const char *account_ref,
+                                                          const struct MarmotMessageDraftRevision *revision,
+                                                          const char *attachment_id,
+                                                          const struct MarmotMediaFileTransferControl *control,
+                                                          struct MarmotAttachmentHandoff **out);
+
+/**
+ * marmot_upload_media_files for the draft attachments ids names (1..=64, in
+ * order), read from the draft's own copies. Upload only: pass the returned
+ * references, in order, to marmot_send_message_draft with the same revision.
+ * blossom_server (nullable) overrides the group's
+ * endpoints. Free with marmot_media_upload_result_free. Blocking.
+ * # Safety
+ * client, control, strings, ids (ids_len readable strings) and revision valid
+ * until return; out writable.
+ */
+MarmotStatus marmot_upload_message_draft_attachments(const struct MarmotClient *client,
+                                                     const char *account_ref,
+                                                     const struct MarmotMessageDraftRevision *revision,
+                                                     const char *const *ids,
+                                                     uintptr_t ids_len,
+                                                     const char *blossom_server,
+                                                     const struct MarmotMediaFileTransferControl *control,
+                                                     struct MarmotMediaUploadResult **out);
 
 /**
  * Send the exact selected revision; successful durable acceptance clears it atomically.

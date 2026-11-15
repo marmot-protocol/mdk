@@ -83,12 +83,20 @@ fn capacity_error() -> AppError {
     ))
 }
 
-/// Where a retained attachment is, and what to call its copy.
+/// Where an attachment is, and what to call its copy.
 pub(crate) struct HandoffSource {
-    pub(crate) reference: storage_sqlite::AttachmentAssetRef,
+    pub(crate) body: HandoffBody,
     pub(crate) byte_count: u64,
     pub(crate) media_type: String,
     pub(crate) file_name: String,
+}
+
+/// The body a handoff copies: a retained attachment (either layout), or a
+/// composer draft attachment (its staged file, or its inline bytes).
+pub(crate) enum HandoffBody {
+    Retained(storage_sqlite::AttachmentAssetRef),
+    Staged(media_store::FileId),
+    Bytes(Zeroizing<Vec<u8>>),
 }
 
 impl HandoffSource {
@@ -128,7 +136,7 @@ impl HandoffSource {
             |reference| (reference.file_name, reference.media_type),
         );
         Ok(Some(Self {
-            reference: asset.reference,
+            body: HandoffBody::Retained(asset.reference),
             byte_count: asset.byte_count,
             file_name: handoff_name(&file_name, &media_type),
             media_type,
@@ -399,56 +407,71 @@ fn write_copy(
     // Unbuffered: chunks are already 64 KiB to 1 MiB, and no plaintext is
     // left behind in a writer buffer.
     let mut file = fs_private::create_new_private(path).map_err(handoff_error)?;
-    let now = crate::unix_now_seconds();
     let mut written = 0u64;
     // Nothing past the admitted length is ever written: a longer body is a
     // length mismatch before its extra bytes reach the file.
     let changed =
         || AppError::InvalidEncryptedMedia("attachment length changed during the copy".into());
-    loop {
-        control.check()?;
-        match storage.app_storage().retained_attachment_read(
-            &source.reference,
-            now,
-            written,
-            LEGACY_READ_BYTES,
-        )? {
-            None => return Ok(false),
-            Some(RetainedAttachmentRead::Bytes(bytes)) => {
-                if bytes.is_empty() {
-                    break;
+    let mut copy = |bytes: &[u8], written: &mut u64| -> Result<(), AppError> {
+        if *written + bytes.len() as u64 > source.byte_count {
+            return Err(changed());
+        }
+        file.write_all(bytes).map_err(handoff_error)?;
+        *written += bytes.len() as u64;
+        control.advance(*written);
+        Ok(())
+    };
+    let media_file = match &source.body {
+        HandoffBody::Bytes(bytes) => {
+            control.check()?;
+            copy(bytes, &mut written)?;
+            None
+        }
+        HandoffBody::Staged(id) => Some(
+            app.account_media_store(account, storage)?
+                .open_staged_reader(id)
+                .map_err(storage_sqlite::media_storage_error)?,
+        ),
+        HandoffBody::Retained(reference) => {
+            let now = crate::unix_now_seconds();
+            loop {
+                control.check()?;
+                match storage.app_storage().retained_attachment_read(
+                    reference,
+                    now,
+                    written,
+                    LEGACY_READ_BYTES,
+                )? {
+                    None => return Ok(false),
+                    Some(RetainedAttachmentRead::Bytes(bytes)) => {
+                        if bytes.is_empty() {
+                            break None;
+                        }
+                        copy(&bytes, &mut written)?;
+                    }
+                    Some(RetainedAttachmentRead::MediaFile(id)) => {
+                        break Some(
+                            app.account_media_store(account, storage)?
+                                .open_reader(&id)
+                                .map_err(storage_sqlite::media_storage_error)?,
+                        );
+                    }
                 }
-                if written + bytes.len() as u64 > source.byte_count {
-                    return Err(changed());
-                }
-                file.write_all(&bytes).map_err(handoff_error)?;
-                written += bytes.len() as u64;
-                control.advance(written);
             }
-            Some(RetainedAttachmentRead::MediaFile(id)) => {
-                let media = app.account_media_store(account, storage)?;
-                let Some(mut reader) = media
-                    .open_reader(&id)
-                    .map_err(storage_sqlite::media_storage_error)?
-                else {
-                    return Ok(false);
-                };
-                let mut buffer = Zeroizing::new(vec![0; FILE_TRANSFER_BUFFER_BYTES]);
-                loop {
-                    control.check()?;
-                    let read = reader.read(&mut buffer).map_err(handoff_error)?;
-                    if read == 0 {
-                        break;
-                    }
-                    if written + read as u64 > source.byte_count {
-                        return Err(changed());
-                    }
-                    file.write_all(&buffer[..read]).map_err(handoff_error)?;
-                    written += read as u64;
-                    control.advance(written);
-                }
+        }
+    };
+    if let Some(reader) = media_file {
+        let Some(mut reader) = reader else {
+            return Ok(false);
+        };
+        let mut buffer = Zeroizing::new(vec![0; FILE_TRANSFER_BUFFER_BYTES]);
+        loop {
+            control.check()?;
+            let read = reader.read(&mut buffer).map_err(handoff_error)?;
+            if read == 0 {
                 break;
             }
+            copy(&buffer[..read], &mut written)?;
         }
     }
     file.flush().map_err(handoff_error)?;

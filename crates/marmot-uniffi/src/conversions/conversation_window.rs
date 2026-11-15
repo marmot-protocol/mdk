@@ -250,6 +250,11 @@ pub struct SelectedMessageDraftAttachmentFfi {
     pub thumbhash: Option<String>,
     pub duration_seconds: Option<f64>,
     pub waveform_samples: Vec<f64>,
+    /// The body is a staged file in the media store, not inline bytes:
+    /// read it with `read_message_draft_attachment` or a handoff, and keep
+    /// it across saves with `MessageDraftAttachmentInputFfi::Retained`.
+    #[uniffi(default = false)]
+    pub file_backed: bool,
 }
 impl From<app::SelectedMessageDraftAttachment> for SelectedMessageDraftAttachmentFfi {
     fn from(v: app::SelectedMessageDraftAttachment) -> Self {
@@ -262,6 +267,7 @@ impl From<app::SelectedMessageDraftAttachment> for SelectedMessageDraftAttachmen
             thumbhash: v.thumbhash,
             duration_seconds: v.duration_seconds,
             waveform_samples: v.waveform_samples,
+            file_backed: v.file_backed,
         }
     }
 }

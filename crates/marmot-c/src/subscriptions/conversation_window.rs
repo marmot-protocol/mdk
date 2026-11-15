@@ -350,7 +350,9 @@ pub unsafe extern "C" fn marmot_save_message_draft_if_revision(
     })
 }
 /// Read one selected attachment. found=0 distinguishes absence from an empty acquired attachment.
-/// Free returned bytes with marmot_bytes_free; revision conflicts return an error.
+/// Free returned bytes with marmot_bytes_free; revision conflicts return an error. A file-backed
+/// attachment is `MARMOT_STATUS_INVALID_MESSAGE_DRAFT`: read it with
+/// `marmot_read_message_draft_attachment`.
 /// # Safety
 /// client, strings, revision valid; revision's owning draft stays live; all out pointers writable.
 #[unsafe(no_mangle)]
@@ -382,6 +384,211 @@ pub unsafe extern "C" fn marmot_message_draft_attachment_if_revision(
             },
             Ok(None) => MarmotStatus::Ok,
             Err(e) => status_from_error(&e),
+        }
+    })
+}
+
+/// Save only if the selected revision still matches, keeping attachments the
+/// draft already holds by id (bodies untouched) and copying new inline ones.
+/// Leaving a file-backed attachment out deletes its file; an id the draft
+/// does not hold is MARMOT_STATUS_INVALID_MESSAGE_DRAFT.
+/// # Safety
+/// As marmot_save_message_draft_if_revision, with inputs pointing to len
+/// readable items (or NULL with zero len).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_save_message_draft_inputs_if_revision(
+    client: *const MarmotClient,
+    account_ref: *const c_char,
+    revision: *const MarmotMessageDraftRevision,
+    content: *const c_char,
+    reply: *const c_char,
+    inputs: *const crate::types::draft::MarmotMessageDraftAttachmentSaveInput,
+    inputs_len: usize,
+    out: *mut *mut MarmotSelectedMessageDraft,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { preflight_out_ptr(out) });
+        let client = try_arg!(unsafe { client_ref(client) });
+        let account = try_arg!(unsafe { required_str(account_ref) });
+        let content = try_arg!(unsafe { required_str(content) });
+        let reply = try_arg!(unsafe { optional_str(reply) });
+        let revision = try_arg!(unsafe { revision.as_ref() }.ok_or(MarmotStatus::NullPointer));
+        let inputs =
+            try_arg!(unsafe { crate::commands::struct_array(inputs, inputs_len, |a| a.to_ffi()) });
+        unsafe {
+            deliver(
+                client.marmot.save_message_draft_inputs_if_revision(
+                    account,
+                    revision.inner.clone(),
+                    content,
+                    reply,
+                    inputs,
+                ),
+                out,
+            )
+        }
+    })
+}
+/// Copy a host file into the encrypted media store and append it to the
+/// draft revision selects, up to the encrypted-media blob limit; out gets the
+/// new selected draft. The host may delete its file once this returns. Text
+/// saves during the copy keep it; the host's next save with an older revision
+/// conflicts and must reload. A draft cleared, deleted or sent during the copy
+/// discards it (MARMOT_STATUS_MESSAGE_DRAFT_REVISION_CONFLICT). Refused before
+/// copying: over the blob limit,
+/// past 64 attachments or one upload batch, a duplicate id, or a copy the disk
+/// cannot hold beyond its reserve (MARMOT_STATUS_STORAGE_FULL). control
+/// reports copied bytes and cancels; a cancelled copy leaves nothing.
+/// Blocking for the whole copy: call off the UI thread.
+/// # Safety
+/// client, control, strings, request and revision valid until return; out writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_stage_message_draft_attachment_file(
+    client: *const MarmotClient,
+    account_ref: *const c_char,
+    revision: *const MarmotMessageDraftRevision,
+    request: *const crate::types::draft::MarmotMessageDraftAttachmentFileRequest,
+    control: *const crate::file_media::MarmotMediaFileTransferControl,
+    out: *mut *mut MarmotSelectedMessageDraft,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { preflight_out_ptr(out) });
+        let client = try_arg!(unsafe { client_ref(client) });
+        let account = try_arg!(unsafe { required_str(account_ref) });
+        let revision = try_arg!(unsafe { revision.as_ref() }.ok_or(MarmotStatus::NullPointer));
+        let request = try_arg!(unsafe { request.as_ref() }.ok_or(MarmotStatus::NullPointer));
+        let request = try_arg!(unsafe { request.to_ffi() });
+        let control = try_arg!(unsafe { control.as_ref() }.ok_or(MarmotStatus::NullPointer));
+        unsafe {
+            deliver(
+                client.block_on(client.marmot.stage_message_draft_attachment_file(
+                    account,
+                    revision.inner.clone(),
+                    request,
+                    control.inner.clone(),
+                )),
+                out,
+            )
+        }
+    })
+}
+/// Read 1..=1048576 bytes at offset from one draft attachment, inline or
+/// file-backed. found=0 means the draft holds no such attachment; found=1 with
+/// zero bytes is the end. Revision conflicts return an error. Free returned
+/// bytes with marmot_bytes_free. Blocking local read.
+/// # Safety
+/// client, strings, revision valid; revision's owning draft stays live; all out pointers writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_read_message_draft_attachment(
+    client: *const MarmotClient,
+    account_ref: *const c_char,
+    revision: *const MarmotMessageDraftRevision,
+    attachment_id: *const c_char,
+    offset: u64,
+    limit: u32,
+    out_found: *mut u8,
+    out_data: *mut *mut u8,
+    out_len: *mut usize,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { crate::preflight_out(out_found) });
+        try_arg!(unsafe { preflight_out_ptr(out_data) });
+        try_arg!(unsafe { crate::preflight_out(out_len) });
+        let client = try_arg!(unsafe { client_ref(client) });
+        let account = try_arg!(unsafe { required_str(account_ref) });
+        let attachment = try_arg!(unsafe { required_str(attachment_id) });
+        let revision = try_arg!(unsafe { revision.as_ref() }.ok_or(MarmotStatus::NullPointer));
+        match client.block_on(client.marmot.read_message_draft_attachment(
+            account,
+            revision.inner.clone(),
+            attachment,
+            offset,
+            limit,
+        )) {
+            Ok(Some(bytes)) => unsafe {
+                out_found.write(1);
+                crate::commands::deliver_bytes(Ok(bytes), out_data, out_len)
+            },
+            Ok(None) => MarmotStatus::Ok,
+            Err(e) => status_from_error(&e),
+        }
+    })
+}
+/// marmot_open_attachment_handoff for one draft attachment: a plaintext copy
+/// for an OS surface that needs a real file, released with
+/// marmot_release_attachment_handoff. The revision is checked once, before
+/// the copy. out stays NULL when the draft holds no such attachment. Free the
+/// record with marmot_attachment_handoff_free; that does not release the
+/// lease. Blocking for the whole copy; cancel through control.
+/// # Safety
+/// client, control, strings and revision valid until return; out writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_open_message_draft_attachment_handoff(
+    client: *const MarmotClient,
+    account_ref: *const c_char,
+    revision: *const MarmotMessageDraftRevision,
+    attachment_id: *const c_char,
+    control: *const crate::file_media::MarmotMediaFileTransferControl,
+    out: *mut *mut crate::attachment_access::MarmotAttachmentHandoff,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { preflight_out_ptr(out) });
+        let client = try_arg!(unsafe { client_ref(client) });
+        let account = try_arg!(unsafe { required_str(account_ref) });
+        let attachment = try_arg!(unsafe { required_str(attachment_id) });
+        let revision = try_arg!(unsafe { revision.as_ref() }.ok_or(MarmotStatus::NullPointer));
+        let control = try_arg!(unsafe { control.as_ref() }.ok_or(MarmotStatus::NullPointer));
+        unsafe {
+            crate::commands::deliver_opt(
+                client.block_on(client.marmot.open_message_draft_attachment_handoff(
+                    account,
+                    revision.inner.clone(),
+                    attachment,
+                    control.inner.clone(),
+                )),
+                out,
+            )
+        }
+    })
+}
+/// marmot_upload_media_files for the draft attachments ids names (1..=64, in
+/// order), read from the draft's own copies. Upload only: pass the returned
+/// references, in order, to marmot_send_message_draft with the same revision.
+/// blossom_server (nullable) overrides the group's
+/// endpoints. Free with marmot_media_upload_result_free. Blocking.
+/// # Safety
+/// client, control, strings, ids (ids_len readable strings) and revision valid
+/// until return; out writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_upload_message_draft_attachments(
+    client: *const MarmotClient,
+    account_ref: *const c_char,
+    revision: *const MarmotMessageDraftRevision,
+    ids: *const *const c_char,
+    ids_len: usize,
+    blossom_server: *const c_char,
+    control: *const crate::file_media::MarmotMediaFileTransferControl,
+    out: *mut *mut crate::types::media::MarmotMediaUploadResult,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { preflight_out_ptr(out) });
+        let client = try_arg!(unsafe { client_ref(client) });
+        let account = try_arg!(unsafe { required_str(account_ref) });
+        let revision = try_arg!(unsafe { revision.as_ref() }.ok_or(MarmotStatus::NullPointer));
+        let ids = try_arg!(unsafe { crate::memory::str_array(ids, ids_len) });
+        let server = try_arg!(unsafe { optional_str(blossom_server) });
+        let control = try_arg!(unsafe { control.as_ref() }.ok_or(MarmotStatus::NullPointer));
+        unsafe {
+            deliver(
+                client.block_on(client.marmot.upload_message_draft_attachments(
+                    account,
+                    revision.inner.clone(),
+                    ids,
+                    server,
+                    control.inner.clone(),
+                )),
+                out,
+            )
         }
     })
 }

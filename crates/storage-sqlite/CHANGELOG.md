@@ -9,6 +9,27 @@
   attachments join the live source view and insert trigger. Raw events, deleted
   tombstones and unrelated custom rows are preserved. Account schema advances from 207 to 208; older binaries refuse
   the upgraded database. Downgrade is unsupported.
+- `save_message_draft_if_revision` takes `&[StoredMessageDraftAttachmentInput]`:
+  wrap existing bodies in `Inline`, and keep an attachment the draft already
+  holds with `Retained(id)` (#3431). `message_draft` returns
+  `Result<_, MessageDraftRevisionError>` and refuses a draft with a file-backed
+  attachment, as `message_draft_attachment_if_revision` does.
+  `SelectedMessageDraftAttachment` gains `file_backed` and
+  `AttachmentStorageUsage` gains `draft_bytes`.
+- Account migration 0209 adds file-backed draft attachments (#3431). Account
+  schema advances from 208 to 209; older binaries refuse the upgraded
+  database. Downgrade is unsupported.
+
+### Added
+
+- File-backed composer-draft attachments (#3431, migration 0209): a
+  `message_draft_attachments` row can own a staged media file
+  (`message_draft_attachment_stage`, a `StageTarget`) instead of holding bytes,
+  and triggers release the file's key when the row goes. Ranged reads, upload
+  sources and the draft's file list (`read_message_draft_attachment_if_revision`,
+  `message_draft_upload_sources_if_revision`, `message_draft_attachment_files`)
+  read it without loading the body; the media catalog keeps a staged file a
+  draft owns through the sweep.
 
 ### Fixed
 

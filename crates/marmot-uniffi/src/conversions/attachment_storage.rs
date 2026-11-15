@@ -28,6 +28,10 @@ pub struct AttachmentStorageUsageFfi {
     /// attachments it can be cleared (`clear_avatar_cache`) and is fetched
     /// again on demand.
     pub cache_bytes: u64,
+    /// Composer-draft attachments staged as media-store files. Freed when
+    /// the draft drops them, is cleared, or is sent.
+    #[uniffi(default = 0)]
+    pub draft_bytes: u64,
 }
 impl From<app::AttachmentStorageUsage> for AttachmentStorageUsageFfi {
     fn from(v: app::AttachmentStorageUsage) -> Self {
@@ -53,6 +57,7 @@ impl From<app::AttachmentStorageUsage> for AttachmentStorageUsageFfi {
             migration,
             migration_bytes,
             cache_bytes: v.cache_bytes,
+            draft_bytes: v.draft_bytes,
         }
     }
 }

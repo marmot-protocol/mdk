@@ -395,6 +395,8 @@ mod migration_0206_committed_rosters;
 mod migration_0207_commit_refusals;
 #[path = "migrations/0208_nip22_comments.rs"]
 mod migration_0208_nip22_comments;
+#[path = "migrations/0209_file_backed_draft_attachments.rs"]
+mod migration_0209_file_backed_draft_attachments;
 
 const MIGRATIONS: &[Migration] = &[
     Migration {
@@ -1497,6 +1499,12 @@ const MIGRATIONS: &[Migration] = &[
         name: "0208_nip22_comments",
         suspend_foreign_keys: &[],
         apply: migration_0208_nip22_comments::apply,
+    },
+    Migration {
+        version: 209,
+        name: "0209_file_backed_draft_attachments",
+        suspend_foreign_keys: &[],
+        apply: migration_0209_file_backed_draft_attachments::apply,
     },
 ];
 

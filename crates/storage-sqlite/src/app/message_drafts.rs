@@ -1,4 +1,9 @@
+pub(crate) mod files;
 pub(crate) mod revisioned;
+pub use files::{
+    MessageDraftAttachmentFileMeta, MessageDraftAttachmentRead, MessageDraftAttachmentStage,
+    MessageDraftStageRefusal, MessageDraftUploadBody, MessageDraftUploadSource,
+};
 pub use revisioned::{
     ChatListDraftVersion, MessageDraftRevision, MessageDraftRevisionError, SelectedMessageDraft,
     SelectedMessageDraftAttachment, SelectedMessageDraftContent,
@@ -34,6 +39,56 @@ impl fmt::Debug for StoredMessageDraftAttachment {
             .field("plaintext_len", &self.plaintext.len())
             .field("waveform_sample_count", &self.waveform_samples.len())
             .finish()
+    }
+}
+
+/// One attachment of a draft being saved: new inline bytes, or the id of an
+/// attachment already in the draft, kept as stored without its bytes.
+#[derive(Clone, PartialEq)]
+pub enum StoredMessageDraftAttachmentInput {
+    Inline(StoredMessageDraftAttachment),
+    Retained(String),
+}
+
+impl fmt::Debug for StoredMessageDraftAttachmentInput {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Inline(attachment) => formatter.debug_tuple("Inline").field(attachment).finish(),
+            Self::Retained(_) => formatter.debug_tuple("Retained").finish_non_exhaustive(),
+        }
+    }
+}
+
+/// A borrowed [`StoredMessageDraftAttachmentInput`], so inline bytes are
+/// never copied on their way into the database.
+#[derive(Clone, Copy)]
+pub(crate) enum DraftAttachmentInput<'a> {
+    Inline(&'a StoredMessageDraftAttachment),
+    Retained(&'a str),
+}
+
+impl<'a> From<&'a StoredMessageDraftAttachmentInput> for DraftAttachmentInput<'a> {
+    fn from(value: &'a StoredMessageDraftAttachmentInput) -> Self {
+        match value {
+            StoredMessageDraftAttachmentInput::Inline(attachment) => Self::Inline(attachment),
+            StoredMessageDraftAttachmentInput::Retained(id) => Self::Retained(id),
+        }
+    }
+}
+
+impl<'a> DraftAttachmentInput<'a> {
+    fn id(&self) -> &'a str {
+        match self {
+            Self::Inline(attachment) => &attachment.id,
+            Self::Retained(id) => id,
+        }
+    }
+
+    pub(crate) fn inline(&self) -> Option<&'a StoredMessageDraftAttachment> {
+        match self {
+            Self::Inline(attachment) => Some(attachment),
+            Self::Retained(_) => None,
+        }
     }
 }
 
@@ -151,10 +206,27 @@ impl SqliteAppStorage {
         Ok(drafts)
     }
 
-    /// Load one fully hydrated draft for a group.
-    pub fn message_draft(&self, group_id_hex: &str) -> StorageResult<Option<StoredMessageDraft>> {
+    /// Load one fully hydrated draft for a group. A draft holding a
+    /// file-backed attachment is refused: its bytes are never hydrated.
+    pub fn message_draft(
+        &self,
+        group_id_hex: &str,
+    ) -> Result<Option<StoredMessageDraft>, MessageDraftRevisionError> {
         let mut conn = self.lock()?;
         let tx = conn.transaction().storage()?;
+        let file_backed: bool = tx
+            .query_row_cached(
+                "SELECT EXISTS(SELECT 1 FROM message_draft_attachments
+                 WHERE group_id_hex = ?1 AND file_id IS NOT NULL)",
+                params![group_id_hex],
+                |row| row.get(0),
+            )
+            .storage()?;
+        if file_backed {
+            return Err(MessageDraftRevisionError::Invalid(
+                "the draft holds a file-backed attachment",
+            ));
+        }
         let draft = load_message_draft(&tx, group_id_hex)?;
         tx.commit().storage()?;
         Ok(draft)
@@ -170,12 +242,16 @@ impl SqliteAppStorage {
         media_attachments: &[StoredMessageDraftAttachment],
     ) -> StorageResult<StoredMessageDraft> {
         validate_waveform_samples(media_attachments)?;
+        let media_attachments = media_attachments
+            .iter()
+            .map(DraftAttachmentInput::Inline)
+            .collect::<Vec<_>>();
         self.connection.with_transaction(|| {
             self.write_message_draft(
                 group_id_hex,
                 content,
                 reply_to_message_id_hex,
-                media_attachments,
+                &media_attachments,
             )?;
             let conn = self.lock()?;
             load_message_draft(&conn, group_id_hex)?.ok_or_else(|| {
@@ -192,7 +268,7 @@ impl SqliteAppStorage {
         group_id_hex: &str,
         content: &str,
         reply_to_message_id_hex: Option<&str>,
-        media_attachments: &[StoredMessageDraftAttachment],
+        media_attachments: &[DraftAttachmentInput<'_>],
     ) -> StorageResult<()> {
         let now_ms = unix_now_ms();
         self.connection.with_transaction(|| {
@@ -228,19 +304,18 @@ impl SqliteAppStorage {
 
     /// Delete one draft and its cascading attachment rows.
     pub fn delete_message_draft(&self, group_id_hex: &str) -> StorageResult<()> {
-        self.lock()?
-            .execute_cached(
-                "DELETE FROM message_drafts WHERE group_id_hex = ?1",
-                params![group_id_hex],
-            )
-            .storage()?;
-        Ok(())
+        self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            revisioned::end_composition_tx(&conn, group_id_hex)
+        })
     }
 }
 
-fn validate_waveform_samples(attachments: &[StoredMessageDraftAttachment]) -> StorageResult<()> {
+fn validate_waveform_samples<'a>(
+    attachments: impl IntoIterator<Item = &'a StoredMessageDraftAttachment>,
+) -> StorageResult<()> {
     if attachments
-        .iter()
+        .into_iter()
         .flat_map(|attachment| &attachment.waveform_samples)
         .any(|sample| !sample.is_finite())
     {
@@ -251,8 +326,9 @@ fn validate_waveform_samples(attachments: &[StoredMessageDraftAttachment]) -> St
     Ok(())
 }
 
-pub(crate) const ATTACHMENT_SUMMARIES_SQL: &str =
-    "SELECT attachment_id, file_name, media_type, length(plaintext)
+pub(crate) const ATTACHMENT_SUMMARIES_SQL: &str = "SELECT attachment_id, file_name, media_type,
+             CASE WHEN file_id IS NULL THEN length(plaintext)
+                 ELSE (SELECT m.byte_len FROM media_files m WHERE m.id = file_id) END
              FROM message_draft_attachments
              WHERE group_id_hex = ?1
              ORDER BY position ASC";
@@ -268,7 +344,7 @@ fn load_message_draft_attachment_summaries(
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
-                row.get::<_, i64>(3)?,
+                row.get::<_, Option<i64>>(3)?.unwrap_or_default(),
             ))
         })
         .storage()?;
@@ -288,13 +364,54 @@ fn load_message_draft_attachment_summaries(
     Ok(attachments)
 }
 
+/// The ids of a draft's attachments, for checking retained ids.
+pub(crate) fn draft_attachment_ids_tx(
+    conn: &Connection,
+    group_id_hex: &str,
+) -> StorageResult<HashSet<String>> {
+    let mut statement = conn
+        .prepare_cached(
+            "SELECT attachment_id FROM message_draft_attachments WHERE group_id_hex = ?1",
+        )
+        .storage()?;
+    let ids = statement
+        .query_map(params![group_id_hex], |row| row.get(0))
+        .storage()?
+        .collect::<Result<_, _>>()
+        .storage()?;
+    Ok(ids)
+}
+
+/// A stored attachment row. A file-backed one holds no inline bytes.
+struct ExistingAttachment {
+    attachment: StoredMessageDraftAttachment,
+    file_backed: bool,
+}
+
+impl ExistingAttachment {
+    /// Whether `input` leaves this row exactly as it is.
+    fn kept_by(&self, input: &DraftAttachmentInput<'_>) -> bool {
+        match input {
+            DraftAttachmentInput::Retained(id) => self.attachment.id == *id,
+            DraftAttachmentInput::Inline(attachment) => {
+                !self.file_backed && self.attachment == **attachment
+            }
+        }
+    }
+}
+
 fn sync_message_draft_attachments(
     tx: &Connection,
     group_id_hex: &str,
-    incoming: &[StoredMessageDraftAttachment],
+    incoming: &[DraftAttachmentInput<'_>],
 ) -> StorageResult<()> {
-    let existing = load_message_draft_attachments(tx, group_id_hex)?;
-    if existing == incoming {
+    let existing = load_existing_attachments(tx, group_id_hex)?;
+    if existing.len() == incoming.len()
+        && existing
+            .iter()
+            .zip(incoming)
+            .all(|(stored, replacement)| stored.kept_by(replacement))
+    {
         return Ok(());
     }
 
@@ -302,10 +419,12 @@ fn sync_message_draft_attachments(
         && existing
             .iter()
             .zip(incoming)
-            .all(|(stored, replacement)| stored.id == replacement.id);
+            .all(|(stored, replacement)| stored.attachment.id == replacement.id());
     if same_id_order {
         for (stored, replacement) in existing.iter().zip(incoming) {
-            if stored != replacement {
+            if let Some(replacement) = replacement.inline()
+                && !stored.kept_by(&DraftAttachmentInput::Inline(replacement))
+            {
                 update_message_draft_attachment(tx, group_id_hex, None, replacement)?;
             }
         }
@@ -314,11 +433,11 @@ fn sync_message_draft_attachments(
 
     let existing_by_id = existing
         .iter()
-        .map(|attachment| (attachment.id.as_str(), attachment))
+        .map(|stored| (stored.attachment.id.as_str(), stored))
         .collect::<HashMap<_, _>>();
     let incoming_ids = incoming
         .iter()
-        .map(|attachment| attachment.id.as_str())
+        .map(DraftAttachmentInput::id)
         .collect::<HashSet<_>>();
     let position_offset = existing
         .len()
@@ -340,31 +459,37 @@ fn sync_message_draft_attachments(
     for (position, attachment) in incoming.iter().enumerate() {
         let position = i64::try_from(position)
             .map_err(|_| StorageError::Backend("too many message draft attachments".to_owned()))?;
-        match existing_by_id.get(attachment.id.as_str()) {
-            Some(stored) if *stored == attachment => {
+        match (existing_by_id.get(attachment.id()), attachment.inline()) {
+            (Some(stored), _) if stored.kept_by(attachment) => {
                 tx.execute_cached(
                     "UPDATE message_draft_attachments
                      SET position = ?3
                      WHERE group_id_hex = ?1 AND attachment_id = ?2",
-                    params![group_id_hex, attachment.id, position],
+                    params![group_id_hex, attachment.id(), position],
                 )
                 .storage()?;
             }
-            Some(_) => {
-                update_message_draft_attachment(tx, group_id_hex, Some(position), attachment)?;
+            (Some(_), Some(replacement)) => {
+                update_message_draft_attachment(tx, group_id_hex, Some(position), replacement)?;
             }
-            None => {
-                insert_message_draft_attachment(tx, group_id_hex, position, attachment)?;
+            (None, Some(new)) => {
+                insert_message_draft_attachment(tx, group_id_hex, position, new)?;
+            }
+            // Callers check retained ids against the draft first.
+            (_, None) => {
+                return Err(StorageError::Backend(
+                    "retained message draft attachment is missing".to_owned(),
+                ));
             }
         }
     }
 
-    for attachment in &existing {
-        if !incoming_ids.contains(attachment.id.as_str()) {
+    for stored in &existing {
+        if !incoming_ids.contains(stored.attachment.id.as_str()) {
             tx.execute_cached(
                 "DELETE FROM message_draft_attachments
                  WHERE group_id_hex = ?1 AND attachment_id = ?2",
-                params![group_id_hex, attachment.id],
+                params![group_id_hex, stored.attachment.id],
             )
             .storage()?;
         }
@@ -414,7 +539,7 @@ fn update_message_draft_attachment(
             "UPDATE message_draft_attachments
              SET position = ?3, file_name = ?4, media_type = ?5, plaintext = ?6,
                  dim = ?7, thumbhash = ?8, duration_seconds = ?9,
-                 waveform_samples_json = ?10
+                 waveform_samples_json = ?10, file_id = NULL
              WHERE group_id_hex = ?1 AND attachment_id = ?2",
             params![
                 group_id_hex,
@@ -434,7 +559,8 @@ fn update_message_draft_attachment(
         tx.execute_cached(
             "UPDATE message_draft_attachments
              SET file_name = ?3, media_type = ?4, plaintext = ?5, dim = ?6,
-                 thumbhash = ?7, duration_seconds = ?8, waveform_samples_json = ?9
+                 thumbhash = ?7, duration_seconds = ?8, waveform_samples_json = ?9,
+                 file_id = NULL
              WHERE group_id_hex = ?1 AND attachment_id = ?2",
             params![
                 group_id_hex,
@@ -463,10 +589,20 @@ fn load_message_draft_attachments(
     conn: &Connection,
     group_id_hex: &str,
 ) -> StorageResult<Vec<StoredMessageDraftAttachment>> {
+    Ok(load_existing_attachments(conn, group_id_hex)?
+        .into_iter()
+        .map(|stored| stored.attachment)
+        .collect())
+}
+
+fn load_existing_attachments(
+    conn: &Connection,
+    group_id_hex: &str,
+) -> StorageResult<Vec<ExistingAttachment>> {
     let mut statement = conn
         .prepare_cached(
             "SELECT attachment_id, file_name, media_type, plaintext, dim, thumbhash,
-                    duration_seconds, waveform_samples_json
+                    duration_seconds, waveform_samples_json, file_id IS NOT NULL
              FROM message_draft_attachments
              WHERE group_id_hex = ?1
              ORDER BY position ASC",
@@ -483,17 +619,13 @@ fn load_message_draft_attachments(
                 row.get::<_, Option<String>>(5)?,
                 row.get::<_, Option<f64>>(6)?,
                 row.get::<_, String>(7)?,
+                row.get::<_, bool>(8)?,
             ))
         })
         .storage()?;
     let mut attachments = Vec::new();
     for row in rows {
-        let (id, file_name, media_type, plaintext, dim, thumbhash, duration_seconds, samples) =
-            row.storage()?;
-        let waveform_samples = serde_json::from_str(&samples).map_err(|_| {
-            StorageError::Serialization("invalid message draft waveform samples".to_owned())
-        })?;
-        attachments.push(StoredMessageDraftAttachment {
+        let (
             id,
             file_name,
             media_type,
@@ -501,7 +633,24 @@ fn load_message_draft_attachments(
             dim,
             thumbhash,
             duration_seconds,
-            waveform_samples,
+            samples,
+            file_backed,
+        ) = row.storage()?;
+        let waveform_samples = serde_json::from_str(&samples).map_err(|_| {
+            StorageError::Serialization("invalid message draft waveform samples".to_owned())
+        })?;
+        attachments.push(ExistingAttachment {
+            attachment: StoredMessageDraftAttachment {
+                id,
+                file_name,
+                media_type,
+                plaintext,
+                dim,
+                thumbhash,
+                duration_seconds,
+                waveform_samples,
+            },
+            file_backed,
         });
     }
     Ok(attachments)
