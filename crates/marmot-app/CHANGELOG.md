@@ -8,6 +8,20 @@
   `disappearing_message_secs`. A new direct conversation carries it in its founding MLS state and Welcome; reuse,
   retry and same-account concurrent starts keep the existing group's duration and roles. `start_direct_conversation`
   is unchanged (#3365).
+- File-backed composer-draft attachments up to the encrypted-media blob limit
+  (#3431): `stage_message_draft_attachment_file`,
+  `read_message_draft_attachment`, `open_message_draft_attachment_handoff` and
+  `upload_message_draft_attachments` on `MarmotAppRuntime`, and
+  `save_message_draft_inputs_if_revision`, which keeps attachments by id
+  (`MessageDraftAttachmentInput::Retained`). Every draft save, clear and delete
+  unlinks the files it released before returning.
+
+### Changed
+
+- `send_message_draft` and captured-media admission match prepared media to
+  the draft's attachments after an upload's version normalization (a V1
+  upload trims the file name; both versions canonicalize the media type)
+  instead of comparing the strings literally (#3431).
 
 ### Fixed
 

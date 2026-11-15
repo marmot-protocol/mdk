@@ -215,7 +215,10 @@ fn conditional_mutations_reject_stale_cross_store_and_failed_attachment_edits() 
         &first.revision,
         "broken",
         None,
-        &[attachment(), attachment()],
+        &[
+            StoredMessageDraftAttachmentInput::Inline(attachment()),
+            StoredMessageDraftAttachmentInput::Inline(attachment()),
+        ],
     );
     assert!(
         matches!(&duplicate, Err(MessageDraftRevisionError::Storage(StorageError::Backend(message)))

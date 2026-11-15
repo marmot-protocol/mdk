@@ -2884,6 +2884,22 @@ impl AccountManager {
         request: crate::MediaFileUploadRequest,
         control: std::sync::Arc<crate::MediaFileTransferControl>,
     ) -> Result<MediaUploadResult, AppError> {
+        self.upload_file_sources(
+            account_ref,
+            group_id,
+            crate::media::file_transfer::FileUploadSources::Host(request),
+            control,
+        )
+        .await
+    }
+
+    pub(crate) async fn upload_file_sources(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+        request: crate::media::file_transfer::FileUploadSources,
+        control: std::sync::Arc<crate::MediaFileTransferControl>,
+    ) -> Result<MediaUploadResult, AppError> {
         control.check()?;
         let (command, admission) = self.media_worker_commands(account_ref).await?;
         let (respond, response) = oneshot::channel();

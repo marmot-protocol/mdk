@@ -91,6 +91,26 @@ impl OutgoingDescriptor {
     }
 }
 
+/// Whether `reference` was prepared for a draft attachment described by
+/// `file_name` and `media_type`: equal once the draft's strings get the
+/// normalization an upload of the reference's version applies (a V1 upload
+/// trims the name; both canonicalize the type). A draft stores what the host
+/// gave it, so a literal comparison would refuse a correct upload.
+pub(crate) fn describes_draft_attachment(
+    file_name: &str,
+    media_type: &str,
+    reference: &super::MediaAttachmentReference,
+) -> bool {
+    EncryptedMediaVersion::parse(&reference.version)
+        .and_then(|version| {
+            OutgoingDescriptor::new(file_name.to_owned(), media_type, None, None, version)
+        })
+        .is_ok_and(|descriptor| {
+            descriptor.file_name == reference.file_name
+                && descriptor.media_type == reference.media_type
+        })
+}
+
 /// The send-side error for a store failure: a full disk or database is the
 /// typed storage-full error hosts show; nothing else names the store.
 pub(crate) fn staging_error(error: MediaError) -> AppError {
@@ -181,11 +201,36 @@ impl HostSource {
 
     /// After staging: the source must not have changed while it was read.
     fn unchanged(&self) -> bool {
-        self.file.metadata().is_ok_and(|after| {
-            self.read == self.len
-                && after.len() == self.len
-                && after.modified().ok() == self.modified
+        self.read == self.len
+            && self.file.metadata().is_ok_and(|after| {
+                after.len() == self.len && after.modified().ok() == self.modified
+            })
+    }
+
+    /// A second handle on the source, for checking it is unchanged while the
+    /// store still holds this one as the body it reads.
+    pub(crate) fn watch(&self) -> Result<HostSourceWatch, AppError> {
+        Ok(HostSourceWatch {
+            file: self.file.try_clone().map_err(source_error)?,
+            len: self.len,
+            modified: self.modified,
         })
+    }
+}
+
+/// See [`HostSource::watch`]. The store reads exactly the source's length,
+/// so an unchanged length and modification time mean an unchanged body.
+pub(crate) struct HostSourceWatch {
+    file: std::fs::File,
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+}
+
+impl HostSourceWatch {
+    pub(crate) fn unchanged(&self) -> bool {
+        self.file
+            .metadata()
+            .is_ok_and(|after| after.len() == self.len && after.modified().ok() == self.modified)
     }
 }
 
@@ -724,17 +769,12 @@ impl SendStaging {
             tracing::warn!(target: "marmot_app::media", method = "outgoing_upload_prune",
                 "outgoing upload cleanup deferred");
         }
-        let policy = storage.app_storage().attachment_download_policy(
-            &crate::runtime::attachment_controls::default_policy(&app.config),
-        )?;
         Ok(Self {
             app: app.clone(),
             account: account.to_owned(),
+            disk: send_disk_policy(app, &storage)?,
             storage,
             media,
-            disk: DiskPolicy {
-                reserve_bytes: policy.disk_reserve,
-            },
             group: hex::encode(group.as_slice()),
             source_epoch,
         })
@@ -744,19 +784,8 @@ impl SendStaging {
         &self.media
     }
 
-    /// Refuses a `len`-byte body the volume cannot hold beyond its reserve.
-    /// Unknown free space admits it: the write itself then reports a full
-    /// disk.
     fn admit(&self, len: u64) -> Result<(), AppError> {
-        let Ok(free) =
-            super::attachment_resume::available_space(&self.app.account_dir(&self.account))
-        else {
-            return Ok(());
-        };
-        match self.disk.admit(free, DiskPolicy::send_need(len)) {
-            Admission::Admitted => Ok(()),
-            Admission::StorageFull { .. } => Err(staging_error(MediaError::Capacity)),
-        }
+        admit_send_body(&self.app, &self.account, self.disk, len)
     }
 
     /// Admits, reserves and stages one body, recording its upload in
@@ -806,6 +835,134 @@ impl SendStaging {
             .app_storage()
             .bind_attachment_uploads(tokens, &slots)?;
         Ok(())
+    }
+}
+
+/// The disk reserve a local copy of an outgoing body must leave. Blocking.
+pub(crate) fn send_disk_policy(
+    app: &MarmotApp,
+    storage: &SqliteAccountStorage,
+) -> Result<DiskPolicy, AppError> {
+    let policy = storage.app_storage().attachment_download_policy(
+        &crate::runtime::attachment_controls::default_policy(&app.config),
+    )?;
+    Ok(DiskPolicy {
+        reserve_bytes: policy.disk_reserve,
+    })
+}
+
+/// Refuses a `len`-byte body the volume cannot hold beyond `disk`'s reserve.
+/// Unknown free space admits it: the write itself then reports a full disk.
+pub(crate) fn admit_send_body(
+    app: &MarmotApp,
+    account: &str,
+    disk: DiskPolicy,
+    len: u64,
+) -> Result<(), AppError> {
+    let Ok(free) = super::attachment_resume::available_space(&app.account_dir(account)) else {
+        return Ok(());
+    };
+    match disk.admit(free, DiskPolicy::send_need(len)) {
+        Admission::Admitted => Ok(()),
+        Admission::StorageFull { .. } => Err(staging_error(MediaError::Capacity)),
+    }
+}
+
+/// Stages each draft attachment `request` names as an upload, read from the
+/// copy the draft holds (inline bytes or its staged file), within the
+/// aggregate wire bound. The draft keeps its own copy until it is sent or
+/// cleared. Blocking.
+pub(crate) fn stage_draft_sources(
+    staging: &SendStaging,
+    tokens: &mut Vec<Vec<u8>>,
+    request: super::file_transfer::DraftUploadRequest,
+    version: EncryptedMediaVersion,
+    control: &MediaFileTransferControl,
+) -> Result<Vec<StagedSource>, AppError> {
+    let sources = staging
+        .storage
+        .app_storage()
+        .message_draft_upload_sources_if_revision(&request.revision, &request.attachment_ids)
+        .map_err(|error| crate::drafts::revision_error(error, request.revision.group_id_hex()))?;
+    let cancelled = || control.is_cancelled();
+    let mut total = 0u64;
+    let mut staged = Vec::with_capacity(sources.len());
+    for source in sources {
+        control.check()?;
+        let attachment = source.attachment;
+        let descriptor = OutgoingDescriptor::new(
+            attachment.file_name,
+            &attachment.media_type,
+            attachment.dim,
+            attachment.thumbhash,
+            version,
+        )?;
+        let len = attachment.plaintext_size;
+        total = total
+            .checked_add(len.saturating_add(MEDIA_AEAD_TAG_BYTES))
+            .filter(|total| *total <= MAX_FILE_MEDIA_CIPHERTEXT_BYTES)
+            .ok_or_else(|| {
+                AppError::InvalidEncryptedMedia("file attachments exceed transfer bound".into())
+            })?;
+        let (file, digest) = match source.body {
+            storage_sqlite::MessageDraftUploadBody::Inline(bytes) => {
+                staging.stage(tokens, len, |media, target| {
+                    stage_body(
+                        media,
+                        target,
+                        &mut std::io::Cursor::new(Zeroizing::new(bytes)),
+                        len,
+                        &cancelled,
+                    )
+                })?
+            }
+            storage_sqlite::MessageDraftUploadBody::File { id, digest } => {
+                staging.stage(tokens, len, |media, target| {
+                    let reader = media
+                        .open_staged_reader(&id)
+                        .map_err(staging_error)?
+                        .ok_or_else(|| {
+                            AppError::InvalidMessageDraft(
+                                "draft attachment is no longer available".into(),
+                            )
+                        })?;
+                    let mut body = ProgressReader {
+                        inner: reader,
+                        read: 0,
+                        control,
+                    };
+                    let (file, staged) = stage_body(media, target, &mut body, len, &cancelled)?;
+                    // The store authenticates every segment; a different
+                    // digest means the draft's file is not what was staged.
+                    if staged != digest {
+                        let _ = media.release_staged(target, file);
+                        return Err(AppError::InvalidMessageDraft(
+                            "draft attachment no longer matches its digest".into(),
+                        ));
+                    }
+                    Ok((file, staged))
+                })?
+            }
+        };
+        staged.push(descriptor.staged(file, len, digest));
+    }
+    control.check()?;
+    Ok(staged)
+}
+
+/// Reports bytes read as preparation progress.
+struct ProgressReader<'a, R> {
+    inner: R,
+    read: u64,
+    control: &'a MediaFileTransferControl,
+}
+
+impl<R: Read> Read for ProgressReader<'_, R> {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        let read = self.inner.read(out)?;
+        self.read = self.read.saturating_add(read as u64);
+        self.control.advance(self.read);
+        Ok(read)
     }
 }
 

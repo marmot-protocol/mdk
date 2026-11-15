@@ -1012,6 +1012,134 @@ mod tests {
                 MarmotStatus::MessageDraftRevisionConflict
             );
             assert_eq!((found, bytes.is_null(), bytes_len), (0, true, 0));
+            // A file-backed attachment: staged from a host file, read in
+            // chunks, kept by id through a save, and lent as a handoff.
+            let source_dir = tempfile::tempdir().unwrap();
+            let source = source_dir.path().join("clip.bin");
+            std::fs::write(&source, b"file-backed body").unwrap();
+            let source = CString::new(source.to_str().unwrap()).unwrap();
+            let request = crate::types::draft::MarmotMessageDraftAttachmentFileRequest {
+                id: c"clip".as_ptr(),
+                source_path: source.as_ptr(),
+                has_expected_size: 1,
+                expected_size: 16,
+                file_name: c"clip.bin".as_ptr(),
+                media_type: c"application/octet-stream".as_ptr(),
+                dim: ptr::null(),
+                thumbhash: ptr::null(),
+                has_duration_seconds: 0,
+                duration_seconds: 0.0,
+                waveform_samples: ptr::null(),
+                waveform_samples_len: 0,
+            };
+            let mut control = ptr::null_mut();
+            assert_eq!(
+                crate::file_media::marmot_media_file_transfer_control_new(&mut control),
+                MarmotStatus::Ok
+            );
+            let mut staged = ptr::null_mut();
+            assert_eq!(
+                marmot_stage_message_draft_attachment_file(
+                    &client,
+                    account.as_ptr(),
+                    (*edited).revision,
+                    &request,
+                    control,
+                    &mut staged,
+                ),
+                MarmotStatus::Ok
+            );
+            let draft = &*(*staged).draft;
+            let staged_attachments =
+                std::slice::from_raw_parts(draft.media_attachments, draft.media_attachments_len);
+            assert_eq!(
+                staged_attachments
+                    .iter()
+                    .map(|a| (a.plaintext_size, a.file_backed))
+                    .collect::<Vec<_>>(),
+                [(0, false), (16, true)]
+            );
+            assert_eq!(
+                marmot_read_message_draft_attachment(
+                    &client,
+                    account.as_ptr(),
+                    (*staged).revision,
+                    c"clip".as_ptr(),
+                    5,
+                    6,
+                    &mut found,
+                    &mut bytes,
+                    &mut bytes_len,
+                ),
+                MarmotStatus::Ok
+            );
+            assert_eq!(
+                (found, std::slice::from_raw_parts(bytes, bytes_len)),
+                (1, &b"backed"[..])
+            );
+            crate::marmot_bytes_free(bytes, bytes_len);
+            let keep = [crate::types::draft::MarmotMessageDraftAttachmentSaveInput {
+                retained_id: c"clip".as_ptr(),
+                attachment: crate::types::draft::MarmotMessageDraftAttachmentInput {
+                    id: ptr::null(),
+                    ..attachment
+                },
+            }];
+            let mut kept = ptr::null_mut();
+            assert_eq!(
+                marmot_save_message_draft_inputs_if_revision(
+                    &client,
+                    account.as_ptr(),
+                    (*staged).revision,
+                    c"caption".as_ptr(),
+                    ptr::null(),
+                    keep.as_ptr(),
+                    keep.len(),
+                    &mut kept,
+                ),
+                MarmotStatus::Ok
+            );
+            assert_eq!((*(*kept).draft).media_attachments_len, 1);
+            let mut handoff = ptr::null_mut();
+            assert_eq!(
+                marmot_open_message_draft_attachment_handoff(
+                    &client,
+                    account.as_ptr(),
+                    (*kept).revision,
+                    c"clip".as_ptr(),
+                    control,
+                    &mut handoff,
+                ),
+                MarmotStatus::Ok
+            );
+            let path = std::ffi::CStr::from_ptr((*handoff).path).to_str().unwrap();
+            assert_eq!(std::fs::read(path).unwrap(), b"file-backed body");
+            assert_eq!(
+                crate::attachment_access::marmot_release_attachment_handoff(
+                    &client,
+                    (*handoff).lease
+                ),
+                MarmotStatus::Ok
+            );
+            crate::attachment_access::marmot_attachment_handoff_free(handoff);
+            let mut uploaded = ptr::null_mut();
+            assert_eq!(
+                marmot_upload_message_draft_attachments(
+                    &client,
+                    account.as_ptr(),
+                    (*kept).revision,
+                    ptr::null(),
+                    1,
+                    ptr::null(),
+                    control,
+                    &mut uploaded,
+                ),
+                MarmotStatus::NullPointer
+            );
+            crate::file_media::marmot_media_file_transfer_control_free(control);
+            marmot_selected_message_draft_free(staged);
+            marmot_selected_message_draft_free(edited);
+            let edited = kept;
             let mut selected = ptr::null_mut();
             assert_eq!(
                 marmot_clear_message_draft_if_revision(

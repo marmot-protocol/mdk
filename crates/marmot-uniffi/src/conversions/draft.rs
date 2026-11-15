@@ -3,7 +3,8 @@
 use std::fmt;
 
 use marmot_app::{
-    MessageDraft, MessageDraftAttachment, MessageDraftAttachmentSummary, MessageDraftSummary,
+    MessageDraft, MessageDraftAttachment, MessageDraftAttachmentFileRequest,
+    MessageDraftAttachmentInput, MessageDraftAttachmentSummary, MessageDraftSummary,
 };
 
 /// One fully hydrated draft attachment crossing the host boundary.
@@ -51,6 +52,84 @@ impl From<MessageDraftAttachmentFfi> for MessageDraftAttachment {
             file_name: value.file_name,
             media_type: value.media_type,
             plaintext: value.plaintext,
+            dim: value.dim,
+            thumbhash: value.thumbhash,
+            duration_seconds: value.duration_seconds,
+            waveform_samples: value.waveform_samples,
+        }
+    }
+}
+
+/// One attachment of a revisioned draft save: a new inline body, or an
+/// attachment the draft already holds, kept by id with its body untouched.
+/// Retain every file-backed attachment (`file_backed` on the selected
+/// draft) by id; leaving one out deletes its staged file.
+#[derive(Clone, uniffi::Enum)]
+pub enum MessageDraftAttachmentInputFfi {
+    Inline {
+        attachment: MessageDraftAttachmentFfi,
+    },
+    Retained {
+        id: String,
+    },
+}
+
+impl fmt::Debug for MessageDraftAttachmentInputFfi {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Inline { attachment } => formatter
+                .debug_struct("Inline")
+                .field("attachment", attachment)
+                .finish(),
+            Self::Retained { .. } => formatter.debug_struct("Retained").finish_non_exhaustive(),
+        }
+    }
+}
+
+impl From<MessageDraftAttachmentInputFfi> for MessageDraftAttachmentInput {
+    fn from(value: MessageDraftAttachmentInputFfi) -> Self {
+        match value {
+            MessageDraftAttachmentInputFfi::Inline { attachment } => {
+                Self::Inline(attachment.into())
+            }
+            MessageDraftAttachmentInputFfi::Retained { id } => Self::Retained(id),
+        }
+    }
+}
+
+/// A host file to copy into the draft as attachment `id`. `source_path`
+/// names a regular file the process can open (not a symlink);
+/// `expected_size`, when set, must equal its length. The metadata is the
+/// same as an inline draft attachment's. Debug output omits every field.
+#[derive(Clone, uniffi::Record)]
+pub struct MessageDraftAttachmentFileRequestFfi {
+    pub id: String,
+    pub source_path: String,
+    pub expected_size: Option<u64>,
+    pub file_name: String,
+    pub media_type: String,
+    pub dim: Option<String>,
+    pub thumbhash: Option<String>,
+    pub duration_seconds: Option<f64>,
+    pub waveform_samples: Vec<f64>,
+}
+
+impl fmt::Debug for MessageDraftAttachmentFileRequestFfi {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MessageDraftAttachmentFileRequestFfi")
+            .finish_non_exhaustive()
+    }
+}
+
+impl From<MessageDraftAttachmentFileRequestFfi> for MessageDraftAttachmentFileRequest {
+    fn from(value: MessageDraftAttachmentFileRequestFfi) -> Self {
+        Self {
+            id: value.id,
+            source_path: value.source_path,
+            expected_size: value.expected_size,
+            file_name: value.file_name,
+            media_type: value.media_type,
             dim: value.dim,
             thumbhash: value.thumbhash,
             duration_seconds: value.duration_seconds,
@@ -228,11 +307,32 @@ mod tests {
         let summary_debug = format!("{summary:?}");
         assert!(summary_debug.contains("attachment_count: 1"));
         assert!(summary_debug.contains("attachment_bytes: 24"));
+        let inputs = [
+            MessageDraftAttachmentInputFfi::Inline {
+                attachment: draft.media_attachments[0].clone(),
+            },
+            MessageDraftAttachmentInputFfi::Retained {
+                id: draft.media_attachments[0].id.clone(),
+            },
+        ];
+        let file_request = MessageDraftAttachmentFileRequestFfi {
+            id: draft.media_attachments[0].id.clone(),
+            source_path: "/private-file-name.txt".to_owned(),
+            expected_size: Some(24),
+            file_name: draft.media_attachments[0].file_name.clone(),
+            media_type: draft.media_attachments[0].media_type.clone(),
+            dim: Some("private-dimensions".to_owned()),
+            thumbhash: Some("private-thumbhash".to_owned()),
+            duration_seconds: Some(1.5),
+            waveform_samples: vec![0.25, 0.75],
+        };
         for debug in [
             debug,
             attachment_debug,
             format!("{attachment_summary:?}"),
             summary_debug,
+            format!("{inputs:?}"),
+            format!("{file_request:?}"),
         ] {
             for sensitive in [
                 "private-group-id",

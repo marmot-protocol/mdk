@@ -4,9 +4,10 @@ use std::collections::HashSet;
 use std::fmt;
 
 use cgka_traits::storage::StorageError;
+use media_store::FileId;
 use storage_sqlite::{
-    StoredMessageDraft, StoredMessageDraftAttachment, StoredMessageDraftAttachmentSummary,
-    StoredMessageDraftSummary,
+    StoredMessageDraft, StoredMessageDraftAttachment, StoredMessageDraftAttachmentInput,
+    StoredMessageDraftAttachmentSummary, StoredMessageDraftSummary,
 };
 
 use crate::{AppError, MarmotApp};
@@ -33,6 +34,42 @@ impl fmt::Debug for MessageDraftAttachment {
             .field("plaintext_len", &self.plaintext.len())
             .field("waveform_sample_count", &self.waveform_samples.len())
             .finish()
+    }
+}
+
+/// One attachment of a draft being saved: new inline bytes, or the id of an
+/// attachment already in the draft, kept as stored. Retaining is how a
+/// file-backed attachment stays in a draft without its bytes crossing again.
+#[derive(Clone, PartialEq)]
+pub enum MessageDraftAttachmentInput {
+    Inline(MessageDraftAttachment),
+    Retained(String),
+}
+
+impl MessageDraftAttachmentInput {
+    fn id(&self) -> &str {
+        match self {
+            Self::Inline(attachment) => &attachment.id,
+            Self::Retained(id) => id,
+        }
+    }
+}
+
+impl fmt::Debug for MessageDraftAttachmentInput {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Inline(attachment) => formatter.debug_tuple("Inline").field(attachment).finish(),
+            Self::Retained(_) => formatter.debug_tuple("Retained").finish_non_exhaustive(),
+        }
+    }
+}
+
+impl From<MessageDraftAttachmentInput> for StoredMessageDraftAttachmentInput {
+    fn from(value: MessageDraftAttachmentInput) -> Self {
+        match value {
+            MessageDraftAttachmentInput::Inline(attachment) => Self::Inline(attachment.into()),
+            MessageDraftAttachmentInput::Retained(id) => Self::Retained(id),
+        }
     }
 }
 
@@ -209,6 +246,9 @@ pub(crate) fn revision_error(
         storage_sqlite::MessageDraftRevisionError::Conflict => {
             AppError::MessageDraftRevisionConflict
         }
+        storage_sqlite::MessageDraftRevisionError::Invalid(details) => {
+            AppError::InvalidMessageDraft(details.to_owned())
+        }
         storage_sqlite::MessageDraftRevisionError::Storage(error) => {
             draft_storage_error(error, group)
         }
@@ -287,14 +327,39 @@ impl MarmotApp {
         reply: Option<&str>,
         attachments: Vec<MessageDraftAttachment>,
     ) -> Result<SelectedMessageDraft, AppError> {
-        validate_message_draft_attachments(&attachments)?;
+        self.save_message_draft_inputs_if_revision(
+            account_ref,
+            expected,
+            content,
+            reply,
+            attachments
+                .into_iter()
+                .map(MessageDraftAttachmentInput::Inline)
+                .collect(),
+        )
+    }
+    /// [`Self::save_message_draft_if_revision`] where each attachment is new
+    /// inline bytes or a retained id of one already in the draft. An
+    /// attachment left out is deleted, and a file it owned is unlinked.
+    pub fn save_message_draft_inputs_if_revision(
+        &self,
+        account_ref: &str,
+        expected: &MessageDraftRevision,
+        content: &str,
+        reply: Option<&str>,
+        attachments: Vec<MessageDraftAttachmentInput>,
+    ) -> Result<SelectedMessageDraft, AppError> {
+        validate_message_draft_inputs(&attachments)?;
         let storage = self.draft_storage(account_ref)?;
         let attachments = attachments.into_iter().map(Into::into).collect::<Vec<_>>();
-        let result = storage
-            .app_storage()
-            .save_message_draft_if_revision(expected, content, reply, &attachments)
-            .map_err(|error| revision_error(error, expected.group_id_hex()))?;
-        self.notify_draft_changed(account_ref, expected.group_id_hex());
+        let group = expected.group_id_hex();
+        let result = self.releasing_draft_files(account_ref, &storage, group, || {
+            storage
+                .app_storage()
+                .save_message_draft_if_revision(expected, content, reply, &attachments)
+                .map_err(|error| revision_error(error, group))
+        })?;
+        self.notify_draft_changed(account_ref, group);
         Ok(result)
     }
     pub fn clear_message_draft_if_revision(
@@ -302,13 +367,61 @@ impl MarmotApp {
         account_ref: &str,
         expected: &MessageDraftRevision,
     ) -> Result<SelectedMessageDraft, AppError> {
-        let result = self
-            .draft_storage(account_ref)?
-            .app_storage()
-            .clear_message_draft_if_revision(expected)
-            .map_err(|error| revision_error(error, expected.group_id_hex()))?;
-        self.notify_draft_changed(account_ref, expected.group_id_hex());
+        let storage = self.draft_storage(account_ref)?;
+        let group = expected.group_id_hex();
+        let result = self.releasing_draft_files(account_ref, &storage, group, || {
+            storage
+                .app_storage()
+                .clear_message_draft_if_revision(expected)
+                .map_err(|error| revision_error(error, group))
+        })?;
+        self.notify_draft_changed(account_ref, group);
         Ok(result)
+    }
+    /// Runs a draft write and then unlinks the staged files it released:
+    /// the write deletes their keys, and nothing else would remove the files
+    /// before the next sweep. Blocking.
+    pub(crate) fn releasing_draft_files<T>(
+        &self,
+        account_ref: &str,
+        storage: &storage_sqlite::SqliteAccountStorage,
+        group: &str,
+        write: impl FnOnce() -> Result<T, AppError>,
+    ) -> Result<T, AppError> {
+        let files = self.draft_files(storage, group);
+        let result = write()?;
+        self.unlink_released_draft_files(account_ref, storage, &files);
+        Ok(result)
+    }
+    /// The staged files a group's draft owns now. Best effort: a failed read
+    /// leaves any release to the sweep. Blocking.
+    pub(crate) fn draft_files(
+        &self,
+        storage: &storage_sqlite::SqliteAccountStorage,
+        group: &str,
+    ) -> Vec<FileId> {
+        storage
+            .app_storage()
+            .message_draft_attachment_files(group)
+            .unwrap_or_default()
+    }
+    /// Unlinks those of `files` whose rows are gone. Best effort; the sweep
+    /// removes anything left. Blocking.
+    pub(crate) fn unlink_released_draft_files(
+        &self,
+        account_ref: &str,
+        storage: &storage_sqlite::SqliteAccountStorage,
+        files: &[FileId],
+    ) {
+        if files.is_empty() {
+            return;
+        }
+        let Ok(account) = self.account_home().account(account_ref) else {
+            return;
+        };
+        if let Ok(media) = self.account_media_store(&account.label, storage) {
+            media.unlink_released(files);
+        }
     }
     pub(crate) fn notify_draft_changed(&self, account_ref: &str, group: &str) {
         if let Ok(account) = self.account_home().account(account_ref) {
@@ -358,6 +471,8 @@ impl MarmotApp {
     }
 
     /// Load one fully hydrated composer draft, including attachment plaintext.
+    /// A draft holding a file-backed attachment is `InvalidMessageDraft`: use
+    /// the selected draft and read file-backed attachments in chunks.
     pub fn message_draft(
         &self,
         account_ref: &str,
@@ -368,7 +483,8 @@ impl MarmotApp {
         Ok(self
             .account_storage(&account.label)?
             .app_storage()
-            .message_draft(group_id_hex)?
+            .message_draft(group_id_hex)
+            .map_err(|error| revision_error(error, group_id_hex))?
             .map(Into::into))
     }
 
@@ -391,10 +507,17 @@ impl MarmotApp {
             .into_iter()
             .map(Into::into)
             .collect::<Vec<_>>();
-        let result = self
-            .account_storage(&account.label)?
-            .app_storage()
-            .save_message_draft(group_id_hex, content, reply_to_message_id_hex, &attachments);
+        let storage = self.account_storage(&account.label)?;
+        let files = self.draft_files(&storage, group_id_hex);
+        let result = storage.app_storage().save_message_draft(
+            group_id_hex,
+            content,
+            reply_to_message_id_hex,
+            &attachments,
+        );
+        if result.is_ok() {
+            self.unlink_released_draft_files(&account.label, &storage, &files);
+        }
         match result {
             Ok(draft) => {
                 self.notify_draft_changed(&account.label, group_id_hex);
@@ -413,9 +536,10 @@ impl MarmotApp {
     ) -> Result<(), AppError> {
         let account = self.account_home().account(account_ref)?;
         self.ensure_account_state(&account.label)?;
-        self.account_storage(&account.label)?
-            .app_storage()
-            .delete_message_draft(group_id_hex)?;
+        let storage = self.account_storage(&account.label)?;
+        self.releasing_draft_files(&account.label, &storage, group_id_hex, || {
+            Ok(storage.app_storage().delete_message_draft(group_id_hex)?)
+        })?;
         self.notify_draft_changed(&account.label, group_id_hex);
         Ok(())
     }
@@ -426,33 +550,58 @@ fn validate_message_draft_attachments(
 ) -> Result<(), AppError> {
     let mut ids = HashSet::with_capacity(attachments.len());
     for attachment in attachments {
-        if attachment.id.trim().is_empty() {
-            return Err(AppError::InvalidMessageDraft(
-                "attachment id must not be empty".to_owned(),
-            ));
+        validate_attachment_id(&mut ids, &attachment.id)?;
+        validate_attachment_media_metadata(
+            attachment.duration_seconds,
+            &attachment.waveform_samples,
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_message_draft_inputs(inputs: &[MessageDraftAttachmentInput]) -> Result<(), AppError> {
+    let mut ids = HashSet::with_capacity(inputs.len());
+    for input in inputs {
+        validate_attachment_id(&mut ids, input.id())?;
+        if let MessageDraftAttachmentInput::Inline(attachment) = input {
+            validate_attachment_media_metadata(
+                attachment.duration_seconds,
+                &attachment.waveform_samples,
+            )?;
         }
-        if !ids.insert(attachment.id.as_str()) {
-            return Err(AppError::InvalidMessageDraft(
-                "attachment ids must be unique".to_owned(),
-            ));
-        }
-        if attachment
-            .duration_seconds
-            .is_some_and(|duration| !duration.is_finite())
-        {
-            return Err(AppError::InvalidMessageDraft(
-                "attachment duration must be finite".to_owned(),
-            ));
-        }
-        if attachment
-            .waveform_samples
-            .iter()
-            .any(|sample| !sample.is_finite())
-        {
-            return Err(AppError::InvalidMessageDraft(
-                "attachment waveform samples must be finite".to_owned(),
-            ));
-        }
+    }
+    Ok(())
+}
+
+fn validate_attachment_id<'a>(ids: &mut HashSet<&'a str>, id: &'a str) -> Result<(), AppError> {
+    if id.trim().is_empty() {
+        return Err(AppError::InvalidMessageDraft(
+            "attachment id must not be empty".to_owned(),
+        ));
+    }
+    if !ids.insert(id) {
+        return Err(AppError::InvalidMessageDraft(
+            "attachment ids must be unique".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// Numeric media metadata must be finite, so callers get a typed validation
+/// error rather than a storage-backend failure.
+pub(crate) fn validate_attachment_media_metadata(
+    duration_seconds: Option<f64>,
+    waveform_samples: &[f64],
+) -> Result<(), AppError> {
+    if duration_seconds.is_some_and(|duration| !duration.is_finite()) {
+        return Err(AppError::InvalidMessageDraft(
+            "attachment duration must be finite".to_owned(),
+        ));
+    }
+    if waveform_samples.iter().any(|sample| !sample.is_finite()) {
+        return Err(AppError::InvalidMessageDraft(
+            "attachment waveform samples must be finite".to_owned(),
+        ));
     }
     Ok(())
 }

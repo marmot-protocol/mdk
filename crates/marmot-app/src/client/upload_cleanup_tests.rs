@@ -817,7 +817,10 @@ async fn a_send_dropped_during_staging_releases_its_upload() {
     let (http, _finish) = client
         .prepare_encrypted_media_upload_payload(
             &group,
-            crate::media::file_transfer::MediaUploadPayload::Files(request, control.clone()),
+            crate::media::file_transfer::MediaUploadPayload::Files(
+                crate::media::file_transfer::FileUploadSources::Host(request),
+                control.clone(),
+            ),
         )
         .await
         .unwrap();

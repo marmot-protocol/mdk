@@ -140,7 +140,8 @@ impl MediaCatalog for SqliteMediaCatalog {
             Ok(conn
                 .execute(
                     "DELETE FROM media_files WHERE id=?1 AND state=?2
-                     AND NOT EXISTS(SELECT 1 FROM outgoing_attachment_uploads WHERE file_id=?1)",
+                     AND NOT EXISTS(SELECT 1 FROM outgoing_attachment_uploads WHERE file_id=?1)
+                     AND NOT EXISTS(SELECT 1 FROM message_draft_attachments WHERE file_id=?1)",
                     params![id.as_bytes().as_slice(), STATE_STAGED],
                 )
                 .storage()?

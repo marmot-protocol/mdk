@@ -46,6 +46,11 @@ impl MessageDraftRevision {
         &self.group_id_hex
     }
 
+    /// Whether `other` names the same store and group, at any revision.
+    pub(crate) fn same_store(&self, other: &Self) -> bool {
+        self.store_epoch == other.store_epoch && self.group_id_hex == other.group_id_hex
+    }
+
     /// Device-local idempotency binding. Never send or log this value.
     #[doc(hidden)]
     pub fn local_submission_binding(&self) -> [u8; 32] {
@@ -75,6 +80,9 @@ pub struct SelectedMessageDraftAttachment {
     pub thumbhash: Option<String>,
     pub duration_seconds: Option<f64>,
     pub waveform_samples: Vec<f64>,
+    /// The bytes live in a staged media-store file rather than the database:
+    /// read them in chunks or through a handoff, never as one buffer.
+    pub file_backed: bool,
 }
 
 #[derive(Clone, PartialEq)]
@@ -91,6 +99,9 @@ pub struct SelectedMessageDraftContent {
 pub enum MessageDraftRevisionError {
     #[error("message draft revision no longer matches")]
     Conflict,
+    /// A request the current draft cannot satisfy; retrying it unchanged fails again.
+    #[error("invalid message draft: {0}")]
+    Invalid(&'static str),
     #[error(transparent)]
     Storage(#[from] StorageError),
 }
@@ -104,7 +115,8 @@ impl SqliteAppStorage {
 
     /// Hash ordered plaintext in the caller's draft-admission snapshot. Ordinary
     /// selected-draft reads remain metadata-only; attachment bytes are borrowed
-    /// one row at a time and never copied into a hydrated draft.
+    /// one row at a time and never copied into a hydrated draft. A file-backed
+    /// attachment reports the digest recorded when its file was staged.
     #[doc(hidden)]
     pub fn message_draft_plaintext_hashes(
         &self,
@@ -115,13 +127,20 @@ impl SqliteAppStorage {
             check_revision_tx(conn, expected)?;
             let mut statement = conn
                 .prepare_cached(
-                    "SELECT plaintext FROM message_draft_attachments
-                     WHERE group_id_hex = ?1 ORDER BY position ASC",
+                    "SELECT a.plaintext, m.plaintext_digest
+                     FROM message_draft_attachments a LEFT JOIN media_files m ON m.id = a.file_id
+                     WHERE a.group_id_hex = ?1 ORDER BY a.position ASC",
                 )
                 .storage()?;
             let mut rows = statement.query([&expected.group_id_hex]).storage()?;
             let mut hashes = Vec::new();
             while let Some(row) = rows.next().storage()? {
+                if let Some(digest) = row.get::<_, Option<Vec<u8>>>(1).storage()? {
+                    hashes.push(digest.try_into().map_err(|_| {
+                        StorageError::Backend("invalid draft attachment digest".into())
+                    })?);
+                    continue;
+                }
                 let plaintext = row.get_ref(0).storage()?;
                 let plaintext = plaintext
                     .as_blob()
@@ -133,20 +152,37 @@ impl SqliteAppStorage {
         })
     }
 
+    /// Replace the draft if `expected` is still current. Each attachment is
+    /// either new inline bytes or a [`StoredMessageDraftAttachmentInput::Retained`]
+    /// id of an attachment already in this draft, kept as stored (a
+    /// file-backed one keeps its file). An attachment left out is deleted,
+    /// and a file it owned is released.
     pub fn save_message_draft_if_revision(
         &self,
         expected: &MessageDraftRevision,
         content: &str,
         reply: Option<&str>,
-        attachments: &[StoredMessageDraftAttachment],
+        attachments: &[StoredMessageDraftAttachmentInput],
     ) -> Result<SelectedMessageDraft, MessageDraftRevisionError> {
-        validate_waveform_samples(attachments)?;
+        let attachments = attachments
+            .iter()
+            .map(DraftAttachmentInput::from)
+            .collect::<Vec<_>>();
+        validate_waveform_samples(attachments.iter().filter_map(DraftAttachmentInput::inline))?;
         self.connection.with_transaction(|| {
             {
                 let conn = self.lock()?;
                 check_revision_tx(&conn, expected)?;
+                let stored = draft_attachment_ids_tx(&conn, &expected.group_id_hex)?;
+                if attachments.iter().any(|attachment| {
+                    matches!(attachment, DraftAttachmentInput::Retained(id) if !stored.contains(*id))
+                }) {
+                    return Err(MessageDraftRevisionError::Invalid(
+                        "a retained attachment is not in the draft",
+                    ));
+                }
             }
-            self.write_message_draft(&expected.group_id_hex, content, reply, attachments)?;
+            self.write_message_draft(&expected.group_id_hex, content, reply, &attachments)?;
             Ok(self.selected_message_draft(&expected.group_id_hex)?)
         })
     }
@@ -158,16 +194,13 @@ impl SqliteAppStorage {
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
             check_revision_tx(&conn, expected)?;
-            conn.execute_cached(
-                "DELETE FROM message_drafts WHERE group_id_hex = ?1",
-                [&expected.group_id_hex],
-            )
-            .storage()?;
+            end_composition_tx(&conn, &expected.group_id_hex)?;
             Ok(selected_tx(&conn, &expected.group_id_hex)?)
         })
     }
 
     /// Hydrate only the requested attachment, guarded by the selected revision.
+    /// A file-backed attachment is refused: read it in chunks instead.
     pub fn message_draft_attachment_if_revision(
         &self,
         expected: &MessageDraftRevision,
@@ -175,16 +208,21 @@ impl SqliteAppStorage {
     ) -> Result<Option<Vec<u8>>, MessageDraftRevisionError> {
         self.connection.with_deferred_read(|conn| {
             check_revision_tx(conn, expected)?;
-            let bytes = conn
+            let row: Option<(Vec<u8>, bool)> = conn
                 .query_row_cached(
-                    "SELECT plaintext FROM message_draft_attachments
+                    "SELECT plaintext, file_id IS NOT NULL FROM message_draft_attachments
                 WHERE group_id_hex = ?1 AND attachment_id = ?2",
                     params![expected.group_id_hex, attachment_id],
-                    |row| row.get(0),
+                    |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .optional()
                 .storage()?;
-            Ok(bytes)
+            match row {
+                Some((_, true)) => Err(MessageDraftRevisionError::Invalid(
+                    "file-backed draft attachments are read in chunks",
+                )),
+                row => Ok(row.map(|(bytes, _)| bytes)),
+            }
         })
     }
 
@@ -247,7 +285,50 @@ impl SqliteAppStorage {
     }
 }
 
-fn revision_tx(conn: &Connection, group: &str) -> StorageResult<MessageDraftRevision> {
+/// Ends the group's composition: deletes its draft, if any, and moves the
+/// composition so a file still being staged into it never joins the next
+/// one. The trigger on `message_drafts` moves it when a row goes; a
+/// composer with no row yet is moved here.
+pub(super) fn end_composition_tx(conn: &Connection, group: &str) -> StorageResult<()> {
+    let deleted = conn
+        .execute_cached(
+            "DELETE FROM message_drafts WHERE group_id_hex = ?1",
+            [group],
+        )
+        .storage()?;
+    if deleted == 0 {
+        conn.execute_cached(
+            "UPDATE message_draft_revision_clock SET revision = revision + 1",
+            [],
+        )
+        .storage()?;
+        conn.execute_cached(
+            "UPDATE message_draft_revisions
+                SET composition = (SELECT revision FROM message_draft_revision_clock)
+              WHERE group_id_hex = ?1",
+            [group],
+        )
+        .storage()?;
+    }
+    Ok(())
+}
+
+/// The group's composition: a revision-clock value taken when its row was
+/// created and whenever a draft ended ([`end_composition_tx`] or a deleted
+/// draft row), so no two compositions, of one group or its recreation, share
+/// it.
+pub(super) fn composition_tx(conn: &Connection, group: &str) -> StorageResult<i64> {
+    conn.query_row_cached(
+        "SELECT composition FROM message_draft_revisions WHERE group_id_hex = ?1",
+        [group],
+        |row| row.get(0),
+    )
+    .optional()
+    .storage()?
+    .ok_or(StorageError::NotFound)
+}
+
+pub(super) fn revision_tx(conn: &Connection, group: &str) -> StorageResult<MessageDraftRevision> {
     conn.query_row_cached(
         "SELECT m.store_epoch, r.revision FROM message_draft_revisions r
          CROSS JOIN chat_presentation_meta m WHERE r.group_id_hex = ?1 AND m.id = 1",
@@ -287,7 +368,7 @@ pub(crate) fn chat_list_version_tx(
     }))
 }
 
-fn check_revision_tx(
+pub(super) fn check_revision_tx(
     conn: &Connection,
     expected: &MessageDraftRevision,
 ) -> Result<(), MessageDraftRevisionError> {
@@ -323,9 +404,11 @@ pub(crate) fn selected_tx(conn: &Connection, group: &str) -> StorageResult<Selec
     Ok(SelectedMessageDraft { revision, draft })
 }
 
-pub(crate) const SELECTED_ATTACHMENTS_SQL: &str =
-    "SELECT attachment_id, file_name, media_type, length(plaintext),
-        dim, thumbhash, duration_seconds, waveform_samples_json FROM message_draft_attachments
+pub(crate) const SELECTED_ATTACHMENTS_SQL: &str = "SELECT attachment_id, file_name, media_type,
+        CASE WHEN file_id IS NULL THEN length(plaintext)
+            ELSE (SELECT m.byte_len FROM media_files m WHERE m.id = file_id) END,
+        dim, thumbhash, duration_seconds, waveform_samples_json, file_id IS NOT NULL
+        FROM message_draft_attachments
         WHERE group_id_hex = ?1 ORDER BY position";
 
 fn selected_attachments_tx(
@@ -339,17 +422,27 @@ fn selected_attachments_tx(
                 row.get(0)?,
                 row.get(1)?,
                 row.get(2)?,
-                row.get::<_, i64>(3)?,
+                row.get::<_, Option<i64>>(3)?.unwrap_or_default(),
                 row.get(4)?,
                 row.get(5)?,
                 row.get(6)?,
                 row.get::<_, String>(7)?,
+                row.get(8)?,
             ))
         })
         .storage()?;
     rows.map(|row| {
-        let (id, file_name, media_type, size, dim, thumbhash, duration_seconds, waveform) =
-            row.storage()?;
+        let (
+            id,
+            file_name,
+            media_type,
+            size,
+            dim,
+            thumbhash,
+            duration_seconds,
+            waveform,
+            file_backed,
+        ) = row.storage()?;
         Ok(SelectedMessageDraftAttachment {
             id,
             file_name,
@@ -361,6 +454,7 @@ fn selected_attachments_tx(
             duration_seconds,
             waveform_samples: serde_json::from_str(&waveform)
                 .map_err(|_| StorageError::Serialization("invalid draft waveform".into()))?,
+            file_backed,
         })
     })
     .collect()

@@ -110,6 +110,112 @@ impl Marmot {
             )?
             .into())
     }
+    /// `save_message_draft_if_revision` for drafts with file-backed
+    /// attachments: each input is a new inline body or an attachment the
+    /// draft already holds, kept by id. Saving text never copies a retained
+    /// body. Leaving a file-backed attachment out deletes its file; an id
+    /// the draft does not hold is `InvalidMessageDraft`.
+    pub fn save_message_draft_inputs_if_revision(
+        &self,
+        account_ref: String,
+        revision: Arc<MessageDraftRevisionFfi>,
+        content: String,
+        reply_to_message_id_hex: Option<String>,
+        media_attachments: Vec<MessageDraftAttachmentInputFfi>,
+    ) -> Result<SelectedMessageDraftFfi, MarmotKitError> {
+        let reply = crate::optional_message_id_hex(reply_to_message_id_hex)?;
+        Ok(self
+            .app
+            .save_message_draft_inputs_if_revision(
+                &account_ref,
+                &revision.inner,
+                &content,
+                reply.as_deref(),
+                media_attachments.into_iter().map(Into::into).collect(),
+            )?
+            .into())
+    }
+    /// Copy a host file into the account's encrypted media store and append
+    /// it to the draft `revision` selects, up to the encrypted-media blob
+    /// limit; returns the new selected draft. The host may delete its file
+    /// once this returns. Text saves while the file copies keep it, but the
+    /// host's next save with an older revision conflicts and must reload; a
+    /// draft cleared, deleted or sent during the copy discards it with
+    /// `MessageDraftRevisionConflict`.
+    /// Refused before copying: a file over the blob limit, a draft it would
+    /// take past 64 attachments or one upload batch, an id already in the
+    /// draft, and a copy the disk cannot hold beyond its reserve
+    /// (`StorageFull`). The media type is stored in its canonical form, as
+    /// the upload describes it; one that has none is refused before copying.
+    /// `control` reports copied bytes and cancels; a cancelled copy leaves no
+    /// file and no change to the draft.
+    pub async fn stage_message_draft_attachment_file(
+        &self,
+        account_ref: String,
+        revision: Arc<MessageDraftRevisionFfi>,
+        request: MessageDraftAttachmentFileRequestFfi,
+        control: Arc<MediaFileTransferControlFfi>,
+    ) -> Result<SelectedMessageDraftFfi, MarmotKitError> {
+        Ok(self
+            .runtime
+            .stage_message_draft_attachment_file(
+                &account_ref,
+                revision.inner.clone(),
+                request.into(),
+                control.inner.clone(),
+            )
+            .await?
+            .into())
+    }
+    /// Read 1..=1048576 bytes at an offset from one draft attachment, inline
+    /// or file-backed, rejecting a changed selected draft. `None` means the
+    /// draft holds no such attachment; an empty result is the end.
+    pub async fn read_message_draft_attachment(
+        &self,
+        account_ref: String,
+        revision: Arc<MessageDraftRevisionFfi>,
+        attachment_id: String,
+        offset: u64,
+        limit: u32,
+    ) -> Result<Option<Vec<u8>>, MarmotKitError> {
+        Ok(self
+            .runtime
+            .read_message_draft_attachment(
+                &account_ref,
+                revision.inner.clone(),
+                attachment_id,
+                offset,
+                limit as usize,
+            )
+            .await?
+            .map(|mut bytes| std::mem::take(&mut *bytes)))
+    }
+    /// `open_attachment_handoff` for a draft attachment: a plaintext copy
+    /// for an OS surface that needs a real file (thumbnails, playback),
+    /// released with `release_attachment_handoff`. The revision is checked
+    /// once, before the copy. `None` means the draft holds no such
+    /// attachment. Cancel only through `control`, as for
+    /// `open_attachment_handoff`.
+    // Polled on the caller for the same reason as `open_attachment_handoff`.
+    #[marmot_uniffi_macros::receive]
+    pub async fn open_message_draft_attachment_handoff(
+        &self,
+        account_ref: String,
+        revision: Arc<MessageDraftRevisionFfi>,
+        attachment_id: String,
+        control: Arc<MediaFileTransferControlFfi>,
+    ) -> Result<Option<AttachmentHandoffFfi>, MarmotKitError> {
+        Ok(self
+            .runtime
+            .open_message_draft_attachment_handoff(
+                &account_ref,
+                revision.inner.clone(),
+                attachment_id,
+                control.inner.clone(),
+            )
+            .await?
+            .map(Into::into))
+    }
     /// Read only the requested local attachment, rejecting a changed selected draft.
     pub fn message_draft_attachment_if_revision(
         &self,

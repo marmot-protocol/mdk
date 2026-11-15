@@ -182,8 +182,11 @@ func conversationRoundTrips() throws {
     precondition(copy == refs)
     let attachment = SelectedMessageDraftAttachmentFfi(id: "a", fileName: "voice.ogg", mediaType: "audio/ogg",
         plaintextSize: UInt64.max, dim: nil, thumbhash: "thumb", durationSeconds: 1.5, waveformSamples: [0.2, 0.5])
+    precondition(!attachment.fileBacked)
+    let staged = SelectedMessageDraftAttachmentFfi(id: "v", fileName: "clip.mp4", mediaType: "video/mp4",
+        plaintextSize: UInt64.max, dim: nil, thumbhash: nil, durationSeconds: nil, waveformSamples: [], fileBacked: true)
     let draft = SelectedMessageDraftContentFfi(groupIdHex: "group", content: "unsent", replyToMessageIdHex: nil,
-        mediaAttachments: [attachment], createdAtMs: 1, updatedAtMs: 2)
+        mediaAttachments: [attachment, staged], createdAtMs: 1, updatedAtMs: 2)
     let draftCopy = try FfiConverterTypeSelectedMessageDraftContentFfi.lift(FfiConverterTypeSelectedMessageDraftContentFfi.lower(draft))
     precondition(draftCopy == draft)
 }
@@ -199,6 +202,15 @@ func compileConversationCommands(_ marmot: Marmot, account: String, group: Strin
         }
         _ = try marmot.messageDraftAttachmentIfRevision(accountRef: account, revision: initial.draft.revision, attachmentId: "a")
         _ = try marmot.saveMessageDraftIfRevision(accountRef: account, revision: initial.draft.revision, content: "draft", replyToMessageIdHex: nil, mediaAttachments: [])
+        let control = MediaFileTransferControlFfi()
+        let request = MessageDraftAttachmentFileRequestFfi(id: "v", sourcePath: "/tmp/clip.mp4", expectedSize: nil,
+            fileName: "clip.mp4", mediaType: "video/mp4", dim: nil, thumbhash: nil, durationSeconds: nil, waveformSamples: [])
+        let staged = try await marmot.stageMessageDraftAttachmentFile(accountRef: account, revision: initial.draft.revision, request: request, control: control)
+        _ = try marmot.saveMessageDraftInputsIfRevision(accountRef: account, revision: staged.revision, content: "draft",
+            replyToMessageIdHex: nil, mediaAttachments: [.retained(id: "v")])
+        _ = try await marmot.readMessageDraftAttachment(accountRef: account, revision: staged.revision, attachmentId: "v", offset: 0, limit: 1024)
+        _ = try await marmot.openMessageDraftAttachmentHandoff(accountRef: account, revision: staged.revision, attachmentId: "v", control: control)
+        _ = try await marmot.uploadMessageDraftAttachments(accountRef: account, revision: staged.revision, attachmentIds: ["v"], blossomServer: nil, control: control)
     }
     _ = try await window.next()
     await window.cancel()

@@ -290,9 +290,10 @@ pub use config::{
     MarmotServiceEndpoints, RelayTelemetrySettings,
 };
 pub use drafts::{
-    ChatListDraftVersion, MessageDraft, MessageDraftAttachment, MessageDraftAttachmentSummary,
-    MessageDraftInvalidation, MessageDraftRevision, MessageDraftSummary, SelectedMessageDraft,
-    SelectedMessageDraftAttachment, SelectedMessageDraftContent,
+    ChatListDraftVersion, MessageDraft, MessageDraftAttachment, MessageDraftAttachmentInput,
+    MessageDraftAttachmentSummary, MessageDraftInvalidation, MessageDraftRevision,
+    MessageDraftSummary, SelectedMessageDraft, SelectedMessageDraftAttachment,
+    SelectedMessageDraftContent,
 };
 pub use error::{
     AccountCatchUpFailure, AppError, FullHistoryRepairIncompleteReason, MissingKeyPackageReason,
@@ -9504,7 +9505,8 @@ pub use runtime::{
 };
 pub use runtime::{
     AttachmentKeepMedia, AttachmentMigrationState, AttachmentStorageUsage, ChatAttachmentUsage,
-    ChatUsageCursor, RetainedAttachmentSummary, RetainedSizeCursor,
+    ChatUsageCursor, MAX_MESSAGE_DRAFT_ATTACHMENT_FILE_BYTES, MAX_MESSAGE_DRAFT_ATTACHMENTS,
+    MessageDraftAttachmentFileRequest, RetainedAttachmentSummary, RetainedSizeCursor,
 };
 
 pub use runtime::{

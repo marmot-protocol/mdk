@@ -680,6 +680,12 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   retained body (either layout) into `<account>/handoff/<lease>/<name>` for an OS surface that needs a real file.
   Register a lease before its directory exists, delete only on explicit release or by `wipe_stale` (worker start,
   sparing this process's live leases and never following a symlink), and never sync, rename or lock these files.
+- `runtime/draft_files.rs` owns file-backed composer-draft attachments (mdk#3431): staging a host file into the draft
+  (limits, `DiskPolicy::send_need` admission and the count/size checks before any copy; cancellation and a changed
+  source are checked inside the commit), ranged reads, handoffs (`HandoffBody::Staged`) and uploads, which copy the
+  draft's file into an upload-owned staged file (`stage_draft_sources`) and check its digest. Every draft write that
+  can drop a file-backed row (`drafts.rs` `releasing_draft_files`) unlinks the released files before returning;
+  sends leave that to the sweep.
 - `media/outgoing.rs` owns the send path on the media store (mdk#2314 step 3): `SendStaging` admits each body with
   `DiskPolicy::send_need` (a shortfall is `StorageError::Capacity`, which bindings surface as `StorageFull`), reserves
   an `outgoing_attachment_uploads` row and stages the body as that row's file before the first PUT; `upload_staged`

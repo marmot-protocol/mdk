@@ -1316,7 +1316,55 @@ pub fn message_draft_attachment_if_revision( &self, account_ref: String, revisio
 
 Read only the requested local attachment, rejecting a changed selected draft.
 
-[Source](src/commands/conversation_window.rs#L114)
+[Source](src/commands/conversation_window.rs#L220)
+
+### `Marmot::save_message_draft_inputs_if_revision`
+
+**Current.** **C:** `marmot_save_message_draft_inputs_if_revision`.
+
+```rust
+pub fn save_message_draft_inputs_if_revision( &self, account_ref: String, revision: Arc<MessageDraftRevisionFfi>, content: String, reply_to_message_id_hex: Option<String>, media_attachments: Vec<MessageDraftAttachmentInputFfi>, ) -> Result<SelectedMessageDraftFfi, MarmotKitError>
+```
+
+The save to use once a draft can hold file-backed attachments. Each input is a new inline body (`Inline`) or an attachment the draft already holds, kept by id (`Retained`) without reading or copying its body, so typing a caption next to a large video stays cheap. Order is the inputs' order. Retain every `file_backed` attachment you mean to keep: one left out is deleted with its staged file before this returns. A retained id the draft does not hold is `InvalidMessageDraft`; a stale revision is `MessageDraftRevisionConflict`. `save_message_draft_if_revision` remains for drafts with inline bodies only.
+
+[Source](src/commands/conversation_window.rs#L118)
+
+### `Marmot::stage_message_draft_attachment_file`
+
+**Current.** **C:** `marmot_stage_message_draft_attachment_file`.
+
+```rust
+pub async fn stage_message_draft_attachment_file( &self, account_ref: String, revision: Arc<MessageDraftRevisionFfi>, request: MessageDraftAttachmentFileRequestFfi, control: Arc<MediaFileTransferControlFfi>, ) -> Result<SelectedMessageDraftFfi, MarmotKitError>
+```
+
+Add a large attachment to a draft from a host file instead of a byte array. The file (a regular file, not a symlink; `expected_size` must match when set, and it must not change while it is read) is copied with bounded buffers into the account's encrypted media store, and the draft owns that copy: it survives text saves and restarts and is released when the draft drops it, is cleared or is sent. The host may delete its own file once this returns. Attachments may reach the encrypted-media blob limit (the limit less the 16-byte AEAD tag), with at most 64 per draft and the draft within one upload batch (`max_file_media_ciphertext_bytes()`). These limits, a duplicate id and a copy the disk cannot hold beyond the attachment policy's `disk_reserve` (`StorageFull`) are refused before anything is copied. The media type is stored in its canonical form (lowercase, parameters dropped), as the upload will describe it; a type with no canonical form is refused before copying too. `revision` must be current when the call starts; text saves made while the file copies do not lose it, but the next save with an older revision conflicts, so reload with `selected_message_draft` after this returns. A draft cleared, deleted or sent during the copy stays so, and the copy is discarded with `MessageDraftRevisionConflict`. `control` reports copied bytes and cancels; a cancelled or failed copy leaves no file and no change to the draft.
+
+[Source](src/commands/conversation_window.rs#L152)
+
+### `Marmot::read_message_draft_attachment`
+
+**Current.** **C:** `marmot_read_message_draft_attachment`.
+
+```rust
+pub async fn read_message_draft_attachment( &self, account_ref: String, revision: Arc<MessageDraftRevisionFfi>, attachment_id: String, offset: u64, limit: u32, ) -> Result<Option<Vec<u8>>, MarmotKitError>
+```
+
+Read 1..=1048576 bytes at `offset` from one draft attachment, inline or file-backed, for previews and thumbnails without hydrating the whole body. `None` means the draft holds no such attachment; an empty result is the end. Every call rechecks `revision`, so a draft edited between chunks conflicts and the host must restart from a fresh revision; for long reads or OS surfaces that need a file, prefer `open_message_draft_attachment_handoff`. `message_draft_attachment_if_revision` refuses file-backed attachments.
+
+[Source](src/commands/conversation_window.rs#L173)
+
+### `Marmot::open_message_draft_attachment_handoff`
+
+**Current.** **C:** `marmot_open_message_draft_attachment_handoff`.
+
+```rust
+pub async fn open_message_draft_attachment_handoff( &self, account_ref: String, revision: Arc<MessageDraftRevisionFfi>, attachment_id: String, control: Arc<MediaFileTransferControlFfi>, ) -> Result<Option<AttachmentHandoffFfi>, MarmotKitError>
+```
+
+`open_attachment_handoff` for a draft attachment: writes a plaintext copy under the account's `handoff/` directory for an OS surface that needs a real file (AVFoundation thumbnails, playback, share sheets) and lends it under a lease. The revision is checked once, before the copy; later draft edits neither interrupt it nor revoke the lease. `None` means the draft holds no such attachment. Release the copy with `release_attachment_handoff`. `StorageFull`, the `control` contract and the cancellation rules are those of `open_attachment_handoff`: cancel only through `control`, never by cancelling the awaiting task.
+
+[Source](src/commands/conversation_window.rs#L201)
 
 </details>
 
@@ -2766,6 +2814,18 @@ File-backed uploads have no fixed worker-response timeout; per-endpoint network 
 
 [Source](src/commands/media.rs#L182)
 
+### `Marmot::upload_message_draft_attachments`
+
+**Current.** **C:** `marmot_upload_message_draft_attachments`.
+
+```rust
+pub async fn upload_message_draft_attachments( &self, account_ref: String, revision: Arc<MessageDraftRevisionFfi>, attachment_ids: Vec<String>, blossom_server: Option<String>, control: Arc<MediaFileTransferControlFfi>, ) -> Result<MediaUploadResultFfi, MarmotKitError>
+```
+
+`upload_media_files` for a draft's own attachments: encrypts and uploads the attachments `attachment_ids` names (1..=64 distinct ids, in that order) from the copies the draft holds, inline or file-backed, so the host never re-reads or re-sends large bodies. Upload only: pass the returned references, in order, to `send_message_draft` with the same revision; they carry the draft's descriptors and the staged bodies' `plaintext_sha256`, and durable acceptance clears the draft, releasing its files. `revision` must be current when the bodies are read. `blossom_server` overrides the group's endpoints. Progress, cancellation, the batch bound, `StorageFull` and server fallback are as for `upload_media_files`; the draft and its files are untouched by the upload.
+
+[Source](src/commands/media.rs#L209)
+
 ### `Marmot::download_media`
 
 **Compatibility.** Prefer retained local access plus transfer controls for received chat media. Explicit one-shot fetch remains supported.
@@ -2776,7 +2836,7 @@ pub async fn download_media( &self, account_ref: String, group_id_hex: String, r
 
 Fetch an encrypted media blob and decrypt it using the group's encrypted media component secret.
 
-[Source](src/commands/media.rs#L212)
+[Source](src/commands/media.rs#L240)
 
 ### `Marmot::list_media`
 
@@ -2788,7 +2848,7 @@ pub fn list_media( &self, account_ref: String, group_id_hex: String, limit: Opti
 
 Typed media references projected from group message history. Host apps can pass a returned `reference` back to `download_media`.
 
-[Source](src/commands/media.rs#L233)
+[Source](src/commands/media.rs#L261)
 
 </details>
 
@@ -4331,7 +4391,7 @@ pub fn includes_chat_list_version(&self, version: Arc<ChatListDraftVersionFfi>) 
 
 Compare a chat-list row’s opaque `draft_version` with this captured composer revision. True means the same account store/group and a version no newer than this revision; false includes foreign store/group metadata and newer identical edits. This is presentation correlation, not mutation authorization. Keep both values device-local and use revision-checked cleanup. See [pending-send draft presentation](CHAT-LIST-ROWS.md#pending-send-draft-presentation-0130).
 
-[Source](src/conversions/conversation_window.rs#L350)
+[Source](src/conversions/conversation_window.rs#L356)
 
 </details>
 
@@ -4560,7 +4620,7 @@ pub fn new_with_configuration( root_path: String, relay_urls: Vec<String>, optio
 
 Open with any combination of runtime options, including the required deployment. The other constructors are wrappers around this entry point and take the deployment as their last argument.
 
-[Source](src/lib.rs#L339)
+[Source](src/lib.rs#L340)
 
 ### `Marmot::new_with_experimental_device_groups`
 
@@ -4570,7 +4630,7 @@ pub fn new_with_experimental_device_groups( root_path: String, relay_urls: Vec<S
 
 Open a controlled development build with device-group capability and explicit runtime intent. The library must enable `dev-device-groups`; otherwise it returns Runtime with `experimental_device_groups_unavailable` before opening the root or acquiring host secret storage. It takes the same `MarmotOptions` and required deployment as `new_with_configuration`, preserving their ordinary meanings and ownership. Ordinary constructors remain disabled even in a capable library. Use this constructor for every foreground/background opener of the experimental root, a notification service extension included: an ordinary constructor does not open an account that holds or is joining a device group and reports Runtime with `experimental_device_groups_required`; see the [shared host test-build guidance](README.md#experimental-device-group-test-builds). Production timing is unchanged. This is not release activation or proof of mobile artifact/device validation.
 
-[Source](src/lib.rs#L354)
+[Source](src/lib.rs#L355)
 
 ### `Marmot::new_with_options`
 
@@ -4582,7 +4642,7 @@ pub fn new_with_options( root_path: String, relay_urls: Vec<String>, relay_polic
 
 Open with an explicit relay policy and optional host-owned key storage. Existing constructors retain their public-only relay policy.
 
-[Source](src/lib.rs#L365)
+[Source](src/lib.rs#L366)
 
 ### `Marmot::new`
 
@@ -4594,7 +4654,7 @@ pub fn new( root_path: String, relay_urls: Vec<String>, deployment: MarmotDeploy
 
 Open the Marmot app at `root_path`, configured with the given default relay URLs and `deployment`. Account secrets (Nostr private keys) are stored in the platform keyring (Keychain on Apple platforms, Android's native keyring on Android) under the deployment's `keychain_service` — not in a plaintext file. Fallible because initializing the platform secret store can fail or another process may own the same root (`MarmotKitError::RuntimeBusy`). Root ownership is nonblocking and remains held until the final `Marmot`/runtime handle is dropped, even after `Marmot::shutdown`. Call `Marmot::start` before subscribing to events.
 
-[Source](src/lib.rs#L394)
+[Source](src/lib.rs#L395)
 
 ### `Marmot::new_with_secret_store`
 
@@ -4606,7 +4666,7 @@ pub fn new_with_secret_store( root_path: String, relay_urls: Vec<String>, secret
 
 Open the Marmot app with host-supplied account-secret storage instead of the platform keychain. Identical to `Marmot::new` except that every read, write, and removal of an account signing key goes through `secret_store`.
 
-[Source](src/lib.rs#L420)
+[Source](src/lib.rs#L421)
 
 ### `Marmot::new_with_cursor_persistence`
 
@@ -4618,7 +4678,7 @@ pub fn new_with_cursor_persistence( root_path: String, relay_urls: Vec<String>, 
 
 Construct with explicit advancing/frozen relay cursor behavior; new_with_configuration composes this with other options.
 
-[Source](src/lib.rs#L451)
+[Source](src/lib.rs#L452)
 
 ### `Marmot::new_with_client_name`
 
@@ -4630,7 +4690,7 @@ pub fn new_with_client_name( root_path: String, relay_urls: Vec<String>, client_
 
 Open with an optional public client label for new KeyPackage publications. Existing constructors remain untagged. Whitespace-only labels, and labels longer than 64 bytes once trimmed, are omitted rather than truncated. Hosts must supply this on every foreground/background runtime construction.
 
-[Source](src/lib.rs#L472)
+[Source](src/lib.rs#L473)
 
 ### `Marmot::start`
 
@@ -4642,7 +4702,7 @@ pub async fn start(&self) -> Result<(), MarmotKitError>
 
 Bring the runtime to local readiness.
 
-[Source](src/lib.rs#L510)
+[Source](src/lib.rs#L511)
 
 ### `Marmot::shutdown`
 
@@ -4654,7 +4714,7 @@ pub async fn shutdown(&self)
 
 Tear the runtime down. Drops all subscriptions; long-lived `EventsSubscription` / `ChatsSubscription` / etc. instances on the host side will see their `next()` return `None` shortly after.
 
-[Source](src/lib.rs#L522)
+[Source](src/lib.rs#L523)
 
 ### `Marmot::shutdown_and_close`
 
@@ -4666,7 +4726,7 @@ pub async fn shutdown_and_close(&self) -> Result<(), MarmotKitError>
 
 Terminally stop work, close storage and release root ownership; reconstruct before further reads/work.
 
-[Source](src/lib.rs#L558)
+[Source](src/lib.rs#L559)
 
 ### `Marmot::storage_is_closed`
 
@@ -4678,7 +4738,7 @@ pub fn storage_is_closed(&self) -> bool
 
 True once `Marmot::shutdown_and_close` has closed the store. A host can check this to confirm it is safe to be suspended, or to notice it is holding a spent handle and needs a fresh one.
 
-[Source](src/lib.rs#L566)
+[Source](src/lib.rs#L567)
 
 ### `Marmot::is_stopping`
 
@@ -4690,7 +4750,7 @@ pub fn is_stopping(&self) -> bool
 
 True once shutdown has started. Host apps can use this to avoid launching more subscriptions or account work while they are moving to the background.
 
-[Source](src/lib.rs#L573)
+[Source](src/lib.rs#L574)
 
 </details>
 

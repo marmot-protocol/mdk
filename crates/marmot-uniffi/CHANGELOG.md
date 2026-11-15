@@ -8,6 +8,13 @@
   chat with `disappearingMessageSecs` in its founding MLS state and Welcome. Reuse and retry keep the existing chat's
   duration and roles. `startDirectConversation` is unchanged. Regenerate Swift and Kotlin bindings with the matching
   native library (#3365).
+- File-backed composer-draft attachments (#3431):
+  `stage_message_draft_attachment_file`, `read_message_draft_attachment`,
+  `open_message_draft_attachment_handoff`, `upload_message_draft_attachments`
+  and `save_message_draft_inputs_if_revision` with
+  `MessageDraftAttachmentInputFfi`. `SelectedMessageDraftAttachmentFfi` gains
+  `file_backed` and `AttachmentStorageUsageFfi` gains `draft_bytes`, both with
+  defaults. See [Conversation windows](CONVERSATION-WINDOW.md#file-backed-attachments).
 
 ## 0.17.0 - 2026-11-15
 

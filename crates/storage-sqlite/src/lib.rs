@@ -121,9 +121,12 @@ pub use app::history_deliveries::{
     ParkedHistoryDelivery,
 };
 pub use app::message_drafts::{
-    ChatListDraftVersion, MessageDraftRevision, MessageDraftRevisionError, SelectedMessageDraft,
-    SelectedMessageDraftAttachment, SelectedMessageDraftContent, StoredMessageDraft,
-    StoredMessageDraftAttachment, StoredMessageDraftAttachmentSummary, StoredMessageDraftSummary,
+    ChatListDraftVersion, MessageDraftAttachmentFileMeta, MessageDraftAttachmentRead,
+    MessageDraftAttachmentStage, MessageDraftRevision, MessageDraftRevisionError,
+    MessageDraftStageRefusal, MessageDraftUploadBody, MessageDraftUploadSource,
+    SelectedMessageDraft, SelectedMessageDraftAttachment, SelectedMessageDraftContent,
+    StoredMessageDraft, StoredMessageDraftAttachment, StoredMessageDraftAttachmentInput,
+    StoredMessageDraftAttachmentSummary, StoredMessageDraftSummary,
 };
 pub use app::pending_welcome_delivery::PendingWelcomeDeliveryRecord;
 pub use app::private_key_packages::{PrivateKeyPackageNeed, ReceivedPrivateKeyPackage};

@@ -156,7 +156,10 @@ fun conversationRoundTrips() {
     check(FfiConverterTypeConversationMessageReferencesFfi.lift(FfiConverterTypeConversationMessageReferencesFfi.lower(refs)) == refs)
     val attachment = SelectedMessageDraftAttachmentFfi("a", "voice.ogg", "audio/ogg", ULong.MAX_VALUE,
         null, "thumb", 1.5, listOf(0.2, 0.5))
-    val draft = SelectedMessageDraftContentFfi("group", "unsent", null, listOf(attachment), 1L, 2L)
+    check(!attachment.fileBacked)
+    val staged = SelectedMessageDraftAttachmentFfi("v", "clip.mp4", "video/mp4", ULong.MAX_VALUE,
+        null, null, null, emptyList(), true)
+    val draft = SelectedMessageDraftContentFfi("group", "unsent", null, listOf(attachment, staged), 1L, 2L)
     check(FfiConverterTypeSelectedMessageDraftContentFfi.lift(FfiConverterTypeSelectedMessageDraftContentFfi.lower(draft)) == draft)
 }
 suspend fun compileConversationCommands(marmot: Marmot, account: String, group: String) {
@@ -170,6 +173,15 @@ suspend fun compileConversationCommands(marmot: Marmot, account: String, group: 
             }
             marmot.messageDraftAttachmentIfRevision(account, initial.draft.revision, "a")
             marmot.saveMessageDraftIfRevision(account, initial.draft.revision, "draft", null, emptyList())
+            val control = MediaFileTransferControlFfi()
+            val request = MessageDraftAttachmentFileRequestFfi("v", "/tmp/clip.mp4", null, "clip.mp4", "video/mp4",
+                null, null, null, emptyList())
+            val staged = marmot.stageMessageDraftAttachmentFile(account, initial.draft.revision, request, control)
+            marmot.saveMessageDraftInputsIfRevision(account, staged.revision, "draft", null,
+                listOf(MessageDraftAttachmentInputFfi.Retained("v")))
+            marmot.readMessageDraftAttachment(account, staged.revision, "v", 0uL, 1024u)
+            marmot.openMessageDraftAttachmentHandoff(account, staged.revision, "v", control)
+            marmot.uploadMessageDraftAttachments(account, staged.revision, listOf("v"), null, control)
         }
         window.next()
         window.cancel()

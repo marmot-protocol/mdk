@@ -9,6 +9,7 @@ mod compromise_warning;
 mod device_group;
 #[cfg(feature = "test-policy-overrides")]
 mod device_pairing;
+mod draft_files;
 mod draft_lifecycle;
 mod follow_list_edits;
 mod group_lookup;

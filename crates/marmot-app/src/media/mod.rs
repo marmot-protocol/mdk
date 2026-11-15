@@ -22,7 +22,7 @@ use marmot_observability::AppPerformanceOperation;
 use marmot_observability::PerformanceRecorder;
 
 mod blossom;
-mod crypto;
+pub(crate) mod crypto;
 #[cfg(test)]
 pub(crate) use blossom::fetch_blossom_file_with_transport;
 #[cfg(test)]

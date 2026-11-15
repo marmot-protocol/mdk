@@ -121,6 +121,11 @@ pub use attachment_history::{
 mod avatar_access;
 pub use avatar_access::{LocalAvatarRead, MAX_AVATAR_BATCH_BYTES, MAX_AVATAR_BATCH_ITEMS};
 mod commands;
+mod draft_files;
+pub use draft_files::{
+    MAX_MESSAGE_DRAFT_ATTACHMENT_FILE_BYTES, MAX_MESSAGE_DRAFT_ATTACHMENTS,
+    MessageDraftAttachmentFileRequest,
+};
 mod event_routing;
 mod local_submission_queue;
 mod local_submissions;
@@ -3557,6 +3562,22 @@ impl MarmotAppRuntime {
         attachments: Vec<MessageDraftAttachment>,
     ) -> Result<crate::SelectedMessageDraft, AppError> {
         self.accounts.app.save_message_draft_if_revision(
+            account,
+            expected,
+            content,
+            reply,
+            attachments,
+        )
+    }
+    pub fn save_message_draft_inputs_if_revision(
+        &self,
+        account: &str,
+        expected: &crate::MessageDraftRevision,
+        content: &str,
+        reply: Option<&str>,
+        attachments: Vec<crate::MessageDraftAttachmentInput>,
+    ) -> Result<crate::SelectedMessageDraft, AppError> {
+        self.accounts.app.save_message_draft_inputs_if_revision(
             account,
             expected,
             content,

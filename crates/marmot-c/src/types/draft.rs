@@ -1,7 +1,8 @@
 //! C mirrors of the per-conversation message-draft conversions.
 
 use marmot_uniffi::conversions::{
-    MessageDraftAttachmentFfi, MessageDraftAttachmentSummaryFfi, MessageDraftFfi,
+    MessageDraftAttachmentFfi, MessageDraftAttachmentFileRequestFfi,
+    MessageDraftAttachmentInputFfi, MessageDraftAttachmentSummaryFfi, MessageDraftFfi,
     MessageDraftSummaryFfi,
 };
 
@@ -115,6 +116,82 @@ impl MarmotMessageDraftAttachmentInput {
             duration_seconds: crate::memory::c_bool(self.has_duration_seconds)
                 .then_some(self.duration_seconds),
             waveform_samples,
+        })
+    }
+}
+
+/// One attachment of `marmot_save_message_draft_inputs_if_revision`.
+/// Borrowed input only. A non-NULL `retained_id` keeps the draft's own
+/// attachment with that id, body untouched, and `attachment` is ignored;
+/// a NULL `retained_id` saves `attachment` as a new inline body. Keep every
+/// file-backed attachment by id: leaving one out deletes its file.
+#[repr(C)]
+pub struct MarmotMessageDraftAttachmentSaveInput {
+    /// Nullable.
+    pub retained_id: *const ::std::ffi::c_char,
+    pub attachment: MarmotMessageDraftAttachmentInput,
+}
+
+impl MarmotMessageDraftAttachmentSaveInput {
+    /// # Safety
+    /// `retained_id` must be NULL or valid; otherwise `attachment` must meet
+    /// [`MarmotMessageDraftAttachmentInput::to_ffi`]'s contract.
+    pub(crate) unsafe fn to_ffi(&self) -> Result<MessageDraftAttachmentInputFfi, MarmotStatus> {
+        Ok(match unsafe { optional_str(self.retained_id) }? {
+            Some(id) => MessageDraftAttachmentInputFfi::Retained { id },
+            None => MessageDraftAttachmentInputFfi::Inline {
+                attachment: unsafe { self.attachment.to_ffi() }?,
+            },
+        })
+    }
+}
+
+/// A host file to copy into a draft as attachment `id`. Borrowed input
+/// only; the path is local and never published. `source_path` names a
+/// regular file (not a symlink); a nonzero `has_expected_size` requires it
+/// to hold exactly `expected_size` bytes.
+#[repr(C)]
+pub struct MarmotMessageDraftAttachmentFileRequest {
+    pub id: *const ::std::ffi::c_char,
+    pub source_path: *const ::std::ffi::c_char,
+    pub has_expected_size: u8,
+    pub expected_size: u64,
+    pub file_name: *const ::std::ffi::c_char,
+    pub media_type: *const ::std::ffi::c_char,
+    /// Nullable.
+    pub dim: *const ::std::ffi::c_char,
+    /// Nullable.
+    pub thumbhash: *const ::std::ffi::c_char,
+    /// Playback length for audio/video; set `has_duration_seconds`.
+    pub has_duration_seconds: u8,
+    pub duration_seconds: f64,
+    /// Waveform preview samples; NULL with length 0 for none.
+    pub waveform_samples: *const f64,
+    pub waveform_samples_len: usize,
+}
+
+impl MarmotMessageDraftAttachmentFileRequest {
+    /// # Safety
+    /// Strings must be valid; `waveform_samples` must point to
+    /// `waveform_samples_len` values, or be NULL with length 0.
+    pub(crate) unsafe fn to_ffi(
+        &self,
+    ) -> Result<MessageDraftAttachmentFileRequestFfi, MarmotStatus> {
+        Ok(MessageDraftAttachmentFileRequestFfi {
+            id: unsafe { required_str(self.id) }?,
+            source_path: unsafe { required_str(self.source_path) }?,
+            expected_size: crate::memory::c_bool(self.has_expected_size)
+                .then_some(self.expected_size),
+            file_name: unsafe { required_str(self.file_name) }?,
+            media_type: unsafe { required_str(self.media_type) }?,
+            dim: unsafe { optional_str(self.dim) }?,
+            thumbhash: unsafe { optional_str(self.thumbhash) }?,
+            duration_seconds: crate::memory::c_bool(self.has_duration_seconds)
+                .then_some(self.duration_seconds),
+            waveform_samples: unsafe {
+                crate::memory::opt_num_array(self.waveform_samples, self.waveform_samples_len)
+            }?
+            .unwrap_or_default(),
         })
     }
 }
