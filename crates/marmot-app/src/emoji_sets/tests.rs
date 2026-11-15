@@ -1058,6 +1058,133 @@ async fn install_with_no_usable_emoji_installs_nothing() {
     fixture.assert_nothing_installed().await;
 }
 
+/// Retrying the shown version keeps verified installed bytes when their
+/// hosts fail, while filling entries that were missing on the first install.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_partial_reinstall_preserves_downloaded_emoji_and_fills_missing_entries() {
+    let fixture = fixture().await;
+    let (app, account, host) = (&fixture.app, fixture.account(), &fixture.host);
+    app.sync_emoji_sets(account, None).await.unwrap();
+    let shown = fixture.shown_event_id().await;
+    let first = app
+        .install_emoji_set(
+            account,
+            &fixture.set_coordinate,
+            &shown,
+            &EmojiSetInstallControl::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.installed_count, 2);
+    let expected = png(32, 32, None);
+    host.routes.lock().unwrap().clear();
+    host.serve("/missing.png", Canned::image("image/png", expected.clone()));
+
+    let retried = app
+        .install_emoji_set(
+            account,
+            &fixture.set_coordinate,
+            &shown,
+            &EmojiSetInstallControl::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(retried.installed_count, 3);
+    for code in ["good", "mislabeled", "missing"] {
+        let read = app
+            .read_installed_custom_emoji(account, &fixture.set_coordinate, code)
+            .await
+            .unwrap();
+        assert_eq!(read.bytes, expected);
+        assert_eq!(read.emoji.sha256, hex::encode(Sha256::digest(&expected)));
+    }
+    assert!(
+        retried
+            .skipped
+            .iter()
+            .any(|skip| skip.shortcode.as_deref() == Some("good")
+                && skip.reason == AppEmojiSkipReason::DownloadFailed)
+    );
+
+    // A fully failed subsequent retry also keeps every successful entry.
+    host.routes.lock().unwrap().clear();
+    let retried = app
+        .install_emoji_set(
+            account,
+            &fixture.set_coordinate,
+            &shown,
+            &EmojiSetInstallControl::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(retried.installed_count, 3);
+    assert_eq!(app.installed_custom_emoji(account).await.unwrap().len(), 3);
+}
+
+/// A successful explicit refresh replaces an old image, but a new set version
+/// replaces the snapshot without resurrecting entries from its predecessor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reinstall_refreshes_images_and_a_new_version_replaces_the_snapshot() {
+    let fixture = fixture().await;
+    let (app, account, host) = (&fixture.app, fixture.account(), &fixture.host);
+    app.sync_emoji_sets(account, None).await.unwrap();
+    let shown = fixture.shown_event_id().await;
+    app.install_emoji_set(
+        account,
+        &fixture.set_coordinate,
+        &shown,
+        &EmojiSetInstallControl::new(),
+    )
+    .await
+    .unwrap();
+    let changed = png(48, 48, None);
+    host.serve("/good.png", Canned::image("image/png", changed.clone()));
+    app.install_emoji_set(
+        account,
+        &fixture.set_coordinate,
+        &shown,
+        &EmojiSetInstallControl::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        app.read_installed_custom_emoji(account, &fixture.set_coordinate, "good")
+            .await
+            .unwrap()
+            .bytes,
+        changed
+    );
+
+    let next = fixture.next_version(
+        fixture.set_created_at,
+        &[("new", "/good.png"), ("mislabeled", "/missing.png")],
+    );
+    fixture.publish(&next).await;
+    let next = app
+        .fetch_emoji_set(account, &fixture.set_coordinate)
+        .await
+        .unwrap();
+    let replaced = app
+        .install_emoji_set(
+            account,
+            &fixture.set_coordinate,
+            &next.event_id_hex,
+            &EmojiSetInstallControl::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(replaced.installed_count, 1);
+    assert_eq!(
+        app.installed_custom_emoji(account)
+            .await
+            .unwrap()
+            .iter()
+            .map(|entry| entry.shortcode.as_str())
+            .collect::<Vec<_>>(),
+        vec!["new"]
+    );
+}
+
 /// An image that does not fit the remaining byte budget is skipped on its
 /// own; a later, smaller one is still fetched and kept.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1083,7 +1210,12 @@ async fn an_image_over_the_budget_does_not_stop_later_ones() {
 
     let (kept, skipped) = fixture
         .app
-        .download_set(&entries, budget, &EmojiSetInstallControl::new())
+        .download_set(
+            &entries,
+            budget,
+            &EmojiSetInstallControl::new(),
+            InstalledEmojiSnapshot::new(),
+        )
         .await;
 
     assert_eq!(
@@ -1099,6 +1231,66 @@ async fn an_image_over_the_budget_does_not_stop_later_ones() {
             .collect::<Vec<_>>(),
         vec![(Some("big"), AppEmojiSkipReason::OverCap)]
     );
+}
+
+/// Earlier new images cannot consume retained bytes, and an oversized refresh
+/// or a transfer-budget stop leaves the old verified image available.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reinstall_reserves_retained_bytes_and_keeps_them_after_download_caps() {
+    let fixture = fixture().await;
+    let good = StoredEmojiSetEntry {
+        shortcode: "good".to_owned(),
+        url: fixture.host.url("/good.png"),
+    };
+    let (initial, _) = fixture
+        .app
+        .download_set(
+            std::slice::from_ref(&good),
+            MAX_INSTALLED_EMOJI_SET_BYTES,
+            &EmojiSetInstallControl::new(),
+            InstalledEmojiSnapshot::new(),
+        )
+        .await;
+    let original = initial.into_iter().next().unwrap();
+    let budget = original.1.len() as u64;
+    let previous = || HashMap::from([("good".to_owned(), original.clone())]);
+    let missing = StoredEmojiSetEntry {
+        url: fixture.host.url("/missing.png"),
+        ..good.clone()
+    };
+    let newcomer = StoredEmojiSetEntry {
+        shortcode: "new".to_owned(),
+        ..good.clone()
+    };
+    let lied = StoredEmojiSetEntry {
+        shortcode: "lied".to_owned(),
+        url: fixture.host.url("/lied.png"),
+    };
+    let changed = png(48, 48, None);
+    assert!(changed.len() as u64 > budget);
+    fixture
+        .host
+        .serve("/changed.png", Canned::image("image/png", changed));
+    let refresh = StoredEmojiSetEntry {
+        url: fixture.host.url("/changed.png"),
+        ..good
+    };
+    for entries in [
+        vec![newcomer, missing.clone()],
+        vec![refresh],
+        vec![lied.clone(), lied, missing],
+    ] {
+        let (kept, skipped) = fixture
+            .app
+            .download_set(&entries, budget, &EmojiSetInstallControl::new(), previous())
+            .await;
+        assert_eq!(kept, vec![original.clone()]);
+        assert!(
+            skipped
+                .iter()
+                .any(|skip| skip.reason == AppEmojiSkipReason::OverCap)
+        );
+    }
 }
 
 /// No download dials once the install is cancelled, even one the stream
@@ -1117,7 +1309,12 @@ async fn a_cancelled_install_starts_no_download() {
 
     let (kept, _) = fixture
         .app
-        .download_set(&entries, MAX_INSTALLED_EMOJI_SET_BYTES, &control)
+        .download_set(
+            &entries,
+            MAX_INSTALLED_EMOJI_SET_BYTES,
+            &control,
+            InstalledEmojiSnapshot::new(),
+        )
         .await;
 
     assert!(kept.is_empty());
@@ -1145,7 +1342,10 @@ async fn rejected_bodies_count_toward_the_download_stop() {
 
     let control = EmojiSetInstallControl::new();
     control.start(entries.len());
-    let (kept, skipped) = fixture.app.download_set(&entries, budget, &control).await;
+    let (kept, skipped) = fixture
+        .app
+        .download_set(&entries, budget, &control, InstalledEmojiSnapshot::new())
+        .await;
 
     assert!(kept.is_empty());
     assert!(

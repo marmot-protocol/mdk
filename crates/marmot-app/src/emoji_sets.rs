@@ -14,7 +14,9 @@
 //! Installing snapshots one set version: each emoji is downloaded once,
 //! validated, and stored with its SHA-256 under the account. Reading an
 //! installed emoji never touches the network, and a later change of URL or
-//! image cannot replace what was installed until the user reinstalls.
+//! image cannot replace what was installed until the user reinstalls. A retry
+//! of the same version retains verified installed images when a refresh fails.
+//! Installing a different version replaces the snapshot as a whole.
 //! Nothing here builds a group message: hosts re-upload installed bytes as
 //! encrypted attachments, so no set URL or address reaches a chat.
 
@@ -73,6 +75,13 @@ pub const MAX_INSTALLED_EMOJI_SET_BYTES: u64 = 32 * 1024 * 1024;
 /// Stored bytes across every installed set of the account.
 pub const MAX_INSTALLED_EMOJI_BYTES: u64 = 128 * 1024 * 1024;
 const EMOJI_DOWNLOAD_CONCURRENCY: usize = 4;
+type InstalledEmojiSnapshot = HashMap<String, (StoredInstalledEmoji, Vec<u8>)>;
+
+struct EmojiInstallPlan {
+    set: StoredEmojiSet,
+    budget: u64,
+    previous: InstalledEmojiSnapshot,
+}
 /// Relay reads in flight at once when resolving a user list's pointers.
 const EMOJI_SET_READ_CONCURRENCY: usize = 4;
 const MAX_FUTURE_EVENT_SKEW_SECONDS: u64 = 5 * 60;
@@ -972,7 +981,8 @@ impl MarmotApp {
 
     /// Install the stored version of a set: download every emoji once,
     /// validate it and store its bytes and SHA-256 under the account,
-    /// replacing any earlier snapshot of the same set. Entries that are
+    /// replacing an earlier version of the set. A same-version retry preserves
+    /// verified installed images when refreshing them fails. Entries that are
     /// invalid, duplicated, fail to download or validate, or go over a cap
     /// are reported, not fatal. This reveals the user's IP address to every
     /// image host in the set.
@@ -1010,7 +1020,11 @@ impl MarmotApp {
         };
         // Read under the lock, so no other install or uninstall changes the
         // version, the set count or the byte budget before the write.
-        let (set, budget) = {
+        let EmojiInstallPlan {
+            set,
+            budget,
+            previous,
+        } = {
             let (storage, coordinate) = (storage.clone(), coordinate.clone());
             let expected = expected_event_id_hex.to_owned();
             read_blocking(move || install_plan(&storage, &coordinate, &expected)).await?
@@ -1020,7 +1034,7 @@ impl MarmotApp {
         let (kept, install_skips) = tokio::select! {
             biased;
             () = &mut stop => return Err(AppError::EmojiSetInstallCancelled),
-            downloaded = self.download_set(&set.emoji, budget, control) => downloaded,
+            downloaded = self.download_set(&set.emoji, budget, control, previous) => downloaded,
         };
         // A cancellation in the poll that finished the downloads still wins
         // over a failed result.
@@ -1193,10 +1207,16 @@ impl MarmotApp {
         entries: &[StoredEmojiSetEntry],
         budget: u64,
         control: &EmojiSetInstallControl,
+        mut previous: InstalledEmojiSnapshot,
     ) -> (Vec<(StoredInstalledEmoji, Vec<u8>)>, Vec<AppEmojiSkip>) {
         let mut kept = Vec::new();
         let mut skipped = Vec::new();
-        let mut used = 0_u64;
+        // Reserve every fallback before downloading: an early new image must
+        // not consume the space occupied by an old image later in the set.
+        let mut used = previous
+            .values()
+            .map(|(_, bytes)| bytes.len() as u64)
+            .sum::<u64>();
         let mut fetched = 0_u64;
         // Owned inputs keep the stream's closure free of higher-ranked
         // borrows, which the FFI's `Send` future bound cannot prove.
@@ -1227,13 +1247,17 @@ impl MarmotApp {
                 shortcode: Some(entry.shortcode.clone()),
                 reason,
             };
+            let mut retained = previous.remove(&entry.shortcode);
             match result {
                 Ok(image) => {
                     let len = image.bytes.len() as u64;
-                    if used.saturating_add(len) > budget {
+                    let old_len = retained.as_ref().map_or(0, |(_, bytes)| bytes.len() as u64);
+                    let next_used = used.saturating_sub(old_len).saturating_add(len);
+                    if next_used > budget {
                         skipped.push(skip(AppEmojiSkipReason::OverCap));
                     } else {
-                        used += len;
+                        used = next_used;
+                        retained = None;
                         kept.push((
                             StoredInstalledEmoji {
                                 shortcode: entry.shortcode.clone(),
@@ -1250,17 +1274,21 @@ impl MarmotApp {
                 }
                 Err(reason) => skipped.push(skip(reason)),
             }
+            kept.extend(retained);
             if fetched >= budget.saturating_mul(2) {
                 break;
             }
         }
         drop(downloads);
         control.finish_entries(entries.len().saturating_sub(done), 0);
-        skipped.extend(entries.iter().skip(done).map(|entry| AppEmojiSkip {
-            position: None,
-            shortcode: Some(entry.shortcode.clone()),
-            reason: AppEmojiSkipReason::OverCap,
-        }));
+        for entry in entries.iter().skip(done) {
+            kept.extend(previous.remove(&entry.shortcode));
+            skipped.push(AppEmojiSkip {
+                position: None,
+                shortcode: Some(entry.shortcode.clone()),
+                reason: AppEmojiSkipReason::OverCap,
+            });
+        }
         (kept, skipped)
     }
 
@@ -1622,7 +1650,7 @@ fn install_plan(
     storage: &SqliteAppStorage,
     coordinate: &str,
     expected_event_id_hex: &str,
-) -> Result<(StoredEmojiSet, u64), AppError> {
+) -> Result<EmojiInstallPlan, AppError> {
     let set = shown_version(storage, coordinate, expected_event_id_hex)?;
     if set.emoji.is_empty() {
         return Err(no_valid_emoji());
@@ -1646,7 +1674,32 @@ fn install_plan(
             "installed emoji storage is full".into(),
         ));
     }
-    Ok((set, budget))
+    let mut previous = InstalledEmojiSnapshot::new();
+    let same_version = installed_sets.iter().any(|installed| {
+        installed.coordinate == coordinate
+            && installed.version.event_id_hex == set.version.event_id_hex
+    });
+    if same_version {
+        for entry in &set.emoji {
+            let stored = storage.installed_custom_emoji_bytes(coordinate, &entry.shortcode);
+            match stored {
+                Ok(Some((row, bytes))) => {
+                    previous.insert(entry.shortcode.clone(), (row.emoji, bytes));
+                }
+                Ok(None) => {}
+                // A failed integrity check supplies no fallback. Fetching again
+                // can repair that entry; other storage errors abort the install.
+                Err(cgka_traits::storage::StorageError::Backend(detail))
+                    if detail == "stored custom emoji failed its hash check" => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+    Ok(EmojiInstallPlan {
+        set,
+        budget,
+        previous,
+    })
 }
 
 /// Run a local read on the blocking pool, so account resolution, a cold
