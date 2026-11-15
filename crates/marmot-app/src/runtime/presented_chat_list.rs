@@ -211,7 +211,7 @@ async fn prepared_snapshot(
                         &app.shared_storage()?,
                         &account.account_id_hex,
                     );
-                    app.presentation_signals.wake();
+                    app.presentation_signals.wake_account(&label);
                     result
                 },
             )?;

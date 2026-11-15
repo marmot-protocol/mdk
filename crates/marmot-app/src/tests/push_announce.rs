@@ -466,6 +466,170 @@ async fn a_change_shared_before_the_catch_up_is_announced_after_it() {
     assert!(!fx.bob.client.has_pending_push_registration_work());
 }
 
+/// The account worker's Push job (mdk#2923 step B): it samples the fetch
+/// clock every 15 s, only while push timing is owed, as `push_timing_owed`
+/// reads it. Each sample here steps the clock the test sets by 15 s.
+async fn run_push_job_while_owed(device: &mut Device, samples: usize) -> usize {
+    for sample in 1..=samples {
+        if !device.client.push_timing_owed() {
+            return sample - 1;
+        }
+        let now_ms = device
+            .client
+            .test_push_now_ms
+            .expect("the test sets the clock");
+        device.client.test_push_now_ms = Some(now_ms + 15_000);
+        device.client.advance_push_join_windows().await;
+        if device.client.has_pending_push_registration_work() {
+            retry(device).await;
+        }
+    }
+    samples
+}
+
+/// On an idle account the worker no longer samples the push fetch clock, so
+/// a token change finds it unsettled: the new token goes out at once in a
+/// plain self-update, and it owes an announce. Owing it makes the worker
+/// sample the clock, and the announce follows once the clock settles, at the
+/// first 15 s sample (mdk#2923 step B). Without that sampling it never would.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_idle_token_change_goes_out_plain_and_its_announce_follows() {
+    let mut fx = Fixture::new().await;
+    let group = fx.group.clone();
+    let group_hex = fx.group_hex();
+    finish_post_join_fetch(&fx.bob, &group);
+    fx.bob.can_fetch().await;
+    end_join_windows(&mut fx.bob);
+    assert!(!retry(&mut fx.bob).await);
+
+    // A worker that sampled the clock once as it opened, then went idle:
+    // the stretch has begun but has not been watched for the settle.
+    fx.bob.client.push_announce_timing.catch_up_settle =
+        PushAnnounceTiming::default().catch_up_settle;
+    fx.bob.client.test_push_now_ms = Some(crate::notifications::unix_now_ms());
+    fx.bob.client.test_push_device_can_fetch = Some(false);
+    fx.bob.client.advance_push_join_windows().await;
+    fx.bob.client.test_push_device_can_fetch = Some(true);
+    fx.bob.client.advance_push_join_windows().await;
+    assert!(!fx.bob.client.push_timing_owed(), "an idle worker rests");
+
+    fx.bob.register("bob-token-2", &fx.server);
+    let from = gossip_sent(&fx.bob);
+    assert_eq!(fx.bob.share().await.succeeded_groups, 1);
+    let shared = sent_updates(&fx.bob, from);
+    assert_eq!(shared.len(), 1, "the new token goes out at once");
+    assert_eq!(have(&shared[0]), None, "in a plain self-update");
+    assert!(
+        fx.bob.client.push_timing_owed(),
+        "the announce owed makes the worker sample the clock"
+    );
+
+    let samples = run_push_job_while_owed(&mut fx.bob, 8).await;
+    let sent = sent_updates(&fx.bob, from);
+    assert_eq!(
+        sent.len(),
+        2,
+        "the announce followed after {samples} samples"
+    );
+    assert_eq!(have(&sent[1]), Some(held(&fx.bob, &group_hex)));
+    assert_eq!(samples, 1, "at the first 15 s sample");
+    assert!(
+        !fx.bob.client.push_timing_owed(),
+        "and the worker rests again"
+    );
+}
+
+/// A device whose fetch clock settled, then sat idle while the worker
+/// stopped looking: `cut` its fetching or not, and move the clock an hour
+/// on. Its clock was settled at the last look.
+async fn settle_then_idle_for_an_hour(fx: &mut Fixture, cut: bool) {
+    let group = fx.group.clone();
+    finish_post_join_fetch(&fx.bob, &group);
+    let start = crate::notifications::unix_now_ms();
+    fx.bob.client.test_push_now_ms = Some(start);
+    fx.bob.can_fetch().await;
+    end_join_windows(&mut fx.bob);
+    assert!(!retry(&mut fx.bob).await);
+    fx.bob.client.push_announce_timing.catch_up_settle =
+        PushAnnounceTiming::default().catch_up_settle;
+    fx.bob.client.test_push_now_ms = Some(start + 15_000);
+    fx.bob.client.advance_push_join_windows().await;
+    assert!(
+        !fx.bob.client.push_timing_owed(),
+        "the worker stops looking"
+    );
+    if cut {
+        fx.bob.client.test_push_device_can_fetch = Some(false);
+    }
+    fx.bob.client.test_push_now_ms = Some(start + 15_000 + 3_600_000);
+}
+
+/// A token change an hour after the clock last settled goes out plain, not
+/// as an announce: the last look says nothing about now, and here the
+/// device has since lost its relays (mdk#2923).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_token_change_after_idle_and_lost_relays_goes_out_plain() {
+    let mut fx = Fixture::new().await;
+    settle_then_idle_for_an_hour(&mut fx, true).await;
+    fx.bob.register("bob-token-2", &fx.server);
+    let from = gossip_sent(&fx.bob);
+    assert_eq!(fx.bob.share().await.succeeded_groups, 1);
+    let shared = sent_updates(&fx.bob, from);
+    assert_eq!(shared.len(), 1);
+    assert_eq!(have(&shared[0]), None, "a plain self-update");
+
+    // Once the relays return, the announce follows and settles the debt.
+    fx.bob.client.test_push_device_can_fetch = Some(true);
+    announce_follows(&mut fx, from).await;
+}
+
+/// The plain self-update's announce, after a token change on a clock that
+/// was not settled: the Push job samples until it goes out, then the group
+/// owes nothing.
+async fn announce_follows(fx: &mut Fixture, from: usize) {
+    let group_hex = fx.group_hex();
+    assert!(fx.bob.client.push_timing_owed(), "the announce is owed");
+    let samples = run_push_job_while_owed(&mut fx.bob, 8).await;
+    let sent = sent_updates(&fx.bob, from);
+    assert_eq!(
+        sent.len(),
+        2,
+        "the announce followed after {samples} samples"
+    );
+    assert_eq!(have(&sent[1]), Some(held(&fx.bob, &group_hex)));
+    assert_eq!(
+        gossip_state(&fx.bob, &group_hex).announce_owed_at_ms,
+        None,
+        "and settled the debt"
+    );
+    assert!(!fx.bob.client.push_timing_owed(), "the worker rests again");
+}
+
+/// The same after a suspend that left fetching on: the hour the process did
+/// not run counts nothing, so the change goes out plain and the catch-up is
+/// watched again before an announce (mdk#2923).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_token_change_after_a_suspend_goes_out_plain() {
+    let mut fx = Fixture::new().await;
+    settle_then_idle_for_an_hour(&mut fx, false).await;
+    fx.bob.register("bob-token-2", &fx.server);
+    let from = gossip_sent(&fx.bob);
+    assert_eq!(fx.bob.share().await.succeeded_groups, 1);
+    let shared = sent_updates(&fx.bob, from);
+    assert_eq!(shared.len(), 1);
+    assert_eq!(have(&shared[0]), None, "a plain self-update");
+
+    // The first look after the gap starts the watch, so no announce yet.
+    fx.bob.client.advance_push_join_windows().await;
+    retry(&mut fx.bob).await;
+    assert_eq!(
+        sent_updates(&fx.bob, from).len(),
+        1,
+        "no announce on the first look after the gap"
+    );
+    announce_follows(&mut fx, from).await;
+}
+
 /// The periodic announce goes out with the first group message sent once the
 /// interval has passed, even one left in the group's outbox, and never on its
 /// own.

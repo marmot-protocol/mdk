@@ -63,10 +63,11 @@ pub use app::attachment_acquisition::{
     AttachmentPartial, AttachmentPartialIdentity, AttachmentPermissionCategory,
     AttachmentPublication, AttachmentPublishResult, AttachmentRemoval, AttachmentStorageUsage,
     AttachmentUploadOwner, AttachmentUploadPromotion, AttachmentUploadSource,
-    AttachmentUploadStage, AttachmentWorkerDemand, ChatAttachmentUsage, ChatUsageCursor,
-    LegacyAttachmentBody, LegacyBodyPublication, LegacyBodyReader, MAX_ATTACHMENT_LOCAL_READ_BYTES,
-    MAX_RETAINED_ATTACHMENT_BYTES, MAX_RETAINED_FILE_ATTACHMENT_BYTES, RetainedAttachmentAsset,
-    RetainedAttachmentEntry, RetainedAttachmentRead, RetainedSizeCursor,
+    AttachmentUploadStage, AttachmentWorkSchedule, AttachmentWorkerDemand, ChatAttachmentUsage,
+    ChatUsageCursor, LegacyAttachmentBody, LegacyBodyPublication, LegacyBodyReader,
+    MAX_ATTACHMENT_LOCAL_READ_BYTES, MAX_RETAINED_ATTACHMENT_BYTES,
+    MAX_RETAINED_FILE_ATTACHMENT_BYTES, RetainedAttachmentAsset, RetainedAttachmentEntry,
+    RetainedAttachmentRead, RetainedSizeCursor,
 };
 pub use app::attachment_history::{
     AccountAttachmentCursor, AccountAttachmentEntry, AccountAttachmentHistoryError,

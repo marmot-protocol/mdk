@@ -2429,6 +2429,8 @@ impl MarmotApp {
             #[cfg(test)]
             test_push_device_can_fetch: None,
             #[cfg(test)]
+            test_push_now_ms: None,
+            #[cfg(test)]
             test_fail_push_announce_owed_write: false,
             pending_welcome_delivery_events: Vec::new(),
             announced_welcome_failures: HashSet::new(),
@@ -2443,6 +2445,11 @@ impl MarmotApp {
             fail_next_terminal_recovery_retire: false,
             #[cfg(test)]
             fail_next_convergence_retry_advance: false,
+            recovery_seam_owed: None,
+            post_join_advanced: false,
+            key_package_lifecycle_changed: false,
+            history_dispatch_changed: Default::default(),
+            backups_configured: None,
             encrypted_media_not_required_epochs: HashMap::new(),
             checkpoint_route_refresh_recomputes: 0,
             #[cfg(feature = "unreleased-device-pairing")]
@@ -6677,7 +6684,7 @@ impl MarmotApp {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .invalidate(label);
-        self.presentation_signals.wake();
+        self.presentation_signals.wake_account(label);
     }
 
     fn save_state_delta_clearing_local_group_deletion_frontiers_and_acking_application_events(
@@ -6698,7 +6705,7 @@ impl MarmotApp {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .invalidate(&delta.label);
-        self.presentation_signals.wake();
+        self.presentation_signals.wake_account(&delta.label);
         Ok(())
     }
 
@@ -6729,7 +6736,7 @@ impl MarmotApp {
                 &classifier,
             )?
             .ok_or_else(|| AppError::UnknownGroup(group_id_hex.to_owned()))?;
-        self.presentation_signals.wake();
+        self.presentation_signals.wake_account(&delta.label);
         self.hydrate_chat_list_row(Some(&mut row));
 
         // Only the created row belongs on the response tail. Preserve any
@@ -6761,7 +6768,7 @@ impl MarmotApp {
             return Err(AppError::GroupDisbanding(group_id_hex.to_owned()));
         }
         let deleted = storage.delete_local_group_data(group_id_hex)?.did_delete();
-        self.presentation_signals.wake();
+        self.presentation_signals.wake_account(label);
         self.chat_list_projection_stale
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -7478,7 +7485,7 @@ impl MarmotApp {
         })?;
         if message.direction == "sent" {
             // The worker promotes the message's staged uploads.
-            self.presentation_signals.wake();
+            self.presentation_signals.wake_account(label);
         }
         Ok(update)
     }
@@ -7538,7 +7545,7 @@ impl MarmotApp {
         })?;
         if message.direction == "sent" {
             // The worker promotes the message's staged uploads.
-            self.presentation_signals.wake();
+            self.presentation_signals.wake_account(label);
         }
         Ok(update)
     }
@@ -7592,7 +7599,7 @@ impl MarmotApp {
                 .transpose()
         })?;
         // The worker promotes the message's staged uploads.
-        self.presentation_signals.wake();
+        self.presentation_signals.wake_account(label);
         if update.is_some()
             && let Some(observation) = observation
         {

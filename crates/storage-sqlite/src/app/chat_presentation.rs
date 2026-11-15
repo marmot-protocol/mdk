@@ -205,6 +205,21 @@ impl SqliteAppStorage {
             ))),
         }
     }
+    /// Whether the presentation pass has rows left: a legacy row to
+    /// initialize, or an input not yet applied. Reads only (mdk#2923).
+    pub fn chat_presentation_work_pending(&self) -> StorageResult<bool> {
+        self.lock()?
+            .query_row_cached(
+                "SELECT EXISTS(SELECT 1 FROM chat_presentation_row_work)
+                     OR EXISTS(SELECT 1 FROM chat_list_rows INDEXED BY chat_presentation_pending
+                         WHERE presentation_json IS NULL
+                            OR presentation_applied_source_revision != presentation_source_revision)",
+                [],
+                |row| row.get(0),
+            )
+            .storage()
+    }
+
     /// The pending partial index is the durable backfill worklist. Committed rows leave it;
     /// interruption or a later invalidation makes precisely that row available again.
     pub fn pending_chat_presentation_inputs(&self) -> StorageResult<Vec<ChatPresentationInput>> {

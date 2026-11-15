@@ -15,6 +15,8 @@ mod tests;
 
 use announce::PushShareForm;
 pub(crate) use announce::{AcceptedPushAnnounce, PushAnnounceTiming, PushFetchClock};
+#[cfg(test)]
+pub(crate) use announce::{TestPushOverride, TestPushOverrideGuard};
 pub(crate) use repair::PushRepairs;
 
 const PUSH_PUBLISH_CONCURRENCY: usize = 4;

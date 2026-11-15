@@ -16,6 +16,9 @@
   also refuses a fanout a target may hold (`OutboundFanout::possible_exposure`), so a commit a relay may have kept
   never rolls back (mdk#1577, mdk#2332).
 
+- `Engine::discard_private_key_packages` reads first and opens no writer transaction when nothing matches, so an
+  idle maintenance pass no longer writes (mdk#2923).
+
 ### Fixed
 
 - Hydration restores a pending commit's link to the queued intent it was drained from, from the frozen fanout that

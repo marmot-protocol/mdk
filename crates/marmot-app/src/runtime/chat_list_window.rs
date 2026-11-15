@@ -380,10 +380,11 @@ impl Reader {
                 )?;
             }
             let read = || storage.app_storage().read_chat_list_window(query.clone());
-            let mut result = match read().inspect_err(|_| app.presentation_signals.wake()) {
-                Ok(result) => result,
-                Err(error) => return Ok(Err(error)),
-            };
+            let mut result =
+                match read().inspect_err(|_| app.presentation_signals.wake_account(&label)) {
+                    Ok(result) => result,
+                    Err(error) => return Ok(Err(error)),
+                };
             if result.snapshot.is_none() {
                 let prepared = crate::chat_presentation::maintenance::prepare_window(
                     &storage.app_storage(),
@@ -391,7 +392,7 @@ impl Reader {
                     &account_id,
                     &result.pending_presentations,
                 );
-                app.presentation_signals.wake();
+                app.presentation_signals.wake_account(&label);
                 // Notify other windows even when a later selection failed.
                 let _ = app
                     .presentation_signals

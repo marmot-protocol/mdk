@@ -346,8 +346,11 @@ fn backfill_is_bounded_and_resumes_from_persisted_pending_rows() {
             .unwrap();
     }
     assert!(app.pending_chat_presentation_inputs().unwrap().is_empty());
+    // The worker's presentation pass rests once nothing is pending.
+    assert!(!app.chat_presentation_work_pending().unwrap());
     seed(&store, "0000a"); // New work can sort before the previous completion boundary.
     assert_eq!(app.pending_chat_presentation_inputs().unwrap().len(), 1);
+    assert!(app.chat_presentation_work_pending().unwrap());
 }
 #[test]
 fn failed_dependency_write_rolls_back_value_and_revision() {

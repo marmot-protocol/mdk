@@ -89,7 +89,7 @@ impl MarmotAppRuntime {
                 .collect::<Result<Vec<_>, AppError>>();
             // Even a later-item failure must publish already committed demand.
             if requested {
-                app.presentation_signals.wake();
+                app.presentation_signals.wake_account(&account.label);
             }
             if changed {
                 let _ = app.presentation_signals.avatars.send(account.label);
@@ -169,7 +169,7 @@ impl MarmotAppRuntime {
                 Ok(reads)
             })();
             if repaired {
-                app.presentation_signals.wake();
+                app.presentation_signals.wake_account(&account.label);
                 let _ = app.presentation_signals.avatars.send(account.label);
             }
             outcome
