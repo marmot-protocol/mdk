@@ -6114,9 +6114,12 @@ where
                     }) => {
                         // Past quorum, a send started now would be cancelled
                         // before it could finish; the target stays unmarked
-                        // for the next pass.
+                        // for the next pass. The attempt is dated now, not when
+                        // the pass began: a slow check must not move the
+                        // commit's first attempt, and with it the read-back
+                        // bound, earlier (mdk#2332).
                         if accepted < ack_goal || finish_retries {
-                            fanout.mark_attempt_started_at(index, now_ms)?;
+                            fanout.mark_attempt_started_at(index, self.wall_clock.now_ms())?;
                             self.session.put_outbound_fanout(&fanout)?;
                             attempts.push(step(index, true));
                         }
@@ -6384,7 +6387,9 @@ where
         if found == 0 {
             return Ok(false);
         }
-        self.session.put_observed_outbound_fanout(fanout, now_ms)?;
+        // The acceptance is observed when the read answered.
+        self.session
+            .put_observed_outbound_fanout(fanout, self.wall_clock.now_ms())?;
         Ok(fanout.outcome().accepted_targets >= fanout.request().required_acks.max(1))
     }
 

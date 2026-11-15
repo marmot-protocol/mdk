@@ -143,6 +143,34 @@ async fn a_read_back_hit_confirms_without_a_resend() {
     assert_eq!(publishes_to(&adapter, &relay), 1);
 }
 
+/// The bound counts from when the first attempt was sent, after its size
+/// check, however long the check took. A commit whose check took eleven
+/// minutes is not read back a minute after it was sent.
+#[tokio::test]
+async fn the_bound_counts_from_the_send_after_a_slow_size_check() {
+    let relay = TransportEndpoint("wss://read-slow-check.example".into());
+    let (fixture, alice) = FloorFixture::new("read-back-slow-check", &[&relay]).await;
+    let adapter = RecordingAdapter::default();
+    let mut runtime = fixture.runtime(alice, &adapter);
+    adapter.fail_endpoints_as(
+        vec![relay.clone()],
+        TransportEndpointFailureKind::PossiblyExposed,
+    );
+    adapter.answer_read_backs(relay.clone(), TransportReadBack::Found);
+    let start = fixture.wall.now().0;
+    let sent = start + READ_BACK_BOUND_SECS + 60;
+    adapter.slow_next_commit_size_check(fixture.wall.clone(), sent - start);
+    runtime.send(fixture.rename()).await.unwrap();
+
+    let (fanout, _) = stored_fanout(&runtime, &relay);
+    assert_eq!(fanout.first_attempt_at_ms(), Some(sent * 1_000));
+    fixture.wall.set(sent + 60);
+    let effects = runtime.resume_outbound_fanouts().await.unwrap();
+    assert!(effects.pending.is_empty(), "{:?}", effects.pending);
+    assert!(adapter.read_backs().is_empty(), "{:?}", adapter.read_backs());
+    assert_eq!(publishes_to(&adapter, &relay), 2);
+}
+
 /// Proofs 2 and 12: a relay that never returns the commit, whether it ends
 /// each read (`NotFound`) or answers none (`NoAnswer`, all an adapter without
 /// read-back gives). For 72 hours the commit stays pending and never rolls

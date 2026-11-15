@@ -433,6 +433,7 @@ struct RecordingAdapterInner {
     read_backs: Mutex<Vec<(MessageId, Vec<TransportEndpoint>)>>,
     /// What each endpoint answers every read-back; any other answers nothing.
     read_back_answers: Mutex<std::collections::HashMap<TransportEndpoint, TransportReadBack>>,
+    slow_commit_size_check: Mutex<Option<(Arc<TestWallClock>, u64)>>,
 }
 
 struct WelcomePublishGate {
@@ -579,6 +580,11 @@ impl RecordingAdapter {
 
     fn read_backs(&self) -> Vec<(MessageId, Vec<TransportEndpoint>)> {
         self.inner.read_backs.lock().unwrap().clone()
+    }
+
+    /// Make the next commit size check take `secs` on `wall`.
+    fn slow_next_commit_size_check(&self, wall: Arc<TestWallClock>, secs: u64) {
+        *self.inner.slow_commit_size_check.lock().unwrap() = Some((wall, secs));
     }
 
     /// Answer the next publishes to `endpoint` with `failures`, in order.
@@ -849,6 +855,10 @@ impl TransportAdapter for RecordingAdapter {
             .lock()
             .unwrap()
             .push(target.endpoints().to_vec());
+        let slow = self.inner.slow_commit_size_check.lock().unwrap().take();
+        if let Some((wall, secs)) = slow {
+            wall.set(wall.now().0 + secs);
+        }
         let gate = self.inner.commit_size_check_gate.lock().unwrap().clone();
         if let Some(gate) = gate {
             gate.acquire().await.unwrap().forget();
