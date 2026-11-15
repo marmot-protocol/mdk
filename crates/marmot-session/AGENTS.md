@@ -170,7 +170,16 @@ multi-device Welcome delivery, Welcome withdrawal, staged and owed Welcome deliv
   `PENDING_COMMIT_READ_BACK_AFTER_MS` after the commit's first send attempt, each due retry of a target that may hold
   it reads the event back first (`read_back_pending_commit`). Only the exact frozen event from a target counts. Any
   other read answer changes no status, bit or schedule; the target is resent to as before. Nothing rolls back for want
-  of an echo, or on a read. A confirmed commit's owed relays, and every other fanout, are never read.
+  of an echo, or because a read found nothing. A confirmed commit's owed relays, and every other fanout, are never read.
+- Give up a pending commit that no relay may hold (mdk#2332). From `PENDING_COMMIT_READ_BACK_AFTER_MS` after its first
+  send attempt, a pending group commit that no target accepted and none may hold (`OutboundFanout::possible_exposure`,
+  which reads a row stored before the exposure bit by its stored status), with some targets still outstanding, rolls
+  back once the device shows it is online: a target refused it definitively in an attempt started since then, or a
+  target answered a read of it (`abandon_unsent_pending_commit`, at most once per
+  `PENDING_COMMIT_REACHABILITY_READ_INTERVAL_MS`, stored as `reachability_read_at_ms`). The outstanding targets end
+  `Abandoned` and a queued intent is retired as `not_delivered` (`publish_not_delivered`). A read only tells an online
+  device; the exposure record alone decides, and `validate_successor_of` and the engine both refuse an abandonment of a
+  fanout a relay may hold (mdk#1577). A read that returns the event confirms. Offline, nothing changes.
 - Never let a durable maintenance record depend on an engine event alone. Engine events are in-memory, and this layer
   consumes them *after* awaiting the batch's relay publishes, so the loss window is network-wide. `GroupStateInvalidated`
   retires a `DurableGroupEvolution`, and `run_due_maintenance` re-derives that same retirement from the commit's stored

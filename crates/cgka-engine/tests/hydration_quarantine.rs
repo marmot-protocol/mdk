@@ -2072,9 +2072,21 @@ async fn pending_fanout_is_not_exposed_until_hydration_fully_succeeds() {
     reopened
         .put_outbound_fanout(&recovered_fanout)
         .expect("persist recovered attempt");
+    // A definitive refusal of the recovered attempt: a commit a relay may hold
+    // never rolls back (mdk#1577).
     recovered_fanout
-        .mark_target_failed(0)
-        .expect("fail recovered attempt");
+        .record_target_failure(
+            0,
+            cgka_traits::TransportEndpointFailure {
+                endpoint: TransportEndpoint("wss://hydrate.example".into()),
+                reason: "invalid: refused".into(),
+                kind: cgka_traits::TransportEndpointFailureKind::TerminalRejected,
+                rejection_category: None,
+                size_class: None,
+                pre_send: false,
+            },
+        )
+        .expect("refuse recovered attempt");
     reopened
         .put_outbound_fanout(&recovered_fanout)
         .expect("persist recovered failure");

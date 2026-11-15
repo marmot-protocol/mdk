@@ -29,6 +29,7 @@
 
 use crate::engine::Engine;
 use crate::provider::EngineOpenMlsProvider;
+use crate::queued_intent_refusal::QueuedIntentRetirement;
 use cgka_traits::OutboundFanout;
 use cgka_traits::engine::GroupEvent;
 use cgka_traits::engine_state::PendingStateRef;
@@ -495,16 +496,21 @@ impl<S: StorageProvider> Engine<S> {
     }
 
     /// Roll back `pending`, which no endpoint accepted. With `retired`, the
-    /// queued intent it was drained from is refused for good, as when its
-    /// event fits none of its relays (mdk#2334): the record is deleted in the
-    /// rollback's transaction and the refusal announced once that commits, so
-    /// no later drain prepares it again. Without it, a drained intent stays
-    /// queued for the next drain.
+    /// queued intent it was drained from is retired for good, as when its
+    /// event fits none of its relays (mdk#2334) or reached none of them
+    /// (mdk#2332): the record is deleted in the rollback's transaction and
+    /// the retirement announced once that commits, so no later drain
+    /// prepares it again. Without it, a drained intent stays queued for the
+    /// next drain.
+    ///
+    /// With `fanout`, it must be complete with no target accepted and none
+    /// that may hold the event (mdk#1577): a commit a relay may have
+    /// forwarded is never rolled back, whoever asks.
     pub(crate) async fn do_publish_failed_with_fanout(
         &mut self,
         pending: PendingStateRef,
         mut fanout: Option<&mut OutboundFanout>,
-        retired: Option<(&QueuedOutboundIntent, &EngineError)>,
+        retired: Option<(&QueuedOutboundIntent, QueuedIntentRetirement<'_>)>,
     ) -> Result<(), EngineError> {
         let origin_commit_id = self.peek_pending_origin_commit(pending);
 
@@ -526,9 +532,11 @@ impl<S: StorageProvider> Engine<S> {
                 if fanout.pending_ref() != Some(pending)
                     || outcome.accepted_targets != 0
                     || !outcome.fanout_complete
+                    || fanout.possible_exposure()
                 {
                     return Err(EngineError::Other(
-                        "fanout is not a complete all-failed matching pending publish".into(),
+                        "fanout is not a complete all-failed unexposed matching pending publish"
+                            .into(),
                     ));
                 }
                 let mut rolled_back = fanout.clone();
@@ -633,8 +641,8 @@ impl<S: StorageProvider> Engine<S> {
             *fanout = rolled_back;
         }
         // Announced before any fallible step below: the retirement is durable.
-        if let Some((record, refusal)) = retired {
-            self.announce_refused_queued_intent(record, refusal);
+        if let Some((record, retirement)) = retired {
+            self.announce_refused_queued_intent(record, retirement);
         }
         let pending_epoch_pre = EpochId(mls_group.epoch().as_u64());
         let audit_context = self.epoch_manager.audit_context_for_pending(pending);

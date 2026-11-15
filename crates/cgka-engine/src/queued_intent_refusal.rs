@@ -52,6 +52,27 @@ use cgka_traits::error::EngineError;
 use cgka_traits::storage::{QueuedOutboundIntent, StorageProvider};
 use cgka_traits::types::GroupId;
 
+/// Why a rollback retires the queued intent its commit was drained from.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum QueuedIntentRetirement<'a> {
+    /// The settled state, or every relay, refused it; the error says why, such
+    /// as `EventTooLarge` (mdk#2334).
+    Refused(&'a EngineError),
+    /// Its commit reached no relay and was given up (mdk#2332). Preparing it
+    /// again would send to the same relays.
+    NotDelivered,
+}
+
+impl QueuedIntentRetirement<'_> {
+    /// The stable reason [`GroupEvent::QueuedIntentRefused`] names.
+    fn reason(self) -> &'static str {
+        match self {
+            Self::Refused(error) => error.privacy_safe_kind(),
+            Self::NotDelivered => "not_delivered",
+        }
+    }
+}
+
 /// What a failed drain-time preparation means for the queued record.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum QueuedPreparationFailure {
@@ -175,7 +196,7 @@ impl<S: StorageProvider> Engine<S> {
         error: &EngineError,
     ) -> Result<(), EngineError> {
         self.storage.delete_queued_outbound_intent(&record.id)?;
-        self.announce_refused_queued_intent(record, error);
+        self.announce_refused_queued_intent(record, QueuedIntentRetirement::Refused(error));
         Ok(())
     }
 
@@ -183,30 +204,36 @@ impl<S: StorageProvider> Engine<S> {
     pub(crate) fn announce_refused_queued_intent(
         &mut self,
         record: &QueuedOutboundIntent,
-        error: &EngineError,
+        retirement: QueuedIntentRetirement<'_>,
     ) {
         let intent_kind = crate::audit_helpers::send_intent_kind_str(&record.intent);
-        let reason = error.privacy_safe_kind();
+        let reason = retirement.reason();
         self.audit_group(
             &record.group_id,
             marmot_forensics::AuditEventKind::Rejection {
                 msg_id: hex::encode(record.id.as_slice()),
-                reason: "queued_outbound_intent_refused_on_settled_state".to_string(),
+                reason: match retirement {
+                    QueuedIntentRetirement::Refused(_) => {
+                        "queued_outbound_intent_refused_on_settled_state"
+                    }
+                    QueuedIntentRetirement::NotDelivered => "queued_outbound_intent_not_delivered",
+                }
+                .to_string(),
             },
         );
-        // Privacy-safe: the intent's kind and the error's variant name only.
+        // Privacy-safe: the intent's kind and the reason's stable name only.
         tracing::info!(
             target: "cgka_engine::queued_intent_refusal",
             method = "retire_refused_queued_intent",
             intent_kind,
             error_kind = reason,
-            "queued intent refused on the settled state; retired"
+            "queued intent retired unsent"
         );
-        let (artifact, size_class) = match error {
-            EngineError::EventTooLarge {
+        let (artifact, size_class) = match retirement {
+            QueuedIntentRetirement::Refused(EngineError::EventTooLarge {
                 artifact,
                 size_class,
-            } => (Some(*artifact), Some(*size_class)),
+            }) => (Some(*artifact), Some(*size_class)),
             _ => (None, None),
         };
         self.events_buf.push_back(GroupEvent::QueuedIntentRefused {

@@ -634,8 +634,15 @@ async fn a_relay_answer_stored_before_the_upgrade_keeps_the_commit_pending() {
         let mut row = serde_json::to_value(&stored).unwrap();
         row["target_failures"][index] = serde_json::to_value(&answer).unwrap();
         assert!(!row.to_string().contains("pre_send"), "{name}: no proof field");
+        let bit_clear = row["target_possible_exposure"]
+            .as_array()
+            .is_none_or(|bits| bits.get(index) != Some(&serde_json::Value::Bool(true)));
+        assert!(bit_clear, "{name}: the old row's bit is clear");
         let legacy: cgka_traits::OutboundFanout = serde_json::from_value(row).unwrap();
-        assert!(!legacy.possible_exposure(), "{name}: the old row's bit is clear");
+        assert!(
+            legacy.target_may_hold_event(index),
+            "{name}: its stored answer reads as exposure"
+        );
         alice.put_outbound_fanout(&legacy).unwrap();
 
         if floor_refusal {

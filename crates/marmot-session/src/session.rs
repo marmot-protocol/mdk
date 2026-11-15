@@ -1874,6 +1874,17 @@ impl AccountDeviceSession {
         Ok(self.collect_effects(vec![]))
     }
 
+    /// Roll back a commit that reached no relay and was given up, retiring
+    /// the queued intent it was drained from as `not_delivered` (mdk#2332).
+    pub async fn publish_not_delivered(
+        &mut self,
+        pending: PendingStateRef,
+        fanout: &mut OutboundFanout,
+    ) -> SessionResult<SessionEffects> {
+        self.engine.publish_not_delivered(pending, fanout).await?;
+        Ok(self.collect_effects(vec![]))
+    }
+
     /// Roll back a commit none of whose relays will take it, retiring the
     /// queued intent it was drained from (mdk#2334).
     pub async fn publish_refused_as_too_large(

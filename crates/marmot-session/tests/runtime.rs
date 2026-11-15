@@ -1006,6 +1006,7 @@ include!("runtime/commit_floor.rs");
 include!("runtime/commit_refusal.rs");
 include!("runtime/own_echo.rs");
 include!("runtime/read_back.rs");
+include!("runtime/abandon.rs");
 include!("runtime/hydrated_welcome.rs");
 include!("support/recovery_challenge.rs");
 include!("runtime/key_package_generation_upgrade.rs");

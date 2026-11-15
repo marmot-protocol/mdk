@@ -51,7 +51,16 @@
   and a relay that returns it confirms the change. The read never signs in as
   the account, sends one request per relay, at most eight an hour, and feeds
   nothing into message handling. Any other answer changes nothing: the relay
-  is resent to as before, and nothing rolls back on a read.
+  is resent to as before, and nothing rolls back because a read found nothing.
+- Give up a group change that reached no relay (#2332). Ten minutes after its
+  first send, a pending change that no relay accepted and none may hold, with
+  relays still unreached, rolls back once the device shows it is online: a
+  relay refused a send made since then, or a relay answered a read of the
+  change, asked at most once an hour. The unreached relays are given up, and a
+  queued change is announced as `QueuedIntentRefused` with reason
+  `not_delivered`. A change any relay may hold still never rolls back,
+  including one stored before this release recorded that exposure, and an
+  offline device keeps the change pending.
 
 ## 0.17.0 - 2026-11-15
 

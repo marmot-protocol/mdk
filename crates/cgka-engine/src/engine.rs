@@ -13,6 +13,7 @@ use crate::convergence_clock::{ConvergenceClock, ConvergenceTime, SystemConverge
 use crate::feature_registry::FeatureRegistry;
 use crate::identity::Identity;
 pub use crate::own_account_devices::{OwedSiblingWelcome, SiblingWelcomeResendOutcome};
+use crate::queued_intent_refusal::QueuedIntentRetirement;
 use async_trait::async_trait;
 use cgka_traits::OutboundFanout;
 use cgka_traits::app_components::{
@@ -1289,7 +1290,39 @@ impl<S: StorageProvider> Engine<S> {
         self.do_publish_failed_with_fanout(
             pending,
             fanout,
-            retired.as_ref().map(|record| (record, &refusal)),
+            retired
+                .as_ref()
+                .map(|record| (record, QueuedIntentRetirement::Refused(&refusal))),
+        )
+        .await
+    }
+
+    /// Roll back a pending commit that never reached a relay and was given up
+    /// (mdk#2332): `fanout` ends each target nothing was sent to `Abandoned`
+    /// ([`OutboundFanout::abandon_unsent_targets`]), and storage admits that
+    /// edge only with this rollback, from the row it was computed on. The
+    /// queued intent it was drained from is retired with the reason
+    /// `not_delivered`, in the rollback's transaction: preparing it again
+    /// would send to the same relays. A commit not drained from the queue
+    /// rolls back as [`Self::publish_failed_fanout`] does.
+    pub async fn publish_not_delivered(
+        &mut self,
+        pending: PendingStateRef,
+        fanout: &mut OutboundFanout,
+    ) -> Result<(), EngineError> {
+        if let Some(group_id) = fanout.group_id() {
+            self.ensure_group_live(group_id)?;
+        }
+        self.pending_group_id(pending)?;
+        // Read before the rollback's transaction, so a failed read writes
+        // nothing.
+        let retired = self.queued_intent_for_pending(pending)?;
+        self.do_publish_failed_with_fanout(
+            pending,
+            Some(fanout),
+            retired
+                .as_ref()
+                .map(|record| (record, QueuedIntentRetirement::NotDelivered)),
         )
         .await
     }

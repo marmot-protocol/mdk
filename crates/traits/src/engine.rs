@@ -807,8 +807,9 @@ pub enum GroupEvent {
     /// A queued intent was dropped unsent: once the group settled, the
     /// settled state refused it, as it would have refused the same intent
     /// sent directly (the sender is no longer an admin, a precondition no
-    /// longer holds, the change is not valid on that state), or one of its
-    /// events fits none of its relays (mdk#2334). The engine does not prepare
+    /// longer holds, the change is not valid on that state), one of its
+    /// events fits none of its relays (mdk#2334), or its commit reached none
+    /// of its relays and was given up (mdk#2332). The engine does not prepare
     /// it again; the user may ask again (mdk#2694).
     QueuedIntentRefused {
         group_id: GroupId,
@@ -819,7 +820,8 @@ pub enum GroupEvent {
         /// Stable, privacy-safe name of the refusal: the
         /// [`EngineError::privacy_safe_kind`](crate::error::EngineError::privacy_safe_kind)
         /// of the error the preparation returned, such as `not_group_admin`,
-        /// or `event_too_large`.
+        /// or `event_too_large`; or `not_delivered` for a commit that no
+        /// relay received and that was rolled back.
         reason: String,
         /// For `event_too_large`, which event fit none of its relays: the
         /// commit, or a Welcome whose invitee's inbox relays all refuse it.

@@ -3881,6 +3881,255 @@ async fn a_too_large_queued_intent_is_retired_with_its_rollback() {
     );
 }
 
+/// A queued intent whose drained commit reached no relay is retired with the
+/// rollback that gives the commit up (mdk#2332), named `not_delivered`. The
+/// rollback carries each unsent target's `Abandoned` edge, which storage
+/// checks against the stored row in the rollback's transaction: one computed
+/// before a pass marked the target is refused, and the MLS rewind and the
+/// retirement fail with it. A fanout a relay may hold is never rolled back,
+/// whoever asks (mdk#1577).
+#[tokio::test]
+async fn a_queued_intent_whose_commit_reached_no_relay_is_retired_with_its_rollback() {
+    use cgka_traits::{
+        EpochState, TransportEndpoint, TransportEndpointFailure, TransportEndpointFailureKind,
+        TransportPublishRequest, TransportPublishTarget,
+    };
+
+    let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
+    let mut engine = EngineBuilder::new(FaultStorage {
+        inner: storage.clone(),
+        fault: PutGroupFault::default(),
+        leave_write_fault: LeaveWriteFault::default(),
+        intent_write_fault: LeaveWriteFault::default(),
+        failed_state_fault: FailedStateWriteFault::default(),
+        release_fault: LeaveWriteFault::default(),
+        preparation_delay: PreparationDelay::default(),
+        deferred_usage_read_fault: DeferredUsageReadFault::default(),
+        retained_anchor_rewinds: RetainedAnchorRewindCounter::default(),
+        apply_snapshots: ApplySnapshotCounter::default(),
+        termination_fault: LeaveWriteFault::default(),
+        post_commit_disband_read_fault: LeaveWriteFault::default(),
+        deferred_release_read_fault: DeferredReleaseReadFault::default(),
+        message_list_fault: LeaveWriteFault::default(),
+    })
+    .legacy_compatibility_profile()
+    .identity(pad32(b"undelivered-retirement"))
+    .account_identity_proof_signer(proof_signer(b"undelivered-retirement"))
+    .peeler(Box::new(MockPeeler))
+    .build()
+    .unwrap();
+    let (group_id, created) = engine
+        .create_group(CreateGroupRequest {
+            name: "undelivered".into(),
+            description: String::new(),
+            members: vec![],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let SendResult::GroupCreated { pending, .. } = created else {
+        panic!("create")
+    };
+    engine.confirm_published(pending).await.unwrap();
+    let intent_id = MessageId::new(b"queued-undelivered-edit".to_vec());
+    storage
+        .put_queued_outbound_intent(&QueuedOutboundIntent {
+            id: intent_id.clone(),
+            group_id: group_id.clone(),
+            intent: SendIntent::UpdateGroupData {
+                group_id: group_id.clone(),
+                name: Some("undelivered edit".into()),
+                description: None,
+            },
+            created_at_ms: 0,
+            reissue_attempts: 0,
+        })
+        .unwrap();
+    let drained = engine
+        .converge_and_drain_queued_outbound_intents(&group_id, 1_000_000)
+        .await
+        .unwrap();
+    let [SendResult::GroupEvolution { msg, pending, .. }] = drained.as_slice() else {
+        panic!("the queued edit stages: {drained:?}")
+    };
+    let pending = *pending;
+    engine.drain_events();
+    let TransportEnvelope::GroupMessage { transport_group_id } = &msg.envelope else {
+        panic!("a group commit: {:?}", msg.envelope)
+    };
+    let refusing = TransportEndpoint("wss://undelivered-refusing.example".into());
+    let dead = TransportEndpoint("wss://undelivered-dead.example".into());
+    let mut fanout = OutboundFanout::stage(
+        TransportPublishRequest {
+            account_id: engine.self_id(),
+            message: msg.clone(),
+            target: TransportPublishTarget::Group {
+                group_id: group_id.clone(),
+                transport_group_id: transport_group_id.clone(),
+                endpoints: vec![refusing.clone(), dead.clone()],
+            },
+            required_acks: 1,
+        },
+        Some(pending),
+        Some(group_id.clone()),
+        0,
+    )
+    .unwrap();
+    let failure = |endpoint: &TransportEndpoint, kind, pre_send| TransportEndpointFailure {
+        endpoint: endpoint.clone(),
+        reason: "scripted answer".into(),
+        kind,
+        rejection_category: None,
+        size_class: None,
+        pre_send,
+    };
+    engine.put_outbound_fanout(&fanout).unwrap();
+    for index in [0, 1] {
+        fanout.mark_attempt_started_at(index, 100).unwrap();
+    }
+    engine.put_outbound_fanout(&fanout).unwrap();
+    fanout
+        .record_target_failure(
+            0,
+            failure(
+                &refusing,
+                TransportEndpointFailureKind::TerminalRejected,
+                false,
+            ),
+        )
+        .unwrap();
+    fanout
+        .record_target_failure(
+            1,
+            failure(
+                &dead,
+                TransportEndpointFailureKind::RetryableUnavailable,
+                true,
+            ),
+        )
+        .unwrap();
+    engine.put_outbound_fanout(&fanout).unwrap();
+    let still_pending = |engine: &cgka_engine::Engine<FaultStorage>| {
+        matches!(
+            engine.epoch_state(&group_id),
+            Some(EpochState::PendingPublish { .. })
+        )
+    };
+    let queued = |storage: &SqliteAccountStorage| {
+        storage
+            .list_queued_outbound_intents(&group_id)
+            .unwrap()
+            .len()
+    };
+
+    // A relay that may hold the commit: no rollback, by either path.
+    let mut exposed = fanout.clone();
+    exposed.mark_attempt_started_at(1, 200).unwrap();
+    exposed.mark_target_failed(1).unwrap();
+    assert!(exposed.outcome().fanout_complete && exposed.possible_exposure());
+    assert!(
+        engine
+            .publish_failed_fanout(pending, &mut exposed.clone())
+            .await
+            .is_err()
+    );
+    assert!(
+        engine
+            .publish_not_delivered(pending, &mut exposed)
+            .await
+            .is_err()
+    );
+    assert!(still_pending(&engine));
+
+    // Abandoned, then a pass marks the unsent target before the rollback.
+    let mut stale = fanout.clone();
+    assert_eq!(stale.abandon_unsent_targets().unwrap(), 1);
+    fanout.mark_attempt_started_at(1, 300).unwrap();
+    engine.put_outbound_fanout(&fanout).unwrap();
+    assert!(
+        engine
+            .publish_not_delivered(pending, &mut stale)
+            .await
+            .is_err()
+    );
+    assert!(
+        still_pending(&engine),
+        "the stale abandonment rewinds nothing"
+    );
+    assert_eq!(queued(&storage), 1, "the stale abandonment retires nothing");
+    assert_eq!(
+        engine.outbound_fanouts().unwrap(),
+        vec![fanout.clone()],
+        "the stale abandonment stores nothing"
+    );
+    assert!(
+        !engine
+            .drain_events()
+            .iter()
+            .any(|event| matches!(event, GroupEvent::QueuedIntentRefused { .. }))
+    );
+
+    // That attempt sends nothing either; abandoned from the row it marked.
+    fanout
+        .record_target_failure(
+            1,
+            failure(
+                &dead,
+                TransportEndpointFailureKind::RetryableUnavailable,
+                true,
+            ),
+        )
+        .unwrap();
+    engine.put_outbound_fanout(&fanout).unwrap();
+    fanout.abandon_unsent_targets().unwrap();
+    engine
+        .publish_not_delivered(pending, &mut fanout)
+        .await
+        .expect("a commit that reached no relay rolls back");
+    assert_eq!(fanout.mls_state(), cgka_traits::FanoutMlsState::RolledBack);
+    assert_eq!(engine.outbound_fanouts().unwrap(), vec![fanout.clone()]);
+    assert!(matches!(
+        engine.epoch_state(&group_id),
+        Some(EpochState::Stable { .. })
+    ));
+    assert_eq!(queued(&storage), 0);
+    let refusals: Vec<_> = engine
+        .drain_events()
+        .into_iter()
+        .filter(|event| matches!(event, GroupEvent::QueuedIntentRefused { .. }))
+        .collect();
+    assert!(
+        matches!(
+            refusals.as_slice(),
+            [GroupEvent::QueuedIntentRefused {
+                intent_id: refused,
+                intent_kind,
+                reason,
+                artifact: None,
+                size_class: None,
+                ..
+            }] if *refused == intent_id
+                && intent_kind == "update_group_data"
+                && reason == "not_delivered"
+        ),
+        "{refusals:?}"
+    );
+    assert!(
+        engine
+            .converge_and_drain_queued_outbound_intents(&group_id, 1_000_001)
+            .await
+            .unwrap()
+            .is_empty(),
+        "the next drain prepares nothing"
+    );
+    assert_ne!(
+        engine.group_record(&group_id).unwrap().name,
+        "undelivered edit"
+    );
+}
+
 /// A queued change the settled state already holds drains to `NoChange` and
 /// is retired then (mdk#2842). A failed retirement leaves it for the next
 /// drain, and the pass still returns the message it prepared before it: had

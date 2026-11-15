@@ -15,6 +15,13 @@
   the first attempt on any target started, written once and kept by `validate_successor_of`; a stored fanout without
   it reads `created_at_ms` once any target was attempted. `target_may_hold_event` tells a target whose relay may hold
   the event.
+- `FanoutTargetStatus::Abandoned` ends a target nothing was ever sent to when its pending commit is given up and rolled
+  back (mdk#2332). `OutboundFanout::abandon_unsent_targets` sets it on every outstanding target, refusing unless the
+  commit is pending, no target accepted it and none may hold it; `validate_successor_of` admits the edge only with MLS
+  `Pending → RolledBack` and only from a stored row no target may hold. `reachability_read_at_ms` and
+  `record_reachability_read` keep when the device last read the commit to learn whether it is online.
+  `possible_exposure` and `target_may_hold_event` now read a row stored before the exposure bit by its stored status, as
+  `RetryableUnavailable` with a failure that does not prove nothing was sent, so such a row counts as exposed.
 
 ## 0.17.0 - 2026-11-15
 

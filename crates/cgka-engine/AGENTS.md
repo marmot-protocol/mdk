@@ -566,8 +566,12 @@ peel runs. `Engine::retry_deferred_peels` offers those contexts to every retaine
   failure or crash leaves both the pending commit and the record. The session calls it for a fanout that every target
   refused for size, known limit or relay answer (`OversizedEvent::of_fanout`), and for a drained invite whose Welcome
   fits none of its invitee's inbox relays, judged before the commit is published by the check a direct invite uses.
-  A plain `publish_failed_with_fanout` keeps the record, so the drain stages it again. Pinned by
-  `tests/record_write_atomicity.rs::a_too_large_queued_intent_is_retired_with_its_rollback` and marmot-app
+  A pending commit the session gives up because it reached no relay (mdk#2332) goes through `publish_not_delivered`:
+  the same retirement in the rollback's transaction, announced as `not_delivered`. Every fanout rollback refuses a
+  fanout that a target accepted, that is incomplete, or that a target may hold (`OutboundFanout::possible_exposure`,
+  mdk#1577). A plain `publish_failed_with_fanout` keeps the record, so the drain stages it again. Pinned by
+  `tests/record_write_atomicity.rs::a_too_large_queued_intent_is_retired_with_its_rollback`,
+  `::a_queued_intent_whose_commit_reached_no_relay_is_retired_with_its_rollback` and marmot-app
   `tests/relay_event_limits.rs::a_queued_commit_too_large_for_every_group_relay_is_retired` and
   `::a_queued_invite_whose_welcome_fits_no_inbox_relay_is_retired_unsent`.
 - **A send never goes ahead of an intent queued earlier for its group (mdk#2842).** While any queued intent of the

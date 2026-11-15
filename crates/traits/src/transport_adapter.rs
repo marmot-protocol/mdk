@@ -204,6 +204,10 @@ pub enum FanoutTargetStatus {
     PossiblyExposed,
     /// The endpoint was transiently unavailable without a claim of exposure.
     RetryableUnavailable,
+    /// Nothing was ever sent to the endpoint, and its pending commit was
+    /// given up and rolled back (mdk#2332). Only a rollback stores it: see
+    /// [`OutboundFanout::abandon_unsent_targets`].
+    Abandoned,
 }
 
 impl FanoutTargetStatus {
@@ -303,6 +307,11 @@ pub struct OutboundFanout {
     first_attempt_at_ms: Option<u64>,
     #[serde(default)]
     target_possible_exposure: Vec<bool>,
+    /// When the device last read a pending commit back to learn whether it
+    /// can reach any of its relays (mdk#2332). See
+    /// [`Self::reachability_read_at_ms`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reachability_read_at_ms: Option<u64>,
     /// Per target, the acknowledgement that ended it `Accepted` without a
     /// publish answer. Empty until one does.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -465,6 +474,7 @@ impl OutboundFanout {
             target_last_attempt_at_ms: vec![None; target_count],
             first_attempt_at_ms: None,
             target_possible_exposure: vec![false; target_count],
+            reachability_read_at_ms: None,
             target_acknowledgements: Vec::new(),
             post_confirmation_welcomes_pending: !post_confirmation_welcomes.is_empty(),
             post_confirmation_welcomes,
@@ -614,17 +624,16 @@ impl OutboundFanout {
     }
 
     /// Whether the endpoint may hold the event without having acknowledged
-    /// it: its exposure bit is set, or it is `PossiblyExposed` or
-    /// `Attempting` (see [`Self::possible_exposure`]).
+    /// it: its exposure bit is set, it is `PossiblyExposed` or `Attempting`,
+    /// or its stored status records exposure the bit does not yet carry (see
+    /// [`Self::possible_exposure`]).
     pub fn target_may_hold_event(&self, index: usize) -> bool {
         self.target_possible_exposure
             .get(index)
             .copied()
             .unwrap_or(false)
-            || matches!(
-                self.target_status(index),
-                Some(FanoutTargetStatus::PossiblyExposed | FanoutTargetStatus::Attempting)
-            )
+            || self.target_status(index) == Some(FanoutTargetStatus::Attempting)
+            || self.stored_status_records_exposure(index)
     }
 
     /// How the target was acknowledged when it was not by a publish answer.
@@ -730,17 +739,57 @@ impl OutboundFanout {
         woken
     }
 
-    /// Whether any endpoint may hold the event without having acknowledged it.
-    /// An `Attempting` target counts: its bytes may already have left, and
-    /// only a recorded result says otherwise.
+    /// Whether any endpoint may hold the event without having acknowledged it
+    /// ([`Self::target_may_hold_event`]). An `Attempting` target counts: its
+    /// bytes may already have left, and only a recorded result says
+    /// otherwise. So does a row stored before the exposure bit carried a
+    /// relay's retryable answer (mdk#2332): its stored status is read as the
+    /// bit it would set.
     pub fn possible_exposure(&self) -> bool {
-        self.target_possible_exposure.iter().any(|exposed| *exposed)
-            || self.target_statuses.iter().any(|status| {
-                matches!(
-                    status,
-                    FanoutTargetStatus::PossiblyExposed | FanoutTargetStatus::Attempting
-                )
-            })
+        (0..self.target_statuses.len()).any(|index| self.target_may_hold_event(index))
+    }
+
+    /// When the device last read this pending commit back from its relays to
+    /// learn whether it can reach any of them (mdk#2332), none before it has.
+    /// The session uses it to read at most once an hour.
+    pub fn reachability_read_at_ms(&self) -> Option<u64> {
+        self.reachability_read_at_ms
+    }
+
+    /// Record that the device read this pending commit back from its relays
+    /// to learn whether it can reach any of them. It changes no target.
+    pub fn record_reachability_read(&mut self, at_ms: u64) {
+        self.reachability_read_at_ms = Some(at_ms);
+    }
+
+    /// Give up a pending commit that never reached a relay (mdk#2332): end
+    /// each outstanding target `Abandoned`, ready for the rollback that
+    /// stores the edge with MLS `Pending → RolledBack`. Storage admits it no
+    /// other way (see [`Self::validate_successor_of`]).
+    ///
+    /// It refuses, changing nothing, unless every target is safe to give
+    /// up: no target accepted the event and none may hold it
+    /// ([`Self::possible_exposure`]). Each outstanding target is then
+    /// `NotAttempted` or a `RetryableUnavailable` whose every attempt sent
+    /// nothing, and each other target is `Failed` by a definitive refusal or
+    /// a refusal that sent nothing. Returns how many targets it ended.
+    pub fn abandon_unsent_targets(&mut self) -> Result<usize, TransportAdapterError> {
+        if !matches!(self.mls_state, FanoutMlsState::Pending(_))
+            || self.outcome().accepted_targets != 0
+            || self.possible_exposure()
+        {
+            return Err(TransportAdapterError::Other(
+                "only a pending commit that reached no relay can be abandoned".into(),
+            ));
+        }
+        let mut abandoned = 0;
+        for index in 0..self.target_statuses.len() {
+            if self.target_statuses[index].is_outstanding() {
+                self.target_statuses[index] = FanoutTargetStatus::Abandoned;
+                abandoned += 1;
+            }
+        }
+        Ok(abandoned)
     }
 
     pub fn pending_post_confirmation_welcomes(&self) -> &[TransportMessage] {
@@ -826,7 +875,9 @@ impl OutboundFanout {
                 self.held_attempts.start(index, self.target_statuses.len());
                 Ok(true)
             }
-            FanoutTargetStatus::Accepted | FanoutTargetStatus::Failed => Ok(false),
+            FanoutTargetStatus::Accepted
+            | FanoutTargetStatus::Failed
+            | FanoutTargetStatus::Abandoned => Ok(false),
         }
     }
 
@@ -1027,6 +1078,25 @@ impl OutboundFanout {
                 .is_some_and(|failure| self.ends_exposed_target(failure))
     }
 
+    /// Whether storage admits `NotAttempted` or `RetryableUnavailable` →
+    /// `Abandoned` for one target (mdk#2332): only in the rollback that gives
+    /// up a pending commit no relay may hold, judged on the stored row, as
+    /// [`Self::abandon_unsent_targets`] judged the value it changed. So a
+    /// successor computed before a pass marked the target `Attempting`, or
+    /// from a row whose stored status records exposure, is refused, and the
+    /// rollback that carries it fails with it.
+    fn abandonment_admitted(&self, previous: &Self, index: usize) -> bool {
+        matches!(
+            previous.target_status(index),
+            Some(FanoutTargetStatus::NotAttempted | FanoutTargetStatus::RetryableUnavailable)
+        ) && matches!(previous.mls_state, FanoutMlsState::Pending(_))
+            && self.mls_state == FanoutMlsState::RolledBack
+            && previous.outcome().accepted_targets == 0
+            && self.outcome().accepted_targets == 0
+            && !previous.possible_exposure()
+            && !self.possible_exposure()
+    }
+
     /// Each target that refused this confirmed commit for good (mdk#2333):
     /// `Failed` with a relay's final answer, or with MDK's size refusal. A
     /// target that failed the host-safety rule was never contacted and is not
@@ -1090,7 +1160,12 @@ impl OutboundFanout {
         let failed_targets = self
             .target_statuses
             .iter()
-            .filter(|status| **status == FanoutTargetStatus::Failed)
+            .filter(|status| {
+                matches!(
+                    status,
+                    FanoutTargetStatus::Failed | FanoutTargetStatus::Abandoned
+                )
+            })
             .count();
         let outstanding_targets = self
             .target_statuses
@@ -1204,6 +1279,8 @@ impl OutboundFanout {
                             && *next == FanoutTargetStatus::Failed
                             && self.size_refusal_ends_exposed_target(index))
                         || (*next == FanoutTargetStatus::Accepted && newly_acknowledged(index))
+                        || (*next == FanoutTargetStatus::Abandoned
+                            && self.abandonment_admitted(previous, index))
                 });
         let exposure_advances = previous.target_possible_exposure.is_empty()
             || self
@@ -1285,22 +1362,28 @@ impl OutboundFanout {
         }
     }
 
-    /// Set the exposure bit when the target's stored status records exposure,
-    /// before anything replaces that status. A `PossiblyExposed` status does.
-    /// So does a `RetryableUnavailable` whose failure does not prove nothing
-    /// was sent: a row stored before that proof existed (mdk#2332) records a
-    /// relay's `rate-limited:` or `auth-required:` answer that way, with the
-    /// bit clear.
+    /// Set the exposure bit when the target's stored status records exposure
+    /// ([`Self::stored_status_records_exposure`]), before anything replaces
+    /// that status.
     fn fold_stored_exposure(&mut self, index: usize) {
-        let exposed = match self.target_statuses[index] {
-            FanoutTargetStatus::PossiblyExposed => true,
-            FanoutTargetStatus::RetryableUnavailable => !self.target_failures[index]
-                .as_ref()
+        if self.stored_status_records_exposure(index) {
+            self.target_possible_exposure[index] = true;
+        }
+    }
+
+    /// Whether the target's stored status records that its relay may hold the
+    /// event, whatever the bit says. A `PossiblyExposed` status does. So does
+    /// a `RetryableUnavailable` whose failure does not prove nothing was sent:
+    /// a row stored before that proof existed (mdk#2332) records a relay's
+    /// `rate-limited:` or `auth-required:` answer that way, with the bit
+    /// clear, and one with no stored failure says nothing either way.
+    fn stored_status_records_exposure(&self, index: usize) -> bool {
+        match self.target_status(index) {
+            Some(FanoutTargetStatus::PossiblyExposed) => true,
+            Some(FanoutTargetStatus::RetryableUnavailable) => !self
+                .target_failure(index)
                 .is_some_and(TransportEndpointFailure::proves_nothing_sent),
             _ => false,
-        };
-        if exposed {
-            self.target_possible_exposure[index] = true;
         }
     }
 }
@@ -2950,6 +3033,187 @@ mod tests {
             forged.target_acknowledgements = vec![None; forged.target_statuses.len()];
             forged.target_acknowledgements[0] = Some(FanoutAcknowledgement::Echo);
             assert!(forged.validate_successor_of(fanout).is_err());
+        }
+    }
+
+    /// mdk#2332 R5: a pending commit is given up only when no relay may hold
+    /// it. Targets 1 and 2 refused it definitively; each shape of target 0
+    /// either lets the commit be abandoned, and storage then admits the edge
+    /// only with the rollback and only from the row it was computed on, or
+    /// refuses, changing nothing, and storage refuses a forged successor
+    /// of the same row. A row stored before a relay's retryable answer set
+    /// the bit reads as exposed.
+    #[test]
+    fn a_pending_commit_is_abandoned_only_when_no_relay_may_hold_it() {
+        use FanoutTargetStatus::{Abandoned, Failed};
+        use TransportEndpointFailureKind as Kind;
+        let endpoints = fanout_request().target.endpoints().to_vec();
+        let answer = |index: usize, kind, pre_send| TransportEndpointFailure {
+            endpoint: endpoints[index].clone(),
+            reason: "scripted answer".into(),
+            kind,
+            rejection_category: None,
+            size_class: None,
+            pre_send,
+        };
+        let stage = |pending: bool| {
+            let mut fanout = OutboundFanout::stage(
+                fanout_request(),
+                pending.then(|| crate::engine_state::PendingStateRef::new(9)),
+                Some(GroupId::new(vec![0xD4; 16])),
+                55,
+            )
+            .unwrap();
+            for index in [1, 2] {
+                fanout.mark_attempt_started_at(index, 100).unwrap();
+                fanout
+                    .record_target_failure(index, answer(index, Kind::TerminalRejected, false))
+                    .unwrap();
+            }
+            fanout
+        };
+        let reload = |fanout: &OutboundFanout| -> OutboundFanout {
+            serde_json::from_value(serde_json::to_value(fanout).unwrap()).unwrap()
+        };
+        let attempted = |result: Option<TransportEndpointFailure>| {
+            let mut fanout = stage(true);
+            fanout.mark_attempt_started_at(0, 200).unwrap();
+            if let Some(failure) = result {
+                fanout.record_target_failure(0, failure).unwrap();
+            }
+            fanout
+        };
+        let unreachable = attempted(Some(answer(0, Kind::RetryableUnavailable, true)));
+        let mut legacy_answer = unreachable.clone();
+        legacy_answer.target_failures[0] = Some(answer(0, Kind::RetryableUnavailable, false));
+        let mut legacy_no_failure = unreachable.clone();
+        legacy_no_failure.target_failures[0] = None;
+        let mut legacy_no_bits = legacy_answer.clone();
+        legacy_no_bits.target_possible_exposure.clear();
+        let mut accepted = attempted(None);
+        accepted.mark_target_accepted(0).unwrap();
+        let mut unclassified = unreachable.clone();
+        unclassified.target_statuses[1] = FanoutTargetStatus::Attempting;
+        unclassified.mark_target_failed(1).unwrap();
+        let mut application = stage(false);
+        application.mark_attempt_started_at(0, 200).unwrap();
+        application
+            .record_target_failure(0, answer(0, Kind::RetryableUnavailable, true))
+            .unwrap();
+
+        // (case, stored row, target 0 may hold the event, abandoned).
+        let cases = [
+            ("never attempted", stage(true), false, true),
+            ("connection never made", unreachable.clone(), false, true),
+            (
+                "connection never made, reloaded",
+                reload(&unreachable),
+                false,
+                true,
+            ),
+            (
+                "relay's retryable answer",
+                attempted(Some(answer(0, Kind::RetryableUnavailable, false))),
+                true,
+                false,
+            ),
+            (
+                "stored before the bit: retryable answer",
+                legacy_answer,
+                true,
+                false,
+            ),
+            (
+                "stored before the bit: no failure",
+                legacy_no_failure,
+                true,
+                false,
+            ),
+            (
+                "stored before the bit: no bits",
+                legacy_no_bits,
+                true,
+                false,
+            ),
+            ("in flight", attempted(None), true, false),
+            (
+                "interrupted, reloaded",
+                reload(&attempted(None)),
+                true,
+                false,
+            ),
+            (
+                "timed out",
+                attempted(Some(answer(0, Kind::PossiblyExposed, false))),
+                true,
+                false,
+            ),
+            ("accepted", accepted, false, false),
+            (
+                "another target failed unclassified",
+                unclassified,
+                false,
+                false,
+            ),
+            ("an application message", application, false, false),
+        ];
+        for (case, stored, may_hold, abandons) in cases {
+            assert_eq!(stored.target_may_hold_event(0), may_hold, "{case}");
+            let mut after = stored.clone();
+            let result = after.abandon_unsent_targets();
+            if !abandons {
+                assert!(result.is_err(), "{case}: {result:?}");
+                assert_eq!(after, stored, "{case}: a refusal changes nothing");
+                let mut forged = stored.clone();
+                forged.target_statuses[0] = Abandoned;
+                forged.mls_state = FanoutMlsState::RolledBack;
+                assert!(
+                    forged.validate_successor_of(&stored).is_err(),
+                    "{case}: storage admits a forged abandonment"
+                );
+                continue;
+            }
+            assert_eq!(result.unwrap(), 1, "{case}");
+            assert_eq!(
+                after.target_statuses,
+                vec![Abandoned, Failed, Failed],
+                "{case}"
+            );
+            let outcome = after.outcome();
+            assert!(outcome.fanout_complete, "{case}");
+            assert_eq!(outcome.failed_targets, 3, "{case}");
+            assert!(
+                after.validate_successor_of(&stored).is_err(),
+                "{case}: an abandonment is stored only with its rollback"
+            );
+            let mut rolled_back = after.clone();
+            rolled_back.mark_mls_rolled_back().unwrap();
+            rolled_back
+                .validate_successor_of(&stored)
+                .unwrap_or_else(|error| panic!("{case}: storage refuses it: {error}"));
+            rolled_back
+                .validate_successor_of(&rolled_back.clone())
+                .unwrap();
+            // A pass that marked the target after the abandonment was computed
+            // makes the stale successor fail (15c).
+            let mut marked = stored.clone();
+            marked.mark_attempt_started_at(0, 300).unwrap();
+            assert!(
+                rolled_back.validate_successor_of(&marked).is_err(),
+                "{case}: storage admits a stale abandonment"
+            );
+            // `Abandoned` is terminal.
+            assert!(
+                !rolled_back.mark_attempt_started_at(0, 400).unwrap(),
+                "{case}"
+            );
+            assert!(
+                !rolled_back
+                    .record_target_failure(0, answer(0, Kind::PossiblyExposed, false))
+                    .unwrap(),
+                "{case}"
+            );
+            assert_eq!(rolled_back.target_status(0), Some(Abandoned), "{case}");
         }
     }
 

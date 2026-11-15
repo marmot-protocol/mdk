@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Added
+
+- `Engine::publish_not_delivered` rolls back a pending commit the session gave up because it reached no relay
+  (mdk#2332), retiring its queued intent in the rollback's transaction and announcing it as `QueuedIntentRefused`
+  with reason `not_delivered`.
+
+### Changed
+
+- Every fanout rollback (`publish_failed_with_fanout`, `publish_refused_as_too_large`, `publish_not_delivered`) now
+  also refuses a fanout a target may hold (`OutboundFanout::possible_exposure`), so a commit a relay may have kept
+  never rolls back (mdk#1577, mdk#2332).
+
 ### Fixed
 
 - Received NIP-22 comments (kind 1111 with a numeric lowercase `k` tag) carry their source-epoch encrypted-media
