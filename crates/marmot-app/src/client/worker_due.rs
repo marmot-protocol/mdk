@@ -67,6 +67,21 @@ impl AppClient {
             .map(|at| at.0)
     }
 
+    /// What the KeyPackage catch-up's schedule reads: whether a catch-up is
+    /// due now, and when it next comes due by time alone. `None` when a read
+    /// fails, which counts as a change.
+    pub(crate) fn key_package_catch_up_state(&self) -> Option<(bool, Option<u64>)> {
+        Some((
+            self.runtime
+                .key_package_maintenance_requires_catch_up()
+                .ok()?,
+            self.runtime
+                .key_package_maintenance_next_due()
+                .ok()?
+                .map(|at| at.0),
+        ))
+    }
+
     /// When history dispatch next has work, in unix seconds: a restore
     /// waiting for a slot now; with device groups on and maintenance
     /// running, the earliest history upload or fetch deadline, and while

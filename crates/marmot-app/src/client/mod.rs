@@ -1505,6 +1505,7 @@ impl AppClient {
                 .maintenance_run_summary(&marmot_session::AccountDeviceEffects::default())?;
             return Ok(maintenance_run_summary_from_account(summary));
         }
+        let key_package_before = self.key_package_catch_up_state();
         // Drain edges between ticks too. A new consent generation establishes a
         // baseline so earlier local work cannot become a post-consent backlog.
         let mut previous = self.runtime.take_maintenance_activity();
@@ -1709,9 +1710,14 @@ impl AppClient {
                 },
             );
         }
-        // Maintenance may change what the KeyPackage catch-up owes: a device
-        // tag or capability change, or a sign-in check (mdk#2923).
-        self.key_package_lifecycle_changed = true;
+        // Maintenance may change what the KeyPackage catch-up owes: a
+        // publication, a device tag or capability change, or a sign-in check.
+        // Wake it only when that answer changed, so its own deadline decides
+        // otherwise (mdk#2923, mdk#3265).
+        let key_package_after = self.key_package_catch_up_state();
+        if key_package_before.is_none() || key_package_after != key_package_before {
+            self.key_package_lifecycle_changed = true;
+        }
         let effects = effects?;
         boxed(|| self.finish_maintenance_effects(&effects)).await
     }
