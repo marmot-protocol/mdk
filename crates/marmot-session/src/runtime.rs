@@ -5909,6 +5909,16 @@ where
                     return Err(error.into());
                 }
             };
+            // A drained commit names its queued intent in the same record, so
+            // a restart still retires the intent with the commit (mdk#2332).
+            if let Some(intent_id) =
+                pending.and_then(|pending| self.session.drained_queued_intent_id(pending))
+                && let Err(error) = fanout.set_queued_intent(intent_id)
+            {
+                self.rollback_unstaged_pending(pending, output, queue)
+                    .await?;
+                return Err(error.into());
+            }
             if let Some(application_message) = application_message
                 && let Err(error) = fanout.set_application_message(application_message)
             {

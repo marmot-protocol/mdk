@@ -7,6 +7,8 @@
 - `Engine::publish_not_delivered` rolls back a pending commit the session gave up because it reached no relay
   (mdk#2332), retiring its queued intent in the rollback's transaction and announcing it as `QueuedIntentRefused`
   with reason `not_delivered`.
+- `Engine::drained_queued_intent_id` returns the queued intent the drain prepared a pending commit from, for its frozen
+  fanout to name (mdk#2332).
 
 ### Changed
 
@@ -16,6 +18,9 @@
 
 ### Fixed
 
+- Hydration restores a pending commit's link to the queued intent it was drained from, from the frozen fanout that
+  names it, so confirming the commit, refusing it for size or `publish_not_delivered` after a restart retires that
+  intent instead of leaving it for the drain to prepare again (mdk#2332).
 - Received NIP-22 comments (kind 1111 with a numeric lowercase `k` tag) carry their source-epoch encrypted-media
   secret through the same ingest and replay handoff as chat attachments (#3409).
 

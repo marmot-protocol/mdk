@@ -1900,6 +1900,12 @@ impl AccountDeviceSession {
         Ok(self.collect_effects(vec![]))
     }
 
+    /// The queued intent the drain prepared `pending` from, for its frozen
+    /// fanout to name (mdk#2332).
+    pub fn drained_queued_intent_id(&self, pending: PendingStateRef) -> Option<MessageId> {
+        self.engine.drained_queued_intent_id(pending)
+    }
+
     /// Whether `pending` is the commit of a queued invite the drain prepared.
     pub fn pending_is_queued_invite(&self, pending: PendingStateRef) -> SessionResult<bool> {
         Ok(self.engine.pending_is_queued_invite(pending)?)

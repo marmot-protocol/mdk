@@ -312,6 +312,10 @@ pub struct OutboundFanout {
     /// [`Self::reachability_read_at_ms`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     reachability_read_at_ms: Option<u64>,
+    /// The queued intent a pending commit was drained from (mdk#2332). See
+    /// [`Self::queued_intent_id`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    queued_intent_id: Option<MessageId>,
     /// Per target, the acknowledgement that ended it `Accepted` without a
     /// publish answer. Empty until one does.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -475,6 +479,7 @@ impl OutboundFanout {
             first_attempt_at_ms: None,
             target_possible_exposure: vec![false; target_count],
             reachability_read_at_ms: None,
+            queued_intent_id: None,
             target_acknowledgements: Vec::new(),
             post_confirmation_welcomes_pending: !post_confirmation_welcomes.is_empty(),
             post_confirmation_welcomes,
@@ -527,6 +532,36 @@ impl OutboundFanout {
                 "application-message fanout context changed".into(),
             )),
         }
+    }
+
+    /// Record the queued intent this pending commit was drained from
+    /// (mdk#2332), before the fanout is first stored. It is written with the
+    /// pending commit's durable record, so a restart can still retire that
+    /// intent when the commit resolves. Setting the same id again is a no-op;
+    /// any other change, or a fanout with no pending commit, is refused.
+    pub fn set_queued_intent(&mut self, intent_id: MessageId) -> Result<(), TransportAdapterError> {
+        if !matches!(self.mls_state, FanoutMlsState::Pending(_)) {
+            return Err(TransportAdapterError::Other(
+                "only a pending commit's fanout names a queued intent".into(),
+            ));
+        }
+        match &self.queued_intent_id {
+            None => {
+                self.queued_intent_id = Some(intent_id);
+                Ok(())
+            }
+            Some(previous) if previous == &intent_id => Ok(()),
+            Some(_) => Err(TransportAdapterError::Other(
+                "queued intent of a fanout changed".into(),
+            )),
+        }
+    }
+
+    /// The queued intent this pending commit was drained from, when it was
+    /// drained from one and staged by a release that records it (mdk#2332).
+    /// Immutable once stored (see [`Self::validate_successor_of`]).
+    pub fn queued_intent_id(&self) -> Option<&MessageId> {
+        self.queued_intent_id.as_ref()
     }
 
     /// Stored OpenMLS commit row used to restore this pending lifecycle.
@@ -1199,6 +1234,7 @@ impl OutboundFanout {
             && self.group_id == previous.group_id
             && self.application_message == previous.application_message
             && self.pending_origin_message_id == previous.pending_origin_message_id
+            && self.queued_intent_id == previous.queued_intent_id
             && self.pending_kind == previous.pending_kind
             && self.created_at_ms == previous.created_at_ms
             && self.post_confirmation_welcomes == previous.post_confirmation_welcomes
@@ -3220,6 +3256,59 @@ mod tests {
     /// mdk#2332: an acknowledgement names its target by the endpoint the
     /// event came from, in any spelling of the same URL, and only the exact
     /// frozen event, or the id the adapter published it under, is this one.
+    /// mdk#2332: a pending commit's fanout names the queued intent it was
+    /// drained from once, before it is stored, and storage keeps that name.
+    /// A row stored before the name existed reads as naming none.
+    #[test]
+    fn a_pending_fanout_names_its_queued_intent_once() {
+        let unnamed = OutboundFanout::stage(
+            fanout_request(),
+            Some(crate::engine_state::PendingStateRef::new(4)),
+            Some(GroupId::new(vec![0xD4; 16])),
+            55,
+        )
+        .unwrap();
+        let intent = MessageId::new(b"queued-intent".to_vec());
+        let other = MessageId::new(b"another-intent".to_vec());
+
+        let mut resolved = unnamed.clone();
+        resolved.mark_mls_rolled_back().unwrap();
+        assert!(resolved.set_queued_intent(intent.clone()).is_err());
+
+        let mut named = unnamed.clone();
+        named.set_queued_intent(intent.clone()).unwrap();
+        named.set_queued_intent(intent.clone()).unwrap();
+        assert!(named.clone().set_queued_intent(other.clone()).is_err());
+        assert_eq!(named.queued_intent_id(), Some(&intent));
+
+        assert!(named.validate_successor_of(&named).is_ok());
+        assert!(
+            named.validate_successor_of(&unnamed).is_err(),
+            "named after storing"
+        );
+        assert!(
+            unnamed.validate_successor_of(&named).is_err(),
+            "name dropped"
+        );
+
+        let stored = serde_json::to_value(&named).unwrap();
+        let reloaded: OutboundFanout = serde_json::from_value(stored.clone()).unwrap();
+        assert_eq!(reloaded.queued_intent_id(), Some(&intent));
+        let mut legacy = stored;
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("queued_intent_id")
+            .unwrap();
+        let legacy: OutboundFanout = serde_json::from_value(legacy).unwrap();
+        assert_eq!(legacy.queued_intent_id(), None);
+        assert!(
+            !serde_json::to_string(&unnamed)
+                .unwrap()
+                .contains("queued_intent_id")
+        );
+    }
+
     #[test]
     fn a_target_is_found_by_any_spelling_of_its_endpoint() {
         let mut fanout = OutboundFanout::stage(fanout_request(), None, None, 55).unwrap();

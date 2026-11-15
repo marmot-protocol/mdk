@@ -4130,6 +4130,246 @@ async fn a_queued_intent_whose_commit_reached_no_relay_is_retired_with_its_rollb
     );
 }
 
+/// mdk#2332: a drained commit's frozen fanout names the queued intent it was
+/// drained from, so after a restart the commit's resolution still retires that
+/// intent: given up as `not_delivered`, confirmed, or refused for size. The
+/// next drain then stages nothing. A fanout staged before the name existed
+/// cannot say which intent it carries: its rollback keeps the intent, which
+/// the drain stages once more, named this time.
+#[tokio::test]
+async fn a_drained_commit_retires_its_queued_intent_after_a_restart() {
+    use cgka_traits::{
+        EpochState, EventSizeClass, OversizedArtifact, TransportEndpoint, TransportEndpointFailure,
+        TransportEndpointFailureKind, TransportPublishRequest, TransportPublishTarget,
+    };
+
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Resolution {
+        NotDelivered,
+        Confirmed,
+        TooLarge,
+        StagedBeforeTheName,
+    }
+    for resolution in [
+        Resolution::NotDelivered,
+        Resolution::Confirmed,
+        Resolution::TooLarge,
+        Resolution::StagedBeforeTheName,
+    ] {
+        let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
+        let build = || {
+            EngineBuilder::new(storage.clone())
+                .legacy_compatibility_profile()
+                .identity(pad32(b"queued-name-restart"))
+                .account_identity_proof_signer(proof_signer(b"queued-name-restart"))
+                .peeler(Box::new(MockPeeler))
+                .build()
+                .unwrap()
+        };
+        let mut engine = build();
+        let (group_id, created) = engine
+            .create_group(CreateGroupRequest {
+                name: "before".into(),
+                description: String::new(),
+                members: vec![],
+                required_features: vec![],
+                app_components: vec![],
+                initial_admins: vec![],
+            })
+            .await
+            .unwrap();
+        let SendResult::GroupCreated { pending, .. } = created else {
+            panic!("create")
+        };
+        engine.confirm_published(pending).await.unwrap();
+        let intent_id = MessageId::new(b"queued-named-edit".to_vec());
+        storage
+            .put_queued_outbound_intent(&QueuedOutboundIntent {
+                id: intent_id.clone(),
+                group_id: group_id.clone(),
+                intent: SendIntent::UpdateGroupData {
+                    group_id: group_id.clone(),
+                    name: Some("queued edit".into()),
+                    description: None,
+                },
+                created_at_ms: 0,
+                reissue_attempts: 0,
+            })
+            .unwrap();
+        let drained = engine
+            .converge_and_drain_queued_outbound_intents(&group_id, 1_000_000)
+            .await
+            .unwrap();
+        let [SendResult::GroupEvolution { msg, pending, .. }] = drained.as_slice() else {
+            panic!("{resolution:?}: the queued edit stages: {drained:?}")
+        };
+        let pending = *pending;
+        assert_eq!(
+            engine.drained_queued_intent_id(pending),
+            Some(intent_id.clone())
+        );
+        let TransportEnvelope::GroupMessage { transport_group_id } = &msg.envelope else {
+            panic!("a group commit: {:?}", msg.envelope)
+        };
+        let refusing = TransportEndpoint("wss://queued-name-refusing.example".into());
+        let dead = TransportEndpoint("wss://queued-name-dead.example".into());
+        let mut fanout = OutboundFanout::stage(
+            TransportPublishRequest {
+                account_id: engine.self_id(),
+                message: msg.clone(),
+                target: TransportPublishTarget::Group {
+                    group_id: group_id.clone(),
+                    transport_group_id: transport_group_id.clone(),
+                    endpoints: vec![refusing.clone(), dead.clone()],
+                },
+                required_acks: 1,
+            },
+            Some(pending),
+            Some(group_id.clone()),
+            0,
+        )
+        .unwrap();
+        if resolution != Resolution::StagedBeforeTheName {
+            fanout.set_queued_intent(intent_id.clone()).unwrap();
+        }
+        engine.put_outbound_fanout(&fanout).unwrap();
+        drop(engine);
+
+        let mut engine = build();
+        engine.hydrate_all_stored_groups().unwrap();
+        engine.drain_events();
+        assert!(
+            matches!(
+                engine.epoch_state(&group_id),
+                Some(EpochState::PendingPublish { .. })
+            ),
+            "{resolution:?}"
+        );
+        let mut fanout = engine.outbound_fanouts().unwrap().remove(0);
+        let failure = |endpoint: &TransportEndpoint, kind, pre_send| TransportEndpointFailure {
+            endpoint: endpoint.clone(),
+            reason: "scripted answer".into(),
+            kind,
+            rejection_category: None,
+            size_class: None,
+            pre_send,
+        };
+        match resolution {
+            Resolution::NotDelivered | Resolution::StagedBeforeTheName => {
+                for index in [0, 1] {
+                    fanout.mark_attempt_started_at(index, 100).unwrap();
+                }
+                engine.put_outbound_fanout(&fanout).unwrap();
+                fanout
+                    .record_target_failure(
+                        0,
+                        failure(
+                            &refusing,
+                            TransportEndpointFailureKind::TerminalRejected,
+                            false,
+                        ),
+                    )
+                    .unwrap();
+                fanout
+                    .record_target_failure(
+                        1,
+                        failure(
+                            &dead,
+                            TransportEndpointFailureKind::RetryableUnavailable,
+                            true,
+                        ),
+                    )
+                    .unwrap();
+                engine.put_outbound_fanout(&fanout).unwrap();
+                fanout.abandon_unsent_targets().unwrap();
+                engine
+                    .publish_not_delivered(pending, &mut fanout)
+                    .await
+                    .unwrap();
+            }
+            Resolution::Confirmed => {
+                fanout.mark_attempt_started_at(0, 100).unwrap();
+                engine.put_outbound_fanout(&fanout).unwrap();
+                fanout.mark_target_accepted(0).unwrap();
+                engine
+                    .confirm_published_fanout(pending, &mut fanout)
+                    .await
+                    .unwrap();
+            }
+            Resolution::TooLarge => {
+                for (index, endpoint) in [(0, &refusing), (1, &dead)] {
+                    fanout
+                        .record_target_failure(
+                            index,
+                            TransportEndpointFailure::over_known_limit(endpoint.clone(), 70_000),
+                        )
+                        .unwrap();
+                }
+                engine
+                    .publish_refused_as_too_large(
+                        pending,
+                        Some(&mut fanout),
+                        OversizedArtifact::Commit,
+                        EventSizeClass::Under64Kib,
+                    )
+                    .await
+                    .unwrap();
+            }
+        }
+
+        let refusals = engine
+            .drain_events()
+            .into_iter()
+            .filter_map(|event| match event {
+                GroupEvent::QueuedIntentRefused {
+                    intent_id: refused,
+                    reason,
+                    ..
+                } => Some((refused, reason)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let queued = storage.list_queued_outbound_intents(&group_id).unwrap();
+        let next = engine
+            .converge_and_drain_queued_outbound_intents(&group_id, 2_000_000)
+            .await
+            .unwrap();
+        match resolution {
+            Resolution::NotDelivered | Resolution::TooLarge => {
+                let reason = if resolution == Resolution::TooLarge {
+                    "event_too_large"
+                } else {
+                    "not_delivered"
+                };
+                assert_eq!(refusals, vec![(intent_id.clone(), reason.to_owned())]);
+                assert!(queued.is_empty(), "{resolution:?}");
+                assert!(next.is_empty(), "{resolution:?}: {next:?}");
+            }
+            Resolution::Confirmed => {
+                assert!(refusals.is_empty(), "{refusals:?}");
+                assert!(queued.is_empty(), "the confirmed intent is retired");
+                assert!(next.is_empty(), "{next:?}");
+                assert_eq!(storage.get_group(&group_id).unwrap().name, "queued edit");
+            }
+            Resolution::StagedBeforeTheName => {
+                assert!(refusals.is_empty(), "{refusals:?}");
+                assert_eq!(
+                    queued.len(),
+                    1,
+                    "an unnamed fanout cannot retire the intent"
+                );
+                let [SendResult::GroupEvolution { pending: again, .. }] = next.as_slice() else {
+                    panic!("the kept intent is staged once more: {next:?}")
+                };
+                assert_eq!(
+                    engine.drained_queued_intent_id(*again),
+                    Some(intent_id.clone())
+                );
+            }
+        }
+    }
+}
+
 /// A queued change the settled state already holds drains to `NoChange` and
 /// is retired then (mdk#2842). A failed retirement leaves it for the next
 /// drain, and the pass still returns the message it prepared before it: had

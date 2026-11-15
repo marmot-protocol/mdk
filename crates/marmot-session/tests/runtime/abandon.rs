@@ -162,6 +162,93 @@ async fn an_interrupted_online_read_waits_out_its_hour() {
     );
 }
 
+/// A queued change whose commit reached no relay is given up after a restart
+/// too, and retired: its frozen fanout names the intent it was drained from,
+/// so the rollback announces it as `not_delivered` and nothing sends it
+/// again.
+#[tokio::test]
+async fn a_queued_change_given_up_after_a_restart_is_retired() {
+    let refusing = TransportEndpoint("wss://abandon-queued-refusing.example".into());
+    let dead = TransportEndpoint("wss://abandon-queued-dead.example".into());
+    let (fixture, alice) = FloorFixture::new("abandon-queued", &[&refusing, &dead]).await;
+    let adapter = RecordingAdapter::default();
+    // The refusing relay takes the queued message and refuses the change.
+    adapter.script_commit_failures(refusing.clone(), vec![blocked(&refusing)]);
+    adapter.fail_endpoints_as(
+        vec![dead.clone()],
+        TransportEndpointFailureKind::RetryableUnavailable,
+    );
+    adapter.answer_read_backs(refusing.clone(), TransportReadBack::NotFound);
+    let mut runtime = fixture.runtime(alice, &adapter);
+    let start = fixture.wall.now().0;
+    let sender = hex::encode(runtime.session().self_id().as_slice());
+    runtime
+        .queue_app_message_with_audit_context(
+            fixture.group_id.clone(),
+            app_payload_for(&sender, b"queued first"),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+    // A change sent behind a queued send waits in the queue too (mdk#2842).
+    let queued = runtime.send(fixture.rename()).await.unwrap();
+    let [intent] = queued.queued.as_slice() else {
+        panic!("the change is queued: {queued:?}")
+    };
+    let intent_id = intent.intent_id.clone();
+    let drained = runtime.advance_convergence(&fixture.group_id).await.unwrap();
+    runtime
+        .acknowledge_published_app_messages(&drained.published_app_messages)
+        .unwrap();
+    assert!(
+        !adapter.commit_publishes().is_empty(),
+        "the drained change was sent"
+    );
+    let staged = runtime
+        .session()
+        .outbound_fanouts()
+        .unwrap()
+        .into_iter()
+        .find(|fanout| matches!(fanout.mls_state(), FanoutMlsState::Pending(_)))
+        .expect("the drained commit is pending");
+    assert_eq!(staged.queued_intent_id(), Some(&intent_id));
+    drop(runtime);
+
+    let mut restarted = fixture.runtime(fixture.reopen(), &adapter);
+    fixture.wall.set(start + READ_BACK_BOUND_SECS);
+    let effects = restarted.resume_outbound_fanouts().await.unwrap();
+
+    assert!(
+        matches!(effects.pending.as_slice(), [PendingResolution::RolledBack { .. }]),
+        "{:?}",
+        effects.pending
+    );
+    assert!(
+        effects.events.iter().any(|event| matches!(
+            event,
+            GroupEvent::QueuedIntentRefused { intent_id: refused, reason, .. }
+                if refused == &intent_id && reason == "not_delivered"
+        )),
+        "{:?}",
+        effects.events
+    );
+    assert!(
+        !restarted
+            .has_queued_outbound_intents(&fixture.group_id)
+            .unwrap()
+    );
+    let commits = adapter.commit_publishes().len();
+    restarted
+        .advance_convergence(&fixture.group_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        adapter.commit_publishes().len(),
+        commits,
+        "the retired change is not sent again"
+    );
+}
+
 /// A relay's definitive refusal of an attempt started since the bound shows
 /// the device online by itself: the relay never reached is given up in the
 /// same pass, with no read.

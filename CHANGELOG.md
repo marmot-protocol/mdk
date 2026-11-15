@@ -61,6 +61,12 @@
   `not_delivered`. A change any relay may hold still never rolls back,
   including one stored before this release recorded that exposure, and an
   offline device keeps the change pending.
+- Retire a queued group change when its commit resolves after a restart
+  (#2332). The commit's stored send now names the queued change it came from,
+  so a confirmation, a size refusal or giving the commit up retires that change
+  instead of leaving it queued to be prepared and sent again. A change whose
+  commit was stored by an earlier release is prepared once more after such a
+  rollback, and its new commit carries the link.
 
 ## 0.17.0 - 2026-11-15
 

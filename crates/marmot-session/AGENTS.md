@@ -177,7 +177,8 @@ multi-device Welcome delivery, Welcome withdrawal, staged and owed Welcome deliv
   back once the device shows it is online: a target refused it definitively in an attempt started since then, or a
   target answered a read of it (`abandon_unsent_pending_commit`, at most once per
   `PENDING_COMMIT_REACHABILITY_READ_INTERVAL_MS`, stored as `reachability_read_at_ms`). The outstanding targets end
-  `Abandoned` and a queued intent is retired as `not_delivered` (`publish_not_delivered`). A read only tells an online
+  `Abandoned` and a queued intent is retired as `not_delivered` (`publish_not_delivered`); a drained commit's fanout
+  names its queued intent from staging on (`set_queued_intent`), so that holds after a restart. A read only tells an online
   device; the exposure record alone decides, and `validate_successor_of` and the engine both refuse an abandonment of a
   fanout a relay may hold (mdk#1577). A read that returns the event confirms. Offline, nothing changes.
 - Never let a durable maintenance record depend on an engine event alone. Engine events are in-memory, and this layer

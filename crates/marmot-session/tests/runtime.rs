@@ -429,6 +429,9 @@ struct RecordingAdapterInner {
     /// Exact failures each endpoint answers its next publishes with, in order.
     scripted_failures:
         Mutex<std::collections::HashMap<TransportEndpoint, VecDeque<TransportEndpointFailure>>>,
+    /// Like `scripted_failures`, answered only by the commit entry point.
+    scripted_commit_failures:
+        Mutex<std::collections::HashMap<TransportEndpoint, VecDeque<TransportEndpointFailure>>>,
     /// Each read-back's event id and endpoints, in order (mdk#2332).
     read_backs: Mutex<Vec<(MessageId, Vec<TransportEndpoint>)>>,
     /// What each endpoint answers every read-back; any other answers nothing.
@@ -603,6 +606,22 @@ impl RecordingAdapter {
     ) {
         self.inner
             .scripted_failures
+            .lock()
+            .unwrap()
+            .entry(endpoint)
+            .or_default()
+            .extend(failures);
+    }
+
+    /// Like [`Self::script_failures`], for commits only: other events
+    /// published to `endpoint` are answered as before.
+    fn script_commit_failures(
+        &self,
+        endpoint: TransportEndpoint,
+        failures: Vec<TransportEndpointFailure>,
+    ) {
+        self.inner
+            .scripted_commit_failures
             .lock()
             .unwrap()
             .entry(endpoint)
@@ -915,6 +934,26 @@ impl TransportAdapter for RecordingAdapter {
             return Err(TransportAdapterError::PublishEndpoints(
                 TransportPublishFailure::with_endpoint_failures("refused unsent", refused)
                     .with_message_id(request.message.id),
+            ));
+        }
+        let scripted = match request.target.endpoints() {
+            [endpoint] => self
+                .inner
+                .scripted_commit_failures
+                .lock()
+                .unwrap()
+                .get_mut(endpoint)
+                .and_then(VecDeque::pop_front),
+            _ => None,
+        };
+        if let Some(failure) = scripted {
+            self.inner.publishes.lock().unwrap().push(request.clone());
+            return Err(TransportAdapterError::PublishEndpoints(
+                TransportPublishFailure::with_endpoint_failures(
+                    "scripted commit failure",
+                    vec![failure],
+                )
+                .with_message_id(request.message.id),
             ));
         }
         self.publish(request).await
