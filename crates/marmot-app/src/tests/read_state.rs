@@ -1555,11 +1555,13 @@ async fn an_offer_hidden_by_a_failed_load_is_read_again() {
 /// copy, never waiting for the worker.
 ///
 /// A kept group crossing its reinvite's real `not_after` needs a system clock
-/// a test can move, and OpenMLS reads the system clock itself, so four tests
+/// a test can move, and OpenMLS reads the system clock itself, so five tests
 /// compose it with no seam: the version's bound is the KeyPackage's
 /// `not_after` and a status built past it fails (here); the deadline the
 /// worker waits for ends at that bound
 /// (`client::read_state::tests::the_deadline_measures_each_bound_on_its_own_clock`);
+/// the worker wakes at that deadline and publishes, with no command, delivery
+/// or write (`the_worker_publishes_a_time_bound_answer_when_its_bound_passes`);
 /// an entry stops holding there
 /// (`client::read_state::tests::an_entry_holds_only_inside_its_key_package_window`);
 /// and a publish judges a kept entry by the system-clock reading it took
