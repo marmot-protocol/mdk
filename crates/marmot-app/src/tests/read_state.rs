@@ -1585,8 +1585,11 @@ async fn a_reinvite_key_package_bounds_the_group_entry_until_it_expires() {
         .unwrap();
     let template = client.durably_owned_key_packages().unwrap().remove(0);
 
-    // Alice's own KeyPackage with a lifetime of a few seconds, built into a
-    // scratch store so her owned list keeps its own, later, bound.
+    // Alice's own KeyPackage with the shortest lifetime sure to hold at the
+    // first publish, built into a scratch store so her owned list keeps its
+    // own, later, bound. OpenMLS counts whole seconds and accepts a
+    // KeyPackage while the clock is below `not_after`, so a bound one second
+    // out can pass within a millisecond; two seconds leave at least one.
     let storage = app.account_storage("alice").unwrap();
     let account = app.account_home().account("alice").unwrap();
     let identity = MemberId::new(hex::decode(account.account_id_hex).unwrap());
@@ -1608,7 +1611,9 @@ async fn a_reinvite_key_package_bounds_the_group_entry_until_it_expires() {
     let crypto = openmls_rust_crypto::RustCrypto::default();
     let parsed = parsed.validate(&crypto, ProtocolVersion::Mls10).unwrap();
     let leaf = parsed.leaf_node();
-    let not_after = crate::unix_now_seconds() + 3;
+    const LIFETIME_SECS: u64 = 2;
+    let built = std::time::Instant::now();
+    let not_after = crate::unix_now_seconds() + LIFETIME_SECS;
     let scratch = storage_sqlite::SqliteAccountStorage::in_memory_for_test().unwrap();
     let bundle = MlsKeyPackage::builder()
         .leaf_node_capabilities(leaf.capabilities().clone())
@@ -1657,14 +1662,21 @@ async fn a_reinvite_key_package_bounds_the_group_entry_until_it_expires() {
     assert!(
         client
             .read_state_deadline()
-            .is_some_and(|deadline| deadline <= Duration::from_secs(3))
+            .is_some_and(|deadline| deadline <= Duration::from_secs(LIFETIME_SECS))
     );
 
-    // OpenMLS judges a KeyPackage's lifetime against the system clock, which
-    // Tokio's paused clock cannot move: wait until the system clock passes
-    // the bound itself, so load lengthens the wait but never ends it early.
+    // OpenMLS judges a KeyPackage's lifetime against the system clock
+    // (`SystemTime`), which Tokio's paused clock cannot move, so this polls
+    // until the system clock itself passes `not_after`, as the MLS-expiry
+    // test in `tests/invite_recovery.rs` waits out its lifetime. Load
+    // lengthens the wait but never ends it early, and a clock still short of
+    // the bound five seconds after it fails the test instead of hanging it.
     while crate::unix_now_seconds() < not_after {
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            built.elapsed() < Duration::from_secs(LIFETIME_SECS + 5),
+            "the system clock did not pass the KeyPackage's not_after"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
     client.publish_read_state();
     assert!(
