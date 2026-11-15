@@ -242,8 +242,13 @@ pub(crate) fn replace_encrypted_media_secret_references_for_parts_tx(
     )
     .storage()?;
 
-    // Reactions carry imeta for NIP-30 custom emoji images.
-    if (kind == MARMOT_APP_EVENT_KIND_CHAT || kind == MARMOT_APP_EVENT_KIND_REACTION)
+    // Comments carry attachments; reactions carry NIP-30 custom emoji images.
+    let comment = kind == 1111
+        && tags.iter().any(|tag| {
+            tag.first().is_some_and(|name| name == "k")
+                && tag.get(1).is_some_and(|kind| kind.parse::<u64>().is_ok())
+        });
+    if (kind == MARMOT_APP_EVENT_KIND_CHAT || kind == MARMOT_APP_EVENT_KIND_REACTION || comment)
         && let Some(source_epoch) = source_epoch
     {
         let source_epoch = u64_to_i64(source_epoch)?;
@@ -624,6 +629,10 @@ mod tests {
         non_chat.kind = cgka_traits::app_event::MARMOT_APP_EVENT_KIND_EDIT;
         store.app_storage().record_app_event(&non_chat).unwrap();
 
+        let mut unmarked = media_event("unmarked", 20, 8);
+        unmarked.kind = 1111;
+        store.app_storage().record_app_event(&unmarked).unwrap();
+
         let references: i64 = store
             .lock()
             .unwrap()
@@ -678,6 +687,59 @@ mod tests {
                 .unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn comment_media_key_lifetime() {
+        for (version, component_id) in [
+            (
+                ENCRYPTED_MEDIA_FORMAT_V1,
+                GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID,
+            ),
+            (
+                ENCRYPTED_MEDIA_FORMAT_V2,
+                GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
+            ),
+        ] {
+            let store = SqliteAccountStorage::in_memory().unwrap();
+            let app = store.app_storage();
+            app.record_app_event(&media_event_with_versions("old", 10, 8, &[version]))
+                .unwrap();
+            let mut comment = media_event_with_versions("comment", 20, 7, &[version]);
+            comment.kind = 1111;
+            comment.tags.push(vec!["k".into(), "9".into()]);
+            app.record_app_event(&comment).unwrap();
+            for epoch in [7, 8] {
+                app.remember_encrypted_media_epoch_secret("aa", component_id, epoch, &[1, 2, 3])
+                    .unwrap();
+            }
+
+            let sweep = app
+                .secure_prune_app_events_before("aa", 15, "local", &no_mentions)
+                .unwrap();
+            assert_eq!(sweep.pruned_messages, 1);
+            assert!(
+                app.encrypted_media_epoch_secret_may_be_served("aa", 7)
+                    .unwrap()
+            );
+            assert_eq!(
+                app.encrypted_media_epoch_secret("aa", component_id, 7)
+                    .unwrap(),
+                Some(vec![1, 2, 3])
+            );
+
+            app.secure_prune_app_events_before("aa", 21, "local", &no_mentions)
+                .unwrap();
+            assert!(
+                !app.encrypted_media_epoch_secret_may_be_served("aa", 7)
+                    .unwrap()
+            );
+            assert_eq!(
+                app.encrypted_media_epoch_secret("aa", component_id, 7)
+                    .unwrap(),
+                None
+            );
+        }
     }
 
     #[test]

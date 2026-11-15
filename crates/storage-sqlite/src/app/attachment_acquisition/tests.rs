@@ -51,6 +51,47 @@ fn seed(store: &SqliteAccountStorage, message: &str) {
         .record_app_event(&source(message))
         .unwrap();
 }
+
+#[test]
+fn comment_attachment_is_live() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    seed(&store, "parent");
+    let app = store.app_storage();
+    let mut comment = source("comment");
+    comment.kind = 1111;
+    comment.tags[0].push("v encrypted-media-v2".into());
+    comment.tags.extend([
+        vec!["k".into(), "9".into()],
+        vec!["e".into(), "parent".into()],
+    ]);
+    app.record_app_event(&comment).unwrap();
+    for rebuild in [false, true] {
+        if rebuild {
+            app.rebuild_message_timeline_for_group(GROUP).unwrap();
+        }
+        let slot = app
+            .attachment_control_entry(GROUP, "comment", "source-comment", 0, 12)
+            .unwrap()
+            .unwrap();
+        assert_eq!(slot.slot, serde_json::json!(comment.tags[0]));
+        assert_eq!(slot.source_epoch, Some(3));
+        assert!(matches!(
+            app.request_attachment_acquisition(GROUP, &slot, digest(), 12)
+                .unwrap(),
+            AttachmentDemand::Requested(_)
+        ));
+    }
+
+    let mut unmarked = source("unmarked");
+    unmarked.kind = 1111;
+    app.record_app_event(&unmarked).unwrap();
+    assert!(
+        app.attachment_control_entry(GROUP, "unmarked", "source-unmarked", 0, 12)
+            .unwrap()
+            .is_none()
+    );
+}
+
 fn request(store: &SqliteAppStorage, message: &str) -> AttachmentAssetRef {
     match store
         .request_attachment_acquisition(GROUP, &selected(message), digest(), 11)
