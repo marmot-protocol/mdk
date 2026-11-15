@@ -241,6 +241,20 @@ impl AppRuntimeProbe {
         status.await.map_err(app_error)
     }
 
+    /// Wait until the account's worker has finished startup.
+    pub async fn worker_startup_finished(&self) -> Result<(), SubjectError> {
+        let finished = self.runtime.worker_startup_finished(&self.account_id);
+        finished.await.map_err(app_error)
+    }
+
+    /// One command through the account's worker after startup: it answers
+    /// once the worker has taken every command queued before it. Reads the
+    /// published read state answers never reach the worker.
+    pub async fn worker_round_trip(&self) -> Result<(), SubjectError> {
+        let round_trip = self.runtime.worker_round_trip(&self.account_id);
+        round_trip.await.map_err(app_error)
+    }
+
     pub async fn epoch(&self, group: &GroupId) -> Result<u64, SubjectError> {
         let state = self.runtime.group_mls_state(&self.account_id, group);
         Ok(state.await.map_err(app_error)?.epoch)

@@ -699,7 +699,12 @@ async fn queued_publication_updates_live_window_before_later_publish_finishes() 
         relay.release_publish();
         observed
     };
-    let (wake, observed) = tokio::join!(runtime.group_recovery_status("alice", &group), observe,);
+    // The wake is a worker command: a read answered from the published read
+    // state would not wake the worker for its due pass.
+    let (wake, observed) = tokio::join!(
+        crate::worker_fences::worker_round_trip(&runtime, "alice"),
+        observe,
+    );
     runtime.shutdown_and_close().await.unwrap();
     wake.unwrap();
     let observed = observed.expect("live conversation must show the first accepted source before the later publication is released");

@@ -12,6 +12,7 @@ use marmot_session::ChangeStamp;
 
 use super::{Fact, GroupFacts, RecoveryRead};
 use crate::client::AppClient;
+use crate::client::read_state::ReadAnswer;
 use crate::{AccountRecoveryStatus, AppError};
 
 /// What the account's recovery answer is read at besides its groups' facts.
@@ -29,7 +30,6 @@ pub(crate) struct RecoveryInputs {
     routes: u64,
 }
 
-#[cfg_attr(not(test), allow(dead_code))] // A reads them at every publish (mdk#3273 PR 8).
 impl AppClient {
     /// The account recovery answer's inputs now ([`RecoveryInputs`]).
     pub(crate) fn recovery_inputs(&self) -> RecoveryInputs {
@@ -46,67 +46,76 @@ impl AppClient {
 pub(crate) struct RecoveryAnswer {
     /// A builds each group's notices from the same read.
     read: Result<RecoveryRead, Arc<AppError>>,
-    status: Result<AccountRecoveryStatus, Arc<AppError>>,
+    status: ReadAnswer<Arc<AccountRecoveryStatus>>,
     validity: RecoveryValidity,
 }
 
-/// What a [`RecoveryAnswer`] was read at. The runner's survey is the read's
-/// own [`super::SurveyMark`].
+/// What a [`RecoveryAnswer`] was read at. The read holds while its inputs
+/// and the runner's survey (the read's own [`super::SurveyMark`]) hold; the
+/// status built from it holds while the read does and so do the facts of
+/// every group it asked of.
 struct RecoveryValidity {
     inputs: RecoveryInputs,
     /// Each group the status asked a fact of, with the stamp its facts were
     /// read at.
     groups: Vec<(Vec<u8>, ChangeStamp)>,
-    /// False when the read failed, or the status used a fact that did not
-    /// settle or had no stamp: a group outside the mirror, or live facts.
-    reusable: bool,
+    /// False when the status used a fact that did not settle or had no
+    /// stamp: a group outside the mirror, or live facts.
+    facts_reusable: bool,
 }
 
-#[cfg_attr(not(test), allow(dead_code))] // A keeps it (mdk#3273 PR 8).
 impl RecoveryAnswer {
     /// The answer from `read`, whose inputs were at `inputs` before it, with
     /// the account status built with `facts`.
     pub(crate) fn build(
         inputs: RecoveryInputs,
-        read: Result<RecoveryRead, AppError>,
+        read: Result<RecoveryRead, Arc<AppError>>,
         facts: &dyn GroupFacts,
     ) -> Self {
-        let read = read.map_err(Arc::new);
         let recorder = Recorder::new(facts);
         let status = match &read {
-            Ok(read) => Ok(read.account_status(&recorder)),
+            Ok(read) => Ok(Arc::new(read.account_status(&recorder))),
             Err(error) => Err(Arc::clone(error)),
         };
         let (groups, facts_reusable) = recorder.finish();
         Self {
+            read,
+            status,
             validity: RecoveryValidity {
                 inputs,
                 groups,
-                reusable: read.is_ok() && facts_reusable,
+                facts_reusable,
             },
-            read,
-            status,
         }
     }
 
-    /// Whether the answer still holds with its inputs now at `inputs` and
-    /// each group's change stamp now at `stamp`: no input moved, no survey
-    /// changed what is catching up since the read, and no group the status
-    /// asked a fact of moved or left the mirror (`stamp` gives `None`).
-    pub(crate) fn holds(
-        &self,
-        inputs: &RecoveryInputs,
-        stamp: &dyn Fn(&[u8]) -> Option<ChangeStamp>,
-    ) -> bool {
-        let validity = &self.validity;
-        validity.reusable
-            && validity.inputs.notice_writes.is_some()
-            && validity.inputs.notice_writes == inputs.notice_writes
-            && validity.inputs.routes == inputs.routes
+    /// The status built afresh with `facts` from this answer's read, which
+    /// [`Self::read_holds`]: no query runs.
+    pub(crate) fn refresh(self, facts: &dyn GroupFacts) -> Self {
+        Self::build(self.validity.inputs, self.read, facts)
+    }
+
+    /// Whether the read still holds with its inputs now at `inputs`: it
+    /// succeeded, no input moved, and no survey changed what is catching up
+    /// since.
+    pub(crate) fn read_holds(&self, inputs: &RecoveryInputs) -> bool {
+        let read_at = &self.validity.inputs;
+        read_at.notice_writes.is_some()
+            && read_at.notice_writes == inputs.notice_writes
+            && read_at.routes == inputs.routes
             && self
                 .read
                 .as_ref()
                 .is_ok_and(|read| !read.survey().landed_since())
+    }
+
+    /// Whether the status still holds while its read does, with each
+    /// group's change stamp now at `stamp`: every fact it used settled, and
+    /// no group it asked a fact of moved or left the mirror (`stamp` gives
+    /// `None`).
+    pub(crate) fn status_holds(&self, stamp: &dyn Fn(&[u8]) -> Option<ChangeStamp>) -> bool {
+        let validity = &self.validity;
+        validity.facts_reusable
             && validity
                 .groups
                 .iter()
@@ -118,18 +127,23 @@ impl RecoveryAnswer {
         self.read.as_ref()
     }
 
-    pub(crate) fn status(&self) -> &Result<AccountRecoveryStatus, Arc<AppError>> {
+    pub(crate) fn status(&self) -> &ReadAnswer<Arc<AccountRecoveryStatus>> {
         &self.status
     }
 
-    /// How the status differs from the client's live one now, or `None`.
-    /// The notices are compared strictly. What is catching up is compared
-    /// strictly unless a survey changed it after the read: the runner writes
-    /// its survey off the worker (decision 2). A failure matches a failure
-    /// of the same form.
+    /// How `status`, published from this answer, differs from `live`, the
+    /// client's status read live after it, or `None`. The notices are
+    /// compared strictly. What is catching up is compared strictly unless a
+    /// survey changed it after this answer's read: the runner writes its
+    /// survey off the worker (mdk#3273 decision 2). A failure matches a failure of
+    /// the same form.
     #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn differs_from_live(&self, client: &AppClient) -> Option<&'static str> {
-        match (&self.status, &client.account_recovery_status()) {
+    pub(crate) fn differs_from_live(
+        &self,
+        status: &ReadAnswer<Arc<AccountRecoveryStatus>>,
+        live: &Result<AccountRecoveryStatus, AppError>,
+    ) -> Option<&'static str> {
+        match (status, live) {
             (Ok(ours), Ok(live)) => {
                 if ours.notices != live.notices {
                     return Some("history notices");

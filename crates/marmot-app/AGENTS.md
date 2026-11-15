@@ -1143,12 +1143,20 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   `answer_off_quiescent` or `send_from_published`; a unit that holds the client publishes A before it starts
   (`publish_before_unit`), and what it answers meanwhile comes from that version.
   `read_state_tests::every_reply_and_event_leaves_the_worker_through_a_named_exit` fails on a new raw send.
-  Every account answer is rebuilt at every publish except the owned-KeyPackage list. That list and each group
-  entry are reused only while the typed validity built with them holds, and reuse checks nothing else. A group
-  entry (`EntryValidity`) holds while its change generation, mirror record and maintenance pause are unchanged,
-  the clock is inside its commit-delivery window (from the reading that answer was computed at to its next
-  deadline), and no answer failed on something other than a fact about the group (`settled_failure`) nor did the
-  device-group check that hides it fail. The KeyPackage list (`KeyPackagesValidity`) holds while the file's
+  Every account answer is rebuilt at every publish except the owned-KeyPackage list and the recovery answer (R9).
+  Those two and each group entry are reused only while the typed validity built with them holds, and reuse checks
+  nothing else. A group entry (`EntryValidity`) holds while its change generation, mirror record and maintenance
+  pause are unchanged, the clock is inside its commit-delivery window (from the reading that answer was computed at
+  to its next deadline), and no answer failed on something other than a fact about the group (`settled_failure`)
+  nor did the device-group check that hides it fail; at a publish that reads recovery afresh, its history notices
+  must also equal that read's (`EntryValidity::notices_hold`). The recovery answer (`RecoveryAnswer`,
+  `client/history_recovery/history_notices/reuse.rs`) keeps its read (recovery notices, routing, catch-up survey)
+  while the file's recovery-notice write count and the routing version are the ones read before it, the read
+  succeeded, and no catch-up survey landed since; it keeps the account status built from that read while every
+  group fact the status took settled and each group it asked a fact of is still in the mirror with an unchanged
+  change stamp (`ChangeStamp::unchanged_since`), so no status is kept that read a group outside the mirror. An
+  invitation-recovery row (a Welcome, an own-commit intent, rejoin progress, a recovery failure) moves its group's
+  generation. The KeyPackage list (`KeyPackagesValidity`) holds while the file's
   KeyPackage write count (`key_package_write_count`: stored bundles and issued private KeyPackages only, so a send
   keeps it) and the engine's protocol profile are the ones read before the build, the system clock is inside the
   window from the one reading its lifetimes are judged at to its next lifetime bound (a listed `not_after` or a
@@ -1160,8 +1168,11 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   published entry and the version. A new input of a reused answer must be in its validity or move one of
   its counts (a new table needs a `storage-sqlite` `cross/group_writes.rs` trigger). In this crate's own tests,
   every publish that changed something, and every reused KeyPackage list, is checked against today's live reads
-  (`read_state::oracle`); the only pair let through unequal is one where a terminal storage close landed between
-  the publish and the check and one side is that close's `Closed` error. The oracle runs in this crate's unit tests
+  (`read_state::oracle`), and at every publish, changed or not, so are the account recovery status and each mirror
+  group's recovery status. The only pairs let through unequal are one where a terminal storage close landed
+  between the publish and the check and one side is that close's `Closed` error, and an account status whose
+  catching-up groups or inbox flag differ after a catch-up survey landed since its read (the recovery runner
+  writes the survey off the worker); its notices are compared strictly. The oracle runs in this crate's unit tests
   and, through the runner's `CARGO_PKG_NAME`, its integration tests; downstream crates' tests link `test-support`
   too (feature unification) and run without it (`oracle::enabled`). Keep its proof in this crate's suites.
 - The account reads in `runtime/commands.rs` that answer from A (`read_from_state`) take the worker lane's
@@ -1185,6 +1196,11 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   there (`acknowledge_from_published`), else defers it in order. A delete still waits for the hydration phase to end:
   its route changes need the account active in the transport, which startup sync makes it. A group that quarantined or
   is gone by then answers `UnknownGroup` from that version.
+- The group recovery status (`GroupRecoveryStatus`) is the third exception, beside the hydration request and a
+  failure with no exact copy: A answers it only for a group in the version's mirror. Any other id (a locally deleted
+  group whose MLS state is kept, or one the engine does not store) goes to the worker's command, which answers it as
+  it did before A. One mirror check in the version the read took, on the caller's task, decides; a failed answer
+  never routes a read to the worker.
 - A read that combines groups answers from one version of A, never one joined with live rows. `group_co_members`
   takes its groups' saved-row standings and members from one version (`ReadState::co_members`), so a group not yet
   published is not in its radius yet. It judges a group by its saved `account_groups` row alone (`group_standing`),

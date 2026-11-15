@@ -452,7 +452,7 @@ async fn each_groups_notices_move_with_what_they_read() {
 
     // Facts only: the compared notices stay and the generation moves.
     let (notices, at) = (
-        read(&client).group_notices(&other),
+        read(&client).group_notices(&other).clone(),
         generation(&client, &other),
     );
     let mut halted = storage.get_group(&other).unwrap();
@@ -463,11 +463,11 @@ async fn each_groups_notices_move_with_what_they_read() {
         1,
         "an Unrecoverable copy's rejoin notice waits; its parked one stays"
     );
-    assert!(read(&client).group_notices(&other) == notices);
+    assert!(*read(&client).group_notices(&other) == notices);
     assert!(!generation(&client, &other).unchanged_since(&at));
 
     let (notices, at) = (
-        read(&client).group_notices(&group),
+        read(&client).group_notices(&group).clone(),
         generation(&client, &group),
     );
     assert!(
@@ -484,7 +484,7 @@ async fn each_groups_notices_move_with_what_they_read() {
         1,
         "a hidden group's rejoin notice goes; its parked one stays"
     );
-    assert!(read(&client).group_notices(&group) == notices);
+    assert!(*read(&client).group_notices(&group) == notices);
     assert!(!generation(&client, &group).unchanged_since(&at));
     app.execute_batch_for_test("DELETE FROM device_groups")
         .unwrap();
@@ -493,7 +493,7 @@ async fn each_groups_notices_move_with_what_they_read() {
     // A route lives in memory: the compared notices move, the generation
     // does not.
     let (notices, at) = (
-        read(&client).group_notices(&group),
+        read(&client).group_notices(&group).clone(),
         generation(&client, &group),
     );
     let routes = client
@@ -509,12 +509,12 @@ async fn each_groups_notices_move_with_what_they_read() {
         1,
         "a rejoin notice shows only while its group is routed"
     );
-    assert!(read(&client).group_notices(&group) != notices);
+    assert!(*read(&client).group_notices(&group) != notices);
     assert!(generation(&client, &group).unchanged_since(&at));
     client.routing.replace_group_routes(&group, routes);
     assert_eq!(ids(&client, &group).len(), 2);
 
     assert!(client.dismiss_history_notice(&rejoin_id).unwrap());
     assert_eq!(ids(&client, &group).len(), 1);
-    assert!(read(&client).group_notices(&group) != notices);
+    assert!(*read(&client).group_notices(&group) != notices);
 }

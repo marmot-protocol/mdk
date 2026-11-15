@@ -465,8 +465,7 @@ async fn native_error_keeps_fairness() {
     // Exercise public serviceability separately from the error-rate window.
     timeout(Duration::from_secs(30), async {
         for _ in 0..4 {
-            runtime
-                .group_recovery_status("receiver", &group)
+            crate::worker_fences::worker_round_trip(&runtime, "receiver")
                 .await
                 .unwrap();
         }

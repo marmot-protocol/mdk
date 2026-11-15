@@ -1,12 +1,13 @@
 //! A kept recovery answer holds exactly while none of its inputs moved
 //! (mdk#3273 decision 3). Each validity field has its own test: moving only
 //! that field's input makes the next publish rebuild, and the rebuilt answer
-//! is the live one; with the field left out of `holds`, the kept answer
-//! would be published instead. Every publish here compares its answer with
-//! the live one, as A's oracle does.
+//! is the live one; with the field left out of `read_holds` or
+//! `status_holds`, the kept answer would be published instead. Every publish
+//! here compares its answer with the live one, as A's oracle does.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use cgka_traits::GroupId;
 use marmot_session::ChangeStamp;
@@ -92,9 +93,10 @@ impl GroupFacts for EntryFacts<'_> {
     }
 }
 
-/// One publish as A runs it: the inputs first, the kept answer while it
-/// holds, else a rebuild with `facts`. The answer published is compared with
-/// the live one either way. Returns whether it rebuilt.
+/// One publish as A runs it: the inputs first; the kept read while it
+/// holds, else a fresh one; the kept status while it holds too, else one
+/// built with `facts`. The answer published is compared with the live one
+/// either way. Returns whether the status was built.
 fn publish_with<'a>(
     client: &'a AppClient,
     kept: &mut Option<RecoveryAnswer>,
@@ -102,23 +104,28 @@ fn publish_with<'a>(
 ) -> bool {
     let inputs = client.recovery_inputs();
     let stamp = |group_id: &[u8]| stamp_now(client, group_id);
-    let rebuilt = match kept.take() {
-        Some(answer) if answer.holds(&inputs, &stamp) => {
-            *kept = Some(answer);
-            false
+    let (answer, built) = match kept.take() {
+        Some(answer) if answer.read_holds(&inputs) && answer.status_holds(&stamp) => {
+            (answer, false)
         }
-        _ => {
-            let facts = facts(client);
-            *kept = Some(RecoveryAnswer::build(
+        Some(answer) if answer.read_holds(&inputs) => (answer.refresh(&facts(client)), true),
+        _ => (
+            RecoveryAnswer::build(
                 inputs,
-                client.read_recovery(),
-                &facts,
-            ));
-            true
-        }
+                client.read_recovery().map_err(Arc::new),
+                &facts(client),
+            ),
+            true,
+        ),
     };
-    assert_eq!(kept.as_ref().unwrap().differs_from_live(client), None);
-    rebuilt
+    assert_eq!(differs(&answer, client), None);
+    *kept = Some(answer);
+    built
+}
+
+/// How the answer's own status differs from the live one now.
+fn differs(answer: &RecoveryAnswer, client: &AppClient) -> Option<&'static str> {
+    answer.differs_from_live(answer.status(), &client.account_recovery_status())
 }
 
 fn publish(client: &AppClient, kept: &mut Option<RecoveryAnswer>) -> bool {
@@ -209,6 +216,7 @@ async fn a_route_change_ends_the_kept_answer() {
             .ok()
             .unwrap()
             .group_notices(&group)
+            .clone()
     };
     let notices = read(&kept);
 
@@ -324,18 +332,14 @@ async fn an_answer_that_can_change_unseen_is_never_kept() {
 
     let failed = RecoveryAnswer::build(
         client.recovery_inputs(),
-        Err(AppError::RuntimeBusy),
+        Err(Arc::new(AppError::RuntimeBusy)),
         &EntryFacts::of(&client),
     );
-    assert!(
-        !failed.holds(&client.recovery_inputs(), &|group_id| stamp_now(
-            &client, group_id
-        ))
-    );
+    assert!(!failed.read_holds(&client.recovery_inputs()));
 }
 
 /// The oracle compares the notices strictly, and what is catching up
-/// strictly unless a survey changed it after the answer's read (decision 2):
+/// strictly unless a survey changed it after the answer's read (mdk#3273 decision 2):
 /// with no survey since, a wrong catching-up set fails it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_oracle_excuses_only_a_catching_up_set_a_later_survey_changed() {
@@ -345,13 +349,13 @@ async fn the_oracle_excuses_only_a_catching_up_set_a_later_survey_changed() {
     let answer = |client: &AppClient| {
         RecoveryAnswer::build(
             client.recovery_inputs(),
-            client.read_recovery(),
+            client.read_recovery().map_err(Arc::new),
             &EntryFacts::of(client),
         )
     };
     let wrong = |mut answer: RecoveryAnswer, edit: fn(&mut AccountRecoveryStatus)| {
         if let Ok(status) = &mut answer.status {
-            edit(status);
+            edit(Arc::make_mut(status));
         }
         answer
     };
@@ -361,15 +365,15 @@ async fn the_oracle_excuses_only_a_catching_up_set_a_later_survey_changed() {
     let inbox = |status: &mut AccountRecoveryStatus| status.inbox_catching_up = true;
     let notices = |status: &mut AccountRecoveryStatus| status.notices.clear();
 
-    assert_eq!(answer(&client).differs_from_live(&client), None);
+    assert_eq!(differs(&answer(&client), &client), None);
     for edit in [catching, inbox] {
         assert_eq!(
-            wrong(answer(&client), edit).differs_from_live(&client),
+            differs(&wrong(answer(&client), edit), &client),
             Some("catching up")
         );
     }
     assert_eq!(
-        wrong(answer(&client), notices).differs_from_live(&client),
+        differs(&wrong(answer(&client), notices), &client),
         Some("history notices")
     );
 
@@ -379,10 +383,58 @@ async fn the_oracle_excuses_only_a_catching_up_set_a_later_survey_changed() {
         wrong(answer(&client), notices),
     );
     catching_up(&client, &[&route, &TransportReconciliationRoute::Inbox]);
-    assert_eq!(catching_up_answer.differs_from_live(&client), None);
-    assert_eq!(inbox_answer.differs_from_live(&client), None);
+    assert_eq!(differs(&catching_up_answer, &client), None);
+    assert_eq!(differs(&inbox_answer, &client), None);
+    assert_eq!(differs(&notices_answer, &client), Some("history notices"));
+}
+
+/// A publish builds each group's recovery status from the account's
+/// recovery read, so a group whose notices in the read changed is rebuilt
+/// though nothing the group holds was written: here its routes go in
+/// memory, which hides its rejoin notice and moves no write of the group.
+/// A publish that moved nothing keeps the group's entry and the account's
+/// answer. With the notices left out of the entry's validity, the stale
+/// entry would be published, and the oracle that compares every publish
+/// with the live reads fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_groups_notices_alone_rebuild_its_entry() {
+    use crate::client::read_state::{GroupAnswers, UploadsInFlight, read_state_channel};
+
+    let dir = tempfile::tempdir().unwrap();
+    let (mut client, app, group, route) = fixture(&dir).await;
+    rejoin(&app, &group, &route);
+    client.start_read_state(read_state_channel().0, UploadsInFlight::default());
+    let state = client.subscribe_read_state().unwrap();
+    let entry = || Arc::clone(&state.borrow().groups[&group]);
+    let ids = |entry: &GroupAnswers| {
+        entry
+            .recovery_status
+            .as_ref()
+            .unwrap()
+            .history_notice_ids
+            .clone()
+    };
+    let kept_status = || client.read_state_recovery_status().unwrap().unwrap();
+    let noticed = entry();
+    assert_eq!(ids(&noticed).len(), 1);
+    let status = kept_status();
+    assert_eq!(status.notices.len(), 1);
+
+    client.publish_read_state();
+    assert!(Arc::ptr_eq(&noticed, &entry()), "nothing moved");
+    assert!(Arc::ptr_eq(&status, &kept_status()), "nothing moved");
+
+    let before = Others::now(&client, &group);
+    assert!(client.routing.replace_group_routes(&group, Vec::new()));
+    let after = Others::now(&client, &group);
+    assert!(after.stamp.unwrap().unchanged_since(&before.stamp.unwrap()));
+    client.publish_read_state();
+    let hidden = entry();
+    assert!(!Arc::ptr_eq(&noticed, &hidden), "the notices moved");
+    assert!(ids(&hidden).is_empty());
+    assert!(kept_status().notices.is_empty());
     assert_eq!(
-        notices_answer.differs_from_live(&client),
-        Some("history notices")
+        hidden.recovery_status.as_ref().unwrap(),
+        &client.group_recovery_status(&group).unwrap()
     );
 }

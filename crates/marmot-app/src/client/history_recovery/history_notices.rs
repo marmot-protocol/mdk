@@ -17,6 +17,7 @@ use storage_sqlite::{
 
 use crate::client::AppClient;
 use crate::client::history_recovery::recovery_runner::UnitKey;
+use crate::client::read_state::settled_failure;
 use crate::history_notices::{
     decode_notice_id, encode_notice_id, history_notice, rejoin_group_tag,
 };
@@ -67,9 +68,9 @@ pub(crate) trait GroupFacts {
 pub(crate) struct Fact {
     pub(crate) value: bool,
     /// Whether the check behind it settled: it succeeded, or failed on a
-    /// fact about the group (the engine does not know the group, or has not
-    /// hydrated it). Any other failure can clear without a write, so an
-    /// answer that used the fact is never kept (mdk#3273).
+    /// fact about the group ([`settled_failure`], the rule A's group entries
+    /// judge their reads by). Any other failure can clear without a write,
+    /// so an answer that used the fact is never kept (mdk#3273).
     pub(crate) settled: bool,
 }
 
@@ -106,7 +107,7 @@ impl GroupFacts for LiveFacts<'_> {
             },
             Err(error) => Fact {
                 value: false,
-                settled: failed_on_a_fact_about_the_group(&AppError::from(error)),
+                settled: settled_failure(&AppError::from(error)),
             },
         }
     }
@@ -114,20 +115,6 @@ impl GroupFacts for LiveFacts<'_> {
     fn stamp(&self, _: &[u8]) -> Option<ChangeStamp> {
         None
     }
-}
-
-/// Whether a failed check is a fact about the group that only a move of the
-/// group's change generation can change: the engine does not know the group,
-/// or has not hydrated it yet. Any other failure, a busy or failing database
-/// above all, can clear without a write. A's group entries judge their reads
-/// by the same rule.
-pub(crate) fn failed_on_a_fact_about_the_group(error: &AppError) -> bool {
-    use cgka_traits::error::EngineError;
-    matches!(error, AppError::UnknownGroup(_))
-        || matches!(
-            error.as_engine_error(),
-            Some(EngineError::UnknownGroup(_) | EngineError::GroupNotHydrated(_))
-        )
 }
 
 /// One read of what the account's recovery answers come from: the parked
@@ -225,12 +212,12 @@ impl RecoveryRead {
     }
 
     /// The group's occurrences before any facts apply, as A compares them.
-    #[cfg_attr(not(test), allow(dead_code))] // A compares them at every publish (mdk#3273 PR 8).
-    pub(crate) fn group_notices(&self, group_id: &GroupId) -> GroupNotices {
-        self.by_group
-            .get(group_id.as_slice())
-            .cloned()
-            .unwrap_or_default()
+    pub(crate) fn group_notices(&self, group_id: &GroupId) -> &GroupNotices {
+        const NONE: &GroupNotices = &GroupNotices {
+            parked: Vec::new(),
+            rejoin: None,
+        };
+        self.by_group.get(group_id.as_slice()).unwrap_or(NONE)
     }
 
     pub(crate) fn survey(&self) -> &SurveyMark {
@@ -762,8 +749,11 @@ mod tests {
         );
     }
 
+    /// The runtime answers the notices from the published read state and
+    /// sends a dismissal to the account worker, which rejects a malformed
+    /// id and finds an unknown one stale.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn runtime_serves_notices_and_dismissals_through_the_account_worker() {
+    async fn runtime_serves_notices_from_the_read_state_and_dismissals_on_the_worker() {
         let dir = tempfile::tempdir().unwrap();
         let runtime = MarmotAppRuntime::new(app(&dir));
         runtime.reconcile_accounts().await.unwrap();

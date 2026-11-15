@@ -6,6 +6,7 @@ use crate::AppError;
 use cgka_traits::engine::{
     SendIntent, SupersededIntentKind, SupersededIntentOutcome, SupersededIntentReport,
 };
+use cgka_traits::group::Group;
 
 use cgka_traits::storage::WelcomeStorage;
 use cgka_traits::{GroupId, MessageId};
@@ -54,19 +55,20 @@ impl AppClient {
         group_id: &cgka_traits::GroupId,
     ) -> Result<crate::GroupRecoveryStatus, AppError> {
         let read = self.read_recovery()?;
-        self.group_recovery_status_in(group_id, &read, &LiveFacts(self))
+        let group = self.runtime.group_record(group_id)?;
+        self.group_recovery_status_in(group_id, &group, &read, &LiveFacts(self))
     }
 
-    /// [`Self::group_recovery_status`] from a recovery read and the group's
-    /// facts the caller has: A builds a group's entry with those it holds
-    /// (mdk#3273).
+    /// [`Self::group_recovery_status`] from the group's engine record, a
+    /// recovery read, and the group's facts the caller has: A builds a
+    /// group's entry with the record and facts it holds (mdk#3273).
     pub(crate) fn group_recovery_status_in(
         &self,
         group_id: &cgka_traits::GroupId,
+        group: &Group,
         read: &RecoveryRead,
         facts: &dyn GroupFacts,
     ) -> Result<crate::GroupRecoveryStatus, AppError> {
-        let group = self.runtime.group_record(group_id)?;
         let rejoin_invitations = self
             .runtime
             .pending_group_rejoins_for(group_id)?

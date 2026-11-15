@@ -161,7 +161,9 @@ Reads marked *A* answer from the worker's published read state on the caller's t
 wait for no unit and record in their class's series only when the worker answers them instead:
 before the worker's first publish, or for a published failure that has no exact copy. A group
 read from A also records there the wait of its hydration request: one worker command, sent only
-while startup's hydration pipeline has not reached a group the read names.
+while startup's hydration pipeline has not reached a group the read names. `group_recovery_status`
+answers from A only for a group in the version's mirror: the worker answers any other id, such
+as a locally deleted group, and the read records that wait in R9.
 
 | Class | Reads |
 | --- | --- |
@@ -173,7 +175,7 @@ while startup's hydration pipeline has not reached a group the read names.
 | R6, device roster | `linked_devices`, `key_package_refresh_overdue`, `unrecognized_sign_ins`, `compromise_warning`, `removed_device_leftover_chats`, `chats_closed_to_linked_devices`, `backup_history_availability`, `backup_settings` |
 | R7, backup restore | from A: `backup_restore_status`, `watch_backup_restore` |
 | R8, media imeta tag | `build_media_imeta_tag` |
-| R9, recovery state | `group_recovery_status`, `history_notices`, `account_recovery_status` |
+| R9, recovery state | from A: `group_recovery_status`, `history_notices`, `account_recovery_status` |
 
 Startup sync, an explicit catch-up, a scheduled convergence pass, a full-history repair and a
 Welcome fanout publish the read state before they start. While they run they answer the
