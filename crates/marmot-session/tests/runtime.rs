@@ -4,7 +4,7 @@ mod storage_fixture;
 use storage_fixture::relaxed_storage_dir;
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -433,6 +433,9 @@ struct RecordingAdapterInner {
     read_backs: Mutex<Vec<(MessageId, Vec<TransportEndpoint>)>>,
     /// What each endpoint answers every read-back; any other answers nothing.
     read_back_answers: Mutex<std::collections::HashMap<TransportEndpoint, TransportReadBack>>,
+    /// Whether a read-back, once recorded, never answers, as if the process
+    /// stopped while it was in flight.
+    stall_read_backs: AtomicBool,
     slow_commit_size_check: Mutex<Option<(Arc<TestWallClock>, u64)>>,
 }
 
@@ -580,6 +583,11 @@ impl RecordingAdapter {
 
     fn read_backs(&self) -> Vec<(MessageId, Vec<TransportEndpoint>)> {
         self.inner.read_backs.lock().unwrap().clone()
+    }
+
+    /// Make every later read-back, once recorded, never answer.
+    fn stall_read_backs(&self, stall: bool) {
+        self.inner.stall_read_backs.store(stall, Ordering::SeqCst);
     }
 
     /// Make the next commit size check take `secs` on `wall`.
@@ -833,6 +841,9 @@ impl TransportAdapter for RecordingAdapter {
             .lock()
             .unwrap()
             .push((message.id.clone(), endpoints.to_vec()));
+        if self.inner.stall_read_backs.load(Ordering::SeqCst) {
+            std::future::pending::<()>().await;
+        }
         let answers = self.inner.read_back_answers.lock().unwrap();
         endpoints
             .iter()

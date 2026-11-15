@@ -6472,6 +6472,10 @@ where
         }) {
             return Ok(());
         } else {
+            // Record the read before it is sent, so a restart while it is in
+            // flight does not read again within the hour.
+            fanout.record_reachability_read(now_ms);
+            self.session.put_outbound_fanout(fanout)?;
             let answers = self
                 .adapter
                 .read_back(
@@ -6480,7 +6484,6 @@ where
                     fanout.request().target.endpoints(),
                 )
                 .await;
-            fanout.record_reachability_read(now_ms);
             let mut found = 0_usize;
             let mut answered = 0_usize;
             for (index, answer) in answers.into_iter().enumerate().take(targets) {
@@ -6511,7 +6514,6 @@ where
                     .resolve_outbound_fanout_mls(fanout, output, queue, context)
                     .await;
             }
-            self.session.put_outbound_fanout(fanout)?;
             answered > 0
         };
         if !online {

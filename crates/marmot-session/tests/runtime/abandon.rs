@@ -112,6 +112,56 @@ async fn an_offline_device_never_gives_up_an_unsent_commit() {
     assert!(publishes_to(&adapter, &second) > 72 * 2, "still retried");
 }
 
+/// The hourly read is recorded before it is sent: a device that stops while
+/// the read is in flight does not read again until the hour is up.
+#[tokio::test]
+async fn an_interrupted_online_read_waits_out_its_hour() {
+    let first = TransportEndpoint("wss://abandon-interrupted-1.example".into());
+    let second = TransportEndpoint("wss://abandon-interrupted-2.example".into());
+    let (fixture, alice) = FloorFixture::new("abandon-interrupted", &[&first, &second]).await;
+    let adapter = RecordingAdapter::default();
+    adapter.fail_endpoints_as(
+        vec![first.clone(), second.clone()],
+        TransportEndpointFailureKind::RetryableUnavailable,
+    );
+    let mut runtime = fixture.runtime(alice, &adapter);
+    let start = fixture.wall.now().0;
+    runtime.send(fixture.rename()).await.unwrap();
+
+    fixture.wall.set(start + READ_BACK_BOUND_SECS);
+    adapter.stall_read_backs(true);
+    {
+        let pass = runtime.resume_outbound_fanouts();
+        tokio::pin!(pass);
+        while adapter.read_backs().is_empty() {
+            tokio::select! {
+                biased;
+                _ = &mut pass => panic!("the stalled read never answers"),
+                () = tokio::task::yield_now() => {}
+            }
+        }
+    }
+    drop(runtime);
+    adapter.stall_read_backs(false);
+    adapter.answer_read_backs(first.clone(), TransportReadBack::NotFound);
+
+    let mut restarted = fixture.runtime(fixture.reopen(), &adapter);
+    fixture.wall.set(start + READ_BACK_BOUND_SECS + HOUR - 1);
+    let effects = restarted.resume_outbound_fanouts().await.unwrap();
+    assert!(effects.pending.is_empty(), "{:?}", effects.pending);
+    assert_eq!(adapter.read_backs().len(), 1, "no second read within the hour");
+    assert!(epoch_is_pending(&restarted, &fixture));
+
+    fixture.wall.set(start + READ_BACK_BOUND_SECS + HOUR);
+    let effects = restarted.resume_outbound_fanouts().await.unwrap();
+    assert_eq!(adapter.read_backs().len(), 2);
+    assert!(
+        matches!(effects.pending.as_slice(), [PendingResolution::RolledBack { .. }]),
+        "{:?}",
+        effects.pending
+    );
+}
+
 /// A relay's definitive refusal of an attempt started since the bound shows
 /// the device online by itself: the relay never reached is given up in the
 /// same pass, with no read.
