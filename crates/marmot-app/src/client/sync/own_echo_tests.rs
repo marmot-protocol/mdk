@@ -302,7 +302,7 @@ async fn native_admission_passes_a_pending_commits_own_echo() {
     client.recovery_owner.native_ingress = Some(ingress);
     client.recovery_owner.native_batch = Some(batch);
 
-    assert!(client.admit_native_turn().await.unwrap());
+    assert!(client.admit_native_turn(None).await.unwrap());
     fixture.assert_confirmed_by_echo();
 }
 
