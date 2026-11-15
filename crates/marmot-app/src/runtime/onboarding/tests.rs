@@ -1535,6 +1535,8 @@ async fn minimal_relay_repair_retains_a_currently_allowed_damus_declaration() {
         OnboardingStep::Relays,
         Some(&event),
         &["wss://public.example".into()],
+        &BTreeMap::new(),
+        false,
     );
     assert_eq!(repair.before_tags[0].fields, tags[0]);
     assert_eq!(repair.after_tags[0].fields, tags[0]);
@@ -1569,6 +1571,8 @@ async fn minimal_relay_repair_preserves_exact_custom_tags_and_removes_only_polic
         OnboardingStep::Relays,
         Some(&event),
         &["wss://default.example".into()],
+        &BTreeMap::new(),
+        false,
     );
     assert_eq!(repair.mode, OnboardingRelayRepairMode::RemovalOnly);
     assert_eq!(repair.original_event_id.as_deref(), Some(event.id.as_str()));
@@ -1612,6 +1616,8 @@ async fn minimal_relay_repair_retains_unsafe_routes_while_removing_retired_route
         OnboardingStep::Relays,
         Some(&event),
         &["wss://public.example".into()],
+        &BTreeMap::new(),
+        false,
     );
     assert_eq!(repair.mode, OnboardingRelayRepairMode::RemovalAndAdditive);
     assert_eq!(repair.after_tags[0].fields, tags[0]);
@@ -1653,6 +1659,8 @@ async fn minimal_relay_repair_matches_default_by_normalized_relay_key() {
         OnboardingStep::Relays,
         Some(&event),
         &["wss://other.example".into(), "wss://custom.example".into()],
+        &BTreeMap::new(),
+        false,
     );
     assert_eq!(repair.mode, OnboardingRelayRepairMode::Additive);
     assert_eq!(
@@ -1679,6 +1687,8 @@ async fn minimal_relay_repair_adds_only_missing_role_and_preserves_unmarked_dupl
         OnboardingStep::Relays,
         Some(&read_only),
         &["wss://custom.example".into()],
+        &BTreeMap::new(),
+        false,
     );
     assert_eq!(repair.mode, OnboardingRelayRepairMode::Additive);
     assert_eq!(repair.after_tags[0].fields, read_only.tags[0]);
@@ -1704,6 +1714,8 @@ async fn minimal_relay_repair_adds_only_missing_role_and_preserves_unmarked_dupl
         OnboardingStep::Relays,
         Some(&unmarked),
         &["wss://default.example".into()],
+        &BTreeMap::new(),
+        false,
     );
     assert_eq!(repair.mode, OnboardingRelayRepairMode::ManualReview);
     assert_eq!(repair.before_tags, repair.after_tags);
@@ -1728,6 +1740,8 @@ async fn minimal_relay_repair_falls_back_to_unapprovable_manual_review() {
         OnboardingStep::Relays,
         Some(&malformed),
         &["wss://default.example".into()],
+        &BTreeMap::new(),
+        false,
     );
     assert_eq!(repair.mode, OnboardingRelayRepairMode::ManualReview);
     assert_eq!(repair.before_tags, repair.after_tags);
@@ -2423,6 +2437,8 @@ async fn removal_only_preview_is_unapprovable_when_no_route_completed_inspection
             OnboardingStep::Relays,
             Some(&source),
             &checkpoint.options.default_relays,
+            &BTreeMap::new(),
+            false,
         );
     assert_eq!(old_repair.mode, OnboardingRelayRepairMode::RemovalOnly);
     let mut stale = runtime
@@ -2510,6 +2526,7 @@ fn older_repair_proposal_without_typed_preview_remains_readable() {
         follows: None,
         relay_repair: None,
         inconclusive: false,
+        unusable_routes: BTreeMap::new(),
     };
     let mut serialized = serde_json::to_value(&proposal).unwrap();
     serialized.as_object_mut().unwrap().remove("relay_repair");
@@ -4147,7 +4164,7 @@ async fn an_inbox_list_no_declared_route_answers_can_be_extended_with_consent() 
         .unwrap();
     assert_eq!(no_route.context, OnboardingFindingContext::DeclaredRoute);
     assert!(no_route.actions.contains(&OnboardingAction::EditRelays));
-    // The failed probe nominates nothing for removal.
+    // The refusal itself offers no finding-level edit.
     let refused = state
         .findings
         .iter()
@@ -4155,7 +4172,13 @@ async fn an_inbox_list_no_declared_route_answers_can_be_extended_with_consent() 
         .unwrap();
     assert!(!refused.actions.contains(&OnboardingAction::EditRelays));
 
-    // Suggest a Fix finds nothing it may change on its own and opens the editor.
+    // mdk#3449: the relay refused the account's own key, so Suggest a Fix
+    // offers replacing it with a recommended default, keeping other tags.
+    assert!(
+        state
+            .actions
+            .contains(&OnboardingAction::RemoveUnusableRelays)
+    );
     let setup = runtime.account_setup();
     let preview = setup
         .propose_onboarding_relay_repair(&id, OnboardingStep::InboxRelays)
@@ -4163,14 +4186,32 @@ async fn an_inbox_list_no_declared_route_answers_can_be_extended_with_consent() 
         .unwrap();
     let proposal = preview.proposal.as_ref().unwrap();
     assert!(proposal.inconclusive);
+    let repair = proposal.relay_repair.as_ref().unwrap();
+    assert_eq!(repair.mode, OnboardingRelayRepairMode::RemovalAndAdditive);
     assert_eq!(
-        proposal.relay_repair.as_ref().unwrap().mode,
-        OnboardingRelayRepairMode::ManualReview
+        repair
+            .after_tags
+            .iter()
+            .map(|t| t.fields.clone())
+            .collect::<Vec<_>>(),
+        vec![
+            inbox[0].clone(),
+            vec!["relay".into(), "wss://default.example".into()]
+        ]
+    );
+    assert_eq!(
+        repair.changes[1].removal_reason,
+        OnboardingRelayRemovalReason::AuthenticationRequired
     );
     let cancelled = setup.cancel_onboarding_repair(&id).await.unwrap();
     let state = &cancelled.steps[OnboardingStep::InboxRelays.index()];
     assert_eq!(state.status, OnboardingStatus::RetryableFailure);
     assert!(offers_relay_edits(state));
+    assert!(
+        state
+            .actions
+            .contains(&OnboardingAction::RemoveUnusableRelays)
+    );
 
     let proposed = setup
         .propose_onboarding_relays(&id, OnboardingStep::InboxRelays, None)
@@ -4778,6 +4819,7 @@ async fn optional_repairs_preserve_unknown_profile_fields_and_follow_tag_metadat
         follows: None,
         relay_repair: None,
         inconclusive: false,
+        unusable_routes: BTreeMap::new(),
     };
     let (tags, content, _) = relay_repair_event(&c, &proposal);
     let json: serde_json::Value = serde_json::from_str(&content).unwrap();
@@ -5005,6 +5047,7 @@ async fn profile_url_validation_and_explicit_clear_preserve_unrelated_fields() {
         follows: None,
         relay_repair: None,
         inconclusive: false,
+        unusable_routes: BTreeMap::new(),
     };
     let (_, content, _) = relay_repair_event(&c, &proposal);
     let json: serde_json::Value = serde_json::from_str(&content).unwrap();
@@ -10107,4 +10150,334 @@ mod product_analytics {
         }
         runtime.shutdown_and_close().await.unwrap();
     }
+}
+
+/// Check `step` against the fixture network and keep the result as the
+/// step's evidence, with every other step passed, the way a run leaves it.
+async fn checked_relay_step(
+    runtime: &MarmotAppRuntime,
+    id: &str,
+    step: OnboardingStep,
+) -> OnboardingSnapshot {
+    let manager = runtime.accounts();
+    let mut checkpoint = manager
+        .setup_records()
+        .onboarding_checkpoint(id)
+        .unwrap()
+        .unwrap();
+    for state in &mut checkpoint.snapshot.steps {
+        state.status = OnboardingStatus::Passed;
+    }
+    let (status, findings, record) = manager
+        .account_setup()
+        .check_onboarding_step(&checkpoint, step)
+        .await;
+    checkpoint.set(step, status, findings);
+    checkpoint.records[step.index()] = record;
+    manager
+        .account_setup()
+        .save_onboarding(&mut checkpoint)
+        .unwrap();
+    manager
+        .account_setup()
+        .onboarding_snapshot(id)
+        .unwrap()
+        .unwrap()
+}
+
+fn offers_cleanup(snapshot: &OnboardingSnapshot, step: OnboardingStep) -> bool {
+    snapshot.steps[step.index()]
+        .actions
+        .contains(&OnboardingAction::RemoveUnusableRelays)
+}
+
+// mdk#3449: a members-only or paid inbox relay refusing the account's own
+// authenticated gift-wrap read loses every gift wrap sent to it. The passed
+// step offers its removal as advice the user may take or decline.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_passed_step_offers_removing_a_relay_that_refused_the_local_key() {
+    use transport_nostr::DirectoryInspectionError;
+
+    for (error, reason) in [
+        (
+            DirectoryInspectionError::AuthenticationRequired,
+            OnboardingRelayRemovalReason::AuthenticationRequired,
+        ),
+        (
+            DirectoryInspectionError::PaymentRequired,
+            OnboardingRelayRemovalReason::PaymentRequired,
+        ),
+    ] {
+        let (_dir, runtime, network, keys, id) = fixture().await;
+        let manager = runtime.accounts();
+        let source = signed(
+            &keys,
+            10050,
+            vec![
+                vec!["relay".into(), "wss://healthy.example".into()],
+                vec!["client".into(), "keep".into()],
+                vec!["relay".into(), "wss://members.example".into()],
+            ],
+            "opaque content",
+            unix_now_seconds() - 1,
+        );
+        *network.events.lock() = vec![source.clone()];
+        network
+            .inspection_errors
+            .lock()
+            .insert("members.example".into(), error);
+        let checked = checked_relay_step(&runtime, &id, OnboardingStep::InboxRelays).await;
+        assert_eq!(
+            checked.steps[OnboardingStep::InboxRelays.index()].status,
+            OnboardingStatus::Passed
+        );
+        assert!(checked.ready, "{error:?}");
+        assert!(offers_cleanup(&checked, OnboardingStep::InboxRelays));
+        // Step-level advice: no finding carries it.
+        assert!(checked.steps.iter().all(|step| {
+            step.findings
+                .iter()
+                .all(|f| !f.actions.contains(&OnboardingAction::RemoveUnusableRelays))
+        }));
+
+        let preview = manager
+            .account_setup()
+            .propose_onboarding_relay_repair(&id, OnboardingStep::InboxRelays)
+            .await
+            .unwrap();
+        assert!(preview.ready);
+        assert!(!offers_cleanup(&preview, OnboardingStep::InboxRelays));
+        let repair = preview
+            .proposal
+            .as_ref()
+            .unwrap()
+            .relay_repair
+            .as_ref()
+            .unwrap();
+        assert_eq!(repair.mode, OnboardingRelayRepairMode::RemovalOnly);
+        assert_eq!(repair.proposed_content, source.content);
+        let removed: Vec<_> = repair
+            .changes
+            .iter()
+            .filter(|c| c.disposition == OnboardingRelayTagDisposition::Removed)
+            .map(|c| (c.endpoint.as_deref(), c.before_index, c.removal_reason))
+            .collect();
+        assert_eq!(
+            removed,
+            vec![(Some("wss://members.example"), Some(2), reason)]
+        );
+        assert!(repair.changes.iter().all(|c| {
+            (c.disposition == OnboardingRelayTagDisposition::Removed)
+                == (c.removal_reason != OnboardingRelayRemovalReason::None)
+        }));
+        let retained = vec![source.tags[0].clone(), source.tags[1].clone()];
+        assert_eq!(
+            repair
+                .after_tags
+                .iter()
+                .map(|t| t.fields.clone())
+                .collect::<Vec<_>>(),
+            retained
+        );
+
+        // Declining costs nothing: the step keeps its status and readiness,
+        // and the advice stays on offer.
+        let declined = manager
+            .account_setup()
+            .cancel_onboarding_repair(&id)
+            .await
+            .unwrap();
+        assert!(declined.ready);
+        assert_eq!(
+            declined.steps[OnboardingStep::InboxRelays.index()].status,
+            OnboardingStatus::Passed
+        );
+        assert!(offers_cleanup(&declined, OnboardingStep::InboxRelays));
+
+        // Approval replaces the step's findings before publication validates
+        // the preview again; the proposal's own evidence rebuilds it, and
+        // exactly the retained tags are published.
+        let preview = manager
+            .account_setup()
+            .propose_onboarding_relay_repair(&id, OnboardingStep::InboxRelays)
+            .await
+            .unwrap();
+        network.zero_acks.store(true, Ordering::SeqCst);
+        manager
+            .account_setup()
+            .approve_onboarding_repair(&id, preview.revision)
+            .await
+            .unwrap();
+        let published = network.attempts.lock()[0].clone();
+        assert_eq!(published.kind, 10050);
+        assert_eq!(published.tags, retained);
+        assert_eq!(published.content, source.content);
+        runtime.shutdown_and_close().await.unwrap();
+    }
+}
+
+// mdk#3449: a timeout, an unreachable relay or a catch-all refusal can be an
+// outage that passes, and a refusal without the local key may be the signer's
+// fault. None of them nominates a declared route for removal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn only_a_policy_refusal_of_the_local_key_nominates_a_route_for_removal() {
+    use transport_nostr::DirectoryInspectionError;
+
+    let inbox = |keys: &nostr::prelude::Keys| {
+        signed(
+            keys,
+            10050,
+            vec![
+                vec!["relay".into(), "wss://healthy.example".into()],
+                vec!["relay".into(), "wss://flaky.example".into()],
+            ],
+            "",
+            unix_now_seconds() - 1,
+        )
+    };
+    let (_dir, runtime, network, keys, id) = fixture().await;
+    *network.events.lock() = vec![inbox(&keys)];
+    for error in [
+        DirectoryInspectionError::TimedOut,
+        DirectoryInspectionError::Unreachable,
+        DirectoryInspectionError::Restricted,
+    ] {
+        network
+            .inspection_errors
+            .lock()
+            .insert("flaky.example".into(), error);
+        let checked = checked_relay_step(&runtime, &id, OnboardingStep::InboxRelays).await;
+        assert_eq!(
+            checked.steps[OnboardingStep::InboxRelays.index()].status,
+            OnboardingStatus::Passed,
+            "{error:?}"
+        );
+        assert!(!offers_cleanup(&checked, OnboardingStep::InboxRelays));
+        assert!(
+            runtime
+                .account_setup()
+                .propose_onboarding_relay_repair(&id, OnboardingStep::InboxRelays)
+                .await
+                .is_err()
+        );
+    }
+    runtime.shutdown_and_close().await.unwrap();
+
+    // The same refusal through a host signer is not evidence.
+    let directory = tempfile::tempdir().unwrap();
+    let network = Arc::new(Network::default());
+    let runtime = self::runtime(directory.path(), network.clone());
+    let keys = nostr::prelude::Keys::generate();
+    let id = keys.public_key().to_hex();
+    runtime
+        .account_setup()
+        .begin_external_signer_onboarding(
+            id.clone(),
+            BlockingSigner {
+                keys: keys.clone(),
+                block: Arc::new(AtomicBool::new(false)),
+                started: Arc::new(Notify::new()),
+            },
+            options(),
+        )
+        .await
+        .unwrap();
+    *network.events.lock() = vec![inbox(&keys)];
+    network.inspection_errors.lock().insert(
+        "flaky.example".into(),
+        DirectoryInspectionError::AuthenticationRequired,
+    );
+    let checked = checked_relay_step(&runtime, &id, OnboardingStep::InboxRelays).await;
+    let step = &checked.steps[OnboardingStep::InboxRelays.index()];
+    assert_eq!(step.status, OnboardingStatus::Passed);
+    assert!(
+        step.findings
+            .iter()
+            .any(|f| f.issue == OnboardingIssue::AuthenticationRequired)
+    );
+    assert!(!offers_cleanup(&checked, OnboardingStep::InboxRelays));
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+// A removal-only cleanup never empties a role: an unusable entry that is the
+// list's last allowed route for its role stays. A repair that may add routes
+// replaces it with a default instead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_removal_only_cleanup_keeps_the_last_route_of_each_role() {
+    let (_dir, runtime, _network, keys, _id) = fixture().await;
+    let manager = runtime.accounts();
+    let setup = manager.account_setup();
+    let unusable = BTreeMap::from([(
+        relay_key("wss://members.example"),
+        OnboardingRelayRemovalReason::AuthenticationRequired,
+    )]);
+    let removed = |repair: &OnboardingRelayRepair| {
+        repair
+            .changes
+            .iter()
+            .filter(|c| c.disposition == OnboardingRelayTagDisposition::Removed)
+            .map(|c| c.endpoint.clone().unwrap())
+            .collect::<Vec<_>>()
+    };
+    let only_read = signed(
+        &keys,
+        10002,
+        vec![
+            vec!["r".into(), "wss://write.example".into(), "write".into()],
+            vec!["r".into(), "wss://members.example".into(), "read".into()],
+        ],
+        "",
+        unix_now_seconds(),
+    );
+    let defaults = ["wss://default.example".to_owned()];
+    let (kept, _, _) = setup.minimal_relay_repair(
+        OnboardingStep::Relays,
+        Some(&only_read),
+        &defaults,
+        &unusable,
+        true,
+    );
+    assert_eq!(kept.mode, OnboardingRelayRepairMode::ManualReview);
+    assert!(removed(&kept).is_empty());
+    let (replaced, read, write) = setup.minimal_relay_repair(
+        OnboardingStep::Relays,
+        Some(&only_read),
+        &defaults,
+        &unusable,
+        false,
+    );
+    assert_eq!(replaced.mode, OnboardingRelayRepairMode::RemovalAndAdditive);
+    assert_eq!(removed(&replaced), vec!["wss://members.example"]);
+    assert_eq!(read, vec!["wss://default.example"]);
+    assert_eq!(write, vec!["wss://write.example"]);
+
+    let spare_read = signed(
+        &keys,
+        10002,
+        vec![
+            vec!["r".into(), "wss://write.example".into(), "write".into()],
+            vec!["r".into(), "wss://members.example".into(), "read".into()],
+            vec!["r".into(), "wss://read.example".into(), "READ".into()],
+        ],
+        "",
+        unix_now_seconds(),
+    );
+    let (cleanup, _, _) = setup.minimal_relay_repair(
+        OnboardingStep::Relays,
+        Some(&spare_read),
+        &defaults,
+        &unusable,
+        true,
+    );
+    assert_eq!(cleanup.mode, OnboardingRelayRepairMode::RemovalOnly);
+    assert_eq!(removed(&cleanup), vec!["wss://members.example"]);
+    assert_eq!(
+        cleanup
+            .after_tags
+            .iter()
+            .map(|t| &t.fields)
+            .collect::<Vec<_>>(),
+        vec![&spare_read.tags[0], &spare_read.tags[2]]
+    );
+    runtime.shutdown_and_close().await.unwrap();
 }

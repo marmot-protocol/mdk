@@ -3,6 +3,7 @@
 //! bytes are checkpointed before they can reach a relay.
 use super::*;
 use nostr::prelude::{EventBuilder, FinalizeUnsignedEvent, Kind, PublicKey, Tag, Timestamp};
+use std::collections::BTreeMap;
 use std::future::Future;
 use transport_nostr::{DirectoryEventQuery, DirectoryRelayEventRecord, RelayEndpointPolicy};
 use transport_nostr_peeler::NostrTransportEvent;
@@ -371,6 +372,11 @@ pub enum OnboardingAction {
     EditDiscoveryRelays,
     ContinueAnyway,
     CancelOnboarding,
+    /// Preview removing declared relays the check showed cannot serve their
+    /// role, through `propose_onboarding_relay_repair`. Offered only when that
+    /// preview would be approvable and remove at least one entry. Advice only:
+    /// readiness never depends on it, and declining it costs nothing.
+    RemoveUnusableRelays,
 }
 /// Evidence from the queried relays, never a claim that multi-device use is safe.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -462,6 +468,13 @@ pub struct OnboardingFinding {
     /// observation time. It is not a live-health certificate.
     #[serde(default)]
     pub observed_revision: Option<u64>,
+    /// The inspection held the account's own local key, so the client
+    /// answered any NIP-42 challenge itself. An authentication or payment
+    /// refusal is then the relay's policy for this account, not a signer
+    /// fault. A host or remote signer that is slow or offline looks the same
+    /// as a refusal, so its refusals never set this.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    local_key_held: bool,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct OnboardingStepState {
@@ -510,6 +523,22 @@ pub enum OnboardingRelayCapability {
     Inbox,
 }
 
+/// Why a relay repair removes a declared entry: what the check observed, by
+/// class, for hosts to explain. `None` on retained and added entries.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+pub enum OnboardingRelayRemovalReason {
+    #[default]
+    None,
+    /// The host is on MDK's retired-relay denylist.
+    Retired,
+    /// The relay refused the declared-route check with `auth-required`
+    /// although the client could authenticate as the account (NIP-42).
+    AuthenticationRequired,
+    /// The relay refused the declared-route check with `payment-required`
+    /// while the client could authenticate as the account.
+    PaymentRequired,
+}
+
 /// One exact before/after tag occurrence and its effect on route capability.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct OnboardingRelayTagChange {
@@ -520,6 +549,9 @@ pub struct OnboardingRelayTagChange {
     pub endpoint: Option<String>,
     pub role: OnboardingRelayTagRole,
     pub restores: OnboardingRelayCapability,
+    /// Set on every `Removed` change.
+    #[serde(default)]
+    pub removal_reason: OnboardingRelayRemovalReason,
 }
 
 /// A lossless, non-publishing preview. `ManualReview` is intentionally not
@@ -565,6 +597,12 @@ pub struct OnboardingRepairProposal {
     /// other clients. Hosts confirm at the user's own risk before approving.
     #[serde(default)]
     pub inconclusive: bool,
+    /// The declared routes this relay-repair preview treats as unusable,
+    /// keyed by normalized endpoint: the check's evidence, kept with the
+    /// proposal so approval and publication rebuild the same preview after
+    /// the step's findings are replaced.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    unusable_routes: BTreeMap<String, OnboardingRelayRemovalReason>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct OnboardingSnapshot {
@@ -944,6 +982,7 @@ fn finding(issue: OnboardingIssue) -> OnboardingFinding {
         declared_capability: OnboardingRelayCapability::None,
         actions: Vec::new(),
         observed_revision: None,
+        local_key_held: false,
     }
 }
 
@@ -1082,7 +1121,9 @@ fn refresh_finding_actions(snapshot: &mut OnboardingSnapshot) {
                         OnboardingAction::ReconnectSigner,
                     ]
                 }
-                // A failed read query does not nominate a route for removal.
+                // A failed read query offers no finding-level edit. A policy
+                // refusal of the local key reaches the step's advice instead
+                // (`RemoveUnusableRelays`, mdk#3449).
                 OnboardingFindingContext::DeclaredRoute => {
                     &[OnboardingAction::Retry, OnboardingAction::ReconnectSigner]
                 }
@@ -1742,6 +1783,16 @@ impl AccountSetup<'_> {
             .revision
             .checked_add(1)
             .ok_or_else(onboarding_error)?;
+        // Derived advice: recomputed on every save from the retained evidence,
+        // so cancelling a proposal or a recheck restores or retires it.
+        for step in [OnboardingStep::Relays, OnboardingStep::InboxRelays] {
+            let available = self.relay_cleanup_available(checkpoint, step);
+            let actions = &mut checkpoint.snapshot.steps[step.index()].actions;
+            actions.retain(|action| *action != OnboardingAction::RemoveUnusableRelays);
+            if available {
+                actions.push(OnboardingAction::RemoveUnusableRelays);
+            }
+        }
         refresh_finding_actions(&mut checkpoint.snapshot);
         // Mark pauses reported only while the collector counts them, so a
         // grant or configuration later in the attempt still sees the pause.
@@ -2398,12 +2449,18 @@ impl AccountSetup<'_> {
         Vec<OnboardingFinding>,
         HashMap<String, String>,
     ) {
-        let signer = self
+        let account_signer = self
             .records()
             .resolve(account_id)
             .ok()
-            .and_then(|account| self.app().account_signer_for_summary(&account).ok())
-            .map(|signer| signer.as_nostr_signer());
+            .and_then(|account| self.app().account_signer_for_summary(&account).ok());
+        // Only the local key always answers a NIP-42 challenge; see
+        // `OnboardingFinding::local_key_held`.
+        let local_key_held = matches!(
+            account_signer,
+            Some(crate::external_signer::AccountSigner::Local(_))
+        );
+        let signer = account_signer.map(|signer| signer.as_nostr_signer());
         let mut tasks = JoinSet::new();
         let classifications = self.app().relay_plane.classify_relay_endpoints(endpoints);
         let mut failures = Vec::new();
@@ -2506,6 +2563,12 @@ impl AccountSetup<'_> {
                     };
                     failures.push(OnboardingFinding {
                         endpoint: Some(endpoint),
+                        local_key_held: local_key_held
+                            && matches!(
+                                issue,
+                                OnboardingIssue::AuthenticationRequired
+                                    | OnboardingIssue::PaymentRequired
+                            ),
                         ..finding(issue)
                     });
                 }
@@ -2986,6 +3049,7 @@ impl AccountSetup<'_> {
             follows: None,
             relay_repair,
             inconclusive: check_inconclusive(&c.snapshot.steps[step.index()].findings),
+            unusable_routes: BTreeMap::new(),
         });
         c.snapshot.steps[step.index()].actions = if manual_review {
             vec![OnboardingAction::EditRelays, OnboardingAction::CancelRepair]
@@ -3102,6 +3166,7 @@ impl AccountSetup<'_> {
             follows,
             relay_repair: None,
             inconclusive: false,
+            unusable_routes: BTreeMap::new(),
         });
         c.snapshot.steps[step.index()].actions = vec![
             OnboardingAction::ApproveRepair,
@@ -3319,10 +3384,14 @@ impl AccountSetup<'_> {
                 }
                 return Ok(());
             }
+            // The proposal keeps the evidence it was built from: approval
+            // replaces the step's findings before publication validates again.
             let (expected, read_relays, write_relays) = self.minimal_relay_repair(
                 proposal.step,
                 c.records[proposal.step.index()].as_ref(),
                 c.options.defaults_for(proposal.step),
+                &proposal.unusable_routes,
+                repair.mode == OnboardingRelayRepairMode::RemovalOnly,
             );
             if (repair.mode == OnboardingRelayRepairMode::RemovalOnly
                 && c.snapshot.steps[proposal.step.index()]

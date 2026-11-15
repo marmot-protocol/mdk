@@ -12,6 +12,17 @@
   `acknowledgeChangeNotDelivered(accountRef, groupIdHex, commitIdHex)` clears one (mdk#2332).
   `GroupEventKindFfi::GroupChangeNotDelivered` announces a direct change; handle it in exhaustive switches. See
   [Group changes that were not applied](README.md#group-changes-that-were-not-applied).
+- Onboarding suggests removing declared relays the check showed can't serve their role (#3449). A step offers
+  `OnboardingActionFfi.RemoveUnusableRelays` when `propose_onboarding_relay_repair` would return an approvable
+  preview that removes at least one entry: a retired relay, or one that refused the declared-route check with
+  `auth-required` or `payment-required` although the client held the account's local key. On a passed step the
+  preview is `RemovalOnly` and never removes a role's last allowed route; on a failing step it may also add a
+  default. Each `Removed` `OnboardingRelayTagChangeFfi` carries `removal_reason`
+  (`OnboardingRelayRemovalReasonFfi`: `Retired`, `AuthenticationRequired`, `PaymentRequired`; `None` otherwise)
+  for typed, localized explanations. It is advice: `ready` never depends on it, and declining costs nothing.
+  Swift and Kotlin `switch`/`when` over `OnboardingActionFfi` need the new case. See
+  [Interactive account onboarding](README.md#interactive-account-onboarding). Regenerate Swift and Kotlin
+  bindings with the matching native library.
 - `startDirectConversationWithOptions(accountRef, peerAccountId, DirectConversationOptionsFfi)` founds a new direct
   chat with `disappearingMessageSecs` in its founding MLS state and Welcome. Reuse and retry keep the existing chat's
   duration and roles. `startDirectConversation` is unchanged. Regenerate Swift and Kotlin bindings with the matching

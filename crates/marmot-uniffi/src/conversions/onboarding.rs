@@ -167,6 +167,10 @@ pub enum OnboardingActionFfi {
     EditDiscoveryRelays,
     ContinueAnyway,
     CancelOnboarding,
+    /// Preview removing declared relays the check showed cannot serve their
+    /// role with `propose_onboarding_relay_repair`. Advice only: readiness
+    /// never depends on it, and declining it costs nothing.
+    RemoveUnusableRelays,
 }
 impl From<marmot_app::OnboardingAction> for OnboardingActionFfi {
     fn from(value: marmot_app::OnboardingAction) -> Self {
@@ -183,6 +187,7 @@ impl From<marmot_app::OnboardingAction> for OnboardingActionFfi {
             marmot_app::OnboardingAction::ReconnectSigner => Self::ReconnectSigner,
             marmot_app::OnboardingAction::ContinueAnyway => Self::ContinueAnyway,
             marmot_app::OnboardingAction::CancelOnboarding => Self::CancelOnboarding,
+            marmot_app::OnboardingAction::RemoveUnusableRelays => Self::RemoveUnusableRelays,
         }
     }
 }
@@ -201,6 +206,7 @@ impl From<OnboardingActionFfi> for marmot_app::OnboardingAction {
             OnboardingActionFfi::ReconnectSigner => Self::ReconnectSigner,
             OnboardingActionFfi::ContinueAnyway => Self::ContinueAnyway,
             OnboardingActionFfi::CancelOnboarding => Self::CancelOnboarding,
+            OnboardingActionFfi::RemoveUnusableRelays => Self::RemoveUnusableRelays,
         }
     }
 }
@@ -394,6 +400,31 @@ impl From<marmot_app::OnboardingRelayTag> for OnboardingRelayTagFfi {
         }
     }
 }
+/// Why a relay repair removes a declared entry, by observed class. `None` on
+/// retained and added entries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum OnboardingRelayRemovalReasonFfi {
+    None,
+    /// The host is on MDK's retired-relay denylist.
+    Retired,
+    /// The relay refused the declared-route check with `auth-required`
+    /// although the client could authenticate as the account.
+    AuthenticationRequired,
+    /// The relay refused the declared-route check with `payment-required`.
+    PaymentRequired,
+}
+impl From<marmot_app::OnboardingRelayRemovalReason> for OnboardingRelayRemovalReasonFfi {
+    fn from(value: marmot_app::OnboardingRelayRemovalReason) -> Self {
+        match value {
+            marmot_app::OnboardingRelayRemovalReason::None => Self::None,
+            marmot_app::OnboardingRelayRemovalReason::Retired => Self::Retired,
+            marmot_app::OnboardingRelayRemovalReason::AuthenticationRequired => {
+                Self::AuthenticationRequired
+            }
+            marmot_app::OnboardingRelayRemovalReason::PaymentRequired => Self::PaymentRequired,
+        }
+    }
+}
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct OnboardingRelayTagChangeFfi {
     pub disposition: OnboardingRelayTagDispositionFfi,
@@ -403,6 +434,8 @@ pub struct OnboardingRelayTagChangeFfi {
     pub endpoint: Option<String>,
     pub role: OnboardingRelayTagRoleFfi,
     pub restores: OnboardingRelayCapabilityFfi,
+    /// Set on every `Removed` change.
+    pub removal_reason: OnboardingRelayRemovalReasonFfi,
 }
 impl From<marmot_app::OnboardingRelayTagChange> for OnboardingRelayTagChangeFfi {
     fn from(value: marmot_app::OnboardingRelayTagChange) -> Self {
@@ -414,6 +447,7 @@ impl From<marmot_app::OnboardingRelayTagChange> for OnboardingRelayTagChangeFfi 
             endpoint: value.endpoint,
             role: value.role.into(),
             restores: value.restores.into(),
+            removal_reason: value.removal_reason.into(),
         }
     }
 }
@@ -704,6 +738,10 @@ mod tests {
                 marmot_app::OnboardingAction::CancelOnboarding,
                 OnboardingActionFfi::CancelOnboarding,
             ),
+            (
+                marmot_app::OnboardingAction::RemoveUnusableRelays,
+                OnboardingActionFfi::RemoveUnusableRelays,
+            ),
         ] {
             assert_eq!(OnboardingActionFfi::from(native), foreign);
             assert_eq!(marmot_app::OnboardingAction::from(foreign), native);
@@ -940,6 +978,26 @@ mod tests {
             ),
         ] {
             assert_eq!(OnboardingRelayCapabilityFfi::from(native), foreign);
+        }
+        for (native, foreign) in [
+            (
+                marmot_app::OnboardingRelayRemovalReason::None,
+                OnboardingRelayRemovalReasonFfi::None,
+            ),
+            (
+                marmot_app::OnboardingRelayRemovalReason::Retired,
+                OnboardingRelayRemovalReasonFfi::Retired,
+            ),
+            (
+                marmot_app::OnboardingRelayRemovalReason::AuthenticationRequired,
+                OnboardingRelayRemovalReasonFfi::AuthenticationRequired,
+            ),
+            (
+                marmot_app::OnboardingRelayRemovalReason::PaymentRequired,
+                OnboardingRelayRemovalReasonFfi::PaymentRequired,
+            ),
+        ] {
+            assert_eq!(OnboardingRelayRemovalReasonFfi::from(native), foreign);
         }
         for (native, foreign) in [
             (
