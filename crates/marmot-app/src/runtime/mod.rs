@@ -2075,13 +2075,38 @@ impl MarmotAppRuntime {
     /// different accounts can create separate groups, each with both participants
     /// as admins.
     /// See [`Self::pending_welcome_deliveries`] for delivery failures.
+    ///
+    /// Equivalent to [`Self::start_direct_conversation_with_options`] with
+    /// default options: a new group has disappearing messages disabled.
     pub async fn start_direct_conversation(
         &self,
         account_ref: &str,
         peer_account_id: &str,
     ) -> Result<GroupId, AppError> {
+        self.start_direct_conversation_with_options(
+            account_ref,
+            peer_account_id,
+            crate::DirectConversationOptions::default(),
+        )
+        .await
+    }
+
+    /// [`Self::start_direct_conversation`] with founding options for a new
+    /// group. A nonzero `disappearing_message_secs` is written into the
+    /// founding MLS state and Welcome, with no follow-up retention commit.
+    /// Options never change a reused or retried conversation: its group id,
+    /// duration and roles stay as founded, whatever duration the retry
+    /// proposes. A nonzero duration also requires the peer's KeyPackages to
+    /// support message retention, exactly as [`Self::create_group_with_options`]
+    /// does; a peer without it fails the start and nothing is created.
+    pub async fn start_direct_conversation_with_options(
+        &self,
+        account_ref: &str,
+        peer_account_id: &str,
+        options: crate::DirectConversationOptions,
+    ) -> Result<GroupId, AppError> {
         self.accounts
-            .start_direct_conversation(account_ref, peer_account_id)
+            .start_direct_conversation(account_ref, peer_account_id, options)
             .await
     }
 

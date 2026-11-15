@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Added
+
+- `MarmotAppRuntime::start_direct_conversation_with_options` takes `DirectConversationOptions` with a founding
+  `disappearing_message_secs`. A new direct conversation carries it in its founding MLS state and Welcome; reuse,
+  retry and same-account concurrent starts keep the existing group's duration and roles. `start_direct_conversation`
+  is unchanged (#3365).
+
 ## 0.17.0 - 2026-11-15
 
 ### Breaking changes

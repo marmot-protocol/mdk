@@ -538,6 +538,7 @@ impl AccountManager {
         &self,
         account_ref: &str,
         peer_account_id: &str,
+        options: crate::DirectConversationOptions,
     ) -> Result<GroupId, AppError> {
         let account = self.resolve(account_ref)?;
         let peer_account_id_hex = crate::ids::account_id_hex_from_ref(peer_account_id)?;
@@ -552,7 +553,12 @@ impl AccountManager {
                 request: GroupCreationRequest::Direct {
                     peer_account_id_hex: peer_account_id_hex.clone(),
                 },
-                options: AppCreateGroupOptions::default(),
+                // The worker applies these only when it creates the group;
+                // reuse returns the founded group untouched.
+                options: AppCreateGroupOptions {
+                    disappearing_message_secs: options.disappearing_message_secs,
+                    ..Default::default()
+                },
                 respond,
             })
             .await

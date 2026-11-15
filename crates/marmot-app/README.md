@@ -313,6 +313,13 @@ pub async fn start_direct_conversation(
     account_ref: &str,
     peer_account_id: &str,
 ) -> Result<GroupId, AppError>
+
+pub async fn start_direct_conversation_with_options(
+    &self,
+    account_ref: &str,
+    peer_account_id: &str,
+    options: DirectConversationOptions,
+) -> Result<GroupId, AppError>
 ```
 
 `MarmotAppRuntime::start_direct_conversation` accepts a hex or npub peer identity. The account worker serializes the
@@ -327,6 +334,14 @@ even when the chat-list projection is missing. If a matching canonical group is 
 returns an error rather than creating another group. Removed and disbanded copies do not block a fresh start. Concurrent
 starts on the same account return one local group. Simultaneous starts by different accounts can create two groups, each
 with both accounts as founding admins.
+
+`start_direct_conversation_with_options` takes founding options for a new group. A nonzero
+`DirectConversationOptions::disappearing_message_secs` is written into the founding MLS state and Welcome, as
+`AppCreateGroupOptions` does for generic creation, so the recipient joins with that duration and no retention commit
+follows. Options apply only when the call creates the group: reuse, retry, and same-account concurrent starts return the
+existing group with its founding duration and roles, whatever duration they propose. A nonzero duration requires the
+peer's KeyPackages to support message retention; without it the start fails and nothing is created.
+`start_direct_conversation` is the same call with default options, which leave disappearing messages disabled.
 
 There is no immutable cross-client DM provenance, so MDK cannot prove legacy groups eligible for automatic admin repair.
 Legacy and generic groups retain their authoritative roles, including unnamed two-member groups. Clients using generic

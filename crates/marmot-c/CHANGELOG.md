@@ -7,6 +7,14 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ## [Unreleased]
 
+### Added
+
+- `marmot_start_direct_chat_with_options` and the borrowed input struct
+  `MarmotDirectConversationOptions { disappearing_message_secs }` found a new
+  direct chat with that duration in its founding MLS state and Welcome. Reuse
+  and retry keep the existing chat's duration and roles.
+  `marmot_start_direct_chat` is unchanged (#3365).
+
 ## [0.17.0] - 2026-11-15
 
 ### Breaking changes

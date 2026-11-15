@@ -453,7 +453,10 @@ invitations) using the
 Optional C operation fields (`group_id_hex`, `created`, or `summary`) are NULL when
 no operation occurred. Free the whole result even when its operation is absent.
 
-`marmot_start_direct_chat` still requires its peer. It and explicit directory
+`marmot_start_direct_chat` still requires its peer, as does
+`marmot_start_direct_chat_with_options`, which takes a borrowed
+`MarmotDirectConversationOptions` for the founding disappearing-message
+duration. Both and explicit directory
 lookups can return `MARMOT_STATUS_MISSING_KEY_PACKAGE` when the lookup found nothing
 invitable; the detail ends in `[obsolete_only]` when the recipient must update their
 app. `MARMOT_STATUS_DIRECTORY_LOOKUP_INCOMPLETE` means the lookup ran out of time or

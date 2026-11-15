@@ -126,7 +126,12 @@ accounts can produce two groups, each with symmetric founding admins.
 MDK has no immutable cross-client DM provenance and does not automatically repair legacy or generic groups based on an
 unnamed two-member roster. Those groups retain their authoritative roles. Generic creator-only clients remain interoperable,
 but their new groups stay asymmetric until they adopt this operation. A non-admin recipient cannot self-promote.
-See the [exact Rust signature and contract](API-REFERENCE.md#marmotstart_direct_conversation).
+To found the chat with a disappearing-message duration, such as the user's default, call
+`startDirectConversationWithOptions` with `DirectConversationOptionsFfi(disappearingMessageSecs:)`. The duration is part
+of the founding state and Welcome; a reused or retried start keeps the existing chat's duration and roles. Do not follow
+the start with `updateMessageRetention`, which would overwrite a reused chat's policy.
+See the [exact Rust signature and contract](API-REFERENCE.md#marmotstart_direct_conversation) and the
+[options variant](API-REFERENCE.md#marmotstart_direct_conversation_with_options).
 
 ### Feature map
 

@@ -62,13 +62,13 @@ use crate::types::group::{
     MarmotAccountDevicesActivation, MarmotAppBlobEndpoint, MarmotAppGroupMemberIdsList,
     MarmotAppGroupMemberRecordList, MarmotAppGroupMlsState, MarmotAppGroupRecord,
     MarmotAppQuarantinedGroupList, MarmotCreateGroupOptions, MarmotDetailedGroupCreationResult,
-    MarmotDisbandRequest, MarmotGroupAppComponent, MarmotGroupCommitDelivery,
-    MarmotGroupConversationSnapshot, MarmotGroupCreationResult, MarmotGroupDetails,
-    MarmotGroupInviteDeclineResult, MarmotGroupInviteResult, MarmotGroupManagementState,
-    MarmotGroupMutationResult, MarmotGroupRecoveryStatus, MarmotGroupRoster,
-    MarmotInitialGroupImage, MarmotInviteMembersResult, MarmotMemberKeyPackagePrewarmSummary,
-    MarmotMemberRef, MarmotPendingWelcomeDeliveryList, MarmotPreparedGroupImageUpload,
-    MarmotPreparedGroupImageUploadList,
+    MarmotDirectConversationOptions, MarmotDisbandRequest, MarmotGroupAppComponent,
+    MarmotGroupCommitDelivery, MarmotGroupConversationSnapshot, MarmotGroupCreationResult,
+    MarmotGroupDetails, MarmotGroupInviteDeclineResult, MarmotGroupInviteResult,
+    MarmotGroupManagementState, MarmotGroupMutationResult, MarmotGroupRecoveryStatus,
+    MarmotGroupRoster, MarmotInitialGroupImage, MarmotInviteMembersResult,
+    MarmotMemberKeyPackagePrewarmSummary, MarmotMemberRef, MarmotPendingWelcomeDeliveryList,
+    MarmotPreparedGroupImageUpload, MarmotPreparedGroupImageUploadList,
 };
 use crate::types::history_import::MarmotChatHistoryImportList;
 use crate::types::history_notice::{MarmotAccountRecoveryStatus, MarmotHistoryNoticeList};
@@ -2606,6 +2606,42 @@ pub unsafe extern "C" fn marmot_save_message_draft(
                     reply_to_message_id_hex,
                     attachments,
                 ),
+                out,
+            )
+        }
+    })
+}
+
+/// `marmot_start_direct_chat` with founding options for a new group. A
+/// nonzero retention value is written into the founding MLS state and
+/// Welcome. Reuse and retry return the existing conversation with its
+/// founding duration and roles, whatever duration they propose. Writes the
+/// canonical MLS group id as hex; free it with `marmot_string_free`.
+///
+/// # Safety
+/// `client` must be a live handle; strings valid; `options` a valid
+/// borrowed struct; `out` valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_start_direct_chat_with_options(
+    client: *const MarmotClient,
+    account_ref: *const c_char,
+    peer_account_id: *const c_char,
+    options: *const MarmotDirectConversationOptions,
+    out: *mut *mut c_char,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { crate::preflight_out_ptr(out) });
+        let client = try_arg!(unsafe { client_ref(client) });
+        let account_ref = try_arg!(unsafe { required_str(account_ref) });
+        let peer_account_id = try_arg!(unsafe { required_str(peer_account_id) });
+        let options = try_arg!(unsafe { borrowed(options) }).to_ffi();
+        unsafe {
+            deliver_string(
+                client.block_on(client.marmot.start_direct_conversation_with_options(
+                    account_ref,
+                    peer_account_id,
+                    options,
+                )),
                 out,
             )
         }
