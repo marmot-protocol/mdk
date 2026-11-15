@@ -243,11 +243,7 @@ pub(crate) fn replace_encrypted_media_secret_references_for_parts_tx(
     .storage()?;
 
     // Comments carry attachments; reactions carry NIP-30 custom emoji images.
-    let comment = kind == 1111
-        && tags.iter().any(|tag| {
-            tag.first().is_some_and(|name| name == "k")
-                && tag.get(1).is_some_and(|kind| kind.parse::<u64>().is_ok())
-        });
+    let comment = super::timeline::is_nip22_comment(kind, tags);
     if (kind == MARMOT_APP_EVENT_KIND_CHAT || kind == MARMOT_APP_EVENT_KIND_REACTION || comment)
         && let Some(source_epoch) = source_epoch
     {
@@ -728,8 +724,10 @@ mod tests {
                 Some(vec![1, 2, 3])
             );
 
-            app.secure_prune_app_events_before("aa", 21, "local", &no_mentions)
+            let final_sweep = app
+                .secure_prune_app_events_before("aa", 21, "local", &no_mentions)
                 .unwrap();
+            assert_eq!(final_sweep.pruned_media_epoch_secrets, 1);
             assert!(
                 !app.encrypted_media_epoch_secret_may_be_served("aa", 7)
                     .unwrap()
@@ -738,6 +736,53 @@ mod tests {
                 app.encrypted_media_epoch_secret("aa", component_id, 7)
                     .unwrap(),
                 None
+            );
+        }
+    }
+
+    #[test]
+    fn comment_only_key_retirement() {
+        for damaged in [false, true] {
+            let store = SqliteAccountStorage::in_memory().unwrap();
+            let app = store.app_storage();
+            for (id, at, epoch) in [("comment", 10, 7), ("retained", 50, 6)] {
+                let mut event = media_event(id, at, epoch);
+                event.kind = 1111;
+                event.tags.push(vec!["k".into(), "9".into()]);
+                app.record_app_event(&event).unwrap();
+                app.remember_encrypted_media_epoch_secret("aa", 0x8008, epoch, &[1, 2, 3])
+                    .unwrap();
+            }
+            if damaged {
+                store
+                    .lock()
+                    .unwrap()
+                    .execute(
+                        "UPDATE app_events SET tags_json=x'ff' WHERE message_id_hex='comment'",
+                        [],
+                    )
+                    .unwrap();
+            }
+            let swept = app
+                .secure_prune_app_events_before("aa", 11, "local", &no_mentions)
+                .unwrap();
+            assert_eq!(swept.pruned_media_epoch_secrets, 1);
+            assert!(
+                !app.encrypted_media_epoch_secret_may_be_served("aa", 7)
+                    .unwrap()
+            );
+            assert_eq!(
+                app.encrypted_media_epoch_secret("aa", 0x8008, 7).unwrap(),
+                None
+            );
+            assert_eq!(store.lock().unwrap().query_row("SELECT count(*) FROM encrypted_media_epoch_secrets WHERE group_id_hex='aa' AND source_epoch=7", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
+            assert!(
+                app.encrypted_media_epoch_secret_may_be_served("aa", 6)
+                    .unwrap()
+            );
+            assert_eq!(
+                app.encrypted_media_epoch_secret("aa", 0x8008, 6).unwrap(),
+                Some(vec![1, 2, 3])
             );
         }
     }

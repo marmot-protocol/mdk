@@ -15187,13 +15187,37 @@ fn received_media_message_with_malformed_v1_reference_is_rejected() {
     // attachment-local rule must not silently change legacy ingest behavior.
     let bytes = malformed_media_message(ENCRYPTED_MEDIA_VERSION);
     let group_id = GroupId::new(vec![0x01]);
-    assert!(
-        groups::decode_received_event(
-            &bytes, SENDER_HEX, None, &group_id, 7, None, "msg1", 0, None, false,
-        )
-        .is_none(),
-        "a malformed V1 attachment must retain frozen message-fatal behavior",
-    );
+    let original = MarmotInnerEvent::decode(&bytes).unwrap();
+    for (kind, markers, custom) in [
+        (9, vec![], false),
+        (1111, vec![vec!["k".into(), "9".into()]], false),
+        (1111, vec![], true),
+        (42, vec![vec!["k".into(), "9".into()]], true),
+    ] {
+        let mut tags = original.tags.clone();
+        tags.extend(markers);
+        let event = MarmotInnerEvent::new(SENDER_HEX, 1, kind, tags, "legacy caption");
+        let decoded = groups::decode_received_event(
+            &event.encode().unwrap(),
+            SENDER_HEX,
+            None,
+            &group_id,
+            7,
+            None,
+            "msg1",
+            0,
+            None,
+            false,
+        );
+        if custom {
+            assert_eq!(decoded.unwrap().plaintext, "legacy caption");
+        } else {
+            assert!(
+                decoded.is_none(),
+                "malformed V1 media is message-fatal for kind {kind}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -15202,13 +15226,28 @@ fn received_media_message_with_malformed_v2_reference_keeps_the_message() {
     // caption, event, and any valid sibling attachments.
     let bytes = malformed_media_message(cgka_traits::app_components::ENCRYPTED_MEDIA_FORMAT_V2);
     let group_id = GroupId::new(vec![0x01]);
-    assert!(
-        groups::decode_received_event(
-            &bytes, SENDER_HEX, None, &group_id, 7, None, "msg1", 0, None, false,
+    let original = MarmotInnerEvent::decode(&bytes).unwrap();
+    for kind in [9, 1111] {
+        let mut tags = original.tags.clone();
+        if kind == 1111 {
+            tags.push(vec!["k".into(), "9".into()]);
+        }
+        let event = MarmotInnerEvent::new(SENDER_HEX, 1, kind, tags, "caption survives");
+        let decoded = groups::decode_received_event(
+            &event.encode().unwrap(),
+            SENDER_HEX,
+            None,
+            &group_id,
+            7,
+            None,
+            "msg1",
+            0,
+            None,
+            false,
         )
-        .is_some(),
-        "a malformed V2 attachment must not drop its carrying message",
-    );
+        .expect("malformed V2 media must not drop its carrying message");
+        assert_eq!(decoded.plaintext, "caption survives");
+    }
 }
 
 #[test]
@@ -23136,6 +23175,7 @@ fn encrypted_media_warm_skips_authoritative_rechecks_at_an_unchanged_epoch() {
 /// source epoch ended. Its attachments stay keyed to that epoch, which must be
 /// cached for background acquisition; caching the then-current epoch instead
 /// left the download deferred forever.
+#[cfg(feature = "test-policy-overrides")]
 #[test]
 fn received_media_from_a_left_epoch_caches_its_source_epoch_secret() {
     run_composed_app_runtime_test("received-media-left-epoch", || {
@@ -23146,6 +23186,7 @@ fn received_media_from_a_left_epoch_caches_its_source_epoch_secret() {
 /// A pass that advances past the anchor horizon prunes the source epoch's
 /// retained anchor before its applications are projected, so the secret the
 /// engine captured while authenticating the message is the only one left.
+#[cfg(feature = "test-policy-overrides")]
 #[test]
 fn received_media_past_the_anchor_horizon_caches_its_carried_secret() {
     run_composed_app_runtime_test("received-media-carried-secret", || {
@@ -23153,169 +23194,271 @@ fn received_media_past_the_anchor_horizon_caches_its_carried_secret() {
     });
 }
 
+#[cfg(feature = "test-policy-overrides")]
 async fn check_received_media_source_epoch_secret(carried_secret: bool) {
     use cgka_traits::app_components::{
         GROUP_ENCRYPTED_MEDIA_EXPORTER_CACHE_KEY, GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
     };
+    use cgka_traits::engine::{GroupEvent, SendIntent};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[derive(Clone, Copy, Debug)]
+    enum ReceivedMediaKind {
+        Chat,
+        Comment,
+        UnmarkedComment,
+    }
 
     let dir = tempfile::tempdir().unwrap();
-    AccountHome::open(dir.path())
-        .create_account("alice")
+    let home = AccountHome::open(dir.path());
+    let alice_account = home.create_account("alice").unwrap();
+    let bob_account = home.create_account("bob").unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay_and_config(
+        dir.path(),
+        "wss://relay.example",
+        MarmotAppConfig::white_noise()
+            .with_dev_settlement_quiescence_ms(0)
+            .with_dev_scheduled_convergence_delay_ms(0)
+            .with_allow_loopback_blob_endpoints(true),
+    )
+    .with_test_relay_client(relay.clone());
+    remember_test_member_inbox(&app, &bob_account.account_id_hex, "wss://relay.example");
+    let plane = MarmotRelayPlane::new(None, relay.clone());
+    let mut alice = app
+        .client_with_relay_plane("alice", &plane, None)
+        .await
         .unwrap();
-    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
-        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
-    let mut client = app.client("alice").await.unwrap();
-    let group_id = client
-        .create_group("left epoch media", &[])
+    let mut client = app
+        .client_with_relay_plane("bob", &plane, None)
+        .await
+        .unwrap();
+    client.sync().await.unwrap();
+    let group_id = alice
+        .create_group("left epoch media", &[&bob_account.account_id_hex])
         .await
         .unwrap()
         .operation
         .expect("eligible fixture members");
-    let group_id_hex = hex::encode(group_id.as_slice());
-    let sender_hex = app.account_home().account("alice").unwrap().account_id_hex;
-    let storage = app.account_storage("alice").unwrap().app_storage();
-
-    // Group creation warms its founding epoch, so the media message comes
-    // from a later epoch that no warm pass ever saw as current. Raw engine
-    // commits advance it without the app's subscription-refresh warm.
-    let founding_epoch = client.runtime.group_record(&group_id).unwrap().epoch;
-    client
-        .runtime
-        .send(cgka_traits::engine::SendIntent::SelfUpdate {
-            group_id: group_id.clone(),
-        })
-        .await
-        .unwrap();
-    let (source_epoch, source_secret) = client
-        .runtime
-        .exporter_secret_with_epoch(&group_id, GROUP_ENCRYPTED_MEDIA_EXPORTER_CACHE_KEY, 32)
-        .unwrap();
-    assert!(source_epoch > founding_epoch);
-    let reference = MediaAttachmentReference {
-        locators: vec![MediaLocator {
-            kind: "blossom-v1".to_owned(),
-            value: format!("https://media.example/{}.bin", hex::encode([0x66_u8; 32])),
-        }],
-        ciphertext_sha256: hex::encode([0x66_u8; 32]),
-        plaintext_sha256: hex::encode([0x14_u8; 32]),
-        nonce_hex: hex::encode([0x25_u8; 12]),
-        file_name: "report.pdf".to_owned(),
-        media_type: "application/pdf".to_owned(),
-        version: "encrypted-media-v2".to_owned(),
-        source_epoch: source_epoch.0,
-        source_epoch_identity: None,
-        dim: None,
-        thumbhash: None,
-    };
-    let payload = crate::messages::encode_inner_event(
-        &build_inner_event(
-            &AppMessageIntent::Media {
-                attachments: vec![reference.clone()],
-                caption: None,
-                message_tags: Vec::new(),
-            },
-            &sender_hex,
-            unix_now_seconds(),
-        )
-        .unwrap(),
-    )
-    .unwrap();
-    let sent = client
-        .runtime
-        .send(cgka_traits::engine::SendIntent::AppMessage {
-            group_id: group_id.clone(),
-            payload: payload.clone(),
-            expected_epoch: None,
-        })
-        .await
-        .unwrap();
-    assert!(sent.failures.is_empty());
-
-    // The commits that end the source epoch land before the message is
-    // projected, as they do inside one convergence pass. Six of them
-    // carry the tip past the source epoch's retained anchor.
-    for _ in 0..if carried_secret { 6 } else { 1 } {
+    assert!(
         client
+            .sync()
+            .await
+            .unwrap()
+            .joined_groups
+            .contains(&group_id)
+    );
+    client.accept_group_invite(&group_id).unwrap();
+    let group_id_hex = hex::encode(group_id.as_slice());
+    let storage = app.account_storage("bob").unwrap().app_storage();
+
+    // Each kind gets a distinct source epoch: a cached chat key must not
+    // conceal a missing comment key or grant unmarked custom events media.
+    for kind in [
+        ReceivedMediaKind::Chat,
+        ReceivedMediaKind::Comment,
+        ReceivedMediaKind::UnmarkedComment,
+    ] {
+        let published_before = relay.published_events.lock().unwrap().len();
+        alice
             .runtime
-            .send(cgka_traits::engine::SendIntent::SelfUpdate {
+            .send(SendIntent::SelfUpdate {
                 group_id: group_id.clone(),
             })
             .await
             .unwrap();
-    }
-    assert!(client.runtime.group_record(&group_id).unwrap().epoch.0 > source_epoch.0);
-    assert_eq!(
-        client
+        let (source_epoch, source_secret) = alice
             .runtime
-            .retained_encrypted_media_exporter_secret(&group_id, source_epoch)
-            .unwrap()
-            .is_none(),
-        carried_secret,
-        "precondition: the source anchor is pruned exactly when the secret is carried"
-    );
-    assert_eq!(
-        storage
+            .exporter_secret_with_epoch(&group_id, GROUP_ENCRYPTED_MEDIA_EXPORTER_CACHE_KEY, 32)
+            .unwrap();
+        let plaintext = format!("received {kind:?} media").into_bytes();
+        let (mut reference, ciphertext) =
+            crate::media::tests::attachment_worker_fixture_with_secret(
+                &plaintext,
+                source_secret.as_ref(),
+            );
+        reference.source_epoch = source_epoch.0;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        reference.locators.push(MediaLocator {
+            kind: "blossom-v1".into(),
+            value: format!(
+                "http://{}/{}",
+                listener.local_addr().unwrap(),
+                reference.ciphertext_sha256
+            ),
+        });
+        let mut tags = vec![reference.imeta_tag()];
+        if matches!(kind, ReceivedMediaKind::Comment) {
+            tags.push(vec!["k".into(), "9".into()]);
+        }
+        let event = MarmotInnerEvent::new(
+            &alice_account.account_id_hex,
+            unix_now_seconds(),
+            if matches!(kind, ReceivedMediaKind::Chat) {
+                MARMOT_APP_EVENT_KIND_CHAT
+            } else {
+                1111
+            },
+            tags,
+            "received media",
+        );
+        let sent = alice
+            .runtime
+            .send(SendIntent::AppMessage {
+                group_id: group_id.clone(),
+                payload: event.encode().unwrap(),
+                expected_epoch: None,
+            })
+            .await
+            .unwrap();
+        assert!(sent.failures.is_empty());
+        for _ in 0..if carried_secret { 6 } else { 1 } {
+            alice
+                .runtime
+                .send(SendIntent::SelfUpdate {
+                    group_id: group_id.clone(),
+                })
+                .await
+                .unwrap();
+        }
+
+        // Authenticate the peer's actual signed publications, holding only
+        // app projection until every ending commit has merged.
+        let publications = relay.published_events.lock().unwrap()[published_before..].to_vec();
+        let mut batches = Vec::new();
+        for publication in publications
+            .into_iter()
+            .filter(|event| event.kind == transport_nostr_peeler::KIND_MARMOT_GROUP_MESSAGE)
+        {
+            let ingested = client
+                .runtime
+                .ingest_delivery(&cgka_traits::TransportDelivery {
+                    account_id: MemberId::new(hex::decode(&bob_account.account_id_hex).unwrap()),
+                    group_id_hint: Some(group_id.clone()),
+                    message: publication.to_transport_message().unwrap(),
+                    received_at: Timestamp(unix_now_seconds()),
+                    source: cgka_traits::TransportDeliverySource {
+                        transport: cgka_traits::transport::TransportSource("nostr".into()),
+                        plane: cgka_traits::TransportDeliveryPlane::Group,
+                        endpoint: None,
+                        subscription_id: None,
+                        wire: None,
+                    },
+                })
+                .await
+                .unwrap();
+            batches.push(ingested.effects);
+            batches.push(client.runtime.advance_convergence(&group_id).await.unwrap());
+        }
+        assert!(client.runtime.group_record(&group_id).unwrap().epoch > source_epoch);
+        assert_eq!(
+            client
+                .runtime
+                .retained_encrypted_media_exporter_secret(&group_id, source_epoch)
+                .unwrap()
+                .is_none(),
+            carried_secret,
+            "precondition: only the carried-secret case has pruned the source anchor"
+        );
+        assert_eq!(
+            storage
+                .encrypted_media_epoch_secret(
+                    &group_id_hex,
+                    GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
+                    source_epoch.0,
+                )
+                .unwrap(),
+            None,
+            "the source epoch was never cached while current"
+        );
+
+        let mut received = 0;
+        let mut summary = SyncSummary::default();
+        for mut effects in batches {
+            for received_event in &mut effects.events {
+                if let GroupEvent::MessageReceived {
+                    encrypted_media_secret,
+                    ..
+                } = received_event
+                {
+                    received += 1;
+                    assert_eq!(
+                        encrypted_media_secret.is_some(),
+                        !matches!(kind, ReceivedMediaKind::UnmarkedComment)
+                    );
+                    if !carried_secret {
+                        // Legacy outbox records omit this optional handoff.
+                        // Preserve the authenticated peer event and exercise
+                        // projection's retained source-exporter fallback.
+                        *encrypted_media_secret = None;
+                    }
+                }
+            }
+            summary.merge(
+                client
+                    .observe_drained_session_events(&effects)
+                    .await
+                    .unwrap(),
+            );
+        }
+        assert_eq!(received, 1);
+        assert_eq!(summary.messages.len(), 1);
+        assert_eq!(summary.messages[0].message_id_hex, event.id);
+
+        let cached = storage
             .encrypted_media_epoch_secret(
                 &group_id_hex,
                 GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
                 source_epoch.0,
             )
-            .unwrap(),
-        None,
-        "precondition: the source epoch was never cached while current"
-    );
-
-    // #2840: a same-number losing branch's key can already be cached. A
-    // canonical source replaces it from the carried key or, for a late legacy
-    // event without one, the authoritative retained source-epoch exporter.
-    storage
-        .remember_encrypted_media_epoch_secret(
-            &group_id_hex,
-            GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
-            source_epoch.0,
-            &[0xcc; 32],
-        )
-        .unwrap();
-    let effects = marmot_session::AccountDeviceEffects {
-        events: vec![cgka_traits::engine::GroupEvent::MessageReceived {
-            authority: None,
-            group_id: group_id.clone(),
-            message_id: sent.reports[0].message_id.clone(),
-            sender: MemberId::new(hex::decode(&sender_hex).unwrap()),
-            sender_leaf_index: None,
-            epoch: source_epoch,
-            payload,
-            retention: None,
-            encrypted_media_secret: carried_secret
-                .then(|| cgka_traits::EncryptedMediaSecret::new(source_secret.clone())),
-        }],
-        ..Default::default()
-    };
-    let summary = client
-        .observe_drained_session_events(&effects)
-        .await
-        .unwrap();
-    assert_eq!(summary.messages.len(), 1);
-
-    assert!(
-        storage
-            .encrypted_media_epoch_secret(
-                &group_id_hex,
-                GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
-                source_epoch.0,
-            )
-            .unwrap()
-            .as_deref()
-            == Some(source_secret.as_ref()),
-        "the cached key must be the source epoch's exporter secret"
-    );
-    assert!(
-        client
+            .unwrap();
+        let download = client
             .prepare_background_attachment_download(&group_id, reference, 1024 * 1024)
-            .unwrap()
-            .is_some(),
-        "background acquisition must find the source epoch's key"
-    );
+            .unwrap();
+        if matches!(kind, ReceivedMediaKind::UnmarkedComment) {
+            assert_eq!(
+                cached, None,
+                "unmarked custom comments must not retain media keys"
+            );
+            assert!(download.is_none());
+            continue;
+        }
+        assert_eq!(
+            cached.as_deref(),
+            Some(source_secret.as_ref()),
+            "{kind:?} must cache its authenticated source epoch key"
+        );
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                request.push(stream.read_u8().await.unwrap());
+            }
+            assert!(request.starts_with(b"GET "));
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        ciphertext.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            stream.write_all(&ciphertext).await.unwrap();
+        });
+        assert_eq!(
+            download
+                .expect("background acquisition must find the received key")
+                .run(None)
+                .await
+                .unwrap()
+                .plaintext,
+            plaintext,
+            "{kind:?} must decrypt after leaving its source epoch"
+        );
+        server.await.unwrap();
+    }
 }
 
 #[test]

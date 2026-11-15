@@ -2286,7 +2286,8 @@ pub(crate) fn decode_received_event(
     // encrypted-media validity rule. V1 made a malformed V1 reference fatal to
     // its carrying message; V2 changed rejection to attachment-local. Preserve
     // that version boundary instead of applying V2 behavior to legacy traffic.
-    if event.kind == MARMOT_APP_EVENT_KIND_CHAT
+    if (event.kind == MARMOT_APP_EVENT_KIND_CHAT
+        || crate::messages::is_nip22_comment(event.kind, &event.tags))
         && !media_imeta_tags_preserve_message(&event.tags, allow_loopback_http)
     {
         tracing::warn!(

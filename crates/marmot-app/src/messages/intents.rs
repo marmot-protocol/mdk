@@ -192,6 +192,16 @@ fn append_mention_tags(tags: &mut Vec<Vec<String>>, content: &str) {
     }
 }
 
+const NIP22_COMMENT_KIND: u64 = 1111;
+
+pub(crate) fn is_nip22_comment(kind: u64, tags: &[Vec<String>]) -> bool {
+    kind == NIP22_COMMENT_KIND
+        && tags.iter().any(|tag| {
+            tag.first().is_some_and(|name| name == "k")
+                && tag.get(1).is_some_and(|kind| kind.parse::<u64>().is_ok())
+        })
+}
+
 /// Value of the `stream-type` tag on an agent text stream start event.
 const STREAM_TYPE_TEXT: &str = "text";
 /// Value of the `route` tag on a brokered QUIC agent text stream start event.
@@ -798,12 +808,7 @@ pub(crate) fn build_inner_event_with_media_reply(
         } => {
             validate_custom_event_kind(*kind)?;
             let mut tags = tags.clone();
-            if *kind == 1111
-                && tags.iter().any(|tag| {
-                    tag.first().is_some_and(|name| name == "k")
-                        && tag.get(1).is_some_and(|value| value.parse::<u64>().is_ok())
-                })
-            {
+            if is_nip22_comment(*kind, &tags) {
                 append_mention_tags(&mut tags, content);
             }
             Ok(event(*kind, tags, content.clone()))

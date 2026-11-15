@@ -146,6 +146,7 @@ and backfills missing attachment slots. Encrypted-media-v1 and v2 source-epoch r
 retention-managed. Deleted targets keep their tombstones; malformed
 sources and unrelated custom rows stay unchanged. Raw events are not rewritten. Account schema advances to 208;
 older binaries refuse the upgraded database, and downgrade is unsupported.
+Previously erased media keys cannot be recovered.
 
 Migration 0204 drops the timeline rows of own sends that failed and were then deleted. Such a send reached no one, so
 the projection no longer gives it a row; its source row stays in `app_events`. A deleted send a peer reacted to (or

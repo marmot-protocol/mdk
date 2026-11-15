@@ -2003,22 +2003,17 @@ fn secure_prune_selected_app_events_tx(
                 .extend(tag_values(&event.tags, EVENT_REF_TAG).map(ToOwned::to_owned));
         }
         collect_media_ciphertext_hashes(&event.tags, &mut media_ciphertext_sha256);
-        // A damaged row's timeline row may have lost its media (reprojected
-        // since); the references its tags wrote while they decoded have not.
-        let carries_encrypted_media = if event.tags_damaged {
-            !encrypted_media_secret_reference_epochs_for_message_tx(
+        // Recorded ownership survives damaged tags, including a comment's k tag.
+        if event.tags_damaged || event.kind == NIP22_COMMENT_KIND {
+            retiring_media_epochs.extend(encrypted_media_secret_reference_epochs_for_message_tx(
                 tx,
                 group_id_hex,
                 &event.message_id_hex,
-            )?
-            .is_empty()
-        } else {
-            !encrypted_media_component_ids(&event.tags).is_empty()
-        };
-        if matches!(
+            )?);
+        } else if matches!(
             event.kind,
             MARMOT_APP_EVENT_KIND_CHAT | MARMOT_APP_EVENT_KIND_REACTION
-        ) && carries_encrypted_media
+        ) && !encrypted_media_component_ids(&event.tags).is_empty()
             && let Some(source_epoch) = event.source_epoch
         {
             retiring_media_epochs.insert(u64_to_i64(source_epoch)?);
@@ -4709,7 +4704,7 @@ fn keep_receipts_of_pruned_reactions_tx(
 
 const NIP22_COMMENT_KIND: u64 = 1111;
 
-fn is_nip22_comment(kind: u64, tags: &[Vec<String>]) -> bool {
+pub(super) fn is_nip22_comment(kind: u64, tags: &[Vec<String>]) -> bool {
     kind == NIP22_COMMENT_KIND && tag_values(tags, "k").any(|kind| kind.parse::<u64>().is_ok())
 }
 

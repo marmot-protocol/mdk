@@ -14,6 +14,8 @@
 - Custom sends of NIP-22 comments (kind 1111 with a numeric lowercase `k` tag) derive mention `p` tags without
   duplicating an existing pubkey tag, including one carrying a relay hint. Author edits of these comments pass
   send admission (#3409).
+- Received NIP-22 comments cache their source-epoch media keys, and history bundles carry their attachment file keys
+  so comment media remains decryptable after epoch advancement and on devices importing that history (#3409).
 
 ## 0.17.0 - 2026-11-15
 

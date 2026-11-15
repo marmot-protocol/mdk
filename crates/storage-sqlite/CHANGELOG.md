@@ -14,6 +14,8 @@
 
 - NIP-22 comments (kind 1111 with a numeric lowercase `k` tag) project their parent and media, and accept author-only
   edits in the timeline and edit history. Lowercase `e`, not a quoted event's `q`, identifies the parent (#3409).
+- Comment media references protect cached epoch secrets while retained and retire their keys on the final prune,
+  including when damaged source tags no longer identify the comment (#3409).
 
 ## 0.17.0 - 2026-11-15
 

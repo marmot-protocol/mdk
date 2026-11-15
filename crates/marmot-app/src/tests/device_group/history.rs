@@ -251,12 +251,39 @@ async fn a_member_who_joined_later_imports_the_history_it_missed() {
         Vec::new(),
         r#"{"v":1,"items":[]}"#,
     );
+    let malformed_media = vec![
+        "imeta".to_owned(),
+        format!("v {}", crate::media::EncryptedMediaVersion::V1.as_str()),
+    ];
+    let rejected_comment = MarmotAppEvent::new(
+        bob_account.account_id_hex.clone(),
+        2,
+        1111,
+        vec![vec!["k".into(), "1".into()], malformed_media.clone()],
+        "malformed legacy comment attachment",
+    );
+    let custom_events = [
+        (1111, vec!["k".into(), "not-a-kind".into()]),
+        (1111, vec!["K".into(), "1".into()]),
+        (42, vec!["k".into(), "1".into()]),
+    ]
+    .map(|(kind, marker)| {
+        MarmotAppEvent::new(
+            bob_account.account_id_hex.clone(),
+            2,
+            kind,
+            vec![marker, malformed_media.clone()],
+            "app-defined metadata stays unchanged",
+        )
+    });
     let mut bundle = HistoryBundle::new(
         chat.as_slice(),
         ChatPosition::of(&honest, 0),
         ChatPosition::of(&device_group_control, 0),
     );
-    bundle.events = [&honest, &forged, &device_group_control]
+    bundle.events = [&honest, &forged, &device_group_control, &rejected_comment]
+        .into_iter()
+        .chain(custom_events.iter())
         .map(|event| BundledEvent {
             event: event.clone(),
             epoch: 0,
@@ -264,7 +291,7 @@ async fn a_member_who_joined_later_imports_the_history_it_missed() {
             grant: None,
             keys: None,
         })
-        .to_vec();
+        .collect();
     let mut elsewhere = bundle.clone();
     elsewhere.chat = "77".repeat(16);
     assert_eq!(
@@ -305,12 +332,27 @@ async fn a_member_who_joined_later_imports_the_history_it_missed() {
             .unwrap(),
         None
     );
+    assert!(
+        storage
+            .timeline_message(&chat_hex, &rejected_comment.id)
+            .unwrap()
+            .is_none(),
+        "comments obey the live path's message-fatal legacy media validation"
+    );
+    for event in custom_events {
+        let imported = storage
+            .timeline_message(&chat_hex, &event.id)
+            .unwrap()
+            .expect("custom imeta metadata is not interpreted as an attachment");
+        assert_eq!(imported.plaintext, event.content);
+        assert_eq!(imported.tags, event.tags);
+    }
 }
 
-/// Bob joins after Alice sent a photo. He was never in that epoch, so he can
-/// open the photo only with the key Alice's bundle carries for it: the
-/// photo's message gets an attachment slot and the key, a key naming no
-/// attachment is dropped, and Bob passes the key on when he exports.
+/// Bob joins after Alice sent a photo, reaction artwork and a comment image.
+/// Their bundle supplies attachment slots and per-file keys so he can decrypt
+/// without the source epoch. Unnamed keys and custom-event metadata acquire
+/// no attachment semantics, and later exports preserve the imported keys.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_imported_photo_comes_with_its_attachment_key() {
     let dir = tempfile::tempdir().unwrap();
@@ -331,25 +373,29 @@ async fn an_imported_photo_comes_with_its_attachment_key() {
         .expect("eligible fixture members");
     let chat_hex = hex::encode(chat.as_slice());
 
-    let ciphertext_sha256 = "11".repeat(32);
-    let reference = crate::media::MediaAttachmentReference {
-        locators: vec![crate::media::MediaLocator {
-            kind: "blossom-v1".into(),
-            value: format!("https://blossom.example/{ciphertext_sha256}"),
-        }],
-        ciphertext_sha256: ciphertext_sha256.clone(),
-        plaintext_sha256: "22".repeat(32),
-        nonce_hex: "33".repeat(12),
-        file_name: "photo.jpg".into(),
-        media_type: "image/jpeg".into(),
-        version: crate::media::EncryptedMediaVersion::V2.as_str().into(),
-        source_epoch: 0,
-        source_epoch_identity: Some(hex::encode(
-            alice.runtime.epoch_pin(&chat).unwrap().identity,
-        )),
-        dim: None,
-        thumbhash: None,
-    };
+    let blossom = super::history_delivery::local_blossom();
+    let plaintext = b"history comment image";
+    let uploaded = alice
+        .upload_media(
+            &chat,
+            MediaUploadRequest {
+                attachments: vec![MediaUploadAttachmentRequest {
+                    file_name: "photo.jpg".into(),
+                    media_type: "image/jpeg".into(),
+                    plaintext: plaintext.to_vec(),
+                    dim: None,
+                    thumbhash: None,
+                }],
+                caption: None,
+                send: false,
+                blossom_server: Some(blossom.url.clone()),
+                message_tags: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+    let reference = uploaded.attachments[0].reference.clone();
+    let ciphertext_sha256 = reference.ciphertext_sha256.clone();
     let photo = send(
         &mut alice,
         &chat,
@@ -383,17 +429,40 @@ async fn an_imported_photo_comes_with_its_attachment_key() {
         .unwrap()
         .source_epoch
         .unwrap();
-    let secret = [0x5a; 32];
-    alice_storage
-        .remember_encrypted_media_epoch_secret(
+    let secret = alice_storage
+        .encrypted_media_epoch_secret(
             &chat_hex,
             crate::media::EncryptedMediaVersion::V2.component_id(),
             epoch,
-            &secret,
         )
-        .unwrap();
+        .unwrap()
+        .expect("upload cached its source epoch secret");
     let file_key =
         hex::encode(crate::media::media_file_key_for_reference(&secret, &reference).unwrap());
+    let comment = send(
+        &mut alice,
+        &chat,
+        AppMessageIntent::Custom {
+            kind: 1111,
+            tags: vec![
+                vec!["k".into(), "not-a-kind".into()],
+                vec!["k".into(), "01".into()],
+                reference.imeta_tag(),
+            ],
+            content: "comment image".into(),
+        },
+    )
+    .await;
+    let custom = send(
+        &mut alice,
+        &chat,
+        AppMessageIntent::Custom {
+            kind: 1111,
+            tags: vec![vec!["K".into(), "1".into()], reference.imeta_tag()],
+            content: "app-defined image metadata".into(),
+        },
+    )
+    .await;
 
     alice
         .invite_members(&chat, &[&bob_account.account_id_hex])
@@ -420,19 +489,31 @@ async fn an_imported_photo_comes_with_its_attachment_key() {
         .unwrap()
         .unwrap()
         .bundle;
-    assert!(
-        bundle
-            .events
-            .iter()
-            .find(|event| event.event.id == reaction)
-            .unwrap()
-            .keys
-            == Some(vec![crate::history_bundle::FileKey {
+    for id in [&reaction, &comment] {
+        assert_eq!(
+            bundle
+                .events
+                .iter()
+                .find(|event| &event.event.id == id)
+                .unwrap()
+                .keys,
+            Some(vec![crate::history_bundle::FileKey {
                 ciphertext_sha256: ciphertext_sha256.clone(),
-                key: file_key.clone()
+                key: file_key.clone(),
             }]),
-        "reaction artwork must carry its per-file key to later devices"
-    );
+            "reaction artwork and comment images carry their per-file keys"
+        );
+    }
+    let custom_event = bundle
+        .events
+        .iter_mut()
+        .find(|event| event.event.id == custom)
+        .unwrap();
+    assert_eq!(custom_event.keys, None);
+    custom_event.keys = Some(vec![crate::history_bundle::FileKey {
+        ciphertext_sha256: ciphertext_sha256.clone(),
+        key: file_key.clone(),
+    }]);
     let event = bundle
         .events
         .iter_mut()
@@ -472,8 +553,8 @@ async fn an_imported_photo_comes_with_its_attachment_key() {
         .attachment_history_page(&chat_hex, 10, None)
         .unwrap()
         .entries;
-    assert_eq!(slots.len(), 2);
-    for id in [&photo, &reaction] {
+    assert_eq!(slots.len(), 3);
+    for id in [&photo, &reaction, &comment] {
         let slot = slots
             .iter()
             .find(|slot| &slot.message_id_hex == id)
@@ -495,6 +576,41 @@ async fn an_imported_photo_comes_with_its_attachment_key() {
         .expect("the imported key opens reaction artwork");
     bob.cache_attachment_source_epoch_secret(&chat, &photo, &source)
         .expect("the imported key opens the photo");
+    bob.cache_attachment_source_epoch_secret(&chat, &comment, &source)
+        .expect("the imported key opens the comment image");
+    assert!(
+        storage
+            .imported_media_file_keys(&chat_hex, &custom)
+            .unwrap()
+            .is_empty(),
+        "unmarked kind 1111 does not acquire attachment semantics"
+    );
+    let prepared_comment = bob
+        .prepare_background_attachment_download_for_message(
+            &chat,
+            Some(&comment),
+            source.clone(),
+            1024,
+        )
+        .unwrap()
+        .expect("the imported comment key permits acquisition");
+    assert!(prepared_comment.opens_with_imported_key());
+    assert_eq!(
+        storage
+            .encrypted_media_epoch_secret(
+                &chat_hex,
+                crate::media::EncryptedMediaVersion::V2.component_id(),
+                epoch,
+            )
+            .unwrap(),
+        None,
+        "the importing sibling has no source epoch secret"
+    );
+    assert_eq!(
+        prepared_comment.run(None).await.unwrap().plaintext,
+        plaintext.as_slice(),
+        "the sibling decrypts comment image bytes without the source epoch"
+    );
     let prepared = bob
         .prepare_background_attachment_download_for_message(
             &chat,
@@ -548,19 +664,21 @@ async fn an_imported_photo_comes_with_its_attachment_key() {
         .unwrap()
         .unwrap()
         .bundle;
-    assert!(
-        passed_on
-            .events
-            .iter()
-            .find(|event| event.event.id == reaction)
-            .unwrap()
-            .keys
-            == Some(vec![crate::history_bundle::FileKey {
+    for id in [&reaction, &comment] {
+        assert_eq!(
+            passed_on
+                .events
+                .iter()
+                .find(|event| &event.event.id == id)
+                .unwrap()
+                .keys,
+            Some(vec![crate::history_bundle::FileKey {
                 ciphertext_sha256: ciphertext_sha256.clone(),
-                key: file_key.clone()
+                key: file_key.clone(),
             }]),
-        "a later export must preserve the reaction key"
-    );
+            "a later export preserves reaction and comment keys"
+        );
+    }
     let event = passed_on
         .events
         .iter()
