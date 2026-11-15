@@ -45,6 +45,9 @@ enum StateRead {
     /// A read the worker answers through `respond_diagnosed` within the
     /// local wait: a failure is counted as a storage failure.
     DiagnosedLocal,
+    /// A storage read the worker answers through `reply`, within the app
+    /// wait: no failure is counted.
+    Uncounted,
 }
 
 impl StateRead {
@@ -58,7 +61,7 @@ impl StateRead {
     ) -> Result<T, AppError> {
         match self {
             Self::Local | Self::DiagnosedLocal => local_account_worker_response(response).await,
-            Self::Diagnosed => account_worker_response(response).await,
+            Self::Diagnosed | Self::Uncounted => account_worker_response(response).await,
         }
     }
 }
@@ -1497,44 +1500,62 @@ impl AccountManager {
         account_worker_response(response).await
     }
 
+    /// `GroupRecoveryStatus` from A (mdk#3273 PR 8) for a group in the
+    /// version's mirror, after the hydration request its worker command
+    /// made with `ensure_group_hydrated`. Any other id, a locally deleted
+    /// group whose MLS state is kept or one the engine does not store, is
+    /// answered by the worker command, which answers it as before A: the
+    /// third exception to answering from A, beside the hydration request
+    /// and a failure with no exact copy. The version's mirror decides,
+    /// never a failure (mdk#3273 decision 1).
     pub async fn group_recovery_status(
         &self,
         account_ref: &str,
         group_id: &GroupId,
     ) -> Result<crate::GroupRecoveryStatus, AppError> {
-        let (command, respond, response) = self.read_command(account_ref, ReadClass::R9).await?;
-        command
-            .send(AccountWorkerCommand::GroupRecoveryStatus {
+        let lane = self.worker_lane(account_ref).await?;
+        self.read_group_from_state(
+            &lane,
+            ReadClass::R9,
+            StateRead::Uncounted,
+            Admission::Queue,
+            std::slice::from_ref(group_id),
+            HydrationFailure::Returned,
+            |state| async move { reissue(state.group_recovery_status(group_id)?) },
+            |respond| AccountWorkerCommand::GroupRecoveryStatus {
                 group_id: group_id.clone(),
                 respond,
-            })
-            .await
-            .map_err(|_| AppError::TransportClosed)?;
-        account_worker_response(response).await
+            },
+        )
+        .await
     }
 
     pub async fn history_notices(
         &self,
         account_ref: &str,
     ) -> Result<Vec<crate::HistoryNotice>, AppError> {
-        let (command, respond, response) = self.read_command(account_ref, ReadClass::R9).await?;
-        command
-            .send(AccountWorkerCommand::HistoryNotices { respond })
-            .await
-            .map_err(|_| AppError::TransportClosed)?;
-        account_worker_response(response).await
+        self.read_from_state(
+            account_ref,
+            ReadClass::R9,
+            StateRead::Diagnosed,
+            ReadState::history_notices,
+            |respond| AccountWorkerCommand::HistoryNotices { respond },
+        )
+        .await
     }
 
     pub async fn account_recovery_status(
         &self,
         account_ref: &str,
     ) -> Result<crate::AccountRecoveryStatus, AppError> {
-        let (command, respond, response) = self.read_command(account_ref, ReadClass::R9).await?;
-        command
-            .send(AccountWorkerCommand::AccountRecoveryStatus { respond })
-            .await
-            .map_err(|_| AppError::TransportClosed)?;
-        account_worker_response(response).await
+        self.read_from_state(
+            account_ref,
+            ReadClass::R9,
+            StateRead::Diagnosed,
+            ReadState::account_recovery_status,
+            |respond| AccountWorkerCommand::AccountRecoveryStatus { respond },
+        )
+        .await
     }
 
     pub async fn linked_devices(
@@ -3657,20 +3678,31 @@ mod tests {
         let account_engine = |engine| AppError::Account(AccountError::Engine(engine));
         let session_engine =
             |engine| AppError::Account(AccountError::Session(SessionError::Engine(engine)));
-        let copyable: [&dyn Fn() -> AppError; 8] = [
+        let app_session_engine = |engine| AppError::Session(SessionError::Engine(engine));
+        let lifetime = || EngineError::InvalidKeyPackageLifetime {
+            not_before: Some(1),
+            not_after: None,
+        };
+        let copyable: [&dyn Fn() -> AppError; 13] = [
             &|| AppError::UnknownGroup("11".to_owned()),
             &|| AppError::Storage(storage()),
             &|| account_engine(EngineError::UnknownGroup(group.clone())),
             &|| account_engine(EngineError::GroupNotHydrated(group.clone())),
             &|| account_engine(EngineError::Storage(storage())),
+            &|| account_engine(lifetime()),
             &|| session_engine(EngineError::UnknownGroup(group.clone())),
             &|| session_engine(EngineError::GroupNotHydrated(group.clone())),
             &|| session_engine(EngineError::Storage(storage())),
+            &|| app_session_engine(EngineError::UnknownGroup(group.clone())),
+            &|| app_session_engine(EngineError::GroupNotHydrated(group.clone())),
+            &|| app_session_engine(EngineError::Storage(storage())),
+            &|| app_session_engine(lifetime()),
         ];
-        let uncopyable: [&dyn Fn() -> AppError; 3] = [
+        let uncopyable: [&dyn Fn() -> AppError; 4] = [
             &|| AppError::Sqlite(rusqlite::Error::InvalidQuery),
             &|| account_engine(EngineError::UnknownPending),
             &|| session_engine(EngineError::UnknownPending),
+            &|| app_session_engine(EngineError::UnknownPending),
         ];
         for (index, failure) in copyable.iter().enumerate() {
             // A failure with no exact copy sends the read to the worker, whose

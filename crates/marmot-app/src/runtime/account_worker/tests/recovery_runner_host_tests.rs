@@ -303,6 +303,75 @@ async fn the_workers_runner_announces_what_it_catches_up() {
     worker.runtime.shutdown_and_close().await.unwrap();
 }
 
+/// A host that re-reads the status on `RecoveryStatusChanged` sees the
+/// survey the event announces: the worker publishes the read state before it
+/// emits (mdk#3273). The relay holds the sweep of the owed day, so once the
+/// runner has found it owed it surveys no more and nothing else announces
+/// anything: a read after every event that misses the group fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_read_right_after_the_recovery_event_sees_the_survey_it_announces() {
+    let _serial = BOUNDED_WORKER_FIXTURE_LOCK.lock().await;
+    let hold = HeldSweep::default();
+    let _release = ReleaseOnDrop(hold.clone());
+    let relay = LocalRelay::new(RelayBuilder::default().query_policy(hold.clone()));
+    relay.run().await.unwrap();
+    let url = relay.url().await.to_string();
+    let started = crate::unix_now_seconds();
+    let worker = RunnerWorker::start(&url).await;
+    worker.served_after(started).await;
+    timeout(SETTLE, worker.pass().await).await.unwrap().unwrap();
+    let group_hex = worker.group_hex();
+    // Re-read at each event, as a host does, until a read shows `catching`.
+    async fn read_at_events(
+        worker: &RunnerWorker,
+        events: &mut broadcast::Receiver<MarmotAppEvent>,
+        group_hex: &str,
+        catching: bool,
+    ) {
+        loop {
+            if !matches!(
+                events.recv().await.unwrap(),
+                MarmotAppEvent::RecoveryStatusChanged { .. }
+            ) {
+                continue;
+            }
+            let status = worker
+                .runtime
+                .account_recovery_status(&worker.label)
+                .await
+                .unwrap();
+            if status
+                .catching_up_group_ids_hex
+                .iter()
+                .any(|group| group == group_hex)
+                == catching
+            {
+                return;
+            }
+        }
+    }
+
+    let mut events = worker.runtime.subscribe();
+    hold.arm(&worker.route_hex);
+    worker.lose_a_day();
+    let _pass = worker.pass().await;
+    timeout(
+        SETTLE,
+        read_at_events(&worker, &mut events, &group_hex, true),
+    )
+    .await
+    .expect("a read after the announcing event shows the group catching up");
+
+    hold.release();
+    timeout(
+        SETTLE,
+        read_at_events(&worker, &mut events, &group_hex, false),
+    )
+    .await
+    .expect("a read after the announcing event shows it caught up");
+    worker.runtime.shutdown_and_close().await.unwrap();
+}
+
 /// A reconnect gives the worker a new client, which keeps its own record of
 /// what the runner catches up: the new runner's survey is announced too.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

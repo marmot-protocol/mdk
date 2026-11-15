@@ -5189,6 +5189,11 @@ async fn app_runtime_uploads_armed_backfill_row_without_visible_activity() {
          tracker even though the arming traffic produced no visible activity",
     );
 
+    // The read answers from the published read state: fence the worker
+    // first, so it has published every write it made before.
+    marmot_app::worker_fences::worker_round_trip(&runtime, "bob")
+        .await
+        .unwrap();
     assert!(
         !runtime
             .group_recovery_status("bob", &group_id)

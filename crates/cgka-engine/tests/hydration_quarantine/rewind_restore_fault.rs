@@ -1005,6 +1005,14 @@ async fn a_failed_restore_hides_a_rejoin_offer_until_the_next_open() {
             .is_empty(),
         "no offer carries an anchor token"
     );
+    let read = fork
+        .carol
+        .rejoin_offers(fork.carol.stored_rejoin_welcomes().unwrap());
+    assert!(read.offers.is_empty());
+    assert!(
+        read.every_offer_read,
+        "the refusal is a fact the group's change generation holds"
+    );
     let anchor_state = image(&fork.storage, &fork.group);
     unknown(
         fork.carol

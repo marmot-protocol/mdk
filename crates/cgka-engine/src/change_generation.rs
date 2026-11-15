@@ -57,8 +57,9 @@ pub struct GroupChangeGeneration {
     /// record writes, lifecycle and commit-derived MLS state, the
     /// convergence-pass row, fanouts, maintenance rows and evolutions,
     /// withdrawn-commit message states, the app's device-group and
-    /// self-membership rows, and availability (hydration, quarantine
-    /// entered or cleared, forget).
+    /// self-membership rows, invitation recovery (Welcomes, own-commit
+    /// intents, rejoin progress, the app's recovery-failure flag), and
+    /// availability (hydration, quarantine entered or cleared, forget).
     pub state: ChangeStamp,
     /// Moves on commit-derived and availability changes: the inputs of
     /// answers read from a loaded group, such as app components.

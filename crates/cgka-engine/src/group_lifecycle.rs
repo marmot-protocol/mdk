@@ -1199,11 +1199,34 @@ impl<S: StorageProvider> Engine<S> {
         &self,
         group_id: Option<&GroupId>,
     ) -> Result<Vec<PendingWelcome>, EngineError> {
-        let mut candidates = Vec::new();
-        for mut candidate in self.storage.list_welcomes()? {
-            if group_id.is_some_and(|id| id != &candidate.group_id) {
-                continue;
-            }
+        let mut stored = self.stored_rejoin_welcomes()?;
+        if let Some(group_id) = group_id {
+            stored.retain(|candidate| &candidate.group_id == group_id);
+        }
+        Ok(self.rejoin_offers(stored).offers)
+    }
+
+    /// Every stored Welcome that offers a re-join, without its consent
+    /// token: one read for callers that hand groups' candidates to
+    /// [`Self::rejoin_offers`] one group at a time.
+    pub fn stored_rejoin_welcomes(&self) -> Result<Vec<PendingWelcome>, EngineError> {
+        let mut stored = self.storage.list_welcomes()?;
+        stored.retain(|candidate| candidate.rejoin.is_some());
+        Ok(stored)
+    }
+
+    /// The offers among `candidates` (from [`Self::stored_rejoin_welcomes`])
+    /// whose group's MLS state loads, each with its consent token.
+    ///
+    /// A candidate whose group has no MLS state, or whose rewind restore
+    /// failed, is left out on a fact the group's change generation holds. One
+    /// whose load failed on anything else is left out too, so one damaged
+    /// group's offer hides no healthy group's offer and blocks no ingress, but
+    /// `every_offer_read` is then false: that failure can clear with no write.
+    pub fn rejoin_offers(&self, candidates: Vec<PendingWelcome>) -> RejoinOffers {
+        let mut offers = Vec::with_capacity(candidates.len());
+        let mut every_offer_read = true;
+        for mut candidate in candidates {
             let Some(rejoin) = &mut candidate.rejoin else {
                 continue;
             };
@@ -1214,20 +1237,23 @@ impl<S: StorageProvider> Engine<S> {
             let loaded = self.load_mls_group_in(self.storage.mls_storage(), &candidate.group_id);
             let group = match loaded {
                 Ok(Some(group)) => group,
-                Ok(None) => continue,
+                Ok(None) | Err(EngineError::UnknownGroup(_)) => continue,
                 Err(_) => {
-                    // Hydration owns quarantine and repair. One damaged group's
-                    // offer must not hide healthy groups' offers or block ingress.
+                    // Hydration owns quarantine and repair.
+                    every_offer_read = false;
                     tracing::debug!(target: "cgka_engine::group_lifecycle",
-                        method = "pending_group_rejoins", "skipping an unreadable group");
+                        method = "rejoin_offers", "skipping an unreadable group");
                     continue;
                 }
             };
             rejoin.local_state_token =
                 Sha256::digest(group.epoch_authenticator().as_slice()).to_vec();
-            candidates.push(candidate);
+            offers.push(candidate);
         }
-        Ok(candidates)
+        RejoinOffers {
+            offers,
+            every_offer_read,
+        }
     }
 
     /// Retry owned offers once trusted removal (or Unrecoverable repair) makes
@@ -2704,6 +2730,16 @@ fn rejoin_confirmation_required() -> EngineError {
         to: "JoinWelcome",
         reason: "replacement Welcome requires trusted removal evidence or explicit recipient confirmation",
     })
+}
+
+/// Re-join offers with their consent tokens ([`Engine::rejoin_offers`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RejoinOffers {
+    pub offers: Vec<PendingWelcome>,
+    /// False when an offer was left out because its group's MLS state failed
+    /// to load on something other than a fact the group's change generation
+    /// holds (no MLS state, a failed rewind restore).
+    pub every_offer_read: bool,
 }
 
 #[cfg(test)]

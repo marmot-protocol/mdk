@@ -1463,3 +1463,232 @@ async fn a_failed_rewind_restore_withdraws_trust_in_an_unchanged_roster() {
     assert!(trusted_members(&state, &second).is_empty());
     assert_eq!(storage.committed_roster(&group).unwrap(), Some(roster));
 }
+
+/// A group's re-join offer is left out of its recovery status while the
+/// group's MLS state fails to load. That failure can clear with no write, so
+/// the entry built during it is not reused: the next publish reads the offer
+/// again. Here a TEMP table on the engine's connection shadows the OpenMLS
+/// values, failing the load without writing the database.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_offer_hidden_by_a_failed_load_is_read_again() {
+    use cgka_traits::storage::WelcomeStorage;
+    use cgka_traits::welcome::{PendingWelcome, RejoinWelcome};
+
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+    let mut client = app.client("alice").await.unwrap();
+    let group = client
+        .create_group("offered", &[])
+        .await
+        .unwrap()
+        .operation
+        .unwrap();
+    let storage = app.account_storage("alice").unwrap();
+    storage
+        .put_welcome(&PendingWelcome {
+            message_id: cgka_traits::MessageId::new(vec![0xe1; 32]),
+            group_id: group.clone(),
+            welcome_bytes: vec![],
+            rejoin: Some(RejoinWelcome {
+                epoch: cgka_traits::EpochId(0),
+                content_id: cgka_traits::MessageId::new(vec![0xe2; 32]),
+                welcomer: client.runtime.session().self_id(),
+                local_state_token: vec![],
+            }),
+        })
+        .unwrap();
+    client.start_read_state(read_state_channel().0, UploadsInFlight::default());
+    let state = client.subscribe_read_state().unwrap();
+    let offers = |state: &watch::Receiver<Arc<ReadState>>| {
+        state.borrow().groups[&group]
+            .recovery_status
+            .as_ref()
+            .unwrap()
+            .rejoin_invitations
+            .len()
+    };
+    assert_eq!(offers(&state), 1);
+
+    // Move the group's generation, then fail the load the rebuild makes on
+    // the engine's connection.
+    storage
+        .app_storage()
+        .execute_batch_for_test("UPDATE cgka_welcomes SET record = record")
+        .unwrap();
+    let engine = &client.engine_storage;
+    let group_key =
+        serde_json::to_vec(&openmls::group::GroupId::from_slice(group.as_slice())).unwrap();
+    engine
+        .execute_batch_for_test(&format!(
+            "CREATE TEMP VIEW openmls_values AS SELECT provider_version, label, storage_key, \
+             group_key, CASE WHEN label = X'{}' AND group_key = X'{}' THEN X'7b' ELSE value END \
+             AS value FROM main.openmls_values",
+            hex::encode(b"GroupContext"),
+            hex::encode(&group_key),
+        ))
+        .unwrap();
+    client.publish_read_state();
+    // Every other answer reads the group's loaded state, so only the offer
+    // fails: the entry would be reused but for the offer listing.
+    assert!(state.borrow().groups[&group].mls_state.is_ok());
+    assert_eq!(
+        offers(&state),
+        0,
+        "the offer is left out while it fails to load"
+    );
+
+    engine
+        .execute_batch_for_test("DROP VIEW temp.openmls_values")
+        .unwrap();
+    client.publish_read_state();
+    assert_eq!(offers(&state), 1, "the offer comes back with no write");
+}
+
+/// A retained reinvite's KeyPackage is judged against the system clock. A
+/// live one bounds its group's entry: the version names its `not_after` as
+/// when an answer can change. One past its `not_after` fails the group's
+/// recovery status, and a host's read serves that failure from A as an exact
+/// copy, never waiting for the worker.
+///
+/// A kept group crossing its reinvite's real `not_after` needs a system clock
+/// a test can move, and OpenMLS reads the system clock itself, so five tests
+/// compose it with no seam: the version's bound is the KeyPackage's
+/// `not_after` and a status built past it fails (here); the deadline the
+/// worker waits for ends at that bound
+/// (`client::read_state::tests::the_deadline_measures_each_bound_on_its_own_clock`);
+/// the worker wakes at that deadline and publishes, with no command, delivery
+/// or write (`the_worker_publishes_a_time_bound_answer_when_its_bound_passes`);
+/// an entry stops holding there
+/// (`client::read_state::tests::an_entry_holds_only_inside_its_key_package_window`);
+/// and a publish judges a kept entry by the system-clock reading it took
+/// (`client::read_state::tests::a_publish_rebuilds_an_entry_once_its_key_package_window_ends`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_live_reinvite_bounds_its_entry_and_an_expired_one_fails_as_an_exact_copy() {
+    use cgka_engine::provider::EngineOpenMlsProvider;
+    use cgka_traits::engine::SendIntent;
+    use cgka_traits::storage::{
+        AccountDeviceSignerStorage as _, OutboundIntentStorage as _, OwnCommitBaseline,
+        OwnCommitIntent, ReinviteRetry, StorageProvider as _,
+    };
+    use openmls::prelude::{
+        CredentialWithKey, KeyPackage as MlsKeyPackage, Lifetime, MlsMessageBodyIn, MlsMessageIn,
+        MlsMessageOut, ProtocolVersion,
+    };
+    use openmls_basic_credential::SignatureKeyPair;
+    use tls_codec::{Deserialize as _, Serialize as _};
+
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+    let mut client = app.client("alice").await.unwrap();
+    client.publish_key_package().await.unwrap();
+    let mut groups = Vec::new();
+    for name in ["live", "expired"] {
+        let created = client.create_group(name, &[]).await.unwrap();
+        groups.push(created.operation.unwrap());
+    }
+    let [live, expired] = <[GroupId; 2]>::try_from(groups).unwrap();
+    let template = client.durably_owned_key_packages().unwrap().remove(0);
+
+    // Alice's own KeyPackages at chosen lifetimes, built into a scratch store
+    // so her owned list keeps its own, later, bound.
+    let storage = app.account_storage("alice").unwrap();
+    let account = app.account_home().account("alice").unwrap();
+    let identity = MemberId::new(hex::decode(account.account_id_hex).unwrap());
+    let binding = storage.account_device_signer(&identity).unwrap().unwrap();
+    let suite = cgka_engine::DEFAULT_CIPHERSUITE;
+    let signer = SignatureKeyPair::read(
+        storage.mls_storage(),
+        &binding.mls_signature_public_key,
+        suite.signature_algorithm(),
+    )
+    .unwrap();
+    let MlsMessageBodyIn::KeyPackage(parsed) =
+        MlsMessageIn::tls_deserialize_exact(template.bytes())
+            .unwrap()
+            .extract()
+    else {
+        panic!("expected a KeyPackage")
+    };
+    let crypto = openmls_rust_crypto::RustCrypto::default();
+    let parsed = parsed.validate(&crypto, ProtocolVersion::Mls10).unwrap();
+    let leaf = parsed.leaf_node();
+    let scratch = storage_sqlite::SqliteAccountStorage::in_memory_for_test().unwrap();
+    let reinvite = |group: &GroupId, commit_byte: u8, lifetime: Lifetime| {
+        let bundle = MlsKeyPackage::builder()
+            .leaf_node_capabilities(leaf.capabilities().clone())
+            .leaf_node_extensions(leaf.extensions().clone())
+            .key_package_lifetime(lifetime)
+            .build(
+                suite,
+                &EngineOpenMlsProvider::<storage_sqlite::SqliteAccountStorage>::new(
+                    &crypto,
+                    scratch.mls_storage(),
+                ),
+                &signer,
+                CredentialWithKey {
+                    credential: leaf.credential().clone(),
+                    signature_key: signer.public().into(),
+                },
+            )
+            .unwrap();
+        let mut key_package = KeyPackage::new(
+            MlsMessageOut::from(bundle.key_package().clone())
+                .tls_serialize_detached()
+                .unwrap(),
+        );
+        key_package.protocol_profile = template.protocol_profile;
+        storage
+            .put_own_commit_intent(&OwnCommitIntent {
+                commit_id: cgka_traits::MessageId::new(vec![commit_byte; 32]),
+                group_id: group.clone(),
+                source_epoch: cgka_traits::EpochId(0),
+                intent: SendIntent::Invite {
+                    group_id: group.clone(),
+                    key_packages: vec![key_package],
+                    initial_admins: vec![],
+                },
+                baseline: OwnCommitBaseline::None,
+                reinvite: Some(ReinviteRetry::default()),
+                reissue_attempts: 0,
+                created_at_ms: 0,
+            })
+            .unwrap();
+    };
+    // An hour out: no load reaches the bound during the test, and it stays
+    // the version's earliest one.
+    let now = crate::unix_now_seconds();
+    let not_after = now + 3_600;
+    reinvite(&live, 0xc1, Lifetime::init(now - 3_600, not_after));
+    reinvite(&expired, 0xc2, Lifetime::init(now - 7_200, now - 3_600));
+
+    client.start_read_state(read_state_channel().0, UploadsInFlight::default());
+    let state = client.subscribe_read_state().unwrap();
+    assert!(state.borrow().groups[&live].recovery_status.is_ok());
+    assert_eq!(state.borrow().valid_until, Some(Timestamp(not_after)));
+    assert!(
+        client
+            .read_state_deadline()
+            .is_some_and(|deadline| deadline <= Duration::from_secs(3_600))
+    );
+
+    let published = state.borrow().groups[&expired].recovery_status.clone();
+    let published = published.unwrap_err();
+    assert!(
+        matches!(
+            published.as_engine_error(),
+            Some(cgka_traits::EngineError::InvalidKeyPackageLifetime { .. })
+        ),
+        "the expired KeyPackage fails the status: {published:?}"
+    );
+    let served = crate::client::read_state::reissue_error(&published)
+        .expect("the expired KeyPackage's failure has an exact copy");
+    assert_eq!(format!("{served:?}"), format!("{published:?}"));
+}

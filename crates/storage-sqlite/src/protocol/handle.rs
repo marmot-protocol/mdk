@@ -69,6 +69,16 @@ impl SqliteAccountStorage {
         self.group_writes.key_package_writes(&self.connection)
     }
 
+    /// Rows written to the account's history notices' inputs, the recovery
+    /// obligations and the recovery copies, counted as for
+    /// [`Self::write_count`], which also moves it on any change this process
+    /// cannot attribute to a row: a value that moves with every change to
+    /// those inputs a reader could observe (mdk#3273). Compare it as
+    /// [`Self::write_count`].
+    pub fn recovery_notice_write_count(&self) -> u64 {
+        self.group_writes.recovery_notice_writes(&self.connection)
+    }
+
     /// Neutral open-time result. Existing ledger entries are not new migrations.
     pub fn migration_summary(&self) -> (usize, Duration) {
         (self.migrations_applied, self.migration_duration)
@@ -202,6 +212,15 @@ impl SqliteAccountStorage {
     #[cfg(any(test, feature = "test-support"))]
     pub fn fail_snapshot_releases_for_test(&self, fault: Option<crate::SnapshotFault>) {
         self.connection.set_snapshot_release_fault(fault);
+    }
+
+    /// Runs `sql` on this handle's connection, to fail a read without
+    /// writing the database (a TEMP table that shadows one) and mend it
+    /// again under a test. Test support only.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn execute_batch_for_test(&self, sql: &str) -> StorageResult<()> {
+        use crate::SqliteResultExt as _;
+        self.lock()?.execute_batch(sql).storage()
     }
 
     /// Install a SQLite statement/row trace for dependent-crate regression tests.

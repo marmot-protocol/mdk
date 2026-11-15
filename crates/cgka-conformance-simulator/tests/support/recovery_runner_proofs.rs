@@ -18,7 +18,7 @@ use cgka_conformance_simulator::app_runtime::{
     ConnectionTrafficV1, HistoryRequestV1, LiveGroupReplyV1, RelayDeliveryPath,
 };
 use cgka_conformance_simulator::{
-    AppRuntimeHarness, AppRuntimeProbe, ConvergenceSubject, SubjectCreateGroup,
+    AppRuntimeHarness, AppRuntimeProbe, ConvergenceSubject, SubjectCreateGroup, SubjectError,
     SubjectRemoveMembers, SubjectSelfUpdate, SubjectUpdateGroupData,
 };
 use cgka_traits::GroupId;
@@ -73,12 +73,12 @@ const FENCE_STALL: Duration = Duration::from_secs(12);
 const FENCE_RELEASE: Duration = Duration::from_secs(30);
 /// The scorecard's targets (#1945), asserted in the owed proof while the
 /// backlog is admitted: a quiet group's live message shows within 2 s, and
-/// the account worker answers status commands with p95 under 500 ms. One
-/// command over 2 s is a hang a user would notice.
+/// the account worker answers commands with p95 under 500 ms. One command
+/// over 2 s is a hang a user would notice.
 const LIVE_VISIBLE_TARGET_MS: f64 = 2_000.0;
 const COMMAND_P95_TARGET_MS: f64 = 500.0;
 const COMMAND_MAX_MS: f64 = 2_000.0;
-/// Status commands the admission window must hold for their latency to
+/// Worker commands the admission window must hold for their latency to
 /// count: five seconds of the probe's calls every 250 ms.
 const ADMISSION_COMMANDS_AT_LEAST: u64 = 20;
 /// How often the 5,000-owed proof checks whether every owed message shows.
@@ -808,42 +808,49 @@ fn pacing(from: u64, to: u64) -> Value {
     })
 }
 
-/// Bob's worker command latency while recovery runs: one cheap status command
-/// every 250 ms, as the scorecard samples it.
+/// Bob's worker command latency while recovery runs: one worker round trip
+/// every 250 ms, as the scorecard samples its commands. Host status reads
+/// answer from the published read state and never reach the worker
+/// (mdk#3273), so the probe sends a command the worker answers. Startup
+/// defers that command to its end, so sampling starts once startup has
+/// finished; the backlog is admitted after it.
 struct CommandProbe {
     stop: Arc<AtomicBool>,
-    /// The trace clock when the probe's own clock started.
-    trace_start_ms: u64,
-    samples: tokio::task::JoinHandle<Vec<Sample>>,
+    /// The trace clock when the probe's own clock started, and its samples.
+    samples: tokio::task::JoinHandle<Result<(u64, Vec<Sample>), SubjectError>>,
 }
 
 impl CommandProbe {
-    fn start(bob: &AppRuntimeProbe, group: &GroupId) -> Self {
+    fn start(bob: &AppRuntimeProbe, _group: &GroupId) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
-        let (bob, group) = (bob.clone(), group.clone());
-        let trace_start_ms = runner_trace::now_ms();
-        let samples = periodic(
-            &stop,
-            Duration::from_millis(250),
-            Instant::now(),
-            move |_| {
-                let (bob, group) = (bob.clone(), group.clone());
-                async move { bob.group_recovery_status(&group).await.map(|_| 0) }
-            },
-        );
-        Self {
-            stop,
-            trace_start_ms,
-            samples,
-        }
+        let bob = bob.clone();
+        let samples = tokio::spawn({
+            let stop = stop.clone();
+            async move {
+                bob.worker_startup_finished().await?;
+                let trace_start_ms = runner_trace::now_ms();
+                let samples = periodic(
+                    &stop,
+                    Duration::from_millis(250),
+                    Instant::now(),
+                    move |_| {
+                        let bob = bob.clone();
+                        async move { bob.worker_round_trip().await.map(|()| 0) }
+                    },
+                );
+                let samples = samples.await.expect("the probe's sampler does not panic");
+                Ok((trace_start_ms, samples))
+            }
+        });
+        Self { stop, samples }
     }
 
     /// Latencies of every call, and of the calls in flight at any time within
     /// `window` (trace clock).
     async fn finish(self, window: (u64, u64)) -> TestResult<(Value, Value)> {
         self.stop.store(true, Ordering::Relaxed);
-        let samples = self.samples.await?;
-        let seconds = |at: u64| at.saturating_sub(self.trace_start_ms) as f64 / 1e3;
+        let (trace_start_ms, samples) = self.samples.await??;
+        let seconds = |at: u64| at.saturating_sub(trace_start_ms) as f64 / 1e3;
         let within = latencies_within(&samples, seconds(window.0), seconds(window.1));
         Ok((latencies(&samples), within))
     }
@@ -2191,12 +2198,12 @@ pub(super) async fn owed_history() {
         let failed_commands = commands["errors"].as_object().into_iter().flatten();
         let failed_commands = failed_commands.filter_map(|(_, count)| count.as_u64()).sum::<u64>();
         if commands["calls"].as_u64() < Some(ADMISSION_COMMANDS_AT_LEAST) || failed_commands > 0 {
-            return failure("too few status commands answered while the backlog was admitted");
+            return failure("too few worker commands answered while the backlog was admitted");
         }
         if commands["p95"].as_f64().is_none_or(|ms| ms >= COMMAND_P95_TARGET_MS)
             || commands["max"].as_f64().is_none_or(|ms| ms >= COMMAND_MAX_MS)
         {
-            return failure("the account worker answered status commands too slowly while the backlog was admitted");
+            return failure("the account worker answered commands too slowly while the backlog was admitted");
         }
         if resweep_result.is_err() {
             return failure("the reconnect's owed ranges were not swept");

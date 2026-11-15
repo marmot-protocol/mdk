@@ -195,9 +195,10 @@ also records packed live group REQs through EOSE, including raw counts, so the f
   - a message to the quiet group arrives within a minute, while the busy group is still owed;
   - fairness while the backlog is admitted, at the scorecard's targets. Once the runner's trace shows an admission
     turn and owed messages are showing, a second quiet-group message must show within 2 seconds of alice's send
-    returning, before the busy group finishes and before the runner's last admission turn. Status commands in
-    flight at any time between the first admission turn and the last one logged before every owed message showed
-    (at least 20) must all succeed, with p95 under 500 ms and none at 2 seconds or more. The window can miss the
+    returning, before the busy group finishes and before the runner's last admission turn. Worker round trips
+    (status reads answer from the published read state, so the probe sends a command the worker answers, from the
+    end of startup) in flight at any time between the first admission turn and the last one logged before every
+    owed message showed (at least 20) must all succeed, with p95 under 500 ms and none at 2 seconds or more. The window can miss the
     final turn but never includes a later one. The first quiet message shows before admission starts, so it does
     not count for fairness;
   - no history notice before the restart, when the restart reports caught up, or at the end. This is its own
@@ -231,7 +232,7 @@ also records packed live group REQs through EOSE, including raw counts, so the f
     that, consecutive useful advances must stay under one request timeout apart, so a single stalled attempt
     between two opens fails it.
   - The report gives the time to the first open, the largest gaps, bob's epochs as they changed, and the runner's
-    attempts, admission pacing and status-command latency while opening. Its runner trace includes admission
+    attempts, admission pacing and worker-command latency while opening. Its runner trace includes admission
     turns.
 - `public_app_runner_orders_six_thousand_backlog_messages_before_live_input` retains the captured three-sender
   6,000-event admission-order failure. Live subscription traffic competes with older recovery. It requires every

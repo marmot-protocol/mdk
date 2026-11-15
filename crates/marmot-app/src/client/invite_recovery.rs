@@ -1,10 +1,16 @@
 //! Durable invitation recovery. Relay discovery stays in the app; the engine
 //! validates identities and atomically transfers fresh intent into its queue.
 use super::AppClient;
+use super::history_recovery::history_notices::{GroupFacts, LiveFacts, RecoveryRead};
 use crate::AppError;
 use cgka_traits::engine::{
     SendIntent, SupersededIntentKind, SupersededIntentOutcome, SupersededIntentReport,
 };
+use cgka_traits::group::Group;
+use cgka_traits::storage::OwnCommitIntent;
+use cgka_traits::transport::Timestamp;
+use cgka_traits::welcome::PendingWelcome;
+use marmot_session::WallClockWindow;
 
 use cgka_traits::storage::WelcomeStorage;
 use cgka_traits::{GroupId, MessageId};
@@ -52,10 +58,61 @@ impl AppClient {
         &self,
         group_id: &cgka_traits::GroupId,
     ) -> Result<crate::GroupRecoveryStatus, AppError> {
+        let read = self.read_recovery()?;
         let group = self.runtime.group_record(group_id)?;
-        let rejoin_invitations = self
-            .runtime
-            .pending_group_rejoins_for(group_id)?
+        let judged_at = crate::client::read_state::system_clock_now();
+        self.group_recovery_status_in(group_id, &group, &read, &LiveFacts(self), None, judged_at)
+            .map(|(status, _)| status)
+    }
+
+    /// The account's invitation-recovery rows, by group: one read of every
+    /// stored re-join Welcome and every fresh-material reinvite record, for
+    /// a publish that rebuilds many groups' recovery statuses (mdk#3273).
+    pub(crate) fn invitation_rows(&self) -> Result<InvitationRows, AppError> {
+        let mut rows = InvitationRows::default();
+        for candidate in self.runtime.stored_rejoin_welcomes()? {
+            rows.rejoins
+                .entry(candidate.group_id.clone())
+                .or_default()
+                .push(candidate);
+        }
+        for record in self.runtime.reinvite_recovery_records()? {
+            rows.reinvites
+                .entry(record.group_id.clone())
+                .or_default()
+                .push(record);
+        }
+        Ok(rows)
+    }
+
+    /// [`Self::group_recovery_status`] from the group's engine record, a
+    /// recovery read, and the group's facts the caller has: A builds a
+    /// group's entry with the record and facts it holds (mdk#3273). `rows`
+    /// are the account's invitation-recovery rows when the caller read them
+    /// once for many groups; `None` reads this group's. KeyPackage lifetimes
+    /// are judged against the system clock, which read `judged_at` before
+    /// the call. The status comes with what keeping it rests on besides the
+    /// group's change stamp.
+    pub(crate) fn group_recovery_status_in(
+        &self,
+        group_id: &cgka_traits::GroupId,
+        group: &Group,
+        read: &RecoveryRead,
+        facts: &dyn GroupFacts,
+        rows: Option<&InvitationRows>,
+        judged_at: Timestamp,
+    ) -> Result<(crate::GroupRecoveryStatus, StatusInputs), AppError> {
+        let candidates = match rows {
+            Some(rows) => rows.rejoins.get(group_id).cloned().unwrap_or_default(),
+            None => {
+                let mut candidates = self.runtime.stored_rejoin_welcomes()?;
+                candidates.retain(|candidate| &candidate.group_id == group_id);
+                candidates
+            }
+        };
+        let offers = self.runtime.rejoin_offers(candidates);
+        let rejoin_invitations = offers
+            .offers
             .into_iter()
             .filter_map(|candidate| {
                 candidate.rejoin.map(|rejoin| crate::GroupRejoinInvitation {
@@ -66,7 +123,21 @@ impl AppClient {
                 })
             })
             .collect();
-        let records = self.runtime.reinvite_recovery_records()?;
+        let read_here;
+        let records = match rows {
+            Some(rows) => rows.reinvites.get(group_id).map_or(&[][..], Vec::as_slice),
+            None => {
+                read_here = self.runtime.reinvite_recovery_records()?;
+                &read_here[..]
+            }
+        };
+        let mut inputs = StatusInputs {
+            reusable: offers.every_offer_read,
+            key_packages: WallClockWindow {
+                from: judged_at,
+                until: None,
+            },
+        };
         let mut pending_reinvites = 0u32;
         let mut failed_reinvites = 0u32;
         for record in records.iter().filter(|record| &record.group_id == group_id) {
@@ -77,6 +148,7 @@ impl AppClient {
                         .runtime
                         .key_package_metadata(package)
                         .map_err(marmot_session::SessionError::from)?;
+                    inputs.judged(metadata.not_before, metadata.not_after);
                     missing |= !group.members.iter().any(|member| {
                         hex::encode(member.id.as_slice()) == metadata.credential_identity_hex
                     });
@@ -96,8 +168,8 @@ impl AppClient {
             }
         }
         let storage = self.app.account_storage(&self.state.label)?;
-        let history_notice_ids = self.group_history_notice_ids(group_id)?;
-        Ok(crate::GroupRecoveryStatus {
+        let history_notice_ids = read.group_notice_ids(group_id, facts);
+        let status = crate::GroupRecoveryStatus {
             pending_reinvites,
             failed_reinvites,
             group_id_hex: hex::encode(group_id.as_slice()),
@@ -110,7 +182,8 @@ impl AppClient {
             rejoin_invitations,
             history_may_be_incomplete: !history_notice_ids.is_empty(),
             history_notice_ids,
-        })
+        };
+        Ok((status, inputs))
     }
 
     pub async fn confirm_group_rejoin(
@@ -506,9 +579,81 @@ fn without_consumed_packages<T>(packages: Vec<(String, bool, T)>) -> Vec<T> {
         .collect()
 }
 
+/// The account's invitation-recovery rows by group ([`AppClient::invitation_rows`]).
+#[derive(Default)]
+pub(crate) struct InvitationRows {
+    rejoins: HashMap<GroupId, Vec<PendingWelcome>>,
+    reinvites: HashMap<GroupId, Vec<OwnCommitIntent>>,
+}
+
+/// What keeping a group's recovery status rests on besides its group's
+/// change stamp (mdk#3273).
+#[derive(Clone, Debug)]
+pub(crate) struct StatusInputs {
+    /// False when the read left out something that can come back with no
+    /// write: a re-join offer whose group's MLS state failed to load on a
+    /// failure that can clear, or a KeyPackage lifetime the clock crossed
+    /// between the reading and OpenMLS's own check.
+    pub(crate) reusable: bool,
+    /// The system-clock window the KeyPackage lifetimes judged leave the
+    /// status in: from the reading they were judged against until the first
+    /// `not_after` ahead. A KeyPackage past it fails the status.
+    pub(crate) key_packages: WallClockWindow,
+}
+
+impl StatusInputs {
+    /// Note a KeyPackage OpenMLS accepted, so valid at its own check, with
+    /// lifetime `not_before..not_after` (OpenMLS's rule: valid from
+    /// `not_before` until before `not_after`).
+    fn judged(&mut self, not_before: u64, not_after: u64) {
+        let at = self.key_packages.from.0;
+        if at < not_before || at >= not_after {
+            // The clock crossed a bound between the reading and the check.
+            self.reusable = false;
+        }
+        self.key_packages.until = self
+            .key_packages
+            .until
+            .into_iter()
+            .chain([Timestamp(not_after)])
+            .min();
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::without_consumed_packages;
+    use super::{StatusInputs, without_consumed_packages};
+    use cgka_traits::transport::Timestamp;
+    use marmot_session::WallClockWindow;
+
+    /// The KeyPackages a status judged bound it until the first `not_after`
+    /// ahead of the reading. One OpenMLS accepted on the other side of a
+    /// bound from that reading means the clock moved between the two, and
+    /// the status is not kept.
+    #[test]
+    fn judged_key_packages_bound_the_status_and_a_crossed_bound_ends_its_reuse() {
+        let at = |reading| StatusInputs {
+            reusable: true,
+            key_packages: WallClockWindow {
+                from: Timestamp(reading),
+                until: None,
+            },
+        };
+        let mut inputs = at(100);
+        inputs.judged(50, 200);
+        inputs.judged(90, 150);
+        assert!(inputs.reusable);
+        assert_eq!(inputs.key_packages.until, Some(Timestamp(150)));
+
+        for (not_before, not_after) in [(101, 200), (50, 100)] {
+            let mut inputs = at(100);
+            inputs.judged(not_before, not_after);
+            assert!(
+                !inputs.reusable,
+                "accepted at {not_before}..{not_after}, outside the reading"
+            );
+        }
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn partial_prepare_keeps_notice() {

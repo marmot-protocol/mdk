@@ -331,6 +331,26 @@ impl ParticipantRuntime {
                 .map_err(WireError::app),
         }
     }
+    /// [`marmot_app::worker_fences::worker_startup_finished`].
+    pub async fn worker_startup_finished(&self, account: &str) -> Result<(), AppError> {
+        match self {
+            Self::Local(r) => marmot_app::worker_fences::worker_startup_finished(r, account).await,
+            Self::Remote(p) => p
+                .call_async("worker_startup_finished", json!([account]))
+                .await
+                .map_err(WireError::app),
+        }
+    }
+    /// [`marmot_app::worker_fences::worker_round_trip`].
+    pub async fn worker_round_trip(&self, account: &str) -> Result<(), AppError> {
+        match self {
+            Self::Local(r) => marmot_app::worker_fences::worker_round_trip(r, account).await,
+            Self::Remote(p) => p
+                .call_async("worker_round_trip", json!([account]))
+                .await
+                .map_err(WireError::app),
+        }
+    }
     pub async fn confirm_group_rejoin(
         &self,
         account: &str,
@@ -713,6 +733,14 @@ impl ParticipantServer {
             "account_recovery_status" => {
                 let (account,): (String,) = args(arguments)?;
                 value(r.account_recovery_status(&account).await?)
+            }
+            "worker_startup_finished" => {
+                let (account,): (String,) = args(arguments)?;
+                value(marmot_app::worker_fences::worker_startup_finished(r, &account).await?)
+            }
+            "worker_round_trip" => {
+                let (account,): (String,) = args(arguments)?;
+                value(marmot_app::worker_fences::worker_round_trip(r, &account).await?)
             }
             "set_audit_log" => {
                 let (enabled,): (bool,) = args(arguments)?;
