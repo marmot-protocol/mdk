@@ -1160,9 +1160,9 @@ may try again. `reason` is a stable tag such as `not_group_admin`. With
 `event_too_large`, the send's commit or an invitee's Welcome fits none of its
 relays' known size limits, or every relay refused it for size: `artifact` names
 that event and `size_class` its coarse size. Both are `nil` for other reasons.
-With `not_delivered`, the send's commit reached no relay: every relay that
-answered refused it, the others could not be reached while this device was
-online, and it was rolled back.
+With `not_delivered`, the send's commit reached no relay and was rolled back:
+no relay accepted it, this device's record shows none can hold it, and at least
+ten minutes after the first send a relay's answer showed the device online.
 
 ## Discarding a failed send
 

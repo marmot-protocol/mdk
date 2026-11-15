@@ -21,7 +21,8 @@
   `Pending → RolledBack` and only from a stored row no target may hold. `reachability_read_at_ms` and
   `record_reachability_read` keep when the device last read the commit to learn whether it is online.
   `possible_exposure` and `target_may_hold_event` now read a row stored before the exposure bit by its stored status, as
-  `RetryableUnavailable` with a failure that does not prove nothing was sent, so such a row counts as exposed.
+  `RetryableUnavailable` with a failure that does not prove nothing was sent, or as a `Failed` with no stored failure
+  (the first frozen-fanout writer's shape for every publish error), so such a row counts as exposed.
 - `OutboundFanout::set_queued_intent` names, before the fanout is first stored, the queued intent a pending commit was
   drained from, and `queued_intent_id` reads it (mdk#2332). `validate_successor_of` keeps it unchanged; a row stored
   without it reads as naming none.

@@ -3404,6 +3404,8 @@ impl<S: StorageProvider> Engine<S> {
             .retain(|pending, _| !restored_pending.contains(pending));
         self.auto_publish_buf
             .retain(|work| !restored_pending.contains(&work.pending));
+        self.queued_intent_by_pending
+            .retain(|pending, _| !restored_pending.contains(pending));
         // Same durable revert as `restore_durable_group_evolution_on_hydrate`'s
         // own `begin_pending` failure path.
         if !restored_pending.is_empty()

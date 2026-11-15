@@ -1412,13 +1412,18 @@ impl OutboundFanout {
     /// a `RetryableUnavailable` whose failure does not prove nothing was sent:
     /// a row stored before that proof existed (mdk#2332) records a relay's
     /// `rate-limited:` or `auth-required:` answer that way, with the bit
-    /// clear, and one with no stored failure says nothing either way.
+    /// clear, and one with no stored failure says nothing either way. So does
+    /// a `Failed` with no stored failure: the first frozen-fanout writer
+    /// (mdk#1098) stored that, with no bit, for every publish error, a timeout
+    /// after sending included. Every writer since stores a `Failed` with its
+    /// failure.
     fn stored_status_records_exposure(&self, index: usize) -> bool {
         match self.target_status(index) {
             Some(FanoutTargetStatus::PossiblyExposed) => true,
             Some(FanoutTargetStatus::RetryableUnavailable) => !self
                 .target_failure(index)
                 .is_some_and(TransportEndpointFailure::proves_nothing_sent),
+            Some(FanoutTargetStatus::Failed) => self.target_failure(index).is_none(),
             _ => false,
         }
     }
@@ -3078,7 +3083,8 @@ mod tests {
     /// only with the rollback and only from the row it was computed on, or
     /// refuses, changing nothing, and storage refuses a forged successor
     /// of the same row. A row stored before a relay's retryable answer set
-    /// the bit reads as exposed.
+    /// the bit reads as exposed, and so does a bare `Failed` stored before
+    /// failures were recorded.
     #[test]
     fn a_pending_commit_is_abandoned_only_when_no_relay_may_hold_it() {
         use FanoutTargetStatus::{Abandoned, Failed};
@@ -3131,6 +3137,12 @@ mod tests {
         let mut unclassified = unreachable.clone();
         unclassified.target_statuses[1] = FanoutTargetStatus::Attempting;
         unclassified.mark_target_failed(1).unwrap();
+        // The first frozen-fanout writer (mdk#1098) stored a bare `Failed`,
+        // with no failure and no bit, for every publish error.
+        let mut bare_failure = unreachable.clone();
+        bare_failure.target_failures[1] = None;
+        bare_failure.target_possible_exposure.clear();
+        assert!(bare_failure.target_may_hold_event(1));
         let mut application = stage(false);
         application.mark_attempt_started_at(0, 200).unwrap();
         application
@@ -3188,6 +3200,12 @@ mod tests {
             (
                 "another target failed unclassified",
                 unclassified,
+                false,
+                false,
+            ),
+            (
+                "another target stored a bare failure",
+                bare_failure,
                 false,
                 false,
             ),
