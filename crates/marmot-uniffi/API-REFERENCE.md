@@ -2805,6 +2805,18 @@ Send `send_text` content plus application tags on the same kind-9, e.g. NIP-30 `
 
 [Source](src/commands/message.rs#L39)
 
+### `Marmot::send_tagged_sticker`
+
+**Current.**
+
+```rust
+pub async fn send_tagged_sticker( &self, account_ref: String, group_id_hex: String, sticker_ref: StickerRefFfi, message_tags: Vec<Vec<String>>, ) -> Result<SendSummaryFfi, MarmotKitError>
+```
+
+Send an authorized exact sticker reference with reply `e`, NIP-22 `E`/`K`/`P`, or effect tags on the same kind-9 message. Rejects `imeta` and extra `sticker` rows. Context is bounded to 64 tags and 16 KiB of tag values. Native sticker authorization and normal send admission still apply; this does not upload media. `send_sticker` keeps its existing signature and sends without context.
+
+[Source](src/commands/message.rs#L73)
+
 ### `Marmot::send_sticker`
 
 **Current.**
@@ -2827,7 +2839,7 @@ pub async fn retry_group_convergence( &self, account_ref: String, group_id_hex: 
 
 Re-attempt publishing a group's pending (committed-but-undelivered) commit(s) without minting a new event.
 
-[Source](src/commands/message.rs#L90)
+[Source](src/commands/message.rs#L107)
 
 ### `Marmot::react_to_message`
 
@@ -2839,7 +2851,7 @@ pub async fn react_to_message( &self, account_ref: String, group_id_hex: String,
 
 React to `target_message_id` with `emoji` (an "add" reaction).
 
-[Source](src/commands/message.rs#L104)
+[Source](src/commands/message.rs#L121)
 
 ### `Marmot::react_with_media`
 
@@ -2863,7 +2875,7 @@ pub async fn unreact_from_message( &self, account_ref: String, group_id_hex: Str
 
 Remove all of this account's active reactions from `target_message_id`.
 
-[Source](src/commands/message.rs#L120)
+[Source](src/commands/message.rs#L137)
 
 ### `Marmot::reply_to_message`
 
@@ -2875,7 +2887,7 @@ pub async fn reply_to_message( &self, account_ref: String, group_id_hex: String,
 
 Send `text` as a reply that quotes `target_message_id`.
 
-[Source](src/commands/message.rs#L135)
+[Source](src/commands/message.rs#L152)
 
 ### `Marmot::delete_message`
 
@@ -2887,7 +2899,7 @@ pub async fn delete_message( &self, account_ref: String, group_id_hex: String, t
 
 Mark `target_message_id` deleted for the whole group. This is a tombstone — the original stays in everyone's store; clients render a "message deleted" placeholder.
 
-[Source](src/commands/message.rs#L153)
+[Source](src/commands/message.rs#L170)
 
 ### `Marmot::discard_failed_send`
 
@@ -2899,7 +2911,7 @@ pub async fn discard_failed_send( &self, account_ref: String, group_id_hex: Stri
 
 Remove a failed own send from this device without publishing anything. Offer it, instead of `delete_message`, on a row whose `invalidation_status` is `local_publish_failed`: a delete would tell the group about a message nobody received. `Discarded` securely deletes the row, its edits and its media references, and timeline subscribers receive the row's removal with reason `Cleared`; purge `media_ciphertext_sha256` from any decrypted-media cache. `erasure_pending` means secure WAL truncation is still owed; the next secure delete in the group retries it. `StillSending` means the group has a send the engine may still publish, which could be this one, so nothing changed: keep the row and offer the action again later. `NotFailedSend` means the row was delivered, is still pending, was confirmed by a peer's reaction, or is already gone.
 
-[Source](src/commands/message.rs#L174)
+[Source](src/commands/message.rs#L191)
 
 ### `Marmot::secure_delete_expired`
 
@@ -2911,7 +2923,7 @@ pub async fn secure_delete_expired( &self, account_ref: String, group_id_hex: St
 
 Securely scrub and prune expired disappearing-message plaintext for a group according to its active retention component. The media hash list identifies pruned encrypted-media blobs so host apps can purge their own decrypted-media disk caches keyed by ciphertext hash.
 
-[Source](src/commands/message.rs#L192)
+[Source](src/commands/message.rs#L209)
 
 ### `Marmot::sweep_expired_retention`
 
@@ -2923,7 +2935,7 @@ pub async fn sweep_expired_retention( &self, account_ref: String, now_ms: u64, )
 
 Run the engine-owned disappearing-message sweep for one account using the supplied Unix wall-clock time in milliseconds. Each group reports pruning, a fail-closed deferral, or a privacy-safe failure category.
 
-[Source](src/commands/message.rs#L208)
+[Source](src/commands/message.rs#L225)
 
 ### `Marmot::edit_message`
 
@@ -2935,7 +2947,7 @@ pub async fn edit_message( &self, account_ref: String, group_id_hex: String, tar
 
 Edit `target_message_id` by publishing a kind-1009 event that references it and carries the replacement plaintext in `content`. Recipients honour the edit only when its authenticated author matches the target's author; MDK ignores mismatched edits. It returns `InvalidEditTarget`, publishing nothing, unless the target is an available chat message this account sent. Competing edits resolve by `created_at`, then the larger event id.
 
-[Source](src/commands/message.rs#L232)
+[Source](src/commands/message.rs#L249)
 
 ### `Marmot::send_custom_event`
 
@@ -2947,7 +2959,19 @@ pub async fn send_custom_event( &self, account_ref: String, group_id_hex: String
 
 Send an app-defined event with an arbitrary non-reserved kind. `tags` and `content` pass through verbatim; kinds MDK owns (chat, reaction, edit, delete, agent, group system, push token, device group: 457, 458, 459, 460, 461, 473, 475, 476) are rejected so an app cannot forge protocol events. Custom events appear in the timeline as standalone rows and can be fetched via `Marmot::messages` with a `kinds` filter.
 
-[Source](src/commands/message.rs#L253)
+[Source](src/commands/message.rs#L270)
+
+### `Marmot::create_tagged_poll`
+
+**Current.**
+
+```rust
+pub async fn create_tagged_poll( &self, account_ref: String, group_id_hex: String, question: String, options: Vec<String>, poll_type: PollTypeFfi, ends_at: Option<u64>, message_tags: Vec<Vec<String>>, ) -> Result<SendSummaryFfi, MarmotKitError>
+```
+
+Create the same encrypted NIP-88 poll as `create_poll`, adding reply `e`, NIP-22 `E`/`K`/`P`, or effect context on the same event. Rejects `imeta`, `option`, `polltype`, `endsAt`, and `response` context rows. Generated poll tags plus context must total at most 32; context also follows the tagged-text bounds of 64 tags and 16 KiB of values. Poll replies project the same reply target and preview as chat messages. See [Polls](POLLS.md) for question, option, deadline and vote semantics. The original `create_poll` remains available without context.
+
+[Source](src/commands/message.rs#L316)
 
 ### `Marmot::create_poll`
 
@@ -2963,7 +2987,7 @@ poll projection. Creation follows MDK's canonical conversation classification: n
 groups, while unnamed two-member conversations are direct. Polls are neither anonymous nor election-grade. See
 [Polls](POLLS.md).
 
-[Source](src/commands/message.rs#L271)
+[Source](src/commands/message.rs#L288)
 
 ### `Marmot::cast_poll_vote`
 
@@ -2978,7 +3002,7 @@ or one through ten unique ids for multiple choice; use the ids from `TimelineMes
 This is a replacement, not a delta or unvote. MDK revalidates the poll against the response event's actual timestamp at
 send time, and an accepted open poll remains votable after conversation reclassification. See [Polls](POLLS.md).
 
-[Source](src/commands/message.rs#L296)
+[Source](src/commands/message.rs#L343)
 
 ### `Marmot::message_reactions`
 
@@ -3019,7 +3043,7 @@ pub fn messages( &self, account_ref: String, group_id_hex: Option<String>, limit
 
 Initial history fetch for a group (or, when `group_id_hex` is None, the account-wide tail). Used to populate the conversation view before the subscription stream takes over.
 
-[Source](src/commands/message.rs#L317)
+[Source](src/commands/message.rs#L364)
 
 </details>
 

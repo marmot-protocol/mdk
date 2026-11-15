@@ -307,6 +307,79 @@ fn polls_fold_latest_response_and_delete_falls_back_deterministically() {
 }
 
 #[test]
+fn poll_reply_survives_rebuild() {
+    let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
+    let group = "11".repeat(32);
+    let parent_id = "21".repeat(32);
+    let poll_id = "22".repeat(32);
+    store
+        .record_app_event(&chat(&parent_id, "alice", 90, "Choose a drink"))
+        .unwrap();
+    let mut event = poll(&poll_id, "creator", 100);
+    event.tags.push(vec!["e".to_owned(), parent_id.clone()]);
+    event.tags.extend([
+        vec!["imeta".into(), "url https://example.com/poll.png".into()],
+        vec![STREAM_TAG.into(), "aa".repeat(32)],
+    ]);
+
+    let update = store.record_app_event(&event).unwrap();
+    assert_eq!(update.messages.len(), 1);
+    let projected = &update.messages[0];
+    assert_eq!(
+        projected.reply_to_message_id_hex.as_deref(),
+        Some(parent_id.as_str())
+    );
+    let preview = projected
+        .reply_preview
+        .as_ref()
+        .expect("poll reply preview");
+    assert_eq!(preview.message_id_hex, parent_id);
+    assert_eq!(preview.sender, "alice");
+    assert_eq!(preview.plaintext, "Choose a drink");
+
+    store
+        .record_app_event(&poll_response(
+            &"33".repeat(32),
+            "bob",
+            &poll_id,
+            150,
+            "1",
+            "received",
+        ))
+        .unwrap();
+    for rebuild in [false, true] {
+        if rebuild {
+            store.rebuild_message_timeline_for_group(&group).unwrap();
+        }
+        let projected = store.timeline_message(&group, &poll_id).unwrap().unwrap();
+        assert_eq!(projected.kind, MARMOT_APP_EVENT_KIND_POLL);
+        assert!(projected.media.is_none());
+        assert!(projected.agent_text_stream.is_none());
+        assert_eq!(
+            projected.reply_to_message_id_hex.as_deref(),
+            Some(parent_id.as_str())
+        );
+        let preview = projected
+            .reply_preview
+            .as_ref()
+            .expect("poll reply preview");
+        assert_eq!(preview.message_id_hex, parent_id);
+        assert_eq!(preview.sender, "alice");
+        assert_eq!(preview.plaintext, "Choose a drink");
+        let poll = projected.poll.as_ref().expect("poll projection");
+        assert_eq!(poll.participants, 1);
+        assert_eq!(
+            poll.options
+                .iter()
+                .map(|option| option.votes)
+                .collect::<Vec<_>>(),
+            [0, 1]
+        );
+        assert_eq!(list(&store).len(), 2);
+    }
+}
+
+#[test]
 fn poll_votes_list_each_effective_selection_and_match_the_tally() {
     let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
     store
