@@ -7455,24 +7455,26 @@ async fn recovery_device_acknowledgment_requires_the_displayed_epoch() {
 
 /// Continue after a long pause rechecks the stale prerequisite and reruns
 /// discovery, but asks again only when that discovery shows something the
-/// user has not acknowledged: another slot, or a less complete result.
+/// user has not acknowledged: another slot, a slot newly carrying a usable
+/// package, or a weaker result. A same-slot refresh is not new.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn device_acknowledgment_survives_a_staleness_recheck_that_finds_nothing_new() {
     let (_dir, runtime, network, keys, id) = fixture().await;
     let manager = runtime.accounts();
     let setup = manager.account_setup();
-    let foreign = |slot: &str| {
-        signed(
-            &keys,
-            30443,
-            vec![vec!["d".into(), slot.into()]],
-            "malformed",
-            unix_now_seconds(),
-        )
+    let account = manager.app.account_home().account(&id).unwrap();
+    // Another installation's packages: real, usable, and not owned here.
+    let (app, account, keys) = (&manager.app, &account, &keys);
+    let usable = |slot: &'static str, at: u64| async move {
+        let package = crate::tests::fresh_key_package_for_account(app, account, false).await;
+        let unsigned =
+            crate::tests::key_package_inventory::key_package_event(account, package, slot, at);
+        signed(keys, 30443, unsigned.tags, &unsigned.content, at)
     };
+    let now = unix_now_seconds();
     *network.events.lock() = vec![
-        signed(&keys, 0, vec![], "{}", unix_now_seconds()),
-        foreign("other-installation"),
+        signed(keys, 0, vec![], "{}", now),
+        usable("other-installation", now).await,
     ];
     let mut c = manager
         .setup_records()
@@ -7489,14 +7491,16 @@ async fn device_acknowledgment_survives_a_staleness_recheck_that_finds_nothing_n
     c.set(OnboardingStep::Follows, OnboardingStatus::Skipped, vec![]);
     // Discovery also reads the account's declared relay.
     c.records[OnboardingStep::Relays.index()] = Some(signed(
-        &keys,
+        keys,
         10002,
         vec![vec!["r".into(), "wss://declared.example".into()]],
         "",
-        unix_now_seconds(),
+        now,
     ));
     setup.check_onboarding_single_device(&mut c).await.unwrap();
     setup.save_onboarding(&mut c).unwrap();
+    let notice = c.snapshot.single_device_notice.as_ref().unwrap();
+    assert!(notice.discovery_complete && notice.other_packages[0].usable);
     // Age only the profile check past CHECK_MAX_AGE, as a backgrounded app
     // would, then press Continue on the displayed notice.
     let continue_after_pause = || async {
@@ -7516,6 +7520,11 @@ async fn device_acknowledgment_survives_a_staleness_recheck_that_finds_nothing_n
         let device = snapshot.steps[OnboardingStep::SingleDevice.index()].clone();
         (device, snapshot.single_device_notice.unwrap())
     };
+    let asked_again = |(device, notice): (OnboardingStepState, OnboardingSingleDeviceNotice)| {
+        assert_eq!(device.status, OnboardingStatus::NeedsInput);
+        assert_eq!(notice.acknowledged_at, None);
+        notice
+    };
 
     // A relay that no longer answers leaves discovery weaker than acknowledged.
     network.inspection_errors.lock().insert(
@@ -7523,28 +7532,45 @@ async fn device_acknowledgment_survives_a_staleness_recheck_that_finds_nothing_n
         transport_nostr::DirectoryInspectionError::TimedOut,
     );
     let (device, notice) = continue_after_pause().await;
-    assert_eq!(device.status, OnboardingStatus::NeedsInput);
-    assert_eq!(notice.acknowledged_at, None);
     assert!(device.findings.iter().any(|finding| {
         finding.issue == OnboardingIssue::TimedOut
             && finding.endpoint.as_deref() == Some("wss://declared.example")
     }));
+    assert!(!asked_again((device, notice)).discovery_complete);
     network.inspection_errors.lock().clear();
 
     // Another slot appeared while the notice was displayed.
-    network.events.lock().push(foreign("newer-installation"));
-    let (device, notice) = continue_after_pause().await;
-    assert_eq!(device.status, OnboardingStatus::NeedsInput);
-    assert_eq!(notice.acknowledged_at, None);
-    assert_eq!(notice.other_packages.len(), 2);
+    network.events.lock().push(signed(
+        keys,
+        30443,
+        vec![vec!["d".into(), "newer-installation".into()]],
+        "malformed",
+        now,
+    ));
+    assert_eq!(
+        asked_again(continue_after_pause().await)
+            .other_packages
+            .len(),
+        2
+    );
 
-    // Nothing changed since the displayed notice: Continue continues.
+    // That slot now carries a usable package.
+    let package = usable("newer-installation", now + 1).await;
+    network.events.lock().push(package);
+    let notice = asked_again(continue_after_pause().await);
+    assert!(notice.discovery_complete);
+    assert!(notice.other_packages.iter().all(|package| package.usable));
+
+    // Nothing new; the first installation refreshing its slot is not new.
+    let package = usable("other-installation", now + 2).await;
+    network.events.lock().push(package);
     let (device, notice) = continue_after_pause().await;
     assert_eq!(device.status, OnboardingStatus::Passed, "{device:?}");
     assert!(notice.acknowledged_at.is_some());
     assert_eq!(notice.other_packages.len(), 2);
     runtime.shutdown_and_close().await.unwrap();
 }
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn repeated_recovery_changes_epoch_even_when_attempt_numbers_repeat() {
     let (dir, runtime, _, keys, id) = fixture().await;
