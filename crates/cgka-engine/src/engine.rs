@@ -13,6 +13,7 @@ use crate::convergence_clock::{ConvergenceClock, ConvergenceTime, SystemConverge
 use crate::feature_registry::FeatureRegistry;
 use crate::identity::Identity;
 pub use crate::own_account_devices::{OwedSiblingWelcome, SiblingWelcomeResendOutcome};
+use crate::queued_intent_refusal::QueuedIntentRetirement;
 use async_trait::async_trait;
 use cgka_traits::OutboundFanout;
 use cgka_traits::app_components::{
@@ -1243,6 +1244,16 @@ impl<S: StorageProvider> Engine<S> {
             .is_some_and(|record| matches!(record.intent, SendIntent::Invite { .. })))
     }
 
+    /// The id of the queued intent the drain prepared `pending` from
+    /// (mdk#2332). The session stores it on the commit's frozen fanout, and
+    /// hydration restores it from there, so the intent is retired with the
+    /// commit's resolution after a restart too.
+    pub fn drained_queued_intent_id(&self, pending: PendingStateRef) -> Option<MessageId> {
+        self.queued_intent_by_pending
+            .get(&pending)
+            .map(|(_, intent_id)| intent_id.clone())
+    }
+
     /// The queued intent the drain prepared `pending` from, while it is
     /// still queued.
     fn queued_intent_for_pending(
@@ -1289,7 +1300,39 @@ impl<S: StorageProvider> Engine<S> {
         self.do_publish_failed_with_fanout(
             pending,
             fanout,
-            retired.as_ref().map(|record| (record, &refusal)),
+            retired
+                .as_ref()
+                .map(|record| (record, QueuedIntentRetirement::Refused(&refusal))),
+        )
+        .await
+    }
+
+    /// Roll back a pending commit that never reached a relay and was given up
+    /// (mdk#2332): `fanout` ends each target nothing was sent to `Abandoned`
+    /// ([`OutboundFanout::abandon_unsent_targets`]), and storage admits that
+    /// edge only with this rollback, from the row it was computed on. The
+    /// queued intent it was drained from is retired with the reason
+    /// `not_delivered`, in the rollback's transaction: preparing it again
+    /// would send to the same relays. A commit not drained from the queue
+    /// rolls back as [`Self::publish_failed_fanout`] does.
+    pub async fn publish_not_delivered(
+        &mut self,
+        pending: PendingStateRef,
+        fanout: &mut OutboundFanout,
+    ) -> Result<(), EngineError> {
+        if let Some(group_id) = fanout.group_id() {
+            self.ensure_group_live(group_id)?;
+        }
+        self.pending_group_id(pending)?;
+        // Read before the rollback's transaction, so a failed read writes
+        // nothing.
+        let retired = self.queued_intent_for_pending(pending)?;
+        self.do_publish_failed_with_fanout(
+            pending,
+            Some(fanout),
+            retired
+                .as_ref()
+                .map(|record| (record, QueuedIntentRetirement::NotDelivered)),
         )
         .await
     }
@@ -2500,6 +2543,7 @@ impl<S: StorageProvider> Engine<S> {
                 fanout
                     .pending_kind()
                     .unwrap_or(cgka_traits::FanoutPendingKind::GroupEvolution),
+                fanout.queued_intent_id().cloned(),
             ))
         } else {
             None
@@ -2613,11 +2657,11 @@ impl<S: StorageProvider> Engine<S> {
         // convergence work. Otherwise queued user sends and stored branch
         // inputs remain asleep after a process restart until unrelated traffic
         // happens to touch the group.
-        let has_queued_intents = !self
+        let queued_intents = self
             .storage
             .list_queued_outbound_intents(group_id)
-            .map_err(|_| GroupHydrationQuarantineReason::GroupRecordLoadFailed)?
-            .is_empty();
+            .map_err(|_| GroupHydrationQuarantineReason::GroupRecordLoadFailed)?;
+        let has_queued_intents = !queued_intents.is_empty();
         let has_convergence_inputs = self
             .has_unresolved_convergence_inputs_in_records(group_id, &group, &stored_message_records)
             .map_err(|_| GroupHydrationQuarantineReason::GroupRecordLoadFailed)?;
@@ -2671,7 +2715,8 @@ impl<S: StorageProvider> Engine<S> {
             self.epoch_manager
                 .restore_unrecoverable(group_id.clone(), group.epoch);
             ("unrecoverable", "hydrate_unrecoverable_group")
-        } else if let Some((pending_ref, prior_epoch, message_id, pending_kind)) = pending_recovery
+        } else if let Some((pending_ref, prior_epoch, message_id, pending_kind, queued_intent_id)) =
+            pending_recovery
         {
             let pending_kind = match pending_kind {
                 cgka_traits::FanoutPendingKind::GroupEvolution => {
@@ -2696,6 +2741,15 @@ impl<S: StorageProvider> Engine<S> {
                 .map_err(|_| GroupHydrationQuarantineReason::PendingCommitRecoveryFailed)?;
             if let Some(message_id) = message_id {
                 self.track_pending_origin_commit(pending_ref, message_id);
+            }
+            // The intent the commit was drained from, while it is still
+            // queued in this group (mdk#2332). A queued row the fanout does
+            // not name stays for the drain.
+            if let Some(intent_id) = queued_intent_id
+                && queued_intents.iter().any(|record| record.id == intent_id)
+            {
+                self.queued_intent_by_pending
+                    .insert(pending_ref, (group_id.clone(), intent_id));
             }
             ("pending_publish", promotion_reason)
         } else if restored_durable_evolution {
@@ -3350,6 +3404,8 @@ impl<S: StorageProvider> Engine<S> {
             .retain(|pending, _| !restored_pending.contains(pending));
         self.auto_publish_buf
             .retain(|work| !restored_pending.contains(&work.pending));
+        self.queued_intent_by_pending
+            .retain(|pending, _| !restored_pending.contains(pending));
         // Same durable revert as `restore_durable_group_evolution_on_hydrate`'s
         // own `begin_pending` failure path.
         if !restored_pending.is_empty()

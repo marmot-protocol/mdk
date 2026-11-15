@@ -4,7 +4,7 @@ mod storage_fixture;
 use storage_fixture::relaxed_storage_dir;
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -429,10 +429,16 @@ struct RecordingAdapterInner {
     /// Exact failures each endpoint answers its next publishes with, in order.
     scripted_failures:
         Mutex<std::collections::HashMap<TransportEndpoint, VecDeque<TransportEndpointFailure>>>,
+    /// Like `scripted_failures`, answered only by the commit entry point.
+    scripted_commit_failures:
+        Mutex<std::collections::HashMap<TransportEndpoint, VecDeque<TransportEndpointFailure>>>,
     /// Each read-back's event id and endpoints, in order (mdk#2332).
     read_backs: Mutex<Vec<(MessageId, Vec<TransportEndpoint>)>>,
     /// What each endpoint answers every read-back; any other answers nothing.
     read_back_answers: Mutex<std::collections::HashMap<TransportEndpoint, TransportReadBack>>,
+    /// Whether a read-back, once recorded, never answers, as if the process
+    /// stopped while it was in flight.
+    stall_read_backs: AtomicBool,
     slow_commit_size_check: Mutex<Option<(Arc<TestWallClock>, u64)>>,
 }
 
@@ -582,6 +588,11 @@ impl RecordingAdapter {
         self.inner.read_backs.lock().unwrap().clone()
     }
 
+    /// Make every later read-back, once recorded, never answer.
+    fn stall_read_backs(&self, stall: bool) {
+        self.inner.stall_read_backs.store(stall, Ordering::SeqCst);
+    }
+
     /// Make the next commit size check take `secs` on `wall`.
     fn slow_next_commit_size_check(&self, wall: Arc<TestWallClock>, secs: u64) {
         *self.inner.slow_commit_size_check.lock().unwrap() = Some((wall, secs));
@@ -595,6 +606,22 @@ impl RecordingAdapter {
     ) {
         self.inner
             .scripted_failures
+            .lock()
+            .unwrap()
+            .entry(endpoint)
+            .or_default()
+            .extend(failures);
+    }
+
+    /// Like [`Self::script_failures`], for commits only: other events
+    /// published to `endpoint` are answered as before.
+    fn script_commit_failures(
+        &self,
+        endpoint: TransportEndpoint,
+        failures: Vec<TransportEndpointFailure>,
+    ) {
+        self.inner
+            .scripted_commit_failures
             .lock()
             .unwrap()
             .entry(endpoint)
@@ -833,6 +860,9 @@ impl TransportAdapter for RecordingAdapter {
             .lock()
             .unwrap()
             .push((message.id.clone(), endpoints.to_vec()));
+        if self.inner.stall_read_backs.load(Ordering::SeqCst) {
+            std::future::pending::<()>().await;
+        }
         let answers = self.inner.read_back_answers.lock().unwrap();
         endpoints
             .iter()
@@ -904,6 +934,26 @@ impl TransportAdapter for RecordingAdapter {
             return Err(TransportAdapterError::PublishEndpoints(
                 TransportPublishFailure::with_endpoint_failures("refused unsent", refused)
                     .with_message_id(request.message.id),
+            ));
+        }
+        let scripted = match request.target.endpoints() {
+            [endpoint] => self
+                .inner
+                .scripted_commit_failures
+                .lock()
+                .unwrap()
+                .get_mut(endpoint)
+                .and_then(VecDeque::pop_front),
+            _ => None,
+        };
+        if let Some(failure) = scripted {
+            self.inner.publishes.lock().unwrap().push(request.clone());
+            return Err(TransportAdapterError::PublishEndpoints(
+                TransportPublishFailure::with_endpoint_failures(
+                    "scripted commit failure",
+                    vec![failure],
+                )
+                .with_message_id(request.message.id),
             ));
         }
         self.publish(request).await
@@ -1006,6 +1056,7 @@ include!("runtime/commit_floor.rs");
 include!("runtime/commit_refusal.rs");
 include!("runtime/own_echo.rs");
 include!("runtime/read_back.rs");
+include!("runtime/abandon.rs");
 include!("runtime/hydrated_welcome.rs");
 include!("support/recovery_challenge.rs");
 include!("runtime/key_package_generation_upgrade.rs");

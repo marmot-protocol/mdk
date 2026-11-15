@@ -2072,9 +2072,21 @@ async fn pending_fanout_is_not_exposed_until_hydration_fully_succeeds() {
     reopened
         .put_outbound_fanout(&recovered_fanout)
         .expect("persist recovered attempt");
+    // A definitive refusal of the recovered attempt: a commit a relay may hold
+    // never rolls back (mdk#1577).
     recovered_fanout
-        .mark_target_failed(0)
-        .expect("fail recovered attempt");
+        .record_target_failure(
+            0,
+            cgka_traits::TransportEndpointFailure {
+                endpoint: TransportEndpoint("wss://hydrate.example".into()),
+                reason: "invalid: refused".into(),
+                kind: cgka_traits::TransportEndpointFailureKind::TerminalRejected,
+                rejection_category: None,
+                size_class: None,
+                pre_send: false,
+            },
+        )
+        .expect("refuse recovered attempt");
     reopened
         .put_outbound_fanout(&recovered_fanout)
         .expect("persist recovered failure");
@@ -2244,6 +2256,90 @@ async fn a_failed_retry_republishes_a_restored_evolution_exactly_once() {
         .await
         .expect("confirm the republished evolution");
     assert_eq!(reopened.epoch(&group_id).unwrap(), EpochId(1));
+}
+
+/// A hydration that restored a pending commit's queued-intent link and then
+/// failed drops the link with the rest of what it restored (mdk#2332). Kept,
+/// it would mark the intent in flight under a pending ref nothing resolves any
+/// more, and the drain would pass the intent over.
+#[tokio::test]
+async fn a_discarded_hydration_drops_the_queued_intent_link_it_restored() {
+    let storage =
+        FlakyGroupRecordStorage::new(SqliteAccountStorage::in_memory_for_test().expect("storage"));
+    let mut initial = build_flaky_engine(storage.clone());
+    let group_id = create_confirmed_group_flaky(&mut initial).await;
+    let (message, pending) = match initial
+        .send(SendIntent::UpdateGroupData {
+            group_id: group_id.clone(),
+            name: Some("linked".into()),
+            description: None,
+        })
+        .await
+        .expect("stage update")
+    {
+        SendResult::GroupEvolution { msg, pending, .. } => (msg, pending),
+        other => panic!("expected group evolution, got {other:?}"),
+    };
+    let TransportEnvelope::GroupMessage { transport_group_id } = &message.envelope else {
+        panic!("expected group message, got {:?}", message.envelope)
+    };
+    let intent_id = MessageId::new(b"discarded-hydration-link".to_vec());
+    storage
+        .inner
+        .put_queued_outbound_intent(&QueuedOutboundIntent {
+            id: intent_id.clone(),
+            group_id: group_id.clone(),
+            intent: SendIntent::UpdateGroupData {
+                group_id: group_id.clone(),
+                name: Some("linked".into()),
+                description: None,
+            },
+            created_at_ms: 0,
+            reissue_attempts: 0,
+        })
+        .expect("queue the intent");
+    let mut fanout = OutboundFanout::stage(
+        TransportPublishRequest {
+            account_id: initial.self_id(),
+            message: message.clone(),
+            target: TransportPublishTarget::Group {
+                group_id: group_id.clone(),
+                transport_group_id: transport_group_id.clone(),
+                endpoints: vec![TransportEndpoint("wss://hydrate.example".into())],
+            },
+            required_acks: 1,
+        },
+        Some(pending),
+        Some(group_id.clone()),
+        0,
+    )
+    .expect("stage frozen fanout");
+    fanout
+        .set_queued_intent(intent_id.clone())
+        .expect("name the intent");
+    initial
+        .put_outbound_fanout(&fanout)
+        .expect("persist frozen fanout");
+    drop(initial);
+
+    // Hydration restores the pending commit and its link, then fails on the
+    // last read.
+    storage.set_fail_disband_request(true);
+    let mut reopened = build_flaky_engine(storage.clone());
+    reopened
+        .hydrate_all_stored_groups()
+        .expect("a late per-group failure is quarantined");
+    assert_eq!(reopened.quarantined_groups().len(), 1);
+    assert_eq!(reopened.drained_queued_intent_id(pending), None);
+
+    storage.set_fail_disband_request(false);
+    assert!(
+        reopened
+            .retry_hydrate_quarantined_group(&group_id)
+            .expect("retry"),
+        "a healthy retry recovers the group"
+    );
+    assert_eq!(reopened.drained_queued_intent_id(pending), Some(intent_id));
 }
 
 #[tokio::test]

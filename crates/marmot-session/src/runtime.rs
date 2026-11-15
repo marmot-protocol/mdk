@@ -130,8 +130,14 @@ const FROZEN_FANOUT_AMBIGUOUS_RETRY_MAX_MS: u64 = 60 * 60 * 1_000;
 const FROZEN_FANOUT_UNAVAILABLE_RETRY_DELAY_MS: u64 = 5 * 1_000;
 /// How long after a pending commit's first send attempt it is only resent
 /// (mdk#2332). From then on, each retry of a relay that may hold it reads the
-/// commit back from that relay first; one that returns it acknowledges it.
+/// commit back from that relay first; one that returns it acknowledges it. A
+/// commit that reached no relay is given up from then on, once the device is
+/// online (see `AccountDeviceRuntime::abandon_unsent_pending_commit`).
 const PENDING_COMMIT_READ_BACK_AFTER_MS: u64 = 10 * 60 * 1_000;
+/// How often a pending commit past the bound that reached no relay is read
+/// back from its relays to learn whether the device can reach any of them
+/// (mdk#2332).
+const PENDING_COMMIT_REACHABILITY_READ_INTERVAL_MS: u64 = 60 * 60 * 1_000;
 
 /// Local scheduling windows for own-leaf maintenance rotations.
 ///
@@ -5903,6 +5909,16 @@ where
                     return Err(error.into());
                 }
             };
+            // A drained commit names its queued intent in the same record, so
+            // a restart still retires the intent with the commit (mdk#2332).
+            if let Some(intent_id) =
+                pending.and_then(|pending| self.session.drained_queued_intent_id(pending))
+                && let Err(error) = fanout.set_queued_intent(intent_id)
+            {
+                self.rollback_unstaged_pending(pending, output, queue)
+                    .await?;
+                return Err(error.into());
+            }
             if let Some(application_message) = application_message
                 && let Err(error) = fanout.set_application_message(application_message)
             {
@@ -6239,6 +6255,8 @@ where
             self.resolve_outbound_fanout_mls(&mut fanout, output, queue, context.clone())
                 .await?;
         }
+        boxed(|| self.abandon_unsent_pending_commit(&mut fanout, output, queue, context.clone()))
+            .await?;
 
         let report = frozen_fanout_report(&fanout);
         let fanout_outcome = fanout.outcome();
@@ -6409,6 +6427,127 @@ where
         self.session
             .put_observed_outbound_fanout(fanout, self.wall_clock.now_ms())?;
         Ok(fanout.outcome().accepted_targets >= fanout.request().required_acks.max(1))
+    }
+
+    /// Give up a pending commit that reached no relay (mdk#2332). Past the
+    /// bound, when no target accepted the commit, none may hold it
+    /// ([`OutboundFanout::possible_exposure`]) and some are still owed, every
+    /// relay refused it, was sent nothing, or was never reached. If one of
+    /// them has answered since the bound, the device is online and the relays
+    /// it never reached are down: those targets end `Abandoned` and the commit
+    /// rolls back, retiring a queued intent as `not_delivered`. An answer is a
+    /// definitive refusal of an attempt started since the bound, or, read at
+    /// most hourly, any answer to a read of the commit from its relays. A read
+    /// only shows that the device is online; whether the commit may roll back
+    /// is the exposure record's alone (mdk#1577). A read that returns the
+    /// commit confirms it. Offline, nothing changes and the commit waits.
+    async fn abandon_unsent_pending_commit(
+        &mut self,
+        fanout: &mut OutboundFanout,
+        output: &mut AccountDeviceEffects,
+        queue: &mut VecDeque<PublishWork>,
+        context: Option<AuditEventContext>,
+    ) -> AccountResult<()> {
+        let now_ms = self.wall_clock.now_ms();
+        let outcome = fanout.outcome();
+        let Some(bound_at) = fanout
+            .first_attempt_at_ms()
+            .map(|first| first.saturating_add(PENDING_COMMIT_READ_BACK_AFTER_MS))
+        else {
+            return Ok(());
+        };
+        if !is_group_commit(fanout)
+            || !matches!(fanout.mls_state(), FanoutMlsState::Pending(_))
+            || now_ms < bound_at
+            || outcome.accepted_targets != 0
+            || outcome.outstanding_targets == 0
+            || fanout.possible_exposure()
+        {
+            return Ok(());
+        }
+        let targets = fanout.request().target.endpoints().len();
+        let refused_since_bound = (0..targets).any(|index| {
+            fanout.target_status(index) == Some(cgka_traits::FanoutTargetStatus::Failed)
+                && fanout.target_failure(index).is_some_and(|failure| {
+                    failure.kind == TransportEndpointFailureKind::TerminalRejected
+                })
+                && fanout
+                    .target_last_attempt_at_ms(index)
+                    .is_some_and(|attempted| attempted >= bound_at)
+        });
+        let online = if refused_since_bound {
+            true
+        } else if fanout.reachability_read_at_ms().is_some_and(|read| {
+            now_ms.saturating_sub(read) < PENDING_COMMIT_REACHABILITY_READ_INTERVAL_MS
+        }) {
+            return Ok(());
+        } else {
+            // Record the read before it is sent, so a restart while it is in
+            // flight does not read again within the hour.
+            fanout.record_reachability_read(now_ms);
+            self.session.put_outbound_fanout(fanout)?;
+            let answers = self
+                .adapter
+                .read_back(
+                    &fanout.request().account_id,
+                    &fanout.request().message,
+                    fanout.request().target.endpoints(),
+                )
+                .await;
+            let mut found = 0_usize;
+            let mut answered = 0_usize;
+            for (index, answer) in answers.into_iter().enumerate().take(targets) {
+                match answer {
+                    TransportReadBack::Found => {
+                        answered += 1;
+                        found += usize::from(
+                            fanout.acknowledge_target(index, FanoutAcknowledgement::ReadBack)?,
+                        );
+                    }
+                    TransportReadBack::NotFound => answered += 1,
+                    TransportReadBack::NoAnswer => {}
+                }
+            }
+            tracing::debug!(
+                target: TRACE_TARGET,
+                method = "abandon_unsent_pending_commit",
+                read = targets,
+                answered,
+                found,
+                "read an unsent pending commit back to learn whether the device is online"
+            );
+            if found > 0 {
+                // The acceptance is observed when the read answered.
+                self.session
+                    .put_observed_outbound_fanout(fanout, self.wall_clock.now_ms())?;
+                return self
+                    .resolve_outbound_fanout_mls(fanout, output, queue, context)
+                    .await;
+            }
+            answered > 0
+        };
+        if !online {
+            return Ok(());
+        }
+        let Some(pending) = fanout.pending_ref() else {
+            return Ok(());
+        };
+        let mut abandoned = fanout.clone();
+        let count = abandoned.abandon_unsent_targets()?;
+        let effects = give_up_unsent_commit(&mut self.session, pending, &mut abandoned).await?;
+        *fanout = abandoned;
+        tracing::info!(
+            target: TRACE_TARGET,
+            method = "abandon_unsent_pending_commit",
+            abandoned = count,
+            targets,
+            "gave up a pending commit that reached no relay"
+        );
+        output
+            .pending
+            .push(PendingResolution::RolledBack { pending });
+        output.absorb_session_effects(effects, queue);
+        Ok(())
     }
 
     async fn resolve_outbound_fanout_mls(
@@ -7254,7 +7393,12 @@ fn frozen_fanout_target_retry_delay_ms(
                     Some(last.saturating_add(delay_ms).saturating_sub(now_ms))
                 })
         }
-        Some(FanoutTargetStatus::Accepted | FanoutTargetStatus::Failed) | None => None,
+        Some(
+            FanoutTargetStatus::Accepted
+            | FanoutTargetStatus::Failed
+            | FanoutTargetStatus::Abandoned,
+        )
+        | None => None,
     }
 }
 
@@ -7324,7 +7468,8 @@ fn frozen_fanout_report(fanout: &OutboundFanout) -> TransportPublishReport {
                     ack_kind: None,
                 });
             }
-            cgka_traits::FanoutTargetStatus::Failed => {
+            cgka_traits::FanoutTargetStatus::Failed
+            | cgka_traits::FanoutTargetStatus::Abandoned => {
                 failed.push(fanout.target_failure(index).cloned().unwrap_or_else(|| {
                     TransportEndpointFailure {
                         pre_send: false,
@@ -8030,6 +8175,19 @@ fn roll_back_failed_fanout<'a>(
             None => session.publish_failed_fanout(pending, fanout).await,
         }
     })
+}
+
+/// Roll back `pending`, a commit that reached no relay and was given up,
+/// boxed as [`refuse_too_large`] is (mdk#2332): `fanout` carries its unsent
+/// targets' `Abandoned` edge, and a queued intent it was drained from is
+/// retired as `not_delivered`.
+#[inline(never)]
+fn give_up_unsent_commit<'a>(
+    session: &'a mut AccountDeviceSession,
+    pending: PendingStateRef,
+    fanout: &'a mut OutboundFanout,
+) -> Pin<Box<impl Future<Output = SessionResult<SessionEffects>> + 'a>> {
+    Box::pin(session.publish_not_delivered(pending, fanout))
 }
 
 /// Privacy-safe explanation of an observed all-target size refusal, without
