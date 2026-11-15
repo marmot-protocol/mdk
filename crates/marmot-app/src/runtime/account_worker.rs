@@ -5,9 +5,13 @@ mod attachments;
 mod read_queue;
 pub(crate) mod recovery_credits;
 
+use read_queue::run_as_account_worker;
 pub(crate) use read_queue::{
-    ReadClass, ReadReply, WorkerLane, WorkerReply, WorkerUnit, WorkerUnitGauge,
+    QueuedCommand, ReadClass, ReadReply, UnitKind, WorkerCommands, WorkerLane, WorkerReply,
+    WorkerUnit, WorkerUnitGauge, observe_on_account_worker,
 };
+#[cfg(test)]
+pub(crate) use read_queue::{TestWorkerReceiver, test_worker_channel, test_worker_queue};
 
 use crate::RuntimePerformanceOperation as RuntimeOp;
 use marmot_observability::{Observation, Outcome as TelemetryOutcome};
@@ -63,7 +67,7 @@ use marmot_observability::{AppPerformanceOperation, SyncFailureClassification, S
 pub(crate) struct ManagedAccountWorker {
     pub(super) ready: bool,
     pub(crate) handle: JoinHandle<()>,
-    pub(crate) commands: mpsc::Sender<AccountWorkerCommand>,
+    pub(crate) commands: WorkerCommands,
     pub(crate) media_admission: Arc<Semaphore>,
     pub(crate) shutdown: oneshot::Sender<()>,
     /// Which long unit the worker is inside, for host-read telemetry.
@@ -975,7 +979,7 @@ impl AccountWorkerCommand {
 enum DeferredStartupCommand {
     /// A non-read command to run against the live session after catch-up. Boxed
     /// because `AccountWorkerCommand` is far larger than the `CatchUp` variant.
-    Command(Box<AccountWorkerCommand>),
+    Command(Box<QueuedCommand>),
     /// A `CatchUp` coalesced onto the initial catch-up, fulfilled with its
     /// result at this position in the sequence.
     CatchUp(oneshot::Sender<Result<(), AccountCatchUpFailure>>),
@@ -988,15 +992,17 @@ enum DeferredStartupCommand {
 /// the latest published version shows hydrated is acknowledged from it at
 /// once, and otherwise joins that FIFO.
 fn handle_startup_sync_command(
-    command: AccountWorkerCommand,
+    queued: QueuedCommand,
     published: Option<&watch::Receiver<Arc<crate::client::read_state::ReadState>>>,
     deferred: &mut Vec<DeferredStartupCommand>,
     setup_key_package_result: &mut Option<Result<usize, AppError>>,
 ) {
-    let Some(command) = acknowledge_from_published(command, published) else {
+    let Some(queued) =
+        queued.serve_or_keep(|command| acknowledge_from_published(command, published))
+    else {
         return;
     };
-    match command {
+    let Some(queued) = queued.serve_or_keep(|command| match command {
         AccountWorkerCommand::CaptureConversation {
             respond, queued, ..
         } => {
@@ -1004,35 +1010,42 @@ fn handle_startup_sync_command(
                 queued.finish(TelemetryOutcome::NotReady);
             }
             let _ = respond.send_not_ready(Err(ConversationWindowError::NotReady));
+            None
         }
         AccountWorkerCommand::ConfirmGroupRejoin { respond, .. } => {
             let _ = answer_off_quiescent(respond, Err(AppError::AccountWorkerBusy));
+            None
         }
         AccountWorkerCommand::DeclineGroupRejoin { respond, .. } => {
             let _ = answer_off_quiescent(respond, Err(AppError::AccountWorkerBusy));
+            None
         }
         AccountWorkerCommand::AcceptGroupInvite { respond, .. } => {
             // Invite acceptance needs the live client, which the initial
             // sync holds until it ends.
             let _ = answer_off_quiescent(respond, Err(AppError::AccountWorkerBusy));
+            None
         }
         AccountWorkerCommand::CatchUp { respond } => {
             // Join the initial catch-up at this FIFO position; do not start a
             // second acquisition while the startup grant is still owned.
             deferred.push(DeferredStartupCommand::CatchUp(respond));
+            None
         }
         AccountWorkerCommand::PublishSetupKeyPackage { respond } => {
             match setup_key_package_result.take() {
                 Some(result) => {
                     let _ = answer_off_quiescent(respond, result);
+                    None
                 }
-                None => deferred.push(DeferredStartupCommand::Command(Box::new(
-                    AccountWorkerCommand::PublishSetupKeyPackage { respond },
-                ))),
+                None => Some(AccountWorkerCommand::PublishSetupKeyPackage { respond }),
             }
         }
-        other => deferred.push(DeferredStartupCommand::Command(Box::new(other))),
-    }
+        other => Some(other),
+    }) else {
+        return;
+    };
+    deferred.push(DeferredStartupCommand::Command(Box::new(queued)));
 }
 
 /// Relay-only startup Welcome work. Dropping the worker aborts the task so no
@@ -1079,19 +1092,23 @@ fn install_storage_telemetry(
 
 pub(crate) fn spawn_app_runtime_account_worker(
     runtime: AccountWorkerRuntime,
-    command_tx: mpsc::Sender<AccountWorkerCommand>,
-    commands: mpsc::Receiver<AccountWorkerCommand>,
+    command_tx: WorkerCommands,
+    commands: mpsc::Receiver<QueuedCommand>,
     ready: oneshot::Sender<Result<(), AppError>>,
     startup_progress: AccountStartupProgress,
     shutdown: oneshot::Receiver<()>,
 ) -> JoinHandle<()> {
-    tokio::spawn(run_app_runtime_account_worker(
-        runtime,
-        command_tx,
-        commands,
-        ready,
-        startup_progress,
-        shutdown,
+    let telemetry = runtime.shared.observer.performance().clone();
+    tokio::spawn(run_as_account_worker(
+        telemetry,
+        run_app_runtime_account_worker(
+            runtime,
+            command_tx,
+            commands,
+            ready,
+            startup_progress,
+            shutdown,
+        ),
     ))
 }
 
@@ -1112,8 +1129,8 @@ fn stop_recovery_runner<'a>(
 
 async fn run_app_runtime_account_worker(
     runtime: AccountWorkerRuntime,
-    command_tx: mpsc::Sender<AccountWorkerCommand>,
-    mut commands: mpsc::Receiver<AccountWorkerCommand>,
+    command_tx: WorkerCommands,
+    mut commands: mpsc::Receiver<QueuedCommand>,
     ready: oneshot::Sender<Result<(), AppError>>,
     startup_progress: AccountStartupProgress,
     mut shutdown: oneshot::Receiver<()>,
@@ -1603,21 +1620,23 @@ async fn run_app_runtime_account_worker(
         .into_iter()
         .map(|deferred_command| match deferred_command {
             DeferredStartupCommand::CatchUp(respond) => {
-                AccountWorkerCommand::StartupCatchUpResult {
+                QueuedCommand::unobserved(AccountWorkerCommand::StartupCatchUpResult {
                     result: catch_up_result.clone(),
                     respond,
-                }
+                })
             }
             DeferredStartupCommand::Command(command) => *command,
         })
         .collect::<VecDeque<_>>();
     // Skip only media waiting for capacity; retain FIFO order among the rest.
     while let Some(index) = ready_command_index(&pending, &media_http) {
-        let command = pending
+        let (command, wait) = pending
             .remove(index)
-            .expect("selected pending command exists");
+            .expect("selected pending command exists")
+            .into_parts();
         match command {
             AccountWorkerCommand::CatchUp { respond } => {
+                wait.take_up();
                 handle_account_worker_catch_up(
                     &mut client,
                     respond,
@@ -1639,6 +1658,7 @@ async fn run_app_runtime_account_worker(
                 // The durable setup lane may publish before background setup
                 // sends its worker command. Return that exact result even if
                 // the initial catch-up has already finished.
+                wait.take_up();
                 let _ = reply(
                     respond,
                     setup_key_package_result
@@ -1650,7 +1670,7 @@ async fn run_app_runtime_account_worker(
             command => {
                 handle_account_worker_command(
                     &mut client,
-                    command,
+                    QueuedCommand::from_parts(command, wait),
                     AccountWorkerCommandContext {
                         commands: &mut commands,
                         pending: &mut pending,
@@ -1757,7 +1777,7 @@ async fn run_app_runtime_account_worker(
         let native_progress = match if !admission_retry.ready() {
             Ok(false)
         } else {
-            admission_retry.admit_native_turn(&mut client).await
+            admission_retry.admit_native_turn(&mut client, &unit).await
         } {
             Ok(progress) => progress,
             Err(error) => {
@@ -1782,6 +1802,7 @@ async fn run_app_runtime_account_worker(
         if !client.has_pending_effect_projections()
             && let Some(turn) = recovery_runner.as_mut().and_then(SpawnedRunner::ready_turn)
         {
+            let _turn_unit = unit.time(UnitKind::RunnerTurn);
             turn.serve(&mut client).await;
             publish_settled_recovery_copies(&mut client, &events, &account_id_hex, &account_label);
         }
@@ -2003,12 +2024,13 @@ async fn run_app_runtime_account_worker(
                 }
             }, if !yield_to_convergence || !scheduled_convergence.has_ready() || scheduled_convergence_held_for_test(&account_id_hex) => {
                 yield_to_convergence = true;
-                match command {
-                    Some(command) => {
+                match command.map(QueuedCommand::into_parts) {
+                    Some((command, wait)) => {
                         #[cfg(test)]
                         tests::secondary_retry_scheduler_tests::record_command(&account_id_hex, &command);
                         let command = match command {
                             AccountWorkerCommand::Drain { respond } => {
+                                wait.take_up();
                                 if let Some(recovery) = &mut welcome_recovery {
                                     recovery.drain_waiters.push(respond);
                                 } else {
@@ -2018,6 +2040,7 @@ async fn run_app_runtime_account_worker(
                             }
                             #[cfg(test)]
                             AccountWorkerCommand::RecoveryRunnerPassForTest { budget, respond } => {
+                                wait.take_up();
                                 match &recovery_runner {
                                     Some(runner) => {
                                         let handle = runner.handle().clone();
@@ -2037,6 +2060,7 @@ async fn run_app_runtime_account_worker(
                             command.may_change_push_registration_work();
                         match command {
                             AccountWorkerCommand::CatchUp { respond } => {
+                                wait.take_up();
                                 handle_account_worker_catch_up(
                                     &mut client,
                                     respond,
@@ -2055,6 +2079,7 @@ async fn run_app_runtime_account_worker(
                             AccountWorkerCommand::PublishSetupKeyPackage { respond }
                                 if setup_key_package_result.is_some() =>
                             {
+                                wait.take_up();
                                 let _ = reply( respond,
                                     setup_key_package_result.take().expect("cached setup result"),&client,
                                 );
@@ -2062,7 +2087,7 @@ async fn run_app_runtime_account_worker(
                             command => {
                                 handle_account_worker_command(
                                     &mut client,
-                                    command,
+                                    QueuedCommand::from_parts(command, wait),
                                     AccountWorkerCommandContext {
                                         commands: &mut commands,
                                         pending: &mut pending,
@@ -2327,6 +2352,12 @@ async fn run_app_runtime_account_worker(
                 // commands remain queued until that durable sequence lands.
                 let delivery_started = matches!(&received, Ok(transport_nostr::AccountDeliveryReceive::Delivery(_)))
                     .then(Instant::now);
+                // A delivery unit covers a received delivery or overflow, not
+                // a failed receive or the reconnect that follows a failure.
+                let delivery_unit = received
+                    .is_ok()
+                    .then(|| unit.time(UnitKind::Delivery))
+                    .flatten();
                 let receive_observation = shared.observer.performance().observe(RuntimeOp::WorkerReceive);
                 let result = match received {
                     Ok(transport_nostr::AccountDeliveryReceive::Delivery(delivery)) => {
@@ -2418,6 +2449,7 @@ async fn run_app_runtime_account_worker(
                         ).await;
                     }
                     Err(err) => {
+                        drop(delivery_unit);
                         publish_app_runtime_account_error(
                             Emit::Quiescent(&client),
                             &events,
@@ -2458,11 +2490,12 @@ async fn run_app_runtime_account_worker(
                                     _ = &mut shutdown => break 'worker,
                                     _ = &mut retry_delay => break,
                                     command = commands.recv() => {
-                                        match command {
-                                            Some(
+                                        match command.map(QueuedCommand::into_parts) {
+                                            Some((
                                                 command @ (AccountWorkerCommand::CatchUp { .. }
                                                 | AccountWorkerCommand::ConnectivityRestored { .. }),
-                                            ) => {
+                                                wait,
+                                            )) => {
                                                 // Host recovery commands are meaningful without
                                                 // an engine session: retain their responses and use
                                                 // them to end only this stale sleep. Coalesce an
@@ -2470,14 +2503,14 @@ async fn run_app_runtime_account_worker(
                                                 // new signals can still interrupt later sleeps, so
                                                 // extra attempts remain bounded by host signal rate
                                                 // while the network stays unavailable.
-                                                pending.push_back(command);
+                                                pending.push_back(QueuedCommand::from_parts(command, wait));
                                                 while let Ok(command) = commands.try_recv() {
-                                                    match command {
-                                                        command @ (AccountWorkerCommand::CatchUp { .. }
-                                                        | AccountWorkerCommand::ConnectivityRestored { .. }) => {
-                                                            pending.push_back(command);
+                                                    match command.into_parts() {
+                                                        (command @ (AccountWorkerCommand::CatchUp { .. }
+                                                        | AccountWorkerCommand::ConnectivityRestored { .. }), wait) => {
+                                                            pending.push_back(QueuedCommand::from_parts(command, wait));
                                                         }
-                                                        AccountWorkerCommand::CaptureConversation { respond, queued, .. } => {
+                                                        (AccountWorkerCommand::CaptureConversation { respond, queued, .. }, _) => {
                                                             if let Some(queued) = queued { queued.finish(TelemetryOutcome::NotReady); }
                                                             let _ = respond.send_not_ready(Err(ConversationWindowError::NotReady));
                                                         }
@@ -2500,7 +2533,7 @@ async fn run_app_runtime_account_worker(
                                                 );
                                                 break;
                                             }
-                                            Some(AccountWorkerCommand::CaptureConversation { respond, queued, .. }) => {
+                                            Some((AccountWorkerCommand::CaptureConversation { respond, queued, .. }, _)) => {
                                                 if let Some(queued) = queued { queued.finish(TelemetryOutcome::NotReady); }
                                                 let _ = respond.send_not_ready(Err(ConversationWindowError::NotReady));
                                             }
@@ -2676,6 +2709,7 @@ async fn run_app_runtime_account_worker(
             // An idle worker waits for the runner's next turn here; the
             // loop's top serves one per pass while other work is ready.
             turn = next_runner_turn(&mut recovery_runner), if !client.has_pending_effect_projections() => {
+                let _turn_unit = unit.time(UnitKind::RunnerTurn);
                 turn.serve(&mut client).await;
                 publish_settled_recovery_copies(&mut client, &events, &account_id_hex, &account_label);
             }
@@ -3079,8 +3113,8 @@ struct AccountWorkerCatchUpContext<'a> {
 async fn handle_account_worker_catch_up(
     client: &mut AppClient,
     respond: oneshot::Sender<Result<(), AccountCatchUpFailure>>,
-    commands: &mut mpsc::Receiver<AccountWorkerCommand>,
-    pending: &mut VecDeque<AccountWorkerCommand>,
+    commands: &mut mpsc::Receiver<QueuedCommand>,
+    pending: &mut VecDeque<QueuedCommand>,
     context: AccountWorkerCatchUpContext<'_>,
 ) {
     let _unit = context.unit.enter(WorkerUnit::CatchUp);
@@ -3128,10 +3162,13 @@ async fn handle_account_worker_catch_up(
             let Some(command) = command else {
                 continue;
             };
-            let Some(command) = acknowledge_from_published(command, published.as_ref()) else {
+            let Some(command) = command
+                .serve_or_keep(|command| acknowledge_from_published(command, published.as_ref()))
+            else {
                 continue;
             };
-            match command {
+            let deferring = !deferred.is_empty();
+            let Some(command) = command.serve_or_keep(|command| match command {
                 AccountWorkerCommand::CaptureConversation {
                     respond, queued, ..
                 } => {
@@ -3139,12 +3176,15 @@ async fn handle_account_worker_catch_up(
                         queued.finish(TelemetryOutcome::NotReady);
                     }
                     let _ = respond.send_not_ready(Err(ConversationWindowError::NotReady));
+                    None
                 }
                 AccountWorkerCommand::ConfirmGroupRejoin { respond, .. } => {
                     let _ = answer_off_quiescent(respond, Err(AppError::AccountWorkerBusy));
+                    None
                 }
                 AccountWorkerCommand::DeclineGroupRejoin { respond, .. } => {
                     let _ = answer_off_quiescent(respond, Err(AppError::AccountWorkerBusy));
+                    None
                 }
                 AccountWorkerCommand::AcceptGroupInvite { respond, .. } => {
                     // The pinned sync exclusively owns the live client. This
@@ -3152,6 +3192,7 @@ async fn handle_account_worker_catch_up(
                     // safely retry after catch-up rather than waiting behind
                     // an arbitrarily slow relay drain.
                     let _ = answer_off_quiescent(respond, Err(AppError::AccountWorkerBusy));
+                    None
                 }
                 AccountWorkerCommand::RetryRuntimeGroupSubscriptions { respond } => {
                     // This is worker-owned maintenance, not caller work. Keep
@@ -3159,17 +3200,22 @@ async fn handle_account_worker_catch_up(
                     // otherwise later catch-up requests could no longer
                     // coalesce onto this one.
                     let _ = answer_off_quiescent(respond, true);
+                    None
                 }
-                AccountWorkerCommand::CatchUp { respond } if deferred.is_empty() => {
+                AccountWorkerCommand::CatchUp { respond } if !deferring => {
                     telemetry.record_runtime(
                         RuntimeOp::CatchUpCoalesced,
                         Duration::ZERO,
                         TelemetryOutcome::Success,
                     );
                     catch_up_responders.push(respond);
+                    None
                 }
-                command => deferred.push_back(command),
-            }
+                command => Some(command),
+            }) else {
+                continue;
+            };
+            deferred.push_back(command);
         }
     };
     let result = match sync_result {
@@ -3410,7 +3456,7 @@ fn run_legacy_message_promotion_batch_with(
 async fn run_startup_hydration_pipeline(
     app: &MarmotApp,
     client: &mut AppClient,
-    commands: &mut mpsc::Receiver<AccountWorkerCommand>,
+    commands: &mut mpsc::Receiver<QueuedCommand>,
     deferred: &mut Vec<DeferredStartupCommand>,
     events: &broadcast::Sender<MarmotAppEvent>,
     account_id_hex: &str,
@@ -3648,7 +3694,7 @@ pub(crate) async fn drain_deferred_hydration(client: &mut AppClient) -> Result<(
 #[allow(clippy::too_many_arguments)]
 async fn handle_startup_hydration_command(
     client: &mut AppClient,
-    command: AccountWorkerCommand,
+    queued: QueuedCommand,
     deferred: &mut Vec<DeferredStartupCommand>,
     events: &broadcast::Sender<MarmotAppEvent>,
     account_id_hex: &str,
@@ -3656,6 +3702,9 @@ async fn handle_startup_hydration_command(
     shared: &RuntimeSharedServices,
     setup_key_package_result: &mut Option<Result<usize, AppError>>,
 ) {
+    // A mutation served here ends its wait as it starts; one deferred keeps
+    // it for the replay. Reads carry no mutation wait.
+    let (command, wait) = queued.into_parts();
     match command {
         AccountWorkerCommand::GroupRecoveryStatus {
             group_id,
@@ -3670,6 +3719,7 @@ async fn handle_startup_hydration_command(
             token,
             respond,
         } => {
+            wait.take_up();
             let result = client.confirm_group_rejoin(&welcome_id, &token).await;
             publish_client_pending_projection_updates(
                 client,
@@ -3684,6 +3734,7 @@ async fn handle_startup_hydration_command(
             welcome_id,
             respond,
         } => {
+            wait.take_up();
             let result = client.decline_group_rejoin(&welcome_id);
             publish_client_pending_projection_updates(
                 client,
@@ -3791,6 +3842,7 @@ async fn handle_startup_hydration_command(
         // done; the forget drops the group's buffered convergence request
         // with the rest of its state.
         AccountWorkerCommand::ForgetGroupLocal { group_id, respond } => {
+            wait.take_up();
             let storage_permit = shared.observer.product().permit();
             let result = client.forget_group_local(&group_id).await;
             if matches!(result, Ok(true)) {
@@ -3833,6 +3885,7 @@ async fn handle_startup_hydration_command(
             // need the remaining MLS groups to finish hydrating. Apply and
             // publish it immediately so a locally visible invite cannot be
             // held behind unrelated startup work.
+            wait.take_up();
             let result = client.accept_group_invite(&group_id);
             if result.is_ok() {
                 publish_app_runtime_group_state_updated(
@@ -3870,14 +3923,20 @@ async fn handle_startup_hydration_command(
         AccountWorkerCommand::PublishSetupKeyPackage { respond } => {
             match setup_key_package_result.take() {
                 Some(result) => {
+                    wait.take_up();
                     let _ = reply(respond, result, client);
                 }
                 None => deferred.push(DeferredStartupCommand::Command(Box::new(
-                    AccountWorkerCommand::PublishSetupKeyPackage { respond },
+                    QueuedCommand::from_parts(
+                        AccountWorkerCommand::PublishSetupKeyPackage { respond },
+                        wait,
+                    ),
                 ))),
             }
         }
-        other => deferred.push(DeferredStartupCommand::Command(Box::new(other))),
+        other => deferred.push(DeferredStartupCommand::Command(Box::new(
+            QueuedCommand::from_parts(other, wait),
+        ))),
     }
 }
 
@@ -4255,14 +4314,14 @@ fn spawn_media_http<T>(
 }
 
 fn ready_command_index(
-    pending: &VecDeque<AccountWorkerCommand>,
+    pending: &VecDeque<QueuedCommand>,
     media_http: &MediaHttpContext,
 ) -> Option<usize> {
     let has_capacity =
         !media_http.permits.is_closed() && media_http.permits.available_permits() != 0;
     pending
         .iter()
-        .position(|command| has_capacity || !command.needs_media_slot())
+        .position(|queued| has_capacity || !queued.command().needs_media_slot())
 }
 
 fn reserve_media_http(media_http: &MediaHttpContext) -> OwnedSemaphorePermit {
@@ -4588,8 +4647,8 @@ fn publish_before_unit(
 async fn defer_commands_until<Fut>(
     published: Option<watch::Receiver<Arc<crate::client::read_state::ReadState>>>,
     work: Fut,
-    commands: &mut mpsc::Receiver<AccountWorkerCommand>,
-    pending: &mut VecDeque<AccountWorkerCommand>,
+    commands: &mut mpsc::Receiver<QueuedCommand>,
+    pending: &mut VecDeque<QueuedCommand>,
     mut send_waiting: Option<oneshot::Sender<()>>,
 ) -> Fut::Output
 where
@@ -4621,7 +4680,7 @@ where
         // Keep mutation FIFO, but let optional relay retries finish early at
         // their safe boundary. Never drop the client-owning work future.
         if matches!(
-            command,
+            command.command(),
             AccountWorkerCommand::SendMessage { .. }
                 | AccountWorkerCommand::SendMessageDraft { .. }
                 | AccountWorkerCommand::SendAppEvent { .. }
@@ -4629,10 +4688,12 @@ where
         {
             let _ = waiting.send(());
         }
-        let Some(command) = acknowledge_from_published(command, published.as_ref()) else {
+        let Some(command) = command
+            .serve_or_keep(|command| acknowledge_from_published(command, published.as_ref()))
+        else {
             continue;
         };
-        match command {
+        let Some(command) = command.serve_or_keep(|command| match command {
             AccountWorkerCommand::CaptureConversation {
                 respond, queued, ..
             } => {
@@ -4640,16 +4701,23 @@ where
                     queued.finish(TelemetryOutcome::NotReady);
                 }
                 let _ = respond.send_not_ready(Err(ConversationWindowError::NotReady));
-            }
-            AccountWorkerCommand::CatchUp { .. } => {
-                catch_up_seen = true;
-                follow_up.push_back(command);
+                None
             }
             AccountWorkerCommand::RetryRuntimeGroupSubscriptions { respond } => {
                 let _ = answer_off_quiescent(respond, true);
+                None
             }
-            command if catch_up_seen => follow_up.push_back(command),
-            command => deferred.push_back(command),
+            command => Some(command),
+        }) else {
+            continue;
+        };
+        if matches!(command.command(), AccountWorkerCommand::CatchUp { .. }) {
+            catch_up_seen = true;
+            follow_up.push_back(command);
+        } else if catch_up_seen {
+            follow_up.push_back(command);
+        } else {
+            deferred.push_back(command);
         }
     };
     pending.append(&mut deferred);
@@ -4711,8 +4779,8 @@ fn acknowledge_hydration(
 }
 
 struct AccountWorkerCommandContext<'a> {
-    commands: &'a mut mpsc::Receiver<AccountWorkerCommand>,
-    pending: &'a mut VecDeque<AccountWorkerCommand>,
+    commands: &'a mut mpsc::Receiver<QueuedCommand>,
+    pending: &'a mut VecDeque<QueuedCommand>,
     app: &'a MarmotApp,
     events: &'a broadcast::Sender<MarmotAppEvent>,
     account_id_hex: &'a str,
@@ -4763,21 +4831,22 @@ fn answer_off_quiescent<T>(respond: oneshot::Sender<T>, value: T) -> Result<(), 
 /// they read the live session.
 async fn handle_account_worker_command(
     client: &mut AppClient,
-    mut command: AccountWorkerCommand,
+    queued: QueuedCommand,
     context: AccountWorkerCommandContext<'_>,
 ) {
     if (context.media_http.permits.is_closed()
         || context.media_http.permits.available_permits() == 0)
-        && command.needs_media_slot()
+        && queued.command().needs_media_slot()
     {
         // Only newly received commands reach this gate; parked media keep their order.
-        context.pending.push_back(command);
+        context.pending.push_back(queued);
         return;
     }
     let events = context.events;
     let account_id_hex = context.account_id_hex;
     let account_label = context.account_label;
-    // A host read's wait on the worker ends here, before it runs.
+    // A command's wait on the worker ends here, before it runs.
+    let mut command = queued.take_up();
     command.read_dispatched();
     if account_worker_command_future(client, command, context).await {
         // One publication seam covers all successful dispatch completions. Early
@@ -7261,7 +7330,7 @@ fn push_registration_retry_delay(attempt: u32) -> Duration {
 fn schedule_push_work_after_turn(
     client: &mut AppClient,
     scheduled: &mut ScheduledPushRegistrationRetry,
-    commands: &mpsc::Sender<AccountWorkerCommand>,
+    commands: &WorkerCommands,
 ) {
     client.retry_pending_member_add_push_shares();
     if client.take_queued_push_registration_share()
@@ -7290,7 +7359,7 @@ impl ScheduledPushRegistrationRetry {
             .is_some_and(|task| !task.is_finished())
     }
 
-    fn observe_pending(&mut self, pending: bool, commands: &mpsc::Sender<AccountWorkerCommand>) {
+    fn observe_pending(&mut self, pending: bool, commands: &WorkerCommands) {
         if !pending {
             self.disarm();
         } else if !self.is_armed() {
@@ -7298,11 +7367,7 @@ impl ScheduledPushRegistrationRetry {
         }
     }
 
-    fn schedule_after_attempt(
-        &mut self,
-        pending: bool,
-        commands: &mpsc::Sender<AccountWorkerCommand>,
-    ) {
+    fn schedule_after_attempt(&mut self, pending: bool, commands: &WorkerCommands) {
         if !pending {
             self.disarm();
             return;
@@ -7310,7 +7375,7 @@ impl ScheduledPushRegistrationRetry {
         self.arm(commands.clone(), 1);
     }
 
-    fn arm(&mut self, commands: mpsc::Sender<AccountWorkerCommand>, first_attempt: u32) {
+    fn arm(&mut self, commands: WorkerCommands, first_attempt: u32) {
         if let Some(task) = self.timer_task.take() {
             task.abort();
         }
@@ -7393,7 +7458,7 @@ impl ScheduledRuntimeGroupSubscriptionRefresh {
             .is_some_and(|task| !task.is_finished())
     }
 
-    fn observe_pending(&mut self, pending: bool, commands: &mpsc::Sender<AccountWorkerCommand>) {
+    fn observe_pending(&mut self, pending: bool, commands: &WorkerCommands) {
         if !pending {
             self.disarm();
         } else if !self.is_armed() {
@@ -7401,7 +7466,7 @@ impl ScheduledRuntimeGroupSubscriptionRefresh {
         }
     }
 
-    fn arm(&mut self, commands: mpsc::Sender<AccountWorkerCommand>) {
+    fn arm(&mut self, commands: WorkerCommands) {
         if let Some(task) = self.timer_task.take() {
             task.abort();
         }
@@ -7777,11 +7842,15 @@ struct ReplayAdmissionRetry {
 }
 
 impl ReplayAdmissionRetry {
-    async fn admit_native_turn(&mut self, client: &mut AppClient) -> Result<bool, AppError> {
+    async fn admit_native_turn(
+        &mut self,
+        client: &mut AppClient,
+        unit: &WorkerUnitGauge,
+    ) -> Result<bool, AppError> {
         if !self.ready() {
             return Ok(false);
         }
-        match client.admit_native_turn().await {
+        match client.admit_native_turn(Some(unit)).await {
             Ok(progress) => {
                 if progress {
                     self.reset();
@@ -7830,7 +7899,7 @@ struct ReceiveTailContext<'a> {
     account_label: &'a str,
     shared: &'a RuntimeSharedServices,
     scheduled_push_retry: &'a mut ScheduledPushRegistrationRetry,
-    command_tx: &'a mpsc::Sender<AccountWorkerCommand>,
+    command_tx: &'a WorkerCommands,
 }
 
 /// Forget the device-group copy and ask the runtime to deactivate the
@@ -8708,6 +8777,7 @@ mod tests {
     pub(super) mod secondary_retry_scheduler_tests;
     mod selective_history_tests;
     mod worker_recovery_resume_tests;
+    mod writer_hold_tests;
 
     static BOUNDED_WORKER_FIXTURE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
@@ -8717,7 +8787,7 @@ mod tests {
     /// acknowledges a hydration request that needs no hydration at once,
     /// from A (mdk#3273 PR 4). The main loop answers it too, so it says
     /// nothing about whether a unit is held.
-    async fn held_unit_took_queued_commands(commands: &mpsc::Sender<AccountWorkerCommand>) {
+    async fn held_unit_took_queued_commands(commands: &WorkerCommands) {
         let (respond, ack) = ReadReply::unobserved();
         commands
             .send(AccountWorkerCommand::HydrateGroups {
@@ -8850,7 +8920,7 @@ mod tests {
             .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
         let client = publishing_client(&app).await;
         for published in [publish_before_unit(&client), None] {
-            let (commands, mut receiver) = mpsc::channel(8);
+            let (commands, mut receiver) = test_worker_queue(8);
             let (respond, response) = ReadReply::unobserved();
             commands
                 .try_send(AccountWorkerCommand::CaptureConversation {
@@ -8904,7 +8974,7 @@ mod tests {
             .unwrap();
         let published = publish_before_unit(&client);
         let version = published.as_ref().unwrap().borrow().version;
-        let (commands, mut receiver) = mpsc::channel(8);
+        let (commands, mut receiver) = test_worker_queue(8);
         let (respond, mut mutation) = oneshot::channel();
         commands
             .try_send(AccountWorkerCommand::ConnectivityRestored { respond })
@@ -8938,7 +9008,7 @@ mod tests {
         result.unwrap();
         assert_eq!(pending.len(), 1);
         assert!(matches!(
-            pending.pop_front(),
+            pending.pop_front().map(QueuedCommand::take_up),
             Some(AccountWorkerCommand::ConnectivityRestored { .. })
         ));
     }
@@ -8984,7 +9054,7 @@ mod tests {
                 .awaiting_hydration(std::slice::from_ref(&group)),
             std::slice::from_ref(&group)
         );
-        let (commands, mut receiver) = mpsc::channel(8);
+        let (commands, mut receiver) = test_worker_queue(8);
         let (respond, forgotten) = oneshot::channel();
         commands
             .try_send(AccountWorkerCommand::ForgetGroupLocal {
@@ -9018,14 +9088,15 @@ mod tests {
         };
         let (result, ()) = tokio::join!(serve, check);
         result.unwrap();
-        let Some(AccountWorkerCommand::ForgetGroupLocal { respond, .. }) = pending.pop_front()
+        let Some(AccountWorkerCommand::ForgetGroupLocal { respond, .. }) =
+            pending.pop_front().map(QueuedCommand::take_up)
         else {
             panic!("the forget runs first");
         };
         let Some(AccountWorkerCommand::HydrateGroups {
             group_ids,
             respond: ack_reply,
-        }) = pending.pop_front()
+        }) = pending.pop_front().map(QueuedCommand::take_up)
         else {
             panic!("the hydration request runs second");
         };
@@ -9052,12 +9123,16 @@ mod tests {
             .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
         let client = publishing_client(&app).await;
         let published = publish_before_unit(&client);
-        let (commands, mut receiver) = mpsc::channel(8);
+        let (commands, mut receiver) = test_worker_queue(8);
         let mut pending = VecDeque::new();
         let (respond, mut before) = oneshot::channel();
-        pending.push_back(AccountWorkerCommand::ConnectivityRestored { respond });
+        pending.push_back(QueuedCommand::unobserved(
+            AccountWorkerCommand::ConnectivityRestored { respond },
+        ));
         let (respond, mut catch_up) = oneshot::channel();
-        pending.push_back(AccountWorkerCommand::CatchUp { respond });
+        pending.push_back(QueuedCommand::unobserved(AccountWorkerCommand::CatchUp {
+            respond,
+        }));
         let (respond, mut after) = oneshot::channel();
         commands
             .try_send(AccountWorkerCommand::ConnectivityRestored { respond })
@@ -9106,19 +9181,19 @@ mod tests {
         let (result, ()) = tokio::join!(serve, check);
         result.unwrap();
         assert!(matches!(
-            pending.pop_front(),
+            pending.pop_front().map(QueuedCommand::take_up),
             Some(AccountWorkerCommand::ConnectivityRestored { .. })
         ));
         assert!(matches!(
-            pending.pop_front(),
+            pending.pop_front().map(QueuedCommand::take_up),
             Some(AccountWorkerCommand::CatchUp { .. })
         ));
         assert!(matches!(
-            pending.pop_front(),
+            pending.pop_front().map(QueuedCommand::take_up),
             Some(AccountWorkerCommand::ConnectivityRestored { .. })
         ));
         assert!(matches!(
-            pending.pop_front(),
+            pending.pop_front().map(QueuedCommand::take_up),
             Some(AccountWorkerCommand::Drain { .. })
         ));
         assert!(pending.is_empty());
@@ -9502,11 +9577,11 @@ mod tests {
         let (respond, mut confirm) = oneshot::channel();
         handle_startup_hydration_command(
             &mut client,
-            AccountWorkerCommand::ConfirmGroupRejoin {
+            QueuedCommand::unobserved(AccountWorkerCommand::ConfirmGroupRejoin {
                 welcome_id: id.clone(),
                 token: vec![0; 32],
                 respond,
-            },
+            }),
             &mut deferred,
             &events,
             "",
@@ -9524,10 +9599,10 @@ mod tests {
         let (respond, mut decline) = oneshot::channel();
         handle_startup_hydration_command(
             &mut client,
-            AccountWorkerCommand::DeclineGroupRejoin {
+            QueuedCommand::unobserved(AccountWorkerCommand::DeclineGroupRejoin {
                 welcome_id: id,
                 respond,
-            },
+            }),
             &mut deferred,
             &events,
             "",
@@ -9815,6 +9890,10 @@ mod tests {
         let _permit = reserve_media_http(&media_http);
     }
 
+    /// Hold 7 of step 3 of the runtime-concurrency pass, flipped by its PR 3
+    /// (the other holds are in `writer_hold_tests`): with every media transfer
+    /// permit taken, a media command parks in the writer's own queue, while
+    /// commands behind it are still served.
     // Pauses the clock, which needs the current-thread runtime.
     #[tokio::test(flavor = "current_thread")]
     async fn full_media_capacity_queues() {
@@ -9851,7 +9930,7 @@ mod tests {
         drop(client);
 
         // Fill the startup channel before spawning the real worker.
-        let (commands, receiver) = mpsc::channel(8);
+        let (commands, receiver) = test_worker_queue(8);
         let mut transfers = Vec::new();
         for _ in 0..MEDIA_HTTP_IN_FLIGHT_LIMIT {
             let (started, start) = oneshot::channel();
@@ -10423,7 +10502,7 @@ mod tests {
             push_registration_retry_max_delay()
         );
 
-        let (commands, mut received_commands) = mpsc::channel(2);
+        let (commands, mut received_commands) = test_worker_channel(2);
         let mut scheduled = ScheduledPushRegistrationRetry::new();
         scheduled.observe_pending(true, &commands);
         assert!(scheduled.is_armed());
@@ -10470,7 +10549,7 @@ mod tests {
             app.record_group_push_snapshot_owed(&account.label, &group_hex, epoch)
                 .unwrap()
         );
-        let (commands, mut received) = mpsc::channel(2);
+        let (commands, mut received) = test_worker_channel(2);
         let mut scheduled = ScheduledPushRegistrationRetry::new();
         schedule_push_work_after_turn(&mut client, &mut scheduled, &commands);
         assert!(!scheduled.is_armed());
@@ -10527,7 +10606,7 @@ mod tests {
         client.test_push_device_can_fetch = Some(true);
         client.push_announce_timing.catch_up_settle = Duration::ZERO;
         client.advance_push_join_windows().await;
-        let (commands, mut received) = mpsc::channel(2);
+        let (commands, mut received) = test_worker_channel(2);
         let mut scheduled = ScheduledPushRegistrationRetry::new();
         schedule_push_work_after_turn(&mut client, &mut scheduled, &commands);
         assert!(!scheduled.is_armed(), "nothing is owed before a send");
@@ -10582,7 +10661,7 @@ mod tests {
         assert!(client.has_pending_push_registration_work());
         let shared = RuntimeSharedServices::default();
         let (events, _) = broadcast::channel(8);
-        let (commands, mut received) = mpsc::channel(2);
+        let (commands, mut received) = test_worker_channel(2);
         let mut scheduled = ScheduledPushRegistrationRetry::new();
         relay.block_next_publish();
         let responsive = {
@@ -10653,7 +10732,7 @@ mod tests {
             runtime_group_subscription_retry_max_delay()
         );
 
-        let (commands, mut received_commands) = mpsc::channel(2);
+        let (commands, mut received_commands) = test_worker_channel(2);
         let mut scheduled = ScheduledRuntimeGroupSubscriptionRefresh::new();
         scheduled.observe_pending(true, &commands);
         assert!(scheduled.is_armed());

@@ -848,7 +848,10 @@ impl AppClient {
         &mut self,
         rebuild_since: Option<cgka_traits::transport::Timestamp>,
     ) -> Result<(), AppError> {
-        self.runtime.sync_transport_groups(rebuild_since).await?;
+        let step = self.lane_step(RuntimeOp::RouteRefresh);
+        let applied = self.runtime.sync_transport_groups(rebuild_since).await;
+        step.finish(&applied);
+        applied?;
         self.synchronize_native_replay().await?;
         self.warm_encrypted_media_epoch_secrets("post_subscription_sync");
         Ok(())
@@ -1111,13 +1114,16 @@ impl AppClient {
             )
             .into());
         }
-        self.relay_plane
+        let step = self.lane_step(RuntimeOp::RelayReconnect);
+        let reconnected = self
+            .relay_plane
             .reconnect_relay(
                 self.adapter.account_id(),
                 cgka_traits::TransportEndpoint(canonical_url),
             )
-            .await
-            .map_err(AppError::from)
+            .await;
+        step.finish(&reconnected);
+        reconnected.map_err(AppError::from)
     }
 
     pub(crate) async fn prepare_transport(&mut self) -> Result<(), AppError> {
@@ -2277,7 +2283,7 @@ impl AppClient {
     pub async fn next_event(&mut self) -> Result<SyncSummary, AppError> {
         loop {
             let mut native_changes = self.adapter.replay_changes().await;
-            if self.admit_native_turn().await? {
+            if self.admit_native_turn(None).await? {
                 self.retry_pending_runtime_group_subscription_refresh()
                     .await?;
                 let summary = self.take_pending_applied_sync_summary();
@@ -2703,7 +2709,8 @@ impl AppClient {
         let overflowed = loop {
             let mut native_changes = self.adapter.replay_changes().await;
             self.native_sync_deliveries = counts.deliveries;
-            let native_result = self.admit_native_turn().await;
+            // A drain's turns are part of the unit that runs the drain.
+            let native_result = self.admit_native_turn(None).await;
             counts.deliveries = self.native_sync_deliveries;
             let native_progress = match native_result {
                 Ok(progress) => progress,

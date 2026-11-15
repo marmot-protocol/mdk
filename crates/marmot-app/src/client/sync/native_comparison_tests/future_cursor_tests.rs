@@ -12,7 +12,7 @@ async fn future_cursor_keeps_old_text() {
         .app_storage();
     timeout(Duration::from_secs(10), async {
         loop {
-            fixture.receiver.admit_native_turn().await.unwrap();
+            fixture.receiver.admit_native_turn(None).await.unwrap();
             fixture.receiver.synchronize_native_replay().await.unwrap();
             if storage
                 .pending_recovery_demands()
@@ -153,7 +153,7 @@ async fn future_cursor_keeps_old_text() {
         .unwrap();
     adapter.handle_relay_eose(copy.endpoint, id).await;
     fixture.receiver.recovery_owner.native_ingress = Some(ingress);
-    assert!(fixture.receiver.admit_native_turn().await.unwrap());
+    assert!(fixture.receiver.admit_native_turn(None).await.unwrap());
     let messages = fixture
         .receiver
         .take_pending_applied_sync_summary()

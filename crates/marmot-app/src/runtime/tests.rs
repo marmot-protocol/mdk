@@ -475,7 +475,7 @@ async fn worker_lookup_skips_reconcile() {
     let account = app.account_home().create_account("alice").unwrap();
     let runtime = app.runtime();
     let manager = runtime.accounts();
-    let (commands, received) = mpsc::channel(1);
+    let (commands, received) = crate::runtime::test_worker_channel(1);
     let (shutdown, stopped) = oneshot::channel();
     manager.workers.lock().await.insert(
         account.account_id_hex.clone(),
@@ -1585,7 +1585,7 @@ async fn managed_account_worker_shutdown_aborts_unresponsive_task_after_timeout(
         }
     }
 
-    let (commands, _commands_rx) = mpsc::channel(1);
+    let (commands, _commands_rx) = crate::runtime::test_worker_channel(1);
     let (shutdown, _shutdown_rx) = oneshot::channel();
     let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let drop_signal = DropSignal(dropped.clone());
@@ -3294,7 +3294,7 @@ async fn account_manager_shutdown_drains_worker_inserted_by_in_flight_catch_up()
         let _ = catch_up_waiting_tx.send(());
         insertion_released.await;
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
-        let (commands, _command_rx) = mpsc::channel(1);
+        let (commands, _command_rx) = crate::runtime::test_worker_channel(1);
         let handle = tokio::spawn(async move {
             let _ = shutdown_rx.await;
             let _ = worker_exited_tx.send(());
@@ -3359,7 +3359,7 @@ fn invite_catch_up_is_not_spawned_after_shutdown_stops_accepting_tasks() {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .accepting = false;
 
-    let (command, _receiver) = mpsc::channel(1);
+    let (command, _receiver) = crate::runtime::test_worker_channel(1);
     manager.spawn_invite_catch_up(command);
 
     assert!(
@@ -3730,7 +3730,7 @@ async fn finished_worker_is_replaced_on_first_requested_lookup() {
     .await
     .expect("stand-in worker finishes");
     let (shutdown, _shutdown_rx) = oneshot::channel();
-    let (old_commands, _old_receiver) = mpsc::channel(1);
+    let (old_commands, _old_receiver) = crate::runtime::test_worker_channel(1);
     manager.workers.lock().await.insert(
         account.account_id_hex.clone(),
         ManagedAccountWorker {
@@ -3769,7 +3769,7 @@ async fn finished_worker_is_replaced_on_first_batch_reconcile() {
     .await
     .expect("stand-in worker finishes");
     let (shutdown, _shutdown_rx) = oneshot::channel();
-    let (old_commands, _old_receiver) = mpsc::channel(1);
+    let (old_commands, _old_receiver) = crate::runtime::test_worker_channel(1);
     manager.workers.lock().await.insert(
         account.account_id_hex.clone(),
         ManagedAccountWorker {
@@ -4529,7 +4529,7 @@ async fn stuck_worker_reap_does_not_block_a_healthy_account() {
     let manager = runtime.accounts();
     let (release_tx, release_rx) = std::sync::mpsc::channel();
     let (shutdown, _shutdown_rx) = oneshot::channel();
-    let (commands, _receiver) = mpsc::channel(1);
+    let (commands, _receiver) = crate::runtime::test_worker_channel(1);
     manager.workers.lock().await.insert(
         alice.account_id_hex.clone(),
         ManagedAccountWorker {
@@ -4606,7 +4606,7 @@ async fn deactivation_waits_for_worker_abort_before_committing_sign_out() {
     let runtime = MarmotAppRuntime::new(app);
     let manager = runtime.accounts();
     let (shutdown, _shutdown_rx) = oneshot::channel();
-    let (commands, _commands_rx) = mpsc::channel(1);
+    let (commands, _commands_rx) = crate::runtime::test_worker_channel(1);
     manager.workers.lock().await.insert(
         alice.account_id_hex.clone(),
         ManagedAccountWorker {
@@ -4734,7 +4734,7 @@ fn transient_transport_catch_up_failure() -> AccountCatchUpFailure {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn catch_up_retries_only_the_worker_with_a_transient_transport_failure() {
-    let (flaky_tx, mut flaky_rx) = mpsc::channel(4);
+    let (flaky_tx, mut flaky_rx) = crate::runtime::test_worker_channel(4);
     let flaky = tokio::spawn(async move {
         let mut attempts = 0;
         while let Some(command) = flaky_rx.recv().await {
@@ -4754,7 +4754,7 @@ async fn catch_up_retries_only_the_worker_with_a_transient_transport_failure() {
         }
         attempts
     });
-    let (healthy_tx, mut healthy_rx) = mpsc::channel(4);
+    let (healthy_tx, mut healthy_rx) = crate::runtime::test_worker_channel(4);
     let healthy = tokio::spawn(async move {
         let Some(AccountWorkerCommand::CatchUp { respond }) = healthy_rx.recv().await else {
             panic!("expected catch-up command");
@@ -4777,7 +4777,7 @@ async fn catch_up_retries_only_the_worker_with_a_transient_transport_failure() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn catch_up_returns_after_transient_retry_budget_is_exhausted() {
-    let (worker_tx, mut worker_rx) = mpsc::channel(8);
+    let (worker_tx, mut worker_rx) = crate::runtime::test_worker_channel(8);
     let worker = tokio::spawn(async move {
         let mut attempts = 0;
         while let Some(command) = worker_rx.recv().await {
@@ -4807,7 +4807,7 @@ async fn catch_up_returns_after_transient_retry_budget_is_exhausted() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn catch_up_does_not_retry_a_closed_worker_response() {
-    let (worker_tx, mut worker_rx) = mpsc::channel(2);
+    let (worker_tx, mut worker_rx) = crate::runtime::test_worker_channel(2);
     let worker = tokio::spawn(async move {
         let Some(AccountWorkerCommand::CatchUp { respond }) = worker_rx.recv().await else {
             panic!("expected catch-up command");
@@ -4852,7 +4852,7 @@ async fn catch_up_error_from_ready_account_takes_precedence_over_sibling_backoff
     }
 
     let (shutdown, mut shutdown_rx) = oneshot::channel();
-    let (commands, mut receiver) = mpsc::channel(1);
+    let (commands, mut receiver) = crate::runtime::test_worker_channel(1);
     let handle = tokio::spawn(async move {
         loop {
             tokio::select! {

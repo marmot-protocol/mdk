@@ -71,10 +71,18 @@ impl RelayEventLimits for AppRelayEventLimits {
         if event_bytes <= ADVERTISED_LIMIT_CHECK_ABOVE_BYTES {
             return configured;
         }
+        // The lookup a size check on the account worker waits for, which a
+        // later step-3 PR moves to a lane.
+        let lookup = crate::runtime::observe_on_account_worker(
+            crate::RuntimePerformanceOperation::RelayLimitLookup,
+        );
         let advertised = self
             .caps
             .max_message_length(endpoint.as_str(), self.allow_loopback)
             .await;
+        if let Some(lookup) = lookup {
+            lookup.finish(marmot_observability::Outcome::Success);
+        }
         effective_limit(configured, advertised)
     }
 }

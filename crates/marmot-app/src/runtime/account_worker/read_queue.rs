@@ -1,15 +1,23 @@
-//! How long host reads wait on the account worker (mdk#3273 PR 0).
+//! How long host work waits on the account worker, and how long the worker's
+//! units take (mdk#3273 PR 0, step 3 PR 0).
 //!
 //! Every host read the read-path plan classifies (R1–R9) carries a
 //! [`ReadReply`] to the worker instead of a bare oneshot sender. Its wait, from
 //! just before channel admission until the worker takes it up, is recorded in
 //! its class's `read_queue_r<n>` series. A read enqueued while the worker is
 //! inside one of the plan's long units records the same wait in that unit's
-//! `read_queue_behind_<unit>` series too. Recording only observes: nothing here
-//! changes when or how the worker serves a read.
+//! `read_queue_behind_<unit>` series too.
+//!
+//! A host mutation enqueued while the worker is inside a long unit carries the
+//! same wait in its [`QueuedCommand`], recorded in `mutation_queue_behind_<unit>`.
+//! Each unit the worker runs records its duration in `worker_unit_<kind>`, and
+//! once more in `worker_unit_<kind>_over_budget` when it outlasts the engine's
+//! budget for its kind. Recording only observes: nothing here changes when or
+//! how the worker serves a command.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
+use std::time::{Duration, Instant};
 
 use marmot_observability::{Observation, Outcome as TelemetryOutcome, PerformanceRecorder};
 use tokio::sync::{mpsc, oneshot};
@@ -102,46 +110,465 @@ impl WorkerUnit {
             Self::Maintenance => RuntimeOp::ReadQueueBehindMaintenance,
         }
     }
-}
 
-/// Which long unit one account worker is inside, if any. The worker sets it;
-/// a host read samples it once, when it is enqueued. One relaxed atomic per
-/// unit and per read, so the worker's hot paths pay nothing per delivery.
-#[derive(Debug, Default)]
-pub(crate) struct WorkerUnitGauge(AtomicU8);
-
-impl WorkerUnitGauge {
-    /// Be inside `unit` until the guard drops, which restores the unit it
-    /// interrupted: a Welcome fanout runs inside its create or invite.
-    pub(crate) fn enter(&self, unit: WorkerUnit) -> WorkerUnitGuard<'_> {
-        let previous = self.0.swap(unit as u8, Ordering::Relaxed);
-        WorkerUnitGuard {
-            gauge: self,
-            previous,
+    const fn mutation_operation(self) -> RuntimeOp {
+        match self {
+            Self::StartupSync => RuntimeOp::MutationQueueBehindStartupSync,
+            Self::CatchUp => RuntimeOp::MutationQueueBehindCatchUp,
+            Self::Convergence => RuntimeOp::MutationQueueBehindConvergence,
+            Self::WelcomeFanout => RuntimeOp::MutationQueueBehindWelcomeFanout,
+            Self::Repair => RuntimeOp::MutationQueueBehindRepair,
+            Self::Send => RuntimeOp::MutationQueueBehindSend,
+            Self::InviteOrCreate => RuntimeOp::MutationQueueBehindInviteOrCreate,
+            Self::Maintenance => RuntimeOp::MutationQueueBehindMaintenance,
         }
     }
 
+    const fn kind(self) -> UnitKind {
+        match self {
+            Self::StartupSync => UnitKind::StartupSync,
+            Self::CatchUp => UnitKind::CatchUp,
+            Self::Convergence => UnitKind::Convergence,
+            Self::WelcomeFanout => UnitKind::WelcomeFanout,
+            Self::Repair => UnitKind::Repair,
+            Self::Send => UnitKind::Send,
+            Self::InviteOrCreate => UnitKind::InviteOrCreate,
+            Self::Maintenance => UnitKind::Maintenance,
+        }
+    }
+}
+
+tokio::task_local! {
+    /// The recorder of the account worker whose task this is.
+    static ACCOUNT_WORKER: PerformanceRecorder;
+}
+
+/// Run `worker` as an account worker's task, whose waits
+/// [`observe_on_account_worker`] observes.
+pub(crate) async fn run_as_account_worker<F: std::future::Future>(
+    telemetry: PerformanceRecorder,
+    worker: F,
+) -> F::Output {
+    ACCOUNT_WORKER.scope(telemetry, worker).await
+}
+
+/// A span of `operation` for a wait the account worker's own task starts,
+/// inside whichever unit it is running; none for a wait any other task
+/// starts, a lane's or a host call's. Tokio does not carry the scope into
+/// spawned tasks.
+pub(crate) fn observe_on_account_worker(operation: RuntimeOp) -> Option<Observation> {
+    ACCOUNT_WORKER
+        .try_with(|telemetry| telemetry.observe(operation))
+        .ok()
+}
+
+/// The engine's cooperative budgets for one unit of work
+/// (`cgka_engine::message_processor::FOREGROUND_DEFERRED_PEEL_BUDGET_MS` and
+/// `BACKGROUND_CONVERGENCE_BUDGET_MS`), which the over-budget counts judge
+/// against. marmot-app reaches the engine only through the session, so the
+/// values are restated here and a test keeps them equal.
+const FOREGROUND_UNIT_BUDGET: Duration = Duration::from_millis(250);
+const BACKGROUND_UNIT_BUDGET: Duration = Duration::from_millis(500);
+
+/// Every kind of worker unit with a duration series: the gauge's long units,
+/// and the short ones it does not show.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum UnitKind {
+    StartupSync,
+    CatchUp,
+    Convergence,
+    WelcomeFanout,
+    Repair,
+    Send,
+    InviteOrCreate,
+    Maintenance,
+    /// One delivery batch the worker receives and ingests: a received
+    /// delivery, or a turn of native admission that has a ready frame.
+    Delivery,
+    /// One turn of the account's recovery runner, served on the worker.
+    RunnerTurn,
+}
+
+impl UnitKind {
+    /// The kind's duration series and its over-budget count.
+    const fn operations(self) -> (RuntimeOp, RuntimeOp) {
+        match self {
+            Self::StartupSync => (
+                RuntimeOp::WorkerUnitStartupSync,
+                RuntimeOp::WorkerUnitStartupSyncOverBudget,
+            ),
+            Self::CatchUp => (
+                RuntimeOp::WorkerUnitCatchUp,
+                RuntimeOp::WorkerUnitCatchUpOverBudget,
+            ),
+            Self::Convergence => (
+                RuntimeOp::WorkerUnitConvergence,
+                RuntimeOp::WorkerUnitConvergenceOverBudget,
+            ),
+            Self::WelcomeFanout => (
+                RuntimeOp::WorkerUnitWelcomeFanout,
+                RuntimeOp::WorkerUnitWelcomeFanoutOverBudget,
+            ),
+            Self::Repair => (
+                RuntimeOp::WorkerUnitRepair,
+                RuntimeOp::WorkerUnitRepairOverBudget,
+            ),
+            Self::Send => (
+                RuntimeOp::WorkerUnitSend,
+                RuntimeOp::WorkerUnitSendOverBudget,
+            ),
+            Self::InviteOrCreate => (
+                RuntimeOp::WorkerUnitInviteOrCreate,
+                RuntimeOp::WorkerUnitInviteOrCreateOverBudget,
+            ),
+            Self::Maintenance => (
+                RuntimeOp::WorkerUnitMaintenance,
+                RuntimeOp::WorkerUnitMaintenanceOverBudget,
+            ),
+            Self::Delivery => (
+                RuntimeOp::WorkerUnitDelivery,
+                RuntimeOp::WorkerUnitDeliveryOverBudget,
+            ),
+            Self::RunnerTurn => (
+                RuntimeOp::WorkerUnitRunnerTurn,
+                RuntimeOp::WorkerUnitRunnerTurnOverBudget,
+            ),
+        }
+    }
+
+    /// A send, an invite and a create run for a waiting host caller, so they
+    /// get the foreground budget; everything else is background work.
+    const fn budget(self) -> Duration {
+        match self {
+            Self::Send | Self::InviteOrCreate => FOREGROUND_UNIT_BUDGET,
+            _ => BACKGROUND_UNIT_BUDGET,
+        }
+    }
+}
+
+/// One unit's span: how long the worker stays in it. It ends when dropped,
+/// and a unit that outlasted its kind's budget is counted over budget too.
+pub(crate) struct UnitTiming {
+    telemetry: PerformanceRecorder,
+    kind: UnitKind,
+    observation: Option<Observation>,
+    started: Instant,
+}
+
+impl UnitTiming {
+    fn start(telemetry: &PerformanceRecorder, kind: UnitKind) -> Self {
+        Self {
+            telemetry: telemetry.clone(),
+            kind,
+            observation: Some(telemetry.observe(kind.operations().0)),
+            started: Instant::now(),
+        }
+    }
+}
+
+impl UnitTiming {
+    /// End the unit's span after `elapsed` in it. A span ends once.
+    fn end(&mut self, elapsed: Duration) {
+        let Some(observation) = self.observation.take() else {
+            return;
+        };
+        observation.finish(TelemetryOutcome::Success);
+        if elapsed > self.kind.budget() {
+            self.telemetry.record_runtime(
+                self.kind.operations().1,
+                elapsed,
+                TelemetryOutcome::Success,
+            );
+        }
+    }
+}
+
+impl Drop for UnitTiming {
+    fn drop(&mut self) {
+        self.end(self.started.elapsed());
+    }
+}
+
+/// Which long unit one account worker is inside, if any. The worker sets it;
+/// a host read or mutation samples it once, when it is enqueued. One relaxed
+/// atomic per unit and per command, so the worker's hot paths pay nothing per
+/// delivery. A gauge built with a recorder also times each unit.
+#[derive(Debug, Default)]
+pub(crate) struct WorkerUnitGauge {
+    unit: AtomicU8,
+    telemetry: Option<PerformanceRecorder>,
+}
+
+impl WorkerUnitGauge {
+    /// A gauge that times the units its worker enters into `telemetry`.
+    pub(crate) fn recording(telemetry: PerformanceRecorder) -> Self {
+        Self {
+            unit: AtomicU8::default(),
+            telemetry: Some(telemetry),
+        }
+    }
+
+    /// Be inside `unit` until the guard drops, which restores the unit it
+    /// interrupted and ends the unit's span.
+    pub(crate) fn enter(&self, unit: WorkerUnit) -> WorkerUnitGuard<'_> {
+        let previous = self.unit.swap(unit as u8, Ordering::Relaxed);
+        WorkerUnitGuard {
+            gauge: self,
+            previous,
+            _timing: self.time(unit.kind()),
+        }
+    }
+
+    /// Time one short unit the gauge does not show, until the timing drops.
+    pub(crate) fn time(&self, kind: UnitKind) -> Option<UnitTiming> {
+        self.telemetry
+            .as_ref()
+            .map(|telemetry| UnitTiming::start(telemetry, kind))
+    }
+
     fn current(&self) -> Option<WorkerUnit> {
-        let unit = usize::from(self.0.load(Ordering::Relaxed));
+        let unit = usize::from(self.unit.load(Ordering::Relaxed));
         WorkerUnit::ALL.get(unit.checked_sub(1)?).copied()
+    }
+
+    /// The wait of a host mutation enqueued now: none for a read, which
+    /// carries its own, or for a catch-up, which `catch_up_requested` and
+    /// `catch_up_coalesced` already time, or while no long unit runs.
+    fn mutation_wait(&self, command: &AccountWorkerCommand) -> QueueWait {
+        let Some(telemetry) = &self.telemetry else {
+            return QueueWait(None);
+        };
+        if command.is_host_read() || matches!(command, AccountWorkerCommand::CatchUp { .. }) {
+            return QueueWait(None);
+        }
+        QueueWait(
+            self.current()
+                .map(|unit| telemetry.observe(unit.mutation_operation())),
+        )
     }
 }
 
 pub(crate) struct WorkerUnitGuard<'a> {
     gauge: &'a WorkerUnitGauge,
     previous: u8,
+    _timing: Option<UnitTiming>,
 }
 
 impl Drop for WorkerUnitGuard<'_> {
     fn drop(&mut self) {
-        self.gauge.0.store(self.previous, Ordering::Relaxed);
+        self.gauge.unit.store(self.previous, Ordering::Relaxed);
+    }
+}
+
+/// A command on its way to the worker, with the wait of a host mutation
+/// enqueued while the worker was inside a long unit. The wait ends when the
+/// worker takes the command up, whatever it answers; a command a unit keeps
+/// for later keeps its wait. Dropping one untaken (worker shutdown, a
+/// reconnect rejection) records the wait as cancelled.
+pub(crate) struct QueuedCommand {
+    command: AccountWorkerCommand,
+    wait: QueueWait,
+}
+
+/// The wait half of a [`QueuedCommand`], apart from its command while the
+/// worker decides whether to serve it or keep it.
+pub(crate) struct QueueWait(Option<Observation>);
+
+impl QueueWait {
+    /// The worker takes the command up: its wait ends here.
+    pub(crate) fn take_up(self) {
+        if let Some(wait) = self.0 {
+            wait.finish(TelemetryOutcome::Success);
+        }
+    }
+}
+
+impl QueuedCommand {
+    /// A command whose wait nothing observes: the worker's own sends.
+    pub(crate) fn unobserved(command: AccountWorkerCommand) -> Self {
+        Self {
+            command,
+            wait: QueueWait(None),
+        }
+    }
+
+    pub(crate) fn command(&self) -> &AccountWorkerCommand {
+        &self.command
+    }
+
+    pub(crate) fn into_parts(self) -> (AccountWorkerCommand, QueueWait) {
+        (self.command, self.wait)
+    }
+
+    pub(crate) fn from_parts(command: AccountWorkerCommand, wait: QueueWait) -> Self {
+        Self { command, wait }
+    }
+
+    /// The worker takes the command up to run it: its wait ends here, before
+    /// it runs.
+    pub(crate) fn take_up(self) -> AccountWorkerCommand {
+        self.wait.take_up();
+        self.command
+    }
+
+    /// Let `serve` answer the command where it waits. A command `serve` hands
+    /// back stays queued with its wait; one it answers is taken up.
+    pub(crate) fn serve_or_keep(
+        self,
+        serve: impl FnOnce(AccountWorkerCommand) -> Option<AccountWorkerCommand>,
+    ) -> Option<Self> {
+        let Self { command, wait } = self;
+        match serve(command) {
+            Some(command) => Some(Self { command, wait }),
+            None => {
+                wait.take_up();
+                None
+            }
+        }
+    }
+}
+
+/// An account worker's command sender. A host mutation sent through it while
+/// the worker is inside a long unit carries its wait to the worker.
+#[derive(Clone)]
+pub(crate) struct WorkerCommands {
+    sender: mpsc::Sender<QueuedCommand>,
+    gauge: Option<Arc<WorkerUnitGauge>>,
+}
+
+impl std::fmt::Debug for WorkerCommands {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WorkerCommands").finish_non_exhaustive()
+    }
+}
+
+impl WorkerCommands {
+    /// The host's sender, whose mutations sample `gauge` when enqueued.
+    pub(crate) fn observed(
+        sender: mpsc::Sender<QueuedCommand>,
+        gauge: Arc<WorkerUnitGauge>,
+    ) -> Self {
+        Self {
+            sender,
+            gauge: Some(gauge),
+        }
+    }
+
+    /// The worker's own sender, for the commands it sends itself.
+    pub(crate) fn unobserved(sender: mpsc::Sender<QueuedCommand>) -> Self {
+        Self {
+            sender,
+            gauge: None,
+        }
+    }
+
+    fn queued(&self, command: AccountWorkerCommand) -> QueuedCommand {
+        let wait = match &self.gauge {
+            Some(gauge) => gauge.mutation_wait(&command),
+            None => QueueWait(None),
+        };
+        QueuedCommand { command, wait }
+    }
+
+    pub(crate) async fn send(
+        &self,
+        command: AccountWorkerCommand,
+    ) -> Result<(), mpsc::error::SendError<AccountWorkerCommand>> {
+        self.sender
+            .send(self.queued(command))
+            .await
+            .map_err(|mpsc::error::SendError(queued)| mpsc::error::SendError(queued.command))
+    }
+
+    /// Hands an unadmitted command back, as `mpsc::Sender::try_send` does.
+    #[expect(
+        clippy::result_large_err,
+        reason = "keeps the shape of tokio's try_send, which returns the unsent command"
+    )]
+    pub(crate) fn try_send(
+        &self,
+        command: AccountWorkerCommand,
+    ) -> Result<(), mpsc::error::TrySendError<AccountWorkerCommand>> {
+        self.sender
+            .try_send(self.queued(command))
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(queued) => {
+                    mpsc::error::TrySendError::Full(queued.command)
+                }
+                mpsc::error::TrySendError::Closed(queued) => {
+                    mpsc::error::TrySendError::Closed(queued.command)
+                }
+            })
+    }
+
+    pub(crate) fn is_closed(&self) -> bool {
+        self.sender.is_closed()
+    }
+
+    pub(crate) async fn closed(&self) {
+        self.sender.closed().await;
+    }
+}
+
+#[cfg(test)]
+impl WorkerCommands {
+    pub(crate) fn same_channel(&self, other: &Self) -> bool {
+        self.sender.same_channel(&other.sender)
+    }
+
+    pub(crate) fn max_capacity(&self) -> usize {
+        self.sender.max_capacity()
+    }
+
+    pub(crate) fn capacity(&self) -> usize {
+        self.sender.capacity()
+    }
+
+    pub(crate) async fn reserve_many(
+        &self,
+        n: usize,
+    ) -> Result<mpsc::PermitIterator<'_, QueuedCommand>, mpsc::error::SendError<()>> {
+        self.sender.reserve_many(n).await
+    }
+}
+
+/// A worker's command channel for a test that drives the worker's own
+/// receiving code: an unobserved sender, and the raw receiver.
+#[cfg(test)]
+pub(crate) fn test_worker_queue(buffer: usize) -> (WorkerCommands, mpsc::Receiver<QueuedCommand>) {
+    let (sender, receiver) = mpsc::channel(buffer);
+    (WorkerCommands::unobserved(sender), receiver)
+}
+
+/// A fake worker's command channel: an unobserved sender, and a receiver
+/// that yields each command taken up as it arrives.
+#[cfg(test)]
+pub(crate) fn test_worker_channel(buffer: usize) -> (WorkerCommands, TestWorkerReceiver) {
+    let (sender, receiver) = mpsc::channel(buffer);
+    (
+        WorkerCommands::unobserved(sender),
+        TestWorkerReceiver(receiver),
+    )
+}
+
+#[cfg(test)]
+pub(crate) struct TestWorkerReceiver(mpsc::Receiver<QueuedCommand>);
+
+#[cfg(test)]
+impl TestWorkerReceiver {
+    pub(crate) async fn recv(&mut self) -> Option<AccountWorkerCommand> {
+        self.0.recv().await.map(QueuedCommand::take_up)
+    }
+
+    pub(crate) fn try_recv(&mut self) -> Result<AccountWorkerCommand, mpsc::error::TryRecvError> {
+        self.0.try_recv().map(QueuedCommand::take_up)
     }
 }
 
 /// An account worker's command lane, with the gauge of what that worker is doing.
 #[derive(Clone, Debug)]
 pub(crate) struct WorkerLane {
-    pub(crate) commands: mpsc::Sender<AccountWorkerCommand>,
+    pub(crate) commands: WorkerCommands,
     unit: Arc<WorkerUnitGauge>,
     /// The worker's published read state, A, which the account reads answer
     /// from without a queue wait (mdk#3273).
@@ -150,7 +577,7 @@ pub(crate) struct WorkerLane {
 
 impl WorkerLane {
     pub(crate) fn new(
-        commands: mpsc::Sender<AccountWorkerCommand>,
+        commands: WorkerCommands,
         unit: Arc<WorkerUnitGauge>,
         read_state: ReadStateReader,
     ) -> Self {
@@ -189,8 +616,8 @@ impl WorkerLane {
 /// A test lane for a fake worker: its gauge never leaves idle, and it never
 /// publishes A, so every read is sent to it.
 #[cfg(test)]
-impl From<mpsc::Sender<AccountWorkerCommand>> for WorkerLane {
-    fn from(commands: mpsc::Sender<AccountWorkerCommand>) -> Self {
+impl From<WorkerCommands> for WorkerLane {
+    fn from(commands: WorkerCommands) -> Self {
         Self::new(commands, Arc::default(), read_state_channel().1)
     }
 }
@@ -315,6 +742,11 @@ macro_rules! host_reads {
                     _ => {}
                 }
             }
+
+            /// Whether this is a host read, which carries its own wait.
+            fn is_host_read(&self) -> bool {
+                matches!(self, $(Self::$variant { .. })|+)
+            }
         }
     };
 }
@@ -369,7 +801,7 @@ mod tests {
     #[test]
     fn send_with_ends_the_wait_before_the_answer_runs() {
         let telemetry = PerformanceRecorder::default();
-        let (commands, _receiver) = mpsc::channel::<AccountWorkerCommand>(1);
+        let (commands, _receiver) = test_worker_channel(1);
         let lane = WorkerLane::from(commands);
         let _unit = lane.unit.enter(WorkerUnit::CatchUp);
         let in_flight = |operation| {
@@ -399,7 +831,7 @@ mod tests {
     #[test]
     fn a_hydration_request_ends_its_wait_when_taken_up() {
         let telemetry = PerformanceRecorder::default();
-        let (commands, _receiver) = mpsc::channel::<AccountWorkerCommand>(1);
+        let (commands, _receiver) = test_worker_channel(1);
         let lane = WorkerLane::from(commands);
         let in_flight = || {
             telemetry
@@ -425,7 +857,7 @@ mod tests {
     #[test]
     fn a_not_ready_answer_to_a_gone_caller_is_cancelled() {
         let telemetry = PerformanceRecorder::default();
-        let (commands, _receiver) = mpsc::channel::<AccountWorkerCommand>(1);
+        let (commands, _receiver) = test_worker_channel(1);
         let lane = WorkerLane::from(commands);
         let _unit = lane.unit.enter(WorkerUnit::StartupSync);
         let (respond, waiting) = lane.read_reply(&telemetry, ReadClass::R4);
@@ -449,5 +881,141 @@ mod tests {
                 "{operation:?}"
             );
         }
+    }
+
+    fn sample(
+        telemetry: &PerformanceRecorder,
+        operation: RuntimeOp,
+    ) -> marmot_observability::RuntimePerformanceSnapshot {
+        telemetry
+            .snapshot()
+            .runtime_operations
+            .into_iter()
+            .find(|sample| sample.operation == operation)
+            .unwrap()
+    }
+
+    /// The over-budget counts judge a unit against the engine's own budgets
+    /// for one unit of work.
+    #[test]
+    fn unit_budgets_are_the_engines() {
+        use cgka_engine::message_processor::{
+            BACKGROUND_CONVERGENCE_BUDGET_MS, FOREGROUND_DEFERRED_PEEL_BUDGET_MS,
+        };
+        assert_eq!(
+            FOREGROUND_UNIT_BUDGET,
+            Duration::from_millis(FOREGROUND_DEFERRED_PEEL_BUDGET_MS)
+        );
+        assert_eq!(
+            BACKGROUND_UNIT_BUDGET,
+            Duration::from_millis(BACKGROUND_CONVERGENCE_BUDGET_MS)
+        );
+    }
+
+    /// Every unit counts once in its kind's series when it ends, and once
+    /// more over budget only past its kind's budget: a send at 250 ms is in
+    /// budget and at 251 ms over, a catch-up still in budget at 500 ms.
+    #[test]
+    fn a_unit_past_its_budget_is_counted_over_budget() {
+        let telemetry = PerformanceRecorder::default();
+        let gauge = WorkerUnitGauge::recording(telemetry.clone());
+        for (kind, elapsed, over) in [
+            (UnitKind::Send, 250, false),
+            (UnitKind::Send, 251, true),
+            (UnitKind::InviteOrCreate, 251, true),
+            (UnitKind::CatchUp, 500, false),
+            (UnitKind::Delivery, 501, true),
+        ] {
+            let (series, over_budget) = kind.operations();
+            let before = (sample(&telemetry, series), sample(&telemetry, over_budget));
+            let mut timing = gauge.time(kind).expect("a recording gauge times units");
+            assert_eq!(sample(&telemetry, series).in_flight, before.0.in_flight + 1);
+            timing.end(Duration::from_millis(elapsed));
+            drop(timing);
+            assert_eq!(
+                sample(&telemetry, series).successes - before.0.successes,
+                1,
+                "{kind:?} at {elapsed} ms ends once"
+            );
+            assert_eq!(
+                sample(&telemetry, over_budget).successes - before.1.successes,
+                u64::from(over),
+                "{kind:?} at {elapsed} ms"
+            );
+        }
+        assert!(
+            WorkerUnitGauge::default().time(UnitKind::Send).is_none(),
+            "a gauge without a recorder times nothing"
+        );
+    }
+
+    /// Entering a long unit times it until the guard drops.
+    #[test]
+    fn an_entered_unit_is_timed_until_its_guard_drops() {
+        let telemetry = PerformanceRecorder::default();
+        let gauge = WorkerUnitGauge::recording(telemetry.clone());
+        let unit = gauge.enter(WorkerUnit::Repair);
+        assert_eq!(sample(&telemetry, RuntimeOp::WorkerUnitRepair).in_flight, 1);
+        drop(unit);
+        let ended = sample(&telemetry, RuntimeOp::WorkerUnitRepair);
+        assert_eq!((ended.in_flight, ended.successes), (0, 1));
+    }
+
+    /// A host mutation sent while the worker is inside a long unit waits in
+    /// that unit's mutation series until the worker takes it up, through a
+    /// unit that keeps it for later. A read carries its own wait, a
+    /// catch-up is timed by its own series, and nothing waits while no unit
+    /// runs or on the worker's own sender.
+    #[tokio::test]
+    async fn a_mutation_sent_inside_a_unit_waits_until_taken_up() {
+        let telemetry = PerformanceRecorder::default();
+        let gauge = Arc::new(WorkerUnitGauge::recording(telemetry.clone()));
+        let (sender, mut receiver) = mpsc::channel(8);
+        let commands = WorkerCommands::observed(sender.clone(), gauge.clone());
+        let in_flight = || sample(&telemetry, RuntimeOp::MutationQueueBehindSend).in_flight;
+        let mutation = || {
+            let (respond, _) = oneshot::channel();
+            AccountWorkerCommand::Drain { respond }
+        };
+
+        commands.send(mutation()).await.unwrap();
+        assert_eq!(in_flight(), 0, "no unit runs");
+        receiver.recv().await.unwrap().take_up();
+
+        let unit = gauge.enter(WorkerUnit::Send);
+        commands.send(mutation()).await.unwrap();
+        let (respond, _) = ReadReply::unobserved();
+        commands
+            .send(AccountWorkerCommand::StartedFresh { respond })
+            .await
+            .unwrap();
+        let (respond, _) = oneshot::channel();
+        commands
+            .send(AccountWorkerCommand::CatchUp { respond })
+            .await
+            .unwrap();
+        WorkerCommands::unobserved(sender)
+            .send(mutation())
+            .await
+            .unwrap();
+        assert_eq!(in_flight(), 1, "only the host mutation waits");
+        drop(unit);
+        assert_eq!(in_flight(), 1, "the wait lasts past the unit");
+
+        let kept = receiver
+            .recv()
+            .await
+            .unwrap()
+            .serve_or_keep(Some)
+            .expect("the unit keeps the command");
+        assert_eq!(in_flight(), 1, "a kept command keeps its wait");
+        kept.take_up();
+        let ended = sample(&telemetry, RuntimeOp::MutationQueueBehindSend);
+        assert_eq!((ended.in_flight, ended.successes), (0, 1));
+        while let Ok(queued) = receiver.try_recv() {
+            queued.take_up();
+        }
+        let after = sample(&telemetry, RuntimeOp::MutationQueueBehindSend);
+        assert_eq!((after.started, after.in_flight), (1, 0));
     }
 }

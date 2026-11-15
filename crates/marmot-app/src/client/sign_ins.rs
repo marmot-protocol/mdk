@@ -289,10 +289,13 @@ impl AppClient {
             return Ok(SignInCheckReport::default());
         }
         let own = self.own_key_packages()?;
+        let step = self.lane_step(crate::RuntimePerformanceOperation::SignInSlotRead);
         let read = self
             .app
             .read_account_key_package_slots(&self.state.label, own.slot.as_deref())
-            .await?;
+            .await;
+        step.finish(&read);
+        let read = read?;
         let trusted = self.trusted_device_roster()?;
         if !read.reached {
             // A relay whose own read finished still shows the slot empty,
