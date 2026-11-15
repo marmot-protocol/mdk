@@ -7453,6 +7453,98 @@ async fn recovery_device_acknowledgment_requires_the_displayed_epoch() {
     runtime.shutdown_and_close().await.unwrap();
 }
 
+/// Continue after a long pause rechecks the stale prerequisite and reruns
+/// discovery, but asks again only when that discovery shows something the
+/// user has not acknowledged: another slot, or a less complete result.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn device_acknowledgment_survives_a_staleness_recheck_that_finds_nothing_new() {
+    let (_dir, runtime, network, keys, id) = fixture().await;
+    let manager = runtime.accounts();
+    let setup = manager.account_setup();
+    let foreign = |slot: &str| {
+        signed(
+            &keys,
+            30443,
+            vec![vec!["d".into(), slot.into()]],
+            "malformed",
+            unix_now_seconds(),
+        )
+    };
+    *network.events.lock() = vec![
+        signed(&keys, 0, vec![], "{}", unix_now_seconds()),
+        foreign("other-installation"),
+    ];
+    let mut c = manager
+        .setup_records()
+        .onboarding_checkpoint(&id)
+        .unwrap()
+        .unwrap();
+    for step in [
+        OnboardingStep::Profile,
+        OnboardingStep::Relays,
+        OnboardingStep::InboxRelays,
+    ] {
+        c.set(step, OnboardingStatus::Passed, vec![]);
+    }
+    c.set(OnboardingStep::Follows, OnboardingStatus::Skipped, vec![]);
+    // Discovery also reads the account's declared relay.
+    c.records[OnboardingStep::Relays.index()] = Some(signed(
+        &keys,
+        10002,
+        vec![vec!["r".into(), "wss://declared.example".into()]],
+        "",
+        unix_now_seconds(),
+    ));
+    setup.check_onboarding_single_device(&mut c).await.unwrap();
+    setup.save_onboarding(&mut c).unwrap();
+    // Age only the profile check past CHECK_MAX_AGE, as a backgrounded app
+    // would, then press Continue on the displayed notice.
+    let continue_after_pause = || async {
+        let mut c = manager
+            .setup_records()
+            .onboarding_checkpoint(&id)
+            .unwrap()
+            .unwrap();
+        let stale = unix_now_seconds() - CHECK_MAX_AGE - 1;
+        c.snapshot.steps[OnboardingStep::Profile.index()].checked_at = Some(stale);
+        setup.save_onboarding(&mut c).unwrap();
+        let snapshot = setup
+            .acknowledge_onboarding_single_device(&id, c.snapshot.revision)
+            .await
+            .unwrap();
+        assert!(snapshot.steps[OnboardingStep::Profile.index()].checked_at > Some(stale));
+        let device = snapshot.steps[OnboardingStep::SingleDevice.index()].clone();
+        (device, snapshot.single_device_notice.unwrap())
+    };
+
+    // A relay that no longer answers leaves discovery weaker than acknowledged.
+    network.inspection_errors.lock().insert(
+        "declared.example".into(),
+        transport_nostr::DirectoryInspectionError::TimedOut,
+    );
+    let (device, notice) = continue_after_pause().await;
+    assert_eq!(device.status, OnboardingStatus::NeedsInput);
+    assert_eq!(notice.acknowledged_at, None);
+    assert!(device.findings.iter().any(|finding| {
+        finding.issue == OnboardingIssue::TimedOut
+            && finding.endpoint.as_deref() == Some("wss://declared.example")
+    }));
+    network.inspection_errors.lock().clear();
+
+    // Another slot appeared while the notice was displayed.
+    network.events.lock().push(foreign("newer-installation"));
+    let (device, notice) = continue_after_pause().await;
+    assert_eq!(device.status, OnboardingStatus::NeedsInput);
+    assert_eq!(notice.acknowledged_at, None);
+    assert_eq!(notice.other_packages.len(), 2);
+
+    // Nothing changed since the displayed notice: Continue continues.
+    let (device, notice) = continue_after_pause().await;
+    assert_eq!(device.status, OnboardingStatus::Passed, "{device:?}");
+    assert!(notice.acknowledged_at.is_some());
+    assert_eq!(notice.other_packages.len(), 2);
+    runtime.shutdown_and_close().await.unwrap();
+}
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn repeated_recovery_changes_epoch_even_when_attempt_numbers_repeat() {
     let (dir, runtime, _, keys, id) = fixture().await;

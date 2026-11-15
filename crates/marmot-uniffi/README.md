@@ -759,9 +759,12 @@ for approvals. Pass the epoch from the same displayed snapshot. The original
 revision-only methods reject recovered attempts, even when the number matches.
 MDK rejects a stale revision, persists the acknowledgment, and resumes setup.
 The acknowledgment survives KeyPackage publication failure, task interruption,
-and restart. Rechecking an earlier prerequisite, changing discovery sources,
-approving another repair, explicitly retrying `SingleDevice`, or signing in again
-after signing out a completed account invalidates it and requires a fresh notice.
+and restart. It also survives the automatic recheck of reachability older than
+five minutes: discovery runs again, and the notice returns only when it shows
+another slot, a slot newly carrying a usable package, a new finding, or a less
+complete result. Explicitly retrying an earlier prerequisite or `SingleDevice`,
+changing discovery sources, approving another repair, or signing in again after
+signing out a completed account invalidates it and requires a fresh notice.
 Retries preserve optional steps the user skipped unless that skipped step is the
 explicit retry target. Older checkpoints refresh their derived retry hints on
 read, and package records without a `usable` field default to `false`.

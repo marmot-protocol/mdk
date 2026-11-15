@@ -95,17 +95,28 @@ impl AccountSetup<'_> {
         } else {
             OnboardingDeviceDiscovery::Unknown
         };
-        checkpoint.snapshot.single_device_notice = Some(OnboardingSingleDeviceNotice {
+        let mut notice = OnboardingSingleDeviceNotice {
             discovery,
             other_packages: packages,
             discovery_complete,
             acknowledged_at: None,
-        });
-        checkpoint.set(
-            OnboardingStep::SingleDevice,
-            OnboardingStatus::NeedsInput,
-            findings,
-        );
+        };
+        // After a staleness recheck, keep the user's acknowledgment while
+        // discovery shows nothing beyond what they acknowledged.
+        let status = match checkpoint
+            .stale_device_acknowledgment
+            .take()
+            .filter(|acknowledged| acknowledged.covers(&notice, &findings))
+        {
+            Some(acknowledged) => {
+                notice.acknowledged_at = acknowledged.notice.acknowledged_at;
+                checkpoint.single_device_acknowledged = true;
+                OnboardingStatus::Passed
+            }
+            None => OnboardingStatus::NeedsInput,
+        };
+        checkpoint.snapshot.single_device_notice = Some(notice);
+        checkpoint.set(OnboardingStep::SingleDevice, status, findings);
         Ok(())
     }
 

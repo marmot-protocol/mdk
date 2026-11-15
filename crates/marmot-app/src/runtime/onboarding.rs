@@ -597,6 +597,11 @@ struct OnboardingCheckpoint {
     manual_relay_edit: bool,
     #[serde(default)]
     single_device_acknowledged: bool,
+    // The acknowledged device notice a staleness recheck reset (mdk#3442). Its rerun
+    // discovery restores the acknowledgment only when it shows nothing new.
+    // Older readers ignore it and ask again.
+    #[serde(default)]
+    stale_device_acknowledgment: Option<AcknowledgedDeviceNotice>,
     #[serde(default)]
     setup_cleanup_pending: bool,
     #[serde(default)]
@@ -605,6 +610,36 @@ struct OnboardingCheckpoint {
     // so a host can still look past an unreachable indexer.
     #[serde(default)]
     explicit_discovery: bool,
+}
+
+/// A device notice the user acknowledged, with the findings shown beside it.
+#[derive(Clone, Serialize, Deserialize)]
+struct AcknowledgedDeviceNotice {
+    notice: OnboardingSingleDeviceNotice,
+    findings: Vec<OnboardingFinding>,
+}
+impl AcknowledgedDeviceNotice {
+    /// Whether fresh discovery shows nothing the user has not acknowledged:
+    /// no other slot, no slot newly carrying a usable package, no new
+    /// finding, and no less complete a result.
+    fn covers(
+        &self,
+        notice: &OnboardingSingleDeviceNotice,
+        findings: &[OnboardingFinding],
+    ) -> bool {
+        (notice.discovery_complete || !self.notice.discovery_complete)
+            && notice.other_packages.iter().all(|fresh| {
+                self.notice
+                    .other_packages
+                    .iter()
+                    .any(|seen| seen.slot_id == fresh.slot_id && (seen.usable || !fresh.usable))
+            })
+            && findings.iter().all(|fresh| {
+                self.findings
+                    .iter()
+                    .any(|seen| seen.issue == fresh.issue && seen.endpoint == fresh.endpoint)
+            })
+    }
 }
 
 pub struct OnboardingSubscription {
@@ -652,6 +687,7 @@ impl OnboardingCheckpoint {
         }
         if step == OnboardingStep::SingleDevice {
             self.single_device_acknowledged = false;
+            self.stale_device_acknowledgment = None;
             self.snapshot.single_device_notice = None;
         }
         self.set(step, OnboardingStatus::Pending, Vec::new());
@@ -693,6 +729,7 @@ impl OnboardingCheckpoint {
             append_relays: false,
             manual_relay_edit: false,
             single_device_acknowledged: false,
+            stale_device_acknowledgment: None,
             setup_cleanup_pending: false,
             attempt_start_revision: 0,
             explicit_discovery: false,
@@ -1695,6 +1732,7 @@ impl AccountSetup<'_> {
                 existing.append_relays = false;
                 existing.manual_relay_edit = false;
                 existing.single_device_acknowledged = false;
+                existing.stale_device_acknowledgment = None;
                 existing.snapshot.single_device_notice = None;
                 for index in 0..STEP_COUNT {
                     let step = existing.snapshot.steps[index].step;
@@ -1890,7 +1928,19 @@ impl AccountSetup<'_> {
         }
         if !c.approved && c.snapshot.proposal.is_none() {
             // A long pause cannot turn a historical reachability check into
-            // evidence for today's publication route.
+            // evidence for today's publication route. It does not withdraw the
+            // user's device acknowledgment: discovery reruns, and asks again
+            // only if it shows something the user has not acknowledged.
+            let acknowledged = match &c.snapshot.single_device_notice {
+                Some(notice) if c.single_device_acknowledged => Some(AcknowledgedDeviceNotice {
+                    notice: notice.clone(),
+                    findings: c.snapshot.steps[OnboardingStep::SingleDevice.index()]
+                        .findings
+                        .clone(),
+                }),
+                _ => c.stale_device_acknowledgment.clone(),
+            };
+            let mut rechecked = false;
             for index in 0..OnboardingStep::SingleDevice.index() {
                 if c.snapshot.steps[index].status == OnboardingStatus::Passed
                     && c.snapshot.steps[index]
@@ -1901,7 +1951,11 @@ impl AccountSetup<'_> {
                     c.reset_step(step);
                     c.reset_step(OnboardingStep::SingleDevice);
                     c.reset_step(OnboardingStep::KeyPackage);
+                    rechecked = true;
                 }
+            }
+            if rechecked {
+                c.stale_device_acknowledgment = acknowledged;
             }
             self.save_onboarding(c)?;
         }
