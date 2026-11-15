@@ -393,6 +393,8 @@ mod migration_0205_attachment_storage_readmitted;
 mod migration_0206_committed_rosters;
 #[path = "migrations/0207_commit_refusals.rs"]
 mod migration_0207_commit_refusals;
+#[path = "migrations/0208_nip22_comments.rs"]
+mod migration_0208_nip22_comments;
 
 const MIGRATIONS: &[Migration] = &[
     Migration {
@@ -1489,6 +1491,12 @@ const MIGRATIONS: &[Migration] = &[
         name: "0207_commit_refusals",
         suspend_foreign_keys: &[],
         apply: migration_0207_commit_refusals::apply,
+    },
+    Migration {
+        version: 208,
+        name: "0208_nip22_comments",
+        suspend_foreign_keys: &[],
+        apply: migration_0208_nip22_comments::apply,
     },
 ];
 

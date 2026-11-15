@@ -20,6 +20,7 @@ use crate::media::{
     EncryptedMediaVersion, MediaAttachmentReference, media_attachment_from_imeta_tag,
     media_file_key_for_reference, media_imeta_tags_preserve_message,
 };
+use crate::messages::is_nip22_comment;
 use crate::{AppError, AppProjectionUpdate, unix_now_seconds};
 use cgka_traits::MarmotAppEvent;
 use cgka_traits::app_components::DeviceSlotId;
@@ -115,7 +116,7 @@ impl AppClient {
 
     /// Import `events` into `group_id` with their actual device or backup
     /// provenance. Drops an event whose id does not match its content,
-    /// a group-system row (those are local to each device), a chat message
+    /// a group-system row (those are local to each device), a chat message or comment
     /// whose encrypted-media reference the live path would reject, and each
     /// attachment key that names none of its message's attachments.
     fn import_chat_history(
@@ -338,11 +339,12 @@ fn importable(event: &ImportedAppEvent, allow_loopback_http: bool) -> bool {
     id == event.message_id_hex
         && event.kind != MARMOT_APP_EVENT_KIND_GROUP_SYSTEM
         && !super::device_group::is_device_group_kind(event.kind)
-        && (event.kind != MARMOT_APP_EVENT_KIND_CHAT
+        && (!(event.kind == MARMOT_APP_EVENT_KIND_CHAT
+            || is_nip22_comment(event.kind, &event.tags))
             || media_imeta_tags_preserve_message(&event.tags, allow_loopback_http))
 }
 
-/// The encrypted-media references of a chat message or reaction, each with
+/// The encrypted-media references of a chat message, reaction or comment, each with
 /// `epoch` as its source epoch. Empty for any other kind.
 fn chat_media_references(
     kind: u64,
@@ -353,7 +355,8 @@ fn chat_media_references(
     if !matches!(
         kind,
         MARMOT_APP_EVENT_KIND_CHAT | MARMOT_APP_EVENT_KIND_REACTION
-    ) {
+    ) && !is_nip22_comment(kind, tags)
+    {
         return Vec::new();
     }
     tags.iter()
@@ -421,7 +424,7 @@ fn attachment_keys(
     Ok(keys)
 }
 
-/// Drops each key that names none of the chat message's or reaction's attachments.
+/// Drops each key that names none of the event's attachments.
 fn keep_keys_naming_attachments(event: &mut ImportedAppEvent, allow_loopback_http: bool) {
     if event.file_keys.is_empty() {
         return;

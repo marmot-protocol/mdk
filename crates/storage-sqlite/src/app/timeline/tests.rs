@@ -2700,6 +2700,148 @@ fn custom_kind_event_with_e_tag_still_projects_as_standalone_row() {
 }
 
 #[test]
+fn nip22_comment_in_timeline() {
+    let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
+    let mut comment = chat("comment", "alice", 2, "original");
+    comment.kind = NIP22_COMMENT_KIND;
+    comment.tags = vec![
+        vec!["k".into(), "9".into()],
+        vec!["e".into(), "issue".into()],
+        vec!["q".into(), "quote".into()],
+        vec![
+            "imeta".into(),
+            "url https://example.com/image.png".into(),
+            "m image/png".into(),
+        ],
+    ];
+    let group = &comment.group_id_hex;
+    store
+        .record_app_event(&chat("issue", "bob", 1, "parent"))
+        .unwrap();
+    store
+        .record_app_event(&chat("quote", "carol", 1, "quoted"))
+        .unwrap();
+    let update = store.record_app_event(&comment).unwrap();
+    let row = &update.messages[0];
+    assert_eq!(row.kind, NIP22_COMMENT_KIND);
+    assert_eq!(row.reply_to_message_id_hex.as_deref(), Some("issue"));
+    assert_eq!(row.reply_preview.as_ref().unwrap().plaintext, "parent");
+    assert_eq!(row.media, Some(json!({ "imeta": [comment.tags[3]] })));
+
+    store
+        .record_app_event(&edit("edit", "alice", "comment", 3, "updated"))
+        .unwrap();
+    store
+        .record_app_event(&edit("forged", "bob", "comment", 4, "forged"))
+        .unwrap();
+    store
+        .record_app_event(&reaction("react", "bob", "comment", 5, "+"))
+        .unwrap();
+    for rebuild in [false, true] {
+        if rebuild {
+            store.rebuild_message_timeline_for_group(group).unwrap();
+        }
+        let row = store.timeline_message(group, "comment").unwrap().unwrap();
+        assert_eq!(row.plaintext, "updated");
+        assert_eq!(row.edit.as_ref().unwrap().edit_count, 1);
+        assert_eq!(
+            row.edit.as_ref().unwrap().latest_edit_message_id_hex,
+            "edit"
+        );
+        assert_eq!(row.reply_to_message_id_hex.as_deref(), Some("issue"));
+        assert_eq!(row.media, Some(json!({ "imeta": [comment.tags[3]] })));
+        assert_eq!(
+            row.reactions.by_emoji,
+            BTreeMap::from([("+".into(), vec!["bob".into()])])
+        );
+        let history = store
+            .message_edit_history(group, "comment", None, 10)
+            .unwrap();
+        assert_eq!(
+            history.versions,
+            vec![TimelineEditVersion {
+                message_id_hex: "edit".into(),
+                edited_at: 3,
+                plaintext: "updated".into(),
+            }]
+        );
+        assert!(!history.has_more_before);
+    }
+
+    store
+        .record_app_event(&delete("unauthorized", "bob", "comment", 6))
+        .unwrap();
+    assert!(
+        !store
+            .timeline_message(group, "comment")
+            .unwrap()
+            .unwrap()
+            .deleted
+    );
+    store
+        .record_app_event(&delete("delete", "alice", "comment", 7))
+        .unwrap();
+    let deleted = store.timeline_message(group, "comment").unwrap().unwrap();
+    assert!(deleted.deleted);
+    assert!(deleted.plaintext.is_empty());
+    assert!(deleted.edit.is_none());
+    assert!(
+        store
+            .message_edit_history(group, "comment", None, 10)
+            .unwrap()
+            .versions
+            .is_empty()
+    );
+    store.rebuild_message_timeline_for_group(group).unwrap();
+    assert_eq!(
+        store.timeline_message(group, "comment").unwrap().unwrap(),
+        deleted
+    );
+}
+
+#[test]
+fn unmarked_comments_stay_custom() {
+    for kind_tag in [None, Some("invalid")] {
+        let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
+        let mut comment = chat("custom", "alice", 1, "original");
+        comment.kind = NIP22_COMMENT_KIND;
+        comment.tags = vec![
+            vec!["e".into(), "parent".into()],
+            vec!["imeta".into(), "url https://example.com/image.png".into()],
+        ];
+        if let Some(kind) = kind_tag {
+            comment.tags.push(vec!["k".into(), kind.into()]);
+        }
+        store.record_app_event(&comment).unwrap();
+        store
+            .record_app_event(&edit("edit", "alice", "custom", 2, "ignored"))
+            .unwrap();
+        for rebuild in [false, true] {
+            if rebuild {
+                store
+                    .rebuild_message_timeline_for_group(&comment.group_id_hex)
+                    .unwrap();
+            }
+            let row = store
+                .timeline_message(&comment.group_id_hex, "custom")
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.plaintext, "original");
+            assert_eq!(row.reply_to_message_id_hex, None);
+            assert!(row.media.is_none());
+            assert!(row.edit.is_none());
+            assert!(
+                store
+                    .message_edit_history(&comment.group_id_hex, "custom", None, 10)
+                    .unwrap()
+                    .versions
+                    .is_empty()
+            );
+        }
+    }
+}
+
+#[test]
 fn recording_new_message_does_not_delete_existing_timeline_rows() {
     let store = SqliteAccountStorage::in_memory().unwrap();
     let app = store.app_storage();

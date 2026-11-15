@@ -2003,22 +2003,17 @@ fn secure_prune_selected_app_events_tx(
                 .extend(tag_values(&event.tags, EVENT_REF_TAG).map(ToOwned::to_owned));
         }
         collect_media_ciphertext_hashes(&event.tags, &mut media_ciphertext_sha256);
-        // A damaged row's timeline row may have lost its media (reprojected
-        // since); the references its tags wrote while they decoded have not.
-        let carries_encrypted_media = if event.tags_damaged {
-            !encrypted_media_secret_reference_epochs_for_message_tx(
+        // Recorded ownership survives damaged tags, including a comment's k tag.
+        if event.tags_damaged || event.kind == NIP22_COMMENT_KIND {
+            retiring_media_epochs.extend(encrypted_media_secret_reference_epochs_for_message_tx(
                 tx,
                 group_id_hex,
                 &event.message_id_hex,
-            )?
-            .is_empty()
-        } else {
-            !encrypted_media_component_ids(&event.tags).is_empty()
-        };
-        if matches!(
+            )?);
+        } else if matches!(
             event.kind,
             MARMOT_APP_EVENT_KIND_CHAT | MARMOT_APP_EVENT_KIND_REACTION
-        ) && carries_encrypted_media
+        ) && !encrypted_media_component_ids(&event.tags).is_empty()
             && let Some(source_epoch) = event.source_epoch
         {
             retiring_media_epochs.insert(u64_to_i64(source_epoch)?);
@@ -4707,6 +4702,16 @@ fn keep_receipts_of_pruned_reactions_tx(
     Ok(())
 }
 
+const NIP22_COMMENT_KIND: u64 = 1111;
+
+pub(super) fn is_nip22_comment(kind: u64, tags: &[Vec<String>]) -> bool {
+    kind == NIP22_COMMENT_KIND && tag_values(tags, "k").any(|kind| kind.parse::<u64>().is_ok())
+}
+
+fn is_editable_message(kind: u64, tags: &[Vec<String>]) -> bool {
+    kind == MARMOT_APP_EVENT_KIND_CHAT || is_nip22_comment(kind, tags)
+}
+
 fn timeline_row_from_chat(event: &RawAppEvent) -> TimelineRow {
     let (media, agent_text_stream) = if event.kind == MARMOT_APP_EVENT_KIND_CHAT {
         (
@@ -4771,11 +4776,17 @@ fn timeline_row_from_app_event(event: &RawAppEvent) -> TimelineRow {
     }
 }
 
-/// App-defined custom kinds own their tag semantics: an `e` tag may mean
-/// anything to the app, so it is never interpreted as MDK reply metadata.
+/// NIP-22 comments use `e` for their parent and `q` for body quotes.
+/// Other custom kinds own their tags, so `e` is not MDK reply metadata.
 /// Ordinary chat replies can still target a custom row — reply linkage is
 /// derived from the replying event's own tags, not the target's.
 fn timeline_row_from_custom_event(event: &RawAppEvent) -> TimelineRow {
+    if is_nip22_comment(event.kind, &event.tags) {
+        return TimelineRow {
+            media: media_metadata(&event.tags),
+            ..timeline_row_from_app_event(event)
+        };
+    }
     TimelineRow {
         reply_to_message_id_hex: None,
         ..timeline_row_from_app_event(event)

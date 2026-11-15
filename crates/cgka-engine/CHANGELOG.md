@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Fixed
+
+- Received NIP-22 comments (kind 1111 with a numeric lowercase `k` tag) carry their source-epoch encrypted-media
+  secret through the same ingest and replay handoff as chat attachments (#3409).
+
 ## 0.17.0 - 2026-11-15
 
 ### Added

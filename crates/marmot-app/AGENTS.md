@@ -93,7 +93,10 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   (`encrypted_media_not_required_epochs`, mdk#1380), and the sync checkpoint skips its second
   `refresh_group_routes` when the drained prefix carried zero deliveries and clean routes.
 - Keep app-defined custom events on the `AppMessageIntent::Custom` path in `src/messages/intents.rs`: kind, tags, and
-  content pass through verbatim, and kinds MDK owns (`is_reserved_app_event_kind`: chat, reaction, edit, delete,
+  content pass through unchanged, except NIP-22 comments (kind 1111 with a lowercase `k` tag whose value parses as
+  `u64`) gain missing mention `p` tags. Match existing `p` tags by pubkey even with relay hints or extra elements;
+  preserve supplied tags and content. Unmarked kind 1111 remains app-defined. Kinds MDK owns
+  (`is_reserved_app_event_kind`: chat, reaction, edit, delete,
   agent, group system, push token, and the device-group kinds `is_device_group_kind` lists) are rejected with `AppError::InvalidAppMessagePayload` so apps cannot forge
   protocol-owned events. Custom kinds project as standalone timeline rows under
   `TimelineUpdateTrigger::CustomEvent` (never folding onto a target message like reactions/deletes) and are queryable

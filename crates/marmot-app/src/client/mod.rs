@@ -4813,7 +4813,7 @@ impl AppClient {
                     intent
                 }
                 // Fail fast on edits recipients would ignore: the target must be an
-                // available chat message by the same author in this device's view
+                // available chat or NIP-22 comment by the same author in this device's view
                 // now. Recipients stay authoritative; a delete or convergence change
                 // landing after this check yields a harmlessly ignored edit, so it is
                 // not re-checked later. Retained edits were checked at admission and
@@ -4829,7 +4829,8 @@ impl AppClient {
                         .app_storage()
                         .timeline_message(&hex::encode(group_id.as_slice()), target_message_id)?
                         .filter(|target| {
-                            target.kind == cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT
+                            (target.kind == cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT
+                                || crate::messages::is_nip22_comment(target.kind, &target.tags))
                                 && target.sender == sender
                                 && !target.deleted
                                 // A failed local publish is retried; recipients

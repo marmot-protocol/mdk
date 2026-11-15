@@ -140,6 +140,14 @@ preconditions: this read is not an atomic authorization for a later write.
 
 ## Migrations
 
+Migration 0208 repairs retained NIP-22 comments (kind 1111 with any lowercase `k` value that parses as a Rust `u64`).
+It restores their first lowercase `e` parent, media metadata and accepted author edits, admits their attachment sources
+and backfills missing attachment slots. Encrypted-media-v1 and v2 source-epoch references make cached secrets
+retention-managed. Deleted targets keep their tombstones; malformed
+sources and unrelated custom rows stay unchanged. Raw events are not rewritten. Account schema advances to 208;
+older binaries refuse the upgraded database, and downgrade is unsupported.
+Previously erased media keys cannot be recovered.
+
 Migration 0204 drops the timeline rows of own sends that failed and were then deleted. Such a send reached no one, so
 the projection no longer gives it a row; its source row stays in `app_events`. A deleted send a peer reacted to (or
 whose receipt retention kept) was received after all: it is settled as delivered and keeps its placeholder.
@@ -255,6 +263,10 @@ still need their record blob until bounded promotion converts them. The default 
 compatible with other backends.
 
 ## Conversation reads
+
+NIP-22 comments (kind 1111 with a numeric lowercase `k` tag) use lowercase `e` for the reply parent, not `q` quotes.
+Their `imeta` tags project as media, and author-only edits update the text and `message_edit_history`.
+Other custom events, including unmarked kind-1111 events, retain app-defined tag semantics.
 
 `message_timeline` combines `TimelineMessageQuery`'s literal, Unicode-lowercased substring search with an exact
 sender match, an inclusive `since` and exclusive `until` on `timeline_at`, and an attachment type. All filters apply

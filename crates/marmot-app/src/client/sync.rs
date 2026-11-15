@@ -4283,13 +4283,15 @@ impl AppClient {
             }
             return Ok(());
         }
-        let retains_encrypted_media = matches!(
-            message.kind,
-            MARMOT_APP_EVENT_KIND_CHAT | MARMOT_APP_EVENT_KIND_REACTION
-        ) && media_imeta_tags_are_valid(
-            &message.tags,
-            self.app.allow_loopback_blob_endpoints(),
-        );
+        let retains_encrypted_media =
+            (matches!(
+                message.kind,
+                MARMOT_APP_EVENT_KIND_CHAT | MARMOT_APP_EVENT_KIND_REACTION
+            ) || crate::messages::is_nip22_comment(message.kind, &message.tags))
+                && media_imeta_tags_are_valid(
+                    &message.tags,
+                    self.app.allow_loopback_blob_endpoints(),
+                );
         if let Err(error) = self
             .app
             .directory()
