@@ -2437,10 +2437,11 @@ impl AccountSetup<'_> {
         (records, failures, completed)
     }
     /// Whether a lookup source that answered vouches for the account's own
-    /// records. The host's discovery relays are its own relays, which rarely
-    /// hold an imported account's lists (see `append_public_indexers`), so
-    /// they vouch only when no public indexer was searched: a host-selected
-    /// or hermetic discovery set.
+    /// records: a public indexer or a relay the account declares. The host's
+    /// other discovery relays are its own relays, which rarely hold an
+    /// imported account's lists (see `append_public_indexers`), so they vouch
+    /// only when no public indexer was searched: a host-selected or hermetic
+    /// discovery set.
     fn authoritative_answered(
         &self,
         c: &OnboardingCheckpoint,
@@ -2456,15 +2457,23 @@ impl AccountSetup<'_> {
         let indexer_searched = sources
             .iter()
             .any(|source| indexers.contains(&relay_key(source)));
+        let declared: HashSet<String> = c.records[OnboardingStep::Relays.index()]
+            .as_ref()
+            .and_then(crate::relay_list_state_from_event)
+            .map(|state| state.relays.iter().map(|relay| relay_key(relay)).collect())
+            .unwrap_or_default();
         let host: HashSet<String> = c
             .options
             .discovery_relays
             .iter()
             .map(|relay| relay_key(relay))
             .collect();
-        completed
-            .keys()
-            .any(|key| !indexer_searched || !host.contains(key))
+        completed.keys().any(|key| {
+            !indexer_searched
+                || indexers.contains(key)
+                || declared.contains(key)
+                || !host.contains(key)
+        })
     }
     async fn onboarding_sources(
         &self,
@@ -3106,9 +3115,31 @@ impl AccountSetup<'_> {
         // holds; a record only an unanswered source holds is the accepted risk.
         let accepted_risk = !complete
             && proposal.inconclusive
-            && self.authoritative_answered(&c, &sources, &completed)
-            && (proposal.previous_event_id.is_none() || !records.is_empty());
-        if !complete && !accepted_risk {
+            && self.authoritative_answered(&c, &sources, &completed);
+        let basis_newest = records.first().map(|e| &e.id) == proposal.previous_event_id.as_ref();
+        // Past a failed source, only a record that replaces the proposal's own
+        // counts as a change; an older copy must not displace it.
+        let basis = c.records[proposal.step.index()]
+            .as_ref()
+            .filter(|event| Some(&event.id) == proposal.previous_event_id.as_ref());
+        let newer_seen = records.first().is_some_and(|event| {
+            basis.is_none_or(|basis| {
+                event.created_at > basis.created_at
+                    || (event.created_at == basis.created_at && event.id < basis.id)
+            })
+        });
+        if !basis_newest && (complete || (accepted_risk && newer_seen)) {
+            c.records[proposal.step.index()] = records.first().cloned();
+            c.snapshot.proposal = None;
+            c.set(
+                proposal.step,
+                OnboardingStatus::RetryableFailure,
+                vec![finding(OnboardingIssue::RecordChanged).in_context(
+                    OnboardingFindingContext::RepairApproval,
+                    OnboardingCheckPurpose::SourceFreshness,
+                )],
+            );
+        } else if !complete && !(accepted_risk && basis_newest) {
             let failures = if failures.is_empty() {
                 vec![finding(OnboardingIssue::DiscoveryIncomplete)]
             } else {
@@ -3128,17 +3159,6 @@ impl AccountSetup<'_> {
                     .collect(),
             );
             c.snapshot.proposal = None;
-        } else if records.first().map(|e| &e.id) != proposal.previous_event_id.as_ref() {
-            c.records[proposal.step.index()] = records.first().cloned();
-            c.snapshot.proposal = None;
-            c.set(
-                proposal.step,
-                OnboardingStatus::RetryableFailure,
-                vec![finding(OnboardingIssue::RecordChanged).in_context(
-                    OnboardingFindingContext::RepairApproval,
-                    OnboardingCheckPurpose::SourceFreshness,
-                )],
-            );
         } else {
             c.approved = true;
             // The sources this approval went past stay visible.

@@ -4294,6 +4294,124 @@ async fn an_inconclusive_inbox_lookup_offers_an_edit_whose_approval_tolerates_th
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_older_copy_never_displaces_an_inconclusive_proposals_record() {
+    use transport_nostr::DirectoryInspectionError;
+
+    let (_dir, runtime, network, keys, id) = fixture().await;
+    network.inspection_errors.lock().insert(
+        "gated.example".into(),
+        DirectoryInspectionError::AuthenticationRequired,
+    );
+    inbox_step(
+        &runtime,
+        &network,
+        &keys,
+        &id,
+        vec![vec!["r".into(), "wss://healthy.example".into()]],
+        Some(vec![vec!["relay".into(), "wss://gated.example".into()]]),
+    )
+    .await;
+    let setup = runtime.account_setup();
+    let proposed = setup
+        .propose_onboarding_relays(&id, OnboardingStep::InboxRelays, None)
+        .await
+        .unwrap();
+    let basis = proposed
+        .proposal
+        .as_ref()
+        .unwrap()
+        .previous_event_id
+        .clone();
+    assert!(basis.is_some());
+    // At approval the relay holding the proposal's record times out, and an
+    // indexer that answers holds only an older copy.
+    network.events.lock().retain(|event| event.kind != 10050);
+    network.public_indexer_events.lock().push(signed(
+        &keys,
+        10050,
+        vec![vec!["relay".into(), "wss://older.example".into()]],
+        "",
+        unix_now_seconds() - 100,
+    ));
+    network
+        .inspection_errors
+        .lock()
+        .insert("healthy.example".into(), DirectoryInspectionError::TimedOut);
+    let result = setup
+        .approve_onboarding_repair(&id, proposed.revision)
+        .await
+        .unwrap();
+    assert!(network.attempts.lock().is_empty());
+    let state = &result.steps[OnboardingStep::InboxRelays.index()];
+    assert_eq!(state.status, OnboardingStatus::RetryableFailure);
+    assert!(state.findings.iter().any(|f| {
+        f.issue == OnboardingIssue::TimedOut
+            && f.context == OnboardingFindingContext::RepairApproval
+    }));
+    assert!(
+        !state
+            .findings
+            .iter()
+            .any(|f| f.issue == OnboardingIssue::RecordChanged)
+    );
+    let checkpoint = runtime
+        .accounts()
+        .setup_records()
+        .onboarding_checkpoint(&id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        checkpoint.records[OnboardingStep::InboxRelays.index()]
+            .as_ref()
+            .map(|event| event.id.clone()),
+        basis
+    );
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_host_relay_the_account_declares_vouches_while_public_indexers_fail() {
+    use transport_nostr::DirectoryInspectionError;
+
+    let (_dir, runtime, network, keys, id) = fixture().await;
+    fail_public_indexers(&network);
+    network
+        .inspection_errors
+        .lock()
+        .insert("dead.example".into(), DirectoryInspectionError::Unreachable);
+    // The account declares the host's discovery relay, so its empty answer
+    // counts in the lookup and again at approval.
+    let snapshot = inbox_step(
+        &runtime,
+        &network,
+        &keys,
+        &id,
+        vec![
+            vec!["r".into(), "wss://index.example".into()],
+            vec!["r".into(), "wss://dead.example".into()],
+        ],
+        None,
+    )
+    .await;
+    let state = &snapshot.steps[OnboardingStep::InboxRelays.index()];
+    assert_eq!(state.status, OnboardingStatus::RetryableFailure);
+    assert!(offers_relay_edits(state), "{:?}", state.actions);
+    let setup = runtime.account_setup();
+    let proposed = setup
+        .propose_onboarding_relays(&id, OnboardingStep::InboxRelays, None)
+        .await
+        .unwrap();
+    assert!(proposed.proposal.as_ref().unwrap().inconclusive);
+    setup
+        .approve_onboarding_repair(&id, proposed.revision)
+        .await
+        .unwrap();
+    let published = network.attempts.lock()[0].clone();
+    assert_eq!(published.kind, 10050);
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_unanswered_lookup_offers_no_relay_edit() {
     // Nothing answers, or only the host's own relays answer while every
     // public indexer fails: nothing vouches that the lists are absent.
