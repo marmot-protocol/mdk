@@ -37,7 +37,7 @@ use cgka_traits::{
     TransportDeliverySource, TransportEndpoint, TransportEndpointFailure,
     TransportEndpointFailureKind, TransportEndpointReceipt, TransportEndpointRejectionCategory,
     TransportGroupSync, TransportPublishFailure, TransportPublishReport, TransportPublishRequest,
-    TransportPublishTarget,
+    TransportPublishTarget, TransportReadBack,
 };
 use marmot_session::{
     AccountDeviceEffects, AccountDeviceRuntime, AccountDeviceSession, AccountError,
@@ -429,6 +429,10 @@ struct RecordingAdapterInner {
     /// Exact failures each endpoint answers its next publishes with, in order.
     scripted_failures:
         Mutex<std::collections::HashMap<TransportEndpoint, VecDeque<TransportEndpointFailure>>>,
+    /// Each read-back's event id and endpoints, in order (mdk#2332).
+    read_backs: Mutex<Vec<(MessageId, Vec<TransportEndpoint>)>>,
+    /// What each endpoint answers every read-back; any other answers nothing.
+    read_back_answers: Mutex<std::collections::HashMap<TransportEndpoint, TransportReadBack>>,
 }
 
 struct WelcomePublishGate {
@@ -562,6 +566,19 @@ impl RecordingAdapter {
 
     fn commit_publishes(&self) -> Vec<TransportPublishRequest> {
         self.inner.commit_publishes.lock().unwrap().clone()
+    }
+
+    /// Answer every read-back at `endpoint` with `answer` (mdk#2332).
+    fn answer_read_backs(&self, endpoint: TransportEndpoint, answer: TransportReadBack) {
+        self.inner
+            .read_back_answers
+            .lock()
+            .unwrap()
+            .insert(endpoint, answer);
+    }
+
+    fn read_backs(&self) -> Vec<(MessageId, Vec<TransportEndpoint>)> {
+        self.inner.read_backs.lock().unwrap().clone()
     }
 
     /// Answer the next publishes to `endpoint` with `failures`, in order.
@@ -799,6 +816,29 @@ impl TransportAdapter for RecordingAdapter {
         Ok(None)
     }
 
+    async fn read_back(
+        &self,
+        _account_id: &MemberId,
+        message: &TransportMessage,
+        endpoints: &[TransportEndpoint],
+    ) -> Vec<TransportReadBack> {
+        self.inner
+            .read_backs
+            .lock()
+            .unwrap()
+            .push((message.id.clone(), endpoints.to_vec()));
+        let answers = self.inner.read_back_answers.lock().unwrap();
+        endpoints
+            .iter()
+            .map(|endpoint| {
+                answers
+                    .get(endpoint)
+                    .copied()
+                    .unwrap_or(TransportReadBack::NoAnswer)
+            })
+            .collect()
+    }
+
     async fn commit_size_refusals(
         &self,
         _commit: &TransportMessage,
@@ -955,6 +995,7 @@ include!("runtime/interrupted_attempt.rs");
 include!("runtime/commit_floor.rs");
 include!("runtime/commit_refusal.rs");
 include!("runtime/own_echo.rs");
+include!("runtime/read_back.rs");
 include!("runtime/hydrated_welcome.rs");
 include!("support/recovery_challenge.rs");
 include!("runtime/key_package_generation_upgrade.rs");

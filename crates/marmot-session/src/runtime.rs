@@ -43,7 +43,7 @@ use cgka_traits::{
     TransportAdapterError, TransportDelivery, TransportEndpoint, TransportEndpointAckKind,
     TransportEndpointFailure, TransportEndpointFailureKind, TransportEndpointReceipt,
     TransportEndpointRejectionCategory, TransportGroupSync, TransportPublishReport,
-    TransportPublishRequest, TransportPublishTarget, WelcomeSizeCheck,
+    TransportPublishRequest, TransportPublishTarget, TransportReadBack, WelcomeSizeCheck,
 };
 use futures::stream::FuturesUnordered;
 use futures::{FutureExt, StreamExt};
@@ -128,6 +128,10 @@ const FROZEN_FANOUT_AMBIGUOUS_RETRY_MAX_MS: u64 = 60 * 60 * 1_000;
 /// Keep this aligned with the adapter's fixed reconnect interval so restoring
 /// connectivity does not leave a user send behind the ambiguity backoff.
 const FROZEN_FANOUT_UNAVAILABLE_RETRY_DELAY_MS: u64 = 5 * 1_000;
+/// How long after a pending commit's first send attempt it is only resent
+/// (mdk#2332). From then on, each retry of a relay that may hold it reads the
+/// commit back from that relay first; one that returns it acknowledges it.
+const PENDING_COMMIT_READ_BACK_AFTER_MS: u64 = 10 * 60 * 1_000;
 
 /// Local scheduling windows for own-leaf maintenance rotations.
 ///
@@ -5954,8 +5958,12 @@ where
             self.resolve_outbound_fanout_mls(&mut fanout, output, queue, context.clone())
                 .await?;
         }
-        let endpoints = fanout.request().target.endpoints().to_vec();
         let now_ms = self.wall_clock.now().0.saturating_mul(1_000);
+        if self.read_back_pending_commit(&mut fanout, now_ms).await? {
+            self.resolve_outbound_fanout_mls(&mut fanout, output, queue, context.clone())
+                .await?;
+        }
+        let endpoints = fanout.request().target.endpoints().to_vec();
         let secondary_retry_yield = (fanout.outcome().accepted_targets
             >= fanout.request().required_acks.max(1)
             && !matches!(fanout.mls_state(), FanoutMlsState::Pending(_)))
@@ -5986,13 +5994,7 @@ where
             // (mdk#2332). Each target is checked on its own and sent once its
             // check passes, so a slow check, such as a connection probe to a
             // relay of unknown limit, holds back no other target's send.
-            let commit = matches!(
-                fanout.pending_kind(),
-                Some(FanoutPendingKind::GroupEvolution | FanoutPendingKind::Disband)
-            ) && matches!(
-                fanout.request().message.envelope,
-                TransportEnvelope::GroupMessage { .. }
-            );
+            let commit = is_group_commit(&fanout);
             let mut pass_failed = Vec::new();
             if !commit {
                 for &index in &due {
@@ -6318,6 +6320,72 @@ where
             self.session.merge_commit_refusal(&refusal)?;
         }
         Ok(status)
+    }
+
+    /// Read a pending commit back from each relay that may hold it and whose
+    /// retry is due, once the commit's first send attempt is
+    /// [`PENDING_COMMIT_READ_BACK_AFTER_MS`] old (mdk#2332). A relay that
+    /// returns the exact event holds it, so it acknowledges the commit by
+    /// read-back. Any other answer changes nothing: the relay is resent to as
+    /// before, and nothing rolls back. Returns whether the acknowledgements
+    /// met the commit's goal, for the caller to confirm it.
+    async fn read_back_pending_commit(
+        &mut self,
+        fanout: &mut OutboundFanout,
+        now_ms: u64,
+    ) -> AccountResult<bool> {
+        if !is_group_commit(fanout)
+            || !matches!(fanout.mls_state(), FanoutMlsState::Pending(_))
+            || fanout.first_attempt_at_ms().is_none_or(|first| {
+                now_ms.saturating_sub(first) < PENDING_COMMIT_READ_BACK_AFTER_MS
+            })
+        {
+            return Ok(false);
+        }
+        let read = fanout
+            .outstanding_target_indexes()
+            .into_iter()
+            .filter(|&index| {
+                fanout.target_may_hold_event(index)
+                    && frozen_fanout_target_retry_due(fanout, index, now_ms)
+            })
+            .collect::<Vec<_>>();
+        if read.is_empty() {
+            return Ok(false);
+        }
+        let endpoints = fanout.request().target.endpoints();
+        let read_endpoints = read
+            .iter()
+            .map(|&index| endpoints[index].clone())
+            .collect::<Vec<_>>();
+        let answers = self
+            .adapter
+            .read_back(
+                &fanout.request().account_id,
+                &fanout.request().message,
+                &read_endpoints,
+            )
+            .await;
+        let mut found = 0_usize;
+        for (&index, answer) in read.iter().zip(answers) {
+            if answer == TransportReadBack::Found
+                && fanout.acknowledge_target(index, FanoutAcknowledgement::ReadBack)?
+            {
+                found += 1;
+            }
+        }
+        tracing::debug!(
+            target: TRACE_TARGET,
+            method = "read_back_pending_commit",
+            read = read.len(),
+            found,
+            "read a pending commit back"
+        );
+        if found == 0 {
+            return Ok(false);
+        }
+        self.session.put_observed_outbound_fanout(fanout, now_ms)?;
+        Ok(fanout.outcome().accepted_targets >= fanout.request().required_acks.max(1))
     }
 
     async fn resolve_outbound_fanout_mls(
@@ -7111,6 +7179,18 @@ fn ambiguous_endpoint_failure(endpoint: TransportEndpoint) -> TransportEndpointF
         kind: TransportEndpointFailureKind::PossiblyExposed,
         rejection_category: None,
     }
+}
+
+/// Whether `fanout` carries one of this device's group commits, a group
+/// evolution or a disband, rather than an application message or a Welcome.
+fn is_group_commit(fanout: &OutboundFanout) -> bool {
+    matches!(
+        fanout.pending_kind(),
+        Some(FanoutPendingKind::GroupEvolution | FanoutPendingKind::Disband)
+    ) && matches!(
+        fanout.request().message.envelope,
+        TransportEnvelope::GroupMessage { .. }
+    )
 }
 
 fn frozen_fanout_target_retry_due(fanout: &OutboundFanout, index: usize, now_ms: u64) -> bool {
