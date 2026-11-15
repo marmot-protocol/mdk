@@ -256,6 +256,10 @@ compatible with other backends.
 
 ## Conversation reads
 
+NIP-22 comments (kind 1111 with a numeric lowercase `k` tag) use lowercase `e` for the reply parent, not `q` quotes.
+Their `imeta` tags project as media, and author-only edits update the text and `message_edit_history`.
+Other custom events, including unmarked kind-1111 events, retain app-defined tag semantics.
+
 `message_timeline` combines `TimelineMessageQuery`'s literal, Unicode-lowercased substring search with an exact
 sender match, an inclusive `since` and exclusive `until` on `timeline_at`, and an attachment type. All filters apply
 before the page limit. `TimelineAttachmentType` reads individual `imeta` tags, independently of the decoded media

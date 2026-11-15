@@ -2997,7 +2997,7 @@ fn edits_require_an_available_own_chat_target() {
 }
 
 async fn edit_target_preflight_body() {
-    // Recipients honor an edit only of an available chat message by the same
+    // Recipients honor an edit only of an available chat or NIP-22 comment by the same
     // author. The sender must refuse every other target before publishing it
     // to the group.
     let dir = tempfile::tempdir().unwrap();
@@ -3032,6 +3032,36 @@ async fn edit_target_preflight_body() {
         .unwrap();
     assert_eq!(row.plaintext, "status: done");
 
+    let mut unmarked_id = String::new();
+    for tags in [vec![vec!["k".into(), "9".into()]], vec![]] {
+        let marked = !tags.is_empty();
+        let (_, comment) = client
+            .send_app_event(
+                &group_id,
+                AppMessageIntent::Custom {
+                    kind: 1111,
+                    tags,
+                    content: "comment".into(),
+                },
+            )
+            .await
+            .unwrap();
+        let id = &comment.message_ids[0];
+        if !marked {
+            unmarked_id.clone_from(id);
+            continue;
+        }
+        client
+            .send_app_event(&group_id, edit(id, "edited comment"))
+            .await
+            .unwrap();
+        let row = app
+            .timeline_message("alice", &group_hex, id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.plaintext, "edited comment");
+    }
+
     let reaction = client
         .react_to_message(&group_id, &original_id, "+")
         .await
@@ -3065,6 +3095,7 @@ async fn edit_target_preflight_body() {
 
     let published_before = relay.published_event_ids().len();
     for (target, case) in [
+        (unmarked_id.as_str(), "an app-defined kind-1111 event"),
         (foreign_id.as_str(), "another account's message"),
         (reaction.message_ids[0].as_str(), "a reaction"),
         (deleted.message_ids[0].as_str(), "a deleted message"),

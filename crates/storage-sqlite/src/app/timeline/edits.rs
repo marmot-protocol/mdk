@@ -62,7 +62,8 @@ fn resolve<'a>(
     edits: impl Iterator<Item = &'a RawAppEvent>,
     deleted: &HashSet<String>,
 ) -> Vec<TimelineEditVersion> {
-    if row.kind != MARMOT_APP_EVENT_KIND_CHAT || row.invalidation_status.is_some() || row.deleted {
+    if !is_editable_message(row.kind, &row.tags) || row.invalidation_status.is_some() || row.deleted
+    {
         return Vec::new();
     }
     let mut versions = edits
@@ -93,7 +94,8 @@ pub(super) fn accepted_versions_tx(
     conn: &Connection,
     row: &TimelineRow,
 ) -> StorageResult<Vec<TimelineEditVersion>> {
-    if row.kind != MARMOT_APP_EVENT_KIND_CHAT || row.invalidation_status.is_some() || row.deleted {
+    if !is_editable_message(row.kind, &row.tags) || row.invalidation_status.is_some() || row.deleted
+    {
         return Ok(Vec::new());
     }
     let edits = app_events_targeting_message_tx(
@@ -138,7 +140,7 @@ impl SqliteAppStorage {
             let visible: bool = conn
                 .query_row_cached(
                     "SELECT EXISTS(SELECT 1 FROM visible_message_timeline
-                 WHERE group_id_hex=?1 AND message_id_hex=?2 AND kind=9
+                 WHERE group_id_hex=?1 AND message_id_hex=?2
                  AND deleted=0 AND invalidation_status IS NULL)",
                     params![group, target],
                     |r| r.get(0),

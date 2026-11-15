@@ -182,6 +182,16 @@ fn mention_p_tags(content: &str) -> Vec<Vec<String>> {
     tags
 }
 
+fn append_mention_tags(tags: &mut Vec<Vec<String>>, content: &str) {
+    for mention in mention_p_tags(content) {
+        if !tags.iter().any(|tag| {
+            tag.first().is_some_and(|name| name == PUBKEY_REF_TAG) && tag.get(1) == mention.get(1)
+        }) {
+            tags.push(mention);
+        }
+    }
+}
+
 /// Value of the `stream-type` tag on an agent text stream start event.
 const STREAM_TYPE_TEXT: &str = "text";
 /// Value of the `route` tag on a brokered QUIC agent text stream start event.
@@ -302,10 +312,9 @@ pub(crate) enum AppMessageIntent {
     PushTokenRemoval {
         content: String,
     },
-    /// An app-defined event with an arbitrary non-reserved kind. Tags and
-    /// content pass through verbatim: the intent layer neither derives
-    /// `p`-tags from the content nor shapes the payload, so the caller owns
-    /// the event's semantics end to end.
+    /// An event with an arbitrary non-reserved kind. Tags and content pass
+    /// through unchanged, except NIP-22 comments (1111 with a numeric lowercase
+    /// `k` tag) gain missing mention `p` tags.
     Custom {
         kind: u64,
         tags: Vec<Vec<String>>,
@@ -788,7 +797,16 @@ pub(crate) fn build_inner_event_with_media_reply(
             content,
         } => {
             validate_custom_event_kind(*kind)?;
-            Ok(event(*kind, tags.clone(), content.clone()))
+            let mut tags = tags.clone();
+            if *kind == 1111
+                && tags.iter().any(|tag| {
+                    tag.first().is_some_and(|name| name == "k")
+                        && tag.get(1).is_some_and(|value| value.parse::<u64>().is_ok())
+                })
+            {
+                append_mention_tags(&mut tags, content);
+            }
+            Ok(event(*kind, tags, content.clone()))
         }
     }
 }
@@ -1064,6 +1082,81 @@ mod mention_tests {
         };
         let event = build_inner_event(&intent, &valid_pubkey_hex(), 0).unwrap();
         assert!(event.tags.contains(&vec!["p".to_owned(), hex]));
+    }
+
+    #[test]
+    fn custom_comment_mentions() {
+        let hex = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+        let npub = npub_for_account_id(hex).unwrap();
+        let content = format!("hi @{npub}, again nostr:{npub}, and @{npub}");
+        for existing in [
+            None,
+            Some(vec!["p".into(), hex.into()]),
+            Some(vec!["p".into(), hex.into(), "wss://relay.example".into()]),
+            Some(vec![
+                "p".into(),
+                hex.into(),
+                String::new(),
+                "mention".into(),
+            ]),
+        ] {
+            let mut tags = vec![
+                vec!["k".into(), "9".into()],
+                vec!["e".into(), "ab".repeat(32), "parent hint".into()],
+                vec!["q".into(), "cd".repeat(32)],
+                vec!["app".into(), "keep me".into()],
+            ];
+            if let Some(existing) = existing {
+                tags.push(existing);
+            }
+            let mut expected = tags.clone();
+            if expected.len() == 4 {
+                expected.push(vec!["p".into(), hex.into()]);
+            }
+            let event = build_inner_event(
+                &AppMessageIntent::Custom {
+                    kind: 1111,
+                    tags,
+                    content: content.clone(),
+                },
+                hex,
+                42,
+            )
+            .unwrap();
+            assert_eq!(event.kind, 1111);
+            assert_eq!(event.content, content);
+            assert_eq!(event.tags, expected);
+        }
+    }
+
+    #[test]
+    fn custom_mentions_require_kind() {
+        let hex = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+        let npub = npub_for_account_id(hex).unwrap();
+        let content = format!("unchanged @{npub} and nostr:{npub}");
+        for (kind, tags) in [
+            (12345, vec![vec!["k".into(), "9".into()]]),
+            (1111, vec![]),
+            (1111, vec![vec!["K".into(), "9".into()]]),
+            (1111, vec![vec!["k".into()]]),
+            (1111, vec![vec!["k".into(), "not a kind".into()]]),
+            (1111, vec![vec!["k".into(), "-1".into()]]),
+            (1111, vec![vec!["k".into(), "18446744073709551616".into()]]),
+        ] {
+            let event = build_inner_event(
+                &AppMessageIntent::Custom {
+                    kind,
+                    tags: tags.clone(),
+                    content: content.clone(),
+                },
+                hex,
+                42,
+            )
+            .unwrap();
+            assert_eq!(event.kind, kind);
+            assert_eq!(event.tags, tags);
+            assert_eq!(event.content, content);
+        }
     }
 
     #[test]

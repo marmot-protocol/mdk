@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Fixed
+
+- NIP-22 comments (kind 1111 with a numeric lowercase `k` tag) project their parent and media, and accept author-only
+  edits in the timeline and edit history. Lowercase `e`, not a quoted event's `q`, identifies the parent (#3409).
+
 ## 0.17.0 - 2026-11-15
 
 ### Breaking changes

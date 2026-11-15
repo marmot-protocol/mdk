@@ -4377,7 +4377,8 @@ impl MarmotAppRuntime {
     /// text. Recipients honor an edit only when its authenticated author
     /// matches the target's author. As a fail-fast check against this device's
     /// current view, the send refuses with [`AppError::InvalidEditTarget`]
-    /// unless the target is an available chat message this account sent;
+    /// unless the target is an available chat or NIP-22 comment this account sent
+    /// (kind 1111 with a numeric lowercase `k` tag);
     /// recipients remain authoritative. Competing edits resolve by `created_at`,
     /// then the larger event id. The chat-list preview is
     /// intentionally left untouched so an edit doesn't reorder the

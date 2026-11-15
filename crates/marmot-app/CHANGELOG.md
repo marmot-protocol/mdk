@@ -2,12 +2,11 @@
 
 ## Unreleased
 
-### Added
+### Fixed
 
-- `MarmotAppRuntime::start_direct_conversation_with_options` takes `DirectConversationOptions` with a founding
-  `disappearing_message_secs`. A new direct conversation carries it in its founding MLS state and Welcome; reuse,
-  retry and same-account concurrent starts keep the existing group's duration and roles. `start_direct_conversation`
-  is unchanged (#3365).
+- Custom sends of NIP-22 comments (kind 1111 with a numeric lowercase `k` tag) derive mention `p` tags without
+  duplicating an existing pubkey tag, including one carrying a relay hint. Author edits of these comments pass
+  send admission (#3409).
 
 ## 0.17.0 - 2026-11-15
 

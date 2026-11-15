@@ -4707,6 +4707,16 @@ fn keep_receipts_of_pruned_reactions_tx(
     Ok(())
 }
 
+const NIP22_COMMENT_KIND: u64 = 1111;
+
+fn is_nip22_comment(kind: u64, tags: &[Vec<String>]) -> bool {
+    kind == NIP22_COMMENT_KIND && tag_values(tags, "k").any(|kind| kind.parse::<u64>().is_ok())
+}
+
+fn is_editable_message(kind: u64, tags: &[Vec<String>]) -> bool {
+    kind == MARMOT_APP_EVENT_KIND_CHAT || is_nip22_comment(kind, tags)
+}
+
 fn timeline_row_from_chat(event: &RawAppEvent) -> TimelineRow {
     let (media, agent_text_stream) = if event.kind == MARMOT_APP_EVENT_KIND_CHAT {
         (
@@ -4771,11 +4781,17 @@ fn timeline_row_from_app_event(event: &RawAppEvent) -> TimelineRow {
     }
 }
 
-/// App-defined custom kinds own their tag semantics: an `e` tag may mean
-/// anything to the app, so it is never interpreted as MDK reply metadata.
+/// NIP-22 comments use `e` for their parent and `q` for body quotes.
+/// Other custom kinds own their tags, so `e` is not MDK reply metadata.
 /// Ordinary chat replies can still target a custom row — reply linkage is
 /// derived from the replying event's own tags, not the target's.
 fn timeline_row_from_custom_event(event: &RawAppEvent) -> TimelineRow {
+    if is_nip22_comment(event.kind, &event.tags) {
+        return TimelineRow {
+            media: media_metadata(&event.tags),
+            ..timeline_row_from_app_event(event)
+        };
+    }
     TimelineRow {
         reply_to_message_id_hex: None,
         ..timeline_row_from_app_event(event)
