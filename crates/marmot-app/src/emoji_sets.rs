@@ -220,9 +220,10 @@ pub struct AppEmojiSetSyncResult {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppEmojiSetInstallResult {
     pub set: AppEmojiSet,
+    /// Available images after this install, including verified same-version fallbacks.
     pub installed_count: u32,
-    /// Every entry not installed: the set's parse-time skips first, then
-    /// install-time ones (downloads, validation, caps).
+    /// Parse-time skips first, then failures of this attempt's downloads,
+    /// validation and caps. A failed refresh can retain its earlier installed image.
     pub skipped: Vec<AppEmojiSkip>,
 }
 
@@ -1196,7 +1197,8 @@ impl MarmotApp {
 
     /// Download a set's emoji in order, a few at a time, keeping those that
     /// validate and still fit `budget`; one that does not fit is skipped and
-    /// later, smaller ones are still tried. Once the bytes transferred,
+    /// later, smaller ones are still tried. Verified `previous` bytes remain
+    /// available when their refresh fails or cannot fit. Once the bytes transferred,
     /// valid or not, reach twice the budget, the rest are skipped without
     /// being fetched (beyond the few already in flight). Each finished entry
     /// advances `control`'s progress. No download starts once `control` or

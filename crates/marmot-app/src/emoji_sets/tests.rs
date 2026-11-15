@@ -1266,7 +1266,7 @@ async fn reinstall_reserves_retained_bytes_and_keeps_them_after_download_caps() 
         shortcode: "lied".to_owned(),
         url: fixture.host.url("/lied.png"),
     };
-    let changed = png(48, 48, None);
+    let changed = png(32, 32, Some(2));
     assert!(changed.len() as u64 > budget);
     fixture
         .host
@@ -1278,7 +1278,14 @@ async fn reinstall_reserves_retained_bytes_and_keeps_them_after_download_caps() 
     for entries in [
         vec![newcomer, missing.clone()],
         vec![refresh],
-        vec![lied.clone(), lied, missing],
+        vec![
+            lied.clone(),
+            StoredEmojiSetEntry {
+                shortcode: "lied_again".to_owned(),
+                ..lied
+            },
+            missing,
+        ],
     ] {
         let (kept, skipped) = fixture
             .app
