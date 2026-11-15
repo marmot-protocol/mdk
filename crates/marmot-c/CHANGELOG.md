@@ -44,6 +44,10 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ### Added
 
+- `MarmotGroupCommitDelivery` gains `refused_relays`/`refused_relays_len`, appended after `since`: the group relays
+  that refused the change for good, each a `MarmotGroupCommitRefusedRelay` with `relay_url`, a
+  `MarmotGroupCommitRefusalCause` (`TOO_LARGE` or `REJECTED`) and `has_size_class`/`size_class` (mdk#2333).
+  `marmot_group_commit_delivery_free` frees them. Rebuild with the matching generated header and library.
 - `marmot_discard_failed_send` removes a failed own send from this device without publishing and returns a
   `MarmotDiscardFailedSendResult` (free with `marmot_discard_failed_send_result_free`). Rebuild with the matching
   generated header and library.
@@ -53,6 +57,12 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   (mdk#3283). Inputs are borrowed; free the returned owned string with `marmot_string_free`.
 
 ### Changed
+
+- A group relay's refusal of a confirmed own change now warns until acknowledged, across restarts too (mdk#2333).
+  `marmot_group_commit_delivery` names the oldest refused change ahead of any owed one and writes NULL only once no
+  relay is owed a change of yours and every refusal has been acknowledged. A refusal makes group changes return
+  `MARMOT_STATUS_GROUP_COMMIT_UNDELIVERED` at once. `marmot_acknowledge_group_commit_undelivered` also dismisses the
+  group's refusals for good.
 
 - `MARMOT_HISTORY_NOTICE_CAUSE_UNPROVEN_HISTORY` is no longer emitted (mdk#3308): the recovery runner retries a relay
   that could not prove a route's history quietly, and a notice needs evidence that messages are missing. The value

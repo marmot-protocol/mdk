@@ -27,20 +27,20 @@ use cgka_traits::group::{Group, Member};
 use cgka_traits::ingest::IngestOutcome;
 use cgka_traits::maintenance::KEY_PACKAGE_GENERATION_REVISION;
 use cgka_traits::maintenance::{
-    DurableGroupEvolution, DurableTransportFanout, GroupEvolutionPhase, GroupEvolutionSemantic,
-    GroupMaintenanceStatus, KeyPackageLifecycleState, MaintenanceObligation, MaintenancePhase,
-    MaintenanceTrigger, PendingKeyPackageReplacement, PeriodicMaintenancePolicy,
-    PostJoinHistoryFetch, PostJoinHistoryFetchCompletion, PostJoinHistoryFetchOutcome,
-    RetainedKeyPackagePrivateMaterial, SendMaintenanceDisposition, TransportFanoutAttemptState,
-    TransportFanoutTarget,
+    CommitRefusal, DurableGroupEvolution, DurableTransportFanout, GroupEvolutionPhase,
+    GroupEvolutionSemantic, GroupMaintenanceStatus, KeyPackageLifecycleState,
+    MaintenanceObligation, MaintenancePhase, MaintenanceTrigger, PendingKeyPackageReplacement,
+    PeriodicMaintenancePolicy, PostJoinHistoryFetch, PostJoinHistoryFetchCompletion,
+    PostJoinHistoryFetchOutcome, RetainedKeyPackagePrivateMaterial, SendMaintenanceDisposition,
+    TransportFanoutAttemptState, TransportFanoutTarget,
 };
 use cgka_traits::storage::{DeviceGroupWelcomeExpectation, RosterTagKey};
 use cgka_traits::transport::{TransportEnvelope, TransportMessage};
 use cgka_traits::{
     EngineError, EpochId, FanoutMlsState, FanoutPendingKind, GroupId, MemberId, MessageState,
-    OutboundApplicationMessage, OutboundFanout, OutboundFanoutOutcome, StorageError, Timestamp,
-    TransportAccountActivation, TransportAdapter, TransportAdapterError, TransportDelivery,
-    TransportEndpoint, TransportEndpointAckKind, TransportEndpointFailure,
+    OutboundApplicationMessage, OutboundFanout, OutboundFanoutOutcome, RefusedTarget, StorageError,
+    Timestamp, TransportAccountActivation, TransportAdapter, TransportAdapterError,
+    TransportDelivery, TransportEndpoint, TransportEndpointAckKind, TransportEndpointFailure,
     TransportEndpointFailureKind, TransportEndpointReceipt, TransportEndpointRejectionCategory,
     TransportGroupSync, TransportPublishReport, TransportPublishRequest, TransportPublishTarget,
     WelcomeSizeCheck,
@@ -3096,9 +3096,14 @@ where
                 self.put_maintenance_obligation_if_changed(&original_obligation, &obligation)?;
                 continue;
             }
+            // Each owed or refused commit holds on its own `since`: an old
+            // refusal must not let a self-update build at once on a commit
+            // that confirmed a minute ago and is still owed (mdk#2333).
             if self
-                .undelivered_commit(&obligation.group_id)?
-                .is_some_and(|commit| {
+                .undelivered_commits_in(&obligation.group_id, None)?
+                .0
+                .iter()
+                .any(|commit| {
                     now.0.saturating_sub(commit.since.0) < COMMIT_DELIVERY_SELF_UPDATE_HOLD_SECS
                 })
             {
@@ -3629,6 +3634,7 @@ where
             _ => None,
         };
         let accept_started = Instant::now();
+        self.record_commit_refusals_before_disband(&intent)?;
         let effects = self.session.send(intent).await?;
         let local_accept_duration = accept_started.elapsed();
         let publish_started = Instant::now();
@@ -3655,6 +3661,7 @@ where
             _ => None,
         };
         let accept_started = Instant::now();
+        self.record_commit_refusals_before_disband(&intent)?;
         let effects = self
             .session
             .send_with_audit_context(intent, context.clone())
@@ -3986,12 +3993,15 @@ where
         Ok(self.session.has_queued_outbound_intents(group_id)?)
     }
 
-    /// The oldest confirmed commit in `group_id` that some group relay still
-    /// owes (mdk#2255). A commit confirms on its first acknowledgement, so
-    /// members who read only the other relays cannot follow the group until
-    /// they accept it. Owed relays keep being retried with the exact event; a
-    /// relay that definitively rejected it is not owed. A commit convergence
-    /// withdrew from the selected branch no longer gates the group.
+    /// The commit a group's delivery answer names (mdk#2255, mdk#2333): the
+    /// oldest confirmed commit a group relay refused that the user has not
+    /// acknowledged, or else the oldest one some group relay still owes. A
+    /// commit confirms on its first acknowledgement, so members who read only
+    /// the other relays cannot follow the group until they accept it. Owed
+    /// relays keep being retried with the exact event; a refusal is final and
+    /// warns until [`Self::acknowledge_commit_refusals`]. A commit convergence
+    /// withdrew from the selected branch no longer gates the group, nor does
+    /// any refusal once the group is disbanded.
     pub fn undelivered_commit(
         &self,
         group_id: &GroupId,
@@ -4022,58 +4032,27 @@ where
         group_id: &GroupId,
         rows: Option<&GroupMaintenanceRows>,
     ) -> AccountResult<(Option<UndeliveredCommit>, WallClockWindow)> {
-        let mut oldest: Option<UndeliveredCommit> = None;
-        let mut changes_at: Option<Timestamp> = None;
-        let mut consider = |commit: UndeliveredCommit| {
-            if oldest
-                .as_ref()
-                .is_none_or(|current| commit.since < current.since)
-            {
-                oldest = Some(commit);
-            }
-        };
-        for fanout in self.session.outbound_fanouts_for_group(group_id)? {
-            // Application messages have no MLS state; Welcomes go to inboxes.
-            if !matches!(
-                fanout.request().message.envelope,
-                TransportEnvelope::GroupMessage { .. }
-            ) || fanout.mls_state() != FanoutMlsState::Confirmed
-                || self.commit_withdrawn(
-                    fanout
-                        .pending_origin_message_id()
-                        .unwrap_or_else(|| fanout.message_id()),
-                )?
-            {
-                continue;
-            }
-            let endpoints = fanout.request().target.endpoints();
-            let owed_endpoints = endpoints
-                .iter()
-                .zip(fanout.target_statuses())
-                .filter(|(_, status)| status.is_outstanding())
-                .map(|(endpoint, _)| endpoint.clone())
-                .collect::<Vec<_>>();
-            if !owed_endpoints.is_empty() {
-                // Measured from the first acknowledgement: the accepting
-                // attempt's start, not staging, which can be hours earlier.
-                let first_accepted_ms = (0..endpoints.len())
-                    .filter(|&index| {
-                        fanout.target_status(index)
-                            == Some(cgka_traits::FanoutTargetStatus::Accepted)
-                    })
-                    .filter_map(|index| fanout.target_last_attempt_at_ms(index))
-                    .min()
-                    .unwrap_or_else(|| fanout.created_at_ms());
-                consider(UndeliveredCommit {
-                    message_id: fanout.message_id().clone(),
-                    since: Timestamp(first_accepted_ms / 1_000),
-                    owed_endpoints,
-                    endpoint_count: endpoints.len(),
-                });
-            }
-        }
-        // Self-updates staged before the frozen-fanout migration.
+        let (commits, window) = self.undelivered_commits_in(group_id, rows)?;
+        let named = commits
+            .iter()
+            .position(|commit| !commit.refused_endpoints.is_empty())
+            .or_else(|| (!commits.is_empty()).then_some(0))
+            .map(|index| commits[index].clone());
+        Ok((named, window))
+    }
+
+    /// Every confirmed own commit of `group_id` that some group relay owes,
+    /// or that a group relay refused and the user has not acknowledged, oldest
+    /// first, and the wall-clock window the list holds in without a write.
+    /// The gate refuses a group change while any of them gates, and the
+    /// self-update hold waits on each one's own `since` (mdk#2333).
+    pub fn undelivered_commits_in(
+        &self,
+        group_id: &GroupId,
+        rows: Option<&GroupMaintenanceRows>,
+    ) -> AccountResult<(Vec<UndeliveredCommit>, WallClockWindow)> {
         let now = self.wall_clock.now();
+        let mut changes_at: Option<Timestamp> = None;
         // The ungated lists: the group-scoped lookup fails for a stored group
         // the engine has not hydrated yet, which has nothing owed to report.
         let loaded;
@@ -4084,6 +4063,83 @@ where
                 &loaded
             }
         };
+        let mut commits = Vec::new();
+        // A refusal is read only where the group's fanouts are: a group the
+        // engine does not hold live lists none.
+        let mut stored_refusals = if self.session.check_group_live(group_id).is_ok() {
+            rows.commit_refusals(group_id)
+                .iter()
+                .map(|refusal| (refusal.fanout_id.clone(), refusal))
+                .collect::<HashMap<_, _>>()
+        } else {
+            HashMap::new()
+        };
+        for mut fanout in self.session.outbound_fanouts_for_group(group_id)? {
+            if !is_confirmed_group_commit(&fanout)
+                || self.commit_withdrawn(fanout_commit_id(&fanout))?
+            {
+                continue;
+            }
+            // A row stored before the successor edge may still hold an exposed
+            // target a size answer refused. Read it as the next drive stores
+            // it, a refusal, without writing here (mdk#2333).
+            fanout.end_size_refused_targets();
+            let endpoints = fanout.request().target.endpoints();
+            let owed_endpoints = endpoints
+                .iter()
+                .zip(fanout.target_statuses())
+                .filter(|(_, status)| status.is_outstanding())
+                .map(|(endpoint, _)| endpoint.clone())
+                .collect::<Vec<_>>();
+            // The stored record, and any refusal this fanout holds that a
+            // pass has not merged yet.
+            let refused_endpoints = match stored_refusals.remove(fanout.message_id()) {
+                Some(stored) if stored.acknowledged => Vec::new(),
+                Some(stored) => {
+                    let mut live = stored.clone();
+                    live.merge(fanout.refused_targets());
+                    live.refused
+                }
+                None => fanout.refused_targets(),
+            };
+            if !owed_endpoints.is_empty() || !refused_endpoints.is_empty() {
+                commits.push(UndeliveredCommit {
+                    message_id: fanout.message_id().clone(),
+                    since: commit_confirmed_at(&fanout),
+                    owed_endpoints,
+                    refused_endpoints,
+                    endpoint_count: endpoints.len(),
+                });
+            }
+        }
+        // Refused commits whose fanout is gone.
+        let mut unfanned = stored_refusals.into_values().collect::<Vec<_>>();
+        unfanned.sort_by(|a, b| a.fanout_id.as_slice().cmp(b.fanout_id.as_slice()));
+        for refusal in unfanned {
+            if refusal.acknowledged || self.commit_withdrawn(&refusal.commit_id)? {
+                continue;
+            }
+            commits.push(UndeliveredCommit {
+                message_id: refusal.fanout_id.clone(),
+                since: refusal.since,
+                owed_endpoints: Vec::new(),
+                refused_endpoints: refusal.refused.clone(),
+                endpoint_count: usize::try_from(refusal.relay_count).unwrap_or(usize::MAX),
+            });
+        }
+        // A disband that settles keeps the group's record: its refusals are
+        // moot, and no longer warn or gate.
+        if commits
+            .iter()
+            .any(|commit| !commit.refused_endpoints.is_empty())
+            && self.session.group_record(group_id)?.disbanded.is_some()
+        {
+            for commit in &mut commits {
+                commit.refused_endpoints.clear();
+            }
+            commits.retain(|commit| !commit.owed_endpoints.is_empty());
+        }
+        // Self-updates staged before the frozen-fanout migration.
         let none_confirmed = HashSet::new();
         let confirmed_evolutions = rows
             .confirmed_evolutions
@@ -4122,21 +4178,62 @@ where
                     .filter_map(|target| target.last_attempt_at)
                     .min()
                     .unwrap_or(fanout.created_at);
-                consider(UndeliveredCommit {
+                commits.push(UndeliveredCommit {
                     message_id: fanout.id.clone(),
                     since: first_accepted,
                     owed_endpoints,
+                    refused_endpoints: Vec::new(),
                     endpoint_count: fanout.targets.len(),
                 });
             }
         }
+        // Oldest first; a stable sort keeps storage order among ties.
+        commits.sort_by_key(|commit| commit.since);
         Ok((
-            oldest,
+            commits,
             WallClockWindow {
                 from: now,
                 until: changes_at,
             },
         ))
+    }
+
+    /// Acknowledge every relay refusal of `group_id`'s confirmed commits
+    /// (mdk#2333): none warns or gates again, including a later refusal of
+    /// the same commit by another relay. A refusal whose commit's fanout is
+    /// gone is deleted; the rest stay, marked, until that fanout is.
+    pub fn acknowledge_commit_refusals(&self, group_id: &GroupId) -> AccountResult<()> {
+        self.merge_group_commit_refusals(group_id)?;
+        self.session.acknowledge_commit_refusals(group_id)?;
+        Ok(())
+    }
+
+    /// A disband request deletes every fanout of a group whose epoch is not
+    /// pending. Each confirmed commit's refusals are merged first, so a
+    /// request that then fails leaves them recorded (mdk#2333).
+    fn record_commit_refusals_before_disband(&self, intent: &SendIntent) -> AccountResult<()> {
+        let SendIntent::Disband { group_id } = intent else {
+            return Ok(());
+        };
+        self.merge_group_commit_refusals(group_id)
+    }
+
+    /// Merge each of the group's confirmed commits' refused relays into its
+    /// refusal record. A fanout stored by a release before the successor edge
+    /// may still hold an exposed target a size answer refused; it is ended
+    /// and stored first, as a drive would, so its refusal is merged too
+    /// (mdk#2333). A crash between the two leaves the target ended, and the
+    /// next pass over the fanout merges it.
+    fn merge_group_commit_refusals(&self, group_id: &GroupId) -> AccountResult<()> {
+        for mut fanout in self.session.outbound_fanouts_for_group(group_id)? {
+            if fanout.end_size_refused_targets() {
+                self.session.put_outbound_fanout(&fanout)?;
+            }
+            if let Some(refusal) = commit_refusal_of(&fanout) {
+                self.session.merge_commit_refusal(&refusal)?;
+            }
+        }
+        Ok(())
     }
 
     /// The account-wide rows [`Self::maintenance_status_in`] and
@@ -4151,6 +4248,12 @@ where
             if let Some(group_id) = fanout.group_id.clone() {
                 rows.fanouts.entry(group_id).or_default().push(fanout);
             }
+        }
+        for refusal in self.session.commit_refusals()? {
+            rows.commit_refusals
+                .entry(refusal.group_id.clone())
+                .or_default()
+                .push(refusal);
         }
         // Only a fanout naming an evolution consults the confirmed ones.
         if names_an_evolution {
@@ -4696,18 +4799,24 @@ where
                 self.record_published_application_fanout(&fanout, &mut output);
                 output.fanout.push(outcome);
             } else {
-                let reason = "insufficient publish acknowledgements".to_owned();
-                output.failures.push(PublishFailure {
-                    oversized: OversizedEvent::of_fanout(&fanout),
-                    message_id: fanout
-                        .published_message_id()
-                        .unwrap_or_else(|| fanout.message_id())
-                        .clone(),
-                    reason: reason.clone(),
-                });
-                record_failed_application_fanout(&fanout, reason, &mut output);
+                // Complete when found: a crash after its last result was saved.
+                // A fanout that met its acknowledgements, such as a confirmed
+                // commit, did not fail; the pass that completed it reported it.
+                if !frozen_fanout_report(&fanout).met_required_acks() {
+                    let reason = "insufficient publish acknowledgements".to_owned();
+                    output.failures.push(PublishFailure {
+                        oversized: OversizedEvent::of_fanout(&fanout),
+                        message_id: fanout
+                            .published_message_id()
+                            .unwrap_or_else(|| fanout.message_id())
+                            .clone(),
+                        reason: reason.clone(),
+                    });
+                    record_failed_application_fanout(&fanout, reason, &mut output);
+                }
                 output.fanout.push(outcome);
-                self.session.delete_outbound_fanout(fanout.message_id())?;
+                self.session
+                    .retire_outbound_fanout(&fanout, commit_refusal_of(&fanout).as_ref())?;
             }
         }
         self.publish_queue(&mut output, &mut queue, None).await?;
@@ -4957,6 +5066,14 @@ where
         &mut self,
         now: Timestamp,
     ) -> AccountResult<Vec<SupersededIntentReport>> {
+        // A refusal of a withdrawn commit no longer warns; drop its record.
+        for refusal in self.session.commit_refusals()? {
+            if self.commit_withdrawn(&refusal.commit_id)?
+                && self.session.check_group_live(&refusal.group_id).is_ok()
+            {
+                self.session.delete_commit_refusal(&refusal)?;
+            }
+        }
         for evolution in self.session.group_evolutions()? {
             if evolution.phase == GroupEvolutionPhase::SupersededByConvergence {
                 continue;
@@ -5765,6 +5882,12 @@ where
                     &application.app_event_id,
                 ));
         }
+        // A confirmed commit stored with an exposed target a size refusal
+        // already answered, by a release before this rule, ends that target
+        // before any retry is chosen (mdk#2333). Confirmation does the same.
+        if fanout.end_size_refused_targets() {
+            self.session.put_outbound_fanout(&fanout)?;
+        }
         let outcome = fanout.outcome();
         // A receipt persisted before cancellation can still be below quorum.
         // Finish that pass before releasing its Welcome continuation. Once a
@@ -6127,11 +6250,18 @@ where
             output.pending_convergence.push(group_id.clone());
         }
         output.fanout.push(fanout_outcome.clone());
+        // A relay's refusal of a confirmed commit outlives its fanout: every
+        // pass merges it into the commit's refusal record, and the delete
+        // merges it first, in the same transaction (mdk#2333).
+        let refusal = commit_refusal_of(&fanout);
         if fanout_outcome.fanout_complete
             && !matches!(fanout.mls_state(), FanoutMlsState::Pending(_))
             && !(fanout_outcome.accepted_targets > 0 && fanout.application_message().is_some())
         {
-            self.session.delete_outbound_fanout(fanout.message_id())?;
+            self.session
+                .retire_outbound_fanout(&fanout, refusal.as_ref())?;
+        } else if let Some(refusal) = refusal {
+            self.session.merge_commit_refusal(&refusal)?;
         }
         Ok(status)
     }
@@ -6971,6 +7101,58 @@ fn frozen_fanout_target_retry_delay_ms(
     }
 }
 
+/// Whether `fanout` is one of this device's confirmed group commits: the
+/// fanouts a commit-delivery answer reads. Application messages have no MLS
+/// state, and Welcomes go to inboxes.
+fn is_confirmed_group_commit(fanout: &OutboundFanout) -> bool {
+    matches!(
+        fanout.request().message.envelope,
+        TransportEnvelope::GroupMessage { .. }
+    ) && fanout.mls_state() == FanoutMlsState::Confirmed
+}
+
+/// The stored commit whose disposition says whether convergence withdrew the
+/// fanout's commit.
+fn fanout_commit_id(fanout: &OutboundFanout) -> &cgka_traits::MessageId {
+    fanout
+        .pending_origin_message_id()
+        .unwrap_or_else(|| fanout.message_id())
+}
+
+/// When the commit confirmed: its accepting attempt's start, measured from the
+/// first acknowledgement, not staging, which can be hours earlier.
+fn commit_confirmed_at(fanout: &OutboundFanout) -> Timestamp {
+    let first_accepted_ms = (0..fanout.target_statuses().len())
+        .filter(|&index| {
+            fanout.target_status(index) == Some(cgka_traits::FanoutTargetStatus::Accepted)
+        })
+        .filter_map(|index| fanout.target_last_attempt_at_ms(index))
+        .min()
+        .unwrap_or_else(|| fanout.created_at_ms());
+    Timestamp(first_accepted_ms / 1_000)
+}
+
+/// The refusal record a confirmed commit's fanout holds now: its relays that
+/// refused it for good (mdk#2333). `None` when none has.
+fn commit_refusal_of(fanout: &OutboundFanout) -> Option<CommitRefusal> {
+    if !is_confirmed_group_commit(fanout) {
+        return None;
+    }
+    let refused = fanout.refused_targets();
+    if refused.is_empty() {
+        return None;
+    }
+    Some(CommitRefusal {
+        fanout_id: fanout.message_id().clone(),
+        commit_id: fanout_commit_id(fanout).clone(),
+        group_id: fanout.group_id()?.clone(),
+        since: commit_confirmed_at(fanout),
+        relay_count: u32::try_from(fanout.request().target.endpoints().len()).unwrap_or(u32::MAX),
+        refused,
+        acknowledged: false,
+    })
+}
+
 fn frozen_fanout_report(fanout: &OutboundFanout) -> TransportPublishReport {
     let endpoints = fanout.request().target.endpoints();
     let mut accepted = Vec::new();
@@ -7564,11 +7746,19 @@ pub struct GroupMaintenanceRows {
     /// Each group's fanouts, in storage order.
     fanouts: HashMap<GroupId, Vec<DurableTransportFanout>>,
     confirmed_evolutions: HashMap<GroupId, HashSet<cgka_traits::MessageId>>,
+    /// Each group's stored commit refusals (mdk#2333).
+    commit_refusals: HashMap<GroupId, Vec<CommitRefusal>>,
 }
 
 impl GroupMaintenanceRows {
     fn fanouts(&self, group_id: &GroupId) -> &[DurableTransportFanout] {
         self.fanouts.get(group_id).map_or(&[], Vec::as_slice)
+    }
+
+    fn commit_refusals(&self, group_id: &GroupId) -> &[CommitRefusal] {
+        self.commit_refusals
+            .get(group_id)
+            .map_or(&[], Vec::as_slice)
     }
 }
 
@@ -7608,6 +7798,10 @@ pub struct UndeliveredCommit {
     pub since: Timestamp,
     /// Relays still owed the exact commit.
     pub owed_endpoints: Vec<TransportEndpoint>,
+    /// Relays that refused the commit for good, not yet acknowledged
+    /// (mdk#2333). MDK will not deliver it there; members who read only those
+    /// relays may not have it.
+    pub refused_endpoints: Vec<RefusedTarget>,
     /// Relays the commit was published to.
     pub endpoint_count: usize,
 }

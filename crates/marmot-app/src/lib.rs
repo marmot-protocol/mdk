@@ -1230,19 +1230,62 @@ pub struct AppMessageQuery {
     pub limit: Option<usize>,
 }
 
-/// The group's oldest confirmed change that some group relays have not accepted
-/// yet (mdk#2255). Members who read only those relays cannot follow the group
-/// until they do; MDK keeps retrying them with the exact event. Reported as
-/// soon as a relay is owed; group changes fail only once `since` is two
-/// minutes old. A newer change can be owed to other relays as well.
+/// A confirmed change of yours that some group relays have not accepted yet
+/// (mdk#2255), or that a group relay refused (mdk#2333). Members who read only
+/// those relays may not have it, so they may not follow the group. MDK keeps
+/// retrying owed relays with the exact event; a refusal is final. The change
+/// named is the oldest one a relay refused, if the user has not acknowledged
+/// that refusal, or else the oldest one still owed. Reported at once; group
+/// changes fail at once on a refusal, and on an owed relay only once `since`
+/// is two minutes old. A newer change can be owed to other relays as well.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct GroupCommitDelivery {
     /// Relays that have not accepted the change yet.
     pub owed_relay_urls: Vec<String>,
+    /// Relays that refused the change for good, until the user acknowledges
+    /// it (mdk#2333). MDK will not deliver the change there; members who read
+    /// only those relays may not have it. A refusal never says the relay
+    /// lacks the change.
+    #[serde(default)]
+    pub refused_relays: Vec<GroupCommitRefusedRelay>,
     /// Relays the change was published to.
     pub relay_count: u32,
     /// When the first relay accepted the change, in Unix seconds.
     pub since: u64,
+}
+
+/// A group relay that refused a confirmed change for good (mdk#2333).
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct GroupCommitRefusedRelay {
+    pub relay_url: String,
+    pub cause: GroupCommitRefusalCause,
+}
+
+/// Why a group relay refused a change for good.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GroupCommitRefusalCause {
+    /// Too large for the relay: its own size answer, its known limit, or the
+    /// 64 KiB commit floor at a relay whose limit is unknown. `size_class` is
+    /// absent when unknown, as after an earlier attempt that may have reached
+    /// the relay.
+    TooLarge {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        size_class: Option<EventSizeClass>,
+    },
+    /// Any other final answer from the relay.
+    Rejected,
+}
+
+impl From<cgka_traits::CommitRefusalCause> for GroupCommitRefusalCause {
+    fn from(cause: cgka_traits::CommitRefusalCause) -> Self {
+        match cause {
+            cgka_traits::CommitRefusalCause::TooLarge { size_class } => {
+                Self::TooLarge { size_class }
+            }
+            cgka_traits::CommitRefusalCause::Rejected => Self::Rejected,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

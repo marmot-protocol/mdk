@@ -140,3 +140,48 @@ fn terminal_local_delete_removes_sibling_welcome_timing_associations() {
         1
     );
 }
+
+/// mdk#2333: a commit refusal goes with its group's local state, by each wipe
+/// branch: forgetting the group and deleting a terminal one remove it, while
+/// wiping an active chat keeps the group and the refused commit live, so the
+/// warning stays.
+#[test]
+fn a_commit_refusal_goes_with_a_forgotten_or_terminal_group_and_outlives_an_active_wipe() {
+    for (case, tombstone, forget, kept) in [
+        ("active wipe", false, false, 1),
+        ("terminal delete", true, false, 0),
+        ("forget", false, true, 0),
+    ] {
+        let store = SqliteAccountStorage::in_memory_for_test().unwrap();
+        store
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "INSERT INTO cgka_groups(id, epoch, record) VALUES(x'aa', 1, x'00');
+                 INSERT INTO cgka_commit_refusals(fanout_id, group_id, record)
+                 VALUES(x'01', x'aa', x'00');",
+            )
+            .unwrap();
+        if tombstone {
+            store
+                .lock()
+                .unwrap()
+                .execute_batch(
+                    "INSERT INTO cgka_disband_tombstones(group_id, record) VALUES(x'aa', x'00');",
+                )
+                .unwrap();
+        }
+        if forget {
+            store
+                .forget_group_local_data("aa", cgka_traits::Timestamp(1))
+                .unwrap();
+        } else {
+            store.delete_local_group_data("aa").unwrap();
+        }
+        assert_eq!(
+            count(&store, "SELECT count(*) FROM cgka_commit_refusals"),
+            kept,
+            "{case}"
+        );
+    }
+}

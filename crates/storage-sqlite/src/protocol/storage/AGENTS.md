@@ -25,6 +25,7 @@ Map for Marmot engine-side SQLite tables (the `cgka_traits` storage traits). App
 | `deferred_peel_generations.rs` | `DeferredPeelGenerationStorage`: deferred-peel generation barriers. |
 | `leave_requests.rs`, `disband_requests.rs` | Durable leave and disband requests (plus disband candidates/tombstones). |
 | `maintenance.rs` | `MaintenanceStorage`: maintenance and publication-recovery records. |
+| `commit_refusals.rs` | The relays that refused this device's confirmed commits (mdk#2333, migration 0207): one record per commit, merged before its fanout is deleted and kept, acknowledged, until then. Session-only inherent methods, not a storage trait. Outside every snapshot; rows go with the group's `cgka_groups` row and outlive an active chat wipe. |
 | `private_key_packages.rs` | `PrivateKeyPackageStorage`: one issuer record per private KeyPackage handed to a sibling (mdk#2628 item 3.4b); the key itself stays in the OpenMLS bundle store. |
 | `roster_tag_keys.rs` | `RosterTagKeyStorage`: each tag signature key a device-group roster this device held listed, in a device entry or a `removed` record, by group and slot (mdk#2761). Outside every snapshot, so a rewind keeps them; group deletion drops them. |
 | `sibling_adds.rs` | `SiblingAddStorage`: each sibling slot one of this device's own confirmed Commits added to a group, until the app owes it that group's history (mdk#2628 D76). Outside every snapshot, so a rewind keeps them; group deletion drops them. |

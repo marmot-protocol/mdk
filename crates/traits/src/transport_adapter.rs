@@ -754,7 +754,10 @@ impl OutboundFanout {
     ///
     /// A target whose bit is set stays `PossiblyExposed` whatever it is told
     /// later, so a pending commit that may have reached a relay never rolls
-    /// back (mdk#1577).
+    /// back (mdk#1577). The one exception is a size refusal of a confirmed
+    /// commit (mdk#2333): a confirmed commit cannot roll back, so its exposure
+    /// no longer matters, and these bytes can never be published there, so the
+    /// target ends `Failed` with the bit kept (see [`Self::refused_targets`]).
     pub fn record_target_failure(
         &mut self,
         index: usize,
@@ -774,7 +777,11 @@ impl OutboundFanout {
         }
         self.settle_exposure(index, current, AttemptResult::Failure(&failure));
         let next = if self.target_possible_exposure[index] {
-            FanoutTargetStatus::PossiblyExposed
+            if self.ends_exposed_target(&failure) {
+                FanoutTargetStatus::Failed
+            } else {
+                FanoutTargetStatus::PossiblyExposed
+            }
         } else {
             match failure.kind {
                 TransportEndpointFailureKind::TerminalRejected
@@ -829,10 +836,13 @@ impl OutboundFanout {
         }
     }
 
+    /// Confirm the pending MLS state, and end each exposed target a size
+    /// refusal already answered (see [`Self::end_size_refused_targets`]).
     pub fn mark_mls_confirmed(&mut self) -> Result<bool, TransportAdapterError> {
         match self.mls_state {
             FanoutMlsState::Pending(_) => {
                 self.mls_state = FanoutMlsState::Confirmed;
+                self.end_size_refused_targets();
                 Ok(true)
             }
             FanoutMlsState::Confirmed => Ok(false),
@@ -840,6 +850,100 @@ impl OutboundFanout {
                 TransportAdapterError::Other("fanout has no confirmable pending MLS state".into()),
             ),
         }
+    }
+
+    /// End `Failed` each exposed target of a confirmed commit whose stored
+    /// failure is a size refusal (mdk#2333): a refusal saved while the commit
+    /// was pending, or by a release before this rule. Its bit stays set.
+    /// Returns whether any target changed. Does nothing before confirmation.
+    pub fn end_size_refused_targets(&mut self) -> bool {
+        if self.mls_state != FanoutMlsState::Confirmed {
+            return false;
+        }
+        self.ensure_target_metadata_len();
+        let mut changed = false;
+        for index in 0..self.target_statuses.len() {
+            if self.target_statuses[index] == FanoutTargetStatus::PossiblyExposed
+                && self.target_failures[index]
+                    .as_ref()
+                    .is_some_and(TransportEndpointFailure::is_size_refusal)
+            {
+                self.fold_stored_exposure(index);
+                self.target_statuses[index] = FanoutTargetStatus::Failed;
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    /// Whether `failure` ends a target this fanout's exposure bit marks: a
+    /// size refusal of a confirmed commit. A relay's size answer, MDK's
+    /// refusal over a known limit or the commit floor: either proves these
+    /// bytes cannot be published there now, though not that the relay lacks
+    /// an earlier copy. Only a pending commit can roll back, so only there
+    /// does that earlier copy matter.
+    fn ends_exposed_target(&self, failure: &TransportEndpointFailure) -> bool {
+        self.mls_state == FanoutMlsState::Confirmed && failure.is_size_refusal()
+    }
+
+    /// Whether storage admits `PossiblyExposed` → `Failed` for one target: the
+    /// successor is a confirmed commit, the target's bit is still set, and its
+    /// stored failure is a size refusal, the stored one or a new one recorded
+    /// before marking (mdk#2333). [`target_status_advances`] judges every
+    /// other pair.
+    fn size_refusal_ends_exposed_target(&self, index: usize) -> bool {
+        self.mls_state == FanoutMlsState::Confirmed
+            && self
+                .target_possible_exposure
+                .get(index)
+                .copied()
+                .unwrap_or(false)
+            && self
+                .target_failures
+                .get(index)
+                .and_then(Option::as_ref)
+                .is_some_and(|failure| self.ends_exposed_target(failure))
+    }
+
+    /// Each target that refused this confirmed commit for good (mdk#2333):
+    /// `Failed` with a relay's final answer, or with MDK's size refusal. A
+    /// target that failed the host-safety rule was never contacted and is not
+    /// listed, nor is one ended with no recorded answer. Empty before the
+    /// commit confirms.
+    ///
+    /// A size refusal of a target that may already hold an earlier copy says
+    /// nothing about the event's size class, so none is listed (mdk#2334).
+    pub fn refused_targets(&self) -> Vec<RefusedTarget> {
+        if self.mls_state != FanoutMlsState::Confirmed {
+            return Vec::new();
+        }
+        let endpoints = self.request.target.endpoints();
+        self.target_statuses
+            .iter()
+            .enumerate()
+            .filter(|(_, status)| **status == FanoutTargetStatus::Failed)
+            .filter_map(|(index, _)| {
+                let failure = self.target_failure(index)?;
+                let exposed = self
+                    .target_possible_exposure
+                    .get(index)
+                    .copied()
+                    .unwrap_or(false);
+                let cause = if failure.is_size_refusal() {
+                    CommitRefusalCause::TooLarge {
+                        size_class: failure.size_class.filter(|_| !exposed),
+                    }
+                } else if failure.kind == TransportEndpointFailureKind::TerminalRejected {
+                    CommitRefusalCause::Rejected
+                } else {
+                    return None;
+                };
+                Some(RefusedTarget {
+                    endpoint: endpoints.get(index)?.clone(),
+                    cause,
+                })
+            })
+            .collect()
     }
 
     pub fn mark_mls_rolled_back(&mut self) -> Result<bool, TransportAdapterError> {
@@ -946,7 +1050,13 @@ impl OutboundFanout {
                 .target_statuses
                 .iter()
                 .zip(&previous.target_statuses)
-                .all(|(next, prior)| target_status_advances(*prior, *next));
+                .enumerate()
+                .all(|(index, (next, prior))| {
+                    target_status_advances(*prior, *next)
+                        || (*prior == FanoutTargetStatus::PossiblyExposed
+                            && *next == FanoutTargetStatus::Failed
+                            && self.size_refusal_ends_exposed_target(index))
+                });
         let exposure_advances = previous.target_possible_exposure.is_empty()
             || self
                 .target_possible_exposure
@@ -1087,6 +1197,29 @@ fn mls_state_advances(prior: FanoutMlsState, next: FanoutMlsState) -> bool {
                 FanoutMlsState::Confirmed | FanoutMlsState::RolledBack
             )
         )
+}
+
+/// Why a relay will never carry a confirmed commit (mdk#2333). It never claims
+/// the relay lacks the commit: only that MDK will not deliver it there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "cause")]
+pub enum CommitRefusalCause {
+    /// The relay's size answer, or MDK's refusal over its known limit or the
+    /// commit size floor. `size_class` is absent when the failure carries
+    /// none, or when an earlier attempt may have reached the relay.
+    TooLarge {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        size_class: Option<EventSizeClass>,
+    },
+    /// Any other final answer. The relay's category stays in audit.
+    Rejected,
+}
+
+/// One relay that refused a confirmed commit, and why.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RefusedTarget {
+    pub endpoint: TransportEndpoint,
+    pub cause: CommitRefusalCause,
 }
 
 /// Privacy-safe caller/audit summary for one frozen fanout.
@@ -1356,6 +1489,15 @@ impl TransportEndpointFailure {
             TransportEndpointFailureKind::TerminalRejected
             | TransportEndpointFailureKind::PossiblyExposed => false,
         }
+    }
+
+    /// Whether this failure refuses the event for its size: the endpoint's
+    /// recognised size answer, or MDK's refusal over a known limit or the
+    /// commit size floor. Its kind does not matter: an answer after an earlier
+    /// ambiguous attempt in the same call reads `PossiblyExposed` and keeps
+    /// the category.
+    pub fn is_size_refusal(&self) -> bool {
+        self.rejection_category == Some(TransportEndpointRejectionCategory::TooLarge)
     }
 
     /// The fixed reason of [`Self::over_known_limit`], which audit records as
@@ -1986,6 +2128,204 @@ mod tests {
             Some(FanoutTargetStatus::PossiblyExposed)
         );
         assert!(!fanout.outcome().fanout_complete);
+    }
+
+    /// mdk#2333 (R5): a size refusal ends a target an earlier attempt may have
+    /// exposed `Failed`, with its bit kept, only once the commit is confirmed:
+    /// a relay's answer, MDK's refusal before marking, and a refusal saved
+    /// while the commit was pending, reclassified when it confirms. Storage
+    /// admits that `PossiblyExposed` → `Failed` only with a confirmed MLS
+    /// state, the bit set and a size refusal, the stored failure or a new
+    /// one. A pending commit, an application message, a Welcome and any other
+    /// final answer keep "bit set means `PossiblyExposed`".
+    #[test]
+    fn a_size_refusal_ends_an_exposed_target_only_on_a_confirmed_commit() {
+        use FanoutTargetStatus::{Failed, PossiblyExposed};
+        use TransportEndpointFailureKind as Kind;
+        use TransportEndpointRejectionCategory as Category;
+        #[derive(Clone, Copy, Debug)]
+        enum Shape {
+            PendingCommit,
+            ConfirmedCommit,
+            ApplicationMessage,
+            Welcome,
+        }
+        let endpoint = TransportEndpoint("wss://one.example".into());
+        let answer = |kind, category, size_class| TransportEndpointFailure {
+            endpoint: endpoint.clone(),
+            reason: "scripted answer".into(),
+            kind,
+            rejection_category: category,
+            size_class,
+            pre_send: false,
+        };
+        let class = Some(EventSizeClass::From64To128Kib);
+        let too_large = answer(Kind::TerminalRejected, Some(Category::TooLarge), class);
+        // A size answer after an ambiguous attempt in the same call.
+        let rewritten = answer(Kind::PossiblyExposed, Some(Category::TooLarge), None);
+        let blocked = answer(Kind::TerminalRejected, Some(Category::Blocked), None);
+        let preflight = TransportEndpointFailure::over_known_limit(endpoint.clone(), 70_000);
+        // Target 0 timed out, so it may hold the event; target 1 accepted.
+        let exposed = |shape: Shape| {
+            let mut request = fanout_request();
+            if let Shape::Welcome = shape {
+                let recipient = MemberId::new(vec![0xE5; 32]);
+                request.message.envelope = TransportEnvelope::Welcome {
+                    recipient: recipient.clone(),
+                };
+                request.target = TransportPublishTarget::Inbox {
+                    recipient,
+                    endpoints: request.target.endpoints().to_vec(),
+                };
+            }
+            let pending = matches!(shape, Shape::PendingCommit | Shape::ConfirmedCommit)
+                .then(|| crate::engine_state::PendingStateRef::new(9));
+            let mut fanout =
+                OutboundFanout::stage(request, pending, Some(GroupId::new(vec![0xD4; 16])), 55)
+                    .unwrap();
+            fanout.mark_attempt_started_at(1, 100).unwrap();
+            fanout.mark_target_accepted(1).unwrap();
+            fanout.mark_attempt_started_at(0, 100).unwrap();
+            fanout
+                .record_target_failure(0, answer(Kind::PossiblyExposed, None, None))
+                .unwrap();
+            if let Shape::ConfirmedCommit = shape {
+                fanout.mark_mls_confirmed().unwrap();
+            }
+            fanout
+        };
+        let shapes = [
+            Shape::PendingCommit,
+            Shape::ConfirmedCommit,
+            Shape::ApplicationMessage,
+            Shape::Welcome,
+        ];
+
+        // A relay's later answer, and MDK's refusal before marking.
+        for shape in shapes {
+            let ends = matches!(shape, Shape::ConfirmedCommit);
+            for (case, failure, retried) in [
+                ("too-large answer", &too_large, true),
+                ("rewritten too-large answer", &rewritten, true),
+                ("refusal before marking", &preflight, false),
+                ("blocked answer", &blocked, true),
+            ] {
+                let before = exposed(shape);
+                let mut after = before.clone();
+                if retried {
+                    after.mark_attempt_started_at(0, 200).unwrap();
+                    after.record_target_failure(0, failure.clone()).unwrap();
+                } else {
+                    after
+                        .record_refusal_before_attempt(0, failure.clone(), 200)
+                        .unwrap();
+                }
+                let size_refusal = failure.is_size_refusal();
+                let status = if ends && size_refusal {
+                    Failed
+                } else {
+                    PossiblyExposed
+                };
+                let case = format!("{shape:?}, {case}");
+                assert_eq!(after.target_status(0), Some(status), "{case}");
+                assert!(
+                    after.target_possible_exposure[0],
+                    "{case}: the bit stays set"
+                );
+                after
+                    .validate_successor_of(&before)
+                    .unwrap_or_else(|error| panic!("{case}: storage refuses it: {error}"));
+                let refused = after.refused_targets();
+                if status == Failed {
+                    assert_eq!(
+                        refused,
+                        vec![RefusedTarget {
+                            endpoint: endpoint.clone(),
+                            cause: CommitRefusalCause::TooLarge { size_class: None },
+                        }],
+                        "{case}: no size class after exposure"
+                    );
+                } else {
+                    assert!(refused.is_empty(), "{case}: {refused:?}");
+                }
+            }
+        }
+
+        // A size refusal saved while the commit was pending ends the target
+        // when it confirms, in the transition storage checks.
+        for failure in [&too_large, &rewritten, &preflight] {
+            let mut pending = exposed(Shape::PendingCommit);
+            pending
+                .record_refusal_before_attempt(0, failure.clone(), 200)
+                .unwrap();
+            assert_eq!(pending.target_status(0), Some(PossiblyExposed));
+            let mut confirmed = pending.clone();
+            confirmed.mark_mls_confirmed().unwrap();
+            assert_eq!(confirmed.target_status(0), Some(Failed), "{failure:?}");
+            confirmed.validate_successor_of(&pending).unwrap();
+            assert!(!confirmed.end_size_refused_targets(), "nothing left to end");
+        }
+        let mut pending = exposed(Shape::PendingCommit);
+        pending
+            .record_refusal_before_attempt(0, blocked.clone(), 200)
+            .unwrap();
+        let mut confirmed = pending.clone();
+        confirmed.mark_mls_confirmed().unwrap();
+        assert_eq!(confirmed.target_status(0), Some(PossiblyExposed));
+
+        // The edge, judged on the successor alone: a confirmed commit, the bit
+        // set and a size refusal, the stored one unchanged or a new one.
+        let mut stored = exposed(Shape::PendingCommit);
+        stored
+            .record_refusal_before_attempt(0, rewritten.clone(), 200)
+            .unwrap();
+        stored.mark_mls_confirmed().unwrap();
+        stored.target_statuses[0] = PossiblyExposed;
+        let ended = |before: &OutboundFanout, edit: &dyn Fn(&mut OutboundFanout)| {
+            let mut after = before.clone();
+            after.target_statuses[0] = Failed;
+            edit(&mut after);
+            after.validate_successor_of(before)
+        };
+        assert!(ended(&stored, &|_| {}).is_ok(), "the stored failure");
+        assert!(
+            ended(&stored, &|after| after.target_failures[0] =
+                Some(preflight.clone()))
+            .is_ok(),
+            "a new failure"
+        );
+        assert!(
+            ended(&stored, &|after| after.target_failures[0] =
+                Some(blocked.clone()))
+            .is_err(),
+            "another category"
+        );
+        let mut unconfirmed = stored.clone();
+        unconfirmed.mls_state =
+            FanoutMlsState::Pending(crate::engine_state::PendingStateRef::new(9));
+        assert!(ended(&unconfirmed, &|_| {}).is_err(), "a pending commit");
+        let mut application = exposed(Shape::ApplicationMessage);
+        application.target_failures[0] = Some(rewritten.clone());
+        assert!(
+            ended(&application, &|_| {}).is_err(),
+            "an application message"
+        );
+        // A row stored before the exposure bit existed reads as clear; the
+        // edge needs the bit set in the successor.
+        let mut legacy = stored.clone();
+        legacy.target_possible_exposure.clear();
+        assert!(
+            ended(&legacy, &|after| after.target_possible_exposure =
+                vec![false; 3])
+            .is_err(),
+            "the bit cleared"
+        );
+        assert!(
+            ended(&legacy, &|after| after.target_possible_exposure =
+                vec![true, false, false])
+            .is_ok(),
+            "the bit set"
+        );
     }
 
     /// mdk#2332: the single exposure transition. For every stored state,

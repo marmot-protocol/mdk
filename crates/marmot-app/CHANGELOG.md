@@ -23,6 +23,12 @@
 
 ### Added
 
+- `GroupCommitDelivery::refused_relays` lists the group relays that refused
+  the change for good, each a `GroupCommitRefusedRelay` with a
+  `GroupCommitRefusalCause`: `TooLarge { size_class }` (the relay's size
+  answer, its known limit, or the 64 KiB commit floor) or `Rejected` (any
+  other final answer) (mdk#2333). MDK will not deliver the change there, and
+  members who read only that relay may not have it.
 - `MarmotAppRuntime::discard_failed_send(account_ref, group_id, message_id_hex)`
   securely drops a failed own send from this device without publishing. It
   returns `StillSending` while the group has a send the engine may still
@@ -53,6 +59,18 @@
 
 ### Changed
 
+- A group relay's refusal of a confirmed own change now warns until the user
+  acknowledges it, and survives restarts (mdk#2333). `group_commit_delivery`
+  names the oldest refused change ahead of any owed one, and returns `None`
+  only once no relay is owed a change of yours and every refusal has been
+  acknowledged. A refusal makes group changes fail with
+  `GroupCommitUndelivered` at once, without the two-minute grace.
+  `acknowledge_group_commit_undelivered` now also dismisses the group's
+  refusals for good, and the one attempt it admits covers every change owed
+  or refused when it was called. A relay's size answer after an earlier
+  attempt that may have reached it now ends its retries once the change is
+  confirmed, reported as `TooLarge` with no size class, instead of retrying
+  it with backoff indefinitely. A relay the host-safety rule refuses is not reported.
 - Attachment downloads run four at a time across a runtime's accounts instead
   of one, and each account's media HTTP lane grows from four slots to five so
   one slot stays free for foreground work. A screen of images no longer

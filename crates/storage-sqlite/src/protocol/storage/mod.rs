@@ -1,6 +1,7 @@
 mod account_device_history_key;
 mod account_device_signer;
 mod capabilities;
+mod commit_refusals;
 mod committed_rosters;
 mod convergence_passes;
 mod convergence_policy;

@@ -51,10 +51,12 @@ pub struct GroupAppComponentFfi {
     pub data: Vec<u8>,
 }
 
-/// The group's oldest change that some group relays have not accepted yet
-/// (mdk#2255). Members who read only those relays cannot follow the group until
-/// they do; MDK keeps retrying them with the exact event. A newer change can be
-/// owed to other relays as well.
+/// A change of yours that some group relays have not accepted yet (mdk#2255),
+/// or that a group relay refused (mdk#2333). Members who read only those relays
+/// may not have it, so they may not follow the group. MDK keeps retrying owed
+/// relays with the exact event; a refusal is final. The change named is the
+/// oldest one a relay refused, until the refusal is acknowledged, or else the
+/// oldest one still owed. A newer change can be owed to other relays as well.
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct GroupCommitDeliveryFfi {
     pub group_id_hex: String,
@@ -64,6 +66,50 @@ pub struct GroupCommitDeliveryFfi {
     pub relay_count: u32,
     /// When the first relay accepted the change, in Unix seconds.
     pub since: u64,
+    /// Relays that refused the change for good, until acknowledged. MDK will
+    /// not deliver it there; members who read only those relays may not have
+    /// it. A refusal never says the relay lacks the change.
+    #[uniffi(default = [])]
+    pub refused_relays: Vec<GroupCommitRefusedRelayFfi>,
+}
+
+/// A group relay that refused a change of yours for good (mdk#2333).
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct GroupCommitRefusedRelayFfi {
+    pub relay_url: String,
+    pub cause: GroupCommitRefusalCauseFfi,
+    /// The change's coarse size, for `TooLarge` only, and only when known:
+    /// absent after an earlier attempt that may have reached the relay.
+    pub size_class: Option<crate::EventSizeClassFfi>,
+}
+
+/// Why a group relay refused a change for good.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum GroupCommitRefusalCauseFfi {
+    /// Too large for the relay: its own size answer, its known limit, or the
+    /// 64 KiB commit floor at a relay whose limit is unknown.
+    TooLarge,
+    /// Any other final answer from the relay.
+    Rejected,
+}
+
+impl From<marmot_app::GroupCommitRefusedRelay> for GroupCommitRefusedRelayFfi {
+    fn from(refused: marmot_app::GroupCommitRefusedRelay) -> Self {
+        let (cause, size_class) = match refused.cause {
+            marmot_app::GroupCommitRefusalCause::TooLarge { size_class } => (
+                GroupCommitRefusalCauseFfi::TooLarge,
+                size_class.map(Into::into),
+            ),
+            marmot_app::GroupCommitRefusalCause::Rejected => {
+                (GroupCommitRefusalCauseFfi::Rejected, None)
+            }
+        };
+        Self {
+            relay_url: refused.relay_url,
+            cause,
+            size_class,
+        }
+    }
 }
 
 /// Eligibility of one requested account, not a Welcome delivery receipt.
@@ -1360,6 +1406,42 @@ mod group_state_tests {
                 DisbandRequestFfi::Failed {
                     requested_at_ms: 1_700_000_000_456,
                     reason: expected
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn refused_relay_ffi_flattens_each_cause_and_keeps_a_known_size() {
+        use marmot_app::{GroupCommitRefusalCause, GroupCommitRefusedRelay};
+        for (cause, expected_cause, expected_size) in [
+            (
+                GroupCommitRefusalCause::TooLarge {
+                    size_class: Some(cgka_traits::EventSizeClass::From64To128Kib),
+                },
+                GroupCommitRefusalCauseFfi::TooLarge,
+                Some(crate::EventSizeClassFfi::From64To128Kib),
+            ),
+            (
+                GroupCommitRefusalCause::TooLarge { size_class: None },
+                GroupCommitRefusalCauseFfi::TooLarge,
+                None,
+            ),
+            (
+                GroupCommitRefusalCause::Rejected,
+                GroupCommitRefusalCauseFfi::Rejected,
+                None,
+            ),
+        ] {
+            assert_eq!(
+                GroupCommitRefusedRelayFfi::from(GroupCommitRefusedRelay {
+                    relay_url: "wss://relay.example".into(),
+                    cause,
+                }),
+                GroupCommitRefusedRelayFfi {
+                    relay_url: "wss://relay.example".into(),
+                    cause: expected_cause,
+                    size_class: expected_size,
                 }
             );
         }

@@ -159,9 +159,36 @@ fn commit_delivery_gates_change(since_secs: u64, now_secs: u64, grace_secs: u64)
     now_secs.saturating_sub(since_secs) >= grace_secs
 }
 
+/// Whether an undelivered-commit acknowledgement admits a group change
+/// (mdk#2333): something gates, and every commit that gates is one the user
+/// acknowledged. One that starts gating since, such as a commit confirmed
+/// after the acknowledgement, needs a new one.
+fn acknowledgement_covers(
+    acknowledged: &HashSet<cgka_traits::MessageId>,
+    gating: &[&cgka_traits::MessageId],
+) -> bool {
+    !gating.is_empty() && gating.iter().all(|commit| acknowledged.contains(*commit))
+}
+
 #[cfg(test)]
 mod commit_delivery_gate_tests {
-    use super::{COMMIT_DELIVERY_GATE_GRACE_SECS, commit_delivery_gates_change};
+    use super::{
+        COMMIT_DELIVERY_GATE_GRACE_SECS, acknowledgement_covers, commit_delivery_gates_change,
+    };
+
+    /// mdk#2333: an acknowledgement admits a change only while it covers every
+    /// gating commit, the ones inside their grace when it was given included.
+    #[test]
+    fn an_acknowledgement_admits_only_the_commits_it_covered() {
+        let commit = |byte: u8| cgka_traits::MessageId::new(vec![byte; 32]);
+        let (owed, refused, later) = (commit(1), commit(2), commit(3));
+        let acknowledged = std::collections::HashSet::from([owed.clone(), refused.clone()]);
+        assert!(acknowledgement_covers(&acknowledged, &[&owed, &refused]));
+        assert!(acknowledgement_covers(&acknowledged, &[&owed]));
+        assert!(!acknowledgement_covers(&acknowledged, &[&owed, &later]));
+        assert!(!acknowledgement_covers(&acknowledged, &[&later]));
+        assert!(!acknowledgement_covers(&acknowledged, &[]));
+    }
 
     /// mdk#2255: a relay cut off at quorum and retried 30 s later does not
     /// refuse a quick follow-up change; one still owed after the grace does.
@@ -941,10 +968,12 @@ pub struct AppClient {
     /// one group change attempt at that epoch only. Process-local: a rebuilt
     /// client asks again.
     pub(crate) stale_commit_acknowledgements: HashMap<GroupId, cgka_traits::EpochId>,
-    /// Groups whose undelivered last commit the user explicitly accepted, with
-    /// the commit they accepted (mdk#2255). An acknowledgement admits one group
-    /// change attempt while that commit is owed. Process-local.
-    pub(crate) undelivered_commit_acknowledgements: HashMap<GroupId, cgka_traits::MessageId>,
+    /// Groups whose undelivered commits the user explicitly accepted, with the
+    /// commits owed or refused when they did (mdk#2255, mdk#2333). An
+    /// acknowledgement admits one group change attempt while only those
+    /// commits gate. Process-local; the refusals it dismissed stay dismissed.
+    pub(crate) undelivered_commit_acknowledgements:
+        HashMap<GroupId, HashSet<cgka_traits::MessageId>>,
     /// [`COMMIT_DELIVERY_GATE_GRACE_SECS`]; tests shorten it.
     pub(crate) commit_delivery_gate_grace_secs: u64,
     /// Batch-start local-deletion frontiers crossed by authenticated fresh
@@ -6387,16 +6416,20 @@ impl AppClient {
     /// device leaves the stalled epoch. Dismissing the history notice accepts
     /// missing history, not fork risk, so it does not lift the gate.
     ///
-    /// **Undelivered commit (mdk#2255).** The group's last confirmed commit is
-    /// still owed to a group relay. It confirmed on its first acknowledgement;
-    /// members who read only the other relays cannot follow it, and every
-    /// further change builds on a commit they lack. Groups often list a relay
-    /// that is gone for good and retried forever, so this gate is advisory too:
-    /// [`Self::acknowledge_group_commit_undelivered`] accepts that risk.
-    /// Otherwise it lifts when every owed relay accepts or definitively rejects
-    /// the commit. It refuses only once the commit has been owed for
-    /// [`COMMIT_DELIVERY_GATE_GRACE_SECS`]: the first publish cuts slower
-    /// relays off at the first acknowledgement and retries them 30 s later.
+    /// **Undelivered commit (mdk#2255, mdk#2333).** A confirmed own commit is
+    /// still owed to a group relay, or a group relay refused it for good. It
+    /// confirmed on its first acknowledgement; members who read only the
+    /// other relays may not have it, and every further change builds on a
+    /// commit they lack. Groups often list a relay that is gone for good and
+    /// retried forever, so this gate is advisory too:
+    /// [`Self::acknowledge_group_commit_undelivered`] accepts that risk and
+    /// dismisses the group's refusals. Otherwise an owed commit stops gating
+    /// once every owed relay accepts it; a refusal gates until acknowledged.
+    /// A refusal is final, so it gates at once; an owed commit gates only once
+    /// it has been owed for [`COMMIT_DELIVERY_GATE_GRACE_SECS`]: the first
+    /// publish cuts slower relays off at the first acknowledgement and
+    /// retries them 30 s later. The attempt is admitted only while every
+    /// commit that gates was owed or refused when the user acknowledged.
     ///
     /// An acknowledgement admits exactly one attempt: an admitted attempt
     /// consumes it even if the change then fails, so a different change asks
@@ -6408,14 +6441,24 @@ impl AppClient {
         let epoch = self.runtime.group_record(group_id)?.epoch;
         let catching_up = self.epoch_gap_open_since(group_id, epoch)?.is_some();
         let now_secs = recovery::wall_now_ms()? / 1_000;
-        let undelivered = self.runtime.undelivered_commit(group_id)?.filter(|commit| {
-            commit_delivery_gates_change(
-                commit.since.0,
-                now_secs,
-                self.commit_delivery_gate_grace_secs,
-            )
-        });
-        // Stale acknowledgements (another epoch, another commit) are discarded.
+        // A refusal gates at once: it is final when it arrives, so a grace
+        // buys nothing (mdk#2333). An owed commit gates once its grace ends.
+        let undelivered = self
+            .runtime
+            .undelivered_commits_in(group_id, None)?
+            .0
+            .into_iter()
+            .filter(|commit| {
+                !commit.refused_endpoints.is_empty()
+                    || commit_delivery_gates_change(
+                        commit.since.0,
+                        now_secs,
+                        self.commit_delivery_gate_grace_secs,
+                    )
+            })
+            .collect::<Vec<_>>();
+        // Stale acknowledgements (another epoch, a commit they did not
+        // cover) are discarded.
         let stale_ack = self
             .stale_commit_acknowledgements
             .remove(group_id)
@@ -6424,9 +6467,13 @@ impl AppClient {
             .undelivered_commit_acknowledgements
             .remove(group_id)
             .filter(|acknowledged| {
-                undelivered
-                    .as_ref()
-                    .is_some_and(|commit| &commit.message_id == acknowledged)
+                acknowledgement_covers(
+                    acknowledged,
+                    &undelivered
+                        .iter()
+                        .map(|commit| &commit.message_id)
+                        .collect::<Vec<_>>(),
+                )
             });
         let refusal = if catching_up && stale_ack.is_none() {
             tracing::info!(
@@ -6435,14 +6482,20 @@ impl AppClient {
                 "group change refused while epoch-gap recovery is unresolved"
             );
             Some(AppError::GroupCatchingUp(hex::encode(group_id.as_slice())))
-        } else if let Some(commit) = undelivered.as_ref()
-            && undelivered_ack.is_none()
-        {
+        } else if !undelivered.is_empty() && undelivered_ack.is_none() {
             tracing::info!(
                 target: "marmot_app::client",
                 method = "ensure_group_change_admitted",
-                owed_relays = commit.owed_endpoints.len(),
-                "group change refused while the last commit is owed to a relay"
+                gating_commits = undelivered.len(),
+                owed_relays = undelivered
+                    .iter()
+                    .map(|commit| commit.owed_endpoints.len())
+                    .sum::<usize>(),
+                refused_relays = undelivered
+                    .iter()
+                    .map(|commit| commit.refused_endpoints.len())
+                    .sum::<usize>(),
+                "group change refused while a commit is owed to or refused by a relay"
             );
             Some(AppError::GroupCommitUndelivered(hex::encode(
                 group_id.as_slice(),
@@ -6468,38 +6521,51 @@ impl AppClient {
                 "user accepted fork risk for a group change while catching up"
             );
         }
-        if undelivered.is_some() {
+        if !undelivered.is_empty() {
             tracing::info!(
                 target: "marmot_app::client",
                 method = "ensure_group_change_admitted",
-                "user accepted a group change while the last commit is undelivered"
+                "user accepted a group change while a commit is undelivered"
             );
         }
         Ok(())
     }
 
-    /// Record that the user accepts changing a group whose last change has not
-    /// reached every relay, after [`AppError::GroupCommitUndelivered`]. The next
-    /// group change attempt proceeds; the attempt consumes the acknowledgement
-    /// whether or not it commits. Returns `false`, recording nothing, when no
-    /// relay is owed the group's last change.
+    /// Record that the user accepts changing a group whose changes have not
+    /// reached every relay, after [`AppError::GroupCommitUndelivered`]. Every
+    /// relay refusal in the group is dismissed for good (mdk#2333), and the
+    /// next group change attempt proceeds if no commit gates that this did not
+    /// cover: each one owed or refused now, inside its grace or past it. The
+    /// attempt consumes the acknowledgement whether or not it commits. Returns
+    /// `false`, recording nothing, when no relay is owed or has refused a
+    /// change of yours.
     pub fn acknowledge_group_commit_undelivered(
         &mut self,
         group_id: &GroupId,
     ) -> Result<bool, AppError> {
         self.ensure_group(group_id)?;
-        let Some(undelivered) = self.runtime.undelivered_commit(group_id)? else {
+        let (undelivered, _) = self.runtime.undelivered_commits_in(group_id, None)?;
+        if undelivered.is_empty() {
             self.undelivered_commit_acknowledgements.remove(group_id);
             return Ok(false);
-        };
-        self.undelivered_commit_acknowledgements
-            .insert(group_id.clone(), undelivered.message_id);
+        }
+        self.runtime.acknowledge_commit_refusals(group_id)?;
+        self.undelivered_commit_acknowledgements.insert(
+            group_id.clone(),
+            undelivered
+                .into_iter()
+                .map(|commit| commit.message_id)
+                .collect(),
+        );
         Ok(true)
     }
 
-    /// The group's oldest confirmed change that some group relays still owe, or
-    /// `None` when none is owed (mdk#2255). Reported immediately; the group
-    /// change gate waits out the two-minute delivery grace from `since`.
+    /// The group's confirmed change of yours that a group relay refused, until
+    /// acknowledged, or else the oldest one some group relays still owe; `None`
+    /// once no relay is owed a change of yours and every relay refusal has been
+    /// acknowledged (mdk#2255, mdk#2333). Reported immediately; the group
+    /// change gate refuses at once on a refusal, and waits out the two-minute
+    /// delivery grace from `since` on an owed relay.
     pub fn group_commit_delivery(
         &self,
         group_id: &GroupId,
@@ -6528,6 +6594,14 @@ impl AppClient {
                 .owed_endpoints
                 .into_iter()
                 .map(|endpoint| endpoint.0)
+                .collect(),
+            refused_relays: undelivered
+                .refused_endpoints
+                .into_iter()
+                .map(|refused| crate::GroupCommitRefusedRelay {
+                    relay_url: refused.endpoint.0,
+                    cause: refused.cause.into(),
+                })
                 .collect(),
             relay_count: u32::try_from(undelivered.endpoint_count).unwrap_or(u32::MAX),
             since: undelivered.since.0,

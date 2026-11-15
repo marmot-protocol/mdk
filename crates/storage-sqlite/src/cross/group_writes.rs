@@ -825,6 +825,7 @@ const WHOLE_ROW_TABLES: &[(&str, &str, i64, i64)] = &[
     ("cgka_disband_candidates", "group_id", RAW_ID, STATE),
     ("cgka_disband_tombstones", "group_id", RAW_ID, STATE),
     ("cgka_outbound_fanout", "group_id", RAW_ID, STATE),
+    ("cgka_commit_refusals", "group_id", RAW_ID, STATE),
     ("cgka_group_maintenance", "group_id", RAW_ID, STATE),
     ("cgka_maintenance_obligations", "group_id", RAW_ID, STATE),
     ("cgka_group_evolutions", "group_id", RAW_ID, STATE),

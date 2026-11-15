@@ -2039,6 +2039,58 @@ impl AccountDeviceSession {
         Ok(())
     }
 
+    /// Delete a terminal fanout, first merging `refusal`, its confirmed
+    /// commit's refused relays, into the commit's refusal record, in one
+    /// transaction (mdk#2333).
+    pub fn retire_outbound_fanout(
+        &self,
+        fanout: &OutboundFanout,
+        refusal: Option<&cgka_traits::maintenance::CommitRefusal>,
+    ) -> SessionResult<()> {
+        if let Some(group_id) = fanout.group_id() {
+            self.engine.check_group_live(group_id)?;
+        }
+        Ok(self
+            .storage
+            .retire_outbound_fanout(fanout.message_id(), refusal)?)
+    }
+
+    /// Every stored commit refusal in the account (mdk#2333): an account-wide
+    /// list, as [`Self::group_evolutions`] is.
+    pub fn commit_refusals(&self) -> SessionResult<Vec<cgka_traits::maintenance::CommitRefusal>> {
+        Ok(self.storage.commit_refusals()?)
+    }
+
+    /// Merge a confirmed commit's refused relays into its refusal record,
+    /// creating it when there is none; never clears `acknowledged`.
+    pub fn merge_commit_refusal(
+        &self,
+        refusal: &cgka_traits::maintenance::CommitRefusal,
+    ) -> SessionResult<()> {
+        self.engine.check_group_live(&refusal.group_id)?;
+        Ok(self.storage.merge_commit_refusal(refusal)?)
+    }
+
+    /// Acknowledge every refusal record of the group (mdk#2333).
+    pub fn acknowledge_commit_refusals(&self, group_id: &GroupId) -> SessionResult<()> {
+        self.engine.check_group_live(group_id)?;
+        Ok(self.storage.acknowledge_commit_refusals(group_id)?)
+    }
+
+    /// Delete a commit's refusal record, as when convergence withdraws it.
+    pub fn delete_commit_refusal(
+        &self,
+        refusal: &cgka_traits::maintenance::CommitRefusal,
+    ) -> SessionResult<()> {
+        self.engine.check_group_live(&refusal.group_id)?;
+        Ok(self.storage.delete_commit_refusal(&refusal.fanout_id)?)
+    }
+
+    /// The engine's liveness check for a group (`Engine::check_group_live`).
+    pub fn check_group_live(&self, group_id: &GroupId) -> SessionResult<()> {
+        Ok(self.engine.check_group_live(group_id)?)
+    }
+
     pub fn pending_group_id(&self, pending: PendingStateRef) -> SessionResult<GroupId> {
         Ok(self.engine.pending_group_id(pending)?)
     }

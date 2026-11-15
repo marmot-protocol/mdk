@@ -3036,14 +3036,17 @@ impl MarmotAppRuntime {
             .await
     }
 
-    /// Record that the user accepts changing a group whose last change has not
-    /// reached every group relay yet, after a group change failed with
-    /// [`AppError::GroupCommitUndelivered`] (mdk#2255). Members who read only
-    /// the owed relays cannot follow the group, and the new change builds on
-    /// a change they lack. Retry the change afterwards. The acknowledgement
-    /// admits one group change attempt, consumed even if that attempt fails,
-    /// and is not persisted. Returns false, recording nothing, when no relay
-    /// is owed the group's last change.
+    /// Record that the user accepts changing a group whose changes have not
+    /// reached every group relay, after a group change failed with
+    /// [`AppError::GroupCommitUndelivered`] (mdk#2255, mdk#2333). Members who
+    /// read only the owed or refusing relays may not have those changes, and
+    /// the new change builds on them. Retry the change afterwards. Every relay
+    /// refusal in the group is dismissed for good: it no longer warns or gates,
+    /// including across restarts. The acknowledgement also admits one group
+    /// change attempt, consumed even if that attempt fails and not persisted,
+    /// while only the changes owed or refused now gate. Returns false,
+    /// recording nothing, when no relay is owed or has refused a change of
+    /// yours.
     pub async fn acknowledge_group_commit_undelivered(
         &self,
         account_ref: &str,
@@ -3054,14 +3057,17 @@ impl MarmotAppRuntime {
             .await
     }
 
-    /// The group's oldest change that some group relays have not accepted yet,
-    /// or `None` once every relay has accepted or definitively rejected it
-    /// (mdk#2255). MDK keeps retrying the owed relays. Owed relays are reported
-    /// immediately, while group changes fail with
-    /// [`AppError::GroupCommitUndelivered`] only once `since` is two minutes old:
-    /// a healthy relay cut off at the first acknowledgement is retried after 30
-    /// seconds. A local read; no event announces delivery completing, so poll
-    /// while showing it.
+    /// The group's oldest change of yours that a group relay refused, until
+    /// the user acknowledges it, or else the oldest one some group relays have
+    /// not accepted yet; `None` once no relay is owed a change of yours and
+    /// every relay refusal has been acknowledged (mdk#2255, mdk#2333). MDK
+    /// keeps retrying the owed relays; a refusal is final, and members who
+    /// read only that relay may not have the change. Both are reported
+    /// immediately. Group changes fail with
+    /// [`AppError::GroupCommitUndelivered`] at once on a refusal, and on an
+    /// owed relay only once `since` is two minutes old: a healthy relay cut
+    /// off at the first acknowledgement is retried after 30 seconds. A local
+    /// read; no event announces delivery completing, so poll while showing it.
     pub async fn group_commit_delivery(
         &self,
         account_ref: &str,
