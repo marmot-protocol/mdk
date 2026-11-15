@@ -14,8 +14,10 @@
   contexts for every envelope that missed the live key, so anyone able to post
   correctly signed envelopes to a group's route could make the receiver
   rebuild past group state once per envelope. Live ingest now reuses the
-  contexts that deferred sweeps and publish replay already cache, and each
-  envelope is decoded once per ingest.
+  contexts that deferred sweeps and publish replay already cache, on storage
+  that reports a past-peel-context generation (SQLite does; a custom provider
+  keeping the default `None` still rebuilds per envelope), and each envelope
+  is decoded once per ingest.
 
 ### Breaking changes
 
