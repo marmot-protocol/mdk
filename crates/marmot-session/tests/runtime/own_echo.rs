@@ -120,3 +120,122 @@ async fn an_own_echo_from_a_target_relay_confirms_a_pending_commit() {
     let ambiguous_copy = group_delivery(&runtime, &fixture, &commit, Some("wss://echo-a.example"));
     assert!(!runtime.takes_own_echo(&ambiguous_copy).unwrap());
 }
+
+/// Alice renamed her group, and neither relay answered the publish, when her
+/// process exited: the commit waits for a relay to show it holds the event.
+/// Returns the commit.
+async fn rename_left_pending(
+    fixture: &FloorFixture,
+    alice: AccountDeviceSession,
+    adapter: &RecordingAdapter,
+) -> TransportMessage {
+    let ambiguous = TransportEndpoint("wss://echo-a.example".into());
+    let refusing = TransportEndpoint("wss://echo-b.example".into());
+    let mut runtime = fixture.runtime(alice, adapter);
+    adapter.script_failures(ambiguous.clone(), vec![timed_out(&ambiguous)]);
+    adapter.script_failures(refusing.clone(), vec![blocked(&refusing)]);
+    let sent = runtime.send(fixture.rename()).await.unwrap();
+    assert!(sent.pending.is_empty(), "{:?}", sent.pending);
+    adapter.publishes().last().unwrap().message.clone()
+}
+
+/// The next process opens Alice's account as the account worker does, with
+/// her group only seeded (mdk#1161).
+fn reopened_seeded(fixture: &FloorFixture, adapter: &RecordingAdapter) -> FloorRuntime {
+    let reopened = deferred_session(
+        &fixture.alice_path,
+        &SqlCipherKey::new(FLOOR_KEY).unwrap(),
+        fixture.alice_seed,
+    );
+    let runtime = fixture.runtime(reopened, adapter);
+    assert_eq!(runtime.unhydrated_group_ids(), vec![fixture.group_id.clone()]);
+    runtime
+}
+
+/// Proof 5 after a restart. The engine answers the echo from its stored
+/// record without hydrating the group, so the copy is judged by the group's
+/// stored fanouts, without hydrating it, and its ingest hydrates the group
+/// and confirms the commit.
+#[tokio::test]
+async fn an_own_echo_confirms_a_commit_a_previous_process_left_pending() {
+    let refusing = TransportEndpoint("wss://echo-b.example".into());
+    let (fixture, alice) = FloorFixture::new(
+        "own-echo-restart",
+        &[&TransportEndpoint("wss://echo-a.example".into()), &refusing],
+    )
+    .await;
+    let adapter = RecordingAdapter::default();
+    let commit = rename_left_pending(&fixture, alice, &adapter).await;
+    let mut runtime = reopened_seeded(&fixture, &adapter);
+    let delivery = group_delivery(&runtime, &fixture, &commit, Some("wss://echo-b.example"));
+    assert!(runtime.takes_own_echo(&delivery).unwrap());
+    assert_eq!(
+        runtime.unhydrated_group_ids(),
+        vec![fixture.group_id.clone()],
+        "judging the copy hydrates nothing"
+    );
+
+    let ingested = runtime.ingest_delivery(&delivery).await.unwrap();
+    assert!(runtime.unhydrated_group_ids().is_empty());
+    assert!(
+        matches!(ingested.effects.pending.as_slice(), [PendingResolution::Confirmed { .. }]),
+        "{:?}",
+        ingested.effects.pending
+    );
+    let (fanout, index) = stored_fanout(&runtime, &refusing);
+    assert_eq!(fanout.mls_state(), FanoutMlsState::Confirmed);
+    assert_eq!(
+        fanout.target_acknowledgement(index),
+        Some(cgka_traits::FanoutAcknowledgement::Echo)
+    );
+}
+
+/// After a restart, an echo whose group then fails to hydrate acknowledges
+/// nothing, and the quarantine its ingest caused is announced with that
+/// ingest's effects, not left for a later one.
+#[tokio::test]
+async fn an_own_echo_whose_group_fails_to_hydrate_announces_the_quarantine() {
+    let (fixture, alice) = FloorFixture::new(
+        "own-echo-quarantine",
+        &[
+            &TransportEndpoint("wss://echo-a.example".into()),
+            &TransportEndpoint("wss://echo-b.example".into()),
+        ],
+    )
+    .await;
+    let adapter = RecordingAdapter::default();
+    let commit = rename_left_pending(&fixture, alice, &adapter).await;
+    // The group's OpenMLS state is lost between the processes; its Marmot
+    // record and stored fanouts are not.
+    {
+        use cgka_traits::StorageProvider as _;
+        let storage = SqliteAccountStorage::open_encrypted(
+            &fixture.alice_path,
+            &SqlCipherKey::new(FLOOR_KEY).unwrap(),
+        )
+        .unwrap();
+        let mut group = openmls::group::MlsGroup::load(
+            storage.mls_storage(),
+            &openmls::group::GroupId::from_slice(fixture.group_id.as_slice()),
+        )
+        .unwrap()
+        .unwrap();
+        group.delete(storage.mls_storage()).unwrap();
+    }
+    let mut runtime = reopened_seeded(&fixture, &adapter);
+    let delivery = group_delivery(&runtime, &fixture, &commit, Some("wss://echo-b.example"));
+    assert!(runtime.takes_own_echo(&delivery).unwrap());
+
+    let ingested = runtime.ingest_delivery(&delivery).await.unwrap();
+    assert!(ingested.effects.pending.is_empty(), "{:?}", ingested.effects.pending);
+    assert!(
+        ingested.effects.events.iter().any(|event| matches!(
+            event,
+            GroupEvent::GroupHydrationQuarantined { group_id, .. } if group_id == &fixture.group_id
+        )),
+        "{:?}",
+        ingested.effects.events
+    );
+    assert!(runtime.unhydrated_group_ids().is_empty());
+    assert!(!runtime.takes_own_echo(&delivery).unwrap());
+}

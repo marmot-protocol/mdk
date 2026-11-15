@@ -4793,16 +4793,34 @@ where
     /// as holding it: the copy whose ingest acknowledges that relay and
     /// confirms the commit (mdk#2332). A host that skips events it already
     /// holds before ingest must still ingest this one; it may skip every other
-    /// copy of an own event. A group the session opened only seeded is
-    /// hydrated first, as an ingest would hydrate it, so a commit a previous
-    /// process left pending counts.
-    pub fn takes_own_echo(&mut self, delivery: &TransportDelivery) -> AccountResult<bool> {
-        if let Some((group_id, _)) = group_relay_copy(delivery) {
-            // As on ingest, a group that fails to hydrate is quarantined, and
-            // its copy is then not one.
-            let _ = self.session.ensure_group_hydrated(group_id);
-        }
-        Ok(self.own_echo_target(delivery)?.is_some())
+    /// copy of an own event.
+    ///
+    /// A group the session opened only seeded is judged by its stored
+    /// fanouts, without hydrating it: the ingest that follows hydrates it and
+    /// reports what hydration announces, which a skipped copy never would.
+    /// So a commit a previous process left pending counts.
+    pub fn takes_own_echo(&self, delivery: &TransportDelivery) -> AccountResult<bool> {
+        Ok(self.own_echo_target(delivery)?.is_some()
+            || self.seeded_own_echo_group(delivery)?.is_some())
+    }
+
+    /// The group of a copy that would be an own echo once its group, which
+    /// the session opened only seeded (mdk#1161), is hydrated: a stored
+    /// pending commit holds the copy's exact event and its relay among the
+    /// targets that take an acknowledgement. Read without hydrating.
+    fn seeded_own_echo_group<'a>(
+        &self,
+        delivery: &'a TransportDelivery,
+    ) -> AccountResult<Option<&'a GroupId>> {
+        let Some((group_id, endpoint)) = group_relay_copy(delivery) else {
+            return Ok(None);
+        };
+        Ok(echo_target_among(
+            self.session.seeded_group_outbound_fanouts(group_id)?,
+            delivery,
+            endpoint,
+        )
+        .map(|_| group_id))
     }
 
     /// The pending commit whose exact event `delivery` carries, and its
@@ -4826,17 +4844,11 @@ where
         {
             return Ok(None);
         }
-        Ok(self
-            .session
-            .outbound_fanouts_for_group(group_id)?
-            .into_iter()
-            .find(|fanout| fanout.is_frozen_event(&delivery.message.id))
-            .and_then(|fanout| {
-                let index = fanout.target_index_of(endpoint)?;
-                fanout
-                    .takes_acknowledgement(index)
-                    .then_some((fanout, index))
-            }))
+        Ok(echo_target_among(
+            self.session.outbound_fanouts_for_group(group_id)?,
+            delivery,
+            endpoint,
+        ))
     }
 
     /// The account's own subscription received a pending commit's exact event
@@ -4850,15 +4862,31 @@ where
     /// a publish that asked for an acknowledgement names only relays whose
     /// receipts it got, so it adds no acknowledgement the publish did not
     /// make; every commit attempt asks for one.
+    ///
+    /// The engine answers an own echo from its stored record without
+    /// hydrating the group, so a commit a previous process left pending in a
+    /// group this session opened only seeded (mdk#1161) is hidden until the
+    /// group hydrates. When the group's stored fanouts show the copy is an
+    /// echo, it is hydrated here, and what hydration announces goes out with
+    /// this ingest's effects. A group that fails to hydrate is quarantined,
+    /// and the copy then acknowledges nothing.
     async fn acknowledge_own_echo(
         &mut self,
         delivery: &TransportDelivery,
     ) -> AccountResult<AccountDeviceEffects> {
+        let mut output = AccountDeviceEffects::default();
+        if let Some(group_id) = self.seeded_own_echo_group(delivery)? {
+            self.session.ensure_group_hydrated(group_id)?;
+            let hydrated = self.session.drain();
+            if !hydrated.is_empty() {
+                output.extend(self.publish_session_effects(hydrated).await?);
+            }
+        }
         let Some((mut fanout, index)) = self.own_echo_target(delivery)? else {
-            return Ok(AccountDeviceEffects::default());
+            return Ok(output);
         };
         if !fanout.acknowledge_target(index, FanoutAcknowledgement::Echo)? {
-            return Ok(AccountDeviceEffects::default());
+            return Ok(output);
         }
         self.session
             .put_observed_outbound_fanout(&mut fanout, self.wall_clock.now_ms())?;
@@ -4868,10 +4896,12 @@ where
             "own echo acknowledged a pending commit"
         );
         let group_id = fanout.group_id().cloned();
-        Ok(self
-            .resume_outbound_fanouts_for_group(group_id.as_ref())
-            .await?
-            .0)
+        output.extend(
+            self.resume_outbound_fanouts_for_group(group_id.as_ref())
+                .await?
+                .0,
+        );
+        Ok(output)
     }
 
     async fn resume_outbound_fanouts_for_group(
@@ -7397,6 +7427,25 @@ fn group_relay_copy(delivery: &TransportDelivery) -> Option<(&GroupId, &Transpor
         delivery.group_id_hint.as_ref()?,
         delivery.source.endpoint.as_ref()?,
     ))
+}
+
+/// Among `fanouts`, the pending commit whose exact event `delivery` carries,
+/// and `endpoint`'s index among its targets, when that target takes an
+/// acknowledgement.
+fn echo_target_among(
+    fanouts: Vec<OutboundFanout>,
+    delivery: &TransportDelivery,
+    endpoint: &TransportEndpoint,
+) -> Option<(OutboundFanout, usize)> {
+    fanouts
+        .into_iter()
+        .find(|fanout| fanout.is_frozen_event(&delivery.message.id))
+        .and_then(|fanout| {
+            let index = fanout.target_index_of(endpoint)?;
+            fanout
+                .takes_acknowledgement(index)
+                .then_some((fanout, index))
+        })
 }
 
 fn is_group_commit(fanout: &OutboundFanout) -> bool {

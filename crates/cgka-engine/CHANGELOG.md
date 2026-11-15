@@ -9,6 +9,9 @@
   with reason `not_delivered`.
 - `Engine::drained_queued_intent_id` returns the queued intent the drain prepared a pending commit from, for its frozen
   fanout to name (mdk#2332).
+- `Engine::seeded_group_outbound_fanouts` reads a seeded-but-unhydrated group's stored fanouts without hydrating it,
+  for deciding whether a delivery is worth hydrating the group for (mdk#2332). It is empty for a live, quarantined or
+  unknown group.
 
 ### Changed
 

@@ -2059,6 +2059,15 @@ impl AccountDeviceSession {
         Ok(self.engine.outbound_fanouts_for_group(group_id)?)
     }
 
+    /// A seeded-but-unhydrated group's frozen fanouts as stored, without
+    /// hydrating it (`Engine::seeded_group_outbound_fanouts`).
+    pub fn seeded_group_outbound_fanouts(
+        &self,
+        group_id: &GroupId,
+    ) -> SessionResult<Vec<OutboundFanout>> {
+        Ok(self.engine.seeded_group_outbound_fanouts(group_id)?)
+    }
+
     /// Groups holding a stored frozen fanout, including unhydrated ones (mdk#2762).
     pub fn outbound_fanout_group_ids(&self) -> SessionResult<Vec<GroupId>> {
         Ok(self.engine.outbound_fanout_group_ids()?)

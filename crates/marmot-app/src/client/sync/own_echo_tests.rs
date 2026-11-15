@@ -93,6 +93,48 @@ async fn pending_commit() -> PendingCommit {
 }
 
 impl PendingCommit {
+    /// The account as a process that restarts with the commit pending opens
+    /// it: groups only seeded, as the account worker opens them, and the
+    /// commit still held, since the seen set is durable.
+    async fn reopened(self) -> Self {
+        let Self {
+            _dir,
+            app,
+            client,
+            group,
+            route,
+            earlier,
+            commit,
+        } = self;
+        drop(client);
+        assert!(
+            app.load_state("alice")
+                .unwrap()
+                .seen_events
+                .contains(&commit.id)
+        );
+        let client = app
+            .local_client_with_relay_plane_and_hydration(
+                "alice",
+                &app.relay_plane,
+                None,
+                true,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(client.runtime.unhydrated_group_ids().contains(&group));
+        Self {
+            _dir,
+            app,
+            client,
+            group,
+            route,
+            earlier,
+            commit,
+        }
+    }
+
     /// The account's delivery of `event` from relay `endpoint`, built as
     /// its router receives one.
     async fn delivery(
@@ -166,37 +208,12 @@ fn commit_state(
     (fanout.mls_state(), fanout.target_acknowledgement(index))
 }
 
-/// A process that restarts with the commit pending opens its groups only
-/// seeded, as the account worker does, and holds the commit in its durable
-/// seen set. Its live receive returns the commit's copy, skipping the earlier
-/// own message's copy queued ahead of it, and ingesting it confirms the
-/// commit.
+/// After a restart, the live receive returns the commit's copy, skipping the
+/// earlier own message's copy queued ahead of it, and ingesting it confirms
+/// the commit.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_live_receive_passes_an_own_echo_of_a_commit_left_pending_by_a_restart() {
-    let PendingCommit {
-        _dir,
-        app,
-        client,
-        group,
-        route,
-        earlier,
-        commit,
-    } = pending_commit().await;
-    drop(client);
-    let client = app
-        .local_client_with_relay_plane_and_hydration("alice", &app.relay_plane, None, true, None)
-        .await
-        .unwrap();
-    assert!(client.runtime.unhydrated_group_ids().contains(&group));
-    let mut fixture = PendingCommit {
-        _dir,
-        app,
-        client,
-        group,
-        route,
-        earlier,
-        commit,
-    };
+    let mut fixture = pending_commit().await.reopened().await;
     // A barrier: a receive that skipped the commit's copy returns this.
     let barrier = epoch_gap_probe(&fixture.route, unix_now_seconds(), "own-echo-barrier");
     for event in [&fixture.earlier, &fixture.commit, &barrier] {
@@ -221,6 +238,15 @@ async fn the_live_receive_passes_an_own_echo_of_a_commit_left_pending_by_a_resta
         fixture.commit.id,
         "the earlier own message is skipped, and the commit's copy is not"
     );
+    // Neither copy hydrated the group: what hydration announces reaches the
+    // host only through the ingest that follows.
+    assert!(
+        fixture
+            .client
+            .runtime
+            .unhydrated_group_ids()
+            .contains(&fixture.group)
+    );
     fixture
         .client
         .ingest_received_delivery(*delivery)
@@ -229,11 +255,11 @@ async fn the_live_receive_passes_an_own_echo_of_a_commit_left_pending_by_a_resta
     fixture.assert_confirmed_by_echo();
 }
 
-/// A sync's drain takes the same queued copies through its own skip, and
-/// the commit confirms.
+/// After a restart, a sync's drain takes the same queued copies through its
+/// own skip, and the commit confirms.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_sync_passes_a_pending_commits_own_echo() {
-    let mut fixture = pending_commit().await;
+async fn a_sync_passes_an_own_echo_of_a_commit_left_pending_by_a_restart() {
+    let mut fixture = pending_commit().await.reopened().await;
     for event in [&fixture.earlier, &fixture.commit] {
         let delivery = fixture.delivery(ECHO_A, event).await;
         fixture

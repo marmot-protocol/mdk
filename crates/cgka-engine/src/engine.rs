@@ -1150,6 +1150,22 @@ impl<S: StorageProvider> Engine<S> {
         Ok(self.storage.list_outbound_fanouts_for_group(group_id)?)
     }
 
+    /// A seeded-but-unhydrated group's frozen fanouts as stored, read without
+    /// hydrating it (mdk#1161 keeps them frozen until full hydration restores
+    /// their pending lifecycle). Empty for a live, quarantined or unknown
+    /// group. They tell a caller whether a delivery is worth hydrating the
+    /// group for; nothing may drive or change them before it is hydrated.
+    pub fn seeded_group_outbound_fanouts(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<Vec<OutboundFanout>, EngineError> {
+        if !self.unhydrated_groups.contains(group_id) || self.quarantined_reason(group_id).is_some()
+        {
+            return Ok(Vec::new());
+        }
+        Ok(self.storage.list_outbound_fanouts_for_group(group_id)?)
+    }
+
     /// Delete a terminal fanout after its outcome has been returned.
     pub fn delete_outbound_fanout(&self, message_id: &MessageId) -> Result<(), EngineError> {
         if let Some(group_id) = self
