@@ -127,8 +127,10 @@ operation behind the primary finding, and `failing_sources` is a count bucket
 of distinct failing endpoints. No endpoint leaves the device. Each attempt
 counts a distinct step, status and issue once, across retries and restarts. A
 pause is marked counted only while the collector is collecting (consent
-granted, exporter configured and accepted), so a later save counts a pause
-reached before that. The save that cancels an attempt also counts it.
+granted, exporter configured and accepted). A pause saved before that is
+counted by the attempt's next collecting save, even when that save retries,
+skips or cancels the step. A pause the collector drops after it was marked
+counted (consent revoked mid-save, or a full window) is not retried.
 Rows count paused attempts, not users.
 Message acceptance and relay publication are distinct from recipient receipt,
 decryption, display, and reading. Provisional preview success is separate from

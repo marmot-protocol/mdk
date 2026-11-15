@@ -1523,7 +1523,7 @@ impl AccountSetup<'_> {
             .records()
             .read_onboarding_checkpoint(&checkpoint.snapshot.account_id_hex)?;
         match mode {
-            OnboardingPersist::Update => match existing {
+            OnboardingPersist::Update => match &existing {
                 Some(existing) if existing.attempt() != checkpoint.attempt() => {
                     return Err(onboarding_error());
                 }
@@ -1601,7 +1601,8 @@ impl AccountSetup<'_> {
         let permit = product.collection_permit();
         let reported = checkpoint.reported_pauses.len();
         let pauses = if permit.is_some() {
-            checkpoint.take_unreported_pauses()
+            // An update's stored checkpoint is this attempt's previous save.
+            checkpoint.take_unreported_pauses(existing.as_ref())
         } else {
             Vec::new()
         };

@@ -9520,32 +9520,53 @@ mod product_analytics {
         let serialized = serde_json::to_string(&rows).unwrap();
         assert!(!serialized.contains("example") && !serialized.contains(&id));
 
-        // A pause reached while nothing is collected is counted by the save
-        // that cancels the attempt. Reconfiguring drops queued rows.
-        marmot_observability::wiring::configure(
-            &collector,
-            crate::ProductAnalyticsRuntimeConfig {
-                app_key: None,
-                ..config.clone()
-            },
-            scope.clone(),
-        )
-        .unwrap();
+        // A pause reached while nothing is collected is counted by a later
+        // save, even one that clears it: a retry with another outcome, or the
+        // save that cancels the attempt. Reconfiguring drops queued rows.
         network.fail_reads.store(false, Ordering::SeqCst);
-        network.inspection_errors.lock().insert(
-            "wss://".into(),
-            transport_nostr::DirectoryInspectionError::AuthenticationRequired,
-        );
-        setup
-            .retry_onboarding_step(&id, OnboardingStep::Profile)
-            .await
+        for (error, expected) in [
+            (
+                transport_nostr::DirectoryInspectionError::AuthenticationRequired,
+                "authentication_required",
+            ),
+            (
+                transport_nostr::DirectoryInspectionError::Unreachable,
+                "unreachable",
+            ),
+        ] {
+            marmot_observability::wiring::configure(
+                &collector,
+                crate::ProductAnalyticsRuntimeConfig {
+                    app_key: None,
+                    ..config.clone()
+                },
+                scope.clone(),
+            )
             .unwrap();
-        marmot_observability::wiring::configure(&collector, config, scope).unwrap();
-        assert!(pauses().is_empty());
-        setup.cancel_onboarding(&id).await.unwrap();
-        let rows = pauses();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0]["props"]["issue"], "authentication_required");
+            network
+                .inspection_errors
+                .lock()
+                .insert("wss://".into(), error);
+            setup
+                .retry_onboarding_step(&id, OnboardingStep::Profile)
+                .await
+                .unwrap();
+            marmot_observability::wiring::configure(&collector, config.clone(), scope.clone())
+                .unwrap();
+            network.inspection_errors.lock().clear();
+            if expected == "unreachable" {
+                setup.cancel_onboarding(&id).await.unwrap();
+            } else {
+                // The recheck finds the reported missing profile again.
+                setup
+                    .retry_onboarding_step(&id, OnboardingStep::Profile)
+                    .await
+                    .unwrap();
+            }
+            let rows = pauses();
+            assert_eq!(rows.len(), 1, "{expected}");
+            assert_eq!(rows[0]["props"]["issue"], expected);
+        }
         runtime.shutdown_and_close().await.unwrap();
     }
 }

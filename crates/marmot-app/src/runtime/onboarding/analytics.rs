@@ -142,12 +142,30 @@ fn context_label(context: OnboardingFindingContext) -> &'static str {
 }
 
 impl OnboardingCheckpoint {
-    /// The pauses this snapshot shows that its attempt has not reported, recorded as reported.
-    /// The caller records them once the checkpoint is saved, or forgets them if the save fails.
-    /// A cancelling save still counts the step it was stopped at.
-    pub(super) fn take_unreported_pauses(&mut self) -> Vec<OnboardingPause> {
+    /// The pauses its attempt has not reported, recorded as reported: those this snapshot shows,
+    /// and those `previous` (this attempt's last save) showed, since a save that retries, skips
+    /// or rechecks a step clears the pause it was stopped at. The caller records them once the
+    /// checkpoint is saved, or forgets them if the save fails. A cancelling save still counts the
+    /// step it was stopped at.
+    pub(super) fn take_unreported_pauses(
+        &mut self,
+        previous: Option<&OnboardingCheckpoint>,
+    ) -> Vec<OnboardingPause> {
+        let previous = previous.filter(|previous| previous.attempt() == self.attempt());
+        for key in previous
+            .iter()
+            .flat_map(|previous| &previous.reported_pauses)
+        {
+            if !self.reported_pauses.contains(key) {
+                self.reported_pauses.push(*key);
+            }
+        }
         let mut pauses = Vec::new();
-        for (key, pause) in self.snapshot.steps.iter().filter_map(onboarding_pause) {
+        let shown = previous
+            .iter()
+            .flat_map(|previous| &previous.snapshot.steps)
+            .chain(&self.snapshot.steps);
+        for (key, pause) in shown.filter_map(onboarding_pause) {
             if !self.reported_pauses.contains(&key) {
                 self.reported_pauses.push(key);
                 pauses.push(pause);
