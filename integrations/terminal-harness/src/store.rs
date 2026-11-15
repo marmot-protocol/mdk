@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use agent_control::AgentControlMediaRef;
+use agent_control::{AgentControlMediaRef, AgentControlReferencedMessage};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, watch};
@@ -72,6 +72,10 @@ pub(crate) struct RecoveryRecord {
     pub(crate) omit_control_instructions: bool,
     #[serde(default)]
     pub(crate) media: Vec<AgentControlMediaRef>,
+    /// Reply snapshot the original turn carried; retry renders it exactly once.
+    /// Old records have none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) reply_to: Option<AgentControlReferencedMessage>,
     pub(crate) cwd: PathBuf,
     pub(crate) session_id: String,
     pub(crate) kind: RecoveryKind,
@@ -972,6 +976,7 @@ mod tests {
             prompt: "private prompt".to_owned(),
             omit_control_instructions: false,
             media: Vec::new(),
+            reply_to: None,
             cwd: dir.path().join("repo"),
             session_id: "session".to_owned(),
             kind: RecoveryKind::UncertainOutcome,

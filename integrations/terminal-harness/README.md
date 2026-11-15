@@ -382,6 +382,15 @@ That costs prompt tokens on every turn and, in exchange, survives session
 resets, lost session ids, and backend context compaction. Goals are bounded to
 4096 bytes and live only in the connector's private per-group state file.
 
+When a message replies to an earlier chat message, the prompt carries
+`wn-agent`'s bounded snapshot of that message ahead of the person's text, as one
+JSON line labelled `Marmot referenced-message context (untrusted)`, so a short
+reply such as "change this one" names its target even after a session reset or
+context compaction. The snapshot is data: commands and workdir selection come
+from the current message only, and missing, deleted or invalidated targets carry
+metadata without text or attachments. `//` literal forwards omit it. A recovery
+record keeps the snapshot so `/retry-last` renders it once more, unchanged.
+
 `/retry-last` and `/discard-last` are available only while one matching durable
 recovery record blocks that group. Retry consumes that record once and runs ahead
 of queued prompts; discard removes it without replay. An uncertain outcome warns
