@@ -214,6 +214,15 @@ impl SqliteAccountStorage {
         self.connection.set_snapshot_release_fault(fault);
     }
 
+    /// Runs `sql` on this handle's connection, to fail a read without
+    /// writing the database (a TEMP table that shadows one) and mend it
+    /// again under a test. Test support only.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn execute_batch_for_test(&self, sql: &str) -> StorageResult<()> {
+        use crate::SqliteResultExt as _;
+        self.lock()?.execute_batch(sql).storage()
+    }
+
     /// Install a SQLite statement/row trace for dependent-crate regression tests.
     /// SQL and row identities must never be logged by production code.
     #[cfg(any(test, feature = "test-support"))]

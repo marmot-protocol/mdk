@@ -65,6 +65,7 @@ use super::history_recovery::history_notices::reuse::RecoveryAnswer;
 use super::history_recovery::history_notices::{
     Fact, GroupFacts, GroupNotices, LiveFacts, RecoveryRead,
 };
+use super::invite_recovery::InvitationRows;
 use crate::groups::AppGroupRosterSession;
 use crate::{
     AccountRecoveryStatus, AppError, AppGroupMemberIds, AppGroupMemberRecord, AppGroupMlsState,
@@ -795,6 +796,10 @@ struct EntryValidity {
     /// The wall-clock window the commit-delivery answer holds in: from the
     /// clock reading it was computed at until a delivery deadline passes.
     window: WallClockWindow,
+    /// The system-clock window the recovery status's KeyPackage lifetimes
+    /// leave it in: a retained reinvite's KeyPackage past its `not_after`
+    /// fails the status, with no write.
+    key_packages: WallClockWindow,
     /// The group's notices in the recovery read its recovery status was
     /// built from, `None` when that read failed: a park, a dismissal or a
     /// route gone moves them and no write of the group (mdk#3273 PR 8).
@@ -811,21 +816,24 @@ struct EntryValidity {
 
 impl EntryValidity {
     /// Whether an entry built at `self` still holds for a group now at
-    /// `generation`, `record` and `maintenance_paused`, at `now`. A clock
-    /// moved back before the reading the commit-delivery answer was computed
-    /// at can bring an expired bound back into force.
+    /// `generation`, `record` and `maintenance_paused`, at `now` on the
+    /// account's wall clock and `system_now` on the system clock. A clock
+    /// moved back before the reading an answer was computed at can bring an
+    /// expired bound back into force.
     fn holds(
         &self,
         generation: &GroupChangeGeneration,
         record: &AppGroupRecord,
         maintenance_paused: bool,
         now: Timestamp,
+        system_now: Timestamp,
     ) -> bool {
         self.reusable
             && generation.state.unchanged_since(&self.generation.state)
             && *record == self.record
             && maintenance_paused == self.maintenance_paused
             && self.window.contains(now)
+            && self.key_packages.contains(system_now)
     }
 
     /// Whether the entry's recovery status still holds for the group's
@@ -1035,7 +1043,7 @@ fn key_package_answer(
 
 /// Seconds since the Unix epoch on the system clock, which OpenMLS checks
 /// KeyPackage lifetimes against.
-fn system_clock_now() -> Timestamp {
+pub(crate) fn system_clock_now() -> Timestamp {
     Timestamp(
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1062,6 +1070,9 @@ pub(crate) struct ReadStatePublisher {
     /// The earliest commit-delivery bound among `entries`, on the account's
     /// wall clock.
     groups_valid_until: Option<Timestamp>,
+    /// The earliest KeyPackage bound among `entries`' recovery statuses, on
+    /// the system clock.
+    groups_key_packages_until: Option<Timestamp>,
     /// Whether any account handle the publish reads was still open when the
     /// last publish began: the oracle's window for a terminal close.
     #[cfg(any(test, feature = "test-support"))]
@@ -1082,17 +1093,20 @@ pub(crate) struct ReadStatePublisher {
 
 impl ReadStatePublisher {
     /// How long until an answer in the published version can change with no
-    /// write, each bound measured on its own clock: KeyPackage lifetimes on
-    /// the system clock, commit-delivery bounds on the account's wall clock.
+    /// write, each bound measured on its own clock: KeyPackage lifetimes (the
+    /// owned list's and the recovery statuses') on the system clock,
+    /// commit-delivery bounds on the account's wall clock.
     /// Never under a second, the clocks' resolution, so a bound the clock
     /// does not show as passed yet is waited for rather than spun on.
     fn deadline(&self, wall_now: Timestamp, system_now: Timestamp) -> Option<Duration> {
         let remaining = |until: Timestamp, now: Timestamp| until.0.saturating_sub(now.0);
-        let key_packages = self
-            .key_packages
-            .as_ref()
-            .and_then(|(_, validity)| validity.window.until)
-            .map(|until| remaining(until, system_now));
+        let key_packages = earliest(
+            self.key_packages
+                .as_ref()
+                .and_then(|(_, validity)| validity.window.until),
+            self.groups_key_packages_until,
+        )
+        .map(|until| remaining(until, system_now));
         let groups = self
             .groups_valid_until
             .map(|until| remaining(until, wall_now));
@@ -1112,6 +1126,7 @@ impl ReadStatePublisher {
             entries: HashMap::new(),
             recovery: None,
             groups_valid_until: None,
+            groups_key_packages_until: None,
             #[cfg(any(test, feature = "test-support"))]
             storage_open_at_publish: true,
             #[cfg(any(test, feature = "test-support"))]
@@ -1169,6 +1184,9 @@ impl ReadStatePublisher {
         let uploads_in_flight = self.uploads_in_flight();
         let maintenance_paused = client.runtime.maintenance_is_paused();
         let now = client.runtime.wall_clock_now();
+        // Read before every recovery status's KeyPackage check, so a check on
+        // the other side of a bound shows as a moved clock.
+        let system_now = system_clock_now();
 
         // Read before the build, so a write that lands during it ends the
         // reuse at the next publish.
@@ -1239,9 +1257,11 @@ impl ReadStatePublisher {
         let mut rebuilt = 0usize;
         let mut changed = 0usize;
         let mut groups_valid_until = None;
+        let mut groups_key_packages_until = None;
         // Loaded once, for the first entry rebuilt. A failed load leaves each
         // entry to the per-group reads, so its errors are theirs.
         let mut maintenance_rows = None;
+        let mut invitation_rows = None;
         let mut earlier_entries = std::mem::take(&mut self.entries);
         for ((group_id, record), generation) in mirror.into_iter().zip(generations) {
             let earlier = earlier_entries
@@ -1249,7 +1269,7 @@ impl ReadStatePublisher {
                 .zip(current.groups.get(&group_id));
             let (answers, validity) = match earlier {
                 Some((validity, answers))
-                    if validity.holds(&generation, record, maintenance_paused, now)
+                    if validity.holds(&generation, record, maintenance_paused, now, system_now)
                         && (recovery_read_kept
                             || validity.notices_hold(
                                 recovery_read
@@ -1266,6 +1286,10 @@ impl ReadStatePublisher {
                         .get_or_insert_with(|| client.runtime.group_maintenance_rows())
                         .as_ref()
                         .ok();
+                    let invitations = invitation_rows
+                        .get_or_insert_with(|| client.invitation_rows())
+                        .as_ref()
+                        .ok();
                     let (answers, validity) = group_entry(
                         client,
                         &group_id,
@@ -1276,7 +1300,9 @@ impl ReadStatePublisher {
                             .as_ref()
                             .map(|(validity, answers)| (validity, *answers)),
                         rows,
+                        invitations,
                         recovery_read.read(),
+                        system_now,
                     );
                     // A rebuild whose answers are the published ones keeps
                     // them, and so does not by itself move the version.
@@ -1292,6 +1318,8 @@ impl ReadStatePublisher {
                 }
             };
             groups_valid_until = earliest(groups_valid_until, validity.window.until);
+            groups_key_packages_until =
+                earliest(groups_key_packages_until, validity.key_packages.until);
             entries.insert(group_id.clone(), validity);
             groups.insert(group_id, answers);
         }
@@ -1331,7 +1359,11 @@ impl ReadStatePublisher {
         };
         self.entries = entries;
         self.groups_valid_until = groups_valid_until;
-        let valid_until = earliest(key_packages_valid_until, groups_valid_until);
+        self.groups_key_packages_until = groups_key_packages_until;
+        let valid_until = earliest(
+            earliest(key_packages_valid_until, groups_valid_until),
+            groups_key_packages_until,
+        );
         // Version 0 is the channel's empty state, never a publish.
         let first = current.version == 0;
         if !first
@@ -1435,7 +1467,9 @@ fn group_entry(
     maintenance_paused: bool,
     earlier: Option<(&EntryValidity, &Arc<GroupAnswers>)>,
     maintenance_rows: Option<&GroupMaintenanceRows>,
+    invitation_rows: Option<&InvitationRows>,
     recovery: Result<&RecoveryRead, &Arc<AppError>>,
+    system_now: Timestamp,
 ) -> (GroupAnswers, EntryValidity) {
     let app_components = match earlier {
         Some((validity, answers)) if validity.components_hold(&generation) => {
@@ -1471,13 +1505,22 @@ fn group_entry(
             },
         },
     };
-    // The recovery read fails first, then the record, as today's read.
-    let recovery_status = match (recovery, engine_record) {
-        (Err(error), _) => Err(Arc::clone(error)),
-        (Ok(_), Err(error)) => Err(Arc::new(error)),
-        (Ok(read), Ok(group)) => {
-            arc_err(client.group_recovery_status_in(group_id, &group, read, &recovery_facts))
-        }
+    // The recovery read fails first, then the record, as today's read. A
+    // failed status depends on no clock reading, and is never reused.
+    let (recovery_status, recovery_inputs) = match (recovery, engine_record) {
+        (Err(error), _) => (Err(Arc::clone(error)), None),
+        (Ok(_), Err(error)) => (Err(Arc::new(error)), None),
+        (Ok(read), Ok(group)) => match client.group_recovery_status_in(
+            group_id,
+            &group,
+            read,
+            &recovery_facts,
+            invitation_rows,
+            system_now,
+        ) {
+            Ok((status, inputs)) => (Ok(status), Some(inputs)),
+            Err(error) => (Err(Arc::new(error)), None),
+        },
     };
     // A failed read depends on no clock reading, and is never reused.
     let (commit_delivery, window) =
@@ -1515,12 +1558,16 @@ fn group_entry(
         && settled(&answers.commit_delivery)
         && settled(&answers.maintenance_status)
         && settled(&answers.app_components)
-        && settled(&answers.recovery_status);
+        && settled(&answers.recovery_status)
+        && recovery_inputs
+            .as_ref()
+            .is_none_or(|inputs| inputs.reusable);
     let validity = EntryValidity {
         generation,
         record,
         maintenance_paused,
         window,
+        key_packages: recovery_inputs.map_or(WallClockWindow::ALWAYS, |inputs| inputs.key_packages),
         notices: recovery
             .ok()
             .map(|read| read.group_notices(group_id).clone()),

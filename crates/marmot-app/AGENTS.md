@@ -1148,8 +1148,11 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   nothing else. A group entry (`EntryValidity`) holds while its change generation, mirror record and maintenance
   pause are unchanged, the clock is inside its commit-delivery window (from the reading that answer was computed at
   to its next deadline), and no answer failed on something other than a fact about the group (`settled_failure`)
-  nor did the device-group check that hides it fail; at a publish that reads recovery afresh, its history notices
-  must also equal that read's (`EntryValidity::notices_hold`). The recovery answer (`RecoveryAnswer`,
+  nor did the device-group check that hides it fail. Its recovery status adds three: the system clock inside the
+  window the KeyPackage lifetimes it judged leave it in (a retained reinvite's KeyPackage past its `not_after` fails
+  the status), no re-join offer left out on a load that can fail with no write (`RejoinOffers::every_offer_read`),
+  and, at a publish that reads recovery afresh, its history notices equal to that read's
+  (`EntryValidity::notices_hold`). The recovery answer (`RecoveryAnswer`,
   `client/history_recovery/history_notices/reuse.rs`) keeps its read (recovery notices, routing, catch-up survey)
   while the file's recovery-notice write count and the routing version are the ones read before it, the read
   succeeded, and no catch-up survey landed since; it keeps the account status built from that read while every

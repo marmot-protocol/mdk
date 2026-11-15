@@ -334,8 +334,8 @@ peel runs. `Engine::retry_deferred_peels` offers those contexts to every retaine
   that quarantine's event, side-effect discard and byte discharge: after the pass and the sweep's enumeration, at
   ingest and sweep entry, and in `ensure_hydrated`, retry, `drain_events` and `drain_auto_publish`. The reason is
   sticky: retry answers `false`, `leave_hydration_quarantine` refuses, and a re-join Welcome is refused non-terminally;
-  every OpenMLS load refuses it (`Engine::load_mls_group_in`, above), so `pending_group_rejoins_for` omits the
-  group's stored offers and `confirm_group_rejoin` refuses them with `UnknownGroup`, since a consent token would be
+  every OpenMLS load refuses it (`Engine::load_mls_group_in`, above), so `pending_group_rejoins_for` (through
+  `rejoin_offers`) omits the group's stored offers and `confirm_group_rejoin` refuses them with `UnknownGroup`, since a consent token would be
   the anchor's (mdk#3280). The next open restores the kept snapshot. No committing window opens while any guard snapshot of the group survives,
   so open-time recovery never meets two outermost snapshots.
 - **Engine construction restores every interrupted rewind before anything reads group state** (mdk#3272).

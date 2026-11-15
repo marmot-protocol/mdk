@@ -264,7 +264,8 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
 
 - **File:** `sqlite_storage.rs`
   - **Owns:** SQLCipher-backed `Engine<SqliteAccountStorage>` create + confirm smoke, sender-ratchet migration,
-    history-key continuity, safe-export source/puncture persistence, and local-forget atomicity and restart behavior
+    history-key continuity, safe-export source/puncture persistence, local-forget atomicity and restart behavior, and
+    a re-join offer left out on a failed MLS load, which `rejoin_offers` reports as an incomplete listing
 
 - **File:** `crash_recovery_sqlite.rs`
   - **Owns:** Debug-feature-gated subprocess-kill coverage at retained-anchor rewind and historical-apply transaction

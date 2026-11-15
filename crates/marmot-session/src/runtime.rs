@@ -1189,6 +1189,24 @@ where
         self.session.pending_group_rejoins_for(group_id)
     }
 
+    /// Every stored Welcome that offers a re-join, without its consent token
+    /// ([`cgka_engine::Engine::stored_rejoin_welcomes`]).
+    pub fn stored_rejoin_welcomes(
+        &self,
+    ) -> SessionResult<Vec<cgka_traits::welcome::PendingWelcome>> {
+        self.session.stored_rejoin_welcomes()
+    }
+
+    /// The offers among `candidates` whose group's MLS state loads, and
+    /// whether any was left out on a failure that can clear with no write
+    /// ([`cgka_engine::Engine::rejoin_offers`]).
+    pub fn rejoin_offers(
+        &self,
+        candidates: Vec<cgka_traits::welcome::PendingWelcome>,
+    ) -> cgka_engine::group_lifecycle::RejoinOffers {
+        self.session.rejoin_offers(candidates)
+    }
+
     pub async fn confirm_group_rejoin(
         &mut self,
         welcome_id: &cgka_traits::MessageId,

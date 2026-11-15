@@ -1011,3 +1011,214 @@ async fn a_cleared_invite_counts_toward_co_members_from_the_save_that_writes_it(
         "the publish after the save of the clear counts the group"
     );
 }
+
+/// A group's re-join offer is left out of its recovery status while the
+/// group's MLS state fails to load. That failure can clear with no write, so
+/// the entry built during it is not reused: the next publish reads the offer
+/// again. Here a TEMP table on the engine's connection shadows the OpenMLS
+/// values, failing the load without writing the database.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_offer_hidden_by_a_failed_load_is_read_again() {
+    use cgka_traits::storage::WelcomeStorage;
+    use cgka_traits::welcome::{PendingWelcome, RejoinWelcome};
+
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+    let mut client = app.client("alice").await.unwrap();
+    let group = client
+        .create_group("offered", &[])
+        .await
+        .unwrap()
+        .operation
+        .unwrap();
+    let storage = app.account_storage("alice").unwrap();
+    storage
+        .put_welcome(&PendingWelcome {
+            message_id: cgka_traits::MessageId::new(vec![0xe1; 32]),
+            group_id: group.clone(),
+            welcome_bytes: vec![],
+            rejoin: Some(RejoinWelcome {
+                epoch: cgka_traits::EpochId(0),
+                content_id: cgka_traits::MessageId::new(vec![0xe2; 32]),
+                welcomer: client.runtime.session().self_id(),
+                local_state_token: vec![],
+            }),
+        })
+        .unwrap();
+    client.start_read_state(read_state_channel().0, UploadsInFlight::default());
+    let state = client.subscribe_read_state().unwrap();
+    let offers = |state: &watch::Receiver<Arc<ReadState>>| {
+        state.borrow().groups[&group]
+            .recovery_status
+            .as_ref()
+            .unwrap()
+            .rejoin_invitations
+            .len()
+    };
+    assert_eq!(offers(&state), 1);
+
+    // Move the group's generation, then fail the load the rebuild makes on
+    // the engine's connection.
+    storage
+        .app_storage()
+        .execute_batch_for_test("UPDATE cgka_welcomes SET record = record")
+        .unwrap();
+    let engine = &client.engine_storage;
+    let group_key =
+        serde_json::to_vec(&openmls::group::GroupId::from_slice(group.as_slice())).unwrap();
+    engine
+        .execute_batch_for_test(&format!(
+            "CREATE TEMP VIEW openmls_values AS SELECT provider_version, label, storage_key, \
+             group_key, CASE WHEN label = X'{}' AND group_key = X'{}' THEN X'7b' ELSE value END \
+             AS value FROM main.openmls_values",
+            hex::encode(b"GroupContext"),
+            hex::encode(&group_key),
+        ))
+        .unwrap();
+    client.publish_read_state();
+    // Every other answer reads the group's loaded state, so only the offer
+    // fails: the entry would be reused but for the offer listing.
+    assert!(state.borrow().groups[&group].mls_state.is_ok());
+    assert_eq!(
+        offers(&state),
+        0,
+        "the offer is left out while it fails to load"
+    );
+
+    engine
+        .execute_batch_for_test("DROP VIEW temp.openmls_values")
+        .unwrap();
+    client.publish_read_state();
+    assert_eq!(offers(&state), 1, "the offer comes back with no write");
+}
+
+/// A retained reinvite's KeyPackage is judged against the system clock, and
+/// once it expires the group's recovery status fails, with no write. The
+/// entry holds only until that KeyPackage's `not_after`: the version names
+/// it as when an answer can change, the worker's deadline reaches it, and a
+/// publish after it reads the status again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reinvite_key_package_bounds_the_group_entry_until_it_expires() {
+    use cgka_engine::provider::EngineOpenMlsProvider;
+    use cgka_traits::engine::SendIntent;
+    use cgka_traits::storage::{
+        AccountDeviceSignerStorage as _, OutboundIntentStorage as _, OwnCommitBaseline,
+        OwnCommitIntent, ReinviteRetry, StorageProvider as _,
+    };
+    use openmls::prelude::{
+        CredentialWithKey, KeyPackage as MlsKeyPackage, Lifetime, MlsMessageBodyIn, MlsMessageIn,
+        MlsMessageOut, ProtocolVersion,
+    };
+    use openmls_basic_credential::SignatureKeyPair;
+    use tls_codec::{Deserialize as _, Serialize as _};
+
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+    let mut client = app.client("alice").await.unwrap();
+    client.publish_key_package().await.unwrap();
+    let group = client
+        .create_group("reinvited", &[])
+        .await
+        .unwrap()
+        .operation
+        .unwrap();
+    let template = client.durably_owned_key_packages().unwrap().remove(0);
+
+    // Alice's own KeyPackage with a lifetime of a few seconds, built into a
+    // scratch store so her owned list keeps its own, later, bound.
+    let storage = app.account_storage("alice").unwrap();
+    let account = app.account_home().account("alice").unwrap();
+    let identity = MemberId::new(hex::decode(account.account_id_hex).unwrap());
+    let binding = storage.account_device_signer(&identity).unwrap().unwrap();
+    let suite = cgka_engine::DEFAULT_CIPHERSUITE;
+    let signer = SignatureKeyPair::read(
+        storage.mls_storage(),
+        &binding.mls_signature_public_key,
+        suite.signature_algorithm(),
+    )
+    .unwrap();
+    let MlsMessageBodyIn::KeyPackage(parsed) =
+        MlsMessageIn::tls_deserialize_exact(template.bytes())
+            .unwrap()
+            .extract()
+    else {
+        panic!("expected a KeyPackage")
+    };
+    let crypto = openmls_rust_crypto::RustCrypto::default();
+    let parsed = parsed.validate(&crypto, ProtocolVersion::Mls10).unwrap();
+    let leaf = parsed.leaf_node();
+    let not_after = crate::unix_now_seconds() + 3;
+    let scratch = storage_sqlite::SqliteAccountStorage::in_memory_for_test().unwrap();
+    let bundle = MlsKeyPackage::builder()
+        .leaf_node_capabilities(leaf.capabilities().clone())
+        .leaf_node_extensions(leaf.extensions().clone())
+        .key_package_lifetime(Lifetime::init(not_after - 3_600, not_after))
+        .build(
+            suite,
+            &EngineOpenMlsProvider::<storage_sqlite::SqliteAccountStorage>::new(
+                &crypto,
+                scratch.mls_storage(),
+            ),
+            &signer,
+            CredentialWithKey {
+                credential: leaf.credential().clone(),
+                signature_key: signer.public().into(),
+            },
+        )
+        .unwrap();
+    let mut short_lived = KeyPackage::new(
+        MlsMessageOut::from(bundle.key_package().clone())
+            .tls_serialize_detached()
+            .unwrap(),
+    );
+    short_lived.protocol_profile = template.protocol_profile;
+    storage
+        .put_own_commit_intent(&OwnCommitIntent {
+            commit_id: cgka_traits::MessageId::new(vec![0xc1; 32]),
+            group_id: group.clone(),
+            source_epoch: cgka_traits::EpochId(0),
+            intent: SendIntent::Invite {
+                group_id: group.clone(),
+                key_packages: vec![short_lived],
+                initial_admins: vec![],
+            },
+            baseline: OwnCommitBaseline::None,
+            reinvite: Some(ReinviteRetry::default()),
+            reissue_attempts: 0,
+            created_at_ms: 0,
+        })
+        .unwrap();
+
+    client.start_read_state(read_state_channel().0, UploadsInFlight::default());
+    let state = client.subscribe_read_state().unwrap();
+    assert!(state.borrow().groups[&group].recovery_status.is_ok());
+    assert_eq!(state.borrow().valid_until, Some(Timestamp(not_after)));
+    assert!(
+        client
+            .read_state_deadline()
+            .is_some_and(|deadline| deadline <= Duration::from_secs(3))
+    );
+
+    while crate::unix_now_seconds() < not_after {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    client.publish_read_state();
+    assert!(
+        matches!(
+            state.borrow().groups[&group].recovery_status.as_ref(),
+            Err(error) if matches!(
+                error.as_engine_error(),
+                Some(cgka_traits::EngineError::InvalidKeyPackageLifetime { .. })
+            )
+        ),
+        "the expired KeyPackage fails the status"
+    );
+}

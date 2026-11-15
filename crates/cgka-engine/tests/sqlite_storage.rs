@@ -866,3 +866,101 @@ async fn local_forget_commits_before_dropping_pending_work_and_survives_reopen()
         cutoff
     );
 }
+
+/// A re-join offer whose group's MLS state fails to load is left out, so one
+/// damaged group hides no other group's offer, and the listing says it is
+/// incomplete: the failure can clear with no write, which a caller keeping
+/// the listing must see. A group with no MLS state is left out on a fact its
+/// change generation holds, and the listing stays complete.
+#[tokio::test]
+async fn an_offer_left_out_on_a_failed_load_leaves_the_listing_incomplete() {
+    use cgka_traits::types::GroupId;
+    use cgka_traits::welcome::{PendingWelcome, RejoinWelcome};
+    use sha2::{Digest, Sha256};
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("alice.sqlite");
+    let key = SqlCipherKey::raw([0x42; 32]);
+    let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    let inspection = store.clone();
+    let mut alice = build_client(store, b"alice-rejoin-offers");
+    let (group_id, result) = alice
+        .create_group(CreateGroupRequest {
+            name: "offers".into(),
+            description: String::new(),
+            members: vec![],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .expect("create group");
+    let SendResult::GroupCreated { pending, .. } = result else {
+        panic!("expected group creation, got {result:?}");
+    };
+    alice.confirm_published(pending).await.unwrap();
+    let offer = |group_id: &GroupId| PendingWelcome {
+        message_id: hash_id(group_id.as_slice()),
+        group_id: group_id.clone(),
+        welcome_bytes: Vec::new(),
+        rejoin: Some(RejoinWelcome {
+            epoch: EpochId(1),
+            content_id: hash_id(b"offered content"),
+            welcomer: MemberId::new(pad32(b"bob-rejoin-offers")),
+            local_state_token: Vec::new(),
+        }),
+    };
+    let no_state = GroupId::new(vec![0xa5; 16]);
+    let token = Sha256::digest(
+        load_openmls_group(&inspection, &group_id)
+            .epoch_authenticator()
+            .as_slice(),
+    )
+    .to_vec();
+
+    let read = alice.rejoin_offers(vec![offer(&group_id), offer(&no_state)]);
+    assert!(read.every_offer_read, "no MLS state is a settled fact");
+    assert_eq!(read.offers.len(), 1);
+    assert_eq!(read.offers[0].group_id, group_id);
+    assert_eq!(
+        read.offers[0].rejoin.as_ref().unwrap().local_state_token,
+        token
+    );
+
+    let fault = rusqlite::Connection::open(&path).unwrap();
+    storage_sqlite::open_hardened_sqlcipher(
+        &fault,
+        &key,
+        storage_sqlite::SqlCipherHardening::live_cache(),
+    )
+    .unwrap();
+    let group_key =
+        serde_json::to_vec(&openmls::group::GroupId::from_slice(group_id.as_slice())).unwrap();
+    let context: Vec<u8> = fault
+        .query_row(
+            "SELECT value FROM openmls_values WHERE label = ?1 AND group_key = ?2",
+            rusqlite::params![b"GroupContext".as_slice(), &group_key],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let set_context = |value: &[u8]| {
+        fault
+            .execute(
+                "UPDATE openmls_values SET value = ?1 WHERE label = ?2 AND group_key = ?3",
+                rusqlite::params![value, b"GroupContext".as_slice(), &group_key],
+            )
+            .unwrap()
+    };
+    assert_eq!(set_context(b"{"), 1);
+    let read = alice.rejoin_offers(vec![offer(&no_state), offer(&group_id)]);
+    assert!(read.offers.is_empty());
+    assert!(
+        !read.every_offer_read,
+        "a failed load can clear with no write"
+    );
+
+    assert_eq!(set_context(&context), 1);
+    let read = alice.rejoin_offers(vec![offer(&group_id)]);
+    assert!(read.every_offer_read);
+    assert_eq!(read.offers.len(), 1);
+}

@@ -1722,6 +1722,19 @@ impl AccountDeviceSession {
         Ok(self.engine.pending_group_rejoins_for(Some(group_id))?)
     }
 
+    pub fn stored_rejoin_welcomes(
+        &self,
+    ) -> SessionResult<Vec<cgka_traits::welcome::PendingWelcome>> {
+        Ok(self.engine.stored_rejoin_welcomes()?)
+    }
+
+    pub fn rejoin_offers(
+        &self,
+        candidates: Vec<cgka_traits::welcome::PendingWelcome>,
+    ) -> cgka_engine::group_lifecycle::RejoinOffers {
+        self.engine.rejoin_offers(candidates)
+    }
+
     pub async fn confirm_group_rejoin(
         &mut self,
         welcome_id: &MessageId,
