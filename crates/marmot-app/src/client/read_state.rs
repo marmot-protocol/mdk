@@ -2603,6 +2603,122 @@ mod tests {
         );
     }
 
+    /// Each publish judges a kept group entry against the system clock it
+    /// read: once that clock is past the window the entry's recovery status
+    /// left it in, the publish rebuilds the group's answers instead of
+    /// keeping the published ones (mdk#3273 PR 8). The published answers
+    /// carry a marker no rebuild gives, so they stay only while the entry is
+    /// kept.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_publish_rebuilds_an_entry_once_its_key_package_window_ends() {
+        use cgka_traits::engine::SendIntent;
+        use cgka_traits::storage::{
+            OutboundIntentStorage as _, OwnCommitBaseline, OwnCommitIntent, ReinviteRetry,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        marmot_account::AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let app = crate::MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(std::sync::Arc::new(
+                crate::tests::ScriptedPushRelayClient::default(),
+            ));
+        let mut client = app.client("alice").await.unwrap();
+        client.publish_key_package().await.unwrap();
+        let group = client
+            .create_group("windowed", &[])
+            .await
+            .unwrap()
+            .operation
+            .unwrap();
+        // A retained reinvite of Alice's own live KeyPackage, which the
+        // group's recovery status judges against the system clock.
+        let key_package = client.durably_owned_key_packages().unwrap().remove(0);
+        app.account_storage("alice")
+            .unwrap()
+            .put_own_commit_intent(&OwnCommitIntent {
+                commit_id: cgka_traits::MessageId::new(vec![0xc1; 32]),
+                group_id: group.clone(),
+                source_epoch: cgka_traits::EpochId(0),
+                intent: SendIntent::Invite {
+                    group_id: group.clone(),
+                    key_packages: vec![key_package],
+                    initial_admins: vec![],
+                },
+                baseline: OwnCommitBaseline::None,
+                reinvite: Some(ReinviteRetry::default()),
+                reissue_attempts: 0,
+                created_at_ms: 0,
+            })
+            .unwrap();
+
+        let (sender, _reader) = read_state_channel();
+        let mut publisher = ReadStatePublisher::new(sender, UploadsInFlight::default());
+        assert!(publisher.publish(&client));
+        let system_now = system_clock_now();
+        let window = publisher.entries[&group].key_packages;
+        assert!(
+            window.until.is_some_and(|until| until > system_now),
+            "the live reinvite bounds the entry: {window:?}"
+        );
+        assert!(publisher.current().groups[&group].recovery_status.is_ok());
+
+        let mut marked = None;
+        publisher.sender.send_modify(|state| {
+            let published = &state.groups[&group];
+            let answers = Arc::new(GroupAnswers {
+                record: published.record.clone(),
+                host_may_see: published.host_may_see,
+                awaits_hydration: published.awaits_hydration,
+                serves_reads: published.serves_reads,
+                roster_revision: published.roster_revision.clone(),
+                members: published.members.clone(),
+                standing: published.standing.clone(),
+                mls_state: published.mls_state.clone(),
+                commit_delivery: published.commit_delivery.clone(),
+                maintenance_status: published.maintenance_status.clone(),
+                app_components: published.app_components.clone(),
+                recovery_status: Err(Arc::new(AppError::UnknownGroup("marker".to_owned()))),
+            });
+            let mut groups = HashMap::clone(&state.groups);
+            groups.insert(group.clone(), Arc::clone(&answers));
+            marked = Some(answers);
+            *state = Arc::new(ReadState {
+                version: state.version,
+                valid_until: state.valid_until,
+                account: Arc::clone(&state.account),
+                groups: Arc::new(groups),
+            });
+        });
+        let marked = marked.unwrap();
+        let keeps_marker = |publisher: &ReadStatePublisher| {
+            Arc::ptr_eq(&publisher.current().groups[&group], &marked)
+        };
+
+        publisher.publish(&client);
+        assert!(
+            keeps_marker(&publisher),
+            "an entry inside its window is kept"
+        );
+
+        // The window ends an hour before the clock this publish reads.
+        publisher.entries.get_mut(&group).unwrap().key_packages = WallClockWindow {
+            from: Timestamp(system_now.0 - 7_200),
+            until: Some(Timestamp(system_now.0 - 3_600)),
+        };
+        assert!(publisher.publish(&client));
+        assert!(
+            !keeps_marker(&publisher),
+            "an entry past its window is rebuilt"
+        );
+        assert!(publisher.current().groups[&group].recovery_status.is_ok());
+        assert_eq!(
+            publisher.entries[&group].key_packages.until, window.until,
+            "the rebuilt entry is bounded by the live KeyPackage again"
+        );
+    }
+
     /// Before the worker's first publish a read is sent to the worker; once
     /// storage is closed every read answers so, whatever was published; and
     /// a worker gone answers as its closed lane would.

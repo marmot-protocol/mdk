@@ -1554,10 +1554,12 @@ async fn an_offer_hidden_by_a_failed_load_is_read_again() {
 /// recovery status, and a host's read serves that failure from A as an exact
 /// copy, never waiting for the worker.
 ///
-/// That a kept entry is dropped once the window ends follows, with no wall
-/// clock here, from three facts each pinned on its own: the version's
-/// `valid_until` is the KeyPackage's `not_after` (here); an entry stops
-/// holding at that bound (`client::read_state::tests::an_entry_holds_only_inside_its_key_package_window`);
+/// That a kept entry is dropped once the window ends is pinned with no wall
+/// clock wait: the version's `valid_until` is the KeyPackage's `not_after`
+/// (here); an entry stops holding at that bound
+/// (`client::read_state::tests::an_entry_holds_only_inside_its_key_package_window`);
+/// a publish past it rebuilds the group's answers
+/// (`client::read_state::tests::a_publish_rebuilds_an_entry_once_its_key_package_window_ends`);
 /// and the worker publishes when the earliest bound passes
 /// (`client::read_state::tests::the_deadline_measures_each_bound_on_its_own_clock`,
 /// `the_worker_publishes_a_time_bound_answer_when_its_bound_passes`).
