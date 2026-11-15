@@ -2863,6 +2863,12 @@ mod tests {
                 fanout.target_status(0),
                 Some(FanoutTargetStatus::NotAttempted)
             );
+            // Nor does storage take one written around the writer.
+            let mut forged = fanout.clone();
+            forged.target_statuses[0] = FanoutTargetStatus::Accepted;
+            forged.target_acknowledgements = vec![None; forged.target_statuses.len()];
+            forged.target_acknowledgements[0] = Some(FanoutAcknowledgement::Echo);
+            assert!(forged.validate_successor_of(fanout).is_err());
         }
     }
 

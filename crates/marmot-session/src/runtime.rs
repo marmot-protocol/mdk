@@ -4765,8 +4765,9 @@ where
     /// recorded `Accepted` by echo, and the group's fanouts are driven, which
     /// confirms the commit. A copy under another event id, or from a relay
     /// that is not a target, shows nothing. The adapter's local loop-back of
-    /// a publish names only relays that accepted it, so it adds no
-    /// acknowledgement the publish did not make.
+    /// a publish that asked for an acknowledgement names only relays whose
+    /// receipts it got, so it adds no acknowledgement the publish did not
+    /// make; every commit attempt asks for one.
     async fn acknowledge_own_echo(
         &mut self,
         delivery: &TransportDelivery,
