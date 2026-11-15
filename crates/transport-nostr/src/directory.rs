@@ -1050,6 +1050,11 @@ impl DirectoryRelayFetcher for NostrSdkDirectoryRelayFetcher {
             let filter =
                 directory_query_filter(&query, query.kind == 1059).map_err(|_| InvalidRequest)?;
             let report = loop {
+                // The SDK refuses a zero acquisition timeout.
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    return Err(TimedOut);
+                }
                 // A successful empty fetch can hide a CLOSED terminal. The
                 // bounded SDK acquisition retains that typed outcome and its
                 // wire reason.
@@ -1060,7 +1065,7 @@ impl DirectoryRelayFetcher for NostrSdkDirectoryRelayFetcher {
                             1,
                             query.limit.saturating_add(1).max(1),
                             16 * 1024 * 1024,
-                            deadline.saturating_duration_since(tokio::time::Instant::now()),
+                            remaining,
                         ),
                     )
                     .await
@@ -1082,9 +1087,7 @@ impl DirectoryRelayFetcher for NostrSdkDirectoryRelayFetcher {
                 // One retry per inspection: the next close is final.
                 match auth_notifications.take() {
                     Some(mut notifications) if auth_required_close => {
-                        if !relay_authenticated_by(deadline, &mut notifications).await {
-                            return Err(AuthenticationRequired);
-                        }
+                        relay_authenticated_by(deadline, &mut notifications).await?;
                     }
                     notifications => {
                         auth_notifications = notifications;
@@ -1168,27 +1171,30 @@ impl DirectoryRelayFetcher for NostrSdkDirectoryRelayFetcher {
 }
 
 /// Waits until `deadline` for the SDK to authenticate to the relay whose
-/// notifications these are. True when it did, or when lost notifications
-/// may have hidden it; false when it failed or never happened.
+/// notifications these are. Ok when it did, or when lost notifications may
+/// have hidden it. An authentication that failed, or that cannot happen any
+/// more, leaves the route requiring it; one still running at the deadline
+/// leaves the check undecided.
 async fn relay_authenticated_by(
     deadline: tokio::time::Instant,
     notifications: &mut (impl futures::Stream<Item = NotificationUpdate<RelayNotification>> + Unpin),
-) -> bool {
+) -> Result<(), DirectoryInspectionError> {
+    use DirectoryInspectionError::*;
     tokio::time::timeout_at(deadline, async {
         while let Some(update) = notifications.next().await {
             match update {
                 NotificationUpdate::Notification(RelayNotification::Authenticated)
-                | NotificationUpdate::Lagged { .. } => return true,
+                | NotificationUpdate::Lagged { .. } => return Ok(()),
                 NotificationUpdate::Notification(RelayNotification::AuthenticationFailed) => {
-                    return false;
+                    return Err(AuthenticationRequired);
                 }
                 _ => {}
             }
         }
-        false
+        Err(AuthenticationRequired)
     })
     .await
-    .unwrap_or(false)
+    .unwrap_or(Err(TimedOut))
 }
 
 /// Classifies a relay's CLOSED reason by its NIP-01 machine-readable prefix.
@@ -1729,9 +1735,9 @@ mod tests {
     #[derive(Clone, Copy)]
     enum InspectionRelay {
         /// Close every REQ until the client authenticates, the way a relay
-        /// that wraps the NIP-01 prefix does, sending its challenge after the
-        /// CLOSED. Answer EOSE once authenticated.
-        WrappedAuthRequired,
+        /// that wraps the NIP-01 prefix does, sending its challenge (if
+        /// `challenge`) after the CLOSED. Answer EOSE once authenticated.
+        WrappedAuthRequired { challenge: bool },
         /// Accept the WebSocket handshake after the first delay, then answer
         /// each REQ's EOSE after the second.
         Slow { handshake: Duration, eose: Duration },
@@ -1772,16 +1778,19 @@ mod tests {
                         authenticated = true;
                         vec![serde_json::json!(["OK", request[1]["id"], true, ""])]
                     }
-                    (Some("REQ"), InspectionRelay::WrappedAuthRequired) if !authenticated => {
+                    (Some("REQ"), InspectionRelay::WrappedAuthRequired { challenge })
+                        if !authenticated =>
+                    {
                         counted.fetch_add(1, Ordering::SeqCst);
-                        vec![
-                            serde_json::json!([
-                                "CLOSED",
-                                request[1],
-                                "ERROR: auth-required: requested filter requires auth"
-                            ]),
-                            serde_json::json!(["AUTH", "inspection-challenge"]),
-                        ]
+                        let mut replies = vec![serde_json::json!([
+                            "CLOSED",
+                            request[1],
+                            "ERROR: auth-required: requested filter requires auth"
+                        ])];
+                        if challenge {
+                            replies.push(serde_json::json!(["AUTH", "inspection-challenge"]));
+                        }
+                        replies
                     }
                     (Some("REQ"), script) => {
                         counted.fetch_add(1, Ordering::SeqCst);
@@ -1830,7 +1839,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn signed_inspection_retries_a_wrapped_auth_required_close_after_authenticating() {
         let (endpoint, reqs, server) =
-            spawn_inspection_relay(InspectionRelay::WrappedAuthRequired).await;
+            spawn_inspection_relay(InspectionRelay::WrappedAuthRequired { challenge: true }).await;
         let signer: Arc<dyn transport_nostr_peeler::MarmotNostrSigner> =
             Arc::new(nostr::prelude::Keys::generate());
         let result = inspect_inbox(endpoint.clone(), Some(signer)).await;
@@ -1840,13 +1849,27 @@ mod tests {
 
         // Without a signer there is nothing to retry with.
         let (endpoint, reqs, server) =
-            spawn_inspection_relay(InspectionRelay::WrappedAuthRequired).await;
+            spawn_inspection_relay(InspectionRelay::WrappedAuthRequired { challenge: true }).await;
         let result = inspect_inbox(endpoint, None).await;
         server.abort();
         assert_eq!(
             result,
             Err(DirectoryInspectionError::AuthenticationRequired)
         );
+        assert_eq!(reqs.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    // An authentication still outstanding when the window ends leaves the
+    // route undecided, not refused.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn signed_inspection_times_out_when_authentication_never_completes() {
+        let (endpoint, reqs, server) =
+            spawn_inspection_relay(InspectionRelay::WrappedAuthRequired { challenge: false }).await;
+        let signer: Arc<dyn transport_nostr_peeler::MarmotNostrSigner> =
+            Arc::new(nostr::prelude::Keys::generate());
+        let result = inspect_inbox(endpoint, Some(signer)).await;
+        server.abort();
+        assert_eq!(result, Err(DirectoryInspectionError::TimedOut));
         assert_eq!(reqs.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
