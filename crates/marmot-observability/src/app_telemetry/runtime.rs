@@ -393,9 +393,19 @@ pub(crate) struct RuntimeTelemetry(
 );
 impl Default for RuntimeTelemetry {
     fn default() -> Self {
-        Self(Arc::new(std::array::from_fn(|_| {
-            OperationTelemetry::default()
-        })))
+        // Build each operation's record in its heap slot. The whole array is
+        // hundreds of KiB, and built by value an unoptimized build keeps it,
+        // and its copies, on the caller's stack: a host thread with a small
+        // stack, when a host opens the runtime from one.
+        let operations: Arc<[OperationTelemetry]> = RuntimePerformanceOperation::ALL
+            .iter()
+            .map(|_| OperationTelemetry::default())
+            .collect();
+        Self(
+            operations
+                .try_into()
+                .expect("one record per runtime operation"),
+        )
     }
 }
 impl RuntimeTelemetry {
@@ -744,6 +754,20 @@ mod tests {
             (0, 0)
         );
         assert_eq!(sample(&t).started, sample(&t).completed);
+    }
+    /// A host opens the runtime on its own thread, which can have a small
+    /// stack (a Swift cooperative thread has 512 KiB). Building the per-series
+    /// records by value took about 490 KiB of it in a debug build and
+    /// overflowed once the series list grew (mdk#3452).
+    #[test]
+    fn the_series_records_build_on_a_small_host_stack() {
+        let built = std::thread::Builder::new()
+            .stack_size(128 * 1024)
+            .spawn(|| RuntimeTelemetry::default().snapshot().len())
+            .unwrap()
+            .join()
+            .unwrap();
+        assert_eq!(built, RuntimePerformanceOperation::ALL.len());
     }
     #[test]
     fn every_series_exists_before_its_first_observation() {
