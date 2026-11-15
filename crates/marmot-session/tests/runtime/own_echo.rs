@@ -207,21 +207,11 @@ async fn an_own_echo_whose_group_fails_to_hydrate_announces_the_quarantine() {
     let commit = rename_left_pending(&fixture, alice, &adapter).await;
     // The group's OpenMLS state is lost between the processes; its Marmot
     // record and stored fanouts are not.
-    {
-        use cgka_traits::StorageProvider as _;
-        let storage = SqliteAccountStorage::open_encrypted(
-            &fixture.alice_path,
-            &SqlCipherKey::new(FLOOR_KEY).unwrap(),
-        )
-        .unwrap();
-        let mut group = openmls::group::MlsGroup::load(
-            storage.mls_storage(),
-            &openmls::group::GroupId::from_slice(fixture.group_id.as_slice()),
-        )
-        .unwrap()
-        .unwrap();
-        group.delete(storage.mls_storage()).unwrap();
-    }
+    openmls_state::lose_openmls_group_state(
+        &fixture.alice_path,
+        &SqlCipherKey::new(FLOOR_KEY).unwrap(),
+        &fixture.group_id,
+    );
     let mut runtime = reopened_seeded(&fixture, &adapter);
     let delivery = group_delivery(&runtime, &fixture, &commit, Some("wss://echo-b.example"));
     assert!(runtime.takes_own_echo(&delivery).unwrap());

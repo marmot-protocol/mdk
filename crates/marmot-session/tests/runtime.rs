@@ -1,3 +1,5 @@
+#[path = "support/openmls_state.rs"]
+mod openmls_state;
 #[path = "support/storage_fixture.rs"]
 mod storage_fixture;
 

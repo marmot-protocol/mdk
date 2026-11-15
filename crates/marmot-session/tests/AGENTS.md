@@ -35,6 +35,9 @@ harness opts in at the start of `NostrStackHarness::new`. Keep original keys, op
 encrypted files, independent handles and every open/drop/reopen and assertion. The opt-in skips allocator enablement
 and uses `synchronous=NORMAL`; it does not establish production `FULL` or power-loss guarantees.
 
+`support/openmls_state.rs` deletes a closed account's OpenMLS group state, keeping its Marmot record and fanouts, so a
+runtime test can reopen a group whose hydration quarantines it. Only the runtime binary routes it.
+
 Keep the ignored `send_skips_slow_relay` body and its native `tempfile::tempdir` path unchanged. Required nextest runs
 isolate each test; a fresh process selecting only that diagnostic retains dependent storage defaults. A mixed run
 passing `--include-ignored` to the Rust test harness shares settings with relaxed cases and cannot guarantee those defaults.
