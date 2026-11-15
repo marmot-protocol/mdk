@@ -1660,6 +1660,9 @@ async fn a_reinvite_key_package_bounds_the_group_entry_until_it_expires() {
             .is_some_and(|deadline| deadline <= Duration::from_secs(3))
     );
 
+    // OpenMLS judges a KeyPackage's lifetime against the system clock, which
+    // Tokio's paused clock cannot move: wait until the system clock passes
+    // the bound itself, so load lengthens the wait but never ends it early.
     while crate::unix_now_seconds() < not_after {
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
