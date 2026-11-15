@@ -189,7 +189,9 @@ impl TransportPublishRequest {
 /// pending commit roll back. Ambiguous and transient outcomes remain
 /// outstanding so that exact event can be retried. Terminal callbacks are
 /// idempotent: once a target is `Accepted` or `Failed`, later duplicate or
-/// contradictory results do not change it.
+/// contradictory results do not change it, with one exception: a pending
+/// commit's target becomes `Accepted` from any other status when the endpoint
+/// is seen serving the exact event (see [`OutboundFanout::acknowledge_target`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FanoutTargetStatus {
@@ -218,6 +220,18 @@ impl FanoutTargetStatus {
     pub fn is_terminal(self) -> bool {
         !self.is_outstanding()
     }
+}
+
+/// How an endpoint acknowledged a pending commit other than by answering a
+/// publish (mdk#2332). Kept on the target for audit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FanoutAcknowledgement {
+    /// The endpoint returned the exact event to a read.
+    ReadBack,
+    /// The account's own subscription received the exact event from the
+    /// endpoint.
+    Echo,
 }
 
 /// MLS half of a durable publish obligation.
@@ -284,6 +298,10 @@ pub struct OutboundFanout {
     target_last_attempt_at_ms: Vec<Option<u64>>,
     #[serde(default)]
     target_possible_exposure: Vec<bool>,
+    /// Per target, the acknowledgement that ended it `Accepted` without a
+    /// publish answer. Empty until one does.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    target_acknowledgements: Vec<Option<FanoutAcknowledgement>>,
     /// Exact Welcome artifacts that must be released only after this fanout
     /// confirms its pending MLS transition.
     #[serde(default)]
@@ -441,6 +459,7 @@ impl OutboundFanout {
             target_attempt_counts: vec![0; target_count],
             target_last_attempt_at_ms: vec![None; target_count],
             target_possible_exposure: vec![false; target_count],
+            target_acknowledgements: Vec::new(),
             post_confirmation_welcomes_pending: !post_confirmation_welcomes.is_empty(),
             post_confirmation_welcomes,
             mls_state: pending.map_or(FanoutMlsState::NotApplicable, FanoutMlsState::Pending),
@@ -564,6 +583,65 @@ impl OutboundFanout {
 
     pub fn target_last_attempt_at_ms(&self, index: usize) -> Option<u64> {
         self.target_last_attempt_at_ms.get(index).copied().flatten()
+    }
+
+    /// How the target was acknowledged when it was not by a publish answer.
+    pub fn target_acknowledgement(&self, index: usize) -> Option<FanoutAcknowledgement> {
+        self.target_acknowledgements.get(index).copied().flatten()
+    }
+
+    /// The target `endpoint` names: its frozen spelling, or another spelling
+    /// of the same URL (host case, a default port, an empty path), as a relay
+    /// connection may report it.
+    pub fn target_index_of(&self, endpoint: &TransportEndpoint) -> Option<usize> {
+        let endpoints = self.request.target.endpoints();
+        endpoints
+            .iter()
+            .position(|target| target == endpoint)
+            .or_else(|| {
+                let parsed = url::Url::parse(&endpoint.0).ok()?;
+                endpoints
+                    .iter()
+                    .position(|target| url::Url::parse(&target.0).is_ok_and(|url| url == parsed))
+            })
+    }
+
+    /// Whether `id` names this fanout's exact frozen event: its staged id, or
+    /// the id the adapter reported publishing it under.
+    pub fn is_frozen_event(&self, id: &MessageId) -> bool {
+        self.message_id() == id || self.published_message_id.as_ref() == Some(id)
+    }
+
+    /// Record that the endpoint served this pending commit's exact event
+    /// (mdk#2332): it returned the event to a read, or the account's own
+    /// subscription received it from there. That endpoint holds the commit,
+    /// whatever its publish answers said, so the target ends `Accepted` from
+    /// any other status, a definitive refusal included: a relay that refused
+    /// a later attempt, or one a mirror copied to, can still serve an earlier
+    /// copy. The exposure bit is kept for audit.
+    ///
+    /// Only a pending commit takes one. A confirmed commit's owed relays, and
+    /// every other fanout, keep their publish rules. Returns whether the
+    /// target changed.
+    pub fn acknowledge_target(
+        &mut self,
+        index: usize,
+        kind: FanoutAcknowledgement,
+    ) -> Result<bool, TransportAdapterError> {
+        let current = *self.target_status_mut(index)?;
+        if !matches!(self.mls_state, FanoutMlsState::Pending(_))
+            || current == FanoutTargetStatus::Accepted
+        {
+            return Ok(false);
+        }
+        self.ensure_target_metadata_len();
+        self.held_attempts.end(index);
+        self.fold_stored_exposure(index);
+        self.target_statuses[index] = FanoutTargetStatus::Accepted;
+        self.target_acknowledgements
+            .resize(self.target_statuses.len(), None);
+        self.target_acknowledgements[index] = Some(kind);
+        Ok(true)
     }
 
     /// Make only targets whose last attempt was proven not to reach a relay
@@ -1025,7 +1103,26 @@ impl OutboundFanout {
                 self.target_possible_exposure.len(),
                 previous.target_possible_exposure.len(),
                 self.target_statuses.len(),
+            )
+            && fanout_metadata_len_is_compatible(
+                self.target_acknowledgements.len(),
+                previous.target_acknowledgements.len(),
+                self.target_statuses.len(),
             );
+        // An acknowledgement is recorded once, with the edge to `Accepted`
+        // it makes, and only on a pending commit (see
+        // `Self::acknowledge_target`).
+        let newly_acknowledged = |index: usize| {
+            previous.target_acknowledgement(index).is_none()
+                && self.target_acknowledgement(index).is_some()
+        };
+        let acknowledgements_advance = (0..self.target_statuses.len()).all(|index| {
+            previous.target_acknowledgement(index) == self.target_acknowledgement(index)
+                || (newly_acknowledged(index)
+                    && matches!(previous.mls_state, FanoutMlsState::Pending(_))
+                    && previous.target_statuses.get(index) != Some(&FanoutTargetStatus::Accepted)
+                    && self.target_statuses.get(index) == Some(&FanoutTargetStatus::Accepted))
+        });
         let published_id_advances =
             match (&previous.published_message_id, &self.published_message_id) {
                 (None, _) => true,
@@ -1046,6 +1143,7 @@ impl OutboundFanout {
         let targets_advance = immutable_matches
             && observation_advances
             && published_id_advances
+            && acknowledgements_advance
             && self
                 .target_statuses
                 .iter()
@@ -1056,6 +1154,7 @@ impl OutboundFanout {
                         || (*prior == FanoutTargetStatus::PossiblyExposed
                             && *next == FanoutTargetStatus::Failed
                             && self.size_refusal_ends_exposed_target(index))
+                        || (*next == FanoutTargetStatus::Accepted && newly_acknowledged(index))
                 });
         let exposure_advances = previous.target_possible_exposure.is_empty()
             || self
@@ -2607,6 +2706,196 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// mdk#2332: an endpoint seen serving the exact event acknowledges a
+    /// pending commit's target from any status, keeping its exposure bit, and
+    /// storage admits that edge only with the acknowledgement recorded.
+    #[test]
+    fn a_pending_commit_target_is_acknowledged_from_any_status() {
+        #[derive(Clone, Copy, Debug)]
+        enum Stored {
+            NotAttempted,
+            Current,
+            Interrupted,
+            Unavailable,
+            Exposed,
+            Refused,
+            Accepted,
+        }
+        let endpoint = TransportEndpoint("wss://one.example".into());
+        let failure = |kind, pre_send| TransportEndpointFailure {
+            endpoint: endpoint.clone(),
+            reason: "scripted".into(),
+            kind,
+            rejection_category: None,
+            size_class: None,
+            pre_send,
+        };
+        let pending = || {
+            OutboundFanout::stage(
+                fanout_request(),
+                Some(crate::engine_state::PendingStateRef::new(9)),
+                Some(GroupId::new(vec![0xD4; 16])),
+                55,
+            )
+            .unwrap()
+        };
+        let stored = |state: Stored| {
+            let mut fanout = pending();
+            if !matches!(state, Stored::NotAttempted) {
+                fanout.mark_attempt_started_at(0, 100).unwrap();
+            }
+            match state {
+                Stored::NotAttempted | Stored::Current | Stored::Interrupted => {}
+                Stored::Unavailable => {
+                    fanout
+                        .record_target_failure(
+                            0,
+                            failure(TransportEndpointFailureKind::RetryableUnavailable, true),
+                        )
+                        .unwrap();
+                }
+                Stored::Exposed => {
+                    fanout
+                        .record_target_failure(
+                            0,
+                            failure(TransportEndpointFailureKind::PossiblyExposed, false),
+                        )
+                        .unwrap();
+                }
+                Stored::Refused => {
+                    fanout
+                        .record_target_failure(
+                            0,
+                            failure(TransportEndpointFailureKind::TerminalRejected, false),
+                        )
+                        .unwrap();
+                }
+                Stored::Accepted => {
+                    fanout.mark_target_accepted(0).unwrap();
+                }
+            }
+            // What storage holds, and what a pass loads from it.
+            let json = serde_json::to_vec(&fanout).unwrap();
+            if !matches!(state, Stored::Current) {
+                fanout = serde_json::from_slice(&json).unwrap();
+            }
+            (
+                serde_json::from_slice::<OutboundFanout>(&json).unwrap(),
+                fanout,
+            )
+        };
+        for state in [
+            Stored::NotAttempted,
+            Stored::Current,
+            Stored::Interrupted,
+            Stored::Unavailable,
+            Stored::Exposed,
+            Stored::Refused,
+            Stored::Accepted,
+        ] {
+            for kind in [FanoutAcknowledgement::ReadBack, FanoutAcknowledgement::Echo] {
+                let case = format!("{state:?}, {kind:?}");
+                let (previous, mut fanout) = stored(state);
+                let bit = fanout.target_possible_exposure[0];
+                let acknowledged = fanout.acknowledge_target(0, kind).unwrap();
+                assert_eq!(acknowledged, !matches!(state, Stored::Accepted), "{case}");
+                assert_eq!(
+                    fanout.target_status(0),
+                    Some(FanoutTargetStatus::Accepted),
+                    "{case}"
+                );
+                assert_eq!(
+                    fanout.target_acknowledgement(0),
+                    acknowledged.then_some(kind),
+                    "{case}"
+                );
+                assert_eq!(
+                    fanout.target_possible_exposure[0],
+                    bit || matches!(state, Stored::Exposed),
+                    "{case}: the bit is kept for audit"
+                );
+                assert!(fanout.outcome().mls_confirmation_required, "{case}");
+                fanout
+                    .validate_successor_of(&previous)
+                    .unwrap_or_else(|error| panic!("{case}: {error}"));
+
+                // Storage refuses the same edge with no acknowledgement
+                // recorded, and an acknowledgement that changes or goes.
+                if acknowledged {
+                    let mut unrecorded = serde_json::to_value(&fanout).unwrap();
+                    unrecorded
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("target_acknowledgements");
+                    let unrecorded: OutboundFanout = serde_json::from_value(unrecorded).unwrap();
+                    assert_eq!(
+                        unrecorded.validate_successor_of(&previous).is_ok(),
+                        matches!(state, Stored::Current | Stored::Interrupted),
+                        "{case}: only `Attempting` reaches `Accepted` by a publish answer"
+                    );
+                    assert!(unrecorded.validate_successor_of(&fanout).is_err(), "{case}");
+                    let mut changed = fanout.clone();
+                    changed.target_acknowledgements[0] = Some(match kind {
+                        FanoutAcknowledgement::ReadBack => FanoutAcknowledgement::Echo,
+                        FanoutAcknowledgement::Echo => FanoutAcknowledgement::ReadBack,
+                    });
+                    assert!(changed.validate_successor_of(&fanout).is_err(), "{case}");
+                }
+            }
+        }
+
+        // Only a pending commit takes one: a confirmed commit's owed relay,
+        // an application message's and a Welcome's keep their publish rules.
+        let mut confirmed = pending();
+        confirmed.mark_attempt_started_at(1, 100).unwrap();
+        confirmed.mark_target_accepted(1).unwrap();
+        confirmed.mark_mls_confirmed().unwrap();
+        let mut unconfirmed = OutboundFanout::stage(fanout_request(), None, None, 55).unwrap();
+        for fanout in [&mut confirmed, &mut unconfirmed] {
+            assert!(
+                !fanout
+                    .acknowledge_target(0, FanoutAcknowledgement::Echo)
+                    .unwrap()
+            );
+            assert_eq!(
+                fanout.target_status(0),
+                Some(FanoutTargetStatus::NotAttempted)
+            );
+        }
+    }
+
+    /// mdk#2332: an acknowledgement names its target by the endpoint the
+    /// event came from, in any spelling of the same URL, and only the exact
+    /// frozen event, or the id the adapter published it under, is this one.
+    #[test]
+    fn a_target_is_found_by_any_spelling_of_its_endpoint() {
+        let mut fanout = OutboundFanout::stage(fanout_request(), None, None, 55).unwrap();
+        for (spelling, index) in [
+            ("wss://two.example", Some(1)),
+            ("wss://TWO.example:443/", Some(1)),
+            ("wss://two.example:444", None),
+            ("ws://two.example", None),
+            ("wss://four.example", None),
+            ("not a url", None),
+        ] {
+            assert_eq!(
+                fanout.target_index_of(&TransportEndpoint(spelling.into())),
+                index,
+                "{spelling}"
+            );
+        }
+        let frozen = fanout.message_id().clone();
+        let published = MessageId::new(vec![0xE7; 32]);
+        assert!(fanout.is_frozen_event(&frozen));
+        assert!(!fanout.is_frozen_event(&published));
+        fanout
+            .record_published_message_id(published.clone())
+            .unwrap();
+        assert!(fanout.is_frozen_event(&frozen));
+        assert!(fanout.is_frozen_event(&published));
+        assert!(!fanout.is_frozen_event(&MessageId::new(vec![0xE8; 32])));
     }
 
     #[test]

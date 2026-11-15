@@ -13,6 +13,11 @@
 
 ### Added
 
+- `OutboundFanout::acknowledge_target` records that an endpoint served a pending commit's exact event, by a read or
+  by the account's own echo (`FanoutAcknowledgement`), and ends its target `Accepted` from any other status, its
+  exposure bit kept (mdk#2332). `validate_successor_of` admits that edge only with the acknowledgement recorded, on a
+  pending commit. `target_index_of` finds a target by any spelling of its URL, and `is_frozen_event` tells the
+  fanout's own event by its staged or published id.
 - `StorageProvider::has_atomic_group_savepoints` says whether `with_group_savepoint` is a real savepoint, which writes
   no snapshot and leaves none of its unit's writes after a crash (mdk#3278). It defaults to `false`, matching the
   snapshot fallback, so existing providers build unchanged; a provider that overrides `with_group_savepoint` with a

@@ -79,6 +79,13 @@
   retrying, and while no relay has accepted it, later sends in its group wait
   behind it, as they already do behind a send that timed out. Such an answer
   still retries after 5 seconds, as before.
+- Confirm a group change that stayed pending after an unclear relay answer
+  once the account's own group subscription receives that exact change from
+  one of the group's relays (#2332). The relay holds it, whatever it answered
+  the publish, so the change confirms instead of waiting out its retries; the
+  relay counts as having accepted it even after it refused a later attempt.
+  A copy under another event id, or from a relay outside the group's list,
+  confirms nothing.
 
 ## 0.16.0 - 2026-11-12
 
