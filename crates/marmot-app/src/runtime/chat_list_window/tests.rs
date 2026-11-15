@@ -1495,9 +1495,7 @@ async fn draft_preview_updates_both_list_contracts_without_reordering_or_network
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn chat_list_draft_acceptance_rollback_and_lag_use_authoritative_store() {
-    use cgka_traits::storage::{
-        GroupStorage, OutboundIntentStorage, QueuedOutboundIntent, StorageProvider,
-    };
+    use cgka_traits::storage::{OutboundIntentStorage, QueuedOutboundIntent, StorageProvider};
     use cgka_traits::{GroupId, MessageId, SendIntent};
     let f = Fixture::new(1);
     f.app

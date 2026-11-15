@@ -42,7 +42,9 @@ fn a_commit_from_another_connection_moves_the_generation() {
         "an idle database reports a stable generation"
     );
 
-    other_side.put_group(&sample_group()).unwrap();
+    other_side
+        .put_group_keeping_roster(&sample_group())
+        .unwrap();
     assert_ne!(
         engine_side.mls_write_generation().unwrap(),
         before,

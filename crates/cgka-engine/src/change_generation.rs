@@ -74,6 +74,15 @@ impl GroupChangeGeneration {
     pub fn awaits_hydration(&self) -> bool {
         self.state.availability == Availability::Unhydrated
     }
+
+    /// Whether the engine served the group's gated reads, as its memory said
+    /// when this generation was read: the group is neither quarantined (a
+    /// failed rewind restore included) nor awaiting hydration. A group the
+    /// engine does not store is open too, and its reads answer
+    /// `UnknownGroup`.
+    pub fn serves_reads(&self) -> bool {
+        self.state.availability == Availability::Open
+    }
 }
 
 impl<S: StorageProvider> Engine<S> {

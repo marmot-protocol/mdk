@@ -142,7 +142,6 @@ mod tests {
     use crate::SqlCipherKey;
     use crate::TransportReconciliationRoute;
     use crate::base::test_support::{gid, sample_group};
-    use cgka_traits::storage::GroupStorage;
 
     fn fixture() -> SqliteAccountStorage {
         let store = SqliteAccountStorage::in_memory().unwrap();

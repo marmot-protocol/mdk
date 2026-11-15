@@ -4,6 +4,14 @@
 
 ### Breaking changes
 
+- Account migration 0206 adds each group's committed roster (`cgka_committed_rosters`,
+  `cgka_committed_roster_members`) and the account-wide revision counter (`cgka_committed_roster_revision`)
+  (mdk#3273). It seeds no roster, because a stored record can hold a staged commit's projected members; the engine
+  records each group's roster when it next fully hydrates the group. Account schema advances from 205 to 206; older
+  binaries refuse the upgraded database. Downgrade is unsupported.
+- `SqliteAccountStorage` implements `put_group_with_roster`, `put_group_keeping_roster` and `CommittedRosterStorage`.
+  The inherent `put_group` remains for test fixtures, under `test-support` only, and writes the record without a
+  roster.
 - `SqliteAppStorage::readmit_storage_blocked_attachments` takes a `need` function (what admission needs for a job's
   checkpoint) and readmits parked jobs, explicit first and then by priority, only while free space funds them together:
   each is charged the larger of its target and that need, the need of every job whose writes may not show in free
@@ -33,6 +41,10 @@
 
 ### Added
 
+- `SqliteAppStorage::trusted_roster_members` reads the members of each committed roster whose stored revision is the
+  one a trusted `(group, revision)` pair names, in one statement (mdk#3273). A pair at another revision, or naming a
+  group with no roster, never matches. A write to a group's committed roster moves the group's state write count
+  (`group_write_generation`).
 - `SqliteAppStorage::discard_failed_send` securely drops one failed own send (row, edits, media references) and
   returns its projection update; removals of a user-removed failed send carry `TimelineRemoveReason::Cleared`.
 - `SqliteAppStorage::sticker_pack_relays` and `set_sticker_pack_relays` retain sticker-pack relay hints independently

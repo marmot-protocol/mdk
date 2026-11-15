@@ -682,9 +682,13 @@ async fn co_members_leave_out_a_group_whose_row_save_failed_across_a_restart() {
     crate::worker_fences::worker_startup_finished(&runtime, "alice")
         .await
         .unwrap();
+    // Co-members come back in account-id order, and each run creates fresh
+    // ids, so carol's can sort before bob's.
+    let mut both = vec![bob, carol];
+    both.sort();
     assert_eq!(
         runtime.group_co_members("alice").await.unwrap(),
-        vec![bob, carol],
+        both,
         "once the reconcile saves its row, the group counts"
     );
     runtime.shutdown().await;

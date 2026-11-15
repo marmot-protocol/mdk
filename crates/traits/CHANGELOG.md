@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Breaking changes
+
+- `GroupStorage::put_group` is replaced by `put_group_with_roster(group, committed)` and
+  `put_group_keeping_roster(group)` (mdk#3273). A record write that merges, clears or re-derives committed membership
+  passes the group's committed members and writes them in the same transaction; staging and every other record write
+  keep the stored roster. `StorageProvider` now also requires `CommittedRosterStorage`: each group's committed roster
+  (`CommittedMembers`, its distinct member account ids) at a `RosterRevision` no earlier roster of the account-device
+  held, so a group forgotten or deleted and joined again never reuses one.
+
 ### Added
 
 - `StorageProvider::has_atomic_group_savepoints` says whether `with_group_savepoint` is a real savepoint, which writes

@@ -16,6 +16,7 @@ pub(crate) mod release;
 pub(crate) mod routes;
 #[cfg(test)]
 mod tests;
+pub(crate) mod trusted_rosters;
 pub(crate) mod views;
 mod wipe;
 

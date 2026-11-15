@@ -70,9 +70,7 @@ fn legacy_save_delete_recreate_never_reuses_a_draft_revision() {
     }
 }
 
-use cgka_traits::storage::{
-    GroupStorage, OutboundIntentStorage, QueuedOutboundIntent, StorageProvider,
-};
+use cgka_traits::storage::{OutboundIntentStorage, QueuedOutboundIntent, StorageProvider};
 use cgka_traits::{GroupId, MessageId, SendIntent};
 const GROUP: &str = "22222222222222222222222222222222";
 fn seed(store: &SqliteAccountStorage) {

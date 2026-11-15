@@ -51,6 +51,7 @@ use cgka_traits::app_components::AppComponentId;
 use cgka_traits::engine::KeyPackage;
 use cgka_traits::error::EngineError;
 use cgka_traits::group::ProtocolProfile;
+use cgka_traits::storage::{CommittedMembers, CommittedRosterStorage, RosterRevision};
 use cgka_traits::types::{GroupId, MemberId};
 use cgka_traits::{
     GroupMaintenanceStatus, KeyPackageLifecycleState, PeriodicMaintenancePolicy, StorageError,
@@ -230,6 +231,14 @@ pub(crate) struct GroupAnswers {
     /// Whether the engine has seeded the group without hydrating it yet: a
     /// read that hydrates on demand asks the worker to hydrate it first.
     pub(crate) awaits_hydration: bool,
+    /// Whether the engine serves the group's gated reads: it is neither
+    /// quarantined nor awaiting hydration. Its committed roster is trusted
+    /// only while this holds (mdk#3273 PR 6).
+    pub(crate) serves_reads: bool,
+    /// The group's committed roster revision, `None` when it has none
+    /// (mdk#3273 PR 6). A read of the roster tables matches the group only
+    /// at this revision ([`ReadState::trusted_rosters`]).
+    pub(crate) roster_revision: ReadAnswer<Option<RosterRevision>>,
     /// Member accounts and their device counts, without profiles.
     pub(crate) members: ReadAnswer<Vec<(MemberId, u32)>>,
     /// The saved row's standing, `None` when the group has no saved row:
@@ -255,6 +264,8 @@ impl GroupAnswers {
             record,
             host_may_see,
             awaits_hydration,
+            serves_reads,
+            roster_revision,
             members,
             standing,
             mls_state,
@@ -266,6 +277,8 @@ impl GroupAnswers {
         *record == other.record
             && *host_may_see == other.host_may_see
             && *awaits_hydration == other.awaits_hydration
+            && *serves_reads == other.serves_reads
+            && same_answer(roster_revision, &other.roster_revision, PartialEq::eq)
             && same_answer(members, &other.members, PartialEq::eq)
             && same_answer(standing, &other.standing, PartialEq::eq)
             && same_answer(mls_state, &other.mls_state, PartialEq::eq)
@@ -496,6 +509,37 @@ impl ReadState {
             }
         }
         Ok(co_members.into_iter().collect())
+    }
+
+    /// The committed rosters this version trusts (mdk#3273 PR 6), in group
+    /// id order: each group it holds that the engine serves (neither
+    /// quarantined nor awaiting hydration) and the host may see, at the
+    /// committed roster revision it recorded. A group with no roster, or
+    /// whose revision read failed, is not trusted.
+    #[cfg_attr(not(test), allow(dead_code))] // People search reads it (mdk#2983 slice 6).
+    pub(crate) fn trusted_rosters(&self) -> Vec<(GroupId, RosterRevision)> {
+        let mut trusted: Vec<(GroupId, RosterRevision)> = self
+            .groups
+            .iter()
+            .filter(|(_, group)| group.serves_reads && group.host_may_see)
+            .filter_map(|(group_id, group)| {
+                let revision = (*group.roster_revision.as_ref().ok()?)?;
+                Some((group_id.clone(), revision))
+            })
+            .collect();
+        trusted.sort_by(|(left, _), (right, _)| left.as_slice().cmp(right.as_slice()));
+        trusted
+    }
+
+    /// The members of each roster this version trusts, read from `storage`
+    /// at the revisions it recorded alone (mdk#3273 PR 6): a roster written
+    /// since, which no version has published yet, never matches.
+    #[cfg_attr(not(test), allow(dead_code))] // People search reads it (mdk#2983 slice 6).
+    pub(crate) fn trusted_roster_members(
+        &self,
+        storage: &storage_sqlite::SqliteAppStorage,
+    ) -> Result<Vec<(GroupId, CommittedMembers)>, AppError> {
+        Ok(storage.trusted_roster_members(&self.trusted_rosters())?)
     }
 
     /// `PreparedGroupImageStatus`.
@@ -1531,6 +1575,11 @@ fn group_entry(
     let answers = GroupAnswers {
         host_may_see: matches!(device_group, Ok(false)),
         awaits_hydration: generation.awaits_hydration(),
+        serves_reads: generation.serves_reads(),
+        roster_revision: client
+            .engine_storage
+            .committed_roster_revision(group_id)
+            .map_err(|error| Arc::new(AppError::from(error))),
         members: client
             .runtime
             .members(group_id)
@@ -1552,6 +1601,7 @@ fn group_entry(
         record: record.clone(),
     };
     let reusable = device_group.is_ok()
+        && settled(&answers.roster_revision)
         && settled(&answers.members)
         && settled(&answers.standing)
         && settled(&answers.mls_state)
@@ -2208,12 +2258,33 @@ pub(crate) mod oracle {
         let profiles = client.app.profiles_by_id();
         let unhydrated: HashSet<GroupId> =
             client.runtime.unhydrated_group_ids().into_iter().collect();
+        let quarantined: HashSet<GroupId> = client
+            .runtime
+            .quarantined_groups()
+            .into_iter()
+            .map(|(group_id, _)| group_id)
+            .collect();
         for group_id in &group_ids {
             if let Some(group) = state.groups.get(group_id) {
                 assert_eq!(
                     group.awaits_hydration,
                     unhydrated.contains(group_id),
                     "read state differs from the live read for awaiting hydration"
+                );
+                // What the trusted rosters are built from (mdk#3273 PR 6).
+                assert_eq!(
+                    group.serves_reads,
+                    !unhydrated.contains(group_id) && !quarantined.contains(group_id),
+                    "read state differs from the live read for serving reads"
+                );
+                same(
+                    window,
+                    "committed roster revision",
+                    &group.roster_revision,
+                    &client
+                        .engine_storage
+                        .committed_roster_revision(group_id)
+                        .map_err(AppError::from),
                 );
             }
             if let Ok(profiles) = &profiles {

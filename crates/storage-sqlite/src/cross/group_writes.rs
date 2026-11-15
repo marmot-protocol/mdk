@@ -852,6 +852,10 @@ fn replace_trigger_sql(conn: &Connection) -> StorageResult<String> {
 /// the group and the scope a write moves.
 const WHOLE_ROW_TABLES: &[(&str, &str, i64, i64)] = &[
     ("cgka_groups", "id", RAW_ID, COMMITTED),
+    // The roster revision A records (mdk#3273 PR 6). Every change to a
+    // roster's members moves its revision in the same transaction, so the
+    // member rows need no triggers of their own.
+    ("cgka_committed_rosters", "group_id", RAW_ID, STATE),
     ("cgka_convergence_passes", "group_id", RAW_ID, STATE),
     ("cgka_disband_requests", "group_id", RAW_ID, STATE),
     ("cgka_disband_candidates", "group_id", RAW_ID, STATE),
@@ -1167,6 +1171,38 @@ mod tests {
             assert_eq!(after.committed, before.committed, "{sql}");
             assert_eq!(generation(&storage, &other), other_before, "{sql}");
         }
+    }
+
+    /// A records each group's committed roster revision (mdk#3273 PR 6), so
+    /// the hydration backfill's roster write, which writes no record, moves
+    /// its group's state scope and no other group's. A write that finds the
+    /// roster already there writes nothing and moves nothing.
+    #[test]
+    fn a_committed_roster_write_moves_only_its_groups_state_scope() {
+        use cgka_traits::storage::{CommittedMembers, CommittedRosterStorage};
+        use cgka_traits::types::MemberId;
+
+        let storage = SqliteAccountStorage::in_memory().unwrap();
+        let group = GroupId::new(vec![13; 16]);
+        let other = GroupId::new(vec![14; 16]);
+        insert_group(&storage, &group);
+        insert_group(&storage, &other);
+        let before = generation(&storage, &group);
+        let other_before = generation(&storage, &other);
+        let members = CommittedMembers::from_ids([MemberId::new(vec![1; 32])]);
+
+        storage.put_committed_roster(&group, &members).unwrap();
+        let recorded = generation(&storage, &group);
+        assert!(recorded.state > before.state);
+        assert_eq!(recorded.committed, before.committed);
+        assert_eq!(generation(&storage, &other), other_before);
+
+        storage.put_committed_roster(&group, &members).unwrap();
+        assert_eq!(
+            generation(&storage, &group),
+            recorded,
+            "a roster write that changed nothing moved its group"
+        );
     }
 
     /// A published answer reads a group's saved row only through its

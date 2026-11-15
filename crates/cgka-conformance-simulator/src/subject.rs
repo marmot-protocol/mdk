@@ -319,6 +319,14 @@ pub trait ConvergenceSubject: Send {
         None
     }
 
+    /// Every stored group, across every open client, whose committed roster
+    /// disagrees with its stored committed membership (mdk#3273 B), each
+    /// prefixed with its client label and naming no ids. Subjects without
+    /// engine storage report none.
+    fn committed_roster_divergences(&self) -> Result<Vec<String>, SubjectError> {
+        Ok(Vec::new())
+    }
+
     fn select_scenario_group(
         &mut self,
         _group: &str,
@@ -1587,6 +1595,16 @@ impl ConvergenceSubject for EngineHarnessSubject {
             crate::client::merge_engine_metrics(&mut aggregate, &client.engine_metrics());
         }
         Some(aggregate)
+    }
+
+    fn committed_roster_divergences(&self) -> Result<Vec<String>, SubjectError> {
+        let mut divergences = Vec::new();
+        for (label, client) in &self.clients {
+            for divergence in client.committed_roster_divergences()? {
+                divergences.push(format!("{label}: {divergence}"));
+            }
+        }
+        Ok(divergences)
     }
 
     fn select_scenario_group(

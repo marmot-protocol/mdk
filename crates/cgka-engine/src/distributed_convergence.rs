@@ -779,7 +779,7 @@ impl<S: StorageProvider> Engine<S> {
                     .live_group_record_in(storage, group_id)
                     .map_err(engine_projection_error)?;
                 group.unrecoverable = true;
-                storage.put_group(&group)?;
+                storage.put_group_keeping_roster(&group)?;
             }
             Ok::<(ConvergenceAdmissionOutcome, bool), OpenMlsProjectionError>((admission, opened))
         })?;
@@ -1651,7 +1651,7 @@ impl<S: StorageProvider> Engine<S> {
         if !group.unrecoverable {
             group.unrecoverable = true;
             self.storage
-                .put_group(&group)
+                .put_group_keeping_roster(&group)
                 .map_err(storage_projection_error)?;
         }
         self.realize_group_unrecoverable_for_frozen_pass(group_id, epoch);
@@ -2295,7 +2295,7 @@ impl<S: StorageProvider> Engine<S> {
             if !group.unrecoverable {
                 group.unrecoverable = true;
                 self.storage
-                    .put_group(&group)
+                    .put_group_keeping_roster(&group)
                     .map_err(|e| halt(OpenMlsProjectionError::Storage(format!("{e:?}"))))?;
             }
             let previous_state = self

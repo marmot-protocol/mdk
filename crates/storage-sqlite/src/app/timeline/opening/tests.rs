@@ -947,7 +947,7 @@ fn account_capture_tracks_only_its_groups_durable_leave_request() {
     use crate::base::test_support::sample_group;
     use cgka_traits::{
         GroupId,
-        storage::{GroupStorage, LeaveRequest, LeaveRequestStorage},
+        storage::{LeaveRequest, LeaveRequestStorage},
     };
     let store = SqliteAccountStorage::in_memory().unwrap();
     let app = store.app_storage();
