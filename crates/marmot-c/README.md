@@ -18,7 +18,8 @@ per feature.
 - [Relay liveness](#relay-liveness)
 - [NIP-46 accounts](#nip-46-accounts)
 - Feature notes: [runtime construction](#runtime-construction),
-  [experimental device-group test builds](#experimental-device-group-test-builds), [local sends](#local-sends),
+  [experimental device-group test builds](#experimental-device-group-test-builds),
+  [discarding a failed send](#discarding-a-failed-send), [local sends](#local-sends),
   [attachment handoff leases](#attachment-handoff-leases), [attachment storage](#attachment-storage),
   [custom reaction artwork](#custom-reaction-artwork), [sticker pack sharing](#sticker-pack-sharing),
   [emoji set installs](#emoji-set-installs),
@@ -346,6 +347,12 @@ prevents publication; admission is not interruptible once started.
 ## Account attachment history
 
 `marmot_account_attachment_history_page` blocks off the UI thread and borrows its query arrays and cursor. Deep-free the result with `marmot_account_attachment_page_read_free`; its cursor and version are borrowed fields and must not be freed separately. Clone a version baseline with `marmot_account_attachment_version_clone` when it must outlive a page. Query flags use `uint8_t`, and arrays are capped at 100 before decoding. See the [shared contract](../marmot-uniffi/ACCOUNT-ATTACHMENT-HISTORY.md).
+
+## Discarding a failed send
+
+`marmot_discard_failed_send(client, account_ref, group_id_hex, message_id_hex, &out)` follows the shared
+[contract](../marmot-uniffi/README.md#discarding-a-failed-send) and publishes nothing. Inputs are borrowed; free
+`*out` with `marmot_discard_failed_send_result_free`, which also frees its `media_ciphertext_sha256` array.
 
 ## Local sends
 
