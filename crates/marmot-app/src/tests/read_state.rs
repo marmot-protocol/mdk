@@ -1554,15 +1554,16 @@ async fn an_offer_hidden_by_a_failed_load_is_read_again() {
 /// recovery status, and a host's read serves that failure from A as an exact
 /// copy, never waiting for the worker.
 ///
-/// That a kept entry is dropped once the window ends is pinned with no wall
-/// clock wait: the version's `valid_until` is the KeyPackage's `not_after`
-/// (here); an entry stops holding at that bound
+/// A kept group crossing its reinvite's real `not_after` needs a system clock
+/// a test can move, and OpenMLS reads the system clock itself, so four tests
+/// compose it with no seam: the version's bound is the KeyPackage's
+/// `not_after` and a status built past it fails (here); the deadline the
+/// worker waits for ends at that bound
+/// (`client::read_state::tests::the_deadline_measures_each_bound_on_its_own_clock`);
+/// an entry stops holding there
 /// (`client::read_state::tests::an_entry_holds_only_inside_its_key_package_window`);
-/// a publish past it rebuilds the group's answers
-/// (`client::read_state::tests::a_publish_rebuilds_an_entry_once_its_key_package_window_ends`);
-/// and the worker publishes when the earliest bound passes
-/// (`client::read_state::tests::the_deadline_measures_each_bound_on_its_own_clock`,
-/// `the_worker_publishes_a_time_bound_answer_when_its_bound_passes`).
+/// and a publish judges a kept entry by the system-clock reading it took
+/// (`client::read_state::tests::a_publish_rebuilds_an_entry_once_its_key_package_window_ends`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_live_reinvite_bounds_its_entry_and_an_expired_one_fails_as_an_exact_copy() {
     use cgka_engine::provider::EngineOpenMlsProvider;

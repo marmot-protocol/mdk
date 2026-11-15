@@ -2603,12 +2603,16 @@ mod tests {
         );
     }
 
-    /// Each publish judges a kept group entry against the system clock it
-    /// read: once that clock is past the window the entry's recovery status
-    /// left it in, the publish rebuilds the group's answers instead of
-    /// keeping the published ones (mdk#3273 PR 8). The published answers
-    /// carry a marker no rebuild gives, so they stay only while the entry is
-    /// kept.
+    /// A publish judges a kept group entry's KeyPackage window against the
+    /// system-clock reading it took, and rebuilds the group's answers once
+    /// that reading is past the window (mdk#3273 PR 8). The window is planted
+    /// to end no later than that reading and to hold every other time the
+    /// publish has at hand: the account's wall clock, an hour back; the owned
+    /// KeyPackage list's judged reading, two hours back; and the window's
+    /// own start. The published answers carry a marker no rebuild gives, so
+    /// they stay only while the entry is kept. Readings are whole seconds,
+    /// so this says nothing of a system reading kept from an earlier publish
+    /// in the same second.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_publish_rebuilds_an_entry_once_its_key_package_window_ends() {
         use cgka_traits::engine::SendIntent;
@@ -2652,14 +2656,29 @@ mod tests {
                 created_at_ms: 0,
             })
             .unwrap();
+        // The account's wall clock, an hour behind the system clock from
+        // the first publish on, so the entry's wall-clock window holds it.
+        struct BehindClock(u64);
+        impl marmot_session::WallClock for BehindClock {
+            fn now(&self) -> Timestamp {
+                Timestamp(self.0)
+            }
+            fn now_ms(&self) -> u64 {
+                self.0 * 1_000
+            }
+        }
+        client.runtime = client.runtime.with_maintenance_sources(
+            Arc::new(BehindClock(system_clock_now().0 - 3_600)),
+            Arc::new(marmot_session::SystemMonotonicClock::default()),
+            Arc::new(marmot_session::OsMaintenanceRandom),
+        );
 
         let (sender, _reader) = read_state_channel();
         let mut publisher = ReadStatePublisher::new(sender, UploadsInFlight::default());
         assert!(publisher.publish(&client));
-        let system_now = system_clock_now();
         let window = publisher.entries[&group].key_packages;
         assert!(
-            window.until.is_some_and(|until| until > system_now),
+            window.until.is_some_and(|until| until > system_clock_now()),
             "the live reinvite bounds the entry: {window:?}"
         );
         assert!(publisher.current().groups[&group].recovery_status.is_ok());
@@ -2702,12 +2721,20 @@ mod tests {
             "an entry inside its window is kept"
         );
 
-        // The window ends an hour before the clock this publish reads.
+        // The window ends at or before the reading the next publish takes,
+        // and holds every earlier time: the owned list's judged reading is
+        // moved two hours back, where the list still holds.
+        let reading = system_clock_now();
         publisher.entries.get_mut(&group).unwrap().key_packages = WallClockWindow {
-            from: Timestamp(system_now.0 - 7_200),
-            until: Some(Timestamp(system_now.0 - 3_600)),
+            from: Timestamp(0),
+            until: Some(reading),
         };
+        publisher.key_packages.as_mut().unwrap().1.window.from = Timestamp(reading.0 - 7_200);
         assert!(publisher.publish(&client));
+        assert!(
+            publisher.key_packages_reused,
+            "the owned list is kept with its earlier reading"
+        );
         assert!(
             !keeps_marker(&publisher),
             "an entry past its window is rebuilt"
