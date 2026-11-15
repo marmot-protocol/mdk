@@ -9,6 +9,12 @@
   exposure bit kept (mdk#2332). `validate_successor_of` admits that edge only with the acknowledgement recorded, on a
   pending commit. `target_index_of` finds a target by any spelling of its URL, and `is_frozen_event` tells the
   fanout's own event by its staged or published id.
+- `TransportAdapter::read_back` asks endpoints, now, for a frozen message's exact event, one `TransportReadBack` per
+  endpoint: `Found`, `NotFound` (the endpoint ended the read without it) or `NoAnswer` (mdk#2332). Only `Found` says
+  anything about the event. The default answers `NoAnswer` everywhere. `OutboundFanout::first_attempt_at_ms` is when
+  the first attempt on any target started, written once and kept by `validate_successor_of`; a stored fanout without
+  it reads `created_at_ms` once any target was attempted. `target_may_hold_event` tells a target whose relay may hold
+  the event.
 
 ## 0.17.0 - 2026-11-15
 

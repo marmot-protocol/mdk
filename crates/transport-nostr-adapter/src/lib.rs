@@ -548,6 +548,13 @@ pub struct NostrAdapterMetrics {
     /// Group syncs whose REQs failed, leaving the committed routes in place.
     #[serde(default)]
     pub group_syncs_failed: usize,
+    /// Read-back REQs sent for a pending commit, one per relay asked
+    /// (mdk#2332).
+    #[serde(default)]
+    pub read_back_requests: usize,
+    /// Relays that returned the exact event to a read-back.
+    #[serde(default)]
+    pub read_back_found: usize,
 }
 
 /// Successful/failed endpoint-level result from a relay client publish.
@@ -1398,6 +1405,14 @@ impl NostrTransportAdapter {
         state.metrics.reconciliation_remote_items += summary.remote_items;
         state.metrics.reconciliation_received_items += summary.received_items;
         state.metrics.reconciliation_order_unproven_passes += usize::from(summary.order_unproven);
+    }
+
+    /// Record one read-back: the REQs it sent and the relays that returned
+    /// the exact event (mdk#2332). Diagnostic only, like every counter here.
+    pub async fn record_read_back(&self, requests: usize, found: usize) {
+        let mut state = self.state.write().await;
+        state.metrics.read_back_requests += requests;
+        state.metrics.read_back_found += found;
     }
 
     /// Take the subscription-lifecycle lock (see `subscription_lock`), then

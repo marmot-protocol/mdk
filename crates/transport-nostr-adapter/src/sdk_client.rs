@@ -530,9 +530,11 @@ impl NostrSdkRelayHealth {
 
 fn acquisition_filter(request: &NostrAcquisitionRequest) -> Result<Filter, NostrAcquisitionError> {
     Ok(match &request.scope {
-        NostrAcquisitionScope::KnownEventIds(ids) => {
-            Filter::new().ids(ids.iter().copied().map(EventId::from_byte_array))
-        }
+        // An id names at most one event, so the limit drops no match; it
+        // tells the relay the REQ wants no more (mdk#2332).
+        NostrAcquisitionScope::KnownEventIds(ids) => Filter::new()
+            .ids(ids.iter().copied().map(EventId::from_byte_array))
+            .limit(ids.len()),
         NostrAcquisitionScope::AccountInboxWindow { since, until } => {
             let recipient = PublicKey::from_slice(request.account_id.as_slice())
                 .map_err(|_| NostrAcquisitionError::InvalidRequest)?;

@@ -166,8 +166,11 @@ multi-device Welcome delivery, Welcome withdrawal, staged and owed Welcome deliv
   dev-dependency; never enable it in a normal dependency.
 - Confirm pending work only after the adapter reports enough acknowledgements. A pending commit's relay also
   acknowledges it by serving its exact event: the account's own subscription receiving that event from a target
-  (`acknowledge_own_echo`, mdk#2332) ends the target `Accepted` from any status. Only the exact frozen event from a
-  target counts. Nothing rolls back for want of an echo.
+  (`acknowledge_own_echo`, mdk#2332) ends the target `Accepted` from any status, and so does a read-back: from
+  `PENDING_COMMIT_READ_BACK_AFTER_MS` after the commit's first send attempt, each due retry of a target that may hold
+  it reads the event back first (`read_back_pending_commit`). Only the exact frozen event from a target counts. Any
+  other read answer changes no status, bit or schedule; the target is resent to as before. Nothing rolls back for want
+  of an echo, or on a read. A confirmed commit's owed relays, and every other fanout, are never read.
 - Never let a durable maintenance record depend on an engine event alone. Engine events are in-memory, and this layer
   consumes them *after* awaiting the batch's relay publishes, so the loss window is network-wide. `GroupStateInvalidated`
   retires a `DurableGroupEvolution`, and `run_due_maintenance` re-derives that same retirement from the commit's stored

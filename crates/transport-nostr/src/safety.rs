@@ -425,7 +425,10 @@ impl RelaySafetyPolicy {
 
     /// The spelling a discovered endpoint that passes the host-safety rule
     /// goes on under: its parsed relay URL.
-    fn admitted_spelling(&self, endpoint: &TransportEndpoint) -> Option<TransportEndpoint> {
+    pub(crate) fn admitted_spelling(
+        &self,
+        endpoint: &TransportEndpoint,
+    ) -> Option<TransportEndpoint> {
         self.admitted_relay_url(endpoint)
             .map(|relay_url| TransportEndpoint(relay_url.to_string()))
     }

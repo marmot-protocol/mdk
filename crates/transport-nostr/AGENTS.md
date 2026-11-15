@@ -27,6 +27,7 @@ drop: storage imports loss by count, so a token's count must cover every drop un
 | `src/delivery_spill.rs` | The plane's side of the durable overflow tail: when a full queue spills and how it reports the disposition. |
 | `src/directory.rs`, `src/directory_wire.rs` | Directory fetches and subscriptions, and their relay wire handling. |
 | `src/known_limits.rs` | `RelayEventLimits` and the one refusal of relays an event is over the known limit of, shared by the adapter's publish and `KnownLimitPublishClient`, which wraps every account publisher. |
+| `src/read_back.rs` | `read_back`, a pending commit's exact-event read (mdk#2332), and its per-account, per-relay hourly cap. |
 | `src/safety.rs` | `RelaySafetyPolicy`: the host-safety chokepoint every relay endpoint passes before a connect. |
 | `src/telemetry.rs` | Relay telemetry snapshots and the export rollup. |
 | `src/test_support.rs` | Publish-accounting fixtures and `ScriptedRelayMessages`, the relay messages a fake relay client sends the plane, shared with `marmot-app`'s tests (`test-support` feature). |
@@ -47,6 +48,10 @@ drop: storage imports loss by count, so a token's count must cover every drop un
   An injected client's `relay_notification_source` runs under the same supervisor and dispatch as the SDK's stream,
   so a fake relay's EOSE, CLOSED and EVENT reach the plane as a relay's do; give a fake relay client one instead of a
   hook into the adapter.
+- `read_back` reads only on the account's anonymous publish pool: no signer answers AUTH there, so it never names the
+  account, and its events reach no ingest, sweep cursor or coverage ledger. Only a copy that verifies as the exact
+  event is `Found`, and only an EOSE is `NotFound`. It runs when the session asks; it is not history acquisition and
+  not a recovery-runner quantum.
 - Recovery debt, retry selection and native input qualification belong to the app's recovery runner.
   Bridge the runner's fence plans and borrowed source guards; never fetch history of the plane's own or schedule quiet-period
   repair here. Import actual loss before cursor authorization and retain placement/spill locking through the owner's
