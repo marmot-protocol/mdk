@@ -2706,6 +2706,7 @@ typedef struct MarmotOnboardingRepairProposal {
   struct MarmotUserProfileMetadata *profile;
   struct MarmotStringList *follows;
   struct MarmotOnboardingRelayRepair *relay_repair;
+  bool inconclusive;
 } MarmotOnboardingRepairProposal;
 
 typedef struct MarmotOnboardingDevicePackage {

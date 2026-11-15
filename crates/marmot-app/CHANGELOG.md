@@ -37,6 +37,16 @@
 - Custom sends of NIP-22 comments (kind 1111 with a numeric lowercase `k` tag) derive mention `p` tags without
   duplicating an existing pubkey tag, including one carrying a relay hint. Author edits of these comments pass
   send admission (#3409).
+- Imported-account onboarding no longer strands a relay or inbox list whose check is inconclusive (#3441). Examples
+  are a list whose only relay refuses the declared-route probe, or a missing list next to one dead declared relay.
+  The step's `RetryableFailure` now offers `EditRelays` and, where defaults can change the list,
+  `UseRecommendedRelays`. `propose_onboarding_relays` and `propose_onboarding_relay_repair` accept it, and a lookup
+  that found nothing while a source failed adds `DiscoveryIncomplete`. `OnboardingRepairProposal::inconclusive`
+  marks a proposal built on an inconclusive check. Approving it no longer needs every source to answer. A declared
+  relay or public indexer must answer (the host's discovery relays only when no indexer is searched), and the
+  proposal's record must still be the newest any answering source holds. The failed sources stay in the findings.
+  Proposals from complete checks keep the all-sources rule, and cancelling a relay proposal keeps the step's
+  status.
 - Received NIP-22 comments cache their source-epoch media keys, and history bundles carry their attachment file keys
   so comment media remains decryptable after epoch advancement and on devices importing that history (#3409).
 

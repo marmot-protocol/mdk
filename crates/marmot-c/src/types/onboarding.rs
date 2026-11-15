@@ -31,7 +31,7 @@ c_enum! { MarmotOnboardingRelayRepairMode from OnboardingRelayRepairModeFfi { Ma
 c_mirror! { MarmotOnboardingRelayTag from OnboardingRelayTagFfi { #[doc = "Each element is a JSON string literal. Decode once preserving NUL bytes and UTF-8 lengths."] json_str_vec fields/fields_len, #[doc = "NULL or a JSON string literal; decode once preserving embedded NULs."] json_opt_str endpoint, copy role: MarmotOnboardingRelayTagRole, } }
 c_mirror! { MarmotOnboardingRelayTagChange from OnboardingRelayTagChangeFfi { copy disposition: MarmotOnboardingRelayTagDisposition, opt_copy has_before_index/before_index: u64, opt_copy has_after_index/after_index: u64, #[doc = "Each element is a JSON string literal. Decode once preserving NUL bytes and UTF-8 lengths."] json_str_vec fields/fields_len, #[doc = "NULL or a JSON string literal; decode once preserving embedded NULs."] json_opt_str endpoint, copy role: MarmotOnboardingRelayTagRole, copy restores: MarmotOnboardingRelayCapability, } }
 c_mirror! { MarmotOnboardingRelayRepair from OnboardingRelayRepairFfi { copy mode: MarmotOnboardingRelayRepairMode, opt_str original_event_id, #[doc = "JSON string literal, not raw content. Decode once preserving NUL bytes and UTF-8 lengths."] json_str original_content, #[doc = "JSON string literal, not raw content. Decode once preserving NUL bytes and UTF-8 lengths."] json_str proposed_content, vec before_tags/before_tags_len: MarmotOnboardingRelayTag, vec after_tags/after_tags_len: MarmotOnboardingRelayTag, vec changes/changes_len: MarmotOnboardingRelayTagChange, } }
-c_mirror! { MarmotOnboardingRepairProposal from OnboardingRepairProposalFfi { copy step: MarmotOnboardingStep, copy revision: u64, opt_str previous_event_id, str_vec read_relays/read_relays_len, str_vec write_relays/write_relays_len, opt_rec profile: MarmotUserProfileMetadata, opt_rec follows: MarmotStringList, opt_rec relay_repair: MarmotOnboardingRelayRepair, } }
+c_mirror! { MarmotOnboardingRepairProposal from OnboardingRepairProposalFfi { copy step: MarmotOnboardingStep, copy revision: u64, opt_str previous_event_id, str_vec read_relays/read_relays_len, str_vec write_relays/write_relays_len, opt_rec profile: MarmotUserProfileMetadata, opt_rec follows: MarmotStringList, opt_rec relay_repair: MarmotOnboardingRelayRepair, copy inconclusive: bool, } }
 c_mirror! { MarmotOnboardingSnapshot from OnboardingSnapshotFfi, free marmot_onboarding_snapshot_free { str account_id_hex, opt_str recovery_epoch, copy revision: u64, copy ready: bool, vec steps/steps_len: MarmotOnboardingStepState, opt_rec proposal: MarmotOnboardingRepairProposal, opt_rec single_device_notice: MarmotOnboardingSingleDeviceNotice, copy cancellation_pending: bool, } }
 
 c_enum! { MarmotOnboardingDeviceDiscovery from OnboardingDeviceDiscoveryFfi { NoneFound, OtherInstallationPossible, Unknown } }
@@ -137,6 +137,7 @@ mod tests {
                         restores: OnboardingRelayCapabilityFfi::ReadAndWrite,
                     }],
                 }),
+                inconclusive: true,
             }),
         };
         let value = boxed(MarmotOnboardingSnapshot::from(ffi));

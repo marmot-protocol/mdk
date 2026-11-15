@@ -15,6 +15,18 @@
   `MessageDraftAttachmentInputFfi`. `SelectedMessageDraftAttachmentFfi` gains
   `file_backed` and `AttachmentStorageUsageFfi` gains `draft_bytes`, both with
   defaults. See [Conversation windows](CONVERSATION-WINDOW.md#file-backed-attachments).
+- Onboarding lets users fix a relay or inbox list whose check was inconclusive
+  (#3441). A `RetryableFailure` relay step also offers `EditRelays` and, when
+  defaults can change the list, `UseRecommendedRelays` when no declared route
+  answered (`NoUsableRoute`, `DeclaredRoute`) or no record was found while a
+  lookup source failed (`DiscoveryIncomplete`, `RecordDiscovery`). The propose
+  methods accept those states. `OnboardingRepairProposalFfi.inconclusive`
+  (default `false`) marks a proposal built on an inconclusive check. Show an
+  explicit at-your-own-risk confirmation before approving it. Its approval
+  tolerates failed sources once a declared relay or public indexer answers and
+  the record is unchanged. See
+  [Interactive account onboarding](README.md#interactive-account-onboarding).
+  Regenerate Swift and Kotlin bindings with the matching native library.
 
 ## 0.17.0 - 2026-11-15
 

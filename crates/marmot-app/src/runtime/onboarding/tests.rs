@@ -2491,9 +2491,11 @@ fn older_repair_proposal_without_typed_preview_remains_readable() {
         profile: None,
         follows: None,
         relay_repair: None,
+        inconclusive: false,
     };
     let mut serialized = serde_json::to_value(&proposal).unwrap();
     serialized.as_object_mut().unwrap().remove("relay_repair");
+    serialized.as_object_mut().unwrap().remove("inconclusive");
     let restored: OnboardingRepairProposal = serde_json::from_value(serialized).unwrap();
     assert_eq!(restored, proposal);
 }
@@ -4058,6 +4060,404 @@ async fn explicit_discovery_relays_bypass_unreachable_public_indexers() {
     runtime.shutdown_and_close().await.unwrap();
 }
 
+/// Drive onboarding to the inbox step over the account's published lists.
+async fn inbox_step(
+    runtime: &MarmotAppRuntime,
+    network: &Network,
+    keys: &nostr::prelude::Keys,
+    id: &str,
+    nip65: Vec<Vec<String>>,
+    inbox: Option<Vec<Vec<String>>>,
+) -> OnboardingSnapshot {
+    let mut events = vec![signed(keys, 10002, nip65, "", unix_now_seconds() - 10)];
+    events.extend(inbox.map(|tags| signed(keys, 10050, tags, "opaque", unix_now_seconds() - 10)));
+    *network.events.lock() = events;
+    let setup = runtime.account_setup();
+    setup.run_onboarding(id).await.unwrap();
+    setup
+        .continue_onboarding_without(id, OnboardingStep::Profile)
+        .await
+        .unwrap();
+    let snapshot = setup
+        .continue_onboarding_without(id, OnboardingStep::Follows)
+        .await
+        .unwrap();
+    assert_eq!(
+        snapshot.steps[OnboardingStep::Relays.index()].status,
+        OnboardingStatus::Passed
+    );
+    snapshot
+}
+
+fn offers_relay_edits(state: &OnboardingStepState) -> bool {
+    state.actions.contains(&OnboardingAction::EditRelays)
+        && state
+            .actions
+            .contains(&OnboardingAction::UseRecommendedRelays)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_inbox_list_no_declared_route_answers_can_be_extended_with_consent() {
+    use transport_nostr::DirectoryInspectionError;
+
+    let (_dir, runtime, network, keys, id) = fixture().await;
+    // A members-only relay refuses the declared-route probe.
+    network.inspection_errors.lock().insert(
+        "gated.example".into(),
+        DirectoryInspectionError::AuthenticationRequired,
+    );
+    let inbox = vec![
+        vec!["client".into(), "keep".into()],
+        vec!["relay".into(), "wss://gated.example".into()],
+    ];
+    let snapshot = inbox_step(
+        &runtime,
+        &network,
+        &keys,
+        &id,
+        vec![vec!["r".into(), "wss://healthy.example".into()]],
+        Some(inbox.clone()),
+    )
+    .await;
+    let state = &snapshot.steps[OnboardingStep::InboxRelays.index()];
+    assert_eq!(state.status, OnboardingStatus::RetryableFailure);
+    assert!(offers_relay_edits(state), "{:?}", state.actions);
+    let no_route = state
+        .findings
+        .iter()
+        .find(|f| f.issue == OnboardingIssue::NoUsableRoute)
+        .unwrap();
+    assert_eq!(no_route.context, OnboardingFindingContext::DeclaredRoute);
+    assert!(no_route.actions.contains(&OnboardingAction::EditRelays));
+    // The failed probe nominates nothing for removal.
+    let refused = state
+        .findings
+        .iter()
+        .find(|f| f.issue == OnboardingIssue::AuthenticationRequired)
+        .unwrap();
+    assert!(!refused.actions.contains(&OnboardingAction::EditRelays));
+
+    // Suggest a Fix finds nothing it may change on its own and opens the editor.
+    let setup = runtime.account_setup();
+    let preview = setup
+        .propose_onboarding_relay_repair(&id, OnboardingStep::InboxRelays)
+        .await
+        .unwrap();
+    let proposal = preview.proposal.as_ref().unwrap();
+    assert!(proposal.inconclusive);
+    assert_eq!(
+        proposal.relay_repair.as_ref().unwrap().mode,
+        OnboardingRelayRepairMode::ManualReview
+    );
+    let cancelled = setup.cancel_onboarding_repair(&id).await.unwrap();
+    let state = &cancelled.steps[OnboardingStep::InboxRelays.index()];
+    assert_eq!(state.status, OnboardingStatus::RetryableFailure);
+    assert!(offers_relay_edits(state));
+
+    let proposed = setup
+        .propose_onboarding_relays(&id, OnboardingStep::InboxRelays, None)
+        .await
+        .unwrap();
+    let proposal = proposed.proposal.as_ref().unwrap();
+    assert!(proposal.inconclusive);
+    assert_eq!(
+        proposal.read_relays,
+        ["wss://gated.example", "wss://default.example"]
+    );
+    assert!(network.attempts.lock().is_empty());
+    let approved = setup
+        .approve_onboarding_repair(&id, proposed.revision)
+        .await
+        .unwrap();
+    let published = network.attempts.lock()[0].clone();
+    assert_eq!(published.kind, 10050);
+    let mut expected = inbox;
+    expected.push(vec!["relay".into(), "wss://default.example".into()]);
+    assert_eq!(published.tags, expected);
+    assert_eq!(published.content, "opaque");
+    assert_eq!(
+        approved.steps[OnboardingStep::InboxRelays.index()].status,
+        OnboardingStatus::Passed
+    );
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_inconclusive_inbox_lookup_offers_an_edit_whose_approval_tolerates_the_failed_source() {
+    use transport_nostr::DirectoryInspectionError;
+
+    #[derive(Debug, PartialEq)]
+    enum AtApproval {
+        Unchanged,
+        NewerRecord,
+        OnlyHostAnswers,
+    }
+    for at_approval in [
+        AtApproval::Unchanged,
+        AtApproval::NewerRecord,
+        AtApproval::OnlyHostAnswers,
+    ] {
+        let (_dir, runtime, network, keys, id) = fixture().await;
+        // One declared relay is dead, so no lookup of the missing inbox list completes.
+        network
+            .inspection_errors
+            .lock()
+            .insert("dead.example".into(), DirectoryInspectionError::Unreachable);
+        let snapshot = inbox_step(
+            &runtime,
+            &network,
+            &keys,
+            &id,
+            vec![
+                vec!["r".into(), "wss://healthy.example".into()],
+                vec!["r".into(), "wss://dead.example".into()],
+            ],
+            None,
+        )
+        .await;
+        let state = &snapshot.steps[OnboardingStep::InboxRelays.index()];
+        assert_eq!(state.status, OnboardingStatus::RetryableFailure);
+        assert!(offers_relay_edits(state), "{:?}", state.actions);
+        let incomplete = state
+            .findings
+            .iter()
+            .find(|f| f.issue == OnboardingIssue::DiscoveryIncomplete)
+            .unwrap();
+        assert_eq!(
+            incomplete.context,
+            OnboardingFindingContext::RecordDiscovery
+        );
+        assert!(incomplete.actions.contains(&OnboardingAction::EditRelays));
+        assert!(state.findings.iter().any(|f| {
+            f.issue == OnboardingIssue::Unreachable
+                && f.endpoint.as_deref() == Some("wss://dead.example")
+        }));
+
+        let setup = runtime.account_setup();
+        let proposed = setup
+            .propose_onboarding_relays(&id, OnboardingStep::InboxRelays, None)
+            .await
+            .unwrap();
+        let proposal = proposed.proposal.as_ref().unwrap();
+        assert!(proposal.inconclusive);
+        assert_eq!(proposal.previous_event_id, None);
+        assert_eq!(proposal.read_relays, ["wss://default.example"]);
+        match at_approval {
+            AtApproval::Unchanged => {}
+            AtApproval::NewerRecord => network.events.lock().push(signed(
+                &keys,
+                10050,
+                vec![vec!["relay".into(), "wss://elsewhere.example".into()]],
+                "",
+                unix_now_seconds(),
+            )),
+            AtApproval::OnlyHostAnswers => {
+                fail_public_indexers(&network);
+                network
+                    .inspection_errors
+                    .lock()
+                    .insert("healthy.example".into(), DirectoryInspectionError::TimedOut);
+            }
+        }
+        let result = setup
+            .approve_onboarding_repair(&id, proposed.revision)
+            .await
+            .unwrap();
+        let state = &result.steps[OnboardingStep::InboxRelays.index()];
+        if at_approval == AtApproval::Unchanged {
+            let published = network.attempts.lock()[0].clone();
+            assert_eq!(published.kind, 10050);
+            assert_eq!(
+                published.tags,
+                vec![vec!["relay".to_owned(), "wss://default.example".to_owned()]]
+            );
+            // The dead relay stays visible after the recheck.
+            assert_eq!(state.status, OnboardingStatus::Passed);
+            assert!(state.findings.iter().any(|f| {
+                f.issue == OnboardingIssue::Unreachable
+                    && f.endpoint.as_deref() == Some("wss://dead.example")
+            }));
+        } else {
+            assert!(network.attempts.lock().is_empty(), "{at_approval:?}");
+            assert!(result.proposal.is_none());
+            assert_eq!(state.status, OnboardingStatus::RetryableFailure);
+            let issue = if at_approval == AtApproval::NewerRecord {
+                OnboardingIssue::RecordChanged
+            } else {
+                OnboardingIssue::TimedOut
+            };
+            let refusal = state.findings.iter().find(|f| f.issue == issue).unwrap();
+            assert_eq!(refusal.context, OnboardingFindingContext::RepairApproval);
+        }
+        runtime.shutdown_and_close().await.unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_older_copy_never_displaces_an_inconclusive_proposals_record() {
+    use transport_nostr::DirectoryInspectionError;
+
+    let (_dir, runtime, network, keys, id) = fixture().await;
+    network.inspection_errors.lock().insert(
+        "gated.example".into(),
+        DirectoryInspectionError::AuthenticationRequired,
+    );
+    inbox_step(
+        &runtime,
+        &network,
+        &keys,
+        &id,
+        vec![vec!["r".into(), "wss://healthy.example".into()]],
+        Some(vec![vec!["relay".into(), "wss://gated.example".into()]]),
+    )
+    .await;
+    let setup = runtime.account_setup();
+    let proposed = setup
+        .propose_onboarding_relays(&id, OnboardingStep::InboxRelays, None)
+        .await
+        .unwrap();
+    let basis = proposed
+        .proposal
+        .as_ref()
+        .unwrap()
+        .previous_event_id
+        .clone();
+    assert!(basis.is_some());
+    // At approval the relay holding the proposal's record times out, and an
+    // indexer that answers holds only an older copy.
+    network.events.lock().retain(|event| event.kind != 10050);
+    network.public_indexer_events.lock().push(signed(
+        &keys,
+        10050,
+        vec![vec!["relay".into(), "wss://older.example".into()]],
+        "",
+        unix_now_seconds() - 100,
+    ));
+    network
+        .inspection_errors
+        .lock()
+        .insert("healthy.example".into(), DirectoryInspectionError::TimedOut);
+    let result = setup
+        .approve_onboarding_repair(&id, proposed.revision)
+        .await
+        .unwrap();
+    assert!(network.attempts.lock().is_empty());
+    let state = &result.steps[OnboardingStep::InboxRelays.index()];
+    assert_eq!(state.status, OnboardingStatus::RetryableFailure);
+    assert!(state.findings.iter().any(|f| {
+        f.issue == OnboardingIssue::TimedOut
+            && f.context == OnboardingFindingContext::RepairApproval
+    }));
+    assert!(
+        !state
+            .findings
+            .iter()
+            .any(|f| f.issue == OnboardingIssue::RecordChanged)
+    );
+    let checkpoint = runtime
+        .accounts()
+        .setup_records()
+        .onboarding_checkpoint(&id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        checkpoint.records[OnboardingStep::InboxRelays.index()]
+            .as_ref()
+            .map(|event| event.id.clone()),
+        basis
+    );
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_host_relay_the_account_declares_vouches_while_public_indexers_fail() {
+    use transport_nostr::DirectoryInspectionError;
+
+    let (_dir, runtime, network, keys, id) = fixture().await;
+    fail_public_indexers(&network);
+    network
+        .inspection_errors
+        .lock()
+        .insert("dead.example".into(), DirectoryInspectionError::Unreachable);
+    // The account declares the host's discovery relay, so its empty answer
+    // counts in the lookup and again at approval.
+    let snapshot = inbox_step(
+        &runtime,
+        &network,
+        &keys,
+        &id,
+        vec![
+            vec!["r".into(), "wss://index.example".into()],
+            vec!["r".into(), "wss://dead.example".into()],
+        ],
+        None,
+    )
+    .await;
+    let state = &snapshot.steps[OnboardingStep::InboxRelays.index()];
+    assert_eq!(state.status, OnboardingStatus::RetryableFailure);
+    assert!(offers_relay_edits(state), "{:?}", state.actions);
+    let setup = runtime.account_setup();
+    let proposed = setup
+        .propose_onboarding_relays(&id, OnboardingStep::InboxRelays, None)
+        .await
+        .unwrap();
+    assert!(proposed.proposal.as_ref().unwrap().inconclusive);
+    setup
+        .approve_onboarding_repair(&id, proposed.revision)
+        .await
+        .unwrap();
+    let published = network.attempts.lock()[0].clone();
+    assert_eq!(published.kind, 10050);
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unanswered_lookup_offers_no_relay_edit() {
+    // Nothing answers, or only the host's own relays answer while every
+    // public indexer fails: nothing vouches that the lists are absent.
+    for only_host_answers in [false, true] {
+        let (_dir, runtime, network, _keys, id) = fixture().await;
+        if only_host_answers {
+            fail_public_indexers(&network);
+        } else {
+            network.fail_reads.store(true, Ordering::SeqCst);
+        }
+        let setup = runtime.account_setup();
+        setup.run_onboarding(&id).await.unwrap();
+        setup
+            .continue_onboarding_without(&id, OnboardingStep::Profile)
+            .await
+            .unwrap();
+        let snapshot = setup
+            .continue_onboarding_without(&id, OnboardingStep::Follows)
+            .await
+            .unwrap();
+        let state = &snapshot.steps[OnboardingStep::Relays.index()];
+        assert_eq!(state.status, OnboardingStatus::RetryableFailure);
+        assert!(
+            !state.actions.contains(&OnboardingAction::EditRelays)
+                && !state
+                    .actions
+                    .contains(&OnboardingAction::UseRecommendedRelays),
+            "{:?}",
+            state.actions
+        );
+        assert!(
+            setup
+                .propose_onboarding_relays(&id, OnboardingStep::Relays, None)
+                .await
+                .is_err()
+        );
+        assert!(
+            setup
+                .propose_onboarding_relay_repair(&id, OnboardingStep::Relays)
+                .await
+                .is_err()
+        );
+        runtime.shutdown_and_close().await.unwrap();
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn repairs_publish_to_host_and_declared_relays_never_to_indexers() {
     let (dir, first, network, _keys, id) = fixture().await;
@@ -4359,6 +4759,7 @@ async fn optional_repairs_preserve_unknown_profile_fields_and_follow_tag_metadat
         }),
         follows: None,
         relay_repair: None,
+        inconclusive: false,
     };
     let (tags, content, _) = relay_repair_event(&c, &proposal);
     let json: serde_json::Value = serde_json::from_str(&content).unwrap();
@@ -4585,6 +4986,7 @@ async fn profile_url_validation_and_explicit_clear_preserve_unrelated_fields() {
         }),
         follows: None,
         relay_repair: None,
+        inconclusive: false,
     };
     let (_, content, _) = relay_repair_event(&c, &proposal);
     let json: serde_json::Value = serde_json::from_str(&content).unwrap();

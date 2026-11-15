@@ -318,7 +318,7 @@ impl AccountSetup<'_> {
                 .proposal
                 .as_ref()
                 .is_some_and(|proposal| proposal.step != step)
-            || (state.status != OnboardingStatus::NeedsInput && !passed_with_retired)
+            || (!c.relay_step_editable(step) && !passed_with_retired)
         {
             return Err(onboarding_error());
         }
@@ -343,6 +343,7 @@ impl AccountSetup<'_> {
             write_relays.clear();
         }
         let manual = repair.mode == OnboardingRelayRepairMode::ManualReview;
+        let inconclusive = check_inconclusive(&c.snapshot.steps[step.index()].findings);
         // A typed preview replaces any earlier append-only editor proposal.
         c.append_relays = false;
         c.manual_relay_edit = false;
@@ -359,6 +360,7 @@ impl AccountSetup<'_> {
             profile: None,
             follows: None,
             relay_repair: Some(repair),
+            inconclusive,
         });
         c.snapshot.steps[step.index()].actions = if manual {
             vec![OnboardingAction::EditRelays, OnboardingAction::CancelRepair]
