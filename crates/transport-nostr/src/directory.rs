@@ -22,7 +22,7 @@ use super::DIRECTORY_RELAY_CONNECT_WAIT;
 
 const DIRECTORY_RELAY_FETCH_WAIT: Duration = Duration::from_secs(3);
 
-/// How long an onboarding inspection waits, after connecting, for its REQs to
+/// How long an onboarding inspection waits, once connected, for its REQs to
 /// reach EOSE, including a retry after NIP-42 authentication. Longer than the
 /// pooled directory reads: an inspection is onboarding's only proof that a
 /// declared route works, and a healthy relay has been measured taking over
@@ -1024,13 +1024,21 @@ impl DirectoryRelayFetcher for NostrSdkDirectoryRelayFetcher {
         } else {
             None
         };
-        timeout(
+        // `connect_relay` only queues the dial. Await the handshake, so the
+        // EOSE window below is the relay's answer time alone.
+        match timeout(
             DIRECTORY_RELAY_CONNECT_WAIT,
-            client.connect_relay(url.clone()),
+            client.try_connect_relay(url.clone(), DIRECTORY_RELAY_CONNECT_WAIT),
         )
         .await
-        .map_err(|_| TimedOut)?
-        .map_err(|_| Unreachable)?;
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) if error.kind() == nostr_sdk::prelude::ErrorKind::Timeout => {
+                return Err(TimedOut);
+            }
+            Ok(Err(_)) => return Err(Unreachable),
+            Err(_) => return Err(TimedOut),
+        }
         client
             .relay(url.clone())
             .await
@@ -1724,8 +1732,9 @@ mod tests {
         /// that wraps the NIP-01 prefix does, sending its challenge after the
         /// CLOSED. Answer EOSE once authenticated.
         WrappedAuthRequired,
-        /// Answer EOSE only after this delay.
-        SlowEose(Duration),
+        /// Accept the WebSocket handshake after the first delay, then answer
+        /// each REQ's EOSE after the second.
+        Slow { handshake: Duration, eose: Duration },
     }
 
     /// A loopback relay for one inspection. Returns its endpoint and the
@@ -1748,6 +1757,9 @@ mod tests {
         let counted = reqs.clone();
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
+            if let InspectionRelay::Slow { handshake, .. } = script {
+                tokio::time::sleep(handshake).await;
+            }
             let mut socket = accept_async(stream).await.unwrap();
             let mut authenticated = false;
             while let Some(Ok(message)) = socket.next().await {
@@ -1773,8 +1785,8 @@ mod tests {
                     }
                     (Some("REQ"), script) => {
                         counted.fetch_add(1, Ordering::SeqCst);
-                        if let InspectionRelay::SlowEose(delay) = script {
-                            tokio::time::sleep(delay).await;
+                        if let InspectionRelay::Slow { eose, .. } = script {
+                            tokio::time::sleep(eose).await;
                         }
                         vec![serde_json::json!(["EOSE", request[1]])]
                     }
@@ -1839,13 +1851,17 @@ mod tests {
     }
 
     // mdk#3439: a healthy relay can take several seconds to finish a gift-wrap
-    // query. Onboarding inspection waits longer than the pooled directory reads.
+    // query. Onboarding inspection waits longer than the pooled directory
+    // reads, and its EOSE window starts once the slow handshake is done.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn inspection_waits_past_the_directory_read_window_for_a_slow_eose() {
-        assert!(DIRECTORY_INSPECTION_EOSE_WAIT > DIRECTORY_RELAY_FETCH_WAIT);
-        let delay = DIRECTORY_RELAY_FETCH_WAIT
-            + (DIRECTORY_INSPECTION_EOSE_WAIT - DIRECTORY_RELAY_FETCH_WAIT) / 4;
-        let (endpoint, _, server) = spawn_inspection_relay(InspectionRelay::SlowEose(delay)).await;
+        let handshake = (DIRECTORY_INSPECTION_EOSE_WAIT - DIRECTORY_RELAY_FETCH_WAIT) / 4;
+        let eose = DIRECTORY_INSPECTION_EOSE_WAIT - handshake / 2;
+        assert!(handshake < DIRECTORY_RELAY_CONNECT_WAIT);
+        assert!(eose > DIRECTORY_RELAY_FETCH_WAIT);
+        assert!(handshake + eose > DIRECTORY_INSPECTION_EOSE_WAIT);
+        let (endpoint, _, server) =
+            spawn_inspection_relay(InspectionRelay::Slow { handshake, eose }).await;
         let result = inspect_inbox(endpoint, None).await;
         server.abort();
         assert_eq!(result, Ok(Vec::new()));
