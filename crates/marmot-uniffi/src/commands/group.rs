@@ -71,6 +71,24 @@ pub struct CreateGroupOptionsFfi {
     pub disappearing_message_secs: u64,
 }
 
+/// Founding options for a new direct conversation. They never change a
+/// reused or retried conversation.
+#[derive(Clone, Debug, Default, uniffi::Record)]
+pub struct DirectConversationOptionsFfi {
+    /// Disappearing-message retention written into the founding MLS state
+    /// and Welcome. Zero disables it and adds no founding capability
+    /// requirement.
+    pub disappearing_message_secs: u64,
+}
+
+impl From<DirectConversationOptionsFfi> for marmot_app::DirectConversationOptions {
+    fn from(options: DirectConversationOptionsFfi) -> Self {
+        Self {
+            disappearing_message_secs: options.disappearing_message_secs,
+        }
+    }
+}
+
 impl From<InitialGroupImageFfi> for marmot_app::AppInitialGroupImage {
     fn from(image: InitialGroupImageFfi) -> Self {
         Self {
@@ -426,6 +444,26 @@ impl Marmot {
         let group_id = self
             .runtime
             .start_direct_conversation(&account_ref, &peer_account_id)
+            .await?;
+        Ok(hex::encode(group_id.as_slice()))
+    }
+
+    /// `start_direct_conversation` with founding options for a new group. A
+    /// nonzero retention value is written into the founding MLS state and
+    /// Welcome. Reuse and retry return the existing conversation with its
+    /// founding duration and roles, whatever duration they propose. A nonzero
+    /// duration requires the peer to support message retention, as
+    /// `create_group_with_options` does; otherwise nothing is created.
+    #[marmot_uniffi_macros::survives_cancellation]
+    pub async fn start_direct_conversation_with_options(
+        &self,
+        account_ref: String,
+        peer_account_id: String,
+        options: DirectConversationOptionsFfi,
+    ) -> Result<String, MarmotKitError> {
+        let group_id = self
+            .runtime
+            .start_direct_conversation_with_options(&account_ref, &peer_account_id, options.into())
             .await?;
         Ok(hex::encode(group_id.as_slice()))
     }
@@ -1842,7 +1880,13 @@ mod tests {
             .account
             .account_id_hex;
         let direct = kit
-            .start_direct_conversation(account.clone(), peer.clone())
+            .start_direct_conversation_with_options(
+                account.clone(),
+                peer.clone(),
+                DirectConversationOptionsFfi {
+                    disappearing_message_secs: 300,
+                },
+            )
             .await
             .expect("start through the exported binding");
         let details = kit
@@ -1850,6 +1894,7 @@ mod tests {
             .await
             .expect("returned hex MLS id is accepted by binding queries");
         assert_eq!(details.group.name, "");
+        assert_eq!(details.group.disappearing_message_secs, 300);
         let mut admins = details.group.admins;
         admins.sort();
         let mut expected_admins = vec![account.clone(), peer.clone()];
@@ -1860,6 +1905,14 @@ mod tests {
                 .await
                 .unwrap(),
             direct
+        );
+        assert_eq!(
+            kit.group_details(account.clone(), direct.clone())
+                .await
+                .unwrap()
+                .group
+                .disappearing_message_secs,
+            300
         );
         for name in ["generic", ""] {
             let generic = kit

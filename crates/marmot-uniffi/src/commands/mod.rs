@@ -37,8 +37,9 @@ mod telemetry;
 mod timeline;
 
 pub use group::{
-    CreateGroupOptionsFfi, InitialGroupImageFfi, MemberKeyPackagePrewarmSummaryFfi,
-    PreparedGroupImageUploadFfi, PreparedGroupImageUploadStateFfi,
+    CreateGroupOptionsFfi, DirectConversationOptionsFfi, InitialGroupImageFfi,
+    MemberKeyPackagePrewarmSummaryFfi, PreparedGroupImageUploadFfi,
+    PreparedGroupImageUploadStateFfi,
 };
 pub use media::parse_media_imeta_tag;
 pub use nostr_verification::verify_public_nostr_event_json;

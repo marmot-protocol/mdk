@@ -124,6 +124,19 @@ pub struct AppCreateGroupOptions {
     pub disappearing_message_secs: u64,
 }
 
+/// Founding options for a new canonical direct conversation.
+///
+/// They apply only when a start creates the group. Reuse and retry return the
+/// existing canonical group with its founding duration and roles, even when
+/// the retry proposes a different duration. Zero keeps disappearing messages
+/// disabled and adds no founding capability requirement.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DirectConversationOptions {
+    /// Disappearing-message retention written into the founding MLS state
+    /// and Welcome; 0 disables it.
+    pub disappearing_message_secs: u64,
+}
+
 /// A group invite still pending the local device's confirmation decision
 /// (`pending_confirmation && !archived` in the account projection). Carries
 /// only what an invite policy needs to accept or decline; returned by

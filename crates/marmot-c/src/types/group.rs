@@ -15,8 +15,9 @@ use marmot_uniffi::conversions::{
 // Group-creation option/image records live on the command module rather
 // than `conversions`, because they are inputs, not projections.
 use marmot_uniffi::{
-    CreateGroupOptionsFfi, InitialGroupImageFfi, MemberKeyPackagePrewarmSummaryFfi,
-    PreparedGroupImageUploadFfi, PreparedGroupImageUploadStateFfi,
+    CreateGroupOptionsFfi, DirectConversationOptionsFfi, InitialGroupImageFfi,
+    MemberKeyPackagePrewarmSummaryFfi, PreparedGroupImageUploadFfi,
+    PreparedGroupImageUploadStateFfi,
 };
 
 use super::account::MarmotSendSummary;
@@ -1046,6 +1047,22 @@ impl MarmotCreateGroupOptions {
             initial_image,
             disappearing_message_secs: self.disappearing_message_secs,
         })
+    }
+}
+
+/// Founding options for a new direct conversation. Borrowed input only;
+/// they never change a reused or retried conversation.
+#[repr(C)]
+pub struct MarmotDirectConversationOptions {
+    /// Disappearing-message retention; 0 disables it.
+    pub disappearing_message_secs: u64,
+}
+
+impl MarmotDirectConversationOptions {
+    pub(crate) fn to_ffi(&self) -> DirectConversationOptionsFfi {
+        DirectConversationOptionsFfi {
+            disappearing_message_secs: self.disappearing_message_secs,
+        }
     }
 }
 

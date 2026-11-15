@@ -14024,6 +14024,22 @@ async fn direct_roles(
 }
 
 #[cfg(feature = "test-policy-overrides")]
+fn direct_options(disappearing_message_secs: u64) -> marmot_app::DirectConversationOptions {
+    marmot_app::DirectConversationOptions {
+        disappearing_message_secs,
+    }
+}
+
+#[cfg(feature = "test-policy-overrides")]
+fn direct_retention(app: &MarmotApp, account_label: &str, group: &GroupId) -> u64 {
+    app.group(account_label, &hex::encode(group.as_slice()))
+        .unwrap()
+        .expect("projected direct conversation")
+        .message_retention
+        .disappearing_message_secs
+}
+
+#[cfg(feature = "test-policy-overrides")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn direct_start_is_shared() {
     use std::task::Poll;
@@ -14057,13 +14073,23 @@ async fn direct_start_is_shared() {
         .await
         .expect("the restarted worker must hold startup before either start");
     gate.arm(1);
-    let mut lost_response = Box::pin(runtime.start_direct_conversation(alice_id, &bob_npub));
+    // Only the first admitted start founds the group; every later start
+    // proposes another duration and must keep the founding one.
+    let mut lost_response = Box::pin(runtime.start_direct_conversation_with_options(
+        alice_id,
+        &bob_npub,
+        direct_options(300),
+    ));
     std::future::poll_fn(|cx| {
         assert!(lost_response.as_mut().poll(cx).is_pending());
         Poll::Ready(())
     })
     .await;
-    let mut concurrent = Box::pin(runtime.start_direct_conversation(alice_id, bob_id));
+    let mut concurrent = Box::pin(runtime.start_direct_conversation_with_options(
+        alice_id,
+        bob_id,
+        direct_options(600),
+    ));
     std::future::poll_fn(|cx| {
         assert!(concurrent.as_mut().poll(cx).is_pending());
         Poll::Ready(())
@@ -14084,7 +14110,7 @@ async fn direct_start_is_shared() {
     gate.release();
     let (first, second) = tokio::join!(
         concurrent,
-        runtime.start_direct_conversation(alice_id, &bob_npub)
+        runtime.start_direct_conversation_with_options(alice_id, &bob_npub, direct_options(60))
     );
     let group_id = first.unwrap();
     assert_eq!(second.unwrap(), group_id);
@@ -14094,6 +14120,7 @@ async fn direct_start_is_shared() {
         direct_roles(&runtime, alice_id, &group_id).await,
         (1, expected.clone())
     );
+    assert_eq!(direct_retention(&app, &alice.account.label, &group_id), 300);
 
     wait_for_event(&mut events, |event| {
         matches!(
@@ -14107,11 +14134,12 @@ async fn direct_start_is_shared() {
         direct_roles(&runtime, bob_id, &group_id).await,
         (1, expected.clone())
     );
+    assert_eq!(direct_retention(&app, &bob.account.label, &group_id), 300);
     for _ in 0..2 {
         for (account, peer) in [(alice_id, bob_id), (bob_id, alice_id)] {
             assert_eq!(
                 runtime
-                    .start_direct_conversation(account, peer)
+                    .start_direct_conversation_with_options(account, peer, direct_options(3_600))
                     .await
                     .unwrap(),
                 group_id
@@ -14121,6 +14149,9 @@ async fn direct_start_is_shared() {
                 (1, expected.clone())
             );
         }
+    }
+    for label in [&alice.account.label, &bob.account.label] {
+        assert_eq!(direct_retention(&app, label, &group_id), 300);
     }
     runtime.shutdown().await;
 }
@@ -14231,7 +14262,7 @@ async fn direct_retry_survives_restart() {
         .set_create_group_catch_up_barrier(Some(catch_up.clone()));
     rejecting.store(true, Ordering::Relaxed);
     let group_id = runtime
-        .start_direct_conversation(alice_id, bob_id)
+        .start_direct_conversation_with_options(alice_id, bob_id, direct_options(300))
         .await
         .unwrap();
     assert!(app.groups(&alice.account.label).unwrap().is_empty());
@@ -14252,7 +14283,7 @@ async fn direct_retry_survives_restart() {
     let mut repaired_events = runtime.subscribe();
     assert_eq!(
         runtime
-            .start_direct_conversation(alice_id, bob_id)
+            .start_direct_conversation_with_options(alice_id, bob_id, direct_options(600))
             .await
             .unwrap(),
         group_id
@@ -14269,6 +14300,7 @@ async fn direct_retry_survives_restart() {
         direct_roles(&runtime, alice_id, &group_id).await,
         (1, expected.clone())
     );
+    assert_eq!(direct_retention(&app, &alice.account.label, &group_id), 300);
     assert!(app.groups(&bob.account.label).unwrap().is_empty());
     catch_up.notify_one();
     runtime.shutdown().await;
@@ -14286,12 +14318,13 @@ async fn direct_retry_survives_restart() {
     runtime.catch_up_accounts().await.unwrap();
     assert_eq!(
         runtime
-            .start_direct_conversation(alice_id, bob_id)
+            .start_direct_conversation_with_options(alice_id, bob_id, direct_options(60))
             .await
             .unwrap(),
         group_id
     );
     assert_eq!(app.groups(&alice.account.label).unwrap().len(), 1);
+    assert_eq!(direct_retention(&app, &alice.account.label, &group_id), 300);
     let pending = runtime.pending_welcome_deliveries(alice_id).await.unwrap();
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].group_id_hex, group_hex);
@@ -14314,13 +14347,16 @@ async fn direct_retry_survives_restart() {
         direct_roles(&runtime, bob_id, &group_id).await,
         (1, expected.clone())
     );
+    // The Welcome retained across restart carries the founding duration.
+    assert_eq!(direct_retention(&app, &bob.account.label, &group_id), 300);
     assert_eq!(
         runtime
-            .start_direct_conversation(bob_id, alice_id)
+            .start_direct_conversation_with_options(bob_id, alice_id, direct_options(3_600))
             .await
             .unwrap(),
         group_id
     );
+    assert_eq!(direct_retention(&app, &bob.account.label, &group_id), 300);
     assert_eq!(
         direct_roles(&runtime, alice_id, &group_id).await,
         (1, expected)

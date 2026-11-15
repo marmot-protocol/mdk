@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Added
+
+- `startDirectConversationWithOptions(accountRef, peerAccountId, DirectConversationOptionsFfi)` founds a new direct
+  chat with `disappearingMessageSecs` in its founding MLS state and Welcome. Reuse and retry keep the existing chat's
+  duration and roles. `startDirectConversation` is unchanged. Regenerate Swift and Kotlin bindings with the matching
+  native library (#3365).
+
 ## 0.17.0 - 2026-11-15
 
 ### Breaking changes

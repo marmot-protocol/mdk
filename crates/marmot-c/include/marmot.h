@@ -5782,6 +5782,17 @@ typedef struct MarmotMessageDraftAttachmentInput {
 } MarmotMessageDraftAttachmentInput;
 
 /**
+ * Founding options for a new direct conversation. Borrowed input only;
+ * they never change a reused or retried conversation.
+ */
+typedef struct MarmotDirectConversationOptions {
+  /**
+   * Disappearing-message retention; 0 disables it.
+   */
+  uint64_t disappearing_message_secs;
+} MarmotDirectConversationOptions;
+
+/**
  * An image to attach while creating a group. Borrowed input only: the
  * plaintext bytes are copied, never retained or freed.
  */
@@ -12031,6 +12042,23 @@ MarmotStatus marmot_save_message_draft(const struct MarmotClient *client,
                                        const struct MarmotMessageDraftAttachmentInput *attachments,
                                        uintptr_t attachments_len,
                                        struct MarmotMessageDraft **out);
+
+/**
+ * `marmot_start_direct_chat` with founding options for a new group. A
+ * nonzero retention value is written into the founding MLS state and
+ * Welcome. Reuse and retry return the existing conversation with its
+ * founding duration and roles, whatever duration they propose. Writes the
+ * canonical MLS group id as hex; free it with `marmot_string_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; strings valid; `options` a valid
+ * borrowed struct; `out` valid.
+ */
+MarmotStatus marmot_start_direct_chat_with_options(const struct MarmotClient *client,
+                                                   const char *account_ref,
+                                                   const char *peer_account_id,
+                                                   const struct MarmotDirectConversationOptions *options,
+                                                   char **out);
 
 /**
  * Create a group with the options struct: description, an optional
