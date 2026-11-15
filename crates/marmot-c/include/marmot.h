@@ -15024,7 +15024,9 @@ MarmotStatus marmot_save_message_draft_if_revision(const struct MarmotClient *cl
 
 /**
  * Read one selected attachment. found=0 distinguishes absence from an empty acquired attachment.
- * Free returned bytes with marmot_bytes_free; revision conflicts return an error.
+ * Free returned bytes with marmot_bytes_free; revision conflicts return an error. A file-backed
+ * attachment is `MARMOT_STATUS_INVALID_MESSAGE_DRAFT`: read it with
+ * `marmot_read_message_draft_attachment`.
  * # Safety
  * client, strings, revision valid; revision's owning draft stays live; all out pointers writable.
  */

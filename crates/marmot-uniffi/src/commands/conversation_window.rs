@@ -217,6 +217,8 @@ impl Marmot {
             .map(Into::into))
     }
     /// Read only the requested local attachment, rejecting a changed selected draft.
+    /// A file-backed attachment is `InvalidMessageDraft`: read it with
+    /// `read_message_draft_attachment`.
     pub fn message_draft_attachment_if_revision(
         &self,
         account_ref: String,

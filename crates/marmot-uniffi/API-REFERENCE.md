@@ -1314,9 +1314,9 @@ Save composer state conditional on the observed revision; use the returned resul
 pub fn message_draft_attachment_if_revision( &self, account_ref: String, revision: Arc<MessageDraftRevisionFfi>, attachment_id: String, ) -> Result<Option<Vec<u8>>, MarmotKitError>
 ```
 
-Read only the requested local attachment, rejecting a changed selected draft.
+Read only the requested local attachment, rejecting a changed selected draft. A file-backed attachment is `InvalidMessageDraft`: read it with `read_message_draft_attachment`.
 
-[Source](src/commands/conversation_window.rs#L220)
+[Source](src/commands/conversation_window.rs#L222)
 
 ### `Marmot::save_message_draft_inputs_if_revision`
 
