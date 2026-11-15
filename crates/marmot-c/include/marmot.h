@@ -2720,6 +2720,10 @@ typedef struct MarmotOnboardingDevicePackage {
    */
   uint64_t expires_at;
   bool usable;
+  /**
+   *NULL or a sanitized, peer-controlled app label from the record's first `client` tag. Render as untrusted text; never use it for trust or security decisions.
+   */
+  char *client;
 } MarmotOnboardingDevicePackage;
 
 typedef struct MarmotOnboardingSingleDeviceNotice {

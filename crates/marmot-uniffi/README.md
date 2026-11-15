@@ -735,6 +735,22 @@ could not be checked." `NoneFound` needs no extra warning and does not prove the
 are no other installations. Reinstallation or cleared local state can produce the
 same evidence; do not claim to have identified a physical device or a particular app.
 
+Each `other_packages` entry may carry `client`, the app name the record's publisher
+wrote in its `client` tag (for example "Example Chat"). Hosts can use it to explain
+the most likely source, such as "We found messaging keys from Example Chat and
+another app", which reads less like a warning to stop for someone moving from that
+app. Phrase it as what the records say, not as a verified fact: the label is
+peer-controlled public data that any signer can set to any value. Render it only
+as plain, untrusted text, never as markup or a link, and never use it for trust,
+identity, deduplication, or security decisions. Keep it out of logs, telemetry and
+analytics. MDK reads only the first value of the first `client` tag (never the
+NIP-89 handler address that may follow), removes control, bidirectional and
+invisible formatting characters, collapses whitespace, keeps at most 64 whole
+grapheme clusters and 1024 bytes, and returns `None` when the tag is missing or
+nothing visible remains.
+Several entries can share a label; checkpoints saved before this field existed
+report `None`.
+
 `MultiDeviceUnsupported` remains a legacy issue value for checkpoint and binding
 compatibility; current checks and resumed projections omit it. Render the notice
 from its step, DTO and actions instead of using that historical identifier as a

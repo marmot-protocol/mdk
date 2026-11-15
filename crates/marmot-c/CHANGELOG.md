@@ -15,6 +15,11 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   matching header and library.
 - `MarmotOnboardingRepairProposal` gains `inconclusive` (#3441), so its
   layout changed: rebuild clients with the matching header and library.
+- `MarmotOnboardingDevicePackage` gains a trailing nullable `client` string, a
+  sanitized, peer-controlled app label from the package record's `client` tag
+  that hosts must render as untrusted text (#3438). The layout and the
+  `other_packages` array stride changed: rebuild clients with the matching
+  header and library. `marmot_onboarding_snapshot_free` releases it.
 
 ### Added
 

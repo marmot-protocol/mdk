@@ -20,6 +20,11 @@
   `save_message_draft_inputs_if_revision`, which keeps attachments by id
   (`MessageDraftAttachmentInput::Retained`). Every draft save, clear and delete
   unlinks the files it released before returning.
+- `OnboardingDevicePackage::client` carries the sanitized app label from an
+  other-installation package's `client` tag (first value only; control, bidi and
+  invisible characters removed; at most 64 grapheme clusters and 1024 bytes). It is
+  peer-controlled display text, not evidence of which app published the package.
+  Older checkpoints read it as `None` (#3438).
 
 ### Changed
 

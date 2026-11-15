@@ -50,6 +50,9 @@ impl AccountSetup<'_> {
                 continue;
             }
             let event_id_hex = event.id.clone();
+            let client = event
+                .tag_value("client")
+                .and_then(client_label::client_label);
             let published_at = event.created_at;
             let parsed =
                 crate::key_package_records::key_package_from_record(DirectoryRelayEventRecord {
@@ -83,6 +86,7 @@ impl AccountSetup<'_> {
                     && metadata
                         .as_ref()
                         .is_some_and(|m| m.not_before <= now && m.not_after > now),
+                client,
             });
         }
         // Missing any selected source remains inconclusive even if others reached EOSE.

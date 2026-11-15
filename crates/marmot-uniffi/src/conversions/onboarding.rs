@@ -548,6 +548,13 @@ pub struct OnboardingDevicePackageFfi {
     pub published_at: u64,
     pub expires_at: Option<u64>,
     pub usable: bool,
+    /// The app name the record's publisher put in its first `client` tag,
+    /// such as "messaging keys from <client>". Peer-controlled: render it as
+    /// untrusted plain text, and never use it for trust, identity or security
+    /// decisions. Already sanitized (no control, bidi or invisible formatting
+    /// characters, collapsed whitespace, at most 64 whole grapheme clusters and
+    /// 1024 bytes, never the handler address). `None` when absent or empty. Keep it out of logs and analytics.
+    pub client: Option<String>,
 }
 impl From<marmot_app::OnboardingDevicePackage> for OnboardingDevicePackageFfi {
     fn from(value: marmot_app::OnboardingDevicePackage) -> Self {
@@ -558,6 +565,7 @@ impl From<marmot_app::OnboardingDevicePackage> for OnboardingDevicePackageFfi {
             published_at: value.published_at,
             expires_at: value.expires_at,
             usable: value.usable,
+            client: value.client,
         }
     }
 }
