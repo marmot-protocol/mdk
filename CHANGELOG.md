@@ -13,6 +13,15 @@
 
 ### Added
 
+- Usage diagnostics show where interactive onboarding stops (#3440). MDK
+  itself records a new `mdk_onboarding_summary` aggregate each time an
+  onboarding attempt saves a step in a blocking status. A row carries the step,
+  the status, the primary and per-source issue classes, the finding context and
+  a bucketed count of failing sources. It never carries an endpoint or an
+  identity. Each attempt counts a distinct step, status and issue once, and only
+  under usage-and-diagnostics consent. The catalogue change gives the registry
+  a new revision, so users who opted in are asked to accept the expanded scope
+  again. Hosts need no new calls.
 - Keep composer-draft attachments up to the encrypted-media blob limit as
   files (#3431). `stage_message_draft_attachment_file` (Rust, UniFFI, C) copies
   a host file into the account's encrypted media store and adds it to the

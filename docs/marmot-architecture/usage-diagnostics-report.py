@@ -8,7 +8,7 @@ import uuid
 
 CATALOGUE = json.loads(Path(__file__).with_name("product-event-catalogue.json").read_text())
 EVENTS = {e["name"]: e for e in CATALOGUE["events"]}
-DIMENSIONS = ("operation", "outcome", "unit", "duration_bucket", "partial", "action", "screen", "section", "failure_stage", "error_class", "activity", "media_kind", "source")
+DIMENSIONS = ("operation", "outcome", "unit", "duration_bucket", "partial", "action", "screen", "section", "failure_stage", "error_class", "activity", "media_kind", "source", "status", "issue", "source_issue", "context", "failing_sources")
 
 BOUNDS = {"0": (0, 0), "1": (1, 1), "2": (2, 2), "3_5": (3, 5),
           "6_10": (6, 10), "11_20": (11, 20), "21_50": (21, 50),

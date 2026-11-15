@@ -3,3 +3,4 @@
 {"event_name":"mdk_maintenance_summary","session_id":"1cbd7fce-2fa7-4106-90b9-5e68e7ec1e10","string_props":{"operation":"self_update","unit":"attempt","outcome":"performed","count_bucket":"3_5","duration_bucket":"le_1s","partial":"false"}}
 {"event_name":"mdk_maintenance_summary","session_id":"1cbd7fce-2fa7-4106-90b9-5e68e7ec1e10","string_props":{"operation":"pending","unit":"backlog","count_bucket":"1","partial":"false"}}
 {"eventName":"app_compose","sessionId":"b9cedc1b-83b3-46d0-96d5-ae64c84ba61f","props":{"action":"cancel","count_bucket":"2","partial":"true"}}
+{"event_name":"mdk_onboarding_summary","session_id":"0d6c3a52-4f3e-4b7a-9c1d-2e8f5a7b6c90","string_props":{"operation":"relays","outcome":"failure","unit":"transition","status":"retryable_failure","issue":"no_usable_route","source_issue":"timed_out","context":"declared_route","failing_sources":"3_5","count_bucket":"2","partial":"false"}}

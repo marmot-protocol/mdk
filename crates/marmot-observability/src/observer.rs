@@ -29,7 +29,9 @@ use crate::{
 pub use crate::product_analytics::observed::{
     ObservedOperation, confirmed_or_failure, send_outcome, success_or_failure,
 };
-pub use crate::product_analytics::recording::{ProductBacklogSource, StorageFailureKind};
+pub use crate::product_analytics::recording::{
+    OnboardingPause, ProductBacklogSource, StorageFailureKind,
+};
 
 #[derive(Clone, Debug, Default)]
 pub struct Observer {
@@ -104,6 +106,12 @@ impl ProductRecorder {
 
     pub fn backlog_source(&self) -> ProductBacklogSource {
         self.0.backlog_source()
+    }
+
+    /// Count one onboarding step that stopped in a blocking status, under the permit the caller
+    /// checked before it recorded the pause as reported.
+    pub fn onboarding_pause(&self, permit: &DiagnosticsPermit, pause: OnboardingPause) {
+        self.0.onboarding_pause(permit, pause);
     }
 
     /// Begin an operation whose outcome a rule picks from the result of the work it runs.

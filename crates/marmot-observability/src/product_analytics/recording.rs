@@ -1,10 +1,34 @@
 //! What `marmot-app` records into the collector besides observations (#2627): the storage-failure
-//! kind its errors convert into, and the backlog source an account worker samples. Hosts never see
-//! them; `marmot-app` reaches them through the crate root.
+//! kind its errors convert into, the backlog source an account worker samples, and the onboarding
+//! pause interactive setup reports. Hosts never see them; `marmot-app` reaches them through the
+//! crate root.
 
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use super::{DiagnosticsPermit, ProductAnalytics, ProductFamily};
+use super::{
+    DiagnosticsPermit, ONBOARDING_PAUSE_CONTEXTS, ONBOARDING_PAUSE_ISSUES,
+    ONBOARDING_PAUSE_STATUSES, ProductAnalytics, ProductFamily, product_count_bucket,
+};
+
+/// One interactive onboarding step that stopped in a blocking status (mdk#3440). Every field is a
+/// catalogue label, never an endpoint, identity or free text; a label outside the catalogue drops
+/// the observation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OnboardingPause {
+    /// The step, one of the `mdk_onboarding_summary` operations.
+    pub step: &'static str,
+    /// The blocking status.
+    pub status: &'static str,
+    /// The step's primary issue: its first step-level finding, else `source_issue`.
+    pub issue: &'static str,
+    /// The most common issue among the step's failing sources, `none` without one.
+    pub source_issue: &'static str,
+    /// The relay operation behind the primary finding.
+    pub context: &'static str,
+    /// Distinct sources with a failing finding; bucketed before it leaves the device.
+    pub failing_sources: u64,
+}
 
 /// A storage failure the collector counts, by the class of the error behind it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -73,5 +97,46 @@ impl ProductAnalytics {
             id: NEXT.fetch_add(1, Ordering::Relaxed),
             collector: self.clone(),
         }
+    }
+}
+
+impl ProductAnalytics {
+    /// Count one onboarding pause as a transition of `mdk_onboarding_summary`.
+    pub(crate) fn onboarding_pause(&self, permit: &DiagnosticsPermit, pause: OnboardingPause) {
+        let Some((_, outcome)) = ONBOARDING_PAUSE_STATUSES
+            .iter()
+            .find(|(status, _)| *status == pause.status)
+        else {
+            return;
+        };
+        if !ProductFamily::Onboarding.operations().contains(&pause.step)
+            || !ONBOARDING_PAUSE_ISSUES.contains(&pause.issue)
+            || !ONBOARDING_PAUSE_ISSUES.contains(&pause.source_issue)
+            || !ONBOARDING_PAUSE_CONTEXTS.contains(&pause.context)
+        {
+            return;
+        }
+        let mut s = self.lock();
+        if !permit.valid() || !Self::enabled(&s) {
+            return;
+        }
+        self.advance(&mut s);
+        self.accumulate(
+            &mut s,
+            ProductFamily::Onboarding.as_str(),
+            BTreeMap::from([
+                ("operation".into(), pause.step.into()),
+                ("outcome".into(), (*outcome).into()),
+                ("unit".into(), "transition".into()),
+                ("status".into(), pause.status.into()),
+                ("issue".into(), pause.issue.into()),
+                ("source_issue".into(), pause.source_issue.into()),
+                ("context".into(), pause.context.into()),
+                (
+                    "failing_sources".into(),
+                    product_count_bucket(pause.failing_sources).into(),
+                ),
+            ]),
+        );
     }
 }

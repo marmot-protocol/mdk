@@ -1722,6 +1722,149 @@
       "mode": "aggregate"
     },
     {
+      "name": "mdk_onboarding_summary",
+      "owner": "marmot-app interactive onboarding checkpoint persistence",
+      "trigger": "persisted transition of an interactive onboarding step into a blocking status, at most once per distinct step, status and issue in an onboarding attempt",
+      "units": [
+        "transition"
+      ],
+      "properties": {
+        "operation": [
+          "profile",
+          "follows",
+          "relays",
+          "inbox_relays",
+          "single_device",
+          "key_package"
+        ],
+        "outcome": [
+          "success",
+          "failure",
+          "pending",
+          "confirmed",
+          "unknown",
+          "rejected",
+          "deferred",
+          "no_work_due",
+          "performed",
+          "cancelled",
+          "timeout",
+          "network",
+          "storage",
+          "capacity",
+          "invalid",
+          "unsupported",
+          "not_ready",
+          "empty",
+          "cache",
+          "none",
+          "partial",
+          "available",
+          "duplicate",
+          "usable",
+          "absent",
+          "expired",
+          "unavailable"
+        ],
+        "count_bucket": [
+          "0",
+          "1",
+          "2",
+          "3_5",
+          "6_10",
+          "11_20",
+          "21_50",
+          "51_100",
+          "101_250",
+          "251_1000",
+          "1001_plus"
+        ],
+        "partial": [
+          "true",
+          "false"
+        ],
+        "unit": [
+          "transition"
+        ],
+        "status": [
+          "needs_input",
+          "retryable_failure",
+          "waiting_for_signer"
+        ],
+        "issue": [
+          "none",
+          "missing",
+          "malformed",
+          "future_dated",
+          "invalid_relay",
+          "retired_relay",
+          "unsafe_relay",
+          "unreachable",
+          "timed_out",
+          "authentication_required",
+          "payment_required",
+          "access_restricted",
+          "no_usable_route",
+          "publication_failed",
+          "signer_unavailable",
+          "signer_rejected",
+          "record_changed",
+          "interrupted",
+          "too_many_relays",
+          "multi_device_unsupported",
+          "other_installation_possible",
+          "discovery_incomplete"
+        ],
+        "source_issue": [
+          "none",
+          "missing",
+          "malformed",
+          "future_dated",
+          "invalid_relay",
+          "retired_relay",
+          "unsafe_relay",
+          "unreachable",
+          "timed_out",
+          "authentication_required",
+          "payment_required",
+          "access_restricted",
+          "no_usable_route",
+          "publication_failed",
+          "signer_unavailable",
+          "signer_rejected",
+          "record_changed",
+          "interrupted",
+          "too_many_relays",
+          "multi_device_unsupported",
+          "other_installation_possible",
+          "discovery_incomplete"
+        ],
+        "context": [
+          "unknown",
+          "record_discovery",
+          "published_declaration",
+          "declared_route",
+          "repair_approval",
+          "repair_publication"
+        ],
+        "failing_sources": [
+          "0",
+          "1",
+          "2",
+          "3_5",
+          "6_10",
+          "11_20",
+          "21_50",
+          "51_100",
+          "101_250",
+          "251_1000",
+          "1001_plus"
+        ]
+      },
+      "purpose": "Understand which onboarding step and blocking reason opted-in users stop at, without relay endpoints, identity or free text. Outcome is pending for needs_input, failure for retryable_failure and unavailable for waiting_for_signer. Issue is the first step-level finding, else the most common failing-source issue; failing_sources buckets the distinct failing sources.",
+      "mode": "aggregate"
+    },
+    {
       "name": "mdk_session_started",
       "mode": "journey",
       "properties": {
