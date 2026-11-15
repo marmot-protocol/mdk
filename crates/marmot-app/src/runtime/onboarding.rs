@@ -1725,7 +1725,6 @@ impl AccountSetup<'_> {
                 existing.manual_relay_edit = false;
                 existing.single_device_acknowledged = false;
                 existing.snapshot.single_device_notice = None;
-                existing.reported_pauses.clear();
                 for index in 0..STEP_COUNT {
                     let step = existing.snapshot.steps[index].step;
                     existing.set(step, OnboardingStatus::Pending, Vec::new());
