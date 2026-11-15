@@ -1202,8 +1202,10 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
 - The group recovery status (`GroupRecoveryStatus`) is the third exception, beside the hydration request and a
   failure with no exact copy: A answers it only for a group in the version's mirror. Any other id (a locally deleted
   group whose MLS state is kept, or one the engine does not store) goes to the worker's command, which answers it as
-  it did before A. One mirror check in the version the read took, on the caller's task, decides; a failed answer
-  never routes a read to the worker.
+  it did before A. One mirror check in the version the read took, on the caller's task, decides; whether the answer
+  failed never decides it. A mirror group's failure is served as any read's is: an exact copy (`reissue_error`
+  copies the session-raised engine failures and the KeyPackage lifetime failure this status gives), or the worker's
+  command when it has none.
 - A read that combines groups answers from one version of A, never one joined with live rows. `group_co_members`
   takes its groups' saved-row standings and members from one version (`ReadState::co_members`), so a group not yet
   published is not in its radius yet. It judges a group by its saved `account_groups` row alone (`group_standing`),

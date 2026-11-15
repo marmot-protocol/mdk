@@ -651,10 +651,12 @@ pub(crate) fn reissue<T>(answer: ReadAnswer<T>) -> Option<Result<T, AppError>> {
 
 /// An exact copy of `error`, for the failures the moved reads give whose
 /// payloads can be copied: an unknown group in the mirror or the engine, a
-/// group not hydrated yet, and a storage failure, from the app or the engine.
-/// An engine failure keeps its wrapping, whether the account or its session
-/// raised it. Any other failure (SQLite, I/O, JSON, the rest of the engine's)
-/// has no copy, so it is never rebuilt into a different error.
+/// group not hydrated yet, a storage failure, from the app or the engine,
+/// and a KeyPackage outside its lifetime (a group's recovery status judges
+/// its reinvites' KeyPackages). An engine failure keeps its wrapping, whether
+/// the app's session, the account or the account's session raised it. Any
+/// other failure (SQLite, I/O, JSON, the rest of the engine's) has no copy,
+/// so it is never rebuilt into a different error.
 pub(crate) fn reissue_error(error: &AppError) -> Option<AppError> {
     use marmot_session::{AccountError, SessionError};
     fn copy_engine(engine: &EngineError) -> Option<EngineError> {
@@ -664,12 +666,22 @@ pub(crate) fn reissue_error(error: &AppError) -> Option<AppError> {
                 Some(EngineError::GroupNotHydrated(group.clone()))
             }
             EngineError::Storage(storage) => Some(EngineError::Storage(storage.clone())),
+            EngineError::InvalidKeyPackageLifetime {
+                not_before,
+                not_after,
+            } => Some(EngineError::InvalidKeyPackageLifetime {
+                not_before: *not_before,
+                not_after: *not_after,
+            }),
             _ => None,
         }
     }
     match error {
         AppError::UnknownGroup(group) => Some(AppError::UnknownGroup(group.clone())),
         AppError::Storage(storage) => Some(AppError::Storage(storage.clone())),
+        AppError::Session(SessionError::Engine(engine)) => {
+            copy_engine(engine).map(|engine| AppError::Session(SessionError::Engine(engine)))
+        }
         AppError::Account(AccountError::Engine(engine)) => {
             copy_engine(engine).map(|engine| AppError::Account(AccountError::Engine(engine)))
         }

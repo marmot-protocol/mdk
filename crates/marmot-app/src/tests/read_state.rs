@@ -1552,7 +1552,8 @@ async fn an_offer_hidden_by_a_failed_load_is_read_again() {
 /// once it expires the group's recovery status fails, with no write. The
 /// entry holds only until that KeyPackage's `not_after`: the version names
 /// it as when an answer can change, the worker's deadline reaches it, and a
-/// publish after it reads the status again.
+/// publish after it reads the status again. A host's read serves the failure
+/// from A as an exact copy.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_reinvite_key_package_bounds_the_group_entry_until_it_expires() {
     use cgka_engine::provider::EngineOpenMlsProvider;
@@ -1673,4 +1674,11 @@ async fn a_reinvite_key_package_bounds_the_group_entry_until_it_expires() {
         ),
         "the expired KeyPackage fails the status"
     );
+    // A host's read of the group serves that failure from A, as an exact
+    // copy: it never waits for the worker.
+    let published = state.borrow().groups[&group].recovery_status.clone();
+    let published = published.unwrap_err();
+    let served = crate::client::read_state::reissue_error(&published)
+        .expect("the expired KeyPackage's failure has an exact copy");
+    assert_eq!(format!("{served:?}"), format!("{published:?}"));
 }

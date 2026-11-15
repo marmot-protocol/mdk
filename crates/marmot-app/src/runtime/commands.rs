@@ -3694,20 +3694,31 @@ mod tests {
         let account_engine = |engine| AppError::Account(AccountError::Engine(engine));
         let session_engine =
             |engine| AppError::Account(AccountError::Session(SessionError::Engine(engine)));
-        let copyable: [&dyn Fn() -> AppError; 8] = [
+        let app_session_engine = |engine| AppError::Session(SessionError::Engine(engine));
+        let lifetime = || EngineError::InvalidKeyPackageLifetime {
+            not_before: Some(1),
+            not_after: None,
+        };
+        let copyable: [&dyn Fn() -> AppError; 13] = [
             &|| AppError::UnknownGroup("11".to_owned()),
             &|| AppError::Storage(storage()),
             &|| account_engine(EngineError::UnknownGroup(group.clone())),
             &|| account_engine(EngineError::GroupNotHydrated(group.clone())),
             &|| account_engine(EngineError::Storage(storage())),
+            &|| account_engine(lifetime()),
             &|| session_engine(EngineError::UnknownGroup(group.clone())),
             &|| session_engine(EngineError::GroupNotHydrated(group.clone())),
             &|| session_engine(EngineError::Storage(storage())),
+            &|| app_session_engine(EngineError::UnknownGroup(group.clone())),
+            &|| app_session_engine(EngineError::GroupNotHydrated(group.clone())),
+            &|| app_session_engine(EngineError::Storage(storage())),
+            &|| app_session_engine(lifetime()),
         ];
-        let uncopyable: [&dyn Fn() -> AppError; 3] = [
+        let uncopyable: [&dyn Fn() -> AppError; 4] = [
             &|| AppError::Sqlite(rusqlite::Error::InvalidQuery),
             &|| account_engine(EngineError::UnknownPending),
             &|| session_engine(EngineError::UnknownPending),
+            &|| app_session_engine(EngineError::UnknownPending),
         ];
         for (index, failure) in copyable.iter().enumerate() {
             // A failure with no exact copy sends the read to the worker, whose
