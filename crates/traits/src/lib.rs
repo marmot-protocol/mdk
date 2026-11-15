@@ -126,11 +126,11 @@ pub use transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
 };
 pub use transport_adapter::{
-    CommitRefusalCause, EventSizeClass, FanoutMlsState, FanoutPendingKind, FanoutTargetStatus,
-    OutboundApplicationMessage, OutboundFanout, OutboundFanoutOutcome, OversizedArtifact,
-    PublicationObservation, RefusedTarget, TransportAccountActivation, TransportAdapter,
-    TransportAdapterError, TransportDelivery, TransportDeliveryPlane, TransportDeliverySource,
-    TransportEndpoint, TransportEndpointAckKind, TransportEndpointFailure,
+    CommitRefusalCause, EventSizeClass, FanoutAcknowledgement, FanoutMlsState, FanoutPendingKind,
+    FanoutTargetStatus, OutboundApplicationMessage, OutboundFanout, OutboundFanoutOutcome,
+    OversizedArtifact, PublicationObservation, RefusedTarget, TransportAccountActivation,
+    TransportAdapter, TransportAdapterError, TransportDelivery, TransportDeliveryPlane,
+    TransportDeliverySource, TransportEndpoint, TransportEndpointAckKind, TransportEndpointFailure,
     TransportEndpointFailureKind, TransportEndpointReceipt, TransportEndpointRejectionCategory,
     TransportGroupSubscription, TransportGroupSync, TransportPublishFailure,
     TransportPublishReport, TransportPublishRequest, TransportPublishTarget, TransportWireMetadata,

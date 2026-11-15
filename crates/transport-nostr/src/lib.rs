@@ -3568,7 +3568,10 @@ impl MarmotRelayPlaneAccountAdapter {
                 .iter()
                 .map(|receipt| receipt.endpoint.clone())
                 .collect::<Vec<_>>()
-        } else if outcome.failed.is_empty() {
+        } else if outcome.failed.is_empty() && request.required_acks == 0 {
+            // Only a publish that asked for no acknowledgement loops back
+            // without receipts. One that asked and got none reached no one,
+            // and a local copy would stand in for a relay's (mdk#2332).
             endpoints
         } else {
             Vec::new()

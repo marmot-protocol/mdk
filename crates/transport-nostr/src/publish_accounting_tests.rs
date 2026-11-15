@@ -495,6 +495,36 @@ async fn rejected_and_failed_publishes_do_not_invent_local_delivery() {
             .is_err(),
         "rejected and failed publishes must not deliver locally"
     );
+
+    // A publish that asked for an acknowledgement and got an empty answer
+    // reached no one, so no local subscriber gets it either: a local copy
+    // would stand in for a relay's (mdk#2332). A zero-ack publish still
+    // loops back without receipts, so it is the first delivery Bob sees.
+    let unanswered = fixture
+        .publish(PublishScript::Empty, 1)
+        .await
+        .expect("empty outcome");
+    assert!(!unanswered.met_required_acks());
+    let mut zero_ack = fixture.request(0);
+    zero_ack.message = group_event("zero-ack", &fixture.transport_group_id)
+        .to_transport_message()
+        .expect("event maps");
+    assert_ne!(zero_ack.message.id, fixture.message.id);
+    fixture.client.set_script(PublishScript::Empty);
+    fixture
+        .adapter
+        .publish(zero_ack.clone())
+        .await
+        .expect("zero-ack publish");
+    let delivery = timeout(Duration::from_secs(10), bob.receive())
+        .await
+        .expect("local delivery")
+        .expect("receive")
+        .expect("delivery");
+    assert_eq!(
+        delivery.message.id, zero_ack.message.id,
+        "an unanswered publish must not deliver locally"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

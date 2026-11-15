@@ -164,7 +164,10 @@ multi-device Welcome delivery, Welcome withdrawal, staged and owed Welcome deliv
   Code a host hands the session to gets `group_authority_view()`, not the session. `session()`, `session_mut()` and
   `new` exist only under the `test-support` feature, which this crate's tests and `marmot-app` enable as a
   dev-dependency; never enable it in a normal dependency.
-- Confirm pending work only after the adapter reports enough acknowledgements.
+- Confirm pending work only after the adapter reports enough acknowledgements. A pending commit's relay also
+  acknowledges it by serving its exact event: the account's own subscription receiving that event from a target
+  (`acknowledge_own_echo`, mdk#2332) ends the target `Accepted` from any status. Only the exact frozen event from a
+  target counts. Nothing rolls back for want of an echo.
 - Never let a durable maintenance record depend on an engine event alone. Engine events are in-memory, and this layer
   consumes them *after* awaiting the batch's relay publishes, so the loss window is network-wide. `GroupStateInvalidated`
   retires a `DurableGroupEvolution`, and `run_due_maintenance` re-derives that same retirement from the commit's stored

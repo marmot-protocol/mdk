@@ -37,13 +37,13 @@ use cgka_traits::maintenance::{
 use cgka_traits::storage::{DeviceGroupWelcomeExpectation, RosterTagKey};
 use cgka_traits::transport::{TransportEnvelope, TransportMessage};
 use cgka_traits::{
-    EngineError, EpochId, FanoutMlsState, FanoutPendingKind, GroupId, MemberId, MessageState,
-    OutboundApplicationMessage, OutboundFanout, OutboundFanoutOutcome, RefusedTarget, StorageError,
-    Timestamp, TransportAccountActivation, TransportAdapter, TransportAdapterError,
-    TransportDelivery, TransportEndpoint, TransportEndpointAckKind, TransportEndpointFailure,
-    TransportEndpointFailureKind, TransportEndpointReceipt, TransportEndpointRejectionCategory,
-    TransportGroupSync, TransportPublishReport, TransportPublishRequest, TransportPublishTarget,
-    WelcomeSizeCheck,
+    EngineError, EpochId, FanoutAcknowledgement, FanoutMlsState, FanoutPendingKind, GroupId,
+    MemberId, MessageState, OutboundApplicationMessage, OutboundFanout, OutboundFanoutOutcome,
+    RefusedTarget, StorageError, Timestamp, TransportAccountActivation, TransportAdapter,
+    TransportAdapterError, TransportDelivery, TransportEndpoint, TransportEndpointAckKind,
+    TransportEndpointFailure, TransportEndpointFailureKind, TransportEndpointReceipt,
+    TransportEndpointRejectionCategory, TransportGroupSync, TransportPublishReport,
+    TransportPublishRequest, TransportPublishTarget, WelcomeSizeCheck,
 };
 use futures::stream::FuturesUnordered;
 use futures::{FutureExt, StreamExt};
@@ -4543,7 +4543,15 @@ where
             started.elapsed(),
             published.is_ok(),
         );
-        let effects = published?;
+        let mut effects = published?;
+        if matches!(
+            outcome,
+            IngestOutcome::Ignored {
+                category: cgka_traits::ingest::InputRejectionCategory::OwnEcho
+            }
+        ) {
+            effects.extend(self.acknowledge_own_echo(delivery).await?);
+        }
         // Publication reconciles epoch changes, including its deferred retries.
         let mut noted = HashSet::new();
         for group_id in &valid_proposal_groups {
@@ -4749,6 +4757,52 @@ where
                     .now_or_never()
                     .is_some()
             })
+    }
+
+    /// The account's own subscription received a pending commit's exact event
+    /// from `delivery`'s relay (mdk#2332). That relay holds the commit,
+    /// whatever it answered the publish, so it acknowledged it: its target is
+    /// recorded `Accepted` by echo, and the group's fanouts are driven, which
+    /// confirms the commit. A copy under another event id, or from a relay
+    /// that is not a target, shows nothing. The adapter's local loop-back of
+    /// a publish that asked for an acknowledgement names only relays whose
+    /// receipts it got, so it adds no acknowledgement the publish did not
+    /// make; every commit attempt asks for one.
+    async fn acknowledge_own_echo(
+        &mut self,
+        delivery: &TransportDelivery,
+    ) -> AccountResult<AccountDeviceEffects> {
+        let Some(endpoint) = delivery.source.endpoint.as_ref() else {
+            return Ok(AccountDeviceEffects::default());
+        };
+        let fanouts = match &delivery.group_id_hint {
+            Some(group_id) => self.session.outbound_fanouts_for_group(group_id)?,
+            None => self.session.outbound_fanouts()?,
+        };
+        let Some(mut fanout) = fanouts
+            .into_iter()
+            .find(|fanout| fanout.is_frozen_event(&delivery.message.id))
+        else {
+            return Ok(AccountDeviceEffects::default());
+        };
+        let Some(index) = fanout.target_index_of(endpoint) else {
+            return Ok(AccountDeviceEffects::default());
+        };
+        if !fanout.acknowledge_target(index, FanoutAcknowledgement::Echo)? {
+            return Ok(AccountDeviceEffects::default());
+        }
+        self.session
+            .put_observed_outbound_fanout(&mut fanout, self.wall_clock.now_ms())?;
+        tracing::debug!(
+            target: TRACE_TARGET,
+            method = "acknowledge_own_echo",
+            "own echo acknowledged a pending commit"
+        );
+        let group_id = fanout.group_id().cloned();
+        Ok(self
+            .resume_outbound_fanouts_for_group(group_id.as_ref())
+            .await?
+            .0)
     }
 
     async fn resume_outbound_fanouts_for_group(

@@ -954,6 +954,7 @@ include!("runtime/frozen_fanout.rs");
 include!("runtime/interrupted_attempt.rs");
 include!("runtime/commit_floor.rs");
 include!("runtime/commit_refusal.rs");
+include!("runtime/own_echo.rs");
 include!("runtime/hydrated_welcome.rs");
 include!("support/recovery_challenge.rs");
 include!("runtime/key_package_generation_upgrade.rs");
