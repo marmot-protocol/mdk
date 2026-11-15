@@ -471,7 +471,7 @@
       "sleep": 1
     },
     "crates/transport-nostr/src/directory.rs": {
-      "sleep": 1,
+      "sleep": 3,
       "short_timeout": 1
     },
     "crates/transport-nostr/src/publish_accounting_tests.rs": {

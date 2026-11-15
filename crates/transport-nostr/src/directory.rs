@@ -1860,7 +1860,7 @@ mod tests {
     }
 
     // An authentication still outstanding when the window ends leaves the
-    // route undecided, not refused.
+    // route undecided, not refused. Real time, as for the slow-EOSE test.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn signed_inspection_times_out_when_authentication_never_completes() {
         let (endpoint, reqs, server) =
@@ -1878,7 +1878,10 @@ mod tests {
     // reads, and its EOSE window starts once the slow handshake is done.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn inspection_waits_past_the_directory_read_window_for_a_slow_eose() {
-        let handshake = (DIRECTORY_INSPECTION_EOSE_WAIT - DIRECTORY_RELAY_FETCH_WAIT) / 4;
+        // Real time: paused time auto-advances past the connect wait while
+        // the loopback handshake is still in flight. Each bound keeps a
+        // second or more of slack for a loaded machine.
+        let handshake = (DIRECTORY_INSPECTION_EOSE_WAIT - DIRECTORY_RELAY_FETCH_WAIT) * 2 / 5;
         let eose = DIRECTORY_INSPECTION_EOSE_WAIT - handshake / 2;
         assert!(handshake < DIRECTORY_RELAY_CONNECT_WAIT);
         assert!(eose > DIRECTORY_RELAY_FETCH_WAIT);
