@@ -1121,6 +1121,84 @@ async fn a_partial_reinstall_preserves_downloaded_emoji_and_fills_missing_entrie
     assert_eq!(app.installed_custom_emoji(account).await.unwrap().len(), 3);
 }
 
+/// Corrupted prior pixels never become fallbacks: a successful refresh repairs
+/// them, and a failed refresh keeps only the other verified installed images.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reinstall_repairs_corrupt_images_and_drops_unrecoverable_pixels() {
+    let fixture = fixture().await;
+    let (app, account, host) = (&fixture.app, fixture.account(), &fixture.host);
+    app.sync_emoji_sets(account, None).await.unwrap();
+    let shown = fixture.shown_event_id().await;
+    app.install_emoji_set(
+        account,
+        &fixture.set_coordinate,
+        &shown,
+        &EmojiSetInstallControl::new(),
+    )
+    .await
+    .unwrap();
+    let owner = app.account_home().account(account).unwrap();
+    let path = app.account_storage_path(&owner.label);
+    let lock = crate::sqlcipher::database_open_lock(&path);
+    let key = app
+        .external_sqlcipher_key(
+            &owner.label,
+            &owner.account_id_hex,
+            &lock.lock(),
+            crate::SqlcipherDatabaseKind::Session,
+        )
+        .unwrap();
+    storage_sqlite::expect_uncounted_writes_for_test(&path);
+    let connection = rusqlite::Connection::open(path).unwrap();
+    storage_sqlite::open_hardened_sqlcipher(
+        &connection,
+        &key,
+        storage_sqlite::SqlCipherHardening::cipher_only(),
+    )
+    .unwrap();
+    for recoverable in [true, false] {
+        assert_eq!(connection.execute(
+            "UPDATE app_installed_emoji SET bytes = X'00' WHERE set_coordinate = ?1 AND shortcode = 'good'",
+            [&fixture.set_coordinate]).unwrap(), 1);
+        if !recoverable {
+            host.routes.lock().unwrap().clear();
+        }
+        let result = app
+            .install_emoji_set(
+                account,
+                &fixture.set_coordinate,
+                &shown,
+                &EmojiSetInstallControl::new(),
+            )
+            .await
+            .unwrap();
+        let good = app
+            .read_installed_custom_emoji(account, &fixture.set_coordinate, "good")
+            .await;
+        if recoverable {
+            assert_eq!(result.installed_count, 2);
+            assert_eq!(good.unwrap().bytes, png(32, 32, None));
+        } else {
+            assert_eq!(result.installed_count, 1);
+            assert!(matches!(good, Err(AppError::EmojiSetNotFound)));
+            assert!(
+                result
+                    .skipped
+                    .iter()
+                    .any(|skip| skip.shortcode.as_deref() == Some("good")
+                        && skip.reason == AppEmojiSkipReason::DownloadFailed)
+            );
+        }
+        assert_eq!(
+            app.read_installed_custom_emoji(account, &fixture.set_coordinate, "mislabeled")
+                .await
+                .unwrap()
+                .bytes,
+            png(32, 32, None)
+        );
+    }
+}
+
 /// A successful explicit refresh replaces an old image, but a new set version
 /// replaces the snapshot without resurrecting entries from its predecessor.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
