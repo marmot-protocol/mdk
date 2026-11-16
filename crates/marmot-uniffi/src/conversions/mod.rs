@@ -776,13 +776,20 @@ mod tests {
             moderation_grant: false,
         };
 
-        let ffi = AppMessageRecordFfi::from(record);
+        let ffi = AppMessageRecordFfi::from(record.clone());
 
         assert_eq!(ffi.kind, 7);
         assert_eq!(ffi.content_tokens, MarkdownDocumentFfi::default());
         assert_eq!(ffi.source_epoch, Some(4));
         assert_eq!(ffi.retention_seconds, Some(5));
         assert_eq!(ffi.retention_expires_at, Some(15));
+        assert!(!ffi.invalidated);
+
+        let invalidated = AppMessageRecordFfi::from(AppMessageRecord {
+            invalidated: true,
+            ..record
+        });
+        assert!(invalidated.invalidated);
     }
 
     #[test]
