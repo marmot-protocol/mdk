@@ -23254,6 +23254,7 @@ async fn check_received_media_source_epoch_secret(carried_secret: bool) {
     enum ReceivedMediaKind {
         Chat,
         Comment,
+        Issue,
         UnmarkedComment,
     }
 
@@ -23305,6 +23306,7 @@ async fn check_received_media_source_epoch_secret(carried_secret: bool) {
     for kind in [
         ReceivedMediaKind::Chat,
         ReceivedMediaKind::Comment,
+        ReceivedMediaKind::Issue,
         ReceivedMediaKind::UnmarkedComment,
     ] {
         let published_before = relay.published_events.lock().unwrap().len();
@@ -23342,10 +23344,10 @@ async fn check_received_media_source_epoch_secret(carried_secret: bool) {
         let event = MarmotInnerEvent::new(
             &alice_account.account_id_hex,
             unix_now_seconds(),
-            if matches!(kind, ReceivedMediaKind::Chat) {
-                MARMOT_APP_EVENT_KIND_CHAT
-            } else {
-                1111
+            match kind {
+                ReceivedMediaKind::Chat => MARMOT_APP_EVENT_KIND_CHAT,
+                ReceivedMediaKind::Issue => 1621,
+                ReceivedMediaKind::Comment | ReceivedMediaKind::UnmarkedComment => 1111,
             },
             tags,
             "received media",

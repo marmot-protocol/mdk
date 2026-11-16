@@ -20,13 +20,11 @@ use crate::media::{
     EncryptedMediaVersion, MediaAttachmentReference, media_attachment_from_imeta_tag,
     media_file_key_for_reference, media_imeta_tags_preserve_message,
 };
-use crate::messages::is_nip22_comment;
+use crate::messages::{is_nip22_comment, keeps_media_secret};
 use crate::{AppError, AppProjectionUpdate, unix_now_seconds};
 use cgka_traits::MarmotAppEvent;
 use cgka_traits::app_components::DeviceSlotId;
-use cgka_traits::app_event::{
-    MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_GROUP_SYSTEM, MARMOT_APP_EVENT_KIND_REACTION,
-};
+use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_GROUP_SYSTEM};
 use cgka_traits::types::GroupId;
 use std::collections::BTreeSet;
 use storage_sqlite::{ImportedAppEvent, SqliteAccountStorage, SqliteAppStorage};
@@ -344,19 +342,15 @@ fn importable(event: &ImportedAppEvent, allow_loopback_http: bool) -> bool {
             || media_imeta_tags_preserve_message(&event.tags, allow_loopback_http))
 }
 
-/// The encrypted-media references of a chat message, reaction or comment, each with
-/// `epoch` as its source epoch. Empty for any other kind.
+/// The encrypted-media references of a chat message, reaction, comment or
+/// issue, each with `epoch` as its source epoch. Empty for any other kind.
 fn chat_media_references(
     kind: u64,
     tags: &[Vec<String>],
     epoch: u64,
     allow_loopback_http: bool,
 ) -> Vec<MediaAttachmentReference> {
-    if !matches!(
-        kind,
-        MARMOT_APP_EVENT_KIND_CHAT | MARMOT_APP_EVENT_KIND_REACTION
-    ) && !is_nip22_comment(kind, tags)
-    {
+    if !keeps_media_secret(kind, tags) {
         return Vec::new();
     }
     tags.iter()

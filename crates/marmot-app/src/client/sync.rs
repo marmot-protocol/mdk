@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use cgka_traits::GroupId;
 use cgka_traits::MARMOT_APP_EVENT_KIND_POLL;
-use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_REACTION};
+use cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT;
 use cgka_traits::ingest::IngestOutcome;
 use cgka_traits::transport::TransportEnvelope;
 use storage_sqlite::{
@@ -4291,10 +4291,7 @@ impl AppClient {
             return Ok(());
         }
         let retains_encrypted_media =
-            (matches!(
-                message.kind,
-                MARMOT_APP_EVENT_KIND_CHAT | MARMOT_APP_EVENT_KIND_REACTION
-            ) || crate::messages::is_nip22_comment(message.kind, &message.tags))
+            crate::messages::keeps_media_secret(message.kind, &message.tags)
                 && media_imeta_tags_are_valid(
                     &message.tags,
                     self.app.allow_loopback_blob_endpoints(),

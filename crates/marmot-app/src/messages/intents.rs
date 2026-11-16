@@ -202,6 +202,18 @@ pub(crate) fn is_nip22_comment(kind: u64, tags: &[Vec<String>]) -> bool {
         })
 }
 
+const NIP34_ISSUE_KIND: u64 = 1621;
+
+/// Whether an event's encrypted media keeps its source-epoch key: chats,
+/// NIP-22 comments and NIP-34 issues carry attachments, reactions NIP-30
+/// emoji images. Storage retains and retires keys for the same kinds.
+pub(crate) fn keeps_media_secret(kind: u64, tags: &[Vec<String>]) -> bool {
+    matches!(
+        kind,
+        MARMOT_APP_EVENT_KIND_CHAT | MARMOT_APP_EVENT_KIND_REACTION | NIP34_ISSUE_KIND
+    ) || is_nip22_comment(kind, tags)
+}
+
 /// Value of the `stream-type` tag on an agent text stream start event.
 const STREAM_TYPE_TEXT: &str = "text";
 /// Value of the `route` tag on a brokered QUIC agent text stream start event.

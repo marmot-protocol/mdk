@@ -94,6 +94,8 @@
   status.
 - Received NIP-22 comments cache their source-epoch media keys, and history bundles carry their attachment file keys
   so comment media remains decryptable after epoch advancement and on devices importing that history (#3409).
+- Received NIP-34 issues (kind 1621) cache their source-epoch media keys, and history bundles carry their attachment
+  file keys, as comments do (#3410).
 
 ## 0.17.0 - 2026-11-15
 

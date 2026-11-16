@@ -64,7 +64,8 @@ pub(crate) fn encrypted_media_source_secret(
     Ok(encrypted_media_exporter_secret(group, crypto)?.map(cgka_traits::EncryptedMediaSecret::new))
 }
 
-/// Whether a chat, reaction or recognized comment references attachments (`imeta`).
+/// Whether a chat, reaction, recognized comment or NIP-34 issue (kind 1621)
+/// references attachments (`imeta`).
 pub(crate) fn references_encrypted_media(app_event: &MarmotAppEvent) -> bool {
     let comment = app_event.kind == 1111
         && app_event.tags.iter().any(|tag| {
@@ -73,7 +74,9 @@ pub(crate) fn references_encrypted_media(app_event: &MarmotAppEvent) -> bool {
         });
     (matches!(
         app_event.kind,
-        cgka_traits::MARMOT_APP_EVENT_KIND_CHAT | cgka_traits::MARMOT_APP_EVENT_KIND_REACTION
+        cgka_traits::MARMOT_APP_EVENT_KIND_CHAT
+            | cgka_traits::MARMOT_APP_EVENT_KIND_REACTION
+            | 1621
     ) || comment)
         && app_event
             .tags

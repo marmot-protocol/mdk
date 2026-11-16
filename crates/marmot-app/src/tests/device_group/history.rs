@@ -453,6 +453,16 @@ async fn an_imported_photo_comes_with_its_attachment_key() {
         },
     )
     .await;
+    let issue = send(
+        &mut alice,
+        &chat,
+        AppMessageIntent::Custom {
+            kind: 1621,
+            tags: vec![reference.imeta_tag()],
+            content: "issue screenshot".into(),
+        },
+    )
+    .await;
     let custom = send(
         &mut alice,
         &chat,
@@ -489,7 +499,7 @@ async fn an_imported_photo_comes_with_its_attachment_key() {
         .unwrap()
         .unwrap()
         .bundle;
-    for id in [&reaction, &comment] {
+    for id in [&reaction, &comment, &issue] {
         assert_eq!(
             bundle
                 .events
@@ -501,7 +511,7 @@ async fn an_imported_photo_comes_with_its_attachment_key() {
                 ciphertext_sha256: ciphertext_sha256.clone(),
                 key: file_key.clone(),
             }]),
-            "reaction artwork and comment images carry their per-file keys"
+            "reaction artwork, comment and issue images carry their per-file keys"
         );
     }
     let custom_event = bundle
@@ -578,6 +588,8 @@ async fn an_imported_photo_comes_with_its_attachment_key() {
         .expect("the imported key opens the photo");
     bob.cache_attachment_source_epoch_secret(&chat, &comment, &source)
         .expect("the imported key opens the comment image");
+    bob.cache_attachment_source_epoch_secret(&chat, &issue, &source)
+        .expect("the imported key opens the issue image");
     assert!(
         storage
             .imported_media_file_keys(&chat_hex, &custom)
