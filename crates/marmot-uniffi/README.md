@@ -1226,7 +1226,9 @@ which kind of change failed, in this group, and when. A record stays until
 deletes it or the group's local state is removed. Another change confirming
 does not clear it, and it survives restarts. A change rolled back inside the
 call that made it is that call's own error and is never recorded, and neither
-is a change MDK makes on its own, such as a scheduled self-update.
+is a change MDK makes on its own, such as a scheduled self-update. Nor is a
+direct change staged by an earlier MDK release and given up after the upgrade,
+so an empty list does not cover those.
 
 ## Discarding a failed send
 

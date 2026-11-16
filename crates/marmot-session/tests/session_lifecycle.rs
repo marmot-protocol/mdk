@@ -1474,7 +1474,7 @@ fn group_account_records(
 
 /// Rule 4 of mdk#2602: only the engine decides whether a group is live. The
 /// group-scoped account records live on the session's storage handle, but
-/// each of their accessors, the write included, asks the engine first. A
+/// each of their accessors, writes and deletes included, asks the engine first. A
 /// quarantined group fails with `UnknownGroup` and a seeded-but-unhydrated one
 /// with the retryable `GroupNotHydrated`, before storage is touched, even
 /// though both have stored records. A live group gets its stored records.
@@ -1482,7 +1482,9 @@ fn group_account_records(
 async fn group_scoped_account_records_answer_only_for_live_groups() {
     use cgka_traits::GroupCapabilities;
     use cgka_traits::group::Group;
-    use cgka_traits::storage::MaintenanceStorage;
+    use cgka_traits::storage::{
+        ChangeNotDelivered, ChangeOrigin, MaintenanceStorage, OutboundIntentStorage,
+    };
     use marmot_session::{SessionError, SessionResult};
 
     #[derive(Clone, Copy, Debug)]
@@ -1490,6 +1492,17 @@ async fn group_scoped_account_records_answer_only_for_live_groups() {
         Live,
         Unhydrated,
         Quarantined,
+    }
+
+    fn change_not_delivered(group_id: &GroupId) -> ChangeNotDelivered {
+        ChangeNotDelivered {
+            group_id: group_id.clone(),
+            commit_id: MessageId::new([group_id.as_slice(), b"-commit"].concat()),
+            origin: ChangeOrigin::Direct,
+            intent_kind: "update_group_data".into(),
+            reason: "not_delivered".into(),
+            at_ms: 1_000,
+        }
     }
 
     fn expect<T: std::fmt::Debug + PartialEq>(
@@ -1553,6 +1566,9 @@ async fn group_scoped_account_records_answer_only_for_live_groups() {
             storage.put_group_maintenance(&state).unwrap();
             storage.put_maintenance_obligation(&obligation).unwrap();
             storage.put_group_evolution(&evolution).unwrap();
+            storage
+                .put_change_not_delivered(&change_not_delivered(group_id))
+                .unwrap();
         }
     }
 
@@ -1595,6 +1611,14 @@ async fn group_scoped_account_records_answer_only_for_live_groups() {
             session.group_evolutions_for_group(group_id),
             vec![evolution],
         );
+        let change = change_not_delivered(group_id);
+        expect(
+            "changes_not_delivered",
+            group_id,
+            *liveness,
+            session.changes_not_delivered(group_id),
+            vec![change.clone()],
+        );
 
         let rescheduled = cgka_traits::maintenance::GroupMaintenanceState {
             next_periodic_rotation_at: Some(Timestamp(2_000)),
@@ -1616,6 +1640,24 @@ async fn group_scoped_account_records_answer_only_for_live_groups() {
             observer.group_maintenance(group_id).unwrap(),
             Some(written),
             "put_group_maintenance on a {liveness:?} group"
+        );
+
+        expect(
+            "acknowledge_change_not_delivered",
+            group_id,
+            *liveness,
+            session.acknowledge_change_not_delivered(group_id, &change.commit_id),
+            true,
+        );
+        // A gated delete must not reach storage either.
+        let kept = match liveness {
+            Liveness::Live => Vec::new(),
+            Liveness::Unhydrated | Liveness::Quarantined => vec![change],
+        };
+        assert_eq!(
+            observer.changes_not_delivered(group_id).unwrap(),
+            kept,
+            "acknowledge_change_not_delivered on a {liveness:?} group"
         );
     }
 }
