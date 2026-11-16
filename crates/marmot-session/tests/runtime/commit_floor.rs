@@ -385,6 +385,8 @@ async fn a_size_refusal_before_marking_leaves_no_attempt_behind() {
 /// target `PossiblyExposed` and the commit never rolls back. Each refusal
 /// restarts the target's retry clock, so past the interrupted attempt's
 /// deadline the refused commit backs off instead of coming due on every pass.
+/// That pass is past the bound and the relay answers its read, so the device
+/// is online: the commit is still not given up.
 #[tokio::test]
 async fn a_size_refusal_after_an_interrupted_send_keeps_the_commit_pending() {
     let relay = TransportEndpoint("wss://floor-interrupted.example".into());
@@ -398,6 +400,7 @@ async fn a_size_refusal_after_an_interrupted_send_keeps_the_commit_pending() {
 
     *adapter.inner.endpoint_gate.lock().unwrap() = None;
     adapter.refuse_commits_as_too_large(vec![relay.clone()]);
+    adapter.answer_read_backs(relay.clone(), TransportReadBack::NotFound);
     let mut restarted = fixture.runtime(fixture.reopen(), &adapter);
     let effects = restarted.resume_outbound_fanouts().await.unwrap();
 
@@ -438,6 +441,14 @@ async fn a_size_refusal_after_an_interrupted_send_keeps_the_commit_pending() {
         "a pass at the same moment does not check the size again"
     );
     assert_eq!(adapter.publishes().len(), 1, "the refusals sent nothing");
+    assert_eq!(adapter.read_backs().len(), 1, "the relay answered a read");
+    assert!(epoch_is_pending(&restarted, &fixture));
+    let stored = restarted.session().outbound_fanouts().unwrap();
+    assert_eq!(
+        stored[0].target_status(0),
+        Some(FanoutTargetStatus::PossiblyExposed)
+    );
+    assert!(matches!(stored[0].mls_state(), FanoutMlsState::Pending(_)));
 }
 
 /// Round 4's B2: a relay answered `rate-limited:`, so it received the commit.
@@ -499,7 +510,8 @@ async fn a_relay_that_answered_rate_limited_keeps_the_commit_pending() {
 /// A relay that may hold the commit and then cannot be reached (D9's hold: no
 /// connection, nothing sent) stays possibly exposed. A hold on a relay with
 /// no earlier exposure only waits: the commit neither rolls back nor counts
-/// as possibly delivered.
+/// as possibly delivered. The pass is past the bound and the exposed relay
+/// answers its read, so the device is online: nothing is given up.
 #[tokio::test]
 async fn a_held_relay_keeps_the_exposure_it_had() {
     let exposed = TransportEndpoint("wss://floor-hold-exposed.example".into());
@@ -529,6 +541,7 @@ async fn a_held_relay_keeps_the_exposure_it_had() {
         ],
     );
     adapter.script_failures(fresh.clone(), vec![hold(&fresh), hold(&fresh)]);
+    adapter.answer_read_backs(exposed.clone(), TransportReadBack::NotFound);
     let mut runtime = fixture.runtime(alice, &adapter);
 
     runtime.send(fixture.rename()).await.unwrap();
@@ -537,6 +550,12 @@ async fn a_held_relay_keeps_the_exposure_it_had() {
 
     assert!(effects.pending.is_empty(), "{:?}", effects.pending);
     assert_eq!(adapter.publishes().len(), 4);
+    assert_eq!(
+        adapter.read_backs().last().map(|(_, endpoints)| endpoints.clone()),
+        Some(vec![exposed.clone()]),
+        "only the relay that may hold the commit is read"
+    );
+    assert!(epoch_is_pending(&runtime, &fixture));
     let stored = runtime.session().outbound_fanouts().unwrap();
     let fanout = &stored[0];
     let index = |endpoint: &TransportEndpoint| {

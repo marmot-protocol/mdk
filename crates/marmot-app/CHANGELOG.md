@@ -4,6 +4,9 @@
 
 ### Added
 
+- Opt-in relay telemetry exports `relay_read_back_requests` and `relay_read_back_found`: device-wide, unlabeled
+  counts of the read-back REQs sent for pending commits and of the relays that returned the exact event (mdk#2332).
+  `RelayTelemetryRollup` gains the matching fields; struct literals need them or `..Default::default()`.
 - `MarmotAppRuntime::group_pending_commit` (and `AppClient`) returns `GroupPendingCommit` for the group's own commit
   that has not confirmed yet, `GroupPendingCommitState::Sending` or `Stuck`, with its relays (mdk#2332).
   `AccountDeviceRuntime::pending_commit` in `marmot-session` is its source.

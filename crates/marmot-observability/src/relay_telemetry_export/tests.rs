@@ -300,7 +300,7 @@ fn build_export_batch_includes_unlabeled_reconciliation_counters() {
 }
 
 #[test]
-fn build_export_batch_includes_unlabeled_activation_and_group_sync_counters() {
+fn build_export_batch_includes_unlabeled_activation_group_sync_and_read_back_counters() {
     let rollup = RelayTelemetryRollup {
         activations_full: 11,
         activations_degraded: 3,
@@ -308,6 +308,8 @@ fn build_export_batch_includes_unlabeled_activation_and_group_sync_counters() {
         group_syncs_full: 17,
         group_syncs_degraded: 5,
         group_syncs_failed: 2,
+        read_back_requests: 7,
+        read_back_found: 4,
         ..Default::default()
     };
     let batch = build_export_batch(&rollup, &RelayLabelResolution::default());
@@ -319,6 +321,8 @@ fn build_export_batch_includes_unlabeled_activation_and_group_sync_counters() {
         (metric_names::GROUP_SYNCS_FULL, 17),
         (metric_names::GROUP_SYNCS_DEGRADED, 5),
         (metric_names::GROUP_SYNCS_FAILED, 2),
+        (metric_names::READ_BACK_REQUESTS, 7),
+        (metric_names::READ_BACK_FOUND, 4),
     ] {
         let matching: Vec<_> = batch
             .points

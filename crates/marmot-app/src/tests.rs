@@ -704,6 +704,15 @@ pub(crate) struct ScriptedPushRelayClient {
     /// the answer's category (mdk#2333). The others answer as usual.
     endpoint_refusals:
         std::sync::Mutex<Vec<(u64, String, cgka_traits::TransportEndpointRejectionCategory)>>,
+    /// One event that a relay refuses for good, beside the kind-wide
+    /// refusals above: its id, the endpoint and the answer's category.
+    event_refusals: std::sync::Mutex<
+        Vec<(
+            String,
+            String,
+            cgka_traits::TransportEndpointRejectionCategory,
+        )>,
+    >,
     fail_publish_kind: std::sync::Mutex<Option<(u64, bool)>>,
     accept_first_endpoint_only: std::sync::atomic::AtomicBool,
     accepted_publish_routes: std::sync::Mutex<Vec<(u64, Vec<TransportEndpoint>)>>,
@@ -1227,6 +1236,7 @@ impl ScriptedPushRelayClient {
     /// Hold the next directory read that asks for a KeyPackage slot, as a
     /// sign-in check's read does: it notifies the first notifier once it
     /// waits, and answers once the second is notified.
+    #[cfg(feature = "test-policy-overrides")]
     pub(crate) fn hold_next_slot_read(
         &self,
     ) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
@@ -1353,6 +1363,21 @@ impl ScriptedPushRelayClient {
             .lock()
             .unwrap()
             .push((kind, endpoint.to_owned(), category));
+    }
+
+    /// The relay at `endpoint` refuses the event `event_id` for good with a
+    /// final answer of `category`; its other events answer as usual.
+    pub(crate) fn refuse_event_at(
+        &self,
+        event_id: &str,
+        endpoint: &str,
+        category: cgka_traits::TransportEndpointRejectionCategory,
+    ) {
+        self.event_refusals.lock().unwrap().push((
+            event_id.to_owned(),
+            endpoint.to_owned(),
+            category,
+        ));
     }
 
     pub(crate) fn fail_publishes_of_kind(&self, kind: u64) {
@@ -1538,6 +1563,30 @@ impl transport_nostr::DirectoryRelayFetcher for ScriptedPushRelayClient {
 
 #[async_trait]
 impl NostrRelayClient for ScriptedPushRelayClient {
+    /// A relay whose publishes fail as unavailable cannot be connected to
+    /// either (mdk#2332).
+    async fn connect_for_publish(
+        &self,
+        endpoint: &TransportEndpoint,
+    ) -> Result<(), cgka_traits::TransportEndpointFailure> {
+        if self
+            .unavailable_endpoints
+            .lock()
+            .unwrap()
+            .contains(&endpoint.0)
+        {
+            return Err(cgka_traits::TransportEndpointFailure {
+                pre_send: true,
+                size_class: None,
+                endpoint: endpoint.clone(),
+                reason: "relay unavailable".into(),
+                kind: cgka_traits::TransportEndpointFailureKind::RetryableUnavailable,
+                rejection_category: None,
+            });
+        }
+        Ok(())
+    }
+
     fn relay_notification_source(
         &self,
     ) -> Option<Arc<dyn transport_nostr_adapter::NostrRelayNotificationSource>> {
@@ -1765,11 +1814,18 @@ impl NostrRelayClient for ScriptedPushRelayClient {
             ));
         }
         let refusals = self.endpoint_refusals.lock().unwrap().clone();
+        let event_refusals = self.event_refusals.lock().unwrap().clone();
         let refusal_of = |endpoint: &TransportEndpoint| {
             refusals
                 .iter()
                 .find(|(kind, refusing, _)| *kind == event.kind && *refusing == endpoint.0)
                 .map(|(_, _, category)| *category)
+                .or_else(|| {
+                    event_refusals
+                        .iter()
+                        .find(|(id, refusing, _)| *id == event.id && *refusing == endpoint.0)
+                        .map(|(_, _, category)| *category)
+                })
         };
         if !endpoints.is_empty()
             && endpoints
@@ -26184,6 +26240,159 @@ async fn a_pending_commit_refuses_group_changes_ahead_of_the_delivery_gate() {
     );
 
     client.disband_group(&group_id).await.unwrap();
+}
+
+/// mdk#2332, proof 9's three-way case: a live refusal on commit A, a newer
+/// commit B still owed, and a pending commit C. Each read names its own commit:
+/// the delivery read names A, the oldest unacknowledged refusal, and B once
+/// that is acknowledged; the pending read names C. A group change fails as
+/// `GroupCommitPending` ahead of A's refusal, which would otherwise gate it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refused_an_owed_and_a_pending_commit_each_answer_their_own_read() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relays(
+        dir.path(),
+        vec![
+            "wss://relay-a.example".to_owned(),
+            "wss://relay-b.example".to_owned(),
+            "wss://relay-c.example".to_owned(),
+        ],
+    )
+    .with_test_relay_client(relay.clone());
+    let mut client = app.client("alice").await.unwrap();
+    let group_id = client
+        .create_group("three-way", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
+    let group_hex = hex::encode(group_id.as_slice());
+    let last_commit_id = |relay: &ScriptedPushRelayClient| {
+        relay
+            .attempted_events()
+            .into_iter()
+            .rev()
+            .find(|event| event.kind == 445)
+            .expect("a published commit")
+            .id
+    };
+
+    // A is owed to C, and B to B and C. Inside the grace neither gates.
+    relay.make_endpoints_unavailable(&["wss://relay-c.example"]);
+    client
+        .update_group_profile(&group_id, Some("a"), None)
+        .await
+        .unwrap();
+    let commit_a = last_commit_id(&relay);
+    relay.make_endpoints_unavailable(&["wss://relay-b.example", "wss://relay-c.example"]);
+    client
+        .update_group_profile(&group_id, Some("b"), None)
+        .await
+        .unwrap();
+    // C reaches no relay for sure, so it stays pending.
+    relay.fail_publishes_as_possibly_exposed();
+    client
+        .update_group_profile(&group_id, Some("c"), None)
+        .await
+        .unwrap();
+    let pending = client
+        .group_pending_commit(&group_id)
+        .unwrap()
+        .expect("C is pending");
+    assert_eq!(pending.intent_kind.as_deref(), Some("update_group_data"));
+
+    // Relay C comes back and refuses A for good on its retry; B and C stay
+    // unconfirmed there.
+    relay.make_endpoints_unavailable(&["wss://relay-b.example"]);
+    relay.refuse_event_at(
+        &commit_a,
+        "wss://relay-c.example",
+        cgka_traits::TransportEndpointRejectionCategory::Blocked,
+    );
+    assert!(client.note_connectivity_restored().unwrap() > 0);
+    client
+        .advance_convergence_after_runtime_sync(&group_id)
+        .await
+        .unwrap();
+    assert!(
+        relay
+            .attempted_events()
+            .iter()
+            .filter(|event| event.id == commit_a)
+            .count()
+            > 1,
+        "A was retried"
+    );
+
+    let delivery = client
+        .group_commit_delivery(&group_id)
+        .unwrap()
+        .expect("A's refusal is live");
+    assert_eq!(
+        delivery.refused_relays,
+        vec![crate::GroupCommitRefusedRelay {
+            relay_url: "wss://relay-c.example".into(),
+            cause: crate::GroupCommitRefusalCause::Rejected,
+        }]
+    );
+    assert!(
+        delivery.owed_relay_urls.is_empty(),
+        "A, which relays A and B accepted, is named, not B: {delivery:?}"
+    );
+    let pending_commit = |client: &AppClient| {
+        client
+            .group_pending_commit(&group_id)
+            .unwrap()
+            .map(|pending| pending.commit_id_hex)
+    };
+    assert_eq!(
+        pending_commit(&client).as_ref(),
+        Some(&pending.commit_id_hex),
+        "C is still the pending commit"
+    );
+    let attempted = relay.attempted_event_ids().len();
+    assert_group_commit_pending(
+        client
+            .update_group_profile(&group_id, Some("next"), None)
+            .await,
+        &group_hex,
+        "update_group_profile behind a live refusal",
+    );
+
+    // Acknowledging A's refusal leaves B, the oldest commit still owed.
+    assert!(
+        client
+            .acknowledge_group_commit_undelivered(&group_id)
+            .unwrap()
+    );
+    let delivery = client
+        .group_commit_delivery(&group_id)
+        .unwrap()
+        .expect("B is still owed");
+    assert!(delivery.refused_relays.is_empty(), "{delivery:?}");
+    assert!(
+        delivery
+            .owed_relay_urls
+            .contains(&"wss://relay-b.example".to_owned()),
+        "{delivery:?}"
+    );
+    assert_group_commit_pending(
+        client
+            .update_group_profile(&group_id, Some("next"), None)
+            .await,
+        &group_hex,
+        "update_group_profile after the acknowledgement",
+    );
+    assert_eq!(
+        relay.attempted_event_ids().len(),
+        attempted,
+        "nothing authored"
+    );
+    assert_eq!(pending_commit(&client), Some(pending.commit_id_hex));
 }
 
 /// mdk#2332: a member's leave is a SelfRemove, which the engine prepares only

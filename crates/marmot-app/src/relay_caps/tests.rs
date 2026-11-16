@@ -451,3 +451,106 @@ async fn the_message_limit_shares_the_caps_document() {
         );
     }
 }
+
+/// mdk#2332 (D9): a relay document that times out or is missing gives a
+/// commit over the 64 KiB floor no limit, so the relay's connection decides:
+/// one the device cannot connect to holds the commit unsent and retryable, and
+/// one it can connect to refuses it as too large. Neither is sent anything.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unread_document_leaves_a_large_commit_to_the_relays_connection() {
+    use cgka_traits::{
+        GroupId, MemberId, TransportAdapter as _, TransportAdapterError, TransportEndpoint,
+        TransportEndpointFailureKind, TransportPublishRequest, TransportPublishTarget,
+    };
+    use transport_nostr::RelayEventLimits as _;
+
+    let hanging = DocumentServer::start(Reply::Hang).await;
+    let missing = DocumentServer::start(Reply::Document {
+        status: 404,
+        body: String::new(),
+    })
+    .await;
+    let limits = Arc::new(crate::relay_event_limits::AppRelayEventLimits::new(
+        &[],
+        cache_with(Nip11Fetch {
+            request_timeout: Duration::from_millis(300),
+            ..no_dns()
+        }),
+        true,
+    ));
+    let transport_group_id = [0xD4; 32];
+    let commit = crate::tests::epoch_gap_probe(
+        &hex::encode(transport_group_id),
+        1_700_000_000,
+        &"x".repeat(60_000),
+    );
+    let commit_bytes = serde_json::to_vec(&commit).unwrap().len();
+    assert!(commit_bytes > transport_nostr::COMMIT_SIZE_FLOOR_BYTES);
+
+    for (server, reachable) in [
+        (&hanging, false),
+        (&hanging, true),
+        (&missing, false),
+        (&missing, true),
+    ] {
+        let relay = TransportEndpoint(server.relay("/"));
+        assert_eq!(
+            limits.max_event_bytes(&relay, commit_bytes).await,
+            None,
+            "{relay:?}: an unread document gives no limit"
+        );
+        let client = Arc::new(crate::tests::ScriptedPushRelayClient::default());
+        if !reachable {
+            client.make_endpoints_unavailable(&[relay.as_str()]);
+        }
+        let plane = transport_nostr::MarmotRelayPlane::new_with_loopback(
+            Some(Duration::from_secs(30)),
+            client.clone(),
+            true,
+        );
+        let account = MemberId::new(vec![0xA1; 32]);
+        let adapter = plane
+            .account_adapter(account.clone(), client.clone())
+            .with_event_limits(limits.clone());
+        let result = adapter
+            .publish_commit(TransportPublishRequest {
+                account_id: account,
+                message: commit.to_transport_message().unwrap(),
+                target: TransportPublishTarget::Group {
+                    group_id: GroupId::new(vec![0xC3; 16]),
+                    transport_group_id: transport_group_id.to_vec(),
+                    endpoints: vec![relay.clone()],
+                },
+                required_acks: 1,
+            })
+            .await;
+
+        let Err(TransportAdapterError::PublishEndpoints(failure)) = result else {
+            panic!("{relay:?}, reachable {reachable}: the commit is not sent, got {result:?}");
+        };
+        let [answer] = failure.endpoint_failures.as_slice() else {
+            panic!("{relay:?}: one answer, got {failure:?}");
+        };
+        assert!(answer.proves_nothing_sent(), "{answer:?}");
+        if reachable {
+            assert_eq!(
+                *answer,
+                cgka_traits::TransportEndpointFailure::over_known_limit(
+                    relay.clone(),
+                    commit_bytes
+                )
+            );
+        } else {
+            assert_eq!(
+                answer.kind,
+                TransportEndpointFailureKind::RetryableUnavailable,
+                "{answer:?}"
+            );
+            assert_eq!(answer.size_class, None, "no size proof");
+        }
+        assert!(
+            client.attempted_events().is_empty(),
+            "{relay:?}: nothing was sent"
+        );
+    }
+}

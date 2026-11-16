@@ -2260,6 +2260,8 @@ fn telemetry_rollup_reshapes_and_joins_per_relay_snapshots() {
         group_syncs_full: 13,
         group_syncs_degraded: 5,
         group_syncs_failed: 2,
+        read_back_requests: 9,
+        read_back_found: 4,
         ..NostrAdapterMetrics::default()
     };
     let health = RelayPlaneHealth {
@@ -2314,6 +2316,8 @@ fn telemetry_rollup_reshapes_and_joins_per_relay_snapshots() {
     assert_eq!(rollup.group_syncs_full, 13);
     assert_eq!(rollup.group_syncs_degraded, 5);
     assert_eq!(rollup.group_syncs_failed, 2);
+    assert_eq!(rollup.read_back_requests, 9);
+    assert_eq!(rollup.read_back_found, 4);
     assert_eq!(rollup.observed_reorg_rate(), None);
 }
 
@@ -7512,9 +7516,10 @@ fn floor_adapter(
 }
 
 /// mdk#2332: a commit over 64 KiB is refused unsent at a relay whose limit is
-/// unknown, before and at its publication alike. Other events over 64 KiB,
-/// commits up to 64 KiB, and commits to a relay whose known limit fits are
-/// sent as before. Refusals name each relay as the request spelled it.
+/// unknown, before and at its publication alike. Other events over 64 KiB (an
+/// application message and a Welcome), commits up to 64 KiB, and commits to a
+/// relay whose known limit fits are sent as before. Refusals name each relay
+/// as the request spelled it.
 #[tokio::test]
 async fn a_commit_over_the_floor_is_refused_unsent_where_the_limit_is_unknown() {
     let unknown = TransportEndpoint("wss://unknown.example".into());
@@ -7576,9 +7581,29 @@ async fn a_commit_over_the_floor_is_refused_unsent_where_the_limit_is_unknown() 
         .unwrap_or_else(|error| panic!("{commit} to {endpoint} is sent: {error}"));
         assert_eq!(report.accepted.len(), 1);
     }
+    let welcome = large_welcome_message();
+    assert!(
+        event_json_bytes(&NostrTransportEvent::from_transport_message(&welcome).unwrap())
+            > COMMIT_SIZE_FLOOR_BYTES
+    );
+    let TransportEnvelope::Welcome { recipient } = welcome.envelope.clone() else {
+        panic!("a gift wrap is a Welcome");
+    };
+    let report = adapter
+        .publish(TransportPublishRequest {
+            target: TransportPublishTarget::Inbox {
+                recipient,
+                endpoints: vec![unknown.clone()],
+            },
+            message: welcome,
+            ..request(&over, Vec::new())
+        })
+        .await
+        .expect("a Welcome over the floor is sent");
+    assert_eq!(report.accepted.len(), 1);
     assert_eq!(
         *client.sent_to.lock().unwrap(),
-        [unknown.clone(), roomy, unknown.clone()]
+        [unknown.clone(), roomy, unknown.clone(), unknown.clone()]
     );
     assert_eq!(
         client.probed.lock().unwrap().len(),
@@ -7814,10 +7839,19 @@ fn with_endpoints(
 
 /// A Welcome's gift wrap to a fresh recipient, as a transport message.
 fn welcome_message() -> TransportMessage {
+    welcome_message_of("sealed welcome".to_owned())
+}
+
+/// A Welcome's gift wrap over the 64 KiB commit floor.
+fn large_welcome_message() -> TransportMessage {
+    welcome_message_of("x".repeat(COMMIT_SIZE_FLOOR_BYTES))
+}
+
+fn welcome_message_of(content: String) -> TransportMessage {
     use nostr_sdk::prelude::{EventBuilder, FinalizeEvent, Keys, Kind, Tag};
 
     let recipient = Keys::parse(&"33".repeat(32)).unwrap().public_key();
-    let signed = EventBuilder::new(Kind::GiftWrap, "sealed welcome")
+    let signed = EventBuilder::new(Kind::GiftWrap, content)
         .tags([Tag::public_key(recipient)])
         .finalize(&Keys::parse(&"11".repeat(32)).unwrap())
         .unwrap();
