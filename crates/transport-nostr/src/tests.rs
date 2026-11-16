@@ -2260,6 +2260,8 @@ fn telemetry_rollup_reshapes_and_joins_per_relay_snapshots() {
         group_syncs_full: 13,
         group_syncs_degraded: 5,
         group_syncs_failed: 2,
+        read_back_requests: 9,
+        read_back_found: 4,
         ..NostrAdapterMetrics::default()
     };
     let health = RelayPlaneHealth {
@@ -2314,6 +2316,8 @@ fn telemetry_rollup_reshapes_and_joins_per_relay_snapshots() {
     assert_eq!(rollup.group_syncs_full, 13);
     assert_eq!(rollup.group_syncs_degraded, 5);
     assert_eq!(rollup.group_syncs_failed, 2);
+    assert_eq!(rollup.read_back_requests, 9);
+    assert_eq!(rollup.read_back_found, 4);
     assert_eq!(rollup.observed_reorg_rate(), None);
 }
 

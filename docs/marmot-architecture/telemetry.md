@@ -1,7 +1,7 @@
 ---
 title: "Telemetry, Logging, and Tracing Inventory"
 created: 2026-06-10
-updated: 2026-11-15
+updated: 2026-11-16
 tags: [marmot, architecture, telemetry, logging, tracing, privacy]
 status: current
 ---
@@ -518,6 +518,7 @@ Unresolved relay indices are skipped rather than exported as opaque ids.
 | `relay_reconciliation_order_unproven_passes` | none | Counter | Adapter `reconciliation_order_unproven_passes` (group passes held back without a proven order) |
 | `relay_account_activations_full` / `relay_account_activations_degraded` / `relay_account_activations_failed` | none | Counter | Adapter `activations_full` / `activations_degraded` / `activations_failed` |
 | `relay_group_syncs_full` / `relay_group_syncs_degraded` / `relay_group_syncs_failed` | none | Counter | Adapter `group_syncs_full` / `group_syncs_degraded` / `group_syncs_failed` |
+| `relay_read_back_requests` / `relay_read_back_found` | none | Counter | Adapter `read_back_requests` / `read_back_found` (pending-commit read-backs sent, and relays that returned the event) |
 | `message_observed` | none | Counter | `RelayDeliverySpread.observed` |
 | `message_corroborated` | none | Counter | `RelayDeliverySpread.corroborated` |
 | `message_single_source` | none | Counter | `RelayDeliverySpread.single_source` |

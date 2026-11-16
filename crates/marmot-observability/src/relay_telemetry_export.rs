@@ -99,6 +99,12 @@ pub mod metric_names {
     pub const GROUP_SYNCS_DEGRADED: &str = "relay_group_syncs_degraded";
     /// Device-wide group syncs whose REQs failed (monotonic).
     pub const GROUP_SYNCS_FAILED: &str = "relay_group_syncs_failed";
+    /// Device-wide read-back REQs sent for a pending commit, one per relay
+    /// asked (monotonic).
+    pub const READ_BACK_REQUESTS: &str = "relay_read_back_requests";
+    /// Device-wide relays that returned a pending commit's exact event to a
+    /// read-back (monotonic).
+    pub const READ_BACK_FOUND: &str = "relay_read_back_found";
     /// Engine settle episodes (monotonic).
     pub const SETTLES: &str = "relay_settles";
     /// Engine post-settle reorgs (monotonic).
@@ -1018,6 +1024,8 @@ pub fn build_export_batch(
             rollup.group_syncs_degraded,
         ),
         (metric_names::GROUP_SYNCS_FAILED, rollup.group_syncs_failed),
+        (metric_names::READ_BACK_REQUESTS, rollup.read_back_requests),
+        (metric_names::READ_BACK_FOUND, rollup.read_back_found),
         (metric_names::MESSAGE_OBSERVED, rollup.messages_observed),
         (
             metric_names::MESSAGE_CORROBORATED,

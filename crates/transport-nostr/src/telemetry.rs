@@ -94,6 +94,14 @@ pub struct RelayTelemetryRollup {
     /// Device-wide group syncs whose REQs failed.
     #[serde(default)]
     pub group_syncs_failed: u64,
+    /// Device-wide read-back REQs sent for a pending commit, one per relay
+    /// asked (mdk#2332).
+    #[serde(default)]
+    pub read_back_requests: u64,
+    /// Device-wide relays that returned a pending commit's exact event to a
+    /// read-back.
+    #[serde(default)]
+    pub read_back_found: u64,
     /// Optional engine-side reorg metrics, folded in once the parallel
     /// `observed_reorg_rate` workstream lands. `None` until then.
     pub engine: Option<EngineReorgMetrics>,
@@ -227,6 +235,8 @@ pub fn rollup_from_snapshots(
         group_syncs_full: metrics.group_syncs_full as u64,
         group_syncs_degraded: metrics.group_syncs_degraded as u64,
         group_syncs_failed: metrics.group_syncs_failed as u64,
+        read_back_requests: metrics.read_back_requests as u64,
+        read_back_found: metrics.read_back_found as u64,
         engine,
     }
 }
