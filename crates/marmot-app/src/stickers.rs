@@ -251,6 +251,14 @@ fn parse_sticker_pack_input_with_relays(input: &str) -> Result<ParsedStickerPack
 fn normalize_sticker_relay_hints(
     relays: impl IntoIterator<Item = String>,
 ) -> Vec<TransportEndpoint> {
+    normalize_sticker_relays(relays, MAX_STICKER_RELAY_HINTS)
+}
+
+/// Parse, validate and deduplicate relay URLs, keeping the first `limit`.
+fn normalize_sticker_relays(
+    relays: impl IntoIterator<Item = String>,
+    limit: usize,
+) -> Vec<TransportEndpoint> {
     let mut normalized = Vec::new();
     for relay in relays {
         let Ok(relay) = RelayUrl::parse(relay.trim()) else {
@@ -263,11 +271,37 @@ fn normalize_sticker_relay_hints(
         if !normalized.contains(&endpoint) {
             normalized.push(endpoint);
         }
-        if normalized.len() >= MAX_STICKER_RELAY_HINTS {
+        if normalized.len() >= limit {
             break;
         }
     }
     normalized
+}
+
+/// The relays public pack reads query, for sticker packs (kind 30031) and
+/// emoji sets (kind 30030): the account's relays, then the runtime's
+/// configured relays, deduplicated and passed through the host-safety rule.
+/// Packs and sets are published to few relays, and an account whose relay
+/// list came from another client often names none of them; the host's
+/// configured relays are where it expects its packs to be. Reads only, never
+/// the account's own lists: the sticker installed list, the emoji list and
+/// every sticker publication stay on the account's relays.
+pub(crate) fn pack_read_endpoints(
+    app: &MarmotApp,
+    account_endpoints: &[TransportEndpoint],
+) -> Vec<TransportEndpoint> {
+    let candidates = account_endpoints
+        .iter()
+        .cloned()
+        .chain(app.relay_endpoints())
+        .collect();
+    normalize_sticker_relays(
+        app.retain_safe_discovered_endpoints(candidates, "pack reads")
+            .into_iter()
+            // One spelling per relay, so `wss://r` and `wss://r/` dial once.
+            .map(|endpoint| transport_nostr::canonical_relay(endpoint.as_str())),
+        usize::MAX,
+    )
 }
 
 fn safe_sticker_relays(
@@ -494,9 +528,11 @@ impl MarmotApp {
             .map(|_| ())
     }
 
-    /// Refresh recent public packs and this account's installed-list projection
-    /// from its configured outbox relays. Pending local operations are rebased
-    /// over the winning remote list and published after the fetch.
+    /// Refresh recent public packs from the account's outbox relays and the
+    /// runtime's configured relays, and this account's installed-list
+    /// projection from its outbox relays alone. Pending local operations are
+    /// rebased over the winning remote list and published, to the outbox
+    /// relays only, after the fetch.
     pub async fn sync_sticker_packs(
         &self,
         account_ref: &str,
@@ -510,18 +546,28 @@ impl MarmotApp {
             .kind(Kind::Custom(STICKER_PACK_KIND))
             .custom_tag(SingleLetterTag::LOWERCASE_T, PACK_FORMAT.to_owned())
             .limit(MAX_DISCOVERY_PACKS);
+        // The event budget scales with the relays queried, so one relay's
+        // answers cannot crowd out another's newer versions.
+        let max_events =
+            (MAX_DISCOVERY_PACKS * 2).saturating_mul(context.pack_read_endpoints.len().max(1));
         let events = self
             .relay_plane
             .fetch_public_events(
-                context.endpoints.clone(),
+                context.pack_read_endpoints.clone(),
                 vec![filter],
-                MAX_DISCOVERY_PACKS * 2,
+                max_events,
             )
             .await
             .map_err(AppError::StickerRelay)?
             .events;
         let discovered = events.len().min(MAX_DISCOVERY_PACKS);
-        let updated = ingest_pack_events(self, &context.storage, events, &context.endpoints)?;
+        let updated = ingest_pack_events(
+            self,
+            &context.storage,
+            events,
+            &context.pack_read_endpoints,
+            max_events,
+        )?;
 
         let desired = context.storage.desired_installed_sticker_packs()?;
         for coordinate in desired.iter().take(MAX_INSTALLED_PACKS) {
@@ -679,11 +725,13 @@ impl MarmotApp {
                 "no account relays configured".into(),
             ));
         }
+        let pack_read_endpoints = pack_read_endpoints(self, &endpoints);
         Ok(StickerAccountContext {
             label: account.label.clone(),
             account_id_hex: account.account_id_hex,
             storage: self.account_storage(&account.label)?.app_storage(),
             endpoints,
+            pack_read_endpoints,
         })
     }
 }
@@ -704,8 +752,9 @@ async fn fetch_pack_into_storage(
         .custom_tag(SingleLetterTag::LOWERCASE_D, address.identifier.clone())
         .limit(MAX_REPLACEABLE_VERSIONS_PER_FETCH);
     // Hints only add candidates. Versions from the hint relays and from the
-    // account relays all pass through NIP-01 replacement ordering, so an older
-    // version on a hint relay cannot hide a newer one on the account relays.
+    // pack read relays (account and configured) all pass through NIP-01
+    // replacement ordering, so an older version on one relay cannot hide a
+    // newer one on another.
     let (mut updated, mut found) = (false, false);
     if !relay_hints.is_empty() {
         match fetch_pack_from_endpoints(
@@ -722,11 +771,17 @@ async fn fetch_pack_into_storage(
             Err(error) => return Err(error),
         }
     }
-    match fetch_pack_from_endpoints(app, context, coordinate, context.endpoints.clone(), filter)
-        .await
+    match fetch_pack_from_endpoints(
+        app,
+        context,
+        coordinate,
+        context.pack_read_endpoints.clone(),
+        filter,
+    )
+    .await
     {
-        Ok((account_updated, _)) => updated |= account_updated,
-        // A hint already supplied a validated version; unreachable account
+        Ok((read_updated, _)) => updated |= read_updated,
+        // A hint already supplied a validated version; unreachable read
         // relays do not discard it.
         Err(AppError::StickerRelay(_)) if found => {}
         Err(error) => return Err(error),
@@ -749,7 +804,7 @@ async fn fetch_pack_from_endpoints(
         .fetch_public_events(
             endpoints.clone(),
             vec![filter],
-            MAX_REPLACEABLE_VERSIONS_PER_FETCH,
+            MAX_REPLACEABLE_VERSIONS_PER_FETCH.saturating_mul(endpoints.len().max(1)),
         )
         .await
         .map_err(AppError::StickerRelay)?
@@ -775,10 +830,11 @@ fn ingest_pack_events(
     storage: &SqliteAppStorage,
     events: Vec<Event>,
     endpoints: &[TransportEndpoint],
+    max_events: usize,
 ) -> Result<usize, AppError> {
     let mut updated = 0_usize;
     let mut seen = HashSet::new();
-    for event in events.into_iter().take(MAX_DISCOVERY_PACKS * 2) {
+    for event in events.into_iter().take(max_events) {
         let stored = match stored_pack_from_event(&event) {
             Ok(pack) => pack,
             Err(_) => continue,
@@ -1192,7 +1248,12 @@ struct StickerAccountContext {
     label: String,
     account_id_hex: String,
     storage: SqliteAppStorage,
+    /// The account's own relays: the installed-list read and every sticker
+    /// publication use these, and only these.
     endpoints: Vec<TransportEndpoint>,
+    /// Pack reads (discovery, per-pack fetch and refresh): the account's
+    /// relays plus the runtime's configured relays.
+    pack_read_endpoints: Vec<TransportEndpoint>,
 }
 
 fn app_pack_from_stored(
@@ -1501,6 +1562,38 @@ mod tests {
                 coordinate,
                 relay_hints: vec![TransportEndpoint(relay.url().await.to_string())],
             }
+        );
+    }
+
+    #[test]
+    fn pack_reads_merge_safe_account_and_configured_relays() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = MarmotApp::with_relays_and_account_home_and_config(
+            directory.path(),
+            vec![
+                "wss://configured.example".to_owned(),
+                "wss://shared.example/".to_owned(),
+                "ws://127.0.0.1:7777".to_owned(),
+                "wss://10.1.2.3".to_owned(),
+            ],
+            crate::AccountHome::open(directory.path()),
+            crate::MarmotAppConfig::default(),
+        );
+        let account = [
+            "wss://account.example",
+            "wss://shared.example",
+            "ws://plain.example",
+            "wss://192.168.1.1",
+        ]
+        .map(|url| TransportEndpoint(url.to_owned()));
+        assert_eq!(
+            pack_read_endpoints(&app, &account),
+            [
+                "wss://account.example",
+                "wss://shared.example",
+                "wss://configured.example"
+            ]
+            .map(|url| TransportEndpoint(url.to_owned())),
         );
     }
 

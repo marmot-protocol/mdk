@@ -1,4 +1,4 @@
-//! Sticker relay behavior against local relays.
+//! Sticker and emoji set relay behavior against local relays.
 //!
 //! - Installed list (kind 10031) publication against a multi-device account.
 //!   A device that cannot read the current remote winner must not sign and
@@ -7,6 +7,9 @@
 //! - Pack (kind 30031) lookup with relay hints. Hints add candidates; they
 //!   never hide a newer version on the account's own relays.
 //! - Cached installed packs refresh even outside the newest public-pack window.
+//! - Pack reads also reach the runtime's configured relays; the installed list
+//!   still publishes only to the account's relays.
+//! - Emoji set reads use the same relays as pack reads.
 
 // Test fixtures dial local relays directly; the proxy policy is crate-private.
 #![allow(clippy::disallowed_methods)]
@@ -503,6 +506,278 @@ async fn sync_refreshes_installed_packs() {
     let (created_at, packs) = remote_installed_list(&url, keys.public_key()).await;
     assert_eq!(created_at, now - 300);
     assert_eq!(packs, vec![coordinate]);
+
+    runtime.shutdown().await;
+}
+
+/// How many installed lists (kind 10031) `author` has on `relay_url`.
+async fn installed_list_count(relay_url: &str, author: PublicKey) -> usize {
+    let client = NostrSdkClient::builder().build();
+    client.add_relay(relay_url).await.unwrap();
+    client.connect().await;
+    client
+        .fetch_events(ReqTarget::manual(vec![(
+            RelayUrl::parse(relay_url).unwrap(),
+            vec![
+                Filter::new()
+                    .author(author)
+                    .kind(Kind::Custom(USER_STICKER_PACKS_KIND)),
+            ],
+        )]))
+        .timeout(Duration::from_secs(5))
+        .await
+        .unwrap()
+        .len()
+}
+
+/// An imported account whose NIP-65 relay is `account_url`, on an app whose
+/// configured relay is `configured_url`.
+async fn import_account_on(
+    account_url: &str,
+    configured_url: &str,
+) -> (tempfile::TempDir, MarmotApp, MarmotAppRuntime, Keys, String) {
+    let keys = Keys::generate();
+    let now = unix_now();
+    for (kind, tag) in [
+        (
+            10002,
+            Tag::custom("r", [account_url.to_owned(), "write".to_owned()]),
+        ),
+        (10050, Tag::custom("relay", [account_url.to_owned()])),
+    ] {
+        publish_signed(account_url, &keys, kind, vec![tag], now - 600).await;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let app = MarmotApp::with_relay_and_config(
+        dir.path(),
+        configured_url.to_owned(),
+        MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+    );
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let account = timeout(
+        Duration::from_secs(40),
+        runtime.create_or_import_account(AccountSetupRequest {
+            identity: None,
+            import_nsec: Some(zeroize::Zeroizing::new(
+                keys.secret_key().to_bech32().unwrap(),
+            )),
+            default_relays: vec![endpoint(account_url)],
+            bootstrap_relays: vec![endpoint(account_url)],
+            publish_missing_relay_lists: true,
+            ..AccountSetupRequest::default()
+        }),
+    )
+    .await
+    .expect("account import completes")
+    .expect("account import succeeds");
+    let account_id = account.account.account_id_hex;
+    (dir, app, runtime, keys, account_id)
+}
+
+/// Packs often live only on the host's configured relays, which an imported
+/// account's relay list need not name. Reads reach them; the installed list
+/// still publishes to the account's relays alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn configured_relays_serve_pack_reads_but_not_the_installed_list() {
+    storage_sqlite::relax_storage_for_test_process();
+    install_mock_keyring();
+    let account_relay = LocalRelay::new(RelayBuilder::default());
+    account_relay.run().await.unwrap();
+    let account_url = account_relay.url().await.to_string();
+    let configured_relay = LocalRelay::new(RelayBuilder::default());
+    configured_relay.run().await.unwrap();
+    let configured_url = configured_relay.url().await.to_string();
+
+    let author = Keys::generate();
+    let pack_kind = sonar_stickers::STICKER_PACK_KIND;
+    let now = unix_now();
+    for identifier in ["default", "browse"] {
+        publish_signed(
+            &configured_url,
+            &author,
+            pack_kind,
+            pack_tags(&author, identifier, identifier, "wave"),
+            now - 100,
+        )
+        .await;
+    }
+    let default_pack = format!("{pack_kind}:{}:default", author.public_key().to_hex());
+    let browse_pack = format!("{pack_kind}:{}:browse", author.public_key().to_hex());
+    let (_dir, app, runtime, keys, account_id) =
+        import_account_on(&account_url, &configured_url).await;
+
+    let installed = app
+        .install_sticker_pack(&account_id, &default_pack)
+        .await
+        .expect("a pack only the configured relay holds installs");
+    assert!(installed.installed);
+
+    let synced = app.sync_sticker_packs(&account_id).await.unwrap();
+    assert_eq!(
+        synced.discovered, 2,
+        "discovery reaches the configured relay"
+    );
+    assert_eq!(synced.pending_operations, 0);
+    let browsable = app
+        .sticker_packs(&account_id, false, None, None)
+        .unwrap()
+        .into_iter()
+        .map(|pack| pack.coordinate)
+        .collect::<Vec<_>>();
+    assert!(browsable.contains(&browse_pack));
+
+    let (_, packs) = remote_installed_list(&account_url, keys.public_key()).await;
+    assert_eq!(packs, vec![default_pack]);
+    assert_eq!(
+        installed_list_count(&configured_url, keys.public_key()).await,
+        0,
+        "the installed list is never published to a configured relay"
+    );
+
+    runtime.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn newest_pack_version_wins_across_account_and_configured_relays() {
+    storage_sqlite::relax_storage_for_test_process();
+    install_mock_keyring();
+    let account_relay = LocalRelay::new(RelayBuilder::default());
+    account_relay.run().await.unwrap();
+    let account_url = account_relay.url().await.to_string();
+    let configured_relay = LocalRelay::new(RelayBuilder::default());
+    configured_relay.run().await.unwrap();
+    let configured_url = configured_relay.url().await.to_string();
+
+    let author = Keys::generate();
+    let pack_kind = sonar_stickers::STICKER_PACK_KIND;
+    let now = unix_now();
+    // Each source holds the newer version of one pack and the older of the other.
+    for (identifier, newer_url, older_url) in [
+        ("cats", &configured_url, &account_url),
+        ("dogs", &account_url, &configured_url),
+    ] {
+        publish_signed(
+            older_url,
+            &author,
+            pack_kind,
+            pack_tags(&author, identifier, "Old", "wave"),
+            now - 100,
+        )
+        .await;
+        publish_signed(
+            newer_url,
+            &author,
+            pack_kind,
+            pack_tags(&author, identifier, "New", "wave"),
+            now - 50,
+        )
+        .await;
+    }
+    let (_dir, app, runtime, _keys, account_id) =
+        import_account_on(&account_url, &configured_url).await;
+
+    for identifier in ["cats", "dogs"] {
+        let coordinate = format!("{pack_kind}:{}:{identifier}", author.public_key().to_hex());
+        let pack = app
+            .fetch_sticker_pack(&account_id, &coordinate)
+            .await
+            .expect("the pack resolves");
+        assert_eq!(pack.title, "New", "{identifier}: the newer version wins");
+    }
+
+    runtime.shutdown().await;
+}
+
+fn emoji_set_tags(identifier: &str, title: &str) -> Vec<Tag> {
+    vec![
+        Tag::custom("d", [identifier.to_owned()]),
+        Tag::custom("title", [title.to_owned()]),
+        Tag::custom(
+            "emoji",
+            ["wave".to_owned(), "https://cdn.example/wave.png".to_owned()],
+        ),
+    ]
+}
+
+/// Emoji sets read from the same relays as sticker packs: a set only the
+/// configured relay holds is discovered, fetched and resolved from the
+/// account's list, and the newest version wins across both sources.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn emoji_set_reads_reach_configured_relays() {
+    use marmot_app::{EMOJI_SET_KIND, USER_EMOJI_LIST_KIND};
+
+    storage_sqlite::relax_storage_for_test_process();
+    install_mock_keyring();
+    let account_relay = LocalRelay::new(RelayBuilder::default());
+    account_relay.run().await.unwrap();
+    let account_url = account_relay.url().await.to_string();
+    let configured_relay = LocalRelay::new(RelayBuilder::default());
+    configured_relay.run().await.unwrap();
+    let configured_url = configured_relay.url().await.to_string();
+
+    let author = Keys::generate();
+    let now = unix_now();
+    let coordinate = |identifier: &str| {
+        format!(
+            "{EMOJI_SET_KIND}:{}:{identifier}",
+            author.public_key().to_hex()
+        )
+    };
+    for (url, identifier, title, created_at) in [
+        (&configured_url, "configured", "Configured", now - 100),
+        (&configured_url, "pointed", "Pointed", now - 100),
+        (&configured_url, "both", "Old", now - 100),
+        (&account_url, "both", "New", now - 50),
+    ] {
+        publish_signed(
+            url,
+            &author,
+            EMOJI_SET_KIND,
+            emoji_set_tags(identifier, title),
+            created_at,
+        )
+        .await;
+    }
+    let (_dir, app, runtime, keys, account_id) =
+        import_account_on(&account_url, &configured_url).await;
+    // The account's own list lives on its relay and points at a set only the
+    // configured relay holds.
+    publish_signed(
+        &account_url,
+        &keys,
+        USER_EMOJI_LIST_KIND,
+        vec![Tag::custom("a", [coordinate("pointed")])],
+        now - 40,
+    )
+    .await;
+
+    let synced = app.sync_emoji_sets(&account_id, None).await.unwrap();
+    assert_eq!(
+        synced.discovered, 3,
+        "discovery reaches the configured relay"
+    );
+    let both = app
+        .emoji_set(&account_id, &coordinate("both"))
+        .await
+        .unwrap()
+        .expect("discovered");
+    assert_eq!(both.title.as_deref(), Some("New"), "the newer version wins");
+
+    let fetched = app
+        .fetch_emoji_set(&account_id, &coordinate("configured"))
+        .await
+        .expect("a set only the configured relay holds resolves");
+    assert_eq!(fetched.title.as_deref(), Some("Configured"));
+
+    let list = app.user_emoji_list(&account_id).await.unwrap();
+    assert_eq!(
+        list.sets
+            .iter()
+            .map(|set| set.coordinate.clone())
+            .collect::<Vec<_>>(),
+        vec![coordinate("pointed")]
+    );
+    assert!(list.missing_set_coordinates.is_empty());
 
     runtime.shutdown().await;
 }

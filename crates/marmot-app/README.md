@@ -529,7 +529,7 @@ separate call the host makes after a user action:
 
 | Call | Network | What it reaches |
 | --- | --- | --- |
-| `sync_emoji_sets`, `fetch_emoji_set`, `user_emoji_list` | Relays, text only | The sticker discovery relays (account relays), plus up to 8 relay hints from a pasted `naddr` |
+| `sync_emoji_sets`, `fetch_emoji_set`, `user_emoji_list` | Relays, text only | Sets: the account relays and the runtime's configured relays (the sticker pack read relays), plus up to 8 relay hints from a pasted `naddr`. The account's own kind-10030 list: the account relays only |
 | `fetch_emoji_set_asset`, `fetch_emoji_set_cover` | One image host | The host the set's author chose for that emoji or the cover; nothing is stored |
 | `install_emoji_set` | Every image host in the set | Downloads each emoji once and stores the bytes |
 | `emoji_sets`, `emoji_set`, `installed_custom_emoji`, `read_installed_custom_emoji`, `uninstall_emoji_set` | None | Local storage only, read on the blocking pool |

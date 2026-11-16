@@ -2,7 +2,9 @@
 //! (kind 10030, read only).
 //!
 //! Egress is explicit. Discovery, `fetch_emoji_set` and `user_emoji_list`
-//! read text events from relays and never fetch an image. Image bytes come
+//! read text events from relays and never fetch an image. Sets are read from
+//! the account's relays and the runtime's configured relays together, as
+//! sticker packs are; the account's own list only from the account's relays. Image bytes come
 //! only from `fetch_emoji_set_asset` (one preview), `fetch_emoji_set_cover`
 //! (the set's cover) and `install_emoji_set` (every emoji of a set), each of
 //! which tells the image host the user's IP address, so hosts call them only
@@ -683,7 +685,11 @@ struct EmojiAccountContext {
     label: String,
     account_id_hex: String,
     storage: SqliteAppStorage,
+    /// The account's own relays: the kind-10030 list is read from these only.
     endpoints: Vec<TransportEndpoint>,
+    /// Set reads (discovery, one set, the sets a list points to): the
+    /// account's relays plus the runtime's configured relays.
+    set_read_endpoints: Vec<TransportEndpoint>,
 }
 
 impl MarmotApp {
@@ -732,8 +738,9 @@ impl MarmotApp {
         .await
     }
 
-    /// Fetch the newest kind-30030 sets from the account's relays (the ones
-    /// sticker discovery uses), keeping only the newest version of each
+    /// Fetch the newest kind-30030 sets from the account's relays and the
+    /// runtime's configured relays (the ones sticker discovery uses), keeping
+    /// only the newest version of each
     /// address. Text only: never fetches an image. A `search` that is an
     /// `npub` or hex public key narrows the fetch to that author; other text
     /// is matched locally by [`MarmotApp::emoji_sets`].
@@ -751,12 +758,15 @@ impl MarmotApp {
         if let Some(author) = search.and_then(author_search) {
             filter = filter.author(author);
         }
+        // The event budget scales with the relays queried, so one relay's
+        // answers cannot crowd out another's newer versions.
         let fetched = self
             .relay_plane
             .fetch_public_events(
-                context.endpoints.clone(),
+                context.set_read_endpoints.clone(),
                 vec![filter],
-                MAX_DISCOVERY_EMOJI_SETS * 2,
+                (MAX_DISCOVERY_EMOJI_SETS * 2)
+                    .saturating_mul(context.set_read_endpoints.len().max(1)),
             )
             .await
             .map_err(|_| AppError::EmojiSetNetwork("emoji set discovery failed".into()))?;
@@ -776,7 +786,8 @@ impl MarmotApp {
     }
 
     /// Fetch one set by coordinate or `naddr` (its relay hints, at most 8,
-    /// are tried as well as the account's relays). Text only.
+    /// are tried as well as the account's and the runtime's configured
+    /// relays). Text only.
     pub async fn fetch_emoji_set(
         &self,
         account_ref: &str,
@@ -1286,7 +1297,12 @@ impl MarmotApp {
             }
         }
         match self
-            .fetch_set_versions(context, &coordinate, context.endpoints.clone(), filter)
+            .fetch_set_versions(
+                context,
+                &coordinate,
+                context.set_read_endpoints.clone(),
+                filter,
+            )
             .await
         {
             Ok(_) => {}
@@ -1306,9 +1322,10 @@ impl MarmotApp {
         endpoints: Vec<TransportEndpoint>,
         filter: Filter,
     ) -> Result<bool, AppError> {
+        let max_events = MAX_REPLACEABLE_VERSIONS_PER_FETCH.saturating_mul(endpoints.len().max(1));
         let events = self
             .relay_plane
-            .fetch_public_events(endpoints, vec![filter], MAX_REPLACEABLE_VERSIONS_PER_FETCH)
+            .fetch_public_events(endpoints, vec![filter], max_events)
             .await
             .map_err(|_| AppError::EmojiSetNetwork("emoji set fetch failed".into()))?
             .events;
@@ -1351,7 +1368,8 @@ impl MarmotApp {
                 None => by_author.push((author, vec![pointer.identifier.clone()])),
             }
         }
-        let endpoints = context.endpoints.clone();
+        let endpoints = context.set_read_endpoints.clone();
+        let relays = endpoints.len().max(1);
         let mut reads = futures::stream::iter(by_author)
             .map(|(author, identifiers)| {
                 let endpoints = endpoints.clone();
@@ -1364,7 +1382,7 @@ impl MarmotApp {
                 async move {
                     let read = self
                         .relay_plane
-                        .fetch_public_events(endpoints, vec![filter], limit)
+                        .fetch_public_events(endpoints, vec![filter], limit.saturating_mul(relays))
                         .await;
                     (read, limit)
                 }
@@ -1378,6 +1396,8 @@ impl MarmotApp {
             };
             // A relay applies `limit` to the whole filter: a full reply may be
             // all versions of one set, hiding another of the same author.
+            // Replies from several relays can reach `limit` together; that
+            // reads as incomplete too, never as complete when it is not.
             complete &= fetched.complete && fetched.events.len() < limit;
             for event in fetched.events {
                 if let Ok(set) = stored_set_from_event(&event, allow_loopback)
@@ -1438,7 +1458,8 @@ impl MarmotApp {
         .await
     }
 
-    /// The relays sticker discovery uses: the account's outbox relays.
+    /// The account's outbox relays, and for set reads those plus the
+    /// runtime's configured relays: the relays sticker pack reads use.
     fn emoji_context(&self, account_ref: &str) -> Result<EmojiAccountContext, AppError> {
         let account = self.account_home().account(account_ref)?;
         let relay_lists = self
@@ -1454,6 +1475,7 @@ impl MarmotApp {
             label: account.label.clone(),
             account_id_hex: account.account_id_hex,
             storage: self.account_storage(&account.label)?.app_storage(),
+            set_read_endpoints: crate::stickers::pack_read_endpoints(self, &endpoints),
             endpoints,
         })
     }
