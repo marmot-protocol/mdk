@@ -29,6 +29,7 @@ pub enum PendingCommitChange {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audit::{AuditEventKind, AuditRecord, ForensicRecorder, JsonlRecorder};
     use crate::v5;
 
     /// The change enum is a schema-visible catalog: a variant added on one
@@ -62,5 +63,45 @@ mod tests {
             .map(|value| value.as_str().unwrap().to_owned())
             .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(names, defined);
+    }
+
+    /// A pending commit is always a group's: the writer refuses a row that
+    /// names none, and so do the schema and the Rust validator a receiver
+    /// ports.
+    #[test]
+    fn a_pending_commit_row_names_its_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = crate::audit::default_v5_jsonl_path(dir.path(), &"11".repeat(16));
+        let producer = v5::Producer {
+            mdk_revision: None,
+            build_profile: v5::BuildProfile::Debug,
+            platform: v5::Platform::Other,
+            host_build: None,
+        };
+        let recorder =
+            JsonlRecorder::open_v5_with_account_ref(&path, "11".repeat(16), None, producer)
+                .unwrap();
+        let kind = AuditEventKind::PendingCommitChanged {
+            change: PendingCommitChange::GivenUp,
+            msg_id: "5c".repeat(32),
+            pending_secs: 600,
+        };
+        recorder.record(AuditRecord::new(None, kind.clone()));
+        recorder.record(AuditRecord::new(Some("ab".repeat(16)), kind));
+        let written = std::fs::read_to_string(&path).unwrap();
+        let rows = written
+            .lines()
+            .filter(|line| line.contains("pending_commit_changed"))
+            .collect::<Vec<_>>();
+        let [row] = rows.as_slice() else {
+            panic!("only the group's row is written: {rows:?}")
+        };
+        let schema: serde_json::Value = serde_json::from_str(v5::JSON_SCHEMA).unwrap();
+        let validator = jsonschema::validator_for(&schema).unwrap();
+        let mut value: serde_json::Value = serde_json::from_str(row).unwrap();
+        assert!(validator.is_valid(&value));
+        value["group_ref"] = serde_json::Value::Null;
+        assert!(!validator.is_valid(&value));
+        assert!(v5::Record::from_json(&serde_json::to_vec(&value).unwrap()).is_err());
     }
 }

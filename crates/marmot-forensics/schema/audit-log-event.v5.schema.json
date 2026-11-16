@@ -186,6 +186,29 @@
           }
         }
       }
+    },
+    {
+      "if": {
+        "properties": {
+          "event": {
+            "properties": {
+              "type": {
+                "const": "pending_commit_changed"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "group_ref": {
+            "$ref": "#/$defs/GroupRef"
+          }
+        }
+      }
     }
   ],
   "$defs": {

@@ -716,7 +716,7 @@ account runtime writes it at three points:
 
 Metadata notes:
 
-- This event has `group_ref`.
+- This event always has `group_ref`: the schema and the Rust validator refuse a row without one.
 - A stuck commit can still confirm by a resend's `OK`: then `stuck` is its only row here.
 
 ### `epoch_state_changed`

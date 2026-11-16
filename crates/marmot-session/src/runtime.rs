@@ -6686,9 +6686,11 @@ where
     /// before, and nothing rolls back. Returns whether the acknowledgements
     /// met the commit's goal, for the caller to confirm it.
     ///
-    /// The first read audits that the commit went stuck (mdk#3460), recorded
-    /// on the stored fanout before the read is sent, so a restart does not
-    /// audit it again.
+    /// The first read while no relay has acknowledged the commit, the state
+    /// [`PendingCommitState::Stuck`] reports, audits that it went stuck
+    /// (mdk#3460). That is recorded on the stored fanout before the read is
+    /// sent, so a restart does not audit it again. Below a goal of more than
+    /// one acknowledgement, a commit some relay acknowledged is not stuck.
     async fn read_back_pending_commit(
         &mut self,
         fanout: &mut OutboundFanout,
@@ -6714,7 +6716,7 @@ where
         if read.is_empty() {
             return Ok(false);
         }
-        if fanout.record_stuck(now_ms) {
+        if fanout.outcome().accepted_targets == 0 && fanout.record_stuck(now_ms) {
             self.session.put_outbound_fanout(fanout)?;
             self.record_pending_commit_change(fanout, context, PendingCommitChange::Stuck, now_ms);
         }
