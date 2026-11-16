@@ -1737,6 +1737,47 @@ async fn settled_linked_devices() -> (Devices, GroupId) {
     (devices, group)
 }
 
+/// A settled device group's maintenance pass, the session maintenance every
+/// idle tick runs, takes no writer transaction on either device's app or
+/// session database (mdk#3479). Passes may still owe work at first; rounds
+/// settle until three in a row write nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_settled_device_groups_maintenance_takes_no_writer() {
+    let (mut devices, _) = boxed(settled_linked_devices).await;
+    let writers = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    for client in [&devices.phone, &devices.laptop] {
+        let app = client.app.account_storage("alice").unwrap();
+        for storage in [app, client.engine_storage.clone()] {
+            let writers = writers.clone();
+            storage.set_timing_observer(Some(Arc::new(move |operation, _, _| {
+                if operation == storage_sqlite::SqliteTimingOperation::WriteBegin {
+                    writers.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            })));
+        }
+    }
+    let written = || writers.load(std::sync::atomic::Ordering::Relaxed);
+    let mut quiet = 0;
+    for _ in 0..8 {
+        let before = written();
+        for client in [&mut devices.phone, &mut devices.laptop] {
+            boxed(|| client.run_due_maintenance()).await.unwrap();
+        }
+        quiet = if written() == before { quiet + 1 } else { 0 };
+        if quiet == 3 {
+            break;
+        }
+        // What a round sent reaches the other device; delivery writes.
+        for client in [&mut devices.phone, &mut devices.laptop] {
+            deliver_all(client, &devices.relay).await;
+        }
+    }
+    assert_eq!(
+        quiet, 3,
+        "a settled device group's maintenance pass takes no writer"
+    );
+}
+
 /// `devices` with the phone's client reopened with the audit log on, which a
 /// client reads when it opens.
 async fn with_phone_audit_log(devices: Devices) -> Devices {

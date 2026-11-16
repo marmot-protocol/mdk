@@ -566,6 +566,21 @@ impl SqliteAppStorage {
     /// many went.
     pub fn expire_history_deliveries(&self, now: u64) -> StorageResult<usize> {
         let before = u64_to_i64(now.saturating_sub(HISTORY_DELIVERY_RETENTION_SECS))?;
+        // Every maintenance tick asks: read first, so nothing to expire takes
+        // no writer transaction (mdk#2923, mdk#3479).
+        let expired: bool = self
+            .lock()?
+            .query_row_cached(
+                "SELECT EXISTS(SELECT 1 FROM history_deliveries_owed WHERE owed_at < ?1)
+                     OR EXISTS(SELECT 1 FROM history_delivery_sends WHERE recorded_at < ?1)
+                     OR EXISTS(SELECT 1 FROM history_deliveries_parked WHERE received_at < ?1)",
+                params![before],
+                |row| row.get(0),
+            )
+            .storage()?;
+        if !expired {
+            return Ok(0);
+        }
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
             let owed = conn

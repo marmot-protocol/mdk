@@ -913,6 +913,11 @@ impl SqliteAppStorage {
         now_seconds: u64,
         mark: RecoveryCoverageMark,
     ) -> StorageResult<bool> {
+        // Every maintenance pass re-observes live coverage, and a settled
+        // observation has no slice: that takes no writer (mdk#3479).
+        if slices.is_empty() {
+            return Ok(true);
+        }
         self.connection.with_transaction(|| {
             record_coverage_since_tx(&*self.lock()?, slices, now_seconds, mark)
         })

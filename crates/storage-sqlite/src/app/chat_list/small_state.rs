@@ -16,7 +16,10 @@
 //!   pins, mutes and read positions here, archives by the caller, which owns
 //!   the in-memory account state.
 //!
-//! Nothing happens before [`SqliteAppStorage::start_small_state`].
+//! Nothing happens before [`SqliteAppStorage::start_small_state`]. A pass
+//! with nothing received first runs the same reads on a read snapshot and
+//! takes a writer only when it would change something, so a maintenance pass
+//! with nothing to do writes nothing (mdk#3479).
 
 use super::{
     ChatPinError, MentionClassifier, pinned_chat_order_tx, read_state_tx, refresh_chat_list_row_tx,
@@ -213,6 +216,10 @@ impl SqliteAppStorage {
     /// Start taking part in small state, owing a broadcast request. `true`
     /// when this call started it.
     pub fn start_small_state(&self) -> StorageResult<bool> {
+        // Every maintenance pass asks: read first (mdk#3479).
+        if self.small_state_started()? {
+            return Ok(false);
+        }
         let inserted = self
             .lock()?
             .execute_cached(
@@ -325,31 +332,33 @@ impl SqliteAppStorage {
         rule: &dyn SmallStateRule,
         mention_classifier: &MentionClassifier<'_>,
     ) -> StorageResult<SmallStateSync> {
+        let pass = |pass: &mut Pass<'_>| {
+            small_state_pass_tx(
+                pass,
+                local_account_id_hex,
+                incoming,
+                rule,
+                mention_classifier,
+            )
+        };
+        // With nothing to merge, probe first: a pass that would write nothing
+        // and leaves no archive to apply returns what it would have.
+        if !incoming.iter().any(SmallStateItem::is_valid) {
+            let due = self.connection.with_deferred_read(|conn| {
+                let mut probe = Pass::Probe {
+                    conn,
+                    writes: false,
+                };
+                let outcome = pass(&mut probe)?;
+                Ok::<_, StorageError>(probe.writes() || !outcome.archive_to_apply.is_empty())
+            })?;
+            if !due {
+                return Ok(SmallStateSync::default());
+            }
+        }
         self.connection.with_transaction(|| {
             let mut conn = self.lock()?;
-            let mut outcome = SmallStateSync::default();
-            if !small_state_started_tx(&conn)? {
-                return Ok(outcome);
-            }
-            let now = unix_now_seconds();
-            forget_left_chats_tx(&conn)?;
-            let chats = held_chats_tx(&conn)?;
-            outcome.recorded = record_local_changes_tx(&conn, &chats, rule, now)?;
-            for item in incoming.iter().filter(|item| item.is_valid()) {
-                merge_item_tx(&conn, item, rule, now)?;
-            }
-            apply_winners_tx(&mut conn, &chats, rule, &mut outcome)?;
-            for (group_id_hex, names) in &outcome.applied {
-                if names.contains(&SmallStateItemName::Read) {
-                    refresh_chat_list_row_tx(
-                        &conn,
-                        local_account_id_hex,
-                        group_id_hex,
-                        mention_classifier,
-                    )?;
-                }
-            }
-            Ok(outcome)
+            pass(&mut Pass::Apply(&mut conn))
         })
     }
 
@@ -403,6 +412,85 @@ impl SqliteAppStorage {
             Ok(ordinary + invitations)
         })
     }
+}
+
+/// How [`small_state_pass_tx`] runs: `Apply` writes in the caller's writer
+/// transaction; `Probe` makes the same reads on a read snapshot and only
+/// notes that it would write. Until a probe's first write the two read the
+/// same state, so a probe that notes none means the pass writes nothing.
+enum Pass<'c> {
+    Apply(&'c mut Connection),
+    Probe { conn: &'c Connection, writes: bool },
+}
+
+impl Pass<'_> {
+    fn conn(&self) -> &Connection {
+        match self {
+            Self::Apply(conn) => conn,
+            Self::Probe { conn, .. } => conn,
+        }
+    }
+
+    fn write(
+        &mut self,
+        write: impl FnOnce(&mut Connection) -> StorageResult<()>,
+    ) -> StorageResult<()> {
+        match self {
+            Self::Apply(conn) => write(conn),
+            Self::Probe { writes, .. } => {
+                *writes = true;
+                Ok(())
+            }
+        }
+    }
+
+    /// A new change's id; a probe writes no change, so it draws none.
+    fn new_change_id(&self, rule: &dyn SmallStateRule) -> [u8; 16] {
+        match self {
+            Self::Apply(_) => rule.new_change_id(),
+            Self::Probe { .. } => [0; 16],
+        }
+    }
+
+    fn writes(&self) -> bool {
+        matches!(self, Self::Probe { writes: true, .. })
+    }
+}
+
+/// One [`SqliteAppStorage::sync_small_state`] pass run as `pass` says.
+fn small_state_pass_tx(
+    pass: &mut Pass<'_>,
+    local_account_id_hex: &str,
+    incoming: &[SmallStateItem],
+    rule: &dyn SmallStateRule,
+    mention_classifier: &MentionClassifier<'_>,
+) -> StorageResult<SmallStateSync> {
+    let mut outcome = SmallStateSync::default();
+    if !small_state_started_tx(pass.conn())? {
+        return Ok(outcome);
+    }
+    let now = unix_now_seconds();
+    forget_left_chats_tx(pass)?;
+    let chats = held_chats_tx(pass.conn())?;
+    outcome.recorded = record_local_changes_tx(pass, &chats, rule, now)?;
+    for item in incoming.iter().filter(|item| item.is_valid()) {
+        merge_item_tx(pass, item, rule, now)?;
+    }
+    apply_winners_tx(pass, &chats, rule, &mut outcome)?;
+    for (group_id_hex, names) in &outcome.applied {
+        if names.contains(&SmallStateItemName::Read) {
+            pass.write(|conn| {
+                refresh_chat_list_row_tx(
+                    conn,
+                    local_account_id_hex,
+                    group_id_hex,
+                    mention_classifier,
+                )
+                .map(drop)
+            })?;
+        }
+    }
+    Ok(outcome)
 }
 
 fn small_state_started_tx(conn: &Connection) -> StorageResult<bool> {
@@ -597,14 +685,29 @@ fn held_chats_tx(conn: &Connection) -> StorageResult<BTreeMap<String, HeldChat>>
 /// A chat this device left keeps its items but no longer has its own state of
 /// them: when it comes back, its items are applied again, never taken for a
 /// change.
-fn forget_left_chats_tx(conn: &Connection) -> StorageResult<()> {
-    conn.execute_cached(
-        "UPDATE small_state_items SET observed = NULL
-         WHERE observed IS NOT NULL
-           AND group_id_hex NOT IN (SELECT group_id_hex FROM account_groups)",
-        [],
-    )
-    .storage()?;
+fn forget_left_chats_tx(pass: &mut Pass<'_>) -> StorageResult<()> {
+    let left: bool = pass
+        .conn()
+        .query_row_cached(
+            "SELECT EXISTS(SELECT 1 FROM small_state_items
+                 WHERE observed IS NOT NULL
+                   AND group_id_hex NOT IN (SELECT group_id_hex FROM account_groups))",
+            [],
+            |row| row.get(0),
+        )
+        .storage()?;
+    if left {
+        pass.write(|conn| {
+            conn.execute_cached(
+                "UPDATE small_state_items SET observed = NULL
+                 WHERE observed IS NOT NULL
+                   AND group_id_hex NOT IN (SELECT group_id_hex FROM account_groups)",
+                [],
+            )
+            .storage()?;
+            Ok(())
+        })?;
+    }
     Ok(())
 }
 
@@ -827,7 +930,7 @@ fn set_observed_tx(
 /// into a new value, owed to the siblings. A read position counts only when
 /// it moved past the held one.
 fn record_local_changes_tx(
-    conn: &Connection,
+    pass: &mut Pass<'_>,
     chats: &BTreeMap<String, HeldChat>,
     rule: &dyn SmallStateRule,
     now: u64,
@@ -835,7 +938,7 @@ fn record_local_changes_tx(
     let mut recorded = 0;
     for (group_id_hex, chat) in chats {
         if let Some(local) = chat.read.clone() {
-            let held = held_item_tx(conn, group_id_hex, SmallStateItemName::Read)?;
+            let held = held_item_tx(pass.conn(), group_id_hex, SmallStateItemName::Read)?;
             let further = match held.map(|item| item.value) {
                 Some(SmallStateValue::Read(held)) => local > held,
                 _ => true,
@@ -846,13 +949,13 @@ fn record_local_changes_tx(
                 version: None,
             };
             if further && item.is_valid() {
-                write_item_tx(conn, &item, None, true, now)?;
+                pass.write(|conn| write_item_tx(conn, &item, None, true, now))?;
                 recorded += 1;
             }
         }
         for name in SmallStateItemName::VERSIONED {
             let observed = chat.observed(name);
-            let version = match held_row_tx(conn, group_id_hex, name)? {
+            let version = match held_row_tx(pass.conn(), group_id_hex, name)? {
                 // Not applied yet: the winner is applied below, not replaced.
                 Some(HeldRow { observed: None, .. }) => continue,
                 Some(HeldRow {
@@ -863,7 +966,7 @@ fn record_local_changes_tx(
                     // No change can beat the highest version: put the held
                     // value back.
                     Some(held) if held.version >= MAX_SMALL_STATE_NUMBER => {
-                        clear_observed_tx(conn, group_id_hex, name)?;
+                        pass.write(|conn| clear_observed_tx(conn, group_id_hex, name))?;
                         continue;
                     }
                     held => held.map_or(1, |held| held.version + 1),
@@ -879,11 +982,11 @@ fn record_local_changes_tx(
                 value,
                 version: Some(SmallStateVersion {
                     version,
-                    change_id: rule.new_change_id(),
+                    change_id: pass.new_change_id(rule),
                 }),
             };
             if item.is_valid() {
-                write_item_tx(conn, &item, Some(&observed), true, now)?;
+                pass.write(|conn| write_item_tx(conn, &item, Some(&observed), true, now))?;
                 recorded += 1;
             }
         }
@@ -894,17 +997,17 @@ fn record_local_changes_tx(
 /// Keep `incoming` when it beats the held value. A value that wins is not
 /// applied yet, and is not owed: its sender has it.
 fn merge_item_tx(
-    conn: &Connection,
+    pass: &mut Pass<'_>,
     incoming: &SmallStateItem,
     rule: &dyn SmallStateRule,
     now: u64,
 ) -> StorageResult<()> {
-    let held = held_item_tx(conn, &incoming.group_id_hex, incoming.name())?;
+    let held = held_item_tx(pass.conn(), &incoming.group_id_hex, incoming.name())?;
     if held
         .as_ref()
         .is_none_or(|held| held != incoming && rule.wins(incoming, held))
     {
-        write_item_tx(conn, incoming, None, false, now)?;
+        pass.write(|conn| write_item_tx(conn, incoming, None, false, now))?;
     }
     Ok(())
 }
@@ -913,14 +1016,15 @@ fn merge_item_tx(
 /// applied: pins and mutes once, read positions whenever they are further than
 /// the chat's marker.
 fn apply_winners_tx(
-    conn: &mut Connection,
+    pass: &mut Pass<'_>,
     chats: &BTreeMap<String, HeldChat>,
     rule: &dyn SmallStateRule,
     outcome: &mut SmallStateSync,
 ) -> StorageResult<()> {
     for (group_id_hex, chat) in chats {
         if let Some(SmallStateValue::Read(position)) =
-            held_item_tx(conn, group_id_hex, SmallStateItemName::Read)?.map(|item| item.value)
+            held_item_tx(pass.conn(), group_id_hex, SmallStateItemName::Read)?
+                .map(|item| item.value)
         {
             let key = (
                 1,
@@ -930,7 +1034,7 @@ fn apply_winners_tx(
                 position.message_id_hex.clone(),
             );
             if chat.read_key.as_ref().is_none_or(|current| key > *current) {
-                advance_read_marker_tx(conn, group_id_hex, &position)?;
+                pass.write(|conn| advance_read_marker_tx(conn, group_id_hex, &position))?;
                 note_applied(outcome, group_id_hex, SmallStateItemName::Read);
             }
         }
@@ -939,7 +1043,7 @@ fn apply_winners_tx(
             let Some(HeldRow {
                 item,
                 observed: None,
-            }) = held_row_tx(conn, group_id_hex, name)?
+            }) = held_row_tx(pass.conn(), group_id_hex, name)?
             else {
                 continue;
             };
@@ -951,7 +1055,7 @@ fn apply_winners_tx(
                         continue;
                     }
                     if pin != pinned {
-                        set_pinned_tx(conn, group_id_hex, pin, rule)?;
+                        pass.write(|conn| set_pinned_tx(conn, group_id_hex, pin, rule))?;
                         pinned = pin;
                         note_applied(outcome, group_id_hex, name);
                     }
@@ -966,7 +1070,7 @@ fn apply_winners_tx(
                         }
                     };
                     if mute != chat.mute {
-                        set_mute_tx(conn, group_id_hex, mute)?;
+                        pass.write(|conn| set_mute_tx(conn, group_id_hex, mute))?;
                         note_applied(outcome, group_id_hex, name);
                     }
                     mute_text(mute)
@@ -982,7 +1086,7 @@ fn apply_winners_tx(
                 }
                 SmallStateValue::Read(_) => continue,
             };
-            set_observed_tx(conn, group_id_hex, name, &observed)?;
+            pass.write(|conn| set_observed_tx(conn, group_id_hex, name, &observed))?;
         }
     }
     Ok(())

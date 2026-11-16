@@ -236,6 +236,35 @@ fn starting_seeds_only_settings_that_differ_from_the_default() {
     assert_eq!(sync(&store, &[], &rule).recorded, 0);
 }
 
+/// Every maintenance pass runs one with nothing received (mdk#3479): one
+/// that finds nothing changed takes no writer transaction, and the next local
+/// change is still recorded.
+#[test]
+fn a_pass_with_nothing_to_do_takes_no_writer() {
+    let store = started_store(&[("11", false), ("22", false)]);
+    let app = store.app_storage();
+    let rule = TestRule::new();
+    app.set_chat_pinned("11", true).unwrap();
+    assert_eq!(sync(&store, &[], &rule).recorded, 1);
+    let writers = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+    let counted = writers.clone();
+    store.set_timing_observer(Some(std::sync::Arc::new(
+        move |operation, _duration, _success| {
+            if operation == crate::SqliteTimingOperation::WriteBegin {
+                *counted.lock().unwrap() += 1;
+            }
+        },
+    )));
+    assert!(!app.start_small_state().unwrap());
+    assert_eq!(sync(&store, &[], &rule), SmallStateSync::default());
+    assert_eq!(*writers.lock().unwrap(), 0);
+
+    app.set_chat_pinned("22", true).unwrap();
+    let writes = *writers.lock().unwrap();
+    assert_eq!(sync(&store, &[], &rule).recorded, 1);
+    assert_eq!(*writers.lock().unwrap(), writes + 1);
+}
+
 #[test]
 fn a_local_change_raises_the_version_and_stays_owed_until_sent() {
     let store = started_store(&[("11", false)]);
