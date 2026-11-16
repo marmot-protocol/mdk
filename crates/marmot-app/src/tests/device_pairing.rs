@@ -760,6 +760,92 @@ async fn a_completed_link_can_disappear_from_the_approvers_selected_roster() {
     assert!(!known_departure.previously_linked_here);
 }
 
+/// Alice signing in on one more device, sharing `first`'s relay, after
+/// whatever `first` has done.
+async fn another_alice_device(relay: &Arc<ScriptedPushRelayClient>, first: &Device) -> Device {
+    let first_home = AccountHome::open(first._dir.path());
+    let alice_id = first_home.account("alice").unwrap().account_id_hex;
+    let secret = first_home
+        .load_signing_keys("alice")
+        .unwrap()
+        .secret_key()
+        .to_secret_hex();
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .import_account("alice", &secret)
+        .unwrap();
+    let app = MarmotApp::with_relay_and_config(
+        dir.path(),
+        "wss://relay.example",
+        MarmotAppConfig::white_noise()
+            .with_dev_settlement_quiescence_ms(0)
+            .with_dev_scheduled_convergence_delay_ms(0)
+            .with_device_groups(true),
+    )
+    .with_test_relay_client(relay.clone());
+    remember_test_member_inbox(&app, &alice_id, "wss://relay.example");
+    let mut client = app.client("alice").await.unwrap();
+    published_key_package(&mut client, relay).await;
+    Device {
+        _dir: dir,
+        app,
+        client,
+        cursor: 0,
+    }
+}
+
+/// A device the user removes is not a sign-in to ask about or a rejection
+/// to report. The phone saw the laptop as a new sign-in before linking it,
+/// so it keeps a sign-in record of the laptop's slot. Once the phone removes
+/// the laptop, whose slot the roster then records as `removed`, and links
+/// the laptop again as it signs in afresh (a new slot, the account's same
+/// key), the phone lists neither the old slot nor a rejection of it, and its
+/// compromise warning stays empty.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_removed_and_relinked_device_is_not_a_rejected_sign_in() {
+    let (relay, [mut phone]) = alice_devices::<1>().await;
+    phone.client.check_sign_ins().await.unwrap();
+    let mut laptop = another_alice_device(&relay, &phone).await;
+    let mut relinked = another_alice_device(&relay, &phone).await;
+    let old_slot = laptop.slot_hex();
+    phone.client.check_sign_ins().await.unwrap();
+    let record = phone
+        .app
+        .account_storage("alice")
+        .unwrap()
+        .app_storage()
+        .sign_in(&old_slot)
+        .unwrap()
+        .expect("the phone saw the laptop as a new sign-in");
+    assert!(!record.before_this_device);
+    let group = link(&relay, &mut phone, &mut laptop, "Laptop").await;
+
+    phone.client.remove_linked_device(&old_slot).await.unwrap();
+    let old_slot_id: [u8; 32] = hex::decode(&old_slot).unwrap().try_into().unwrap();
+    assert_eq!(
+        phone.roster(&group).rejected_slots[&old_slot_id].reason,
+        cgka_traits::app_components::RejectedSlotReasonV1::Removed
+    );
+
+    assert_ne!(
+        relinked.slot_hex(),
+        old_slot,
+        "a fresh sign-in is a new slot"
+    );
+    link(&relay, &mut phone, &mut relinked, "Laptop").await;
+    phone.client.check_sign_ins().await.unwrap();
+
+    assert_eq!(phone.client.compromise_warning().unwrap(), []);
+    let listed = phone.client.unrecognized_sign_ins().unwrap();
+    assert!(
+        listed
+            .iter()
+            .all(|sign_in| sign_in.slot_id_hex != old_slot
+                && sign_in.slot_id_hex != relinked.slot_hex()),
+        "{listed:?}"
+    );
+}
+
 /// A later link adds the new device to the device group in one commit, by a
 /// device that joined through a Welcome. First ready wins: the other
 /// sibling's session ends, and its prompt then says who added the device.

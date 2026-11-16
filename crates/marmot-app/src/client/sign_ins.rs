@@ -992,7 +992,8 @@ fn roster_slot(slot_hex: &str) -> Option<DeviceSlotId> {
 /// How `record` is listed, if it is. A sign-in this device rejected is not,
 /// nor one it dismissed while the roster has an entry for its slot. One
 /// another device answered keeps its prompt, saying so, only while that
-/// prompt waited here for a new sign-in. A device that was
+/// prompt waited here for a new sign-in; a device the user removed is no
+/// such answer and leaves the list. A device that was
 /// here before this one, or a sign-in this device put off or linked itself,
 /// leaves the list once the roster answers it.
 fn listed_state(
@@ -1030,8 +1031,11 @@ fn listed_state(
             },
         );
     }
-    if roster.rejected_slots.contains_key(&slot) {
-        return keeps_prompt.then_some(UnrecognizedSignInState::RejectedElsewhere);
+    if let Some(rejected) = roster.rejected_slots.get(&slot) {
+        // A `removed` slot held a device the user linked and then removed:
+        // no one said it was not them, so there is nothing to ask or report.
+        return (keeps_prompt && rejected.reason == RejectedSlotReasonV1::NotMe)
+            .then_some(UnrecognizedSignInState::RejectedElsewhere);
     }
     Some(waiting)
 }
