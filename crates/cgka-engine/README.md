@@ -6,9 +6,9 @@ for Marmot. Read this if you are building on the engine directly or changing how
 The engine sits above OpenMLS, governs commit sequencing, adjudicates forks through distributed convergence, enforces
 MIP-03 admin rules, and returns typed outcomes for every ingest path.
 
-The default-off `dev-device-groups` capability permits the adopted device roster independently of policy-test timing.
-The app still requires runtime intent; a dev `wn`/`wnd` build supplies it. Ordinary release builds keep it off.
-See [dev device linking](../cli/README.md#device-linking-dev-builds).
+Every build may advertise the adopted device roster. `marmot-app` advertises it only when the host turns device groups
+on (`MarmotAppConfig::device_groups`, off by default).
+See [device linking](../cli/README.md#device-linking).
 
 ## Contents
 

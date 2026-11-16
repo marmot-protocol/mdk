@@ -5,11 +5,10 @@ session storage, the Nostr MLS peeler, the Nostr transport adapter, and relay-ba
 result as `MarmotApp` / `MarmotAppRuntime`. It sits below presentation layers (`wn`, the UniFFI and C bindings) and above
 the generic account, session, and engine crates. Read this if you are building a host app or binding on top of MDK.
 
-The default-off `dev-device-groups` capability permits the adopted device roster independently of policy-test timing.
-The app still requires runtime intent; a dev `wn`/`wnd` build supplies it. Ordinary release builds keep it off.
-An account that holds or is joining a device group opens only with both: otherwise its session fails with
+Every build includes device groups; a host turns them on with `MarmotAppConfig::with_device_groups(true)` (off by
+default). An account that holds or is joining a device group opens only with them on: otherwise its session fails with
 `AppError::ExperimentalDeviceGroupsRequired` before anything of it is read, sent or subscribed (mdk#3012).
-See [dev device linking](../cli/README.md#device-linking-dev-builds).
+See [device linking](../cli/README.md#device-linking).
 
 ## Contents
 
@@ -644,8 +643,7 @@ Welcomes travel privately through the device group, independently of the other a
 `MarmotAppRuntime::linked_devices(account_ref)` lists this account's own devices as `LinkedDevice`s, from the roster of
 the device group this device trusts (mdk#2628): this device first (`is_this_device`), then by `linked_at`. Each carries
 its KeyPackage slot (`slot_id_hex`, the handle device actions take), label, client and platform, who linked it, its
-`LinkedDeviceStatus` and its settings. It is empty until this device trusts a device group, or while explicit
-device-group capability and runtime intent are absent. The device group's own events never reach hosts; `MarmotAppEvent::LinkedDevicesChanged`
+`LinkedDeviceStatus` and its settings. It is empty until this device trusts a device group, or while the host keeps device groups off. The device group's own events never reach hosts; `MarmotAppEvent::LinkedDevicesChanged`
 says to re-read. It also fires once each time the account's worker opens or reconnects, so it may fire with no visible
 change.
 
@@ -743,7 +741,7 @@ It shows facts only: a chat with nothing to bring sends nothing, so no chat wait
 after a week leaves nothing. A delivery for a chat this device does not hold yet appears once it joins.
 `MarmotAppEvent::ChatHistoryImportsChanged` fires whenever that answer changes, as rows are pruned or a source device
 is renamed too, and once each time the account's worker opens or reconnects. Everything here is empty and silent unless
-`dev_device_groups` is on.
+`device_groups` is on.
 
 ### Recovery words
 
@@ -780,8 +778,7 @@ worker stop/replacement returns `TransportClosed`. Once queued, this caller's wa
 bounds its OS execution opportunity. Manual restore and
 supported lower-level `AppClient` APIs remain independent.
 
-Backup setup and manual restore require `dev_device_groups` (off by default) and a build with experimental
-device-group support; unsupported setup/restore returns `DeviceGroupRefused("roster_unsupported")`.
+Backup setup and manual restore require `device_groups` (off by default); unsupported setup/restore returns `DeviceGroupRefused("roster_unsupported")`.
 The runtime-wide fact report remains local, and the due-pass wait returns `NotStarted` when device groups are disabled.
 
 ### Manual backup history restore
@@ -830,8 +827,8 @@ publish is still unannounced, and the slot's newest publication by this device i
 days, so tell the user. A routine refresh announces and publishes in one maintenance pass and never shows; one that is
 announced but failing at the relays doesn't count. The client recomputes the answer after each maintenance pass, and
 `MarmotAppEvent::KeyPackageRefreshOverdueChanged` says to re-read. Like `LinkedDevicesChanged`, it also fires once each
-time the account's worker opens or reconnects. It is false, and the event silent, without explicit device-group
-capability and runtime intent.
+time the account's worker opens or reconnects. It is false, and the event silent, unless the host
+turns device groups on.
 
 ## Unrecognized sign-ins
 
@@ -868,14 +865,13 @@ already in the first roster this device trusts count as seen, and a rejected sig
 a device. `dismiss_compromise_warning` marks everything it gathers as seen, on this device only; a rejection that
 branch selection drops and restores stays seen. `CompromiseWarningReason` gains reasons in later releases; show one the
 host does not know as a generic one. `MarmotAppEvent::CompromiseWarningChanged` says to re-read, and also fires once
-each time the account's worker opens. All of it is empty and silent without explicit device-group capability and
-runtime intent.
+each time the account's worker opens. All of it is empty and silent unless the host turns device
+groups on.
 
 ## Linking a new device
 
-Device linking (mdk#2628) runs through the account runtime. It requires the `unreleased-device-pairing` feature,
-explicit device-group build capability (`dev-device-groups`, or policy-test builds), and the per-client
-`dev_device_groups` runtime intent; every call is refused otherwise. Each call returns a `DeviceLinkSnapshot`: the new device's own
+Device linking (mdk#2628) runs through the account runtime. It requires the per-client `device_groups` switch
+(off by default); every call is refused otherwise. Each call returns a `DeviceLinkSnapshot`: the new device's own
 link (`new_device`) and the prompts for sign-ins this device can link (`prompts`).
 
 - On the new device, `start_device_link` asks a device already signed in to link this one. Its state goes from

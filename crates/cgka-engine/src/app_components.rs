@@ -69,7 +69,7 @@ const NEVER_REQUIRED_APP_COMPONENTS: [AppComponentId; 1] = [DEVICE_TAG_COMPONENT
 /// its KeyPackages and leaves. A protocol id outside this list is refused by
 /// [`validate_supported_app_components`]: advertising a component tells other
 /// clients this one enforces its rules, and a group may then require it.
-const ADVERTISABLE_PROTOCOL_APP_COMPONENTS: [AppComponentId; 13] = [
+const ADVERTISABLE_PROTOCOL_APP_COMPONENTS: [AppComponentId; 14] = [
     APP_COMPONENTS_COMPONENT_ID,
     GROUP_PROFILE_COMPONENT_ID,
     GROUP_BLOSSOM_IMAGE_COMPONENT_ID,
@@ -83,17 +83,8 @@ const ADVERTISABLE_PROTOCOL_APP_COMPONENTS: [AppComponentId; 13] = [
     GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
     GROUP_LIFECYCLE_COMPONENT_ID,
     ACCOUNT_DEVICES_COMPONENT_ID,
+    DEVICE_ROSTER_COMPONENT_ID,
 ];
-
-/// Whether this build may advertise `marmot.account.device-roster.v1`. Its
-/// capability is default-off. Explicit `dev-device-groups` builds and policy
-/// tests may advertise the adopted roster; the app still requires runtime
-/// intent. Other builds cannot create or join a device group and treat its
-/// roster bytes in other groups as unknown data.
-const DEVICE_ROSTER_ADVERTISABLE: bool = cfg!(any(
-    feature = "dev-device-groups",
-    feature = "test-policy-overrides"
-));
 
 /// Refuse to advertise a protocol-owned component this engine does not
 /// implement. Application-owned ids (at or above
@@ -103,9 +94,9 @@ pub(crate) fn validate_supported_app_components(
     supported: &AppComponentSet,
 ) -> Result<(), EngineError> {
     for component_id in &supported.ids {
-        let advertisable = ADVERTISABLE_PROTOCOL_APP_COMPONENTS.contains(component_id)
-            || (*component_id == DEVICE_ROSTER_COMPONENT_ID && DEVICE_ROSTER_ADVERTISABLE);
-        if PROTOCOL_OWNED_APP_COMPONENT_IDS.contains(component_id) && !advertisable {
+        if PROTOCOL_OWNED_APP_COMPONENT_IDS.contains(component_id)
+            && !ADVERTISABLE_PROTOCOL_APP_COMPONENTS.contains(component_id)
+        {
             return Err(EngineError::Other(format!(
                 "engine cannot advertise protocol app component {component_id:#06x}: \
                  it does not implement it"
@@ -2465,18 +2456,9 @@ mod tests {
     }
 
     #[test]
-    fn the_device_roster_requires_an_explicit_build_capability() {
+    fn every_build_may_advertise_the_device_roster() {
         let supported = AppComponentSet::new([DEVICE_ROSTER_COMPONENT_ID]);
-        if cfg!(any(
-            feature = "dev-device-groups",
-            feature = "test-policy-overrides"
-        )) {
-            validate_supported_app_components(&supported).unwrap();
-        } else {
-            assert!(matches!(validate_supported_app_components(&supported),
-                Err(EngineError::Other(reason)) if reason ==
-                "engine cannot advertise protocol app component 0x800e: it does not implement it"));
-        }
+        validate_supported_app_components(&supported).unwrap();
     }
 
     #[test]

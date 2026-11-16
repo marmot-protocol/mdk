@@ -1460,40 +1460,22 @@ the stored snapshot.
 
 ## Experimental device-group test builds
 
-Ordinary constructors keep device groups disabled, including when the native library has the capability compiled in.
-For a controlled host test build, compile `dev-device-groups` and open with
+Every native library includes device groups; ordinary constructors keep them off. To turn them on, open with
 `Marmot.newWithExperimentalDeviceGroups(rootPath:relayUrls:options:)` (Swift) or
 `Marmot.newWithExperimentalDeviceGroups(rootPath, relayUrls, options)` (Kotlin). This uses the same `MarmotOptions`
 and required deployment as `newWithConfiguration`; relay policy, secret storage, attachment mode, cursor behavior,
-client name and platform retain their usual meanings. A library without this feature returns
-`experimental_device_groups_unavailable` before opening the root or acquiring a secret store. Use this constructor in
+client name and platform retain their usual meanings. Use this constructor in
 **every** foreground/background opener of the experimental root, a notification service extension or background
 worker included. An ordinary constructor does not open an account that holds or is joining a device group: its
 session fails with `MarmotKitError.Runtime` `experimental_device_groups_required` (and `start` reports it) before
 anything of that account is read, sent or subscribed, so its device-group messages and unfinished device-group commits
-wait for an experimental opener. Other accounts open as usual. This is an opt-in test build, not a release default.
+wait for an experimental opener. Other accounts open as usual. Device groups are opt-in, not a release default.
 Production settlement, retry and recovery timing remains unchanged; never enable `test-policy-overrides` in a host
 artifact.
 
-Build matching native libraries and generated bindings from the same source with the explicit flag:
-
-```sh
-./crates/marmot-uniffi/xcframework.sh --dev-device-groups
-./crates/marmot-uniffi/xcframework-macos.sh --dev-device-groups
-./crates/marmot-uniffi/kotlin-bindings.sh --dev-device-groups
-```
-
-Outputs go to `crates/marmot-uniffi/output-dev-device-groups/` (iOS at the root, macOS in `macos/`, Android
-in `android/`). Cargo outputs use an `dev-device-groups/` child of the selected target directory; Apple
-scratch uses `build/dev-device-groups/<platform>/`. The flag precedes any phase, for example
-`xcframework.sh --dev-device-groups generate`; use it for every phase and transfer only matching inputs.
-Ordinary invocations keep their usual outputs and remain incapable. These commands do not publish artifacts or
-change release automation. Copy the matching native library, generated source and platform resources together;
-source support alone does not establish a platform artifact or device test result.
-
-For a native generated-language constructor check, `options-smoke.sh swift` (or `kotlin`) checks the unavailable
-ordinary build; pass `--dev-device-groups` after the language to check an explicitly capable native library.
-These local host checks do not package or validate iOS/Android device artifacts.
+No build flag or separate artifact is needed: `xcframework.sh`, `xcframework-macos.sh` and `kotlin-bindings.sh`
+build the same library for both constructors. `options-smoke.sh swift` (or `kotlin`) also opens through the
+experimental constructor. These local host checks do not package or validate iOS/Android device artifacts.
 
 ## Linked devices
 
@@ -1842,7 +1824,7 @@ returns a `DeviceLinkSnapshotFfi`, and every call requires the explicit experime
 
 ## Backup recovery and background conditions
 
-Backup setup and manual restore require a `dev-device-groups` build opened with `newWithExperimentalDeviceGroups`
+Backup setup and manual restore require a root opened with `newWithExperimentalDeviceGroups`
 (see [experimental device-group test builds](#experimental-device-group-test-builds)); both are off by default.
 Otherwise every backup call is refused with `roster_unsupported`, and ordinary hosts have nothing to do. MDK owns backup selection, due work, download limits, import validation and membership checks;
 the host supplies platform facts, renders status and obtains recovery words from the user.

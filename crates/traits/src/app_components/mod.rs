@@ -138,9 +138,8 @@ pub const MAX_LEAVES_PER_ACCOUNT: usize = 20;
 /// `marmot.account.device-roster.v1`: the roster of an account's device
 /// group (mdk#2628 D16). Requiring it marks a group as a device group; the
 /// marker alone never makes a group trusted. Its update is a diff of keyed
-/// entries ([`DeviceRosterUpdateV1`]). The adopted roster is advertised only
-/// by explicit `dev-device-groups` or policy-test builds; ordinary releases
-/// keep that capability off.
+/// entries ([`DeviceRosterUpdateV1`]). Every build may advertise the
+/// adopted roster once a host turns device groups on.
 pub const DEVICE_ROSTER_COMPONENT_ID: AppComponentId = 0x800e;
 
 /// `marmot.member.device-tag.v1`: a LeafNode entry that says which of the

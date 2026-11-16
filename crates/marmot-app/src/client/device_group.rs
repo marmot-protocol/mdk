@@ -75,7 +75,6 @@ use super::{AppClient, UnpublishedWelcomeDelivery, UnpublishedWelcomeKind, group
 use crate::{AppError, unix_now_seconds};
 
 /// A link both devices confirmed, as device pairing produces it.
-#[cfg_attr(not(feature = "unreleased-device-pairing"), allow(dead_code))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConfirmedDeviceLink {
     /// The new device's published KeyPackage event.
@@ -271,7 +270,6 @@ impl AppClient {
     ///
     /// Refused unless this device advertises the roster, has no device group
     /// of its own yet, and finds that KeyPackage published by this account.
-    #[cfg_attr(not(feature = "unreleased-device-pairing"), allow(dead_code))]
     pub(crate) async fn create_device_group(
         &mut self,
         link: &ConfirmedDeviceLink,
@@ -485,7 +483,6 @@ impl AppClient {
     /// first and removed again if the engine cannot record the expectation.
     /// A crash between the two writes leaves a row with no expectation
     /// behind it, which admits nothing and which the next sweep drops.
-    #[cfg_attr(not(feature = "unreleased-device-pairing"), allow(dead_code))]
     pub(crate) fn record_confirmed_device_link(
         &mut self,
         link: &ConfirmedDeviceLink,
@@ -998,10 +995,6 @@ impl AppClient {
     /// Remove the leaf `leaf_signature_key` from the device group and its
     /// roster entry in one commit, as `operations` say: undoing a failed link
     /// (D40) or removing a device (3.6b).
-    #[cfg(any(
-        feature = "unreleased-device-pairing",
-        all(test, feature = "test-policy-overrides")
-    ))]
     pub(crate) async fn unlink_device_from_group(
         &mut self,
         group_id: &GroupId,
@@ -1141,7 +1134,6 @@ impl AppClient {
     /// again and retries the mark before it sends anything. Under the runtime,
     /// the deactivation that follows makes the mark too. Once the mark lands,
     /// a crash before the worker stops still leaves the account signed out.
-    #[cfg(any(test, feature = "unreleased-device-pairing"))]
     pub(crate) fn mark_device_unlinked(&mut self) -> Result<(), AppError> {
         self.device_unlinked = true;
         self.app

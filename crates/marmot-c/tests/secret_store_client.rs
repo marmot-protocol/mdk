@@ -542,58 +542,6 @@ mod experimental_host {
         }
     }
 
-    #[cfg(not(feature = "dev-device-groups"))]
-    #[test]
-    fn an_unavailable_experimental_constructor_has_no_root_or_callback_side_effects() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join("unopened");
-        let path = CString::new(root.to_str().unwrap()).unwrap();
-        let vault = Vault::default();
-        let store = store(&vault);
-        let options = options(&store);
-        let mut client = std::ptr::dangling_mut();
-        // Required output preflight still wins before capability checks.
-        assert_eq!(
-            unsafe {
-                marmot_c::marmot_client_new_with_experimental_device_groups(
-                    path.as_ptr(),
-                    std::ptr::null(),
-                    0,
-                    &options,
-                    marmot_c::deployment::OwnedDeployment::white_noise().as_ptr(),
-                    std::ptr::null_mut(),
-                )
-            },
-            MarmotStatus::NullPointer
-        );
-        assert_eq!(
-            unsafe {
-                marmot_c::marmot_client_new_with_experimental_device_groups(
-                    path.as_ptr(),
-                    std::ptr::null(),
-                    0,
-                    &options,
-                    marmot_c::deployment::OwnedDeployment::white_noise().as_ptr(),
-                    &mut client,
-                )
-            },
-            MarmotStatus::Runtime
-        );
-        assert!(client.is_null());
-        let detail = marmot_c::marmot_last_error_message();
-        assert!(
-            unsafe { CStr::from_ptr(detail) }
-                .to_str()
-                .unwrap()
-                .contains("experimental_device_groups_unavailable")
-        );
-        unsafe { marmot_c::marmot_string_free(detail) };
-        assert!(!root.exists(), "an unavailable build never opens a root");
-        assert!(!vault.destroyed.load(Ordering::SeqCst));
-        assert!(vault.entries.lock().unwrap().is_empty());
-    }
-
-    #[cfg(feature = "dev-device-groups")]
     #[test]
     fn experimental_c_hosts_link_real_devices_while_ordinary_opens_stay_disabled() {
         // A composed host lifecycle uses its own 8 MiB caller and runtime

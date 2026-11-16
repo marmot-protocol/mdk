@@ -135,7 +135,6 @@ impl AppClient {
     /// trusts: automatic recovery gave up on an epoch gap at its epoch, or its
     /// copy is unrecoverable and no automatic rejoin is underway. Only the
     /// explicit reset and fresh pairing bring it back (D112).
-    #[cfg(feature = "unreleased-device-pairing")]
     pub(crate) fn device_group_stalled(&self) -> Result<bool, AppError> {
         let Some(group_id) = self.trusted_device_group()? else {
             return Ok(false);

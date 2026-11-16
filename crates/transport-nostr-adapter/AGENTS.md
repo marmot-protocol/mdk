@@ -25,7 +25,7 @@ for reconnect/backoff and relay status mechanics.
 | `src/acquisition.rs` | Owned bounded acquisition and receiver-scoped loss evidence types. |
 | `src/publish_accounting.rs` | Shared logical publish counters and the cancellation guard used by direct and account publish paths. |
 | `src/key_package.rs` | Marmot kind `30443` KeyPackage event building/publishing (`NostrKeyPackagePublication`, `NostrKeyPackagePublisher`). |
-| `src/pairing.rs` | Device-pairing messages as rumors gift-wrapped to the account's own key. Built only with `unreleased-device-pairing` and in this crate's tests. |
+| `src/pairing.rs` | Device-pairing messages as rumors gift-wrapped to the account's own key. |
 | `src/relay_list.rs` | NIP-65 kind `10002` and Marmot inbox kind `10050` relay-list event building. |
 | `src/sweep/` | Time-sliced resumable history sweep (#2660 phase 3): engine over `SweepRelay`, caller-owned sink and cursor store; `sdk.rs` is the SDK-backed relay, `hint_tap.rs` reads NIP-67 `more` off the wire for it and counts each live REQ's reply frames. Called by `marmot-app`'s recovery runner `quantum.rs`, which owns account history debt by default since PR 5g. |
 | `src/compare/` | NIP-77 comparison of one (route, relay, range) against the caller's held ids (#2660 phase 4): windows under the relay's set limit, differences fetched by id oldest first, each window certified once every id the relay holds there is fetched or held. Called by the same recovery runner's `compare.rs`; its `host.rs` builds `SdkSweepRelay` from the account's existing pool. |
@@ -320,9 +320,7 @@ for reconnect/backoff and relay status mechanics.
   after failure, cancellation, removal or account reactivation, require a strictly greater serial for that account/group.
   Never clear `maintenance_attempt_high_water` while the adapter lives: CLOSE and route removal cannot recall late EOSE.
   Only recovery installs use the scoped client API; preserve the legacy maintenance subscribe/cleanup path.
-- Keep `pairing` behind `unreleased-device-pairing` (and `cfg(test)`). The explicit default-off `dev-device-groups`
-  CLI capability forwards it with production timing; ordinary releases do not enable it. A pairing reader accepts only rumors the account authored; that proves the
-  account, never a device.
+- A `pairing` reader accepts only rumors the account authored; that proves the account, never a device.
 - Use Marmot kind `30443` for KeyPackages; never substitute deprecated NIP-104 key package kinds. There is no dedicated
   KeyPackage relay list; KeyPackages go to the NIP-65 kind `10002` relays.
 

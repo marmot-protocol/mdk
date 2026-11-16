@@ -107,7 +107,7 @@ async fn alice_devices_settling_after<const N: usize>(
             MarmotAppConfig::white_noise()
                 .with_dev_settlement_quiescence_ms(settlement_ms)
                 .with_dev_scheduled_convergence_delay_ms(0)
-                .with_dev_device_groups(true),
+                .with_device_groups(true),
         )
         .with_test_relay_client(relay.clone());
         remember_test_member_inbox(&app, &alice_id, "wss://relay.example");
@@ -1700,7 +1700,7 @@ async fn a_failed_links_removal_found_after_a_restart_stops_nothing() {
         MarmotAppConfig::white_noise()
             .with_dev_settlement_quiescence_ms(0)
             .with_dev_scheduled_convergence_delay_ms(0)
-            .with_dev_device_groups(true),
+            .with_device_groups(true),
     )
     .with_test_relay_client(relay.clone());
     let bootstrap = || {
@@ -2552,7 +2552,7 @@ async fn a_failing_link_waits_for_its_welcomes_withdrawal_until_its_deadline() {
     assert_eq!(outcome(), DeviceLinkOutcome::Failed);
 }
 
-/// Without device groups, linking is refused and nothing runs.
+/// With device groups turned off, linking is refused and nothing runs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn linking_is_refused_without_device_groups() {
     let dir = tempfile::tempdir().unwrap();
@@ -2562,7 +2562,7 @@ async fn linking_is_refused_without_device_groups() {
     let app = MarmotApp::with_relay_and_config(
         dir.path(),
         "wss://relay.example",
-        MarmotAppConfig::white_noise(),
+        MarmotAppConfig::white_noise().with_device_groups(false),
     )
     .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
     let mut client = app.client("alice").await.unwrap();

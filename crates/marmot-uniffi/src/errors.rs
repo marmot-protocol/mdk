@@ -649,8 +649,7 @@ impl From<&AppError> for MarmotKitError {
                     account_ref: account_ref.clone(),
                 }
             }
-            // Beside `experimental_device_groups_unavailable`: the same
-            // test-build constructor contract, so the same shape.
+            // A device-group root opened with device groups turned off.
             AppError::ExperimentalDeviceGroupsRequired => Self::Runtime {
                 details: "experimental_device_groups_required".to_owned(),
             },
@@ -1594,9 +1593,8 @@ mod tests {
         );
     }
 
-    /// mdk#3012: an ordinary constructor's refusal of a device-group root
-    /// reaches hosts as the code the README documents, beside
-    /// `experimental_device_groups_unavailable`.
+    /// mdk#3012: refusing a device-group root opened with device groups off
+    /// reaches hosts as the code the README documents.
     #[test]
     fn a_device_group_root_refusal_crosses_ffi_as_its_documented_code() {
         let ffi: MarmotKitError = (&AppError::ExperimentalDeviceGroupsRequired).into();

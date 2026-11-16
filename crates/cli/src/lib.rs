@@ -603,7 +603,6 @@ async fn execute_inner(
             marmot_app::configure_product_analytics_from_environment(&runtime, "daemon");
             usage_diagnostics_command(&runtime, command)
         }
-        #[cfg(feature = "dev-device-groups")]
         Command::Devices { .. } => Err(WnError::DevicesRequireDaemon),
         Command::Debug { command } => {
             commands::debug::debug_command(&account_home, &app, command, account_flag)
@@ -1311,7 +1310,7 @@ fn app_for_role(
         .with_allow_loopback_blob_endpoints(wn_allow_loopback_blob_endpoints())
         .with_allow_loopback_relay_endpoints(wn_allow_loopback_relays())
         .with_directory_relay_urls(directory_relays)
-        .with_dev_device_groups(cfg!(feature = "dev-device-groups"));
+        .with_device_groups(wn_device_groups());
     config.usage_diagnostics_silent = silent;
     // Explicit test builds only: WN_DEV_SETTLEMENT_QUIESCENCE_MS overrides the
     // pinned convergence settlement window (e.g. `0` for integration tests).
@@ -1338,6 +1337,16 @@ fn wn_allow_loopback_blob_endpoints() -> bool {
 /// installs leave `WN_ALLOW_LOOPBACK_RELAYS` unset, so the relay-safety
 /// chokepoint rejects non-public relay hosts. Mirrors
 /// `WN_ALLOW_LOOPBACK_BLOB_ENDPOINTS`.
+/// `WN_DEVICE_GROUPS=1` turns multi-device on (device linking with
+/// `wn devices`, the device roster, admin step-down on Leave). Every build
+/// includes it; `wn` and `wnd` must share the setting.
+pub(crate) fn wn_device_groups() -> bool {
+    matches!(
+        std::env::var("WN_DEVICE_GROUPS").as_deref(),
+        Ok("1") | Ok("true")
+    )
+}
+
 fn wn_allow_loopback_relays() -> bool {
     matches!(
         std::env::var("WN_ALLOW_LOOPBACK_RELAYS").as_deref(),

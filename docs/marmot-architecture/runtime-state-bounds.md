@@ -203,7 +203,7 @@ re-delivery and expiry continue through the existing ingress deduplication and r
 
 ### `marmot-app` device pairing (`src/client/device_pairing/live.rs`)
 
-Built only with `unreleased-device-pairing`, and empty unless `dev_device_groups` is on. Pairing keeps its secrets
+Empty unless the host turns `device_groups` on. Pairing keeps its secrets
 only in memory, so every structure here is dropped with the client, ending any link in progress.
 
 | Structure | Bound | Reclamation |

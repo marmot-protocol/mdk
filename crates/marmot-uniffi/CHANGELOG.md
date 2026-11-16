@@ -7,6 +7,11 @@
 - `AppMessageRecordFfi` gains `invalidated: Bool`, true when a raw row is retained only as an invalidated tombstone
   (#3411). `messages` and message-subscription snapshots expose the stored flag. Code that constructs the record
   directly must pass `invalidated`. Regenerate Swift and Kotlin bindings with the matching native library.
+- Every MarmotKit library includes multi-device (mdk#2628). The `dev-device-groups` Cargo feature, the
+  `--dev-device-groups` flag of `xcframework.sh`, `xcframework-macos.sh`, `kotlin-bindings.sh` and `options-smoke.sh`,
+  and the `output-dev-device-groups/` directory are gone; ordinary build commands produce the library both constructors
+  use. `newWithExperimentalDeviceGroups` turns device groups on in any library and no longer fails with
+  `experimental_device_groups_unavailable`; ordinary constructors still keep them off.
 
 ### Added
 

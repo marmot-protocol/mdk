@@ -1739,7 +1739,6 @@ struct OpenAppAccount {
     audit_v5_peel_slot: Arc<Mutex<client::audit_v5_probe::PeelSlot>>,
     /// Where the Welcome peeler puts the pairing messages it opens; `None`
     /// unless device groups are on.
-    #[cfg(feature = "unreleased-device-pairing")]
     pairing_inbox: Option<client::device_pairing::PairingInbox>,
     session_guard: AppAccountSessionGuard,
     adapter: MarmotRelayPlaneAccountAdapter,
@@ -2443,7 +2442,7 @@ impl MarmotApp {
             audit_v5_probe: audit_v5_enabled.then(client::audit_v5_probe::WelcomeProbe::live),
             audit_v5_peel_slot: Some(open.audit_v5_peel_slot.clone()),
             audit,
-            #[cfg(all(test, feature = "unreleased-device-pairing"))]
+            #[cfg(test)]
             test_fail_roster_read: false,
             recovery_owner,
             history_recovery: client::history_recovery::HistoryRecovery::new(
@@ -2594,7 +2593,6 @@ impl MarmotApp {
             backups_configured: None,
             encrypted_media_not_required_epochs: HashMap::new(),
             checkpoint_route_refresh_recomputes: 0,
-            #[cfg(feature = "unreleased-device-pairing")]
             device_pairing: Box::new(client::device_pairing::DevicePairing::new(
                 open.pairing_inbox,
             )),
@@ -5404,7 +5402,6 @@ impl MarmotApp {
             .unwrap_or_else(|| Arc::new(Mutex::new(client::audit_v5_probe::PeelSlot::default())));
         #[cfg(not(test))]
         let audit_v5_peel_slot = Arc::new(Mutex::new(client::audit_v5_probe::PeelSlot::default()));
-        #[cfg(feature = "unreleased-device-pairing")]
         let pairing_inbox = if self.device_groups_enabled() {
             Some(client::device_pairing::PairingInbox::new(
                 PublicKey::from_hex(&account.account_id_hex)
@@ -5418,7 +5415,6 @@ impl MarmotApp {
                 inner: peeler,
                 slot: audit_v5_peel_slot.clone(),
                 storage: self.account_storage(label)?.app_storage(),
-                #[cfg(feature = "unreleased-device-pairing")]
                 pairing: pairing_inbox.clone(),
             });
         let session_path = self.account_dir(label).join(SESSION_DB_FILE);
@@ -5590,7 +5586,6 @@ impl MarmotApp {
             runtime,
             engine_storage,
             audit_v5_peel_slot,
-            #[cfg(feature = "unreleased-device-pairing")]
             pairing_inbox,
             session_guard,
             adapter,
@@ -8510,13 +8505,10 @@ impl MarmotApp {
     }
 
     /// Whether this device advertises the device roster and so can create and
-    /// join its account's device group. The roster spec is adopted; this still
-    /// requires explicit dev-build capability and runtime intent (mdk#2628 D98).
+    /// join its account's device group: only when the host turned it on
+    /// (mdk#2628 D98).
     pub(crate) fn device_groups_enabled(&self) -> bool {
-        cfg!(any(
-            feature = "dev-device-groups",
-            feature = "test-policy-overrides"
-        )) && self.config.dev_device_groups
+        self.config.device_groups
     }
 
     /// Whether a user's Leave takes an admin account off the chat's admin

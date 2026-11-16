@@ -429,6 +429,8 @@ pub(crate) struct DaemonView {
     pub(crate) pid: Option<u64>,
     pub(crate) last_runtime_activity: Option<DaemonRuntimeActivityView>,
     pub(crate) stream_watches: Vec<DaemonStreamWatchView>,
+    /// The daemon runs with device groups on (`WN_DEVICE_GROUPS`).
+    pub(crate) device_groups: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -4439,6 +4441,10 @@ pub(crate) fn parse_daemon_view(value: &Value) -> DaemonView {
             .and_then(Value::as_bool)
             .unwrap_or(false),
         pid: value.get("pid").and_then(Value::as_u64),
+        device_groups: value
+            .get("device_groups")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
         last_runtime_activity: value
             .get("last_runtime_activity")
             .and_then(parse_daemon_runtime_activity_view),

@@ -13,8 +13,7 @@ can read and send pairing messages. Only the compared code does.
 The crate is transport-neutral and does no I/O. Hosts deliver messages and supply the time; the Nostr events that carry
 the messages live in `transport-nostr-adapter`'s `pairing` module.
 
-**Unreleased.** The wire format follows a spec that has not merged. Nothing sends it until it does: the adapter's
-`pairing` module builds only with its `unreleased-device-pairing` feature, which no release enables.
+The wire format follows the merged device-pairing draft spec, and every build includes it; nothing sends it unless the host turns device groups on.
 
 ## The exchange
 

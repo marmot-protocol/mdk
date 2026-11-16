@@ -1225,7 +1225,7 @@ Signed-in local/external accounts, independent of any list or active worker.
 pub async fn compromise_warning( &self, account_ref: String, ) -> Result<Vec<CompromiseWarningItemFfi>, MarmotKitError>
 ```
 
-List the account's open compromise warning on this device: each item the user has not seen here, the earliest gathered first. An empty list means no warning is open. An item means someone holding the account's signing key, or a session with its remote signer, published where the account's devices did not: a sign-in answered This wasn't me (`RejectedSignIn`), or a KeyPackage this device found in its own slot that it did not make (`ForeignOwnSlotKeyPackage`, with its `key_package_ref_hex`; only the device that found it warns of it). Later releases add reasons; show one the app does not know as a generic one. The warning gathers this device's rejections and those in its device group's roster, so a rejection made on another device warns here too; rejections already in the first roster this device trusts count as seen. A rejected sign-in leaves the warning once its slot is linked as a device. The app writes the wording, and never says the account's devices stopped them. Read from local state with no network I/O. Always empty without explicit dev capability and runtime intent. Refresh on `MarmotEventFfi::CompromiseWarningChanged`, which also fires once each time the account's worker opens, so it may fire with no visible change. Runs on the account worker.
+List the account's open compromise warning on this device: each item the user has not seen here, the earliest gathered first. An empty list means no warning is open. An item means someone holding the account's signing key, or a session with its remote signer, published where the account's devices did not: a sign-in answered This wasn't me (`RejectedSignIn`), or a KeyPackage this device found in its own slot that it did not make (`ForeignOwnSlotKeyPackage`, with its `key_package_ref_hex`; only the device that found it warns of it). Later releases add reasons; show one the app does not know as a generic one. The warning gathers this device's rejections and those in its device group's roster, so a rejection made on another device warns here too; rejections already in the first roster this device trusts count as seen. A rejected sign-in leaves the warning once its slot is linked as a device. The app writes the wording, and never says the account's devices stopped them. Read from local state with no network I/O. Always empty unless the host turns device groups on. Refresh on `MarmotEventFfi::CompromiseWarningChanged`, which also fires once each time the account's worker opens, so it may fire with no visible change. Runs on the account worker.
 
 [Source](src/commands/compromise_warning.rs#L16)
 
@@ -1381,7 +1381,7 @@ pub async fn cancel_device_link( &self, account_ref: String, ) -> Result<DeviceL
 
 On the new device, request cancellation of the link. This does not guarantee notification of the other device: cancellation while waiting in `Joining` can end locally without sending a cancellation message. Before an authenticated Welcome is admitted, successful cancellation ends `new_device` as `Ended { reason: Cancelled }`. Cancelling while still waiting in `Joining` first withdraws this device's Welcome expectation; if withdrawal fails, the call returns an error and the current worker retries while that in-memory link remains active. After restart, a failed cancellation is not durably retried; its stored Welcome wait can remain active until its deadline. While that wait remains, a new ordinary link can reach confirmation and then end as `LinkFailed`. Cancellation does not undo an already-admitted Welcome: an ordinary link can resolve as `Linked`; for a move, inspect `moves` for the durable outcome. Refused as `MarmotKitError::Runtime` with details `device group refused: pairing_unsupported` unless the explicit experimental build/runtime gates are enabled, or `device group refused: no_link_in_progress` when no link is in progress.
 
-[Source](src/commands/device_link.rs#L53)
+[Source](src/commands/device_link.rs#L52)
 
 ### `Marmot::confirm_device_link_match`
 
@@ -1393,7 +1393,7 @@ pub async fn confirm_device_link_match( &self, account_ref: String, ) -> Result<
 
 On the new device, record that the user says both screens show the same emoji. `new_device` moves to `WaitingForOtherDevice` until the other device's user chooses Link device, then `Joining` while that device adds this one, then `Linked` once its Welcome arrives. This device joins only through a Welcome into the device group the other device's verified confirmation named, sent by the leaf that confirmation named, and only while the link waits for it. A mismatch is the user's to report: cancel instead. Refused with `no_link_in_progress` when there is no link to confirm, and ends the link with a reason when the exchange fails a check or time ran out.
 
-[Source](src/commands/device_link.rs#L41)
+[Source](src/commands/device_link.rs#L40)
 
 ### `Marmot::decline_device_link`
 
@@ -1405,7 +1405,7 @@ pub async fn decline_device_link( &self, account_ref: String, prompt_id: String,
 
 On a device already signed in, Not now for the prompt `prompt_id`: the prompt goes and the new device's link ends with `CancelledElsewhere`. Refused with `unknown_prompt` for a stale prompt.
 
-[Source](src/commands/device_link.rs#L85)
+[Source](src/commands/device_link.rs#L84)
 
 ### `Marmot::device_link_snapshot`
 
@@ -1417,7 +1417,7 @@ pub async fn device_link_snapshot( &self, account_ref: String, ) -> Result<Devic
 
 Current linking and durable move progress: `new_device` while this device asked to be linked, `prompts` for the sign-ins it can link, newest last, and `moves` as described in [move guidance](README.md#moving-this-device-to-another-device-group). Each prompt's state says what to show: `Preparing` while the sign-in's KeyPackage is checked, `Comparing` with the code, `CompetingRequests`, `RateLimited` until `retry_at`, `CannotLink` with what its client lacks, `TooManyDevices`, `Linking`, `Linked`, `AddedElsewhere` ("<device_label> was added by <added_by_label>") or `Ended` with a reason. Re-read on `MarmotEventFfi::DeviceLinkChanged`, which also fires each time the account's worker opens or reconnects; unconfirmed comparisons end because their secrets are memory-only, while admitted native/move work keeps its durable owner. Refused when the explicit experimental build/runtime gates are disabled (`pairing_unsupported`). Runs on the account worker and sends what linking owes.
 
-[Source](src/commands/device_link.rs#L115)
+[Source](src/commands/device_link.rs#L114)
 
 ### `Marmot::dismiss_device_group_move_sibling`
 
@@ -1430,7 +1430,7 @@ hint's `slot_id_hex`; this neither links, removes nor trusts the sibling. The re
 Refused when device linking is disabled or the move/sibling is unknown. Refresh on `DeviceLinkChanged`; see
 [move guidance](README.md#moving-this-device-to-another-device-group).
 
-[Source](src/commands/device_link.rs#L99)
+[Source](src/commands/device_link.rs#L98)
 
 ### `Marmot::link_device`
 
@@ -1442,7 +1442,7 @@ pub async fn link_device( &self, account_ref: String, prompt_id: String, label: 
 
 On a device already signed in, Link device for the prompt `prompt_id`, offered while its state is `Comparing`. `label` is the name the user gave the new device: not blank, at most 64 bytes (`label_invalid`). Offer `add_to_all_chats` and `bring_history` as toggles, both on by default. The prompt moves to `Linking` until the new device's confirmation verifies; then this device creates the account's device group on a first link, or adds the new device to the one it trusts, in one commit that also writes its roster entry. That commit is the approval. Its Welcome goes out only once relays confirm the commit, and the prompt remains `Linking` until the new device's first selected own change is present; a Welcome not taken by relays remains under its existing bounded delivery owner. A commit whose publish is retried keeps the prompt `Linking`. A device group that is still settling makes this device retry while the new device waits for its Welcome. A commit that rolls back, or a link not confirmed before the new device stops waiting, ends the prompt with `LinkFailed`. Refused with `unknown_prompt` for a stale prompt, including one from before the client reopened, `link_unavailable` while more than one sign-in competes or the code is not shown, `device_already_linked`, `sign_in_rejected` when its sign-in was rejected after the prompt appeared (the prompt then ends `Rejected`), or `too_many_devices` at 20 devices (remove one first).
 
-[Source](src/commands/device_link.rs#L64)
+[Source](src/commands/device_link.rs#L63)
 
 ### `Marmot::reset_device_group_for_repair`
 
@@ -1454,7 +1454,7 @@ pub async fn reset_device_group_for_repair( &self, account_ref: String, ) -> Res
 
 After explicit user confirmation, discard only this device's quiet trusted hidden device-group copy before fresh code pairing. Keeps ordinary chat data, drafts/settings, account credentials and stable slot; abandons old link-bound preparations, while shared values and security decisions retain their ordinary synchronization rules. This sends no removal, authenticates no device and repairs no chat membership. Active pairing/Move or unsettled native work returns `device_group_busy` without a deadline; no trusted copy returns `no_device_group`. An unlinked device cannot bypass removal. Cancellation after reset restores nothing, while a fresh already-confirmed link keeps its ordinary durable Welcome wait. Duplicate membership, rejection and capacity can still refuse the new link. Requires the explicit experimental capability/constructor; see [the shared reset contract](README.md#explicit-local-device-group-reset-before-fresh-pairing).
 
-[Source](src/commands/device_link.rs#L29)
+[Source](src/commands/device_link.rs#L28)
 
 
 ### `Marmot::start_device_link`
@@ -1467,7 +1467,7 @@ pub async fn start_device_link( &self, account_ref: String, ) -> Result<DeviceLi
 
 Ask a device of this account already signed in to link this one, returning its current comparison state. If this device already trusts a different device group, the same flow moves only this device; keep showing the old trust until `snapshot.moves` reports Made, as described in [move guidance](README.md#moving-this-device-to-another-device-group). The request names this device's published KeyPackage, never one this device already joined a group by, so publish one first, and again after such a join (`key_package_not_published`). `new_device` starts at `WaitingForAnswer`: ask the user to open the app on a device already signed in. Once one answers it moves to `Comparing` with the seven emoji both screens show, each with an English `description` for screen readers; offer "They match" (`confirm_device_link_match`) and cancel (`cancel_device_link`). Refresh on `MarmotEventFfi::DeviceLinkChanged`. Refused with `MarmotKitError::Runtime` (details `device group refused: <reason>`) while a link is in progress (`pairing_in_progress`) or the explicit experimental build/runtime gates are disabled (`pairing_unsupported`). Runs on the account worker and sends one gift-wrapped request to the account's relays.
 
-[Source](src/commands/device_link.rs#L17)
+[Source](src/commands/device_link.rs#L16)
 
 </details>
 
@@ -2670,7 +2670,7 @@ Dismiss one notice after the user accepts that this history may be incomplete. T
 pub async fn linked_devices( &self, account_ref: String, ) -> Result<Vec<LinkedDeviceFfi>, MarmotKitError>
 ```
 
-List this account's own devices for a Devices screen, from the roster of the device group this device trusts: this device first (`is_this_device`), then by `linked_at`. Every entry is this account's own device, never another account's, and it is read from local group state with no network I/O, so it is cheap to re-read. `slot_id_hex` is the device's KeyPackage slot and the handle later device actions take; `label`, `client` and `platform` are empty until set, and `linked_by_slot_id_hex` is `None` for the device that founded the group. `last_active_at` is when a heartbeat last showed a sibling running, in Unix seconds: each device sends one in the device group at most hourly while it runs, and each is dated when it was created or, if earlier, when this device read it. It is `None` for this device and for a sibling none of whose heartbeats has counted. `inactive` is this device's own judgement for showing the user, 30 days after the later of that and when this device first found the sibling in the roster; it is never set for this device, and `status` `Inactive` is the roster's separate mark. The list is empty until this device trusts a device group (a single-device account has none), once that group is terminal, and always without explicit dev capability and runtime intent. The device group's own events never reach hosts: refresh on `MarmotEventFfi::LinkedDevicesChanged`, which may fire with no visible change. A roster that cannot be read fails with `MarmotKitError::Runtime` (details `device group refused: roster_unavailable`). Runs on the account worker.
+List this account's own devices for a Devices screen, from the roster of the device group this device trusts: this device first (`is_this_device`), then by `linked_at`. Every entry is this account's own device, never another account's, and it is read from local group state with no network I/O, so it is cheap to re-read. `slot_id_hex` is the device's KeyPackage slot and the handle later device actions take; `label`, `client` and `platform` are empty until set, and `linked_by_slot_id_hex` is `None` for the device that founded the group. `last_active_at` is when a heartbeat last showed a sibling running, in Unix seconds: each device sends one in the device group at most hourly while it runs, and each is dated when it was created or, if earlier, when this device read it. It is `None` for this device and for a sibling none of whose heartbeats has counted. `inactive` is this device's own judgement for showing the user, 30 days after the later of that and when this device first found the sibling in the roster; it is never set for this device, and `status` `Inactive` is the roster's separate mark. The list is empty until this device trusts a device group (a single-device account has none), once that group is terminal, and always unless the host turns device groups on. The device group's own events never reach hosts: refresh on `MarmotEventFfi::LinkedDevicesChanged`, which may fire with no visible change. A roster that cannot be read fails with `MarmotKitError::Runtime` (details `device group refused: roster_unavailable`). Runs on the account worker.
 
 [Source](src/commands/linked_device.rs#L15)
 
@@ -2694,7 +2694,7 @@ List the held chats whose history from another of this account's devices is arri
 pub async fn key_package_refresh_overdue( &self, account_ref: String, ) -> Result<bool, MarmotKitError>
 ```
 
-Whether this device's device group has held its KeyPackage refresh back for a week, so the app warns the user. While this device trusts a device group, each KeyPackage it publishes is first announced in its own roster entry; if the device group can't take that Commit, the old KeyPackage stays in the slot, and at 30 days inviters stop treating the device as fresh. True once the KeyPackage this device would publish is still unannounced and its slot's newest publication is a week old, or there is none. A routine refresh never shows, and neither does one that is announced but failing at the relays. Always false until this device trusts a device group, and without explicit dev capability and runtime intent. Re-read on `MarmotEventFfi::KeyPackageRefreshOverdueChanged`, which carries no device or group identities and may fire with no visible change. Reads local state with no network I/O; runs on the account worker.
+Whether this device's device group has held its KeyPackage refresh back for a week, so the app warns the user. While this device trusts a device group, each KeyPackage it publishes is first announced in its own roster entry; if the device group can't take that Commit, the old KeyPackage stays in the slot, and at 30 days inviters stop treating the device as fresh. True once the KeyPackage this device would publish is still unannounced and its slot's newest publication is a week old, or there is none. A routine refresh never shows, and neither does one that is announced but failing at the relays. Always false until this device trusts a device group, and unless the host turns device groups on. Re-read on `MarmotEventFfi::KeyPackageRefreshOverdueChanged`, which carries no device or group identities and may fire with no visible change. Reads local state with no network I/O; runs on the account worker.
 
 [Source](src/commands/linked_device.rs#L33)
 
@@ -2706,7 +2706,7 @@ Whether this device's device group has held its KeyPackage refresh back for a we
 pub async fn rename_linked_device( &self, account_ref: String, slot_id_hex: String, label: String, ) -> Result<(), MarmotKitError>
 ```
 
-Rename one of this account's devices, this one included, by its `slot_id_hex` from `linked_devices`: one roster commit in the device group that sets only that device's label. The label is at most 64 bytes of UTF-8, and an empty label clears it. It is refused with `MarmotKitError::Runtime` (details `device group refused: <reason>`) and nothing sent without explicit dev capability and runtime intent (`roster_unsupported`), for a label that is too long (`label_too_long`), without a device group (`no_device_group`), for a slot the roster doesn't list (`unknown_device`), and while the device group has an earlier change of this device's in flight (`device_group_busy`, retry later). A rename whose commit loses a fork is made again on a later maintenance pass, unless another user edit of that device won; that one stands. Show the label `linked_devices` returns after `LinkedDevicesChanged`. Runs on the account worker.
+Rename one of this account's devices, this one included, by its `slot_id_hex` from `linked_devices`: one roster commit in the device group that sets only that device's label. The label is at most 64 bytes of UTF-8, and an empty label clears it. It is refused with `MarmotKitError::Runtime` (details `device group refused: <reason>`) and nothing sent unless the host turns device groups on (`roster_unsupported`), for a label that is too long (`label_too_long`), without a device group (`no_device_group`), for a slot the roster doesn't list (`unknown_device`), and while the device group has an earlier change of this device's in flight (`device_group_busy`, retry later). A rename whose commit loses a fork is made again on a later maintenance pass, unless another user edit of that device won; that one stands. Show the label `linked_devices` returns after `LinkedDevicesChanged`. Runs on the account worker.
 
 [Source](src/commands/linked_device.rs#L53)
 
@@ -2731,7 +2731,7 @@ Patch the supplied settings of any linked device, this one included; `None` pres
 pub async fn remove_linked_device( &self, account_ref: String, slot_id_hex: String, ) -> Result<(), MarmotKitError>
 ```
 
-Remove another of this account's devices, by its `slot_id_hex` from `linked_devices`: from the device group and from every chat, and delete its KeyPackage slot so inviters stop adding it. The decision is recorded at once and carried out as the device group allows, so a busy device group only delays it; `linked_devices` lists the device with `removal_pending` until the device group takes the removal, then no longer lists it. Chats that can't take a same-account removal keep the device; `removed_device_leftover_chats` counts them. It is refused with `MarmotKitError::Runtime` (details `device group refused: <reason>`) and nothing recorded without explicit dev capability and runtime intent (`roster_unsupported`), without a device group (`no_device_group`), for a slot the roster doesn't list (`unknown_device`), for this device (`this_device`: sign out instead), and for a device whose link may still fail (`device_link_pending`). Refresh on `LinkedDevicesChanged`. Runs on the account worker.
+Remove another of this account's devices, by its `slot_id_hex` from `linked_devices`: from the device group and from every chat, and delete its KeyPackage slot so inviters stop adding it. The decision is recorded at once and carried out as the device group allows, so a busy device group only delays it; `linked_devices` lists the device with `removal_pending` until the device group takes the removal, then no longer lists it. Chats that can't take a same-account removal keep the device; `removed_device_leftover_chats` counts them. It is refused with `MarmotKitError::Runtime` (details `device group refused: <reason>`) and nothing recorded unless the host turns device groups on (`roster_unsupported`), without a device group (`no_device_group`), for a slot the roster doesn't list (`unknown_device`), for this device (`this_device`: sign out instead), and for a device whose link may still fail (`device_link_pending`). Refresh on `LinkedDevicesChanged`. Runs on the account worker.
 
 [Source](src/commands/linked_device.rs#L103)
 
@@ -2743,7 +2743,7 @@ Remove another of this account's devices, by its `slot_id_hex` from `linked_devi
 pub async fn removed_device_leftover_chats( &self, account_ref: String, ) -> Result<u32, MarmotKitError>
 ```
 
-How many chats this device is in still hold a device this account no longer has, because the chat does not take a same-account removal. That device is one this account removed, or one its device group stopped listing, as after a failed link. A chat admin can remove it; show the count beside the device list so the user knows to ask. Zero until this device trusts a device group, and always zero without explicit dev capability and runtime intent. It is not evented: read it when showing the device list. Runs on the account worker.
+How many chats this device is in still hold a device this account no longer has, because the chat does not take a same-account removal. That device is one this account removed, or one its device group stopped listing, as after a failed link. A chat admin can remove it; show the count beside the device list so the user knows to ask. Zero until this device trusts a device group, and always zero unless the host turns device groups on. It is not evented: read it when showing the device list. Runs on the account worker.
 
 [Source](src/commands/linked_device.rs#L120)
 
@@ -2755,7 +2755,7 @@ How many chats this device is in still hold a device this account no longer has,
 pub async fn chats_closed_to_linked_devices( &self, account_ref: String, ) -> Result<u32, MarmotKitError>
 ```
 
-How many chats this device is in can't take any device of this account: they don't require `marmot.group.account-devices.v1`, name no relays a sibling Welcome can carry, or already hold this account's limit of 20 leaves. Once a link this device approved is made, MDK adds the new device to this device's other chats by itself when its "add to all my chats" setting is on, for a week after the link; these chats are passed over, and so, uncounted, is a chat that can take this account's devices but whose requirements the new device's KeyPackages don't meet, so zero does not mean the new device reaches every chat. A chat admin can turn the component on; removing a device frees its leaves. Show the count beside the device list, as "N chats can't add your other devices". Zero until this device trusts a device group, and always zero without explicit dev capability and runtime intent. It is not evented: read it when showing the device list. Runs on the account worker.
+How many chats this device is in can't take any device of this account: they don't require `marmot.group.account-devices.v1`, name no relays a sibling Welcome can carry, or already hold this account's limit of 20 leaves. Once a link this device approved is made, MDK adds the new device to this device's other chats by itself when its "add to all my chats" setting is on, for a week after the link; these chats are passed over, and so, uncounted, is a chat that can take this account's devices but whose requirements the new device's KeyPackages don't meet, so zero does not mean the new device reaches every chat. A chat admin can turn the component on; removing a device frees its leaves. Show the count beside the device list, as "N chats can't add your other devices". Zero until this device trusts a device group, and always zero unless the host turns device groups on. It is not evented: read it when showing the device list. Runs on the account worker.
 
 [Source](src/commands/linked_device.rs#L143)
 
@@ -3957,7 +3957,7 @@ Start this device without the devices its first sign-in check found, for "No, st
 pub async fn started_fresh(&self, account_ref: String) -> Result<bool, MarmotKitError>
 ```
 
-Whether this device started fresh and still trusts no device group, so the app can say that only chats it is invited to from now on are here. It turns false once the device trusts a device group; re-read after `start_fresh` and on `LinkedDevicesChanged`. Read from local state with no network I/O. Always false without explicit dev capability and runtime intent. Runs on the account worker.
+Whether this device started fresh and still trusts no device group, so the app can say that only chats it is invited to from now on are here. It turns false once the device trusts a device group; re-read after `start_fresh` and on `LinkedDevicesChanged`. Read from local state with no network I/O. Always false unless the host turns device groups on. Runs on the account worker.
 
 [Source](src/commands/sign_in.rs#L70)
 
@@ -3969,7 +3969,7 @@ Whether this device started fresh and still trusts no device group, so the app c
 pub async fn unrecognized_sign_ins( &self, account_ref: String, ) -> Result<Vec<UnrecognizedSignInFfi>, MarmotKitError>
 ```
 
-List the sign-ins of this account that this device does not recognize, the earliest to appear first. Each is a fresh, valid KeyPackage of this account in a slot that neither this device nor the roster of its device group knows: someone holding the account's key signed in there. An entry with `before_this_device` was found by this device's first check, so it was signed in before this device: ask whether the user still has it, with `last_seen_at`. Any other is new: ask whether it was them, with `client` and `appeared_at`. A `LinkedElsewhere` or `RejectedElsewhere` entry was answered on another device while its prompt waited here; offer Dismiss. A sign-in whose slot empties stays listed with `signed_in` false. Linking one is device pairing's, started from its `slot_id_hex`. Read from local state with no network I/O; the account checks its slots at open, every six hours, and soon after one of its KeyPackages arrives live. Always empty without explicit dev capability and runtime intent. Refresh on `MarmotEventFfi::UnrecognizedSignInsChanged`, which may fire with no visible change. Runs on the account worker.
+List the sign-ins of this account that this device does not recognize, the earliest to appear first. Each is a fresh, valid KeyPackage of this account in a slot that neither this device nor the roster of its device group knows: someone holding the account's key signed in there. An entry with `before_this_device` was found by this device's first check, so it was signed in before this device: ask whether the user still has it, with `last_seen_at`. Any other is new: ask whether it was them, with `client` and `appeared_at`. A `LinkedElsewhere` or `RejectedElsewhere` entry was answered on another device while its prompt waited here; offer Dismiss. A sign-in whose slot empties stays listed with `signed_in` false. Linking one is device pairing's, started from its `slot_id_hex`. Read from local state with no network I/O; the account checks its slots at open, every six hours, and soon after one of its KeyPackages arrives live. Always empty unless the host turns device groups on. Refresh on `MarmotEventFfi::UnrecognizedSignInsChanged`, which may fire with no visible change. Runs on the account worker.
 
 [Source](src/commands/sign_in.rs#L15)
 
@@ -4658,7 +4658,7 @@ pub fn new_with_configuration( root_path: String, relay_urls: Vec<String>, optio
 
 Open with any combination of runtime options, including the required deployment. The other constructors are wrappers around this entry point and take the deployment as their last argument.
 
-[Source](src/lib.rs#L340)
+[Source](src/lib.rs#L328)
 
 ### `Marmot::new_with_experimental_device_groups`
 
@@ -4666,9 +4666,9 @@ Open with any combination of runtime options, including the required deployment.
 pub fn new_with_experimental_device_groups( root_path: String, relay_urls: Vec<String>, options: MarmotOptions, ) -> Result<Arc<Self>, MarmotKitError>
 ```
 
-Open a controlled development build with device-group capability and explicit runtime intent. The library must enable `dev-device-groups`; otherwise it returns Runtime with `experimental_device_groups_unavailable` before opening the root or acquiring host secret storage. It takes the same `MarmotOptions` and required deployment as `new_with_configuration`, preserving their ordinary meanings and ownership. Ordinary constructors remain disabled even in a capable library. Use this constructor for every foreground/background opener of the experimental root, a notification service extension included: an ordinary constructor does not open an account that holds or is joining a device group and reports Runtime with `experimental_device_groups_required`; see the [shared host test-build guidance](README.md#experimental-device-group-test-builds). Production timing is unchanged. This is not release activation or proof of mobile artifact/device validation.
+Open with device groups on. Every native library includes them; ordinary constructors keep them off. It takes the same `MarmotOptions` and required deployment as `new_with_configuration`, preserving their ordinary meanings and ownership. Use this constructor for every foreground/background opener of the experimental root, a notification service extension included: an ordinary constructor does not open an account that holds or is joining a device group and reports Runtime with `experimental_device_groups_required`; see the [shared host test-build guidance](README.md#experimental-device-group-test-builds). Production timing is unchanged. Device groups are opt-in, not a release default.
 
-[Source](src/lib.rs#L355)
+[Source](src/lib.rs#L343)
 
 ### `Marmot::new_with_options`
 
@@ -4680,7 +4680,7 @@ pub fn new_with_options( root_path: String, relay_urls: Vec<String>, relay_polic
 
 Open with an explicit relay policy and optional host-owned key storage. Existing constructors retain their public-only relay policy.
 
-[Source](src/lib.rs#L366)
+[Source](src/lib.rs#L354)
 
 ### `Marmot::new`
 
@@ -4692,7 +4692,7 @@ pub fn new( root_path: String, relay_urls: Vec<String>, deployment: MarmotDeploy
 
 Open the Marmot app at `root_path`, configured with the given default relay URLs and `deployment`. Account secrets (Nostr private keys) are stored in the platform keyring (Keychain on Apple platforms, Android's native keyring on Android) under the deployment's `keychain_service` — not in a plaintext file. Fallible because initializing the platform secret store can fail or another process may own the same root (`MarmotKitError::RuntimeBusy`). Root ownership is nonblocking and remains held until the final `Marmot`/runtime handle is dropped, even after `Marmot::shutdown`. Call `Marmot::start` before subscribing to events.
 
-[Source](src/lib.rs#L395)
+[Source](src/lib.rs#L383)
 
 ### `Marmot::new_with_secret_store`
 
@@ -4704,7 +4704,7 @@ pub fn new_with_secret_store( root_path: String, relay_urls: Vec<String>, secret
 
 Open the Marmot app with host-supplied account-secret storage instead of the platform keychain. Identical to `Marmot::new` except that every read, write, and removal of an account signing key goes through `secret_store`.
 
-[Source](src/lib.rs#L421)
+[Source](src/lib.rs#L409)
 
 ### `Marmot::new_with_cursor_persistence`
 
@@ -4716,7 +4716,7 @@ pub fn new_with_cursor_persistence( root_path: String, relay_urls: Vec<String>, 
 
 Construct with explicit advancing/frozen relay cursor behavior; new_with_configuration composes this with other options.
 
-[Source](src/lib.rs#L452)
+[Source](src/lib.rs#L440)
 
 ### `Marmot::new_with_client_name`
 
@@ -4728,7 +4728,7 @@ pub fn new_with_client_name( root_path: String, relay_urls: Vec<String>, client_
 
 Open with an optional public client label for new KeyPackage publications. Existing constructors remain untagged. Whitespace-only labels, and labels longer than 64 bytes once trimmed, are omitted rather than truncated. Hosts must supply this on every foreground/background runtime construction.
 
-[Source](src/lib.rs#L473)
+[Source](src/lib.rs#L461)
 
 ### `Marmot::start`
 
@@ -4740,7 +4740,7 @@ pub async fn start(&self) -> Result<(), MarmotKitError>
 
 Bring the runtime to local readiness.
 
-[Source](src/lib.rs#L511)
+[Source](src/lib.rs#L499)
 
 ### `Marmot::shutdown`
 
@@ -4752,7 +4752,7 @@ pub async fn shutdown(&self)
 
 Tear the runtime down. Drops all subscriptions; long-lived `EventsSubscription` / `ChatsSubscription` / etc. instances on the host side will see their `next()` return `None` shortly after.
 
-[Source](src/lib.rs#L523)
+[Source](src/lib.rs#L511)
 
 ### `Marmot::shutdown_and_close`
 
@@ -4764,7 +4764,7 @@ pub async fn shutdown_and_close(&self) -> Result<(), MarmotKitError>
 
 Terminally stop work, close storage and release root ownership; reconstruct before further reads/work.
 
-[Source](src/lib.rs#L559)
+[Source](src/lib.rs#L547)
 
 ### `Marmot::storage_is_closed`
 
@@ -4776,7 +4776,7 @@ pub fn storage_is_closed(&self) -> bool
 
 True once `Marmot::shutdown_and_close` has closed the store. A host can check this to confirm it is safe to be suspended, or to notice it is holding a spent handle and needs a fresh one.
 
-[Source](src/lib.rs#L567)
+[Source](src/lib.rs#L555)
 
 ### `Marmot::is_stopping`
 
@@ -4788,7 +4788,7 @@ pub fn is_stopping(&self) -> bool
 
 True once shutdown has started. Host apps can use this to avoid launching more subscriptions or account work while they are moving to the background.
 
-[Source](src/lib.rs#L574)
+[Source](src/lib.rs#L562)
 
 </details>
 

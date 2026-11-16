@@ -960,7 +960,7 @@ async fn a_deferred_worker_attributes_an_accepted_sibling_departure() {
         MarmotAppConfig::white_noise()
             .with_dev_settlement_quiescence_ms(0)
             .with_dev_scheduled_convergence_delay_ms(0)
-            .with_dev_device_groups(true),
+            .with_device_groups(true),
     )
     .with_test_relay_client(relay.clone());
     let runtime = MarmotAppRuntime::new(reopened.clone());
@@ -2548,7 +2548,7 @@ async fn a_chat_that_already_holds_the_new_device_gets_no_add() {
         MarmotAppConfig::white_noise()
             .with_dev_settlement_quiescence_ms(0)
             .with_dev_scheduled_convergence_delay_ms(0)
-            .with_dev_device_groups(true),
+            .with_device_groups(true),
     )
     .with_test_relay_client(relay.clone());
     remember_test_member_inbox(&bob_app, &alice_id, "wss://relay.example");

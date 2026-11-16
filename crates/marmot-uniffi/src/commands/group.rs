@@ -938,8 +938,8 @@ impl Marmot {
     /// while `GroupManagementStateFfi::can_cancel_leave` holds: the leave is
     /// blocked because this account is the group's last active admin. The
     /// chat reads as joined again, and the account can send. Any other state
-    /// returns `MarmotKitError::LeaveNotBlocked`. With experimental device
-    /// groups on, the account's other devices keep their own blocked leaves.
+    /// returns `MarmotKitError::LeaveNotBlocked`. With device groups on,
+    /// the account's other devices keep their own blocked leaves.
     pub async fn cancel_leave(
         &self,
         account_ref: String,

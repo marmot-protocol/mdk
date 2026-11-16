@@ -10,7 +10,7 @@ impl Marmot {
     /// Sign-ins of this account that this device does not recognize, the
     /// earliest to appear first. For one that is `before_this_device`, ask
     /// whether the user still has it; for any other, ask whether it was them.
-    /// Always empty without explicit dev capability and runtime intent. Refresh
+    /// Always empty unless the host turns device groups on. Refresh
     /// on `UnrecognizedSignInsChanged`.
     pub async fn unrecognized_sign_ins(
         &self,
@@ -66,7 +66,7 @@ impl Marmot {
 
     /// Whether this device started fresh and still has no device group, so
     /// the app can say that only chats it is invited to from now on are here.
-    /// Always false without explicit dev capability and runtime intent.
+    /// Always false unless the host turns device groups on.
     pub async fn started_fresh(&self, account_ref: String) -> Result<bool, MarmotKitError> {
         Ok(self.runtime.started_fresh(&account_ref).await?)
     }

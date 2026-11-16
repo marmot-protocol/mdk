@@ -277,13 +277,7 @@ impl AppClient {
     /// It then sends only its remaining SelfRemoves and its slot's deletion
     /// (D67).
     pub(crate) fn removed_while_signing_out(&self) -> Result<bool, AppError> {
-        #[cfg(feature = "unreleased-device-pairing")]
-        return Ok(
-            self.signing_out() && self.app.removed_device_group(&self.state.label)?.is_some()
-        );
-        // Without device groups no device group removes this device.
-        #[cfg(not(feature = "unreleased-device-pairing"))]
-        Ok(false)
+        Ok(self.signing_out() && self.app.removed_device_group(&self.state.label)?.is_some())
     }
 
     /// Hold back every publish of this account once its device group

@@ -11,9 +11,8 @@
 //! Unlike every other v1 GroupContext component, an update is a diff: a
 //! sorted list of operations, each setting or removing one entry. The
 //! resulting state is the prior state with the operations applied
-//! ([`apply_device_roster_update_v1`]). The roster format is adopted; the
-//! engine advertises it only with explicit `dev-device-groups` capability
-//! or in policy-test builds. Ordinary releases keep the capability off.
+//! ([`apply_device_roster_update_v1`]). The roster format is adopted, and
+//! every build may advertise it once a host turns device groups on.
 
 use std::collections::BTreeMap;
 

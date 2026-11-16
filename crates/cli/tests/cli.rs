@@ -10054,11 +10054,9 @@ fn groups_recovery_quarantine_welcome_and_management_inspection_have_stable_cont
     assert_eq!(alice_management["is_last_admin"], true);
     assert_eq!(alice_management["can_invite"], true);
     assert_eq!(alice_management["can_leave"], false);
-    // Leave steps an admin down itself only with device groups (mdk#3014).
-    assert_eq!(
-        alice_management["requires_self_demote_before_leave"],
-        !cfg!(feature = "dev-device-groups")
-    );
+    // Leave steps an admin down itself only with device groups on
+    // (`WN_DEVICE_GROUPS`, mdk#3014); this daemon leaves them off.
+    assert_eq!(alice_management["requires_self_demote_before_leave"], true);
     assert_eq!(alice_management["lifecycle_state"], "stable");
     assert_eq!(alice_management["disbanding"], false);
     assert_eq!(
@@ -10564,32 +10562,12 @@ fn groups_add_members_can_assign_initial_admins_in_one_commit() {
     assert_eq!(recipient_admins, sorted_accounts([&alice, &carol]));
 }
 
-#[cfg(not(feature = "dev-device-groups"))]
-#[test]
-fn ordinary_builds_do_not_expose_device_link_commands() {
-    let dir = tempfile::tempdir().unwrap();
-    let home = dir.path().join("unopened");
-    let output = Command::new(env!("CARGO_BIN_EXE_wn"))
-        .arg("--home")
-        .arg(&home)
-        .args(["--json", "devices", "list"])
-        .output()
-        .unwrap();
-    assert!(!output.status.success());
-    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(value["error"]["code"], "usage");
-    assert!(
-        !home.exists(),
-        "ordinary command parsing never opens a device runtime"
-    );
-}
-
 /// A local CLI/daemon regression, not D66's separate VM/device acceptance.
-/// Compile this owner without policy overrides so the real dev capability and
+/// Compile this owner without policy overrides so `WN_DEVICE_GROUPS` and
 /// production settlement, persistent SAS session and two confirmations run.
-#[cfg(all(feature = "dev-device-groups", not(feature = "test-policy-overrides")))]
+#[cfg(not(feature = "test-policy-overrides"))]
 #[test]
-fn dev_devices_link_across_daemon_commands_at_production_timing() {
+fn devices_link_across_daemon_commands_at_production_timing() {
     /// The command words of `args` for a failure message. Only known command
     /// words are printed, never an argument: no account id, prompt id or label.
     fn command_name(args: &[&str]) -> String {
@@ -10690,6 +10668,7 @@ fn dev_devices_link_across_daemon_commands_at_production_timing() {
                         .arg("--default-account-relays")
                         .arg(relay.url())
                         .env("WN_ALLOW_LOOPBACK_RELAYS", "1")
+                        .env("WN_DEVICE_GROUPS", "1")
                         .env_remove("WN_DEV_SETTLEMENT_QUIESCENCE_MS")
                 })
             })

@@ -312,18 +312,6 @@ impl MarmotOptions {
     }
 }
 
-/// Check the experimental host capability before acquiring constructor resources.
-/// Shared with the C boundary so unavailable builds never take callback ownership.
-pub fn require_experimental_device_groups() -> Result<(), MarmotKitError> {
-    if cfg!(feature = "dev-device-groups") {
-        Ok(())
-    } else {
-        Err(MarmotKitError::Runtime {
-            details: "experimental_device_groups_unavailable".to_owned(),
-        })
-    }
-}
-
 #[derive(uniffi::Object)]
 pub struct Marmot {
     pub(crate) app: MarmotApp,
@@ -345,12 +333,12 @@ impl Marmot {
         Self::open_with_configuration(root_path, relay_urls, options, false)
     }
 
-    /// Open an explicitly experimental device-group test build. The native
-    /// library must enable `dev-device-groups`; otherwise this fails
-    /// before opening the root or taking ownership of host secret storage.
-    /// Ordinary constructors remain disabled even in a capable library.
-    /// Use matching native and generated bindings, and this constructor for
-    /// every foreground/background opener of the same experimental root.
+    /// Open with multi-device on: device linking, the device roster, linked
+    /// devices, backups and admin step-down on Leave. Every native library
+    /// includes it; ordinary constructors keep it off. Takes the same
+    /// `MarmotOptions` and deployment as [`Marmot::new_with_configuration`].
+    /// Use this constructor for every foreground/background opener of the
+    /// same root.
     #[uniffi::constructor]
     pub fn new_with_experimental_device_groups(
         root_path: String,
@@ -582,14 +570,9 @@ impl Marmot {
         root_path: String,
         relay_urls: Vec<String>,
         options: MarmotOptions,
-        experimental_device_groups: bool,
+        device_groups: bool,
     ) -> Result<Arc<Self>, MarmotKitError> {
-        if experimental_device_groups {
-            require_experimental_device_groups()?;
-        }
-        let config = options
-            .app_config()
-            .with_dev_device_groups(experimental_device_groups);
+        let config = options.app_config().with_device_groups(device_groups);
         let store = options.secret_store.map(|store| {
             Arc::new(secret_store::ForeignSecretStore::new(store))
                 as Arc<dyn marmot_account::AccountSecretStore>
@@ -654,21 +637,6 @@ mod tests {
         importable::<crate::TimelineProjectionUpdateFfi>();
         importable::<crate::TimelineSubscriptionUpdateFfi>();
         importable::<crate::StickerPackFfi>();
-    }
-
-    #[cfg(not(feature = "dev-device-groups"))]
-    #[test]
-    fn an_unavailable_experimental_constructor_never_opens_the_root() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join("unopened");
-        let result = Marmot::new_with_experimental_device_groups(
-            root.to_str().unwrap().to_owned(),
-            Vec::new(),
-            MarmotOptions::for_deployment(marmot_deployment_neutral()),
-        );
-        assert!(matches!(result, Err(MarmotKitError::Runtime { details })
-            if details == "experimental_device_groups_unavailable"));
-        assert!(!root.exists());
     }
 
     #[test]

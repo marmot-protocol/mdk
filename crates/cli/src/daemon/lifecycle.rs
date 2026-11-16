@@ -675,6 +675,7 @@ pub(crate) async fn status_daemon(json: bool, socket: &Path) -> CliOutput {
                 last_runtime_activity: None,
                 relay_health: None,
                 stream_watches: Vec::new(),
+                device_groups: false,
             }
         }
     };
@@ -729,6 +730,7 @@ pub(crate) fn daemon_status_json(status: DaemonStatus) -> serde_json::Value {
         "last_runtime_activity": status.last_runtime_activity,
         "relay_health": status.relay_health,
         "stream_watches": status.stream_watches,
+        "device_groups": status.device_groups,
     })
 }
 
@@ -773,6 +775,8 @@ pub(crate) async fn server_status(
         last_runtime_activity,
         relay_health,
         stream_watches,
+        // The daemon built its runtime config from this same variable.
+        device_groups: crate::wn_device_groups(),
     }
 }
 

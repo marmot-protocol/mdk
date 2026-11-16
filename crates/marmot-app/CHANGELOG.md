@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Breaking changes
+
+- Every build includes multi-device (mdk#2628). The `dev-device-groups` and `unreleased-device-pairing` Cargo
+  features are gone: `marmot-pairing` is always linked and the engine may always advertise the device roster.
+  `MarmotAppConfig::dev_device_groups` / `with_dev_device_groups` are renamed `device_groups` / `with_device_groups`;
+  they stay off by default and now take effect in every build. Struct literals and builder calls need the new name.
+
 ### Added
 
 - Opt-in relay telemetry exports `relay_read_back_requests` and `relay_read_back_found`: device-wide, unlabeled

@@ -1849,7 +1849,7 @@ impl AppClient {
 
     /// Test hook: date every prompt's request `secs` earlier, as a code
     /// comparison that took that long would.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "test-policy-overrides"))]
     pub(crate) fn backdate_link_requests(&mut self, secs: u64) {
         for prompt in &mut self.device_pairing.prompts {
             prompt.requested_at = prompt.requested_at.saturating_sub(secs);

@@ -10,9 +10,6 @@
 //! It never authenticates a device: `marmot-pairing` does that with the code
 //! both screens show. A reader here checks only that the rumor's author is
 //! the account, and ignores any tags.
-//!
-//! Unreleased: compiled only with the `unreleased-device-pairing` feature, and
-//! in this crate's tests, until the pairing spec merges.
 
 use std::fmt;
 use std::sync::Arc;
