@@ -279,21 +279,25 @@ fn normalize_sticker_relays(
 }
 
 /// The relays public pack reads query, for sticker packs (kind 30031) and
-/// emoji sets (kind 30030): the account's relays, then the runtime's
-/// configured relays, deduplicated and passed through the host-safety rule.
+/// emoji sets (kind 30030): the runtime's configured relays, then the
+/// account's relays, deduplicated and passed through the host-safety rule.
 /// Packs and sets are published to few relays, and an account whose relay
 /// list came from another client often names none of them; the host's
 /// configured relays are where it expects its packs to be. Reads only, never
 /// the account's own lists: the sticker installed list, the emoji list and
 /// every sticker publication stay on the account's relays.
+///
+/// Configured relays come first because a pack read retains the relays it
+/// queried, in order, as the pack's share-link hints (at most eight): a long
+/// account outbox must not push the host's pack relays out of the link.
 pub(crate) fn pack_read_endpoints(
     app: &MarmotApp,
     account_endpoints: &[TransportEndpoint],
 ) -> Vec<TransportEndpoint> {
-    let candidates = account_endpoints
-        .iter()
-        .cloned()
-        .chain(app.relay_endpoints())
+    let candidates = app
+        .relay_endpoints()
+        .into_iter()
+        .chain(account_endpoints.iter().cloned())
         .collect();
     normalize_sticker_relays(
         app.retain_safe_discovered_endpoints(candidates, "pack reads")
@@ -785,6 +789,11 @@ async fn fetch_pack_into_storage(
         // relays do not discard it.
         Err(AppError::StickerRelay(_)) if found => {}
         Err(error) => return Err(error),
+    }
+    if found {
+        // The read set was retained after the hints; put the hints that
+        // served this pack back in front of the share-link hints.
+        retain_sticker_relays(app, &context.storage, coordinate, relay_hints)?;
     }
     if context.storage.sticker_pack(coordinate)?.is_none() {
         return Err(AppError::StickerNotFound);
@@ -1589,9 +1598,9 @@ mod tests {
         assert_eq!(
             pack_read_endpoints(&app, &account),
             [
-                "wss://account.example",
+                "wss://configured.example",
                 "wss://shared.example",
-                "wss://configured.example"
+                "wss://account.example"
             ]
             .map(|url| TransportEndpoint(url.to_owned())),
         );

@@ -396,6 +396,15 @@ async fn relay_hint_cannot_hide_a_newer_pack_on_account_relays() {
         cats.title, "New",
         "the account relay's newer version must win over the hinted one"
     );
+    let link = app
+        .sticker_pack_share_link(&account_id, &cats.coordinate)
+        .unwrap();
+    let first_hint = link.split("&relay=").nth(1).expect("a relay hint");
+    assert_eq!(
+        first_hint,
+        urlencoding_relay(&hint_url),
+        "a link hint that served the pack leads its share link"
+    );
     let dogs = app
         .fetch_sticker_pack(&account_id, &pack_naddr(&author, "dogs", &hint_url))
         .await
@@ -510,6 +519,11 @@ async fn sync_refreshes_installed_packs() {
     runtime.shutdown().await;
 }
 
+/// `relay` as a share link's `relay=` query value spells it.
+fn urlencoding_relay(relay: &str) -> String {
+    url::form_urlencoded::byte_serialize(relay.trim_end_matches('/').as_bytes()).collect()
+}
+
 /// How many installed lists (kind 10031) `author` has on `relay_url`.
 async fn installed_list_count(relay_url: &str, author: PublicKey) -> usize {
     let client = NostrSdkClient::builder().build();
@@ -536,17 +550,32 @@ async fn import_account_on(
     account_url: &str,
     configured_url: &str,
 ) -> (tempfile::TempDir, MarmotApp, MarmotAppRuntime, Keys, String) {
+    import_account_with_outbox(&[account_url.to_owned()], configured_url).await
+}
+
+/// An imported account whose NIP-65 relays are `account_urls`, its lists
+/// published on the first, on an app whose configured relay is
+/// `configured_url`.
+async fn import_account_with_outbox(
+    account_urls: &[String],
+    configured_url: &str,
+) -> (tempfile::TempDir, MarmotApp, MarmotAppRuntime, Keys, String) {
+    let account_url = account_urls[0].as_str();
     let keys = Keys::generate();
     let now = unix_now();
-    for (kind, tag) in [
-        (
-            10002,
-            Tag::custom("r", [account_url.to_owned(), "write".to_owned()]),
-        ),
-        (10050, Tag::custom("relay", [account_url.to_owned()])),
-    ] {
-        publish_signed(account_url, &keys, kind, vec![tag], now - 600).await;
-    }
+    let outbox = account_urls
+        .iter()
+        .map(|url| Tag::custom("r", [url.clone(), "write".to_owned()]))
+        .collect();
+    publish_signed(account_url, &keys, 10002, outbox, now - 600).await;
+    publish_signed(
+        account_url,
+        &keys,
+        10050,
+        vec![Tag::custom("relay", [account_url.to_owned()])],
+        now - 600,
+    )
+    .await;
     let dir = tempfile::tempdir().unwrap();
     let app = MarmotApp::with_relay_and_config(
         dir.path(),
@@ -581,9 +610,17 @@ async fn import_account_on(
 async fn configured_relays_serve_pack_reads_but_not_the_installed_list() {
     storage_sqlite::relax_storage_for_test_process();
     install_mock_keyring();
-    let account_relay = LocalRelay::new(RelayBuilder::default());
-    account_relay.run().await.unwrap();
-    let account_url = account_relay.url().await.to_string();
+    // Eight outbox relays, none holding a pack: enough to fill every
+    // share-link hint slot on their own.
+    let mut account_relays = Vec::new();
+    let mut account_urls = Vec::new();
+    for _ in 0..8 {
+        let relay = LocalRelay::new(RelayBuilder::default());
+        relay.run().await.unwrap();
+        account_urls.push(relay.url().await.to_string());
+        account_relays.push(relay);
+    }
+    let account_url = account_urls[0].clone();
     let configured_relay = LocalRelay::new(RelayBuilder::default());
     configured_relay.run().await.unwrap();
     let configured_url = configured_relay.url().await.to_string();
@@ -604,7 +641,7 @@ async fn configured_relays_serve_pack_reads_but_not_the_installed_list() {
     let default_pack = format!("{pack_kind}:{}:default", author.public_key().to_hex());
     let browse_pack = format!("{pack_kind}:{}:browse", author.public_key().to_hex());
     let (_dir, app, runtime, keys, account_id) =
-        import_account_on(&account_url, &configured_url).await;
+        import_account_with_outbox(&account_urls, &configured_url).await;
 
     let installed = app
         .install_sticker_pack(&account_id, &default_pack)
@@ -625,6 +662,13 @@ async fn configured_relays_serve_pack_reads_but_not_the_installed_list() {
         .map(|pack| pack.coordinate)
         .collect::<Vec<_>>();
     assert!(browsable.contains(&browse_pack));
+    for pack in [&default_pack, &browse_pack] {
+        let link = app.sticker_pack_share_link(&account_id, pack).unwrap();
+        assert!(
+            link.contains(&urlencoding_relay(&configured_url)),
+            "the share link names the relay holding the pack ahead of a long outbox: {link}"
+        );
+    }
 
     let (_, packs) = remote_installed_list(&account_url, keys.public_key()).await;
     assert_eq!(packs, vec![default_pack]);
@@ -633,6 +677,7 @@ async fn configured_relays_serve_pack_reads_but_not_the_installed_list() {
         0,
         "the installed list is never published to a configured relay"
     );
+    drop(account_relays);
 
     runtime.shutdown().await;
 }
@@ -748,6 +793,16 @@ async fn emoji_set_reads_reach_configured_relays() {
         USER_EMOJI_LIST_KIND,
         vec![Tag::custom("a", [coordinate("pointed")])],
         now - 40,
+    )
+    .await;
+    // A newer list only on the configured relay is never read: the account's
+    // own list comes from its relays alone.
+    publish_signed(
+        &configured_url,
+        &keys,
+        USER_EMOJI_LIST_KIND,
+        vec![Tag::custom("a", [coordinate("configured")])],
+        now - 30,
     )
     .await;
 
