@@ -5565,12 +5565,6 @@ where
         }
     }
 
-    /// Retire the queued intent a resolved application message or proposal
-    /// was drained from (mdk#2332): once a relay accepted the event, or every
-    /// relay refused it for good. A commit's intent retires with the commit.
-    /// Returns false when the intent could not be deleted: the fanout must
-    /// then stay stored, still naming it, for a later pass to retry, since a
-    /// drain that found the intent unnamed would prepare it a second time.
     /// Whether `fanout` names a queued intent that has not retired yet, as
     /// after a failed retirement (mdk#2332). The fanout is then the intent's
     /// only durable link to the message already sent, so it stays until a
@@ -5587,6 +5581,12 @@ where
         })?)
     }
 
+    /// Retire the queued intent a resolved application message or proposal
+    /// was drained from (mdk#2332): once a relay accepted the event, or every
+    /// relay refused it for good. A commit's intent retires with the commit.
+    /// Returns false when the intent could not be deleted: the fanout must
+    /// then stay stored, still naming it, for a later pass to retry, since a
+    /// drain that found the intent unnamed would prepare it a second time.
     fn retire_drained_queued_intent(&mut self, fanout: &OutboundFanout) -> bool {
         let outcome = fanout.outcome();
         let (Some(group_id), Some(intent_id)) = (fanout.group_id(), fanout.queued_intent_id())
