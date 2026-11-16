@@ -92,10 +92,21 @@ fn publish_key_package(runtime: &crate::MarmotAppRuntime) -> HostCall {
     tokio::spawn(async move { runtime.publish_key_package("alice").await.map(drop) })
 }
 
-/// A read the worker answers in its main loop.
-fn started_fresh(runtime: &crate::MarmotAppRuntime) -> HostCall {
-    let runtime = runtime.clone();
-    tokio::spawn(async move { runtime.started_fresh("alice").await.map(drop) })
+/// A read the worker answers in its main loop and keeps there: an exporter
+/// secret (mdk#3273 leaves secrets on the writer).
+fn exporter_secret(runtime: &crate::MarmotAppRuntime, group: &GroupId) -> HostCall {
+    let (accounts, group) = (runtime.accounts(), group.clone());
+    tokio::spawn(async move {
+        accounts
+            .exporter_secret(
+                "alice",
+                &group,
+                cgka_traits::agent_text_stream::AGENT_TEXT_STREAM_EXPORTER_CACHE_KEY,
+                32,
+            )
+            .await
+            .map(drop)
+    })
 }
 
 fn none_answered(calls: &[HostCall], hold: &str) {
@@ -315,7 +326,7 @@ async fn a_held_key_package_resolution_holds_every_command() {
     let waiting = vec![
         send(&runtime, &group),
         publish_key_package(&runtime),
-        started_fresh(&runtime),
+        exporter_secret(&runtime, &group),
     ];
     until("each command queues behind the held lookup", || {
         sample(&telemetry, RuntimeOp::MutationQueueBehindInviteOrCreate).in_flight
@@ -501,7 +512,7 @@ async fn a_held_relay_document_in_an_invites_size_check_holds_every_command() {
     let waiting = vec![
         send(&runtime, &other),
         publish_key_package(&runtime),
-        started_fresh(&runtime),
+        exporter_secret(&runtime, &other),
     ];
     until("each command queues behind the held document", || {
         sample(&telemetry, RuntimeOp::MutationQueueBehindInviteOrCreate).in_flight
@@ -617,8 +628,11 @@ async fn a_held_subscription_refresh_holds_the_media_imeta_tag() {
         .unwrap()
         .operation
         .expect("eligible fixture members");
-    // The create's founding fanout routes the group too; a read waits it out.
-    runtime.started_fresh("alice").await.unwrap();
+    // The create's founding fanout routes the group too; a worker round trip
+    // waits it out.
+    crate::worker_fences::worker_round_trip(&runtime, "alice")
+        .await
+        .unwrap();
 
     relay.block_next_subscribe();
     relay.refuse_group_subscribes(false);
@@ -726,7 +740,7 @@ async fn a_held_sign_in_slot_read_holds_every_command_and_a_delivery() {
     let waiting = vec![
         send(&runtime, &group),
         publish_key_package(&runtime),
-        started_fresh(&runtime),
+        exporter_secret(&runtime, &group),
     ];
     until("each command queues behind the held slot read", || {
         sample(&telemetry, RuntimeOp::MutationQueueBehindMaintenance).in_flight

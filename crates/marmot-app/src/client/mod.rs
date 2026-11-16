@@ -1910,6 +1910,30 @@ impl AppClient {
             .collect())
     }
 
+    /// [`Self::prepared_initial_group_images`] from one statement with the
+    /// uploads whose record [`Self::prepared_initial_group_image_status`]
+    /// fails to read (a column only that read decodes holds another type):
+    /// A cannot answer their status from the list (mdk#3273 PR 5).
+    pub(crate) fn prepared_initial_group_images_with_record_check(
+        &self,
+    ) -> Result<(Vec<AppPreparedGroupImageUpload>, HashSet<String>), AppError> {
+        let checked = self
+            .app
+            .account_storage(&self.state.label)?
+            .app_storage()
+            .list_prepared_group_image_upload_statuses_with_record_check()?;
+        let unread = checked
+            .iter()
+            .filter(|(_, reads)| !reads)
+            .map(|(status, _)| status.upload_id.clone())
+            .collect();
+        let statuses = checked
+            .iter()
+            .map(|(status, _)| prepared_group_image_status(status))
+            .collect();
+        Ok((statuses, unread))
+    }
+
     pub(crate) fn prepare_initial_group_image_upload(
         &self,
         upload_id: &str,

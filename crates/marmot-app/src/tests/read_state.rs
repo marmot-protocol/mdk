@@ -276,6 +276,246 @@ async fn a_failed_account_read_recovers_without_a_write() {
     assert!(state.borrow().account.prepared_group_images.is_ok());
 }
 
+/// A Blossom server that takes one upload and answers it only once
+/// released: its URL, a signal that the whole upload arrived, and the
+/// release.
+async fn held_blossom_upload() -> (String, Arc<tokio::sync::Notify>, watch::Sender<bool>) {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let received = Arc::new(tokio::sync::Notify::new());
+    let (release, mut released) = watch::channel(false);
+    let (server, signal) = (url.clone(), received.clone());
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 16 * 1024];
+        let header_end = loop {
+            let read = stream.read(&mut buffer).await.unwrap();
+            assert!(read > 0, "the upload closed before its headers");
+            request.extend_from_slice(&buffer[..read]);
+            if let Some(offset) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                break offset + 4;
+            }
+        };
+        let headers = String::from_utf8_lossy(&request[..header_end]).into_owned();
+        let header = |name: &str| {
+            headers
+                .lines()
+                .find_map(|line| {
+                    let (key, value) = line.split_once(':')?;
+                    key.eq_ignore_ascii_case(name)
+                        .then(|| value.trim().to_owned())
+                })
+                .unwrap()
+        };
+        let length: usize = header("content-length").parse().unwrap();
+        let hash = header("x-sha-256");
+        while request.len() < header_end + length {
+            let read = stream.read(&mut buffer).await.unwrap();
+            assert!(read > 0, "the upload closed before its body");
+            request.extend_from_slice(&buffer[..read]);
+        }
+        signal.notify_one();
+        released.wait_for(|released| *released).await.unwrap();
+        let body = serde_json::json!({ "url": format!("{server}/{hash}.bin"), "sha256": hash })
+            .to_string();
+        let response = format!(
+            "HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(response.as_bytes()).await.unwrap();
+    });
+    (url, received, release)
+}
+
+/// An upload in flight reads `Uploading` from A (mdk#3273 PR 5). The
+/// worker's in-flight set is published with A, so both prepared-image reads
+/// show the upload `Uploading` while its HTTP is held off the worker, and
+/// `Uploaded` once its reply, which publishes first, has arrived. Neither
+/// read queues on the worker.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_upload_in_flight_reads_uploading_from_the_published_state() {
+    use crate::AppPreparedGroupImageUploadState::{Uploaded, Uploading};
+    let (server, received, release) = held_blossom_upload().await;
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay_and_config(
+        dir.path(),
+        "wss://relay.example",
+        crate::MarmotAppConfig::default().with_allow_loopback_blob_endpoints(true),
+    )
+    .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+    let runtime = crate::MarmotAppRuntime::new(app);
+    runtime.reconcile_accounts().await.unwrap();
+    crate::worker_fences::worker_startup_finished(&runtime, "alice")
+        .await
+        .unwrap();
+    let staged = runtime
+        .stage_prepared_group_image("alice", one_pixel_png(), "image/png".into())
+        .await
+        .unwrap();
+    let uploading = tokio::spawn({
+        let (runtime, upload_id) = (runtime.clone(), staged.upload_id.clone());
+        async move {
+            runtime
+                .upload_prepared_group_image_to_server_for_test("alice", upload_id, server)
+                .await
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(10), received.notified())
+        .await
+        .expect("the upload reaches the server");
+    // The worker has left the upload's command since, so it has published
+    // the upload it reserved.
+    crate::worker_fences::worker_round_trip(&runtime, "alice")
+        .await
+        .unwrap();
+    let telemetry = runtime.shared_services().app_performance_telemetry();
+    let queued = || {
+        telemetry
+            .snapshot()
+            .runtime_operations
+            .into_iter()
+            .find(|sample| sample.operation == crate::RuntimePerformanceOperation::ReadQueueR1)
+            .unwrap()
+            .started
+    };
+    let before = queued();
+    let states = |images: Vec<crate::AppPreparedGroupImageUpload>| {
+        images
+            .into_iter()
+            .map(|status| (status.upload_id, status.state))
+            .collect::<Vec<_>>()
+    };
+
+    let status = runtime
+        .prepared_group_image_status("alice", staged.upload_id.clone())
+        .await
+        .unwrap();
+    assert_eq!(status.state, Uploading);
+    assert_eq!(
+        states(runtime.prepared_group_images("alice").await.unwrap()),
+        [(staged.upload_id.clone(), Uploading)]
+    );
+
+    release.send_replace(true);
+    let uploaded = tokio::time::timeout(Duration::from_secs(10), uploading)
+        .await
+        .expect("the released upload finishes")
+        .unwrap()
+        .unwrap();
+    assert_eq!(uploaded.state, Uploaded);
+    let status = runtime
+        .prepared_group_image_status("alice", staged.upload_id.clone())
+        .await
+        .unwrap();
+    assert_eq!(status.state, Uploaded);
+    assert_eq!(
+        states(runtime.prepared_group_images("alice").await.unwrap()),
+        [(staged.upload_id, Uploaded)]
+    );
+    assert_eq!(
+        queued(),
+        before,
+        "a prepared-image read queued on the worker"
+    );
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+/// A answers one upload's status from the version's list, so where the list
+/// cannot give today's answer the read asks the worker, whose single-row read
+/// answers it (mdk#3273 PR 5). First an upload whose image component is text,
+/// which the list does not decode but the worker's read fails on: the list and
+/// the other upload's status still answer from A. Then a row whose timestamp
+/// does not decode fails the list, and the other upload's status still
+/// answers, from the worker.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_status_read_the_version_cannot_answer_asks_the_worker() {
+    use crate::AppPreparedGroupImageUploadState::Staged;
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+    let runtime = crate::MarmotAppRuntime::new(app.clone());
+    runtime.reconcile_accounts().await.unwrap();
+    crate::worker_fences::worker_startup_finished(&runtime, "alice")
+        .await
+        .unwrap();
+    let stage = || runtime.stage_prepared_group_image("alice", one_pixel_png(), "image/png".into());
+    let healthy = stage().await.unwrap();
+    let broken = stage().await.unwrap();
+    // Each corruption, then a publish after it.
+    let corrupt = |set: &str| {
+        app.account_storage("alice")
+            .unwrap()
+            .app_storage()
+            .execute_batch_for_test(&format!(
+                "UPDATE app_prepared_group_image_upload SET {set} WHERE upload_id = '{}'",
+                broken.upload_id
+            ))
+            .unwrap();
+        crate::worker_fences::worker_round_trip(&runtime, "alice")
+    };
+    let telemetry = runtime.shared_services().app_performance_telemetry();
+    let queued = || {
+        telemetry
+            .snapshot()
+            .runtime_operations
+            .into_iter()
+            .find(|sample| sample.operation == crate::RuntimePerformanceOperation::ReadQueueR1)
+            .unwrap()
+            .started
+    };
+    let status = |upload_id: &str| runtime.prepared_group_image_status("alice", upload_id.into());
+
+    corrupt("component_data = 'x'").await.unwrap();
+    let before = queued();
+    let mut listed: Vec<_> = runtime
+        .prepared_group_images("alice")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|status| (status.upload_id, status.state))
+        .collect();
+    listed.sort_by(|ours, theirs| ours.0.cmp(&theirs.0));
+    let mut expected = vec![
+        (healthy.upload_id.clone(), Staged),
+        (broken.upload_id.clone(), Staged),
+    ];
+    expected.sort_by(|ours, theirs| ours.0.cmp(&theirs.0));
+    assert_eq!(listed, expected, "the list does not decode the component");
+    assert_eq!(status(&healthy.upload_id).await.unwrap().state, Staged);
+    assert_eq!(
+        queued(),
+        before,
+        "the list and a readable record answer from A"
+    );
+    assert!(matches!(
+        status(&broken.upload_id).await,
+        Err(AppError::Storage(cgka_traits::StorageError::Backend(message)))
+            if message.contains("component_data")
+    ));
+    assert_eq!(queued(), before + 1, "an unreadable record asks the worker");
+
+    corrupt("recorded_at = -1").await.unwrap();
+    let before = queued();
+    assert!(matches!(
+        runtime.prepared_group_images("alice").await,
+        Err(AppError::Storage(cgka_traits::StorageError::Serialization(
+            _
+        )))
+    ));
+    assert_eq!(queued(), before, "the list's failure answers from A");
+    assert_eq!(status(&healthy.upload_id).await.unwrap().state, Staged);
+    assert_eq!(queued(), before + 1, "the status read asks the worker");
+    runtime.shutdown_and_close().await.unwrap();
+}
+
 /// The owned KeyPackage list is the one account answer A reuses: its read
 /// re-checks every stored bundle's signatures. It is kept while the account
 /// database's KeyPackage write count holds, which only a write to its inputs
@@ -485,7 +725,9 @@ async fn the_worker_publishes_a_time_bound_answer_when_its_bound_passes() {
     let not_before = crate::unix_now_seconds() + 2;
     store_own_bundle_valid_from(&app, &published[0], not_before);
     // A reply publishes the write first.
-    accounts.started_fresh("alice").await.unwrap();
+    crate::worker_fences::worker_round_trip(&runtime, "alice")
+        .await
+        .unwrap();
     let lane = accounts.worker_lane("alice").await.unwrap();
     let open = AtomicBool::new(false);
     let bounded = lane.read_state.version(&open).unwrap().unwrap();
