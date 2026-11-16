@@ -7414,8 +7414,6 @@ fn ambiguous_endpoint_failure(endpoint: TransportEndpoint) -> TransportEndpointF
     }
 }
 
-/// Whether `fanout` carries one of this device's group commits, a group
-/// evolution or a disband, rather than an application message or a Welcome.
 /// The group and relay a group relay's copy of an event names. The adapter
 /// routes every group copy by its group, so each one names it; a copy from
 /// another plane, or with no relay, is none.
@@ -7448,6 +7446,8 @@ fn echo_target_among(
         })
 }
 
+/// Whether `fanout` carries one of this device's group commits, a group
+/// evolution or a disband, rather than an application message or a Welcome.
 fn is_group_commit(fanout: &OutboundFanout) -> bool {
     matches!(
         fanout.pending_kind(),
