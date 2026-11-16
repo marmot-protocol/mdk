@@ -595,11 +595,21 @@ async fn a_held_welcome_fanout_holds_a_send_to_another_group() {
 /// was made, which arms the worker's retry of it. The tag and a KeyPackage
 /// publish are sent only once that retry's subscribe is held, so both queue
 /// behind it.
+///
+/// The create's own catch-up retries the refused route too, on a clock of
+/// its own. Should that retry send the held subscribe, the refresh runs
+/// inside a catch-up unit, which takes the tag and the publish off the lane
+/// to answer after it. So the catch-up waits until both are seen held.
+#[cfg(feature = "test-policy-overrides")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_held_subscription_refresh_holds_the_media_imeta_tag() {
     let dir = tempfile::tempdir().unwrap();
     let Alice { relay, runtime, .. } = alice_with_groups(&dir, []).await;
     let telemetry = runtime.shared_services().observer.performance().clone();
+    let create_catch_up = Arc::new(tokio::sync::Notify::new());
+    runtime
+        .shared_services()
+        .set_create_group_catch_up_barrier(Some(create_catch_up.clone()));
     relay.refuse_group_subscribes(true);
     let group = runtime
         .create_group("alice", "unrouted", &[], None)
@@ -643,6 +653,7 @@ async fn a_held_subscription_refresh_holds_the_media_imeta_tag() {
         "the tag answered through a held refresh"
     );
     none_answered(std::slice::from_ref(&key_package), "a held refresh");
+    create_catch_up.notify_one();
 
     relay.release_subscribe();
     // The reference names no upload, so the tag may refuse it: the answer,
@@ -742,6 +753,7 @@ async fn a_held_sign_in_slot_read_holds_every_command_and_a_delivery() {
     runtime.shutdown_and_close().await.unwrap();
 }
 
+#[cfg(feature = "test-policy-overrides")]
 fn imeta_reference() -> MediaAttachmentReference {
     MediaAttachmentReference {
         locators: Vec::new(),
