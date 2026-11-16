@@ -3331,7 +3331,7 @@ async fn run_app_runtime_account_worker(
                         if maintenance_due_dirty {
                             continue;
                         }
-                        let step = telemetry.observe(RuntimeOp::WorkerMaintenanceNextDue);
+                        let step = telemetry.observe(RuntimeOp::WatchdogMaintenanceNextDue);
                         let due = client.maintenance_due();
                         step.finish(TelemetryOutcome::Success);
                         schedule.late(

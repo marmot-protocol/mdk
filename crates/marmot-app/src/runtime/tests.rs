@@ -4210,14 +4210,30 @@ async fn session_maintenance_rereads_its_due_time_after_changes_only() {
     let runtime = MarmotAppRuntime::new(app.clone());
     runtime.accounts().reconcile().await.expect("alice starts");
     let count = |operation| startup_stage_snapshot(&runtime, operation).completed;
-    // The watchdog's tick reads the due time once whenever no re-read is
-    // pending, and it ticks on real time, so a slow start can put a tick in
-    // any window below. Count only the reads the tick did not make: a
-    // re-read after a change happens at the top of the loop, before a tick
-    // can interleave, so within each window the difference is exact.
-    let reads = || {
-        i64::try_from(count(RuntimeOp::WorkerMaintenanceNextDue)).expect("count fits")
-            - i64::try_from(count(RuntimeOp::WorkerMaintenance)).expect("count fits")
+    // Change-driven reads only: the watchdog's tick times its own read
+    // apart, as `WatchdogMaintenanceNextDue`, so a tick in any window below
+    // adds nothing here.
+    let reads = || count(RuntimeOp::WorkerMaintenanceNextDue);
+    // A re-read can wait on the read spacing's timer, which tokio rounds up
+    // to its next millisecond, so it lands once real time crosses that
+    // boundary, after however many yields (mdk#3462). Wait for it under the
+    // deadline rather than a fixed number of yields. A maintenance run is
+    // followed by a re-read of its own (the watchdog's real-time tick can
+    // start one), so the change's re-read must come before any run.
+    let reread_since = async |before: u64, what: &str| {
+        let runs = count(RuntimeOp::WorkerMaintenanceDue);
+        timeout(ACCOUNT_OPEN_TEST_DEADLINE, async {
+            while reads() == before && count(RuntimeOp::WorkerMaintenanceDue) == runs {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{what}"));
+        assert_eq!(
+            count(RuntimeOp::WorkerMaintenanceDue),
+            runs,
+            "{what}, before any maintenance run"
+        );
     };
     timeout(ACCOUNT_OPEN_TEST_DEADLINE, async {
         while count(RuntimeOp::WorkerMaintenanceDue) == 0 {
@@ -4230,10 +4246,21 @@ async fn session_maintenance_rereads_its_due_time_after_changes_only() {
     // the read spacing has passed.
     let planned = reads();
     advance_held_clock(Duration::from_secs(2)).await;
-    assert!(reads() > planned, "a run is followed by a re-read");
-    let settled = reads();
-    advance_held_clock(Duration::from_secs(2)).await;
-    assert_eq!(reads(), settled, "nothing changed");
+    reread_since(planned, "a run is followed by a re-read").await;
+    // Startup's last background turns (a route refresh, a checkpoint) can
+    // land late under load and re-read, as they should. Step until a quiet
+    // 2 s window shows the worker has settled.
+    let mut settled = reads();
+    let mut quiet = false;
+    for _ in 0..5 {
+        advance_held_clock(Duration::from_secs(2)).await;
+        if reads() == settled {
+            quiet = true;
+            break;
+        }
+        settled = reads();
+    }
+    assert!(quiet, "with nothing changing, the re-reads stop");
 
     runtime
         .key_package_maintenance_status("alice")
@@ -4251,7 +4278,7 @@ async fn session_maintenance_rereads_its_due_time_after_changes_only() {
         .await
         .expect("policy writes");
     advance_held_clock(Duration::from_secs(2)).await;
-    assert!(reads() > settled, "a state change is followed by a re-read");
+    reread_since(settled, "a state change is followed by a re-read").await;
     runtime.shutdown().await;
 }
 

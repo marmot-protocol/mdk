@@ -166,6 +166,9 @@ operations! {
     // The read of when session maintenance next has work (mdk#3265), once
     // per wake that may have moved it.
     WorkerMaintenanceNextDue => "worker_maintenance_next_due",
+    // The same read made by the maintenance tick's watchdog, counted apart
+    // so the change-driven reads above stay visible on their own.
+    WatchdogMaintenanceNextDue => "watchdog_maintenance_next_due",
     // A job the worker's schedule drives had work with no wake or deadline
     // pending, found by the maintenance tick's watchdog (mdk#2923 step B).
     WatchdogMissedWakeRecovery => "watchdog_missed_wake_recovery",

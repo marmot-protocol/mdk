@@ -113,7 +113,8 @@
   passes) retries 15 s after the last run while it lasts, as before. KeyPackage publication retries now follow their
   stored backoff (30 s doubling to 1 h) instead of every tick. The due time is re-read at most once a second, after a
   command, a receive, a convergence pass, a recovery turn or a maintenance run, and timed as
-  `worker_maintenance_next_due`. A maintenance run wakes the KeyPackage catch-up only when it changed whether the
+  `worker_maintenance_next_due`. The watchdog's own read on each tick is timed apart, as
+  `watchdog_maintenance_next_due`. A maintenance run wakes the KeyPackage catch-up only when it changed whether the
   catch-up is due or when it next comes due, so the catch-up's own deadline decides otherwise. The relay-config retry
   after an inactive account (mdk#3263) moves from the tick to the same schedule. The tick's watchdog counts session
   maintenance found due before its deadline (`watchdog_missed_wake_session_maintenance`) and a relay-config retry with
