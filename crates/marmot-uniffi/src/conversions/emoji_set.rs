@@ -174,7 +174,7 @@ impl From<AppEmojiSetSyncResult> for EmojiSetSyncResultFfi {
 pub struct EmojiSetInstallResultFfi {
     pub set: EmojiSetFfi,
     pub installed_count: u32,
-    /// Parse-time skips, then refresh failures, which can retain earlier images.
+    /// Parse-time skips first, then install-time ones.
     pub skipped: Vec<EmojiSkipFfi>,
 }
 

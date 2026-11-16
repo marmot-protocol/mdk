@@ -6480,7 +6480,7 @@ typedef struct MarmotEmojiSetInstallProgress {
 } MarmotEmojiSetInstallProgress;
 
 /**
- * Installed set and skips. A skipped refresh may retain its earlier image.
+ * The installed set and every entry that was not installed.
  */
 typedef struct MarmotEmojiSetInstallResult {
   struct MarmotEmojiSet set;

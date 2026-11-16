@@ -1098,13 +1098,14 @@ async fn a_partial_reinstall_preserves_downloaded_emoji_and_fills_missing_entrie
         assert_eq!(read.bytes, expected);
         assert_eq!(read.emoji.sha256, hex::encode(Sha256::digest(&expected)));
     }
-    assert!(
-        retried
+    let installed = ["good", "mislabeled", "missing"];
+    let skips_installed = |result: &AppEmojiSetInstallResult| {
+        result
             .skipped
             .iter()
-            .any(|skip| skip.shortcode.as_deref() == Some("good")
-                && skip.reason == AppEmojiSkipReason::DownloadFailed)
-    );
+            .any(|skip| installed.contains(&skip.shortcode.as_deref().unwrap_or_default()))
+    };
+    assert!(!skips_installed(&retried));
 
     // A fully failed subsequent retry also keeps every successful entry.
     host.routes.lock().unwrap().clear();
@@ -1118,6 +1119,7 @@ async fn a_partial_reinstall_preserves_downloaded_emoji_and_fills_missing_entrie
         .await
         .unwrap();
     assert_eq!(retried.installed_count, 3);
+    assert!(!skips_installed(&retried));
     assert_eq!(app.installed_custom_emoji(account).await.unwrap().len(), 3);
 }
 
@@ -1369,11 +1371,13 @@ async fn reinstall_reserves_retained_bytes_and_keeps_them_after_download_caps() 
             .app
             .download_set(&entries, budget, &EmojiSetInstallControl::new(), previous())
             .await;
+        // Every other entry is skipped, and the kept one is not reported.
         assert_eq!(kept, vec![original.clone()]);
+        assert_eq!(skipped.len(), entries.len() - 1);
         assert!(
             skipped
                 .iter()
-                .any(|skip| skip.reason == AppEmojiSkipReason::OverCap)
+                .all(|skip| skip.shortcode.as_deref() != Some("good"))
         );
     }
 }

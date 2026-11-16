@@ -75,16 +75,12 @@ pub const MAX_INSTALLED_EMOJI_SET_BYTES: u64 = 32 * 1024 * 1024;
 /// Stored bytes across every installed set of the account.
 pub const MAX_INSTALLED_EMOJI_BYTES: u64 = 128 * 1024 * 1024;
 const EMOJI_DOWNLOAD_CONCURRENCY: usize = 4;
-type InstalledEmojiSnapshot = HashMap<String, (StoredInstalledEmoji, Vec<u8>)>;
-
-struct EmojiInstallPlan {
-    set: StoredEmojiSet,
-    budget: u64,
-    previous: InstalledEmojiSnapshot,
-}
 /// Relay reads in flight at once when resolving a user list's pointers.
 const EMOJI_SET_READ_CONCURRENCY: usize = 4;
 const MAX_FUTURE_EVENT_SKEW_SECONDS: u64 = 5 * 60;
+
+/// A same-version install's verified stored images, by shortcode.
+type InstalledEmojiSnapshot = HashMap<String, (StoredInstalledEmoji, Vec<u8>)>;
 
 /// Why an `emoji` entry was not offered or not installed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -222,8 +218,8 @@ pub struct AppEmojiSetInstallResult {
     pub set: AppEmojiSet,
     /// Available images after this install, including verified same-version fallbacks.
     pub installed_count: u32,
-    /// Parse-time skips first, then failures of this attempt's downloads,
-    /// validation and caps. A failed refresh can retain its earlier installed image.
+    /// Every entry not installed: the set's parse-time skips first, then
+    /// install-time ones (downloads, validation, caps).
     pub skipped: Vec<AppEmojiSkip>,
 }
 
@@ -1021,11 +1017,7 @@ impl MarmotApp {
         };
         // Read under the lock, so no other install or uninstall changes the
         // version, the set count or the byte budget before the write.
-        let EmojiInstallPlan {
-            set,
-            budget,
-            previous,
-        } = {
+        let (set, budget, previous) = {
             let (storage, coordinate) = (storage.clone(), coordinate.clone());
             let expected = expected_event_id_hex.to_owned();
             read_blocking(move || install_plan(&storage, &coordinate, &expected)).await?
@@ -1198,7 +1190,7 @@ impl MarmotApp {
     /// Download a set's emoji in order, a few at a time, keeping those that
     /// validate and still fit `budget`; one that does not fit is skipped and
     /// later, smaller ones are still tried. Verified `previous` bytes remain
-    /// available when their refresh fails or cannot fit. Once the bytes transferred,
+    /// installed, and unreported, when their refresh fails or cannot fit. Once the bytes transferred,
     /// valid or not, reach twice the budget, the rest are skipped without
     /// being fetched (beyond the few already in flight). Each finished entry
     /// advances `control`'s progress. No download starts once `control` or
@@ -1250,13 +1242,13 @@ impl MarmotApp {
                 reason,
             };
             let mut retained = previous.remove(&entry.shortcode);
-            match result {
+            let reason = match result {
                 Ok(image) => {
                     let len = image.bytes.len() as u64;
                     let old_len = retained.as_ref().map_or(0, |(_, bytes)| bytes.len() as u64);
                     let next_used = used.saturating_sub(old_len).saturating_add(len);
                     if next_used > budget {
-                        skipped.push(skip(AppEmojiSkipReason::OverCap));
+                        Some(AppEmojiSkipReason::OverCap)
                     } else {
                         used = next_used;
                         retained = None;
@@ -1272,11 +1264,16 @@ impl MarmotApp {
                             },
                             image.bytes,
                         ));
+                        None
                     }
                 }
-                Err(reason) => skipped.push(skip(reason)),
+                Err(reason) => Some(reason),
+            };
+            // An entry that keeps its earlier image is installed, not skipped.
+            match retained {
+                Some(image) => kept.push(image),
+                None => skipped.extend(reason.map(skip)),
             }
-            kept.extend(retained);
             if fetched >= budget.saturating_mul(2) {
                 break;
             }
@@ -1284,12 +1281,14 @@ impl MarmotApp {
         drop(downloads);
         control.finish_entries(entries.len().saturating_sub(done), 0);
         for entry in entries.iter().skip(done) {
-            kept.extend(previous.remove(&entry.shortcode));
-            skipped.push(AppEmojiSkip {
-                position: None,
-                shortcode: Some(entry.shortcode.clone()),
-                reason: AppEmojiSkipReason::OverCap,
-            });
+            match previous.remove(&entry.shortcode) {
+                Some(image) => kept.push(image),
+                None => skipped.push(AppEmojiSkip {
+                    position: None,
+                    shortcode: Some(entry.shortcode.clone()),
+                    reason: AppEmojiSkipReason::OverCap,
+                }),
+            }
         }
         (kept, skipped)
     }
@@ -1647,12 +1646,13 @@ fn shown_version(
 
 /// The shown version to install and the byte budget it may use, refused
 /// before any download when the set has no valid emoji, would exceed the
-/// installed set count, or no storage is left.
+/// installed set count, or no storage is left. A same-version install also
+/// returns the verified installed images as fallbacks, corrupt rows excluded.
 fn install_plan(
     storage: &SqliteAppStorage,
     coordinate: &str,
     expected_event_id_hex: &str,
-) -> Result<EmojiInstallPlan, AppError> {
+) -> Result<(StoredEmojiSet, u64, InstalledEmojiSnapshot), AppError> {
     let set = shown_version(storage, coordinate, expected_event_id_hex)?;
     if set.emoji.is_empty() {
         return Err(no_valid_emoji());
@@ -1692,11 +1692,7 @@ fn install_plan(
             }
         }
     }
-    Ok(EmojiInstallPlan {
-        set,
-        budget,
-        previous,
-    })
+    Ok((set, budget, previous))
 }
 
 /// Run a local read on the blocking pool, so account resolution, a cold
