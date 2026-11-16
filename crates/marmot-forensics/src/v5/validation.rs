@@ -15,7 +15,17 @@ pub(super) fn validate(record: &RecordFields) -> Result<(), ContractError> {
     require(record.seq.get() > 0, "sequence must be positive")?;
     let has_group = record.group_ref.is_some();
     match &record.event {
-        Event::Operational(e) => validate_operational(&e.kind)?,
+        Event::Operational(e) => {
+            validate_operational(&e.kind)?;
+            require(
+                has_group
+                    || !matches!(
+                        e.kind,
+                        crate::audit::AuditEventKind::PendingCommitChanged { .. }
+                    ),
+                "a pending commit row names its group",
+            )?;
+        }
         Event::AppUpdateOutcome(e) => {
             require(
                 e.failure_stage.is_some() == e.failure_reason.is_some(),

@@ -3963,6 +3963,32 @@ fn v5_audit_rows(path: &std::path::Path) -> Vec<serde_json::Value> {
         .collect()
 }
 
+/// The `pending_commit_changed` rows in the v5 audit at `path`, as each row's
+/// change and `pending_secs`, after checking that each names `group_id` and
+/// `commit` by their hashed references, as the commit's publish rows do
+/// (mdk#3460).
+fn pending_commit_changes(
+    path: &std::path::Path,
+    group_id: &GroupId,
+    commit: &MessageId,
+) -> Vec<(String, u64)> {
+    let message_ref =
+        marmot_forensics::v5::EngineMessageRef::from_message_id(commit.as_slice()).unwrap();
+    let group_ref = marmot_forensics::v5::GroupRef::from_group_id(group_id.as_slice()).unwrap();
+    v5_audit_rows(path)
+        .into_iter()
+        .filter(|row| row["event"]["type"] == "pending_commit_changed")
+        .map(|row| {
+            assert_eq!(row["event"]["message_ref"], message_ref.as_str(), "{row}");
+            assert_eq!(row["group_ref"], group_ref.as_str(), "{row}");
+            (
+                row["event"]["change"].as_str().unwrap().to_owned(),
+                row["event"]["pending_secs"].as_u64().unwrap(),
+            )
+        })
+        .collect()
+}
+
 /// mdk#2255: a self-update commit confirms on its first relay acknowledgement,
 /// then keeps retrying every group relay that missed it through the same
 /// durable frozen fanout as every other commit, auditing each retry pass.

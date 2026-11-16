@@ -35,9 +35,11 @@ use sha2::{Digest, Sha256};
 /// expiry of closed files; daily sealing keeps that policy at day granularity.
 const AUDIT_LOG_SEGMENT_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
+mod pending_commit;
 mod recovery;
 mod refusal;
 mod shared;
+pub use pending_commit::PendingCommitChange;
 pub use recovery::{
     EoseRepairReceiver, EoseRepairTrigger, RECOVERY_AUDIT_MAX_ENDPOINTS,
     RECOVERY_AUDIT_MAX_OBLIGATIONS, RECOVERY_RUNNER_RACED_WINDOW_SECS, RecoveryAttemptScope,
@@ -1546,6 +1548,26 @@ pub enum AuditEventKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         remainder_until_secs: Option<u64>,
     },
+    /// One of this account's pending group commits went stuck, was confirmed
+    /// without a relay's `OK`, or was given up (mdk#3460). Group-scoped; the
+    /// commit's publish rows say which relays accepted or refused it, and
+    /// this row says what they cannot: `stuck` once, when the commit is first
+    /// read back past the read-back bound, some relay may hold it and none
+    /// has acknowledged it; `read_back_confirmed` or `echo_confirmed` as it
+    /// confirms with no relay's `OK` among its acknowledgements, by a read
+    /// that returned it or only by the account's own echo; `given_up` when it
+    /// reached no relay and rolled back as not delivered, which the
+    /// `epoch_rolled_back` row alone cannot tell apart from any other
+    /// rollback.
+    ///
+    /// `msg_id` is the commit's message id (v5 `message_ref`, joining its
+    /// publish rows), and `pending_secs` how long since its first publish
+    /// attempt. v5 only.
+    PendingCommitChanged {
+        change: PendingCommitChange,
+        msg_id: String,
+        pending_secs: u64,
+    },
 }
 
 impl AuditEventKind {
@@ -1612,6 +1634,7 @@ impl AuditEventKind {
             AuditEventKind::RecoveryRunnerFetched { .. } => "recovery_runner_fetched",
             AuditEventKind::RecoveryRunnerRaced { .. } => "recovery_runner_raced",
             AuditEventKind::RecoveryRunnerChanged { .. } => "recovery_runner_changed",
+            AuditEventKind::PendingCommitChanged { .. } => "pending_commit_changed",
         }
     }
 
@@ -1662,6 +1685,7 @@ impl AuditEventKind {
                 | AuditEventKind::RecoveryRunnerFetched { .. }
                 | AuditEventKind::RecoveryRunnerRaced { .. }
                 | AuditEventKind::RecoveryRunnerChanged { .. }
+                | AuditEventKind::PendingCommitChanged { .. }
         )
     }
 }

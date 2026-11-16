@@ -20,7 +20,8 @@ fn epoch_is_pending(runtime: &FloorRuntime, fixture: &FloorFixture) -> bool {
 /// reached. Before the bound the dead relay is only retried. Past it, the
 /// refusing relay's answer to a read shows the device online, so the dead
 /// relay is given up and the commit rolls back: its fanout is gone, the group
-/// is back where it was, and a restart sends nothing.
+/// is back where it was, and a restart sends nothing. The audit records it
+/// given up, and never stuck: no relay may hold it (mdk#3460).
 #[tokio::test]
 async fn a_commit_no_relay_received_rolls_back_once_another_relay_answers() {
     let refusing = TransportEndpoint("wss://abandon-refusing.example".into());
@@ -34,6 +35,8 @@ async fn a_commit_no_relay_received_rolls_back_once_another_relay_answers() {
     );
     adapter.answer_read_backs(refusing.clone(), TransportReadBack::NotFound);
     let mut runtime = fixture.runtime(alice, &adapter);
+    let audit_path = fixture.alice_path.with_extension("audit.jsonl");
+    runtime.audit_recorder().swap(v5_audit_recorder(&audit_path));
     let start = fixture.wall.now().0;
     let sent = runtime.send(fixture.rename()).await.unwrap();
     assert!(sent.pending.is_empty(), "{:?}", sent.pending);
@@ -60,7 +63,7 @@ async fn a_commit_no_relay_received_rolls_back_once_another_relay_answers() {
     );
     assert_eq!(
         adapter.read_backs(),
-        vec![(commit, vec![refusing.clone(), dead.clone()])]
+        vec![(commit.clone(), vec![refusing.clone(), dead.clone()])]
     );
     let outcome = effects.fanout.last().unwrap();
     assert!(outcome.fanout_complete, "{outcome:?}");
@@ -70,6 +73,10 @@ async fn a_commit_no_relay_received_rolls_back_once_another_relay_answers() {
     assert_ne!(
         runtime.session().group_record(&fixture.group_id).unwrap().name,
         "renamed"
+    );
+    assert_eq!(
+        pending_commit_changes(&audit_path, &fixture.group_id, &commit),
+        [("given_up".into(), READ_BACK_BOUND_SECS)]
     );
 
     drop(runtime);

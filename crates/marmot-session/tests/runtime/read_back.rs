@@ -124,13 +124,17 @@ async fn a_read_back_past_the_bound_confirms_a_pending_commit() {
 }
 
 /// A hit confirms the commit in the pass that reads it, even with nothing
-/// left to send, and the relay that returned it is not resent to.
+/// left to send, and the relay that returned it is not resent to. The audit
+/// records the commit stuck as it is read, then confirmed by the read
+/// (mdk#3460).
 #[tokio::test]
 async fn a_read_back_hit_confirms_without_a_resend() {
     let relay = TransportEndpoint("wss://read-hit.example".into());
     let (fixture, alice) = FloorFixture::new("read-back-hit", &[&relay]).await;
     let adapter = RecordingAdapter::default();
     let mut runtime = fixture.runtime(alice, &adapter);
+    let audit_path = fixture.alice_path.with_extension("audit.jsonl");
+    runtime.audit_recorder().swap(v5_audit_recorder(&audit_path));
     adapter.fail_endpoints_as(
         vec![relay.clone()],
         TransportEndpointFailureKind::PossiblyExposed,
@@ -138,6 +142,7 @@ async fn a_read_back_hit_confirms_without_a_resend() {
     adapter.answer_read_backs(relay.clone(), TransportReadBack::Found);
     let start = fixture.wall.now().0;
     runtime.send(fixture.rename()).await.unwrap();
+    let commit = adapter.publishes().last().unwrap().message.id.clone();
 
     fixture.wall.set(start + HOUR);
     let effects = runtime.resume_outbound_fanouts().await.unwrap();
@@ -150,6 +155,60 @@ async fn a_read_back_hit_confirms_without_a_resend() {
     assert_eq!(adapter.read_backs().len(), 1, "{:?}", adapter.read_backs());
     assert_eq!(publishes_to(&adapter, &relay), 1);
     assert_eq!(runtime.pending_commit(&fixture.group_id).unwrap(), None);
+    assert_eq!(
+        pending_commit_changes(&audit_path, &fixture.group_id, &commit),
+        [("stuck".into(), HOUR), ("read_back_confirmed".into(), HOUR)]
+    );
+}
+
+/// mdk#3460: a stuck commit is audited once, at its first read-back. Later
+/// reads, and a restart that reads it again, record nothing more, and
+/// confirmation by a resend's `OK` adds no pending-commit row: the commit's
+/// publish rows show that.
+#[tokio::test]
+async fn a_stuck_commit_is_audited_once() {
+    let relay = TransportEndpoint("wss://read-audit.example".into());
+    let (fixture, alice) = FloorFixture::new("read-back-audit", &[&relay]).await;
+    let adapter = RecordingAdapter::default();
+    adapter.script_failures(relay.clone(), vec![timed_out(&relay); 4]);
+    adapter.answer_read_backs(relay.clone(), TransportReadBack::NotFound);
+    let mut runtime = fixture.runtime(alice, &adapter);
+    let audit_path = fixture.alice_path.with_extension("audit.jsonl");
+    runtime.audit_recorder().swap(v5_audit_recorder(&audit_path));
+    let start = fixture.wall.now().0;
+    runtime.send(fixture.rename()).await.unwrap();
+    let commit = adapter.publishes().last().unwrap().message.id.clone();
+
+    for hours in [1, 2] {
+        fixture.wall.set(start + hours * HOUR);
+        runtime.resume_outbound_fanouts().await.unwrap();
+    }
+    drop(runtime);
+    let mut restarted = fixture.runtime(fixture.reopen(), &adapter);
+    let restarted_path = fixture.alice_path.with_extension("restarted-audit.jsonl");
+    restarted
+        .audit_recorder()
+        .swap(v5_audit_recorder(&restarted_path));
+    fixture.wall.set(start + 3 * HOUR);
+    restarted.resume_outbound_fanouts().await.unwrap();
+    fixture.wall.set(start + 4 * HOUR);
+    let effects = restarted.resume_outbound_fanouts().await.unwrap();
+
+    assert!(
+        matches!(effects.pending.as_slice(), [PendingResolution::Confirmed { .. }]),
+        "{:?}",
+        effects.pending
+    );
+    // Every read missed: the fifth send's `OK` confirmed it.
+    assert_eq!(adapter.read_backs().len(), 4, "{:?}", adapter.read_backs());
+    assert_eq!(publishes_to(&adapter, &relay), 5);
+    assert_eq!(
+        pending_commit_changes(&audit_path, &fixture.group_id, &commit),
+        [("stuck".into(), HOUR)]
+    );
+    assert!(
+        pending_commit_changes(&restarted_path, &fixture.group_id, &commit).is_empty()
+    );
 }
 
 /// Proof 16: the bound counts from when the first attempt was sent, after its

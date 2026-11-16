@@ -9,6 +9,9 @@
 
 ### Added
 
+- `OutboundFanout::record_stuck` keeps when the session first read a pending commit back past the read-back bound,
+  and `stuck_at_ms` reads it (mdk#3460); the session audits the commit stuck once by it. A fanout stored before the
+  field reads `None`.
 - `OutboundFanout::pending_final_answers` lists each target of a pending commit whose latest answer was final,
   whatever its status, with the causes `refused_targets` gives (mdk#2332). A relay that may hold an earlier copy and
   refused a later attempt is listed, and stays a target that may hold the event.

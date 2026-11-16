@@ -13,6 +13,15 @@
 
 ### Added
 
+- The v5 audit records a pending commit going stuck, confirming without a
+  relay's `OK`, or being given up (#3460). The new `pending_commit_changed` row
+  says `stuck` once, at the commit's first read-back past the ten-minute bound;
+  `read_back_confirmed` or `echo_confirmed` when a read or the account's own
+  echo confirmed it; or `given_up` when it reached no relay and rolled back. It
+  names the group and the commit by hashed references, as the commit's publish
+  rows do, with seconds since the first send attempt. A receiver must accept
+  the new kind before it gets these rows; one that rejects the kind loses only
+  them.
 - Group changes MDK gives up after their call returned are recorded until the
   user has seen them (#2332). A direct group change that answered
   `CompletionUnknown`, or a queued one that answered `AcceptedPending`, gets a

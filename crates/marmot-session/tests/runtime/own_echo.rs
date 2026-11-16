@@ -33,7 +33,8 @@ fn group_delivery(
 /// Proofs 5 and 14: one relay's publish was ambiguous and the other refused
 /// it outright, so the commit waits. Its echo from the refusing relay, in
 /// another spelling of that relay's URL, confirms it; the relay is
-/// `Accepted` by its echo, and the ambiguous relay stays owed.
+/// `Accepted` by its echo, and the ambiguous relay stays owed. The audit
+/// records that the echo confirmed it.
 #[tokio::test]
 async fn an_own_echo_from_a_target_relay_confirms_a_pending_commit() {
     let ambiguous = TransportEndpoint("wss://echo-a.example".into());
@@ -41,6 +42,8 @@ async fn an_own_echo_from_a_target_relay_confirms_a_pending_commit() {
     let (fixture, alice) = FloorFixture::new("own-echo", &[&ambiguous, &refusing]).await;
     let adapter = RecordingAdapter::default();
     let mut runtime = fixture.runtime(alice, &adapter);
+    let audit_path = fixture.alice_path.with_extension("audit.jsonl");
+    runtime.audit_recorder().swap(v5_audit_recorder(&audit_path));
     // An earlier message of Alice's own, delivered before the commit.
     let alice_hex = hex::encode(runtime.session().self_id().as_slice());
     let earlier = runtime
@@ -119,6 +122,56 @@ async fn an_own_echo_from_a_target_relay_confirms_a_pending_commit() {
     assert!(!runtime.takes_own_echo(&delivery).unwrap());
     let ambiguous_copy = group_delivery(&runtime, &fixture, &commit, Some("wss://echo-a.example"));
     assert!(!runtime.takes_own_echo(&ambiguous_copy).unwrap());
+    // The audit records the commit confirmed by its echo (mdk#3460).
+    assert_eq!(
+        pending_commit_changes(&audit_path, &fixture.group_id, &commit.id),
+        [("echo_confirmed".into(), 0)]
+    );
+}
+
+/// mdk#3460: under a goal of two acknowledgements, a commit one relay's echo
+/// acknowledged past the read-back bound is not stuck, though it is still
+/// pending and the other relay is read back first in the same pass. The audit
+/// records no `stuck`, as the host reads `Sending`; the pass then confirms the
+/// commit on the echo it had.
+#[tokio::test]
+async fn an_acknowledged_commit_below_its_goal_is_not_audited_stuck() {
+    let echoing = TransportEndpoint("wss://echo-goal-a.example".into());
+    let silent = TransportEndpoint("wss://echo-goal-b.example".into());
+    let (mut fixture, alice) = FloorFixture::new("own-echo-goal", &[&echoing, &silent]).await;
+    fixture.policy = fixture.policy.clone().required_acks(2);
+    let adapter = RecordingAdapter::default();
+    adapter.fail_endpoints_as(
+        vec![echoing.clone(), silent.clone()],
+        TransportEndpointFailureKind::PossiblyExposed,
+    );
+    adapter.answer_read_backs(silent.clone(), TransportReadBack::NotFound);
+    let mut runtime = fixture.runtime(alice, &adapter);
+    let audit_path = fixture.alice_path.with_extension("audit.jsonl");
+    runtime.audit_recorder().swap(v5_audit_recorder(&audit_path));
+    let start = fixture.wall.now().0;
+    let sent = runtime.send(fixture.rename()).await.unwrap();
+    assert!(sent.pending.is_empty(), "{:?}", sent.pending);
+    let commit = adapter.publishes().last().unwrap().message.clone();
+
+    fixture.wall.set(start + READ_BACK_BOUND_SECS + 60);
+    let delivery = group_delivery(&runtime, &fixture, &commit, Some("wss://echo-goal-a.example"));
+    let ingested = runtime.ingest_delivery(&delivery).await.unwrap();
+
+    assert_eq!(
+        adapter.read_backs(),
+        vec![(commit.id.clone(), vec![silent.clone()])],
+        "the other relay is still read back"
+    );
+    assert!(
+        matches!(ingested.effects.pending.as_slice(), [PendingResolution::Confirmed { .. }]),
+        "{:?}",
+        ingested.effects.pending
+    );
+    assert_eq!(
+        pending_commit_changes(&audit_path, &fixture.group_id, &commit.id),
+        [("echo_confirmed".into(), READ_BACK_BOUND_SECS + 60)]
+    );
 }
 
 /// Alice renamed her group, and neither relay answered the publish, when her

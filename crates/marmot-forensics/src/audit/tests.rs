@@ -1147,6 +1147,11 @@ fn sample_v5_only_kinds() -> Vec<AuditEventKind> {
             remainder_since_secs: None,
             remainder_until_secs: None,
         },
+        AuditEventKind::PendingCommitChanged {
+            change: PendingCommitChange::Stuck,
+            msg_id: "5c".repeat(32),
+            pending_secs: 600,
+        },
         AuditEventKind::TransportCursorAdvanced {
             trigger: TransportCursorTrigger::LivePromotion,
             cursor_before_secs: Some(1_700_000_000),
@@ -2581,7 +2586,11 @@ fn v5_recorder_covers_every_existing_operational_kind_with_strict_typed_rows() {
             converted.is_ok(),
             "v5 conversion failed for {tag}: {converted:?}"
         );
-        recorder.record(AuditRecord::new(None, kind));
+        // A pending commit's row must name its group; the rest are written
+        // account-scoped.
+        let group =
+            matches!(kind, AuditEventKind::PendingCommitChanged { .. }).then(|| "ab".repeat(16));
+        recorder.record(AuditRecord::new(group, kind));
     }
     let schema: serde_json::Value = serde_json::from_str(v5::JSON_SCHEMA).unwrap();
     let validator = jsonschema::validator_for(&schema).unwrap();
