@@ -3943,8 +3943,9 @@ async fn a_too_large_queued_intent_is_retired_with_its_rollback() {
 /// rollback carries each unsent target's `Abandoned` edge, which storage
 /// checks against the stored row in the rollback's transaction: one computed
 /// before a pass marked the target is refused, and the MLS rewind and the
-/// retirement fail with it. A fanout a relay may hold is never rolled back,
-/// whoever asks (mdk#1577).
+/// retirement fail with it. A storage failure inside that transaction leaves
+/// the commit, the intent and the fanout as they were. A fanout a relay may
+/// hold is never rolled back, whoever asks (mdk#1577).
 #[tokio::test]
 async fn a_queued_intent_whose_commit_reached_no_relay_is_retired_with_its_rollback() {
     use cgka_traits::{
@@ -3953,9 +3954,11 @@ async fn a_queued_intent_whose_commit_reached_no_relay_is_retired_with_its_rollb
     };
 
     let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
+    let group_write_fault = PutGroupFault::default();
+    let termination_fault = LeaveWriteFault::default();
     let mut engine = EngineBuilder::new(FaultStorage {
         inner: storage.clone(),
-        fault: PutGroupFault::default(),
+        fault: group_write_fault.clone(),
         leave_write_fault: LeaveWriteFault::default(),
         intent_write_fault: LeaveWriteFault::default(),
         failed_state_fault: FailedStateWriteFault::default(),
@@ -3964,7 +3967,7 @@ async fn a_queued_intent_whose_commit_reached_no_relay_is_retired_with_its_rollb
         deferred_usage_read_fault: DeferredUsageReadFault::default(),
         retained_anchor_rewinds: RetainedAnchorRewindCounter::default(),
         apply_snapshots: ApplySnapshotCounter::default(),
-        termination_fault: LeaveWriteFault::default(),
+        termination_fault: termination_fault.clone(),
         post_commit_disband_read_fault: LeaveWriteFault::default(),
         deferred_release_read_fault: DeferredReleaseReadFault::default(),
         message_list_fault: LeaveWriteFault::default(),
@@ -4145,6 +4148,50 @@ async fn a_queued_intent_whose_commit_reached_no_relay_is_retired_with_its_rollb
         .unwrap();
     engine.put_outbound_fanout(&fanout).unwrap();
     fanout.abandon_unsent_targets().unwrap();
+
+    // A failure anywhere in the rollback's transaction keeps all of it
+    // (proof 8): the intent's delete, the record's write, or the group write
+    // after the MLS rewind. The commit stays pending, the intent queued, the
+    // stored fanout as it was and the caller's copy unrolled.
+    let stored = engine.outbound_fanouts().unwrap();
+    for (arm, case) in [
+        (Some(1), "the intent's delete"),
+        (Some(2), "the record's write"),
+        (None, "the group write"),
+    ] {
+        match arm {
+            Some(write) => termination_fault.arm_on_write(write),
+            None => group_write_fault.arm(1),
+        }
+        let mut attempt = fanout.clone();
+        assert!(
+            matches!(
+                engine
+                    .publish_not_delivered(pending, &mut attempt, RollbackPass::Later)
+                    .await,
+                Err(EngineError::Storage(StorageError::Busy(_)))
+            ),
+            "{case}"
+        );
+        assert_eq!(termination_fault.remaining(), 0, "{case}");
+        assert!(!group_write_fault.should_fail(), "{case}: the fault fired");
+        assert!(still_pending(&engine), "{case}");
+        assert_eq!(queued(&storage), 1, "{case}");
+        assert!(
+            storage.changes_not_delivered(&group_id).unwrap().is_empty(),
+            "{case}"
+        );
+        assert_eq!(engine.outbound_fanouts().unwrap(), stored, "{case}");
+        assert_eq!(attempt, fanout, "{case}: the caller's fanout is untouched");
+        assert!(
+            !engine.drain_events().iter().any(|event| matches!(
+                event,
+                GroupEvent::QueuedIntentRefused { .. } | GroupEvent::GroupChangeNotDelivered { .. }
+            )),
+            "{case}"
+        );
+    }
+
     engine
         .publish_not_delivered(pending, &mut fanout, RollbackPass::Later)
         .await
