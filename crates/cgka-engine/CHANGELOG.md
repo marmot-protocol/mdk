@@ -19,6 +19,8 @@
   fanout to name (mdk#2332).
 - `Engine::retire_drained_queued_intent` retires the queued intent a drained application message or proposal came
   from once its fanout resolves, and is a no-op for an intent already retired (mdk#2332).
+  `Engine::is_queued_outbound_intent` says whether an intent is still queued, so a host keeps the fanout naming it
+  until it retires.
 - `Engine::seeded_group_outbound_fanouts` reads a seeded-but-unhydrated group's stored fanouts without hydrating it,
   for deciding whether a delivery is worth hydrating the group for (mdk#2332). It is empty for a live, quarantined or
   unknown group.
