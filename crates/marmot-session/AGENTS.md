@@ -80,15 +80,26 @@ It must not own MLS internals, transport event parsing, SQLCipher key derivation
     obligation, and every publish reads it first (`welcome_hold`): a withdrawn Welcome never goes out again, a staged
     one waits for its commit, and a device link's Welcome never goes out from its `deliver_until` on, by this
     runtime's wall clock (mdk#2628 D40). A batch checks that deadline again before it starts each relay attempt, so a
-    detached startup retry prepared earlier does not send it late. An expired Welcome is settled for its watch, and
+    detached wave prepared earlier does not send it late. An expired Welcome is settled for its watch, and
     maintenance drops its retry record. The runtime watches the Welcomes it stages, and those the startup pass (or else the first
     maintenance pass) finds staged or owed; a group skipped because it was not live is read again on each pass until it
     is. A Welcome stays watched until its row is settled. Maintenance publishes each watched Welcome that is owed and
-    that no attempt record (stored fanout or detached startup retry) holds, so one whose publish stored nothing (no
+    that no attempt record (stored fanout or detached wave) holds, so one whose publish stored nothing (no
     route) or whose fanout expired goes out again on the next pass, as the startup pass would send it.
     Whichever attempt meets a Welcome's acknowledgement policy marks it delivered, maintenance's retry of its stored
     fanout included. A host that names Welcomes by id (the app's invite drive) publishes them through
     `deliver_owed_welcomes_with_audit_context`, which sends only those the engine says are owed now.
+    With `set_detached_welcome_waves` on (the app's account worker, mdk#3466), every Welcome wave with a relay
+    attempt to make is prepared and reserved on the runtime, and left for the host to run beside it
+    (`take_prepared_welcome_tasks`): a founding create's, a host's owed Welcomes, the confirming pass's released
+    ones, maintenance's watched release and the startup retry. The task holds only the adapter, the clock and the
+    prepared attempts. The host finishes it in input order (`finish_welcome_publish_task`), after dropping the
+    results of a group it no longer shows (`CompletedWelcomePublishTask::drop_gone_groups`), or abandons it
+    (`abandon_welcome_publish_task`), which releases only the reservation. Prepare has already stored each
+    Welcome's exact signed bytes and endpoint snapshot as a transport fanout, with no relay attempt on any endpoint,
+    and the Welcome stays owed, so the next maintenance pass retries that fanout. Every other publish path treats a reserved id as held by its wave. A pending
+    create's first Welcome and `redeliver_welcome` still publish inline; a redelivery of a Welcome a wave holds
+    publishes nothing and records no failure, since that Welcome is in flight.
     A confirmed recovery Welcome also waits while its native origin is `ConvergenceDeferred`: keep its exact bytes,
     watch and retry fanout, including across reopen and missed events. Only terminal origin loss retires that debt;
     native re-adoption can make it owed again under its original deadline. `tests/runtime/hydrated_welcome.rs` owns

@@ -5958,6 +5958,9 @@ async fn replay_missed_inbound_recovers_dropped_messages_and_dedups() {
         .unwrap()
         .operation
         .expect("fixture group is created");
+    // Shutdown cancels a Welcome wave still in flight, as a host's exit does
+    // (mdk#3466); the next start would retry it, after this test sends.
+    setup_runtime.drain_in_flight_work().await.unwrap();
     setup_runtime.shutdown().await;
     let group_id_hex = hex::encode(group_id.as_slice());
 

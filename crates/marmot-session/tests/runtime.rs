@@ -1074,6 +1074,7 @@ include!("runtime/recovery_eligibility.rs");
 include!("runtime/rejoin_budget.rs");
 include!("runtime/account_devices_advertising.rs");
 include!("runtime/welcome_withdrawal.rs");
+include!("runtime/detached_welcome_waves.rs");
 include!("runtime/staged_invite_welcome.rs");
 include!("runtime/welcome_delivery.rs");
 

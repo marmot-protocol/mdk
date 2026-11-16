@@ -28,7 +28,9 @@
 //! so its test also fences on one.
 //! Every held set includes an account-key command: a KeyPackage publish,
 //! keyed on the account rather than a group, a peer or a new group. After a
-//! test's PR flips it, that command still waits for the held step (rule 6).
+//! test's PR flips it, that command still waits for the held step (rule 6),
+//! except for hold 4: its flip moves the wave off the worker, which leaves no
+//! held step for the command to wait behind.
 //! The media permit hold parks only the media command, so its test holds no
 //! other command.
 
@@ -40,7 +42,7 @@ use tokio::task::JoinHandle;
 
 use super::*;
 
-const SETTLE: Duration = Duration::from_secs(10);
+pub(super) const SETTLE: Duration = Duration::from_secs(10);
 
 fn sample(telemetry: &PerformanceRecorder, operation: RuntimeOp) -> RuntimePerformanceSnapshot {
     telemetry
@@ -64,9 +66,9 @@ async fn until(what: &str, mut ready: impl FnMut() -> bool) {
 }
 
 /// A host call on its own task, whose answer the test awaits later.
-type HostCall = JoinHandle<Result<(), AppError>>;
+pub(super) type HostCall = JoinHandle<Result<(), AppError>>;
 
-fn send(runtime: &crate::MarmotAppRuntime, group: &GroupId) -> HostCall {
+pub(super) fn send(runtime: &crate::MarmotAppRuntime, group: &GroupId) -> HostCall {
     let (runtime, group) = (runtime.clone(), group.clone());
     tokio::spawn(async move {
         runtime
@@ -87,7 +89,7 @@ fn rename(runtime: &crate::MarmotAppRuntime, group: &GroupId) -> HostCall {
 }
 
 /// The account-key command each held set includes.
-fn publish_key_package(runtime: &crate::MarmotAppRuntime) -> HostCall {
+pub(super) fn publish_key_package(runtime: &crate::MarmotAppRuntime) -> HostCall {
     let runtime = runtime.clone();
     tokio::spawn(async move { runtime.publish_key_package("alice").await.map(drop) })
 }
@@ -114,7 +116,7 @@ fn none_answered(calls: &[HostCall], hold: &str) {
     assert_eq!(answered, 0, "{answered} commands answered through {hold}");
 }
 
-async fn all_answered(calls: Vec<HostCall>) {
+pub(super) async fn all_answered(calls: Vec<HostCall>) {
     for call in calls {
         timeout(SETTLE, call)
             .await
@@ -183,15 +185,18 @@ fn deliver(
 
 /// Alice's runtime over a scripted relay, with these groups created first,
 /// memberless, and her worker past startup.
-struct Alice<const N: usize> {
-    app: MarmotApp,
-    account: marmot_account::AccountSummary,
-    relay: Arc<ScriptedPushRelayClient>,
-    runtime: crate::MarmotAppRuntime,
-    groups: [GroupId; N],
+pub(super) struct Alice<const N: usize> {
+    pub(super) app: MarmotApp,
+    pub(super) account: marmot_account::AccountSummary,
+    pub(super) relay: Arc<ScriptedPushRelayClient>,
+    pub(super) runtime: crate::MarmotAppRuntime,
+    pub(super) groups: [GroupId; N],
 }
 
-async fn alice_with_groups<const N: usize>(dir: &tempfile::TempDir, names: [&str; N]) -> Alice<N> {
+pub(super) async fn alice_with_groups<const N: usize>(
+    dir: &tempfile::TempDir,
+    names: [&str; N],
+) -> Alice<N> {
     let account = AccountHome::open(dir.path())
         .create_account("alice")
         .unwrap();
@@ -535,12 +540,16 @@ async fn a_held_relay_document_in_an_invites_size_check_holds_every_command() {
     runtime.shutdown_and_close().await.unwrap();
 }
 
-/// Hold 4, flipped by step 3 PR 6: a create's founding Welcome fanout runs
-/// on the worker after the create answers, and while its gift wrap waits on
-/// the relays, the worker keeps every command it takes for after the
-/// fanout. A send to another group and a KeyPackage publish wait.
+/// Hold 4, flipped by mdk#3466 PR 1: a create's founding Welcomes publish
+/// beside the worker once the create answers. While the gift wrap waits on
+/// the relays, a send to another group and a KeyPackage publish answer. The
+/// KeyPackage publish answers too: the wave is not on the worker at all, so
+/// rule 6 has no held step to keep it behind. The worker settles the wave
+/// when the relay answers, and a `Drain` waits for that. So does a read of
+/// the pending deliveries (W8), beside the writer: a send answers while it
+/// waits, and it answers with the wave settled.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_held_welcome_fanout_holds_a_send_to_another_group() {
+async fn a_held_welcome_wave_holds_no_command() {
     let dir = tempfile::tempdir().unwrap();
     let bob = AccountHome::open(dir.path()).create_account("bob").unwrap();
     let Alice {
@@ -550,12 +559,11 @@ async fn a_held_welcome_fanout_holds_a_send_to_another_group() {
         groups: [other],
         ..
     } = alice_with_groups(&dir, ["other"]).await;
-    let telemetry = runtime.shared_services().observer.performance().clone();
     crate::tests::remember_test_member_inbox(&app, &bob.account_id_hex, "wss://relay.example");
     runtime.publish_key_package("bob").await.unwrap();
 
     relay.block_next_publish_of_kind(transport_nostr_peeler::KIND_NIP59_GIFT_WRAP);
-    runtime
+    let group = runtime
         .create_group(
             "alice",
             "held welcome",
@@ -569,34 +577,80 @@ async fn a_held_welcome_fanout_holds_a_send_to_another_group() {
     timeout(SETTLE, relay.wait_for_blocked_publish())
         .await
         .expect("the founding Welcome reaches its relays");
+    all_answered(vec![send(&runtime, &other), publish_key_package(&runtime)]).await;
+    let lane = runtime.accounts().worker_lane("alice").await.unwrap();
+    let (respond, mut drained) = oneshot::channel();
+    lane.commands
+        .send(AccountWorkerCommand::Drain { respond })
+        .await
+        .unwrap();
+    let mut listed = super::welcome_wave_tests::read_pending(&runtime).await;
+    // The worker takes commands in order: once a later send answers, it has
+    // taken the Drain and the read, which still wait for the held wave.
+    all_answered(vec![send(&runtime, &other)]).await;
+    assert!(
+        matches!(drained.try_recv(), Err(oneshot::error::TryRecvError::Empty)),
+        "a Drain waits for the held wave"
+    );
+    assert!(
+        matches!(listed.try_recv(), Err(oneshot::error::TryRecvError::Empty)),
+        "a pending-deliveries read waits for the held wave"
+    );
+
+    relay.release_publish();
+    timeout(SETTLE, drained).await.unwrap().unwrap();
+    assert!(
+        timeout(SETTLE, listed)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .iter()
+            .all(|pending| pending.group_id_hex != hex::encode(group.as_slice())),
+        "the read answers with the settled wave, which delivered the founding Welcome"
+    );
+    super::welcome_wave_tests::close(&runtime).await;
+}
+
+/// What stays on the worker of a create's Welcome delivery holds it as
+/// before: while the founding route sync waits on the relays, a send to
+/// another group waits behind the unit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_held_founding_route_sync_holds_a_send_to_another_group() {
+    let dir = tempfile::tempdir().unwrap();
+    let Alice {
+        relay,
+        runtime,
+        groups: [other],
+        ..
+    } = alice_with_groups(&dir, ["other"]).await;
+    let telemetry = runtime.shared_services().observer.performance().clone();
+
+    relay.block_next_subscribe();
+    runtime
+        .create_group("alice", "held route", &[], None)
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
+    timeout(SETTLE, relay.wait_for_blocked_subscribe())
+        .await
+        .expect("the founding route sync subscribes");
     assert_eq!(
         sample(&telemetry, RuntimeOp::WorkerUnitWelcomeFanout).in_flight,
         1
     );
     let before = sample(&telemetry, RuntimeOp::MutationQueueBehindWelcomeFanout);
-    let waiting = vec![send(&runtime, &other), publish_key_package(&runtime)];
-    until("each command queues behind the held fanout", || {
+    let waiting = vec![send(&runtime, &other)];
+    until("the send queues behind the route sync", || {
         sample(&telemetry, RuntimeOp::MutationQueueBehindWelcomeFanout).in_flight
-            == before.in_flight + 2
+            == before.in_flight + 1
     })
     .await;
-    let lane = runtime.accounts().worker_lane("alice").await.unwrap();
-    held_unit_took_queued_commands(&lane.commands).await;
-    none_answered(&waiting, "a held Welcome fanout");
-    assert_eq!(
-        sample(&telemetry, RuntimeOp::MutationQueueBehindWelcomeFanout).in_flight,
-        before.in_flight + 2,
-        "the fanout keeps what it takes waiting"
-    );
+    none_answered(&waiting, "a held founding route sync");
 
-    relay.release_publish();
+    relay.release_subscribe();
     all_answered(waiting).await;
-    mutations_taken_up(
-        &telemetry,
-        RuntimeOp::MutationQueueBehindWelcomeFanout,
-        &before,
-        2,
-    );
     runtime.shutdown_and_close().await.unwrap();
 }
 

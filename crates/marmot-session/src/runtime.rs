@@ -284,6 +284,8 @@ struct PreparedLegacyPublishAttempt {
 struct WelcomePublishMetadata {
     recipient: Option<MemberId>,
     welcome_id: cgka_traits::MessageId,
+    /// The group this Welcome joins, when its wave knows it.
+    group_id: Option<GroupId>,
     effects: AccountDeviceEffects,
 }
 
@@ -323,6 +325,26 @@ type DetachedWelcomeWithdrawals = Arc<Mutex<HashSet<cgka_traits::MessageId>>>;
 pub struct CompletedWelcomePublishTask {
     completed: CompletedWelcomePublish,
     message_ids: Vec<cgka_traits::MessageId>,
+}
+
+impl CompletedWelcomePublishTask {
+    /// Drop the results of every Welcome whose group `gone` names, so that
+    /// finishing this task changes nothing of a group the host left or
+    /// deleted while the task ran. Their records stay as preparation left
+    /// them, as an abandoned task leaves them; finishing still releases every
+    /// reservation. Returns how many results were dropped.
+    pub fn drop_gone_groups(&mut self, gone: impl Fn(&GroupId) -> bool) -> usize {
+        let completed = &mut self.completed;
+        let before = completed.metadata.len();
+        let (metadata, completions) = std::mem::take(&mut completed.metadata)
+            .into_iter()
+            .zip(std::mem::take(&mut completed.completions))
+            .filter(|(metadata, _)| !metadata.group_id.as_ref().is_some_and(&gone))
+            .unzip();
+        completed.metadata = metadata;
+        completed.completions = completions;
+        before - completed.metadata.len()
+    }
 }
 
 impl PreparedWelcomePublishTask {
@@ -573,6 +595,12 @@ pub struct AccountDeviceRuntime<A, R = StaticTransportRouting, K = NoopKeyPackag
     /// Detached Welcomes withdrawn after their task was prepared. The task
     /// skips each one whose relay attempt has not started.
     detached_welcome_withdrawals: DetachedWelcomeWithdrawals,
+    /// The publish handle detached waves run on, while the host runs every
+    /// Welcome wave itself (`set_detached_welcome_waves`).
+    detached_welcome_adapter: Option<Arc<dyn TransportAdapter>>,
+    /// Waves prepared while detached, reserved and waiting for the host to
+    /// take them (`take_prepared_welcome_tasks`).
+    prepared_welcome_tasks: Vec<PreparedWelcomePublishTask>,
     /// Outbound Welcomes, staged or owed, that no attempt record holds yet,
     /// in the order this runtime met them. Maintenance publishes each once it
     /// is owed (see `welcome_delivery`).
@@ -652,6 +680,8 @@ where
             pending_leaf_reconciliations: HashMap::new(),
             detached_welcome_publishes: HashSet::new(),
             detached_welcome_withdrawals: DetachedWelcomeWithdrawals::default(),
+            detached_welcome_adapter: None,
+            prepared_welcome_tasks: Vec::new(),
             watched_welcomes: Vec::new(),
             welcome_store_read: false,
             unread_welcome_groups: Vec::new(),
@@ -8444,7 +8474,8 @@ pub struct FailedApplicationMessage {
 }
 
 impl AccountDeviceEffects {
-    fn extend(&mut self, mut other: Self) {
+    /// Append `other`, as a later publish's effects follow an earlier one's.
+    pub fn extend(&mut self, mut other: Self) {
         self.fanout.append(&mut other.fanout);
         self.absorb_account_effects(other);
     }

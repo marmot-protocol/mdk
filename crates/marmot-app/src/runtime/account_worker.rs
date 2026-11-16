@@ -5,6 +5,7 @@ mod attachments;
 mod read_queue;
 pub(crate) mod recovery_credits;
 mod schedule;
+mod welcome_runs;
 
 use read_queue::run_as_account_worker;
 pub(crate) use read_queue::{
@@ -24,7 +25,7 @@ use std::time::{Duration, Instant};
 
 use cgka_traits::app_event::MARMOT_APP_EVENT_KIND_AGENT_STREAM_START;
 use cgka_traits::engine::KeyPackage;
-use cgka_traits::{GroupId, MessageId, SecretBytes};
+use cgka_traits::{GroupId, SecretBytes};
 use futures::FutureExt;
 use marmot_account::{AccountHomeError, AccountSetupKind, AccountSetupPhase, AccountSetupState};
 use rand::RngCore;
@@ -45,8 +46,8 @@ use super::{
 use crate::client::history_recovery::recovery_runner::host::{SpawnedRunner, next_runner_turn};
 use crate::client::read_state::{ReadStateReader, ReadStateSender, UploadsInFlight};
 use crate::client::{
-    CommittedSyncProgress, CompletedWelcomeDeliveryRecovery, EncryptedMediaUploadFinish,
-    PreparedGroupImageUploadStart, RetainedSendWake,
+    CommittedSyncProgress, EncryptedMediaUploadFinish, PreparedGroupImageUploadStart,
+    RetainedSendWake,
 };
 use crate::messages::AppMessageIntent;
 use crate::{
@@ -1062,21 +1063,6 @@ fn handle_startup_sync_command(
     deferred.push(DeferredStartupCommand::Command(Box::new(queued)));
 }
 
-/// Relay-only startup Welcome work. Dropping the worker aborts the task so no
-/// detached publication can outlive relay-plane/account shutdown; the exact
-/// durable artifact remains retryable on the next open.
-struct WelcomeRecoveryTask {
-    handle: JoinHandle<CompletedWelcomeDeliveryRecovery>,
-    message_ids: Vec<MessageId>,
-    drain_waiters: Vec<oneshot::Sender<()>>,
-}
-
-impl Drop for WelcomeRecoveryTask {
-    fn drop(&mut self) {
-        self.handle.abort();
-    }
-}
-
 fn install_storage_telemetry(
     client: &AppClient,
     telemetry: &marmot_observability::PerformanceRecorder,
@@ -1766,20 +1752,15 @@ async fn run_app_runtime_account_worker(
     let mut avatar_resumed = false;
     let mut avatar_identities = super::avatar::IdentityAvatarMaintenance::default();
 
-    // Prepare exact Welcome attempts under the serialized owner, then let only
-    // relay I/O run independently. The worker stays available for inbound
-    // delivery, maintenance, media completions, timers, and commands while a
-    // degraded relay is slow. Drain waiters join reconciliation below.
-    let mut welcome_recovery = client
-        .prepare_pending_welcome_delivery_recovery_best_effort()
-        .map(|recovery| {
-            let message_ids = recovery.message_ids().to_vec();
-            WelcomeRecoveryTask {
-                handle: tokio::spawn(recovery.run()),
-                message_ids,
-                drain_waiters: Vec::new(),
-            }
-        });
+    // From here on every detachable Welcome wave runs beside the writer
+    // (mdk#3466); the deferred commands above published theirs inline. The
+    // writer prepares each wave and settles it below, so the worker stays
+    // available for deliveries, maintenance, media completions, timers and
+    // commands while a degraded relay is slow. The startup retry is the
+    // first wave.
+    client.detach_welcome_waves();
+    client.start_startup_welcome_retry();
+    let mut welcome_runs = welcome_runs::WelcomeRuns::default();
 
     let mut yield_to_convergence = false;
     let mut local_submission_service_owed = false;
@@ -1788,6 +1769,8 @@ async fn run_app_runtime_account_worker(
     'worker: loop {
         // The previous unit has ended: publish what it wrote (mdk#3273).
         client.publish_read_state();
+        // And run beside the writer the Welcome waves it started.
+        welcome_runs.adopt(&mut client);
         // An unlinked device stops: no sends, commits, publications or
         // pairing answers once its device group removed it. The account is
         // already marked unlinked; the runtime deactivates it once this
@@ -2019,35 +2002,29 @@ async fn run_app_runtime_account_worker(
                     relay_config_work = RelayConfigWork::Ready;
                 }
             }
-            recovered = async {
-                let recovery = welcome_recovery
-                    .as_mut()
-                    .expect("Welcome recovery branch requires a live task");
-                (&mut recovery.handle).await
-            }, if welcome_recovery.is_some() => {
-                let mut recovery = welcome_recovery
-                    .take()
-                    .expect("completed Welcome recovery task must still be owned");
-                match recovered {
-                    Ok(completed) => {
+            // A Welcome wave's publishes returned: settle it on the writer.
+            ended = welcome_runs.next(), if welcome_runs.is_running() => {
+                if let Some(ended) = ended {
+                    let _unit = unit.enter(WorkerUnit::WelcomeFanout);
+                    if welcome_runs.settle(&mut client, ended).await {
                         client
-                            .finish_pending_welcome_delivery_recovery_best_effort(completed)
+                            .retry_pending_push_registration_shares_best_effort()
                             .await;
-                    }
-                    Err(error) => {
-                        client.abandon_pending_welcome_delivery_recovery(
-                            &recovery.message_ids,
-                        );
-                        tracing::warn!(
-                            target: "marmot_app::runtime",
-                            method = "startup_welcome_recovery",
-                            error_kind = if error.is_panic() { "panic" } else { "cancelled" },
-                            "startup Welcome relay task ended before reconciliation"
+                        scheduled_push_retry.observe_pending(
+                            client.has_pending_push_registration_work(),
+                            &command_tx,
                         );
                     }
-                }
-                for respond in recovery.drain_waiters.drain(..) {
-                    let _ = reply(respond, (), &client);
+                    publish_pending_welcome_delivery_events(
+                        &events,
+                        &account_id_hex,
+                        &account_label,
+                        &mut client,
+                    );
+                    schedule_pending_convergence_groups(&mut scheduled_convergence, &mut client);
+                    #[cfg(test)]
+                    tests::welcome_wave_tests::held_after_settle(&account_id_hex).await;
+                    welcome_runs.answer_waiting(&client, &shared);
                 }
             }
             // Consume completed blobs before admitting more commands.
@@ -2128,11 +2105,17 @@ async fn run_app_runtime_account_worker(
                         let command = match command {
                             AccountWorkerCommand::Drain { respond } => {
                                 wait.take_up();
-                                if let Some(recovery) = &mut welcome_recovery {
-                                    recovery.drain_waiters.push(respond);
-                                } else {
-                                    let _ = reply(respond, (), &client);
-                                }
+                                // It waits for every Welcome wave started before it.
+                                welcome_runs.adopt(&mut client);
+                                welcome_runs.drain(respond, &client, &shared);
+                                continue;
+                            }
+                            AccountWorkerCommand::PendingWelcomeDeliveries { respond } => {
+                                wait.take_up();
+                                // So does a read of what is undelivered (W8):
+                                // it answers with each earlier wave settled.
+                                welcome_runs.adopt(&mut client);
+                                welcome_runs.read_pending_deliveries(respond, &client, &shared);
                                 continue;
                             }
                             #[cfg(test)]
@@ -2575,6 +2558,16 @@ async fn run_app_runtime_account_worker(
                         // this leaves room for a one-shot client during a
                         // prolonged transport outage.
                         let transport_account = client.adapter.account_id().clone();
+                        // Its Welcome waves belong to this client: settle
+                        // each on it, so none reaches the reopened one, and
+                        // answer their waits on it before the backoff.
+                        welcome_runs.settle_all(&mut client, &shared).await;
+                        publish_pending_welcome_delivery_events(
+                            &events,
+                            &account_id_hex,
+                            &account_label,
+                            &mut client,
+                        );
                         // Its turns need this client; the reopened one gets
                         // a runner of its own.
                         stop_recovery_runner(&mut recovery_runner, &mut client).await;
@@ -2783,6 +2776,9 @@ async fn run_app_runtime_account_worker(
                                         &account_id_hex,
                                         &account_label,
                                     );
+                                    // An interrupted wave's Welcomes stay owed;
+                                    // maintenance's fanout retry sends them.
+                                    reopened.detach_welcome_waves();
                                     break reopened;
                                 }
                                 Err(setup_err) => {
@@ -3168,6 +3164,8 @@ async fn run_app_runtime_account_worker(
             }
         }
     }
+    // No Welcome wave outlives the worker; its Welcomes stay owed.
+    welcome_runs.end().await;
     // Each exit that still held the client stopped the runner on it; any
     // other exit's drop aborts the task and refunds the attempts it left
     // open. What a quantum staged stays durable.
@@ -5680,10 +5678,13 @@ fn account_worker_command_future<'a>(
                 Box::pin(defer_commands_until(
                     published,
                     async {
-                        // An undelivered Welcome stays owed; the events below
+                        // The route sync and warm pass run here; the
+                        // publishes run beside the writer, and the worker
+                        // settles them, the push-share retry after (mdk#3466).
+                        // An undelivered Welcome stays owed; the events
                         // report it.
-                        let _ = client
-                            .drive_unpublished_welcome_delivery(Some(&telemetry))
+                        let running = client
+                            .start_unpublished_welcome_delivery(Some(&telemetry))
                             .await;
                         publish_pending_welcome_delivery_events(
                             events,
@@ -5691,9 +5692,11 @@ fn account_worker_command_future<'a>(
                             account_label,
                             client,
                         );
-                        client
-                            .retry_pending_push_registration_shares_best_effort()
-                            .await;
+                        if !running {
+                            client
+                                .retry_pending_push_registration_shares_best_effort()
+                                .await;
+                        }
                     },
                     commands,
                     pending,
@@ -6171,17 +6174,17 @@ fn account_worker_command_future<'a>(
             if canonical {
                 let _unit = unit.enter(WorkerUnit::WelcomeFanout);
                 // Reply first so the inviter is not blocked on Welcome publish.
-                // Group reads answer from A, published after the commit,
-                // while fanout owns the live client.
-                // Later mutations stay queued FIFO behind this delivery.
+                // The publishes run beside the writer, and the worker settles
+                // them (mdk#3466). Group reads answer from A, published after
+                // the commit, while this unit owns the live client.
                 let published = publish_before_unit(client);
                 Box::pin(defer_commands_until(
                     published,
                     async {
-                        // An undelivered Welcome stays owed; the events below
+                        // An undelivered Welcome stays owed; the events
                         // report it.
                         let _ = client
-                            .drive_unpublished_welcome_delivery(Some(&telemetry))
+                            .start_unpublished_welcome_delivery(Some(&telemetry))
                             .await;
                         publish_pending_welcome_delivery_events(
                             events,
@@ -9302,6 +9305,7 @@ mod tests {
     mod resource_bounds_tests;
     pub(super) mod secondary_retry_scheduler_tests;
     mod selective_history_tests;
+    pub(super) mod welcome_wave_tests;
     mod worker_recovery_resume_tests;
     mod writer_hold_tests;
 
@@ -9768,6 +9772,12 @@ mod tests {
             .unwrap()
             .operation
             .expect("eligible fixture members");
+        // The creates' Welcome waves run beside the worker (mdk#3466): Bob
+        // must hold each group before its commit reaches him.
+        timeout(Duration::from_secs(10), runtime.drain_in_flight_work())
+            .await
+            .expect("the creates' Welcome waves settle")
+            .unwrap();
         runtime.catch_up_accounts().await.unwrap();
         let commands = runtime.accounts().worker_commands("bob").await.unwrap();
         runtime

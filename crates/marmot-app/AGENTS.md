@@ -496,8 +496,10 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   already changed. A withdrawal that fails never holds the removal back. A link refused as
   `LinkDeviceUnsettled` made no commit, even while another commit resolves. Publish an undelivered Welcome again every
   few seconds until the new device's Welcome wait ends; neither its publication nor its delivery decides a link.
-  `drive_unpublished_welcome_delivery` returns a `#[must_use]` `WelcomeDelivery`; chat creation goes on either way, as
-  the Welcome stays owed. Prompt ids are random, so an id a host kept from before a reopen names no prompt. The engine
+  `drive_unpublished_welcome_delivery`, which pairing awaits for a first link's founding Welcome, returns a
+  `#[must_use]` `WelcomeDelivery`; a later link's commit Welcome is released by the confirming pass and runs as a
+  detached wave, which a redelivery leaves alone while it holds that Welcome. Chat creation
+  goes on either way, as the Welcome stays owed. Prompt ids are random, so an id a host kept from before a reopen names no prompt. The engine
   refuses a link or an unlink with `LinkDeviceUnsettled` rather than queue it; retry a link on each drive until a
   minute before the new device's Welcome wait ends, counted from when the new device sent its confirmation, never
   attempt it after that, and cancel it as `LinkFailed`. The existing device's confirmation names `own_signature_key`,
@@ -602,8 +604,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   withdrawal ownership re-owe them. Old V1 Welcome bytes are never upgraded to V2 on retry. The source/codec/atomicity
   owners live in the existing engine private-KeyPackage, app small-state and sibling-Welcome modules; do not replay
   comparison/codec checks at the host binding layer.
-- Keep outbound Welcomes on the engine's Welcome rows (mdk#2628 3.5a). The invite slot of
-  `drive_unpublished_welcome_delivery` holds only Welcome ids, published through the runtime's
+- Keep outbound Welcomes on the engine's Welcome rows (mdk#2628 3.5a). The invite slot of the unpublished Welcome
+  delivery (`client/welcome_waves.rs`) holds only Welcome ids, published through the runtime's
   `deliver_owed_welcomes_with_audit_context`; the founding slot keeps the create's `SessionEffects`, because a legacy
   create's `GroupCreated` work rides them. Note a Welcome a publish could not deliver in one place,
   `note_welcome_delivery_failures`, called from `remember_published_reports` (every seam that applies runtime
@@ -615,6 +617,34 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   (`publish_client_pending_projection_updates`) broadcasts the queued events, so every worker seam does.
   `note_welcome_delivery_failures` and that reconcile are the pending table's only writers; never write a row before a
   commit is exposed, since the engine stages an invite's Welcomes with its commit.
+- Run Welcome waves beside the account worker (mdk#3466, `client/welcome_waves.rs`,
+  `runtime/account_worker/welcome_runs.rs`). The worker detaches waves before its first pass. The writer prepares
+  each wave, a task only publishes it, and the writer settles it as one `WelcomeFanout` unit on the client that
+  started it; the create's route sync, warm pass and push-share retry stay on the writer. Device pairing's first link
+  (its founding Welcome) and a directly owned `AppClient` await the same prepare, run and settle in place. A settle drops the results of a group
+  the host no longer shows, and a `Drain` answers once every wave started before it has settled. A
+  `PendingWelcomeDeliveries` read waits the same way, beside the writer, and answers with the list computed then
+  (W8): a read after a create or invite sees that wave's first attempt settled, as it did when the worker published
+  inline. A wave started after the worker took the read up never extends its wait. A wait answers where its last
+  wave settles: on the writer, or on the replaced client before the reconnect backoff. One parked at exit gets the
+  error a queued command gets. A wait whose waves settle as shutdown begins may answer with its result, or with a
+  storage error once `shutdown_and_close` has closed storage; a reply's precedence over shutdown is not a host
+  contract. Every task that
+  runs beside the writer keeps these:
+  - T1: it holds nothing of the writer's: no borrow of the client and no handle on the engine, the session, account
+    storage, the published read state or the account's subscriptions. A Welcome run holds the adapter, a clock, its
+    prepared attempts and the withdrawal set. The account changes only when the writer settles the task.
+  - T2: it reaches existing machinery only through entry points that already run beside the writer under their own
+    ownership. A Welcome run reaches relays only through the adapter's publish, and its local copy reaches the
+    account only as a delivery the writer ingests. No task syncs, activates or closes subscriptions, installs a
+    signer, or restarts a relay.
+  - T3: it writes no input of an answer reused while an in-memory write count is unchanged (today the owned
+    KeyPackage list's and the recovery answer's) unless it moves the count with it.
+  - L1: it belongs to the client generation that started it. Before the worker replaces its client it cancels that
+    generation's tasks and settles each on it (`WelcomeRuns::settle_all`), so no completion reaches a later client;
+    an abandoned wave's Welcomes stay owed for the next client's maintenance.
+  - L2: shutdown, sign-out and unlink cancel every task and wait for it before the worker returns
+    (`WelcomeRuns::end`). Undelivered Welcomes stay owed.
 - Send every host group-change command through the runtime's host-change entry points
   (`send_host_change_with_audit_context`, or `confirm_host_change_without_publish_with_audit_context` for an invite),
   never `send_with_audit_context` (mdk#2332). The commit's fanout then names the change, so a rollback after the
@@ -1301,7 +1331,9 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   and mutation queue-wait telemetry: `ReadReply`, the read classes, the worker-unit gauge with its unit durations and
   over-budget counts, and the lane's A reader, mdk#3273; observes only, never reorders;
   `account_worker/tests/writer_hold_tests.rs` pins the writer holds that step 3 of the runtime-concurrency pass
-  removes; its module doc lists the holds pinned elsewhere or not at all), `conversation_window.rs`, `chat_list_window.rs`,
+  removes; its module doc lists the holds pinned elsewhere or not at all), `account_worker/welcome_runs.rs` (the
+  worker's running Welcome waves and the `Drain`s and pending-deliveries reads that wait for them, mdk#3466; `account_worker/tests/welcome_wave_tests.rs`
+  owns what the worker decides of a wave), `conversation_window.rs`, `chat_list_window.rs`,
   `presentation.rs`, `presented_chat_list.rs`, `account_attention.rs` (presentation windows and account-switcher
   attention), `chat_list_selection.rs` (select-all IDs and revalidation), `user_blocks.rs`, `moderation.rs` (reports, admin labels and operator moderation reports),
   `local_submissions.rs`,
@@ -1319,7 +1351,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   `history_recovery/epoch_stall.rs` (epoch-gap backfill detection), `history_recovery/epoch_backfill.rs` (the client's
   epoch-gap evidence: feeding the detector, arming and escalating backfill, retiring a terminal group's recovery)
   and `history_recovery/history_notices.rs`),
-  `invite_recovery.rs` (durable invitation recovery), `delivery_spill.rs` (worker side of the durable delivery spill),
+  `invite_recovery.rs` (durable invitation recovery), `welcome_waves.rs` (Welcome waves: prepare on the writer, run
+  beside it, settle back on it, mdk#3466), `delivery_spill.rs` (worker side of the durable delivery spill),
   `audit_v5_app_update.rs` (bounded app-boundary audit rows), `sync/native_ingress.rs` (ordered native replay
   admission).
 - The shared relay plane is the [`transport-nostr`](../transport-nostr/AGENTS.md) crate; name its items as

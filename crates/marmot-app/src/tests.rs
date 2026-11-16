@@ -639,6 +639,10 @@ fn legacy_inline_group_image_create_rejects_oversized_input_before_canonical_cre
 /// Which (REQ, relay) a [`ScriptedPushRelayClient`] leaves unanswered.
 pub(crate) type HeldReply = fn(&NostrSubscription, &TransportEndpoint) -> bool;
 
+/// A publish kind to hold, with the notifiers its publish enters and waits
+/// on.
+type HeldPublish = (u64, Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>);
+
 #[derive(Default)]
 pub(crate) struct ScriptedPushRelayClient {
     pub(crate) acquisition_result:
@@ -685,6 +689,9 @@ pub(crate) struct ScriptedPushRelayClient {
     /// Park the next publish of this kind as `block_next_publish` parks the
     /// next publish of any kind.
     block_next_publish_of_kind: std::sync::Mutex<Option<u64>>,
+    /// Hold the next publish of this kind apart from `release_publish`: the
+    /// notifiers it enters and waits on.
+    hold_next_publish_of_kind: std::sync::Mutex<Option<HeldPublish>>,
     /// Hold the next directory read of a KeyPackage slot, a sign-in check's
     /// read, until released: the notifiers it enters and waits on.
     hold_next_slot_read:
@@ -1231,6 +1238,20 @@ impl ScriptedPushRelayClient {
     /// publishes of other kinds pass.
     pub(crate) fn block_next_publish_of_kind(&self, kind: u64) {
         *self.block_next_publish_of_kind.lock().unwrap() = Some(kind);
+    }
+
+    /// Hold the next publish of `kind` until its own release, which
+    /// [`Self::release_publish`] leaves alone: it notifies the first notifier
+    /// once it waits, and goes on once the second is notified.
+    pub(crate) fn hold_next_publish_of_kind(
+        &self,
+        kind: u64,
+    ) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        *self.hold_next_publish_of_kind.lock().unwrap() =
+            Some((kind, entered.clone(), release.clone()));
+        (entered, release)
     }
 
     /// Hold the next directory read that asks for a KeyPackage slot, as a
@@ -1902,6 +1923,15 @@ impl NostrRelayClient for ScriptedPushRelayClient {
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.publish_started.notify_one();
             released.await;
+        }
+        let held = self
+            .hold_next_publish_of_kind
+            .lock()
+            .unwrap()
+            .take_if(|(kind, ..)| *kind == event.kind);
+        if let Some((_, entered, release)) = held {
+            entered.notify_one();
+            release.notified().await;
         }
         if self
             .reject_next_publish
