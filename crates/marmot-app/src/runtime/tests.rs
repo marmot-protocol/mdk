@@ -3988,6 +3988,7 @@ async fn advance_held_clock(by: Duration) {
 /// while it is owed, and the announce follows within 30 s, with no missed
 /// wake and no busy loop. Owed timing that appears with no worker turn to
 /// see it is the watchdog's to find, which runs the job.
+// Holds the clock, which needs the current-thread runtime.
 #[tokio::test(flavor = "current_thread")]
 async fn the_worker_samples_push_timing_only_while_owed() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -4029,15 +4030,30 @@ async fn the_worker_samples_push_timing_only_while_owed() {
     })
     .await
     .expect("the worker opens");
-    // Fifteen seconds of the worker's time and the push clock together.
+    // Fifteen seconds of the worker's time and the push clock together. Tokio
+    // rounds a deadline up to its next millisecond, so the worker's clock
+    // moves one more: a deadline armed 15 s before the step then fires in it
+    // even when no real time passed in between (mdk#3462).
     let step = async |push_now_ms: &mut i64| {
         *push_now_ms += 15_000;
         set_push_clock(*push_now_ms);
-        advance_held_clock(Duration::from_secs(15)).await;
+        advance_held_clock(Duration::from_millis(15_001)).await;
     };
     let gossip = || {
         app.group_push_gossip_state(&account.label, &group_hex)
             .expect("gossip state")
+    };
+    // A wake starts the Push job on a later turn, once the worker's clock
+    // reaches its next millisecond. A fixed number of yields can end sooner
+    // on a fast runner (mdk#3462), so wait until it has run since `runs`.
+    let push_ran_since = async |runs: u64, what: &str| {
+        timeout(ACCOUNT_OPEN_TEST_DEADLINE, async {
+            while push_runs() == runs {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{what}"));
     };
 
     // Steps until the Push job has not run for `need` steps in a row. A
@@ -4079,6 +4095,8 @@ async fn the_worker_samples_push_timing_only_while_owed() {
         .share_push_registration(&account.label)
         .await
         .expect("share");
+    push_ran_since(rested, "the token change wakes the Push job").await;
+    // Then let a repeat run show itself.
     advance_held_clock(Duration::ZERO).await;
     assert!(
         gossip().is_some_and(|state| state.announce_owed_at_ms.is_some()),
@@ -4089,6 +4107,13 @@ async fn the_worker_samples_push_timing_only_while_owed() {
         push_runs() - rested,
         1,
         "the token change woke the Push job once"
+    );
+    // The wait above would also end at the next 15 s tick, through the
+    // watchdog: the worker must have woken the job first.
+    assert_eq!(
+        missed(),
+        0,
+        "the worker woke its Push job on the token change"
     );
     let mut samples = 0;
     while gossip().is_some_and(|state| state.announce_owed_at_ms.is_some()) && samples < 4 {
@@ -4125,8 +4150,7 @@ async fn the_worker_samples_push_timing_only_while_owed() {
         .expect("owed");
     step(&mut push_now_ms).await;
     assert_eq!(missed(), 1, "the watchdog found owed push timing");
-    advance_held_clock(Duration::ZERO).await;
-    assert!(push_runs() > before_missed, "and ran the Push job");
+    push_ran_since(before_missed, "and ran the Push job").await;
     runtime.shutdown().await;
 }
 
