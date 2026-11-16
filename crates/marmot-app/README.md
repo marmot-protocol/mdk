@@ -563,7 +563,8 @@ Limits:
 | Stored bytes | 32 MiB per set, 128 MiB in all |
 
 Invalid, duplicate, failed and over-cap entries are dropped and reported in `skipped`; a set fails only when no entry
-is usable. Shortcode collisions between installed sets are flagged on each `installed_custom_emoji` row and left to
+is usable. Reinstalling the installed version keeps each verified image whose refresh fails or does not fit: that
+entry stays installed, counts in `installed_count` and is not in `skipped`. Shortcode collisions between installed sets are flagged on each `installed_custom_emoji` row and left to
 the host.
 
 ## Application-owned group state

@@ -978,11 +978,11 @@ impl MarmotApp {
 
     /// Install the stored version of a set: download every emoji once,
     /// validate it and store its bytes and SHA-256 under the account,
-    /// replacing an earlier version of the set. A same-version retry preserves
-    /// verified installed images when refreshing them fails. Entries that are
-    /// invalid, duplicated, fail to download or validate, or go over a cap
-    /// are reported, not fatal. This reveals the user's IP address to every
-    /// image host in the set.
+    /// replacing an earlier version of the set. A same-version retry keeps a
+    /// verified installed image when refreshing it fails or does not fit, and
+    /// that entry stays installed. Other entries that are invalid, duplicated,
+    /// fail to download or validate, or go over a cap are reported, not fatal.
+    /// This reveals the user's IP address to every image host in the set.
     ///
     /// `expected_event_id_hex` is the version the user was shown. When the
     /// stored version is another one (a sync or fetch replaced it), the call
@@ -1190,12 +1190,12 @@ impl MarmotApp {
     /// Download a set's emoji in order, a few at a time, keeping those that
     /// validate and still fit `budget`; one that does not fit is skipped and
     /// later, smaller ones are still tried. Verified `previous` bytes remain
-    /// installed, and unreported, when their refresh fails or cannot fit. Once the bytes transferred,
-    /// valid or not, reach twice the budget, the rest are skipped without
-    /// being fetched (beyond the few already in flight). Each finished entry
-    /// advances `control`'s progress. No download starts once `control` or
-    /// the app's install stop is cancelled; returning early is the caller's
-    /// `select!`.
+    /// installed, and unreported, when their refresh fails or cannot fit.
+    /// Once the bytes transferred, valid or not, reach twice the budget, the
+    /// rest are skipped without being fetched (beyond the few already in
+    /// flight). Each finished entry advances `control`'s progress. No
+    /// download starts once `control` or the app's install stop is
+    /// cancelled; returning early is the caller's `select!`.
     async fn download_set(
         &self,
         entries: &[StoredEmojiSetEntry],
