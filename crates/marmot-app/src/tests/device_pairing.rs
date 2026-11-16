@@ -7,6 +7,7 @@
 
 use super::canonical_membership::{deliver_new, published_key_package};
 use super::*;
+use crate::client::boxed;
 use crate::client::device_group::{LINK_DEADLINE_SECS, WELCOME_WAIT_SECS};
 use crate::{
     DeviceLinkChoices, DeviceLinkEndReason, DeviceLinkOp, DeviceLinkPromptState,
@@ -25,6 +26,11 @@ mod linked_device_chats;
 mod three_device_journeys;
 
 /// One of Alice's devices, with its own cursor over the shared relay.
+///
+/// The fixtures here return boxed futures and await large ones through
+/// [`boxed`]: a debug build gives each future an async body awaits its own
+/// slot in that body's poll frame, so a test awaiting dozens of them inline
+/// holds megabytes of the 4 MiB test thread stack at once.
 struct Device {
     _dir: tempfile::TempDir,
     app: MarmotApp,
@@ -35,13 +41,20 @@ struct Device {
 impl Device {
     /// Deliver what the relay holds that this device has not seen, then
     /// read linking as it now stands.
-    async fn step(&mut self, relay: &ScriptedPushRelayClient) -> DeviceLinkSnapshot {
-        deliver_new(&mut self.client, relay, &mut self.cursor).await;
-        self.client.device_link(DeviceLinkOp::Read).await.unwrap()
+    fn step(
+        &mut self,
+        relay: &ScriptedPushRelayClient,
+    ) -> impl Future<Output = DeviceLinkSnapshot> {
+        boxed(move || async move {
+            boxed(|| deliver_new(&mut self.client, relay, &mut self.cursor)).await;
+            boxed(|| self.client.device_link(DeviceLinkOp::Read))
+                .await
+                .unwrap()
+        })
     }
 
-    async fn op(&mut self, op: DeviceLinkOp) -> DeviceLinkSnapshot {
-        self.client.device_link(op).await.unwrap()
+    fn op(&mut self, op: DeviceLinkOp) -> impl Future<Output = DeviceLinkSnapshot> {
+        boxed(move || async move { boxed(|| self.client.device_link(op)).await.unwrap() })
     }
 
     fn slot_hex(&self) -> String {
@@ -77,8 +90,9 @@ impl Device {
 
 /// Alice's devices, each signed in with the same key and with a published
 /// KeyPackage, sharing one scripted relay.
-async fn alice_devices<const N: usize>() -> (Arc<ScriptedPushRelayClient>, [Device; N]) {
-    alice_devices_settling_after::<N>(0).await
+fn alice_devices<const N: usize>()
+-> impl Future<Output = (Arc<ScriptedPushRelayClient>, [Device; N])> {
+    boxed(|| alice_devices_settling_after::<N>(0))
 }
 
 /// [`alice_devices`], with a settlement window of `settlement_ms`.
@@ -111,8 +125,8 @@ async fn alice_devices_settling_after<const N: usize>(
         )
         .with_test_relay_client(relay.clone());
         remember_test_member_inbox(&app, &alice_id, "wss://relay.example");
-        let mut client = app.client("alice").await.unwrap();
-        published_key_package(&mut client, &relay).await;
+        let mut client = boxed(|| app.client("alice")).await.unwrap();
+        boxed(|| published_key_package(&mut client, &relay)).await;
         devices.push(Device {
             _dir: dir,
             app,
@@ -150,93 +164,92 @@ fn prompt_code(
 
 /// Run a link from `new` to `existing` through to the Welcome, the new
 /// device confirming first. Returns the device group.
-async fn link(
+fn link(
     relay: &ScriptedPushRelayClient,
     existing: &mut Device,
     new: &mut Device,
     label: &str,
-) -> GroupId {
-    link_with(relay, existing, new, DeviceLinkChoices::new(label)).await
+) -> impl Future<Output = GroupId> {
+    link_with(relay, existing, new, DeviceLinkChoices::new(label))
 }
 
 /// [`link`], with `choices` for the new device.
-async fn link_with(
+fn link_with(
     relay: &ScriptedPushRelayClient,
     existing: &mut Device,
     new: &mut Device,
     choices: DeviceLinkChoices,
-) -> GroupId {
-    let started = new.op(DeviceLinkOp::Start).await;
-    assert_eq!(
-        started.new_device,
-        Some(NewDeviceLinkState::WaitingForAnswer)
-    );
-    existing.step(relay).await; // request in, answer out
-    let revealed = new.step(relay).await; // answer in, reveal out
-    let new_code = comparing_code(revealed.new_device.as_ref().unwrap());
-    assert_eq!(new_code.len(), 7);
-    assert!(new_code.iter().all(|emoji| !emoji.description.is_empty()));
-    let prompt = existing.step(relay).await; // reveal in: the code
-    let (prompt_id, existing_code) = prompt_code(&prompt, &new.slot_hex());
-    assert_eq!(existing_code, new_code, "both screens show the same emoji");
+) -> impl Future<Output = GroupId> {
+    boxed(move || async move {
+        let started = new.op(DeviceLinkOp::Start).await;
+        assert_eq!(
+            started.new_device,
+            Some(NewDeviceLinkState::WaitingForAnswer)
+        );
+        existing.step(relay).await; // request in, answer out
+        let revealed = new.step(relay).await; // answer in, reveal out
+        let new_code = comparing_code(revealed.new_device.as_ref().unwrap());
+        assert_eq!(new_code.len(), 7);
+        assert!(new_code.iter().all(|emoji| !emoji.description.is_empty()));
+        let prompt = existing.step(relay).await; // reveal in: the code
+        let (prompt_id, existing_code) = prompt_code(&prompt, &new.slot_hex());
+        assert_eq!(existing_code, new_code, "both screens show the same emoji");
 
-    let waiting = new.op(DeviceLinkOp::ConfirmMatch).await;
-    assert_eq!(
-        waiting.new_device,
-        Some(NewDeviceLinkState::WaitingForOtherDevice)
-    );
-    let linking = existing.op(DeviceLinkOp::Link { prompt_id, choices }).await;
-    assert_eq!(
-        linking.prompt_for_slot(&new.slot_hex()).unwrap().state,
-        DeviceLinkPromptState::Linking
-    );
-    let joining = new.step(relay).await; // existing confirm in, own confirm out
-    assert_eq!(joining.new_device, Some(NewDeviceLinkState::Joining));
-    let committed = existing.step(relay).await; // new confirm in: the commit
-    assert_eq!(
-        committed.prompt_for_slot(&new.slot_hex()).unwrap().state,
-        DeviceLinkPromptState::Linking,
-        "only the new device's first commit makes the link"
-    );
-    join_then_linked(relay, existing, new).await;
-    new.client.trusted_device_group().unwrap().unwrap()
+        let waiting = new.op(DeviceLinkOp::ConfirmMatch).await;
+        assert_eq!(
+            waiting.new_device,
+            Some(NewDeviceLinkState::WaitingForOtherDevice)
+        );
+        let linking = existing.op(DeviceLinkOp::Link { prompt_id, choices }).await;
+        assert_eq!(
+            linking.prompt_for_slot(&new.slot_hex()).unwrap().state,
+            DeviceLinkPromptState::Linking
+        );
+        let joining = new.step(relay).await; // existing confirm in, own confirm out
+        assert_eq!(joining.new_device, Some(NewDeviceLinkState::Joining));
+        let committed = existing.step(relay).await; // new confirm in: the commit
+        assert_eq!(
+            committed.prompt_for_slot(&new.slot_hex()).unwrap().state,
+            DeviceLinkPromptState::Linking,
+            "only the new device's first commit makes the link"
+        );
+        join_then_linked(relay, existing, new).await;
+        new.client.trusted_device_group().unwrap().unwrap()
+    })
 }
 
 /// The new device joins through its Welcome and makes its first commit in
 /// the device group on the same drive. The device that linked it reads that
 /// commit and shows the link made, after its settlement window if it waits
 /// one.
-async fn join_then_linked(
+fn join_then_linked(
     relay: &ScriptedPushRelayClient,
     existing: &mut Device,
     new: &mut Device,
-) {
-    let joined = new.step(relay).await; // the Welcome, and its first commit
-    assert_eq!(joined.new_device, Some(NewDeviceLinkState::Linked));
-    let give_up = std::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        let read = existing.step(relay).await; // that commit
-        let state = read.prompt_for_slot(&new.slot_hex()).unwrap().state.clone();
-        if state == DeviceLinkPromptState::Linked || std::time::Instant::now() >= give_up {
-            assert_eq!(state, DeviceLinkPromptState::Linked);
-            return;
+) -> impl Future<Output = ()> {
+    boxed(move || async move {
+        let joined = new.step(relay).await; // the Welcome, and its first commit
+        assert_eq!(joined.new_device, Some(NewDeviceLinkState::Linked));
+        let give_up = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let read = existing.step(relay).await; // that commit
+            let state = read.prompt_for_slot(&new.slot_hex()).unwrap().state.clone();
+            if state == DeviceLinkPromptState::Linked || std::time::Instant::now() >= give_up {
+                assert_eq!(state, DeviceLinkPromptState::Linked);
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            // The worker's timer would take the held commit once the window
+            // passed.
+            let group = existing.client.trusted_device_group().unwrap().unwrap();
+            let advanced = boxed(|| existing.client.runtime.advance_convergence(&group))
+                .await
+                .unwrap();
+            boxed(|| existing.client.observe_drained_session_events(&advanced))
+                .await
+                .unwrap();
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        // The worker's timer would take the held commit once the window
-        // passed.
-        let group = existing.client.trusted_device_group().unwrap().unwrap();
-        let advanced = existing
-            .client
-            .runtime
-            .advance_convergence(&group)
-            .await
-            .unwrap();
-        existing
-            .client
-            .observe_drained_session_events(&advanced)
-            .await
-            .unwrap();
-    }
+    })
 }
 
 /// The link of `slot` that `device` recorded in `group`.
@@ -2461,7 +2474,7 @@ async fn a_retained_link_commit_that_rolls_back_ends_the_link() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_refused_link_commit_ends_the_link_on_both_devices() {
     let (relay, [mut phone, mut laptop, mut tablet]) =
-        alice_devices_settling_after::<3>(1_500).await;
+        boxed(|| alice_devices_settling_after::<3>(1_500)).await;
     let (group, slot) =
         link_tablet_until_commit(&relay, &mut phone, &mut laptop, &mut tablet).await;
 

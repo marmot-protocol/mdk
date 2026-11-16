@@ -1415,6 +1415,10 @@ every thread its stack (`thread_stack_size`). Only a test that needs one thread 
 `#[tokio::test(start_paused = true)]` for a clock paused from the start (Tokio allows that only on the current-thread
 runtime), otherwise `flavor = "current_thread"`, `run_composed_app_runtime_test_on_one_thread`, or
 `Builder::new_current_thread()` with a `//` comment on the line above saying why.
+A debug build gives every future an async body awaits inline its own slot in that body's poll frame, so a test or
+shared fixture with many large awaits can hold megabytes of the 4 MiB test thread stack. Await those through
+`crate::client::boxed`, and have a shared async fixture return a boxed future, as `src/tests/device_pairing.rs` does;
+never raise `RUST_MIN_STACK` instead.
 When a multi-thread test waits for an effect, wait for the state it expects rather than the next event: other
 tasks run between your steps, and window subscriptions keep only the latest snapshot. `Notify::notify_waiters` reaches
 only waiters already registered, so a fixture signal either uses `notify_one`'s permit or the waiter `enable()`s its

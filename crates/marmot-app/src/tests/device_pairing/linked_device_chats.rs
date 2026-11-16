@@ -206,23 +206,24 @@ async fn hold_key_packages(
     // number of maintenance passes settles every replay slice (mdk#2861).
     tokio::time::timeout(Duration::from_secs(30), async {
         loop {
-            deliver_new(&mut phone.client, relay, &mut phone.cursor).await;
-            phone.client.sibling_key_package_upkeep(&[]).await;
-            deliver_new(&mut laptop.client, relay, &mut laptop.cursor).await;
-            laptop.client.run_due_maintenance().await.unwrap();
+            boxed(|| deliver_new(&mut phone.client, relay, &mut phone.cursor)).await;
+            boxed(|| phone.client.sibling_key_package_upkeep(&[])).await;
+            boxed(|| deliver_new(&mut laptop.client, relay, &mut laptop.cursor)).await;
+            boxed(|| laptop.client.run_due_maintenance()).await.unwrap();
             for client in [&mut phone.client, &mut laptop.client] {
                 for group in client.take_pending_convergence_groups() {
-                    client
-                        .advance_convergence_with_projection_progress_and_yield(
+                    boxed(|| {
+                        client.advance_convergence_with_projection_progress_and_yield(
                             &group,
                             None,
                             std::future::pending(),
                         )
-                        .await
-                        .unwrap();
+                    })
+                    .await
+                    .unwrap();
                 }
             }
-            deliver_new(&mut phone.client, relay, &mut phone.cursor).await;
+            boxed(|| deliver_new(&mut phone.client, relay, &mut phone.cursor)).await;
             if held_from(phone, laptop) > 0 {
                 break;
             }
@@ -328,16 +329,27 @@ async fn receive_account_choice(
         crate::small_state::encode_invitation_decision_updates(std::slice::from_ref(&decision)),
     )
     .unwrap();
-    assert!(source.client.send_device_group_message(
-        &group, crate::small_state::KIND_SMALL_STATE_UPDATE, content,
-    ).await.unwrap());
+    assert!(
+        boxed(|| source.client.send_device_group_message(
+            &group,
+            crate::small_state::KIND_SMALL_STATE_UPDATE,
+            content,
+        ))
+        .await
+        .unwrap()
+    );
     // Direct clients have no worker. Await the real authenticated winner,
     // not a fixed count of convergence passes.
     tokio::time::timeout(Duration::from_secs(30), async {
         loop {
-            converge_device_group(&mut source.client, relay, &mut source.cursor, &group, 1).await;
-            converge_device_group(&mut receiver.client, relay, &mut receiver.cursor, &group, 1)
-                .await;
+            boxed(|| {
+                converge_device_group(&mut source.client, relay, &mut source.cursor, &group, 1)
+            })
+            .await;
+            boxed(|| {
+                converge_device_group(&mut receiver.client, relay, &mut receiver.cursor, &group, 1)
+            })
+            .await;
             if store
                 .app_storage()
                 .invitation_decision(&decision.group_id_hex, &generation)
@@ -1349,39 +1361,58 @@ async fn invitation_work_preserves_a_pending_chat_projection() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_declined_generation_holds_automatic_adds_until_a_later_accept() {
     use cgka_traits::storage::{GroupStorage as _, LeaveRequestStorage as _};
-    async fn exchange_decision(
+    fn exchange_decision(
         relay: &ScriptedPushRelayClient,
         source: &mut Device,
         receiver: &mut Device,
         group: &GroupId,
         chat: &GroupId,
         expected: ([u8; 32], u64, bool),
-    ) {
-        let (generation, version, declined) = expected;
-        // Direct clients have no worker to advance scheduled convergence.
-        // Await the real replicated value, not a fixed number of passes.
-        tokio::time::timeout(Duration::from_secs(30), async {
-            loop {
-                source.client.drive_small_state().await;
-                converge_device_group(&mut source.client, relay, &mut source.cursor, group, 1)
+    ) -> impl Future<Output = ()> {
+        boxed(move || async move {
+            let (generation, version, declined) = expected;
+            // Direct clients have no worker to advance scheduled convergence.
+            // Await the real replicated value, not a fixed number of passes.
+            tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    boxed(|| source.client.drive_small_state()).await;
+                    boxed(|| {
+                        converge_device_group(
+                            &mut source.client,
+                            relay,
+                            &mut source.cursor,
+                            group,
+                            1,
+                        )
+                    })
                     .await;
-                converge_device_group(&mut receiver.client, relay, &mut receiver.cursor, group, 1)
+                    boxed(|| {
+                        converge_device_group(
+                            &mut receiver.client,
+                            relay,
+                            &mut receiver.cursor,
+                            group,
+                            1,
+                        )
+                    })
                     .await;
-                let held = receiver
-                    .app
-                    .account_storage("alice")
-                    .unwrap()
-                    .app_storage()
-                    .invitation_decision(&hex::encode(chat.as_slice()), &generation)
-                    .unwrap();
-                if held.is_some_and(|held| held.version == version && held.declined == declined) {
-                    break;
+                    let held = receiver
+                        .app
+                        .account_storage("alice")
+                        .unwrap()
+                        .app_storage()
+                        .invitation_decision(&hex::encode(chat.as_slice()), &generation)
+                        .unwrap();
+                    if held.is_some_and(|held| held.version == version && held.declined == declined)
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
                 }
-                tokio::task::yield_now().await;
-            }
+            })
+            .await
+            .expect("the authenticated decision reaches its sibling");
         })
-        .await
-        .expect("the authenticated decision reaches its sibling");
     }
     let (relay, [first, second, mut laptop]) = alice_devices::<3>().await;
     let (mut tablet, mut phone) = if first.slot_hex() < second.slot_hex() {
@@ -1391,9 +1422,9 @@ async fn a_declined_generation_holds_automatic_adds_until_a_later_accept() {
     };
     let group = link(&relay, &mut phone, &mut laptop, "Laptop").await;
     link(&relay, &mut phone, &mut tablet, "Tablet").await;
-    hold_key_packages(&relay, &mut phone, &mut laptop).await;
-    hold_key_packages(&relay, &mut phone, &mut tablet).await;
-    phone.client.sibling_key_package_upkeep(&[]).await;
+    boxed(|| hold_key_packages(&relay, &mut phone, &mut laptop)).await;
+    boxed(|| hold_key_packages(&relay, &mut phone, &mut tablet)).await;
+    boxed(|| phone.client.sibling_key_package_upkeep(&[])).await;
     let store = phone.app.account_storage("alice").unwrap();
     let stock = store.app_storage();
     let laptop_slot: [u8; 32] = hex::decode(laptop.slot_hex()).unwrap().try_into().unwrap();
@@ -1420,31 +1451,29 @@ async fn a_declined_generation_holds_automatic_adds_until_a_later_accept() {
         .unwrap()
         .account_id_hex;
     remember_test_member_inbox(&bob_app, &alice, "wss://relay.example");
-    let mut bob = bob_app.client("bob").await.unwrap();
+    let mut bob = boxed(|| bob_app.client("bob")).await.unwrap();
     let mut invitations = Vec::new();
     for name in ["direct declined invitation", "gap declined invitation"] {
-        let chat = bob
-            .create_group(name, &[])
+        let chat = boxed(|| bob.create_group(name, &[]))
             .await
             .unwrap()
             .operation
             .expect("eligible fixture members");
         let phone_key = published_key_package(&mut phone.client, &relay).await;
         let tablet_key = published_key_package(&mut tablet.client, &relay).await;
-        let effects = bob
-            .runtime
-            .send(SendIntent::Invite {
-                group_id: chat.clone(),
-                key_packages: vec![phone_key, tablet_key],
-                initial_admins: vec![MemberId::new(hex::decode(&alice).unwrap())],
-            })
+        let invite = SendIntent::Invite {
+            group_id: chat.clone(),
+            key_packages: vec![phone_key, tablet_key],
+            initial_admins: vec![MemberId::new(hex::decode(&alice).unwrap())],
+        };
+        let effects = boxed(|| bob.runtime.send(invite)).await.unwrap();
+        boxed(|| bob.observe_drained_session_events(&effects))
             .await
             .unwrap();
-        bob.observe_drained_session_events(&effects).await.unwrap();
-        deliver_new(&mut phone.client, &relay, &mut phone.cursor).await;
-        phone.client.sync().await.unwrap();
-        deliver_new(&mut tablet.client, &relay, &mut tablet.cursor).await;
-        tablet.client.sync().await.unwrap();
+        boxed(|| deliver_new(&mut phone.client, &relay, &mut phone.cursor)).await;
+        boxed(|| phone.client.sync()).await.unwrap();
+        boxed(|| deliver_new(&mut tablet.client, &relay, &mut tablet.cursor)).await;
+        boxed(|| tablet.client.sync()).await.unwrap();
         assert!(
             phone
                 .client
@@ -1463,9 +1492,9 @@ async fn a_declined_generation_holds_automatic_adds_until_a_later_accept() {
             "the pending admin chat otherwise admits same-account Adds"
         );
         bob.self_demote_admin(&chat).await.unwrap();
-        deliver_new(&mut phone.client, &relay, &mut phone.cursor).await;
-        deliver_new(&mut tablet.client, &relay, &mut tablet.cursor).await;
-        receive_account_choice(&relay, &mut tablet, &mut phone, &chat, 1, true).await;
+        boxed(|| deliver_new(&mut phone.client, &relay, &mut phone.cursor)).await;
+        boxed(|| deliver_new(&mut tablet.client, &relay, &mut tablet.cursor)).await;
+        boxed(|| receive_account_choice(&relay, &mut tablet, &mut phone, &chat, 1, true)).await;
         assert!(store.leave_request(&chat).unwrap().is_none());
         assert!(phone.client.group_quiet(&chat).unwrap());
         invitations.push(chat);
@@ -1480,14 +1509,13 @@ async fn a_declined_generation_holds_automatic_adds_until_a_later_accept() {
         hex::encode(direct.as_slice())
     );
     assert!(
-        tablet
-            .client
-            .send_device_group_message(&group, 458, claim)
+        boxed(|| tablet.client.send_device_group_message(&group, 458, claim))
             .await
             .unwrap()
     );
-    converge_device_group(&mut tablet.client, &relay, &mut tablet.cursor, &group, 1).await;
-    converge_device_group(&mut phone.client, &relay, &mut phone.cursor, &group, 1).await;
+    boxed(|| converge_device_group(&mut tablet.client, &relay, &mut tablet.cursor, &group, 1))
+        .await;
+    boxed(|| converge_device_group(&mut phone.client, &relay, &mut phone.cursor, &group, 1)).await;
     for chat in [&direct, &gap] {
         let generation = store
             .invitation_admission(chat)
@@ -1550,14 +1578,15 @@ async fn a_declined_generation_holds_automatic_adds_until_a_later_accept() {
     }
     let held = held_from(&phone, &laptop);
     let tablet_taken = taken_from(&phone, &tablet);
-    phone
-        .client
-        .add_linked_devices_to_chats(&[], &mut Default::default())
-        .await;
-    phone
-        .client
-        .fill_sibling_chat_gaps(&[], 10, &mut Default::default())
-        .await;
+    let mut selection = Default::default();
+    boxed(|| {
+        phone
+            .client
+            .add_linked_devices_to_chats(&[], &mut selection)
+    })
+    .await;
+    let mut selection = Default::default();
+    boxed(|| phone.client.fill_sibling_chat_gaps(&[], 10, &mut selection)).await;
     assert_eq!(
         taken_from(&phone, &laptop),
         0,
@@ -1578,11 +1607,13 @@ async fn a_declined_generation_holds_automatic_adds_until_a_later_accept() {
         .received_private_key_packages_from(&laptop.slot_hex(), crate::unix_now_seconds())
         .unwrap()
         .remove(0);
-    phone
-        .client
-        .add_sibling_to_chat(&direct, &laptop_slot, candidate)
-        .await
-        .unwrap();
+    boxed(|| {
+        phone
+            .client
+            .add_sibling_to_chat(&direct, &laptop_slot, candidate)
+    })
+    .await
+    .unwrap();
     assert_eq!(
         held_from(&phone, &laptop),
         held,
@@ -1630,11 +1661,13 @@ async fn a_declined_generation_holds_automatic_adds_until_a_later_accept() {
         ]))
         .unwrap();
     assert!(
-        tablet
-            .client
-            .send_device_group_message(&group, crate::small_state::KIND_SMALL_STATE_UPDATE, content)
-            .await
-            .unwrap()
+        boxed(|| tablet.client.send_device_group_message(
+            &group,
+            crate::small_state::KIND_SMALL_STATE_UPDATE,
+            content
+        ))
+        .await
+        .unwrap()
     );
     exchange_decision(
         &relay,
@@ -1655,10 +1688,8 @@ async fn a_declined_generation_holds_automatic_adds_until_a_later_accept() {
         "the device group is ready for an automatic Add"
     );
     let before = relay.published_event_ids().len();
-    phone
-        .client
-        .fill_sibling_chat_gaps(&[], 10, &mut Default::default())
-        .await;
+    let mut selection = Default::default();
+    boxed(|| phone.client.fill_sibling_chat_gaps(&[], 10, &mut selection)).await;
     assert_eq!(
         taken_from(&phone, &laptop),
         0,
@@ -1670,18 +1701,19 @@ async fn a_declined_generation_holds_automatic_adds_until_a_later_accept() {
         "no renewed claim before its original expiry"
     );
     // The approver's independent direct flow does not use advisory gap claims.
-    phone
-        .client
-        .add_linked_devices_to_chats(&[], &mut Default::default())
-        .await;
+    let mut selection = Default::default();
+    boxed(|| {
+        phone
+            .client
+            .add_linked_devices_to_chats(&[], &mut selection)
+    })
+    .await;
     assert_eq!(taken_from(&phone, &laptop), 1);
     assert_eq!(leaves_of(&phone, &laptop, &direct, &group), 1);
     assert_eq!(leaves_of(&phone, &laptop, &gap, &group), 0);
-    phone.client.sibling_key_package_upkeep(&[]).await;
-    phone
-        .client
-        .fill_sibling_chat_gaps(&[], 10, &mut Default::default())
-        .await;
+    boxed(|| phone.client.sibling_key_package_upkeep(&[])).await;
+    let mut selection = Default::default();
+    boxed(|| phone.client.fill_sibling_chat_gaps(&[], 10, &mut selection)).await;
 
     // Both the global eligibility snapshot and the declined chat's due pass
     // were consumed above. Only a winning app decision changes now: no chat
@@ -1707,10 +1739,8 @@ async fn a_declined_generation_holds_automatic_adds_until_a_later_accept() {
     assert_eq!(phone.client.runtime.epoch_pin(&group).unwrap(), pin);
     assert_eq!(phone.client.runtime.epoch_pin(&gap).unwrap(), chat_pin);
     assert!(store.leave_request(&gap).unwrap().is_none());
-    phone
-        .client
-        .fill_sibling_chat_gaps(&[], 10, &mut Default::default())
-        .await;
+    let mut selection = Default::default();
+    boxed(|| phone.client.fill_sibling_chat_gaps(&[], 10, &mut selection)).await;
     assert_eq!(
         taken_from(&phone, &laptop),
         2,
