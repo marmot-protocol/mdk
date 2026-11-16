@@ -1683,17 +1683,12 @@ fn install_plan(
     });
     if same_version {
         for entry in &set.emoji {
-            let stored = storage.installed_custom_emoji_bytes(coordinate, &entry.shortcode);
-            match stored {
-                Ok(Some((row, bytes))) => {
-                    previous.insert(entry.shortcode.clone(), (row.emoji, bytes));
-                }
-                Ok(None) => {}
-                // A failed integrity check supplies no fallback. Fetching again
-                // can repair that entry; other storage errors abort the install.
-                Err(cgka_traits::storage::StorageError::Backend(detail))
-                    if detail == "stored custom emoji failed its hash check" => {}
-                Err(error) => return Err(error.into()),
+            // A stored image that fails its hash check is no fallback,
+            // fetching again can repair it.
+            if let Some((row, bytes)) =
+                storage.intact_installed_custom_emoji_bytes(coordinate, &entry.shortcode)?
+            {
+                previous.insert(entry.shortcode.clone(), (row.emoji, bytes));
             }
         }
     }

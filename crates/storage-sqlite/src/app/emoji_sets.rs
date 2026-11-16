@@ -468,6 +468,33 @@ impl SqliteAppStorage {
         coordinate: &str,
         shortcode: &str,
     ) -> StorageResult<Option<(StoredInstalledEmojiRow, Vec<u8>)>> {
+        match self.stored_emoji_bytes(coordinate, shortcode)? {
+            Some((row, bytes, true)) => Ok(Some((row, bytes))),
+            Some(_) => Err(StorageError::Backend(
+                "stored custom emoji failed its hash check".to_owned(),
+            )),
+            None => Ok(None),
+        }
+    }
+
+    /// As [`Self::installed_custom_emoji_bytes`], but a row that fails its
+    /// hash check reads as absent, so a reinstall fetches it again.
+    pub fn intact_installed_custom_emoji_bytes(
+        &self,
+        coordinate: &str,
+        shortcode: &str,
+    ) -> StorageResult<Option<(StoredInstalledEmojiRow, Vec<u8>)>> {
+        Ok(self
+            .stored_emoji_bytes(coordinate, shortcode)?
+            .and_then(|(row, bytes, intact)| intact.then_some((row, bytes))))
+    }
+
+    /// The stored row and bytes, and whether the bytes match the stored hash.
+    fn stored_emoji_bytes(
+        &self,
+        coordinate: &str,
+        shortcode: &str,
+    ) -> StorageResult<Option<(StoredInstalledEmojiRow, Vec<u8>, bool)>> {
         let conn = self.lock()?;
         let found = conn
             .query_row(
@@ -481,17 +508,11 @@ impl SqliteAppStorage {
             )
             .optional()
             .storage()?;
-        let Some((row, bytes)) = found else {
-            return Ok(None);
-        };
-        if row.emoji.byte_len != bytes.len() as u64
-            || hex::encode(Sha256::digest(&bytes)) != row.emoji.sha256
-        {
-            return Err(StorageError::Backend(
-                "stored custom emoji failed its hash check".to_owned(),
-            ));
-        }
-        Ok(Some((row, bytes)))
+        Ok(found.map(|(row, bytes)| {
+            let intact = row.emoji.byte_len == bytes.len() as u64
+                && hex::encode(Sha256::digest(&bytes)) == row.emoji.sha256;
+            (row, bytes, intact)
+        }))
     }
 }
 
