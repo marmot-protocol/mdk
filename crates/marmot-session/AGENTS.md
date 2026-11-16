@@ -181,6 +181,11 @@ multi-device Welcome delivery, Welcome withdrawal, staged and owed Welcome deliv
   names its queued intent from staging on (`set_queued_intent`), so that holds after a restart. A read only tells an online
   device; the exposure record alone decides, and `validate_successor_of` and the engine both refuse an abandonment of a
   fanout a relay may hold (mdk#1577). A read that returns the event confirms. Offline, nothing changes.
+- Audit each of these pending-commit changes once, as a v5 `pending_commit_changed` row (mdk#3460): `stuck` at a
+  commit's first read-back, kept on the stored fanout (`record_stuck`) before the read is sent; `read_back_confirmed` or
+  `echo_confirmed` where `resolve_outbound_fanout_mls` confirms a commit with no relay's `OK` among its stored
+  acknowledgements (`confirmed_without_ok`), whichever process stored them; `given_up` after
+  `abandon_unsent_pending_commit` rolls one back. Rows name the commit by message id only.
 - Pass `RollbackPass::Staging` only from the drive inside the call that staged the commit
   (`publish_one_with_post_confirmation_welcomes`), and `RollbackPass::Later` from every resume (mdk#2332). A rollback
   on a later pass of a host's change is recorded as not delivered, because its caller already returned. Host group

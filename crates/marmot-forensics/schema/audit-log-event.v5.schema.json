@@ -2588,6 +2588,9 @@
         },
         {
           "$ref": "#/$defs/OperationalEvent_recovery_runner_changed"
+        },
+        {
+          "$ref": "#/$defs/OperationalEvent_pending_commit_changed"
         }
       ]
     },
@@ -3379,6 +3382,14 @@
         "resumed",
         "remainder_parked",
         "remainder_widened"
+      ]
+    },
+    "Operational_pendingCommitChange": {
+      "enum": [
+        "stuck",
+        "read_back_confirmed",
+        "echo_confirmed",
+        "given_up"
       ]
     },
     "Operational_recoveryRunnerBreak": {
@@ -5470,6 +5481,33 @@
           "$ref": "#/$defs/Operational_u64"
         },
         "remainder_until_secs": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "record_context": {
+          "$ref": "#/$defs/Operational_auditEventContext"
+        }
+      }
+    },
+    "OperationalEvent_pending_commit_changed": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "change",
+        "message_ref",
+        "pending_secs"
+      ],
+      "properties": {
+        "type": {
+          "const": "pending_commit_changed"
+        },
+        "change": {
+          "$ref": "#/$defs/Operational_pendingCommitChange"
+        },
+        "message_ref": {
+          "$ref": "#/$defs/EngineMessageRef"
+        },
+        "pending_secs": {
           "$ref": "#/$defs/Operational_u64"
         },
         "record_context": {

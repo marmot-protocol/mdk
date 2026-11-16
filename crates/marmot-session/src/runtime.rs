@@ -52,7 +52,7 @@ use futures::{FutureExt, StreamExt};
 use marmot_forensics::v5 as audit_v5;
 use marmot_forensics::{
     AuditEventContext, AuditEventKind, AuditRecord, AuditTransportWire, ForensicRecorder,
-    MessageArtifactKind, PublishRelayFailure, SharedRecorder,
+    MessageArtifactKind, PendingCommitChange, PublishRelayFailure, SharedRecorder,
 };
 use sha2::{Digest, Sha256};
 
@@ -713,6 +713,30 @@ where
         );
         record.context = context;
         self.audit.record(record);
+    }
+
+    /// Audit how one of this account's pending commits changed (mdk#3460):
+    /// the commit by its message id, and how long since its first send
+    /// attempt.
+    fn record_pending_commit_change(
+        &self,
+        fanout: &OutboundFanout,
+        context: Option<AuditEventContext>,
+        change: PendingCommitChange,
+        now_ms: u64,
+    ) {
+        let pending_secs = fanout
+            .first_attempt_at_ms()
+            .map_or(0, |first| now_ms.saturating_sub(first) / 1_000);
+        self.record_audit_event(
+            fanout.group_id(),
+            context,
+            AuditEventKind::PendingCommitChanged {
+                change,
+                msg_id: hex::encode(fanout.message_id().as_slice()),
+                pending_secs,
+            },
+        );
     }
 
     /// Abandon a group locally without sending a leave or disband.
@@ -6281,7 +6305,10 @@ where
                 .await?;
         }
         let now_ms = self.wall_clock.now().0.saturating_mul(1_000);
-        if self.read_back_pending_commit(&mut fanout, now_ms).await? {
+        if self
+            .read_back_pending_commit(&mut fanout, now_ms, context.clone())
+            .await?
+        {
             self.resolve_outbound_fanout_mls(&mut fanout, output, queue, context.clone(), pass)
                 .await?;
         }
@@ -6658,10 +6685,15 @@ where
     /// read-back. Any other answer changes nothing: the relay is resent to as
     /// before, and nothing rolls back. Returns whether the acknowledgements
     /// met the commit's goal, for the caller to confirm it.
+    ///
+    /// The first read audits that the commit went stuck (mdk#3460), recorded
+    /// on the stored fanout before the read is sent, so a restart does not
+    /// audit it again.
     async fn read_back_pending_commit(
         &mut self,
         fanout: &mut OutboundFanout,
         now_ms: u64,
+        context: Option<AuditEventContext>,
     ) -> AccountResult<bool> {
         if !is_group_commit(fanout)
             || !matches!(fanout.mls_state(), FanoutMlsState::Pending(_))
@@ -6681,6 +6713,10 @@ where
             .collect::<Vec<_>>();
         if read.is_empty() {
             return Ok(false);
+        }
+        if fanout.record_stuck(now_ms) {
+            self.session.put_outbound_fanout(fanout)?;
+            self.record_pending_commit_change(fanout, context, PendingCommitChange::Stuck, now_ms);
         }
         let endpoints = fanout.request().target.endpoints();
         let read_endpoints = read
@@ -6828,6 +6864,7 @@ where
         let effects =
             give_up_unsent_commit(&mut self.session, pending, &mut abandoned, pass).await?;
         *fanout = abandoned;
+        self.record_pending_commit_change(fanout, context, PendingCommitChange::GivenUp, now_ms);
         tracing::info!(
             target: TRACE_TARGET,
             method = "abandon_unsent_pending_commit",
@@ -6858,6 +6895,17 @@ where
             let effects = self
                 .confirm_published_fanout_retrying(pending, fanout)
                 .await?;
+            // A commit no relay's `OK` confirmed is audited once, as it
+            // confirms, however a restart split its acknowledgement from
+            // this confirmation (mdk#3460).
+            if let Some(change) = confirmed_without_ok(fanout) {
+                self.record_pending_commit_change(
+                    fanout,
+                    context.clone(),
+                    change,
+                    self.wall_clock.now_ms(),
+                );
+            }
             output
                 .pending
                 .push(PendingResolution::Confirmed { pending });
@@ -7666,6 +7714,35 @@ fn echo_target_among(
                 .takes_acknowledgement(index)
                 .then_some((fanout, index))
         })
+}
+
+/// How one of this device's group commits that just confirmed was
+/// acknowledged, when no relay's `OK` is among its acceptances (mdk#3460):
+/// by a read-back when one is among them, otherwise by the account's own
+/// echo. `None` when a relay's `OK` is among them, which the commit's
+/// publish rows show.
+fn confirmed_without_ok(fanout: &OutboundFanout) -> Option<PendingCommitChange> {
+    if !is_group_commit(fanout) {
+        return None;
+    }
+    let mut accepted = false;
+    let mut read_back = false;
+    for index in 0..fanout.request().target.endpoints().len() {
+        if fanout.target_status(index) != Some(cgka_traits::FanoutTargetStatus::Accepted) {
+            continue;
+        }
+        accepted = true;
+        match fanout.target_acknowledgement(index) {
+            None => return None,
+            Some(FanoutAcknowledgement::ReadBack) => read_back = true,
+            Some(FanoutAcknowledgement::Echo) => {}
+        }
+    }
+    accepted.then_some(if read_back {
+        PendingCommitChange::ReadBackConfirmed
+    } else {
+        PendingCommitChange::EchoConfirmed
+    })
 }
 
 /// Whether `fanout` carries one of this device's group commits, a group

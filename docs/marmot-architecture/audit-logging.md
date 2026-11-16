@@ -30,11 +30,12 @@ On a hydrated account open or a live audit enable, at most 64 stored groups rece
 eligible, selected, omitted by that cap, and unreadable; these are read counts, not durable-write
 claims. A failed group enumeration leaves all four counts unknown.
 
-Account recovery, transport-cursor, subscription-refusal and recovery-runner rows exist only in v5 (see
-[Account recovery owner rows](#account-recovery-owner-rows-v5-only),
+Account recovery, transport-cursor, subscription-refusal, recovery-runner and pending-commit rows exist only in v5
+(see [Account recovery owner rows](#account-recovery-owner-rows-v5-only),
 [`subscription_refused`](#subscription_refused-v5-only),
-[`recovery_runner_paused`](#recovery_runner_paused-v5-only) and
-[Recovery runner rows](#recovery-runner-rows-v5-only)); a v4 recorder drops them.
+[`recovery_runner_paused`](#recovery_runner_paused-v5-only),
+[Recovery runner rows](#recovery-runner-rows-v5-only) and
+[`pending_commit_changed`](#pending_commit_changed-v5-only)); a v4 recorder drops them.
 
 The host can configure a dedicated v5 OTLP `/v1/logs` sender in memory through
 `MarmotAppRuntime::set_audit_otlp_sender(Some(sender))`, or through the additive
@@ -299,8 +300,9 @@ This catalogue is not yet complete. These event kinds have no section here yet â
 owner (#2660 phase 4). The v5-only recovery kinds are written up under
 [Account recovery owner rows](#account-recovery-owner-rows-v5-only), the v5-only refusal row under
 [`subscription_refused`](#subscription_refused-v5-only), the runner's pause row under
-[`recovery_runner_paused`](#recovery_runner_paused-v5-only), and its fetch, race and state-change rows under
-[Recovery runner rows](#recovery-runner-rows-v5-only).
+[`recovery_runner_paused`](#recovery_runner_paused-v5-only), its fetch, race and state-change rows under
+[Recovery runner rows](#recovery-runner-rows-v5-only), and the pending-commit row under
+[`pending_commit_changed`](#pending_commit_changed-v5-only).
 
 The authoritative catalogue is the `AuditEventKind` enum together with
 [`audit-log-event.v4.schema.json`](../../crates/marmot-forensics/schema/audit-log-event.v4.schema.json); the
@@ -687,6 +689,35 @@ Metadata notes:
 
 - This event has `group_ref`.
 - After rollback the engine clears pending recovery state and replays buffered messages.
+- A commit given up as not delivered also writes a `pending_commit_changed` row with `change = "given_up"`; without
+  one, the rollback is a first pass every relay failed or refused.
+
+### `pending_commit_changed` (v5 only)
+
+One of this account's pending group commits went stuck, confirmed without a relay's `OK`, or was given up (mdk#3460).
+The commit's `publish_*` rows say which relays accepted or refused each pass; this row says what they cannot. The
+account runtime writes it at three points:
+
+- `stuck`: the first read-back of the commit, from `PENDING_COMMIT_READ_BACK_AFTER_MS` (ten minutes) after its first
+  send attempt, when some relay may hold it and none has acknowledged it: the state `group_pending_commit` reports as
+  `Stuck`. Recorded once per commit; the stored fanout keeps when (`stuck_at_ms`), so a restart does not record it
+  again.
+- `read_back_confirmed` or `echo_confirmed`: the commit confirms with no relay's `OK` among its acknowledgements. A read
+  that returned it is among them for `read_back_confirmed`; only the account's own subscription receiving it from its
+  relays is for `echo_confirmed`. Recorded as it confirms, so an acknowledgement a previous process stored is
+  recorded when this one confirms it. A commit a relay's `OK` confirmed writes no row.
+- `given_up`: the commit reached no relay and rolled back as not delivered, once the device showed it was online.
+
+| Field | Meaning |
+| --- | --- |
+| `change` | `stuck`, `read_back_confirmed`, `echo_confirmed` or `given_up`. |
+| `message_ref` | The commit, hashed as on its `publish_*` rows, so a reader joins them. |
+| `pending_secs` | Seconds from the commit's first send attempt to this change, on the device's clock. |
+
+Metadata notes:
+
+- This event has `group_ref`.
+- A stuck commit can still confirm by a resend's `OK`: then `stuck` is its only row here.
 
 ### `epoch_state_changed`
 
@@ -1564,6 +1595,7 @@ metadata keys for indexing.
 | `SubscriptionRefusalRoute` | `inbox`, `group`, `maintenance` |
 | `SubscriptionRefusalCategory` | `duplicate`, `pow`, `blocked`, `rate_limited`, `invalid`, `error`, `unsupported`, `auth_required`, `restricted`, `unclassified` |
 | `SubscriptionRefusalOutcome` | `pending`, `dropped` |
+| `PendingCommitChange` | `stuck`, `read_back_confirmed`, `echo_confirmed`, `given_up` |
 
 ## Delivery and tracker path
 
@@ -1795,7 +1827,8 @@ let server-side tooling collate multiple devices into group-level analytics.
 | Which recorder/session/account/device produced the row? | Top-level `recorder_session_id`, `account_ref`, `engine_id`, `seq`, and `wall_time_ms`. Optional `source_context.local_member_ref` joins that producer to member-ref subjects when present. |
 | What operation was running? | `context.operation_id`, `context.human_action`, `send_*`, `create_group_*`, and app-level `human_action` rows. |
 | What inbound/outbound message entered the engine? | `ingest_entry`, `ingest_outcome`, `ingest_error`, `send_entry`, `send_outcome`, `send_error`, and `message_state_changed`. |
-| How did publish-before-apply resolve? | `publish_attempt`, `publish_outcome`, `publish_failure`, `epoch_confirmed`, `epoch_rolled_back`, and `epoch_state_changed`. |
+| How did publish-before-apply resolve? | `publish_attempt`, `publish_outcome`, `publish_failure`, `epoch_confirmed`, `epoch_rolled_back`, `epoch_state_changed`, and `pending_commit_changed`. |
+| Did a pending commit go stuck, confirm without a relay's `OK`, or get given up? | `pending_commit_changed`, by `group_ref` and the commit's `message_ref`: `stuck` once, then `read_back_confirmed`, `echo_confirmed` or `given_up` when it resolved that way, each with seconds since the first send attempt. |
 | What state did the engine believe the group was in? | `group_context` snapshots and `epoch_state_changed` rows for hydrate, join, pending publish, publish resolution, fork recovery, and unrecoverable transitions. |
 | How did MLS-authenticated group state change? | `group_state_changed` rows for membership, self-leave, admin, rename, avatar, and message-retention deltas, including epoch and origin commit id when attributable. |
 | Why did a fork/convergence decision happen? | `snapshot_created`, `fork_resolution`, `convergence_decision`, `peeler_outcome`, `auto_commit_decision`, and message-state invalidation rows. |

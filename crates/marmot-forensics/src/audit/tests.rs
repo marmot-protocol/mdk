@@ -1147,6 +1147,11 @@ fn sample_v5_only_kinds() -> Vec<AuditEventKind> {
             remainder_since_secs: None,
             remainder_until_secs: None,
         },
+        AuditEventKind::PendingCommitChanged {
+            change: PendingCommitChange::Stuck,
+            msg_id: "5c".repeat(32),
+            pending_secs: 600,
+        },
         AuditEventKind::TransportCursorAdvanced {
             trigger: TransportCursorTrigger::LivePromotion,
             cursor_before_secs: Some(1_700_000_000),

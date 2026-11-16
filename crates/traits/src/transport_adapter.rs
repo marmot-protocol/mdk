@@ -305,6 +305,10 @@ pub struct OutboundFanout {
     /// retry or a wake. See [`Self::first_attempt_at_ms`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     first_attempt_at_ms: Option<u64>,
+    /// When the session first read this pending commit back past the
+    /// read-back bound (mdk#3460). See [`Self::stuck_at_ms`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stuck_at_ms: Option<u64>,
     #[serde(default)]
     target_possible_exposure: Vec<bool>,
     /// When the device last read a pending commit back to learn whether it
@@ -481,6 +485,7 @@ impl OutboundFanout {
             target_attempt_counts: vec![0; target_count],
             target_last_attempt_at_ms: vec![None; target_count],
             first_attempt_at_ms: None,
+            stuck_at_ms: None,
             target_possible_exposure: vec![false; target_count],
             reachability_read_at_ms: None,
             queued_intent_id: None,
@@ -693,6 +698,25 @@ impl OutboundFanout {
                 })
                 .then_some(self.created_at_ms)
         })
+    }
+
+    /// When the session first read this pending commit back from a relay
+    /// that may hold it, past the read-back bound, with no relay having
+    /// acknowledged it (mdk#3460); none before then. The session audits that
+    /// the commit went stuck once, when it records this.
+    pub fn stuck_at_ms(&self) -> Option<u64> {
+        self.stuck_at_ms
+    }
+
+    /// Record that the commit went stuck at `at_ms`. Returns whether this
+    /// recorded it: the first time does, and a later call keeps the first
+    /// time and returns `false`. It changes no target.
+    pub fn record_stuck(&mut self, at_ms: u64) -> bool {
+        if self.stuck_at_ms.is_some() {
+            return false;
+        }
+        self.stuck_at_ms = Some(at_ms);
+        true
     }
 
     /// Whether the endpoint may hold the event without having acknowledged
