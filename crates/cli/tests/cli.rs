@@ -475,6 +475,14 @@ fn relay_pair_json(first: &TestRelay, second: &TestRelay) -> Value {
     serde_json::json!([first.url(), second.url()])
 }
 
+/// A `wn` or `wnd` process with device groups off unless the test turns them
+/// on: it never inherits `WN_DEVICE_GROUPS` from the developer's shell.
+fn cli_binary(program: &str) -> Command {
+    let mut command = Command::new(program);
+    command.env_remove("WN_DEVICE_GROUPS");
+    command
+}
+
 fn wn(home: &std::path::Path) -> Command {
     let mut command = wn_plain(home);
     command.arg("--json");
@@ -482,7 +490,7 @@ fn wn(home: &std::path::Path) -> Command {
 }
 
 fn wn_plain(home: &std::path::Path) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_wn"));
+    let mut command = cli_binary(env!("CARGO_BIN_EXE_wn"));
     command.arg("--home").arg(home);
     command.env("WN_SECRET_STORE", "file");
     command.env("WN_RELAY", test_relay_url());
@@ -762,7 +770,7 @@ fn run_json_with_env(home: &std::path::Path, args: &[&str], envs: &[(&str, &str)
 
 #[test]
 fn whitenoise_command_surface_names_are_present() {
-    let wn_help = Command::new(env!("CARGO_BIN_EXE_wn"))
+    let wn_help = cli_binary(env!("CARGO_BIN_EXE_wn"))
         .arg("--help")
         .output()
         .expect("wn help should run");
@@ -810,7 +818,7 @@ fn whitenoise_command_surface_names_are_present() {
         !wn_help.contains("--relay"),
         "wn --help should not expose a global relay flag"
     );
-    let stream_help = Command::new(env!("CARGO_BIN_EXE_wn"))
+    let stream_help = cli_binary(env!("CARGO_BIN_EXE_wn"))
         .args(["stream", "--help"])
         .output()
         .expect("wn stream help should run");
@@ -846,7 +854,7 @@ fn whitenoise_command_surface_names_are_present() {
         );
     }
 
-    let login_help = Command::new(env!("CARGO_BIN_EXE_wn"))
+    let login_help = cli_binary(env!("CARGO_BIN_EXE_wn"))
         .args(["login", "--help"])
         .output()
         .expect("wn login help should run");
@@ -869,7 +877,7 @@ fn whitenoise_command_surface_names_are_present() {
         "wn login --help should expose stdin-based nsec import"
     );
 
-    let wnd_help = Command::new(env!("CARGO_BIN_EXE_wnd"))
+    let wnd_help = cli_binary(env!("CARGO_BIN_EXE_wnd"))
         .arg("--help")
         .output()
         .expect("wnd help should run");
@@ -896,7 +904,7 @@ fn whitenoise_command_surface_names_are_present() {
         "wnd --help should match wnd-style relay defaults instead of singular --relay"
     );
 
-    let daemon_help = Command::new(env!("CARGO_BIN_EXE_wn"))
+    let daemon_help = cli_binary(env!("CARGO_BIN_EXE_wn"))
         .args(["daemon", "--help"])
         .output()
         .expect("wn daemon help should run");
@@ -915,7 +923,7 @@ fn whitenoise_command_surface_names_are_present() {
         "daemon sync-now should not be a user-facing command"
     );
 
-    let daemon_start_help = Command::new(env!("CARGO_BIN_EXE_wn"))
+    let daemon_start_help = cli_binary(env!("CARGO_BIN_EXE_wn"))
         .args(["daemon", "start", "--help"])
         .output()
         .expect("wn daemon start help should run");
@@ -941,7 +949,7 @@ fn whitenoise_command_surface_names_are_present() {
         );
     }
 
-    let messages_list_help = Command::new(env!("CARGO_BIN_EXE_wn"))
+    let messages_list_help = cli_binary(env!("CARGO_BIN_EXE_wn"))
         .args(["messages", "list", "--help"])
         .output()
         .expect("messages list help should run");
@@ -967,7 +975,7 @@ fn whitenoise_command_surface_names_are_present() {
         );
     }
 
-    let keys_help = Command::new(env!("CARGO_BIN_EXE_wn"))
+    let keys_help = cli_binary(env!("CARGO_BIN_EXE_wn"))
         .args(["keys", "--help"])
         .output()
         .expect("keys help should run");
@@ -995,7 +1003,7 @@ fn whitenoise_command_surface_names_are_present() {
         );
     }
 
-    let groups_help = Command::new(env!("CARGO_BIN_EXE_wn"))
+    let groups_help = cli_binary(env!("CARGO_BIN_EXE_wn"))
         .args(["groups", "--help"])
         .output()
         .expect("groups help should run");
@@ -1041,7 +1049,7 @@ fn whitenoise_command_surface_names_are_present() {
         );
     }
 
-    let messages_help = Command::new(env!("CARGO_BIN_EXE_wn"))
+    let messages_help = cli_binary(env!("CARGO_BIN_EXE_wn"))
         .args(["messages", "--help"])
         .output()
         .expect("messages help should run");
@@ -1074,7 +1082,7 @@ fn whitenoise_command_surface_names_are_present() {
         );
     }
 
-    let chats_help = Command::new(env!("CARGO_BIN_EXE_wn"))
+    let chats_help = cli_binary(env!("CARGO_BIN_EXE_wn"))
         .args(["chats", "--help"])
         .output()
         .expect("chats help should run");
@@ -1095,7 +1103,7 @@ fn whitenoise_command_surface_names_are_present() {
         );
     }
 
-    let media_help = Command::new(env!("CARGO_BIN_EXE_wn"))
+    let media_help = cli_binary(env!("CARGO_BIN_EXE_wn"))
         .args(["media", "--help"])
         .output()
         .expect("media help should run");
@@ -1910,7 +1918,7 @@ fn wait_until_projected_agent_stream_message(
 const DAEMON_START_TIMEOUT: Duration = Duration::from_secs(60);
 
 fn daemon_answers(socket: &std::path::Path) -> bool {
-    let output = Command::new(env!("CARGO_BIN_EXE_wn"))
+    let output = cli_binary(env!("CARGO_BIN_EXE_wn"))
         .arg("--socket")
         .arg(socket)
         .arg("--json")
@@ -1972,7 +1980,7 @@ impl DaemonGuard {
         socket: &std::path::Path,
         configure: impl FnOnce(&mut Command) -> &mut Command,
     ) -> Self {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_wnd"));
+        let mut command = cli_binary(env!("CARGO_BIN_EXE_wnd"));
         command.arg("--socket").arg(socket);
         let child = configure(&mut command).spawn().expect("wnd should start");
         let mut guard = Self {
@@ -2050,7 +2058,7 @@ impl Drop for DaemonGuard {
         if self.running() {
             // `wn daemon stop` has no read timeout, so a daemon that is still
             // starting up could hold it forever; bound it with the daemon.
-            let mut stop = Command::new(env!("CARGO_BIN_EXE_wn"))
+            let mut stop = cli_binary(env!("CARGO_BIN_EXE_wn"))
                 .arg("--socket")
                 .arg(&self.socket)
                 .arg("--json")
@@ -2076,7 +2084,7 @@ impl Drop for DaemonGuard {
 /// process's normal exit; the guard still owns bounded failure cleanup.
 fn stop_owned_test_daemon(mut daemon: DaemonGuard) {
     let mut stop = KillOnDrop::spawn(
-        Command::new(env!("CARGO_BIN_EXE_wn"))
+        cli_binary(env!("CARGO_BIN_EXE_wn"))
             .arg("--socket")
             .arg(&daemon.socket)
             .arg("--json")
@@ -2255,7 +2263,7 @@ fn daemon_guard_stops_a_detached_wnd_when_its_test_panics() {
 
     let pid = pid_after_panicking_with(|| {
         let daemon = DaemonGuard::detached(&socket);
-        let start = Command::new(env!("CARGO_BIN_EXE_wn"))
+        let start = cli_binary(env!("CARGO_BIN_EXE_wn"))
             .arg("--home")
             .arg(home.path())
             .arg("--socket")
@@ -2930,7 +2938,7 @@ fn account_create_uses_global_relay_for_required_relay_lists() {
 #[test]
 fn account_create_requires_relay_setup() {
     let home = tempfile::tempdir().expect("tempdir");
-    let output = Command::new(env!("CARGO_BIN_EXE_wn"))
+    let output = cli_binary(env!("CARGO_BIN_EXE_wn"))
         .arg("--home")
         .arg(home.path())
         .arg("--json")
@@ -6984,7 +6992,7 @@ fn daemon_executes_cli_commands_over_socket() {
             .env("WN_ALLOW_LOOPBACK_BLOB_ENDPOINTS", "1")
     });
 
-    let output = Command::new(env!("CARGO_BIN_EXE_wn"))
+    let output = cli_binary(env!("CARGO_BIN_EXE_wn"))
         .arg("--socket")
         .arg(&socket)
         .arg("--json")
@@ -7015,7 +7023,7 @@ fn daemon_executes_cli_commands_over_socket() {
         (["groups", "quarantined"], "quarantined"),
         (["groups", "pending-welcomes"], "pending_welcome_deliveries"),
     ] {
-        let output = Command::new(env!("CARGO_BIN_EXE_wn"))
+        let output = cli_binary(env!("CARGO_BIN_EXE_wn"))
             .arg("--socket")
             .arg(&socket)
             .arg("--json")
@@ -7039,7 +7047,7 @@ fn daemon_executes_cli_commands_over_socket() {
     // mean the caller's files: run the client from an unrelated directory
     // holding `note.txt` and upload through the daemon.
     let blossom = TestBlossom::new();
-    let created = Command::new(env!("CARGO_BIN_EXE_wn"))
+    let created = cli_binary(env!("CARGO_BIN_EXE_wn"))
         .arg("--socket")
         .arg(&socket)
         .arg("--json")
@@ -7068,7 +7076,7 @@ fn daemon_executes_cli_commands_over_socket() {
         b"forwarded from the caller directory",
     )
     .expect("write caller file");
-    let upload = Command::new(env!("CARGO_BIN_EXE_wn"))
+    let upload = cli_binary(env!("CARGO_BIN_EXE_wn"))
         .current_dir(caller_dir.path())
         .arg("--socket")
         .arg(&socket)
@@ -7136,7 +7144,7 @@ fn daemon_uses_discovery_relays_independently_from_operational_relays() {
             .env("WN_ALLOW_LOOPBACK_RELAYS", "1")
     });
 
-    let output = Command::new(env!("CARGO_BIN_EXE_wn"))
+    let output = cli_binary(env!("CARGO_BIN_EXE_wn"))
         .arg("--socket")
         .arg(&socket)
         .arg("--account")
@@ -7229,7 +7237,7 @@ fn daemon_refuses_reset_over_socket() {
             .env("WN_ALLOW_LOOPBACK_RELAYS", "1")
     });
 
-    let output = Command::new(env!("CARGO_BIN_EXE_wn"))
+    let output = cli_binary(env!("CARGO_BIN_EXE_wn"))
         .arg("--socket")
         .arg(&socket)
         .arg("--json")
@@ -7339,7 +7347,7 @@ fn daemon_execute_failures_preserve_admission_state_and_output_channels() {
                     }
                 }))
             };
-            let mut command = Command::new(env!("CARGO_BIN_EXE_wn"));
+            let mut command = cli_binary(env!("CARGO_BIN_EXE_wn"));
             command
                 .arg("--home")
                 .arg(home.path())
@@ -7402,7 +7410,7 @@ fn daemon_start_status_execute_and_stop_are_user_facing_commands() {
     let socket = home.path().join("dev").join("wnd.sock");
 
     let _daemon = DaemonGuard::detached(&socket);
-    let start = Command::new(env!("CARGO_BIN_EXE_wn"))
+    let start = cli_binary(env!("CARGO_BIN_EXE_wn"))
         .arg("--home")
         .arg(home.path())
         .arg("--socket")
@@ -7429,7 +7437,7 @@ fn daemon_start_status_execute_and_stop_are_user_facing_commands() {
         command_output_summary(&start)
     );
 
-    let status = Command::new(env!("CARGO_BIN_EXE_wn"))
+    let status = cli_binary(env!("CARGO_BIN_EXE_wn"))
         .arg("--socket")
         .arg(&socket)
         .arg("--json")
@@ -7450,7 +7458,7 @@ fn daemon_start_status_execute_and_stop_are_user_facing_commands() {
     assert!(status_json["result"].get("last_sync").is_none());
     assert!(status_json["result"].get("last_runtime_activity").is_some());
 
-    let alice_created = Command::new(env!("CARGO_BIN_EXE_wn"))
+    let alice_created = cli_binary(env!("CARGO_BIN_EXE_wn"))
         .arg("--socket")
         .arg(&socket)
         .arg("--json")
@@ -7470,7 +7478,7 @@ fn daemon_start_status_execute_and_stop_are_user_facing_commands() {
         .as_str()
         .expect("alice account id");
 
-    let bob_created = Command::new(env!("CARGO_BIN_EXE_wn"))
+    let bob_created = cli_binary(env!("CARGO_BIN_EXE_wn"))
         .arg("--socket")
         .arg(&socket)
         .arg("--json")
@@ -7488,7 +7496,7 @@ fn daemon_start_status_execute_and_stop_are_user_facing_commands() {
         .as_str()
         .expect("bob account id");
 
-    let group_created = Command::new(env!("CARGO_BIN_EXE_wn"))
+    let group_created = cli_binary(env!("CARGO_BIN_EXE_wn"))
         .arg("--socket")
         .arg(&socket)
         .arg("--account")
@@ -7503,7 +7511,7 @@ fn daemon_start_status_execute_and_stop_are_user_facing_commands() {
         command_output_summary(&group_created)
     );
 
-    let whoami = Command::new(env!("CARGO_BIN_EXE_wn"))
+    let whoami = cli_binary(env!("CARGO_BIN_EXE_wn"))
         .arg("--socket")
         .arg(&socket)
         .arg("--json")
@@ -7524,7 +7532,7 @@ fn daemon_start_status_execute_and_stop_are_user_facing_commands() {
         2
     );
 
-    let stop = Command::new(env!("CARGO_BIN_EXE_wn"))
+    let stop = cli_binary(env!("CARGO_BIN_EXE_wn"))
         .arg("--socket")
         .arg(&socket)
         .arg("--json")
@@ -7543,7 +7551,7 @@ fn daemon_start_status_execute_and_stop_are_user_facing_commands() {
 
 /// `wn --json daemon start` for `home` on `socket`, against the test relay.
 fn daemon_start_command(home: &std::path::Path, socket: &std::path::Path) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_wn"));
+    let mut command = cli_binary(env!("CARGO_BIN_EXE_wn"));
     command
         .arg("--home")
         .arg(home)
@@ -7679,7 +7687,7 @@ fn daemon_runtime_subscriptions_update_local_accounts_without_manual_sync() {
     let group_id = created_group["group_id"].as_str().expect("group id");
 
     let daemon = DaemonGuard::detached(&socket);
-    let start = Command::new(env!("CARGO_BIN_EXE_wn"))
+    let start = cli_binary(env!("CARGO_BIN_EXE_wn"))
         .arg("--home")
         .arg(home.path())
         .arg("--socket")
@@ -7709,7 +7717,7 @@ fn daemon_runtime_subscriptions_update_local_accounts_without_manual_sync() {
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut saw_group = false;
     while Instant::now() < deadline {
-        let output = Command::new(env!("CARGO_BIN_EXE_wn"))
+        let output = cli_binary(env!("CARGO_BIN_EXE_wn"))
             .arg("--socket")
             .arg(&socket)
             .arg("--account")
@@ -9237,7 +9245,7 @@ fn daemon_human_startup_errors_sanitize_hostile_relays_without_changing_json() {
     // regresses into spawning a daemon.
     let _daemon = DaemonGuard::detached(&wn_cli::daemon::default_socket_path(home.path()));
 
-    let ordinary = Command::new(env!("CARGO_BIN_EXE_wn"))
+    let ordinary = cli_binary(env!("CARGO_BIN_EXE_wn"))
         .arg("--home")
         .arg(home.path())
         .arg("--relay")
@@ -9255,7 +9263,7 @@ fn daemon_human_startup_errors_sanitize_hostile_relays_without_changing_json() {
         "ordinary wn errors must stay sanitized"
     );
 
-    let start = Command::new(env!("CARGO_BIN_EXE_wn"))
+    let start = cli_binary(env!("CARGO_BIN_EXE_wn"))
         .arg("--home")
         .arg(home.path())
         .arg("--secret-store")
@@ -9276,7 +9284,7 @@ fn daemon_human_startup_errors_sanitize_hostile_relays_without_changing_json() {
     assert!(!String::from_utf8_lossy(&start.stderr).contains('\u{202e}'));
     assert!(start.stdout.is_empty());
 
-    let wnd = Command::new(env!("CARGO_BIN_EXE_wnd"))
+    let wnd = cli_binary(env!("CARGO_BIN_EXE_wnd"))
         .arg("--home")
         .arg(home.path())
         .arg("--discovery-relays")
@@ -9296,7 +9304,7 @@ fn daemon_human_startup_errors_sanitize_hostile_relays_without_changing_json() {
     assert!(!String::from_utf8_lossy(&wnd.stderr).contains('\u{202e}'));
     assert!(wnd.stdout.is_empty());
 
-    let start_json = Command::new(env!("CARGO_BIN_EXE_wn"))
+    let start_json = cli_binary(env!("CARGO_BIN_EXE_wn"))
         .arg("--home")
         .arg(home.path())
         .arg("--secret-store")

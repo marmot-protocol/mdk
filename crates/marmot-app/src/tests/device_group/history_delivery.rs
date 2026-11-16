@@ -891,12 +891,7 @@ async fn chat_history_imports_are_empty_and_silent_with_device_groups_off() {
     AccountHome::open(dir.path())
         .create_account("alice")
         .unwrap();
-    let app = MarmotApp::with_relay_and_config(
-        dir.path(),
-        "wss://relay.example",
-        MarmotAppConfig::white_noise(),
-    )
-    .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+    let app = super::ordinary_app_on(&dir, Arc::new(ScriptedPushRelayClient::default()));
     let mut client = app.client("alice").await.unwrap();
     assert!(!client.take_chat_history_imports_changed());
     assert!(client.chat_history_imports().unwrap().is_empty());

@@ -960,14 +960,7 @@ async fn release_builds_refuse_recovery_words() {
         ..
     } = phone_and_laptop().await;
     drop(phone);
-    let phone_app = MarmotApp::with_relay_and_config(
-        _dirs[0].path(),
-        "wss://relay.example",
-        MarmotAppConfig::white_noise()
-            .with_dev_settlement_quiescence_ms(0)
-            .with_dev_scheduled_convergence_delay_ms(0),
-    )
-    .with_test_relay_client(relay);
+    let phone_app = super::ordinary_app_on(&_dirs[0], relay);
     let mut phone = phone_app.client("alice").await.unwrap();
     assert_eq!(
         refusal(phone.begin_recovery_words().unwrap_err()),

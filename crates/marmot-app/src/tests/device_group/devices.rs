@@ -897,14 +897,7 @@ async fn a_rename_needs_a_device_group() {
     // group (mdk#3012), so the phone is reopened before it makes one.
     drop(phone);
 
-    let phone_app = MarmotApp::with_relay_and_config(
-        _dirs[0].path(),
-        "wss://relay.example",
-        MarmotAppConfig::white_noise()
-            .with_dev_settlement_quiescence_ms(0)
-            .with_dev_scheduled_convergence_delay_ms(0),
-    )
-    .with_test_relay_client(relay.clone());
+    let phone_app = super::ordinary_app_on(&_dirs[0], relay.clone());
     let mut phone = phone_app.client("alice").await.unwrap();
     let before = published_count(&relay);
     assert_eq!(
