@@ -858,7 +858,6 @@ async fn emoji_set_reads_reach_configured_relays() {
     };
     for (url, identifier, title, created_at) in [
         (&configured_url, "configured", "Configured", now - 100),
-        (&configured_url, "pointed", "Pointed", now - 100),
         (&configured_url, "both", "Old", now - 100),
         (&account_url, "both", "New", now - 50),
     ] {
@@ -909,9 +908,17 @@ async fn emoji_set_reads_reach_configured_relays() {
     )
     .await;
 
+    // Each read starts from an empty cache for the set it checks, so none
+    // passes on a set another read stored.
+    let fetched = app
+        .fetch_emoji_set(&account_id, &coordinate("configured"))
+        .await
+        .expect("a set only the configured relay holds resolves");
+    assert_eq!(fetched.title.as_deref(), Some("Configured"));
+
     let synced = app.sync_emoji_sets(&account_id, None).await.unwrap();
     assert_eq!(
-        synced.discovered, 3,
+        synced.discovered, 2,
         "discovery reaches the configured relay"
     );
     let both = app
@@ -921,12 +928,15 @@ async fn emoji_set_reads_reach_configured_relays() {
         .expect("discovered");
     assert_eq!(both.title.as_deref(), Some("New"), "the newer version wins");
 
-    let fetched = app
-        .fetch_emoji_set(&account_id, &coordinate("configured"))
-        .await
-        .expect("a set only the configured relay holds resolves");
-    assert_eq!(fetched.title.as_deref(), Some("Configured"));
-
+    // Published after discovery, so only the list's pointer read can find it.
+    publish_signed(
+        &configured_url,
+        &author,
+        EMOJI_SET_KIND,
+        emoji_set_tags("pointed", "Pointed"),
+        now - 100,
+    )
+    .await;
     let list = app.user_emoji_list(&account_id).await.unwrap();
     assert_eq!(
         list.sets
