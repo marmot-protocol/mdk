@@ -789,6 +789,14 @@ pub(crate) enum GroupsCommand {
         group_id: String,
     },
     #[command(
+        name = "pending-commit",
+        about = "Show the group's own commit that has not confirmed yet, if any"
+    )]
+    PendingCommit {
+        #[arg(help = "Group id to inspect")]
+        group_id: String,
+    },
+    #[command(
         name = "changes-not-delivered",
         about = "List your group changes that were given up after their call returned, until acknowledged"
     )]

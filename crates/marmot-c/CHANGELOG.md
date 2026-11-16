@@ -23,6 +23,10 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ### Added
 
+- `marmot_group_pending_commit` returns a `MarmotGroupPendingCommit` (free with
+  `marmot_group_pending_commit_free`) for the group's own commit that has not
+  confirmed yet, with `MarmotGroupPendingCommitState` (mdk#2332). Group changes
+  return the new `MARMOT_STATUS_GROUP_COMMIT_PENDING` (131) while it is pending.
 - `marmot_group_changes_not_delivered` (free with `marmot_group_change_not_delivered_list_free`) and
   `marmot_acknowledge_change_not_delivered` (mdk#2332). `MARMOT_GROUP_EVENT_KIND_GROUP_CHANGE_NOT_DELIVERED` is
   appended to `MarmotGroupEventKind`, so existing tags keep their values: handle it in exhaustive switches and

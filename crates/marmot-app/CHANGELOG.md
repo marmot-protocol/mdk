@@ -4,6 +4,9 @@
 
 ### Added
 
+- `MarmotAppRuntime::group_pending_commit` (and `AppClient`) returns `GroupPendingCommit` for the group's own commit
+  that has not confirmed yet, `GroupPendingCommitState::Sending` or `Stuck`, with its relays (mdk#2332).
+  `AccountDeviceRuntime::pending_commit` in `marmot-session` is its source.
 - `MarmotAppRuntime::group_changes_not_delivered` and `acknowledge_change_not_delivered` read and clear
   `GroupChangeNotDelivered` records (mdk#2332); `AppClient` has both too. Host group-change commands name their
   commits, so a rollback after the command returned is recorded.
@@ -31,6 +34,10 @@
 
 ### Changed
 
+- Commit-preparing group commands fail with `AppError::GroupCommitPending` while the group's own commit is pending,
+  before the catching-up and undelivered checks and without spending their acknowledgements (mdk#2332). So do a
+  member's `leave_group` and `decline_group_invite`. They failed with the engine's untyped refusal before.
+  `disband_group` and an admin's leave keep the advisory checks alone.
 - `send_message_draft` and captured-media admission match prepared media to
   the draft's attachments after an upload's version normalization (a V1
   upload trims the file name; both versions canonicalize the media type)

@@ -214,6 +214,13 @@ pub enum AppError {
     /// `acknowledge_group_commit_undelivered` and retry.
     #[error("the group's last change has not reached every relay yet; try again shortly")]
     GroupCommitUndelivered(String),
+    /// The group's own last commit has not confirmed yet (mdk#2332), so the
+    /// group cannot take another change: `group_pending_commit` shows it.
+    /// Retryable once it confirms or is given up. No acknowledgement
+    /// releases it, so it wins over `GroupCommitUndelivered` and
+    /// `GroupCatchingUp`.
+    #[error("the group's last change is still being sent; try again once it is applied")]
+    GroupCommitPending(String),
     /// Host-supplied draft attachment metadata failed validation before storage.
     #[error("invalid message draft: {0}")]
     InvalidMessageDraft(String),
@@ -747,6 +754,7 @@ impl AppError {
             Self::GroupRemoved(_) => "group_removed",
             Self::GroupCatchingUp(_) => "group_catching_up",
             Self::GroupCommitUndelivered(_) => "group_commit_undelivered",
+            Self::GroupCommitPending(_) => "group_commit_pending",
             Self::InvalidMessageDraft(_) => "invalid_message_draft",
             Self::MessageDraftRevisionConflict => "message_draft_revision_conflict",
             Self::AgentStreamMissingStart => "agent_stream_missing_start",

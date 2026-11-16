@@ -340,6 +340,12 @@ enum MarmotStatus
    * member report is unavailable. Use the existing group; do not recreate it.
    */
   MARMOT_STATUS_CREATED_GROUP_MEMBER_REPORT_UNAVAILABLE = 130,
+  /**
+   * The group's last commit has not confirmed yet, so the group cannot
+   * take another change; MDK keeps sending it. Retry once it confirms;
+   * `marmot_group_pending_commit` shows where it stands (mdk#2332).
+   */
+  MARMOT_STATUS_GROUP_COMMIT_PENDING = 131,
 };
 #ifndef __cplusplus
 #if __STDC_VERSION__ >= 202311L
@@ -667,6 +673,23 @@ typedef enum MarmotEventSizeClass {
   MARMOT_EVENT_SIZE_CLASS_FROM2_TO4_MIB,
   MARMOT_EVENT_SIZE_CLASS_OVER4_MIB,
 } MarmotEventSizeClass;
+
+/**
+ * Where a pending commit stands (mdk#2332).
+ */
+typedef enum MarmotGroupPendingCommitState {
+  /**
+   * MDK is still sending it: for its first ten minutes, and for as
+   * long as no relay may hold it while MDK waits to reach one.
+   */
+  MARMOT_GROUP_PENDING_COMMIT_STATE_SENDING,
+  /**
+   * Ten minutes past its first attempt, some relay may hold it and none
+   * has acknowledged it. MDK keeps sending it and never gives it up,
+   * since members may have seen it.
+   */
+  MARMOT_GROUP_PENDING_COMMIT_STATE_STUCK,
+} MarmotGroupPendingCommitState;
 
 /**
  * Why recovery parked. Current epoch-gap exhaustion emits `EpochGap`; a
@@ -3193,6 +3216,37 @@ typedef struct MarmotGroupCommitDelivery {
   struct MarmotGroupCommitRefusedRelay *refused_relays;
   uintptr_t refused_relays_len;
 } MarmotGroupCommitDelivery;
+
+/**
+ * The group's own commit that has not confirmed yet (mdk#2332). While it
+ * is pending, group changes return `MARMOT_STATUS_GROUP_COMMIT_PENDING`.
+ * `queued_intent_id_hex` is NULL unless it carries a queued change of
+ * yours; `intent_kind` is NULL for a commit MDK made on its own.
+ * `first_attempt_at` (Unix seconds) is read only when
+ * `has_first_attempt_at` is true. `unconfirmed_relay_urls` may hold it
+ * without having acknowledged it; `owed_relay_urls` never received it;
+ * `refused_relays` gave a final latest answer, and can also be
+ * unconfirmed from an earlier attempt.
+ */
+typedef struct MarmotGroupPendingCommit {
+  char *group_id_hex;
+  char *commit_id_hex;
+  char *queued_intent_id_hex;
+  char *intent_kind;
+  bool has_first_attempt_at;
+  /**
+   *Only meaningful when the matching `has_` flag is set.
+   */
+  uint64_t first_attempt_at;
+  enum MarmotGroupPendingCommitState state;
+  char **unconfirmed_relay_urls;
+  uintptr_t unconfirmed_relay_urls_len;
+  char **owed_relay_urls;
+  uintptr_t owed_relay_urls_len;
+  struct MarmotGroupCommitRefusedRelay *refused_relays;
+  uintptr_t refused_relays_len;
+  uint32_t relay_count;
+} MarmotGroupPendingCommit;
 
 /**
  * A group change of yours that was not applied (mdk#2332): its call
@@ -9181,6 +9235,23 @@ MarmotStatus marmot_group_commit_delivery(const struct MarmotClient *client,
                                           const char *account_ref,
                                           const char *group_id_hex,
                                           struct MarmotGroupCommitDelivery **out);
+
+/**
+ * The group's own commit that has not confirmed yet, or NULL
+ * (mdk#2332). While it is pending, group changes return
+ * `MARMOT_STATUS_GROUP_COMMIT_PENDING`. Poll while showing it. Local
+ * read. Free with `marmot_group_pending_commit_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_group_pending_commit(const struct MarmotClient *client,
+                                         const char *account_ref,
+                                         const char *group_id_hex,
+                                         struct MarmotGroupPendingCommit **out);
 
 /**
  * The group's changes of yours that were not applied, oldest first
@@ -15845,6 +15916,16 @@ void marmot_group_app_component_free(struct MarmotGroupAppComponent *ptr);
  * this library.
  */
 void marmot_group_commit_delivery_free(struct MarmotGroupCommitDelivery *ptr);
+
+/**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
+void marmot_group_pending_commit_free(struct MarmotGroupPendingCommit *ptr);
 
 /**
  * Free a disband request returned by `marmot_disband_group`. NULL is a

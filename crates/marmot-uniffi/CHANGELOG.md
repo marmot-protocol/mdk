@@ -4,6 +4,10 @@
 
 ### Added
 
+- `groupPendingCommit(accountRef, groupIdHex)` returns `GroupPendingCommitFfi`, or nil, for the group's own commit
+  that has not confirmed yet, with `GroupPendingCommitStateFfi` `Sending` or `Stuck` (mdk#2332). Group changes fail
+  with the new `MarmotKitError::GroupCommitPending { groupIdHex }` while it is pending; handle it where you handle
+  `GroupCommitUndelivered`. See [A group change still being sent](README.md#a-group-change-still-being-sent).
 - `groupChangesNotDelivered(accountRef, groupIdHex)` returns `GroupChangeNotDeliveredFfi` records and
   `acknowledgeChangeNotDelivered(accountRef, groupIdHex, commitIdHex)` clears one (mdk#2332).
   `GroupEventKindFfi::GroupChangeNotDelivered` announces a direct change; handle it in exhaustive switches. See

@@ -4137,6 +4137,82 @@ where
         self.undelivered_commit_until_in(group_id, None)
     }
 
+    /// The group's own commit that has not confirmed yet, if any (mdk#2332).
+    /// The engine stages one commit at a time, so a group has at most one,
+    /// and no other group change can be staged while it is pending. MDK's own
+    /// commits are included, with no origin. The commit is
+    /// [`PendingCommitState::Stuck`] once its first attempt is past the
+    /// read-back bound while some relay may hold it and none has
+    /// acknowledged it, and [`PendingCommitState::Sending`] otherwise. Only a
+    /// live group answers (mdk#2602): a seeded group fails with
+    /// `GroupNotHydrated` and a quarantined one with `UnknownGroup`, because
+    /// the engine hides their fanouts.
+    pub fn pending_commit(&self, group_id: &GroupId) -> AccountResult<Option<PendingCommit>> {
+        self.session.check_group_live(group_id)?;
+        let now_ms = self.wall_clock.now_ms();
+        let Some(fanout) = self
+            .session
+            .outbound_fanouts_for_group(group_id)?
+            .into_iter()
+            .find(|fanout| {
+                is_group_commit(fanout) && matches!(fanout.mls_state(), FanoutMlsState::Pending(_))
+            })
+        else {
+            return Ok(None);
+        };
+        let endpoints = fanout.request().target.endpoints();
+        let mut unconfirmed_endpoints = Vec::new();
+        let mut owed_endpoints = Vec::new();
+        for (index, endpoint) in endpoints.iter().enumerate() {
+            let status = fanout.target_status(index);
+            if status == Some(cgka_traits::FanoutTargetStatus::Accepted) {
+                continue;
+            }
+            if fanout.target_may_hold_event(index) {
+                unconfirmed_endpoints.push(endpoint.clone());
+            } else if status.is_some_and(cgka_traits::FanoutTargetStatus::is_outstanding) {
+                owed_endpoints.push(endpoint.clone());
+            }
+        }
+        let first_attempt_at_ms = fanout.first_attempt_at_ms();
+        let stuck = first_attempt_at_ms
+            .is_some_and(|first| now_ms.saturating_sub(first) >= PENDING_COMMIT_READ_BACK_AFTER_MS)
+            && fanout.outcome().accepted_targets == 0
+            && !unconfirmed_endpoints.is_empty();
+        let (origin, intent_kind) = if let Some(intent_id) = fanout.queued_intent_id() {
+            (
+                Some(cgka_traits::storage::ChangeOrigin::QueuedIntent {
+                    intent_id: intent_id.clone(),
+                }),
+                self.session
+                    .queued_intent_kind(group_id, intent_id)?
+                    .map(str::to_owned),
+            )
+        } else if let Some(kind) = fanout.host_change_kind() {
+            (
+                Some(cgka_traits::storage::ChangeOrigin::Direct),
+                Some(kind.to_owned()),
+            )
+        } else {
+            (None, None)
+        };
+        Ok(Some(PendingCommit {
+            message_id: fanout.message_id().clone(),
+            origin,
+            intent_kind,
+            first_attempt_at: first_attempt_at_ms.map(|ms| Timestamp(ms / 1_000)),
+            state: if stuck {
+                PendingCommitState::Stuck
+            } else {
+                PendingCommitState::Sending
+            },
+            unconfirmed_endpoints,
+            owed_endpoints,
+            refused_endpoints: fanout.pending_final_answers(),
+            endpoint_count: endpoints.len(),
+        }))
+    }
+
     /// [`Self::undelivered_commit_until`], taking the account-wide rows from
     /// `rows` when given instead of loading them for this one group.
     pub fn undelivered_commit_until_in(
@@ -8363,6 +8439,49 @@ pub struct UndeliveredCommit {
     pub refused_endpoints: Vec<RefusedTarget>,
     /// Relays the commit was published to.
     pub endpoint_count: usize,
+}
+
+/// The group's own commit that has not confirmed yet (mdk#2332). See
+/// [`AccountDeviceRuntime::pending_commit`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingCommit {
+    /// The commit: its frozen fanout's message id, which a not-delivered
+    /// record names if the commit is later given up.
+    pub message_id: cgka_traits::MessageId,
+    /// Which call made it: a host's group change, or the queued intent it
+    /// was drained from. `None` for a commit MDK made on its own, such as a
+    /// scheduled self-update.
+    pub origin: Option<cgka_traits::storage::ChangeOrigin>,
+    /// The stable name of the change's kind, such as `update_group_data`,
+    /// when `origin` is known and names it.
+    pub intent_kind: Option<String>,
+    /// When the first send attempt started, `None` before any has.
+    pub first_attempt_at: Option<Timestamp>,
+    pub state: PendingCommitState,
+    /// Relays that may hold the commit without having acknowledged it. While
+    /// any does, MDK never gives the commit up.
+    pub unconfirmed_endpoints: Vec<TransportEndpoint>,
+    /// Relays still owed the commit that it never reached.
+    pub owed_endpoints: Vec<TransportEndpoint>,
+    /// Each relay whose latest answer was final, with #2333's cause; such a
+    /// relay can also be unconfirmed, from an earlier attempt.
+    pub refused_endpoints: Vec<RefusedTarget>,
+    /// Relays the commit was published to.
+    pub endpoint_count: usize,
+}
+
+/// Where a pending commit stands (mdk#2332).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PendingCommitState {
+    /// MDK is still sending it: its first attempt is less than ten minutes
+    /// old (the bound past which it is read back), or no relay may hold it
+    /// and MDK waits to reach one.
+    Sending,
+    /// Past that bound, some relay may hold it and none has acknowledged it.
+    /// MDK keeps resending it, backing off to about hourly and reading it
+    /// back from each such relay first, and never gives it up, since members
+    /// may have seen it (mdk#1577).
+    Stuck,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

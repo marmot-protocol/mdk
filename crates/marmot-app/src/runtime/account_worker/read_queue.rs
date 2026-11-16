@@ -764,6 +764,7 @@ host_reads!(
     HydrateGroups,
     GroupCommitDelivery,
     GroupChangesNotDelivered,
+    GroupPendingCommit,
     KeyPackageMaintenanceStatus,
     DurablyOwnedKeyPackages,
     PeriodicMaintenancePolicy,

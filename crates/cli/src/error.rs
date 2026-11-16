@@ -754,6 +754,16 @@ fn app_error_json(err: &AppError) -> Value {
                 "status": "wn groups commit-delivery <group-hex>",
             },
         }),
+        // Retryable: the group's own last commit has not confirmed yet, so it
+        // cannot take another change (mdk#2332).
+        AppError::GroupCommitPending(group_id) => json!({
+            "code": "group_commit_pending",
+            "message": err.to_string(),
+            "group_id": group_id,
+            "next_commands": {
+                "status": "wn groups pending-commit <group-hex>",
+            },
+        }),
         AppError::GroupInviteNotPending => json!({
             "code": "group_invite_not_pending",
             "message": err.to_string(),
@@ -1183,6 +1193,15 @@ mod tests {
         assert_eq!(
             undelivered["next_commands"]["status"],
             "wn groups commit-delivery <group-hex>"
+        );
+        let pending = wn_error_json(&WnError::App(AppError::GroupCommitPending(
+            group_id.clone(),
+        )));
+        assert_eq!(pending["code"], "group_commit_pending");
+        assert_eq!(pending["group_id"], group_id);
+        assert_eq!(
+            pending["next_commands"]["status"],
+            "wn groups pending-commit <group-hex>"
         );
     }
 

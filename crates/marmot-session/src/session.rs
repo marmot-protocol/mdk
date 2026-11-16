@@ -2207,6 +2207,26 @@ impl AccountDeviceSession {
         Ok(self.engine.check_group_live(group_id)?)
     }
 
+    /// The stable kind name of the group's queued intent `intent_id`, such as
+    /// `update_group_data` (mdk#2332), or `None` once it is no longer queued.
+    /// Only a live group answers (mdk#2602).
+    pub fn queued_intent_kind(
+        &self,
+        group_id: &GroupId,
+        intent_id: &MessageId,
+    ) -> SessionResult<Option<&'static str>> {
+        self.engine.check_group_live(group_id)?;
+        Ok(
+            cgka_traits::storage::OutboundIntentStorage::list_queued_outbound_intents(
+                &self.storage,
+                group_id,
+            )?
+            .into_iter()
+            .find(|record| &record.id == intent_id)
+            .map(|record| send_intent_kind(&record.intent)),
+        )
+    }
+
     pub fn pending_group_id(&self, pending: PendingStateRef) -> SessionResult<GroupId> {
         Ok(self.engine.pending_group_id(pending)?)
     }

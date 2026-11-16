@@ -27,6 +27,13 @@
   the change by its group, commit id, kind and time only. A change staged before
   this release and given up after it is not recorded. Account migration 0210
   adds the table.
+- `group_pending_commit` (Rust, UniFFI, C, `wn groups pending-commit`) reads
+  the group's own commit that has not confirmed yet (#2332): `Sending` for its
+  first ten minutes and while no relay may hold it, `Stuck` once some relay may
+  hold it and none has acknowledged it, which MDK never gives up. It names the
+  change the commit carries, when its first attempt started, and the relays
+  that may hold it, are still owed it, or gave a final answer. Poll it while
+  showing a stuck change.
 - Usage diagnostics show where interactive onboarding stops (#3440). MDK
   itself records a new `mdk_onboarding_summary` aggregate each time an
   onboarding attempt saves a step in a blocking status. A row carries the step,
@@ -53,6 +60,13 @@
 
 ### Changed
 
+- A group change made while the group's own commit is pending fails with the
+  new `GroupCommitPending` (Rust `AppError`, UniFFI `MarmotKitError`, C
+  `MARMOT_STATUS_GROUP_COMMIT_PENDING`, CLI `group_commit_pending`) instead of
+  the engine's untyped refusal (#2332). It is checked before `GroupCatchingUp`
+  and `GroupCommitUndelivered`, and no acknowledgement releases it: retry once
+  the commit confirms. A member's leave and invite decline fail the same way.
+  Disbanding and an admin's leave are still accepted, and messages still send.
 - `send_message_draft` (Rust, UniFFI, C) and captured-media admission match
   prepared media to the draft's attachments after the normalization an upload
   applies (#3431): a V1 upload's trimmed file name and either version's

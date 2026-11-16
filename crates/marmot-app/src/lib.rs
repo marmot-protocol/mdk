@@ -1332,17 +1332,102 @@ impl From<cgka_traits::storage::ChangeNotDelivered> for GroupChangeNotDelivered 
         Self {
             group_id_hex: hex::encode(record.group_id.as_slice()),
             commit_id_hex: hex::encode(record.commit_id.as_slice()),
-            origin: match record.origin {
-                cgka_traits::storage::ChangeOrigin::Direct => GroupChangeOrigin::Direct,
-                cgka_traits::storage::ChangeOrigin::QueuedIntent { intent_id } => {
-                    GroupChangeOrigin::QueuedIntent {
-                        intent_id_hex: hex::encode(intent_id.as_slice()),
-                    }
-                }
-            },
+            origin: record.origin.into(),
             intent_kind: record.intent_kind,
             reason: record.reason,
             at: record.at_ms / 1_000,
+        }
+    }
+}
+
+impl From<cgka_traits::storage::ChangeOrigin> for GroupChangeOrigin {
+    fn from(origin: cgka_traits::storage::ChangeOrigin) -> Self {
+        match origin {
+            cgka_traits::storage::ChangeOrigin::Direct => Self::Direct,
+            cgka_traits::storage::ChangeOrigin::QueuedIntent { intent_id } => Self::QueuedIntent {
+                intent_id_hex: hex::encode(intent_id.as_slice()),
+            },
+        }
+    }
+}
+
+/// The group's own commit that has not confirmed yet (mdk#2332). While it is
+/// pending, group changes fail with [`AppError::GroupCommitPending`]: the
+/// group cannot take a second commit until this one confirms or is given
+/// up. MDK keeps sending it. It ends by confirming, which needs no signal,
+/// or by being given up, which a [`GroupChangeNotDelivered`] record reports
+/// for a change of yours. Poll while showing it.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct GroupPendingCommit {
+    /// The commit, which a not-delivered record names if it is given up.
+    pub commit_id_hex: String,
+    /// The change that made it, when it was yours; absent for a commit MDK
+    /// made on its own, such as a scheduled self-update.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<GroupChangeOrigin>,
+    /// Stable name of the change's kind, such as `update_group_data`, when
+    /// known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intent_kind: Option<String>,
+    /// When the first send attempt started, in Unix seconds; absent before
+    /// any has.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_attempt_at: Option<u64>,
+    pub state: GroupPendingCommitState,
+    /// Relays that may hold the commit without having acknowledged it. While
+    /// any does, MDK never gives the commit up: members may have seen it.
+    pub unconfirmed_relay_urls: Vec<String>,
+    /// Relays still owed the commit that it never reached.
+    pub owed_relay_urls: Vec<String>,
+    /// Each relay whose latest answer was final, and why. Such a relay can
+    /// also be unconfirmed, from an earlier attempt.
+    pub refused_relays: Vec<GroupCommitRefusedRelay>,
+    /// Relays the commit was published to.
+    pub relay_count: u32,
+}
+
+/// Where a pending commit stands (mdk#2332).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GroupPendingCommitState {
+    /// MDK is still sending it: for its first ten minutes, and for as long
+    /// as no relay may hold it while MDK waits to reach one.
+    Sending,
+    /// Ten minutes past its first attempt, some relay may hold it and none
+    /// has acknowledged it. MDK keeps resending it, backing off to about
+    /// hourly and reading it back from each such relay first, and never gives
+    /// it up, since members may have seen it.
+    Stuck,
+}
+
+impl From<marmot_session::PendingCommit> for GroupPendingCommit {
+    fn from(commit: marmot_session::PendingCommit) -> Self {
+        let urls = |endpoints: Vec<cgka_traits::TransportEndpoint>| {
+            endpoints
+                .into_iter()
+                .map(|endpoint| endpoint.0)
+                .collect::<Vec<_>>()
+        };
+        Self {
+            commit_id_hex: hex::encode(commit.message_id.as_slice()),
+            origin: commit.origin.map(GroupChangeOrigin::from),
+            intent_kind: commit.intent_kind,
+            first_attempt_at: commit.first_attempt_at.map(|at| at.0),
+            state: match commit.state {
+                marmot_session::PendingCommitState::Sending => GroupPendingCommitState::Sending,
+                marmot_session::PendingCommitState::Stuck => GroupPendingCommitState::Stuck,
+            },
+            unconfirmed_relay_urls: urls(commit.unconfirmed_endpoints),
+            owed_relay_urls: urls(commit.owed_endpoints),
+            refused_relays: commit
+                .refused_endpoints
+                .into_iter()
+                .map(|refused| GroupCommitRefusedRelay {
+                    relay_url: refused.endpoint.0,
+                    cause: refused.cause.into(),
+                })
+                .collect(),
+            relay_count: u32::try_from(commit.endpoint_count).unwrap_or(u32::MAX),
         }
     }
 }

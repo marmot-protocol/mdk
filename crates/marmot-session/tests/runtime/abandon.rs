@@ -104,6 +104,10 @@ async fn an_offline_device_never_gives_up_an_unsent_commit() {
     }
 
     assert!(epoch_is_pending(&runtime, &fixture));
+    let pending = pending_commit(&runtime, &fixture);
+    assert_eq!(pending.state, PendingCommitState::Sending, "no relay may hold it");
+    assert!(pending.unconfirmed_endpoints.is_empty());
+    assert_eq!(pending.owed_endpoints, vec![first.clone(), second.clone()]);
     assert_eq!(adapter.read_backs().len(), 72, "one read an hour");
     assert_eq!(
         stored_status(&runtime, &first),
@@ -212,6 +216,14 @@ async fn a_queued_change_given_up_after_a_restart_is_retired() {
         .find(|fanout| matches!(fanout.mls_state(), FanoutMlsState::Pending(_)))
         .expect("the drained commit is pending");
     assert_eq!(staged.queued_intent_id(), Some(&intent_id));
+    let pending = pending_commit(&runtime, &fixture);
+    assert_eq!(
+        pending.origin,
+        Some(cgka_traits::storage::ChangeOrigin::QueuedIntent {
+            intent_id: intent_id.clone(),
+        })
+    );
+    assert_eq!(pending.intent_kind.as_deref(), Some("update_group_data"));
     drop(runtime);
 
     let mut restarted = fixture.runtime(fixture.reopen(), &adapter);
@@ -351,7 +363,8 @@ async fn a_read_that_returns_the_unsent_commit_confirms_it() {
 /// the commit, so its later `invalid:` keeps it possibly exposed. The other
 /// relay is never reached and the device is online, yet the commit is never
 /// given up; the exposed relay is only read back, and nothing rolls back on a
-/// read.
+/// read. The host reads it `Sending`, then `Stuck` from the bound, with the
+/// limited relay both unconfirmed and refused.
 #[tokio::test]
 async fn a_relay_that_answered_rate_limited_keeps_an_unreached_commit_pending() {
     let limited = TransportEndpoint("wss://abandon-rate-limited.example".into());
@@ -379,12 +392,51 @@ async fn a_relay_that_answered_rate_limited_keeps_an_unreached_commit_pending() 
     let mut runtime = fixture.runtime(alice, &adapter);
     let start = fixture.wall.now().0;
     runtime.send(fixture.rename()).await.unwrap();
+    let commit = adapter.publishes().last().unwrap().message.id.clone();
+    let sending = pending_commit(&runtime, &fixture);
+    assert_eq!(
+        (sending.message_id, sending.origin, sending.intent_kind),
+        (commit, None, None),
+        "an automatic commit names no change"
+    );
+    assert_eq!(sending.first_attempt_at.map(|at| at.0), Some(start));
+    assert_eq!(sending.state, PendingCommitState::Sending);
+    assert_eq!(sending.unconfirmed_endpoints, vec![limited.clone()]);
+    assert_eq!(sending.owed_endpoints, vec![dead.clone()]);
+    assert!(sending.refused_endpoints.is_empty(), "rate-limited is no final answer");
+    assert_eq!(sending.endpoint_count, 2);
 
-    for at in [start + 60, start + READ_BACK_BOUND_SECS, start + 3 * HOUR] {
+    // Proof 16: `Stuck` from the bound past the first attempt, though the
+    // last attempt was a second earlier.
+    let mut states = Vec::new();
+    for at in [
+        start + 60,
+        start + READ_BACK_BOUND_SECS - 1,
+        start + READ_BACK_BOUND_SECS,
+        start + 3 * HOUR,
+    ] {
         fixture.wall.set(at);
         let effects = runtime.resume_outbound_fanouts().await.unwrap();
         assert!(effects.pending.is_empty(), "{:?}", effects.pending);
+        states.push(pending_commit(&runtime, &fixture).state);
     }
+    assert_eq!(
+        states,
+        [
+            PendingCommitState::Sending,
+            PendingCommitState::Sending,
+            PendingCommitState::Stuck,
+            PendingCommitState::Stuck,
+        ]
+    );
+    let stuck = pending_commit(&runtime, &fixture);
+    assert_eq!(stuck.unconfirmed_endpoints, vec![limited.clone()]);
+    assert_eq!(stuck.owed_endpoints, vec![dead.clone()]);
+    assert_eq!(
+        stuck.refused_endpoints,
+        vec![refused(&limited, CommitRefusalCause::Rejected)],
+        "the latest final answer, from a relay that may still hold the commit"
+    );
 
     assert!(epoch_is_pending(&runtime, &fixture));
     assert_eq!(

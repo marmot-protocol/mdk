@@ -188,6 +188,11 @@ multi-device Welcome delivery, Welcome withdrawal, staged and owed Welcome deliv
   `confirm_host_change_without_publish_with_audit_context`, and staging stores the change's kind on the fanout
   (`set_host_change`) before the first send; every other send is automatic and is never recorded. Records are read
   and acknowledged through `group_changes_not_delivered` and `acknowledge_change_not_delivered`.
+- Read a pending commit's state from its fanout alone (`AccountDeviceRuntime::pending_commit`, mdk#2332): `Stuck` is
+  past `PENDING_COMMIT_READ_BACK_AFTER_MS` from the first attempt, no target accepted and some may hold it, which is
+  exactly when `abandon_unsent_pending_commit` never runs; `Sending` is everything else. Keep the read and those
+  give-up rules on the same predicates (`first_attempt_at_ms`, `target_may_hold_event`), so a commit the host sees as
+  `Stuck` is never rolled back.
 - Never let a durable maintenance record depend on an engine event alone. Engine events are in-memory, and this layer
   consumes them *after* awaiting the batch's relay publishes, so the loss window is network-wide. `GroupStateInvalidated`
   retires a `DurableGroupEvolution`, and `run_due_maintenance` re-derives that same retirement from the commit's stored
