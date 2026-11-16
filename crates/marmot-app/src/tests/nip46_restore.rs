@@ -951,6 +951,66 @@ async fn nip46_login_retains_retry() {
     peer.close().await;
 }
 
+/// An external-signer account that publishes its relay lists before its first
+/// session open reaches `NetworkReady` whether device groups are on or off.
+/// With them on, the publish gate's look for a stored device-group removal
+/// used to create the account database first, so the session open took the
+/// account for a pre-journal database, minted no KeyPackage slot and left it
+/// `RecoveryRequired` (mdk#3478).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn external_login_ready_with_device_groups() {
+    for device_groups in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let home = AccountHome::open(dir.path());
+        let user = Keys::generate();
+        let account = home
+            .add_external_signer_account(&user.public_key().to_hex())
+            .unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let app = MarmotApp::with_relays_and_account_home_and_config(
+            dir.path(),
+            vec!["wss://account-relay.example".into()],
+            home.clone(),
+            MarmotAppConfig::white_noise()
+                .with_allow_loopback_relay_endpoints(true)
+                .with_device_groups(device_groups),
+        )
+        .with_test_relay_client(relay.clone());
+        let runtime = app.runtime();
+        let endpoints = || vec![TransportEndpoint("wss://account-relay.example".into())];
+        let completed = runtime
+            .login_external_signer(
+                account.account_id_hex.clone(),
+                TestExternalAccountSigner { keys: user },
+                AccountSetupRequest {
+                    default_relays: endpoints(),
+                    bootstrap_relays: endpoints(),
+                    publish_missing_relay_lists: true,
+                    publish_initial_key_package: false,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(completed.readiness, AccountSetupReadiness::NetworkReady);
+        assert!(
+            relay
+                .published_events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| event.kind == KIND_NIP65_RELAY_LIST),
+            "login must publish the missing relay lists (device groups {device_groups})"
+        );
+        assert_eq!(
+            runtime.account_setup_readiness(&account.label).unwrap(),
+            AccountSetupReadiness::NetworkReady,
+            "device groups {device_groups}"
+        );
+        runtime.shutdown_and_close().await.unwrap();
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn nip46_login_restores_host() {
     let peer = LoginPeer::new().await;

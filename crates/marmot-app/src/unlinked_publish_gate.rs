@@ -127,6 +127,13 @@ impl crate::MarmotApp {
         label: &str,
     ) -> Result<Option<cgka_traits::GroupId>, crate::AppError> {
         use cgka_traits::storage::{GroupStorage as _, StorageError};
+        // An account with no database yet holds no device group. Looking must
+        // not create one: a database that predates the account's first session
+        // open makes that open refuse to mint the KeyPackage slot, and setup
+        // then ends in recovery (mdk#3478).
+        if !self.account_storage_path(label).exists() {
+            return Ok(None);
+        }
         let storage = self.account_storage(label)?;
         let Some(record) = storage
             .app_storage()
