@@ -84,6 +84,10 @@
 
 ### Fixed
 
+- Stop a retried emoji-set install from deleting emoji the user already has
+  (#3464). Reinstalling the installed version keeps each image whose download
+  fails, and the result's `skipped` list names only entries left without an
+  image.
 - Stop onboarding's relay checks from failing healthy relays (#3439). A relay
   that closes a query with its NIP-01 `auth-required:` reason behind an
   `ERROR: ` wrapper is reported as needing authentication, not as restricting
