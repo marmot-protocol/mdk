@@ -812,7 +812,7 @@ async fn fetch_pack_from_endpoints(
         updated |= context.storage.replace_sticker_pack_if_newer(&stored)?;
     }
     if found {
-        retain_winning_pack_relays(app, &context.storage, coordinate, &fetched)?;
+        retain_winning_pack_relays(app, &context.storage, coordinate, &fetched, updated)?;
     }
     Ok((updated, found))
 }
@@ -821,11 +821,18 @@ async fn fetch_pack_from_endpoints(
 /// version from. A relay that was only queried, or sent only a version that
 /// lost NIP-01 replacement, is never retained, so a later read cannot push
 /// the relays holding the current version out of the eight hint slots.
+///
+/// When this read `replaced` the stored version, its relays replace the
+/// hints: the earlier hints served the version that lost. Otherwise they go
+/// in front of the hints already retained for that same version. Hints are
+/// advisory, so a crash between storing a version and its hints leaves the
+/// previous hints until the next replacement, never a broken pack.
 fn retain_winning_pack_relays(
     app: &MarmotApp,
     storage: &SqliteAppStorage,
     coordinate: &str,
     fetched: &transport_nostr::PublicEventFetch,
+    replaced: bool,
 ) -> Result<(), AppError> {
     let Some(stored) = storage.sticker_pack(coordinate)? else {
         return Ok(());
@@ -835,6 +842,14 @@ fn retain_winning_pack_relays(
     };
     let served = fetched.sources_of(&winner);
     if served.is_empty() {
+        return Ok(());
+    }
+    if replaced {
+        let relays = safe_sticker_relays(app, served.iter().map(|relay| relay.0.clone()))
+            .into_iter()
+            .map(|relay| relay.0)
+            .collect::<Vec<_>>();
+        storage.set_sticker_pack_relays(coordinate, &relays)?;
         return Ok(());
     }
     retain_sticker_relays(app, storage, coordinate, served)
@@ -848,6 +863,7 @@ fn ingest_pack_events(
 ) -> Result<usize, AppError> {
     let mut updated = 0_usize;
     let mut seen = HashSet::new();
+    let mut replaced = HashSet::new();
     for event in fetched.events.iter().take(max_events) {
         let stored = match stored_pack_from_event(event) {
             Ok(pack) => pack,
@@ -861,6 +877,7 @@ fn ingest_pack_events(
         }
         if storage.replace_sticker_pack_if_newer(&stored)? {
             updated += 1;
+            replaced.insert(stored.coordinate.clone());
         }
     }
     // After every version is in, so each pack's hints come from the relays
@@ -870,7 +887,8 @@ fn ingest_pack_events(
         .map(|(coordinate, _)| coordinate)
         .collect::<HashSet<_>>();
     for coordinate in coordinates {
-        retain_winning_pack_relays(app, storage, &coordinate, &fetched)?;
+        let replaced = replaced.contains(&coordinate);
+        retain_winning_pack_relays(app, storage, &coordinate, &fetched, replaced)?;
     }
     storage
         .prune_uninstalled_sticker_discovery(MAX_DISCOVERY_PACKS, "")

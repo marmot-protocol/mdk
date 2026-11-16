@@ -414,9 +414,9 @@ async fn relay_hint_cannot_hide_a_newer_pack_on_account_relays() {
         "the account relay's newer version must win over the hinted one"
     );
     assert_eq!(
-        share_hints(&app, &account_id, &cats.coordinate).first(),
-        Some(&spelled(&account_url)),
-        "the relay holding the winning version leads the share link"
+        share_hints(&app, &account_id, &cats.coordinate),
+        vec![spelled(&account_url)],
+        "the hint relay served only the version that lost"
     );
     let dogs = app
         .fetch_sticker_pack(&account_id, &pack_naddr(&author, "dogs", &hint_url))
@@ -446,6 +446,28 @@ async fn relay_hint_cannot_hide_a_newer_pack_on_account_relays() {
         share_hints(&app, &account_id, &birds.coordinate),
         vec![spelled(&hint_url)],
         "a relay that sent only the older version is not a hint"
+    );
+
+    // A newer version later appears only on the account relay. The sync that
+    // stores it replaces the hints: the hint relay no longer holds the
+    // version that link would resolve to.
+    publish_signed(
+        &account_url,
+        &author,
+        pack_kind,
+        pack_tags(&author, "birds", "Newest", "wave"),
+        now - 10,
+    )
+    .await;
+    app.sync_sticker_packs(&account_id).await.unwrap();
+    let birds = app
+        .sticker_pack(&account_id, &birds.coordinate)
+        .unwrap()
+        .unwrap();
+    assert_eq!(birds.title, "Newest");
+    assert_eq!(
+        share_hints(&app, &account_id, &birds.coordinate),
+        vec![spelled(&account_url)]
     );
 
     runtime.shutdown().await;
