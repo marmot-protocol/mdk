@@ -312,11 +312,22 @@ peel runs. `Engine::retry_deferred_peels` offers those contexts to every retaine
   reports `Blocked` without touching state; `retry_deferred_peels` skips the group. Those retained rows (like an
   `Unrecoverable` group's) are bounded by per-group deferred-peel caps alone and never charge the account-wide byte
   budget. Any new accessor or data path that reads group state needs the gate — a bypass can silently un-quarantine
-  via `set_stable`. Engine paths read a group's stored record only through `Engine::live_group_record` or
-  `Engine::stored_group_record`, which refuse a quarantined group with `UnknownGroup`: `clippy.toml` bans
-  `GroupStorage::get_group` and `list_group_records` in this crate, and each raw read (open-time recovery and
-  hydration, forget, routing, retention and byte accounting of a quarantined group's input, code inside an already
-  gated window, diagnostics) allows the lint with its reason. OpenMLS state loads only through
+  via `set_stable`. The queued-intent bookkeeping sits outside it (mdk#2332): `has_queued_outbound_intents` and
+  `is_queued_outbound_intent` read only queued-intent rows; `pending_is_queued_invite` reads the drain's link for a
+  pending commit, then its row; `retire_drained_queued_intent` deletes the row while it is still queued and clears the
+  drain's message link to it; `confirm_regenerated_queued_intent` (through `CgkaEngine::confirm_queued_outbound_intent`
+  too) deletes the row and clears both its message and pending-commit links; `regenerated_queued_intent_for_message` and
+  `drained_queued_intent_id` read the message link and the pending-commit link, in that order; and
+  `retry_regenerated_queued_intent` (through `CgkaEngine::retry_queued_outbound_intent` too) clears both and marks the
+  group for another convergence pass. None loads MLS state, reads the group record or calls `set_stable`, so none can
+  un-quarantine a group. A quarantined group's intents stay queued: the drain refuses the group and the fanout listings
+  hide its fanouts, so a sent intent stays named by its stored fanout until the group is live again and a pass retires
+  it. Hosts still ask `has_queued_outbound_intents` whether such a group has sends left, and the true answer keeps, for
+  example, a failed send's discard waiting. Engine paths read a group's stored record only through
+  `Engine::live_group_record` or `Engine::stored_group_record`, which refuse a quarantined group with `UnknownGroup`:
+  `clippy.toml` bans `GroupStorage::get_group` and `list_group_records` in this crate, and each raw read (open-time
+  recovery and hydration, forget, routing, retention and byte accounting of a quarantined group's input, code inside an
+  already gated window, diagnostics) allows the lint with its reason. OpenMLS state loads only through
   `Engine::load_mls_group_in` (`load_mls_group` and the cached `take_mls_group` sit on it), which refuses
   `RewindRestoreFailed` alone, since every other reason's repair reads the group's genuine local state; `clippy.toml`
   bans `MlsGroup::load`, and each raw load (hydration, the cleanup of state its own create or send made, code inside

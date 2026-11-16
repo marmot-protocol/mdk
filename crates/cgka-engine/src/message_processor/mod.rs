@@ -2397,10 +2397,6 @@ impl<S: StorageProvider> Engine<S> {
         Ok(delay)
     }
 
-    /// Whether durable queued outbound intents exist for this group. Runtime
-    /// schedulers must keep a wakeup armed while any remain: the scheduled
-    /// drain is what regenerates and publishes them (and, on an inactive
-    /// transport, what triggers reactivation).
     /// Whether this intent is still queued for the group: not yet retired.
     pub fn is_queued_outbound_intent(
         &self,
@@ -2414,6 +2410,10 @@ impl<S: StorageProvider> Engine<S> {
             .any(|record| &record.id == intent_id))
     }
 
+    /// Whether durable queued outbound intents exist for this group. Runtime
+    /// schedulers must keep a wakeup armed while any remain: the scheduled
+    /// drain is what regenerates and publishes them (and, on an inactive
+    /// transport, what triggers reactivation).
     pub fn has_queued_outbound_intents(&self, group_id: &GroupId) -> Result<bool, EngineError> {
         Ok(!self
             .storage
