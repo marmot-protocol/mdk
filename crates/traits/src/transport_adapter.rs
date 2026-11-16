@@ -1197,27 +1197,58 @@ impl OutboundFanout {
             .enumerate()
             .filter(|(_, status)| **status == FanoutTargetStatus::Failed)
             .filter_map(|(index, _)| {
-                let failure = self.target_failure(index)?;
-                let exposed = self
-                    .target_possible_exposure
-                    .get(index)
-                    .copied()
-                    .unwrap_or(false);
-                let cause = if failure.is_size_refusal() {
-                    CommitRefusalCause::TooLarge {
-                        size_class: failure.size_class.filter(|_| !exposed),
-                    }
-                } else if failure.kind == TransportEndpointFailureKind::TerminalRejected {
-                    CommitRefusalCause::Rejected
-                } else {
-                    return None;
-                };
+                let cause = self.target_final_answer(index)?;
                 Some(RefusedTarget {
                     endpoint: endpoints.get(index)?.clone(),
                     cause,
                 })
             })
             .collect()
+    }
+
+    /// Each target of this pending commit whose latest answer was final
+    /// (mdk#2332), whatever its status: a relay that may already hold an
+    /// earlier copy keeps that exposure after refusing a later attempt, so it
+    /// is listed here and stays unconfirmed. Causes are as
+    /// [`Self::refused_targets`] gives them. Empty for a commit that is not
+    /// pending.
+    pub fn pending_final_answers(&self) -> Vec<RefusedTarget> {
+        if !matches!(self.mls_state, FanoutMlsState::Pending(_)) {
+            return Vec::new();
+        }
+        let endpoints = self.request.target.endpoints();
+        (0..self.target_statuses.len())
+            .filter(|&index| self.target_status(index) != Some(FanoutTargetStatus::Accepted))
+            .filter_map(|index| {
+                Some(RefusedTarget {
+                    endpoint: endpoints.get(index)?.clone(),
+                    cause: self.target_final_answer(index)?,
+                })
+            })
+            .collect()
+    }
+
+    /// The target's latest answer, when it was final: a relay's own final
+    /// answer, or MDK's size refusal. A size refusal of a target that may
+    /// already hold an earlier copy says nothing about the event's size
+    /// class, so none is given (mdk#2334). A host-safety refusal contacted no
+    /// relay and is no answer.
+    fn target_final_answer(&self, index: usize) -> Option<CommitRefusalCause> {
+        let failure = self.target_failure(index)?;
+        let exposed = self
+            .target_possible_exposure
+            .get(index)
+            .copied()
+            .unwrap_or(false);
+        if failure.is_size_refusal() {
+            Some(CommitRefusalCause::TooLarge {
+                size_class: failure.size_class.filter(|_| !exposed),
+            })
+        } else if failure.kind == TransportEndpointFailureKind::TerminalRejected {
+            Some(CommitRefusalCause::Rejected)
+        } else {
+            None
+        }
     }
 
     pub fn mark_mls_rolled_back(&mut self) -> Result<bool, TransportAdapterError> {

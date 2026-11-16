@@ -621,6 +621,13 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   command returned `CompletionUnknown` is recorded for `group_changes_not_delivered`; a command sent the automatic way
   loses that record silently. Maintenance and other runtime-initiated commits stay automatic.
   `tests/changes_not_delivered.rs` pins the wiring.
+- Admit every commit-preparing group change through `ensure_group_commit_admitted` (mdk#2332). The engine stages one
+  commit at a time and refuses a second as an untyped `InvalidTransition`, so while the group's own commit is pending
+  (`AccountDeviceRuntime::pending_commit`) the change fails typed, as `GroupCommitPending`, before the catching-up and
+  undelivered checks spend an acknowledgement. Disband and an admin's leave are accepted in any epoch state and keep
+  `ensure_group_change_admitted`. A member's own leave or decline is a Stable-only SelfRemove with no advisory gate, so
+  it checks `ensure_no_pending_commit` alone; sign-out reports the engine's refusal as a leave failure, and a received
+  decline waits for a quiet group.
 - Keep group DTOs, component projections, and group event projection helpers in `src/groups.rs`.
   `AppCreateGroupOptions::relays` overrides founding group routing only; validate through `RelaySafetyPolicy`
   before member resolution or group mutation, and preserve app-configured relays when omitted.

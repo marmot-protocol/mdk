@@ -175,6 +175,44 @@ c_mirror! {
 }
 
 c_enum! {
+    /// Where a pending commit stands (mdk#2332).
+    MarmotGroupPendingCommitState from marmot_uniffi::conversions::GroupPendingCommitStateFfi {
+        /// MDK is still sending it: for its first ten minutes, and for as
+        /// long as no relay may hold it while MDK waits to reach one.
+        Sending,
+        /// Ten minutes past its first attempt, some relay may hold it and none
+        /// has acknowledged it. MDK keeps sending it and never gives it up,
+        /// since members may have seen it.
+        Stuck,
+    }
+}
+
+c_mirror! {
+    /// The group's own commit that has not confirmed yet (mdk#2332). While it
+    /// is pending, group changes return `MARMOT_STATUS_GROUP_COMMIT_PENDING`.
+    /// `queued_intent_id_hex` is NULL unless it carries a queued change of
+    /// yours; `intent_kind` is NULL for a commit MDK made on its own.
+    /// `first_attempt_at` (Unix seconds) is read only when
+    /// `has_first_attempt_at` is true. `unconfirmed_relay_urls` may hold it
+    /// without having acknowledged it; `owed_relay_urls` never received it;
+    /// `refused_relays` gave a final latest answer, and can also be
+    /// unconfirmed from an earlier attempt.
+    MarmotGroupPendingCommit from marmot_uniffi::conversions::GroupPendingCommitFfi,
+    free marmot_group_pending_commit_free {
+        str group_id_hex,
+        str commit_id_hex,
+        opt_str queued_intent_id_hex,
+        opt_str intent_kind,
+        opt_copy has_first_attempt_at/first_attempt_at: u64,
+        copy state: MarmotGroupPendingCommitState,
+        str_vec unconfirmed_relay_urls/unconfirmed_relay_urls_len,
+        str_vec owed_relay_urls/owed_relay_urls_len,
+        vec refused_relays/refused_relays_len: MarmotGroupCommitRefusedRelay,
+        copy relay_count: u32,
+    }
+}
+
+c_enum! {
     /// Whether the account can turn on account-devices in a group now. Every
     /// answer is about the whole group, never which members or devices.
     MarmotAccountDevicesActivation from AccountDevicesActivationFfi {
@@ -702,6 +740,71 @@ mod tests {
             }
             marmot_group_commit_delivery_free(boxed(delivery));
             marmot_group_commit_delivery_free(std::ptr::null_mut());
+        }
+        #[cfg(feature = "alloc-audit")]
+        assert_eq!(crate::memory::audit::live_allocations(), before);
+    }
+
+    #[test]
+    fn pending_commit_maps_its_state_and_optional_fields_and_frees_deeply() {
+        use marmot_uniffi::conversions::{GroupPendingCommitFfi, GroupPendingCommitStateFfi};
+        let _guard = crate::memory::audit::test_lock();
+        #[cfg(feature = "alloc-audit")]
+        let before = crate::memory::audit::live_allocations();
+        let commit = |queued: Option<&str>, first_attempt_at| GroupPendingCommitFfi {
+            group_id_hex: "12".repeat(16),
+            commit_id_hex: "34".repeat(32),
+            queued_intent_id_hex: queued.map(str::to_owned),
+            intent_kind: queued.map(|_| "update_group_data".to_owned()),
+            first_attempt_at,
+            state: if first_attempt_at.is_some() {
+                GroupPendingCommitStateFfi::Stuck
+            } else {
+                GroupPendingCommitStateFfi::Sending
+            },
+            unconfirmed_relay_urls: vec!["wss://held.example".into()],
+            owed_relay_urls: vec!["wss://owed.example".into()],
+            refused_relays: vec![GroupCommitRefusedRelayFfi {
+                relay_url: "wss://held.example".into(),
+                cause: GroupCommitRefusalCauseFfi::Rejected,
+                size_class: None,
+            }],
+            relay_count: 3,
+        };
+        let stuck: MarmotGroupPendingCommit = commit(Some("56"), Some(9)).into();
+        let sending: MarmotGroupPendingCommit = commit(None, None).into();
+        let text = |ptr: *const std::ffi::c_char| unsafe {
+            std::ffi::CStr::from_ptr(ptr).to_str().unwrap().to_owned()
+        };
+        unsafe {
+            assert_eq!(text(stuck.group_id_hex), "12".repeat(16));
+            assert_eq!(text(stuck.commit_id_hex), "34".repeat(32));
+            assert_eq!(text(stuck.queued_intent_id_hex), "56");
+            assert_eq!(text(stuck.intent_kind), "update_group_data");
+            assert!(stuck.has_first_attempt_at);
+            assert_eq!(stuck.first_attempt_at, 9);
+            assert_eq!(stuck.state, MarmotGroupPendingCommitState::Stuck);
+            assert_eq!(stuck.unconfirmed_relay_urls_len, 1);
+            assert_eq!(text(*stuck.unconfirmed_relay_urls), "wss://held.example");
+            assert_eq!(stuck.owed_relay_urls_len, 1);
+            assert_eq!(text(*stuck.owed_relay_urls), "wss://owed.example");
+            assert_eq!(stuck.refused_relays_len, 1);
+            assert_eq!(
+                text((*stuck.refused_relays).relay_url),
+                "wss://held.example"
+            );
+            assert_eq!(
+                (*stuck.refused_relays).cause,
+                MarmotGroupCommitRefusalCause::Rejected
+            );
+            assert_eq!(stuck.relay_count, 3);
+            assert!(sending.queued_intent_id_hex.is_null());
+            assert!(sending.intent_kind.is_null());
+            assert!(!sending.has_first_attempt_at);
+            assert_eq!(sending.state, MarmotGroupPendingCommitState::Sending);
+            marmot_group_pending_commit_free(boxed(stuck));
+            marmot_group_pending_commit_free(boxed(sending));
+            marmot_group_pending_commit_free(std::ptr::null_mut());
         }
         #[cfg(feature = "alloc-audit")]
         assert_eq!(crate::memory::audit::live_allocations(), before);

@@ -26009,6 +26009,267 @@ async fn one_acknowledgement_covers_an_owed_and_a_refused_commit() {
     ));
 }
 
+fn assert_group_commit_pending<T: std::fmt::Debug>(
+    result: Result<T, AppError>,
+    group_hex: &str,
+    operation: &str,
+) {
+    match result {
+        Err(AppError::GroupCommitPending(held)) => assert_eq!(held, group_hex, "{operation}"),
+        other => {
+            panic!("{operation} must refuse while the group's commit is pending, got {other:?}")
+        }
+    }
+}
+
+/// mdk#2332, proof 9: the group takes one commit at a time. While its own
+/// commit is pending, every commit-preparing group change fails typed as
+/// `GroupCommitPending`, ahead of the delivery gate and whatever it
+/// acknowledges, and authors nothing. The delivery read still names the older
+/// confirmed commit a relay owes, and the pending read names the pending one.
+/// A disband is a request the engine records in any epoch state, so it is
+/// still accepted. Any call site left on the advisory gates alone fails here
+/// with the engine's untyped refusal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pending_commit_refuses_group_changes_ahead_of_the_delivery_gate() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relays(
+        dir.path(),
+        vec![
+            "wss://relay-a.example".to_owned(),
+            "wss://relay-b.example".to_owned(),
+        ],
+    )
+    .with_test_relay_client(relay.clone());
+    let mut client = app.client("alice").await.unwrap();
+    client.commit_delivery_gate_grace_secs = 0;
+    let group_id = client
+        .create_group("pending", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
+    let group_hex = hex::encode(group_id.as_slice());
+    assert_eq!(client.group_pending_commit(&group_id).unwrap(), None);
+
+    // An older commit confirmed on relay A and still owed to relay B.
+    relay.make_endpoints_unavailable(&["wss://relay-b.example"]);
+    client
+        .update_group_profile(&group_id, Some("owed"), None)
+        .await
+        .unwrap();
+    assert_eq!(client.group_pending_commit(&group_id).unwrap(), None);
+    assert!(
+        client
+            .acknowledge_group_commit_undelivered(&group_id)
+            .unwrap()
+    );
+    // The acknowledged change reaches no relay for sure, so it stays pending.
+    relay.fail_publishes_as_possibly_exposed();
+    client
+        .update_group_profile(&group_id, Some("pending"), None)
+        .await
+        .unwrap();
+    let pending = client
+        .group_pending_commit(&group_id)
+        .unwrap()
+        .expect("the change is pending");
+    assert_eq!(pending.origin, Some(crate::GroupChangeOrigin::Direct));
+    assert_eq!(pending.intent_kind.as_deref(), Some("update_group_data"));
+    assert_eq!(pending.state, crate::GroupPendingCommitState::Sending);
+    assert!(pending.first_attempt_at.is_some());
+    assert_eq!(pending.relay_count, 2);
+    assert!(!pending.unconfirmed_relay_urls.is_empty(), "{pending:?}");
+    let delivery = client
+        .group_commit_delivery(&group_id)
+        .unwrap()
+        .expect("relay B still owes the older commit");
+    assert_eq!(
+        delivery.owed_relay_urls,
+        vec!["wss://relay-b.example".to_owned()]
+    );
+
+    // The owed commit gates too; the pending one is checked first.
+    let attempted = relay.attempted_event_ids().len();
+    assert_group_commit_pending(
+        client
+            .update_group_profile(&group_id, Some("next"), None)
+            .await,
+        &group_hex,
+        "update_group_profile",
+    );
+    // No acknowledgement releases it.
+    assert!(
+        client
+            .acknowledge_group_commit_undelivered(&group_id)
+            .unwrap()
+    );
+    let member = Keys::generate().public_key().to_hex();
+    assert_group_commit_pending(
+        client
+            .update_group_profile(&group_id, Some("next"), None)
+            .await,
+        &group_hex,
+        "update_group_profile after an acknowledgement",
+    );
+    assert_group_commit_pending(
+        client.invite_members(&group_id, &[member.as_str()]).await,
+        &group_hex,
+        "invite_members",
+    );
+    assert_group_commit_pending(
+        client.remove_members(&group_id, &[member.as_str()]).await,
+        &group_hex,
+        "remove_members",
+    );
+    assert_group_commit_pending(
+        client.promote_admin(&group_id, &member).await,
+        &group_hex,
+        "promote_admin",
+    );
+    assert_group_commit_pending(
+        client.self_demote_admin(&group_id).await,
+        &group_hex,
+        "self_demote_admin",
+    );
+    assert_group_commit_pending(
+        client.enable_group_disbanding(&group_id).await,
+        &group_hex,
+        "enable_group_disbanding",
+    );
+    assert_group_commit_pending(
+        client.enable_account_devices(&group_id).await,
+        &group_hex,
+        "enable_account_devices",
+    );
+    assert_group_commit_pending(
+        client.update_message_retention(&group_id, 3_600).await,
+        &group_hex,
+        "update_message_retention",
+    );
+    assert_group_commit_pending(
+        client
+            .update_group_avatar_url(&group_id, None, None, None)
+            .await,
+        &group_hex,
+        "update_group_avatar_url",
+    );
+    assert_group_commit_pending(
+        client
+            .replace_encrypted_media_blob_endpoints(&group_id, Vec::new())
+            .await,
+        &group_hex,
+        "replace_encrypted_media_blob_endpoints",
+    );
+    assert_group_commit_pending(
+        client
+            .update_group_image(&group_id, vec![0; 4], "image/png")
+            .await,
+        &group_hex,
+        "update_group_image",
+    );
+    assert_eq!(
+        relay.attempted_event_ids().len(),
+        attempted,
+        "nothing authored"
+    );
+    assert_eq!(
+        client.group_pending_commit(&group_id).unwrap(),
+        Some(pending),
+        "the same commit is still pending"
+    );
+
+    client.disband_group(&group_id).await.unwrap();
+}
+
+/// mdk#2332: a member's leave is a SelfRemove, which the engine prepares only
+/// in a stable epoch. While the member's own commit is pending, here a
+/// self-update MDK made on its own, the host's leave and decline fail typed
+/// as `GroupCommitPending`, not with the engine's untyped refusal, and record
+/// and publish nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pending_commit_refuses_a_members_leave_and_decline() {
+    use cgka_traits::storage::LeaveRequestStorage as _;
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    home.create_account("alice").unwrap();
+    let bob = home.create_account("bob").unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    remember_test_member_inbox(&app, &bob.account_id_hex, "wss://relay.example");
+    let plane = MarmotRelayPlane::new(None, relay.clone());
+    let mut alice = app
+        .client_with_relay_plane("alice", &plane, None)
+        .await
+        .unwrap();
+    let mut bob_client = app
+        .client_with_relay_plane("bob", &plane, None)
+        .await
+        .unwrap();
+    bob_client.sync().await.unwrap();
+    let group_id = alice
+        .create_group("member", &[&bob.account_id_hex])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
+    assert!(
+        bob_client
+            .sync()
+            .await
+            .unwrap()
+            .joined_groups
+            .contains(&group_id)
+    );
+    let group_hex = hex::encode(group_id.as_slice());
+
+    // Bob's self-update is due now and reaches no relay for sure.
+    bob_client.schedule_manual_self_update(&group_id).unwrap();
+    let session = bob_client.runtime.session();
+    for mut obligation in session
+        .maintenance_obligations_for_group(&group_id)
+        .unwrap()
+    {
+        obligation.phase = cgka_traits::MaintenancePhase::Retry;
+        session.put_maintenance_obligation(&obligation).unwrap();
+    }
+    relay.fail_publishes_as_possibly_exposed();
+    bob_client.run_due_maintenance().await.unwrap();
+    let pending = bob_client
+        .group_pending_commit(&group_id)
+        .unwrap()
+        .expect("the self-update is pending");
+    assert_eq!(pending.origin, None);
+
+    let store = app.account_storage("bob").unwrap();
+    let attempted = relay.attempted_event_ids().len();
+    assert_group_commit_pending(
+        bob_client.leave_group(&group_id).await,
+        &group_hex,
+        "leave_group",
+    );
+    assert_group_commit_pending(
+        bob_client.decline_group_invite(&group_id).await,
+        &group_hex,
+        "decline_group_invite",
+    );
+    assert!(store.leave_request(&group_id).unwrap().is_none());
+    assert_eq!(
+        relay.attempted_event_ids().len(),
+        attempted,
+        "nothing authored"
+    );
+    assert_eq!(
+        bob_client.group_pending_commit(&group_id).unwrap(),
+        Some(pending)
+    );
+}
+
 /// mdk#2258: gap evidence armed at an epoch the device has since left does not
 /// hold the group; only an unresolved gap at or above the local epoch does.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

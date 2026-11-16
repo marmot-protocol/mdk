@@ -84,6 +84,77 @@ impl From<marmot_app::GroupChangeNotDelivered> for GroupChangeNotDeliveredFfi {
     }
 }
 
+/// The group's own commit that has not confirmed yet (mdk#2332). While it is
+/// pending, group changes fail with `GroupCommitPending`: the group cannot take
+/// a second commit until this one confirms or is given up. MDK keeps sending
+/// it. It ends by confirming, which no event announces, or by being given up,
+/// which a `GroupChangeNotDeliveredFfi` record reports for a change of yours.
+/// Poll while showing it.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct GroupPendingCommitFfi {
+    pub group_id_hex: String,
+    /// The commit, which a not-delivered record names if it is given up.
+    pub commit_id_hex: String,
+    /// Present for a change of yours that was queued.
+    pub queued_intent_id_hex: Option<String>,
+    /// Stable name of the change, such as `update_group_data`. Present for a
+    /// change of yours; absent for a commit MDK made on its own, such as a
+    /// scheduled self-update.
+    pub intent_kind: Option<String>,
+    /// When the first send attempt started, in Unix seconds; absent before
+    /// any has.
+    pub first_attempt_at: Option<u64>,
+    pub state: GroupPendingCommitStateFfi,
+    /// Relays that may hold the commit without having acknowledged it. While
+    /// any does, MDK never gives the commit up: members may have seen it.
+    pub unconfirmed_relay_urls: Vec<String>,
+    /// Relays still owed the commit that it never reached.
+    pub owed_relay_urls: Vec<String>,
+    /// Each relay whose latest answer was final, and why. Such a relay can
+    /// also be unconfirmed, from an earlier attempt.
+    pub refused_relays: Vec<GroupCommitRefusedRelayFfi>,
+    /// Relays the commit was published to.
+    pub relay_count: u32,
+}
+
+/// Where a pending commit stands (mdk#2332).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum GroupPendingCommitStateFfi {
+    /// MDK is still sending it: for its first ten minutes, and for as long
+    /// as no relay may hold it while MDK waits to reach one.
+    Sending,
+    /// Ten minutes past its first attempt, some relay may hold it and none
+    /// has acknowledged it. MDK keeps resending it, backing off to about
+    /// hourly and reading it back from each such relay first, and never gives
+    /// it up, since members may have seen it.
+    Stuck,
+}
+
+impl GroupPendingCommitFfi {
+    pub(crate) fn new(group_id_hex: String, commit: marmot_app::GroupPendingCommit) -> Self {
+        Self {
+            group_id_hex,
+            commit_id_hex: commit.commit_id_hex,
+            queued_intent_id_hex: match commit.origin {
+                Some(marmot_app::GroupChangeOrigin::QueuedIntent { intent_id_hex }) => {
+                    Some(intent_id_hex)
+                }
+                Some(marmot_app::GroupChangeOrigin::Direct) | None => None,
+            },
+            intent_kind: commit.intent_kind,
+            first_attempt_at: commit.first_attempt_at,
+            state: match commit.state {
+                marmot_app::GroupPendingCommitState::Sending => GroupPendingCommitStateFfi::Sending,
+                marmot_app::GroupPendingCommitState::Stuck => GroupPendingCommitStateFfi::Stuck,
+            },
+            unconfirmed_relay_urls: commit.unconfirmed_relay_urls,
+            owed_relay_urls: commit.owed_relay_urls,
+            refused_relays: commit.refused_relays.into_iter().map(Into::into).collect(),
+            relay_count: commit.relay_count,
+        }
+    }
+}
+
 /// Opaque application-owned state. Empty data is present state.
 #[derive(Clone, uniffi::Record)]
 pub struct GroupAppComponentFfi {
@@ -1484,6 +1555,64 @@ mod group_state_tests {
                     size_class: expected_size,
                 }
             );
+        }
+    }
+
+    #[test]
+    fn pending_commit_ffi_names_a_queued_change_and_keeps_every_relay_list() {
+        use marmot_app::{
+            GroupChangeOrigin, GroupCommitRefusalCause, GroupCommitRefusedRelay,
+            GroupPendingCommit, GroupPendingCommitState,
+        };
+        let commit = |origin, intent_kind: Option<&str>| GroupPendingCommit {
+            commit_id_hex: "cc".into(),
+            origin,
+            intent_kind: intent_kind.map(str::to_owned),
+            first_attempt_at: Some(1_000),
+            state: GroupPendingCommitState::Stuck,
+            unconfirmed_relay_urls: vec!["wss://a.example".into()],
+            owed_relay_urls: vec!["wss://b.example".into()],
+            refused_relays: vec![GroupCommitRefusedRelay {
+                relay_url: "wss://a.example".into(),
+                cause: GroupCommitRefusalCause::Rejected,
+            }],
+            relay_count: 3,
+        };
+        let queued = GroupPendingCommitFfi::new(
+            "ab".into(),
+            commit(
+                Some(GroupChangeOrigin::QueuedIntent {
+                    intent_id_hex: "dd".into(),
+                }),
+                Some("update_group_data"),
+            ),
+        );
+        assert_eq!(
+            queued,
+            GroupPendingCommitFfi {
+                group_id_hex: "ab".into(),
+                commit_id_hex: "cc".into(),
+                queued_intent_id_hex: Some("dd".into()),
+                intent_kind: Some("update_group_data".into()),
+                first_attempt_at: Some(1_000),
+                state: GroupPendingCommitStateFfi::Stuck,
+                unconfirmed_relay_urls: vec!["wss://a.example".into()],
+                owed_relay_urls: vec!["wss://b.example".into()],
+                refused_relays: vec![GroupCommitRefusedRelayFfi {
+                    relay_url: "wss://a.example".into(),
+                    cause: GroupCommitRefusalCauseFfi::Rejected,
+                    size_class: None,
+                }],
+                relay_count: 3,
+            }
+        );
+        for (origin, kind) in [
+            (Some(GroupChangeOrigin::Direct), Some("update_group_data")),
+            (None, None),
+        ] {
+            let ffi = GroupPendingCommitFfi::new("ab".into(), commit(origin, kind));
+            assert_eq!(ffi.queued_intent_id_hex, None);
+            assert_eq!(ffi.intent_kind.as_deref(), kind);
         }
     }
 }

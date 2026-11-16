@@ -10,6 +10,14 @@
 /// The bound past a pending commit's first send attempt, in seconds.
 const READ_BACK_BOUND_SECS: u64 = 10 * 60;
 
+/// The group's own commit that the test expects to be pending.
+fn pending_commit(runtime: &FloorRuntime, fixture: &FloorFixture) -> PendingCommit {
+    runtime
+        .pending_commit(&fixture.group_id)
+        .unwrap()
+        .expect("the commit is pending")
+}
+
 /// Proofs 1, 6 and 16: four relays, three of which may hold the commit.
 /// - `sized` timed out, then answered that the commit is too large;
 /// - `blocking` timed out, then answered `blocked:`;
@@ -141,11 +149,13 @@ async fn a_read_back_hit_confirms_without_a_resend() {
     );
     assert_eq!(adapter.read_backs().len(), 1, "{:?}", adapter.read_backs());
     assert_eq!(publishes_to(&adapter, &relay), 1);
+    assert_eq!(runtime.pending_commit(&fixture.group_id).unwrap(), None);
 }
 
-/// The bound counts from when the first attempt was sent, after its size
-/// check, however long the check took. A commit whose check took eleven
-/// minutes is not read back a minute after it was sent.
+/// Proof 16: the bound counts from when the first attempt was sent, after its
+/// size check, however long the check took. A commit whose check took eleven
+/// minutes is not read back a minute after it was sent, and still reads
+/// `Sending`.
 #[tokio::test]
 async fn the_bound_counts_from_the_send_after_a_slow_size_check() {
     let relay = TransportEndpoint("wss://read-slow-check.example".into());
@@ -169,6 +179,10 @@ async fn the_bound_counts_from_the_send_after_a_slow_size_check() {
     assert!(effects.pending.is_empty(), "{:?}", effects.pending);
     assert!(adapter.read_backs().is_empty(), "{:?}", adapter.read_backs());
     assert_eq!(publishes_to(&adapter, &relay), 2);
+    // Stuck counts from the send too: the commit was staged eleven minutes ago.
+    let pending = pending_commit(&runtime, &fixture);
+    assert_eq!(pending.first_attempt_at.map(|at| at.0), Some(sent));
+    assert_eq!(pending.state, PendingCommitState::Sending);
 }
 
 /// Proofs 2 and 12: a relay that never returns the commit, whether it ends
@@ -176,7 +190,8 @@ async fn the_bound_counts_from_the_send_after_a_slow_size_check() {
 /// read-back gives). For 72 hours the commit stays pending and never rolls
 /// back, the relay stays possibly exposed, and every retry past the bound
 /// reads it and then resends, on the backoff a commit had before read-back:
-/// 30 seconds, doubling to an hour.
+/// 30 seconds, doubling to an hour. The host reads it `Stuck`, held by that
+/// relay.
 #[tokio::test]
 async fn a_read_back_miss_changes_nothing() {
     let mut schedules = Vec::new();
@@ -225,6 +240,11 @@ async fn a_read_back_miss_changes_nothing() {
             "{answer:?}"
         );
         assert_eq!(fanout.first_attempt_at_ms(), Some(start * 1_000), "{answer:?}");
+        let stuck = pending_commit(&runtime, &fixture);
+        assert_eq!(stuck.state, PendingCommitState::Stuck, "{answer:?}");
+        assert_eq!(stuck.unconfirmed_endpoints, vec![relay.clone()], "{answer:?}");
+        assert!(stuck.owed_endpoints.is_empty(), "{answer:?}");
+        assert!(stuck.refused_endpoints.is_empty(), "{answer:?}");
         schedules.push(sends);
     }
     assert_eq!(schedules[0], schedules[1]);
@@ -287,4 +307,56 @@ async fn only_a_pending_commit_is_read_back() {
     assert!(effects.pending.is_empty(), "{:?}", effects.pending);
     assert_eq!(publishes_to(&adapter, &inbox), 2);
     assert!(adapter.read_backs().is_empty(), "{:?}", adapter.read_backs());
+}
+
+/// Rule 4 of mdk#2602 for the pending-commit read: the engine hides a
+/// non-live group's fanouts, so the read checks liveness first rather than
+/// report a group with a stored pending commit as having none. After a
+/// restart, the seeded group fails with the retryable `GroupNotHydrated`
+/// and answers once hydrated; a group that quarantines on hydration fails
+/// with `UnknownGroup`.
+#[tokio::test]
+async fn the_pending_commit_read_answers_only_for_a_live_group() {
+    let (fixture, alice) = FloorFixture::new(
+        "pending-commit-liveness",
+        &[
+            &TransportEndpoint("wss://echo-a.example".into()),
+            &TransportEndpoint("wss://echo-b.example".into()),
+        ],
+    )
+    .await;
+    let adapter = RecordingAdapter::default();
+    let commit = rename_left_pending(&fixture, alice, &adapter).await;
+
+    let mut runtime = reopened_seeded(&fixture, &adapter);
+    let error = runtime.pending_commit(&fixture.group_id).unwrap_err();
+    assert!(
+        matches!(
+            &error,
+            AccountError::Session(SessionError::Engine(cgka_traits::EngineError::GroupNotHydrated(id)))
+                if id == &fixture.group_id
+        ),
+        "{error:?}"
+    );
+    runtime.ensure_group_hydrated(&fixture.group_id).unwrap();
+    assert_eq!(pending_commit(&runtime, &fixture).message_id, commit.id);
+    drop(runtime);
+
+    openmls_state::lose_openmls_group_state(
+        &fixture.alice_path,
+        &SqlCipherKey::new(FLOOR_KEY).unwrap(),
+        &fixture.group_id,
+    );
+    let mut runtime = reopened_seeded(&fixture, &adapter);
+    runtime.ensure_group_hydrated(&fixture.group_id).unwrap();
+    assert!(runtime.unhydrated_group_ids().is_empty());
+    let error = runtime.pending_commit(&fixture.group_id).unwrap_err();
+    assert!(
+        matches!(
+            &error,
+            AccountError::Session(SessionError::Engine(cgka_traits::EngineError::UnknownGroup(id)))
+                if id == &fixture.group_id
+        ),
+        "{error:?}"
+    );
 }

@@ -1619,6 +1619,14 @@ async fn group_scoped_account_records_answer_only_for_live_groups() {
             session.changes_not_delivered(group_id),
             vec![change.clone()],
         );
+        // No intent is queued, so a live group answers that none has that id.
+        expect(
+            "queued_intent_kind",
+            group_id,
+            *liveness,
+            session.queued_intent_kind(group_id, &change.commit_id),
+            None,
+        );
 
         let rescheduled = cgka_traits::maintenance::GroupMaintenanceState {
             next_periodic_rotation_at: Some(Timestamp(2_000)),

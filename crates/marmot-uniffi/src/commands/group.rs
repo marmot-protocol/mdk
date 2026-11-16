@@ -1142,6 +1142,27 @@ impl Marmot {
             .collect())
     }
 
+    /// The group's own commit that has not confirmed yet, or `None`
+    /// (mdk#2332). While it is pending, group changes fail with
+    /// `GroupCommitPending`. `Sending` covers its first ten minutes, and any
+    /// time no relay may hold it; `Stuck` means some relay may hold it, none
+    /// has acknowledged it, and MDK keeps sending it without ever giving it
+    /// up. It ends by confirming, which no event announces, or by being given
+    /// up, which `group_changes_not_delivered` reports for a change of yours.
+    /// Poll while showing it. Local read; no network I/O.
+    pub async fn group_pending_commit(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+    ) -> Result<Option<crate::conversions::GroupPendingCommitFfi>, MarmotKitError> {
+        let group_id = group_id_from_hex(&group_id_hex)?;
+        Ok(self
+            .runtime
+            .group_pending_commit(&account_ref, &group_id)
+            .await?
+            .map(|commit| crate::conversions::GroupPendingCommitFfi::new(group_id_hex, commit)))
+    }
+
     /// Delete one of `group_changes_not_delivered` by its `commit_id_hex`
     /// once the user has seen it (mdk#2332). Returns false, changing nothing,
     /// when the group holds no such record. No network I/O.

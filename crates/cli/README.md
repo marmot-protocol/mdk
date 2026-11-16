@@ -262,6 +262,7 @@ wn --account <npub-or-hex> groups disband-status <group-hex>
 wn --account <npub-or-hex> groups acknowledge-disband-failure <group-hex>
 wn --account <npub-or-hex> groups recovery-status <group-hex>
 wn --account <npub-or-hex> groups commit-delivery <group-hex>
+wn --account <npub-or-hex> groups pending-commit <group-hex>
 wn --account <npub-or-hex> groups changes-not-delivered <group-hex>
 wn --account <npub-or-hex> groups acknowledge-change-not-delivered <group-hex> <commit-hex>
 wn --account <npub-or-hex> groups confirm-rejoin <welcome-id-hex> --local-state-token <hex> --confirm
@@ -297,6 +298,15 @@ never carry it, so group changes fail with the same code at once, until you acce
 owing it, the relays that refused it (`refused_relays`, each with its `cause`) and when the first relay accepted it; it
 reports owed relays immediately, before the two minutes pass. Retry once they accept it, or pass `--accept-undelivered`
 to make the change anyway, which also dismisses the group's refusals for good; scheduled self-updates wait up to an hour.
+
+**A change still being sent.** A group takes one commit at a time. While this device's last commit in the group has
+not confirmed, group changes fail with JSON error code `group_commit_pending`, ahead of `group_catching_up` and
+`group_commit_undelivered`; messages still send, and disbanding and an admin's leave are still accepted. `groups
+pending-commit <group-hex>` shows it under `pending_commit` (`null` when none): `commit_id_hex`, `origin` and
+`intent_kind` for a change of yours (absent for one MDK made on its own), `first_attempt_at`, `state`, and the relays.
+`state` is `sending` for its first ten minutes and while no relay may hold it, and `stuck` once some relay may hold it
+and none has acknowledged it: MDK keeps resending it and never gives it up. `unconfirmed_relay_urls` may hold it,
+`owed_relay_urls` never received it, and `refused_relays` gave a final latest answer with its `cause`.
 
 **Changes that were not applied.** A group change can return before MDK knows whether it reached the group. When MDK
 later gives such a change up, nothing reached members and nothing sends it again. Unlike `commit-delivery`, which shows

@@ -2055,6 +2055,22 @@ impl AccountManager {
         account_worker_response(response).await
     }
 
+    pub async fn group_pending_commit(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+    ) -> Result<Option<crate::GroupPendingCommit>, AppError> {
+        let (command, respond, response) = self.read_command(account_ref, ReadClass::R3).await?;
+        command
+            .send(AccountWorkerCommand::GroupPendingCommit {
+                group_id: group_id.clone(),
+                respond,
+            })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        account_worker_response(response).await
+    }
+
     pub async fn acknowledge_change_not_delivered(
         &self,
         account_ref: &str,

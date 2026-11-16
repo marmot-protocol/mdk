@@ -372,6 +372,10 @@ pub enum MarmotKitError {
     /// them; retry once they accept, or after `acknowledge_group_commit_undelivered`.
     #[error("group {group_id_hex}'s last change has not reached every relay yet")]
     GroupCommitUndelivered { group_id_hex: String },
+    /// The group's last commit has not confirmed yet (mdk#2332). MDK keeps
+    /// sending it; retry once it confirms. `group_pending_commit` shows it.
+    #[error("group {group_id_hex}'s last change is still being sent")]
+    GroupCommitPending { group_id_hex: String },
     #[error("member {member_id_hex} is not in group {group_id_hex}")]
     MemberNotInGroup {
         group_id_hex: String,
@@ -396,14 +400,10 @@ pub enum MarmotKitError {
     #[error("storage busy: {details}")]
     StorageBusy { details: String },
     /// The store has been closed by [`Marmot::shutdown_and_close`][crate::Marmot::shutdown_and_close]
-    /// and this call reached a database that is no longer open.
-    ///
-    /// Typed, and deliberately not [`MarmotKitError::Runtime`], because it is
-    /// an *expected* outcome rather than a fault: a host closing its store
-    /// before suspension races whatever work was still in flight, and that work
-    /// must be reportable as "we shut down" instead of as a storage failure the
-    /// user gets told about. Never retryable — the handle is spent; construct a
-    /// new `Marmot` when the app resumes.
+    /// and this call reached a database that is no longer open: work still in
+    /// flight when the host closed its store. Report it as a shutdown, not a
+    /// storage failure. Never retryable: the handle is spent; construct a new
+    /// `Marmot` when the app resumes.
     #[error("storage closed: {details}")]
     StorageClosed { details: String },
     /// The device has no room for this operation: free space would fall
@@ -459,17 +459,12 @@ pub enum MarmotKitError {
     /// retry without treating the account as broken.
     #[error("external signer request was rejected or cancelled")]
     ExternalSignerRejected,
-    /// The group's outbound retention queue is full
+    /// The group's outbound queue is full
     /// (`MAX_QUEUED_OUTBOUND_INTENTS_PER_GROUP`), so this message was **not**
-    /// accepted and nothing was queued for it. The app layer has already
-    /// retracted the optimistic local row; this variant is typed rather than
-    /// the untyped [`MarmotKitError::Runtime`] bucket so the host can say the
-    /// group is stuck instead of reporting an opaque failure. Unlike
-    /// [`MarmotKitError::StorageBusy`] it is not worth an automatic retry:
-    /// whatever the group is waiting on — a stalled publication, unsettled
-    /// convergence input, or an inactive transport — clears on its own schedule,
-    /// not on a timer this call could pick. Prompt the user to resend once the
-    /// group is sending again.
+    /// accepted and its optimistic local row is already retracted. Say the
+    /// group is stuck. Do not retry on a timer: what it waits on (a stalled
+    /// publication, unsettled convergence input, an inactive transport) clears
+    /// on its own. Prompt the user to resend once the group is sending again.
     #[error("group {group_id_hex} has too many messages waiting to be sent")]
     GroupSendQueueFull { group_id_hex: String },
     /// The group is halted and cannot send until another member re-admits this
@@ -735,6 +730,9 @@ impl From<&AppError> for MarmotKitError {
                 group_id_hex: group_id_hex.clone(),
             },
             AppError::GroupCommitUndelivered(group_id_hex) => Self::GroupCommitUndelivered {
+                group_id_hex: group_id_hex.clone(),
+            },
+            AppError::GroupCommitPending(group_id_hex) => Self::GroupCommitPending {
                 group_id_hex: group_id_hex.clone(),
             },
             AppError::MessageDraftRevisionConflict => Self::MessageDraftRevisionConflict,
@@ -1494,7 +1492,7 @@ mod tests {
     #[test]
     fn app_group_gates_preserve_the_host_recovery_action() {
         type Expected = fn(&MarmotKitError) -> bool;
-        let cases: [(AppError, Expected); 4] = [
+        let cases: [(AppError, Expected); 5] = [
             (
                 AppError::GroupDisbanding("ab".repeat(16)),
                 |e| matches!(e, MarmotKitError::GroupDisbanding { group_id_hex } if group_id_hex == &"ab".repeat(16)),
@@ -1510,6 +1508,10 @@ mod tests {
             (
                 AppError::GroupCommitUndelivered("ab".repeat(16)),
                 |e| matches!(e, MarmotKitError::GroupCommitUndelivered { group_id_hex } if group_id_hex == &"ab".repeat(16)),
+            ),
+            (
+                AppError::GroupCommitPending("ab".repeat(16)),
+                |e| matches!(e, MarmotKitError::GroupCommitPending { group_id_hex } if group_id_hex == &"ab".repeat(16)),
             ),
         ];
         for (source, expected) in cases {

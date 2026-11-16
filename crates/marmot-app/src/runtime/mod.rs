@@ -3136,6 +3136,25 @@ impl MarmotAppRuntime {
             .await
     }
 
+    /// The group's own commit that has not confirmed yet, if any (mdk#2332).
+    /// It is `Sending`, or `Stuck` once it is ten minutes past its first
+    /// attempt while some relay may hold it and none has acknowledged it:
+    /// MDK keeps sending it and never gives it up. While it is pending, group
+    /// changes fail with [`AppError::GroupCommitPending`]; disbanding and an
+    /// admin's leave are still accepted. It ends by confirming, which needs
+    /// no signal, or by being given up, which
+    /// [`Self::group_changes_not_delivered`] records for a change of yours.
+    /// Poll while showing it. A local read.
+    pub async fn group_pending_commit(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+    ) -> Result<Option<crate::GroupPendingCommit>, AppError> {
+        self.accounts
+            .group_pending_commit(account_ref, group_id)
+            .await
+    }
+
     /// Delete one of [`Self::group_changes_not_delivered`] by its
     /// `commit_id_hex` once the user has seen it (mdk#2332). Returns false,
     /// changing nothing, when the group holds no such record. A malformed id

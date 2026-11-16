@@ -66,9 +66,9 @@ use crate::types::group::{
     MarmotGroupChangeNotDeliveredList, MarmotGroupCommitDelivery, MarmotGroupConversationSnapshot,
     MarmotGroupCreationResult, MarmotGroupDetails, MarmotGroupInviteDeclineResult,
     MarmotGroupInviteResult, MarmotGroupManagementState, MarmotGroupMutationResult,
-    MarmotGroupRecoveryStatus, MarmotGroupRoster, MarmotInitialGroupImage,
-    MarmotInviteMembersResult, MarmotMemberKeyPackagePrewarmSummary, MarmotMemberRef,
-    MarmotPendingWelcomeDeliveryList, MarmotPreparedGroupImageUpload,
+    MarmotGroupPendingCommit, MarmotGroupRecoveryStatus, MarmotGroupRoster,
+    MarmotInitialGroupImage, MarmotInviteMembersResult, MarmotMemberKeyPackagePrewarmSummary,
+    MarmotMemberRef, MarmotPendingWelcomeDeliveryList, MarmotPreparedGroupImageUpload,
     MarmotPreparedGroupImageUploadList,
 };
 use crate::types::history_import::MarmotChatHistoryImportList;
@@ -795,6 +795,12 @@ c_cmd! {
     /// is non-empty; with only owed relays, only once `since` is two minutes
     /// old. Poll while showing it. Free with `marmot_group_commit_delivery_free`.
     async fn marmot_group_commit_delivery(account_ref: str, group_id_hex: str) -> opt_rec(MarmotGroupCommitDelivery) = group_commit_delivery;
+
+    /// The group's own commit that has not confirmed yet, or NULL
+    /// (mdk#2332). While it is pending, group changes return
+    /// `MARMOT_STATUS_GROUP_COMMIT_PENDING`. Poll while showing it. Local
+    /// read. Free with `marmot_group_pending_commit_free`.
+    async fn marmot_group_pending_commit(account_ref: str, group_id_hex: str) -> opt_rec(MarmotGroupPendingCommit) = group_pending_commit;
 
     /// The group's changes of yours that were not applied, oldest first
     /// (mdk#2332): each one's call answered `CompletionUnknown` (or

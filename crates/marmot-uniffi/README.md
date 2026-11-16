@@ -31,6 +31,7 @@ Read the documentation at the tag matching your binaries; `master` can describe 
 - Messages and moderation: [deletion provenance and custom events](#deletion-provenance-and-custom-events),
   [group-system previews](#group-system-previews),
   [device-local membership events](#device-local-membership-events), [members are accounts](#members-are-accounts),
+  [a group change still being sent](#a-group-change-still-being-sent),
   [group changes that were not applied](#group-changes-that-were-not-applied),
   [discarding a failed send](#discarding-a-failed-send), [undelivered Welcomes](#undelivered-welcomes),
   [turning on account devices](#turning-on-account-devices),
@@ -1201,6 +1202,33 @@ that event and `size_class` its coarse size. Both are `nil` for other reasons.
 With `not_delivered`, the send's commit reached no relay and was rolled back:
 no relay accepted it, this device's record shows none can hold it, and at least
 ten minutes after the first send a relay's answer showed the device online.
+
+## A group change still being sent
+
+A group takes one commit at a time. While this device's last commit in a group
+has not confirmed, group changes fail with `MarmotKitError::GroupCommitPending`
+(mdk#2332), and so do a member's leave and invite decline; messages still send,
+and disbanding and an admin's leave are still accepted. No acknowledgement releases it, so it is checked before
+`GroupCatchingUp` and `GroupCommitUndelivered`, whose acknowledgements stay
+unspent. `group_pending_commit(account_ref, group_id_hex)` returns the commit,
+or `None`. `GroupPendingCommitFfi` names the change it carries by `intent_kind`
+(plus `queued_intent_id_hex` for a queued one; both are `nil` for a commit MDK
+made on its own) and gives `first_attempt_at` in Unix seconds.
+
+`state` is `Sending` for the commit's first ten minutes, and for as long as no
+relay may hold it while MDK waits to reach one. It is `Stuck` once ten minutes
+have passed, some relay may hold the commit and none has acknowledged it. MDK
+keeps resending it, backing off to about hourly and reading it back from those
+relays first, and never gives it up, because members may have seen it. Show the
+user that the change is stuck and which relays are involved:
+`unconfirmed_relay_urls` may hold it without having acknowledged it,
+`owed_relay_urls` never received it, and `refused_relays` gave a final latest
+answer with its cause, as `group_commit_delivery` reports causes. A relay that
+refused a later attempt can still be unconfirmed from an earlier one.
+
+A pending commit ends by confirming, which no event announces, or by being
+given up, which the next section's record reports for a change of yours. Poll
+while showing it.
 
 ## Group changes that were not applied
 

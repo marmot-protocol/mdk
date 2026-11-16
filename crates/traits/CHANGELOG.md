@@ -9,6 +9,9 @@
 
 ### Added
 
+- `OutboundFanout::pending_final_answers` lists each target of a pending commit whose latest answer was final,
+  whatever its status, with the causes `refused_targets` gives (mdk#2332). A relay that may hold an earlier copy and
+  refused a later attempt is listed, and stays a target that may hold the event.
 - `ChangeNotDelivered` and `ChangeOrigin` (`Direct`, or `QueuedIntent` with its id) describe a group change given up
   after its call returned (mdk#2332), and `GroupEvent::GroupChangeNotDelivered` announces a direct one.
   `OutboundFanout::set_host_change` names the host's change a pending fanout carries, once, and `host_change_kind`

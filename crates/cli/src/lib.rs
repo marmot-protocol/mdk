@@ -2660,6 +2660,15 @@ mod tests {
                 ..
             }
         ));
+        let cli = Cli::try_parse_from(["wn", "groups", "pending-commit", "GROUP"])
+            .expect("pending-commit parses");
+        assert!(matches!(
+            cli.command,
+            Command::Groups {
+                command: crate::GroupsCommand::PendingCommit { .. },
+                ..
+            }
+        ));
         let cli = Cli::try_parse_from(["wn", "groups", "changes-not-delivered", "GROUP"])
             .expect("changes-not-delivered parses");
         assert!(matches!(

@@ -663,6 +663,10 @@ pub(crate) enum AccountWorkerCommand {
         group_id: GroupId,
         respond: ReadReply<Result<Vec<crate::GroupChangeNotDelivered>, AppError>>,
     },
+    GroupPendingCommit {
+        group_id: GroupId,
+        respond: ReadReply<Result<Option<crate::GroupPendingCommit>, AppError>>,
+    },
     AcknowledgeChangeNotDelivered {
         group_id: GroupId,
         commit_id_hex: String,
@@ -6636,6 +6640,19 @@ fn account_worker_command_future<'a>(
                 true
             })
         }
+        AccountWorkerCommand::GroupPendingCommit { group_id, respond } => Box::pin(async move {
+            // See the Members arm: on-demand promotion for pipeline-abort
+            // leftovers.
+            let _ = client.runtime.ensure_group_hydrated(&group_id);
+            let _ = respond_diagnosed(
+                shared,
+                storage_permit.as_ref(),
+                respond,
+                client.group_pending_commit(&group_id),
+                client,
+            );
+            true
+        }),
         AccountWorkerCommand::AcknowledgeChangeNotDelivered {
             group_id,
             commit_id_hex,

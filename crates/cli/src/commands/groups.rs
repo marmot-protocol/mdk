@@ -1120,6 +1120,41 @@ async fn groups_command_once(
                 json,
             })
         }
+        GroupsCommand::PendingCommit { group_id } => {
+            let account = resolve_account(account_home, account_flag)?;
+            ensure_local_signing(&account)?;
+            app.status(&account.label)?;
+            let group_id_hex = normalize_group_id_hex(&group_id)?;
+            let group_id = GroupId::new(hex::decode(&group_id_hex)?);
+            let pending = runtime
+                .group_pending_commit(&account.label, &group_id)
+                .await?;
+            let mut json = json!({
+                "group_id": group_id_hex,
+                "pending": pending.is_some(),
+                "pending_commit": pending,
+            });
+            insert_account_fields(&mut json, &account)?;
+            Ok(CommandOutput {
+                plain: match &pending {
+                    None => format!("pending-commit group={group_id_hex} pending=false"),
+                    Some(pending) => format!(
+                        "pending-commit group={group_id_hex} pending=true commit={} kind={} state={} unconfirmed_relays={} owed_relays={} refused_relays={} relay_count={}",
+                        pending.commit_id_hex,
+                        pending.intent_kind.as_deref().unwrap_or("automatic"),
+                        match pending.state {
+                            marmot_app::GroupPendingCommitState::Sending => "sending",
+                            marmot_app::GroupPendingCommitState::Stuck => "stuck",
+                        },
+                        pending.unconfirmed_relay_urls.len(),
+                        pending.owed_relay_urls.len(),
+                        pending.refused_relays.len(),
+                        pending.relay_count
+                    ),
+                },
+                json,
+            })
+        }
         GroupsCommand::ChangesNotDelivered { group_id } => {
             let account = resolve_account(account_home, account_flag)?;
             ensure_local_signing(&account)?;

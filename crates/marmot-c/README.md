@@ -745,6 +745,11 @@ immediately (free with `marmot_group_commit_delivery_free`), and
 `marmot_acknowledge_group_commit_undelivered` lets one change through. See the
 [shared contract](../marmot-uniffi/README.md#history-may-be-incomplete-notices) for when the
 status is returned.
+While the group's last commit from this device has not confirmed, group changes return
+`MARMOT_STATUS_GROUP_COMMIT_PENDING`, ahead of the catching-up and undelivered statuses.
+`marmot_group_pending_commit` reports the commit, its `Sending` or `Stuck` state and its relays
+(free with `marmot_group_pending_commit_free`). See the
+[shared contract](../marmot-uniffi/README.md#a-group-change-still-being-sent).
 A group change that answered `CompletionUnknown` (or `AcceptedPending`, queued) and that MDK
 later gave up is kept for the host: `marmot_group_changes_not_delivered` lists the group's records
 (free with `marmot_group_change_not_delivered_list_free`), `MARMOT_GROUP_EVENT_KIND_GROUP_CHANGE_NOT_DELIVERED`

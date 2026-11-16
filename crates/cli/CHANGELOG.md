@@ -11,6 +11,9 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Added
 
+- `wn groups pending-commit <group-hex>` shows the group's own commit that has not confirmed yet, `sending` or
+  `stuck`, with its relays (mdk#2332). Group changes fail with the JSON error code `group_commit_pending` while it is
+  pending, ahead of `group_catching_up` and `group_commit_undelivered`.
 - `wn groups changes-not-delivered <group-hex>` lists your group changes given up after their call returned, and
   `wn groups acknowledge-change-not-delivered <group-hex> <commit-hex>` clears one (mdk#2332).
 

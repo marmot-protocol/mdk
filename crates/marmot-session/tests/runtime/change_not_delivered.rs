@@ -45,6 +45,19 @@ async fn given_up_change(
             .is_empty(),
         "a commit still pending is not recorded"
     );
+    // A host's change is named while it is pending; an automatic one is not.
+    let pending = pending_commit(&runtime, &fixture);
+    assert_eq!(pending.message_id, commit);
+    if host {
+        assert_eq!(
+            pending.origin,
+            Some(cgka_traits::storage::ChangeOrigin::Direct)
+        );
+        // The only host caller is the rename.
+        assert_eq!(pending.intent_kind.as_deref(), Some("update_group_data"));
+    } else {
+        assert_eq!((pending.origin, pending.intent_kind), (None, None));
+    }
 
     fixture.wall.set(start + READ_BACK_BOUND_SECS);
     let effects = runtime.resume_outbound_fanouts().await.unwrap();
@@ -53,6 +66,7 @@ async fn given_up_change(
         "{:?}",
         effects.pending
     );
+    assert_eq!(runtime.pending_commit(&fixture.group_id).unwrap(), None);
     (fixture, adapter, runtime, effects, commit)
 }
 

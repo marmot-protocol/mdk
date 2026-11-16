@@ -232,6 +232,10 @@ pub enum MarmotStatus {
     /// A legacy prepared-image create already committed, but its original
     /// member report is unavailable. Use the existing group; do not recreate it.
     CreatedGroupMemberReportUnavailable = 130,
+    /// The group's last commit has not confirmed yet, so the group cannot
+    /// take another change; MDK keeps sending it. Retry once it confirms;
+    /// `marmot_group_pending_commit` shows where it stands (mdk#2332).
+    GroupCommitPending = 131,
 }
 
 thread_local! {
@@ -390,6 +394,7 @@ pub(crate) fn status_from_error(err: &MarmotKitError) -> MarmotStatus {
         MarmotKitError::GroupRemoved { .. } => MarmotStatus::GroupRemoved,
         MarmotKitError::GroupCatchingUp { .. } => MarmotStatus::GroupCatchingUp,
         MarmotKitError::GroupCommitUndelivered { .. } => MarmotStatus::GroupCommitUndelivered,
+        MarmotKitError::GroupCommitPending { .. } => MarmotStatus::GroupCommitPending,
         MarmotKitError::StorageClosed { .. } => MarmotStatus::StorageClosed,
         MarmotKitError::StorageFull { .. } => MarmotStatus::StorageFull,
         MarmotKitError::GroupSendQueueFull { .. } => MarmotStatus::GroupSendQueueFull,
@@ -623,6 +628,9 @@ mod tests {
             MarmotKitError::GroupCommitUndelivered {
                 group_id_hex: "aa".into(),
             },
+            MarmotKitError::GroupCommitPending {
+                group_id_hex: "aa".into(),
+            },
             MarmotKitError::MemberNotInGroup {
                 group_id_hex: "aa".into(),
                 member_id_hex: "bb".into(),
@@ -793,6 +801,12 @@ mod tests {
                 group_id_hex: "aa".into(),
             }) as i32,
             130
+        );
+        assert_eq!(
+            status_from_error(&MarmotKitError::GroupCommitPending {
+                group_id_hex: "aa".into(),
+            }) as i32,
+            131
         );
         assert_eq!(
             status_from_error(&MarmotKitError::GroupRecoverySourceMismatch {

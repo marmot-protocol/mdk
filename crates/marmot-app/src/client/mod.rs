@@ -3078,7 +3078,7 @@ impl AppClient {
         telemetry: Option<&PerformanceRecorder>,
     ) -> Result<crate::GroupMemberResult<SendSummary>, AppError> {
         self.ensure_group(group_id)?;
-        self.ensure_group_change_admitted(group_id)?;
+        self.ensure_group_commit_admitted(group_id)?;
 
         let requested_members = member_refs
             .iter()
@@ -3423,7 +3423,7 @@ impl AppClient {
         );
         let work = async move {
             self.ensure_group(group_id)?;
-            self.ensure_group_change_admitted(group_id)?;
+            self.ensure_group_commit_admitted(group_id)?;
             let mut members = Vec::with_capacity(member_refs.len());
             for member in member_refs {
                 members.push(self.app.member_id(member)?);
@@ -3561,7 +3561,7 @@ impl AppClient {
         group_id: &GroupId,
     ) -> Result<SendSummary, AppError> {
         self.ensure_group(group_id)?;
-        self.ensure_group_change_admitted(group_id)?;
+        self.ensure_group_commit_admitted(group_id)?;
         let audit_context = Self::local_human_action_context(
             "enable_group_disbanding",
             vec!["lifecycle"],
@@ -3616,7 +3616,7 @@ impl AppClient {
         group_id: &GroupId,
     ) -> Result<SendSummary, AppError> {
         self.ensure_group(group_id)?;
-        self.ensure_group_change_admitted(group_id)?;
+        self.ensure_group_commit_admitted(group_id)?;
         let audit_context = Self::local_human_action_context(
             "enable_account_devices",
             vec!["app_components"],
@@ -3913,6 +3913,13 @@ impl AppClient {
         let initially_admin = self.leave_steps_admin_down(group_id, reason)?;
         if initially_admin {
             self.ensure_group_change_admitted(group_id)?;
+        } else if matches!(reason, AccountLeaveReason::User) {
+            // A member's leave is a SelfRemove, which the engine prepares only
+            // in a stable epoch, so the host's leave or decline fails typed
+            // behind a pending commit (mdk#2332). Sign-out reports the
+            // engine's refusal as a leave failure, and a received decline
+            // waits for a quiet group before it gets here.
+            self.ensure_no_pending_commit(group_id)?;
         }
         let local_invitation = if matches!(reason, AccountLeaveReason::User) {
             self.record_user_leave_decision(group_id)?
@@ -4366,7 +4373,7 @@ impl AppClient {
         audit_context: AuditEventContext,
         wake_targets: &[String],
     ) -> Result<SendSummary, AppError> {
-        self.ensure_group_change_admitted(group_id)?;
+        self.ensure_group_commit_admitted(group_id)?;
         let component = AppGroupAdminPolicyComponent::new(admins).to_app_component_data()?;
 
         self.sync_runtime_groups_for_send("update_admin_policy")
@@ -4428,7 +4435,7 @@ impl AppClient {
     ) -> Result<SendSummary, AppError> {
         validate_app_component(component_id, &data)?;
         self.ensure_group(group_id)?;
-        self.ensure_group_change_admitted(group_id)?;
+        self.ensure_group_commit_admitted(group_id)?;
         self.sync_runtime_groups_for_send("update_app_component")
             .await?;
         // `required_capabilities` is read out of the MLS GroupContext, not
@@ -4485,7 +4492,7 @@ impl AppClient {
         );
         let work = async move {
             self.ensure_group(group_id)?;
-            self.ensure_group_change_admitted(group_id)?;
+            self.ensure_group_commit_admitted(group_id)?;
             let component = AppGroupMessageRetentionComponent::new(disappearing_message_secs)
                 .to_app_component_data()?;
             let audit_context = Self::local_human_action_context(
@@ -4527,7 +4534,7 @@ impl AppClient {
         endpoints: Vec<AppBlobEndpoint>,
     ) -> Result<SendSummary, AppError> {
         self.ensure_group(group_id)?;
-        self.ensure_group_change_admitted(group_id)?;
+        self.ensure_group_commit_admitted(group_id)?;
         let endpoint_count = endpoints.len() as u64;
         let mut allowed_locator_kinds = Vec::new();
         for endpoint in &endpoints {
@@ -4604,7 +4611,7 @@ impl AppClient {
         thumbhash: Option<String>,
     ) -> Result<SendSummary, AppError> {
         self.ensure_group(group_id)?;
-        self.ensure_group_change_admitted(group_id)?;
+        self.ensure_group_commit_admitted(group_id)?;
         let component = match url {
             Some(url) if !url.is_empty() => {
                 AppGroupAvatarUrlComponent::new(url, dim, thumbhash)?.to_app_component_data()?
@@ -6226,7 +6233,7 @@ impl AppClient {
         );
         let work = async move {
             self.ensure_group_application_messages_allowed(group_id)?;
-            self.ensure_group_change_admitted(group_id)?;
+            self.ensure_group_commit_admitted(group_id)?;
             let audit_context = Self::local_human_action_context(
                 "update_group_image",
                 vec!["image"],
@@ -6444,7 +6451,7 @@ impl AppClient {
             }
             validate_group_profile(name.unwrap_or(""), description.unwrap_or(""))?;
             self.ensure_group(group_id)?;
-            self.ensure_group_change_admitted(group_id)?;
+            self.ensure_group_commit_admitted(group_id)?;
             let mut fields = Vec::new();
             if name.is_some() {
                 fields.push("name");
@@ -6522,6 +6529,35 @@ impl AppClient {
         self.stale_commit_acknowledgements
             .insert(group_id.clone(), epoch);
         Ok(true)
+    }
+
+    /// Admit a group change that prepares a commit: none while the group's
+    /// own last commit is pending (mdk#2332), then
+    /// [`Self::ensure_group_change_admitted`]. The engine stages one commit at
+    /// a time, so no acknowledgement could help: the pending commit wins over
+    /// both advisory gates, and leaves their acknowledgements unspent. A
+    /// disband or an admin's leave is a request the engine records in any
+    /// epoch state, so it stays on the advisory gates alone.
+    fn ensure_group_commit_admitted(&mut self, group_id: &GroupId) -> Result<(), AppError> {
+        self.ensure_no_pending_commit(group_id)?;
+        self.ensure_group_change_admitted(group_id)
+    }
+
+    /// Refuse a group change, typed as [`AppError::GroupCommitPending`],
+    /// while the group's own last commit is pending (mdk#2332): the engine
+    /// prepares a commit, or a member's SelfRemove, only in a stable epoch.
+    fn ensure_no_pending_commit(&self, group_id: &GroupId) -> Result<(), AppError> {
+        if self.runtime.pending_commit(group_id)?.is_some() {
+            tracing::info!(
+                target: "marmot_app::client",
+                method = "ensure_no_pending_commit",
+                "group change refused while the group's own commit is pending"
+            );
+            return Err(AppError::GroupCommitPending(hex::encode(
+                group_id.as_slice(),
+            )));
+        }
+        Ok(())
     }
 
     /// Admit a group change only past both advisory commit gates.
@@ -6710,6 +6746,21 @@ impl AppClient {
         Ok(self
             .runtime
             .acknowledge_change_not_delivered(group_id, &commit_id)?)
+    }
+
+    /// The group's own commit that has not confirmed yet, if any (mdk#2332):
+    /// `Sending`, or `Stuck` once it is ten minutes past its first attempt
+    /// while some relay may hold it and none has acknowledged it. While it is
+    /// pending, group changes fail with [`AppError::GroupCommitPending`].
+    pub fn group_pending_commit(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<Option<crate::GroupPendingCommit>, AppError> {
+        self.ensure_group(group_id)?;
+        Ok(self
+            .runtime
+            .pending_commit(group_id)?
+            .map(crate::GroupPendingCommit::from))
     }
 
     /// The group's confirmed change of yours that a group relay refused, until
