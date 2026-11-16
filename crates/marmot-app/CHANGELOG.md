@@ -110,10 +110,10 @@
   private KeyPackage expiry, a reinvite retry, or the 10-minute component recheck. A self-update held by an epoch gap is
   due when its 24 h hold ends, and one held by an undelivered commit an hour after that commit's first acknowledgement.
   Work with no stored time (a send failure, an in-memory retry, a rejoin offer, an unrecoverable group, device-group
-  passes) retries 15 s after the last run while it lasts, as before. KeyPackage publication retries now follow their
-  stored backoff (30 s doubling to 1 h) instead of every tick. The due time is re-read at most once a second, after a
-  command, a receive, a convergence pass, a recovery turn or a maintenance run, and timed as
-  `worker_maintenance_next_due`. The watchdog's own read on each tick is timed apart, as
+  passes, an overdue component recheck) retries 15 s after the last run while it lasts, as before. KeyPackage
+  publication retries now follow their stored backoff (30 s doubling to 1 h) instead of every tick. The due time is
+  re-read at most once a second, after a command, a receive, a convergence pass, a recovery turn or a maintenance run,
+  and timed as `worker_maintenance_next_due`. The watchdog's own read on each tick is timed apart, as
   `watchdog_maintenance_next_due`. A maintenance run wakes the KeyPackage catch-up only when it changed whether the
   catch-up is due or when it next comes due, so the catch-up's own deadline decides otherwise. The relay-config retry
   after an inactive account (mdk#3263) moves from the tick to the same schedule. The tick's watchdog counts session
@@ -131,6 +131,8 @@
   and device-inactivity coverage read first and write only when they have work.
 - Emoji discovery applies its 60-set limit after deduplicating coordinates, so overlapping revisions from additional
   relays no longer hide older sets below that limit (#3492).
+- The compaction and housekeeping batch looks again 15 s after the account's storage fails to open, instead of resting
+  until an unrelated wake. This closes a gap left by mdk#2923 step B.
 - Reinstalling the installed version of an emoji set no longer deletes images it already holds (#3464). A verified
   image whose refresh fails or does not fit the byte budget is kept, counts in `installed_count` and is not in
   `skipped`. Newly downloaded images are added, successful refreshes replace the old bytes, and a stored image that
