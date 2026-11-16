@@ -262,6 +262,8 @@ wn --account <npub-or-hex> groups disband-status <group-hex>
 wn --account <npub-or-hex> groups acknowledge-disband-failure <group-hex>
 wn --account <npub-or-hex> groups recovery-status <group-hex>
 wn --account <npub-or-hex> groups commit-delivery <group-hex>
+wn --account <npub-or-hex> groups changes-not-delivered <group-hex>
+wn --account <npub-or-hex> groups acknowledge-change-not-delivered <group-hex> <commit-hex>
 wn --account <npub-or-hex> groups confirm-rejoin <welcome-id-hex> --local-state-token <hex> --confirm
 wn --account <npub-or-hex> groups decline-rejoin <welcome-id-hex>
 wn --account <npub-or-hex> groups quarantined
@@ -295,6 +297,17 @@ never carry it, so group changes fail with the same code at once, until you acce
 owing it, the relays that refused it (`refused_relays`, each with its `cause`) and when the first relay accepted it; it
 reports owed relays immediately, before the two minutes pass. Retry once they accept it, or pass `--accept-undelivered`
 to make the change anyway, which also dismisses the group's refusals for good; scheduled self-updates wait up to an hour.
+
+**Changes that were not applied.** A group change can return before MDK knows whether it reached the group. When MDK
+later gives such a change up, nothing reached members and nothing sends it again. Unlike `commit-delivery`, which shows
+a change members can see but some relay still owes, these changes never took effect. `groups changes-not-delivered
+<group-hex>` lists them, oldest first, under `changes_not_delivered`. Each entry has `commit_id_hex`, `origin`
+(`{"type": "direct"}`, or `{"type": "queued_intent", "intent_id_hex": ...}` for a queued change), `intent_kind` (such
+as `update_group_data`), `reason` and `at` (Unix seconds). The `reason` is `not_delivered` if no relay received it,
+`event_too_large` if it fits none of the group's relays, or `refused` if every relay refused it. An entry stays,
+across restarts and later changes, until `groups acknowledge-change-not-delivered <group-hex> <commit-hex>` clears it
+(`acknowledged` is `false` if there was nothing to clear). A change that failed inside its own command, or one MDK made
+on its own, such as a scheduled self-update, is never listed.
 
 **Group identifiers.** Every `<group-hex>` is the canonical MLS group id (`group_id` in JSON; opaque bytes, 16 bytes for
 OpenMLS-created groups). It is not the 32-byte Nostr routing handle shown under `nostr_routing.nostr_group_id_hex`,
