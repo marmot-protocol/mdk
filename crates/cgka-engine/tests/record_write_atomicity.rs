@@ -4083,6 +4083,18 @@ async fn a_queued_intent_whose_commit_reached_no_relay_is_retired_with_its_rollb
             .unwrap()
             .len()
     };
+    // The stored MLS group, which the rollback clears inside its transaction;
+    // `still_pending` reads only the engine's memory.
+    let mls_commit_staged = |storage: &SqliteAccountStorage| {
+        openmls::group::MlsGroup::load(
+            storage.mls_storage(),
+            &openmls::group::GroupId::from_slice(group_id.as_slice()),
+        )
+        .unwrap()
+        .unwrap()
+        .pending_commit()
+        .is_some()
+    };
 
     // A relay that may hold the commit: no rollback, by either path.
     let mut exposed = fanout.clone();
@@ -4154,6 +4166,7 @@ async fn a_queued_intent_whose_commit_reached_no_relay_is_retired_with_its_rollb
     // after the MLS rewind. The commit stays pending, the intent queued, the
     // stored fanout as it was and the caller's copy unrolled.
     let stored = engine.outbound_fanouts().unwrap();
+    assert!(mls_commit_staged(&storage));
     for (arm, case) in [
         (Some(1), "the intent's delete"),
         (Some(2), "the record's write"),
@@ -4176,6 +4189,10 @@ async fn a_queued_intent_whose_commit_reached_no_relay_is_retired_with_its_rollb
         assert_eq!(termination_fault.remaining(), 0, "{case}");
         assert!(!group_write_fault.should_fail(), "{case}: the fault fired");
         assert!(still_pending(&engine), "{case}");
+        assert!(
+            mls_commit_staged(&storage),
+            "{case}: the MLS clear rolled back"
+        );
         assert_eq!(queued(&storage), 1, "{case}");
         assert!(
             storage.changes_not_delivered(&group_id).unwrap().is_empty(),
@@ -4196,6 +4213,7 @@ async fn a_queued_intent_whose_commit_reached_no_relay_is_retired_with_its_rollb
         .publish_not_delivered(pending, &mut fanout, RollbackPass::Later)
         .await
         .expect("a commit that reached no relay rolls back");
+    assert!(!mls_commit_staged(&storage));
     assert_eq!(fanout.mls_state(), cgka_traits::FanoutMlsState::RolledBack);
     assert_eq!(engine.outbound_fanouts().unwrap(), vec![fanout.clone()]);
     assert!(matches!(
