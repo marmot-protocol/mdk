@@ -582,8 +582,12 @@ peel runs. `Engine::retry_deferred_peels` offers those contexts to every retaine
   fanout as it stages it (`drained_queued_intent_id`, `OutboundFanout::set_queued_intent`), and hydration restores it
   from the fanout it restores the pending commit from, only while that intent is still queued in the group. So
   confirmation, the size rollback and `publish_not_delivered` retire the right intent after a restart; a fanout staged
-  before the link existed retires none, and the drain prepares its intent once more. App messages'
-  `queued_intent_by_message` has no such link yet. Every fanout rollback refuses a
+  before the link existed retires none, and the drain prepares its intent once more. A drained application message or
+  proposal names its intent on its fanout the same way (mdk#2332), and the drain and
+  `has_queued_intent_awaiting_preparation` treat an intent a stored `NotApplicable` fanout names as in flight, from
+  storage, not from `queued_intent_by_message`, which only covers this process's drain until the fanout is stored. The
+  intent retires when the fanout resolves, before the fanout does, and the host keeps the fanout while the intent is
+  still queued (`is_queued_outbound_intent`). Every fanout rollback refuses a
   fanout that a target accepted, that is incomplete, or that a target may hold (`OutboundFanout::possible_exposure`,
   mdk#1577). A plain `publish_failed_with_fanout` keeps the record, so the drain stages it again. Pinned by
   `tests/record_write_atomicity.rs::a_too_large_queued_intent_is_retired_with_its_rollback`,
@@ -596,8 +600,9 @@ peel runs. `Engine::retry_deferred_peels` offers those contexts to every retaine
   the intents that never queue are refused as they are while the group settles, and the drain prepares the queue in
   order; only the fairness slot, a requested disband and the engine's maintenance commits (replay rotation, SelfRemove
   auto-commit), none of which an application message takes, let a group change go first. A retried in-flight intent
-  waits again and takes a later generation, which is why the session runtime resolves each drained intent within the
-  advance that prepared it. Each encryption takes the sender's next generation, and a member reading history in
+  waits again and takes a later generation, which is why the session runtime re-arms a drained intent only when its
+  attempt stored no fanout; one whose fanout is stored retries that exact event, keeping its generation, and stays in
+  flight until the fanout resolves. Each encryption takes the sender's next generation, and a member reading history in
   `created_at` order loses any send `DEFAULT_OUT_OF_ORDER_TOLERANCE` (100) or more generations behind one it already
   read. That order is send order across seconds, not inside one, where the event id decides: more than 100
   application messages from one device in one group in one second can lose their oldest during catch-up, a

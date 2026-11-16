@@ -1060,6 +1060,7 @@ include!("runtime/own_echo.rs");
 include!("runtime/read_back.rs");
 include!("runtime/abandon.rs");
 include!("runtime/change_not_delivered.rs");
+include!("runtime/drained_message_intent.rs");
 include!("runtime/hydrated_welcome.rs");
 include!("support/recovery_challenge.rs");
 include!("runtime/key_package_generation_upgrade.rs");

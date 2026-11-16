@@ -2326,7 +2326,7 @@ async fn regenerated_queued_proposal_keeps_its_original_intent() {
         assert!(advanced.pending_convergence.contains(&created.group_id));
         tokio::task::yield_now().await;
     }
-    bob.confirm_regenerated_queued_intent(original).unwrap();
+    bob.retire_drained_queued_intent(original).unwrap();
     assert!(!bob.has_queued_outbound_intents(&created.group_id).unwrap());
     assert!(
         bob.advance_convergence(&created.group_id)

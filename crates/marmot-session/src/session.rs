@@ -1697,6 +1697,13 @@ impl AccountDeviceSession {
         Ok(self.engine.retry_failed_convergence_pass(group_id)?)
     }
 
+    /// See `Engine::is_queued_outbound_intent`.
+    pub fn is_queued_outbound_intent(&self, intent: &QueuedIntentRef) -> SessionResult<bool> {
+        Ok(self
+            .engine
+            .is_queued_outbound_intent(&intent.group_id, &intent.intent_id)?)
+    }
+
     pub fn has_queued_outbound_intents(&self, group_id: &GroupId) -> SessionResult<bool> {
         Ok(self.engine.has_queued_outbound_intents(group_id)?)
     }
@@ -1822,13 +1829,11 @@ impl AccountDeviceSession {
             .scheduled_self_remove_auto_commit_delay_ms(group_id)?)
     }
 
-    pub fn confirm_regenerated_queued_intent(
-        &mut self,
-        intent: &QueuedIntentRef,
-    ) -> SessionResult<()> {
+    /// See `Engine::retire_drained_queued_intent`.
+    pub fn retire_drained_queued_intent(&mut self, intent: &QueuedIntentRef) -> SessionResult<()> {
         Ok(self
             .engine
-            .confirm_regenerated_queued_intent(&intent.intent_id)?)
+            .retire_drained_queued_intent(&intent.group_id, &intent.intent_id)?)
     }
 
     pub fn retry_regenerated_queued_intent(&mut self, intent: &QueuedIntentRef) {
@@ -1940,6 +1945,14 @@ impl AccountDeviceSession {
     /// fanout to name (mdk#2332).
     pub fn drained_queued_intent_id(&self, pending: PendingStateRef) -> Option<MessageId> {
         self.engine.drained_queued_intent_id(pending)
+    }
+
+    /// The queued intent the drain prepared the application message or
+    /// proposal `message_id` from, for its frozen fanout to name (mdk#2332).
+    pub fn regenerated_queued_intent_id(&self, message_id: &MessageId) -> Option<MessageId> {
+        self.engine
+            .regenerated_queued_intent_for_message(message_id)
+            .map(|(_, intent_id)| intent_id)
     }
 
     /// The stable kind of the host's change `pending` carries, for its frozen
