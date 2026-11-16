@@ -2505,17 +2505,15 @@ impl<S: StorageProvider> Engine<S> {
                 .map_err(|_| GroupHydrationQuarantineReason::OpenMlsLoadFailed)?;
         }
 
-        let group_fanouts = self
+        let durable_pending_fanout = self
             .storage
             .list_outbound_fanouts_for_group(group_id)
-            .map_err(|_| GroupHydrationQuarantineReason::GroupRecordLoadFailed)?;
-        let durable_pending_fanout = group_fanouts
-            .iter()
+            .map_err(|_| GroupHydrationQuarantineReason::GroupRecordLoadFailed)?
+            .into_iter()
             .find(|fanout| {
                 fanout.group_id() == Some(group_id)
                     && matches!(fanout.mls_state(), cgka_traits::FanoutMlsState::Pending(_))
-            })
-            .cloned();
+            });
         // Preparing is the engine's proof that no signed publication handle
         // escaped. Unlike compatibility recovery, this may rewind a commit
         // containing Removes, and must retire its Welcomes in the same unit.
@@ -2850,25 +2848,6 @@ impl<S: StorageProvider> Engine<S> {
         } else {
             self.leave_requests.remove(group_id);
             self.leaving_groups.remove(group_id);
-        }
-
-        // A drained application message or proposal whose fanout is still
-        // stored names its intent (mdk#2332). While that intent is queued it
-        // is in flight, so no drain prepares it again; the fanout retires it.
-        for fanout in &group_fanouts {
-            if fanout.group_id() == Some(group_id)
-                && matches!(
-                    fanout.mls_state(),
-                    cgka_traits::FanoutMlsState::NotApplicable
-                )
-                && let Some(intent_id) = fanout.queued_intent_id()
-                && queued_intents.iter().any(|record| &record.id == intent_id)
-            {
-                self.queued_intent_by_message.insert(
-                    fanout.message_id().clone(),
-                    (group_id.clone(), intent_id.clone()),
-                );
-            }
         }
 
         // #740: the transport routing id was already indexed right after the

@@ -40,9 +40,9 @@
   names it, so confirming the commit, refusing it for size or `publish_not_delivered` after a restart retires that
   intent instead of leaving it for the drain to prepare again (mdk#2332). A hydration that fails after restoring the
   link drops it with the rest of the restored pending state, so the intent is not left marked in flight.
-- Hydration also restores a drained application message's or proposal's link to its queued intent, from a stored
-  fanout naming an intent that is still queued, so a drain after a restart treats the intent as in flight instead of
-  preparing it again (mdk#2332).
+- The drain treats a queued intent that a stored application-message or proposal fanout names as in flight, so a
+  drain after a restart, or after a Welcome made the group live without hydrating it, does not prepare the intent
+  again, and a later send does not queue behind it (mdk#2332).
 - Received NIP-22 comments (kind 1111 with a numeric lowercase `k` tag) carry their source-epoch encrypted-media
   secret through the same ingest and replay handoff as chat attachments (#3409).
 
