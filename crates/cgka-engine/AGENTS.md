@@ -314,10 +314,11 @@ peel runs. `Engine::retry_deferred_peels` offers those contexts to every retaine
   budget. Any new accessor or data path that reads group state needs the gate — a bypass can silently un-quarantine
   via `set_stable`. The queued-intent bookkeeping sits outside it (mdk#2332): `has_queued_outbound_intents` and
   `is_queued_outbound_intent` read only queued-intent rows; `pending_is_queued_invite` reads the drain's link for a
-  pending commit, then its row; `retire_drained_queued_intent` and `confirm_regenerated_queued_intent` (through
-  `CgkaEngine::confirm_queued_outbound_intent` too) delete the row and clear the drain's links to it;
-  `regenerated_queued_intent_for_message` and `drained_queued_intent_id` read those links; and
-  `retry_regenerated_queued_intent` (through `CgkaEngine::retry_queued_outbound_intent` too) clears them and marks the
+  pending commit, then its row; `retire_drained_queued_intent` deletes the row while it is still queued and clears the
+  drain's message link to it; `confirm_regenerated_queued_intent` (through `CgkaEngine::confirm_queued_outbound_intent`
+  too) deletes the row and clears both its message and pending-commit links; `regenerated_queued_intent_for_message` and
+  `drained_queued_intent_id` read the message link and the pending-commit link, in that order; and
+  `retry_regenerated_queued_intent` (through `CgkaEngine::retry_queued_outbound_intent` too) clears both and marks the
   group for another convergence pass. None loads MLS state, reads the group record or calls `set_stable`, so none can
   un-quarantine a group. A quarantined group's intents stay queued: the drain refuses the group and the fanout listings
   hide its fanouts, so a sent intent stays named by its stored fanout until the group is live again and a pass retires
