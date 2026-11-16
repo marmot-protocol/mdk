@@ -1416,9 +1416,15 @@ pack by coordinate or Sonar link when the user opens a shared pack. `installStic
 change the account's published installed list after a complete read of it; without one, the change stays pending for
 a later sync.
 
+Pack reads (sync, fetch, install, and resolving a received sticker) query the account's NIP-65 relays and the
+runtime's configured relays together, plus any relay hints in a pasted link; the newest version among the relays that
+answered wins. Pass the relays where your app's default packs live as configured relays. The installed list is read
+from and published to the account's relays only, never to the configured relays.
+
 Use `stickerPackShareLink(accountRef, coordinate)` for sharing rather than constructing a URL in the host.
-It validates the coordinate and builds a canonical Sonar link without network I/O, using retained relay hints from
-successful pack fetches. Packs without retained hints use the account's current outbox relay candidates.
+It validates the coordinate and builds a canonical Sonar link without network I/O, using retained relay hints: the
+relays that sent the stored version of the pack, newest read first. Packs without retained hints use the account's
+current outbox relay candidates.
 Links contain at most eight normalized, unique relay hints and stay within the parser's 2048-character limit;
 hints that do not fit are omitted.
 
@@ -1434,8 +1440,10 @@ Context uses the tagged-text bounds of 64 tags and 16 KiB of tag values.
 ## Emoji sets
 
 Emoji sets are NIP-51 kind-30030 sets. `syncEmojiSets` and `fetchEmojiSet` fetch set text only, never images;
-`emojiSets`, `emojiSet` and `userEmojiList` read without fetching images. Any call that downloads images reveals the
-user's IP address to the image hosts the set's author chose, so call it only after the user acts:
+`emojiSets`, `emojiSet` and `userEmojiList` read without fetching images. Sets are read from the same relays as
+sticker packs, plus any relay hints in a pasted `naddr`; the account's own emoji list is read from its relays only.
+Any call that downloads images reveals the user's IP address to the image hosts the set's author chose, so call it
+only after the user acts:
 
 - `fetchEmojiSetAsset` and `fetchEmojiSetCover` download and validate one image for a preview after the user opens a
   set. Nothing is stored.

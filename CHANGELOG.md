@@ -88,6 +88,21 @@
   (#3464). Reinstalling the installed version keeps each image whose download
   fails, and the result's `skipped` list names only entries left without an
   image.
+- Find sticker packs an imported account's relay list does not lead to.
+  Sticker pack reads (discovery and installed-pack refresh in
+  `sync_sticker_packs`, `fetch_sticker_pack`, `install_sticker_pack`, and
+  resolving a received sticker) now query the runtime's configured relays as
+  well as the account's NIP-65 relays. Packs are published to few relays, so an
+  account whose relay list came from another client saw an empty pack browser
+  and default-pack installs failed with `StickerNotFound`. The newest version
+  of a pack among the relays that answered wins; a read that misses a relay
+  can keep an older version until a later read reaches it. The installed list (kind 10031) and other
+  sticker publications still go only to the account's own relays. Emoji set
+  reads (`sync_emoji_sets`, `fetch_emoji_set` and the sets `user_emoji_list`
+  points to) use the same relays; the account's own emoji list (kind 10030) is
+  still read from its relays only. A pack's share link now names only relays
+  that served the version MDK kept, never relays that were merely queried or
+  hold only an older version.
 - Stop onboarding's relay checks from failing healthy relays (#3439). A relay
   that closes a query with its NIP-01 `auth-required:` reason behind an
   `ERROR: ` wrapper is reported as needing authentication, not as restricting

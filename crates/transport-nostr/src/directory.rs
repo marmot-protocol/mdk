@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -7,10 +7,11 @@ use cgka_traits::TransportEndpoint;
 use futures::StreamExt;
 use nostr_sdk::NotificationUpdate;
 use nostr_sdk::prelude::{
-    AcquisitionEnd, AcquisitionLimits, Client as NostrSdkClient, Event, Filter, Kind, PublicKey,
-    RelayMessage, RelayNotification, RelayStatus, RelayUrl, ReqTarget, SingleLetterTag,
+    AcquisitionEnd, AcquisitionLimits, Client as NostrSdkClient, Event, EventId, Filter, Kind,
+    PublicKey, RelayMessage, RelayNotification, RelayStatus, RelayUrl, ReqTarget, SingleLetterTag,
     SubscribeAutoCloseOptions, SubscriptionId, Timestamp,
 };
+use nostr_sdk::relay::RelayStreamEvent;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, oneshot};
 use tokio::task::JoinSet;
@@ -926,18 +927,39 @@ impl NostrSdkDirectoryRelayFetcher {
     }
 }
 
-/// Verified events from one public-event read, and whether every requested
-/// relay connected and reached its end of stored events.
+/// Verified events from one public-event read, whether every requested relay
+/// connected and reached its end of stored events, and which relays sent each
+/// event.
 pub struct PublicEventFetch {
     pub events: Vec<Event>,
     pub complete: bool,
+    /// The relays that sent each verified event, by event id, in their parsed
+    /// relay-URL spelling. A relay that sent only a copy failing signature
+    /// verification is not listed.
+    pub sources: HashMap<EventId, Vec<TransportEndpoint>>,
+}
+
+impl PublicEventFetch {
+    /// The relays that sent `id`, or none for an event this read did not
+    /// return.
+    pub fn sources_of(&self, id: &EventId) -> &[TransportEndpoint] {
+        self.sources.get(id).map_or(&[], Vec::as_slice)
+    }
 }
 
 /// One bounded, anonymous read of public events matching `filters`.
 ///
 /// Uses an owned client like [`DirectoryRelayFetcher::fetch_directory_events`],
-/// so hint relays never join a long-lived pool. Signatures are verified here;
-/// callers still match every event against the reference they asked for.
+/// so hint relays never join a long-lived pool. Signatures are verified as each
+/// event arrives, so a relay's forged copy can neither displace a genuine copy
+/// from another relay nor count toward `max_events`; callers still match every
+/// event against the reference they asked for.
+///
+/// It keeps `fetch_events(..).with_outcomes()`'s bounds over one stream per
+/// relay, so the relay behind each copy is known: at most `max_events` unique
+/// events, a read stopped by a new event past that bound is incomplete (one
+/// that ends with exactly `max_events` lost nothing), and one relay's failure
+/// does not stop the others.
 pub async fn fetch_public_events(
     endpoints: &[TransportEndpoint],
     filters: Vec<Filter>,
@@ -949,30 +971,70 @@ pub async fn fetch_public_events(
         let requested_count = requested.len();
         let relay_urls = fetcher.connect_relays(requested).await?;
         let connected_count = relay_urls.len();
-        let outcome = fetcher
-            .client
-            .fetch_events(ReqTarget::manual(
-                relay_urls.into_iter().map(|url| (url, filters.clone())),
-            ))
-            .timeout(DIRECTORY_RELAY_FETCH_WAIT)
-            .max_events(max_events)
-            .with_outcomes()
-            .await
-            .map_err(|_| "fetch public events failed".to_owned())?;
+        // Each connected relay's last outcome: `true` once it completed.
+        let mut completed = relay_urls
+            .iter()
+            .cloned()
+            .map(|url| (url, false))
+            .collect::<HashMap<_, _>>();
+        // One stream per relay: a shared stream drops every copy of an id
+        // after the first relay's, before any signature check, which would
+        // hide the other relays holding it and let a forged first copy
+        // suppress the genuine one.
+        let mut streams = Vec::with_capacity(relay_urls.len());
+        for url in relay_urls {
+            streams.push(
+                fetcher
+                    .client
+                    .stream_events(ReqTarget::manual([(url, filters.clone())]))
+                    .timeout(DIRECTORY_RELAY_FETCH_WAIT)
+                    .with_outcomes()
+                    .await
+                    .map_err(|_| "fetch public events failed".to_owned())?,
+            );
+        }
+        let mut stream = futures::stream::select_all(streams);
+        let mut events = BTreeSet::new();
+        let mut sources: HashMap<EventId, Vec<TransportEndpoint>> = HashMap::new();
+        let mut truncated = false;
+        while let Some((url, item)) = stream.next().await {
+            match item {
+                RelayStreamEvent::Event(event) => {
+                    if event.verify().is_err() {
+                        continue;
+                    }
+                    let id = event.id;
+                    if !sources.contains_key(&id) {
+                        if events.len() >= max_events {
+                            truncated = true;
+                            break;
+                        }
+                        events.insert(event);
+                    }
+                    let from = sources.entry(id).or_default();
+                    let relay = TransportEndpoint(url.to_string());
+                    if !from.contains(&relay) {
+                        from.push(relay);
+                    }
+                }
+                RelayStreamEvent::Completed => {
+                    completed.insert(url, true);
+                }
+                RelayStreamEvent::Error(_) | RelayStreamEvent::LimitReached => {
+                    completed.insert(url, false);
+                }
+            }
+        }
+        // Dropping the streams cancels the requests still outstanding.
+        drop(stream);
         let complete = connected_count == requested_count
-            && !outcome.truncated
-            && outcome.relays.len() == connected_count
-            && outcome
-                .relays
-                .values()
-                .all(|relay| matches!(relay, nostr_sdk::client::FetchRelayOutcome::Completed));
+            && !truncated
+            && completed.len() == connected_count
+            && completed.values().all(|done| *done);
         Ok(PublicEventFetch {
-            events: outcome
-                .events
-                .into_iter()
-                .filter(|event| event.verify().is_ok())
-                .collect(),
+            events: events.into_iter().collect(),
             complete,
+            sources,
         })
     }
     .await;
@@ -1549,6 +1611,76 @@ mod tests {
             .collect::<Vec<_>>();
         actual.sort();
         assert_eq!(actual, expected);
+    }
+
+    // A public read names every relay that sent each event, so a caller can
+    // tell the relays holding a pack from the ones merely queried. A relay
+    // that sent a forged copy is never named, and its copy never displaces
+    // the genuine one another relay sent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn public_fetch_names_the_relays_behind_each_verified_event() {
+        use nostr_sdk::prelude::{EventBuilder, Keys};
+
+        let keys = Keys::generate();
+        let [only_a, shared, only_b] = ["a", "shared", "b"].map(|content| {
+            EventBuilder::new(Kind::from(1), content)
+                .finalize(&keys)
+                .unwrap()
+        });
+        let mut forged = only_b.clone();
+        forged.sig = only_a.sig;
+        let (relay_a, server_a) = spawn_query_relay(
+            vec![only_a.clone(), shared.clone(), forged],
+            QueryRelayEnd::Eose,
+        )
+        .await;
+        let (relay_b, server_b) =
+            spawn_query_relay(vec![shared.clone(), only_b.clone()], QueryRelayEnd::Eose).await;
+        let fetched = timeout(
+            Duration::from_secs(5),
+            fetch_public_events(
+                &[relay_a.clone(), relay_b.clone()],
+                vec![Filter::new().kind(Kind::from(1)).author(keys.public_key())],
+                16,
+            ),
+        )
+        .await
+        .expect("both relays answer")
+        .unwrap();
+        server_a.abort();
+        server_b.abort();
+        let _ = server_a.await;
+        let _ = server_b.await;
+
+        let spelled = |endpoint: &TransportEndpoint| {
+            TransportEndpoint(RelayUrl::parse(endpoint.as_str()).unwrap().to_string())
+        };
+        let (a, b) = (spelled(&relay_a), spelled(&relay_b));
+        let mut ids = fetched
+            .events
+            .iter()
+            .map(|event| event.id)
+            .collect::<Vec<_>>();
+        ids.sort();
+        let mut expected = vec![only_a.id, shared.id, only_b.id];
+        expected.sort();
+        assert_eq!(ids, expected);
+        assert!(
+            fetched.events.iter().all(|event| event.verify().is_ok()),
+            "the genuine copy is kept"
+        );
+        assert!(fetched.complete);
+        assert_eq!(fetched.sources_of(&only_a.id), std::slice::from_ref(&a));
+        let mut shared_from = fetched.sources_of(&shared.id).to_vec();
+        shared_from.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        let mut both = vec![a, b.clone()];
+        both.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        assert_eq!(shared_from, both);
+        assert_eq!(
+            fetched.sources_of(&only_b.id),
+            [b],
+            "the relay that sent a forged copy is not a source"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
