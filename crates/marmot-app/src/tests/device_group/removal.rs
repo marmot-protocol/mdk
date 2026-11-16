@@ -1047,6 +1047,32 @@ async fn the_stored_removal_is_looked_for_once_per_process() {
     drop(laptop);
 }
 
+/// An account with no database has no stored removal to find, and looking
+/// creates none (mdk#3478). A look that cannot tell whether the database
+/// exists refuses to publish and is not counted done, so the next publisher
+/// looks again.
+#[cfg(unix)]
+#[test]
+fn the_removal_look_needs_a_database_it_can_see() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = device_group_app_at(&dir, Arc::new(ScriptedPushRelayClient::default()));
+    let account = app.account_home().create_account("alice").unwrap();
+    let database = app.account_storage_path(&account.label);
+
+    // A link to itself makes the database's metadata unreadable.
+    std::os::unix::fs::symlink(&database, &database).unwrap();
+    assert!(app.account_publishing_stopped(&account.account_id_hex));
+    assert_eq!(app.stored_device_group_checks(&account.account_id_hex), 1);
+
+    std::fs::remove_file(&database).unwrap();
+    assert!(!app.account_publishing_stopped(&account.account_id_hex));
+    assert_eq!(app.stored_device_group_checks(&account.account_id_hex), 2);
+    assert!(
+        !database.try_exists().unwrap(),
+        "looking must not create the account database"
+    );
+}
+
 /// The laptop's engine applies its removal but the app never notes it, as
 /// after a crash between the two (here, its mark fails as it is applied
 /// and the process ends). Started again under the runtime, its worker follows the removal
