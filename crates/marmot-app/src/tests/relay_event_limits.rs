@@ -9,6 +9,16 @@ fn app_with_event_limits(
     relay: Arc<ScriptedPushRelayClient>,
     limits: &[(&str, u64)],
 ) -> MarmotApp {
+    app_with_config_and_event_limits(dir, relay, limits, MarmotAppConfig::white_noise())
+}
+
+/// [`app_with_event_limits`] built from `config`.
+fn app_with_config_and_event_limits(
+    dir: &tempfile::TempDir,
+    relay: Arc<ScriptedPushRelayClient>,
+    limits: &[(&str, u64)],
+    config: MarmotAppConfig,
+) -> MarmotApp {
     let deployment = MarmotDeployment {
         relay_event_limits: limits
             .iter()
@@ -22,7 +32,7 @@ fn app_with_event_limits(
     MarmotApp::with_relays_and_config(
         dir.path(),
         vec!["wss://relay.example".into()],
-        MarmotAppConfig::white_noise()
+        config
             .with_deployment(deployment)
             .with_allow_loopback_relay_endpoints(true)
             .with_open_ranking_provider(None, Vec::new()),
@@ -291,13 +301,27 @@ async fn account_publishes_over_a_known_limit_are_refused_unsent() {
 }
 
 /// Founding-Welcome sizes measured on both sides of the 64 KiB boundary
-/// (mdk#2334); see the notes in the file.
+/// (mdk#2334), with device groups off and on (mdk#3480); see the notes in
+/// the file.
 const FOUNDING_WELCOME_SIZES: &str =
     include_str!("../../tests/fixtures/founding_welcome_sizes.json");
 
 #[derive(Debug, serde::Deserialize)]
 struct FoundingWelcomeSizes {
-    rows: Vec<FoundingWelcomeSize>,
+    device_groups_off: Vec<FoundingWelcomeSize>,
+    device_groups_on: Vec<FoundingWelcomeSize>,
+}
+
+impl FoundingWelcomeSizes {
+    /// The rows measured with device groups `on` or off. With them on, every
+    /// leaf advertises the device roster, so the Welcome is larger.
+    fn rows(self, device_groups: bool) -> Vec<FoundingWelcomeSize> {
+        if device_groups {
+            self.device_groups_on
+        } else {
+            self.device_groups_off
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -371,18 +395,31 @@ fn founding_welcome_size(
 }
 
 /// A founding Welcome's bytes, not its roster count, decide the known-limit
-/// boundary (mdk#2334). Under a 64 KiB limit the largest roster that fits is
-/// created and its Welcomes are sent there; one more member is refused with
-/// nothing written or sent. On a 2 MiB relay that larger roster is created.
-/// The measured Welcome layers match the fixture.
+/// boundary (mdk#2334), with device groups off.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_bulk_create_fits_a_known_limit_up_to_the_fixture_boundary() {
+async fn a_bulk_create_fits_a_known_limit_up_to_the_fixture_boundary_with_device_groups_off() {
+    a_bulk_create_fits_a_known_limit_up_to_the_fixture_boundary(false).await;
+}
+
+/// The same with device groups on, where every leaf also advertises the
+/// device roster and so moves the boundary (mdk#3480).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_bulk_create_fits_a_known_limit_up_to_the_fixture_boundary_with_device_groups_on() {
+    a_bulk_create_fits_a_known_limit_up_to_the_fixture_boundary(true).await;
+}
+
+/// Under a 64 KiB limit the largest roster that fits is created and its
+/// Welcomes are sent there; one more member is refused with nothing written
+/// or sent. On a 2 MiB relay that larger roster is created. The measured
+/// Welcome layers match the fixture's rows for `device_groups`.
+async fn a_bulk_create_fits_a_known_limit_up_to_the_fixture_boundary(device_groups: bool) {
     const SMALL: &str = "wss://small.example";
     const LARGE: &str = "wss://large.example";
     const SMALL_LIMIT: u64 = 64 * 1024;
-    let expected: FoundingWelcomeSizes = serde_json::from_str(FOUNDING_WELCOME_SIZES).unwrap();
+    let expected = serde_json::from_str::<FoundingWelcomeSizes>(FOUNDING_WELCOME_SIZES)
+        .unwrap()
+        .rows(device_groups);
     let (fits, too_large) = expected
-        .rows
         .windows(2)
         .find(|pair| {
             pair[0].gift_wrap_json_bytes as u64 <= SMALL_LIMIT
@@ -396,10 +433,11 @@ async fn a_bulk_create_fits_a_known_limit_up_to_the_fixture_boundary() {
     let home = AccountHome::open(dir.path());
     home.create_account("alice").unwrap();
     let relay = Arc::new(ScriptedPushRelayClient::default());
-    let app = app_with_event_limits(
+    let app = app_with_config_and_event_limits(
         &dir,
         relay.clone(),
         &[(SMALL, SMALL_LIMIT), (LARGE, 2 * 1024 * 1024)],
+        MarmotAppConfig::white_noise().with_device_groups(device_groups),
     );
     let mut keys = std::collections::HashMap::new();
     let mut invitees = Vec::new();
@@ -498,8 +536,9 @@ async fn a_bulk_create_fits_a_known_limit_up_to_the_fixture_boundary() {
     assert!(measured[2].gift_wrap_json_bytes as u64 > SMALL_LIMIT);
     assert_eq!(
         measured,
-        expected.rows,
-        "founding Welcome sizes changed; measured rows:\n{}",
+        expected,
+        "founding Welcome sizes with device groups {} changed; measured rows:\n{}",
+        if device_groups { "on" } else { "off" },
         serde_json::to_string_pretty(&measured).unwrap()
     );
 }
