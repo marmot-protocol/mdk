@@ -8237,6 +8237,70 @@ async fn owed_work_has_no_due_time_and_a_pause_owes_no_new_key_package() {
     assert!(!due.retry_while_owed, "{due:?}");
 }
 
+/// mdk#3265: the 10-minute component recheck is the one due time computed
+/// from now. A wait still to come is rounded up to the next second, and once
+/// the recheck is overdue it is owed, not due now: a group kept from
+/// rechecking would otherwise read as new work on every re-read, and the
+/// worker would run maintenance about once a second.
+#[tokio::test]
+async fn an_overdue_component_recheck_is_owed_not_due_now() {
+    let dir = relaxed_storage_dir().unwrap();
+    let key = SqlCipherKey::new("marmot overdue recheck key").unwrap();
+    let start = 100_000u64;
+    let wall = Arc::new(TestWallClock::new(start));
+    let monotonic = Arc::new(TestMonotonicClock::default());
+    let mut runtime = AccountDeviceRuntime::new(
+        session(dir.path().join("alice.sqlite"), &key, b"alice"),
+        RecordingAdapter::default(),
+        StaticTransportRouting::new(vec![]),
+        RecordingKeyPackages::default(),
+    )
+    .with_maintenance_sources(
+        wall.clone(),
+        monotonic.clone(),
+        Arc::new(TestRandom::new(0)),
+    );
+    let (group_id, _) = runtime
+        .create_group(CreateGroupRequest {
+            name: "rechecked".into(),
+            description: String::new(),
+            members: Vec::new(),
+            required_features: Vec::new(),
+            app_components: Vec::new(),
+            initial_admins: Vec::new(),
+        })
+        .await
+        .unwrap();
+    // No periodic rotation stands in for the recheck.
+    if let Some(mut state) = runtime.session().group_maintenance(&group_id).unwrap() {
+        state.periodic_enrolled = false;
+        state.next_periodic_rotation_at = None;
+        runtime.session().put_group_maintenance(&state).unwrap();
+    }
+    // The run publishes the KeyPackage and checks the group's components.
+    runtime.run_due_maintenance().await.unwrap();
+    let due = runtime.maintenance_due(&[]).unwrap();
+    assert_eq!(due.at, Some(cgka_traits::Timestamp(start + 600)), "{due:?}");
+    assert!(!due.retry_while_owed, "{due:?}");
+
+    // 0.4 s before the recheck, it is due in a second, not now.
+    monotonic.set_millis(599_600);
+    wall.set(start + 599);
+    let due = runtime.maintenance_due(&[]).unwrap();
+    assert_eq!(due.at, Some(cgka_traits::Timestamp(start + 600)), "{due:?}");
+    assert!(!due.retry_while_owed, "{due:?}");
+
+    // Ten minutes on, with no run to recheck the group, it is owed. The only
+    // time left is the group's stored fanout bound, which is later.
+    for (elapsed_ms, now) in [(600_000, start + 600), (601_500, start + 601)] {
+        monotonic.set_millis(elapsed_ms);
+        wall.set(now);
+        let due = runtime.maintenance_due(&[]).unwrap();
+        assert!(due.retry_while_owed, "{due:?}");
+        assert!(due.at.is_none_or(|at| at.0 > now), "not due now: {due:?}");
+    }
+}
+
 /// mdk#3265: a published KeyPackage one relay refused is due again at that
 /// relay's stored backoff, 30 s after the attempt, not every 15 s.
 #[tokio::test]

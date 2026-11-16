@@ -787,6 +787,10 @@ pub struct AppClient {
     /// Fail the device-roster read that tells an unlink from a failed link.
     #[cfg(test)]
     pub(crate) test_fail_roster_read: bool,
+    /// Fail the epoch-gap read, so a maintenance run returns before session
+    /// maintenance.
+    #[cfg(test)]
+    pub(crate) test_fail_epoch_gap_read: bool,
     pub(crate) recovery_owner: recovery::AccountRecoveryOwner,
     /// Recovery's ledger side (mdk#2782): the runner's host state, the
     /// coverage recorder, epoch-gap evidence, and history notices and status.
@@ -6845,6 +6849,10 @@ impl AppClient {
 
     /// Every group currently held by the same bounded epoch-gap predicate.
     fn epoch_gap_held_groups(&self) -> Result<Vec<GroupId>, AppError> {
+        #[cfg(test)]
+        if self.test_fail_epoch_gap_read {
+            return Err(AppError::TransportClosed);
+        }
         let now_ms = recovery::wall_now_ms()?;
         let mut held = Vec::new();
         for group_id in self.runtime.live_group_ids()? {

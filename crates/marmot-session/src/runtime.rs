@@ -726,6 +726,13 @@ where
         self
     }
 
+    /// Replace the monotonic clock in place, for tests that drive a worker
+    /// which owns its runtime.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_monotonic_clock_for_test(&mut self, monotonic_clock: Arc<dyn MonotonicClock>) {
+        self.monotonic_clock = monotonic_clock;
+    }
+
     /// Replace the maintenance scheduling windows. Production runtimes keep
     /// [`MaintenanceTiming::default`]; this exists for test harnesses only.
     pub fn with_maintenance_timing(mut self, timing: MaintenanceTiming) -> Self {

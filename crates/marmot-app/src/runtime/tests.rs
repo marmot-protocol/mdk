@@ -4209,6 +4209,48 @@ async fn owed_session_maintenance_retries_15_s_apart_not_back_to_back() {
     runtime.shutdown().await;
 }
 
+/// A group whose component recheck stays overdue, because each run returns
+/// before session maintenance checks it again, is owed work, retried 15 s
+/// after the last run. Reported as due now, it read as new work on every
+/// re-read, and maintenance ran about once a second (mdk#3265).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_overdue_component_recheck_runs_maintenance_at_most_once_per_15_s() {
+    let root = tempfile::tempdir().expect("tempdir");
+    AccountHome::open(root.path())
+        .create_account("alice")
+        .expect("create alice");
+    let app = MarmotApp::with_relay(root.path(), "wss://relay.example")
+        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+    let runtime = app.runtime();
+    runtime.reconcile_accounts().await.expect("alice starts");
+    runtime
+        .create_group("alice", "rechecked", &[], None)
+        .await
+        .expect("alice creates a group");
+    runtime
+        .accounts()
+        .overdue_component_recheck_for_test("alice")
+        .await
+        .expect("the recheck is held overdue");
+    let runs = || startup_stage_snapshot(&runtime, RuntimeOp::WorkerMaintenanceDue).completed;
+    let before = runs();
+    // Real time: the worker reads wall seconds from the system clock, so a
+    // held tokio clock cannot show a due time that moves with now. Within
+    // 5 s at most one run may come, the owed retry; a second is a spin.
+    let second_run = timeout(Duration::from_secs(5), async {
+        while runs() < before + 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    assert!(
+        second_run.is_err(),
+        "maintenance runs at most once per 15 s, not {} times within 5 s",
+        runs() - before
+    );
+    runtime.shutdown().await;
+}
+
 /// The worker re-reads when session maintenance next has work after a run
 /// and after a command that can change state, and not after a read
 /// (mdk#3265).

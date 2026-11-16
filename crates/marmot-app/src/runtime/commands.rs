@@ -342,6 +342,20 @@ impl AccountManager {
     }
 
     #[cfg(test)]
+    pub(super) async fn overdue_component_recheck_for_test(
+        &self,
+        account_ref: &str,
+    ) -> Result<(), AppError> {
+        let commands = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        commands
+            .send(AccountWorkerCommand::OverdueComponentRecheckForTest { respond })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        response.await.map_err(|_| AppError::TransportClosed)?
+    }
+
+    #[cfg(test)]
     pub(super) async fn unhydrated_group_count_for_test(
         &self,
         account_ref: &str,

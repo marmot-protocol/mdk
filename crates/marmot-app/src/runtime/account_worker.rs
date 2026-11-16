@@ -944,6 +944,14 @@ pub(crate) enum AccountWorkerCommand {
     UnlinkDeviceForTest {
         respond: oneshot::Sender<Result<(), AppError>>,
     },
+    /// Run maintenance once, so it checks every live group's components,
+    /// then hold every group's component recheck overdue: the session's
+    /// monotonic clock jumps an hour on, and each later run fails before
+    /// session maintenance would check again (mdk#3265).
+    #[cfg(test)]
+    OverdueComponentRecheckForTest {
+        respond: oneshot::Sender<Result<(), AppError>>,
+    },
     /// Whether the worker runs a recovery runner, and if so one explicit pass
     /// of it, awaited off the worker. `None` without a runner.
     #[cfg(test)]
@@ -3755,6 +3763,25 @@ fn session_maintenance_late(
     timed || untimed
 }
 
+/// Serves [`AccountWorkerCommand::OverdueComponentRecheckForTest`].
+#[cfg(test)]
+async fn overdue_component_recheck_for_test(client: &mut AppClient) -> Result<(), AppError> {
+    /// The system's monotonic clock, an hour ahead.
+    #[derive(Debug, Default)]
+    struct HourAhead(marmot_session::SystemMonotonicClock);
+    impl marmot_session::MonotonicClock for HourAhead {
+        fn elapsed(&self) -> Duration {
+            self.0.elapsed() + Duration::from_secs(60 * 60)
+        }
+    }
+    client.run_due_maintenance().await?;
+    client
+        .runtime
+        .set_monotonic_clock_for_test(Arc::new(HourAhead::default()));
+    client.test_fail_epoch_gap_read = true;
+    Ok(())
+}
+
 #[cfg(test)]
 mod maintenance_change_tests {
     use super::{AccountWorkerCommand, ReadReply};
@@ -4857,6 +4884,11 @@ async fn handle_startup_hydration_command(
             let _ = reply(respond, client.mark_device_unlinked(), client);
         }
         #[cfg(test)]
+        AccountWorkerCommand::OverdueComponentRecheckForTest { respond } => {
+            let result = overdue_component_recheck_for_test(client).await;
+            let _ = reply(respond, result, client);
+        }
+        #[cfg(test)]
         AccountWorkerCommand::SubscribeReadStateForTest { respond } => {
             let _ = reply(respond, client.subscribe_read_state(), client);
         }
@@ -5923,6 +5955,12 @@ fn account_worker_command_future<'a>(
         #[cfg(test)]
         AccountWorkerCommand::UnlinkDeviceForTest { respond } => Box::pin(async move {
             let _ = reply(respond, client.mark_device_unlinked(), client);
+            true
+        }),
+        #[cfg(test)]
+        AccountWorkerCommand::OverdueComponentRecheckForTest { respond } => Box::pin(async move {
+            let result = overdue_component_recheck_for_test(client).await;
+            let _ = reply(respond, result, client);
             true
         }),
         #[cfg(test)]

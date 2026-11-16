@@ -5,7 +5,8 @@
 //! to sample) is [`MaintenanceDue::retry_while_owed`], which the worker
 //! retries 15 s after its last run while it lasts, as the tick did. Reporting
 //! such work as due "now" would read as new work on every re-read and run
-//! maintenance back to back.
+//! maintenance back to back. The one time computed from the current time, the
+//! 10-minute component recheck, follows the same rule once it is overdue.
 use super::*;
 
 /// The result of [`AccountDeviceRuntime::maintenance_due`].
@@ -83,14 +84,27 @@ where
                 };
                 let state = state.as_ref();
                 due.at_opt(state.and_then(|state| state.leaf_refresh_due_at));
-                // The component check repeats on its own interval.
-                match self.component_migration_checked_at.get(&group_id) {
-                    Some(checked) => {
-                        let wait = COMPONENT_MIGRATION_RECHECK
-                            .saturating_sub(elapsed.saturating_sub(*checked));
-                        due.at(Timestamp(now.0.saturating_add(wait.as_secs())));
+                // The component check repeats on its own interval, and the
+                // run skips a group whose own leaf is still being reconciled.
+                // An overdue check is owed, not due now: a time computed from
+                // now would read as new work on every re-read until a run
+                // checks the group, and some runs return before they do. A
+                // wait still to come is rounded up, so it never reads as now.
+                if !self.pending_leaf_reconciliations.contains_key(&group_id) {
+                    match self.component_migration_checked_at.get(&group_id) {
+                        Some(checked) => {
+                            let wait = COMPONENT_MIGRATION_RECHECK
+                                .saturating_sub(elapsed.saturating_sub(*checked));
+                            if wait.is_zero() {
+                                due.owed();
+                            } else {
+                                let secs = u64::try_from(wait.as_millis().div_ceil(1_000))
+                                    .unwrap_or(u64::MAX);
+                                due.at(Timestamp(now.0.saturating_add(secs)));
+                            }
+                        }
+                        None => due.owed(),
                     }
-                    None => due.owed(),
                 }
                 let Some(state) = state.filter(|state| state.periodic_enrolled) else {
                     continue;
