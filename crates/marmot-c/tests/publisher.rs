@@ -285,6 +285,7 @@ fn publisher_finishes_and_cancels() {
             CStr::from_ptr(final_message.plaintext).to_str().unwrap(),
             "hello world"
         );
+        assert!(!final_message.invalidated);
         marmot_app_message_record_list_free(messages);
         check(marmot_agent_publisher_finish(publisher, &mut summary));
         assert_eq!(CStr::from_ptr(*(*summary).message_ids), final_id.as_c_str());

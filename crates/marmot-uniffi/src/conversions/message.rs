@@ -32,6 +32,8 @@ pub struct AppMessageRecordFfi {
     pub recorded_at: u64,
     /// Local wall-clock time when this device observed the delivery.
     pub received_at: u64,
+    /// True when this raw row is retained only as an invalidated tombstone.
+    pub invalidated: bool,
 }
 
 impl From<AppMessageRecord> for AppMessageRecordFfi {
@@ -53,6 +55,7 @@ impl From<AppMessageRecord> for AppMessageRecordFfi {
             retention_expires_at: value.retention.and_then(|decision| decision.expires_at),
             recorded_at: value.recorded_at,
             received_at: value.received_at,
+            invalidated: value.invalidated,
         }
     }
 }

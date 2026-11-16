@@ -27,6 +27,10 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   that hosts must render as untrusted text (#3438). The layout and the
   `other_packages` array stride changed: rebuild clients with the matching
   header and library. `marmot_onboarding_snapshot_free` releases it.
+- `MarmotAppMessageRecord` gains a trailing `invalidated` flag (#3411), true
+  for raw rows retained as invalidated tombstones. `marmot_messages` and
+  message-subscription snapshots report the stored flag. The layout changed:
+  rebuild clients with the matching header and library.
 
 ### Added
 
