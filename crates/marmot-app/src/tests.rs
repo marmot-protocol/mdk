@@ -16871,36 +16871,61 @@ async fn a_drained_invalidation_event_withdraws_the_timeline_record() {
     let group_id_hex = hex::encode(group_id.as_slice());
     let source_message_id = MessageId::new(vec![0x5c; 32]);
     let source_message_id_hex = hex::encode(source_message_id.as_slice());
+    let reaction_source_message_id = MessageId::new(vec![0x6c; 32]);
+    let reaction_source_message_id_hex = hex::encode(reaction_source_message_id.as_slice());
 
-    app.record_account_app_event(
-        "alice",
-        &AppMessageProjection {
-            authority: None,
-            message_id_hex: "losing-branch-row".to_owned(),
-            source_message_id_hex: Some(source_message_id_hex),
-            direction: "received".to_owned(),
-            group_id_hex: group_id_hex.clone(),
-            sender: account.account_id_hex.clone(),
-            plaintext: "from the losing branch".to_owned(),
-            kind: MARMOT_APP_EVENT_KIND_CHAT,
-            tags: Vec::new(),
-            source_epoch: Some(1),
-            retention: None,
-            recorded_at: Some(11),
-            origin_commit_id: None,
-            moderation_grant: false,
-        },
-    )
-    .unwrap();
+    let losing_row = AppMessageProjection {
+        authority: None,
+        message_id_hex: "losing-branch-row".to_owned(),
+        source_message_id_hex: Some(source_message_id_hex),
+        direction: "received".to_owned(),
+        group_id_hex: group_id_hex.clone(),
+        sender: account.account_id_hex.clone(),
+        plaintext: "from the losing branch".to_owned(),
+        kind: MARMOT_APP_EVENT_KIND_CHAT,
+        tags: Vec::new(),
+        source_epoch: Some(1),
+        retention: None,
+        recorded_at: Some(11),
+        origin_commit_id: None,
+        moderation_grant: false,
+    };
+    app.record_account_app_event("alice", &losing_row).unwrap();
+    let reaction_row = AppMessageProjection {
+        message_id_hex: "losing-reaction-row".to_owned(),
+        source_message_id_hex: Some(reaction_source_message_id_hex),
+        plaintext: "+1".to_owned(),
+        kind: MARMOT_APP_EVENT_KIND_REACTION,
+        ..losing_row
+    };
+    app.record_account_app_event("alice", &reaction_row)
+        .unwrap();
+    let live_row = AppMessageProjection {
+        message_id_hex: "live-row".to_owned(),
+        source_message_id_hex: None,
+        plaintext: "live".to_owned(),
+        kind: MARMOT_APP_EVENT_KIND_CHAT,
+        ..reaction_row
+    };
+    app.record_account_app_event("alice", &live_row).unwrap();
 
     let effects = marmot_session::AccountDeviceEffects {
-        events: vec![cgka_traits::engine::GroupEvent::AppMessageInvalidated {
-            group_id: group_id.clone(),
-            message_id: source_message_id,
-            epoch: cgka_traits::EpochId(1),
-            reason: cgka_traits::engine::AppMessageInvalidationReason::LosingBranch,
-            decrypted_payload_ref: None,
-        }],
+        events: vec![
+            cgka_traits::engine::GroupEvent::AppMessageInvalidated {
+                group_id: group_id.clone(),
+                message_id: source_message_id,
+                epoch: cgka_traits::EpochId(1),
+                reason: cgka_traits::engine::AppMessageInvalidationReason::LosingBranch,
+                decrypted_payload_ref: None,
+            },
+            cgka_traits::engine::GroupEvent::AppMessageInvalidated {
+                group_id: group_id.clone(),
+                message_id: reaction_source_message_id,
+                epoch: cgka_traits::EpochId(1),
+                reason: cgka_traits::engine::AppMessageInvalidationReason::LosingBranch,
+                decrypted_payload_ref: None,
+            },
+        ],
         ..Default::default()
     };
     let summary = client
@@ -16912,6 +16937,18 @@ async fn a_drained_invalidation_event_withdraws_the_timeline_record() {
         !summary.projection_updates.is_empty(),
         "a drained withdrawal must reach live timeline subscribers"
     );
+    let raw_rows = app.messages("alice").unwrap();
+    let reaction = raw_rows
+        .iter()
+        .find(|row| row.message_id_hex == "losing-reaction-row")
+        .expect("raw reaction row");
+    assert_eq!(reaction.kind, MARMOT_APP_EVENT_KIND_REACTION);
+    assert!(reaction.invalidated);
+    let live = raw_rows
+        .iter()
+        .find(|row| row.message_id_hex == "live-row")
+        .expect("raw live row");
+    assert!(!live.invalidated);
     assert_eq!(
         app.timeline_messages_with_query(
             "alice",
