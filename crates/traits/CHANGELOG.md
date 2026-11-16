@@ -36,9 +36,9 @@
   `possible_exposure` and `target_may_hold_event` now read a row stored before the exposure bit by its stored status, as
   `RetryableUnavailable` with a failure that does not prove nothing was sent, or as a `Failed` with no stored failure
   (the first frozen-fanout writer's shape for every publish error), so such a row counts as exposed.
-- `OutboundFanout::set_queued_intent` names, before the fanout is first stored, the queued intent a pending commit was
-  drained from, and `queued_intent_id` reads it (mdk#2332). `validate_successor_of` keeps it unchanged; a row stored
-  without it reads as naming none.
+- `OutboundFanout::set_queued_intent` names, before the fanout is first stored, the queued intent a pending commit, an
+  application message or a proposal was drained from, and `queued_intent_id` reads it (mdk#2332).
+  `validate_successor_of` keeps it unchanged; a row stored without it reads as naming none.
 
 ## 0.17.0 - 2026-11-15
 

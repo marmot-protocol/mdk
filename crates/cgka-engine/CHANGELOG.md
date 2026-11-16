@@ -17,6 +17,8 @@
   with reason `not_delivered`.
 - `Engine::drained_queued_intent_id` returns the queued intent the drain prepared a pending commit from, for its frozen
   fanout to name (mdk#2332).
+- `Engine::retire_drained_queued_intent` retires the queued intent a drained application message or proposal came
+  from once its fanout resolves, and is a no-op for an intent already retired (mdk#2332).
 - `Engine::seeded_group_outbound_fanouts` reads a seeded-but-unhydrated group's stored fanouts without hydrating it,
   for deciding whether a delivery is worth hydrating the group for (mdk#2332). It is empty for a live, quarantined or
   unknown group.
@@ -36,6 +38,9 @@
   names it, so confirming the commit, refusing it for size or `publish_not_delivered` after a restart retires that
   intent instead of leaving it for the drain to prepare again (mdk#2332). A hydration that fails after restoring the
   link drops it with the rest of the restored pending state, so the intent is not left marked in flight.
+- Hydration also restores a drained application message's or proposal's link to its queued intent, from a stored
+  fanout naming an intent that is still queued, so a drain after a restart treats the intent as in flight instead of
+  preparing it again (mdk#2332).
 - Received NIP-22 comments (kind 1111 with a numeric lowercase `k` tag) carry their source-epoch encrypted-media
   secret through the same ingest and replay handoff as chat attachments (#3409).
 
