@@ -25609,10 +25609,6 @@ fn assert_group_catching_up<T: std::fmt::Debug>(
     }
 }
 
-/// mdk#2258: a device with unresolved epoch-gap recovery knows the group moved
-/// past its local epoch. Any commit it authors from there forks the group, so
-/// every group change is refused and the maintenance self-update waits, unless
-/// the user accepts the fork risk for that epoch.
 /// mdk#3265: the app's half of when session maintenance is due. An open
 /// epoch gap holds the group's self-update until 24 h after the gap opened,
 /// and a handed-over KeyPackage's expiry makes maintenance due then.
@@ -25671,6 +25667,10 @@ async fn the_app_due_read_holds_epoch_gaps_and_wakes_for_expiries() {
     assert!(due.at.is_some_and(|at| at.0 <= now + 120), "{due:?}");
 }
 
+/// mdk#2258: a device with unresolved epoch-gap recovery knows the group moved
+/// past its local epoch. Any commit it authors from there forks the group, so
+/// every group change is refused and the maintenance self-update waits, unless
+/// the user accepts the fork risk for that epoch.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn group_changes_refuse_while_epoch_gap_recovery_holds_the_group() {
     let dir = tempfile::tempdir().unwrap();

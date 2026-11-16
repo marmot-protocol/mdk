@@ -806,12 +806,12 @@ impl AccountDeviceSession {
         Ok(self.engine.uncount_outdated_private_key_packages()?)
     }
 
-    /// See [`cgka_engine::Engine::discard_private_key_packages`].
     /// When the earliest issued private KeyPackage expires.
     pub fn private_key_packages_next_expiry(&self) -> SessionResult<Option<u64>> {
         Ok(self.engine.private_key_packages_next_expiry()?)
     }
 
+    /// See [`cgka_engine::Engine::discard_private_key_packages`].
     pub fn discard_private_key_packages(
         &mut self,
         now: u64,

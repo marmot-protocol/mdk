@@ -147,8 +147,6 @@ where
         Ok(GroupRejoinStatus::Pending { attempts: 0 })
     }
 
-    /// Reserve one bounded recovery turn before the host resolves inbox routes.
-    /// Cancellation retains the durable retry deadline, never a reusable permit.
     /// When group recovery next has work, in unix seconds (mdk#3265): the
     /// earliest `retry_at` among the records [`Self::prepare_group_recovery`]
     /// would take, and whether a coordinator still has a grant or
@@ -184,6 +182,8 @@ where
         Ok((next, coordinating))
     }
 
+    /// Reserve one bounded recovery turn before the host resolves inbox routes.
+    /// Cancellation retains the durable retry deadline, never a reusable permit.
     pub fn prepare_group_recovery(&mut self) -> AccountResult<Vec<MemberId>> {
         self.recovery_turn.clear();
         if self.maintenance_paused {
