@@ -3,8 +3,9 @@
 //! the wave's terms, one publisher per Welcome, the abandoned wave's owed
 //! Welcomes and the counted inputs a run leaves alone. These own what only
 //! the worker decides: a wave of a group gone before it settles, the
-//! pending-deliveries read that waits for earlier waves (W8), and the client
-//! replacement and worker exits a wave can meet.
+//! pending-deliveries read that waits for earlier waves (W8), the client
+//! replacement and worker exits a wave can meet, and the bounded wait runtime
+//! shutdown gives a wave (L3).
 //!
 //! Each test holds a create's founding gift wrap on the relays, as hold 4's
 //! flip does, and the worker answers commands while it is held.
@@ -15,6 +16,13 @@ use tokio::sync::Notify;
 
 /// Alice's create with bob, whose founding Welcome waits on the relays.
 async fn held_founding_wave(dir: &tempfile::TempDir) -> (Alice<0>, GroupId) {
+    let (alice, bob) = alice_and_bob(dir).await;
+    let group = hold_founding_wave(&alice, &bob).await;
+    (alice, group)
+}
+
+/// Alice's runtime, with bob's account and KeyPackage ready for an invite.
+async fn alice_and_bob(dir: &tempfile::TempDir) -> (Alice<0>, marmot_account::AccountSummary) {
     let bob = AccountHome::open(dir.path()).create_account("bob").unwrap();
     let alice = alice_with_groups(dir, []).await;
     crate::tests::remember_test_member_inbox(
@@ -23,6 +31,12 @@ async fn held_founding_wave(dir: &tempfile::TempDir) -> (Alice<0>, GroupId) {
         "wss://relay.example",
     );
     alice.runtime.publish_key_package("bob").await.unwrap();
+    (alice, bob)
+}
+
+/// Alice creates a group with bob, and its founding Welcome waits on the
+/// relays.
+async fn hold_founding_wave(alice: &Alice<0>, bob: &marmot_account::AccountSummary) -> GroupId {
     alice
         .relay
         .block_next_publish_of_kind(transport_nostr_peeler::KIND_NIP59_GIFT_WRAP);
@@ -41,7 +55,7 @@ async fn held_founding_wave(dir: &tempfile::TempDir) -> (Alice<0>, GroupId) {
     timeout(SETTLE, alice.relay.wait_for_blocked_publish())
         .await
         .expect("the founding Welcome reaches its relays");
-    (alice, group)
+    group
 }
 
 /// Send a `Drain` to alice's worker, answered once every wave it started
@@ -109,6 +123,11 @@ pub(super) async fn close(runtime: &crate::MarmotAppRuntime) {
 
 /// How many times a gift wrap reached the relays.
 fn gift_wraps_published(relay: &ScriptedPushRelayClient) -> usize {
+    published_gift_wraps(relay).len()
+}
+
+/// The gift wraps that reached the relays, by event id, in order.
+fn published_gift_wraps(relay: &ScriptedPushRelayClient) -> Vec<String> {
     let gift_wraps = relay
         .attempted_events()
         .into_iter()
@@ -117,9 +136,40 @@ fn gift_wraps_published(relay: &ScriptedPushRelayClient) -> usize {
         .collect::<std::collections::HashSet<_>>();
     relay
         .published_event_ids()
-        .iter()
-        .filter(|id| gift_wraps.contains(*id))
-        .count()
+        .into_iter()
+        .filter(|id| gift_wraps.contains(id))
+        .collect()
+}
+
+/// Start alice's next runtime over the same root and relay, and wait for
+/// its startup retry, the first wave, to settle.
+async fn restart(
+    dir: &tempfile::TempDir,
+    relay: &Arc<ScriptedPushRelayClient>,
+) -> crate::MarmotAppRuntime {
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    let runtime = crate::MarmotAppRuntime::new(app);
+    runtime.reconcile_accounts().await.unwrap();
+    crate::worker_fences::worker_startup_finished(&runtime, "alice")
+        .await
+        .unwrap();
+    timeout(SETTLE, drain(&runtime).await)
+        .await
+        .unwrap()
+        .unwrap();
+    runtime
+}
+
+/// Wait until `runtime` has begun shutting down.
+async fn until_stopping(runtime: &crate::MarmotAppRuntime) {
+    timeout(SETTLE, async {
+        while !runtime.is_stopping() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("shutdown begins");
 }
 
 /// The undelivered Welcomes of `group` the host is shown.
@@ -377,22 +427,164 @@ async fn a_client_replacement_abandons_a_held_wave_and_its_welcome_is_sent_once(
     close(&runtime).await;
 }
 
-/// L2, shutdown: a held wave doesn't keep the worker from returning, and
-/// its Welcome stays owed. A pending-deliveries read waiting for the wave is
-/// answered with the error a queued command gets (W8). The next start's
-/// startup retry sends the Welcome.
+/// L3: a wave whose publish ends within the shutdown bound settles before
+/// the worker returns. A pending-deliveries read waiting for it answers with
+/// its list (W8), the settle's audit row lands before the recording's stop
+/// row, the Welcome is recorded as delivered, and the next start sends
+/// nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn shutdown_ends_a_held_wave_and_the_next_start_sends_its_welcome() {
+async fn shutdown_settles_a_wave_that_ends_within_the_bound() {
     let dir = tempfile::tempdir().unwrap();
-    let (Alice { relay, runtime, .. }, _) = held_founding_wave(&dir).await;
+    let (alice, bob) = alice_and_bob(&dir).await;
+    alice
+        .runtime
+        .set_audit_log_settings(crate::AuditLogSettings { enabled: true })
+        .await
+        .unwrap();
+    let group = hold_founding_wave(&alice, &bob).await;
+    let Alice {
+        app,
+        relay,
+        runtime,
+        ..
+    } = alice;
     let listed = read_pending(&runtime).await;
     // The worker takes commands in order: once this one answers, it has
     // taken the read, which waits for the held wave.
     runtime.publish_key_package("alice").await.unwrap();
-    timeout(SETTLE, runtime.shutdown_and_close())
+    let stopping = tokio::spawn({
+        let runtime = runtime.clone();
+        async move { runtime.shutdown().await }
+    });
+    until_stopping(&runtime).await;
+
+    relay.release_publish();
+    let listed = timeout(SETTLE, listed)
         .await
-        .expect("shutdown ends the held wave")
-        .unwrap();
+        .expect("the worker answers the read")
+        .unwrap()
+        .expect("the read answers with its list");
+    assert!(
+        listed
+            .iter()
+            .all(|pending| pending.group_id_hex != hex::encode(group.as_slice())),
+        "the wave settled its Welcome delivered before the read answered"
+    );
+    timeout(SETTLE, stopping).await.unwrap().unwrap();
+    assert_eq!(gift_wraps_published(&relay), 1);
+    let settled_before_stop = app.audit_log_files().unwrap().iter().any(|file| {
+        let events = std::fs::read_to_string(&file.path)
+            .unwrap()
+            .lines()
+            .map(|line| marmot_forensics::v5::Record::from_json(line.as_bytes()).unwrap())
+            .map(|record| record.fields().event.clone())
+            .collect::<Vec<_>>();
+        matches!(
+            events.last(),
+            Some(marmot_forensics::v5::Event::RecordingSessionStopped(stop))
+                if stop.reason == marmot_forensics::v5::RecordingStopReason::CleanRuntimeShutdown
+        ) && events.iter().any(|event| {
+            matches!(
+                event,
+                marmot_forensics::v5::Event::WelcomePublishFinished(_)
+            )
+        })
+    });
+    assert!(
+        settled_before_stop,
+        "the settle is recorded before the recording stops"
+    );
+    runtime.shutdown_and_close().await.unwrap();
+
+    let runtime = restart(&dir, &relay).await;
+    assert_eq!(
+        gift_wraps_published(&relay),
+        1,
+        "the settle recorded the Welcome, so the next start owes nothing"
+    );
+    close(&runtime).await;
+}
+
+/// L3 from the host's answer: a create's wave counts before the create
+/// answers, so a shutdown begun from that answer, before the wave has
+/// started, keeps the relay plane up while it publishes. The wave settles,
+/// and the next start owes nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_shutdown_begun_from_the_create_answer_waits_for_its_wave() {
+    let dir = tempfile::tempdir().unwrap();
+    let (Alice { relay, runtime, .. }, bob) = alice_and_bob(&dir).await;
+    let teardown = runtime.stall_shutdown_for_test(crate::runtime::ShutdownTestPhase::RelayPlane);
+    relay.block_next_publish_of_kind(transport_nostr_peeler::KIND_NIP59_GIFT_WRAP);
+    runtime
+        .create_group(
+            "alice",
+            "answered wave",
+            std::slice::from_ref(&bob.account_id_hex),
+            None,
+        )
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
+    let stopping = tokio::spawn({
+        let runtime = runtime.clone();
+        async move { runtime.shutdown().await }
+    });
+
+    timeout(SETTLE, relay.wait_for_blocked_publish())
+        .await
+        .expect("the founding Welcome reaches its relays");
+    assert!(
+        !teardown.was_entered(),
+        "the relay plane stays up while the wave publishes"
+    );
+    relay.release_publish();
+    timeout(SETTLE, teardown.wait_until_entered())
+        .await
+        .expect("the relay plane is torn down once the wave ends");
+    teardown.release();
+    timeout(SETTLE, stopping).await.unwrap().unwrap();
+    assert_eq!(gift_wraps_published(&relay), 1);
+    runtime.shutdown_and_close().await.unwrap();
+
+    let runtime = restart(&dir, &relay).await;
+    assert_eq!(
+        gift_wraps_published(&relay),
+        1,
+        "the settle recorded the Welcome, so the next start owes nothing"
+    );
+    close(&runtime).await;
+}
+
+/// L3 and L2: a wave that never answers doesn't hold the close, and keeps
+/// the relay plane up only until the shutdown bound, when exit cancels it.
+/// Its Welcome stays owed, a pending-deliveries read waiting for it gets the
+/// error a queued command gets (W8), and the next start sends it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_cancels_a_wave_held_past_the_bound_and_the_next_start_sends_its_welcome() {
+    let dir = tempfile::tempdir().unwrap();
+    let (Alice { relay, runtime, .. }, _) = held_founding_wave(&dir).await;
+    let listed = read_pending(&runtime).await;
+    runtime.publish_key_package("alice").await.unwrap();
+    let teardown = runtime.stall_shutdown_for_test(crate::runtime::ShutdownTestPhase::RelayPlane);
+    let started = Instant::now();
+    let closing = tokio::spawn({
+        let runtime = runtime.clone();
+        async move { runtime.shutdown_and_close().await }
+    });
+    timeout(SETTLE, teardown.wait_until_entered())
+        .await
+        .expect("the relay plane is torn down");
+    assert!(
+        runtime.storage_is_closed(),
+        "the close doesn't wait for the wave"
+    );
+    assert!(
+        started.elapsed() >= crate::WELCOME_WAVE_SHUTDOWN_WAIT,
+        "the relay plane stays up for the wave until the bound"
+    );
+    teardown.release();
+    timeout(SETTLE, closing).await.unwrap().unwrap().unwrap();
     assert!(
         matches!(
             timeout(SETTLE, listed)
@@ -405,18 +597,49 @@ async fn shutdown_ends_a_held_wave_and_the_next_start_sends_its_welcome() {
     relay.release_publish();
     assert_eq!(gift_wraps_published(&relay), 0);
 
-    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
-        .with_test_relay_client(relay.clone());
-    let runtime = crate::MarmotAppRuntime::new(app);
-    runtime.reconcile_accounts().await.unwrap();
-    crate::worker_fences::worker_startup_finished(&runtime, "alice")
-        .await
-        .unwrap();
+    let runtime = restart(&dir, &relay).await;
+    assert_eq!(gift_wraps_published(&relay), 1);
+    close(&runtime).await;
+}
+
+/// L3 after a terminal close: a wave that ends within the bound still
+/// reaches the relays, but its settle meets closed storage. Its Welcome
+/// stays owed, and the next start sends it once more as the same event. A
+/// recipient that already joined leaves its state as it was
+/// (`audit_v5_probe::tests::duplicate_delivery_does_not_rejoin`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_welcome_published_after_the_close_is_sent_once_more_at_the_next_start() {
+    let dir = tempfile::tempdir().unwrap();
+    let (Alice { relay, runtime, .. }, _) = held_founding_wave(&dir).await;
+    let closing = tokio::spawn({
+        let runtime = runtime.clone();
+        async move { runtime.shutdown_and_close().await }
+    });
+    timeout(SETTLE, async {
+        while !runtime.storage_is_closed() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("storage closes while the wave is held");
+
+    relay.release_publish();
+    timeout(SETTLE, closing).await.unwrap().unwrap().unwrap();
+    assert_eq!(
+        gift_wraps_published(&relay),
+        1,
+        "the wave reaches the relays after the close"
+    );
+
+    let runtime = restart(&dir, &relay).await;
+    let sent = published_gift_wraps(&relay);
+    assert_eq!(sent.len(), 2, "the next start sends it once more");
+    assert_eq!(sent[0], sent[1], "as the same event");
     timeout(SETTLE, drain(&runtime).await)
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(gift_wraps_published(&relay), 1);
+    assert_eq!(gift_wraps_published(&relay), 2, "and only once");
     close(&runtime).await;
 }
 

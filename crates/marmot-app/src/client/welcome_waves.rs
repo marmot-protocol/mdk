@@ -12,6 +12,13 @@
 //! stays owed. Maintenance retries its fanout record, and the next open's
 //! startup retry sends it.
 //!
+//! Every wave counts toward the app's waves in flight
+//! ([`WelcomeWavesInFlight`]) until its relay task ends or is aborted: a
+//! create's or an invite's from before its host is answered
+//! ([`AppClient::count_welcome_wave`]), any other from its start. Runtime
+//! shutdown keeps the relay plane up until none counts or its bound passes
+//! (L3).
+//!
 //! Two publishes stay on the writer: a pending create's first Welcome, which
 //! confirms its group, and `redeliver_welcome`. A caller that needs a wave's
 //! outcome before it goes on awaits the wave in place
@@ -23,6 +30,7 @@ use marmot_session::AccountDeviceEffects;
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use tokio::sync::watch;
 use tokio::task::{AbortHandle, JoinError, JoinHandle};
 
 /// What settling a wave does once its results are finished.
@@ -94,6 +102,42 @@ pub(crate) struct StartedWelcomeWave {
     pub(crate) tail: WelcomeWaveTail,
 }
 
+/// The Welcome waves whose relay tasks run, or whose create or invite has
+/// answered its host, across every client of one app (mdk#3466 L3). Runtime
+/// shutdown keeps the relay plane up while any counts.
+#[derive(Clone)]
+pub(crate) struct WelcomeWavesInFlight(Arc<watch::Sender<usize>>);
+
+impl Default for WelcomeWavesInFlight {
+    fn default() -> Self {
+        Self(Arc::new(watch::channel(0).0))
+    }
+}
+
+impl WelcomeWavesInFlight {
+    fn hold(&self) -> WelcomeWaveHold {
+        self.0.send_modify(|running| *running += 1);
+        WelcomeWaveHold(self.0.clone())
+    }
+
+    /// Wait until no wave's relay task runs, or until `deadline`.
+    pub(crate) async fn ended_by(&self, deadline: tokio::time::Instant) {
+        let mut running = self.0.subscribe();
+        let _ = tokio::time::timeout_at(deadline, running.wait_for(|running| *running == 0)).await;
+    }
+}
+
+/// One wave's count in [`WelcomeWavesInFlight`], held by its relay task, or
+/// by its create or invite from the host's answer until the wave started.
+#[must_use = "a wave counts only while its hold lives"]
+pub(crate) struct WelcomeWaveHold(Arc<watch::Sender<usize>>);
+
+impl Drop for WelcomeWaveHold {
+    fn drop(&mut self) {
+        self.0.send_modify(|running| *running -= 1);
+    }
+}
+
 /// Where a stashed create or invite delivery stands once its writer part
 /// is done.
 enum StashedDelivery {
@@ -105,9 +149,11 @@ enum StashedDelivery {
 
 /// Run `tasks` as one wave's relay task, or nothing when there are none.
 /// The task captures only the prepared publishes: each holds a transport
-/// handle, a clock and its exact attempts, nothing of the client.
+/// handle, a clock and its exact attempts, nothing of the client. It counts
+/// in `in_flight` until it ends or is aborted.
 fn spawn_welcome_wave(
     tasks: Vec<PreparedWelcomePublishTask>,
+    in_flight: &WelcomeWavesInFlight,
 ) -> Option<(WelcomeWaveRun, Vec<MessageId>)> {
     if tasks.is_empty() {
         return None;
@@ -116,9 +162,13 @@ fn spawn_welcome_wave(
         .iter()
         .flat_map(|task| task.message_ids().iter().cloned())
         .collect();
-    let run = WelcomeWaveRun(tokio::spawn(futures::future::join_all(
-        tasks.into_iter().map(PreparedWelcomePublishTask::run),
-    )));
+    let publishes =
+        futures::future::join_all(tasks.into_iter().map(PreparedWelcomePublishTask::run));
+    let hold = in_flight.hold();
+    let run = WelcomeWaveRun(tokio::spawn(async move {
+        let _hold = hold;
+        publishes.await
+    }));
     Some((run, message_ids))
 }
 
@@ -131,6 +181,15 @@ impl AppClient {
         self.runtime.set_detached_welcome_waves(true);
     }
 
+    /// Count the wave a create or an invite is about to start, before its
+    /// host is answered (mdk#3466 L3). A shutdown the host begins from that
+    /// answer then keeps the relay plane up for the wave. Drop the hold once
+    /// [`Self::start_unpublished_welcome_delivery`] returns: by then the wave
+    /// counts on its own, or none started.
+    pub(crate) fn count_welcome_wave(&self) -> WelcomeWaveHold {
+        self.app.welcome_waves_in_flight.hold()
+    }
+
     /// The waves started since the last call, in the order they started. A
     /// wave the runtime released since (a confirmed commit's, a maintenance
     /// pass's) is started here.
@@ -141,7 +200,9 @@ impl AppClient {
 
     fn start_released_welcome_waves(&mut self) {
         for task in self.runtime.take_prepared_welcome_tasks() {
-            if let Some((run, message_ids)) = spawn_welcome_wave(vec![task]) {
+            if let Some((run, message_ids)) =
+                spawn_welcome_wave(vec![task], &self.app.welcome_waves_in_flight)
+            {
                 self.started_welcome_waves.push(StartedWelcomeWave {
                     run,
                     message_ids,
@@ -216,6 +277,7 @@ impl AppClient {
                 };
                 self.pending_runtime_group_subscription_refresh = true;
                 let step = self.lane_step(crate::RuntimePerformanceOperation::RouteRefresh);
+                let in_flight = self.app.welcome_waves_in_flight.clone();
                 let register = async {
                     let started = Instant::now();
                     let result = adapter
@@ -242,7 +304,8 @@ impl AppClient {
                         .map_err(AppError::from);
                     // Detached, the publish only prepared the wave: start it
                     // now, beside the route sync, as the inline publish ran.
-                    let run = spawn_welcome_wave(self.runtime.take_prepared_welcome_tasks());
+                    let run =
+                        spawn_welcome_wave(self.runtime.take_prepared_welcome_tasks(), &in_flight);
                     if run.is_none() {
                         record_app_performance(
                             telemetry,
@@ -290,7 +353,10 @@ impl AppClient {
                     )
                     .await
                     .map_err(AppError::from);
-                let run = spawn_welcome_wave(self.runtime.take_prepared_welcome_tasks());
+                let run = spawn_welcome_wave(
+                    self.runtime.take_prepared_welcome_tasks(),
+                    &self.app.welcome_waves_in_flight,
+                );
                 if run.is_none() {
                     record_app_performance(
                         telemetry,
@@ -386,7 +452,9 @@ impl AppClient {
                 crate::ProductUnit::Attempt,
             )
         };
-        if let Some((run, message_ids)) = spawn_welcome_wave(vec![task]) {
+        if let Some((run, message_ids)) =
+            spawn_welcome_wave(vec![task], &self.app.welcome_waves_in_flight)
+        {
             self.started_welcome_waves.push(StartedWelcomeWave {
                 run,
                 message_ids,
@@ -552,5 +620,46 @@ impl AppClient {
             return true;
         }
         self.ensure_group(group_id).is_err() && self.host_may_see_group(group_id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::WelcomeWavesInFlight;
+    use std::time::Duration;
+    use tokio::time::Instant;
+
+    /// L3's shutdown gate: with no wave in flight it doesn't wait; with one,
+    /// it waits until the wave's relay task ends, or until the deadline.
+    #[tokio::test(start_paused = true)]
+    async fn the_shutdown_gate_waits_only_while_a_wave_runs_and_until_its_deadline() {
+        let in_flight = WelcomeWavesInFlight::default();
+        let start = Instant::now();
+        in_flight.ended_by(start + Duration::from_secs(2)).await;
+        assert_eq!(Instant::now(), start, "no wave in flight, no wait");
+
+        let wave = in_flight.hold();
+        let opened = tokio::spawn({
+            let in_flight = in_flight.clone();
+            async move {
+                in_flight.ended_by(start + Duration::from_secs(2)).await;
+                Instant::now()
+            }
+        });
+        tokio::time::advance(Duration::from_secs(1)).await;
+        drop(wave);
+        assert_eq!(
+            opened.await.unwrap(),
+            start + Duration::from_secs(1),
+            "the gate opens when the last wave ends"
+        );
+
+        let _still_running = in_flight.hold();
+        in_flight.ended_by(start + Duration::from_secs(3)).await;
+        assert_eq!(
+            Instant::now(),
+            start + Duration::from_secs(3),
+            "a wave still running holds the gate until the deadline"
+        );
     }
 }

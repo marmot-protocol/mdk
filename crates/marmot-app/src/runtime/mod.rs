@@ -55,7 +55,7 @@ use crate::{
     ReceivedMessage, RecoveryWords, RelayTelemetryExportConfig, RelayTelemetryRuntimeConfig,
     RelayTelemetrySettings, RetentionSweepReport, SecureDeleteExpiredResult, SendSummary,
     TimelineMessageQuery, TimelineMessageRecord, TimelinePage, UserDirectoryRefresh,
-    UserProfileMetadata, default_profile_pseudonym, unix_now_seconds,
+    UserProfileMetadata, WELCOME_WAVE_SHUTDOWN_WAIT, default_profile_pseudonym, unix_now_seconds,
 };
 use marmot_observability::{
     AppPerformanceOperation, AppPerformanceTelemetry, SyncErrorClass, SyncFailureClassification,
@@ -863,6 +863,9 @@ struct RuntimeLifecycleInner {
     stopping: AtomicBool,
     running: AtomicBool,
     stop_tx: watch::Sender<bool>,
+    /// When shutdown began: Welcome waves in flight get the shutdown bound
+    /// from here (mdk#3466 L3).
+    shutdown_began: std::sync::OnceLock<tokio::time::Instant>,
     active_account_opens: AtomicUsize,
     account_opens_drained: Notify,
 }
@@ -880,6 +883,7 @@ impl RuntimeLifecycle {
                 stopping: AtomicBool::new(false),
                 running: AtomicBool::new(false),
                 stop_tx,
+                shutdown_began: std::sync::OnceLock::new(),
                 active_account_opens: AtomicUsize::new(0),
                 account_opens_drained: Notify::new(),
             }),
@@ -887,12 +891,28 @@ impl RuntimeLifecycle {
     }
 
     pub(crate) fn begin_shutdown(&self) -> bool {
+        // Record the start before the latch, so every caller that sees the
+        // runtime stopping, a concurrent one included, sees the same
+        // Welcome-wave deadline (mdk#3466 L3).
+        self.inner
+            .shutdown_began
+            .get_or_init(tokio::time::Instant::now);
         let was_stopping = self.inner.stopping.swap(true, Ordering::AcqRel);
         self.inner.running.store(false, Ordering::Release);
         if !was_stopping {
             self.inner.stop_tx.send_replace(true);
         }
         !was_stopping
+    }
+
+    /// When the Welcome waves still in flight are cancelled: the shutdown
+    /// bound after shutdown began, shared by the runtime and every worker
+    /// (mdk#3466 L3). None before shutdown begins.
+    pub(crate) fn welcome_wave_deadline(&self) -> Option<tokio::time::Instant> {
+        self.inner
+            .shutdown_began
+            .get()
+            .map(|began| *began + WELCOME_WAVE_SHUTDOWN_WAIT)
     }
 
     pub(crate) fn mark_running(&self) {
@@ -6812,6 +6832,17 @@ impl MarmotAppRuntime {
             self.accounts.shutdown().await;
         };
         let relay_plane = async {
+            // Welcome waves publish through the relay plane: keep it up
+            // until none counts or the shutdown bound passes (mdk#3466 L3).
+            // A create's or invite's wave counts from before its host was
+            // answered, so a shutdown begun from that answer waits for it.
+            if let Some(deadline) = self.shared.lifecycle().welcome_wave_deadline() {
+                self.accounts
+                    .app
+                    .welcome_waves_in_flight
+                    .ended_by(deadline)
+                    .await;
+            }
             #[cfg(test)]
             self.stall_shutdown_phase_for_test(ShutdownTestPhase::RelayPlane)
                 .await;
@@ -6877,6 +6908,14 @@ impl MarmotAppRuntime {
     /// statement holding a connection guard and rolls an uncommitted
     /// transaction back on close; later work sees `Closed` and cannot reopen
     /// storage.
+    ///
+    /// Welcome waves still publishing, or about to after their create or
+    /// invite answered, keep the relay plane up in the graceful
+    /// phase, until none counts or `WELCOME_WAVE_SHUTDOWN_WAIT` after shutdown
+    /// began (mdk#3466 L3), so the close never waits for them. A wave that
+    /// settles there meets closed storage: a Welcome it delivered stays owed,
+    /// and the next start sends it once more. A recipient who already joined
+    /// drops that duplicate.
     ///
     /// **Terminal.** This runtime and the [`MarmotApp`] it came from are done:
     /// every later database access fails with

@@ -1957,6 +1957,12 @@ async fn run_app_runtime_account_worker(
         tokio::select! {
             biased;
             _ = wait_for_runtime_shutdown(&mut lifecycle_shutdown) => {
+                // The waves in flight get the shutdown bound to finish
+                // before exit cancels the rest (mdk#3466 L3). Their settles
+                // are recorded before the audit stop row.
+                if let Some(deadline) = lifecycle.welcome_wave_deadline() {
+                    welcome_runs.settle_until(&mut client, &shared, deadline).await;
+                }
                 client.finish_audit_recording();
                 stop_recovery_runner(&mut recovery_runner, &mut client).await;
                 break 'worker;
@@ -5648,6 +5654,13 @@ fn account_worker_command_future<'a>(
                 }
             };
             let response_handoff_started_at = Instant::now();
+            let created = result
+                .as_ref()
+                .is_ok_and(|result| result.operation.is_some());
+            // The wave counts before the host hears of the create, by event
+            // or reply, so a shutdown begun from either waits for it
+            // (mdk#3466 L3).
+            let wave_counted = created.then(|| client.count_welcome_wave());
             if let Ok(crate::GroupMemberResult {
                 operation: Some(created_group),
                 ..
@@ -5661,9 +5674,6 @@ fn account_worker_command_future<'a>(
                     created_group,
                 );
             }
-            let created = result
-                .as_ref()
-                .is_ok_and(|result| result.operation.is_some());
             let response_sent =
                 respond_diagnosed(shared, storage_permit.as_ref(), respond, result, client).is_ok();
             telemetry.record(
@@ -5686,6 +5696,7 @@ fn account_worker_command_future<'a>(
                         let running = client
                             .start_unpublished_welcome_delivery(Some(&telemetry))
                             .await;
+                        drop(wave_counted);
                         publish_pending_welcome_delivery_events(
                             events,
                             account_id_hex,
@@ -6154,6 +6165,10 @@ fn account_worker_command_future<'a>(
                     summary.accept_disposition == cgka_traits::SendAcceptDisposition::Published
                 })
             });
+            // The wave counts before the host hears of the invite, by event
+            // or reply, so a shutdown begun from either waits for it
+            // (mdk#3466 L3).
+            let wave_counted = canonical.then(|| client.count_welcome_wave());
             if canonical {
                 publish_client_pending_projection_updates(
                     client,
@@ -6186,6 +6201,7 @@ fn account_worker_command_future<'a>(
                         let _ = client
                             .start_unpublished_welcome_delivery(Some(&telemetry))
                             .await;
+                        drop(wave_counted);
                         publish_pending_welcome_delivery_events(
                             events,
                             account_id_hex,

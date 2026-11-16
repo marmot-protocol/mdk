@@ -527,6 +527,13 @@ const APP_RUNTIME_LONG_WORKER_RESPONSE_WAIT: Duration = Duration::from_secs(16 *
 /// results are best-effort, so a slow indexer must not stall login.
 pub(crate) const ACCOUNT_SETUP_ADVISORY_WAIT: Duration = Duration::from_secs(10);
 const APP_RUNTIME_ACCOUNT_SHUTDOWN_WAIT: Duration = Duration::from_secs(5);
+/// How long runtime shutdown leaves the Welcome waves in flight to finish,
+/// counted from the moment shutdown begins (mdk#3466 L3). Without a
+/// background task iOS gives a backgrounded app about five seconds, and the
+/// account worker is aborted after `APP_RUNTIME_ACCOUNT_SHUTDOWN_WAIT`. A
+/// healthy relay answers a Welcome within a round trip; a slower one's
+/// Welcome stays owed, and the next start's retry sends it.
+const WELCOME_WAVE_SHUTDOWN_WAIT: Duration = Duration::from_secs(2);
 const APP_RUNTIME_RELAY_REBUILD_LOOKBACK: Duration = Duration::from_secs(120);
 /// Maximum amount the persisted transport cursor may run ahead of local
 /// wall-clock. The cursor is advanced from the inbound message timestamp, which
@@ -609,6 +616,9 @@ pub struct MarmotApp {
     block_list_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     moderation_reports: Arc<moderation_reports::ModerationReportState>,
     pub(crate) block_list_updates: Arc<tokio::sync::watch::Sender<u64>>,
+    /// The Welcome waves whose relay tasks run, across this app's clients:
+    /// runtime shutdown keeps the relay plane up for them (mdk#3466 L3).
+    pub(crate) welcome_waves_in_flight: client::welcome_waves::WelcomeWavesInFlight,
     #[cfg(test)]
     notification_dispatches: Arc<std::sync::atomic::AtomicUsize>,
     root: PathBuf,
@@ -2021,6 +2031,7 @@ impl MarmotApp {
             block_list_locks: Arc::default(),
             moderation_reports: Arc::default(),
             block_list_updates: Arc::new(tokio::sync::watch::channel(0).0),
+            welcome_waves_in_flight: Default::default(),
             account_storages: Arc::new(Mutex::new(HashMap::new())),
             account_open_progress: Arc::default(),
             account_media_stores: Arc::new(Mutex::new(HashMap::new())),
@@ -2148,6 +2159,7 @@ impl MarmotApp {
             block_list_locks: Arc::default(),
             moderation_reports: Arc::default(),
             block_list_updates: Arc::new(tokio::sync::watch::channel(0).0),
+            welcome_waves_in_flight: Default::default(),
             account_storages: Arc::new(Mutex::new(HashMap::new())),
             account_open_progress: Arc::default(),
             account_media_stores: Arc::new(Mutex::new(HashMap::new())),

@@ -627,9 +627,9 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   (W8): a read after a create or invite sees that wave's first attempt settled, as it did when the worker published
   inline. A wave started after the worker took the read up never extends its wait. A wait answers where its last
   wave settles: on the writer, or on the replaced client before the reconnect backoff. One parked at exit gets the
-  error a queued command gets. A wait whose waves settle as shutdown begins may answer with its result, or with a
-  storage error once `shutdown_and_close` has closed storage; a reply's precedence over shutdown is not a host
-  contract. Every task that
+  error a queued command gets. At runtime shutdown a wait whose waves settle within the bound (L3) answers with its
+  result, or with a storage error once `shutdown_and_close` has closed storage; a reply's precedence over shutdown is
+  not a host contract. Every task that
   runs beside the writer keeps these:
   - T1: it holds nothing of the writer's: no borrow of the client and no handle on the engine, the session, account
     storage, the published read state or the account's subscriptions. A Welcome run holds the adapter, a clock, its
@@ -645,6 +645,14 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
     an abandoned wave's Welcomes stay owed for the next client's maintenance.
   - L2: shutdown, sign-out and unlink cancel every task and wait for it before the worker returns
     (`WelcomeRuns::end`). Undelivered Welcomes stay owed.
+  - L3: runtime shutdown first gives running Welcome waves one bound, `WELCOME_WAVE_SHUTDOWN_WAIT` after shutdown
+    began (`RuntimeLifecycle::welcome_wave_deadline`), shared by the runtime and every worker. The worker settles
+    each wave whose task ends by then (`WelcomeRuns::settle_until`); sign-out, unlink and replacement don't wait.
+    Each wave counts in `MarmotApp::welcome_waves_in_flight` until its relay task ends: a create's or invite's from
+    before the host hears of it, by event or reply (`AppClient::count_welcome_wave`), any other from its start.
+    `shutdown` tears the relay plane down only once none counts or the bound passes. The close never waits for a wave:
+    one that settles after `shutdown_and_close` closed storage leaves its Welcome owed, and the next start sends the
+    same event once more.
 - Send every host group-change command through the runtime's host-change entry points
   (`send_host_change_with_audit_context`, or `confirm_host_change_without_publish_with_audit_context` for an invite),
   never `send_with_audit_context` (mdk#2332). The commit's fanout then names the change, so a rollback after the
@@ -1126,7 +1134,7 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   one. The fetch never moves the obligation, so self-update timing stays the obligation's own.
 - Keep `MarmotAppRuntime::shutdown_and_close` the one terminal teardown for hosts whose process can be suspended: it
   closes admission, closes every SQLite database and releases the root runtime lease first, then gives graceful worker
-  cleanup a bounded budget. The terminal operation must outlive cancellation of its caller. `shutdown` alone does not
+  cleanup a bounded budget (Welcome waves get L3's bound there, never ahead of the close). The terminal operation must outlive cancellation of its caller. `shutdown` alone does not
   release file locks. Register every resource that can hold a lock in the root with `root_closers` while holding
   `begin_storage_open` admission (the engine's own `session.sqlite` connection included); `close_storage` closes that
   registry, not the handle caches. Closing is terminal — do not add a path that transparently reopens a database
