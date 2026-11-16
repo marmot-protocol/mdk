@@ -966,19 +966,15 @@ impl AccountWorkerCommand {
     /// owes, so the worker re-reads its due time after it (mdk#3265). Reads
     /// cannot, nor can the transport's subscription retry, which runs about
     /// once a second while relays are out of reach; anything not listed here
-    /// counts as a change.
+    /// counts as a change. A read that hydrates a group is not listed — the
+    /// group it makes live brings its own deadlines.
     fn may_change_maintenance(&self) -> bool {
         !matches!(
             self,
             Self::PreparedGroupImageStatus { .. }
                 | Self::PreparedGroupImages { .. }
-                | Self::Members { .. }
-                | Self::MemberIdsPage { .. }
-                | Self::GroupMlsState { .. }
-                | Self::GroupRoster { .. }
                 | Self::QuarantinedGroups { .. }
                 | Self::ExporterSecret { .. }
-                | Self::GroupRecoveryStatus { .. }
                 | Self::HistoryNotices { .. }
                 | Self::AccountRecoveryStatus { .. }
                 | Self::LinkedDevices { .. }
@@ -994,13 +990,11 @@ impl AccountWorkerCommand {
                 | Self::BackupHistoryAvailability { .. }
                 | Self::BackupSettings { .. }
                 | Self::GroupCommitDelivery { .. }
-                | Self::GroupAppComponent { .. }
                 | Self::PendingWelcomeDeliveries { .. }
                 | Self::KeyPackageMaintenanceStatus { .. }
                 | Self::DurablyOwnedKeyPackages { .. }
                 | Self::MaintenanceStatus { .. }
                 | Self::PeriodicMaintenancePolicy { .. }
-                | Self::GroupPushDebugInfo { .. }
                 | Self::RetryRuntimeGroupSubscriptions { .. }
         )
     }
@@ -1947,6 +1941,9 @@ async fn run_app_runtime_account_worker(
             && let Some(turn) = recovery_runner.as_mut().and_then(SpawnedRunner::ready_turn)
         {
             let _turn_unit = unit.time(UnitKind::RunnerTurn);
+            // A recovery turn can change what session maintenance owes, as
+            // the runner-turn arm's can.
+            maintenance_due_dirty = true;
             turn.serve(&mut client).await;
             publish_settled_recovery_copies(&mut client, &events, &account_id_hex, &account_label);
         }
@@ -3753,6 +3750,58 @@ fn session_maintenance_late(
     });
     let untimed = due.retry_while_owed && planned_wall.is_none();
     timed || untimed
+}
+
+#[cfg(test)]
+mod maintenance_change_tests {
+    use super::{AccountWorkerCommand, ReadReply};
+    use cgka_traits::GroupId;
+
+    /// A read that hydrates a group can make it live, which adds that group's
+    /// deadlines, so the worker re-reads the due time after it (mdk#3265).
+    #[test]
+    fn hydrating_reads_may_change_maintenance() {
+        let group_id = GroupId::new(vec![7; 32]);
+        let hydrating = [
+            AccountWorkerCommand::Members {
+                group_id: group_id.clone(),
+                respond: ReadReply::unobserved().0,
+            },
+            AccountWorkerCommand::MemberIdsPage {
+                group_ids: vec![group_id.clone()],
+                respond: ReadReply::unobserved().0,
+            },
+            AccountWorkerCommand::GroupMlsState {
+                group_id: group_id.clone(),
+                respond: ReadReply::unobserved().0,
+            },
+            AccountWorkerCommand::GroupRoster {
+                group_id: group_id.clone(),
+                respond: ReadReply::unobserved().0,
+            },
+            AccountWorkerCommand::GroupRecoveryStatus {
+                group_id: group_id.clone(),
+                respond: ReadReply::unobserved().0,
+            },
+            AccountWorkerCommand::GroupAppComponent {
+                group_id: group_id.clone(),
+                component_id: 1,
+                respond: ReadReply::unobserved().0,
+            },
+            AccountWorkerCommand::GroupPushDebugInfo {
+                group_id,
+                respond: ReadReply::unobserved().0,
+            },
+        ];
+        for (index, command) in hydrating.iter().enumerate() {
+            assert!(command.may_change_maintenance(), "hydrating read {index}");
+        }
+        // A read that hydrates nothing still changes nothing.
+        let quarantined = AccountWorkerCommand::QuarantinedGroups {
+            respond: ReadReply::unobserved().0,
+        };
+        assert!(!quarantined.may_change_maintenance());
+    }
 }
 
 #[cfg(test)]

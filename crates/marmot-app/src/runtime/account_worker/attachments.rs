@@ -883,8 +883,8 @@ pub(super) fn pass_owed_now(client: &AppClient, admission: &Admission) -> bool {
 /// tick gave it; `at` for the earliest deadline (the keep-media sweep, the
 /// hourly recheck, a compaction retry), due now when not yet set (a fresh
 /// worker); and `cleanup_changed` when this connection deleted media rows
-/// since the last batch. `None` when the batch cannot run: cursors frozen,
-/// or the account's storage unreadable.
+/// since the last batch. `None` when the batch cannot run (cursors frozen);
+/// storage that cannot be opened polls, so the job retries.
 struct HousekeepingWork {
     poll: bool,
     at: Option<TokioInstant>,
@@ -896,7 +896,15 @@ fn housekeeping_work(client: &AppClient, admission: &Admission) -> Option<Housek
     if client.app.config.cursor_persistence == crate::CursorPersistence::Frozen {
         return None;
     }
-    let storage = client.app.account_storage(&client.state.label).ok()?;
+    let Ok(storage) = client.app.account_storage(&client.state.label) else {
+        // Look again in 15 s, as the attachment pass does on a failed read,
+        // so a passing failure does not rest the job until an unrelated wake.
+        return Some(HousekeepingWork {
+            poll: true,
+            at: None,
+            cleanup_changed: false,
+        });
+    };
     let now = TokioInstant::now();
     let latches = &admission.latches;
     let compaction_flagged =

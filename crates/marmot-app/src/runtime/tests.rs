@@ -4210,7 +4210,15 @@ async fn session_maintenance_rereads_its_due_time_after_changes_only() {
     let runtime = MarmotAppRuntime::new(app.clone());
     runtime.accounts().reconcile().await.expect("alice starts");
     let count = |operation| startup_stage_snapshot(&runtime, operation).completed;
-    let reads = || count(RuntimeOp::WorkerMaintenanceNextDue);
+    // The watchdog's tick reads the due time once whenever no re-read is
+    // pending, and it ticks on real time, so a slow start can put a tick in
+    // any window below. Count only the reads the tick did not make: a
+    // re-read after a change happens at the top of the loop, before a tick
+    // can interleave, so within each window the difference is exact.
+    let reads = || {
+        i64::try_from(count(RuntimeOp::WorkerMaintenanceNextDue)).expect("count fits")
+            - i64::try_from(count(RuntimeOp::WorkerMaintenance)).expect("count fits")
+    };
     timeout(ACCOUNT_OPEN_TEST_DEADLINE, async {
         while count(RuntimeOp::WorkerMaintenanceDue) == 0 {
             tokio::task::yield_now().await;
@@ -4223,7 +4231,6 @@ async fn session_maintenance_rereads_its_due_time_after_changes_only() {
     let planned = reads();
     advance_held_clock(Duration::from_secs(2)).await;
     assert!(reads() > planned, "a run is followed by a re-read");
-    // All within one tick, so the watchdog's own read does not count.
     let settled = reads();
     advance_held_clock(Duration::from_secs(2)).await;
     assert_eq!(reads(), settled, "nothing changed");
