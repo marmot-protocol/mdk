@@ -87,7 +87,7 @@ c_mirror! {
 }
 
 c_mirror! {
-    /// The installed set and every entry that was not installed.
+    /// Installed set and skips. A skipped refresh may retain its earlier image.
     MarmotEmojiSetInstallResult from EmojiSetInstallResultFfi,
     free marmot_emoji_set_install_result_free {
         rec set: MarmotEmojiSet,
