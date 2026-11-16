@@ -6125,5 +6125,12 @@ fn idle_maintenance_checks_take_no_writer() {
     assert!(!app.has_legacy_attachment_work().unwrap());
     assert!(!app.has_database_held_avatars().unwrap());
     assert!(!app.has_file_backed_uploads().unwrap());
+    // Device-group upkeep (mdk#3479).
+    assert_eq!(app.expire_history_deliveries(1_000_000).unwrap(), 0);
+    let mark = app.recovery_coverage_mark().unwrap();
+    assert!(
+        app.record_recovery_coverage_since(&[], 1_000, mark)
+            .unwrap()
+    );
     assert_eq!(*writers.lock().unwrap(), 0);
 }

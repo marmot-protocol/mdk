@@ -613,7 +613,9 @@ impl<S: StorageProvider> Engine<S> {
     /// Stop counting every private KeyPackage that no longer advertises what
     /// one built now would, so upkeep issues replacements, as a published
     /// KeyPackage is replaced when the capabilities change. Their keys stay
-    /// until a Welcome consumes them or they expire. Returns how many.
+    /// until a Welcome consumes them or they expire. Returns how many. With
+    /// none outdated it reads only and opens no writer transaction, as each
+    /// maintenance pass asks (mdk#3479).
     pub fn uncount_outdated_private_key_packages(&mut self) -> Result<usize, EngineError> {
         let mut outdated = Vec::new();
         for record in self.issued_private_key_packages()? {
@@ -630,6 +632,9 @@ impl<S: StorageProvider> Engine<S> {
                     ..record
                 });
             }
+        }
+        if outdated.is_empty() {
+            return Ok(0);
         }
         self.storage.with_transaction(|storage| {
             let private = private_storage(storage)?;

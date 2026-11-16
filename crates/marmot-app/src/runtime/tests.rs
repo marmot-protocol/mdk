@@ -4320,8 +4320,9 @@ async fn idle_ticks_take_no_writer_and_spawn_no_housekeeping() {
 /// recovery key is kept, so no backup pass or condemned-blob delete can run,
 /// and history dispatch runs once at startup, then stops. Before, an absent
 /// backup schedule counted as due at once and dispatch retried every 15 s.
-/// The tick's session maintenance still runs device-group upkeep, which
-/// writes, so this does not check writers.
+/// The tick's device-group upkeep writes nothing either (mdk#3479); a
+/// settled device group's is checked in
+/// `a_settled_device_groups_maintenance_takes_no_writer`.
 #[cfg(feature = "test-policy-overrides")]
 #[tokio::test(flavor = "current_thread")]
 async fn idle_ticks_with_device_groups_and_no_backups_stop_history_dispatch() {
@@ -4339,6 +4340,11 @@ async fn idle_ticks_with_device_groups_and_no_backups_stop_history_dispatch() {
     assert!(
         idle.dispatched_at_startup > 0,
         "history dispatch ran at startup, before it knew backups were off"
+    );
+    assert_eq!(
+        (idle.app_writes, idle.session_writes),
+        (0, 0),
+        "an idle tick with device groups on takes no app- or session-storage writer"
     );
 
     // Keeping a recovery key configures backups: the next worker turn sees

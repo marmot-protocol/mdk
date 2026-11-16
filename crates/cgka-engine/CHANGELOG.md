@@ -36,6 +36,7 @@
 
 ### Fixed
 
+- `uncount_outdated_private_key_packages` opens no writer transaction when nothing is outdated (mdk#3479).
 - Hydration restores a pending commit's link to the queued intent it was drained from, from the frozen fanout that
   names it, so confirming the commit, refusing it for size or `publish_not_delivered` after a restart retires that
   intent instead of leaving it for the drain to prepare again (mdk#2332). A hydration that fails after restoring the

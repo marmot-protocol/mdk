@@ -52,6 +52,10 @@
 
 ### Fixed
 
+- `expire_history_deliveries`, `record_recovery_coverage_since` with no slices, `start_small_state` once started
+  and a `sync_small_state` pass that receives nothing and would change nothing take no writer transaction
+  (mdk#3479). A small-state pass with nothing received first runs its reads on a read snapshot; it returns the same
+  result, and the probe draws no change id from the rule.
 - NIP-22 comments (kind 1111 with a numeric lowercase `k` tag) project their parent and media, and accept author-only
   edits in the timeline and edit history. Lowercase `e`, not a quoted event's `q`, identifies the parent (#3409).
 - Comment media references protect cached epoch secrets while retained and retire their keys on the final prune,
