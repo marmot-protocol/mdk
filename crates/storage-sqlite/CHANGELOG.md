@@ -4,6 +4,10 @@
 
 ### Breaking changes
 
+- Account migration 0211 backfills encrypted-media source-epoch references for retained NIP-34 issues (kind 1621) and
+  marks their cached secrets retention-managed (#3410). A reference makes a retired epoch servable and storable
+  again; secrets already erased must be exported again. Account schema advances from 210 to 211; older binaries
+  refuse the upgraded database. Downgrade is unsupported.
 - Account migration 0210 adds `cgka_changes_not_delivered`: one row per group change given up after its call
   returned, kept until the user acknowledges it and deleted with its group (mdk#2332). Account schema advances from
   209 to 210; older binaries refuse the upgraded database. Downgrade is unsupported.
@@ -53,6 +57,8 @@
   edits in the timeline and edit history. Lowercase `e`, not a quoted event's `q`, identifies the parent (#3409).
 - Comment media references protect cached epoch secrets while retained and retire their keys on the final prune,
   including when damaged source tags no longer identify the comment (#3409).
+- NIP-34 issue (kind 1621) attachments keep their epoch's media secret when retention prunes the chat messages and
+  reactions of that epoch; the issue's own prune retires it (#3410).
 
 ## 0.17.0 - 2026-11-15
 

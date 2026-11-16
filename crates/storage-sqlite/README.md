@@ -140,6 +140,12 @@ preconditions: this read is not an atomic authorization for a later write.
 
 ## Migrations
 
+Migration 0211 backfills encrypted-media-v1 and v2 source-epoch references for retained NIP-34 issues (kind 1621),
+whose attachments recorded none before (#3410), and makes their epochs' cached secrets retention-managed. An epoch
+retired while only such issues still needed it becomes servable again, so the runtime can export and store its secret
+while the MLS state still holds it. Damaged source tags are skipped. Account schema advances to 211; older binaries
+refuse the upgraded database, and downgrade is unsupported.
+
 Migration 0208 repairs retained NIP-22 comments (kind 1111 with any lowercase `k` value that parses as a Rust `u64`).
 It restores their first lowercase `e` parent, media metadata and accepted author edits, admits their attachment sources
 and backfills missing attachment slots. Encrypted-media-v1 and v2 source-epoch references make cached secrets

@@ -37,7 +37,7 @@ use crate::{
     app::encrypted_media_secrets::{
         encrypted_media_component_ids, encrypted_media_secret_reference_epochs_for_message_tx,
         replace_encrypted_media_secret_references_for_parts_tx,
-        replace_encrypted_media_secret_references_tx,
+        replace_encrypted_media_secret_references_tx, retains_media_by_kind,
         retire_unreferenced_encrypted_media_secret_epochs_tx,
     },
     i64_to_u64, optional_u64_to_i64, tags_from_json, u64_to_i64, unix_now_seconds,
@@ -2010,10 +2010,8 @@ fn secure_prune_selected_app_events_tx(
                 group_id_hex,
                 &event.message_id_hex,
             )?);
-        } else if matches!(
-            event.kind,
-            MARMOT_APP_EVENT_KIND_CHAT | MARMOT_APP_EVENT_KIND_REACTION
-        ) && !encrypted_media_component_ids(&event.tags).is_empty()
+        } else if retains_media_by_kind(event.kind)
+            && !encrypted_media_component_ids(&event.tags).is_empty()
             && let Some(source_epoch) = event.source_epoch
         {
             retiring_media_epochs.insert(u64_to_i64(source_epoch)?);

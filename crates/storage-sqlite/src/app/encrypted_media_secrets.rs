@@ -162,6 +162,19 @@ WHERE group_id_hex = ?1
     }
 }
 
+/// NIP-34 issues carry attachments like chat messages (mdk#3410).
+const NIP34_ISSUE_KIND: u64 = 1621;
+
+/// Kinds whose encrypted `imeta` keeps its source epoch's secret by kind
+/// alone: chats and issues carry attachments, reactions NIP-30 emoji images.
+/// A NIP-22 comment also qualifies, but only with its `k` tag.
+pub(crate) fn retains_media_by_kind(kind: u64) -> bool {
+    matches!(
+        kind,
+        MARMOT_APP_EVENT_KIND_CHAT | MARMOT_APP_EVENT_KIND_REACTION | NIP34_ISSUE_KIND
+    )
+}
+
 pub(crate) fn encrypted_media_component_ids(tags: &[Vec<String>]) -> BTreeSet<u16> {
     let mut component_ids = BTreeSet::new();
     for tag in tags
@@ -242,9 +255,8 @@ pub(crate) fn replace_encrypted_media_secret_references_for_parts_tx(
     )
     .storage()?;
 
-    // Comments carry attachments; reactions carry NIP-30 custom emoji images.
     let comment = super::timeline::is_nip22_comment(kind, tags);
-    if (kind == MARMOT_APP_EVENT_KIND_CHAT || kind == MARMOT_APP_EVENT_KIND_REACTION || comment)
+    if (retains_media_by_kind(kind) || comment)
         && let Some(source_epoch) = source_epoch
     {
         let source_epoch = u64_to_i64(source_epoch)?;
@@ -685,9 +697,11 @@ mod tests {
         );
     }
 
+    // A comment's or issue's media key outlives the chat messages of its epoch
+    // and retires with the event itself, for good (mdk#3410).
     #[test]
-    fn comment_media_key_lifetime() {
-        for (version, component_id) in [
+    fn media_key_outlives_chat_prune() {
+        let formats = [
             (
                 ENCRYPTED_MEDIA_FORMAT_V1,
                 GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID,
@@ -696,24 +710,28 @@ mod tests {
                 ENCRYPTED_MEDIA_FORMAT_V2,
                 GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
             ),
-        ] {
+        ];
+        for ((version, component_id), kind) in formats
+            .into_iter()
+            .flat_map(|format| [1111, 1621].map(|kind| (format, kind)))
+        {
             let store = SqliteAccountStorage::in_memory().unwrap();
             let app = store.app_storage();
-            app.record_app_event(&media_event_with_versions("old", 10, 8, &[version]))
+            app.record_app_event(&media_event_with_versions("chat", 10, 7, &[version]))
                 .unwrap();
-            let mut comment = media_event_with_versions("comment", 20, 7, &[version]);
-            comment.kind = 1111;
-            comment.tags.push(vec!["k".into(), "9".into()]);
-            app.record_app_event(&comment).unwrap();
-            for epoch in [7, 8] {
-                app.remember_encrypted_media_epoch_secret("aa", component_id, epoch, &[1, 2, 3])
-                    .unwrap();
-            }
+            let mut retained = media_event_with_versions("retained", 20, 7, &[version]);
+            retained.kind = kind;
+            // A NIP-22 comment needs its k tag; an issue ignores it.
+            retained.tags.push(vec!["k".into(), "9".into()]);
+            app.record_app_event(&retained).unwrap();
+            app.remember_encrypted_media_epoch_secret("aa", component_id, 7, &[1, 2, 3])
+                .unwrap();
 
             let sweep = app
                 .secure_prune_app_events_before("aa", 15, "local", &no_mentions)
                 .unwrap();
-            assert_eq!(sweep.pruned_messages, 1);
+            assert_eq!(sweep.pruned_messages, 1, "kind {kind} {version}");
+            assert_eq!(sweep.pruned_media_epoch_secrets, 0, "kind {kind} {version}");
             assert!(
                 app.encrypted_media_epoch_secret_may_be_served("aa", 7)
                     .unwrap()
@@ -721,21 +739,28 @@ mod tests {
             assert_eq!(
                 app.encrypted_media_epoch_secret("aa", component_id, 7)
                     .unwrap(),
-                Some(vec![1, 2, 3])
+                Some(vec![1, 2, 3]),
+                "kind {kind} {version}"
             );
 
             let final_sweep = app
                 .secure_prune_app_events_before("aa", 21, "local", &no_mentions)
                 .unwrap();
-            assert_eq!(final_sweep.pruned_media_epoch_secrets, 1);
+            assert_eq!(
+                final_sweep.pruned_media_epoch_secrets, 1,
+                "kind {kind} {version}"
+            );
             assert!(
                 !app.encrypted_media_epoch_secret_may_be_served("aa", 7)
                     .unwrap()
             );
+            app.remember_encrypted_media_epoch_secret("aa", component_id, 7, &[1, 2, 3])
+                .unwrap();
             assert_eq!(
                 app.encrypted_media_epoch_secret("aa", component_id, 7)
                     .unwrap(),
-                None
+                None,
+                "kind {kind} {version}"
             );
         }
     }
