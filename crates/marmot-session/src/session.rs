@@ -1829,15 +1829,6 @@ impl AccountDeviceSession {
             .scheduled_self_remove_auto_commit_delay_ms(group_id)?)
     }
 
-    pub fn confirm_regenerated_queued_intent(
-        &mut self,
-        intent: &QueuedIntentRef,
-    ) -> SessionResult<()> {
-        Ok(self
-            .engine
-            .confirm_regenerated_queued_intent(&intent.intent_id)?)
-    }
-
     /// See `Engine::retire_drained_queued_intent`.
     pub fn retire_drained_queued_intent(&mut self, intent: &QueuedIntentRef) -> SessionResult<()> {
         Ok(self
