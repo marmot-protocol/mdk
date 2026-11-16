@@ -4176,6 +4176,9 @@ async fn owed_session_maintenance_retries_15_s_apart_not_back_to_back() {
     .await
     .expect("the first session maintenance run completes");
     let runs = count(RuntimeOp::WorkerMaintenanceDue);
+    // The run's retry is due 15 s after it started, so no later than 15 s
+    // from here on the worker's clock.
+    let after_run = tokio::time::Instant::now();
     // Ten seconds in one-second steps: past the re-read spacing each time,
     // short of the 15 s retry.
     for _ in 0..10 {
@@ -4186,14 +4189,23 @@ async fn owed_session_maintenance_retries_15_s_apart_not_back_to_back() {
         runs,
         "no run within 10 s"
     );
-    advance_held_clock(Duration::from_secs(6)).await;
+    // To 15 s and 1 ms: tokio rounds the retry's deadline up to its next
+    // millisecond (mdk#3462). The run then starts once real time crosses
+    // that boundary, so wait for it, then check it came within 1 s of the
+    // worker's clock: a retry later than that misses the 15 s cadence.
+    advance_held_clock(Duration::from_millis(5_001)).await;
     timeout(ACCOUNT_OPEN_TEST_DEADLINE, async {
         while count(RuntimeOp::WorkerMaintenanceDue) == runs {
             tokio::task::yield_now().await;
         }
     })
     .await
-    .expect("the owed work retries after 15 s");
+    .expect("the owed work retries");
+    let retried_after = after_run.elapsed();
+    assert!(
+        retried_after < Duration::from_secs(16),
+        "the owed work retries 15 s after its last run, not {retried_after:?}"
+    );
     runtime.shutdown().await;
 }
 

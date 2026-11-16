@@ -2160,6 +2160,9 @@ async fn run_app_runtime_account_worker(
                     Some(done) => {
                         let history_unsettled =
                             complete_media_http(&mut client, done, &shared, &media_http).await;
+                        // A finished upload can send its message, which can
+                        // leave relay retries the plan does not know yet.
+                        maintenance_due_dirty = true;
                         // Ordinary transfers return the same credits used by
                         // restore; resume only after completion released one.
                         dispatch_backup_restore(&mut client, &media_http);
