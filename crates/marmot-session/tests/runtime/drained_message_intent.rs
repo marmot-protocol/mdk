@@ -129,3 +129,59 @@ async fn a_drained_message_still_unanswered_after_a_restart_is_in_flight() {
     assert!(queued(&restarted, &fixture));
     assert_eq!(published_ids(&adapter).len(), 1);
 }
+
+/// The intent cannot be retired when its message is accepted. The app's
+/// acknowledgement of the message then keeps the fanout, the intent's only
+/// durable link to the sent message, so a restart treats the intent as in
+/// flight. The pass after it retires the intent, and only then does an
+/// acknowledgement delete the fanout.
+#[tokio::test]
+async fn a_drained_message_whose_intent_fails_to_retire_is_prepared_once() {
+    let relay = TransportEndpoint("wss://drained-cleanup.example".into());
+    let (fixture, alice) = FloorFixture::new("drained-cleanup", &[&relay]).await;
+    let adapter = RecordingAdapter::default();
+    let mut runtime = fixture.runtime(alice, &adapter);
+    queue_message(&mut runtime, &fixture).await;
+    let connection = rusqlite::Connection::open(&fixture.alice_path).unwrap();
+    storage_sqlite::open_hardened_sqlcipher(
+        &connection,
+        &SqlCipherKey::new(FLOOR_KEY).unwrap(),
+        storage_sqlite::SqlCipherHardening::cipher_only(),
+    )
+    .unwrap();
+    connection
+        .execute_batch(
+            "CREATE TRIGGER fail_intent_retirement BEFORE DELETE ON cgka_queued_outbound
+             BEGIN SELECT RAISE(ABORT, 'injected intent retirement failure'); END;",
+        )
+        .unwrap();
+
+    let sent = runtime.advance_convergence(&fixture.group_id).await.unwrap();
+    assert_eq!(sent.published_app_messages.len(), 1);
+    runtime
+        .acknowledge_published_app_messages(&sent.published_app_messages)
+        .unwrap();
+    assert!(queued(&runtime, &fixture));
+    assert_eq!(runtime.session().outbound_fanouts().unwrap().len(), 1);
+    drop(runtime);
+
+    connection
+        .execute_batch("DROP TRIGGER fail_intent_retirement;")
+        .unwrap();
+    drop(connection);
+    let mut restarted = fixture.runtime(fixture.reopen(), &adapter);
+    let resumed = restarted
+        .advance_convergence(&fixture.group_id)
+        .await
+        .unwrap();
+    assert!(!queued(&restarted, &fixture));
+    restarted
+        .acknowledge_published_app_messages(&resumed.published_app_messages)
+        .unwrap();
+    assert!(restarted.session().outbound_fanouts().unwrap().is_empty());
+    restarted
+        .advance_convergence(&fixture.group_id)
+        .await
+        .unwrap();
+    assert_eq!(published_ids(&adapter).len(), 1, "prepared once");
+}

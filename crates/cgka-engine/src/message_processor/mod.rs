@@ -1781,12 +1781,7 @@ impl<S: StorageProvider> Engine<S> {
         group_id: &GroupId,
         intent_id: &MessageId,
     ) -> Result<(), EngineError> {
-        let queued = self
-            .storage
-            .list_queued_outbound_intents(group_id)?
-            .iter()
-            .any(|record| &record.id == intent_id);
-        if queued {
+        if self.is_queued_outbound_intent(group_id, intent_id)? {
             self.storage.delete_queued_outbound_intent(intent_id)?;
         }
         self.queued_intent_by_message
@@ -2365,6 +2360,19 @@ impl<S: StorageProvider> Engine<S> {
     /// schedulers must keep a wakeup armed while any remain: the scheduled
     /// drain is what regenerates and publishes them (and, on an inactive
     /// transport, what triggers reactivation).
+    /// Whether this intent is still queued for the group: not yet retired.
+    pub fn is_queued_outbound_intent(
+        &self,
+        group_id: &GroupId,
+        intent_id: &MessageId,
+    ) -> Result<bool, EngineError> {
+        Ok(self
+            .storage
+            .list_queued_outbound_intents(group_id)?
+            .iter()
+            .any(|record| &record.id == intent_id))
+    }
+
     pub fn has_queued_outbound_intents(&self, group_id: &GroupId) -> Result<bool, EngineError> {
         Ok(!self
             .storage

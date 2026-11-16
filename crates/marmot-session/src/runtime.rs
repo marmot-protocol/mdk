@@ -4938,7 +4938,8 @@ where
     /// Until this acknowledgement arrives, restart drains replay the same
     /// publication metadata. App projection is idempotent, so a crash between
     /// its database commit and this call leaves a harmless replay instead of a
-    /// permanently pending message.
+    /// permanently pending message. A fanout whose queued intent has not
+    /// retired stays too, for the pass that retires it (mdk#2332).
     pub fn acknowledge_published_app_messages(
         &self,
         published_messages: &[PublishedApplicationMessage],
@@ -4957,6 +4958,7 @@ where
                     && outcome.accepted_targets > 0
                     && outcome.fanout_complete
                     && !matches!(fanout.mls_state(), FanoutMlsState::Pending(_))
+                    && !self.names_unretired_queued_intent(&fanout)?
                 {
                     self.session.delete_outbound_fanout(fanout.message_id())?;
                 }
@@ -5545,6 +5547,22 @@ where
     /// Returns false when the intent could not be deleted: the fanout must
     /// then stay stored, still naming it, for a later pass to retry, since a
     /// drain that found the intent unnamed would prepare it a second time.
+    /// Whether `fanout` names a queued intent that has not retired yet, as
+    /// after a failed retirement (mdk#2332). The fanout is then the intent's
+    /// only durable link to the message already sent, so it stays until a
+    /// later pass retires the intent; deleting it first would let a drain
+    /// after a restart prepare the intent again.
+    fn names_unretired_queued_intent(&self, fanout: &OutboundFanout) -> AccountResult<bool> {
+        let (Some(group_id), Some(intent_id)) = (fanout.group_id(), fanout.queued_intent_id())
+        else {
+            return Ok(false);
+        };
+        Ok(self.session.is_queued_outbound_intent(&QueuedIntentRef {
+            group_id: group_id.clone(),
+            intent_id: intent_id.clone(),
+        })?)
+    }
+
     fn retire_drained_queued_intent(&mut self, fanout: &OutboundFanout) -> bool {
         let outcome = fanout.outcome();
         let (Some(group_id), Some(intent_id)) = (fanout.group_id(), fanout.queued_intent_id())

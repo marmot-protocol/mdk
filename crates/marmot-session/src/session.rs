@@ -1697,6 +1697,13 @@ impl AccountDeviceSession {
         Ok(self.engine.retry_failed_convergence_pass(group_id)?)
     }
 
+    /// See `Engine::is_queued_outbound_intent`.
+    pub fn is_queued_outbound_intent(&self, intent: &QueuedIntentRef) -> SessionResult<bool> {
+        Ok(self
+            .engine
+            .is_queued_outbound_intent(&intent.group_id, &intent.intent_id)?)
+    }
+
     pub fn has_queued_outbound_intents(&self, group_id: &GroupId) -> SessionResult<bool> {
         Ok(self.engine.has_queued_outbound_intents(group_id)?)
     }
