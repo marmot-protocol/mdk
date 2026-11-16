@@ -31,6 +31,7 @@ Read the documentation at the tag matching your binaries; `master` can describe 
 - Messages and moderation: [deletion provenance and custom events](#deletion-provenance-and-custom-events),
   [group-system previews](#group-system-previews),
   [device-local membership events](#device-local-membership-events), [members are accounts](#members-are-accounts),
+  [group changes that were not applied](#group-changes-that-were-not-applied),
   [discarding a failed send](#discarding-a-failed-send), [undelivered Welcomes](#undelivered-welcomes),
   [turning on account devices](#turning-on-account-devices),
   [backup recovery and background conditions](#backup-recovery-and-background-conditions),
