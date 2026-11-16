@@ -164,8 +164,8 @@ async fn an_interrupted_online_read_waits_out_its_hour() {
 
 /// A queued change whose commit reached no relay is given up after a restart
 /// too, and retired: its frozen fanout names the intent it was drained from,
-/// so the rollback announces it as `not_delivered` and nothing sends it
-/// again.
+/// so the rollback records and announces it as `not_delivered` and nothing
+/// sends it again.
 #[tokio::test]
 async fn a_queued_change_given_up_after_a_restart_is_retired() {
     let refusing = TransportEndpoint("wss://abandon-queued-refusing.example".into());
@@ -231,6 +231,32 @@ async fn a_queued_change_given_up_after_a_restart_is_retired() {
         )),
         "{:?}",
         effects.events
+    );
+    assert!(
+        !effects
+            .events
+            .iter()
+            .any(|event| matches!(event, GroupEvent::GroupChangeNotDelivered { .. })),
+        "a queued change is announced as refused only"
+    );
+    let records = restarted
+        .group_changes_not_delivered(&fixture.group_id)
+        .unwrap();
+    assert!(
+        matches!(
+            records.as_slice(),
+            [cgka_traits::storage::ChangeNotDelivered {
+                commit_id,
+                origin: cgka_traits::storage::ChangeOrigin::QueuedIntent { intent_id: retired },
+                intent_kind,
+                reason,
+                ..
+            }] if commit_id == staged.message_id()
+                && *retired == intent_id
+                && intent_kind == "update_group_data"
+                && reason == "not_delivered"
+        ),
+        "the retirement records the change not delivered: {records:?}"
     );
     assert!(
         !restarted

@@ -4,6 +4,9 @@
 
 ### Breaking changes
 
+- Account migration 0210 adds `cgka_changes_not_delivered`: one row per group change given up after its call
+  returned, kept until the user acknowledges it and deleted with its group (mdk#2332). Account schema advances from
+  209 to 210; older binaries refuse the upgraded database. Downgrade is unsupported.
 - Account migration 0208 repairs retained NIP-22 comment parents, media and accepted author edits, and backfills
   attachment slots, encrypted-media source-epoch references and cached-secret retention management (#3409). Comment
   attachments join the live source view and insert trigger. Raw events, deleted

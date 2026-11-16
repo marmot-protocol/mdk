@@ -2,7 +2,7 @@
 #![allow(clippy::disallowed_methods)]
 
 use async_trait::async_trait;
-use cgka_engine::{Engine, EngineBuilder};
+use cgka_engine::{Engine, EngineBuilder, RollbackPass};
 use cgka_traits::capabilities::{CapabilityRequirement, Feature, GroupCapabilities};
 use cgka_traits::engine::{
     CgkaEngine, CreateGroupRequest, GroupEvent, GroupHydrationQuarantineReason, SendIntent,
@@ -1049,6 +1049,25 @@ impl OutboundIntentStorage for FlakyGroupRecordStorage {
     fn delete_own_commit_intent(&self, commit_id: &MessageId) -> StorageResult<()> {
         self.inner.delete_own_commit_intent(commit_id)
     }
+    fn put_change_not_delivered(
+        &self,
+        record: &cgka_traits::storage::ChangeNotDelivered,
+    ) -> StorageResult<()> {
+        self.inner.put_change_not_delivered(record)
+    }
+    fn changes_not_delivered(
+        &self,
+        group_id: &GroupId,
+    ) -> StorageResult<Vec<cgka_traits::storage::ChangeNotDelivered>> {
+        self.inner.changes_not_delivered(group_id)
+    }
+    fn delete_change_not_delivered(
+        &self,
+        group_id: &GroupId,
+        commit_id: &MessageId,
+    ) -> StorageResult<bool> {
+        self.inner.delete_change_not_delivered(group_id, commit_id)
+    }
 }
 
 impl OutboundFanoutStorage for FlakyGroupRecordStorage {
@@ -2044,7 +2063,7 @@ async fn pending_fanout_is_not_exposed_until_hydration_fully_succeeds() {
     let mut rollback_candidate = fanout.clone();
     assert!(matches!(
         reopened
-            .publish_failed_fanout(pending, &mut rollback_candidate)
+            .publish_failed_fanout(pending, &mut rollback_candidate, RollbackPass::Later)
             .await,
         Err(EngineError::UnknownGroup(id)) if id == group_id
     ));
@@ -2091,7 +2110,7 @@ async fn pending_fanout_is_not_exposed_until_hydration_fully_succeeds() {
         .put_outbound_fanout(&recovered_fanout)
         .expect("persist recovered failure");
     reopened
-        .publish_failed_fanout(pending, &mut recovered_fanout)
+        .publish_failed_fanout(pending, &mut recovered_fanout, RollbackPass::Later)
         .await
         .expect("recovered pending can roll back");
     assert_eq!(reopened.epoch(&group_id).unwrap(), baseline_epoch);

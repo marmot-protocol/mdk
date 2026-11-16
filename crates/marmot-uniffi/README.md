@@ -1201,6 +1201,32 @@ With `not_delivered`, the send's commit reached no relay and was rolled back:
 no relay accepted it, this device's record shows none can hold it, and at least
 ten minutes after the first send a relay's answer showed the device online.
 
+## Group changes that were not applied
+
+A group change can answer before MDK knows whether it reached the group: a
+direct change whose summary says `CompletionUnknown`, or a queued one that said
+`AcceptedPending`. MDK keeps sending it. When MDK later gives the change up
+instead (no relay received it, none would take it for its size, or every relay
+refused it), nothing reached members and nothing sends it again. MDK then keeps
+a record of it, and announces it: a direct change with
+`GroupEventKindFfi::GroupChangeNotDelivered { commit_id_hex, intent_kind,
+reason }`, a queued one with `QueuedIntentRefused` as above.
+
+The events are only notifications. `group_changes_not_delivered(account_ref,
+group_id_hex)` returns the group's records, oldest first, so a host that was not
+running, or missed the event, finds them on its next start. Each
+`GroupChangeNotDeliveredFfi` carries the group, the change's `intent_kind`
+(such as `update_group_data` or `remove_members`), `reason` (`not_delivered`,
+`event_too_large` or `refused`) and `at`, when MDK gave it up, in Unix seconds.
+It names the change only by `commit_id_hex`, plus `queued_intent_id_hex` for a
+queued change: a direct change's send result carries no id, so tell the user
+which kind of change failed, in this group, and when. A record stays until
+`acknowledge_change_not_delivered(account_ref, group_id_hex, commit_id_hex)`
+deletes it or the group's local state is removed. Another change confirming
+does not clear it, and it survives restarts. A change rolled back inside the
+call that made it is that call's own error and is never recorded, and neither
+is a change MDK makes on its own, such as a scheduled self-update.
+
 ## Discarding a failed send
 
 Offer `discardFailedSend(accountRef, groupIdHex, messageIdHex)` instead of `deleteMessage` on a row whose

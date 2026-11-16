@@ -2,8 +2,17 @@
 
 ## Unreleased
 
+### Breaking changes
+
+- `OutboundIntentStorage` gains `put_change_not_delivered`, `changes_not_delivered` and
+  `delete_change_not_delivered` for `ChangeNotDelivered` records (mdk#2332); custom storage must implement them.
+
 ### Added
 
+- `ChangeNotDelivered` and `ChangeOrigin` (`Direct`, or `QueuedIntent` with its id) describe a group change given up
+  after its call returned (mdk#2332), and `GroupEvent::GroupChangeNotDelivered` announces a direct one.
+  `OutboundFanout::set_host_change` names the host's change a pending fanout carries, once, and `host_change_kind`
+  reads it; a fanout stored before the field reads `None`.
 - `OutboundFanout::acknowledge_target` records that an endpoint served a pending commit's exact event, by a read or
   by the account's own echo (`FanoutAcknowledgement`), and ends its target `Accepted` from any other status, its
   exposure bit kept (mdk#2332). `validate_successor_of` admits that edge only with the acknowledgement recorded, on a

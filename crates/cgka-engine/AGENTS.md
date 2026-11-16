@@ -141,6 +141,16 @@ and `feature_status` count the leaves it adds. Current-profile `do_create_group`
 no ordinary group commit and persists each Welcome as independent retryable work. Tests: `tests/publish_lifecycle.rs`,
 `tests/group_creation.rs`, `tests/invite_leave.rs`.
 
+A rollback that resolves a change whose caller already holds an unresolved result writes a `ChangeNotDelivered`
+record in the rollback's own transaction (mdk#2332): a queued intent it retires (`not_delivered` or a size refusal), on
+any pass, or a host's direct change on a `RollbackPass::Later` pass. A host change is one sent through
+`send_host_change_with_audit_context`; `host_change_kind` names it until the fanout stores it
+(`OutboundFanout::set_host_change`), which is what a later pass, after a restart included, reads. A rollback inside
+the staging call is that call's error and records nothing, and so does an automatic commit or a fanout stored before
+the field. Only a direct record is announced (`GroupChangeNotDelivered`); a queued one keeps `QueuedIntentRefused`.
+The record outlives later commits and rewinds; only the host's acknowledgement or the group's removal deletes it.
+Tests: `tests/publish_lifecycle/change_not_delivered.rs`, the queued retirements in `tests/record_write_atomicity.rs`.
+
 ## Fork resolution and branch-relative peel
 
 **One route.** Same-epoch rival commits are adjudicated by distributed convergence for every member — committer,

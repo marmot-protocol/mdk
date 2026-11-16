@@ -1118,6 +1118,46 @@ impl Marmot {
             }))
     }
 
+    /// The group's changes of yours that were not applied, oldest first
+    /// (mdk#2332). Each one's call answered `CompletionUnknown` (or
+    /// `AcceptedPending`, queued) and MDK then gave its commit up: no relay
+    /// received it, none would take it, or every relay refused it. Nothing
+    /// reached members and MDK does not send it again. A record stays, across
+    /// restarts and later changes, until `acknowledge_change_not_delivered`
+    /// or the group's local state is removed; read it on start, since the
+    /// `GroupChangeNotDelivered` and `QueuedIntentRefused` events only
+    /// notify. Local read; no network I/O.
+    pub async fn group_changes_not_delivered(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+    ) -> Result<Vec<crate::conversions::GroupChangeNotDeliveredFfi>, MarmotKitError> {
+        let group_id = group_id_from_hex(&group_id_hex)?;
+        Ok(self
+            .runtime
+            .group_changes_not_delivered(&account_ref, &group_id)
+            .await?
+            .into_iter()
+            .map(Into::into)
+            .collect())
+    }
+
+    /// Delete one of `group_changes_not_delivered` by its `commit_id_hex`
+    /// once the user has seen it (mdk#2332). Returns false, changing nothing,
+    /// when the group holds no such record. No network I/O.
+    pub async fn acknowledge_change_not_delivered(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+        commit_id_hex: String,
+    ) -> Result<bool, MarmotKitError> {
+        let group_id = group_id_from_hex(&group_id_hex)?;
+        Ok(self
+            .runtime
+            .acknowledge_change_not_delivered(&account_ref, &group_id, &commit_id_hex)
+            .await?)
+    }
+
     /// Canonical creates or confirmed Adds whose Welcome is still owed, oldest first. The coarse
     /// size class is a best-effort diagnosis, never a terminal verdict. The
     /// pending notice is once per process/Welcome; re-read this query for later

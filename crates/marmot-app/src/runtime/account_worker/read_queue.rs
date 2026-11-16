@@ -763,6 +763,7 @@ host_reads!(
     GroupRoster,
     HydrateGroups,
     GroupCommitDelivery,
+    GroupChangesNotDelivered,
     KeyPackageMaintenanceStatus,
     DurablyOwnedKeyPackages,
     PeriodicMaintenancePolicy,

@@ -56,6 +56,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use storage_sqlite::SqliteAccountStorage;
 
+#[path = "publish_lifecycle/change_not_delivered.rs"]
+mod change_not_delivered;
 #[path = "publish_lifecycle/late_descriptor.rs"]
 mod late_descriptor;
 
@@ -2401,6 +2403,25 @@ impl OutboundIntentStorage for FaultStorage {
     }
     fn delete_own_commit_intent(&self, commit_id: &MessageId) -> StorageResult<()> {
         self.inner.delete_own_commit_intent(commit_id)
+    }
+    fn put_change_not_delivered(
+        &self,
+        record: &cgka_traits::storage::ChangeNotDelivered,
+    ) -> StorageResult<()> {
+        self.inner.put_change_not_delivered(record)
+    }
+    fn changes_not_delivered(
+        &self,
+        group_id: &GroupId,
+    ) -> StorageResult<Vec<cgka_traits::storage::ChangeNotDelivered>> {
+        self.inner.changes_not_delivered(group_id)
+    }
+    fn delete_change_not_delivered(
+        &self,
+        group_id: &GroupId,
+        commit_id: &MessageId,
+    ) -> StorageResult<bool> {
+        self.inner.delete_change_not_delivered(group_id, commit_id)
     }
 }
 

@@ -2039,6 +2039,41 @@ impl AccountManager {
         .await
     }
 
+    pub async fn group_changes_not_delivered(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+    ) -> Result<Vec<crate::GroupChangeNotDelivered>, AppError> {
+        let (command, respond, response) = self.read_command(account_ref, ReadClass::R3).await?;
+        command
+            .send(AccountWorkerCommand::GroupChangesNotDelivered {
+                group_id: group_id.clone(),
+                respond,
+            })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        account_worker_response(response).await
+    }
+
+    pub async fn acknowledge_change_not_delivered(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+        commit_id_hex: &str,
+    ) -> Result<bool, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::AcknowledgeChangeNotDelivered {
+                group_id: group_id.clone(),
+                commit_id_hex: commit_id_hex.to_owned(),
+                respond,
+            })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        account_worker_response(response).await
+    }
+
     pub async fn dismiss_history_notice(
         &self,
         account_ref: &str,

@@ -3195,6 +3195,31 @@ typedef struct MarmotGroupCommitDelivery {
 } MarmotGroupCommitDelivery;
 
 /**
+ * A group change of yours that was not applied (mdk#2332): its call
+ * answered `CompletionUnknown` (or `AcceptedPending`, queued) and MDK then
+ * gave its commit up. Nothing reached members and nothing sends it again.
+ * `queued_intent_id_hex` is NULL for a direct change. `reason` is
+ * `not_delivered`, `event_too_large` or `refused`; `at` is in Unix
+ * seconds. Requires the matching library and header.
+ */
+typedef struct MarmotGroupChangeNotDelivered {
+  char *group_id_hex;
+  char *commit_id_hex;
+  char *queued_intent_id_hex;
+  char *intent_kind;
+  char *reason;
+  uint64_t at;
+} MarmotGroupChangeNotDelivered;
+
+/**
+ *Owned list; free the root with its `_free` function only.
+ */
+typedef struct MarmotGroupChangeNotDeliveredList {
+  struct MarmotGroupChangeNotDelivered *items;
+  uintptr_t len;
+} MarmotGroupChangeNotDeliveredList;
+
+/**
  * A retained Welcome repair handle after a canonical create or confirmed Add.
  * Unknown includes legacy rows and later coarse retry outcomes; it does
  * not clear the debt. A class explains the observed refusal, not delivery:
@@ -6707,6 +6732,14 @@ typedef enum MarmotGroupEventKind_Tag {
    * `intent_kind` names the action and `reason` is a stable tag.
    */
   MARMOT_GROUP_EVENT_KIND_QUEUED_INTENT_REFUSED,
+  /**
+   * A group change whose call answered `CompletionUnknown` was not
+   * applied, and nothing sends it again (mdk#2332). `commit_id_hex` names
+   * its record in `marmot_group_changes_not_delivered`, which keeps it for
+   * a host that misses this event. `reason` is `not_delivered`,
+   * `event_too_large` or `refused`.
+   */
+  MARMOT_GROUP_EVENT_KIND_GROUP_CHANGE_NOT_DELIVERED,
 } MarmotGroupEventKind_Tag;
 
 typedef struct MarmotGroupEventKind_GroupJoined_Body {
@@ -6810,6 +6843,12 @@ typedef struct MarmotGroupEventKind_QueuedIntentRefused_Body {
   enum MarmotEventSizeClass size_class;
 } MarmotGroupEventKind_QueuedIntentRefused_Body;
 
+typedef struct MarmotGroupEventKind_GroupChangeNotDelivered_Body {
+  char *commit_id_hex;
+  char *intent_kind;
+  char *reason;
+} MarmotGroupEventKind_GroupChangeNotDelivered_Body;
+
 typedef struct MarmotGroupEventKind {
   MarmotGroupEventKind_Tag tag;
   union {
@@ -6828,6 +6867,7 @@ typedef struct MarmotGroupEventKind {
     MarmotGroupEventKind_LocalGroupCopyTerminated_Body LOCAL_GROUP_COPY_TERMINATED;
     MarmotGroupEventKind_GroupMemberLeavesRemoved_Body GROUP_MEMBER_LEAVES_REMOVED;
     MarmotGroupEventKind_QueuedIntentRefused_Body QUEUED_INTENT_REFUSED;
+    MarmotGroupEventKind_GroupChangeNotDelivered_Body GROUP_CHANGE_NOT_DELIVERED;
   };
 } MarmotGroupEventKind;
 
@@ -9141,6 +9181,42 @@ MarmotStatus marmot_group_commit_delivery(const struct MarmotClient *client,
                                           const char *account_ref,
                                           const char *group_id_hex,
                                           struct MarmotGroupCommitDelivery **out);
+
+/**
+ * The group's changes of yours that were not applied, oldest first
+ * (mdk#2332): each one's call answered `CompletionUnknown` (or
+ * `AcceptedPending`, queued) and MDK then gave its commit up. A record
+ * stays, across restarts and later changes, until
+ * `marmot_acknowledge_change_not_delivered`; read it on start. Free the
+ * list with `marmot_group_change_not_delivered_list_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_group_changes_not_delivered(const struct MarmotClient *client,
+                                                const char *account_ref,
+                                                const char *group_id_hex,
+                                                struct MarmotGroupChangeNotDeliveredList **out);
+
+/**
+ * Delete one of `marmot_group_changes_not_delivered` by its
+ * `commit_id_hex` once the user has seen it (mdk#2332). Writes false,
+ * changing nothing, when the group holds no such record.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_acknowledge_change_not_delivered(const struct MarmotClient *client,
+                                                     const char *account_ref,
+                                                     const char *group_id_hex,
+                                                     const char *commit_id_hex,
+                                                     bool *out);
 
 /**
  * Canonical creates or confirmed Adds whose Welcome is still owed, oldest first. Coarse size
@@ -15740,6 +15816,15 @@ void marmot_group_invite_free(struct MarmotGroupInviteResult *ptr);
  * library.
  */
 void marmot_pending_welcome_delivery_list_free(struct MarmotPendingWelcomeDeliveryList *list);
+
+/**
+ * Free a list returned by this library. NULL is a no-op.
+ *
+ * # Safety
+ * `list` must be NULL or an unfreed pointer returned by this
+ * library.
+ */
+void marmot_group_change_not_delivered_list_free(struct MarmotGroupChangeNotDeliveredList *list);
 
 /**
  * Free a value of this type returned by this library. NULL

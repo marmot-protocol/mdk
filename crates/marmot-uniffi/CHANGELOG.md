@@ -4,6 +4,10 @@
 
 ### Added
 
+- `groupChangesNotDelivered(accountRef, groupIdHex)` returns `GroupChangeNotDeliveredFfi` records and
+  `acknowledgeChangeNotDelivered(accountRef, groupIdHex, commitIdHex)` clears one (mdk#2332).
+  `GroupEventKindFfi::GroupChangeNotDelivered` announces a direct change; handle it in exhaustive switches. See
+  [Group changes that were not applied](README.md#group-changes-that-were-not-applied).
 - `startDirectConversationWithOptions(accountRef, peerAccountId, DirectConversationOptionsFfi)` founds a new direct
   chat with `disappearingMessageSecs` in its founding MLS state and Welcome. Reuse and retry keep the existing chat's
   duration and roles. `startDirectConversation` is unchanged. Regenerate Swift and Kotlin bindings with the matching

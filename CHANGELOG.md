@@ -13,6 +13,20 @@
 
 ### Added
 
+- Group changes MDK gives up after their call returned are recorded until the
+  user has seen them (#2332). A direct group change that answered
+  `CompletionUnknown`, or a queued one that answered `AcceptedPending`, gets a
+  durable record when MDK later rolls its commit back: no relay received it
+  (`not_delivered`), it fits none of the group's relays (`event_too_large`), or
+  every relay refused it (`refused`). Read them with
+  `group_changes_not_delivered` (Rust, UniFFI, C, `wn groups
+  changes-not-delivered`) and clear one with `acknowledge_change_not_delivered`.
+  A direct change is also announced by the new `GroupChangeNotDelivered` group
+  event; a queued one by `QueuedIntentRefused`, as before. Handle the new event
+  kind and read the records on start: the events only notify. A record names
+  the change by its group, commit id, kind and time only. A change staged before
+  this release and given up after it is not recorded. Account migration 0210
+  adds the table.
 - Usage diagnostics show where interactive onboarding stops (#3440). MDK
   itself records a new `mdk_onboarding_summary` aggregate each time an
   onboarding attempt saves a step in a blocking status. A row carries the step,

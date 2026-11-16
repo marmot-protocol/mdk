@@ -314,6 +314,12 @@ unrecoverable halt, a pending restored-epoch rotation) keeps the intent queued (
 If regeneration creates a group-evolution commit, `advance_convergence` MUST return that one publishable result and
 pause later queued work until `confirm_published` or `publish_failed` resolves the pending commit.
 
+A rollback that resolves a change whose caller already holds an unresolved result (a queued intent it retires, or a
+host's direct change rolled back after the call that staged it returned) MUST write a durable not-delivered record in
+the rollback's own transaction (mdk#2332). The record names the group, the commit, the change's kind and why, and
+stays until the host acknowledges it or the group's local state is removed. A rollback inside the staging call is that
+call's own result and records nothing, and so does a commit the engine makes on its own.
+
 ## Commit Convergence
 
 Commits are the consensus log. All honest engines that see the same valid commit set under the same pinned protocol

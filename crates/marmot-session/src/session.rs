@@ -31,7 +31,7 @@ pub use cgka_engine::private_key_packages::{
     SiblingWelcome, private_key_package_stock, validate_received_private_key_package,
 };
 pub use cgka_engine::recovery_key::RECOVERY_ENTROPY_LEN;
-use cgka_engine::{Engine, EngineBuilder};
+use cgka_engine::{Engine, EngineBuilder, RollbackPass};
 use cgka_traits::app_components::{
     AppComponentId, AppComponentSet, DeviceRosterV1, DeviceTagClaim, default_group_components,
 };
@@ -1387,6 +1387,33 @@ impl AccountDeviceSession {
         Ok(self.collect_effects(vec![result]))
     }
 
+    /// Send a group change the host asked for, as
+    /// [`Self::send_with_audit_context`] does, noting a commit staged at once
+    /// as the host's so its fanout names it (mdk#2332).
+    pub async fn send_host_change_with_audit_context(
+        &mut self,
+        intent: SendIntent,
+        context: AuditEventContext,
+    ) -> SessionResult<SessionEffects> {
+        tracing::debug!(
+            target: TRACE_TARGET,
+            method = "send_host_change_with_audit_context",
+            intent_kind = send_intent_kind(&intent),
+            "sending host group change"
+        );
+        let result = self
+            .engine
+            .send_host_change_with_audit_context(intent, Some(context))
+            .await?;
+        tracing::debug!(
+            target: TRACE_TARGET,
+            method = "send_host_change_with_audit_context",
+            result_kind = send_result_kind(&result),
+            "host group change accepted"
+        );
+        Ok(self.collect_effects(vec![result]))
+    }
+
     pub async fn queue_app_message_with_audit_context(
         &mut self,
         group_id: GroupId,
@@ -1865,12 +1892,17 @@ impl AccountDeviceSession {
         Ok(self.collect_effects(vec![]))
     }
 
+    /// Roll back a commit every relay refused. On a later `pass`, a host's
+    /// change the fanout names is recorded as not delivered (mdk#2332).
     pub async fn publish_failed_fanout(
         &mut self,
         pending: PendingStateRef,
         fanout: &mut OutboundFanout,
+        pass: RollbackPass,
     ) -> SessionResult<SessionEffects> {
-        self.engine.publish_failed_fanout(pending, fanout).await?;
+        self.engine
+            .publish_failed_fanout(pending, fanout, pass)
+            .await?;
         Ok(self.collect_effects(vec![]))
     }
 
@@ -1880,8 +1912,11 @@ impl AccountDeviceSession {
         &mut self,
         pending: PendingStateRef,
         fanout: &mut OutboundFanout,
+        pass: RollbackPass,
     ) -> SessionResult<SessionEffects> {
-        self.engine.publish_not_delivered(pending, fanout).await?;
+        self.engine
+            .publish_not_delivered(pending, fanout, pass)
+            .await?;
         Ok(self.collect_effects(vec![]))
     }
 
@@ -1893,9 +1928,10 @@ impl AccountDeviceSession {
         fanout: Option<&mut OutboundFanout>,
         artifact: cgka_traits::OversizedArtifact,
         size_class: cgka_traits::EventSizeClass,
+        pass: RollbackPass,
     ) -> SessionResult<SessionEffects> {
         self.engine
-            .publish_refused_as_too_large(pending, fanout, artifact, size_class)
+            .publish_refused_as_too_large(pending, fanout, artifact, size_class, pass)
             .await?;
         Ok(self.collect_effects(vec![]))
     }
@@ -1904,6 +1940,12 @@ impl AccountDeviceSession {
     /// fanout to name (mdk#2332).
     pub fn drained_queued_intent_id(&self, pending: PendingStateRef) -> Option<MessageId> {
         self.engine.drained_queued_intent_id(pending)
+    }
+
+    /// The stable kind of the host's change `pending` carries, for its frozen
+    /// fanout to name (mdk#2332).
+    pub fn host_change_kind(&self, pending: PendingStateRef) -> Option<&'static str> {
+        self.engine.host_change_kind(pending)
     }
 
     /// Whether `pending` is the commit of a queued invite the drain prepared.
@@ -2123,6 +2165,37 @@ impl AccountDeviceSession {
     ) -> SessionResult<()> {
         self.engine.check_group_live(&refusal.group_id)?;
         Ok(self.storage.delete_commit_refusal(&refusal.fanout_id)?)
+    }
+
+    /// The group's changes that were not delivered (mdk#2332), oldest first:
+    /// each a queued intent the drain retired, or a host's change whose
+    /// commit rolled back after the call that staged it returned.
+    pub fn changes_not_delivered(
+        &self,
+        group_id: &GroupId,
+    ) -> SessionResult<Vec<cgka_traits::storage::ChangeNotDelivered>> {
+        Ok(
+            cgka_traits::storage::OutboundIntentStorage::changes_not_delivered(
+                &self.storage,
+                group_id,
+            )?,
+        )
+    }
+
+    /// Delete the group's not-delivered record for `commit_id` (mdk#2332),
+    /// saying whether there was one.
+    pub fn acknowledge_change_not_delivered(
+        &self,
+        group_id: &GroupId,
+        commit_id: &MessageId,
+    ) -> SessionResult<bool> {
+        Ok(
+            cgka_traits::storage::OutboundIntentStorage::delete_change_not_delivered(
+                &self.storage,
+                group_id,
+                commit_id,
+            )?,
+        )
     }
 
     /// The engine's liveness check for a group (`Engine::check_group_live`).

@@ -44,6 +44,46 @@ impl From<marmot_app::PendingWelcomeDelivery> for PendingWelcomeDeliveryFfi {
     }
 }
 
+/// A group change of yours that was not applied (mdk#2332): its call
+/// answered `CompletionUnknown`, or `AcceptedPending` for a queued change, and
+/// MDK then gave its commit up. Nothing reached members and nothing sends it
+/// again. It names the change only by `commit_id_hex` (and, for a queued
+/// change, the `queued_intent_id_hex` that `QueuedIntentRefused` carried):
+/// tell the user which kind of change failed, in which group, and when.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct GroupChangeNotDeliveredFfi {
+    pub group_id_hex: String,
+    /// What `acknowledge_change_not_delivered` takes.
+    pub commit_id_hex: String,
+    /// Present for a change that was queued; absent for a direct one.
+    pub queued_intent_id_hex: Option<String>,
+    /// Stable name of the change, such as `update_group_data`.
+    pub intent_kind: String,
+    /// `not_delivered` (no relay received it), `event_too_large` (it fits none
+    /// of the group's relays) or `refused` (every relay refused it).
+    pub reason: String,
+    /// When MDK gave it up, in Unix seconds.
+    pub at: u64,
+}
+
+impl From<marmot_app::GroupChangeNotDelivered> for GroupChangeNotDeliveredFfi {
+    fn from(value: marmot_app::GroupChangeNotDelivered) -> Self {
+        Self {
+            group_id_hex: value.group_id_hex,
+            commit_id_hex: value.commit_id_hex,
+            queued_intent_id_hex: match value.origin {
+                marmot_app::GroupChangeOrigin::Direct => None,
+                marmot_app::GroupChangeOrigin::QueuedIntent { intent_id_hex } => {
+                    Some(intent_id_hex)
+                }
+            },
+            intent_kind: value.intent_kind,
+            reason: value.reason,
+            at: value.at,
+        }
+    }
+}
+
 /// Opaque application-owned state. Empty data is present state.
 #[derive(Clone, uniffi::Record)]
 pub struct GroupAppComponentFfi {

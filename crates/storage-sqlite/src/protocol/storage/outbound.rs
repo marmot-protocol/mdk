@@ -3,8 +3,8 @@ use crate::base::connection::retry_on_busy;
 use crate::{SqliteAccountStorage, SqliteResultExt, created_at_to_i64, deserialize, serialize};
 use cgka_traits::OutboundFanout;
 use cgka_traits::storage::{
-    OutboundFanoutStorage, OutboundIntentStorage, OwnCommitIntent, QueuedOutboundIntent,
-    StorageError, StorageResult,
+    ChangeNotDelivered, OutboundFanoutStorage, OutboundIntentStorage, OwnCommitIntent,
+    QueuedOutboundIntent, StorageError, StorageResult,
 };
 use cgka_traits::types::{GroupId, MessageId};
 use rusqlite::{OptionalExtension, params};
@@ -196,6 +196,72 @@ impl OutboundIntentStorage for SqliteAccountStorage {
             retry_on_busy(delete)?;
         }
         Ok(())
+    }
+
+    /// The table is outside every snapshot (migration 0210): a rewind neither
+    /// drops nor restores a record, and its rows go with the group's
+    /// `cgka_groups` row.
+    fn put_change_not_delivered(&self, record: &ChangeNotDelivered) -> StorageResult<()> {
+        let serialized = serialize(record)?;
+        let write = || {
+            self.lock()?
+                .execute_cached(
+                    "INSERT INTO cgka_changes_not_delivered (commit_id, group_id, record)
+                     VALUES (?1, ?2, ?3)
+                     ON CONFLICT(commit_id) DO NOTHING",
+                    params![
+                        record.commit_id.as_slice(),
+                        record.group_id.as_slice(),
+                        serialized
+                    ],
+                )
+                .storage()
+        };
+        if self.connection.is_current_thread_transaction_owner() {
+            write()?;
+        } else {
+            retry_on_busy(write)?;
+        }
+        Ok(())
+    }
+
+    fn changes_not_delivered(&self, group_id: &GroupId) -> StorageResult<Vec<ChangeNotDelivered>> {
+        let conn = self.lock()?;
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT record FROM cgka_changes_not_delivered
+                 WHERE group_id = ?1
+                 ORDER BY rowid",
+            )
+            .storage()?;
+        let records = stmt
+            .query_map(params![group_id.as_slice()], |row| row.get::<_, Vec<u8>>(0))
+            .storage()?
+            .collect::<Result<Vec<_>, _>>()
+            .storage()?;
+        records.iter().map(|record| deserialize(record)).collect()
+    }
+
+    fn delete_change_not_delivered(
+        &self,
+        group_id: &GroupId,
+        commit_id: &MessageId,
+    ) -> StorageResult<bool> {
+        let delete = || {
+            self.lock()?
+                .execute_cached(
+                    "DELETE FROM cgka_changes_not_delivered
+                     WHERE group_id = ?1 AND commit_id = ?2",
+                    params![group_id.as_slice(), commit_id.as_slice()],
+                )
+                .storage()
+        };
+        let deleted = if self.connection.is_current_thread_transaction_owner() {
+            delete()?
+        } else {
+            retry_on_busy(delete)?
+        };
+        Ok(deleted > 0)
     }
 }
 

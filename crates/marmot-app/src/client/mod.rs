@@ -3226,7 +3226,7 @@ impl AppClient {
         let engine_publish_started_at = Instant::now();
         let commit = self
             .runtime
-            .confirm_commit_without_publish_with_audit_context(
+            .confirm_host_change_without_publish_with_audit_context(
                 SendIntent::Invite {
                     group_id: group_id.clone(),
                     key_packages,
@@ -3444,7 +3444,7 @@ impl AppClient {
                 self.snapshot_group_push_tokens_for_members(group_id, &target_hexes);
             let effects = self
                 .runtime
-                .send_with_audit_context(
+                .send_host_change_with_audit_context(
                     SendIntent::RemoveMembers {
                         group_id: group_id.clone(),
                         members,
@@ -3575,7 +3575,7 @@ impl AppClient {
             .await?;
         let effects = self
             .runtime
-            .send_with_audit_context(
+            .send_host_change_with_audit_context(
                 SendIntent::EnableDisbanding {
                     group_id: group_id.clone(),
                 },
@@ -3630,7 +3630,7 @@ impl AppClient {
             .await?;
         let effects = self
             .runtime
-            .send_with_audit_context(
+            .send_host_change_with_audit_context(
                 SendIntent::EnableAccountDevices {
                     group_id: group_id.clone(),
                 },
@@ -3674,7 +3674,7 @@ impl AppClient {
             self.sync_runtime_groups_for_send("disband_group").await?;
             let effects = self
                 .runtime
-                .send_with_audit_context(
+                .send_host_change_with_audit_context(
                     SendIntent::Disband {
                         group_id: group_id.clone(),
                     },
@@ -3971,7 +3971,7 @@ impl AppClient {
             let effects = sign_out_step
                 .run(
                     self.runtime
-                        .send_with_audit_context(intent, audit_context.clone()),
+                        .send_host_change_with_audit_context(intent, audit_context.clone()),
                 )
                 .await?;
             self.observe_recovery_evidence_then_fail_if_publish_failed(&effects)
@@ -4385,7 +4385,7 @@ impl AppClient {
         let wake_snapshot = self.snapshot_group_push_tokens_for_members(group_id, wake_targets);
         let effects = self
             .runtime
-            .send_with_audit_context(
+            .send_host_change_with_audit_context(
                 SendIntent::UpdateAppComponents {
                     group_id: group_id.clone(),
                     updates: vec![component],
@@ -4456,7 +4456,7 @@ impl AppClient {
         );
         let effects = self
             .runtime
-            .send_with_audit_context(
+            .send_host_change_with_audit_context(
                 SendIntent::UpdateAppComponents {
                     group_id: group_id.clone(),
                     updates: vec![AppComponentData { component_id, data }],
@@ -4499,7 +4499,7 @@ impl AppClient {
                 .await?;
             let effects = self
                 .runtime
-                .send_with_audit_context(
+                .send_host_change_with_audit_context(
                     SendIntent::UpdateAppComponents {
                         group_id: group_id.clone(),
                         updates: vec![component],
@@ -4576,7 +4576,7 @@ impl AppClient {
             .await?;
         let effects = self
             .runtime
-            .send_with_audit_context(
+            .send_host_change_with_audit_context(
                 SendIntent::UpdateAppComponents {
                     group_id: group_id.clone(),
                     updates: vec![component],
@@ -4622,7 +4622,7 @@ impl AppClient {
             .await?;
         let effects = self
             .runtime
-            .send_with_audit_context(
+            .send_host_change_with_audit_context(
                 SendIntent::UpdateAppComponents {
                     group_id: group_id.clone(),
                     updates: vec![component],
@@ -6253,7 +6253,7 @@ impl AppClient {
             let data = hex::decode(AppGroupImageComponent::new(input).data_hex)?;
             let effects = self
                 .runtime
-                .send_with_audit_context(
+                .send_host_change_with_audit_context(
                     SendIntent::UpdateAppComponents {
                         group_id: group_id.clone(),
                         updates: vec![AppComponentData {
@@ -6463,7 +6463,7 @@ impl AppClient {
                 .await?;
             let effects = self
                 .runtime
-                .send_with_audit_context(
+                .send_host_change_with_audit_context(
                     SendIntent::UpdateGroupData {
                         group_id: group_id.clone(),
                         name: name.map(ToOwned::to_owned),
@@ -6679,6 +6679,37 @@ impl AppClient {
                 .collect(),
         );
         Ok(true)
+    }
+
+    /// The group's changes of yours that were not applied (mdk#2332), oldest
+    /// first: each one's caller got an unresolved answer, and its commit was
+    /// then rolled back. Each stays until acknowledged by its commit id.
+    pub fn group_changes_not_delivered(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<Vec<crate::GroupChangeNotDelivered>, AppError> {
+        self.ensure_group(group_id)?;
+        Ok(self
+            .runtime
+            .group_changes_not_delivered(group_id)?
+            .into_iter()
+            .map(crate::GroupChangeNotDelivered::from)
+            .collect())
+    }
+
+    /// Delete one of [`Self::group_changes_not_delivered`] by its commit id
+    /// (mdk#2332). Returns `false`, changing nothing, when the group holds no
+    /// such record. A malformed id is an `AppError::Hex`.
+    pub fn acknowledge_change_not_delivered(
+        &mut self,
+        group_id: &GroupId,
+        commit_id_hex: &str,
+    ) -> Result<bool, AppError> {
+        let commit_id = cgka_traits::MessageId::new(hex::decode(commit_id_hex)?);
+        self.ensure_group(group_id)?;
+        Ok(self
+            .runtime
+            .acknowledge_change_not_delivered(group_id, &commit_id)?)
     }
 
     /// The group's confirmed change of yours that a group relay refused, until

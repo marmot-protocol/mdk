@@ -4,6 +4,9 @@
 
 ### Added
 
+- `MarmotAppRuntime::group_changes_not_delivered` and `acknowledge_change_not_delivered` read and clear
+  `GroupChangeNotDelivered` records (mdk#2332); `AppClient` has both too. Host group-change commands name their
+  commits, so a rollback after the command returned is recorded.
 - Interactive onboarding records an `mdk_onboarding_summary` usage-diagnostics aggregate when a saved checkpoint
   leaves a step in a blocking status (#3440). `ProductFamily::Onboarding` is the new family. Its rows carry only the
   step, status, issue classes, finding context and a bucketed failing-source count. Each attempt counts a distinct

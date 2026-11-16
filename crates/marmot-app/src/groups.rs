@@ -2475,6 +2475,7 @@ pub(crate) fn event_group_id(event: &GroupEvent) -> Option<&GroupId> {
         GroupEvent::LocalGroupCopyTerminated { group_id, .. }
         | GroupEvent::LocalGroupCopyRestored { group_id }
         | GroupEvent::QueuedIntentRefused { group_id, .. }
+        | GroupEvent::GroupChangeNotDelivered { group_id, .. }
         | GroupEvent::GroupMemberLeavesRemoved { group_id, .. }
         | GroupEvent::GroupCreated { group_id }
         | GroupEvent::GroupJoined { group_id, .. }

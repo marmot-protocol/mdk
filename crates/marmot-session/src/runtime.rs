@@ -16,6 +16,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use cgka_engine::RollbackPass;
 use cgka_traits::AppComponentId;
 use cgka_traits::app_components::{DeviceRosterV1, DeviceTagClaim};
 use cgka_traits::engine::{
@@ -215,6 +216,14 @@ struct PublishStatus {
     /// The Welcome is staged with its unconfirmed commit, so nothing was
     /// published and nothing is recorded or owed yet.
     awaits_commit: bool,
+}
+
+/// Who asked for a send: the host, for a group change (mdk#2332), or anything
+/// else, whose commits name no host change.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SendOrigin {
+    Host,
+    Automatic,
 }
 
 struct PendingFanoutContinuation {
@@ -3697,6 +3706,30 @@ where
         intent: SendIntent,
         context: AuditEventContext,
     ) -> AccountResult<AccountDeviceEffects> {
+        self.send_with_audit_context_from(intent, context, SendOrigin::Automatic)
+            .await
+    }
+
+    /// Send a group change the host asked for, as
+    /// [`Self::send_with_audit_context`] does. A commit staged at once names
+    /// the change on its frozen fanout, so a rollback after this call returns
+    /// is recorded as not delivered (mdk#2332); see
+    /// [`Self::group_changes_not_delivered`].
+    pub async fn send_host_change_with_audit_context(
+        &mut self,
+        intent: SendIntent,
+        context: AuditEventContext,
+    ) -> AccountResult<AccountDeviceEffects> {
+        self.send_with_audit_context_from(intent, context, SendOrigin::Host)
+            .await
+    }
+
+    async fn send_with_audit_context_from(
+        &mut self,
+        intent: SendIntent,
+        context: AuditEventContext,
+        origin: SendOrigin,
+    ) -> AccountResult<AccountDeviceEffects> {
         let disposition_group = match &intent {
             SendIntent::AppMessage { group_id, .. } => Some(group_id.clone()),
             _ => None,
@@ -3704,8 +3737,7 @@ where
         let accept_started = Instant::now();
         self.record_commit_refusals_before_disband(&intent)?;
         let effects = self
-            .session
-            .send_with_audit_context(intent, context.clone())
+            .send_session_intent(intent, context.clone(), origin)
             .await?;
         let local_accept_duration = accept_started.elapsed();
         let publish_started = Instant::now();
@@ -3740,6 +3772,28 @@ where
         intent: SendIntent,
         context: AuditEventContext,
     ) -> AccountResult<PreparedSessionSend> {
+        self.confirm_commit_without_publish_from(intent, context, SendOrigin::Automatic)
+            .await
+    }
+
+    /// Accept a group change the host asked for without publishing it, as
+    /// [`Self::confirm_commit_without_publish_with_audit_context`] does. A
+    /// staged commit names the change on its frozen fanout (mdk#2332).
+    pub async fn confirm_host_change_without_publish_with_audit_context(
+        &mut self,
+        intent: SendIntent,
+        context: AuditEventContext,
+    ) -> AccountResult<PreparedSessionSend> {
+        self.confirm_commit_without_publish_from(intent, context, SendOrigin::Host)
+            .await
+    }
+
+    async fn confirm_commit_without_publish_from(
+        &mut self,
+        intent: SendIntent,
+        context: AuditEventContext,
+        origin: SendOrigin,
+    ) -> AccountResult<PreparedSessionSend> {
         if !supports_deferred_commit_publish(&intent) {
             return Err(cgka_traits::EngineError::Other(
                 "deferred-publish acceptance requires a commit-producing or durably queued intent"
@@ -3750,10 +3804,7 @@ where
         // Only an invite: other commits that carry Welcomes (recovery, own
         // devices) keep their own handling of a Welcome that cannot be sent.
         let invite = matches!(intent, SendIntent::Invite { .. });
-        let session_effects = self
-            .session
-            .send_with_audit_context(intent, context)
-            .await?;
+        let session_effects = self.send_session_intent(intent, context, origin).await?;
         let prepared = classify_prepared_session_send(session_effects)?;
         let PreparedSessionSend::Commit(commit) = prepared else {
             return Ok(prepared);
@@ -3857,6 +3908,26 @@ where
         let superseded = self.reconcile_superseded_maintenance(&output.events)?;
         output.superseded_intents.extend(superseded);
         Ok(output)
+    }
+
+    async fn send_session_intent(
+        &mut self,
+        intent: SendIntent,
+        context: AuditEventContext,
+        origin: SendOrigin,
+    ) -> AccountResult<SessionEffects> {
+        Ok(match origin {
+            SendOrigin::Host => {
+                self.session
+                    .send_host_change_with_audit_context(intent, context)
+                    .await?
+            }
+            SendOrigin::Automatic => {
+                self.session
+                    .send_with_audit_context(intent, context)
+                    .await?
+            }
+        })
     }
 
     /// Confirm an outbound intent's commit without waiting for Welcome fanout,
@@ -4247,6 +4318,31 @@ where
         self.merge_group_commit_refusals(group_id)?;
         self.session.acknowledge_commit_refusals(group_id)?;
         Ok(())
+    }
+
+    /// The group's changes that were not delivered (mdk#2332), oldest first.
+    /// Each is a change whose caller was given an unresolved result and whose
+    /// commit was then rolled back: a queued intent the drain retired, or a
+    /// host's change that returned `CompletionUnknown`. A record stays until
+    /// [`Self::acknowledge_change_not_delivered`] or the group's local state
+    /// is removed; another commit confirming does not clear it.
+    pub fn group_changes_not_delivered(
+        &self,
+        group_id: &GroupId,
+    ) -> AccountResult<Vec<cgka_traits::storage::ChangeNotDelivered>> {
+        Ok(self.session.changes_not_delivered(group_id)?)
+    }
+
+    /// Delete the group's not-delivered record for `commit_id` (mdk#2332),
+    /// saying whether there was one.
+    pub fn acknowledge_change_not_delivered(
+        &self,
+        group_id: &GroupId,
+        commit_id: &cgka_traits::MessageId,
+    ) -> AccountResult<bool> {
+        Ok(self
+            .session
+            .acknowledge_change_not_delivered(group_id, commit_id)?)
     }
 
     /// A disband request deletes every fanout of a group whose epoch is not
@@ -4940,9 +5036,14 @@ where
                 || !fanout.pending_post_confirmation_welcomes().is_empty()
             {
                 let fanout_group = fanout.group_id().cloned();
-                let status =
-                    Box::pin(self.drive_outbound_fanout(fanout, &mut output, &mut queue, None))
-                        .await?;
+                let status = Box::pin(self.drive_outbound_fanout(
+                    fanout,
+                    &mut output,
+                    &mut queue,
+                    None,
+                    RollbackPass::Later,
+                ))
+                .await?;
                 if status.retry_deferred
                     && (!status.met_required_acks || self.secondary_retry_yield_requested())
                     && let Some(fanout_group) = fanout_group
@@ -5617,7 +5718,14 @@ where
         if self.session.pending_is_queued_invite(pending)?
             && let Some(oversized) = self.oversized_invite_events(&commit, &welcomes).await
         {
-            let effects = refuse_too_large(&mut self.session, pending, None, oversized).await?;
+            let effects = refuse_too_large(
+                &mut self.session,
+                pending,
+                None,
+                oversized,
+                RollbackPass::Staging,
+            )
+            .await?;
             output
                 .pending
                 .push(PendingResolution::RolledBack { pending });
@@ -6002,6 +6110,16 @@ where
                     .await?;
                 return Err(error.into());
             }
+            // A host's direct change is named on the same record, so a
+            // rollback after this call returns is recorded (mdk#2332).
+            if let Some(intent_kind) =
+                pending.and_then(|pending| self.session.host_change_kind(pending))
+                && let Err(error) = fanout.set_host_change(intent_kind)
+            {
+                self.rollback_unstaged_pending(pending, output, queue)
+                    .await?;
+                return Err(error.into());
+            }
             if let Some(application_message) = application_message
                 && let Err(error) = fanout.set_application_message(application_message)
             {
@@ -6019,7 +6137,14 @@ where
                 output.local_accept_duration =
                     Some(output.local_accept_duration.unwrap_or_default() + started.elapsed());
             }
-            Box::pin(self.drive_outbound_fanout(fanout, output, queue, context)).await
+            Box::pin(self.drive_outbound_fanout(
+                fanout,
+                output,
+                queue,
+                context,
+                RollbackPass::Staging,
+            ))
+            .await
         } else {
             self.publish_legacy_one(message, output, context).await
         }
@@ -6041,12 +6166,16 @@ where
         Ok(())
     }
 
+    /// Drive one frozen fanout's pass. `pass` says whether it runs inside the
+    /// call that staged it, which returns a rollback to its caller, or later,
+    /// when a rollback of a host's change is recorded instead (mdk#2332).
     async fn drive_outbound_fanout(
         &mut self,
         mut fanout: OutboundFanout,
         output: &mut AccountDeviceEffects,
         queue: &mut VecDeque<PublishWork>,
         mut context: Option<AuditEventContext>,
+        pass: RollbackPass,
     ) -> AccountResult<PublishStatus> {
         // Durable application identity connects first publication and exact
         // retries to the same logical send, including after process restart.
@@ -6072,12 +6201,12 @@ where
             || outcome.accepted_targets >= fanout.request().required_acks.max(1)
             || outcome.fanout_complete
         {
-            self.resolve_outbound_fanout_mls(&mut fanout, output, queue, context.clone())
+            self.resolve_outbound_fanout_mls(&mut fanout, output, queue, context.clone(), pass)
                 .await?;
         }
         let now_ms = self.wall_clock.now().0.saturating_mul(1_000);
         if self.read_back_pending_commit(&mut fanout, now_ms).await? {
-            self.resolve_outbound_fanout_mls(&mut fanout, output, queue, context.clone())
+            self.resolve_outbound_fanout_mls(&mut fanout, output, queue, context.clone(), pass)
                 .await?;
         }
         let endpoints = fanout.request().target.endpoints().to_vec();
@@ -6335,11 +6464,13 @@ where
                 },
             );
             output.reports.push(report);
-            self.resolve_outbound_fanout_mls(&mut fanout, output, queue, context.clone())
+            self.resolve_outbound_fanout_mls(&mut fanout, output, queue, context.clone(), pass)
                 .await?;
         }
-        boxed(|| self.abandon_unsent_pending_commit(&mut fanout, output, queue, context.clone()))
-            .await?;
+        boxed(|| {
+            self.abandon_unsent_pending_commit(&mut fanout, output, queue, context.clone(), pass)
+        })
+        .await?;
 
         let report = frozen_fanout_report(&fanout);
         let fanout_outcome = fanout.outcome();
@@ -6530,6 +6661,7 @@ where
         output: &mut AccountDeviceEffects,
         queue: &mut VecDeque<PublishWork>,
         context: Option<AuditEventContext>,
+        pass: RollbackPass,
     ) -> AccountResult<()> {
         let now_ms = self.wall_clock.now_ms();
         let outcome = fanout.outcome();
@@ -6604,7 +6736,7 @@ where
                 self.session
                     .put_observed_outbound_fanout(fanout, self.wall_clock.now_ms())?;
                 return self
-                    .resolve_outbound_fanout_mls(fanout, output, queue, context)
+                    .resolve_outbound_fanout_mls(fanout, output, queue, context, pass)
                     .await;
             }
             answered > 0
@@ -6617,7 +6749,8 @@ where
         };
         let mut abandoned = fanout.clone();
         let count = abandoned.abandon_unsent_targets()?;
-        let effects = give_up_unsent_commit(&mut self.session, pending, &mut abandoned).await?;
+        let effects =
+            give_up_unsent_commit(&mut self.session, pending, &mut abandoned, pass).await?;
         *fanout = abandoned;
         tracing::info!(
             target: TRACE_TARGET,
@@ -6639,6 +6772,7 @@ where
         output: &mut AccountDeviceEffects,
         queue: &mut VecDeque<PublishWork>,
         context: Option<AuditEventContext>,
+        pass: RollbackPass,
     ) -> AccountResult<()> {
         let outcome = fanout.outcome();
         if outcome.mls_confirmation_required {
@@ -6657,7 +6791,7 @@ where
             && !fanout.possible_exposure()
             && let Some(pending) = fanout.pending_ref()
         {
-            let effects = roll_back_failed_fanout(&mut self.session, pending, fanout).await?;
+            let effects = roll_back_failed_fanout(&mut self.session, pending, fanout, pass).await?;
             output
                 .pending
                 .push(PendingResolution::RolledBack { pending });
@@ -8264,12 +8398,14 @@ fn refuse_too_large<'a>(
     pending: PendingStateRef,
     fanout: Option<&'a mut OutboundFanout>,
     oversized: OversizedEvent,
+    pass: RollbackPass,
 ) -> Pin<Box<impl Future<Output = SessionResult<SessionEffects>> + 'a>> {
     Box::pin(session.publish_refused_as_too_large(
         pending,
         fanout,
         oversized.artifact,
         oversized.size_class,
+        pass,
     ))
 }
 
@@ -8282,6 +8418,7 @@ fn roll_back_failed_fanout<'a>(
     session: &'a mut AccountDeviceSession,
     pending: PendingStateRef,
     fanout: &'a mut OutboundFanout,
+    pass: RollbackPass,
 ) -> Pin<Box<impl Future<Output = SessionResult<SessionEffects>> + 'a>> {
     Box::pin(async move {
         match OversizedEvent::of_fanout(fanout) {
@@ -8292,10 +8429,11 @@ fn roll_back_failed_fanout<'a>(
                         Some(fanout),
                         oversized.artifact,
                         oversized.size_class,
+                        pass,
                     )
                     .await
             }
-            None => session.publish_failed_fanout(pending, fanout).await,
+            None => session.publish_failed_fanout(pending, fanout, pass).await,
         }
     })
 }
@@ -8309,8 +8447,9 @@ fn give_up_unsent_commit<'a>(
     session: &'a mut AccountDeviceSession,
     pending: PendingStateRef,
     fanout: &'a mut OutboundFanout,
+    pass: RollbackPass,
 ) -> Pin<Box<impl Future<Output = SessionResult<SessionEffects>> + 'a>> {
-    Box::pin(session.publish_not_delivered(pending, fanout))
+    Box::pin(session.publish_not_delivered(pending, fanout, pass))
 }
 
 /// Privacy-safe explanation of an observed all-target size refusal, without

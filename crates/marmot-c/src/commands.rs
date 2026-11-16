@@ -63,12 +63,13 @@ use crate::types::group::{
     MarmotAppGroupMemberRecordList, MarmotAppGroupMlsState, MarmotAppGroupRecord,
     MarmotAppQuarantinedGroupList, MarmotCreateGroupOptions, MarmotDetailedGroupCreationResult,
     MarmotDirectConversationOptions, MarmotDisbandRequest, MarmotGroupAppComponent,
-    MarmotGroupCommitDelivery, MarmotGroupConversationSnapshot, MarmotGroupCreationResult,
-    MarmotGroupDetails, MarmotGroupInviteDeclineResult, MarmotGroupInviteResult,
-    MarmotGroupManagementState, MarmotGroupMutationResult, MarmotGroupRecoveryStatus,
-    MarmotGroupRoster, MarmotInitialGroupImage, MarmotInviteMembersResult,
-    MarmotMemberKeyPackagePrewarmSummary, MarmotMemberRef, MarmotPendingWelcomeDeliveryList,
-    MarmotPreparedGroupImageUpload, MarmotPreparedGroupImageUploadList,
+    MarmotGroupChangeNotDeliveredList, MarmotGroupCommitDelivery, MarmotGroupConversationSnapshot,
+    MarmotGroupCreationResult, MarmotGroupDetails, MarmotGroupInviteDeclineResult,
+    MarmotGroupInviteResult, MarmotGroupManagementState, MarmotGroupMutationResult,
+    MarmotGroupRecoveryStatus, MarmotGroupRoster, MarmotInitialGroupImage,
+    MarmotInviteMembersResult, MarmotMemberKeyPackagePrewarmSummary, MarmotMemberRef,
+    MarmotPendingWelcomeDeliveryList, MarmotPreparedGroupImageUpload,
+    MarmotPreparedGroupImageUploadList,
 };
 use crate::types::history_import::MarmotChatHistoryImportList;
 use crate::types::history_notice::{MarmotAccountRecoveryStatus, MarmotHistoryNoticeList};
@@ -794,6 +795,19 @@ c_cmd! {
     /// is non-empty; with only owed relays, only once `since` is two minutes
     /// old. Poll while showing it. Free with `marmot_group_commit_delivery_free`.
     async fn marmot_group_commit_delivery(account_ref: str, group_id_hex: str) -> opt_rec(MarmotGroupCommitDelivery) = group_commit_delivery;
+
+    /// The group's changes of yours that were not applied, oldest first
+    /// (mdk#2332): each one's call answered `CompletionUnknown` (or
+    /// `AcceptedPending`, queued) and MDK then gave its commit up. A record
+    /// stays, across restarts and later changes, until
+    /// `marmot_acknowledge_change_not_delivered`; read it on start. Free the
+    /// list with `marmot_group_change_not_delivered_list_free`.
+    async fn marmot_group_changes_not_delivered(account_ref: str, group_id_hex: str) -> rec(MarmotGroupChangeNotDeliveredList) = group_changes_not_delivered;
+
+    /// Delete one of `marmot_group_changes_not_delivered` by its
+    /// `commit_id_hex` once the user has seen it (mdk#2332). Writes false,
+    /// changing nothing, when the group holds no such record.
+    async fn marmot_acknowledge_change_not_delivered(account_ref: str, group_id_hex: str, commit_id_hex: str) -> scalar(bool) = acknowledge_change_not_delivered;
 
     /// Canonical creates or confirmed Adds whose Welcome is still owed, oldest first. Coarse size
     /// evidence is diagnostic only. A false has_size_class means Unknown,

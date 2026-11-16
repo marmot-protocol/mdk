@@ -19,6 +19,7 @@ pub(crate) const TABLE_OWNERS: &[(&str, Side)] = &[
     // The engine: `cgka_*`, OpenMLS values, the engine-to-app outbox and local forgets.
     ("cgka_account_device_history_keys", Side::Protocol),
     ("cgka_account_device_signers", Side::Protocol),
+    ("cgka_changes_not_delivered", Side::Protocol),
     ("cgka_commit_refusals", Side::Protocol),
     ("cgka_committed_roster_members", Side::Protocol),
     ("cgka_committed_roster_revision", Side::Protocol),
