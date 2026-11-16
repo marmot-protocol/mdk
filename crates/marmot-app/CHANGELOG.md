@@ -218,6 +218,8 @@
   are members, member-id pages, MLS state and its diagnostic form, roster and conversation snapshot, and app
   components. A group read that names a group still awaiting startup hydration asks the worker to hydrate it and
   answers once it has. A forget sent during startup hydration now runs at its place in the worker's command order.
+  The prepared group image status and list (an upload in flight reads `Uploading`), the fresh-start flag and chat
+  history imports answer the same way.
 
 ### Fixed
 

@@ -21,7 +21,12 @@
 //! outside a transaction, so its write is committed and visible first: a
 //! count read before an answer is built never names state the answer cannot
 //! see. A rolled-back write is still counted; that costs a rebuild, never a
-//! stale answer.
+//! stale answer. The other direction has a window: a commit is visible to
+//! every connection before its release joins its notes, so a count read in
+//! between still matches an answer built before the write. A reuse that
+//! compares counts is exact only if every write to its inputs is released
+//! before the count is read; marmot-app keeps those writes on the account
+//! worker, which publishes only after its own releases (its `AGENTS.md`).
 //!
 //! Writers the triggers do not see (another process, a raw connection) are
 //! caught by `PRAGMA data_version`: reading the write count checks it, and a

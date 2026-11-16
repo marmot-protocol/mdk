@@ -108,6 +108,27 @@ impl AccountManager {
         answer: impl FnOnce(&ReadState) -> ReadAnswer<T>,
         command: impl FnOnce(ReadReply<Result<T, AppError>>) -> AccountWorkerCommand,
     ) -> Result<T, AppError> {
+        self.read_from_state_where_held(
+            account_ref,
+            class,
+            read,
+            |state| Some(answer(state)),
+            command,
+        )
+        .await
+    }
+
+    /// [`Self::read_from_state`] for a read whose answer the version may not
+    /// hold: `answer` gives `None` for such a request, which the worker
+    /// then answers.
+    async fn read_from_state_where_held<T>(
+        &self,
+        account_ref: &str,
+        class: ReadClass,
+        read: StateRead,
+        answer: impl FnOnce(&ReadState) -> Option<ReadAnswer<T>>,
+        command: impl FnOnce(ReadReply<Result<T, AppError>>) -> AccountWorkerCommand,
+    ) -> Result<T, AppError> {
         let lane = self.worker_lane(account_ref).await?;
         if let Some(answer) = self.answer_from_state(&lane, read, answer) {
             return answer;
@@ -117,16 +138,17 @@ impl AccountManager {
     }
 
     /// `answer` from `lane`'s current version of A, or `None` when the
-    /// worker must answer: before its first publish, or for a published
-    /// failure [`reissue`] cannot copy exactly.
+    /// worker must answer: before its first publish, for a request the
+    /// version holds no answer to (`answer` gives `None`), or for a
+    /// published failure [`reissue`] cannot copy exactly.
     fn answer_from_state<T>(
         &self,
         lane: &WorkerLane,
         read: StateRead,
-        answer: impl FnOnce(&ReadState) -> ReadAnswer<T>,
+        answer: impl FnOnce(&ReadState) -> Option<ReadAnswer<T>>,
     ) -> Option<Result<T, AppError>> {
         let result = match lane.read_state.version(&self.app.storage_closed) {
-            Ok(Some(state)) => reissue(answer(&state))?,
+            Ok(Some(state)) => reissue(answer(&state)?)?,
             Ok(None) => return None,
             Err(error) => Err(error),
         };
@@ -676,29 +698,36 @@ impl AccountManager {
         long_account_worker_response(response).await
     }
 
+    /// From A (mdk#3273 PR 5), except while the version's list of prepared
+    /// uploads failed: the worker's single read of the upload answers then.
     pub async fn prepared_group_image_status(
         &self,
         account_ref: &str,
         upload_id: String,
     ) -> Result<AppPreparedGroupImageUpload, AppError> {
-        let (command, respond, response) = self.read_command(account_ref, ReadClass::R1).await?;
-        command
-            .send(AccountWorkerCommand::PreparedGroupImageStatus { upload_id, respond })
-            .await
-            .map_err(|_| AppError::TransportClosed)?;
-        account_worker_response(response).await
+        let lookup = upload_id.clone();
+        self.read_from_state_where_held(
+            account_ref,
+            ReadClass::R1,
+            StateRead::Diagnosed,
+            move |state| state.prepared_group_image_status(&lookup),
+            |respond| AccountWorkerCommand::PreparedGroupImageStatus { upload_id, respond },
+        )
+        .await
     }
 
     pub async fn prepared_group_images(
         &self,
         account_ref: &str,
     ) -> Result<Vec<AppPreparedGroupImageUpload>, AppError> {
-        let (command, respond, response) = self.read_command(account_ref, ReadClass::R1).await?;
-        command
-            .send(AccountWorkerCommand::PreparedGroupImages { respond })
-            .await
-            .map_err(|_| AppError::TransportClosed)?;
-        account_worker_response(response).await
+        self.read_from_state(
+            account_ref,
+            ReadClass::R1,
+            StateRead::Diagnosed,
+            ReadState::prepared_group_images,
+            |respond| AccountWorkerCommand::PreparedGroupImages { respond },
+        )
+        .await
     }
 
     pub async fn create_group_with_prepared_initial_image(
@@ -1571,12 +1600,14 @@ impl AccountManager {
         &self,
         account_ref: &str,
     ) -> Result<Vec<crate::ChatHistoryImport>, AppError> {
-        let (command, respond, response) = self.read_command(account_ref, ReadClass::R2).await?;
-        command
-            .send(AccountWorkerCommand::ChatHistoryImports { respond })
-            .await
-            .map_err(|_| AppError::TransportClosed)?;
-        local_account_worker_response(response).await
+        self.read_from_state(
+            account_ref,
+            ReadClass::R2,
+            StateRead::DiagnosedLocal,
+            ReadState::chat_history_imports,
+            |respond| AccountWorkerCommand::ChatHistoryImports { respond },
+        )
+        .await
     }
 
     pub async fn key_package_refresh_overdue(&self, account_ref: &str) -> Result<bool, AppError> {
@@ -1643,12 +1674,14 @@ impl AccountManager {
     }
 
     pub async fn started_fresh(&self, account_ref: &str) -> Result<bool, AppError> {
-        let (command, respond, response) = self.read_command(account_ref, ReadClass::R2).await?;
-        command
-            .send(AccountWorkerCommand::StartedFresh { respond })
-            .await
-            .map_err(|_| AppError::TransportClosed)?;
-        local_account_worker_response(response).await
+        self.read_from_state(
+            account_ref,
+            ReadClass::R2,
+            StateRead::DiagnosedLocal,
+            ReadState::started_fresh,
+            |respond| AccountWorkerCommand::StartedFresh { respond },
+        )
+        .await
     }
 
     pub async fn compromise_warning(
@@ -3252,11 +3285,9 @@ impl AccountManager {
         let Some(lane) = self.existing_worker_commands(account_ref).await? else {
             return Ok(None);
         };
-        if let Some(answer) = self.answer_from_state(
-            &lane,
-            StateRead::Diagnosed,
-            ReadState::key_package_maintenance_status,
-        ) {
+        if let Some(answer) = self.answer_from_state(&lane, StateRead::Diagnosed, |state| {
+            Some(state.key_package_maintenance_status())
+        }) {
             return answer.map(Some);
         }
         self.ask_worker(

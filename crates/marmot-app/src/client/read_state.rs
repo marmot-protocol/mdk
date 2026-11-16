@@ -135,12 +135,10 @@ pub(crate) struct AccountAnswers {
     /// A receiver of the client's backup-restore progress channel, which
     /// `WatchBackupRestore` hands out a copy of.
     pub(crate) backup_restore_updates: watch::Receiver<BackupRestoreStatus>,
-    /// With the in-flight upload overlay applied.
-    #[cfg_attr(not(test), allow(dead_code))] // Account reads answer from A (mdk#3273 PR 5).
+    /// With the in-flight upload overlay applied: the worker's set as it
+    /// stood at the publish, which only the worker changes.
     pub(crate) prepared_group_images: ReadAnswer<Vec<AppPreparedGroupImageUpload>>,
-    #[cfg_attr(not(test), allow(dead_code))] // Account reads answer from A (mdk#3273 PR 5).
     pub(crate) started_fresh: ReadAnswer<bool>,
-    #[cfg_attr(not(test), allow(dead_code))] // Account reads answer from A (mdk#3273 PR 5).
     pub(crate) chat_history_imports: ReadAnswer<Vec<ChatHistoryImport>>,
     /// The account's recovery status, whose notices `HistoryNotices` lists
     /// (mdk#3273 PR 8). Shared with the publisher's kept answer.
@@ -541,26 +539,6 @@ impl ReadState {
     ) -> Result<Vec<(GroupId, CommittedMembers)>, AppError> {
         Ok(storage.trusted_roster_members(&self.trusted_rosters())?)
     }
-
-    /// `PreparedGroupImageStatus`.
-    #[cfg_attr(not(test), allow(dead_code))] // Account reads answer from A (mdk#3273 PR 5).
-    pub(crate) fn prepared_group_image_status(
-        &self,
-        upload_id: &str,
-    ) -> ReadAnswer<AppPreparedGroupImageUpload> {
-        self.account
-            .prepared_group_images
-            .as_ref()
-            .map_err(Arc::clone)?
-            .iter()
-            .find(|status| status.upload_id == upload_id)
-            .cloned()
-            .ok_or_else(|| {
-                Arc::new(AppError::InvalidEncryptedMedia(
-                    "prepared group image upload was not found".into(),
-                ))
-            })
-    }
 }
 
 /// The account reads that answer from A (mdk#3273 PR 3), from this version
@@ -600,6 +578,49 @@ impl ReadState {
         BackupRestoreWatch {
             receiver: self.account.backup_restore_updates.clone(),
         }
+    }
+}
+
+/// The prepared group image reads (R1) and the account's device-group
+/// history reads (R2), from this version alone (mdk#3273 PR 5).
+impl ReadState {
+    /// `PreparedGroupImages`, with the in-flight overlay applied.
+    pub(crate) fn prepared_group_images(&self) -> ReadAnswer<Vec<AppPreparedGroupImageUpload>> {
+        self.account.prepared_group_images.clone()
+    }
+
+    /// `PreparedGroupImageStatus`: the listed upload's status, or today's
+    /// not-found failure for an id the list does not hold. Both storage
+    /// reads decode the same status columns, so where both succeed they
+    /// agree. `None` while the list failed: this version then holds no
+    /// answer for one upload, which the worker's read of that one row gives,
+    /// since another row's failure does not fail it.
+    pub(crate) fn prepared_group_image_status(
+        &self,
+        upload_id: &str,
+    ) -> Option<ReadAnswer<AppPreparedGroupImageUpload>> {
+        let statuses = self.account.prepared_group_images.as_ref().ok()?;
+        Some(
+            statuses
+                .iter()
+                .find(|status| status.upload_id == upload_id)
+                .cloned()
+                .ok_or_else(|| {
+                    Arc::new(AppError::InvalidEncryptedMedia(
+                        "prepared group image upload was not found".into(),
+                    ))
+                }),
+        )
+    }
+
+    /// `StartedFresh`.
+    pub(crate) fn started_fresh(&self) -> ReadAnswer<bool> {
+        self.account.started_fresh.clone()
+    }
+
+    /// `ChatHistoryImports`.
+    pub(crate) fn chat_history_imports(&self) -> ReadAnswer<Vec<ChatHistoryImport>> {
+        self.account.chat_history_imports.clone()
     }
 }
 
@@ -652,8 +673,10 @@ pub(crate) fn reissue<T>(answer: ReadAnswer<T>) -> Option<Result<T, AppError>> {
 /// An exact copy of `error`, for the failures the moved reads give whose
 /// payloads can be copied: an unknown group in the mirror or the engine, a
 /// group not hydrated yet, a storage failure, from the app or the engine,
-/// and a KeyPackage outside its lifetime (a group's recovery status judges
-/// its reinvites' KeyPackages). An engine failure keeps its wrapping, whether
+/// a KeyPackage outside its lifetime (a group's recovery status judges
+/// its reinvites' KeyPackages), and an encrypted-media failure, whose payload
+/// is its message (a prepared group image upload the list does not hold).
+/// An engine failure keeps its wrapping, whether
 /// the app's session, the account or the account's session raised it. Any
 /// other failure (SQLite, I/O, JSON, the rest of the engine's) has no copy,
 /// so it is never rebuilt into a different error.
@@ -679,6 +702,9 @@ pub(crate) fn reissue_error(error: &AppError) -> Option<AppError> {
     match error {
         AppError::UnknownGroup(group) => Some(AppError::UnknownGroup(group.clone())),
         AppError::Storage(storage) => Some(AppError::Storage(storage.clone())),
+        AppError::InvalidEncryptedMedia(message) => {
+            Some(AppError::InvalidEncryptedMedia(message.clone()))
+        }
         AppError::Session(SessionError::Engine(engine)) => {
             copy_engine(engine).map(|engine| AppError::Session(SessionError::Engine(engine)))
         }
@@ -2178,12 +2204,17 @@ pub(crate) mod oracle {
                         .pop()
                         .expect("one status in, one out")
                 });
-            same(
-                window,
-                "prepared group image status",
-                &state.prepared_group_image_status(upload_id),
-                &live,
-            );
+            // A version whose list failed sends the read to the worker,
+            // whose single read is the live one.
+            match state.prepared_group_image_status(upload_id) {
+                Some(published) => {
+                    same(window, "prepared group image status", &published, &live);
+                }
+                None => assert!(
+                    state.account.prepared_group_images.is_err(),
+                    "a version with a list answers every upload id"
+                ),
+            }
         }
         same(
             window,
