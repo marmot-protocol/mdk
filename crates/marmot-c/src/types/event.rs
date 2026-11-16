@@ -97,6 +97,16 @@ pub enum MarmotGroupEventKind {
         /// Only meaningful when has_size_class is true.
         size_class: MarmotEventSizeClass,
     },
+    /// A group change whose call answered `CompletionUnknown` was not
+    /// applied, and nothing sends it again (mdk#2332). `commit_id_hex` names
+    /// its record in `marmot_group_changes_not_delivered`, which keeps it for
+    /// a host that misses this event. `reason` is `not_delivered`,
+    /// `event_too_large` or `refused`.
+    GroupChangeNotDelivered {
+        commit_id_hex: *mut c_char,
+        intent_kind: *mut c_char,
+        reason: *mut c_char,
+    },
 }
 
 impl From<GroupEventKindFfi> for MarmotGroupEventKind {
@@ -120,6 +130,15 @@ impl From<GroupEventKindFfi> for MarmotGroupEventKind {
                 artifact: owned_opt_c_string(artifact.map(|artifact| artifact.to_string())),
                 has_size_class: size_class.is_some(),
                 size_class: size_class.map(Into::into).unwrap_or_default(),
+            },
+            F::GroupChangeNotDelivered {
+                commit_id_hex,
+                intent_kind,
+                reason,
+            } => Self::GroupChangeNotDelivered {
+                commit_id_hex: owned_c_string(commit_id_hex),
+                intent_kind: owned_c_string(intent_kind),
+                reason: owned_c_string(reason),
             },
             F::GroupMemberLeavesRemoved { epoch } => Self::GroupMemberLeavesRemoved { epoch },
             F::GroupCreated => Self::GroupCreated,
@@ -240,6 +259,15 @@ impl CFree for MarmotGroupEventKind {
                     free_c_string(*intent_kind);
                     free_c_string(*reason);
                     free_c_string(*artifact);
+                }
+                Self::GroupChangeNotDelivered {
+                    commit_id_hex,
+                    intent_kind,
+                    reason,
+                } => {
+                    free_c_string(*commit_id_hex);
+                    free_c_string(*intent_kind);
+                    free_c_string(*reason);
                 }
                 Self::MessageReceived { sender_id_hex, .. } => free_c_string(*sender_id_hex),
                 Self::AppMessageInvalidated {
@@ -1044,6 +1072,41 @@ mod tests {
             }
             assert_eq!(audit::live_allocations(), before);
         }
+    }
+    #[test]
+    fn a_group_change_not_delivered_names_its_commit_and_frees_deeply() {
+        let _lock = audit::test_lock();
+        let before = audit::live_allocations();
+        let event = boxed(MarmotEvent::from(MarmotEventFfi::GroupEvent {
+            account_id_hex: "account".into(),
+            account_label: "alice".into(),
+            group_id_hex: "31".repeat(16),
+            event: GroupEventKindFfi::GroupChangeNotDelivered {
+                commit_id_hex: "43".repeat(32),
+                intent_kind: "remove_members".into(),
+                reason: "not_delivered".into(),
+            },
+        }));
+        unsafe {
+            let MarmotEvent::GroupEvent {
+                event:
+                    MarmotGroupEventKind::GroupChangeNotDelivered {
+                        commit_id_hex,
+                        intent_kind,
+                        reason,
+                    },
+                ..
+            } = &*event
+            else {
+                panic!("change not delivered");
+            };
+            let text = |value: *mut c_char| std::ffi::CStr::from_ptr(value).to_str().unwrap();
+            assert_eq!(text(*commit_id_hex), "43".repeat(32));
+            assert_eq!(text(*intent_kind), "remove_members");
+            assert_eq!(text(*reason), "not_delivered");
+            marmot_event_free(event);
+        }
+        assert_eq!(audit::live_allocations(), before);
     }
     #[test]
     fn a_queued_intent_refusal_names_an_oversized_event_and_frees_deeply() {

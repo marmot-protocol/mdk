@@ -316,6 +316,10 @@ pub struct OutboundFanout {
     /// [`Self::queued_intent_id`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     queued_intent_id: Option<MessageId>,
+    /// The kind of the host's change a pending commit carries, when the host
+    /// asked for it directly (mdk#2332). See [`Self::host_change_kind`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    host_change_kind: Option<String>,
     /// Per target, the acknowledgement that ended it `Accepted` without a
     /// publish answer. Empty until one does.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -480,6 +484,7 @@ impl OutboundFanout {
             target_possible_exposure: vec![false; target_count],
             reachability_read_at_ms: None,
             queued_intent_id: None,
+            host_change_kind: None,
             target_acknowledgements: Vec::new(),
             post_confirmation_welcomes_pending: !post_confirmation_welcomes.is_empty(),
             post_confirmation_welcomes,
@@ -562,6 +567,38 @@ impl OutboundFanout {
     /// Immutable once stored (see [`Self::validate_successor_of`]).
     pub fn queued_intent_id(&self) -> Option<&MessageId> {
         self.queued_intent_id.as_ref()
+    }
+
+    /// Record that this pending commit carries a change the host asked for
+    /// directly, by the intent's stable kind (mdk#2332), before the fanout is
+    /// first stored. A rollback on a later pass than the call that staged it
+    /// then writes a not-delivered record the host can read; an automatic
+    /// commit names none and writes none. Setting the same kind again is a
+    /// no-op; any other change, or a fanout with no pending commit, is
+    /// refused.
+    pub fn set_host_change(&mut self, intent_kind: &str) -> Result<(), TransportAdapterError> {
+        if !matches!(self.mls_state, FanoutMlsState::Pending(_)) {
+            return Err(TransportAdapterError::Other(
+                "only a pending commit's fanout names a host change".into(),
+            ));
+        }
+        match &self.host_change_kind {
+            None => {
+                self.host_change_kind = Some(intent_kind.to_owned());
+                Ok(())
+            }
+            Some(previous) if previous == intent_kind => Ok(()),
+            Some(_) => Err(TransportAdapterError::Other(
+                "host change of a fanout changed".into(),
+            )),
+        }
+    }
+
+    /// The kind of the host's change this pending commit carries, when the
+    /// host asked for it directly and a release that records it staged it
+    /// (mdk#2332). Immutable once stored (see [`Self::validate_successor_of`]).
+    pub fn host_change_kind(&self) -> Option<&str> {
+        self.host_change_kind.as_deref()
     }
 
     /// Stored OpenMLS commit row used to restore this pending lifecycle.
@@ -1245,6 +1282,7 @@ impl OutboundFanout {
             && self.application_message == previous.application_message
             && self.pending_origin_message_id == previous.pending_origin_message_id
             && self.queued_intent_id == previous.queued_intent_id
+            && self.host_change_kind == previous.host_change_kind
             && self.pending_kind == previous.pending_kind
             && self.created_at_ms == previous.created_at_ms
             && self.post_confirmation_welcomes == previous.post_confirmation_welcomes
@@ -3334,6 +3372,54 @@ mod tests {
             !serde_json::to_string(&unnamed)
                 .unwrap()
                 .contains("queued_intent_id")
+        );
+    }
+
+    #[test]
+    fn a_pending_fanout_names_its_host_change_once() {
+        let unnamed = OutboundFanout::stage(
+            fanout_request(),
+            Some(crate::engine_state::PendingStateRef::new(4)),
+            Some(GroupId::new(vec![0xD4; 16])),
+            55,
+        )
+        .unwrap();
+
+        let mut resolved = unnamed.clone();
+        resolved.mark_mls_rolled_back().unwrap();
+        assert!(resolved.set_host_change("remove_members").is_err());
+
+        let mut named = unnamed.clone();
+        named.set_host_change("remove_members").unwrap();
+        named.set_host_change("remove_members").unwrap();
+        assert!(named.clone().set_host_change("invite").is_err());
+        assert_eq!(named.host_change_kind(), Some("remove_members"));
+
+        assert!(named.validate_successor_of(&named).is_ok());
+        assert!(
+            named.validate_successor_of(&unnamed).is_err(),
+            "named after storing"
+        );
+        assert!(
+            unnamed.validate_successor_of(&named).is_err(),
+            "name dropped"
+        );
+
+        let stored = serde_json::to_value(&named).unwrap();
+        let reloaded: OutboundFanout = serde_json::from_value(stored.clone()).unwrap();
+        assert_eq!(reloaded.host_change_kind(), Some("remove_members"));
+        let mut legacy = stored;
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("host_change_kind")
+            .unwrap();
+        let legacy: OutboundFanout = serde_json::from_value(legacy).unwrap();
+        assert_eq!(legacy.host_change_kind(), None);
+        assert!(
+            !serde_json::to_string(&unnamed)
+                .unwrap()
+                .contains("host_change_kind")
         );
     }
 

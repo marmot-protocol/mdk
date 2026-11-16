@@ -833,6 +833,23 @@ pub enum GroupEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         size_class: Option<crate::EventSizeClass>,
     },
+    /// A change the host asked for directly was not applied (mdk#2332): the
+    /// call that staged its commit returned with the commit unresolved, and a
+    /// later pass rolled it back because no relay received it or none would
+    /// take it. The durable record
+    /// ([`ChangeNotDelivered`](crate::storage::ChangeNotDelivered)) is what a
+    /// host reads; this event only announces it. A queued intent's outcome is
+    /// announced as [`Self::QueuedIntentRefused`].
+    GroupChangeNotDelivered {
+        group_id: GroupId,
+        /// The rolled-back commit, which names the record.
+        commit_id: MessageId,
+        /// Stable name of the intent's kind, such as `remove_members`.
+        intent_kind: String,
+        /// Stable name of why, as the record names it: `not_delivered`,
+        /// `event_too_large` or `refused`.
+        reason: String,
+    },
     /// Device destinations invalidated by an actual canonical state transition.
     /// Derived from the live pre-apply tree and the final selected tree, rather
     /// than replaying removals from an already-applied common prefix.

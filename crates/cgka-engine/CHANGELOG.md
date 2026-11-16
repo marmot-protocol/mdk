@@ -2,8 +2,16 @@
 
 ## Unreleased
 
+### Breaking changes
+
+- `Engine::publish_failed_fanout`, `publish_not_delivered` and `publish_refused_as_too_large` take a `RollbackPass`
+  (mdk#2332). On `RollbackPass::Later`, a host change the fanout names is recorded as not delivered and announced
+  with `GroupChangeNotDelivered`; a retired queued intent is recorded on any pass.
+
 ### Added
 
+- `Engine::send_host_change_with_audit_context` sends a host's group change, and `host_change_kind` names the change
+  a pending commit carries, for its fanout to store (mdk#2332).
 - `Engine::publish_not_delivered` rolls back a pending commit the session gave up because it reached no relay
   (mdk#2332), retiring its queued intent in the rollback's transaction and announcing it as `QueuedIntentRefused`
   with reason `not_delivered`.

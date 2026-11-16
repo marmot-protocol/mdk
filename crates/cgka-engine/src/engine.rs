@@ -343,6 +343,12 @@ pub struct Engine<S: StorageProvider> {
     /// leaves the intent queued for retry.
     pub(crate) queued_intent_by_pending: HashMap<PendingStateRef, (GroupId, MessageId)>,
 
+    /// Pending commits a host asked for directly, by the intent's stable kind
+    /// (mdk#2332), until each resolves. The session names the kind on the
+    /// commit's frozen fanout as it stages it, and the rollback reads it from
+    /// there, so a restart needs nothing from this map.
+    pub(crate) host_change_by_pending: HashMap<PendingStateRef, (GroupId, &'static str)>,
+
     pub(crate) convergence_policy: crate::canonicalization::CanonicalizationPolicy,
     /// Test-only selection experiment switch. It is always true in production;
     /// only the feature-gated builder method can disable witness admission.
@@ -784,6 +790,7 @@ impl<S: StorageProvider> EngineBuilder<S> {
             pending_confirmation_replays: HashSet::new(),
             queued_intent_by_message: HashMap::new(),
             queued_intent_by_pending: HashMap::new(),
+            host_change_by_pending: HashMap::new(),
             // Keep the in-memory app-message window aligned with MLS
             // `max_past_epochs` from construction so the two knobs cannot drift
             // before the first `set_convergence_policy` call.
@@ -1237,18 +1244,31 @@ impl<S: StorageProvider> Engine<S> {
     }
 
     /// Roll back MLS and persist the matching all-failed fanout edge in the
-    /// same backend transaction.
+    /// same backend transaction. On a [`RollbackPass::Later`] pass, a host's
+    /// change the fanout names is recorded as not delivered, `refused`
+    /// (mdk#2332).
+    ///
+    /// [`RollbackPass::Later`]: crate::publish::RollbackPass::Later
     pub async fn publish_failed_fanout(
         &mut self,
         pending: PendingStateRef,
         fanout: &mut OutboundFanout,
+        pass: crate::publish::RollbackPass,
     ) -> Result<(), EngineError> {
         if let Some(group_id) = fanout.group_id() {
             self.ensure_group_live(group_id)?;
         }
         self.pending_group_id(pending)?;
-        self.do_publish_failed_with_fanout(pending, Some(fanout), None)
-            .await
+        self.do_publish_failed_with_fanout(
+            pending,
+            Some(fanout),
+            None,
+            Some(crate::publish::DirectChangeRollback {
+                pass,
+                reason: "refused",
+            }),
+        )
+        .await
     }
 
     /// Whether `pending` is the commit of a queued invite that the drain
@@ -1294,13 +1314,18 @@ impl<S: StorageProvider> Engine<S> {
     /// [`GroupEvent::QueuedIntentRefused`] naming the event. A commit not
     /// drained from the queue rolls back as `publish_failed` does, and its
     /// caller reports the refusal. With `fanout`, its all-failed edge is
-    /// written in the same transaction.
+    /// written in the same transaction. A retired intent, and on a
+    /// [`RollbackPass::Later`] pass a host's change the fanout names, are
+    /// recorded as not delivered (mdk#2332).
+    ///
+    /// [`RollbackPass::Later`]: crate::publish::RollbackPass::Later
     pub async fn publish_refused_as_too_large(
         &mut self,
         pending: PendingStateRef,
         fanout: Option<&mut OutboundFanout>,
         artifact: cgka_traits::OversizedArtifact,
         size_class: cgka_traits::EventSizeClass,
+        pass: crate::publish::RollbackPass,
     ) -> Result<(), EngineError> {
         if let Some(group_id) = fanout.as_ref().and_then(|fanout| fanout.group_id()) {
             self.ensure_group_live(group_id)?;
@@ -1319,6 +1344,10 @@ impl<S: StorageProvider> Engine<S> {
             retired
                 .as_ref()
                 .map(|record| (record, QueuedIntentRetirement::Refused(&refusal))),
+            Some(crate::publish::DirectChangeRollback {
+                pass,
+                reason: refusal.privacy_safe_kind(),
+            }),
         )
         .await
     }
@@ -1330,11 +1359,16 @@ impl<S: StorageProvider> Engine<S> {
     /// queued intent it was drained from is retired with the reason
     /// `not_delivered`, in the rollback's transaction: preparing it again
     /// would send to the same relays. A commit not drained from the queue
-    /// rolls back as [`Self::publish_failed_fanout`] does.
+    /// rolls back as [`Self::publish_failed_fanout`] does. A retired intent,
+    /// and on a [`RollbackPass::Later`] pass a host's change the fanout
+    /// names, are recorded as not delivered (mdk#2332).
+    ///
+    /// [`RollbackPass::Later`]: crate::publish::RollbackPass::Later
     pub async fn publish_not_delivered(
         &mut self,
         pending: PendingStateRef,
         fanout: &mut OutboundFanout,
+        pass: crate::publish::RollbackPass,
     ) -> Result<(), EngineError> {
         if let Some(group_id) = fanout.group_id() {
             self.ensure_group_live(group_id)?;
@@ -1349,6 +1383,10 @@ impl<S: StorageProvider> Engine<S> {
             retired
                 .as_ref()
                 .map(|record| (record, QueuedIntentRetirement::NotDelivered)),
+            Some(crate::publish::DirectChangeRollback {
+                pass,
+                reason: "not_delivered",
+            }),
         )
         .await
     }
@@ -1472,6 +1510,36 @@ impl<S: StorageProvider> Engine<S> {
     ) -> Result<SendResult, EngineError> {
         self.accept_send_with_audit_context(intent, context, SendAcceptance::Prepare)
             .await
+    }
+
+    /// Send a group change the host asked for (mdk#2332). It is sent as
+    /// [`Self::send_with_audit_context`] sends it; a commit staged at once is
+    /// also noted as the host's, by the intent's stable kind, until it
+    /// resolves ([`Self::host_change_kind`]). A queued change is named by its
+    /// queued intent instead.
+    pub async fn send_host_change_with_audit_context(
+        &mut self,
+        intent: SendIntent,
+        context: Option<AuditEventContext>,
+    ) -> Result<SendResult, EngineError> {
+        let intent_kind = crate::audit_helpers::send_intent_kind_str(&intent);
+        let result = self.send_with_audit_context(intent, context).await?;
+        if let SendResult::GroupEvolution { pending, .. } = &result
+            && let Some(group_id) = self.epoch_manager.group_for_pending(*pending)
+        {
+            self.host_change_by_pending
+                .insert(*pending, (group_id, intent_kind));
+        }
+        Ok(result)
+    }
+
+    /// The stable kind of the host's change `pending` carries, when the host
+    /// asked for it directly (mdk#2332). The session stores it on the
+    /// commit's frozen fanout as it stages it.
+    pub fn host_change_kind(&self, pending: PendingStateRef) -> Option<&'static str> {
+        self.host_change_by_pending
+            .get(&pending)
+            .map(|(_, intent_kind)| *intent_kind)
     }
 
     pub async fn queue_app_message_with_audit_context(
@@ -4005,6 +4073,8 @@ impl<S: StorageProvider> Engine<S> {
             .retain(|_, (group, _)| group != group_id);
         self.queued_intent_by_pending
             .retain(|_, (group, _)| group != group_id);
+        self.host_change_by_pending
+            .retain(|_, (group, _)| group != group_id);
         self.pending_origin_commits
             .retain(|reference, _| !pending.contains(reference));
         self.auto_publish_buf
@@ -4020,6 +4090,9 @@ impl<S: StorageProvider> Engine<S> {
             }
             | GroupEvent::LocalGroupCopyRestored { group_id: group }
             | GroupEvent::QueuedIntentRefused {
+                group_id: group, ..
+            }
+            | GroupEvent::GroupChangeNotDelivered {
                 group_id: group, ..
             }
             | GroupEvent::GroupMemberLeavesRemoved {

@@ -706,6 +706,44 @@ pub struct OwnCommitIntent {
     pub created_at_ms: u64,
 }
 
+/// Where a group change that was not delivered came from (mdk#2332).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ChangeOrigin {
+    /// A change the host asked for and the engine prepared at once. The
+    /// record's `commit_id` names it.
+    Direct,
+    /// A queued intent, named by the id [`SendResult::Queued`] returned.
+    ///
+    /// [`SendResult::Queued`]: crate::engine::SendResult::Queued
+    QueuedIntent { intent_id: MessageId },
+}
+
+/// A group change this device rolled back after its caller was given an
+/// unresolved result (mdk#2332): a queued intent the drain retired, or a
+/// host's change whose commit rolled back on a pass after the call that
+/// staged it. The rollback's transaction writes it, so a crash before the
+/// host reads events loses nothing. It stays until the host acknowledges it
+/// by commit id or the group's local state is removed; another commit
+/// confirming does not clear it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChangeNotDelivered {
+    pub group_id: GroupId,
+    /// The rolled-back commit, its frozen fanout's message id.
+    pub commit_id: MessageId,
+    pub origin: ChangeOrigin,
+    /// Stable name of the intent's kind, as
+    /// [`GroupEvent::QueuedIntentRefused`] names it, such as
+    /// `update_group_data`.
+    pub intent_kind: String,
+    /// Stable name of why: `not_delivered` (no relay received it),
+    /// `event_too_large` (it fits none of its relays) or `refused` (every
+    /// relay refused it for another reason).
+    pub reason: String,
+    /// When the rollback committed, in local wall-clock milliseconds.
+    pub at_ms: u64,
+}
+
 pub trait OutboundIntentStorage {
     fn put_queued_outbound_intent(&self, record: &QueuedOutboundIntent) -> StorageResult<()>;
     fn list_queued_outbound_intents(
@@ -725,6 +763,20 @@ pub trait OutboundIntentStorage {
     ) -> StorageResult<Vec<OwnCommitIntent>>;
     /// Idempotent: a commit that never recorded an intent is not an error.
     fn delete_own_commit_intent(&self, commit_id: &MessageId) -> StorageResult<()>;
+
+    /// Record a group change that was not delivered (mdk#2332). The engine
+    /// calls it inside the rollback's transaction. A record already stored
+    /// for the same commit is kept as it is.
+    fn put_change_not_delivered(&self, record: &ChangeNotDelivered) -> StorageResult<()>;
+    /// The group's records, oldest first.
+    fn changes_not_delivered(&self, group_id: &GroupId) -> StorageResult<Vec<ChangeNotDelivered>>;
+    /// Delete the group's record for `commit_id`, saying whether there was
+    /// one.
+    fn delete_change_not_delivered(
+        &self,
+        group_id: &GroupId,
+        commit_id: &MessageId,
+    ) -> StorageResult<bool>;
 }
 
 // ── OutboundFanoutStorage ──────────────────────────────────────────────────

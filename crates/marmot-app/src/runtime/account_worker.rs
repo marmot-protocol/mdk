@@ -659,6 +659,15 @@ pub(crate) enum AccountWorkerCommand {
         group_id: GroupId,
         respond: ReadReply<Result<Option<crate::GroupCommitDelivery>, AppError>>,
     },
+    GroupChangesNotDelivered {
+        group_id: GroupId,
+        respond: ReadReply<Result<Vec<crate::GroupChangeNotDelivered>, AppError>>,
+    },
+    AcknowledgeChangeNotDelivered {
+        group_id: GroupId,
+        commit_id_hex: String,
+        respond: oneshot::Sender<Result<bool, AppError>>,
+    },
     ConfirmGroupRejoin {
         welcome_id: cgka_traits::MessageId,
         token: Vec<u8>,
@@ -6608,6 +6617,32 @@ fn account_worker_command_future<'a>(
                 storage_permit.as_ref(),
                 respond,
                 client.group_commit_delivery(&group_id),
+                client,
+            );
+            true
+        }),
+        AccountWorkerCommand::GroupChangesNotDelivered { group_id, respond } => {
+            Box::pin(async move {
+                let _ = respond_diagnosed(
+                    shared,
+                    storage_permit.as_ref(),
+                    respond,
+                    client.group_changes_not_delivered(&group_id),
+                    client,
+                );
+                true
+            })
+        }
+        AccountWorkerCommand::AcknowledgeChangeNotDelivered {
+            group_id,
+            commit_id_hex,
+            respond,
+        } => Box::pin(async move {
+            let _ = respond_diagnosed(
+                shared,
+                storage_permit.as_ref(),
+                respond,
+                client.acknowledge_change_not_delivered(&group_id, &commit_id_hex),
                 client,
             );
             true

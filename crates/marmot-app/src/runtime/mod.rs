@@ -3111,6 +3111,46 @@ impl MarmotAppRuntime {
             .await
     }
 
+    /// The group's changes of yours that were not applied (mdk#2332), oldest
+    /// first. Each one's call got an unresolved answer (`CompletionUnknown`,
+    /// or a queued change's `AcceptedPending`), and its commit was then rolled
+    /// back: no relay received it, none would take it, or every relay refused
+    /// it. Nothing reached members and MDK does not send it again. A record
+    /// stays until [`Self::acknowledge_change_not_delivered`] or the group's
+    /// local state is removed; another change confirming does not clear it.
+    /// A direct change is also announced by
+    /// [`GroupEvent::GroupChangeNotDelivered`] and a queued one by
+    /// [`GroupEvent::QueuedIntentRefused`], but the events are only
+    /// notifications: read this on start to catch any you missed. A local
+    /// read.
+    ///
+    /// [`GroupEvent::GroupChangeNotDelivered`]: cgka_traits::engine::GroupEvent::GroupChangeNotDelivered
+    /// [`GroupEvent::QueuedIntentRefused`]: cgka_traits::engine::GroupEvent::QueuedIntentRefused
+    pub async fn group_changes_not_delivered(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+    ) -> Result<Vec<crate::GroupChangeNotDelivered>, AppError> {
+        self.accounts
+            .group_changes_not_delivered(account_ref, group_id)
+            .await
+    }
+
+    /// Delete one of [`Self::group_changes_not_delivered`] by its
+    /// `commit_id_hex` once the user has seen it (mdk#2332). Returns false,
+    /// changing nothing, when the group holds no such record. A malformed id
+    /// is an `AppError::Hex`.
+    pub async fn acknowledge_change_not_delivered(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+        commit_id_hex: &str,
+    ) -> Result<bool, AppError> {
+        self.accounts
+            .acknowledge_change_not_delivered(account_ref, group_id, commit_id_hex)
+            .await
+    }
+
     /// Dismiss one notice after the user accepts that this history may be
     /// incomplete. The dismissal is durable and is recorded as its own
     /// outcome, never as recovered history. Returns false, changing nothing,

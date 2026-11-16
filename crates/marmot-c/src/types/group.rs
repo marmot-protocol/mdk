@@ -111,6 +111,24 @@ c_mirror! {
 }
 
 c_mirror! {
+    /// A group change of yours that was not applied (mdk#2332): its call
+    /// answered `CompletionUnknown` (or `AcceptedPending`, queued) and MDK then
+    /// gave its commit up. Nothing reached members and nothing sends it again.
+    /// `queued_intent_id_hex` is NULL for a direct change. `reason` is
+    /// `not_delivered`, `event_too_large` or `refused`; `at` is in Unix
+    /// seconds. Requires the matching library and header.
+    MarmotGroupChangeNotDelivered from marmot_uniffi::conversions::GroupChangeNotDeliveredFfi,
+    list(MarmotGroupChangeNotDeliveredList, marmot_group_change_not_delivered_list_free) {
+        str group_id_hex,
+        str commit_id_hex,
+        opt_str queued_intent_id_hex,
+        str intent_kind,
+        str reason,
+        copy at: u64,
+    }
+}
+
+c_mirror! {
     /// Opaque application-owned group state. Empty data is distinct from absence.
     MarmotGroupAppComponent from GroupAppComponentFfi, free marmot_group_app_component_free {
         copy component_id: u16,

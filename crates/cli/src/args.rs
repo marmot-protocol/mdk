@@ -789,6 +789,24 @@ pub(crate) enum GroupsCommand {
         group_id: String,
     },
     #[command(
+        name = "changes-not-delivered",
+        about = "List your group changes that were given up after their call returned, until acknowledged"
+    )]
+    ChangesNotDelivered {
+        #[arg(help = "Group id to inspect")]
+        group_id: String,
+    },
+    #[command(
+        name = "acknowledge-change-not-delivered",
+        about = "Clear one change listed by changes-not-delivered once you have seen it"
+    )]
+    AcknowledgeChangeNotDelivered {
+        #[arg(help = "Group id holding the record")]
+        group_id: String,
+        #[arg(help = "The record's commit id (hex)")]
+        commit_id: String,
+    },
+    #[command(
         name = "recovery-status",
         about = "Show the durable recovery snapshot and pending rejoin offers for a group"
     )]

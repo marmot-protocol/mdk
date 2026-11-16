@@ -1120,6 +1120,63 @@ async fn groups_command_once(
                 json,
             })
         }
+        GroupsCommand::ChangesNotDelivered { group_id } => {
+            let account = resolve_account(account_home, account_flag)?;
+            ensure_local_signing(&account)?;
+            app.status(&account.label)?;
+            let group_id_hex = normalize_group_id_hex(&group_id)?;
+            let group_id = GroupId::new(hex::decode(&group_id_hex)?);
+            let changes = runtime
+                .group_changes_not_delivered(&account.label, &group_id)
+                .await?;
+            let mut json = json!({
+                "group_id": group_id_hex,
+                "changes_not_delivered": changes,
+            });
+            insert_account_fields(&mut json, &account)?;
+            Ok(CommandOutput {
+                plain: if changes.is_empty() {
+                    format!("changes-not-delivered group={group_id_hex} count=0")
+                } else {
+                    changes
+                        .iter()
+                        .map(|change| {
+                            format!(
+                                "change-not-delivered group={group_id_hex} commit={} kind={} reason={} at={}",
+                                change.commit_id_hex, change.intent_kind, change.reason, change.at
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                },
+                json,
+            })
+        }
+        GroupsCommand::AcknowledgeChangeNotDelivered {
+            group_id,
+            commit_id,
+        } => {
+            let account = resolve_account(account_home, account_flag)?;
+            ensure_local_signing(&account)?;
+            app.status(&account.label)?;
+            let group_id_hex = normalize_group_id_hex(&group_id)?;
+            let group_id = GroupId::new(hex::decode(&group_id_hex)?);
+            let acknowledged = runtime
+                .acknowledge_change_not_delivered(&account.label, &group_id, &commit_id)
+                .await?;
+            let mut json = json!({
+                "group_id": group_id_hex,
+                "commit_id": commit_id,
+                "acknowledged": acknowledged,
+            });
+            insert_account_fields(&mut json, &account)?;
+            Ok(CommandOutput {
+                plain: format!(
+                    "acknowledged change not delivered={acknowledged} for group {group_id_hex}"
+                ),
+                json,
+            })
+        }
         GroupsCommand::RecoveryStatus { group_id } => {
             let account = resolve_account(account_home, account_flag)?;
             ensure_local_signing(&account)?;

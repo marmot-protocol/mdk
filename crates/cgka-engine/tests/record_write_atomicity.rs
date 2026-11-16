@@ -14,9 +14,9 @@
 #![allow(clippy::disallowed_methods)]
 
 use async_trait::async_trait;
-use cgka_engine::EngineBuilder;
 use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_engine::openmls_projection::OpenMlsProjectionError;
+use cgka_engine::{EngineBuilder, RollbackPass};
 use cgka_traits::OutboundFanout;
 use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
 use cgka_traits::engine::{
@@ -31,14 +31,15 @@ use cgka_traits::message::{MessageRecord, MessageState};
 use cgka_traits::peeler::TransportPeeler;
 use cgka_traits::storage::{
     AccountDeviceHistoryKey, AccountDeviceHistoryKeyStorage, AccountDeviceSignerBinding,
-    AccountDeviceSignerStorage, CapabilityStorage, CommittedMembers, CommittedRoster,
-    CommittedRosterStorage, CommittedRosterWrite, ConvergencePassStorage, ConvergencePolicyStorage,
-    DeviceGroupWelcomeExpectation, DeviceGroupWelcomeStorage, DisbandCandidate,
-    DisbandCandidateStorage, DisbandRequest, DisbandRequestStorage, DisbandTombstoneStorage,
-    GroupStateCheckpointRef, GroupStorage, KeyPackageBundleStorage, LeaveRequest,
-    LeaveRequestStorage, MemberValidationCacheStorage, MessageStorage, OpenMlsContentFilter,
-    OutboundFanoutStorage, OutboundIntentStorage, QueuedOutboundIntent, RosterRevision,
-    StorageError, StorageProvider, StorageResult, StoredKeyPackageBundle, WelcomeStorage,
+    AccountDeviceSignerStorage, CapabilityStorage, ChangeNotDelivered, ChangeOrigin,
+    CommittedMembers, CommittedRoster, CommittedRosterStorage, CommittedRosterWrite,
+    ConvergencePassStorage, ConvergencePolicyStorage, DeviceGroupWelcomeExpectation,
+    DeviceGroupWelcomeStorage, DisbandCandidate, DisbandCandidateStorage, DisbandRequest,
+    DisbandRequestStorage, DisbandTombstoneStorage, GroupStateCheckpointRef, GroupStorage,
+    KeyPackageBundleStorage, LeaveRequest, LeaveRequestStorage, MemberValidationCacheStorage,
+    MessageStorage, OpenMlsContentFilter, OutboundFanoutStorage, OutboundIntentStorage,
+    QueuedOutboundIntent, RosterRevision, StorageError, StorageProvider, StorageResult,
+    StoredKeyPackageBundle, WelcomeStorage,
 };
 use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
@@ -766,6 +767,30 @@ impl OutboundIntentStorage for FaultStorage {
             ));
         }
         self.inner.delete_own_commit_intent(commit_id)
+    }
+    fn put_change_not_delivered(
+        &self,
+        record: &cgka_traits::storage::ChangeNotDelivered,
+    ) -> StorageResult<()> {
+        if self.termination_fault.should_fail() {
+            return Err(StorageError::Busy(
+                "injected change-not-delivered write failure".into(),
+            ));
+        }
+        self.inner.put_change_not_delivered(record)
+    }
+    fn changes_not_delivered(
+        &self,
+        group_id: &GroupId,
+    ) -> StorageResult<Vec<cgka_traits::storage::ChangeNotDelivered>> {
+        self.inner.changes_not_delivered(group_id)
+    }
+    fn delete_change_not_delivered(
+        &self,
+        group_id: &GroupId,
+        commit_id: &MessageId,
+    ) -> StorageResult<bool> {
+        self.inner.delete_change_not_delivered(group_id, commit_id)
     }
 }
 
@@ -3723,8 +3748,9 @@ async fn a_queued_intent_held_by_a_storage_failure_stays_queued() {
 }
 
 /// A queued intent whose drained commit fits none of its relays is retired in
-/// the rollback's own transaction (mdk#2334). A failed delete undoes the
-/// rollback too: the commit stays pending, the intent queued and nothing is
+/// the rollback's own transaction (mdk#2334), which records the change as not
+/// delivered (mdk#2332). A failed delete or record write undoes the rollback
+/// too: the commit stays pending, the intent queued and nothing is recorded or
 /// announced, so the refusal can run again. It never leaves a rolled-back
 /// commit whose intent the next drain prepares again.
 #[tokio::test]
@@ -3788,47 +3814,54 @@ async fn a_too_large_queued_intent_is_retired_with_its_rollback() {
         .converge_and_drain_queued_outbound_intents(&group_id, 1_000_000)
         .await
         .unwrap();
-    let [SendResult::GroupEvolution { pending, .. }] = drained.as_slice() else {
+    let [SendResult::GroupEvolution { msg, pending, .. }] = drained.as_slice() else {
         panic!("the queued edit stages: {drained:?}")
     };
     let pending = *pending;
+    let commit_id = msg.id.clone();
     engine.drain_events();
 
-    termination_fault.arm_on_write(1);
-    assert!(matches!(
-        engine
-            .publish_refused_as_too_large(
-                pending,
-                None,
-                OversizedArtifact::Commit,
-                EventSizeClass::Under64Kib,
-            )
-            .await,
-        Err(EngineError::Storage(StorageError::Busy(_)))
-    ));
-    assert_eq!(termination_fault.remaining(), 0);
-    assert!(
-        matches!(
-            engine.epoch_state(&group_id),
-            Some(EpochState::PendingPublish { .. })
-        ),
-        "a failed retirement leaves the commit pending: {:?}",
-        engine.epoch_state(&group_id)
-    );
-    assert_eq!(
-        storage
-            .list_queued_outbound_intents(&group_id)
-            .unwrap()
-            .len(),
-        1,
-        "a failed retirement leaves the intent queued"
-    );
-    assert!(
-        !engine
-            .drain_events()
-            .iter()
-            .any(|event| matches!(event, GroupEvent::QueuedIntentRefused { .. }))
-    );
+    // The retirement's delete fails, then its not-delivered record's write.
+    for write in [1, 2] {
+        termination_fault.arm_on_write(write);
+        assert!(matches!(
+            engine
+                .publish_refused_as_too_large(
+                    pending,
+                    None,
+                    OversizedArtifact::Commit,
+                    EventSizeClass::Under64Kib,
+                    RollbackPass::Later,
+                )
+                .await,
+            Err(EngineError::Storage(StorageError::Busy(_)))
+        ));
+        assert_eq!(termination_fault.remaining(), 0);
+        assert!(
+            matches!(
+                engine.epoch_state(&group_id),
+                Some(EpochState::PendingPublish { .. })
+            ),
+            "a failed retirement leaves the commit pending: {:?}",
+            engine.epoch_state(&group_id)
+        );
+        assert_eq!(
+            storage
+                .list_queued_outbound_intents(&group_id)
+                .unwrap()
+                .len(),
+            1,
+            "a failed retirement leaves the intent queued"
+        );
+        assert!(
+            storage.changes_not_delivered(&group_id).unwrap().is_empty(),
+            "a failed retirement records nothing"
+        );
+        assert!(!engine.drain_events().iter().any(|event| matches!(
+            event,
+            GroupEvent::QueuedIntentRefused { .. } | GroupEvent::GroupChangeNotDelivered { .. }
+        )));
+    }
 
     engine
         .publish_refused_as_too_large(
@@ -3836,6 +3869,7 @@ async fn a_too_large_queued_intent_is_retired_with_its_rollback() {
             None,
             OversizedArtifact::Commit,
             EventSizeClass::Under64Kib,
+            RollbackPass::Later,
         )
         .await
         .expect("the refusal runs again once storage recovers");
@@ -3845,9 +3879,9 @@ async fn a_too_large_queued_intent_is_retired_with_its_rollback() {
             .unwrap()
             .is_empty()
     );
-    let refusals: Vec<_> = engine
-        .drain_events()
-        .into_iter()
+    let events = engine.drain_events();
+    let refusals: Vec<_> = events
+        .iter()
         .filter(|event| matches!(event, GroupEvent::QueuedIntentRefused { .. }))
         .collect();
     assert!(
@@ -3862,6 +3896,29 @@ async fn a_too_large_queued_intent_is_retired_with_its_rollback() {
             }] if *refused == intent_id && reason == "event_too_large"
         ),
         "{refusals:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, GroupEvent::GroupChangeNotDelivered { .. })),
+        "a queued intent is announced as refused only"
+    );
+    let records = storage.changes_not_delivered(&group_id).unwrap();
+    assert!(
+        matches!(
+            records.as_slice(),
+            [ChangeNotDelivered {
+                commit_id: recorded,
+                origin: ChangeOrigin::QueuedIntent { intent_id: retired },
+                intent_kind,
+                reason,
+                ..
+            }] if *recorded == commit_id
+                && *retired == intent_id
+                && intent_kind == "update_group_data"
+                && reason == "event_too_large"
+        ),
+        "the retirement records the change not delivered: {records:?}"
     );
     assert!(matches!(
         engine.epoch_state(&group_id),
@@ -4031,13 +4088,13 @@ async fn a_queued_intent_whose_commit_reached_no_relay_is_retired_with_its_rollb
     assert!(exposed.outcome().fanout_complete && exposed.possible_exposure());
     assert!(
         engine
-            .publish_failed_fanout(pending, &mut exposed.clone())
+            .publish_failed_fanout(pending, &mut exposed.clone(), RollbackPass::Later)
             .await
             .is_err()
     );
     assert!(
         engine
-            .publish_not_delivered(pending, &mut exposed)
+            .publish_not_delivered(pending, &mut exposed, RollbackPass::Later)
             .await
             .is_err()
     );
@@ -4050,7 +4107,7 @@ async fn a_queued_intent_whose_commit_reached_no_relay_is_retired_with_its_rollb
     engine.put_outbound_fanout(&fanout).unwrap();
     assert!(
         engine
-            .publish_not_delivered(pending, &mut stale)
+            .publish_not_delivered(pending, &mut stale, RollbackPass::Later)
             .await
             .is_err()
     );
@@ -4059,6 +4116,10 @@ async fn a_queued_intent_whose_commit_reached_no_relay_is_retired_with_its_rollb
         "the stale abandonment rewinds nothing"
     );
     assert_eq!(queued(&storage), 1, "the stale abandonment retires nothing");
+    assert!(
+        storage.changes_not_delivered(&group_id).unwrap().is_empty(),
+        "the stale abandonment records nothing"
+    );
     assert_eq!(
         engine.outbound_fanouts().unwrap(),
         vec![fanout.clone()],
@@ -4085,7 +4146,7 @@ async fn a_queued_intent_whose_commit_reached_no_relay_is_retired_with_its_rollb
     engine.put_outbound_fanout(&fanout).unwrap();
     fanout.abandon_unsent_targets().unwrap();
     engine
-        .publish_not_delivered(pending, &mut fanout)
+        .publish_not_delivered(pending, &mut fanout, RollbackPass::Later)
         .await
         .expect("a commit that reached no relay rolls back");
     assert_eq!(fanout.mls_state(), cgka_traits::FanoutMlsState::RolledBack);
@@ -4115,6 +4176,23 @@ async fn a_queued_intent_whose_commit_reached_no_relay_is_retired_with_its_rollb
                 && reason == "not_delivered"
         ),
         "{refusals:?}"
+    );
+    let records = storage.changes_not_delivered(&group_id).unwrap();
+    assert!(
+        matches!(
+            records.as_slice(),
+            [ChangeNotDelivered {
+                commit_id,
+                origin: ChangeOrigin::QueuedIntent { intent_id: retired },
+                intent_kind,
+                reason,
+                ..
+            }] if commit_id == fanout.message_id()
+                && *retired == intent_id
+                && intent_kind == "update_group_data"
+                && reason == "not_delivered"
+        ),
+        "{records:?}"
     );
     assert!(
         engine
@@ -4289,7 +4367,7 @@ async fn a_drained_commit_retires_its_queued_intent_after_a_restart() {
                 engine.put_outbound_fanout(&fanout).unwrap();
                 fanout.abandon_unsent_targets().unwrap();
                 engine
-                    .publish_not_delivered(pending, &mut fanout)
+                    .publish_not_delivered(pending, &mut fanout, RollbackPass::Later)
                     .await
                     .unwrap();
             }
@@ -4317,6 +4395,7 @@ async fn a_drained_commit_retires_its_queued_intent_after_a_restart() {
                         Some(&mut fanout),
                         OversizedArtifact::Commit,
                         EventSizeClass::Under64Kib,
+                        RollbackPass::Later,
                     )
                     .await
                     .unwrap();

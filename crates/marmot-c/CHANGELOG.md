@@ -23,6 +23,10 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ### Added
 
+- `marmot_group_changes_not_delivered` (free with `marmot_group_change_not_delivered_list_free`) and
+  `marmot_acknowledge_change_not_delivered` (mdk#2332). `MARMOT_GROUP_EVENT_KIND_GROUP_CHANGE_NOT_DELIVERED` is
+  appended to `MarmotGroupEventKind`, so existing tags keep their values: handle it in exhaustive switches and
+  rebuild with the matching header and library.
 - `marmot_start_direct_chat_with_options` and the borrowed input struct
   `MarmotDirectConversationOptions { disappearing_message_secs }` found a new
   direct chat with that duration in its founding MLS state and Welcome. Reuse

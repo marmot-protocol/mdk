@@ -3,6 +3,7 @@ mod account_devices_advertising;
 mod audit_ownership;
 #[cfg(feature = "test-policy-overrides")]
 mod canonical_membership;
+mod changes_not_delivered;
 #[cfg(feature = "test-policy-overrides")]
 mod compromise_warning;
 #[cfg(feature = "test-policy-overrides")]

@@ -1290,6 +1290,63 @@ impl From<cgka_traits::CommitRefusalCause> for GroupCommitRefusalCause {
     }
 }
 
+/// A group change of yours that was not applied (mdk#2332). Its caller got an
+/// unresolved answer, and the commit was then rolled back: no relay received
+/// it, none would take it, or every relay refused it. Nothing was sent to
+/// members, and MDK does not send it again; ask again to make the change. A
+/// record stays until you acknowledge it by `commit_id_hex` or the group's
+/// local state is removed. Another change confirming does not clear it, and
+/// it is kept across restarts, so a host that missed the event finds it here.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct GroupChangeNotDelivered {
+    pub group_id_hex: String,
+    /// The rolled-back commit, which [acknowledging] names.
+    ///
+    /// [acknowledging]: crate::MarmotAppRuntime::acknowledge_change_not_delivered
+    pub commit_id_hex: String,
+    pub origin: GroupChangeOrigin,
+    /// Stable name of the change's kind, such as `remove_members` or
+    /// `update_group_data`.
+    pub intent_kind: String,
+    /// Stable name of why: `not_delivered` (no relay received it),
+    /// `event_too_large` (it fits none of the group's relays) or `refused`
+    /// (every relay refused it for another reason).
+    pub reason: String,
+    /// When it was rolled back, in Unix seconds.
+    pub at: u64,
+}
+
+/// Which call made a change that was not applied (mdk#2332).
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum GroupChangeOrigin {
+    /// A group change call that answered `CompletionUnknown`. Its commit is
+    /// named only by `commit_id_hex`.
+    Direct,
+    /// A change that was queued: the id `QueuedIntentRefused` names.
+    QueuedIntent { intent_id_hex: String },
+}
+
+impl From<cgka_traits::storage::ChangeNotDelivered> for GroupChangeNotDelivered {
+    fn from(record: cgka_traits::storage::ChangeNotDelivered) -> Self {
+        Self {
+            group_id_hex: hex::encode(record.group_id.as_slice()),
+            commit_id_hex: hex::encode(record.commit_id.as_slice()),
+            origin: match record.origin {
+                cgka_traits::storage::ChangeOrigin::Direct => GroupChangeOrigin::Direct,
+                cgka_traits::storage::ChangeOrigin::QueuedIntent { intent_id } => {
+                    GroupChangeOrigin::QueuedIntent {
+                        intent_id_hex: hex::encode(intent_id.as_slice()),
+                    }
+                }
+            },
+            intent_kind: record.intent_kind,
+            reason: record.reason,
+            at: record.at_ms / 1_000,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SendSummary {
     pub published: usize,

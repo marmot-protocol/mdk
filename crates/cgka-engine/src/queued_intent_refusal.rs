@@ -65,7 +65,7 @@ pub(crate) enum QueuedIntentRetirement<'a> {
 
 impl QueuedIntentRetirement<'_> {
     /// The stable reason [`GroupEvent::QueuedIntentRefused`] names.
-    fn reason(self) -> &'static str {
+    pub(crate) fn reason(self) -> &'static str {
         match self {
             Self::Refused(error) => error.privacy_safe_kind(),
             Self::NotDelivered => "not_delivered",

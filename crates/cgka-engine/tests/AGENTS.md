@@ -168,6 +168,10 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
 - **File:** `publish_lifecycle.rs`
   - **Owns:** Explicit publish-before-apply lifecycle for local group evolution
     Its `late_descriptor` module owns failed SelfUpdate Prepared and final Disband request writes: complete sent/native/protocol rollback, encrypted reopen, and real preparation/confirmation retry (mdk#3170).
+    Its `change_not_delivered` module owns which direct rollbacks are recorded (mdk#2332): a host change on a later
+    pass is recorded and announced, the staging pass and an automatic commit are not, and a record outlives a later
+    confirmed commit until deleted. The queued-intent record and its atomicity with the retirement belong to
+    `record_write_atomicity.rs`.
 
 - **File:** `pending_commit_recovery.rs`
   - **Owns:** Crash-during-publish recovery at session open — `hydrate_all_stored_groups` detects a surviving

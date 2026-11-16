@@ -9,6 +9,11 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+### Added
+
+- `wn groups changes-not-delivered <group-hex>` lists your group changes given up after their call returned, and
+  `wn groups acknowledge-change-not-delivered <group-hex> <commit-hex>` clears one (mdk#2332).
+
 ## [0.17.0] - 2026-11-15
 
 ### Changed

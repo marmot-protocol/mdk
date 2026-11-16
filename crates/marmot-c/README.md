@@ -745,6 +745,12 @@ immediately (free with `marmot_group_commit_delivery_free`), and
 `marmot_acknowledge_group_commit_undelivered` lets one change through. See the
 [shared contract](../marmot-uniffi/README.md#history-may-be-incomplete-notices) for when the
 status is returned.
+A group change that answered `CompletionUnknown` (or `AcceptedPending`, queued) and that MDK
+later gave up is kept for the host: `marmot_group_changes_not_delivered` lists the group's records
+(free with `marmot_group_change_not_delivered_list_free`), `MARMOT_GROUP_EVENT_KIND_GROUP_CHANGE_NOT_DELIVERED`
+announces a direct one, and `marmot_acknowledge_change_not_delivered` clears one by its
+`commit_id_hex`. A record names the change by its group, kind and time only. See the
+[shared contract](../marmot-uniffi/README.md#group-changes-that-were-not-applied).
 
 Automatic Unrecoverable rejoin runs inside the account workers; C hosts keep their existing group-state
 subscriptions. See the [shared automatic rejoin contract](../../docs/marmot-architecture/invitation-recovery.md#automatic-rejoin-of-an-unrecoverable-copy)

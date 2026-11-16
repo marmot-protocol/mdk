@@ -2660,6 +2660,30 @@ mod tests {
                 ..
             }
         ));
+        let cli = Cli::try_parse_from(["wn", "groups", "changes-not-delivered", "GROUP"])
+            .expect("changes-not-delivered parses");
+        assert!(matches!(
+            cli.command,
+            Command::Groups {
+                command: crate::GroupsCommand::ChangesNotDelivered { .. },
+                ..
+            }
+        ));
+        let cli = Cli::try_parse_from([
+            "wn",
+            "groups",
+            "acknowledge-change-not-delivered",
+            "GROUP",
+            "COMMIT",
+        ])
+        .expect("acknowledge-change-not-delivered parses");
+        assert!(matches!(
+            cli.command,
+            Command::Groups {
+                command: crate::GroupsCommand::AcknowledgeChangeNotDelivered { group_id, commit_id },
+                ..
+            } if group_id == "GROUP" && commit_id == "COMMIT"
+        ));
     }
 
     #[test]

@@ -230,7 +230,8 @@ cargo test -p marmot-session
 
 - `tests/runtime.rs` plus `tests/runtime/` — the account-device runtime over a real session and a scripted transport:
   transport activation, KeyPackage publication, rotation and retention, Welcome publication and withdrawal, durable
-  maintenance, publish confirmation and rollback, frozen fanouts and relay retries, KeyPackage generator upgrades,
+  maintenance, publish confirmation and rollback, records of host changes given up after their call returned, frozen
+  fanouts and relay retries, KeyPackage generator upgrades,
   app-component migration, and each device of an account joining only through the Welcome delivery that names its own
   KeyPackage, including, in a group that requires account-devices, a Welcome from another device of the account. An
   upgrade to advertising account-devices replaces the published KeyPackage in its slot and refreshes each existing

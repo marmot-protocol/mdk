@@ -181,6 +181,13 @@ multi-device Welcome delivery, Welcome withdrawal, staged and owed Welcome deliv
   names its queued intent from staging on (`set_queued_intent`), so that holds after a restart. A read only tells an online
   device; the exposure record alone decides, and `validate_successor_of` and the engine both refuse an abandonment of a
   fanout a relay may hold (mdk#1577). A read that returns the event confirms. Offline, nothing changes.
+- Pass `RollbackPass::Staging` only from the drive inside the call that staged the commit
+  (`publish_one_with_post_confirmation_welcomes`), and `RollbackPass::Later` from every resume (mdk#2332). A rollback
+  on a later pass of a host's change is recorded as not delivered, because its caller already returned. Host group
+  changes come in through `send_host_change_with_audit_context` and
+  `confirm_host_change_without_publish_with_audit_context`, and staging stores the change's kind on the fanout
+  (`set_host_change`) before the first send; every other send is automatic and is never recorded. Records are read
+  and acknowledged through `group_changes_not_delivered` and `acknowledge_change_not_delivered`.
 - Never let a durable maintenance record depend on an engine event alone. Engine events are in-memory, and this layer
   consumes them *after* awaiting the batch's relay publishes, so the loss window is network-wide. `GroupStateInvalidated`
   retires a `DurableGroupEvolution`, and `run_due_maintenance` re-derives that same retirement from the commit's stored

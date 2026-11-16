@@ -35,9 +35,34 @@ use cgka_traits::engine::GroupEvent;
 use cgka_traits::engine_state::PendingStateRef;
 use cgka_traits::error::EngineError;
 use cgka_traits::message::MessageState;
-use cgka_traits::storage::{QueuedOutboundIntent, StorageProvider};
+use cgka_traits::storage::{
+    ChangeNotDelivered, ChangeOrigin, QueuedOutboundIntent, StorageProvider,
+};
 use cgka_traits::types::{EpochId, GroupId};
 use openmls::group::MlsGroup;
+
+/// Which pass of a commit's publication rolls it back (mdk#2332).
+///
+/// A rollback that resolves a change whose caller was already given an
+/// unresolved result writes a durable not-delivered record. A queued intent
+/// always was (it returned `Queued`). A host's direct change was only when
+/// the call that staged it returned before the rollback: inside that call,
+/// the caller gets the rollback as the call's own error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RollbackPass {
+    /// The pass inside the call that staged the commit.
+    Staging,
+    /// Any later pass: a retry, a wake, or a resume after a restart.
+    Later,
+}
+
+/// How a fanout rollback reports a host's direct change (mdk#2332).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DirectChangeRollback {
+    pub(crate) pass: RollbackPass,
+    /// Stable name of why, which the record and event carry.
+    pub(crate) reason: &'static str,
+}
 use openmls_traits::OpenMlsProvider as _;
 
 impl<S: StorageProvider> Engine<S> {
@@ -382,6 +407,7 @@ impl<S: StorageProvider> Engine<S> {
             *fanout = confirmed;
         }
         self.queued_intent_by_pending.remove(&pending);
+        self.host_change_by_pending.remove(&pending);
         if has_pending_commit {
             // A proposal-arrival signal only resets scheduling for its source
             // epoch. Confirming any commit crosses that boundary, so no
@@ -491,7 +517,7 @@ impl<S: StorageProvider> Engine<S> {
         &mut self,
         pending: PendingStateRef,
     ) -> Result<(), EngineError> {
-        self.do_publish_failed_with_fanout(pending, None, None)
+        self.do_publish_failed_with_fanout(pending, None, None, None)
             .await
     }
 
@@ -506,11 +532,16 @@ impl<S: StorageProvider> Engine<S> {
     /// With `fanout`, it must be complete with no target accepted and none
     /// that may hold the event (mdk#1577): a commit a relay may have
     /// forwarded is never rolled back, whoever asks.
+    ///
+    /// The same transaction records a change whose caller was already given
+    /// an unresolved result (mdk#2332): the retired intent, or, with
+    /// `direct` on a later pass, the host's change `fanout` names.
     pub(crate) async fn do_publish_failed_with_fanout(
         &mut self,
         pending: PendingStateRef,
         mut fanout: Option<&mut OutboundFanout>,
         retired: Option<(&QueuedOutboundIntent, QueuedIntentRetirement<'_>)>,
+        direct: Option<DirectChangeRollback>,
     ) -> Result<(), EngineError> {
         let origin_commit_id = self.peek_pending_origin_commit(pending);
 
@@ -546,6 +577,13 @@ impl<S: StorageProvider> Engine<S> {
                 Ok(rolled_back)
             })
             .transpose()?;
+        let not_delivered = self.change_not_delivered(
+            &group_id,
+            fanout.as_deref(),
+            origin_commit_id.as_ref(),
+            retired,
+            direct,
+        );
 
         let has_pending_commit = mls_group.pending_commit().is_some();
         let pending_was_self_remove_only = mls_group.pending_commit().is_some_and(|staged| {
@@ -568,6 +606,11 @@ impl<S: StorageProvider> Engine<S> {
                 // crash leaves both, and the refusal can run again.
                 if let Some((record, _)) = retired {
                     storage.delete_queued_outbound_intent(&record.id)?;
+                }
+                // The caller holds an unresolved result, so the outcome must
+                // outlive the events that announce it.
+                if let Some(record) = not_delivered.as_ref() {
+                    storage.put_change_not_delivered(record)?;
                 }
                 if has_pending_commit {
                     let source_epoch = EpochId(mls_group.epoch().as_u64());
@@ -644,6 +687,11 @@ impl<S: StorageProvider> Engine<S> {
         if let Some((record, retirement)) = retired {
             self.announce_refused_queued_intent(record, retirement);
         }
+        if let Some(record) = not_delivered
+            && record.origin == ChangeOrigin::Direct
+        {
+            self.announce_change_not_delivered(record);
+        }
         let pending_epoch_pre = EpochId(mls_group.epoch().as_u64());
         let audit_context = self.epoch_manager.audit_context_for_pending(pending);
         let (group_id, prior_epoch) = self.epoch_manager.rollback_publish(pending)?;
@@ -675,6 +723,7 @@ impl<S: StorageProvider> Engine<S> {
         if let Some((queued_group_id, _)) = self.queued_intent_by_pending.remove(&pending) {
             self.schedule_pending_convergence_group(&queued_group_id);
         }
+        self.host_change_by_pending.remove(&pending);
         self.schedule_drain_for_retained_outbound_intents(&group_id);
         self.take_pending_origin_commit(pending);
         self.restore_self_remove_auto_commit_schedules_for_group(
@@ -684,6 +733,71 @@ impl<S: StorageProvider> Engine<S> {
         )?;
         self.replay_buffered_messages(&group_id).await?;
         Ok(())
+    }
+
+    /// The not-delivered record a rollback writes, if its change's caller was
+    /// already given an unresolved result (mdk#2332): a retired queued intent
+    /// on any pass, or a host's direct change, which `fanout` names, on a pass
+    /// after the call that staged it. An automatic commit, and a fanout
+    /// stored before fanouts named host changes, write none.
+    fn change_not_delivered(
+        &self,
+        group_id: &GroupId,
+        fanout: Option<&OutboundFanout>,
+        origin_commit_id: Option<&cgka_traits::types::MessageId>,
+        retired: Option<(&QueuedOutboundIntent, QueuedIntentRetirement<'_>)>,
+        direct: Option<DirectChangeRollback>,
+    ) -> Option<ChangeNotDelivered> {
+        let commit_id = fanout
+            .map(|fanout| fanout.message_id())
+            .or(origin_commit_id)?
+            .clone();
+        let (origin, intent_kind, reason) = match retired {
+            Some((record, retirement)) => (
+                ChangeOrigin::QueuedIntent {
+                    intent_id: record.id.clone(),
+                },
+                crate::audit_helpers::send_intent_kind_str(&record.intent).to_owned(),
+                retirement.reason(),
+            ),
+            None => {
+                let direct = direct.filter(|direct| direct.pass == RollbackPass::Later)?;
+                (
+                    ChangeOrigin::Direct,
+                    fanout?.host_change_kind()?.to_owned(),
+                    direct.reason,
+                )
+            }
+        };
+        Some(ChangeNotDelivered {
+            group_id: group_id.clone(),
+            commit_id,
+            origin,
+            intent_kind,
+            reason: reason.to_owned(),
+            at_ms: self.wall_clock.now().0.saturating_mul(1_000),
+        })
+    }
+
+    /// Tell the host its direct change was not applied, once the record is
+    /// durable (mdk#2332). A queued intent's is told as
+    /// `QueuedIntentRefused`.
+    fn announce_change_not_delivered(&mut self, record: ChangeNotDelivered) {
+        // Privacy-safe: the intent's kind and the reason's stable name only.
+        tracing::info!(
+            target: "cgka_engine::publish",
+            method = "announce_change_not_delivered",
+            intent_kind = record.intent_kind.as_str(),
+            reason = record.reason.as_str(),
+            "direct group change not delivered"
+        );
+        self.events_buf
+            .push_back(GroupEvent::GroupChangeNotDelivered {
+                group_id: record.group_id,
+                commit_id: record.commit_id,
+                intent_kind: record.intent_kind,
+                reason: record.reason,
+            });
     }
 
     /// Put a group back on the runtime's drain list when it still holds durable

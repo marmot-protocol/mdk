@@ -182,7 +182,7 @@ as a locally deleted group, and the read records that wait in R9.
 | --- | --- |
 | R1, prepared group images | `prepared_group_image_status`, `prepared_group_images` |
 | R2, device-group history | `chat_history_imports`, `started_fresh`, `history_import_provenance` |
-| R3, durable engine facts | `pending_welcome_deliveries`; from A: `group_members`, `group_member_ids_page`, `group_conversation_snapshot` (and `group_roster`, built from it), `group_co_members`, `quarantined_groups`, `group_commit_delivery`, `key_package_maintenance_status` and its diagnostic form, `durably_owned_key_packages`, `maintenance_status`, `periodic_maintenance_policy` |
+| R3, durable engine facts | `pending_welcome_deliveries`, `group_changes_not_delivered`; from A: `group_members`, `group_member_ids_page`, `group_conversation_snapshot` (and `group_roster`, built from it), `group_co_members`, `quarantined_groups`, `group_commit_delivery`, `key_package_maintenance_status` and its diagnostic form, `durably_owned_key_packages`, `maintenance_status`, `periodic_maintenance_policy` |
 | R4, facts that need a hydrated group | `account_devices_activation`, `group_push_debug_info`, the conversation window's authority capture; from A: `group_mls_state` and its diagnostic form, `group_app_component` |
 | R5, exporter secrets | `exporter_secret`, `safe_export_secret` |
 | R6, device roster | `linked_devices`, `key_package_refresh_overdue`, `unrecognized_sign_ins`, `compromise_warning`, `removed_device_leftover_chats`, `chats_closed_to_linked_devices`, `backup_history_availability`, `backup_settings` |
