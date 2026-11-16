@@ -1831,6 +1831,13 @@ impl AccountDeviceSession {
             .confirm_regenerated_queued_intent(&intent.intent_id)?)
     }
 
+    /// See `Engine::retire_drained_queued_intent`.
+    pub fn retire_drained_queued_intent(&mut self, intent: &QueuedIntentRef) -> SessionResult<()> {
+        Ok(self
+            .engine
+            .retire_drained_queued_intent(&intent.group_id, &intent.intent_id)?)
+    }
+
     pub fn retry_regenerated_queued_intent(&mut self, intent: &QueuedIntentRef) {
         self.engine
             .retry_regenerated_queued_intent(&intent.group_id, &intent.intent_id);
@@ -1940,6 +1947,14 @@ impl AccountDeviceSession {
     /// fanout to name (mdk#2332).
     pub fn drained_queued_intent_id(&self, pending: PendingStateRef) -> Option<MessageId> {
         self.engine.drained_queued_intent_id(pending)
+    }
+
+    /// The queued intent the drain prepared the application message or
+    /// proposal `message_id` from, for its frozen fanout to name (mdk#2332).
+    pub fn regenerated_queued_intent_id(&self, message_id: &MessageId) -> Option<MessageId> {
+        self.engine
+            .regenerated_queued_intent_for_message(message_id)
+            .map(|(_, intent_id)| intent_id)
     }
 
     /// The stable kind of the host's change `pending` carries, for its frozen

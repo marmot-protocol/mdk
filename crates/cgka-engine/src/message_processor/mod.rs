@@ -1771,6 +1771,29 @@ impl<S: StorageProvider> Engine<S> {
         Ok(())
     }
 
+    /// Retire the queued intent a drained application message or proposal
+    /// was prepared from, once the event resolved: a relay accepted it, or
+    /// every relay refused it for good (mdk#2332). The event's fanout names
+    /// the intent, and later passes over it retire it again, so an intent
+    /// already retired counts as retired.
+    pub fn retire_drained_queued_intent(
+        &mut self,
+        group_id: &GroupId,
+        intent_id: &MessageId,
+    ) -> Result<(), EngineError> {
+        let queued = self
+            .storage
+            .list_queued_outbound_intents(group_id)?
+            .iter()
+            .any(|record| &record.id == intent_id);
+        if queued {
+            self.storage.delete_queued_outbound_intent(intent_id)?;
+        }
+        self.queued_intent_by_message
+            .retain(|_, (_, queued_intent_id)| queued_intent_id != intent_id);
+        Ok(())
+    }
+
     /// Re-arm a regenerated intent whose publication reached no endpoint.
     /// Clearing the in-flight association lets the next drain regenerate a
     /// fresh artifact; the durable intent row is untouched.

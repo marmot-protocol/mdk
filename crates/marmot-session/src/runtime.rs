@@ -218,6 +218,15 @@ struct PublishStatus {
     awaits_commit: bool,
 }
 
+impl PublishStatus {
+    /// Whether the publish staged no fanout: nothing accepted, nothing
+    /// refused for good, and nothing left to retry. A staged fanout always
+    /// ends in one of those.
+    fn staged_nothing(&self) -> bool {
+        !self.accepted_by_any_endpoint && !self.terminal_failure && !self.retry_deferred
+    }
+}
+
 /// Who asked for a send: the host, for a group change (mdk#2332), or anything
 /// else, whose commits name no host change.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -4834,13 +4843,13 @@ where
                         context.clone(),
                     ))
                     .await?;
-                    self.resolve_regenerated_queued_intent(queued_intent, status);
+                    self.rearm_unstaged_queued_intent(queued_intent, status);
                 }
                 PublishWork::Proposal { msg, queued_intent } => {
                     let status =
                         Box::pin(self.publish_one(msg, None, None, output, queue, context.clone()))
                             .await?;
-                    self.resolve_regenerated_queued_intent(queued_intent, status);
+                    self.rearm_unstaged_queued_intent(queued_intent, status);
                 }
                 PublishWork::GroupCreated { welcomes, pending } => {
                     Box::pin(self.publish_group_created(
@@ -5138,7 +5147,13 @@ where
                     blocked_groups.insert(fanout_group);
                 }
             } else if outcome.accepted_targets > 0 && fanout.application_message().is_some() {
+                // A crash after the accepting result was saved, before its
+                // intent was retired (mdk#2332).
+                self.retire_drained_queued_intent(&fanout);
                 self.record_published_application_fanout(&fanout, &mut output);
+                output.fanout.push(outcome);
+            } else if !self.retire_drained_queued_intent(&fanout) {
+                // Kept, still naming its intent, for the next pass.
                 output.fanout.push(outcome);
             } else {
                 // Complete when found: a crash after its last result was saved.
@@ -5508,55 +5523,53 @@ where
         Ok(())
     }
 
-    fn resolve_regenerated_queued_intent(
+    /// Re-arm a drained intent whose event was never staged, as when its
+    /// publish target could not be resolved: no fanout names the intent, so
+    /// the next drain prepares it again. A staged event's fanout names its
+    /// intent and retires it once the event resolves (mdk#2332).
+    fn rearm_unstaged_queued_intent(
         &mut self,
         intent: Option<QueuedIntentRef>,
         status: PublishStatus,
     ) {
-        let Some(intent) = intent else {
-            return;
-        };
-        if status.met_required_acks || status.accepted_by_any_endpoint {
-            if self
-                .session
-                .confirm_regenerated_queued_intent(&intent)
-                .is_err()
-            {
-                // The message is externally visible, so do not report the send
-                // as failed. Keep the durable intent and re-arm convergence;
-                // the duplicate-safe publish layer can retry cleanup later.
-                self.session.retry_regenerated_queued_intent(&intent);
-                tracing::warn!(
-                    target: TRACE_TARGET,
-                    method = "resolve_regenerated_queued_intent",
-                    error_kind = "queued_intent_cleanup",
-                    "published queued message but could not clear its durable intent"
-                );
-            }
-        } else if status.terminal_failure {
-            if self
-                .session
-                .confirm_regenerated_queued_intent(&intent)
-                .is_err()
-            {
-                // Every target failed terminally, so the logical queued intent
-                // is complete even though it was not delivered. If durable
-                // cleanup fails, retain and re-arm it rather than losing the
-                // obligation.
-                self.session.retry_regenerated_queued_intent(&intent);
-                tracing::warn!(
-                    target: TRACE_TARGET,
-                    method = "resolve_regenerated_queued_intent",
-                    error_kind = "terminal_queued_intent_cleanup",
-                    "terminal queued message failed but its durable intent could not be cleared"
-                );
-            }
-        } else {
-            // Nothing accepted, but routing/setup failure or at least one
-            // retryable or ambiguously exposed target means terminal failure
-            // has not been proved. Preserve and re-arm the durable intent.
+        if let Some(intent) = intent
+            && status.staged_nothing()
+        {
             self.session.retry_regenerated_queued_intent(&intent);
         }
+    }
+
+    /// Retire the queued intent a resolved application message or proposal
+    /// was drained from (mdk#2332): once a relay accepted the event, or every
+    /// relay refused it for good. A commit's intent retires with the commit.
+    /// Returns false when the intent could not be deleted: the fanout must
+    /// then stay stored, still naming it, for a later pass to retry, since a
+    /// drain that found the intent unnamed would prepare it a second time.
+    fn retire_drained_queued_intent(&mut self, fanout: &OutboundFanout) -> bool {
+        let outcome = fanout.outcome();
+        let (Some(group_id), Some(intent_id)) = (fanout.group_id(), fanout.queued_intent_id())
+        else {
+            return true;
+        };
+        if !matches!(fanout.mls_state(), FanoutMlsState::NotApplicable)
+            || (outcome.accepted_targets == 0 && outcome.outstanding_targets > 0)
+        {
+            return true;
+        }
+        let intent = QueuedIntentRef {
+            group_id: group_id.clone(),
+            intent_id: intent_id.clone(),
+        };
+        if self.session.retire_drained_queued_intent(&intent).is_err() {
+            tracing::warn!(
+                target: TRACE_TARGET,
+                method = "retire_drained_queued_intent",
+                error_kind = "queued_intent_cleanup",
+                "resolved queued send could not clear its durable intent; retrying on a later pass"
+            );
+            return false;
+        }
+        true
     }
 
     /// Confirm a published commit, retrying on transient backend contention.
@@ -6178,8 +6191,16 @@ where
             };
             // A drained commit names its queued intent in the same record, so
             // a restart still retires the intent with the commit (mdk#2332).
-            if let Some(intent_id) =
-                pending.and_then(|pending| self.session.drained_queued_intent_id(pending))
+            // So does a drained application message or proposal: its intent
+            // retires when the event resolves, on whichever pass that is, and
+            // no drain prepares the intent again meanwhile.
+            let drained_intent = match pending {
+                Some(pending) => self.session.drained_queued_intent_id(pending),
+                None => self
+                    .session
+                    .regenerated_queued_intent_id(fanout.message_id()),
+            };
+            if let Some(intent_id) = drained_intent
                 && let Err(error) = fanout.set_queued_intent(intent_id)
             {
                 self.rollback_unstaged_pending(pending, output, queue)
@@ -6639,7 +6660,11 @@ where
         // pass merges it into the commit's refusal record, and the delete
         // merges it first, in the same transaction (mdk#2333).
         let refusal = commit_refusal_of(&fanout);
-        if fanout_outcome.fanout_complete
+        // The intent goes first: a crash before the fanout's retirement leaves
+        // a resolved fanout a later pass retires, never an unnamed intent.
+        let intent_retired = self.retire_drained_queued_intent(&fanout);
+        if intent_retired
+            && fanout_outcome.fanout_complete
             && !matches!(fanout.mls_state(), FanoutMlsState::Pending(_))
             && !(fanout_outcome.accepted_targets > 0 && fanout.application_message().is_some())
         {
