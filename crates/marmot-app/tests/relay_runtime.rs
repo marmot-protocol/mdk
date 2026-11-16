@@ -562,6 +562,14 @@ async fn mock_relay() -> (TestRelay, String) {
 }
 
 async fn mock_app(dir: &tempfile::TempDir) -> (TestRelay, MarmotApp, String) {
+    mock_app_with(dir, |config| config).await
+}
+
+/// [`mock_app`] with its config adjusted by `configure`.
+async fn mock_app_with(
+    dir: &tempfile::TempDir,
+    configure: impl FnOnce(MarmotAppConfig) -> MarmotAppConfig,
+) -> (TestRelay, MarmotApp, String) {
     // Opt in at ordinary app fixtures; shared relay/setup helpers also serve
     // ignored diagnostics and nightly replay, which keep their original settings.
     storage_sqlite::relax_storage_for_test_process();
@@ -572,9 +580,11 @@ async fn mock_app(dir: &tempfile::TempDir) -> (TestRelay, MarmotApp, String) {
     let app = MarmotApp::with_relay_and_config(
         dir.path(),
         url.clone(),
-        MarmotAppConfig::white_noise()
-            .with_allow_loopback_blob_endpoints(true)
-            .with_allow_loopback_relay_endpoints(true),
+        configure(
+            MarmotAppConfig::white_noise()
+                .with_allow_loopback_blob_endpoints(true)
+                .with_allow_loopback_relay_endpoints(true),
+        ),
     );
     (relay, app, url)
 }
@@ -3322,10 +3332,24 @@ async fn local_account_key_packages_are_readable_while_startup_is_held() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn app_runtime_rotate_publishes_key_package_to_nip65_outbox_relays() {
+    rotate_publishes_key_package_to_nip65_outbox_relays(false).await;
+}
+
+/// The relay lists go out before the account's first open, so the device
+/// groups' publish gate looks for a stored removal before the KeyPackage
+/// cutover has classified the fresh account; that look must not leave it
+/// without a slot to rotate in (mdk#3477).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn app_runtime_rotate_publishes_key_package_to_nip65_outbox_relays_with_device_groups() {
+    rotate_publishes_key_package_to_nip65_outbox_relays(true).await;
+}
+
+async fn rotate_publishes_key_package_to_nip65_outbox_relays(device_groups: bool) {
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());
     home.create_account("bob").unwrap();
-    let (_relay, app, url) = mock_app(&dir).await;
+    let (_relay, app, url) =
+        mock_app_with(&dir, |config| config.with_device_groups(device_groups)).await;
 
     app.publish_account_relay_list_kind("bob", "nip65", vec![endpoint(&url)], vec![endpoint(&url)])
         .await
