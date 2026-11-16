@@ -936,16 +936,36 @@ async fn emoji_set_reads_reach_configured_relays() {
         vec![coordinate("pointed")]
     );
     assert!(list.missing_set_coordinates.is_empty());
-    // Fetching the list by its own address reads the account's relays too.
-    let own = app
-        .fetch_emoji_set(
-            &account_id,
-            &format!("{USER_EMOJI_LIST_KIND}:{}:", keys.public_key().to_hex()),
-        )
-        .await
-        .unwrap();
+    // Fetching the list by its own address, even through an `naddr` hinting
+    // the relay with the newer decoy, reads the account's relays only.
+    let mut own_list =
+        nostr::nips::nip01::Coordinate::new(Kind::Custom(USER_EMOJI_LIST_KIND), keys.public_key());
+    own_list.identifier = String::new();
+    let hinted_naddr = nostr::nips::nip19::Nip19Coordinate::new(
+        own_list,
+        [RelayUrl::parse(&configured_url).unwrap()],
+    )
+    .to_bech32()
+    .unwrap();
+    for input in [
+        format!("{USER_EMOJI_LIST_KIND}:{}:", keys.public_key().to_hex()),
+        hinted_naddr,
+    ] {
+        let own = app.fetch_emoji_set(&account_id, &input).await.unwrap();
+        assert_eq!(
+            own.emoji
+                .iter()
+                .map(|emoji| emoji.shortcode.as_str())
+                .collect::<Vec<_>>(),
+            ["mine"],
+            "{input}"
+        );
+    }
+    let list = app.user_emoji_list(&account_id).await.unwrap();
     assert_eq!(
-        own.emoji
+        list.own_emoji
+            .expect("the account's list has an emoji")
+            .emoji
             .iter()
             .map(|emoji| emoji.shortcode.as_str())
             .collect::<Vec<_>>(),

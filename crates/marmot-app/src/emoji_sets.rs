@@ -1285,8 +1285,13 @@ impl MarmotApp {
         let filter = address.filter()?;
         // Hints only add candidates: every version passes NIP-01 replacement
         // ordering, so an old version on a hint relay cannot hide a newer one.
+        // The account's own emoji list (kind 10030) is read from its relays
+        // only, as `user_emoji_list` reads it: no hints, no configured
+        // relays. Another account's list keeps its hints.
+        let own_list = address.kind == USER_EMOJI_LIST_KIND
+            && address.author_pubkey_hex == context.account_id_hex;
         let mut found = false;
-        if !relay_hints.is_empty() {
+        if !relay_hints.is_empty() && !own_list {
             match self
                 .fetch_set_versions(context, &coordinate, relay_hints.to_vec(), filter.clone())
                 .await
@@ -1296,9 +1301,8 @@ impl MarmotApp {
                 Err(error) => return Err(error),
             }
         }
-        // An account emoji list (kind 10030) is read from the account's
-        // relays only, as `user_emoji_list` reads it; sets from the wider
-        // read set.
+        // Lists (kind 10030) stay on the account's relays, as before; sets
+        // read the wider set.
         let endpoints = if address.kind == USER_EMOJI_LIST_KIND {
             context.endpoints.clone()
         } else {
