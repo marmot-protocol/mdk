@@ -82,7 +82,8 @@
   well as the account's NIP-65 relays. Packs are published to few relays, so an
   account whose relay list came from another client saw an empty pack browser
   and default-pack installs failed with `StickerNotFound`. The newest version
-  of a pack wins across every relay. The installed list (kind 10031) and other
+  of a pack among the relays that answered wins; a read that misses a relay
+  can keep an older version until a later read reaches it. The installed list (kind 10031) and other
   sticker publications still go only to the account's own relays. Emoji set
   reads (`sync_emoji_sets`, `fetch_emoji_set` and the sets `user_emoji_list`
   points to) use the same relays; the account's own emoji list (kind 10030) is

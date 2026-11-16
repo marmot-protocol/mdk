@@ -1417,9 +1417,9 @@ change the account's published installed list after a complete read of it; witho
 a later sync.
 
 Pack reads (sync, fetch, install, and resolving a received sticker) query the account's NIP-65 relays and the
-runtime's configured relays together, plus any relay hints in a pasted link; the newest version of each pack wins.
-Pass the relays where your app's default packs live as configured relays. The installed list is read from and
-published to the account's relays only, never to the configured relays.
+runtime's configured relays together, plus any relay hints in a pasted link; the newest version among the relays that
+answered wins. Pass the relays where your app's default packs live as configured relays. The installed list is read
+from and published to the account's relays only, never to the configured relays.
 
 Use `stickerPackShareLink(accountRef, coordinate)` for sharing rather than constructing a URL in the host.
 It validates the coordinate and builds a canonical Sonar link without network I/O, using retained relay hints: the

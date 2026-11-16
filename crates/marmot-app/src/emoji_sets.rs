@@ -1296,13 +1296,16 @@ impl MarmotApp {
                 Err(error) => return Err(error),
             }
         }
+        // An account emoji list (kind 10030) is read from the account's
+        // relays only, as `user_emoji_list` reads it; sets from the wider
+        // read set.
+        let endpoints = if address.kind == USER_EMOJI_LIST_KIND {
+            context.endpoints.clone()
+        } else {
+            context.set_read_endpoints.clone()
+        };
         match self
-            .fetch_set_versions(
-                context,
-                &coordinate,
-                context.set_read_endpoints.clone(),
-                filter,
-            )
+            .fetch_set_versions(context, &coordinate, endpoints, filter)
             .await
         {
             Ok(_) => {}

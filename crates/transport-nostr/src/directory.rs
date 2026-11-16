@@ -957,7 +957,8 @@ impl PublicEventFetch {
 ///
 /// It keeps `fetch_events(..).with_outcomes()`'s bounds over one stream per
 /// relay, so the relay behind each copy is known: at most `max_events` unique
-/// events, a read that hit that bound is incomplete, and one relay's failure
+/// events, a read stopped by a new event past that bound is incomplete (one
+/// that ends with exactly `max_events` lost nothing), and one relay's failure
 /// does not stop the others.
 pub async fn fetch_public_events(
     endpoints: &[TransportEndpoint],

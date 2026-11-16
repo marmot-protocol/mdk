@@ -879,7 +879,13 @@ async fn emoji_set_reads_reach_configured_relays() {
         &account_url,
         &keys,
         USER_EMOJI_LIST_KIND,
-        vec![Tag::custom("a", [coordinate("pointed")])],
+        vec![
+            Tag::custom("a", [coordinate("pointed")]),
+            Tag::custom(
+                "emoji",
+                ["mine".to_owned(), "https://cdn.example/mine.png".to_owned()],
+            ),
+        ],
         now - 40,
     )
     .await;
@@ -889,7 +895,16 @@ async fn emoji_set_reads_reach_configured_relays() {
         &configured_url,
         &keys,
         USER_EMOJI_LIST_KIND,
-        vec![Tag::custom("a", [coordinate("configured")])],
+        vec![
+            Tag::custom("a", [coordinate("configured")]),
+            Tag::custom(
+                "emoji",
+                [
+                    "decoy".to_owned(),
+                    "https://cdn.example/decoy.png".to_owned(),
+                ],
+            ),
+        ],
         now - 30,
     )
     .await;
@@ -921,6 +936,21 @@ async fn emoji_set_reads_reach_configured_relays() {
         vec![coordinate("pointed")]
     );
     assert!(list.missing_set_coordinates.is_empty());
+    // Fetching the list by its own address reads the account's relays too.
+    let own = app
+        .fetch_emoji_set(
+            &account_id,
+            &format!("{USER_EMOJI_LIST_KIND}:{}:", keys.public_key().to_hex()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        own.emoji
+            .iter()
+            .map(|emoji| emoji.shortcode.as_str())
+            .collect::<Vec<_>>(),
+        ["mine"]
+    );
 
     runtime.shutdown().await;
 }
