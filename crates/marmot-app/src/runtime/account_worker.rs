@@ -9761,6 +9761,12 @@ mod tests {
             .unwrap()
             .operation
             .expect("eligible fixture members");
+        // The creates' Welcome waves run beside the worker (mdk#3466): Bob
+        // must hold each group before its commit reaches him.
+        timeout(Duration::from_secs(10), runtime.drain_in_flight_work())
+            .await
+            .expect("the creates' Welcome waves settle")
+            .unwrap();
         runtime.catch_up_accounts().await.unwrap();
         let commands = runtime.accounts().worker_commands("bob").await.unwrap();
         runtime

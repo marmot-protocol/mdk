@@ -6300,6 +6300,13 @@ async fn live_muted_chat_notifies_direct_mentions_but_not_ordinary_messages() {
         .unwrap()
         .operation
         .expect("eligible fixture members");
+    // The create's Welcome wave runs beside the worker (mdk#3466): wait for
+    // it to publish before Bob catches up, so his join notification comes
+    // before the subscription.
+    timeout(Duration::from_secs(10), runtime.drain_in_flight_work())
+        .await
+        .expect("the create's Welcome wave settles")
+        .unwrap();
     let group_hex = hex::encode(group_id.as_slice());
     app.set_local_notifications_enabled(&bob_id, true).unwrap();
     runtime.catch_up_accounts().await.unwrap();
@@ -6443,6 +6450,12 @@ async fn concurrent_wake_collection_and_foreground_subscription_share_notificati
         .unwrap()
         .operation
         .expect("eligible fixture members");
+    // The create's Welcome wave runs beside the worker (mdk#3466): wait for
+    // it to publish before Bob catches up and mutes the chat.
+    timeout(Duration::from_secs(10), runtime.drain_in_flight_work())
+        .await
+        .expect("the create's Welcome wave settles")
+        .unwrap();
 
     app.set_local_notifications_enabled(&bob.account.account_id_hex, true)
         .unwrap();
@@ -15843,6 +15856,12 @@ async fn app_runtime_exposes_welcome_redelivery_surface() {
         .operation
         .expect("eligible fixture members");
 
+    // The create's Welcome wave runs beside the worker (mdk#3466): until it
+    // settles, its Welcome is still outstanding. Wait for it.
+    timeout(Duration::from_secs(10), runtime.drain_in_flight_work())
+        .await
+        .expect("the create's Welcome wave settles")
+        .unwrap();
     // The welcome delivered over the live relay, so nothing is queued...
     assert!(
         runtime
@@ -18154,6 +18173,12 @@ async fn user_blocks_dm_history_send_gate_and_invite_admission() {
         .unwrap()
         .operation
         .expect("eligible fixture members");
+    // The create's Welcome wave runs beside the worker (mdk#3466): wait for
+    // it to publish while Alice's block applies.
+    timeout(Duration::from_secs(10), runtime.drain_in_flight_work())
+        .await
+        .expect("the create's Welcome wave settles")
+        .unwrap();
     sleep(Duration::from_millis(500)).await;
     assert!(
         runtime

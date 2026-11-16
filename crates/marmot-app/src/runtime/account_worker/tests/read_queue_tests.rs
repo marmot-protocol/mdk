@@ -729,6 +729,12 @@ async fn host_reads_wait_behind_a_held_convergence_pass() {
         .unwrap()
         .operation
         .expect("eligible fixture members");
+    // The create's Welcome wave runs beside the worker (mdk#3466): Bob must
+    // hold the group before its commit reaches him.
+    timeout(Duration::from_secs(10), runtime.drain_in_flight_work())
+        .await
+        .expect("the create's Welcome wave settles")
+        .unwrap();
     runtime.catch_up_accounts().await.unwrap();
     runtime
         .update_group_profile("alice", &group, Some("changed".into()), None)
