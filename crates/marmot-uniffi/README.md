@@ -604,6 +604,16 @@ Imported identities can use the durable preflight API instead of `login`:
    extension fields remain unchanged in the preview and published event. Show its typed
    before/after diff and repair mode. `ManualReview` cannot be approved; prefill
    a manual editor from the original tags or offer a separately labeled reset.
+   A step offers `RemoveUnusableRelays`, even after it passed, when this preview
+   is approvable and removes declared relays the check showed cannot serve
+   their role. Each `Removed` change's `removal_reason` gives the class for
+   localized copy: `Retired`, or `AuthenticationRequired` / `PaymentRequired`
+   when the relay refused the account's own authenticated check (local keys
+   only; a host or remote signer's failure looks the same, so it never counts).
+   Timeouts, unreachable relays and other refusals may pass and are never
+   suggested. On a passed step the preview only removes entries and keeps a
+   role's last allowed route; on a failing step it may also add a default.
+   It is advice: `ready` never depends on it, and declining costs nothing.
    No proposal signs or publishes until explicit approval. The older
    `propose_onboarding_recommended_relays`, `propose_onboarding_relays`,
    `propose_onboarding_profile`, and `propose_onboarding_follows` only prepare

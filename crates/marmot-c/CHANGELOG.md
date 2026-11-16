@@ -9,6 +9,13 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ### Breaking changes
 
+- `MarmotOnboardingRelayTagChange` gains a trailing `removal_reason`
+  (`MarmotOnboardingRelayRemovalReason`), set on every removed entry (#3449).
+  Its layout and the `changes` array stride changed: rebuild clients with the
+  matching header and library. `MarmotOnboardingAction` gains
+  `MARMOT_ONBOARDING_ACTION_REMOVE_UNUSABLE_RELAYS` after the existing values,
+  offered when `marmot_propose_onboarding_relay_repair` would return an
+  approvable preview that removes a declared relay.
 - `MarmotSelectedMessageDraftAttachment` gains `file_backed` and
   `MarmotAttachmentStorageUsage` gains `draft_bytes` (#3431). Both layouts
   changed, and draft attachments are read as an array: rebuild clients with the

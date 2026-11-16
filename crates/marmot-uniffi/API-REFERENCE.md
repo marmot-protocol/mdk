@@ -3399,7 +3399,7 @@ Preserve opaque evidence, sign out, and retire the old attempt. Hosts invalidate
 pub async fn propose_onboarding_relay_repair( &self, account_ref: String, step: OnboardingStepFfi, ) -> Result<OnboardingSnapshotFfi, MarmotKitError>
 ```
 
-Preview an exact, minimal general or inbox relay-list repair. The returned `proposal.relay_repair` carries the source event ID, ordered before/after tags, unchanged content, typed occurrence diff, and repair mode. This method only persists a revision-bound proposal; it never signs or publishes. Show the diff and use `approve_onboarding_repair` (or its epoch-aware variant) only when `ApproveRepair` is offered. `ManualReview` deliberately has no approval action; prefill an editor from `before_tags` or offer a separately labeled full reset. Preserve the account, attempt, recovery epoch, source event, and snapshot revision until approval.
+Preview an exact, minimal general or inbox relay-list repair. The returned `proposal.relay_repair` carries the source event ID, ordered before/after tags, unchanged content, typed occurrence diff, and repair mode. This method only persists a revision-bound proposal; it never signs or publishes. Show the diff and use `approve_onboarding_repair` (or its epoch-aware variant) only when `ApproveRepair` is offered. `ManualReview` deliberately has no approval action; prefill an editor from `before_tags` or offer a separately labeled full reset. Offered as `RemoveUnusableRelays` when the preview is approvable and removes declared relays the check showed cannot serve their role; each removed change carries `removal_reason`. Preserve the account, attempt, recovery epoch, source event, and snapshot revision until approval.
 
 [Source](src/commands/onboarding.rs#L277)
 

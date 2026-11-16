@@ -18,7 +18,7 @@ impl MarmotOnboardingStep {
 }
 c_enum! { MarmotOnboardingStatus from OnboardingStatusFfi {  Pending, Checking, Passed, NeedsInput, RetryableFailure, WaitingForSigner, Skipped  } }
 c_enum! { MarmotOnboardingIssue from OnboardingIssueFfi {  Missing, Malformed, FutureDated, InvalidRelay, RetiredRelay, UnsafeRelay, Unreachable, TimedOut, AuthenticationRequired, PaymentRequired, AccessRestricted, NoUsableRoute, PublicationFailed, SignerUnavailable, SignerRejected, RecordChanged, Interrupted, TooManyRelays, MultiDeviceUnsupported, OtherInstallationPossible, DiscoveryIncomplete, InspectionCompleted  } }
-c_enum! { MarmotOnboardingAction from OnboardingActionFfi {  Retry, ContinueWithout, UseRecommendedRelays, EditRelays, EditProfile, EditFollows, ApproveRepair, CancelRepair, ReconnectSigner, EditDiscoveryRelays, ContinueAnyway, CancelOnboarding  } }
+c_enum! { MarmotOnboardingAction from OnboardingActionFfi {  Retry, ContinueWithout, UseRecommendedRelays, EditRelays, EditProfile, EditFollows, ApproveRepair, CancelRepair, ReconnectSigner, EditDiscoveryRelays, ContinueAnyway, CancelOnboarding, RemoveUnusableRelays  } }
 c_enum! { MarmotOnboardingFindingContext from OnboardingFindingContextFfi { Unknown, RecordDiscovery, PublishedDeclaration, DeclaredRoute, RepairApproval, RepairPublication } }
 c_enum! { MarmotOnboardingCheckPurpose from OnboardingCheckPurposeFfi { Unknown, RecordLookup, DeclarationValidation, DirectoryQuery, SourceFreshness, EventPublication } }
 c_enum! { MarmotOnboardingCheckOutcome from OnboardingCheckOutcomeFfi { Unknown, Success, Failure } }
@@ -27,9 +27,10 @@ c_mirror! { MarmotOnboardingStepState from OnboardingStepStateFfi { copy step: M
 c_enum! { MarmotOnboardingRelayTagRole from OnboardingRelayTagRoleFfi { Other, Unmarked, Read, Write, Inbox } }
 c_enum! { MarmotOnboardingRelayTagDisposition from OnboardingRelayTagDispositionFfi { Retained, Removed, Added } }
 c_enum! { MarmotOnboardingRelayCapability from OnboardingRelayCapabilityFfi { None, Read, Write, ReadAndWrite, Inbox } }
+c_enum! { MarmotOnboardingRelayRemovalReason from OnboardingRelayRemovalReasonFfi { None, Retired, AuthenticationRequired, PaymentRequired } }
 c_enum! { MarmotOnboardingRelayRepairMode from OnboardingRelayRepairModeFfi { ManualReview, RemovalOnly, Additive, RemovalAndAdditive } }
 c_mirror! { MarmotOnboardingRelayTag from OnboardingRelayTagFfi { #[doc = "Each element is a JSON string literal. Decode once preserving NUL bytes and UTF-8 lengths."] json_str_vec fields/fields_len, #[doc = "NULL or a JSON string literal; decode once preserving embedded NULs."] json_opt_str endpoint, copy role: MarmotOnboardingRelayTagRole, } }
-c_mirror! { MarmotOnboardingRelayTagChange from OnboardingRelayTagChangeFfi { copy disposition: MarmotOnboardingRelayTagDisposition, opt_copy has_before_index/before_index: u64, opt_copy has_after_index/after_index: u64, #[doc = "Each element is a JSON string literal. Decode once preserving NUL bytes and UTF-8 lengths."] json_str_vec fields/fields_len, #[doc = "NULL or a JSON string literal; decode once preserving embedded NULs."] json_opt_str endpoint, copy role: MarmotOnboardingRelayTagRole, copy restores: MarmotOnboardingRelayCapability, } }
+c_mirror! { MarmotOnboardingRelayTagChange from OnboardingRelayTagChangeFfi { copy disposition: MarmotOnboardingRelayTagDisposition, opt_copy has_before_index/before_index: u64, opt_copy has_after_index/after_index: u64, #[doc = "Each element is a JSON string literal. Decode once preserving NUL bytes and UTF-8 lengths."] json_str_vec fields/fields_len, #[doc = "NULL or a JSON string literal; decode once preserving embedded NULs."] json_opt_str endpoint, copy role: MarmotOnboardingRelayTagRole, copy restores: MarmotOnboardingRelayCapability, copy removal_reason: MarmotOnboardingRelayRemovalReason, } }
 c_mirror! { MarmotOnboardingRelayRepair from OnboardingRelayRepairFfi { copy mode: MarmotOnboardingRelayRepairMode, opt_str original_event_id, #[doc = "JSON string literal, not raw content. Decode once preserving NUL bytes and UTF-8 lengths."] json_str original_content, #[doc = "JSON string literal, not raw content. Decode once preserving NUL bytes and UTF-8 lengths."] json_str proposed_content, vec before_tags/before_tags_len: MarmotOnboardingRelayTag, vec after_tags/after_tags_len: MarmotOnboardingRelayTag, vec changes/changes_len: MarmotOnboardingRelayTagChange, } }
 c_mirror! { MarmotOnboardingRepairProposal from OnboardingRepairProposalFfi { copy step: MarmotOnboardingStep, copy revision: u64, opt_str previous_event_id, str_vec read_relays/read_relays_len, str_vec write_relays/write_relays_len, opt_rec profile: MarmotUserProfileMetadata, opt_rec follows: MarmotStringList, opt_rec relay_repair: MarmotOnboardingRelayRepair, copy inconclusive: bool, } }
 c_mirror! { MarmotOnboardingSnapshot from OnboardingSnapshotFfi, free marmot_onboarding_snapshot_free { str account_id_hex, opt_str recovery_epoch, copy revision: u64, copy ready: bool, vec steps/steps_len: MarmotOnboardingStepState, opt_rec proposal: MarmotOnboardingRepairProposal, opt_rec single_device_notice: MarmotOnboardingSingleDeviceNotice, copy cancellation_pending: bool, } }
@@ -123,20 +124,33 @@ mod tests {
                         endpoint: Some("wss://safe.example".into()),
                         role: OnboardingRelayTagRoleFfi::Unmarked,
                     }],
-                    changes: vec![OnboardingRelayTagChangeFfi {
-                        disposition: OnboardingRelayTagDispositionFfi::Added,
-                        before_index: None,
-                        after_index: Some(0),
-                        fields: vec![
-                            "r".into(),
-                            "wss://safe.example".into(),
-                            "a\0b\"\\🙂".into(),
-                            "".into(),
-                        ],
-                        endpoint: Some("wss://safe.example".into()),
-                        role: OnboardingRelayTagRoleFfi::Unmarked,
-                        restores: OnboardingRelayCapabilityFfi::ReadAndWrite,
-                    }],
+                    changes: vec![
+                        OnboardingRelayTagChangeFfi {
+                            disposition: OnboardingRelayTagDispositionFfi::Added,
+                            before_index: None,
+                            after_index: Some(0),
+                            fields: vec![
+                                "r".into(),
+                                "wss://safe.example".into(),
+                                "a\0b\"\\🙂".into(),
+                                "".into(),
+                            ],
+                            endpoint: Some("wss://safe.example".into()),
+                            role: OnboardingRelayTagRoleFfi::Unmarked,
+                            restores: OnboardingRelayCapabilityFfi::ReadAndWrite,
+                            removal_reason: OnboardingRelayRemovalReasonFfi::None,
+                        },
+                        OnboardingRelayTagChangeFfi {
+                            disposition: OnboardingRelayTagDispositionFfi::Removed,
+                            before_index: Some(0),
+                            after_index: None,
+                            fields: vec!["r".into(), "wss://members.example".into()],
+                            endpoint: Some("wss://members.example".into()),
+                            role: OnboardingRelayTagRoleFfi::Unmarked,
+                            restores: OnboardingRelayCapabilityFfi::None,
+                            removal_reason: OnboardingRelayRemovalReasonFfi::PaymentRequired,
+                        },
+                    ],
                 }),
                 inconclusive: true,
             }),
@@ -190,10 +204,18 @@ mod tests {
         assert_eq!(decode(change.endpoint), "wss://safe.example");
         assert_eq!(repair.before_tags_len, 1);
         assert_eq!(repair.after_tags_len, 1);
-        assert_eq!(repair.changes_len, 1);
+        assert_eq!(repair.changes_len, 2);
         assert_eq!(
             unsafe { &*repair.changes }.restores,
             MarmotOnboardingRelayCapability::ReadAndWrite
+        );
+        assert_eq!(
+            unsafe { &*repair.changes }.removal_reason,
+            MarmotOnboardingRelayRemovalReason::None
+        );
+        assert_eq!(
+            unsafe { &*repair.changes.add(1) }.removal_reason,
+            MarmotOnboardingRelayRemovalReason::PaymentRequired
         );
         unsafe {
             free_boxed(value);

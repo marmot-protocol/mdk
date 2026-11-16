@@ -13,6 +13,17 @@
 - `MarmotAppRuntime::group_changes_not_delivered` and `acknowledge_change_not_delivered` read and clear
   `GroupChangeNotDelivered` records (mdk#2332); `AppClient` has both too. Host group-change commands name their
   commits, so a rollback after the command returned is recorded.
+- Interactive onboarding suggests removing declared relays its check showed can't serve their role (#3449). A
+  relay that refused the declared-route check with `auth-required` or `payment-required` while the inspection held
+  the account's local key joins retired relays as a removal candidate in `propose_onboarding_relay_repair`.
+  Timeouts, unreachable relays, `AccessRestricted`, external-signer refusals and `Unsafe`/`Invalid` entries never
+  qualify. On a passed step the preview is strictly `RemovalOnly` and keeps an entry that is the list's last
+  allowed route for one of its roles. On a failing step it joins the existing minimal repair, which adds a default
+  when a role is left empty. `OnboardingAction::RemoveUnusableRelays` is offered exactly when that preview is
+  approvable and removes an entry, including the existing retired-relay cleanup. Every `Removed`
+  `OnboardingRelayTagChange` carries `removal_reason` (`OnboardingRelayRemovalReason`). It is advice:
+  readiness never depends on it, and cancelling keeps the step's status and the action. A retired-relay preview
+  saved by an earlier build has no reasons and still approves.
 - Interactive onboarding records an `mdk_onboarding_summary` usage-diagnostics aggregate when a saved checkpoint
   leaves a step in a blocking status (#3440). `ProductFamily::Onboarding` is the new family. Its rows carry only the
   step, status, issue classes, finding context and a bucketed failing-source count. Each attempt counts a distinct

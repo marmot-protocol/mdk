@@ -52,6 +52,62 @@ pub(super) fn tag_change(
         endpoint: tag.endpoint.clone(),
         role: tag.role,
         restores,
+        removal_reason: OnboardingRelayRemovalReason::None,
+    }
+}
+
+fn removal(
+    tag: &OnboardingRelayTag,
+    before_index: usize,
+    reason: OnboardingRelayRemovalReason,
+) -> OnboardingRelayTagChange {
+    OnboardingRelayTagChange {
+        removal_reason: reason,
+        ..tag_change(
+            tag,
+            OnboardingRelayTagDisposition::Removed,
+            Some(before_index),
+            None,
+            OnboardingRelayCapability::None,
+        )
+    }
+}
+
+/// The declared routes a step's last check showed cannot serve their role,
+/// by normalized endpoint. Only a deliberate policy answer counts: the relay
+/// refused the declared-route check with `auth-required` or
+/// `payment-required` while the client held the account's local key. A
+/// timeout, an unreachable relay or another refusal can be an outage that
+/// passes, so it never nominates a route for removal (mdk#3449).
+pub(super) fn unusable_routes(
+    findings: &[OnboardingFinding],
+) -> BTreeMap<String, OnboardingRelayRemovalReason> {
+    findings
+        .iter()
+        .filter(|finding| {
+            finding.context == OnboardingFindingContext::DeclaredRoute && finding.local_key_held
+        })
+        .filter_map(|finding| {
+            let reason = match finding.issue {
+                OnboardingIssue::AuthenticationRequired => {
+                    OnboardingRelayRemovalReason::AuthenticationRequired
+                }
+                OnboardingIssue::PaymentRequired => OnboardingRelayRemovalReason::PaymentRequired,
+                _ => return None,
+            };
+            Some((relay_key(finding.endpoint.as_deref()?), reason))
+        })
+        .collect()
+}
+
+/// The routes a relay entry declares: (read, write, inbox).
+fn declared_roles(role: OnboardingRelayTagRole) -> (bool, bool, bool) {
+    match role {
+        OnboardingRelayTagRole::Unmarked => (true, true, false),
+        OnboardingRelayTagRole::Read => (true, false, false),
+        OnboardingRelayTagRole::Write => (false, true, false),
+        OnboardingRelayTagRole::Inbox => (false, false, true),
+        OnboardingRelayTagRole::Other => (false, false, false),
     }
 }
 
@@ -91,11 +147,17 @@ fn push_unique(values: &mut Vec<String>, value: &str) {
 }
 
 impl AccountSetup<'_> {
+    /// `unusable` names declared routes to remove besides retired ones (see
+    /// [`unusable_routes`]). With `removal_only`, the preview never adds a
+    /// route: an unusable entry that is the list's last policy-allowed route
+    /// for one of its roles stays, so a cleanup never empties a role.
     pub(super) fn minimal_relay_repair(
         &self,
         step: OnboardingStep,
         event: Option<&NostrTransportEvent>,
         defaults: &[String],
+        unusable: &BTreeMap<String, OnboardingRelayRemovalReason>,
+        removal_only: bool,
     ) -> (OnboardingRelayRepair, Vec<String>, Vec<String>) {
         let before = event
             .map(|value| {
@@ -126,6 +188,49 @@ impl AccountSetup<'_> {
             .into_iter()
             .map(|classified| (classified.endpoint, classified.policy))
             .collect();
+        let relevant = |tag: &OnboardingRelayTag| {
+            tag.fields
+                .first()
+                .is_some_and(|name| name == relay_tag_name(step))
+        };
+        let unusable_reason = |endpoint: &str| {
+            (policies.get(endpoint) == Some(&RelayEndpointPolicy::Allowed))
+                .then(|| unusable.get(&relay_key(endpoint)).copied())
+                .flatten()
+        };
+        // A removal-only preview keeps, in tag order, the first unusable
+        // endpoint (with all its tags) that declares a role no allowed entry
+        // left in the list declares, and removes the rest.
+        let mut kept = HashSet::new();
+        if removal_only {
+            let mut covered = (false, false, false);
+            let mut unusable_roles: HashMap<String, (bool, bool, bool)> = HashMap::new();
+            for tag in before.iter().filter(|tag| relevant(tag)) {
+                let Some(endpoint) = tag.endpoint.as_deref() else {
+                    continue;
+                };
+                let (read, write, inbox) = declared_roles(tag.role);
+                if unusable_reason(endpoint).is_some() {
+                    let roles = unusable_roles.entry(relay_key(endpoint)).or_default();
+                    *roles = (roles.0 || read, roles.1 || write, roles.2 || inbox);
+                } else if policies.get(endpoint) == Some(&RelayEndpointPolicy::Allowed) {
+                    covered = (covered.0 || read, covered.1 || write, covered.2 || inbox);
+                }
+            }
+            for tag in before.iter().filter(|tag| relevant(tag)) {
+                let Some(endpoint) = tag.endpoint.as_deref() else {
+                    continue;
+                };
+                let key = relay_key(endpoint);
+                let Some(&(read, write, inbox)) = unusable_roles.get(&key) else {
+                    continue;
+                };
+                if (read && !covered.0) || (write && !covered.1) || (inbox && !covered.2) {
+                    covered = (covered.0 || read, covered.1 || write, covered.2 || inbox);
+                    kept.insert(key);
+                }
+            }
+        }
         let mut after = Vec::with_capacity(before.len() + 1);
         let mut changes = Vec::with_capacity(before.len() + 1);
         let mut safe_endpoints = HashMap::new();
@@ -134,26 +239,23 @@ impl AccountSetup<'_> {
         let mut has_inbox = false;
         let mut removed = 0;
         for (index, tag) in before.iter().enumerate() {
-            if tag
-                .fields
-                .first()
-                .is_some_and(|name| name == relay_tag_name(step))
-            {
+            if relevant(tag) {
                 if tag.role == OnboardingRelayTagRole::Other {
                     return manual();
                 }
                 let Some(endpoint) = tag.endpoint.as_ref() else {
                     return manual();
                 };
+                if let Some(reason) = unusable_reason(endpoint)
+                    && !kept.contains(&relay_key(endpoint))
+                {
+                    changes.push(removal(tag, index, reason));
+                    removed += 1;
+                    continue;
+                }
                 match policies.get(endpoint) {
                     Some(RelayEndpointPolicy::Retired) => {
-                        changes.push(tag_change(
-                            tag,
-                            OnboardingRelayTagDisposition::Removed,
-                            Some(index),
-                            None,
-                            OnboardingRelayCapability::None,
-                        ));
+                        changes.push(removal(tag, index, OnboardingRelayRemovalReason::Retired));
                         removed += 1;
                         continue;
                     }
@@ -203,6 +305,8 @@ impl AccountSetup<'_> {
                 .into_iter()
                 .filter(|classified| classified.policy == RelayEndpointPolicy::Allowed)
                 .map(|classified| classified.endpoint.trim().to_owned())
+                // Never put back a route this preview treats as unusable.
+                .filter(|endpoint| !unusable.contains_key(&relay_key(endpoint)))
                 .collect::<Vec<_>>();
             let candidate = allowed_defaults
                 .iter()
@@ -290,6 +394,85 @@ impl AccountSetup<'_> {
         )
     }
 
+    /// The preview `propose_onboarding_relay_repair` would show for `step`,
+    /// and the unusable routes it was built from, or `Err` when the step
+    /// accepts none. Local work only: no fetch, signature or publication.
+    pub(super) fn relay_repair_preview(
+        &self,
+        c: &OnboardingCheckpoint,
+        step: OnboardingStep,
+    ) -> Result<RelayRepairPreview, AppError> {
+        let state = &c.snapshot.steps[step.index()];
+        let unusable = unusable_routes(&state.findings);
+        // A step that passed offers only advice: removal of retired or
+        // unusable declarations, never an added route.
+        let passed = state.status == OnboardingStatus::Passed
+            && (!unusable.is_empty()
+                || state
+                    .findings
+                    .iter()
+                    .any(|finding| finding.issue == OnboardingIssue::RetiredRelay));
+        if !step.relay()
+            || c.approved
+            || c.snapshot
+                .proposal
+                .as_ref()
+                .is_some_and(|proposal| proposal.step != step)
+            || (!c.relay_step_editable(step) && !passed)
+        {
+            return Err(onboarding_error());
+        }
+        let (mut repair, mut read_relays, mut write_relays) = self.minimal_relay_repair(
+            step,
+            c.records[step.index()].as_ref(),
+            c.options.defaults_for(step),
+            &unusable,
+            passed,
+        );
+        if passed && repair.mode != OnboardingRelayRepairMode::RemovalOnly {
+            return Err(onboarding_error());
+        }
+        // Removing a retired or unusable declaration cannot make a timed-out
+        // usable route complete inspection. Do not present that removal as an
+        // approvable fix.
+        if repair.mode == OnboardingRelayRepairMode::RemovalOnly
+            && state
+                .findings
+                .iter()
+                .any(|finding| finding.issue == OnboardingIssue::NoUsableRoute)
+        {
+            repair = manual_review(c.records[step.index()].as_ref(), repair.before_tags);
+            read_relays.clear();
+            write_relays.clear();
+        }
+        Ok(RelayRepairPreview {
+            repair,
+            read_relays,
+            write_relays,
+            unusable,
+        })
+    }
+
+    /// Whether `step` should offer `RemoveUnusableRelays`: its preview is
+    /// approvable and removes at least one declared entry.
+    pub(super) fn relay_cleanup_available(
+        &self,
+        c: &OnboardingCheckpoint,
+        step: OnboardingStep,
+    ) -> bool {
+        step.relay()
+            && c.snapshot.proposal.is_none()
+            && !c.snapshot.cancellation_pending
+            && self.relay_repair_preview(c, step).is_ok_and(|preview| {
+                preview.repair.mode != OnboardingRelayRepairMode::ManualReview
+                    && preview
+                        .repair
+                        .changes
+                        .iter()
+                        .any(|change| change.disposition == OnboardingRelayTagDisposition::Removed)
+            })
+    }
+
     /// Prepare an exact, minimal relay repair without signing or publishing.
     /// When no lossless candidate exists, return a typed manual-review preview
     /// with no approval action; callers may open a prefilled manual editor.
@@ -306,42 +489,12 @@ impl AccountSetup<'_> {
             .onboarding_checkpoint(account_ref)?
             .ok_or_else(onboarding_error)?;
         self.require_captured_attempt(&c, attempt)?;
-        let state = &c.snapshot.steps[step.index()];
-        let passed_with_retired = state.status == OnboardingStatus::Passed
-            && state
-                .findings
-                .iter()
-                .any(|finding| finding.issue == OnboardingIssue::RetiredRelay);
-        if !step.relay()
-            || c.approved
-            || c.snapshot
-                .proposal
-                .as_ref()
-                .is_some_and(|proposal| proposal.step != step)
-            || (!c.relay_step_editable(step) && !passed_with_retired)
-        {
-            return Err(onboarding_error());
-        }
-        let (mut repair, mut read_relays, mut write_relays) = self.minimal_relay_repair(
-            step,
-            c.records[step.index()].as_ref(),
-            c.options.defaults_for(step),
-        );
-        if passed_with_retired && repair.mode != OnboardingRelayRepairMode::RemovalOnly {
-            return Err(onboarding_error());
-        }
-        // Removing a retired declaration cannot make a timed-out usable route
-        // complete inspection. Do not present that removal as an approvable fix.
-        if repair.mode == OnboardingRelayRepairMode::RemovalOnly
-            && c.snapshot.steps[step.index()]
-                .findings
-                .iter()
-                .any(|finding| finding.issue == OnboardingIssue::NoUsableRoute)
-        {
-            repair = manual_review(c.records[step.index()].as_ref(), repair.before_tags);
-            read_relays.clear();
-            write_relays.clear();
-        }
+        let RelayRepairPreview {
+            repair,
+            read_relays,
+            write_relays,
+            unusable,
+        } = self.relay_repair_preview(&c, step)?;
         let manual = repair.mode == OnboardingRelayRepairMode::ManualReview;
         let inconclusive = check_inconclusive(&c.snapshot.steps[step.index()].findings);
         // A typed preview replaces any earlier append-only editor proposal.
@@ -361,6 +514,7 @@ impl AccountSetup<'_> {
             follows: None,
             relay_repair: Some(repair),
             inconclusive,
+            unusable_routes: if manual { BTreeMap::new() } else { unusable },
         });
         c.snapshot.steps[step.index()].actions = if manual {
             vec![OnboardingAction::EditRelays, OnboardingAction::CancelRepair]
@@ -373,4 +527,11 @@ impl AccountSetup<'_> {
         self.save_onboarding(&mut c)?;
         Ok(c.snapshot)
     }
+}
+
+pub(super) struct RelayRepairPreview {
+    pub(super) repair: OnboardingRelayRepair,
+    pub(super) read_relays: Vec<String>,
+    pub(super) write_relays: Vec<String>,
+    pub(super) unusable: BTreeMap<String, OnboardingRelayRemovalReason>,
 }

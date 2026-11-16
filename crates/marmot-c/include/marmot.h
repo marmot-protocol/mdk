@@ -511,6 +511,7 @@ typedef enum MarmotOnboardingAction {
   MARMOT_ONBOARDING_ACTION_EDIT_DISCOVERY_RELAYS,
   MARMOT_ONBOARDING_ACTION_CONTINUE_ANYWAY,
   MARMOT_ONBOARDING_ACTION_CANCEL_ONBOARDING,
+  MARMOT_ONBOARDING_ACTION_REMOVE_UNUSABLE_RELAYS,
 } MarmotOnboardingAction;
 
 typedef enum MarmotOnboardingRelayRepairMode {
@@ -533,6 +534,13 @@ typedef enum MarmotOnboardingRelayTagDisposition {
   MARMOT_ONBOARDING_RELAY_TAG_DISPOSITION_REMOVED,
   MARMOT_ONBOARDING_RELAY_TAG_DISPOSITION_ADDED,
 } MarmotOnboardingRelayTagDisposition;
+
+typedef enum MarmotOnboardingRelayRemovalReason {
+  MARMOT_ONBOARDING_RELAY_REMOVAL_REASON_NONE,
+  MARMOT_ONBOARDING_RELAY_REMOVAL_REASON_RETIRED,
+  MARMOT_ONBOARDING_RELAY_REMOVAL_REASON_AUTHENTICATION_REQUIRED,
+  MARMOT_ONBOARDING_RELAY_REMOVAL_REASON_PAYMENT_REQUIRED,
+} MarmotOnboardingRelayRemovalReason;
 
 typedef enum MarmotOnboardingDeviceDiscovery {
   MARMOT_ONBOARDING_DEVICE_DISCOVERY_NONE_FOUND,
@@ -2697,6 +2705,7 @@ typedef struct MarmotOnboardingRelayTagChange {
   char *endpoint;
   enum MarmotOnboardingRelayTagRole role;
   enum MarmotOnboardingRelayCapability restores;
+  enum MarmotOnboardingRelayRemovalReason removal_reason;
 } MarmotOnboardingRelayTagChange;
 
 typedef struct MarmotOnboardingRelayRepair {

@@ -217,6 +217,13 @@ publish it or treat it as a full reset. Free the snapshot with
 `marmot_onboarding_snapshot_free` after presenting the exact diff. Approval
 remains a separate revision- and recovery-epoch-bound call.
 
+A step that offers `MARMOT_ONBOARDING_ACTION_REMOVE_UNUSABLE_RELAYS`, including
+one that passed, has an approvable preview that removes declared relays the
+check showed cannot serve their role. Each removed change's `removal_reason`
+says why (retired, or refused with `auth-required` / `payment-required` while
+the client could authenticate as the account). It is optional advice; see the
+shared [onboarding guide](../marmot-uniffi/README.md#interactive-account-onboarding).
+
 Explicit `marmot_propose_onboarding_relays` selections also return the typed
 preview. See the shared [manual-edit preservation and checkpoint compatibility
 contract](../marmot-uniffi/README.md#explicit-recovery-and-checkpoint-compatibility).
