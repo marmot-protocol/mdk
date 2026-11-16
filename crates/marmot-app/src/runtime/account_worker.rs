@@ -6623,6 +6623,9 @@ fn account_worker_command_future<'a>(
         }),
         AccountWorkerCommand::GroupChangesNotDelivered { group_id, respond } => {
             Box::pin(async move {
+                // The records answer only for a live group. See the Members
+                // arm: on-demand promotion for pipeline-abort leftovers.
+                let _ = client.runtime.ensure_group_hydrated(&group_id);
                 let _ = respond_diagnosed(
                     shared,
                     storage_permit.as_ref(),
@@ -6638,6 +6641,7 @@ fn account_worker_command_future<'a>(
             commit_id_hex,
             respond,
         } => Box::pin(async move {
+            let _ = client.runtime.ensure_group_hydrated(&group_id);
             let _ = respond_diagnosed(
                 shared,
                 storage_permit.as_ref(),

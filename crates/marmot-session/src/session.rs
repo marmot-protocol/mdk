@@ -2169,11 +2169,13 @@ impl AccountDeviceSession {
 
     /// The group's changes that were not delivered (mdk#2332), oldest first:
     /// each a queued intent the drain retired, or a host's change whose
-    /// commit rolled back after the call that staged it returned.
+    /// commit rolled back after the call that staged it returned. Only a
+    /// live group answers (mdk#2602).
     pub fn changes_not_delivered(
         &self,
         group_id: &GroupId,
     ) -> SessionResult<Vec<cgka_traits::storage::ChangeNotDelivered>> {
+        self.engine.check_group_live(group_id)?;
         Ok(
             cgka_traits::storage::OutboundIntentStorage::changes_not_delivered(
                 &self.storage,
@@ -2183,12 +2185,14 @@ impl AccountDeviceSession {
     }
 
     /// Delete the group's not-delivered record for `commit_id` (mdk#2332),
-    /// saying whether there was one.
+    /// saying whether there was one. Only a live group's record is deleted
+    /// (mdk#2602).
     pub fn acknowledge_change_not_delivered(
         &self,
         group_id: &GroupId,
         commit_id: &MessageId,
     ) -> SessionResult<bool> {
+        self.engine.check_group_live(group_id)?;
         Ok(
             cgka_traits::storage::OutboundIntentStorage::delete_change_not_delivered(
                 &self.storage,
