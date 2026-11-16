@@ -33,6 +33,9 @@
   `message_draft_upload_sources_if_revision`, `message_draft_attachment_files`)
   read it without loading the body; the media catalog keeps a staged file a
   draft owns through the sweep.
+- `list_prepared_group_image_upload_statuses_with_record_check` lists each prepared upload's status with whether
+  `prepared_group_image_upload` reads its record, from one statement and without reading the image, ciphertext or
+  secret (mdk#3273).
 
 ### Changed
 

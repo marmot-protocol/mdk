@@ -52,7 +52,7 @@ use futures::{FutureExt, StreamExt};
 use marmot_forensics::v5 as audit_v5;
 use marmot_forensics::{
     AuditEventContext, AuditEventKind, AuditRecord, AuditTransportWire, ForensicRecorder,
-    MessageArtifactKind, PublishRelayFailure, SharedRecorder,
+    MessageArtifactKind, PendingCommitChange, PublishRelayFailure, SharedRecorder,
 };
 use sha2::{Digest, Sha256};
 
@@ -216,6 +216,15 @@ struct PublishStatus {
     /// The Welcome is staged with its unconfirmed commit, so nothing was
     /// published and nothing is recorded or owed yet.
     awaits_commit: bool,
+}
+
+impl PublishStatus {
+    /// Whether the publish staged no fanout: nothing accepted, nothing
+    /// refused for good, and nothing left to retry. A staged fanout always
+    /// ends in one of those.
+    fn staged_nothing(&self) -> bool {
+        !self.accepted_by_any_endpoint && !self.terminal_failure && !self.retry_deferred
+    }
 }
 
 /// Who asked for a send: the host, for a group change (mdk#2332), or anything
@@ -713,6 +722,30 @@ where
         );
         record.context = context;
         self.audit.record(record);
+    }
+
+    /// Audit how one of this account's pending commits changed (mdk#3460):
+    /// the commit by its message id, and how long since its first send
+    /// attempt.
+    fn record_pending_commit_change(
+        &self,
+        fanout: &OutboundFanout,
+        context: Option<AuditEventContext>,
+        change: PendingCommitChange,
+        now_ms: u64,
+    ) {
+        let pending_secs = fanout
+            .first_attempt_at_ms()
+            .map_or(0, |first| now_ms.saturating_sub(first) / 1_000);
+        self.record_audit_event(
+            fanout.group_id(),
+            context,
+            AuditEventKind::PendingCommitChanged {
+                change,
+                msg_id: hex::encode(fanout.message_id().as_slice()),
+                pending_secs,
+            },
+        );
     }
 
     /// Abandon a group locally without sending a leave or disband.
@@ -4834,13 +4867,13 @@ where
                         context.clone(),
                     ))
                     .await?;
-                    self.resolve_regenerated_queued_intent(queued_intent, status);
+                    self.rearm_unstaged_queued_intent(queued_intent, status);
                 }
                 PublishWork::Proposal { msg, queued_intent } => {
                     let status =
                         Box::pin(self.publish_one(msg, None, None, output, queue, context.clone()))
                             .await?;
-                    self.resolve_regenerated_queued_intent(queued_intent, status);
+                    self.rearm_unstaged_queued_intent(queued_intent, status);
                 }
                 PublishWork::GroupCreated { welcomes, pending } => {
                     Box::pin(self.publish_group_created(
@@ -4929,7 +4962,8 @@ where
     /// Until this acknowledgement arrives, restart drains replay the same
     /// publication metadata. App projection is idempotent, so a crash between
     /// its database commit and this call leaves a harmless replay instead of a
-    /// permanently pending message.
+    /// permanently pending message. A fanout whose queued intent has not
+    /// retired stays too, for the pass that retires it (mdk#2332).
     pub fn acknowledge_published_app_messages(
         &self,
         published_messages: &[PublishedApplicationMessage],
@@ -4948,6 +4982,7 @@ where
                     && outcome.accepted_targets > 0
                     && outcome.fanout_complete
                     && !matches!(fanout.mls_state(), FanoutMlsState::Pending(_))
+                    && !self.names_unretired_queued_intent(&fanout)?
                 {
                     self.session.delete_outbound_fanout(fanout.message_id())?;
                 }
@@ -5138,7 +5173,13 @@ where
                     blocked_groups.insert(fanout_group);
                 }
             } else if outcome.accepted_targets > 0 && fanout.application_message().is_some() {
+                // A crash after the accepting result was saved, before its
+                // intent was retired (mdk#2332).
+                self.retire_drained_queued_intent(&fanout);
                 self.record_published_application_fanout(&fanout, &mut output);
+                output.fanout.push(outcome);
+            } else if !self.retire_drained_queued_intent(&fanout) {
+                // Kept, still naming its intent, for the next pass.
                 output.fanout.push(outcome);
             } else {
                 // Complete when found: a crash after its last result was saved.
@@ -5508,55 +5549,69 @@ where
         Ok(())
     }
 
-    fn resolve_regenerated_queued_intent(
+    /// Re-arm a drained intent whose event was never staged, as when its
+    /// publish target could not be resolved: no fanout names the intent, so
+    /// the next drain prepares it again. A staged event's fanout names its
+    /// intent and retires it once the event resolves (mdk#2332).
+    fn rearm_unstaged_queued_intent(
         &mut self,
         intent: Option<QueuedIntentRef>,
         status: PublishStatus,
     ) {
-        let Some(intent) = intent else {
-            return;
-        };
-        if status.met_required_acks || status.accepted_by_any_endpoint {
-            if self
-                .session
-                .confirm_regenerated_queued_intent(&intent)
-                .is_err()
-            {
-                // The message is externally visible, so do not report the send
-                // as failed. Keep the durable intent and re-arm convergence;
-                // the duplicate-safe publish layer can retry cleanup later.
-                self.session.retry_regenerated_queued_intent(&intent);
-                tracing::warn!(
-                    target: TRACE_TARGET,
-                    method = "resolve_regenerated_queued_intent",
-                    error_kind = "queued_intent_cleanup",
-                    "published queued message but could not clear its durable intent"
-                );
-            }
-        } else if status.terminal_failure {
-            if self
-                .session
-                .confirm_regenerated_queued_intent(&intent)
-                .is_err()
-            {
-                // Every target failed terminally, so the logical queued intent
-                // is complete even though it was not delivered. If durable
-                // cleanup fails, retain and re-arm it rather than losing the
-                // obligation.
-                self.session.retry_regenerated_queued_intent(&intent);
-                tracing::warn!(
-                    target: TRACE_TARGET,
-                    method = "resolve_regenerated_queued_intent",
-                    error_kind = "terminal_queued_intent_cleanup",
-                    "terminal queued message failed but its durable intent could not be cleared"
-                );
-            }
-        } else {
-            // Nothing accepted, but routing/setup failure or at least one
-            // retryable or ambiguously exposed target means terminal failure
-            // has not been proved. Preserve and re-arm the durable intent.
+        if let Some(intent) = intent
+            && status.staged_nothing()
+        {
             self.session.retry_regenerated_queued_intent(&intent);
         }
+    }
+
+    /// Retire the queued intent a resolved application message or proposal
+    /// was drained from (mdk#2332): once a relay accepted the event, or every
+    /// relay refused it for good. A commit's intent retires with the commit.
+    /// Returns false when the intent could not be deleted: the fanout must
+    /// then stay stored, still naming it, for a later pass to retry, since a
+    /// drain that found the intent unnamed would prepare it a second time.
+    /// Whether `fanout` names a queued intent that has not retired yet, as
+    /// after a failed retirement (mdk#2332). The fanout is then the intent's
+    /// only durable link to the message already sent, so it stays until a
+    /// later pass retires the intent; deleting it first would let a drain
+    /// after a restart prepare the intent again.
+    fn names_unretired_queued_intent(&self, fanout: &OutboundFanout) -> AccountResult<bool> {
+        let (Some(group_id), Some(intent_id)) = (fanout.group_id(), fanout.queued_intent_id())
+        else {
+            return Ok(false);
+        };
+        Ok(self.session.is_queued_outbound_intent(&QueuedIntentRef {
+            group_id: group_id.clone(),
+            intent_id: intent_id.clone(),
+        })?)
+    }
+
+    fn retire_drained_queued_intent(&mut self, fanout: &OutboundFanout) -> bool {
+        let outcome = fanout.outcome();
+        let (Some(group_id), Some(intent_id)) = (fanout.group_id(), fanout.queued_intent_id())
+        else {
+            return true;
+        };
+        if !matches!(fanout.mls_state(), FanoutMlsState::NotApplicable)
+            || (outcome.accepted_targets == 0 && outcome.outstanding_targets > 0)
+        {
+            return true;
+        }
+        let intent = QueuedIntentRef {
+            group_id: group_id.clone(),
+            intent_id: intent_id.clone(),
+        };
+        if self.session.retire_drained_queued_intent(&intent).is_err() {
+            tracing::warn!(
+                target: TRACE_TARGET,
+                method = "retire_drained_queued_intent",
+                error_kind = "queued_intent_cleanup",
+                "resolved queued send could not clear its durable intent; retrying on a later pass"
+            );
+            return false;
+        }
+        true
     }
 
     /// Confirm a published commit, retrying on transient backend contention.
@@ -6178,8 +6233,16 @@ where
             };
             // A drained commit names its queued intent in the same record, so
             // a restart still retires the intent with the commit (mdk#2332).
-            if let Some(intent_id) =
-                pending.and_then(|pending| self.session.drained_queued_intent_id(pending))
+            // So does a drained application message or proposal: its intent
+            // retires when the event resolves, on whichever pass that is, and
+            // no drain prepares the intent again meanwhile.
+            let drained_intent = match pending {
+                Some(pending) => self.session.drained_queued_intent_id(pending),
+                None => self
+                    .session
+                    .regenerated_queued_intent_id(fanout.message_id()),
+            };
+            if let Some(intent_id) = drained_intent
                 && let Err(error) = fanout.set_queued_intent(intent_id)
             {
                 self.rollback_unstaged_pending(pending, output, queue)
@@ -6281,7 +6344,10 @@ where
                 .await?;
         }
         let now_ms = self.wall_clock.now().0.saturating_mul(1_000);
-        if self.read_back_pending_commit(&mut fanout, now_ms).await? {
+        if self
+            .read_back_pending_commit(&mut fanout, now_ms, context.clone())
+            .await?
+        {
             self.resolve_outbound_fanout_mls(&mut fanout, output, queue, context.clone(), pass)
                 .await?;
         }
@@ -6639,7 +6705,11 @@ where
         // pass merges it into the commit's refusal record, and the delete
         // merges it first, in the same transaction (mdk#2333).
         let refusal = commit_refusal_of(&fanout);
-        if fanout_outcome.fanout_complete
+        // The intent goes first: a crash before the fanout's retirement leaves
+        // a resolved fanout a later pass retires, never an unnamed intent.
+        let intent_retired = self.retire_drained_queued_intent(&fanout);
+        if intent_retired
+            && fanout_outcome.fanout_complete
             && !matches!(fanout.mls_state(), FanoutMlsState::Pending(_))
             && !(fanout_outcome.accepted_targets > 0 && fanout.application_message().is_some())
         {
@@ -6658,10 +6728,17 @@ where
     /// read-back. Any other answer changes nothing: the relay is resent to as
     /// before, and nothing rolls back. Returns whether the acknowledgements
     /// met the commit's goal, for the caller to confirm it.
+    ///
+    /// The first read while no relay has acknowledged the commit, the state
+    /// [`PendingCommitState::Stuck`] reports, audits that it went stuck
+    /// (mdk#3460). That is recorded on the stored fanout before the read is
+    /// sent, so a restart does not audit it again. Below a goal of more than
+    /// one acknowledgement, a commit some relay acknowledged is not stuck.
     async fn read_back_pending_commit(
         &mut self,
         fanout: &mut OutboundFanout,
         now_ms: u64,
+        context: Option<AuditEventContext>,
     ) -> AccountResult<bool> {
         if !is_group_commit(fanout)
             || !matches!(fanout.mls_state(), FanoutMlsState::Pending(_))
@@ -6681,6 +6758,10 @@ where
             .collect::<Vec<_>>();
         if read.is_empty() {
             return Ok(false);
+        }
+        if fanout.outcome().accepted_targets == 0 && fanout.record_stuck(now_ms) {
+            self.session.put_outbound_fanout(fanout)?;
+            self.record_pending_commit_change(fanout, context, PendingCommitChange::Stuck, now_ms);
         }
         let endpoints = fanout.request().target.endpoints();
         let read_endpoints = read
@@ -6828,6 +6909,7 @@ where
         let effects =
             give_up_unsent_commit(&mut self.session, pending, &mut abandoned, pass).await?;
         *fanout = abandoned;
+        self.record_pending_commit_change(fanout, context, PendingCommitChange::GivenUp, now_ms);
         tracing::info!(
             target: TRACE_TARGET,
             method = "abandon_unsent_pending_commit",
@@ -6858,6 +6940,17 @@ where
             let effects = self
                 .confirm_published_fanout_retrying(pending, fanout)
                 .await?;
+            // A commit no relay's `OK` confirmed is audited once, as it
+            // confirms, however a restart split its acknowledgement from
+            // this confirmation (mdk#3460).
+            if let Some(change) = confirmed_without_ok(fanout) {
+                self.record_pending_commit_change(
+                    fanout,
+                    context.clone(),
+                    change,
+                    self.wall_clock.now_ms(),
+                );
+            }
             output
                 .pending
                 .push(PendingResolution::Confirmed { pending });
@@ -7666,6 +7759,35 @@ fn echo_target_among(
                 .takes_acknowledgement(index)
                 .then_some((fanout, index))
         })
+}
+
+/// How one of this device's group commits that just confirmed was
+/// acknowledged, when no relay's `OK` is among its acceptances (mdk#3460):
+/// by a read-back when one is among them, otherwise by the account's own
+/// echo. `None` when a relay's `OK` is among them, which the commit's
+/// publish rows show.
+fn confirmed_without_ok(fanout: &OutboundFanout) -> Option<PendingCommitChange> {
+    if !is_group_commit(fanout) {
+        return None;
+    }
+    let mut accepted = false;
+    let mut read_back = false;
+    for index in 0..fanout.request().target.endpoints().len() {
+        if fanout.target_status(index) != Some(cgka_traits::FanoutTargetStatus::Accepted) {
+            continue;
+        }
+        accepted = true;
+        match fanout.target_acknowledgement(index) {
+            None => return None,
+            Some(FanoutAcknowledgement::ReadBack) => read_back = true,
+            Some(FanoutAcknowledgement::Echo) => {}
+        }
+    }
+    accepted.then_some(if read_back {
+        PendingCommitChange::ReadBackConfirmed
+    } else {
+        PendingCommitChange::EchoConfirmed
+    })
 }
 
 /// Whether `fanout` carries one of this device's group commits, a group

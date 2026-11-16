@@ -305,6 +305,10 @@ pub struct OutboundFanout {
     /// retry or a wake. See [`Self::first_attempt_at_ms`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     first_attempt_at_ms: Option<u64>,
+    /// When the session first read this pending commit back past the
+    /// read-back bound (mdk#3460). See [`Self::stuck_at_ms`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stuck_at_ms: Option<u64>,
     #[serde(default)]
     target_possible_exposure: Vec<bool>,
     /// When the device last read a pending commit back to learn whether it
@@ -312,7 +316,7 @@ pub struct OutboundFanout {
     /// [`Self::reachability_read_at_ms`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     reachability_read_at_ms: Option<u64>,
-    /// The queued intent a pending commit was drained from (mdk#2332). See
+    /// The queued intent this fanout's event was drained from (mdk#2332). See
     /// [`Self::queued_intent_id`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     queued_intent_id: Option<MessageId>,
@@ -481,6 +485,7 @@ impl OutboundFanout {
             target_attempt_counts: vec![0; target_count],
             target_last_attempt_at_ms: vec![None; target_count],
             first_attempt_at_ms: None,
+            stuck_at_ms: None,
             target_possible_exposure: vec![false; target_count],
             reachability_read_at_ms: None,
             queued_intent_id: None,
@@ -539,15 +544,20 @@ impl OutboundFanout {
         }
     }
 
-    /// Record the queued intent this pending commit was drained from
-    /// (mdk#2332), before the fanout is first stored. It is written with the
-    /// pending commit's durable record, so a restart can still retire that
-    /// intent when the commit resolves. Setting the same id again is a no-op;
-    /// any other change, or a fanout with no pending commit, is refused.
+    /// Record the queued intent this fanout's event was drained from
+    /// (mdk#2332), before the fanout is first stored: a pending commit, or an
+    /// application message or proposal, which awaits no MLS state. It is
+    /// written with the event's durable record, so a restart can still retire
+    /// that intent when the event resolves, and a drain does not prepare the
+    /// intent a second time. Setting the same id again is a no-op; any other
+    /// change, or a fanout whose MLS state is already resolved, is refused.
     pub fn set_queued_intent(&mut self, intent_id: MessageId) -> Result<(), TransportAdapterError> {
-        if !matches!(self.mls_state, FanoutMlsState::Pending(_)) {
+        if !matches!(
+            self.mls_state,
+            FanoutMlsState::Pending(_) | FanoutMlsState::NotApplicable
+        ) {
             return Err(TransportAdapterError::Other(
-                "only a pending commit's fanout names a queued intent".into(),
+                "a resolved fanout names no queued intent".into(),
             ));
         }
         match &self.queued_intent_id {
@@ -562,7 +572,7 @@ impl OutboundFanout {
         }
     }
 
-    /// The queued intent this pending commit was drained from, when it was
+    /// The queued intent this fanout's event was drained from, when it was
     /// drained from one and staged by a release that records it (mdk#2332).
     /// Immutable once stored (see [`Self::validate_successor_of`]).
     pub fn queued_intent_id(&self) -> Option<&MessageId> {
@@ -693,6 +703,25 @@ impl OutboundFanout {
                 })
                 .then_some(self.created_at_ms)
         })
+    }
+
+    /// When the session first read this pending commit back from a relay
+    /// that may hold it, past the read-back bound, with no relay having
+    /// acknowledged it (mdk#3460); none before then. The session audits that
+    /// the commit went stuck once, when it records this.
+    pub fn stuck_at_ms(&self) -> Option<u64> {
+        self.stuck_at_ms
+    }
+
+    /// Record that the commit went stuck at `at_ms`. Returns whether this
+    /// recorded it: the first time does, and a later call keeps the first
+    /// time and returns `false`. It changes no target.
+    pub fn record_stuck(&mut self, at_ms: u64) -> bool {
+        if self.stuck_at_ms.is_some() {
+            return false;
+        }
+        self.stuck_at_ms = Some(at_ms);
+        true
     }
 
     /// Whether the endpoint may hold the event without having acknowledged
@@ -3357,7 +3386,7 @@ mod tests {
     /// drained from once, before it is stored, and storage keeps that name.
     /// A row stored before the name existed reads as naming none.
     #[test]
-    fn a_pending_fanout_names_its_queued_intent_once() {
+    fn a_fanout_names_its_queued_intent_once() {
         let unnamed = OutboundFanout::stage(
             fanout_request(),
             Some(crate::engine_state::PendingStateRef::new(4)),
@@ -3371,6 +3400,11 @@ mod tests {
         let mut resolved = unnamed.clone();
         resolved.mark_mls_rolled_back().unwrap();
         assert!(resolved.set_queued_intent(intent.clone()).is_err());
+        // An application message or proposal awaits no MLS state and names
+        // its intent too.
+        let mut message = OutboundFanout::stage(fanout_request(), None, None, 55).unwrap();
+        message.set_queued_intent(intent.clone()).unwrap();
+        assert_eq!(message.queued_intent_id(), Some(&intent));
 
         let mut named = unnamed.clone();
         named.set_queued_intent(intent.clone()).unwrap();

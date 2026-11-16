@@ -110,10 +110,6 @@ fn host_reads(
             store_epoch: Vec::new(),
             observer: None,
         }
-        Waits PreparedGroupImageStatus { upload_id: "probe".into() }
-        Waits PreparedGroupImages {}
-        Waits StartedFresh {}
-        Waits ChatHistoryImports {}
         Waits HistoryImportProvenance { group_id: group_id(), event_id: "00".repeat(32) }
         Waits PendingWelcomeDeliveries {}
         Waits AccountDevicesActivation { group_id: group_id() }
@@ -147,7 +143,7 @@ fn host_reads(
     }
 }
 
-/// The reads that answer from A (mdk#3273 PRs 3, 4 and 8), each through its
+/// The reads that answer from A (mdk#3273 PRs 3, 4, 5 and 8), each through its
 /// host wrapper while `behind` holds the worker: every one answers before the
 /// unit ends, and none queues on the worker, so neither its class's series
 /// nor the unit's counts it. The group reads find their group hydrated, so
@@ -162,6 +158,8 @@ async fn reads_from_published_state(
     let queued = || {
         [
             behind,
+            RuntimeOp::ReadQueueR1,
+            RuntimeOp::ReadQueueR2,
             RuntimeOp::ReadQueueR3,
             RuntimeOp::ReadQueueR4,
             RuntimeOp::ReadQueueR7,
@@ -258,6 +256,25 @@ async fn reads_from_published_state(
         ),
         Err(AppError::InvalidAppComponent(_))
     ));
+    answers!(
+        "prepared_group_images",
+        accounts.prepared_group_images(account)
+    )
+    .unwrap();
+    assert!(matches!(
+        answers!(
+            "prepared_group_image_status",
+            accounts.prepared_group_image_status(account, "probe".into())
+        ),
+        Err(AppError::InvalidEncryptedMedia(message))
+            if message == "prepared group image upload was not found"
+    ));
+    answers!("started_fresh", accounts.started_fresh(account)).unwrap();
+    answers!(
+        "chat_history_imports",
+        accounts.chat_history_imports(account)
+    )
+    .unwrap();
     answers!("history_notices", accounts.history_notices(account)).unwrap();
     answers!(
         "account_recovery_status",
@@ -543,13 +560,23 @@ async fn host_reads_wait_behind_held_worker_units() {
         .await
         .expect("the explicit catch-up reaches its hold");
     // A host read through its public wrapper records its class, and the
-    // unit it waits behind once that ends: the fresh-start flag still waits
+    // unit it waits behind once that ends: an exporter secret, which stays
     // on the worker.
-    let class_before = sample(&telemetry, RuntimeOp::ReadQueueR2);
+    let class_before = sample(&telemetry, RuntimeOp::ReadQueueR5);
     let unit_before = sample(&telemetry, RuntimeOp::ReadQueueBehindCatchUp);
     let wrapped = tokio::spawn({
-        let runtime = runtime.clone();
-        async move { runtime.started_fresh("alice").await }
+        let accounts = runtime.accounts();
+        let group = group.clone();
+        async move {
+            accounts
+                .exporter_secret(
+                    "alice",
+                    &group,
+                    cgka_traits::agent_text_stream::AGENT_TEXT_STREAM_EXPORTER_CACHE_KEY,
+                    32,
+                )
+                .await
+        }
     });
     timeout(SETTLE, async {
         while sample(&telemetry, RuntimeOp::ReadQueueBehindCatchUp).in_flight
@@ -578,7 +605,7 @@ async fn host_reads_wait_behind_held_worker_units() {
         .unwrap()
         .unwrap();
     timeout(SETTLE, wrapped).await.unwrap().unwrap().unwrap();
-    let class_after = sample(&telemetry, RuntimeOp::ReadQueueR2);
+    let class_after = sample(&telemetry, RuntimeOp::ReadQueueR5);
     assert_eq!(class_after.successes - class_before.successes, 1);
     // The unit's series counts it with the probes.
     held.all_answered(&telemetry).await;

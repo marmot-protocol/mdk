@@ -1060,6 +1060,7 @@ include!("runtime/own_echo.rs");
 include!("runtime/read_back.rs");
 include!("runtime/abandon.rs");
 include!("runtime/change_not_delivered.rs");
+include!("runtime/drained_message_intent.rs");
 include!("runtime/hydrated_welcome.rs");
 include!("support/recovery_challenge.rs");
 include!("runtime/key_package_generation_upgrade.rs");
@@ -3958,6 +3959,32 @@ fn v5_audit_rows(path: &std::path::Path) -> Vec<serde_json::Value> {
         .map(|line| {
             marmot_forensics::v5::Record::from_json(line.as_bytes()).expect("strict v5 row");
             serde_json::from_str::<serde_json::Value>(line).unwrap()
+        })
+        .collect()
+}
+
+/// The `pending_commit_changed` rows in the v5 audit at `path`, as each row's
+/// change and `pending_secs`, after checking that each names `group_id` and
+/// `commit` by their hashed references, as the commit's publish rows do
+/// (mdk#3460).
+fn pending_commit_changes(
+    path: &std::path::Path,
+    group_id: &GroupId,
+    commit: &MessageId,
+) -> Vec<(String, u64)> {
+    let message_ref =
+        marmot_forensics::v5::EngineMessageRef::from_message_id(commit.as_slice()).unwrap();
+    let group_ref = marmot_forensics::v5::GroupRef::from_group_id(group_id.as_slice()).unwrap();
+    v5_audit_rows(path)
+        .into_iter()
+        .filter(|row| row["event"]["type"] == "pending_commit_changed")
+        .map(|row| {
+            assert_eq!(row["event"]["message_ref"], message_ref.as_str(), "{row}");
+            assert_eq!(row["group_ref"], group_ref.as_str(), "{row}");
+            (
+                row["event"]["change"].as_str().unwrap().to_owned(),
+                row["event"]["pending_secs"].as_u64().unwrap(),
+            )
         })
         .collect()
 }

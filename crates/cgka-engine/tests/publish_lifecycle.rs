@@ -4802,6 +4802,154 @@ async fn queued_outbound_intents_are_capped_per_group_while_a_publish_stays_unre
     );
 }
 
+/// mdk#2332: a drained queued message is in flight while this engine's drain
+/// holds it or a stored message fanout names it, and owed otherwise. Memory
+/// covers a drained message until the host stores its fanout; the stored name
+/// covers every later pass, after a retry clears memory and after a restart.
+/// A message memory alone held is owed again after a restart: no fanout means
+/// the host never staged it. A rolled-back commit's fanout names no message,
+/// so the intent it names is owed too.
+#[tokio::test]
+async fn a_queued_message_is_in_flight_while_its_drain_or_stored_fanout_holds_it() {
+    let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
+    let mut alice = build_engine_with_storage(b"alice", storage.clone());
+    let mut bob = build(b"bob");
+    let group_id = group_with_bob(&mut alice, &mut bob).await;
+    let (_, pending) = evolution(
+        alice
+            .send(SendIntent::SelfUpdate {
+                group_id: group_id.clone(),
+            })
+            .await
+            .unwrap(),
+    );
+    for body in ["memory", "named", "owed"] {
+        let queued = alice
+            .send(SendIntent::AppMessage {
+                group_id: group_id.clone(),
+                payload: app_payload_for(&alice, body),
+                expected_epoch: None,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(queued, SendResult::Queued { .. }), "{queued:?}");
+    }
+    alice.confirm_published(pending).await.unwrap();
+    let drained: Vec<_> = alice
+        .advance_convergence(&group_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|result| {
+            let SendResult::ApplicationMessage { msg, .. } = result else {
+                panic!("queued messages drain as application messages, got {result:?}")
+            };
+            let (_, intent_id) = alice
+                .regenerated_queued_intent_for_message(&msg.id)
+                .unwrap();
+            (msg, intent_id)
+        })
+        .collect();
+    let [(memory_msg, memory), (named_msg, named), (_, owed)] = drained.as_slice() else {
+        panic!("all three drain, got {}", drained.len())
+    };
+
+    // Memory alone holds all three: no fanout is stored yet.
+    assert!(
+        alice
+            .advance_convergence(&group_id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    // The host stores the second message's fanout, naming its intent, and a
+    // retry clears memory for the second and the third. The stored name
+    // still holds the second; the third is owed and drains again.
+    let account_id = alice.self_id();
+    let stage = |msg: &TransportMessage, pending, intent_id: &MessageId| {
+        let TransportEnvelope::GroupMessage { transport_group_id } = &msg.envelope else {
+            panic!("a group message: {:?}", msg.envelope)
+        };
+        let mut fanout = OutboundFanout::stage(
+            cgka_traits::TransportPublishRequest {
+                account_id: account_id.clone(),
+                message: msg.clone(),
+                target: cgka_traits::TransportPublishTarget::Group {
+                    group_id: group_id.clone(),
+                    transport_group_id: transport_group_id.clone(),
+                    endpoints: vec![cgka_traits::TransportEndpoint(
+                        "wss://in-flight.example".into(),
+                    )],
+                },
+                required_acks: 1,
+            },
+            pending,
+            Some(group_id.clone()),
+            0,
+        )
+        .unwrap();
+        fanout.set_queued_intent(intent_id.clone()).unwrap();
+        fanout
+    };
+    alice
+        .put_outbound_fanout(&stage(named_msg, None, named))
+        .unwrap();
+    alice.retry_regenerated_queued_intent(&group_id, named);
+    alice.retry_regenerated_queued_intent(&group_id, owed);
+    let again = alice.advance_convergence(&group_id).await.unwrap();
+    let [SendResult::ApplicationMessage { msg, .. }] = again.as_slice() else {
+        panic!("only the owed message drains again, got {again:?}")
+    };
+    assert_eq!(
+        alice
+            .regenerated_queued_intent_for_message(&msg.id)
+            .map(|(_, intent_id)| intent_id),
+        Some(owed.clone())
+    );
+
+    // A rolled-back commit's fanout names the first intent: no message
+    // fanout, so it does not hold it.
+    let mut rolled_back = stage(
+        memory_msg,
+        Some(cgka_traits::PendingStateRef::new(u64::MAX)),
+        memory,
+    );
+    rolled_back.mark_mls_rolled_back().unwrap();
+    alice.put_outbound_fanout(&rolled_back).unwrap();
+    drop(alice);
+
+    // After a restart only the stored message fanout holds its intent.
+    let mut restarted = build_engine_with_storage(b"alice", storage.clone());
+    restarted.hydrate_all_stored_groups().unwrap();
+    let redrained: std::collections::HashSet<_> = restarted
+        .advance_convergence(&group_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|result| {
+            let SendResult::ApplicationMessage { msg, .. } = result else {
+                panic!("queued messages drain as application messages, got {result:?}")
+            };
+            restarted
+                .regenerated_queued_intent_for_message(&msg.id)
+                .unwrap()
+                .1
+        })
+        .collect();
+    assert_eq!(
+        redrained,
+        std::collections::HashSet::from([memory.clone(), owed.clone()])
+    );
+    assert_eq!(
+        storage
+            .list_queued_outbound_intents(&group_id)
+            .unwrap()
+            .len(),
+        3
+    );
+}
+
 /// A held publication and an unresolved convergence input are mutually
 /// exclusive, and that is what keeps a convergence pass from ever landing on
 /// top of a staged commit.

@@ -225,10 +225,12 @@ pub const MAX_PEEL_DEFERRED_BYTES_PER_ACCOUNT: usize = 256 * 1024 * 1024;
 /// holds the change (mdk#2842; a failed delete leaves it for the next drain).
 /// A payload that was prepared and published but never acknowledged still
 /// holds its slot and stays in flight.
-/// A definite retry clears that in-flight association so the next drain
-/// re-prepares it. A group whose transport keeps failing therefore sits at the
-/// cap: its rows keep being re-attempted, but nothing frees a slot until a
-/// publish is accepted by at least one endpoint.
+/// A definite retry of an attempt that stored no fanout clears that in-flight
+/// association so the next drain re-prepares it; a message or proposal whose
+/// fanout is stored stays in flight while the fanout retries its exact event
+/// (mdk#2332). A group whose transport keeps failing therefore sits at the
+/// cap: nothing frees a slot until a publish is accepted by at least one
+/// endpoint or refused by every one.
 pub const MAX_QUEUED_OUTBOUND_INTENTS_PER_GROUP: usize = 256;
 
 /// Shared background allowance for deferred-peel attempts and retained
@@ -1358,11 +1360,14 @@ impl<S: StorageProvider> Engine<S> {
         {
             return Ok(Vec::new());
         }
+        let named = self.intents_named_by_stored_fanouts(group_id, &queued)?;
         for record in queued {
             // A regenerated intent the host has not yet confirmed or retired
             // is still the host's obligation: re-preparing it would publish
-            // the same logical message twice (mdk#1472).
-            if self.queued_outbound_intent_in_flight(group_id, &record.id) {
+            // the same logical message twice (mdk#1472, mdk#2332).
+            if self.queued_outbound_intent_in_flight(group_id, &record.id)
+                || named.contains(&record.id)
+            {
                 continue;
             }
             if !reservation.permits(&record.intent) {
@@ -1700,11 +1705,44 @@ impl<S: StorageProvider> Engine<S> {
         &self,
         group_id: &GroupId,
     ) -> Result<bool, EngineError> {
+        let queued = self.storage.list_queued_outbound_intents(group_id)?;
+        let named = self.intents_named_by_stored_fanouts(group_id, &queued)?;
+        Ok(queued.iter().any(|record| {
+            !self.queued_outbound_intent_in_flight(group_id, &record.id)
+                && !named.contains(&record.id)
+        }))
+    }
+
+    /// The queued intents a stored application-message or proposal fanout of
+    /// this group names (mdk#2332). The fanout is the durable record that the
+    /// intent was prepared and sent, so the intent is in flight until the
+    /// fanout resolves and retires it, whatever this engine's memory holds:
+    /// after a restart, a Welcome that made the group live without hydrating
+    /// it, or a retirement that failed. Read only when some queued intent is
+    /// not already in flight in memory.
+    fn intents_named_by_stored_fanouts(
+        &self,
+        group_id: &GroupId,
+        queued: &[QueuedOutboundIntent],
+    ) -> Result<HashSet<MessageId>, EngineError> {
+        if queued
+            .iter()
+            .all(|record| self.queued_outbound_intent_in_flight(group_id, &record.id))
+        {
+            return Ok(HashSet::new());
+        }
         Ok(self
             .storage
-            .list_queued_outbound_intents(group_id)?
-            .iter()
-            .any(|record| !self.queued_outbound_intent_in_flight(group_id, &record.id)))
+            .list_outbound_fanouts_for_group(group_id)?
+            .into_iter()
+            .filter(|fanout| {
+                matches!(
+                    fanout.mls_state(),
+                    cgka_traits::FanoutMlsState::NotApplicable
+                )
+            })
+            .filter_map(|fanout| fanout.queued_intent_id().cloned())
+            .collect())
     }
 
     /// Settle authenticated input and give current-fingerprint deferred rows
@@ -1731,10 +1769,13 @@ impl<S: StorageProvider> Engine<S> {
         ))
     }
 
-    /// Whether a durable queued intent was already regenerated into an
-    /// artifact the host has not yet confirmed or retired. The association
-    /// lives from regeneration until `confirm_regenerated_queued_intent`,
-    /// `retry_regenerated_queued_intent`, or a publish rollback clears it.
+    /// Whether a durable queued intent was already regenerated, in this
+    /// process, into an artifact the host has not yet confirmed or retired.
+    /// The association lives from regeneration until
+    /// `confirm_regenerated_queued_intent`, `retry_regenerated_queued_intent`,
+    /// `retire_drained_queued_intent`, or a publish rollback clears it. The
+    /// drain also treats an intent a stored fanout names as in flight (see
+    /// `intents_named_by_stored_fanouts`).
     fn queued_outbound_intent_in_flight(&self, group_id: &GroupId, intent_id: &MessageId) -> bool {
         self.queued_intent_by_message
             .values()
@@ -1767,6 +1808,24 @@ impl<S: StorageProvider> Engine<S> {
         self.queued_intent_by_message
             .retain(|_, (_, queued_intent_id)| queued_intent_id != intent_id);
         self.queued_intent_by_pending
+            .retain(|_, (_, queued_intent_id)| queued_intent_id != intent_id);
+        Ok(())
+    }
+
+    /// Retire the queued intent a drained application message or proposal
+    /// was prepared from, once the event resolved: a relay accepted it, or
+    /// every relay refused it for good (mdk#2332). The event's fanout names
+    /// the intent, and later passes over it retire it again, so an intent
+    /// already retired counts as retired.
+    pub fn retire_drained_queued_intent(
+        &mut self,
+        group_id: &GroupId,
+        intent_id: &MessageId,
+    ) -> Result<(), EngineError> {
+        if self.is_queued_outbound_intent(group_id, intent_id)? {
+            self.storage.delete_queued_outbound_intent(intent_id)?;
+        }
+        self.queued_intent_by_message
             .retain(|_, (_, queued_intent_id)| queued_intent_id != intent_id);
         Ok(())
     }
@@ -2342,6 +2401,19 @@ impl<S: StorageProvider> Engine<S> {
     /// schedulers must keep a wakeup armed while any remain: the scheduled
     /// drain is what regenerates and publishes them (and, on an inactive
     /// transport, what triggers reactivation).
+    /// Whether this intent is still queued for the group: not yet retired.
+    pub fn is_queued_outbound_intent(
+        &self,
+        group_id: &GroupId,
+        intent_id: &MessageId,
+    ) -> Result<bool, EngineError> {
+        Ok(self
+            .storage
+            .list_queued_outbound_intents(group_id)?
+            .iter()
+            .any(|record| &record.id == intent_id))
+    }
+
     pub fn has_queued_outbound_intents(&self, group_id: &GroupId) -> Result<bool, EngineError> {
         Ok(!self
             .storage

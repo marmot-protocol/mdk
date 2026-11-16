@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Breaking changes
+
+- `AppMessageRecordFfi` gains `invalidated: Bool`, true when a raw row is retained only as an invalidated tombstone
+  (#3411). `messages` and message-subscription snapshots expose the stored flag. Code that constructs the record
+  directly must pass `invalidated`. Regenerate Swift and Kotlin bindings with the matching native library.
+
 ### Added
 
 - `groupPendingCommit(accountRef, groupIdHex)` returns `GroupPendingCommitFfi`, or nil, for the group's own commit

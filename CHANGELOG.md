@@ -13,6 +13,15 @@
 
 ### Added
 
+- The v5 audit records a pending commit going stuck, confirming without a
+  relay's `OK`, or being given up (#3460). The new `pending_commit_changed` row
+  says `stuck` once, at the commit's first read-back past the ten-minute bound;
+  `read_back_confirmed` or `echo_confirmed` when a read or the account's own
+  echo confirmed it; or `given_up` when it reached no relay and rolled back. It
+  names the group and the commit by hashed references, as the commit's publish
+  rows do, with seconds since the first send attempt. A receiver must accept
+  the new kind before it gets these rows; one that rejects the kind loses only
+  them.
 - Group changes MDK gives up after their call returned are recorded until the
   user has seen them (#2332). A direct group change that answered
   `CompletionUnknown`, or a queued one that answered `AcceptedPending`, gets a
@@ -75,6 +84,10 @@
 
 ### Fixed
 
+- Stop a retried emoji-set install from deleting emoji the user already has
+  (#3464). Reinstalling the installed version keeps each image whose download
+  fails, and the result's `skipped` list names only entries left without an
+  image.
 - Find sticker packs an imported account's relay list does not lead to.
   Sticker pack reads (discovery and installed-pack refresh in
   `sync_sticker_packs`, `fetch_sticker_pack`, `install_sticker_pack`, and
@@ -126,6 +139,13 @@
   instead of leaving it queued to be prepared and sent again. A change whose
   commit was stored by an earlier release is prepared once more after such a
   rollback, and its new commit carries the link.
+- Send a queued message once (#2332). A message sent while a group change was
+  pending waits in the queue, and it was prepared and sent a second time when
+  its first send reached no relay and a retry later did, or when the app
+  restarted before its send resolved. Its stored send now names the queued
+  message, which retires when the send resolves, so a retry or a restart no
+  longer duplicates it. A message whose send was stored by an earlier release
+  can still be sent once more after a restart.
 
 ## 0.17.0 - 2026-11-15
 

@@ -93,6 +93,10 @@
 
 ### Fixed
 
+- Reinstalling the installed version of an emoji set no longer deletes images it already holds (#3464). A verified
+  image whose refresh fails or does not fit the byte budget is kept, counts in `installed_count` and is not in
+  `skipped`. Newly downloaded images are added, successful refreshes replace the old bytes, and a stored image that
+  fails its hash check is fetched again. Installing a different version still replaces the whole set.
 - Sticker pack reads (discovery and installed-pack refresh in `sync_sticker_packs`, `fetch_sticker_pack`,
   `install_sticker_pack`, and `fetch_sticker_asset`'s on-demand pack fetch) query the runtime's configured relays as
   well as the account's NIP-65 relays, deduplicated and filtered by the host-safety rule, so a pack only the host's
@@ -244,6 +248,8 @@
   are members, member-id pages, MLS state and its diagnostic form, roster and conversation snapshot, and app
   components. A group read that names a group still awaiting startup hydration asks the worker to hydrate it and
   answers once it has. A forget sent during startup hydration now runs at its place in the worker's command order.
+  The prepared group image status and list (an upload in flight reads `Uploading`), the fresh-start flag and chat
+  history imports answer the same way.
 
 ### Fixed
 

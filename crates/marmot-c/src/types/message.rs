@@ -37,6 +37,9 @@ c_mirror! {
         copy recorded_at: u64,
         /// Local wall-clock time when this device observed the delivery.
         copy received_at: u64,
+        /// True when this raw row is retained only as an invalidated
+        /// tombstone.
+        copy invalidated: bool,
     }
 }
 

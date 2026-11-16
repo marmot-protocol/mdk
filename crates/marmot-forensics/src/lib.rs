@@ -14,7 +14,7 @@ pub use audit::{
     EpochBackfillDeferredReason, EpochBackfillExecutionSeam, EpochBackfillReplayScope,
     EpochStallBackfillTrigger, ForensicRecorder, ForkWinner, GroupRefHex, GroupStateValue,
     JsonlRecorder, MemberRefHex, MembershipChangeSource, MessageArtifactKind, MessageRefHex,
-    NoopRecorder, OutboundMessage, PeelerOutcomeKind, PublishRelayFailure,
+    NoopRecorder, OutboundMessage, PeelerOutcomeKind, PendingCommitChange, PublishRelayFailure,
     RECOVERY_AUDIT_MAX_ENDPOINTS, RECOVERY_AUDIT_MAX_OBLIGATIONS,
     RECOVERY_RUNNER_RACED_WINDOW_SECS, RecipientExpectation, RecipientScope, RecoveryAttemptScope,
     RecoveryGoalBound, RecoveryNeedChange, RecoveryNextAttempt, RecoveryObligationCause,

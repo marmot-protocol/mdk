@@ -233,17 +233,40 @@ impl SqliteAppStorage {
     pub fn list_prepared_group_image_upload_statuses(
         &self,
     ) -> StorageResult<Vec<PreparedGroupImageUploadStatus>> {
+        Ok(self
+            .list_prepared_group_image_upload_statuses_with_record_check()?
+            .into_iter()
+            .map(|(status, _)| status)
+            .collect())
+    }
+
+    /// The status list, each status with whether
+    /// [`Self::prepared_group_image_upload`] reads its record: the columns
+    /// only that read decodes hold the types it decodes them as. One
+    /// statement, so both come from one snapshot, and the check fails no
+    /// row. It still reads no image component, ciphertext or upload secret:
+    /// `typeof` reads a column's type, not its value.
+    pub fn list_prepared_group_image_upload_statuses_with_record_check(
+        &self,
+    ) -> StorageResult<Vec<(PreparedGroupImageUploadStatus, bool)>> {
         let conn = self.lock()?;
         let mut statement = conn
             .prepare_cached(
                 "SELECT upload_id, state, group_id_hex, attempt_count, last_error_kind,
-                        recorded_at, updated_at
+                        recorded_at, updated_at,
+                        typeof(component_data) = 'blob'
+                            AND typeof(encrypted_blob) IN ('blob', 'null')
+                            AND typeof(upload_secret) IN ('blob', 'null'),
+                        member_outcomes_json
                  FROM app_prepared_group_image_upload
                  ORDER BY recorded_at, upload_id",
             )
             .storage()?;
         let rows = statement
             .query_map([], |row| {
+                // As the record read decodes them (`RawPreparedGroupImageUpload`).
+                let record_reads =
+                    row.get::<_, bool>(7)? && row.get::<_, Option<String>>(8).is_ok();
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
@@ -252,6 +275,7 @@ impl SqliteAppStorage {
                     row.get::<_, Option<String>>(4)?,
                     row.get::<_, i64>(5)?,
                     row.get::<_, i64>(6)?,
+                    record_reads,
                 ))
             })
             .storage()?
@@ -259,16 +283,28 @@ impl SqliteAppStorage {
             .storage()?;
         rows.into_iter()
             .map(
-                |(upload_id, state, group_id_hex, attempts, last_error_kind, recorded, updated)| {
-                    Ok(PreparedGroupImageUploadStatus {
-                        upload_id,
-                        state: PreparedGroupImageUploadState::from_storage(&state)?,
-                        group_id_hex,
-                        attempt_count: attempt_count_from_storage(attempts)?,
-                        last_error_kind,
-                        recorded_at: i64_to_u64(recorded)?,
-                        updated_at: i64_to_u64(updated)?,
-                    })
+                |(
+                    upload_id,
+                    state,
+                    group_id_hex,
+                    attempts,
+                    last_error_kind,
+                    recorded,
+                    updated,
+                    record_reads,
+                )| {
+                    Ok((
+                        PreparedGroupImageUploadStatus {
+                            upload_id,
+                            state: PreparedGroupImageUploadState::from_storage(&state)?,
+                            group_id_hex,
+                            attempt_count: attempt_count_from_storage(attempts)?,
+                            last_error_kind,
+                            recorded_at: i64_to_u64(recorded)?,
+                            updated_at: i64_to_u64(updated)?,
+                        },
+                        record_reads,
+                    ))
                 },
             )
             .collect()
@@ -801,6 +837,79 @@ mod tests {
         assert_eq!(
             app.list_prepared_group_image_upload_statuses().unwrap(),
             records.map(|record| record.status()).to_vec()
+        );
+    }
+
+    /// The record check says a record reads exactly when the record read
+    /// reads it: each column only that read decodes, given a type it does
+    /// not decode as, fails the record and leaves the list answering.
+    #[test]
+    fn the_record_check_flags_exactly_the_records_the_record_read_fails_on() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let app = store.app_storage();
+        let cases = [
+            ("healthy", None, true),
+            ("component-text", Some("component_data = 'x'"), false),
+            ("ciphertext-integer", Some("encrypted_blob = 7"), false),
+            (
+                "secret-text",
+                Some("upload_secret = '0123456789abcdef0123456789abcdef'"),
+                false,
+            ),
+            ("outcomes-text", Some("member_outcomes_json = '[]'"), true),
+            ("outcomes-blob", Some("member_outcomes_json = x'01'"), false),
+            (
+                "outcomes-not-utf8",
+                Some("member_outcomes_json = CAST(x'ff' AS TEXT)"),
+                false,
+            ),
+        ];
+        for (at, (upload_id, corruption, _)) in (10..).zip(cases) {
+            app.stage_prepared_group_image_upload(&staged_record_with(upload_id.into(), at))
+                .unwrap();
+            if let Some(corruption) = corruption {
+                app.execute_batch_for_test(&format!(
+                    "UPDATE app_prepared_group_image_upload SET {corruption} \
+                     WHERE upload_id = '{upload_id}'"
+                ))
+                .unwrap();
+            }
+        }
+        // A consumed record holds no ciphertext or secret.
+        app.stage_prepared_group_image_upload(&staged_record_with("consumed".into(), 30))
+            .unwrap();
+        app.mark_prepared_group_image_upload_uploaded("consumed", 31)
+            .unwrap();
+        app.consume_prepared_group_image_upload("consumed", "abcd", 32)
+            .unwrap();
+
+        let checked = app
+            .list_prepared_group_image_upload_statuses_with_record_check()
+            .unwrap();
+        let expected: Vec<_> = cases
+            .iter()
+            .map(|(upload_id, _, reads)| (upload_id.to_string(), *reads))
+            .chain([("consumed".to_string(), true)])
+            .collect();
+        let flags: Vec<_> = checked
+            .iter()
+            .map(|(status, reads)| (status.upload_id.clone(), *reads))
+            .collect();
+        assert_eq!(flags, expected);
+        for (status, reads) in &checked {
+            assert_eq!(
+                app.prepared_group_image_upload(&status.upload_id).is_ok(),
+                *reads,
+                "{}",
+                status.upload_id
+            );
+        }
+        assert_eq!(
+            app.list_prepared_group_image_upload_statuses().unwrap(),
+            checked
+                .into_iter()
+                .map(|(status, _)| status)
+                .collect::<Vec<_>>()
         );
     }
 }

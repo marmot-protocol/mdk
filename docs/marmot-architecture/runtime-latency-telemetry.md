@@ -176,12 +176,15 @@ before the worker's first publish, or for a published failure that has no exact 
 read from A also records there the wait of its hydration request: one worker command, sent only
 while startup's hydration pipeline has not reached a group the read names. `group_recovery_status`
 answers from A only for a group in the version's mirror: the worker answers any other id, such
-as a locally deleted group, and the read records that wait in R9.
+as a locally deleted group, and the read records that wait in R9. `prepared_group_image_status`
+answers from the version's list of prepared uploads: while that list failed, or for an upload
+whose record the worker's read cannot read, the worker reads the one upload instead, and the read
+records that wait in R1.
 
 | Class | Reads |
 | --- | --- |
-| R1, prepared group images | `prepared_group_image_status`, `prepared_group_images` |
-| R2, device-group history | `chat_history_imports`, `started_fresh`, `history_import_provenance` |
+| R1, prepared group images | from A: `prepared_group_image_status`, `prepared_group_images` |
+| R2, device-group history | `history_import_provenance`; from A: `chat_history_imports`, `started_fresh` |
 | R3, durable engine facts | `pending_welcome_deliveries`, `group_changes_not_delivered`, `group_pending_commit`; from A: `group_members`, `group_member_ids_page`, `group_conversation_snapshot` (and `group_roster`, built from it), `group_co_members`, `quarantined_groups`, `group_commit_delivery`, `key_package_maintenance_status` and its diagnostic form, `durably_owned_key_packages`, `maintenance_status`, `periodic_maintenance_policy` |
 | R4, facts that need a hydrated group | `account_devices_activation`, `group_push_debug_info`, the conversation window's authority capture; from A: `group_mls_state` and its diagnostic form, `group_app_component` |
 | R5, exporter secrets | `exporter_secret`, `safe_export_secret` |

@@ -1192,7 +1192,14 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   (`AppClient::read_state_deadline`, each bound on its own clock) and publishes at the loop top. A rebuilt entry
   whose answers equal the published ones (`GroupAnswers::same_as`, which destructures every field) keeps the
   published entry and the version. A new input of a reused answer must be in its validity or move one of
-  its counts (a new table needs a `storage-sqlite` `cross/group_writes.rs` trigger). In this crate's own tests,
+  its counts (a new table needs a `storage-sqlite` `cross/group_writes.rs` trigger). While a worker runs, write
+  every input of a count-validated reuse (a group entry's generation, the KeyPackage and recovery-notice counts) on
+  that worker. A commit is visible to every connection before its guard's release joins its count, so a publish
+  that read the count in between would keep the answer that write made stale; the worker's own writes are released
+  before it publishes. The writers of the KeyPackage and recovery-notice inputs that run off the worker run only
+  while none runs, fenced by the worker transaction (`write_without_worker`) or the session guard (a signed-out
+  account's KeyPackage withdrawal, onboarding's first KeyPackage, one-shot sync). Moving one of those writes off
+  the worker needs a validity that closes that window first. In this crate's own tests,
   every publish that changed something, and every reused KeyPackage list, is checked against today's live reads
   (`read_state::oracle`), and at every publish, changed or not, so are the account recovery status and each mirror
   group's recovery status. The only pairs let through unequal are one where a terminal storage close landed
@@ -1209,7 +1216,11 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   served only as an exact copy (`read_state::reissue`), never a lossy one; one with no copy, and any read before the
   first publish, goes to the worker's command, which stays as that fallback and records its wait under the read's
   class. A storage read counts its failure as the worker's
-  `respond_diagnosed` would. Moving a read to A moves its row in `read_queue_tests.rs` and in
+  `respond_diagnosed` would. `prepared_group_image_status` answers from the version's list of prepared uploads, with
+  the worker's in-flight set (`UploadsInFlight`, changed only on the worker) applied at the publish; while that list
+  failed, or for an upload whose record the worker's read fails on a column the list does not decode (the list's
+  statement flags it: `prepared_group_image_records_unread`), the worker's read of the one row answers
+  (`read_from_state_where_held`), since another row's failure does not fail it. Moving a read to A moves its row in `read_queue_tests.rs` and in
   `runtime-latency-telemetry.md`'s "Host read classes"; don't move a multi-device read (mdk#2628) without Jeff.
 - The group reads (`read_group_from_state`) answer the same way, with one exception, the hydration request. When the
   version shows a named group awaiting hydration (`GroupAnswers::awaits_hydration`, only during startup's hydration

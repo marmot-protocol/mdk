@@ -4820,6 +4820,11 @@ typedef struct MarmotAppMessageRecord {
    * Local wall-clock time when this device observed the delivery.
    */
   uint64_t received_at;
+  /**
+   * True when this raw row is retained only as an invalidated
+   * tombstone.
+   */
+  bool invalidated;
 } MarmotAppMessageRecord;
 
 /**
