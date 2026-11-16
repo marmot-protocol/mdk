@@ -99,8 +99,11 @@
   relays hold is found. The newest version of a pack wins across every relay. The installed list (kind 10031) is still
   read from and published to the account's relays only. Emoji set reads (`sync_emoji_sets`, `fetch_emoji_set` and the
   sets `user_emoji_list` points to) use the same relays; the kind-10030 emoji list itself is still read from the
-  account's relays only. Share-link hints list a link hint that served the pack first, then the configured relays,
-  then the account's relays, so a long account outbox no longer pushes the relays holding the pack out of the link.
+  account's relays only. Share-link hints are the relays that sent the stored version of the pack: a relay that was
+  only queried, or sent only a version that lost NIP-01 replacement, is never a hint.
+  `transport_nostr::PublicEventFetch` gains `sources` (the relays that sent each verified event); public reads verify
+  each event before deduplicating it, so a relay's forged copy can no longer displace the genuine copy another relay
+  sent.
 - Interactive onboarding keeps a single-device acknowledgment when Continue follows a pause of more than five
   minutes. The stale prerequisite checks and device discovery still run again, but the notice returns only when
   discovery shows another slot, a slot newly carrying a usable package, a new finding or a less complete result

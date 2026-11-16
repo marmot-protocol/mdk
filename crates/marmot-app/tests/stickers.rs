@@ -336,8 +336,9 @@ async fn relay_hint_cannot_hide_a_newer_pack_on_account_relays() {
     }
     let author = Keys::generate();
     let pack_kind = sonar_stickers::STICKER_PACK_KIND;
-    // The hint relay only knows an older version; the account relay has the
-    // current one. A second pack exists only behind the hint.
+    // The hint relay only knows an older version of `cats`; the account relay
+    // has the current one. `birds` is the other way round. A third pack
+    // exists only behind the hint.
     publish_signed(
         &hint_url,
         &author,
@@ -359,6 +360,22 @@ async fn relay_hint_cannot_hide_a_newer_pack_on_account_relays() {
         &author,
         pack_kind,
         pack_tags(&author, "dogs", "Hinted", "wave"),
+        now - 50,
+    )
+    .await;
+    publish_signed(
+        &account_url,
+        &author,
+        pack_kind,
+        pack_tags(&author, "birds", "Old", "wave"),
+        now - 100,
+    )
+    .await;
+    publish_signed(
+        &hint_url,
+        &author,
+        pack_kind,
+        pack_tags(&author, "birds", "New", "wave"),
         now - 50,
     )
     .await;
@@ -396,20 +413,40 @@ async fn relay_hint_cannot_hide_a_newer_pack_on_account_relays() {
         cats.title, "New",
         "the account relay's newer version must win over the hinted one"
     );
-    let link = app
-        .sticker_pack_share_link(&account_id, &cats.coordinate)
-        .unwrap();
-    let first_hint = link.split("&relay=").nth(1).expect("a relay hint");
     assert_eq!(
-        first_hint,
-        urlencoding_relay(&hint_url),
-        "a link hint that served the pack leads its share link"
+        share_hints(&app, &account_id, &cats.coordinate).first(),
+        Some(&spelled(&account_url)),
+        "the relay holding the winning version leads the share link"
     );
     let dogs = app
         .fetch_sticker_pack(&account_id, &pack_naddr(&author, "dogs", &hint_url))
         .await
         .expect("a pack only the hint relay holds still resolves");
     assert_eq!(dogs.title, "Hinted");
+
+    // The hint holds the newer version. Later reads that see only the older
+    // one (discovery, and the installed refresh, which has no hints) never
+    // replace the hint relay in the share link.
+    let birds = app
+        .install_sticker_pack(&account_id, &pack_naddr(&author, "birds", &hint_url))
+        .await
+        .expect("the hinted pack installs");
+    assert_eq!(birds.title, "New");
+    assert_eq!(
+        share_hints(&app, &account_id, &birds.coordinate),
+        vec![spelled(&hint_url)]
+    );
+    app.sync_sticker_packs(&account_id).await.unwrap();
+    let birds = app
+        .sticker_pack(&account_id, &birds.coordinate)
+        .unwrap()
+        .unwrap();
+    assert_eq!(birds.title, "New");
+    assert_eq!(
+        share_hints(&app, &account_id, &birds.coordinate),
+        vec![spelled(&hint_url)],
+        "a relay that sent only the older version is not a hint"
+    );
 
     runtime.shutdown().await;
 }
@@ -519,9 +556,24 @@ async fn sync_refreshes_installed_packs() {
     runtime.shutdown().await;
 }
 
-/// `relay` as a share link's `relay=` query value spells it.
-fn urlencoding_relay(relay: &str) -> String {
-    url::form_urlencoded::byte_serialize(relay.trim_end_matches('/').as_bytes()).collect()
+/// The relay hints in a share link, in order.
+fn link_relays(link: &str) -> Vec<String> {
+    url::Url::parse(link)
+        .unwrap()
+        .query_pairs()
+        .filter(|(key, _)| key == "relay")
+        .map(|(_, relay)| relay.into_owned())
+        .collect()
+}
+
+/// `relay` as share-link hints spell it.
+fn spelled(relay: &str) -> String {
+    RelayUrl::parse(relay).unwrap().to_string()
+}
+
+/// The relay hints `account_id`'s share link for `pack` carries.
+fn share_hints(app: &MarmotApp, account_id: &str, pack: &str) -> Vec<String> {
+    link_relays(&app.sticker_pack_share_link(account_id, pack).unwrap())
 }
 
 /// How many installed lists (kind 10031) `author` has on `relay_url`.
@@ -610,8 +662,8 @@ async fn import_account_with_outbox(
 async fn configured_relays_serve_pack_reads_but_not_the_installed_list() {
     storage_sqlite::relax_storage_for_test_process();
     install_mock_keyring();
-    // Eight outbox relays, none holding a pack: enough to fill every
-    // share-link hint slot on their own.
+    // Eight outbox relays: enough to fill every share-link hint slot on their
+    // own. Only the last holds a pack.
     let mut account_relays = Vec::new();
     let mut account_urls = Vec::new();
     for _ in 0..8 {
@@ -638,8 +690,17 @@ async fn configured_relays_serve_pack_reads_but_not_the_installed_list() {
         )
         .await;
     }
+    publish_signed(
+        &account_urls[7],
+        &author,
+        pack_kind,
+        pack_tags(&author, "eighth", "eighth", "wave"),
+        now - 100,
+    )
+    .await;
     let default_pack = format!("{pack_kind}:{}:default", author.public_key().to_hex());
     let browse_pack = format!("{pack_kind}:{}:browse", author.public_key().to_hex());
+    let eighth_pack = format!("{pack_kind}:{}:eighth", author.public_key().to_hex());
     let (_dir, app, runtime, keys, account_id) =
         import_account_with_outbox(&account_urls, &configured_url).await;
 
@@ -651,7 +712,7 @@ async fn configured_relays_serve_pack_reads_but_not_the_installed_list() {
 
     let synced = app.sync_sticker_packs(&account_id).await.unwrap();
     assert_eq!(
-        synced.discovered, 2,
+        synced.discovered, 3,
         "discovery reaches the configured relay"
     );
     assert_eq!(synced.pending_operations, 0);
@@ -662,13 +723,18 @@ async fn configured_relays_serve_pack_reads_but_not_the_installed_list() {
         .map(|pack| pack.coordinate)
         .collect::<Vec<_>>();
     assert!(browsable.contains(&browse_pack));
+    // Share links name the relays that served each pack, not the relays
+    // that were queried.
     for pack in [&default_pack, &browse_pack] {
-        let link = app.sticker_pack_share_link(&account_id, pack).unwrap();
-        assert!(
-            link.contains(&urlencoding_relay(&configured_url)),
-            "the share link names the relay holding the pack ahead of a long outbox: {link}"
+        assert_eq!(
+            share_hints(&app, &account_id, pack),
+            vec![spelled(&configured_url)]
         );
     }
+    assert_eq!(
+        share_hints(&app, &account_id, &eighth_pack),
+        vec![spelled(&account_urls[7])]
+    );
 
     let (_, packs) = remote_installed_list(&account_url, keys.public_key()).await;
     assert_eq!(packs, vec![default_pack]);

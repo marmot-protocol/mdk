@@ -7,7 +7,7 @@ use nostr::nips::nip19::{FromBech32, Nip19Coordinate};
 use nostr::prelude::FinalizeEvent;
 use nostr::prelude::FinalizeUnsignedEvent;
 use nostr::prelude::{
-    Event, EventBuilder, Filter, Kind, PublicKey, RelayUrl, SingleLetterTag, Tag,
+    Event, EventBuilder, EventId, Filter, Kind, PublicKey, RelayUrl, SingleLetterTag, Tag,
     Timestamp as NostrTimestamp,
 };
 use serde::{Deserialize, Serialize};
@@ -279,25 +279,21 @@ fn normalize_sticker_relays(
 }
 
 /// The relays public pack reads query, for sticker packs (kind 30031) and
-/// emoji sets (kind 30030): the runtime's configured relays, then the
-/// account's relays, deduplicated and passed through the host-safety rule.
+/// emoji sets (kind 30030): the account's relays, then the runtime's
+/// configured relays, deduplicated and passed through the host-safety rule.
 /// Packs and sets are published to few relays, and an account whose relay
 /// list came from another client often names none of them; the host's
 /// configured relays are where it expects its packs to be. Reads only, never
 /// the account's own lists: the sticker installed list, the emoji list and
 /// every sticker publication stay on the account's relays.
-///
-/// Configured relays come first because a pack read retains the relays it
-/// queried, in order, as the pack's share-link hints (at most eight): a long
-/// account outbox must not push the host's pack relays out of the link.
 pub(crate) fn pack_read_endpoints(
     app: &MarmotApp,
     account_endpoints: &[TransportEndpoint],
 ) -> Vec<TransportEndpoint> {
-    let candidates = app
-        .relay_endpoints()
-        .into_iter()
-        .chain(account_endpoints.iter().cloned())
+    let candidates = account_endpoints
+        .iter()
+        .cloned()
+        .chain(app.relay_endpoints())
         .collect();
     normalize_sticker_relays(
         app.retain_safe_discovered_endpoints(candidates, "pack reads")
@@ -554,7 +550,7 @@ impl MarmotApp {
         // answers cannot crowd out another's newer versions.
         let max_events =
             (MAX_DISCOVERY_PACKS * 2).saturating_mul(context.pack_read_endpoints.len().max(1));
-        let events = self
+        let fetched = self
             .relay_plane
             .fetch_public_events(
                 context.pack_read_endpoints.clone(),
@@ -562,16 +558,9 @@ impl MarmotApp {
                 max_events,
             )
             .await
-            .map_err(AppError::StickerRelay)?
-            .events;
-        let discovered = events.len().min(MAX_DISCOVERY_PACKS);
-        let updated = ingest_pack_events(
-            self,
-            &context.storage,
-            events,
-            &context.pack_read_endpoints,
-            max_events,
-        )?;
+            .map_err(AppError::StickerRelay)?;
+        let discovered = fetched.events.len().min(MAX_DISCOVERY_PACKS);
+        let updated = ingest_pack_events(self, &context.storage, fetched, max_events)?;
 
         let desired = context.storage.desired_installed_sticker_packs()?;
         for coordinate in desired.iter().take(MAX_INSTALLED_PACKS) {
@@ -790,11 +779,6 @@ async fn fetch_pack_into_storage(
         Err(AppError::StickerRelay(_)) if found => {}
         Err(error) => return Err(error),
     }
-    if found {
-        // The read set was retained after the hints; put the hints that
-        // served this pack back in front of the share-link hints.
-        retain_sticker_relays(app, &context.storage, coordinate, relay_hints)?;
-    }
     if context.storage.sticker_pack(coordinate)?.is_none() {
         return Err(AppError::StickerNotFound);
     }
@@ -808,7 +792,7 @@ async fn fetch_pack_from_endpoints(
     endpoints: Vec<TransportEndpoint>,
     filter: Filter,
 ) -> Result<(bool, bool), AppError> {
-    let events = app
+    let fetched = app
         .relay_plane
         .fetch_public_events(
             endpoints.clone(),
@@ -816,12 +800,11 @@ async fn fetch_pack_from_endpoints(
             MAX_REPLACEABLE_VERSIONS_PER_FETCH.saturating_mul(endpoints.len().max(1)),
         )
         .await
-        .map_err(AppError::StickerRelay)?
-        .events;
+        .map_err(AppError::StickerRelay)?;
     let mut updated = false;
     let mut found = false;
-    for event in events {
-        let stored = match stored_pack_from_event(&event) {
+    for event in &fetched.events {
+        let stored = match stored_pack_from_event(event) {
             Ok(pack) if pack.coordinate == coordinate => pack,
             _ => continue,
         };
@@ -829,22 +812,44 @@ async fn fetch_pack_from_endpoints(
         updated |= context.storage.replace_sticker_pack_if_newer(&stored)?;
     }
     if found {
-        retain_sticker_relays(app, &context.storage, coordinate, &endpoints)?;
+        retain_winning_pack_relays(app, &context.storage, coordinate, &fetched)?;
     }
     Ok((updated, found))
+}
+
+/// Retain, as share-link hints, the relays this read got the pack's stored
+/// version from. A relay that was only queried, or sent only a version that
+/// lost NIP-01 replacement, is never retained, so a later read cannot push
+/// the relays holding the current version out of the eight hint slots.
+fn retain_winning_pack_relays(
+    app: &MarmotApp,
+    storage: &SqliteAppStorage,
+    coordinate: &str,
+    fetched: &transport_nostr::PublicEventFetch,
+) -> Result<(), AppError> {
+    let Some(stored) = storage.sticker_pack(coordinate)? else {
+        return Ok(());
+    };
+    let Ok(winner) = EventId::from_hex(&stored.version.event_id_hex) else {
+        return Ok(());
+    };
+    let served = fetched.sources_of(&winner);
+    if served.is_empty() {
+        return Ok(());
+    }
+    retain_sticker_relays(app, storage, coordinate, served)
 }
 
 fn ingest_pack_events(
     app: &MarmotApp,
     storage: &SqliteAppStorage,
-    events: Vec<Event>,
-    endpoints: &[TransportEndpoint],
+    fetched: transport_nostr::PublicEventFetch,
     max_events: usize,
 ) -> Result<usize, AppError> {
     let mut updated = 0_usize;
     let mut seen = HashSet::new();
-    for event in events.into_iter().take(max_events) {
-        let stored = match stored_pack_from_event(&event) {
+    for event in fetched.events.iter().take(max_events) {
+        let stored = match stored_pack_from_event(event) {
             Ok(pack) => pack,
             Err(_) => continue,
         };
@@ -857,7 +862,15 @@ fn ingest_pack_events(
         if storage.replace_sticker_pack_if_newer(&stored)? {
             updated += 1;
         }
-        retain_sticker_relays(app, storage, &stored.coordinate, endpoints)?;
+    }
+    // After every version is in, so each pack's hints come from the relays
+    // holding the version that won.
+    let coordinates = seen
+        .into_iter()
+        .map(|(coordinate, _)| coordinate)
+        .collect::<HashSet<_>>();
+    for coordinate in coordinates {
+        retain_winning_pack_relays(app, storage, &coordinate, &fetched)?;
     }
     storage
         .prune_uninstalled_sticker_discovery(MAX_DISCOVERY_PACKS, "")
@@ -1598,9 +1611,9 @@ mod tests {
         assert_eq!(
             pack_read_endpoints(&app, &account),
             [
-                "wss://configured.example",
+                "wss://account.example",
                 "wss://shared.example",
-                "wss://account.example"
+                "wss://configured.example"
             ]
             .map(|url| TransportEndpoint(url.to_owned())),
         );

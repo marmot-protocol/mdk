@@ -1422,8 +1422,9 @@ Pass the relays where your app's default packs live as configured relays. The in
 published to the account's relays only, never to the configured relays.
 
 Use `stickerPackShareLink(accountRef, coordinate)` for sharing rather than constructing a URL in the host.
-It validates the coordinate and builds a canonical Sonar link without network I/O, using retained relay hints from
-successful pack fetches. Packs without retained hints use the account's current outbox relay candidates.
+It validates the coordinate and builds a canonical Sonar link without network I/O, using retained relay hints: the
+relays that sent the stored version of the pack, newest read first. Packs without retained hints use the account's
+current outbox relay candidates.
 Links contain at most eight normalized, unique relay hints and stay within the parser's 2048-character limit;
 hints that do not fit are omitted.
 

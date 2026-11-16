@@ -92,7 +92,7 @@ pub use directory::{
     DirectoryInspectionError, DirectoryRelayEventRecord, DirectoryRelayFetcher,
     DirectoryRelayPlane, DirectoryRelayStats, DirectorySubscriptionFilter,
     DirectorySubscriptionSyncSummary, DirectorySyncBatch, DirectorySyncPlan,
-    NostrSdkDirectoryRelayFetcher,
+    NostrSdkDirectoryRelayFetcher, PublicEventFetch,
 };
 pub use safety::{RelaySafetyPolicy, canonical_relay, recovery_required_endpoints, same_relay};
 pub use telemetry::rollup_from_snapshots;
@@ -2086,7 +2086,7 @@ impl MarmotRelayPlane {
         endpoints: Vec<TransportEndpoint>,
         filters: Vec<Filter>,
         max_events: usize,
-    ) -> Result<directory::PublicEventFetch, String> {
+    ) -> Result<PublicEventFetch, String> {
         let endpoints = self
             .inner
             .relay_safety

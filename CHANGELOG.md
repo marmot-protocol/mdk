@@ -86,8 +86,9 @@
   sticker publications still go only to the account's own relays. Emoji set
   reads (`sync_emoji_sets`, `fetch_emoji_set` and the sets `user_emoji_list`
   points to) use the same relays; the account's own emoji list (kind 10030) is
-  still read from its relays only. A pack's share link lists a link hint that
-  served it first, then the configured relays, then the account's relays.
+  still read from its relays only. A pack's share link now names only relays
+  that served the version MDK kept, never relays that were merely queried or
+  hold only an older version.
 - Stop onboarding's relay checks from failing healthy relays (#3439). A relay
   that closes a query with its NIP-01 `auth-required:` reason behind an
   `ERROR: ` wrapper is reported as needing authentication, not as restricting
