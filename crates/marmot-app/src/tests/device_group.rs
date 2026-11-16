@@ -551,7 +551,7 @@ async fn a_device_without_the_roster_takes_no_link() {
         .create_account("alice")
         .unwrap();
     let relay = Arc::new(ScriptedPushRelayClient::default());
-    let app = super::canonical_membership::app_at(&dir, relay);
+    let app = ordinary_app_on(&dir, relay);
     assert!(
         !app.supported_app_component_ids()
             .contains(&DEVICE_ROSTER_COMPONENT_ID)
@@ -1316,7 +1316,8 @@ fn ordinary_app_on(dir: &tempfile::TempDir, relay: Arc<ScriptedPushRelayClient>)
         "wss://relay.example",
         MarmotAppConfig::white_noise()
             .with_dev_settlement_quiescence_ms(0)
-            .with_dev_scheduled_convergence_delay_ms(0),
+            .with_dev_scheduled_convergence_delay_ms(0)
+            .with_device_groups(false),
     )
     .with_test_relay_client(relay)
 }

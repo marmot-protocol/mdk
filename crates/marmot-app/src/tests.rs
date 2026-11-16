@@ -4882,6 +4882,19 @@ async fn local_group_wipe_push_removal_body() {
     runtime.shutdown().await;
 }
 
+/// [`MarmotApp::with_relay`]'s app with device groups explicitly off, for
+/// tests whose contract is the behavior without them.
+fn app_without_device_groups(root: &std::path::Path) -> MarmotApp {
+    MarmotApp::with_relay_and_config(
+        root,
+        "wss://relay.example",
+        MarmotAppConfig::white_noise()
+            .with_allow_loopback_relay_endpoints(true)
+            .with_open_ranking_provider(None, Vec::new())
+            .with_device_groups(false),
+    )
+}
+
 #[test]
 fn failed_leave_restores_push_registration_after_removal_publishes() {
     run_composed_app_runtime_test(
@@ -4896,8 +4909,8 @@ async fn failed_leave_push_compensation_body() {
         .create_account("alice")
         .unwrap();
     let relay = Arc::new(ScriptedPushRelayClient::default());
-    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
-        .with_test_relay_client(relay.clone());
+    // Device groups off: with them on, the accept below records a decision.
+    let app = app_without_device_groups(dir.path()).with_test_relay_client(relay.clone());
     let alice = app.account_home().account("alice").unwrap().account_id_hex;
     let plane = MarmotRelayPlane::new(None, relay.clone());
     let mut alice_client = app
@@ -5106,7 +5119,7 @@ async fn failed_leave_push_compensation_body() {
             .invitation_decision(&hex::encode(group_id.as_slice()), &admission.generation)
             .unwrap()
             .is_none(),
-        "without a trusted device group, UserLeave creates no replicated decline"
+        "with device groups off, UserLeave creates no replicated decline"
     );
     runtime.shutdown().await;
 }
@@ -5123,8 +5136,7 @@ async fn an_admin_leave_without_device_groups_waits_for_the_host_demotion() {
         .create_account("alice")
         .unwrap();
     let relay = Arc::new(ScriptedPushRelayClient::default());
-    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
-        .with_test_relay_client(relay.clone());
+    let app = app_without_device_groups(dir.path()).with_test_relay_client(relay.clone());
     assert!(!app.admin_leave_steps_down());
     let bob_dir = tempfile::tempdir().unwrap();
     let bob_id = AccountHome::open(bob_dir.path())
@@ -5222,8 +5234,7 @@ async fn an_admin_invitee_without_device_groups_demotes_before_declining() {
     home.create_account("alice").unwrap();
     let bob = home.create_account("bob").unwrap();
     let relay = Arc::new(ScriptedPushRelayClient::default());
-    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
-        .with_test_relay_client(relay.clone());
+    let app = app_without_device_groups(dir.path()).with_test_relay_client(relay.clone());
     assert!(!app.admin_leave_steps_down());
     remember_test_member_inbox(&app, &bob.account_id_hex, "wss://relay.example");
     let plane = MarmotRelayPlane::new(None, relay.clone());
