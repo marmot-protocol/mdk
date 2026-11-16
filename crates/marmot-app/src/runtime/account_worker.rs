@@ -1968,6 +1968,12 @@ async fn run_app_runtime_account_worker(
                 stop_recovery_runner(&mut recovery_runner, &mut client).await;
                 break 'worker;
             }
+            // A `Drain` or pending-deliveries read whose Welcome waves have
+            // settled answers in its own turn, after the shutdown arms: a
+            // stopping worker leaves it for `WelcomeRuns::end` (W8).
+            () = std::future::ready(()), if welcome_runs.has_answerable() => {
+                welcome_runs.answer_waiting(&client, &shared);
+            }
             () = std::future::ready(()), if relay_config_work == RelayConfigWork::Ready => {
                 relay_config_work = match client.sync_relay_liveness().await {
                     Ok(_) => RelayConfigWork::Idle,
@@ -2022,7 +2028,8 @@ async fn run_app_runtime_account_worker(
                         &mut client,
                     );
                     schedule_pending_convergence_groups(&mut scheduled_convergence, &mut client);
-                    welcome_runs.answer_waiting(&client, &shared);
+                    #[cfg(test)]
+                    tests::welcome_wave_tests::held_after_settle(&account_label).await;
                 }
             }
             // Consume completed blobs before admitting more commands.
@@ -2558,7 +2565,7 @@ async fn run_app_runtime_account_worker(
                         let transport_account = client.adapter.account_id().clone();
                         // Its Welcome waves belong to this client: settle
                         // each on it, so none reaches the reopened one.
-                        welcome_runs.settle_all(&mut client, &shared).await;
+                        welcome_runs.settle_all(&mut client).await;
                         publish_pending_welcome_delivery_events(
                             &events,
                             &account_id_hex,
@@ -9302,7 +9309,7 @@ mod tests {
     mod resource_bounds_tests;
     pub(super) mod secondary_retry_scheduler_tests;
     mod selective_history_tests;
-    mod welcome_wave_tests;
+    pub(super) mod welcome_wave_tests;
     mod worker_recovery_resume_tests;
     mod writer_hold_tests;
 

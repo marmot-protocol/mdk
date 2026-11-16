@@ -11,6 +11,7 @@
 
 use super::writer_hold_tests::{Alice, SETTLE, alice_with_groups};
 use super::*;
+use tokio::sync::Notify;
 
 /// Alice's create with bob, whose founding Welcome waits on the relays.
 async fn held_founding_wave(dir: &tempfile::TempDir) -> (Alice<0>, GroupId) {
@@ -53,6 +54,32 @@ pub(super) async fn drain(runtime: &crate::MarmotAppRuntime) -> oneshot::Receive
         .await
         .unwrap();
     drained
+}
+
+/// A hold the worker of the labelled account enters after it settles a wave
+/// and before its next turn: the notifiers it enters and waits on.
+type SettleHold = (String, Arc<Notify>, Arc<Notify>);
+static HOLD_AFTER_SETTLE: std::sync::Mutex<Option<SettleHold>> = std::sync::Mutex::new(None);
+
+/// Hold `account`'s worker after it next settles a wave.
+fn hold_after_settle(account: &str) -> (Arc<Notify>, Arc<Notify>) {
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    *HOLD_AFTER_SETTLE.lock().unwrap() =
+        Some((account.to_owned(), entered.clone(), release.clone()));
+    (entered, release)
+}
+
+/// The worker's side of [`hold_after_settle`].
+pub(in crate::runtime::account_worker) async fn held_after_settle(account: &str) {
+    let held = HOLD_AFTER_SETTLE
+        .lock()
+        .unwrap()
+        .take_if(|(held, ..)| held == account);
+    if let Some((_, entered, release)) = held {
+        entered.notify_one();
+        release.notified().await;
+    }
 }
 
 /// Send a pending-deliveries read to alice's worker, answered once every
@@ -380,6 +407,48 @@ async fn shutdown_ends_a_held_wave_and_the_next_start_sends_its_welcome() {
         .unwrap();
     assert_eq!(gift_wraps_published(&relay), 1);
     close(&runtime).await;
+}
+
+/// W8 at shutdown: a read whose wave settles while shutdown begins is left
+/// for the worker's exit, which answers it with the error a queued command
+/// gets, as a read queued behind an inline publish was. It is not answered
+/// from the list once the worker is stopping.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_read_whose_wave_settles_as_shutdown_begins_gets_the_shutdown_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let (Alice { relay, runtime, .. }, _) = held_founding_wave(&dir).await;
+    let listed = read_pending(&runtime).await;
+    // Once this answers, the worker has taken the read up.
+    runtime.publish_key_package("alice").await.unwrap();
+    let (settled, resume) = hold_after_settle("alice");
+    relay.release_publish();
+    timeout(SETTLE, settled.notified())
+        .await
+        .expect("the worker settles the released wave");
+
+    let stopping = tokio::spawn({
+        let runtime = runtime.clone();
+        async move { runtime.shutdown().await }
+    });
+    timeout(SETTLE, async {
+        while !runtime.is_stopping() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("shutdown begins");
+    resume.notify_one();
+    assert!(
+        matches!(
+            timeout(SETTLE, listed)
+                .await
+                .expect("the worker answers the read"),
+            Ok(Err(AppError::TransportClosed))
+        ),
+        "a stopping worker answers the read with the shutdown error"
+    );
+    timeout(SETTLE, stopping).await.unwrap().unwrap();
+    runtime.shutdown_and_close().await.unwrap();
 }
 
 /// L2, sign-out: a held wave doesn't hold the sign-out.
