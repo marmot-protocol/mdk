@@ -138,6 +138,19 @@ impl<'a> SynchronizedTransportReceipts<'a> {
         self.client.seen_events_index.0.contains(event_id)
     }
 
+    /// Whether a receive skips `delivery` before ingest because the account
+    /// already holds its event. A group relay's copy of this account's own
+    /// commit that is still pending is not skipped: the session takes it as
+    /// that relay's acknowledgement and confirms the commit (mdk#2332), news
+    /// the index of held events cannot carry. Every other held event is.
+    pub(crate) fn skips(
+        &mut self,
+        delivery: &cgka_traits::TransportDelivery,
+    ) -> Result<bool, AppError> {
+        Ok(self.contains(&hex::encode(delivery.message.id.as_slice()))
+            && !self.client.runtime.takes_own_echo(delivery)?)
+    }
+
     pub(crate) fn pending_seen_events(&self) -> Vec<String> {
         let start = self
             .client

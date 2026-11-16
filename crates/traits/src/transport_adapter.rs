@@ -706,18 +706,16 @@ impl OutboundFanout {
     /// a later attempt, or one a mirror copied to, can still serve an earlier
     /// copy. The exposure bit is kept for audit.
     ///
-    /// Only a pending commit takes one. A confirmed commit's owed relays, and
-    /// every other fanout, keep their publish rules. Returns whether the
-    /// target changed.
+    /// Only a pending commit takes one ([`Self::takes_acknowledgement`]). A
+    /// confirmed commit's owed relays, and every other fanout, keep their
+    /// publish rules. Returns whether the target changed.
     pub fn acknowledge_target(
         &mut self,
         index: usize,
         kind: FanoutAcknowledgement,
     ) -> Result<bool, TransportAdapterError> {
-        let current = *self.target_status_mut(index)?;
-        if !matches!(self.mls_state, FanoutMlsState::Pending(_))
-            || current == FanoutTargetStatus::Accepted
-        {
+        self.target_status_mut(index)?;
+        if !self.takes_acknowledgement(index) {
             return Ok(false);
         }
         self.ensure_target_metadata_len();
@@ -728,6 +726,18 @@ impl OutboundFanout {
             .resize(self.target_statuses.len(), None);
         self.target_acknowledgements[index] = Some(kind);
         Ok(true)
+    }
+
+    /// Whether [`Self::acknowledge_target`] would change the target at
+    /// `index`: this is a pending commit, and the target is not `Accepted`
+    /// yet. A caller deciding whether a relay's copy of the event is worth
+    /// handing on asks this, so it applies exactly the rule the
+    /// acknowledgement does.
+    pub fn takes_acknowledgement(&self, index: usize) -> bool {
+        matches!(self.mls_state, FanoutMlsState::Pending(_))
+            && self
+                .target_status(index)
+                .is_some_and(|status| status != FanoutTargetStatus::Accepted)
     }
 
     /// Make only targets whose last attempt was proven not to reach a relay

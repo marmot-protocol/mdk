@@ -40,10 +40,11 @@ use cgka_traits::{
     EngineError, EpochId, FanoutAcknowledgement, FanoutMlsState, FanoutPendingKind, GroupId,
     MemberId, MessageState, OutboundApplicationMessage, OutboundFanout, OutboundFanoutOutcome,
     RefusedTarget, StorageError, Timestamp, TransportAccountActivation, TransportAdapter,
-    TransportAdapterError, TransportDelivery, TransportEndpoint, TransportEndpointAckKind,
-    TransportEndpointFailure, TransportEndpointFailureKind, TransportEndpointReceipt,
-    TransportEndpointRejectionCategory, TransportGroupSync, TransportPublishReport,
-    TransportPublishRequest, TransportPublishTarget, TransportReadBack, WelcomeSizeCheck,
+    TransportAdapterError, TransportDelivery, TransportDeliveryPlane, TransportEndpoint,
+    TransportEndpointAckKind, TransportEndpointFailure, TransportEndpointFailureKind,
+    TransportEndpointReceipt, TransportEndpointRejectionCategory, TransportGroupSync,
+    TransportPublishReport, TransportPublishRequest, TransportPublishTarget, TransportReadBack,
+    WelcomeSizeCheck,
 };
 use futures::stream::FuturesUnordered;
 use futures::{FutureExt, StreamExt};
@@ -4799,37 +4800,105 @@ where
             })
     }
 
+    /// Whether `delivery` is a group relay's copy of this account's own commit
+    /// that is still pending, from one of the commit's relays not yet recorded
+    /// as holding it: the copy whose ingest acknowledges that relay and
+    /// confirms the commit (mdk#2332). A host that skips events it already
+    /// holds before ingest must still ingest this one; it may skip every other
+    /// copy of an own event.
+    ///
+    /// A group the session opened only seeded is judged by its stored
+    /// fanouts, without hydrating it: the ingest that follows hydrates it and
+    /// reports what hydration announces, which a skipped copy never would.
+    /// So a commit a previous process left pending counts.
+    pub fn takes_own_echo(&self, delivery: &TransportDelivery) -> AccountResult<bool> {
+        Ok(self.own_echo_target(delivery)?.is_some()
+            || self.seeded_own_echo_group(delivery)?.is_some())
+    }
+
+    /// The group of a copy that would be an own echo once its group, which
+    /// the session opened only seeded (mdk#1161), is hydrated: a stored
+    /// pending commit holds the copy's exact event and its relay among the
+    /// targets that take an acknowledgement. Read without hydrating.
+    fn seeded_own_echo_group<'a>(
+        &self,
+        delivery: &'a TransportDelivery,
+    ) -> AccountResult<Option<&'a GroupId>> {
+        let Some((group_id, endpoint)) = group_relay_copy(delivery) else {
+            return Ok(None);
+        };
+        Ok(echo_target_among(
+            self.session.seeded_group_outbound_fanouts(group_id)?,
+            delivery,
+            endpoint,
+        )
+        .map(|_| group_id))
+    }
+
+    /// The pending commit whose exact event `delivery` carries, and its
+    /// relay's index among the commit's targets, when `delivery` is a group
+    /// relay's copy and that relay is not yet recorded as holding the commit.
+    /// A copy under another event id, from a relay that is not a target, or
+    /// in a group not resolving a publication of its own, has none.
+    fn own_echo_target(
+        &self,
+        delivery: &TransportDelivery,
+    ) -> AccountResult<Option<(OutboundFanout, usize)>> {
+        let Some((group_id, endpoint)) = group_relay_copy(delivery) else {
+            return Ok(None);
+        };
+        // Only a group whose own publication is unresolved holds a pending
+        // commit, so no other copy reads storage.
+        if !self
+            .session
+            .epoch_state(group_id)
+            .is_some_and(|state| state.is_resolving_local_publish())
+        {
+            return Ok(None);
+        }
+        Ok(echo_target_among(
+            self.session.outbound_fanouts_for_group(group_id)?,
+            delivery,
+            endpoint,
+        ))
+    }
+
     /// The account's own subscription received a pending commit's exact event
     /// from `delivery`'s relay (mdk#2332). That relay holds the commit,
     /// whatever it answered the publish, so it acknowledged it: its target is
     /// recorded `Accepted` by echo, and the group's fanouts are driven, which
-    /// confirms the commit. A copy under another event id, or from a relay
-    /// that is not a target, shows nothing. The adapter's local loop-back of
+    /// confirms the commit. A copy under another event id, from a relay that
+    /// is not a target, or in a group not resolving a publication of its own,
+    /// shows nothing ([`Self::own_echo_target`], the rule
+    /// [`Self::takes_own_echo`] applies too). The adapter's local loop-back of
     /// a publish that asked for an acknowledgement names only relays whose
     /// receipts it got, so it adds no acknowledgement the publish did not
     /// make; every commit attempt asks for one.
+    ///
+    /// The engine answers an own echo from its stored record without
+    /// hydrating the group, so a commit a previous process left pending in a
+    /// group this session opened only seeded (mdk#1161) is hidden until the
+    /// group hydrates. When the group's stored fanouts show the copy is an
+    /// echo, it is hydrated here, and what hydration announces goes out with
+    /// this ingest's effects. A group that fails to hydrate is quarantined,
+    /// and the copy then acknowledges nothing.
     async fn acknowledge_own_echo(
         &mut self,
         delivery: &TransportDelivery,
     ) -> AccountResult<AccountDeviceEffects> {
-        let Some(endpoint) = delivery.source.endpoint.as_ref() else {
-            return Ok(AccountDeviceEffects::default());
-        };
-        let fanouts = match &delivery.group_id_hint {
-            Some(group_id) => self.session.outbound_fanouts_for_group(group_id)?,
-            None => self.session.outbound_fanouts()?,
-        };
-        let Some(mut fanout) = fanouts
-            .into_iter()
-            .find(|fanout| fanout.is_frozen_event(&delivery.message.id))
-        else {
-            return Ok(AccountDeviceEffects::default());
-        };
-        let Some(index) = fanout.target_index_of(endpoint) else {
-            return Ok(AccountDeviceEffects::default());
+        let mut output = AccountDeviceEffects::default();
+        if let Some(group_id) = self.seeded_own_echo_group(delivery)? {
+            self.session.ensure_group_hydrated(group_id)?;
+            let hydrated = self.session.drain();
+            if !hydrated.is_empty() {
+                output.extend(self.publish_session_effects(hydrated).await?);
+            }
+        }
+        let Some((mut fanout, index)) = self.own_echo_target(delivery)? else {
+            return Ok(output);
         };
         if !fanout.acknowledge_target(index, FanoutAcknowledgement::Echo)? {
-            return Ok(AccountDeviceEffects::default());
+            return Ok(output);
         }
         self.session
             .put_observed_outbound_fanout(&mut fanout, self.wall_clock.now_ms())?;
@@ -4839,10 +4908,12 @@ where
             "own echo acknowledged a pending commit"
         );
         let group_id = fanout.group_id().cloned();
-        Ok(self
-            .resume_outbound_fanouts_for_group(group_id.as_ref())
-            .await?
-            .0)
+        output.extend(
+            self.resume_outbound_fanouts_for_group(group_id.as_ref())
+                .await?
+                .0,
+        );
+        Ok(output)
     }
 
     async fn resume_outbound_fanouts_for_group(
@@ -7353,6 +7424,38 @@ fn ambiguous_endpoint_failure(endpoint: TransportEndpoint) -> TransportEndpointF
         kind: TransportEndpointFailureKind::PossiblyExposed,
         rejection_category: None,
     }
+}
+
+/// The group and relay a group relay's copy of an event names. The adapter
+/// routes every group copy by its group, so each one names it; a copy from
+/// another plane, or with no relay, is none.
+fn group_relay_copy(delivery: &TransportDelivery) -> Option<(&GroupId, &TransportEndpoint)> {
+    if delivery.source.plane != TransportDeliveryPlane::Group {
+        return None;
+    }
+    Some((
+        delivery.group_id_hint.as_ref()?,
+        delivery.source.endpoint.as_ref()?,
+    ))
+}
+
+/// Among `fanouts`, the pending commit whose exact event `delivery` carries,
+/// and `endpoint`'s index among its targets, when that target takes an
+/// acknowledgement.
+fn echo_target_among(
+    fanouts: Vec<OutboundFanout>,
+    delivery: &TransportDelivery,
+    endpoint: &TransportEndpoint,
+) -> Option<(OutboundFanout, usize)> {
+    fanouts
+        .into_iter()
+        .find(|fanout| fanout.is_frozen_event(&delivery.message.id))
+        .and_then(|fanout| {
+            let index = fanout.target_index_of(endpoint)?;
+            fanout
+                .takes_acknowledgement(index)
+                .then_some((fanout, index))
+        })
 }
 
 /// Whether `fanout` carries one of this device's group commits, a group
