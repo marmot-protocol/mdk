@@ -2581,6 +2581,7 @@ impl MarmotApp {
             pending_superseded_change_events: Vec::new(),
             maintenance_failed_backlog: 0,
             unpublished_welcome_delivery: None,
+            started_welcome_waves: Vec::new(),
             #[cfg(test)]
             fail_next_released_backfill_reload: false,
             #[cfg(test)]

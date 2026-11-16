@@ -103,16 +103,53 @@ where
         A: Clone + 'static,
     {
         let prepared = self.prepare_welcome_publish(welcomes, None, Some(context), true)?;
+        Ok(self.reserve_welcome_publish_task(Arc::new(self.adapter.clone()), prepared))
+    }
+
+    /// Have the host run every Welcome wave this runtime would publish,
+    /// or stop. While detached, each wave that has a relay attempt to make is
+    /// prepared and reserved as the startup retry is, and waits in
+    /// [`Self::take_prepared_welcome_tasks`] instead of being awaited: a
+    /// founding create's Welcomes, the owed Welcomes a host names, the
+    /// Welcomes a confirmed commit releases, and maintenance's release of
+    /// watched Welcomes. A wave keeps its own group and retry policy. A
+    /// pending create's first Welcome, which confirms its group, and
+    /// [`Self::redeliver_welcome`] still publish inline.
+    ///
+    /// A host that turns this on must take and run every prepared task, and
+    /// pass each completion to [`Self::finish_welcome_publish_task`] or
+    /// release it with [`Self::abandon_welcome_publish_task`].
+    #[doc(hidden)]
+    pub fn set_detached_welcome_waves(&mut self, detached: bool)
+    where
+        A: Clone + 'static,
+    {
+        self.detached_welcome_adapter =
+            detached.then(|| Arc::new(self.adapter.clone()) as Arc<dyn TransportAdapter>);
+    }
+
+    /// The waves prepared while detached, in the order they were prepared.
+    /// Each is reserved until its completion is finished or abandoned.
+    #[doc(hidden)]
+    pub fn take_prepared_welcome_tasks(&mut self) -> Vec<PreparedWelcomePublishTask> {
+        std::mem::take(&mut self.prepared_welcome_tasks)
+    }
+
+    fn reserve_welcome_publish_task(
+        &mut self,
+        adapter: Arc<dyn TransportAdapter>,
+        prepared: PreparedWelcomePublish,
+    ) -> PreparedWelcomePublishTask {
         let message_ids = prepared.network_message_ids();
         self.detached_welcome_publishes
             .extend(message_ids.iter().cloned());
-        Ok(PreparedWelcomePublishTask {
-            adapter: Arc::new(self.adapter.clone()),
+        PreparedWelcomePublishTask {
+            adapter,
             wall_clock: self.wall_clock.clone(),
             prepared,
             message_ids,
             withdrawals: self.detached_welcome_withdrawals.clone(),
-        })
+        }
     }
 
     /// Reconcile every relay result from a detached Welcome publish in input
@@ -148,6 +185,9 @@ where
 
     /// Bounded-concurrency Welcome publication used by founding creates and by
     /// deferred existing-group invite fanout after the commit is confirmed.
+    /// While detached, a wave with a relay attempt to make is reserved and
+    /// left for the host to run (`set_detached_welcome_waves`); one with none
+    /// is finished here, as it always was.
     pub(super) async fn publish_welcome_fanout(
         &mut self,
         welcomes: Vec<TransportMessage>,
@@ -157,6 +197,13 @@ where
         force_retry: bool,
     ) -> AccountResult<()> {
         let prepared = self.prepare_welcome_publish(welcomes, group_id, context, force_retry)?;
+        if !prepared.pending.is_empty()
+            && let Some(adapter) = self.detached_welcome_adapter.clone()
+        {
+            let task = self.reserve_welcome_publish_task(adapter, prepared);
+            self.prepared_welcome_tasks.push(task);
+            return Ok(());
+        }
         let completed = prepared
             .publish(&self.adapter, self.wall_clock.as_ref(), None)
             .await;
@@ -192,6 +239,7 @@ where
             metadata.push(WelcomePublishMetadata {
                 recipient,
                 welcome_id,
+                group_id: group_id.clone(),
                 effects,
             });
         }
@@ -226,6 +274,7 @@ where
             let WelcomePublishMetadata {
                 recipient,
                 welcome_id,
+                group_id: _,
                 mut effects,
             } = metadata;
             let status = match completion.expect("every Welcome publish completed") {
@@ -306,15 +355,23 @@ where
     /// involved — the group evolution this welcome belongs to was confirmed
     /// when the failure was recorded. A re-delivery that again misses the ack
     /// threshold records a fresh [`WelcomeDeliveryFailure`] on the returned
-    /// effects, so the caller can keep retrying from the same handle.
+    /// effects, so the caller can keep retrying from the same handle. A
+    /// Welcome a detached wave holds is left to that wave: nothing is
+    /// published and no failure is recorded.
     pub async fn redeliver_welcome(
         &mut self,
         message_id: &cgka_traits::MessageId,
     ) -> AccountResult<AccountDeviceEffects> {
         let (group_id, message) = self.session.stored_sent_welcome(message_id)?;
+        let mut output = AccountDeviceEffects::default();
+        // A detached wave holds this Welcome: it is the Welcome's one
+        // publisher, and until it settles the Welcome is in flight, not
+        // undelivered.
+        if self.detached_welcome_publishes.contains(message_id) {
+            return Ok(output);
+        }
         // `stored_sent_welcome` only returns welcome envelopes.
         let recipient = welcome_recipient(&message);
-        let mut output = AccountDeviceEffects::default();
         let failures_before = output.failures.len();
         // This is an explicit operator/user retry, so do not make the caller
         // wait for the automatic fanout backoff window. The original exact
@@ -345,7 +402,7 @@ where
     /// startup recovery, maintenance retries, explicit redelivery, nor
     /// release after its commit confirms. Its remaining relay retries are
     /// dropped with it. A relay attempt already started cannot be recalled;
-    /// a detached startup retry skips every attempt it has not started.
+    /// a detached wave skips every attempt it has not started.
     ///
     /// This touches only the Welcome, never group state, so it works before
     /// hydration reaches the Welcome's group.
@@ -358,9 +415,9 @@ where
             return Ok(withdrawal);
         }
         if self.detached_welcome_publishes.contains(message_id) {
-            // A detached startup publish holds the Welcome and its record: it
-            // skips the attempt if not started, and the next maintenance pass
-            // drops the record.
+            // A detached wave holds the Welcome and its record: it skips the
+            // attempt if not started, and the next maintenance pass drops the
+            // record.
             self.detached_welcome_withdrawals
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
@@ -486,13 +543,15 @@ where
         if work.owed.is_empty() {
             return Ok(None);
         }
-        let welcomes = work
-            .owed
-            .into_iter()
-            .map(|(_, welcome)| welcome)
-            .collect::<Vec<_>>();
+        let (groups, welcomes): (Vec<_>, Vec<_>) = work.owed.into_iter().unzip();
         let ids = welcomes.iter().map(|welcome| welcome.id.clone()).collect();
-        let task = self.prepare_welcome_retry_task_with_audit_context(welcomes, context)?;
+        let mut prepared = self.prepare_welcome_publish(welcomes, None, Some(context), true)?;
+        // The retry spans groups: each Welcome keeps its own, so a host can
+        // drop the results of a group it left while the retry ran.
+        for (metadata, group_id) in prepared.metadata.iter_mut().zip(groups) {
+            metadata.group_id = Some(group_id);
+        }
+        let task = self.reserve_welcome_publish_task(Arc::new(self.adapter.clone()), prepared);
         Ok(Some((ids, task)))
     }
 
@@ -541,7 +600,7 @@ where
 
     /// Publish each watched Welcome that is owed and that no attempt record
     /// holds. A Welcome stays watched until its row is settled. While a stored
-    /// fanout or the detached startup retry holds it, that record retries it;
+    /// fanout or a detached wave holds it, that record retries it;
     /// once none does, as after a publish that found no route or a fanout that
     /// expired, the next pass publishes it again, as the startup pass would.
     pub(super) async fn deliver_watched_welcomes(

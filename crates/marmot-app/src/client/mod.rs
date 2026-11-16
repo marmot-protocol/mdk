@@ -113,6 +113,7 @@ mod small_state;
 mod sync;
 #[cfg(test)]
 pub(crate) mod upload_cleanup_tests;
+pub(crate) mod welcome_waves;
 mod worker_due;
 
 pub(crate) use history_recovery::recovery_coverage::LiveCoverage;
@@ -247,32 +248,6 @@ pub(crate) struct UnpublishedWelcomeDelivery {
     group_id: GroupId,
     audit_context: AuditEventContext,
     kind: UnpublishedWelcomeKind,
-}
-
-pub(crate) struct PendingWelcomeDeliveryRecovery {
-    observation: Option<crate::ProductObservation>,
-    welcome_ids: Vec<String>,
-    publish: PreparedWelcomePublishTask,
-}
-
-pub(crate) struct CompletedWelcomeDeliveryRecovery {
-    observation: Option<crate::ProductObservation>,
-    welcome_ids: Vec<String>,
-    publish: CompletedWelcomePublishTask,
-}
-
-impl PendingWelcomeDeliveryRecovery {
-    pub(crate) fn message_ids(&self) -> &[MessageId] {
-        self.publish.message_ids()
-    }
-
-    pub(crate) async fn run(self) -> CompletedWelcomeDeliveryRecovery {
-        CompletedWelcomeDeliveryRecovery {
-            observation: self.observation,
-            welcome_ids: self.welcome_ids,
-            publish: self.publish.run().await,
-        }
-    }
 }
 
 pub(crate) struct EncryptedMediaUploadHttp {
@@ -1107,6 +1082,9 @@ pub struct AppClient {
     /// Canonical create/invite work whose Welcome fanout has not run yet.
     /// The managed account worker replies first, then drives this delivery.
     pub(crate) unpublished_welcome_delivery: Option<UnpublishedWelcomeDelivery>,
+    /// Welcome waves started beside the writer that the account worker has
+    /// not taken yet (`welcome_waves`).
+    pub(crate) started_welcome_waves: Vec<welcome_waves::StartedWelcomeWave>,
     /// One-shot storage-read failure after durable release consumption.
     #[cfg(test)]
     pub(crate) fail_next_released_backfill_reload: bool,
@@ -7717,137 +7695,6 @@ impl AppClient {
         );
     }
 
-    /// Publish Welcome obligations stashed at the canonical create/invite
-    /// boundary. Managed workers call this after replying; direct AppClient
-    /// callers still await it so existing tests keep a complete delivery path.
-    pub(crate) async fn drive_unpublished_welcome_delivery(
-        &mut self,
-        telemetry: Option<&PerformanceRecorder>,
-    ) -> WelcomeDelivery {
-        let Some(work) = self.unpublished_welcome_delivery.take() else {
-            return WelcomeDelivery::Delivered;
-        };
-        match work.kind {
-            UnpublishedWelcomeKind::Founding {
-                effects,
-                welcome_intents,
-            } => {
-                // The canonical group already populated routing. Its REQs and
-                // founding Welcome publication can progress independently.
-                let adapter = self.adapter.clone();
-                let sync = TransportGroupSync {
-                    account_id: adapter.account_id().clone(),
-                    group_subscriptions: self.routing.group_subscriptions(),
-                    since: self.subscription_rebuild_since(),
-                };
-                self.pending_runtime_group_subscription_refresh = true;
-                let step = self.lane_step(crate::RuntimePerformanceOperation::RouteRefresh);
-                let register = async {
-                    let started = Instant::now();
-                    let result = adapter
-                        .sync_account_groups(sync)
-                        .await
-                        .map_err(AppError::from);
-                    step.finish(&result);
-                    record_app_performance(
-                        telemetry,
-                        AppPerformanceOperation::GroupCreateSubscriptionRefresh,
-                        started.elapsed(),
-                        result.is_ok(),
-                    );
-                    result
-                };
-                let publish = async {
-                    let started = Instant::now();
-                    let result = self
-                        .runtime
-                        .publish_prepared_session_effects_with_audit_context(
-                            effects,
-                            work.audit_context.clone(),
-                        )
-                        .await
-                        .map_err(AppError::from);
-                    record_app_performance(
-                        telemetry,
-                        AppPerformanceOperation::GroupCreateWelcomePublish,
-                        started.elapsed(),
-                        result.is_ok(),
-                    );
-                    result
-                };
-                let (publish_result, registered) = tokio::join!(publish, register);
-                let published = publish_result.is_ok();
-                self.pending_runtime_group_subscription_refresh = registered.is_err();
-                match registered {
-                    Ok(()) => self.warm_encrypted_media_epoch_secrets("post_subscription_sync"),
-                    Err(error) => tracing::warn!(
-                        target: "marmot_app::client",
-                        method = "create_group_subscription_refresh",
-                        error_kind = error.privacy_safe_kind(),
-                        "confirmed group creation could not refresh subscriptions immediately"
-                    ),
-                }
-                let effects = recover_post_canonical_result(
-                    "publish_prepared_founding_group",
-                    publish_result,
-                );
-                let delivery = WelcomeDelivery::of(published, &effects);
-                recover_post_canonical_result(
-                    "clear_delivered_welcome_rows",
-                    self.clear_delivered_welcome_rows(&welcome_intents, &effects),
-                );
-                // Non-fatal here: this classification only logs, so no
-                // refusal is lost to an early return. It still arms through the
-                // same gate, so no publishing seam reaches the bare check.
-                recover_post_canonical_result(
-                    "classify_founding_welcome_publish",
-                    self.observe_recovery_evidence_then_fail_if_publish_failed(&effects)
-                        .await,
-                );
-                self.record_human_action_succeeded(&work.group_id, &work.audit_context, &effects);
-                self.remember_published_reports(&effects);
-                delivery
-            }
-            UnpublishedWelcomeKind::Invite { welcome_ids } => {
-                let welcome_publish_started_at = Instant::now();
-                let publish_result = self
-                    .runtime
-                    .deliver_owed_welcomes_with_audit_context(
-                        &welcome_ids,
-                        work.group_id.clone(),
-                        work.audit_context,
-                    )
-                    .await
-                    .map_err(AppError::from);
-                record_app_performance(
-                    telemetry,
-                    AppPerformanceOperation::GroupInviteWelcomePublish,
-                    welcome_publish_started_at.elapsed(),
-                    publish_result.is_ok(),
-                );
-                let effects = match publish_result {
-                    Ok(effects) => effects,
-                    Err(error) => {
-                        tracing::warn!(
-                            target: "marmot_app::client",
-                            method = "drive_unpublished_welcome_delivery",
-                            error_kind = error.privacy_safe_kind(),
-                            "confirmed invite outpaced Welcome fanout; pending obligations remain retryable"
-                        );
-                        return WelcomeDelivery::Undelivered;
-                    }
-                };
-                let welcome_ids = welcome_ids
-                    .iter()
-                    .map(|id| hex::encode(id.as_slice()))
-                    .collect::<Vec<_>>();
-                let _ = self.clear_delivered_welcome_rows(&welcome_ids, &effects);
-                self.remember_published_reports(&effects);
-                WelcomeDelivery::of(true, &effects)
-            }
-        }
-    }
-
     /// Drain the Welcomes queued for re-delivery since the last drain, for the
     /// runtime worker to broadcast as `WelcomeDeliveryPending` events
     /// (mdk#352).
@@ -7858,98 +7705,6 @@ impl AppClient {
             .into_iter()
             .filter(|pending| self.host_may_see_group_hex(&pending.group_id_hex))
             .collect()
-    }
-
-    /// Prepare one bounded startup retry for every engine-authoritative
-    /// outstanding Welcome. The same read lets the runtime watch the Welcomes
-    /// still staged with their commits, so maintenance delivers them once
-    /// those commits confirm.
-    ///
-    /// Only relay I/O moves into the returned task. Exact artifacts, endpoint
-    /// snapshots, and attempt reservations are durable/owned by this client so
-    /// the account worker can keep processing inbound traffic and commands
-    /// without creating a second retry for the same message id.
-    pub(crate) fn prepare_pending_welcome_delivery_recovery_best_effort(
-        &mut self,
-    ) -> Option<PendingWelcomeDeliveryRecovery> {
-        let (welcome_ids, publish) = match self
-            .runtime
-            .prepare_owed_welcome_retry_task_with_audit_context(AuditEventContext::default())
-        {
-            Ok(Some((welcome_ids, publish))) => (welcome_ids, publish),
-            Ok(None) => return None,
-            Err(error) => {
-                tracing::warn!(
-                    target: "marmot_app::client",
-                    method = "prepare_pending_welcome_delivery_recovery_best_effort",
-                    error_kind = AppError::from(error).privacy_safe_kind(),
-                    "could not prepare retained Welcome obligations at startup"
-                );
-                return None;
-            }
-        };
-        let welcome_ids = welcome_ids
-            .iter()
-            .map(|id| hex::encode(id.as_slice()))
-            .collect::<Vec<_>>();
-        let observation = if publish.message_ids().is_empty() {
-            None
-        } else {
-            self.app.product_analytics.begin(
-                crate::ProductFamily::Welcome,
-                "retry",
-                crate::ProductUnit::Attempt,
-            )
-        };
-        Some(PendingWelcomeDeliveryRecovery {
-            observation,
-            welcome_ids,
-            publish,
-        })
-    }
-
-    /// Reconcile a detached startup retry back through the serialized account
-    /// owner and retire only obligations whose acknowledgement policy landed.
-    pub(crate) async fn finish_pending_welcome_delivery_recovery_best_effort(
-        &mut self,
-        completed: CompletedWelcomeDeliveryRecovery,
-    ) {
-        match self
-            .runtime
-            .finish_welcome_publish_task(completed.publish)
-            .await
-        {
-            Ok(effects) => {
-                if let Some(observation) = completed.observation {
-                    observation.finish(
-                        if effects.failures.is_empty() && effects.welcome_failures.is_empty() {
-                            "confirmed"
-                        } else {
-                            "pending"
-                        },
-                    );
-                }
-                let _ = self.clear_delivered_welcome_rows(&completed.welcome_ids, &effects);
-                self.remember_published_reports(&effects);
-            }
-            Err(error) => {
-                if let Some(observation) = completed.observation {
-                    observation.finish("failure");
-                }
-                tracing::warn!(
-                    target: "marmot_app::client",
-                    method = "finish_pending_welcome_delivery_recovery_best_effort",
-                    error_kind = AppError::from(error).privacy_safe_kind(),
-                    "startup Welcome retry left obligations pending"
-                );
-            }
-        }
-    }
-
-    /// Release an in-memory retry reservation after its relay task panics or is
-    /// cancelled. The exact durable obligation remains available for restart.
-    pub(crate) fn abandon_pending_welcome_delivery_recovery(&mut self, message_ids: &[MessageId]) {
-        self.runtime.abandon_welcome_publish_task(message_ids);
     }
 
     /// Welcomes still awaiting re-delivery for this account (mdk#352), oldest
