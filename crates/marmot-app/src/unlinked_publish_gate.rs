@@ -14,7 +14,6 @@
 //! app looks for one; a client open notes it before it returns.
 
 use std::sync::Arc;
-#[cfg(feature = "unreleased-device-pairing")]
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -34,9 +33,8 @@ pub(crate) struct AccountPublishStop {
     stop: Arc<AtomicBool>,
     /// Whether this process has looked for a removal the engine stored and
     /// the app never noted. Held while looking, so one look runs at a time.
-    #[cfg(feature = "unreleased-device-pairing")]
     checked: Arc<Mutex<bool>>,
-    #[cfg(all(test, feature = "unreleased-device-pairing"))]
+    #[cfg(test)]
     checks: Arc<std::sync::atomic::AtomicUsize>,
 }
 
@@ -60,7 +58,6 @@ impl crate::MarmotApp {
             return Arc::new(AtomicBool::new(true));
         }
         let entry = self.account_publish_stop_entry(account_id_hex);
-        #[cfg(feature = "unreleased-device-pairing")]
         if !self.check_stored_device_group_removal(&account.label, &entry) {
             return Arc::new(AtomicBool::new(true));
         }
@@ -90,7 +87,6 @@ impl crate::MarmotApp {
     /// an unlink from a failed link's undo (D40), so its open decides and
     /// lifts the stop for a failed link. False when the look failed: the
     /// caller refuses, and the next publisher looks again.
-    #[cfg(feature = "unreleased-device-pairing")]
     fn check_stored_device_group_removal(&self, label: &str, entry: &AccountPublishStop) -> bool {
         if !self.device_groups_enabled() {
             return true;
@@ -126,7 +122,6 @@ impl crate::MarmotApp {
 
     /// This account's trusted device group, when its stored copy records
     /// this device's removal.
-    #[cfg(feature = "unreleased-device-pairing")]
     pub(crate) fn removed_device_group(
         &self,
         label: &str,
@@ -151,7 +146,6 @@ impl crate::MarmotApp {
 
     /// Refuse every publish of this account on this device from now on: its
     /// device group unlinked this device (mdk#2628 D67).
-    #[cfg(any(test, feature = "unreleased-device-pairing"))]
     pub(crate) fn stop_unlinked_account_publishing(&self, account_id_hex: &str) {
         self.account_publish_stop_entry(account_id_hex)
             .stop
@@ -160,7 +154,6 @@ impl crate::MarmotApp {
 
     /// Lift the stop a stored removal set: a client found that the removal
     /// undid a failed link (D40), which stops nothing.
-    #[cfg(feature = "unreleased-device-pairing")]
     pub(crate) fn lift_failed_link_publish_stop(&self, account_id_hex: &str) {
         self.account_publish_stop_entry(account_id_hex)
             .stop
@@ -178,7 +171,7 @@ impl crate::MarmotApp {
 
     /// How many times this process has looked for the account's stored
     /// removal.
-    #[cfg(all(test, feature = "unreleased-device-pairing"))]
+    #[cfg(all(test, feature = "test-policy-overrides"))]
     pub(crate) fn stored_device_group_checks(&self, account_id_hex: &str) -> usize {
         self.account_publish_stop_entry(account_id_hex)
             .checks

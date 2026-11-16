@@ -785,7 +785,7 @@ pub struct AppClient {
     /// rows, rotation and the log's end go through it, not the runtime.
     pub(crate) audit: marmot_forensics::SharedRecorder,
     /// Fail the device-roster read that tells an unlink from a failed link.
-    #[cfg(all(test, feature = "unreleased-device-pairing"))]
+    #[cfg(test)]
     pub(crate) test_fail_roster_read: bool,
     pub(crate) recovery_owner: recovery::AccountRecoveryOwner,
     /// Recovery's ledger side (mdk#2782): the runner's host state, the
@@ -1134,7 +1134,6 @@ pub struct AppClient {
     /// only: a restart ends every pairing session. Boxed: the client is held
     /// by value in deep async call chains, whose debug-build frames copy it,
     /// and linking is rarely in progress.
-    #[cfg(feature = "unreleased-device-pairing")]
     pub(crate) device_pairing: Box<device_pairing::DevicePairing>,
 }
 

@@ -516,11 +516,9 @@ pub unsafe extern "C" fn marmot_client_new_with_configuration(
     })
 }
 
-/// Open an explicitly experimental device-group test build, with the same
-/// options and ownership as marmot_client_new_with_configuration. Requires a
-/// library built with `dev-device-groups`; unavailable builds return
-/// MARMOT_STATUS_RUNTIME before opening the root or taking callback ownership.
-/// Normal constructors remain disabled even in a capable library.
+/// Open with multi-device on, with the same options and ownership as
+/// marmot_client_new_with_configuration. Every library includes it; ordinary
+/// constructors keep it off. Use it for every opener of the same root.
 ///
 /// # Safety
 /// Same pointer contracts as marmot_client_new_with_configuration.
@@ -546,7 +544,7 @@ pub unsafe extern "C" fn marmot_client_new_with_experimental_device_groups(
     })
 }
 
-/// Shared option validation and ownership for normal and experimental opens.
+/// Shared option validation and ownership for every configured open.
 ///
 /// # Safety
 /// Same pointer contracts as marmot_client_new_with_configuration.
@@ -557,15 +555,10 @@ unsafe fn open_client_with_configuration(
     options: *const MarmotClientOptions,
     deployment: *const deployment::MarmotDeployment,
     out_client: *mut *mut MarmotClient,
-    experimental_device_groups: bool,
+    device_groups: bool,
 ) -> MarmotStatus {
     if let Err(status) = unsafe { preflight_out_ptr(out_client) } {
         return status;
-    }
-    if experimental_device_groups
-        && let Err(error) = marmot_uniffi::require_experimental_device_groups()
-    {
-        return status::status_from_error(&error);
     }
     let deployment = match unsafe { required_deployment(deployment) } {
         Ok(deployment) => deployment,
@@ -632,7 +625,7 @@ unsafe fn open_client_with_configuration(
                     moderation_report_config: None,
                     deployment,
                 };
-                if experimental_device_groups {
+                if device_groups {
                     Marmot::new_with_experimental_device_groups(root, relays, options)
                 } else {
                     Marmot::new_with_configuration(root, relays, options)

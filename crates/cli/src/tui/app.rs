@@ -90,6 +90,10 @@ pub(crate) struct TuiApp {
     /// True once an account has been activated into the main view, so `Esc` from
     /// the account picker knows whether there is a session to return to.
     pub(crate) entered_main: bool,
+    /// This process's `WN_DEVICE_GROUPS`, which one-shot `wn` calls inherit
+    /// when no daemon runs. A running daemon's own setting wins
+    /// ([`TuiApp::leave_steps_admin_down`]).
+    pub(crate) local_device_groups: bool,
     /// Whether the opt-in MLS group diagnostics panel is shown (`/diagnostics`).
     pub(crate) show_diagnostics: bool,
     pub(crate) focus: Focus,
@@ -416,6 +420,7 @@ impl TuiApp {
             running: true,
             screen: Screen::Login(LoginMode::Menu),
             entered_main: false,
+            local_device_groups: crate::wn_device_groups(),
             show_diagnostics: false,
             focus: Focus::Chats,
             accounts: Vec::new(),
@@ -1969,15 +1974,25 @@ impl TuiApp {
     }
 
     /// Confirm before invoking the authoritative Leave command, or explain why
-    /// an admin cannot leave yet (`leave_group_decision`). The CLI turns
-    /// device groups on exactly in a `dev-device-groups` build, and only there
-    /// does Leave step an admin down itself.
+    /// an admin cannot leave yet (`leave_group_decision`).
+    /// Whether Leave steps an admin down itself: only with device groups on,
+    /// as the process that runs the Leave has them. That is the running
+    /// daemon, or else the one-shot `wn` that inherits this process's
+    /// environment.
+    pub(crate) fn leave_steps_admin_down(&self) -> bool {
+        if self.daemon.running {
+            self.daemon.device_groups
+        } else {
+            self.local_device_groups
+        }
+    }
+
     fn open_leave_group_popup(&mut self) {
         let Some(view) = &self.group_detail else {
             return;
         };
         self.popup = Some(
-            match leave_group_decision(view, cfg!(feature = "dev-device-groups")) {
+            match leave_group_decision(view, self.leave_steps_admin_down()) {
                 LeaveDecision::Blocked(message) => Popup::info(CANNOT_LEAVE_TITLE, message),
                 LeaveDecision::Confirm => Popup::Confirm {
                     purpose: ConfirmPurpose::LeaveGroup {

@@ -9,9 +9,6 @@ description = "Nostr transport adapter for Marmot CGKA transport messages."
 [features]
 default = []
 sdk = ["dep:nostr-gossip", "dep:nostr-sdk", "dep:async-wsocket", "dep:tokio-socks", "dep:tokio-tungstenite", "dep:zeroize"]
-# Device pairing's Nostr events (#2628). Unreleased until the pairing spec
-# merges: nothing enables it, so no release sends pairing messages.
-unreleased-device-pairing = ["dep:marmot-pairing"]
 # Test hooks for crates that drive the adapter in their own tests. Never
 # enable in app artifacts.
 test-support = []
@@ -23,7 +20,7 @@ base64.workspace = true
 cgka-traits.workspace = true
 futures.workspace = true
 hex.workspace = true
-marmot-pairing = { workspace = true, optional = true }
+marmot-pairing.workspace = true
 nostr.workspace = true
 nostr-gossip = { workspace = true, optional = true }
 nostr-sdk = { workspace = true, optional = true }
@@ -39,7 +36,6 @@ transport-nostr-peeler.workspace = true
 zeroize = { workspace = true, optional = true }
 
 [dev-dependencies]
-marmot-pairing.workspace = true
 nostr-memory = { git = "https://github.com/erskingardner/rust-nostr", rev = "e93cc06b5624f06c21ecd8111a124176eb0c7589" }
 nostr-relay-builder.workspace = true
 tokio = { workspace = true, features = ["net", "test-util"] }

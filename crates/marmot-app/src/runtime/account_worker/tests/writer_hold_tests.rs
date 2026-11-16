@@ -744,8 +744,7 @@ async fn a_held_subscription_refresh_holds_the_media_imeta_tag() {
 /// read, and so does a delivery. After PR 1 the KeyPackage publish still
 /// waits, as an account-key command (rule 6).
 ///
-/// Sign-in checks run only with device groups, which builds without
-/// `test-policy-overrides` (or `dev-device-groups`) leave off.
+/// Sign-in checks run only with device groups on.
 #[cfg(feature = "test-policy-overrides")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_held_sign_in_slot_read_holds_every_command_and_a_delivery() {
@@ -759,7 +758,7 @@ async fn a_held_sign_in_slot_read_holds_every_command_and_a_delivery() {
         "wss://relay.example",
         crate::MarmotAppConfig::white_noise()
             .with_allow_loopback_relay_endpoints(true)
-            .with_dev_device_groups(true),
+            .with_device_groups(true),
     )
     .with_test_relay_client(relay.clone());
     crate::tests::remember_test_member_inbox(&app, &account.account_id_hex, "wss://relay.example");

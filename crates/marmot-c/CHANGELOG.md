@@ -31,6 +31,10 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   for raw rows retained as invalidated tombstones. `marmot_messages` and
   message-subscription snapshots report the stored flag. The layout changed:
   rebuild clients with the matching header and library.
+- Every library build includes multi-device (mdk#2628). The `dev-device-groups` Cargo feature,
+  `c-bindings.sh --dev-device-groups` and `output-dev-device-groups/` are gone.
+  `marmot_client_new_with_experimental_device_groups` turns device groups on in any library and no longer returns
+  `MARMOT_STATUS_RUNTIME` for an unavailable build; ordinary constructors still keep them off.
 
 ### Added
 

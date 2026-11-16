@@ -133,7 +133,6 @@ async fn blocked_inbox_demux() {
         }),
         slot: Arc::new(Mutex::new(PeelSlot::default())),
         storage: storage.clone(),
-        #[cfg(feature = "unreleased-device-pairing")]
         pairing: None,
     };
     let welcome = from
@@ -1386,7 +1385,6 @@ async fn recovery_inbox_audit_metrics() {
     .expect("bounded control audit and analytics scenario");
 }
 
-#[cfg(feature = "unreleased-device-pairing")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pairing_inbox_audit_metrics() {
     use marmot_pairing::{CancelReason, PairingCancel, PairingMessage, SessionId};
@@ -2320,7 +2318,6 @@ async fn ambiguous_nip59_decrypt_error_is_failed_without_inner_refs() {
         storage: storage_sqlite::SqliteAccountStorage::in_memory_for_test()
             .unwrap()
             .app_storage(),
-        #[cfg(feature = "unreleased-device-pairing")]
         pairing: None,
     };
     assert!(matches!(

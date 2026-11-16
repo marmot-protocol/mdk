@@ -9,6 +9,12 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+### Changed
+
+- Every `wn`/`wnd` build includes multi-device (mdk#2628); `--features dev-device-groups` is gone. Export
+  `WN_DEVICE_GROUPS=1` for `wn` and `wnd` to turn device groups on: `wn devices` linking, the device roster and admin
+  step-down on Leave in the CLI and TUI. Without it they stay off, as before.
+
 ### Added
 
 - `wn groups pending-commit <group-hex>` shows the group's own commit that has not confirmed yet, `sending` or

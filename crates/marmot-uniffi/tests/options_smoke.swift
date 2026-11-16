@@ -71,24 +71,13 @@ struct OptionsSmoke {
         precondition(session.status().state == .disconnected)
         session.cancel()
         precondition(session.status().state == .cancelled)
+        // Every native library opens through the experimental constructor.
         let experimentalRoot = root.appendingPathComponent("experimental")
-        if CommandLine.arguments.contains("--dev-device-groups") {
-            let experimental = try Marmot.newWithExperimentalDeviceGroups(
-                rootPath: experimentalRoot.path, relayUrls: ["ws://127.0.0.1:1"], options: copy
-            )
-            let experimentalAccounts = try experimental.listAccounts()
-            precondition(experimentalAccounts.isEmpty)
-        } else {
-            do {
-                _ = try Marmot.newWithExperimentalDeviceGroups(
-                    rootPath: experimentalRoot.path, relayUrls: [], options: copy
-                )
-                preconditionFailure("default native library accepted experimental construction")
-            } catch MarmotKitError.Runtime(let details) {
-                precondition(details == "experimental_device_groups_unavailable")
-                precondition(!FileManager.default.fileExists(atPath: experimentalRoot.path))
-            }
-        }
+        let experimental = try Marmot.newWithExperimentalDeviceGroups(
+            rootPath: experimentalRoot.path, relayUrls: ["ws://127.0.0.1:1"], options: copy
+        )
+        let experimentalAccounts = try experimental.listAccounts()
+        precondition(experimentalAccounts.isEmpty)
         print("Swift onboarding diagnostics, runtime options and host-store construction passed")
     }
 }

@@ -2850,6 +2850,7 @@ fn fake_starting_daemon_status(
                 last_runtime_activity: None,
                 relay_health: None,
                 stream_watches: Vec::new(),
+                device_groups: false,
             };
             starting = starting.saturating_sub(1);
             let output = CliOutput {

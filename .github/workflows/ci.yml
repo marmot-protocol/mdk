@@ -446,17 +446,6 @@ jobs:
       - name: Alloc-audit tests
         run: cargo test -p marmot-c --features alloc-audit --locked
 
-      - name: Experimental device-group C host tests
-        run: cargo test -p marmot-c --test secret_store_client --features dev-device-groups --locked
-
-      - name: Experimental UniFFI backup forwarding
-        run: |
-          set -euo pipefail
-          test_name='commands::backups::tests::backup_bindings_preserve_the_gate_tokens_and_observer_lifetime'
-          cargo test -p marmot-uniffi --lib --features dev-device-groups --locked "$test_name" -- --exact --list \
-            | grep -Fx "${test_name}: test"
-          cargo test -p marmot-uniffi --lib --features dev-device-groups --locked "$test_name" -- --exact
-
       - name: Compile and run debug C smoke test (gcc)
         run: ./crates/marmot-c/c-smoke.sh --debug gcc
 
@@ -874,10 +863,10 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/master' }}
           shared-key: cli-e2e
 
-      # Keep the narrow dogfood path separate: workspace policy features would
+      # Keep the device-linking path separate: workspace policy features would
       # mask an accidental test-policy-only device-group capability gate.
-      - name: Dev device linking at production timing
-        run: cargo nextest run -p wn-cli --lib --test cli --features dev-device-groups --locked --profile ci --retries 0 -E 'test(=dev_devices_link_across_daemon_commands_at_production_timing) | test(=commands::devices::tests::plain_prompt_details_keep_capability_names_and_sanitize_device_labels)' --no-tests=fail
+      - name: Device linking at production timing
+        run: cargo nextest run -p wn-cli --lib --test cli --locked --profile ci --retries 0 -E 'test(=devices_link_across_daemon_commands_at_production_timing) | test(=commands::devices::tests::plain_prompt_details_keep_capability_names_and_sanitize_device_labels)' --no-tests=fail
 
       - name: Verify CLI shard coverage
         run: bash scripts/check_ci_partitions.sh count:2 -p wn-cli --test cli --features test-policy-overrides --locked --profile ci -E 'all()'

@@ -2370,6 +2370,7 @@ fn test_tui_app(client: WnClient, account_id: &str) -> TuiApp {
         running: true,
         screen: Screen::Main,
         entered_main: true,
+        local_device_groups: false,
         show_diagnostics: false,
         focus: Focus::Composer,
         accounts: vec![AccountRow {
@@ -9165,15 +9166,11 @@ fn group_detail_leave_confirms_before_the_authoritative_command() {
         (self_id.clone(), "npubself".to_owned()),
         (peer_id.clone(), "npubpeer".to_owned()),
     ];
-    // Ordinary members reach the authoritative command after confirmation.
-    // Where Leave steps an admin down itself (a `dev-device-groups` build),
-    // eligible admins do too; elsewhere the guard below stops them first.
-    let admin_cases: &[bool] = if cfg!(feature = "dev-device-groups") {
-        &[true, false]
-    } else {
-        &[false]
-    };
-    for &is_admin in admin_cases {
+    // Members reach the authoritative command after confirmation, and so do
+    // admins where Leave steps an admin down itself (`WN_DEVICE_GROUPS`);
+    // elsewhere `group_detail_leave_guard_stops_admins_where_leave_does_not_demote`
+    // stops them first.
+    for is_admin in [true, false] {
         for local_signing in [true, false] {
             let dir = tempfile::tempdir().expect("tempdir");
             let (exe, args_file) = test_appending_arg_executable(
@@ -9201,6 +9198,7 @@ fn group_detail_leave_confirms_before_the_authoritative_command() {
             app.selected_account = 1;
             app.chats = vec![flick_chat("other-group", "Other")];
             app.screen = Screen::GroupDetail;
+            app.local_device_groups = is_admin;
             let admins = if is_admin {
                 vec![self_id.clone(), peer_id.clone()]
             } else {
@@ -9297,9 +9295,30 @@ fn group_detail_leave_guard_stops_admins_where_leave_does_not_demote() {
         assert_eq!(leave_group_decision(view, true), LeaveDecision::Confirm);
     }
 
-    if cfg!(feature = "dev-device-groups") {
-        return;
+    // The process that runs the Leave decides: a running daemon's setting,
+    // else this process's own, which one-shot `wn` calls inherit.
+    let mut app = test_tui_app(test_unused_client(), &self_id);
+    for (running, daemon, local, steps_down) in [
+        (true, true, false, true),
+        (true, false, true, false),
+        (false, true, false, false),
+        (false, false, true, true),
+    ] {
+        app.daemon.running = running;
+        app.daemon.device_groups = daemon;
+        app.local_device_groups = local;
+        assert_eq!(app.leave_steps_admin_down(), steps_down);
     }
+    app.daemon.device_groups = true;
+    app.screen = Screen::GroupDetail;
+    app.group_detail = Some(coadmin.clone());
+    app.handle_key(char_key('L')).expect("L on an admin");
+    assert!(
+        matches!(&app.popup, Some(Popup::Confirm { .. })),
+        "a daemon with device groups steps the admin down"
+    );
+
+    // Without device groups the TUI shows the guard instead of confirming.
     let mut app = test_tui_app(test_unused_client(), &self_id);
     app.screen = Screen::GroupDetail;
     for (view, message) in [

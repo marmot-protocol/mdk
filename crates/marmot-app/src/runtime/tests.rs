@@ -4332,7 +4332,7 @@ async fn idle_ticks_with_device_groups_and_no_backups_stop_history_dispatch() {
         crate::MarmotAppConfig::white_noise()
             .with_allow_loopback_relay_endpoints(true)
             .with_open_ranking_provider(None, Vec::new())
-            .with_dev_device_groups(true),
+            .with_device_groups(true),
     );
     assert!(app.device_groups_enabled());
     let idle = idle_ticks_run_nothing(app.clone()).await;

@@ -19,7 +19,6 @@ impl AppClient {
     /// or a device group, join, move or link stored. Never with device
     /// pairing compiled out or device groups off.
     pub(crate) fn device_pairing_owed(&self) -> bool {
-        #[cfg(feature = "unreleased-device-pairing")]
         if self.app.device_groups_enabled() && !self.signing_out() {
             return self.device_pairing.has_state()
                 || self

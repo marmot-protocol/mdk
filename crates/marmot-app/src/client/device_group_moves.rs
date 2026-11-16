@@ -13,7 +13,6 @@ use storage_sqlite::{DeviceGroupMovePhase, DeviceGroupMoveRecord};
 
 const TRACE_TARGET: &str = "marmot_app::client::device_group_moves";
 
-#[cfg_attr(not(feature = "unreleased-device-pairing"), allow(dead_code))]
 impl AppClient {
     pub(super) fn device_group_move_views(&self) -> Result<Vec<DeviceGroupMoveView>, AppError> {
         let current = self.trusted_device_group()?;
@@ -171,7 +170,6 @@ impl AppClient {
                     self.received_private_key_package_generation =
                         self.received_private_key_package_generation.wrapping_add(1);
                     self.sync_device_tag_group()?;
-                    #[cfg(feature = "unreleased-device-pairing")]
                     self.note_move_link_made(&movement.destination_id);
                     self.note_device_roster_changed();
                     self.device_link_changed = true;
@@ -234,7 +232,6 @@ impl AppClient {
             storage_sqlite::DeviceGroupTrust::AwaitingWelcome,
         )?;
         storage.end_device_group_move_before_made(movement.move_id)?;
-        #[cfg(feature = "unreleased-device-pairing")]
         self.note_move_link_failed(&movement.destination_id);
         self.device_link_changed = true;
         Ok(())

@@ -71,20 +71,11 @@ fun main(args: Array<String>) = runBlocking {
                 session.cancel()
                 check(session.status().state == Nip46StateFfi.CANCELLED)
             }
+            // Every native library opens through the experimental constructor.
             val experimentalRoot = root.resolve("experimental")
-            if (args.contains("--dev-device-groups")) {
-                Marmot.newWithExperimentalDeviceGroups(experimentalRoot.path,
-                    listOf("ws://127.0.0.1:1"), copy).use { experimental ->
-                    check(experimental.listAccounts().isEmpty())
-                }
-            } else {
-                try {
-                    Marmot.newWithExperimentalDeviceGroups(experimentalRoot.path, emptyList(), copy).close()
-                    error("default native library accepted experimental construction")
-                } catch (error: MarmotKitException.Runtime) {
-                    check(error.details == "experimental_device_groups_unavailable")
-                    check(!experimentalRoot.exists())
-                }
+            Marmot.newWithExperimentalDeviceGroups(experimentalRoot.path,
+                listOf("ws://127.0.0.1:1"), copy).use { experimental ->
+                check(experimental.listAccounts().isEmpty())
             }
         }
     } finally {

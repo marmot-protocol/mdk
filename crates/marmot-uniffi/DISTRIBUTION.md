@@ -10,10 +10,9 @@ Remove any host-owned copy of `CancellablePresentedChatList.swift` when adopting
 will reject the duplicate methods. The existing Swift asset hash covers the generated bindings and adapters together;
 there is no extra support-file download.
 
-Experimental device-group host test builds are separate from these published release/snapshot assets. Use the
-[explicit build flag and experimental constructor](README.md#experimental-device-group-test-builds), retain matching
-native and generated inputs, and take artifacts only from `output-dev-device-groups/`. Ordinary release
-automation and constructors do not opt in; never add policy-test timing overrides to a host artifact.
+Published release and snapshot assets include device groups; hosts turn them on with the
+[experimental constructor](README.md#experimental-device-group-test-builds). There is no separate device-group
+artifact. Never add policy-test timing overrides to a host artifact.
 
 ## Apple privacy migration
 

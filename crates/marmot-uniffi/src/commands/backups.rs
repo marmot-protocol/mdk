@@ -249,7 +249,7 @@ mod tests {
                 .with_deployment(deployment)
                 .with_allow_loopback_relay_endpoints(true)
                 .with_directory_relay_urls(vec![relay_url])
-                .with_dev_device_groups(true),
+                .with_device_groups(true),
         );
         let kit = Marmot {
             runtime: app.runtime(),
@@ -275,24 +275,7 @@ mod tests {
             matches!(kit.cancel_backup_restore("alice".into(), "bad".into()).await,
             Err(MarmotKitError::InvalidHex { ref details }) if details == "invalid backup restore operation token")
         );
-        let words = match kit.begin_recovery_words("alice".into()).await {
-            Ok(words) => words,
-            Err(MarmotKitError::Runtime { details }) if details.contains("roster_unsupported") => {
-                if cfg!(feature = "dev-device-groups") {
-                    panic!("the explicit dev build must exercise active backup forwarding");
-                }
-                // A default dependency build cannot enable the experimental
-                // core gate through this wrapper. CI's existing app-policy
-                // feature union takes the active-operation branch below.
-                assert!(
-                    matches!(kit.begin_backup_restore("alice".into(), "not words".into()).await,
-                    Err(MarmotKitError::Runtime { ref details }) if details.contains("roster_unsupported"))
-                );
-                kit.runtime.shutdown_and_close().await.unwrap();
-                return;
-            }
-            Err(error) => panic!("unexpected recovery-word refusal: {error:?}"),
-        };
+        let words = kit.begin_recovery_words("alice".into()).await.unwrap();
         assert_eq!(words.words.len(), 12);
         assert_eq!(words.confirm_positions.len(), 2);
         let redaction_probe = RecoveryWordsFfi {

@@ -1509,7 +1509,7 @@ async fn a_long_history_of_a_text_only_chat_is_forgotten() {
         MarmotAppConfig::default()
             .with_dev_settlement_quiescence_ms(0)
             .with_dev_scheduled_convergence_delay_ms(0)
-            .with_dev_device_groups(true)
+            .with_device_groups(true)
             .with_allow_loopback_blob_endpoints(true),
     )
     .with_test_relay_client(relay.clone());

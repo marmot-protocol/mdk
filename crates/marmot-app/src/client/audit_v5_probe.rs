@@ -22,7 +22,6 @@ use cgka_traits::types::MemberId;
 use cgka_traits::{GroupEvent, GroupId, MessageId, TransportMessage};
 use marmot_forensics::v5::*;
 use marmot_session::{PublishWork, SessionEffects};
-#[cfg(feature = "unreleased-device-pairing")]
 use transport_nostr_peeler::AccountGiftWrap;
 use transport_nostr_peeler::{NostrMlsPeeler, NostrTransportEvent, WelcomePeelProvenance};
 
@@ -86,7 +85,6 @@ pub(crate) struct ProbePeeler {
     pub slot: Arc<Mutex<PeelSlot>>,
     pub storage: storage_sqlite::SqliteAppStorage,
     /// Takes the pairing messages among the gift wraps to the account.
-    #[cfg(feature = "unreleased-device-pairing")]
     pub pairing: Option<super::device_pairing::PairingInbox>,
 }
 
@@ -98,24 +96,19 @@ impl ProbePeeler {
         &self,
         msg: &TransportMessage,
     ) -> Result<(PeeledMessage, Option<WelcomePeelProvenance>), PeelerError> {
-        #[cfg(feature = "unreleased-device-pairing")]
-        {
-            let opened = self.inner.peel_account_gift_wrap(msg).await?;
-            if let AccountGiftWrap::Other(unwrapped) = &opened {
-                // Remember the authenticated inner kind before the engine
-                // refuses this non-Welcome, even when pairing is disabled or
-                // its content cannot be admitted to the pairing inbox.
-                if marmot_pairing::PAIRING_KINDS.contains(&unwrapped.rumor.kind.as_u16()) {
-                    self.slot.lock().unwrap().private_control = true;
-                }
-                if let Some(pairing) = &self.pairing {
-                    pairing.offer(unwrapped);
-                }
+        let opened = self.inner.peel_account_gift_wrap(msg).await?;
+        if let AccountGiftWrap::Other(unwrapped) = &opened {
+            // Remember the authenticated inner kind before the engine
+            // refuses this non-Welcome, even when pairing is disabled or
+            // its content cannot be admitted to the pairing inbox.
+            if marmot_pairing::PAIRING_KINDS.contains(&unwrapped.rumor.kind.as_u16()) {
+                self.slot.lock().unwrap().private_control = true;
             }
-            opened.into_welcome()
+            if let Some(pairing) = &self.pairing {
+                pairing.offer(unwrapped);
+            }
         }
-        #[cfg(not(feature = "unreleased-device-pairing"))]
-        self.inner.peel_welcome_with_provenance(msg).await
+        opened.into_welcome()
     }
 }
 

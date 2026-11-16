@@ -538,7 +538,7 @@ async fn expired_private_key_packages_go_while_maintenance_is_paused_or_frozen()
         _dirs[0].path(),
         "wss://relay.example",
         MarmotAppConfig::white_noise()
-            .with_dev_device_groups(true)
+            .with_device_groups(true)
             .with_cursor_persistence(crate::CursorPersistence::Frozen),
     )
     .with_test_relay_client(relay);

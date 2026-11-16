@@ -32,7 +32,7 @@ fn sign_in_app_at(
         MarmotAppConfig::white_noise()
             .with_dev_settlement_quiescence_ms(0)
             .with_dev_scheduled_convergence_delay_ms(0)
-            .with_dev_device_groups(device_groups),
+            .with_device_groups(device_groups),
     )
     .with_test_relay_client(relay)
 }

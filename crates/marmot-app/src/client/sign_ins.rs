@@ -767,7 +767,6 @@ impl AppClient {
     /// roster holds the slot as a device, whether or not it has a device
     /// group and whether or not the roster has the rejection yet, and does
     /// not link the slot meanwhile (device-group.md, "Before answering").
-    #[cfg_attr(not(feature = "unreleased-device-pairing"), allow(dead_code))]
     pub(crate) fn rejected_sign_in_here(
         &self,
         published_slot: &str,
@@ -871,7 +870,6 @@ fn rejected_slots_here(records: &[SignInRecord]) -> BTreeSet<String> {
 /// of a device's slot leaves that device linkable. One the roster can name
 /// also refuses any other spelling a link would record as that slot, since
 /// that link would end it.
-#[cfg_attr(not(feature = "unreleased-device-pairing"), allow(dead_code))]
 fn rejects_slot(records: &[SignInRecord], published_slot: &str, slot: &DeviceSlotId) -> bool {
     records.iter().any(|record| {
         record.answer == SignInAnswer::Rejected

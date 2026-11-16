@@ -1,6 +1,5 @@
 //! Linking a new device of this account: the code both screens show, then
-//! joining or moving to the answering device's group. Requires an explicitly capable
-//! experimental library and the experimental constructor; normal opens refuse it.
+//! joining or moving to the answering device's group.
 
 use crate::Marmot;
 use crate::conversions::DeviceLinkSnapshotFfi;
@@ -25,7 +24,7 @@ impl Marmot {
     /// Keeps credentials, slot and ordinary data; abandons old link-bound
     /// preparation, not shared state/security sync. No membership repair/removal. Busy
     /// native work/pairing/Move can refuse indefinitely; cancellation after
-    /// reset does not restore old trust. Requires explicit experimental gates.
+    /// reset does not restore old trust.
     pub async fn reset_device_group_for_repair(
         &self,
         account_ref: String,

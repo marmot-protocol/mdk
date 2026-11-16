@@ -72,7 +72,6 @@ pub(crate) struct Cli {
     pub(crate) command: Command,
 }
 
-#[cfg(feature = "dev-device-groups")]
 #[derive(Clone, Debug, Serialize, Deserialize, Subcommand)]
 pub(crate) enum DevicesCommand {
     #[command(about = "List devices from this account's trusted device group")]
@@ -84,7 +83,6 @@ pub(crate) enum DevicesCommand {
     },
 }
 
-#[cfg(feature = "dev-device-groups")]
 #[derive(Clone, Debug, Serialize, Deserialize, Subcommand)]
 pub(crate) enum DeviceLinkCommand {
     #[command(about = "On the new device, request a link")]
@@ -158,8 +156,9 @@ pub(crate) enum Command {
         )]
         default_account_relays: Vec<String>,
     },
-    #[cfg(feature = "dev-device-groups")]
-    #[command(about = "Link and list this account's devices (dev build; requires wnd)")]
+    #[command(
+        about = "Link and list this account's devices (requires wnd with WN_DEVICE_GROUPS=1)"
+    )]
     Devices {
         #[command(subcommand)]
         command: DevicesCommand,
