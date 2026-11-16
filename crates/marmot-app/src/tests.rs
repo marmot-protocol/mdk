@@ -1236,6 +1236,7 @@ impl ScriptedPushRelayClient {
     /// Hold the next directory read that asks for a KeyPackage slot, as a
     /// sign-in check's read does: it notifies the first notifier once it
     /// waits, and answers once the second is notified.
+    #[cfg(feature = "test-policy-overrides")]
     pub(crate) fn hold_next_slot_read(
         &self,
     ) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {

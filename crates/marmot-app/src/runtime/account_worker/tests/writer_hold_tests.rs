@@ -675,6 +675,10 @@ async fn a_held_subscription_refresh_holds_the_media_imeta_tag() {
 /// tick that runs it. Every command waits, a send, a KeyPackage publish and a
 /// read, and so does a delivery. After PR 1 the KeyPackage publish still
 /// waits, as an account-key command (rule 6).
+///
+/// Sign-in checks run only with device groups, which builds without
+/// `test-policy-overrides` (or `dev-device-groups`) leave off.
+#[cfg(feature = "test-policy-overrides")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_held_sign_in_slot_read_holds_every_command_and_a_delivery() {
     let dir = tempfile::tempdir().unwrap();
