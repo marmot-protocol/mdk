@@ -625,9 +625,11 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   the host no longer shows, and a `Drain` answers once every wave started before it has settled. A
   `PendingWelcomeDeliveries` read waits the same way, beside the writer, and answers with the list computed then
   (W8): a read after a create or invite sees that wave's first attempt settled, as it did when the worker published
-  inline. A wave started after the worker took the read up never extends its wait. Once its waves settle, the read
-  answers in a worker turn of its own after the shutdown arms, as a queued command does: a client replacement leaves
-  it for the next turn, and a stopping worker answers it at exit with the error a queued command gets. Every task that
+  inline. A wave started after the worker took the read up never extends its wait. A wait answers where its last
+  wave settles: on the writer, or on the replaced client before the reconnect backoff. One parked at exit gets the
+  error a queued command gets. A wait whose waves settle as shutdown begins may answer with its result, or with a
+  storage error once `shutdown_and_close` has closed storage; a reply's precedence over shutdown is not a host
+  contract. Every task that
   runs beside the writer keeps these:
   - T1: it holds nothing of the writer's: no borrow of the client and no handle on the engine, the session, account
     storage, the published read state or the account's subscriptions. A Welcome run holds the adapter, a clock, its

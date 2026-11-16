@@ -56,26 +56,28 @@ pub(super) async fn drain(runtime: &crate::MarmotAppRuntime) -> oneshot::Receive
     drained
 }
 
-/// A hold the worker of the labelled account enters after it settles a wave
-/// and before its next turn: the notifiers it enters and waits on.
+/// A hold the worker of one account, by id, enters after it settles a wave
+/// and before it answers the waits on it: the notifiers it enters and waits
+/// on.
 type SettleHold = (String, Arc<Notify>, Arc<Notify>);
 static HOLD_AFTER_SETTLE: std::sync::Mutex<Option<SettleHold>> = std::sync::Mutex::new(None);
 
-/// Hold `account`'s worker after it next settles a wave.
-fn hold_after_settle(account: &str) -> (Arc<Notify>, Arc<Notify>) {
+/// Hold the worker of the account `account_id_hex` after it next settles a
+/// wave.
+fn hold_after_settle(account_id_hex: &str) -> (Arc<Notify>, Arc<Notify>) {
     let entered = Arc::new(Notify::new());
     let release = Arc::new(Notify::new());
     *HOLD_AFTER_SETTLE.lock().unwrap() =
-        Some((account.to_owned(), entered.clone(), release.clone()));
+        Some((account_id_hex.to_owned(), entered.clone(), release.clone()));
     (entered, release)
 }
 
 /// The worker's side of [`hold_after_settle`].
-pub(in crate::runtime::account_worker) async fn held_after_settle(account: &str) {
+pub(in crate::runtime::account_worker) async fn held_after_settle(account_id_hex: &str) {
     let held = HOLD_AFTER_SETTLE
         .lock()
         .unwrap()
-        .take_if(|(held, ..)| held == account);
+        .take_if(|(held, ..)| held == account_id_hex);
     if let Some((_, entered, release)) = held {
         entered.notify_one();
         release.notified().await;
@@ -300,10 +302,10 @@ async fn a_later_wave_does_not_extend_a_pending_deliveries_read() {
 }
 
 /// L1: a client replacement during a held wave abandons it on the client
-/// that started it, so a `Drain` and a pending-deliveries read waiting for
-/// the wave answer. Its Welcome
-/// stays owed, the next client's maintenance sends it, and it reaches the
-/// relays once.
+/// that started it, and a `Drain` and a pending-deliveries read waiting for
+/// the wave answer on that client, before the worker backs off to reopen:
+/// an outage never holds them. Its Welcome stays owed, the next client's
+/// maintenance sends it, and it reaches the relays once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_client_replacement_abandons_a_held_wave_and_its_welcome_is_sent_once() {
     let dir = tempfile::tempdir().unwrap();
@@ -341,6 +343,15 @@ async fn a_client_replacement_abandons_a_held_wave_and_its_welcome_is_sent_once(
         .expect("the replacement answers the waiting read")
         .unwrap()
         .unwrap();
+    // Both answered before the reopen: the backoff, two seconds at least,
+    // drops a command unanswered, and the worker is still in it.
+    assert!(
+        timeout(SETTLE, drain(&runtime).await)
+            .await
+            .expect("the worker takes the probe up")
+            .is_err(),
+        "the replacement answers its waits before the worker backs off to reopen"
+    );
     assert_eq!(gift_wraps_published(&relay), 0);
 
     runtime.notify_connectivity_restored().await.unwrap();
@@ -409,18 +420,25 @@ async fn shutdown_ends_a_held_wave_and_the_next_start_sends_its_welcome() {
     close(&runtime).await;
 }
 
-/// W8 at shutdown: a read whose wave settles while shutdown begins is left
-/// for the worker's exit, which answers it with the error a queued command
-/// gets, as a read queued behind an inline publish was. It is not answered
-/// from the list once the worker is stopping.
+/// W8 at shutdown: a read whose wave settles as shutdown begins is
+/// answered, with its list or with the error a queued command gets. Which
+/// one is not a host contract; that it never hangs is.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_read_whose_wave_settles_as_shutdown_begins_gets_the_shutdown_error() {
+async fn a_read_whose_wave_settles_as_shutdown_begins_is_answered() {
     let dir = tempfile::tempdir().unwrap();
-    let (Alice { relay, runtime, .. }, _) = held_founding_wave(&dir).await;
+    let (
+        Alice {
+            account,
+            relay,
+            runtime,
+            ..
+        },
+        _,
+    ) = held_founding_wave(&dir).await;
     let listed = read_pending(&runtime).await;
     // Once this answers, the worker has taken the read up.
     runtime.publish_key_package("alice").await.unwrap();
-    let (settled, resume) = hold_after_settle("alice");
+    let (settled, resume) = hold_after_settle(&account.account_id_hex);
     relay.release_publish();
     timeout(SETTLE, settled.notified())
         .await
@@ -443,9 +461,9 @@ async fn a_read_whose_wave_settles_as_shutdown_begins_gets_the_shutdown_error() 
             timeout(SETTLE, listed)
                 .await
                 .expect("the worker answers the read"),
-            Ok(Err(AppError::TransportClosed))
+            Ok(Ok(_) | Err(AppError::TransportClosed))
         ),
-        "a stopping worker answers the read with the shutdown error"
+        "the read answers with its list or the shutdown error"
     );
     timeout(SETTLE, stopping).await.unwrap().unwrap();
     runtime.shutdown_and_close().await.unwrap();

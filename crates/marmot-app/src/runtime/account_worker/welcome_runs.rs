@@ -14,10 +14,13 @@
 //!
 //! A read of the pending deliveries waits as a `Drain` does, beside the
 //! writer, so it answers with each earlier wave's first attempt settled, as
-//! it did when the worker published Welcomes inline. Once its waves have
-//! settled, the worker answers it in a turn of its own after the shutdown
-//! arms ([`WelcomeRuns::has_answerable`]), as a queued command waits for its
-//! turn: a stopping worker leaves it for [`WelcomeRuns::end`].
+//! it did when the worker published Welcomes inline. Each wait answers
+//! where its last wave settles: on the writer once the wave settles, or on
+//! the replaced client before the worker drops it. A wait whose waves settle
+//! as shutdown begins may answer with its result, or with a storage error
+//! once `shutdown_and_close` has closed storage: whether a reply wins over
+//! shutdown is not a host contract. A wait still parked when the worker
+//! returns gets the error a queued command gets ([`WelcomeRuns::end`]).
 
 use futures::StreamExt;
 use futures::future::BoxFuture;
@@ -131,14 +134,6 @@ impl WelcomeRuns {
         self.answer_waiting(client, shared);
     }
 
-    /// Whether a `Drain` or pending-deliveries read waits on no unsettled
-    /// wave, so [`Self::answer_waiting`] would answer it.
-    pub(super) fn has_answerable(&self) -> bool {
-        let settled = self.settled();
-        self.drains.iter().any(|(upto, _)| settled(*upto))
-            || self.reads.iter().any(|(upto, _)| settled(*upto))
-    }
-
     /// Whether every wave below `upto` has settled.
     fn settled(&self) -> impl Fn(u64) -> bool + use<> {
         let oldest = self.in_flight.first().map(|(id, _)| *id);
@@ -147,8 +142,7 @@ impl WelcomeRuns {
 
     /// Answer each `Drain` and pending-deliveries read whose waves have all
     /// settled. A read answers with the list computed now. The worker calls
-    /// this only where it takes a command up, or in a turn of its own after
-    /// the shutdown arms.
+    /// this where it takes a wait up and where a wave settles.
     pub(super) fn answer_waiting(&mut self, client: &AppClient, shared: &RuntimeSharedServices) {
         let settled = self.settled();
         let (ready, waiting) = std::mem::take(&mut self.drains)
@@ -177,8 +171,13 @@ impl WelcomeRuns {
     /// Before the worker replaces `client`: cancel its waves and settle each
     /// on it. A wave whose task already returned is finished, and any other
     /// is abandoned, its Welcomes left owed. Every `Drain` and
-    /// pending-deliveries read is then answerable, in the worker's next turn.
-    pub(super) async fn settle_all(&mut self, client: &mut AppClient) {
+    /// pending-deliveries read is then answered on `client`, before the
+    /// worker drops it and backs off to reopen.
+    pub(super) async fn settle_all(
+        &mut self,
+        client: &mut AppClient,
+        shared: &RuntimeSharedServices,
+    ) {
         self.adopt(client);
         for (_, abort) in &self.in_flight {
             abort.abort();
@@ -193,6 +192,7 @@ impl WelcomeRuns {
             let _ = client.settle_welcome_wave(message_ids, tail, run).await;
         }
         self.in_flight.clear();
+        self.answer_waiting(client, shared);
     }
 
     /// When the worker returns: cancel every wave and wait for its task to
