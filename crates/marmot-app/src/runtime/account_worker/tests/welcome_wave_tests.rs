@@ -2,8 +2,9 @@
 //! wave beside the writer keeps of a wave on it. The session's tests own
 //! the wave's terms, one publisher per Welcome, the abandoned wave's owed
 //! Welcomes and the counted inputs a run leaves alone. These own what only
-//! the worker decides: a wave of a group gone before it settles, and the
-//! client replacement and worker exits a wave can meet.
+//! the worker decides: a wave of a group gone before it settles, the
+//! pending-deliveries read that waits for earlier waves (W8), and the client
+//! replacement and worker exits a wave can meet.
 //!
 //! Each test holds a create's founding gift wrap on the relays, as hold 4's
 //! flip does, and the worker answers commands while it is held.
@@ -54,6 +55,20 @@ pub(super) async fn drain(runtime: &crate::MarmotAppRuntime) -> oneshot::Receive
     drained
 }
 
+/// Send a pending-deliveries read to alice's worker, answered once every
+/// wave it started before has settled (W8).
+pub(super) async fn read_pending(
+    runtime: &crate::MarmotAppRuntime,
+) -> oneshot::Receiver<Result<Vec<crate::PendingWelcomeDelivery>, AppError>> {
+    let lane = runtime.accounts().worker_lane("alice").await.unwrap();
+    let (respond, listed) = ReadReply::unobserved();
+    lane.commands
+        .send(AccountWorkerCommand::PendingWelcomeDeliveries { respond })
+        .await
+        .unwrap();
+    listed
+}
+
 /// Stop the workers, then close storage. A settled wave's own Welcome comes
 /// back as a local copy that the worker ingests after the `Drain` answers;
 /// stopping first keeps terminal close from landing inside that ingest,
@@ -101,7 +116,6 @@ async fn a_wave_settling_after_its_chat_is_deleted_leaves_it_alone() {
     let (Alice { relay, runtime, .. }, group) = held_founding_wave(&dir).await;
     relay.fail_publishes_of_kind(transport_nostr_peeler::KIND_NIP59_GIFT_WRAP);
     assert!(runtime.delete_group_local("alice", &group).await.unwrap());
-    let before = pending_of(&runtime, &group).await;
     let mut events = runtime.subscribe();
 
     let drained = drain(&runtime).await;
@@ -116,7 +130,9 @@ async fn a_wave_settling_after_its_chat_is_deleted_leaves_it_alone() {
             "a deleted chat's settle emits no pending delivery"
         );
     }
-    assert_eq!(pending_of(&runtime, &group).await, before);
+    // The engine still owes the Welcome, as it did while the wave ran: a
+    // read then would have listed it the same way.
+    assert_eq!(pending_of(&runtime, &group).await.len(), 1);
     close(&runtime).await;
 }
 
@@ -169,7 +185,6 @@ async fn a_startup_retry_settling_after_its_chat_is_deleted_leaves_it_alone() {
         .await
         .expect("the startup retry reaches the relays");
     assert!(runtime.delete_group_local("alice", &group).await.unwrap());
-    let before = pending_of(&runtime, &group).await;
 
     let drained = drain(&runtime).await;
     relay.release_publish();
@@ -183,12 +198,83 @@ async fn a_startup_retry_settling_after_its_chat_is_deleted_leaves_it_alone() {
             "a deleted chat's settle emits no pending delivery"
         );
     }
-    assert_eq!(pending_of(&runtime, &group).await, before);
+    assert_eq!(pending_of(&runtime, &group).await.len(), 1);
+    close(&runtime).await;
+}
+
+/// W8: a pending-deliveries read waits only for the waves started before
+/// the worker took it up. A wave the next create starts, held on the relays,
+/// doesn't extend the wait: the read answers once the earlier wave settles,
+/// with that wave's Welcome delivered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_later_wave_does_not_extend_a_pending_deliveries_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let carol = AccountHome::open(dir.path())
+        .create_account("carol")
+        .unwrap();
+    let (
+        Alice {
+            app,
+            relay,
+            runtime,
+            ..
+        },
+        group,
+    ) = held_founding_wave(&dir).await;
+    crate::tests::remember_test_member_inbox(&app, &carol.account_id_hex, "wss://relay.example");
+    runtime.publish_key_package("carol").await.unwrap();
+
+    let mut listed = read_pending(&runtime).await;
+    let (later_entered, later_release) =
+        relay.hold_next_publish_of_kind(transport_nostr_peeler::KIND_NIP59_GIFT_WRAP);
+    runtime
+        .create_group(
+            "alice",
+            "later wave",
+            std::slice::from_ref(&carol.account_id_hex),
+            None,
+        )
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
+    timeout(SETTLE, later_entered.notified())
+        .await
+        .expect("the later wave reaches its relays");
+    assert!(
+        matches!(listed.try_recv(), Err(oneshot::error::TryRecvError::Empty)),
+        "the read waits for the earlier wave"
+    );
+
+    relay.release_publish();
+    let listed = timeout(SETTLE, listed)
+        .await
+        .expect("the read answers while the later wave is held")
+        .unwrap()
+        .unwrap();
+    assert!(
+        listed
+            .iter()
+            .all(|pending| pending.group_id_hex != hex::encode(group.as_slice())),
+        "the earlier wave delivered its Welcome before the read answered"
+    );
+    assert_eq!(
+        gift_wraps_published(&relay),
+        1,
+        "the later wave is still held"
+    );
+
+    later_release.notify_one();
+    timeout(SETTLE, drain(&runtime).await)
+        .await
+        .unwrap()
+        .unwrap();
     close(&runtime).await;
 }
 
 /// L1: a client replacement during a held wave abandons it on the client
-/// that started it, so a `Drain` waiting for the wave answers. Its Welcome
+/// that started it, so a `Drain` and a pending-deliveries read waiting for
+/// the wave answer. Its Welcome
 /// stays owed, the next client's maintenance sends it, and it reaches the
 /// relays once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -196,6 +282,7 @@ async fn a_client_replacement_abandons_a_held_wave_and_its_welcome_is_sent_once(
     let dir = tempfile::tempdir().unwrap();
     let (Alice { relay, runtime, .. }, _) = held_founding_wave(&dir).await;
     let drained = drain(&runtime).await;
+    let listed = read_pending(&runtime).await;
     let mut events = runtime.subscribe();
     runtime
         .shared_services()
@@ -221,6 +308,11 @@ async fn a_client_replacement_abandons_a_held_wave_and_its_welcome_is_sent_once(
     timeout(SETTLE, drained)
         .await
         .expect("the replacement settles the held wave")
+        .unwrap();
+    timeout(SETTLE, listed)
+        .await
+        .expect("the replacement answers the waiting read")
+        .unwrap()
         .unwrap();
     assert_eq!(gift_wraps_published(&relay), 0);
 
@@ -248,15 +340,30 @@ async fn a_client_replacement_abandons_a_held_wave_and_its_welcome_is_sent_once(
 }
 
 /// L2, shutdown: a held wave doesn't keep the worker from returning, and
-/// its Welcome stays owed. The next start's startup retry sends it.
+/// its Welcome stays owed. A pending-deliveries read waiting for the wave is
+/// answered with the error a queued command gets (W8). The next start's
+/// startup retry sends the Welcome.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shutdown_ends_a_held_wave_and_the_next_start_sends_its_welcome() {
     let dir = tempfile::tempdir().unwrap();
     let (Alice { relay, runtime, .. }, _) = held_founding_wave(&dir).await;
+    let listed = read_pending(&runtime).await;
+    // The worker takes commands in order: once this one answers, it has
+    // taken the read, which waits for the held wave.
+    runtime.publish_key_package("alice").await.unwrap();
     timeout(SETTLE, runtime.shutdown_and_close())
         .await
         .expect("shutdown ends the held wave")
         .unwrap();
+    assert!(
+        matches!(
+            timeout(SETTLE, listed)
+                .await
+                .expect("shutdown answers the read"),
+            Ok(Err(AppError::TransportClosed))
+        ),
+        "the read is answered, not dropped"
+    );
     relay.release_publish();
     assert_eq!(gift_wraps_published(&relay), 0);
 

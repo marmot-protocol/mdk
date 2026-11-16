@@ -545,7 +545,9 @@ async fn a_held_relay_document_in_an_invites_size_check_holds_every_command() {
 /// the relays, a send to another group and a KeyPackage publish answer. The
 /// KeyPackage publish answers too: the wave is not on the worker at all, so
 /// rule 6 has no held step to keep it behind. The worker settles the wave
-/// when the relay answers, and a `Drain` waits for that.
+/// when the relay answers, and a `Drain` waits for that. So does a read of
+/// the pending deliveries (W8), beside the writer: a send answers while it
+/// waits, and it answers with the wave settled.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_held_welcome_wave_holds_no_command() {
     let dir = tempfile::tempdir().unwrap();
@@ -582,24 +584,30 @@ async fn a_held_welcome_wave_holds_no_command() {
         .send(AccountWorkerCommand::Drain { respond })
         .await
         .unwrap();
+    let mut listed = super::welcome_wave_tests::read_pending(&runtime).await;
     // The worker takes commands in order: once a later send answers, it has
-    // taken the Drain, which still waits for the held wave.
+    // taken the Drain and the read, which still wait for the held wave.
     all_answered(vec![send(&runtime, &other)]).await;
     assert!(
         matches!(drained.try_recv(), Err(oneshot::error::TryRecvError::Empty)),
         "a Drain waits for the held wave"
     );
+    assert!(
+        matches!(listed.try_recv(), Err(oneshot::error::TryRecvError::Empty)),
+        "a pending-deliveries read waits for the held wave"
+    );
 
     relay.release_publish();
     timeout(SETTLE, drained).await.unwrap().unwrap();
     assert!(
-        runtime
-            .pending_welcome_deliveries("alice")
+        timeout(SETTLE, listed)
             .await
+            .unwrap()
+            .unwrap()
             .unwrap()
             .iter()
             .all(|pending| pending.group_id_hex != hex::encode(group.as_slice())),
-        "the settled wave delivered the founding Welcome"
+        "the read answers with the settled wave, which delivered the founding Welcome"
     );
     super::welcome_wave_tests::close(&runtime).await;
 }

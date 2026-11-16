@@ -2022,7 +2022,7 @@ async fn run_app_runtime_account_worker(
                         &mut client,
                     );
                     schedule_pending_convergence_groups(&mut scheduled_convergence, &mut client);
-                    welcome_runs.answer_drains(&client);
+                    welcome_runs.answer_waiting(&client, &shared);
                 }
             }
             // Consume completed blobs before admitting more commands.
@@ -2105,7 +2105,15 @@ async fn run_app_runtime_account_worker(
                                 wait.take_up();
                                 // It waits for every Welcome wave started before it.
                                 welcome_runs.adopt(&mut client);
-                                welcome_runs.drain(respond, &client);
+                                welcome_runs.drain(respond, &client, &shared);
+                                continue;
+                            }
+                            AccountWorkerCommand::PendingWelcomeDeliveries { respond } => {
+                                wait.take_up();
+                                // So does a read of what is undelivered (W8):
+                                // it answers with each earlier wave settled.
+                                welcome_runs.adopt(&mut client);
+                                welcome_runs.read_pending_deliveries(respond, &client, &shared);
                                 continue;
                             }
                             #[cfg(test)]
@@ -2550,7 +2558,7 @@ async fn run_app_runtime_account_worker(
                         let transport_account = client.adapter.account_id().clone();
                         // Its Welcome waves belong to this client: settle
                         // each on it, so none reaches the reopened one.
-                        welcome_runs.settle_all(&mut client).await;
+                        welcome_runs.settle_all(&mut client, &shared).await;
                         publish_pending_welcome_delivery_events(
                             &events,
                             &account_id_hex,

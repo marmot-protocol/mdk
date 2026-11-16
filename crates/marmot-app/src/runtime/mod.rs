@@ -4612,7 +4612,10 @@ impl MarmotAppRuntime {
     }
 
     /// Welcomes a confirmed create/invite could not deliver and that still await
-    /// re-delivery for `account_ref` (mdk#352), oldest first.
+    /// re-delivery for `account_ref` (mdk#352), oldest first. The read waits
+    /// for the Welcome deliveries already under way when the account worker
+    /// takes it up (mdk#3466), so after a create or invite returns it reports
+    /// that delivery's first attempt.
     pub async fn pending_welcome_deliveries(
         &self,
         account_ref: &str,

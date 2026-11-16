@@ -622,7 +622,11 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   each wave, a task only publishes it, and the writer settles it as one `WelcomeFanout` unit on the client that
   started it; the create's route sync, warm pass and push-share retry stay on the writer. Device pairing's first link
   (its founding Welcome) and a directly owned `AppClient` await the same prepare, run and settle in place. A settle drops the results of a group
-  the host no longer shows, and a `Drain` answers once every wave started before it has settled. Every task that
+  the host no longer shows, and a `Drain` answers once every wave started before it has settled. A
+  `PendingWelcomeDeliveries` read waits the same way, beside the writer, and answers with the list computed then
+  (W8): a read after a create or invite sees that wave's first attempt settled, as it did when the worker published
+  inline. A wave started after the worker took the read up never extends its wait. Client replacement answers it
+  after `settle_all`, and worker exit answers it with the error a queued command gets. Every task that
   runs beside the writer keeps these:
   - T1: it holds nothing of the writer's: no borrow of the client and no handle on the engine, the session, account
     storage, the published read state or the account's subscriptions. A Welcome run holds the adapter, a clock, its
@@ -1325,7 +1329,7 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   over-budget counts, and the lane's A reader, mdk#3273; observes only, never reorders;
   `account_worker/tests/writer_hold_tests.rs` pins the writer holds that step 3 of the runtime-concurrency pass
   removes; its module doc lists the holds pinned elsewhere or not at all), `account_worker/welcome_runs.rs` (the
-  worker's running Welcome waves and the `Drain`s that wait for them, mdk#3466; `account_worker/tests/welcome_wave_tests.rs`
+  worker's running Welcome waves and the `Drain`s and pending-deliveries reads that wait for them, mdk#3466; `account_worker/tests/welcome_wave_tests.rs`
   owns what the worker decides of a wave), `conversation_window.rs`, `chat_list_window.rs`,
   `presentation.rs`, `presented_chat_list.rs`, `account_attention.rs` (presentation windows and account-switcher
   attention), `chat_list_selection.rs` (select-all IDs and revalidation), `user_blocks.rs`, `moderation.rs` (reports, admin labels and operator moderation reports),
