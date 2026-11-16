@@ -425,13 +425,16 @@ async fn an_upload_in_flight_reads_uploading_from_the_published_state() {
     runtime.shutdown_and_close().await.unwrap();
 }
 
-/// A answers one upload's status from the version's list, so while that list
-/// failed it knows no upload's status: the read asks the worker, whose
-/// single-row read answers an upload the failed list could not reach (mdk#3273
-/// PR 5). Here a row whose timestamp does not decode fails the list, and the
-/// other upload's status still answers.
+/// A answers one upload's status from the version's list, so where the list
+/// cannot give today's answer the read asks the worker, whose single-row read
+/// answers it (mdk#3273 PR 5). First an upload whose image component is text,
+/// which the list does not decode but the worker's read fails on: the list and
+/// the other upload's status still answer from A. Then a row whose timestamp
+/// does not decode fails the list, and the other upload's status still
+/// answers, from the worker.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_status_read_asks_the_worker_while_the_list_failed() {
+async fn a_status_read_the_version_cannot_answer_asks_the_worker() {
+    use crate::AppPreparedGroupImageUploadState::Staged;
     let dir = tempfile::tempdir().unwrap();
     AccountHome::open(dir.path())
         .create_account("alice")
@@ -446,18 +449,18 @@ async fn a_status_read_asks_the_worker_while_the_list_failed() {
     let stage = || runtime.stage_prepared_group_image("alice", one_pixel_png(), "image/png".into());
     let healthy = stage().await.unwrap();
     let broken = stage().await.unwrap();
-    app.account_storage("alice")
-        .unwrap()
-        .app_storage()
-        .execute_batch_for_test(&format!(
-            "UPDATE app_prepared_group_image_upload SET recorded_at = -1 WHERE upload_id = '{}'",
-            broken.upload_id
-        ))
-        .unwrap();
-    // A publish after the write.
-    crate::worker_fences::worker_round_trip(&runtime, "alice")
-        .await
-        .unwrap();
+    // Each corruption, then a publish after it.
+    let corrupt = |set: &str| {
+        app.account_storage("alice")
+            .unwrap()
+            .app_storage()
+            .execute_batch_for_test(&format!(
+                "UPDATE app_prepared_group_image_upload SET {set} WHERE upload_id = '{}'",
+                broken.upload_id
+            ))
+            .unwrap();
+        crate::worker_fences::worker_round_trip(&runtime, "alice")
+    };
     let telemetry = runtime.shared_services().app_performance_telemetry();
     let queued = || {
         telemetry
@@ -468,7 +471,38 @@ async fn a_status_read_asks_the_worker_while_the_list_failed() {
             .unwrap()
             .started
     };
+    let status = |upload_id: &str| runtime.prepared_group_image_status("alice", upload_id.into());
 
+    corrupt("component_data = 'x'").await.unwrap();
+    let before = queued();
+    let mut listed: Vec<_> = runtime
+        .prepared_group_images("alice")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|status| (status.upload_id, status.state))
+        .collect();
+    listed.sort_by(|ours, theirs| ours.0.cmp(&theirs.0));
+    let mut expected = vec![
+        (healthy.upload_id.clone(), Staged),
+        (broken.upload_id.clone(), Staged),
+    ];
+    expected.sort_by(|ours, theirs| ours.0.cmp(&theirs.0));
+    assert_eq!(listed, expected, "the list does not decode the component");
+    assert_eq!(status(&healthy.upload_id).await.unwrap().state, Staged);
+    assert_eq!(
+        queued(),
+        before,
+        "the list and a readable record answer from A"
+    );
+    assert!(matches!(
+        status(&broken.upload_id).await,
+        Err(AppError::Storage(cgka_traits::StorageError::Backend(message)))
+            if message.contains("component_data")
+    ));
+    assert_eq!(queued(), before + 1, "an unreadable record asks the worker");
+
+    corrupt("recorded_at = -1").await.unwrap();
     let before = queued();
     assert!(matches!(
         runtime.prepared_group_images("alice").await,
@@ -477,17 +511,7 @@ async fn a_status_read_asks_the_worker_while_the_list_failed() {
         )))
     ));
     assert_eq!(queued(), before, "the list's failure answers from A");
-    let status = runtime
-        .prepared_group_image_status("alice", healthy.upload_id.clone())
-        .await
-        .unwrap();
-    assert_eq!(
-        (status.upload_id, status.state),
-        (
-            healthy.upload_id,
-            crate::AppPreparedGroupImageUploadState::Staged
-        )
-    );
+    assert_eq!(status(&healthy.upload_id).await.unwrap().state, Staged);
     assert_eq!(queued(), before + 1, "the status read asks the worker");
     runtime.shutdown_and_close().await.unwrap();
 }

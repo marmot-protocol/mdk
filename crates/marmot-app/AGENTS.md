@@ -1218,8 +1218,9 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   class. A storage read counts its failure as the worker's
   `respond_diagnosed` would. `prepared_group_image_status` answers from the version's list of prepared uploads, with
   the worker's in-flight set (`UploadsInFlight`, changed only on the worker) applied at the publish; while that list
-  failed, the worker's read of the one row answers (`read_from_state_where_held`), since another row's failure does
-  not fail it. Moving a read to A moves its row in `read_queue_tests.rs` and in
+  failed, or for an upload whose record the worker's read fails on a column the list does not decode (the list's
+  statement flags it: `prepared_group_image_records_unread`), the worker's read of the one row answers
+  (`read_from_state_where_held`), since another row's failure does not fail it. Moving a read to A moves its row in `read_queue_tests.rs` and in
   `runtime-latency-telemetry.md`'s "Host read classes"; don't move a multi-device read (mdk#2628) without Jeff.
 - The group reads (`read_group_from_state`) answer the same way, with one exception, the hydration request. When the
   version shows a named group awaiting hydration (`GroupAnswers::awaits_hydration`, only during startup's hydration

@@ -138,6 +138,10 @@ pub(crate) struct AccountAnswers {
     /// With the in-flight upload overlay applied: the worker's set as it
     /// stood at the publish, which only the worker changes.
     pub(crate) prepared_group_images: ReadAnswer<Vec<AppPreparedGroupImageUpload>>,
+    /// The listed uploads whose record the worker's status read fails to read
+    /// (a column only it decodes holds another type), from the list's own
+    /// statement: their status goes to the worker. Empty when the list failed.
+    pub(crate) prepared_group_image_records_unread: HashSet<String>,
     pub(crate) started_fresh: ReadAnswer<bool>,
     pub(crate) chat_history_imports: ReadAnswer<Vec<ChatHistoryImport>>,
     /// The account's recovery status, whose notices `HistoryNotices` lists
@@ -158,6 +162,7 @@ impl AccountAnswers {
             backup_restore_status,
             backup_restore_updates,
             prepared_group_images,
+            prepared_group_image_records_unread,
             started_fresh,
             chat_history_imports,
             recovery_status,
@@ -193,6 +198,7 @@ impl AccountAnswers {
                 &other.prepared_group_images,
                 PartialEq::eq,
             )
+            && *prepared_group_image_records_unread == other.prepared_group_image_records_unread
             && same_answer(started_fresh, &other.started_fresh, PartialEq::eq)
             && same_answer(
                 chat_history_imports,
@@ -592,14 +598,22 @@ impl ReadState {
     /// `PreparedGroupImageStatus`: the listed upload's status, or today's
     /// not-found failure for an id the list does not hold. Both storage
     /// reads decode the same status columns, so where both succeed they
-    /// agree. `None` while the list failed: this version then holds no
-    /// answer for one upload, which the worker's read of that one row gives,
-    /// since another row's failure does not fail it.
+    /// agree. `None` while the list failed, or for an upload whose record
+    /// the worker's read fails on a column the list does not decode: this
+    /// version then holds no answer for it, which the worker's read of that
+    /// one row gives, since another row's failure does not fail it.
     pub(crate) fn prepared_group_image_status(
         &self,
         upload_id: &str,
     ) -> Option<ReadAnswer<AppPreparedGroupImageUpload>> {
         let statuses = self.account.prepared_group_images.as_ref().ok()?;
+        if self
+            .account
+            .prepared_group_image_records_unread
+            .contains(upload_id)
+        {
+            return None;
+        }
         Some(
             statuses
                 .iter()
@@ -759,6 +773,7 @@ fn empty_account_answers() -> AccountAnswers {
         backup_restore_status: BackupRestoreStatus::default(),
         backup_restore_updates: watch::channel(BackupRestoreStatus::default()).1,
         prepared_group_images: Ok(Vec::new()),
+        prepared_group_image_records_unread: HashSet::new(),
         started_fresh: Ok(false),
         chat_history_imports: Ok(Vec::new()),
         recovery_status: Ok(Arc::default()),
@@ -1503,6 +1518,14 @@ fn account_answers(
     durably_owned_key_packages: ReadAnswer<Vec<KeyPackage>>,
     recovery_status: ReadAnswer<Arc<AccountRecoveryStatus>>,
 ) -> AccountAnswers {
+    let (prepared_group_images, prepared_group_image_records_unread) =
+        match client.prepared_initial_group_images_with_record_check() {
+            Ok((statuses, unread)) => (
+                Ok(with_uploads_in_flight(statuses, uploads_in_flight)),
+                unread,
+            ),
+            Err(error) => (Err(Arc::new(error)), HashSet::new()),
+        };
     AccountAnswers {
         quarantined_groups: client.quarantined_groups(),
         key_package_maintenance_status: arc_err(client.key_package_maintenance_status()),
@@ -1511,11 +1534,8 @@ fn account_answers(
         maintenance_paused,
         backup_restore_status: client.backup_restore_status(),
         backup_restore_updates: client.watch_backup_restore().receiver,
-        prepared_group_images: arc_err(
-            client
-                .prepared_initial_group_images()
-                .map(|statuses| with_uploads_in_flight(statuses, uploads_in_flight)),
-        ),
+        prepared_group_images,
+        prepared_group_image_records_unread,
         started_fresh: arc_err(client.started_fresh()),
         chat_history_imports: arc_err(client.chat_history_imports()),
         recovery_status,
@@ -2204,12 +2224,21 @@ pub(crate) mod oracle {
                         .pop()
                         .expect("one status in, one out")
                 });
-            // A version whose list failed sends the read to the worker,
-            // whose single read is the live one.
+            // A version whose list failed, or whose list holds the upload
+            // with a record that does not read, sends the read to the
+            // worker, whose single read is the live one.
+            let unread = state
+                .account
+                .prepared_group_image_records_unread
+                .contains(upload_id);
             match state.prepared_group_image_status(upload_id) {
                 Some(published) => {
                     same(window, "prepared group image status", &published, &live);
                 }
+                None if unread => assert!(
+                    live.is_err(),
+                    "a record the version marks unread reads: {live:?}"
+                ),
                 None => assert!(
                     state.account.prepared_group_images.is_err(),
                     "a version with a list answers every upload id"

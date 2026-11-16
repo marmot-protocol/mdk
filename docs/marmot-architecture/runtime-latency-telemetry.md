@@ -177,8 +177,9 @@ read from A also records there the wait of its hydration request: one worker com
 while startup's hydration pipeline has not reached a group the read names. `group_recovery_status`
 answers from A only for a group in the version's mirror: the worker answers any other id, such
 as a locally deleted group, and the read records that wait in R9. `prepared_group_image_status`
-answers from the version's list of prepared uploads: while that list failed, the worker reads the
-one upload instead, and the read records that wait in R1.
+answers from the version's list of prepared uploads: while that list failed, or for an upload
+whose record the worker's read cannot read, the worker reads the one upload instead, and the read
+records that wait in R1.
 
 | Class | Reads |
 | --- | --- |
