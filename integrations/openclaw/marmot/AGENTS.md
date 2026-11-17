@@ -44,14 +44,25 @@ The OpenClaw counterpart of `integrations/hermes/marmot`. Read `README.md` and `
 - `src/sender-policy.ts` — account-global inbound sender ACL (distinct from welcomers).
 - `src/channel.ts` — `createChatChannelPlugin` (meta, capabilities, config, message, security, threading).
 - `index.ts` / `setup-entry.ts` — source entries; package metadata pairs them with built `dist/` runtime entries.
+- `doctor-contract-api.ts` — OpenClaw Doctor contract, built to `dist/doctor-contract-api.js` (the path the host's
+  Doctor loader resolves); declares no state migrations.
 - `src/openclaw-file-access.d.ts` — narrow declarations for the SDK’s public, untyped file-access runtime export.
 - `test/openclaw-loader.ts` — typed test facade over the host’s private loader; no production imports.
 - `scripts/wn-agent-smoketest.ts` — standalone control-plane smoke test (not built or type-checked).
+- `test/packaged-install.ts` — packed-tarball install/upgrade acceptance through the real `openclaw` CLI (run by the
+  release workflow; Node type stripping, not Vitest).
+- `test/release-acceptance.ts` — live tarball acceptance: local relay, `wn-agent`, `wnd` client, OpenClaw gateway,
+  scripted loopback model.
 - `test/` — Vitest unit and connector tests; `test/readme-version.test.ts` requires README.md to state the pinned SDK
   and host minimum derived from `package.json` (keep those README sentences verbatim when editing).
 
 ## Rules
 
+- Declare every agent tool the entry registers in `openclaw.plugin.json` `contracts.tools`; the host rejects
+  undeclared tool registrations. Keep `doctorContract.stateMigrations` identical (ids, order, authority) to the
+  `stateMigrations` export of `doctor-contract-api.ts`, and keep that module free of runtime SDK imports. It is empty
+  because the plugin owns no OpenClaw state; if the plugin ever stores state under OpenClaw's state directory or
+  config, declare and implement a real migration instead.
 - Keep the `openclaw` dependency pinned; before bumping, verify the
   `openclaw/plugin-sdk/*` subpath exports against the new version's types, and
   re-verify the deliberate test-only `dist/plugins/loader.js` import used by the
@@ -78,6 +89,8 @@ just openclaw-dev-test
 just openclaw-host-compat-test
 just openclaw-dev-script-test
 just openclaw-dev-e2e-connector
+just openclaw-packaged-install-test            # after packaging, manifest, or build changes
+just openclaw-release-acceptance <tarball>     # release acceptance; needs Docker
 ```
 
 After changing OpenClaw plugin dependencies, regenerate the committed beta lock

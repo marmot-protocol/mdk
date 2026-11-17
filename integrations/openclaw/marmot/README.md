@@ -286,6 +286,36 @@ installation.
 The installer prints restart guidance for your existing OpenClaw gateway. It
 does not restart OpenClaw automatically.
 
+### Upgrades and provenance
+
+To upgrade, run the installer from the newer `wn-agent-v*` release. OpenClaw's
+`openclaw plugins update` skips archive installs (`Skipping "marmot" (source:
+archive)`), so the installer's verified `openclaw plugins install --force` is
+the supported update route. It keeps `channels.marmot`, the sender and welcomer
+allowlists, and the connector home, and OpenClaw records the new plugin version.
+
+The plugin declares its agent tools in `contracts.tools` and ships an OpenClaw
+Doctor contract, `dist/doctor-contract-api.js`, declared by
+`doctorContract.stateMigrations: []`. The empty list states that the plugin
+owns no OpenClaw state to migrate: `wn-agent` owns its database, and the
+plugin's own files (profile-onboarding status, outbound media staging) stay in
+the connector home. Plugin releases up to 0.17.0 had neither declaration. On
+OpenClaw 2026.10.10 and later, their tools fail registration, and an upgrade
+that finds a pending Doctor inspection stops with `Plugin config repair could
+not be inspected: marmot`. Installing a release with the Doctor contract
+completes that inspection and clears the pending record.
+
+OpenClaw then reports `reason=provenance-invalid; installSource="archive"` for
+the plugin. That is OpenClaw's distribution-trust classification, not a
+checksum result. The installer's SHA256 check proves the archive matches the
+release's published checksum. OpenClaw treats a plugin as trusted only when it
+is listed in OpenClaw's official external plugin catalog and installed from
+that listing's npm package or ClawHub release. The Marmot plugin is distributed
+only as a verified GitHub release archive, so every install carries this
+warning; it does not stop the plugin from loading. Adding `marmot` to
+`plugins.allow` does not change the classification. Removing the warning needs
+an official listing, which is a distribution decision outside this repository.
+
 The following manual example bootstraps a generated local identity. To reuse
 an existing identity instead, follow the connector's
 [identity import instructions](../../../crates/agent-connector/README.md#run-locally)
@@ -718,4 +748,29 @@ cd integrations/openclaw/marmot
 pnpm install
 pnpm typecheck
 pnpm test
+```
+
+Two acceptance scripts exercise a packed release tarball rather than the
+checkout. `test/packaged-install.ts` drives the real `openclaw` CLI in isolated
+OpenClaw state through a fresh install and an upgrade from the published 0.11.0
+tarball with a pending Doctor-inspection record. It checks that both entry
+points load against the linked host SDK and that both tools register without
+contract diagnostics. It also checks the recorded version, that the pending
+record clears, and that the channel config and connector data are unchanged.
+The release workflow runs it on every packed tarball, on the pinned host and on
+OpenClaw 2026.11.4.
+
+`test/release-acceptance.ts` runs the tarball live. It uses a disposable local
+relay (Docker), a real `wn-agent`, a `wnd` White Noise client, and
+`openclaw gateway run` with a scripted loopback model. The agent turn must find
+both Marmot tools through OpenClaw's Tool Search catalog. It then reads
+history, fetches the client's message by exact id, and has an over-long name
+rejected. Finally it renames the disposable group, and its reply and the new
+name must reach the client.
+
+```sh
+just openclaw-packaged-install-test                       # packs the checkout
+just openclaw-packaged-install-test --tarball PATH --host-version 2026.11.4
+just openclaw-release-acceptance PATH                     # needs Docker
+just openclaw-release-acceptance PATH --host-version 2026.11.4
 ```

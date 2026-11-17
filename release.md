@@ -433,6 +433,17 @@ bash scripts/install-goose-marmot.sh --dry-run --yes --allow-welcomer "$sender_h
 bash scripts/install-wn-agent.sh --dry-run --yes --bootstrap --allow-welcomer "$sender_hex"
 ```
 
+The packaging job installs every OpenClaw plugin tarball it packs through the real `openclaw` CLI, as a fresh install
+and as an upgrade from 0.11.0 with a pending Doctor inspection, on the pinned host and OpenClaw 2026.11.4
+(`test/packaged-install.ts`). Before publishing, also run the live acceptance on the release's own tarball, which
+needs Docker. Use a draft cohort (`just release-all-draft <version>`) and its downloaded, checksum-verified
+`openclaw-marmot-plugin-<version>.tgz`, on the pinned host and the newest supported OpenClaw:
+
+```sh
+just openclaw-release-acceptance path/to/openclaw-marmot-plugin-<version>.tgz
+just openclaw-release-acceptance path/to/openclaw-marmot-plugin-<version>.tgz --host-version <newest-openclaw>
+```
+
 Bridge and control logs for all terminal harnesses use the
 `marmot_terminal_harness` tracing target. Include
 `marmot_terminal_harness=debug` in `RUST_LOG`. The former `wn_opencode` target

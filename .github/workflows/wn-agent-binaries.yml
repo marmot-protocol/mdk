@@ -625,6 +625,20 @@ jobs:
           path: dist/openclaw-marmot-plugin/*
           if-no-files-found: error
 
+      # Install the exact tarball through the real `openclaw` CLI: a fresh install and an upgrade from
+      # 0.11.0 with a pending Doctor-inspection record, on the pinned host and the newest verified stable.
+      # Runs after the upload so the unlocked newer-host install cannot touch the published artifact.
+      - name: Install the packaged OpenClaw plugin
+        shell: bash
+        run: |
+          set -euo pipefail
+          asset="$(find "$GITHUB_WORKSPACE/dist/openclaw-marmot-plugin" -maxdepth 1 -type f -name '*.tgz' -print -quit)"
+          cd integrations/openclaw/marmot
+          pinned="$(node -p 'require("./package.json").devDependencies.openclaw')"
+          for host in "$pinned" 2026.11.4; do
+            node test/packaged-install.ts --tarball "$asset" --host-version "$host"
+          done
+
   publish:
     name: Publish wn-agent release
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/wn-agent-v')
