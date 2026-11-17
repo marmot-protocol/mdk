@@ -1,142 +1,170 @@
 ---
 name: review-local
 description: >-
-  Get two independent, read-only reviews of the current branch's local diff
-  from model families other than the author's, before any PR exists. Use from
-  land-change step 2, or when asked to have the other agents review a local
-  change, branch or worktree.
+  Get two independent, read-only reviews of the current branch's committed
+  local diff from the two agent seats that are not you (Codex GPT-6.1 Sol,
+  Claude Opus 5.5, newest Cursor Grok high-fast), before any PR exists, with
+  free Numes models in OpenCode as the fallback when a seat is out of usage.
+  Then answer their findings. Nothing is posted to GitHub. Use from
+  land-change step 2, or when asked for a self-review, a local review, or to
+  have the other agents review a change, branch or worktree.
 ---
 
 # Review a local change
 
-You are the author. Launch the two seats that are not you, collect their
-verdicts, and answer their findings. Reviewers never edit, commit, push or
-post; the only thing a review produces is its final message.
+You are the author. Do not review your own change. Launch the two seats that
+are not you, collect their verdicts, and answer their findings. Reviewers
+never edit, commit, push or post; the only thing a review produces is its
+final message.
+
+Nothing goes to GitHub. The round covers one commit on your machine.
 
 ## Seats
 
 | Seat | Model |
 | --- | --- |
-| Codex | `gpt-6.1-sol` |
-| Claude | `claude-opus-5-5` (not the `opus` alias) |
-| Cursor | the newest `grok-*-high-fast` in `agent --list-models` |
+| `codex` | `gpt-6.1-sol` |
+| `claude` | `claude-opus-5-5` (not the `opus` alias) |
+| `cursor` | the newest `grok-*-high-fast` in `agent --list-models`, resolved at launch |
+| `opencode` | fallback only, through `numes run opencode`: the first of Kimi K3.1 Pro, GLM 5.3 Flash, DeepSeek V4.1 Flash, Nemotron 3 Ultra (all `:free`, `#high`) that finishes with a verdict |
 
-Your seat is your host product. If you cannot tell which it is, ask. If a
-teammate's setup lacks one of these CLIs, any reviewer from another model
-family can take that seat.
+Your seat is your **host product**, not the model in this session:
+
+- Codex → launch `claude` and `cursor`
+- Claude → launch `cursor` and `codex`
+- Cursor → launch `claude` and `codex`
+- OpenCode, or any other builder → launch the two seats outside your
+  session's model family: on a GPT model `claude` and `cursor`, on a Claude
+  model `cursor` and `codex`, otherwise `claude` and `codex`
+
+If you cannot tell which host you are in, ask. Do not guess. If a seat's CLI
+is missing or not logged in, stop and tell the user. Do not improvise a
+launch: the restrictions live only in `scripts/launch-review.sh`. A teammate
+without one of these CLIs adds a seat there, from another model family and
+with equivalent restrictions.
+
+**Fallback.** When a seat cannot run because its product is out of usage (its
+log shows a usage or rate limit, or the user tells you it is out), use
+`opencode` in its place. If you are OpenCode yourself, use the one seat not
+yet in the round when it is outside your model family; otherwise stop. Tell the
+user which seat you replaced and why. If the other seat already finished on
+the same `HEAD_SHA`, its verdict stands: prepare a round with the replacement
+alone (`prepare-round.sh opencode --context ...`). The `opencode` seat tries
+its models in order and moves to the next only when one exits nonzero or ends
+without a verdict; the review's first line names the model that answered, and
+`opencode.log` records each attempt.
 
 ## What this protects against
 
-The setup below keeps a reviewer that follows its instructions from changing
-anything by accident, and keeps the two reviews independent: each seat reads
-only its own copy of the inputs and its own checkout, and no seat is shown the
-other's output. It does not contain a reviewer that deliberately works around
-it, for example by changing file permissions or writing outside its checkout;
-that would need an OS sandbox or a container. The end-of-round check is a
-tripwire for accidental writes, not proof that nothing was written.
+Each seat works in its own throwaway checkout of one commit, reads only its
+own read-only copy of the inputs, and is never shown the other
+seat's output. Every launch strips write tools and MCP servers (see the
+comments in `scripts/launch-review.sh`). The end-of-round check catches
+accidental writes. It is a tripwire, not a sandbox: a reviewer that
+deliberately changes file modes or writes outside its checkout would need an
+OS sandbox or a container to stop it.
+
+## Scripts
+
+All four live in `scripts/` next to this file. Call each as **one bare
+command** with its absolute path and literal arguments: no `$VARS`, pipes,
+redirects or command substitution. That keeps them inside simple permission
+allow rules, so a launch does not stall on a prompt.
+
+| Script | Does |
+| --- | --- |
+| `prepare-round.sh <seat-a> [<seat-b>] [--context file] [--notes file] [--base ref]` | Fetches, finds the merge-base with the default branch, makes each seat's checkout and read-only input (diff, context, guidelines, prompt), and prints `REVIEW_DIR`, `OUT_DIR`, `BASE`, `HEAD_SHA` |
+| `launch-review.sh <seat> <review-dir> <out-dir>` | Runs one seat with its restriction flags. Review → `<out-dir>/<seat>.md`, stamped with the seat and model; log → `<out-dir>/<seat>.log` |
+| `check-seat.sh <seat> <review-dir> <out-dir> <exit-code>` | Decides one seat: exit 0, a final `VERDICT:` line, and a checkout with no writes |
+| `cleanup-round.sh <review-dir>` | Removes the round's checkouts and inputs |
 
 ## Prepare a round
 
-From the repository root, with `<seat-a>` and `<seat-b>` the two seats you
-launch (`codex`, `claude` or `cursor`):
+**Commit first.** `prepare-round.sh` refuses to run with uncommitted or
+untracked files, so every verdict covers exactly what you will ship.
+
+**Write the context.** Reviewers judge whether the change should exist, not
+only whether the code is right, so they need to know what it is for. Write a
+short file in your scratch space: the issue (`gh issue view <n> --comments`)
+or the user's request, plus any constraints they gave, and the designs you
+considered with why you chose one. Then, from the repository:
 
 ```sh
-git fetch origin master
-REVIEW_DIR="$(mktemp -d "${TMPDIR:-/tmp}/review-local.XXXXXX")"
-OUT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/review-out.XXXXXX")"
-BASE="$(git merge-base HEAD origin/master)"
-HEAD_SHA="$(git rev-parse HEAD)"
-for seat in <seat-a> <seat-b>; do
-  git worktree add --detach "$REVIEW_DIR/$seat" "$HEAD_SHA"
-  mkdir "$REVIEW_DIR/$seat-input"
-  git diff "$BASE" HEAD > "$REVIEW_DIR/$seat-input/change.diff"
-done
+bash /abs/repo/.agents/skills/review-local/scripts/prepare-round.sh claude codex --context /abs/context.md
 ```
 
-Each seat works in its own throwaway checkout of `HEAD_SHA`, never in your
-worktree. The round covers exactly that commit, and you can keep working while
-it runs. Commit before you review; uncommitted changes are not in the round.
-Each seat's output goes to `$OUT_DIR`, which no reviewer is given.
+The prompt tells each reviewer to read the repo's `AGENTS.md`/`CLAUDE.md`
+files, then:
 
-Write `$REVIEW_DIR/<seat>-input/prompt.md` for each seat from this template,
-then make the inputs read-only with `chmod -R a-w "$REVIEW_DIR/<seat>-input"`:
+1. **Question the need**: is the change needed now, does it treat a symptom
+   rather than the root cause, is there a smaller change (including none)?
+2. **Review the code** for real defects.
+3. **Judge simplicity** against [karpathy-guidelines.md](karpathy-guidelines.md)
+   and [simplicity-guidelines.md](simplicity-guidelines.md): fewer lines, net
+   deletions, no needless abstraction, duplication, dead code or drive-by
+   changes.
 
-```text
-Review a change to the mdk repository before it is merged. Your working
-directory is a checkout of the head commit. The change is the diff in
-<REVIEW_DIR>/<seat>-input/change.diff (base <BASE>, head <HEAD_SHA>).
-Read AGENTS.md and the nearest AGENTS.md for every file the diff touches, then
-read the surrounding code you need. Do not edit files, commit, push or post
-anything.
+Each finding has a severity, `file:line`, a failure scenario or cost, and a
+fix. The review ends in `VERDICT: merge` or `VERDICT: changes-needed`.
 
-Report real defects only: wrong behavior, broken AGENTS.md invariants, missing
-or wrong tests for changed behavior, torn multi-step state changes,
-privacy-unsafe logging, security problems. Skip style nits.
-
-For each finding give severity (blocker, should-fix, minor), file:line, a
-concrete failure scenario, and a suggested fix.
-
-<Later rounds only: the previous round's findings and the author's response
-to each — fixed in <sha>, or rejected and why. Say whether each is resolved.>
-
-End with exactly one line: VERDICT: merge or VERDICT: changes-needed
-```
+For a later round, write the previous findings and your answer to each
+(fixed in `<sha>`, or rejected and why) to a file in your scratch space, and
+pass it as `--notes`. The base defaults to `origin/HEAD`.
 
 ## Launch
 
-Start your two seats in parallel, each as its own background job, and keep
-each PID. Each seat writes its review to `$OUT_DIR/<seat>.md`:
+Start both seats in parallel, each as its own background task that your host
+tracks, so you are notified when each exits and you get its exit code:
 
 ```sh
-# Codex: the read-only sandbox blocks writes; --ignore-user-config drops the
-# MCP servers in ~/.codex/config.toml, which run outside the sandbox.
-codex exec --ignore-user-config -s read-only -m gpt-6.1-sol -C "$REVIEW_DIR/codex" \
-  -o "$OUT_DIR/codex.md" - < "$REVIEW_DIR/codex-input/prompt.md" > "$OUT_DIR/codex.log" 2>&1
-
-# Claude: --restricted ignores personal settings, --tools leaves only read
-# tools, and --strict-mcp-config drops every MCP server and claude.ai connector.
-(cd "$REVIEW_DIR/claude" && claude -p --restricted --tools Read Grep Glob --strict-mcp-config \
-  --add-dir "$REVIEW_DIR/claude-input" --model claude-opus-5-5 \
-  < "$REVIEW_DIR/claude-input/prompt.md") > "$OUT_DIR/claude.md" 2> "$OUT_DIR/claude.log"
-
-# Cursor: ask mode inside the sandbox; ask mode also refuses MCP tools that
-# write. Take the model id from `agent --list-models`.
-agent -p --mode ask --sandbox enabled --trust --workspace "$REVIEW_DIR/cursor" \
-  --add-dir "$REVIEW_DIR/cursor-input" --model <grok-*-high-fast> --output-format text \
-  "$(cat "$REVIEW_DIR/cursor-input/prompt.md")" > "$OUT_DIR/cursor.md" 2> "$OUT_DIR/cursor.log"
+bash /abs/repo/.agents/skills/review-local/scripts/launch-review.sh claude /abs/review-dir /abs/out-dir
+bash /abs/repo/.agents/skills/review-local/scripts/launch-review.sh codex  /abs/review-dir /abs/out-dir
 ```
 
-Keep every restriction flag. Checked on 2026-10-17 and 2026-10-18:
+Tell the user which two seats you started, `HEAD_SHA`, and `OUT_DIR`. You can
+keep working in your own worktree while they run; the round is pinned to
+`HEAD_SHA`.
 
-- Without `--restricted --tools`, the Claude reviewer could write into the
-  checkout. Without `--strict-mcp-config`, it still had the user's MCP servers
-  and claude.ai connectors (Drive, Docs, Sheets, Gmail), which edit or share
-  outside the checkout.
-- Without `--sandbox enabled`, the Cursor reviewer could write into the
-  checkout. In ask mode it refused a writing MCP tool call.
-- Without `--ignore-user-config`, the Codex reviewer had a JavaScript REPL
-  MCP server that is not covered by its read-only sandbox.
+A quiet log while a seat runs is normal: these CLIs buffer until they exit.
+If a log already shows a fatal error (bad model id, auth, usage limit), kill
+that seat and count it as failed. Kill and fail any seat still running 30
+minutes after launch. Thirty minutes is a ceiling, not a wait.
 
 ## Collect
 
-A seat succeeded when all three hold:
+Decide each seat as soon as it exits; do not hold one decision for the other:
 
-- its process exited 0;
-- `$OUT_DIR/<seat>.md` ends with a `VERDICT:` line;
-- `git -C "$REVIEW_DIR/<seat>" status --porcelain --ignored=matching` prints
-  nothing. A fresh checkout has no ignored files, so this also catches writes
-  to ignored paths such as `target/` or `reviews/`.
+```sh
+bash /abs/repo/.agents/skills/review-local/scripts/check-seat.sh claude /abs/review-dir /abs/out-dir <exit-code>
+```
 
-Anything else is a failure, whatever the verdict says. Report the seat, the exit
-code, a log excerpt, and any paths it wrote, then check that seat's launch
-flags. A quiet log while the process runs is normal. Kill and count as failed
-any seat still running after 30 minutes.
+Anything but `OK` is a failure, whatever the review says. Tell the user right
+away: the seat, the reason, the log excerpt and any paths it wrote. Then
+check that seat's launch flags.
 
-If one seat fails, rerun it once in a fresh checkout. If it fails again, stop
-and tell the person who asked for the change; one review is not enough to land.
+If a seat fails, rerun it once in a fresh round (one that is out of usage
+goes to its fallback instead). If it fails again, stop and tell the user; one
+review is not enough.
 
-When a seat is decided, remove its checkout with
-`git worktree remove --force "$REVIEW_DIR/<seat>"`. When the round is over,
-remove the rest with `chmod -R u+w "$REVIEW_DIR" && rm -rf "$REVIEW_DIR"`.
-Then answer the findings as `land-change` step 2 describes, and start the next
-round from "Prepare a round" with new directories.
+When both seats are decided, run `cleanup-round.sh` on `REVIEW_DIR`. Keep
+`OUT_DIR` until you have answered the findings.
+
+## Answer the findings
+
+Read `<out-dir>/<seat>.md` for both seats. Do not ask the user which findings
+to take.
+
+- Check each finding's premise before acting on it: run the test it says
+  fails, build what it says does not compile, read the code it cites.
+- Fix what is real, surgically. Rerun the tests the fix touches, and commit.
+- When you reject a finding, write down why, with the evidence. That goes in
+  the next round's `--notes`.
+- Skip noise: informational notes and nits not worth a code change.
+
+**Standalone** (the user asked for a review): do one round and one answer
+pass, then stop and report each seat's verdict, what you fixed, and what you
+rejected and why. Do not start another round unless asked.
+
+**From land-change**: repeat rounds until both seats say `VERDICT: merge` on
+the same head commit, following land-change's review step, including its rules
+for when review does not converge.
