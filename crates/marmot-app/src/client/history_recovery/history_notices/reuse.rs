@@ -74,7 +74,10 @@ impl RecoveryAnswer {
     ) -> Self {
         let recorder = Recorder::new(facts);
         let status = match &read {
-            Ok(read) => Ok(Arc::new(read.account_status(&recorder))),
+            Ok(read) => read
+                .account_status(&recorder)
+                .map(Arc::new)
+                .map_err(Arc::new),
             Err(error) => Err(Arc::clone(error)),
         };
         let (groups, facts_reusable) = recorder.finish();

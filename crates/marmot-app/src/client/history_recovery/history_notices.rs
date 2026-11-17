@@ -8,6 +8,7 @@
 //! notice needs evidence that messages are missing or an action that helps,
 //! and the runner probes its broken units quietly (mdk#3308).
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::{Arc, atomic::AtomicBool, atomic::Ordering};
 
 use cgka_traits::GroupId;
 use marmot_session::ChangeStamp;
@@ -132,6 +133,9 @@ pub(crate) struct RecoveryRead {
     catching_up: BTreeSet<Vec<u8>>,
     inbox_catching_up: bool,
     survey: SurveyMark,
+    /// Terminal close can interrupt a later fact read, whose visibility
+    /// check fails closed. Do not report that as a successful omission.
+    storage_closed: Arc<AtomicBool>,
 }
 
 /// One group's occurrences in a [`RecoveryRead`], before any [`GroupFacts`]
@@ -181,8 +185,11 @@ impl RecoveryRead {
     /// The account's recovery status: its notices, and the groups and inbox
     /// the runner's last survey found catching up. Until a runner has
     /// surveyed, nothing is.
-    pub(crate) fn account_status(&self, facts: &dyn GroupFacts) -> AccountRecoveryStatus {
-        AccountRecoveryStatus {
+    pub(crate) fn account_status(
+        &self,
+        facts: &dyn GroupFacts,
+    ) -> Result<AccountRecoveryStatus, AppError> {
+        let status = AccountRecoveryStatus {
             notices: self.notices(facts),
             catching_up_group_ids_hex: self
                 .catching_up
@@ -191,7 +198,18 @@ impl RecoveryRead {
                 .map(hex::encode)
                 .collect(),
             inbox_catching_up: self.inbox_catching_up,
+        };
+        // Check after the facts: terminal close runs off the account worker
+        // and can turn their storage failures into false visibility midway
+        // through this read (mdk#3451). The interrupted read must fail as
+        // closed, rather than succeed with fewer groups or notices.
+        if self.storage_closed.load(Ordering::Acquire) {
+            return Err(cgka_traits::StorageError::Closed(
+                "account recovery status unavailable: app storage is closed".to_owned(),
+            )
+            .into());
         }
+        Ok(status)
     }
 
     /// The group's notice ids: its own parked occurrences oldest first, the
@@ -240,7 +258,7 @@ impl AppClient {
 
     /// The account's recovery status ([`RecoveryRead::account_status`]).
     pub(crate) fn account_recovery_status(&self) -> Result<AccountRecoveryStatus, AppError> {
-        Ok(self.read_recovery()?.account_status(&LiveFacts(self)))
+        self.read_recovery()?.account_status(&LiveFacts(self))
     }
 
     /// Read what the recovery answers come from ([`RecoveryRead`]). The
@@ -303,6 +321,7 @@ impl AppClient {
             catching_up,
             inbox_catching_up,
             survey: SurveyMark(survey),
+            storage_closed: Arc::clone(&self.app.storage_closed),
         })
     }
 
