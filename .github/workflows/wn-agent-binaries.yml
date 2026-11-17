@@ -625,15 +625,48 @@ jobs:
           path: dist/openclaw-marmot-plugin/*
           if-no-files-found: error
 
-      # Install the exact tarball through the real `openclaw` CLI: a fresh install and an upgrade from
-      # 0.11.0 with a pending Doctor-inspection record, on the pinned host and the newest verified stable.
-      # Runs after the upload so the unlocked newer-host install cannot touch the published artifact.
+
+  # Install the exact uploaded tarball through the real `openclaw` CLI: a fresh install and an upgrade
+  # from 0.11.0 with a pending Doctor-inspection record, on the pinned host and the newest verified
+  # stable. A separate job reads the uploaded artifact, so the unlocked newer-host install never runs
+  # where the artifact is produced, and has its own time budget.
+  openclaw-plugin-install:
+    needs: openclaw-plugin
+    name: Install packaged OpenClaw plugin
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.source_sha }}
+
+      - name: Install OpenClaw Node runtime
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: "24.22.1"
+
+      - name: Install pinned pnpm
+        uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa # v4
+        with:
+          version: "10.13.1"
+
+      - name: Download OpenClaw plugin tarball
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: openclaw-marmot-plugin
+          path: ${{ runner.temp }}/openclaw-marmot-plugin
+
       - name: Install the packaged OpenClaw plugin
         shell: bash
         run: |
           set -euo pipefail
-          asset="$(find "$GITHUB_WORKSPACE/dist/openclaw-marmot-plugin" -maxdepth 1 -type f -name '*.tgz' -print -quit)"
+          asset="$(find "$RUNNER_TEMP/openclaw-marmot-plugin" -maxdepth 1 -type f -name '*.tgz' -print -quit)"
+          ( cd "$(dirname "$asset")" && shasum -a 256 -c "$(basename "$asset").sha256" )
           cd integrations/openclaw/marmot
+          pnpm install --frozen-lockfile
           pinned="$(node -p 'require("./package.json").devDependencies.openclaw')"
           for host in "$pinned" 2026.11.4; do
             node test/packaged-install.ts --tarball "$asset" --host-version "$host"
@@ -649,6 +682,7 @@ jobs:
       - plugin
       - hermes-marmot-integration
       - openclaw-plugin
+      - openclaw-plugin-install
     timeout-minutes: 15
     permissions:
       actions: read
@@ -916,6 +950,7 @@ jobs:
       - plugin
       - hermes-marmot-integration
       - openclaw-plugin
+      - openclaw-plugin-install
     timeout-minutes: 20
     permissions:
       actions: read
