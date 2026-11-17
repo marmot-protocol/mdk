@@ -11,13 +11,16 @@ if [[ $# -ne 1 ]]; then
   exit 2
 fi
 
-review_dir=$1
+review_dir=${1%/}
 tmp_root="${TMPDIR:-/tmp}"
 tmp_root="${tmp_root%/}"
-case "$review_dir" in
-  "$tmp_root"/review-local.* | /tmp/review-local.* | /private/tmp/review-local.* | \
-    /var/folders/*/review-local.* | /private/var/folders/*/review-local.*) ;;
-  *) echo "refusing to remove $review_dir: not a review-local round" >&2; exit 2 ;;
+# Only a round directory itself: a mktemp name directly under a temp root.
+# Checking the parent also refuses a seat checkout and any `..` path.
+refuse() { echo "refusing to remove $review_dir: not a review-local round" >&2; exit 2; }
+case "$(basename "$review_dir")" in review-local.??????) ;; *) refuse ;; esac
+case "$(dirname "$review_dir")" in
+  "$tmp_root" | /tmp | /private/tmp | /var/folders/*/T | /private/var/folders/*/T) ;;
+  *) refuse ;;
 esac
 
 git_dir=""

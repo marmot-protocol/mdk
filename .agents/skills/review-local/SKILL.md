@@ -33,7 +33,9 @@ Your seat is your **host product**, not the model in this session:
 - Codex → launch `claude` and `cursor`
 - Claude → launch `cursor` and `codex`
 - Cursor → launch `claude` and `codex`
-- OpenCode, or any other builder → launch `claude` and `codex`
+- OpenCode, or any other builder → launch the two seats outside your
+  session's model family: on a GPT model `claude` and `cursor`, on a Claude
+  model `cursor` and `codex`, otherwise `claude` and `codex`
 
 If you cannot tell which host you are in, ask. Do not guess. If a seat's CLI
 is missing or not logged in, stop and tell the user. Do not improvise a
