@@ -50,6 +50,16 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   for one exact emoji. Both removal commands return
   `MARMOT_STATUS_REACTION_NOT_FOUND` (132) for a local no-match; refresh
   authoritative state before treating absence as convergence (#1963).
+
+- `marmot_attachment_removals` and additive `MarmotAttachmentBodyRemoval`,
+  `MarmotAttachmentBodyRemovalState`, and `MarmotAttachmentBodyRemovalPage`
+  types expose durable bounded removal identities for derivative caches
+  (mdk#3491). Cursor input is a borrowed nullable string. Copy the returned
+  cursor before freeing the page with `marmot_body_removal_page_free`,
+  which deep-frees its array and strings. Reset responses require full cache
+  reconciliation before saving their captured cursor; journal states never
+  authorize byte reads. Use matching generated headers and libraries.
+
 - `marmot_group_pending_commit` returns a `MarmotGroupPendingCommit` (free with
   `marmot_group_pending_commit_free`) for the group's own commit that has not
   confirmed yet, with `MarmotGroupPendingCommitState` (mdk#2332). Group changes

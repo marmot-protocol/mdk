@@ -419,6 +419,16 @@ typedef enum MarmotAttachmentMigrationState {
   MARMOT_ATTACHMENT_MIGRATION_STATE_COMPACTING,
 } MarmotAttachmentMigrationState;
 
+/**
+ * Historical body-loss reason, not current byte-read authorization.
+ */
+typedef enum MarmotAttachmentBodyRemovalState {
+  MARMOT_ATTACHMENT_BODY_REMOVAL_STATE_CLEANED_BY_SETTING,
+  MARMOT_ATTACHMENT_BODY_REMOVAL_STATE_REMOVED,
+  MARMOT_ATTACHMENT_BODY_REMOVAL_STATE_COMPLETED_UNRETAINED,
+  MARMOT_ATTACHMENT_BODY_REMOVAL_STATE_UNAVAILABLE,
+} MarmotAttachmentBodyRemovalState;
+
 typedef enum MarmotAvatarAvailability {
   MARMOT_AVATAR_AVAILABILITY_MISSING,
   MARMOT_AVATAR_AVAILABILITY_READY,
@@ -2431,6 +2441,30 @@ typedef struct MarmotRetainedAttachmentsPage {
   uintptr_t attachments_len;
   struct MarmotRetainedAttachmentsCursor *next_cursor;
 } MarmotRetainedAttachmentsPage;
+
+/**
+ * Source-slot identity borrowed from its containing removal page.
+ */
+typedef struct MarmotAttachmentBodyRemoval {
+  char *group_id_hex;
+  char *message_id_hex;
+  char *source_message_id_hex;
+  uint32_t attachment_index;
+  enum MarmotAttachmentBodyRemovalState state;
+} MarmotAttachmentBodyRemoval;
+
+/**
+ * Owned durable removal page; free only with
+ * marmot_body_removal_page_free, including its strings and array.
+ * Copy next_cursor before freeing if it will be persisted or reused.
+ */
+typedef struct MarmotAttachmentBodyRemovalPage {
+  struct MarmotAttachmentBodyRemoval *removals;
+  uintptr_t removals_len;
+  char *next_cursor;
+  bool reset_required;
+  bool has_more;
+} MarmotAttachmentBodyRemovalPage;
 
 /**
  * One individual authenticated reaction.
@@ -8420,6 +8454,35 @@ MarmotStatus marmot_set_attachment_keep_media(const struct MarmotClient *client,
                                               const char *account_ref,
                                               uint32_t keep,
                                               uint64_t *out_removed);
+
+/**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
+void marmot_body_removal_page_free(struct MarmotAttachmentBodyRemovalPage *ptr);
+
+/**
+ * Local durable body-removal journal; limit is 1..=256. Cursor is a
+ * borrowed nullable string. NULL captures the current high water with
+ * reset_required=true and no records. Reconcile the derivative cache before
+ * persisting that captured cursor. Invalidated cursors also require reset.
+ * Otherwise evict returned identities idempotently, persist next_cursor,
+ * and continue while has_more. Historical states never authorize byte reads.
+ * Blocking; call off the UI thread. Free with
+ * marmot_body_removal_page_free.
+ * # Safety
+ * Client and account string must be live, cursor NULL or a live string,
+ * and out writable. Inputs are borrowed only for the duration of the call.
+ */
+MarmotStatus marmot_attachment_removals(const struct MarmotClient *client,
+                                        const char *account_ref,
+                                        const char *cursor,
+                                        uint32_t limit,
+                                        struct MarmotAttachmentBodyRemovalPage **out);
 
 /**
  * Read every effective sender/emoji pair for one visible message, off the UI thread.

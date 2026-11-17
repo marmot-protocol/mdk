@@ -402,11 +402,190 @@ pub unsafe extern "C" fn marmot_set_attachment_keep_media(
     })
 }
 
+c_enum! {
+    /// Historical body-loss reason, not current byte-read authorization.
+    MarmotAttachmentBodyRemovalState from AttachmentBodyRemovalStateFfi {
+        CleanedBySetting,
+        Removed,
+        CompletedUnretained,
+        Unavailable,
+    }
+}
+
+c_mirror! {
+    /// Source-slot identity borrowed from its containing removal page.
+    MarmotAttachmentBodyRemoval from AttachmentBodyRemovalFfi {
+        str group_id_hex,
+        str message_id_hex,
+        str source_message_id_hex,
+        copy attachment_index: u32,
+        copy state: MarmotAttachmentBodyRemovalState,
+    }
+}
+
+impl std::fmt::Debug for MarmotAttachmentBodyRemoval {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MarmotAttachmentBodyRemoval")
+            .field("state", &self.state)
+            .finish_non_exhaustive()
+    }
+}
+
+c_mirror! {
+    /// Owned durable removal page; free only with
+    /// marmot_body_removal_page_free, including its strings and array.
+    /// Copy next_cursor before freeing if it will be persisted or reused.
+    MarmotAttachmentBodyRemovalPage from AttachmentBodyRemovalPageFfi,
+    free marmot_body_removal_page_free {
+        vec removals/removals_len: MarmotAttachmentBodyRemoval,
+        str next_cursor,
+        copy reset_required: bool,
+        copy has_more: bool,
+    }
+}
+
+impl std::fmt::Debug for MarmotAttachmentBodyRemovalPage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MarmotAttachmentBodyRemovalPage")
+            .field("removal_count", &self.removals_len)
+            .field("reset_required", &self.reset_required)
+            .field("has_more", &self.has_more)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Local durable body-removal journal; limit is 1..=256. Cursor is a
+/// borrowed nullable string. NULL captures the current high water with
+/// reset_required=true and no records. Reconcile the derivative cache before
+/// persisting that captured cursor. Invalidated cursors also require reset.
+/// Otherwise evict returned identities idempotently, persist next_cursor,
+/// and continue while has_more. Historical states never authorize byte reads.
+/// Blocking; call off the UI thread. Free with
+/// marmot_body_removal_page_free.
+/// # Safety
+/// Client and account string must be live, cursor NULL or a live string,
+/// and out writable. Inputs are borrowed only for the duration of the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_attachment_removals(
+    client: *const MarmotClient,
+    account_ref: *const c_char,
+    cursor: *const c_char,
+    limit: u32,
+    out: *mut *mut MarmotAttachmentBodyRemovalPage,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { preflight_out_ptr(out) });
+        let client = try_arg!(unsafe { client_ref(client) });
+        let account = try_arg!(unsafe { required_str(account_ref) });
+        let cursor = try_arg!(unsafe { optional_str(cursor) });
+        unsafe {
+            deliver(
+                client.block_on(client.marmot.attachment_removals(account, cursor, limit)),
+                out,
+            )
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::memory::{audit, boxed};
     use std::ptr;
+
+    #[test]
+    fn body_removal_page_owns_fields() {
+        let _guard = audit::test_lock();
+        #[cfg(feature = "alloc-audit")]
+        let before = audit::live_allocations();
+        let states = [
+            AttachmentBodyRemovalStateFfi::CleanedBySetting,
+            AttachmentBodyRemovalStateFfi::Removed,
+            AttachmentBodyRemovalStateFfi::CompletedUnretained,
+            AttachmentBodyRemovalStateFfi::Unavailable,
+        ];
+        let page: MarmotAttachmentBodyRemovalPage = AttachmentBodyRemovalPageFfi {
+            removals: states
+                .into_iter()
+                .map(|state| AttachmentBodyRemovalFfi {
+                    group_id_hex: "ab".repeat(16),
+                    message_id_hex: "cd".repeat(32),
+                    source_message_id_hex: "ef".repeat(32),
+                    attachment_index: 7,
+                    state,
+                })
+                .collect(),
+            next_cursor: "durable-cursor".into(),
+            reset_required: false,
+            has_more: true,
+        }
+        .into();
+        assert_eq!(page.removals_len, 4);
+        assert!(!page.reset_required && page.has_more);
+        assert_eq!(
+            format!("{page:?}"),
+            "MarmotAttachmentBodyRemovalPage { removal_count: 4, reset_required: false, has_more: true, .. }"
+        );
+        unsafe {
+            assert_eq!(
+                std::ffi::CStr::from_ptr(page.next_cursor).to_str().unwrap(),
+                "durable-cursor"
+            );
+            for (index, removal) in std::slice::from_raw_parts(page.removals, page.removals_len)
+                .iter()
+                .enumerate()
+            {
+                assert_eq!(removal.state as u32, index as u32);
+                assert_eq!(
+                    std::ffi::CStr::from_ptr(removal.group_id_hex)
+                        .to_str()
+                        .unwrap(),
+                    "ab".repeat(16)
+                );
+                assert_eq!(
+                    std::ffi::CStr::from_ptr(removal.message_id_hex)
+                        .to_str()
+                        .unwrap(),
+                    "cd".repeat(32)
+                );
+                assert_eq!(
+                    std::ffi::CStr::from_ptr(removal.source_message_id_hex)
+                        .to_str()
+                        .unwrap(),
+                    "ef".repeat(32)
+                );
+                assert_eq!(removal.attachment_index, 7);
+                assert_eq!(
+                    format!("{removal:?}"),
+                    format!(
+                        "MarmotAttachmentBodyRemoval {{ state: {:?}, .. }}",
+                        removal.state
+                    )
+                );
+            }
+            marmot_body_removal_page_free(boxed(page));
+            let reset: MarmotAttachmentBodyRemovalPage = AttachmentBodyRemovalPageFfi {
+                removals: Vec::new(),
+                next_cursor: "captured-high-water".into(),
+                reset_required: true,
+                has_more: false,
+            }
+            .into();
+            assert!(reset.removals.is_null());
+            assert_eq!(reset.removals_len, 0);
+            assert!(reset.reset_required && !reset.has_more);
+            assert_eq!(
+                std::ffi::CStr::from_ptr(reset.next_cursor)
+                    .to_str()
+                    .unwrap(),
+                "captured-high-water"
+            );
+            marmot_body_removal_page_free(boxed(reset));
+            marmot_body_removal_page_free(ptr::null_mut());
+        }
+        #[cfg(feature = "alloc-audit")]
+        assert_eq!(audit::live_allocations(), before);
+    }
 
     /// NULL inputs are refused before any work; pages and their borrowed
     /// cursors deep-free; a live client reads an empty account.

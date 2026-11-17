@@ -1025,6 +1025,11 @@ async fn keep_media_cleans_past_the_window_at_once() {
     // The fixture message was received at 10, long before any window.
     seed_file_backed(&app, &store, &[6u8; 8192]);
     let runtime = app.runtime();
+    let baseline = runtime
+        .attachment_removals("alice", None, 64)
+        .await
+        .unwrap();
+    assert!(baseline.reset_required);
     let group = GroupId::new(vec![0xab; 16]);
     assert_eq!(
         runtime.attachment_keep_media("alice").await.unwrap(),
@@ -1065,7 +1070,40 @@ async fn keep_media_cleans_past_the_window_at_once() {
         status.state,
         crate::AttachmentTransferState::CleanedBySetting
     );
+    let removals = runtime
+        .attachment_removals("alice", Some(baseline.next_cursor.clone()), 64)
+        .await
+        .unwrap();
+    assert!(!removals.reset_required);
+    assert!(!removals.has_more);
+    assert_eq!(removals.removals.len(), 1);
+    let removed = &removals.removals[0];
+    assert_eq!(removed.group_id_hex, GROUP);
+    assert_eq!(removed.message_id_hex, target().message_id_hex);
+    assert_eq!(
+        removed.source_message_id_hex,
+        target().source_message_id_hex
+    );
+    assert_eq!(removed.attachment_index, 0);
+    assert_eq!(
+        removed.state,
+        crate::AttachmentBodyRemovalState::CleanedBySetting
+    );
     runtime.shutdown_and_close().await.unwrap();
+
+    let reopened = MarmotApp::with_relay(dir.path(), "wss://relay.example").runtime();
+    let replay = reopened
+        .attachment_removals("alice", Some(baseline.next_cursor), 64)
+        .await
+        .unwrap();
+    assert_eq!(replay, removals);
+    let caught_up = reopened
+        .attachment_removals("alice", Some(replay.next_cursor), 64)
+        .await
+        .unwrap();
+    assert!(!caught_up.reset_required);
+    assert!(caught_up.removals.is_empty());
+    reopened.shutdown_and_close().await.unwrap();
 }
 
 // Moving legacy bodies into the media store (mdk#2314 step 6).

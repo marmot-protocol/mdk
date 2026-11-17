@@ -9620,7 +9620,8 @@ pub use storage_sqlite::{
 pub use storage_sqlite::{ContentReport, ContentReportPage, ReportDismissal, ReportDismissalPage};
 
 pub use runtime::{
-    AttachmentAssetRef, AttachmentAutomaticPermission, AttachmentCategory, AttachmentControl,
+    AttachmentAssetRef, AttachmentAutomaticPermission, AttachmentBodyRemoval,
+    AttachmentBodyRemovalPage, AttachmentBodyRemovalState, AttachmentCategory, AttachmentControl,
     AttachmentDownloadPolicy, AttachmentEntry, AttachmentHistoryCursor, AttachmentHistoryVersion,
     AttachmentLocalTarget, AttachmentPage, AttachmentPageRead, AttachmentRole,
     AttachmentTransferState, AttachmentTransferStatus, AutomaticAttachmentRequest,
