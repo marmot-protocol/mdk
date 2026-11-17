@@ -581,6 +581,11 @@ pub enum MarmotKitError {
     ConversationWindowMessageNotRetained,
     #[error("invalid app component: {details}")]
     InvalidAppComponent { details: String },
+    /// No active reaction matches in the local projection; nothing was published.
+    /// Hosts may treat absence as convergence after refreshing authoritative state.
+    /// This result does not establish that other devices have caught up.
+    #[error("no matching reaction to remove")]
+    ReactionNotFound,
 }
 
 impl From<AppError> for MarmotKitError {
@@ -625,6 +630,7 @@ impl From<&AppError> for MarmotKitError {
             AppError::CannotReportSelf => Self::CannotReportSelf,
             AppError::ModerationReportRateLimited => Self::ModerationReportRateLimited,
             AppError::InvalidEditTarget => Self::InvalidEditTarget,
+            AppError::ReactionNotFound => Self::ReactionNotFound,
             AppError::ProductAnalytics(marmot_app::ProductAnalyticsError::ConsentRequired) => {
                 Self::ConsentRequired
             }
@@ -1242,6 +1248,19 @@ mod tests {
         assert!(matches!(
             MarmotKitError::from(AppError::InvalidEditTarget),
             MarmotKitError::InvalidEditTarget
+        ));
+    }
+
+    #[test]
+    fn reaction_absence_stays_typed() {
+        let error = AppError::ReactionNotFound;
+        assert!(matches!(
+            MarmotKitError::from(&error),
+            MarmotKitError::ReactionNotFound
+        ));
+        assert!(matches!(
+            MarmotKitError::from(error),
+            MarmotKitError::ReactionNotFound
         ));
     }
 

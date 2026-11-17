@@ -1,6 +1,7 @@
 import Foundation
 import MarmotKit
 import XCTest
+import marmot_uniffiFFI
 
 // Test-only plaintext storage. Keep the same instance when reopening its root.
 private final class MemorySecretStore: SecretStore, @unchecked Sendable {
@@ -127,12 +128,91 @@ final class NativeHostSmoke: XCTestCase {
     .filter { $0.plaintext == text && $0.sender == aliceId.accountIdHex }
     XCTAssertEqual(delivered.count, 1)
 
+    print("Native host smoke: scoped reaction removal")
+    let target = try XCTUnwrap(delivered.first).messageIdHex
+    func reactions(_ kit: Marmot) throws -> [TimelineUserReactionFfi] {
+      try kit.messageReactions(
+        accountRef: aliceId.label, groupIdHex: group, messageIdHex: target)
+    }
+    func reactionIds(_ values: [TimelineUserReactionFfi]) -> Set<String> {
+      Set(values.map(\.reactionMessageIdHex))
+    }
+    for emoji in ["👍", "❤️"] {
+      _ = try await alice.reactToMessage(
+        accountRef: aliceId.label, groupIdHex: group, targetMessageId: target, emoji: emoji)
+    }
+    _ = try await bob.reactToMessage(
+      accountRef: bobId.label, groupIdHex: group, targetMessageId: target, emoji: "👍")
+    try await waitUntil("Alice reaction projection") { try reactions(alice).count == 3 }
+    let staleHostReactions = try reactions(alice)
+    try await expectReactionNotFound {
+      _ = try await alice.unreactFromMessageMatching(
+        accountRef: aliceId.label, groupIdHex: group, targetMessageId: target, emoji: "🔥")
+    }
+    XCTAssertEqual(reactionIds(try reactions(alice)), reactionIds(staleHostReactions))
+    let preserved = staleHostReactions.filter {
+      !($0.sender == aliceId.accountIdHex && $0.emoji == "👍")
+    }
+    _ = try await alice.unreactFromMessageMatching(
+      accountRef: aliceId.label, groupIdHex: group, targetMessageId: target, emoji: "👍")
+    XCTAssertEqual(reactionIds(try reactions(alice)), reactionIds(preserved))
+    XCTAssertTrue(
+      staleHostReactions.contains {
+        $0.sender == aliceId.accountIdHex && $0.emoji == "👍"
+      })
+    try await expectReactionNotFound {
+      _ = try await alice.unreactFromMessageMatching(
+        accountRef: aliceId.label, groupIdHex: group, targetMessageId: target, emoji: "👍")
+    }
+
+    func makeRemovalHandle() -> UInt64 {
+      uniffi_marmot_uniffi_fn_method_marmot_unreact_from_message_matching(
+        alice.uniffiClonePointer(), lowerNativeString(aliceId.label),
+        lowerNativeString(group), lowerNativeString(target), lowerNativeString("❤️"))
+    }
+    // No poll means the Tokio wrapper has not admitted any work.
+    let unpolled = makeRemovalHandle()
+    cancelAndFreeNative(unpolled)
+    XCTAssertEqual(reactionIds(try reactions(alice)), reactionIds(preserved))
+
+    // One poll starts the real operation. Observe its effect before cancellation;
+    // neither task creation nor an elapsed delay proves native admission.
+    let bobOnly = staleHostReactions.filter { $0.sender == bobId.accountIdHex }
+    let admitted = makeRemovalHandle()
+    do {
+      defer { cancelAndFreeNative(admitted) }
+      ffi_marmot_uniffi_rust_future_poll_rust_buffer(admitted, { _, _ in }, 0)
+      try await waitUntil("Native removal before cancellation") {
+        try reactionIds(reactions(alice)) == reactionIds(bobOnly)
+      }
+    }
+    XCTAssertEqual(reactionIds(try reactions(alice)), reactionIds(bobOnly))
+    try await expectReactionNotFound {
+      _ = try await alice.unreactFromMessageMatching(
+        accountRef: aliceId.label, groupIdHex: group, targetMessageId: target, emoji: "❤️")
+    }
+
+    for emoji in ["👍", "❤️"] {
+      _ = try await alice.reactToMessage(
+        accountRef: aliceId.label, groupIdHex: group, targetMessageId: target, emoji: emoji)
+    }
+    XCTAssertEqual(try reactions(alice).count, 3)
+    _ = try await alice.unreactFromMessage(
+      accountRef: aliceId.label, groupIdHex: group, targetMessageId: target)
+    XCTAssertEqual(reactionIds(try reactions(alice)), reactionIds(bobOnly))
+
     print("Native host smoke: close and reopen Alice with retained store")
     try await alice.shutdownAndClose()
     XCTAssertTrue(alice.storageIsClosed())
     let reopened = try open(root: aliceRoot, relay: relay, store: aliceStore)
     _ = try await reopened.start()
     XCTAssertEqual(try reopened.listAccounts().map(\.accountIdHex), [aliceId.accountIdHex])
+    // The host's retained snapshot still contains the removed reaction.
+    try await expectReactionNotFound {
+      _ = try await reopened.unreactFromMessageMatching(
+        accountRef: aliceId.label, groupIdHex: group, targetMessageId: target, emoji: "👍")
+    }
+    XCTAssertEqual(reactionIds(try reactions(reopened)), reactionIds(bobOnly))
     // Continued delivery proves retained keys can reopen encrypted account state.
     let reply = "Synthetic message after root reuse"
     _ = try await reopened.sendText(accountRef: aliceId.label, groupIdHex: group, text: reply)
@@ -143,6 +223,29 @@ final class NativeHostSmoke: XCTestCase {
     try await reopened.shutdownAndClose()
     try await bob.shutdownAndClose()
     print("Native host smoke: delivery and root reuse passed")
+  }
+
+  private func expectReactionNotFound(_ operation: () async throws -> Void) async throws {
+    do {
+      try await operation()
+      XCTFail("Missing reaction removal succeeded")
+    } catch MarmotKitError.ReactionNotFound {
+    }
+  }
+
+  private func lowerNativeString(_ value: String) -> RustBuffer {
+    Array(value.utf8).withUnsafeBufferPointer { bytes in
+      var status = RustCallStatus()
+      let buffer = ffi_marmot_uniffi_rustbuffer_from_bytes(
+        ForeignBytes(len: Int32(bytes.count), data: bytes.baseAddress), &status)
+      precondition(status.code == 0, "Native argument allocation failed")
+      return buffer
+    }
+  }
+
+  private func cancelAndFreeNative(_ handle: UInt64) {
+    ffi_marmot_uniffi_rust_future_cancel_rust_buffer(handle)
+    ffi_marmot_uniffi_rust_future_free_rust_buffer(handle)
   }
 
   private func open(root: URL, relay: String, store: MemorySecretStore) throws -> Marmot {

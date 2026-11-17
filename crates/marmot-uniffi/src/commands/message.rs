@@ -148,6 +148,31 @@ impl Marmot {
         Ok(summary.into())
     }
 
+    /// Remove all of this account's active reactions whose content exactly matches
+    /// `emoji`, preserving its other emoji and other accounts' reactions.
+    /// Returns `ReactionNotFound` when the local projection has no matching event.
+    /// Refresh authoritative state before treating that result as convergence;
+    /// it does not establish that other devices have caught up.
+    pub async fn unreact_from_message_matching(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+        target_message_id: String,
+        emoji: String,
+    ) -> Result<SendSummaryFfi, MarmotKitError> {
+        let group_id = group_id_from_hex(&group_id_hex)?;
+        let summary = self
+            .runtime
+            .unreact_from_message_matching(
+                &account_ref,
+                &group_id,
+                &target_message_id,
+                Some(&emoji),
+            )
+            .await?;
+        Ok(summary.into())
+    }
+
     /// Send `text` as a reply that quotes `target_message_id`.
     pub async fn reply_to_message(
         &self,

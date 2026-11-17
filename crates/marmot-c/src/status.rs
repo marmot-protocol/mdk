@@ -236,6 +236,9 @@ pub enum MarmotStatus {
     /// take another change; MDK keeps sending it. Retry once it confirms;
     /// `marmot_group_pending_commit` shows where it stands (mdk#2332).
     GroupCommitPending = 131,
+    /// No active reaction matches locally. Refresh authoritative state before
+    /// treating absence as convergence; other devices may not have caught up.
+    ReactionNotFound = 132,
 }
 
 thread_local! {
@@ -423,6 +426,7 @@ pub(crate) fn status_from_error(err: &MarmotKitError) -> MarmotStatus {
         MarmotKitError::AccountWorkerResponseTimedOut => {
             MarmotStatus::AccountWorkerResponseTimedOut
         }
+        MarmotKitError::ReactionNotFound => MarmotStatus::ReactionNotFound,
     }
 }
 
@@ -631,6 +635,7 @@ mod tests {
             MarmotKitError::GroupCommitPending {
                 group_id_hex: "aa".into(),
             },
+            MarmotKitError::ReactionNotFound,
             MarmotKitError::MemberNotInGroup {
                 group_id_hex: "aa".into(),
                 member_id_hex: "bb".into(),
@@ -807,6 +812,14 @@ mod tests {
                 group_id_hex: "aa".into(),
             }) as i32,
             131
+        );
+        assert_eq!(
+            status_from_error(&MarmotKitError::ReactionNotFound) as i32,
+            132
+        );
+        assert_eq!(
+            take_last_error().as_deref(),
+            Some("no matching reaction to remove")
         );
         assert_eq!(
             status_from_error(&MarmotKitError::GroupRecoverySourceMismatch {

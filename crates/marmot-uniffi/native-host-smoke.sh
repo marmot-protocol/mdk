@@ -53,7 +53,7 @@ let package = Package(
     targets: [
         .systemLibrary(name: "marmot_uniffiFFI"),
         .target(name: "MarmotKit", dependencies: ["marmot_uniffiFFI"]),
-        .testTarget(name: "MarmotKitTests", dependencies: ["MarmotKit"]),
+        .testTarget(name: "MarmotKitTests", dependencies: ["MarmotKit", "marmot_uniffiFFI"]),
     ],
     swiftLanguageVersions: [.v5]
 )

@@ -38,6 +38,10 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ### Added
 
+- `marmot_unreact_matching` removes the account's active events
+  for one exact emoji. Both removal commands return
+  `MARMOT_STATUS_REACTION_NOT_FOUND` (132) for a local no-match; refresh
+  authoritative state before treating absence as convergence (#1963).
 - `marmot_group_pending_commit` returns a `MarmotGroupPendingCommit` (free with
   `marmot_group_pending_commit_free`) for the group's own commit that has not
   confirmed yet, with `MarmotGroupPendingCommitState` (mdk#2332). Group changes

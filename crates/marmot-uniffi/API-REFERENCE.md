@@ -2987,6 +2987,24 @@ Remove all of this account's active reactions from `target_message_id`.
 
 [Source](src/commands/message.rs#L137)
 
+### `Marmot::unreact_from_message_matching`
+
+**Current.**
+
+```rust
+pub async fn unreact_from_message_matching( &self, account_ref: String, group_id_hex: String, target_message_id: String, emoji: String, ) -> Result<SendSummaryFfi, MarmotKitError>
+```
+
+Remove every locally observed active reaction event by the account whose content
+exactly matches `emoji`, including duplicate events from its other devices.
+Other emoji and other accounts' reactions remain. `ReactionNotFound` means the
+local projection has no match; refresh authoritative state before treating
+absence as an idempotent convergence outcome. It does not establish that other
+devices or pending deliveries have caught up. An admitted runtime command may
+finish after cancellation, so refresh before retrying.
+
+[Source](src/commands/message.rs#L156)
+
 ### `Marmot::reply_to_message`
 
 **Current.**
@@ -2997,7 +3015,7 @@ pub async fn reply_to_message( &self, account_ref: String, group_id_hex: String,
 
 Send `text` as a reply that quotes `target_message_id`.
 
-[Source](src/commands/message.rs#L152)
+[Source](src/commands/message.rs#L177)
 
 ### `Marmot::delete_message`
 
@@ -3009,7 +3027,7 @@ pub async fn delete_message( &self, account_ref: String, group_id_hex: String, t
 
 Mark `target_message_id` deleted for the whole group. This is a tombstone — the original stays in everyone's store; clients render a "message deleted" placeholder.
 
-[Source](src/commands/message.rs#L170)
+[Source](src/commands/message.rs#L195)
 
 ### `Marmot::discard_failed_send`
 
@@ -3021,7 +3039,7 @@ pub async fn discard_failed_send( &self, account_ref: String, group_id_hex: Stri
 
 Remove a failed own send from this device without publishing anything. Offer it, instead of `delete_message`, on a row whose `invalidation_status` is `local_publish_failed`: a delete would tell the group about a message nobody received. `Discarded` securely deletes the row, its edits and its media references, and timeline subscribers receive the row's removal with reason `Cleared`; purge `media_ciphertext_sha256` from any decrypted-media cache. `erasure_pending` means secure WAL truncation is still owed; the next secure delete in the group retries it. `StillSending` means the group has a send the engine may still publish, which could be this one, so nothing changed: keep the row and offer the action again later. `NotFailedSend` means the row was delivered, is still pending, was confirmed by a peer's reaction, or is already gone.
 
-[Source](src/commands/message.rs#L191)
+[Source](src/commands/message.rs#L216)
 
 ### `Marmot::secure_delete_expired`
 
@@ -3033,7 +3051,7 @@ pub async fn secure_delete_expired( &self, account_ref: String, group_id_hex: St
 
 Securely scrub and prune expired disappearing-message plaintext for a group according to its active retention component. The media hash list identifies pruned encrypted-media blobs so host apps can purge their own decrypted-media disk caches keyed by ciphertext hash.
 
-[Source](src/commands/message.rs#L209)
+[Source](src/commands/message.rs#L234)
 
 ### `Marmot::sweep_expired_retention`
 
@@ -3045,7 +3063,7 @@ pub async fn sweep_expired_retention( &self, account_ref: String, now_ms: u64, )
 
 Run the engine-owned disappearing-message sweep for one account using the supplied Unix wall-clock time in milliseconds. Each group reports pruning, a fail-closed deferral, or a privacy-safe failure category.
 
-[Source](src/commands/message.rs#L225)
+[Source](src/commands/message.rs#L250)
 
 ### `Marmot::edit_message`
 
@@ -3057,7 +3075,7 @@ pub async fn edit_message( &self, account_ref: String, group_id_hex: String, tar
 
 Edit `target_message_id` by publishing a kind-1009 event that references it and carries the replacement plaintext in `content`. Recipients honour the edit only when its authenticated author matches the target's author; MDK ignores mismatched edits. It returns `InvalidEditTarget`, publishing nothing, unless the target is an available chat message this account sent. Competing edits resolve by `created_at`, then the larger event id.
 
-[Source](src/commands/message.rs#L249)
+[Source](src/commands/message.rs#L274)
 
 ### `Marmot::send_custom_event`
 
@@ -3069,7 +3087,7 @@ pub async fn send_custom_event( &self, account_ref: String, group_id_hex: String
 
 Send an app-defined event with an arbitrary non-reserved kind. `tags` and `content` pass through verbatim; kinds MDK owns (chat, reaction, edit, delete, agent, group system, push token, device group: 457, 458, 459, 460, 461, 473, 475, 476) are rejected so an app cannot forge protocol events. Custom events appear in the timeline as standalone rows and can be fetched via `Marmot::messages` with a `kinds` filter.
 
-[Source](src/commands/message.rs#L270)
+[Source](src/commands/message.rs#L295)
 
 ### `Marmot::create_tagged_poll`
 
@@ -3081,7 +3099,7 @@ pub async fn create_tagged_poll( &self, account_ref: String, group_id_hex: Strin
 
 Create the same encrypted NIP-88 poll as `create_poll`, adding reply `e`, NIP-22 `E`/`K`/`P`, or effect context on the same event. Rejects `imeta`, `option`, `polltype`, `endsAt`, and `response` context rows. Generated poll tags plus context must total at most 32; context also follows the tagged-text bounds of 64 tags and 16 KiB of values. Poll replies project the same reply target and preview as chat messages. See [Polls](POLLS.md) for question, option, deadline and vote semantics. The original `create_poll` remains available without context.
 
-[Source](src/commands/message.rs#L316)
+[Source](src/commands/message.rs#L341)
 
 ### `Marmot::create_poll`
 
@@ -3097,7 +3115,7 @@ poll projection. Creation follows MDK's canonical conversation classification: n
 groups, while unnamed two-member conversations are direct. Polls are neither anonymous nor election-grade. See
 [Polls](POLLS.md).
 
-[Source](src/commands/message.rs#L288)
+[Source](src/commands/message.rs#L313)
 
 ### `Marmot::cast_poll_vote`
 
@@ -3112,7 +3130,7 @@ or one through ten unique ids for multiple choice; use the ids from `TimelineMes
 This is a replacement, not a delta or unvote. MDK revalidates the poll against the response event's actual timestamp at
 send time, and an accepted open poll remains votable after conversation reclassification. See [Polls](POLLS.md).
 
-[Source](src/commands/message.rs#L343)
+[Source](src/commands/message.rs#L368)
 
 ### `Marmot::message_reactions`
 
@@ -3153,7 +3171,7 @@ pub fn messages( &self, account_ref: String, group_id_hex: Option<String>, limit
 
 Initial history fetch for a group (or, when `group_id_hex` is None, the account-wide tail). Used to populate the conversation view before the subscription stream takes over.
 
-[Source](src/commands/message.rs#L364)
+[Source](src/commands/message.rs#L389)
 
 </details>
 

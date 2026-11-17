@@ -5,9 +5,10 @@ use std::time::Duration;
 
 use marmot_account::AccountHome;
 use marmot_app::{
-    MarmotApp, MarmotAppConfig, MarmotAppEvent, RuntimeTimelineMessagesSubscription,
-    TimelineMessageQuery, TimelinePage,
+    AppError, AppMessageQuery, MarmotApp, MarmotAppConfig, MarmotAppEvent,
+    RuntimeTimelineMessagesSubscription, TimelineMessageQuery, TimelinePage,
 };
+use nostr_relay_builder::prelude::{MemoryDatabase, MemoryDatabaseOptions, RelayBuilder};
 
 #[path = "support/limited_relay.rs"]
 mod limited_relay;
@@ -172,14 +173,235 @@ async fn members_share_real_activity_targets_and_reactions_after_reopen() {
     }
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scoped_reactions_after_reopen() {
+    storage_sqlite::relax_storage_for_test_process();
+    let (_relay, url) = limited_relay::relay_publishing_with(
+        RelayBuilder::default().database(MemoryDatabase::with_opts(MemoryDatabaseOptions {
+            events: true,
+            max_events: Some(256),
+        })),
+        Some(500),
+    )
+    .await;
+    let alice_dir = tempfile::tempdir().unwrap();
+    let bob_dir = tempfile::tempdir().unwrap();
+    let sibling_dir = tempfile::tempdir().unwrap();
+    let alice_id = AccountHome::open(alice_dir.path())
+        .create_account("alice")
+        .unwrap()
+        .account_id_hex;
+    let bob_home = AccountHome::open(bob_dir.path());
+    let bob_id = bob_home.create_account("bob").unwrap().account_id_hex;
+    AccountHome::open(sibling_dir.path())
+        .import_account("bob", &bob_home.reveal_nsec("bob").unwrap())
+        .unwrap();
+    let alice_app = open(&alice_dir, &url);
+    let bob_app = open(&bob_dir, &url);
+    let sibling_app = open(&sibling_dir, &url);
+    let mut alice_client = alice_app.client("alice").await.unwrap();
+    let mut bob_client = bob_app.client("bob").await.unwrap();
+    let mut sibling_client = sibling_app.client("bob").await.unwrap();
+    bob_client.publish_key_package().await.unwrap();
+    sibling_client.publish_key_package().await.unwrap();
+    let group = alice_client
+        .create_group("scoped reactions", &[&bob_id])
+        .await
+        .unwrap()
+        .operation
+        .expect("both account devices have published KeyPackages");
+    for client in [&mut bob_client, &mut sibling_client] {
+        client.sync().await.unwrap();
+        client.accept_group_invite(&group).unwrap();
+    }
+    let target = alice_client
+        .send(&group, b"target")
+        .await
+        .unwrap()
+        .message_ids[0]
+        .clone();
+    for client in [&mut bob_client, &mut sibling_client] {
+        client.sync().await.unwrap();
+    }
+    // Directly owned clients project incoming events only when driven. Both
+    // devices therefore add from a local view that has no account reaction.
+    let first = bob_client
+        .react_to_message(&group, &target, "👍")
+        .await
+        .unwrap();
+    // Inner event ids include the account, content and authored second. Wait
+    // for a different second so independent device sends cannot hash alike.
+    let authored = nostr_sdk::prelude::Timestamp::now();
+    let mut clock = tokio::time::interval(Duration::from_millis(10));
+    while nostr_sdk::prelude::Timestamp::now() == authored {
+        clock.tick().await;
+    }
+    let second = sibling_client
+        .react_to_message(&group, &target, "👍")
+        .await
+        .unwrap();
+    assert_ne!(first.message_ids, second.message_ids);
+    alice_client
+        .react_to_message(&group, &target, "👍")
+        .await
+        .unwrap();
+    bob_client
+        .react_to_message(&group, &target, "❤️")
+        .await
+        .unwrap();
+    for client in [&mut alice_client, &mut bob_client, &mut sibling_client] {
+        client.sync().await.unwrap();
+    }
+    drop((alice_client, bob_client, sibling_client));
+    let alice = alice_app.runtime();
+    let bob = bob_app.runtime();
+    let sibling = sibling_app.runtime();
+    for runtime in [&alice, &bob, &sibling] {
+        runtime.start().await.unwrap();
+    }
+    let group_hex = hex::encode(group.as_slice());
+    let query = TimelineMessageQuery {
+        group_id_hex: Some(group_hex.clone()),
+        ..Default::default()
+    };
+    let mut timelines = Vec::new();
+    for (runtime, label) in [(&alice, "alice"), (&bob, "bob"), (&sibling, "bob")] {
+        timelines.push(
+            runtime
+                .subscribe_timeline_messages(label, query.clone())
+                .await
+                .unwrap(),
+        );
+    }
+    let initial = [
+        (alice_id.as_str(), "👍"),
+        (bob_id.as_str(), "👍"),
+        (bob_id.as_str(), "👍"),
+        (bob_id.as_str(), "❤️"),
+    ];
+    for timeline in &mut timelines {
+        wait_for_reactions(timeline, &initial).await;
+    }
+    let removed = bob
+        .unreact_from_message_matching("bob", &group, &target, Some("👍"))
+        .await
+        .unwrap();
+    assert_eq!(removed.message_ids.len(), 1);
+    let deletion = bob_app
+        .message_by_id("bob", &group_hex, &removed.message_ids[0])
+        .unwrap()
+        .unwrap();
+    assert_eq!(deletion.kind, 5);
+    let mut deleted: Vec<_> = deletion
+        .tags
+        .iter()
+        .filter(|tag| tag.first().is_some_and(|name| name == "e"))
+        .map(|tag| tag[1].clone())
+        .collect();
+    deleted.sort();
+    let mut expected_ids = vec![first.message_ids[0].clone(), second.message_ids[0].clone()];
+    expected_ids.sort();
+    assert_eq!(deleted, expected_ids);
+    let remaining = [(alice_id.as_str(), "👍"), (bob_id.as_str(), "❤️")];
+    for timeline in &mut timelines {
+        wait_for_reactions(timeline, &remaining).await;
+    }
+    assert!(matches!(
+        bob.unreact_from_message_matching("bob", &group, &target, Some("👍"))
+            .await,
+        Err(AppError::ReactionNotFound)
+    ));
+
+    bob.react_to_message("bob", &group, &target, "👍")
+        .await
+        .unwrap();
+    let before_offline = [
+        (alice_id.as_str(), "👍"),
+        (bob_id.as_str(), "❤️"),
+        (bob_id.as_str(), "👍"),
+    ];
+    for timeline in &mut timelines {
+        wait_for_reactions(timeline, &before_offline).await;
+    }
+    let saved_host_page = timelines[1].take_snapshot();
+    bob.shutdown_and_close().await.unwrap();
+    sibling
+        .unreact_from_message_matching("bob", &group, &target, Some("👍"))
+        .await
+        .unwrap();
+    let added = sibling
+        .react_to_message("bob", &group, &target, "🔥")
+        .await
+        .unwrap();
+    let after_offline = [
+        (alice_id.as_str(), "👍"),
+        (bob_id.as_str(), "❤️"),
+        (bob_id.as_str(), "🔥"),
+    ];
+    wait_for_reactions(&mut timelines[0], &after_offline).await;
+    wait_for_reactions(&mut timelines[2], &after_offline).await;
+
+    let reopened_app = open(&bob_dir, &url);
+    let stored = reopened_app
+        .timeline_messages_with_query("bob", query.clone())
+        .unwrap();
+    assert_eq!(reactions(&stored), reactions(&saved_host_page));
+    assert!(reactions(&saved_host_page).contains(&(bob_id.as_str(), "👍")));
+    let reopened = reopened_app.runtime();
+    reopened.start().await.unwrap();
+    let mut refreshed = reopened
+        .subscribe_timeline_messages("bob", query)
+        .await
+        .unwrap();
+    wait_for_reactions(&mut refreshed, &after_offline).await;
+    let events = || {
+        reopened_app
+            .messages_with_query(
+                "bob",
+                AppMessageQuery {
+                    group_id_hex: Some(group_hex.clone()),
+                    kinds: Some(vec![5, 7]),
+                    limit: None,
+                },
+            )
+            .unwrap()
+    };
+    let before_retry = events();
+    for _ in 0..2 {
+        assert!(matches!(
+            reopened
+                .unreact_from_message_matching("bob", &group, &target, Some("👍"))
+                .await,
+            Err(AppError::ReactionNotFound)
+        ));
+        let retried = reopened
+            .react_to_message("bob", &group, &target, "🔥")
+            .await
+            .unwrap();
+        assert_eq!(retried.published, 0);
+        assert_eq!(retried.message_ids, added.message_ids);
+    }
+    assert_eq!(
+        events(),
+        before_retry,
+        "retries create neither reactions nor deletions"
+    );
+    wait_for_reactions(&mut refreshed, &after_offline).await;
+    for runtime in [&alice, &sibling, &reopened] {
+        runtime.shutdown_and_close().await.unwrap();
+    }
+}
+
 /// The `(sender, emoji)` reactions on the timeline's one row.
 fn reactions(page: &TimelinePage) -> Vec<(&str, &str)> {
-    page.messages[0]
+    let mut reactions: Vec<_> = page.messages[0]
         .reactions
         .user_reactions
         .iter()
         .map(|reaction| (reaction.sender.as_str(), reaction.emoji.as_str()))
-        .collect()
+        .collect();
+    reactions.sort_unstable();
+    reactions
 }
 
 /// Wait until the live timeline shows exactly `expected`. A timeline also
@@ -189,6 +411,8 @@ async fn wait_for_reactions(
     timeline: &mut RuntimeTimelineMessagesSubscription,
     expected: &[(&str, &str)],
 ) {
+    let mut expected = expected.to_vec();
+    expected.sort_unstable();
     tokio::time::timeout(Duration::from_secs(15), async {
         while reactions(&timeline.take_snapshot()) != expected {
             timeline.recv().await.unwrap();
