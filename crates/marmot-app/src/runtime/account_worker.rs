@@ -1853,6 +1853,7 @@ async fn run_app_runtime_account_worker(
         // Take the scheduled sign-in check the last unit asked for, and
         // read again for a host check whose read a replacement dropped.
         if let Some(settled) = sign_in_reads.adopt(&mut client) {
+            maintenance_due_dirty = true;
             finish_sign_in_check(
                 &mut client,
                 settled,
@@ -2141,6 +2142,9 @@ async fn run_app_runtime_account_worker(
             ended = welcome_runs.next(), if welcome_runs.is_running() => {
                 if let Some(ended) = ended {
                     let _unit = unit.enter(WorkerUnit::WelcomeFanout);
+                    // A settled wave records its deliveries and their
+                    // retries, which session maintenance can owe.
+                    maintenance_due_dirty = true;
                     if welcome_runs.settle(&mut client, ended).await {
                         client
                             .retry_pending_push_registration_shares_best_effort()
@@ -2234,6 +2238,8 @@ async fn run_app_runtime_account_worker(
             read = sign_in_reads.next(), if sign_in_reads.is_running() => {
                 let _unit = unit.enter(WorkerUnit::Maintenance);
                 let settled = sign_in_reads.settle(&mut client, read).await;
+                // The continuation can replace this device's KeyPackage.
+                maintenance_due_dirty = true;
                 finish_sign_in_check(&mut client, settled, &shared, &events, &account_id_hex, &account_label);
             }
             command = async {

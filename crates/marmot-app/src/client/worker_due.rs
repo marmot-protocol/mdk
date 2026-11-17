@@ -214,7 +214,7 @@ impl AppClient {
                 None => reinvite_owed = true,
             }
         }
-        // Device groups are unreleased: their passes keep the 15 s check.
+        // While device groups are on, their passes keep the 15 s check.
         if unrecoverable
             || group_unread
             || reinvite_owed
