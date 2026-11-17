@@ -1357,9 +1357,23 @@ Conversation windows continue to supply their bounded identity dictionary.
 Use the existing reaction commands with the activity row's `messageIdHex`.
 Authenticated system rows retain that deterministic ID across reaction changes,
 replay and restart; the same timeline record exposes both `groupSystem` and
-`reactions`. Retraction uses the existing unreact command, and subscriptions
+`reactions`. Retraction uses the reaction-removal commands, and subscriptions
 update the target row without adding a second activity row. Do not synthesize or
 send a kind-1210 event to react to local group activity.
+
+`unreactFromMessageMatching(accountRef, groupIdHex, targetMessageId, emoji)`
+removes every active reaction event by that account whose content exactly matches
+`emoji`, including duplicates from its other devices already observed locally.
+Other emoji and other accounts' reactions remain. `unreactFromMessage` removes
+all of the account's active emoji reactions on the target.
+
+Both removal commands return `MarmotKitError.ReactionNotFound` when MDK's local
+projection has no matching active event. Refresh the conversation's authoritative
+state before treating absence as an idempotent convergence outcome. A local
+no-match does not establish that other devices or pending deliveries have caught
+up. Cancellation also requires a refresh: an admitted account-worker command can
+complete after the host stops waiting. Keep reaction selection in MDK rather than
+reconstructing deletions from cached event IDs.
 
 Reaction notifications use the supported system payload's text fallback, never
 its JSON envelope. Only the stored target sender receives an alert; activity

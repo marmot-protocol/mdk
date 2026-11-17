@@ -15,6 +15,11 @@
 
 ### Added
 
+- `unreactFromMessageMatching(accountRef, groupIdHex, targetMessageId, emoji)`
+  removes the account's active events for one exact emoji without removing its
+  other emoji. Both removal commands expose `MarmotKitError.ReactionNotFound`
+  for a local no-match; refresh authoritative state before treating it as
+  convergence (#1963).
 - `groupPendingCommit(accountRef, groupIdHex)` returns `GroupPendingCommitFfi`, or nil, for the group's own commit
   that has not confirmed yet, with `GroupPendingCommitStateFfi` `Sending` or `Stuck` (mdk#2332). Group changes fail
   with the new `MarmotKitError::GroupCommitPending { groupIdHex }` while it is pending; handle it where you handle

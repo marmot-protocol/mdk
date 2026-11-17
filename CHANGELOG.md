@@ -13,6 +13,9 @@
 
 ### Added
 
+- MarmotKit and C bindings expose emoji-scoped reaction removal and a typed
+  `ReactionNotFound` outcome for local no-match results. Target-wide removal
+  remains available (#1963).
 - The v5 audit records a pending commit going stuck, confirming without a
   relay's `OK`, or being given up (#3460). The new `pending_commit_changed` row
   says `stuck` once, at the commit's first read-back past the ten-minute bound;

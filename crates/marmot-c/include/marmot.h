@@ -346,6 +346,11 @@ enum MarmotStatus
    * `marmot_group_pending_commit` shows where it stands (mdk#2332).
    */
   MARMOT_STATUS_GROUP_COMMIT_PENDING = 131,
+  /**
+   * No active reaction matches locally. Refresh authoritative state before
+   * treating absence as convergence; other devices may not have caught up.
+   */
+  MARMOT_STATUS_REACTION_NOT_FOUND = 132,
 };
 #ifndef __cplusplus
 #if __STDC_VERSION__ >= 202311L
@@ -10367,7 +10372,7 @@ MarmotStatus marmot_react_to_message(const struct MarmotClient *client,
                                      struct MarmotSendSummary **out);
 
 /**
- * Remove this account's reaction from a message. Free with
+ * Remove all of this account's active reactions from a message. Free with
  * `marmot_send_summary_free`.
  *
  * # Safety
@@ -10381,6 +10386,25 @@ MarmotStatus marmot_unreact_from_message(const struct MarmotClient *client,
                                          const char *group_id_hex,
                                          const char *target_message_id,
                                          struct MarmotSendSummary **out);
+
+/**
+ * Remove this account's active reactions matching the exact emoji.
+ * Returns `MARMOT_STATUS_REACTION_NOT_FOUND` for a local no-match;
+ * refresh authoritative state before treating absence as convergence.
+ * Free with `marmot_send_summary_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_unreact_matching(const struct MarmotClient *client,
+                                     const char *account_ref,
+                                     const char *group_id_hex,
+                                     const char *target_message_id,
+                                     const char *emoji,
+                                     struct MarmotSendSummary **out);
 
 /**
  * Reply to a message. Free with `marmot_send_summary_free`.

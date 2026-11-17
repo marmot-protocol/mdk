@@ -1136,9 +1136,15 @@ c_cmd! {
     /// `marmot_send_summary_free`.
     async fn marmot_react_to_message(account_ref: str, group_id_hex: str, target_message_id: str, emoji: str) -> rec(MarmotSendSummary) = react_to_message;
 
-    /// Remove this account's reaction from a message. Free with
+    /// Remove all of this account's active reactions from a message. Free with
     /// `marmot_send_summary_free`.
     async fn marmot_unreact_from_message(account_ref: str, group_id_hex: str, target_message_id: str) -> rec(MarmotSendSummary) = unreact_from_message;
+
+    /// Remove this account's active reactions matching the exact emoji.
+    /// Returns `MARMOT_STATUS_REACTION_NOT_FOUND` for a local no-match;
+    /// refresh authoritative state before treating absence as convergence.
+    /// Free with `marmot_send_summary_free`.
+    async fn marmot_unreact_matching(account_ref: str, group_id_hex: str, target_message_id: str, emoji: str) -> rec(MarmotSendSummary) = unreact_from_message_matching;
 
     /// Reply to a message. Free with `marmot_send_summary_free`.
     async fn marmot_reply_to_message(account_ref: str, group_id_hex: str, target_message_id: str, text: str) -> rec(MarmotSendSummary) = reply_to_message;
