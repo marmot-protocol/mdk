@@ -11,6 +11,7 @@ export const loadOpenClawPlugins = loader.loadOpenClawPlugins as (
   options: Record<string, unknown>,
 ) => {
   channels: Array<{ plugin: ReturnType<typeof createMarmotChannelPlugin> }>;
-  diagnostics: unknown[];
+  tools: Array<{ pluginId: string; names: string[] }>;
+  diagnostics: Array<{ level?: string; pluginId?: string; message?: string }>;
 };
 export const clearPluginRegistryLoadCache = loader.clearPluginRegistryLoadCache as () => void;

@@ -4,6 +4,12 @@
   "description": "OpenClaw channel plugin for Marmot through the local wn-agent control socket.",
   "activation": { "onStartup": true, "onChannels": ["marmot"] },
   "channels": ["marmot"],
+  "contracts": {
+    "tools": ["marmot_history", "marmot_group_profile"]
+  },
+  "doctorContract": {
+    "stateMigrations": []
+  },
   "configSchema": {
     "type": "object",
     "additionalProperties": false,

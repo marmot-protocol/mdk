@@ -26,6 +26,11 @@ export async function materializeOwnedPluginRoot(workspaceDir: string): Promise<
     `export { default } from ${JSON.stringify(pathToFileURL(join(source, "dist", "setup-entry.js")).href)};\n`,
     { mode: 0o600 },
   );
+  await writeFile(
+    join(isolated, "dist", "doctor-contract-api.js"),
+    `export * from ${JSON.stringify(pathToFileURL(join(source, "dist", "doctor-contract-api.js")).href)};\n`,
+    { mode: 0o600 },
+  );
   await symlink(join(source, "node_modules"), join(isolated, "node_modules"));
   return isolated;
 }

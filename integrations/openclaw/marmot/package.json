@@ -28,7 +28,7 @@
       "pluginApi": ">=2026.10.10"
     }
   },
-  "files": ["dist", "index.ts", "setup-entry.ts", "src", "openclaw.plugin.json", "manifest.json", "README.md"],
+  "files": ["dist", "index.ts", "setup-entry.ts", "doctor-contract-api.ts", "src", "openclaw.plugin.json", "manifest.json", "README.md"],
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",

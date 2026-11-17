@@ -17,6 +17,6 @@
     "isolatedModules": true,
     "forceConsistentCasingInFileNames": true
   },
-  "include": ["index.ts", "setup-entry.ts", "src/**/*.ts", "test/**/*.ts"],
+  "include": ["index.ts", "setup-entry.ts", "doctor-contract-api.ts", "src/**/*.ts", "test/**/*.ts"],
   "exclude": ["dist", "node_modules"]
 }
