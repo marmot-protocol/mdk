@@ -141,6 +141,7 @@ final class NativeHostSmoke: XCTestCase {
       _ = try await alice.reactToMessage(
         accountRef: aliceId.label, groupIdHex: group, targetMessageId: target, emoji: emoji)
     }
+    let initialReactionsSecond = UInt64(Date().timeIntervalSince1970)
     _ = try await bob.reactToMessage(
       accountRef: bobId.label, groupIdHex: group, targetMessageId: target, emoji: "👍")
     try await waitUntil("Alice reaction projection") { try reactions(alice).count == 3 }
@@ -192,6 +193,10 @@ final class NativeHostSmoke: XCTestCase {
         accountRef: aliceId.label, groupIdHex: group, targetMessageId: target, emoji: "❤️")
     }
 
+    // Re-added events need a distinct authored second to avoid deleted IDs.
+    try await waitUntil("Next authored second after initial reactions") {
+      UInt64(Date().timeIntervalSince1970) > initialReactionsSecond
+    }
     for emoji in ["👍", "❤️"] {
       _ = try await alice.reactToMessage(
         accountRef: aliceId.label, groupIdHex: group, targetMessageId: target, emoji: emoji)
