@@ -103,6 +103,8 @@
 - With device groups on, an idle maintenance tick takes no writer transaction again (mdk#3479), whether the account
   holds no device group or a settled one: the history-delivery expiry, small-state pass, private KeyPackage upkeep
   and device-inactivity coverage read first and write only when they have work.
+- Emoji discovery applies its 60-set limit after deduplicating coordinates, so overlapping revisions from additional
+  relays no longer hide older sets below that limit (#3492).
 - Reinstalling the installed version of an emoji set no longer deletes images it already holds (#3464). A verified
   image whose refresh fails or does not fit the byte budget is kept, counts in `installed_count` and is not in
   `skipped`. Newly downloaded images are added, successful refreshes replace the old bytes, and a stored image that

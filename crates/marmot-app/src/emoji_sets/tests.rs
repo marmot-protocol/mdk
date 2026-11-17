@@ -436,6 +436,74 @@ fn an_emptied_version_supersedes_the_populated_one() {
     assert!(storage.emoji_sets(false, None, 10).unwrap().is_empty());
 }
 
+#[test]
+fn discovery_deduplicates_first() {
+    let keys = Keys::generate();
+    let at = |identifier: &str, secs| {
+        EventBuilder::new(Kind::Custom(EMOJI_SET_KIND), "")
+            .tags([
+                tag(&["d", identifier]),
+                emoji_tag("ok", "https://cdn.example/a.png"),
+            ])
+            .custom_created_at(Timestamp::from_secs(secs))
+            .finalize(&keys)
+            .unwrap()
+    };
+    let target = at("target", 1);
+    let target_coordinate = format!("30030:{}:target", keys.public_key().to_hex());
+
+    // Two account relays and one configured relay each hold a revision of
+    // every shared set. The older target must not be lost to those revisions.
+    for shared_count in [40, MAX_DISCOVERY_EMOJI_SETS] {
+        let storage = storage_sqlite::SqliteAccountStorage::in_memory()
+            .unwrap()
+            .app_storage();
+        let mut account_relays = vec![target.clone()];
+        let mut configured_relay = Vec::new();
+        for index in 0..shared_count {
+            let identifier = format!("shared-{index}");
+            account_relays.push(at(&identifier, 100));
+            account_relays.push(at(&identifier, 200));
+            configured_relay.push(at(&identifier, 300));
+        }
+        let expected_count = (shared_count + 1).min(MAX_DISCOVERY_EMOJI_SETS);
+        let events = account_relays
+            .into_iter()
+            .chain(configured_relay.iter().cloned())
+            .collect();
+        assert_eq!(
+            ingest_discovered_sets(&storage, events, false).unwrap(),
+            (expected_count, expected_count)
+        );
+        assert_eq!(
+            storage
+                .emoji_sets(false, None, MAX_DISCOVERY_EMOJI_SETS + 1)
+                .unwrap()
+                .len(),
+            expected_count
+        );
+        assert_eq!(
+            storage
+                .emoji_set(&target_coordinate)
+                .unwrap()
+                .map(|set| set.version.event_id_hex),
+            (shared_count < MAX_DISCOVERY_EMOJI_SETS).then(|| target.id.to_hex())
+        );
+        for (index, event) in configured_relay.into_iter().enumerate() {
+            let coordinate = format!("30030:{}:shared-{index}", keys.public_key().to_hex());
+            assert_eq!(
+                storage
+                    .emoji_set(&coordinate)
+                    .unwrap()
+                    .unwrap()
+                    .version
+                    .event_id_hex,
+                event.id.to_hex()
+            );
+        }
+    }
+}
+
 /// One canned HTTP response. `content_length: false` streams the body until
 /// the connection closes.
 #[derive(Clone)]
