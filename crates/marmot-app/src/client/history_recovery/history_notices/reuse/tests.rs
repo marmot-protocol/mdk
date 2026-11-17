@@ -265,6 +265,52 @@ async fn a_survey_ends_the_kept_answer() {
     );
 }
 
+/// A terminal close between the recovery snapshot and its group-visibility
+/// read must fail the status, rather than succeed with a catching-up group
+/// silently hidden (mdk#3451). No survey changes during this read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_close_during_recovery_facts_fails_the_status() {
+    struct ClosingFacts<'a>(&'a AppClient);
+
+    impl GroupFacts for ClosingFacts<'_> {
+        fn host_may_see(&self, group_id: &[u8]) -> Fact {
+            self.0.app.close_storage().unwrap();
+            LiveFacts(self.0).host_may_see(group_id)
+        }
+
+        fn unrecoverable(&self, group_id: &[u8]) -> Fact {
+            LiveFacts(self.0).unrecoverable(group_id)
+        }
+
+        fn stamp(&self, _group_id: &[u8]) -> Option<ChangeStamp> {
+            None
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let (client, _app, group, route) = fixture(&dir).await;
+    catching_up(&client, &[&route]);
+    assert_eq!(
+        client
+            .account_recovery_status()
+            .unwrap()
+            .catching_up_group_ids_hex,
+        vec![hex::encode(group.as_slice())]
+    );
+    let answer = RecoveryAnswer::build(
+        client.recovery_inputs(),
+        client.read_recovery().map_err(Arc::new),
+        &ClosingFacts(&client),
+    );
+    assert!(!answer.read().unwrap().survey().landed_since());
+    assert!(
+        matches!(answer.status(), Err(error)
+            if matches!(error.as_ref(), AppError::Storage(cgka_traits::StorageError::Closed(_)))),
+        "a close inside the visibility read must be reported: {:?}",
+        answer.status()
+    );
+}
+
 /// An answer that names a group holds until the group's change generation
 /// moves: the group turning device group moves its stamp alone, and the next
 /// publish rebuilds with its notice hidden.

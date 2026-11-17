@@ -233,7 +233,7 @@ async fn the_answers_mark_a_survey_that_lands_after_them() {
 
     let answers = client.read_recovery().unwrap();
     assert!(!answers.survey().landed_since());
-    let published = answers.account_status(&LiveFacts(&client));
+    let published = answers.account_status(&LiveFacts(&client)).unwrap();
     assert_eq!(published, client.account_recovery_status().unwrap());
     let same = BTreeSet::from([UnitKey {
         route: route.clone(),
