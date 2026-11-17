@@ -495,6 +495,44 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
         result.map(|(fetched, _)| fetched)
     }
 
+    pub(super) async fn journal_key_package_records(
+        &self,
+        account_id_hex: &str,
+        records: &[RelayEventRecord],
+    ) -> Result<(), DirectoryError> {
+        let freshness = self.directory_freshness();
+        let replacements = records
+            .iter()
+            .filter(|record| {
+                record.event.kind == KIND_MARMOT_KEY_PACKAGE
+                    && record.event.pubkey == account_id_hex
+                    && freshness.accepts(record)
+                    && record.event.to_verified_nostr_event().is_ok()
+            })
+            .map(|record| storage_sqlite::PublicKeyPackageReplacementRecord {
+                account_id_hex: account_id_hex.to_owned(),
+                key_package_id: record.event.tag_value("d").unwrap_or_default().to_owned(),
+                event_id_hex: record.event.id.clone(),
+                event_created_at: record.event.created_at,
+                // Unselected fetch evidence preserves the last live or selected
+                // observation. A later live sighting advances it in the store.
+                observed_at: 0,
+            })
+            .collect::<Vec<_>>();
+        if replacements.is_empty() {
+            return Ok(());
+        }
+        let directory = self.clone();
+        blocking_directory_task(move || {
+            let shared = directory.resources.shared_storage()?;
+            for replacement in replacements {
+                shared.put_public_key_package_replacement(&replacement)?;
+            }
+            Ok(())
+        })
+        .await
+    }
+
     async fn fetch_latest_key_package_for_account_id_unobserved(
         &self,
         account_id_hex: &str,
@@ -581,6 +619,8 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
             .map_err(|error| {
                 DirectoryError::RelayDirectory(format!("fetch key packages: {error}"))
             })?;
+        self.journal_key_package_records(account_id_hex, &outcome.records)
+            .await?;
         let cached_entry = {
             let directory = self.clone();
             let account_id = account_id_hex.to_owned();
@@ -613,6 +653,8 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                 cached_target,
                 wanted: 1,
             })
+            .await?;
+        self.journal_key_package_records(account_id_hex, &records.records)
             .await?;
         let cached_entry = cached_entry.filter(|entry| {
             records.cache_evidence.as_ref().is_none_or(|evidence| {

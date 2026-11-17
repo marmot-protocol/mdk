@@ -74,6 +74,8 @@ pub struct PublicKeyPackageReplacementRecord {
     pub observed_at: u64,
 }
 
+const KEY_PACKAGE_REPLACEMENT_CAP: i64 = 500;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StoredRelayTelemetrySettings {
     pub export_enabled: bool,
@@ -227,32 +229,56 @@ impl SqliteSharedStorage {
         record: &PublicKeyPackageReplacementRecord,
     ) -> StorageResult<()> {
         retry_on_busy(|| {
-            self.lock()?
-                .execute_cached(
-                    "INSERT INTO directory_key_package_replacements (
-                        account_id_hex, key_package_id, event_id_hex,
-                        event_created_at, observed_at
-                     )
-                     VALUES (?1, ?2, ?3, ?4, ?5)
-                     ON CONFLICT(account_id_hex, key_package_id) DO UPDATE SET
-                        event_id_hex = excluded.event_id_hex,
-                        event_created_at = excluded.event_created_at,
-                        observed_at = excluded.observed_at
-                     WHERE excluded.event_created_at >
-                           directory_key_package_replacements.event_created_at
-                        OR (excluded.event_created_at =
-                            directory_key_package_replacements.event_created_at
-                            AND excluded.event_id_hex <
-                                directory_key_package_replacements.event_id_hex)",
-                    params![
-                        &record.account_id_hex,
-                        &record.key_package_id,
-                        &record.event_id_hex,
-                        u64_to_i64(record.event_created_at)?,
-                        u64_to_i64(record.observed_at)?,
-                    ],
-                )
-                .storage()?;
+            let mut conn = self.lock()?;
+            let tx = conn.transaction().storage()?;
+            tx.execute_cached(
+                "INSERT INTO directory_key_package_replacements (
+                    account_id_hex, key_package_id, event_id_hex,
+                    event_created_at, observed_at
+                 )
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(account_id_hex, key_package_id) DO UPDATE SET
+                    event_id_hex = excluded.event_id_hex,
+                    event_created_at = excluded.event_created_at,
+                    observed_at = CASE
+                        WHEN directory_key_package_replacements.event_id_hex = excluded.event_id_hex
+                        THEN MAX(
+                            directory_key_package_replacements.observed_at,
+                            excluded.observed_at
+                        )
+                        ELSE excluded.observed_at
+                    END
+                 WHERE excluded.event_created_at >
+                       directory_key_package_replacements.event_created_at
+                    OR (excluded.event_created_at =
+                        directory_key_package_replacements.event_created_at
+                        AND excluded.event_id_hex <
+                            directory_key_package_replacements.event_id_hex)
+                    OR (excluded.event_id_hex =
+                        directory_key_package_replacements.event_id_hex
+                        AND excluded.observed_at >
+                            directory_key_package_replacements.observed_at)",
+                params![
+                    &record.account_id_hex,
+                    &record.key_package_id,
+                    &record.event_id_hex,
+                    u64_to_i64(record.event_created_at)?,
+                    u64_to_i64(record.observed_at)?,
+                ],
+            )
+            .storage()?;
+            tx.execute_cached(
+                "DELETE FROM directory_key_package_replacements
+                 WHERE account_id_hex = ?1 AND key_package_id NOT IN (
+                     SELECT key_package_id FROM directory_key_package_replacements
+                     WHERE account_id_hex = ?1
+                     ORDER BY observed_at DESC, event_created_at DESC, event_id_hex, key_package_id
+                     LIMIT ?2
+                 )",
+                params![&record.account_id_hex, KEY_PACKAGE_REPLACEMENT_CAP],
+            )
+            .storage()?;
+            tx.commit().storage()?;
             Ok(())
         })
     }
@@ -1283,6 +1309,7 @@ mod tests {
                 ..winner.clone()
             })
             .unwrap();
+        winner.observed_at = 102;
 
         let other_slot = PublicKeyPackageReplacementRecord {
             key_package_id: "slot-a".into(),
@@ -1316,6 +1343,37 @@ mod tests {
                 .public_key_package_replacements(&other_account.account_id_hex)
                 .unwrap(),
             [other_account]
+        );
+    }
+
+    #[test]
+    fn key_package_replacements_are_bounded_per_account() {
+        let storage = SqliteSharedStorage::in_memory().unwrap();
+        let account_id_hex = "aa".repeat(32);
+        for index in 0..=KEY_PACKAGE_REPLACEMENT_CAP as u64 {
+            storage
+                .put_public_key_package_replacement(&PublicKeyPackageReplacementRecord {
+                    account_id_hex: account_id_hex.clone(),
+                    key_package_id: format!("slot-{index:04}"),
+                    event_id_hex: format!("{index:064x}"),
+                    event_created_at: index,
+                    observed_at: index,
+                })
+                .unwrap();
+        }
+        let records = storage
+            .public_key_package_replacements(&account_id_hex)
+            .unwrap();
+        assert_eq!(records.len(), KEY_PACKAGE_REPLACEMENT_CAP as usize);
+        assert!(
+            !records
+                .iter()
+                .any(|record| record.key_package_id == "slot-0000")
+        );
+        assert!(
+            records
+                .iter()
+                .any(|record| record.key_package_id == "slot-0500")
         );
     }
 

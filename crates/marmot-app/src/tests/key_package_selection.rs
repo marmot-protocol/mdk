@@ -1556,7 +1556,7 @@ async fn availability_recovery_stays_bounded() {
     let shared = app.shared_storage().unwrap();
     let mut replacement = storage_sqlite::PublicKeyPackageReplacementRecord {
         account_id_hex: accounts[0].account_id_hex.clone(),
-        key_package_id: "device".into(),
+        key_package_id: "negative-probe".into(),
         event_id_hex: "ee".repeat(32),
         event_created_at: 0,
         observed_at: checked_at + 1,
@@ -1580,9 +1580,19 @@ async fn availability_recovery_stays_bounded() {
 
     replacement.event_created_at = 1;
     replacement.observed_at = checked_at - 1;
+    replacement.event_id_hex = "dd".repeat(32);
     shared
         .put_public_key_package_replacement(&replacement)
         .unwrap();
+    let replacements = shared
+        .public_key_package_replacements(&accounts[0].account_id_hex)
+        .unwrap();
+    assert!(
+        replacements
+            .iter()
+            .all(|record| record.observed_at < checked_at),
+        "{replacements:?}"
+    );
     assert_eq!(
         app.directory()
             .follow_availability_page(

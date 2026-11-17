@@ -15,7 +15,8 @@
   that; `record_sign_in_check` adds no sign-in for such a publication. Account schema advances
   from 210 to 211; older binaries refuse the upgraded database. Downgrade is unsupported.
 - Shared migration 0005 adds `directory_key_package_replacements`, a per-slot publication barrier used by
-  direct-follow availability (mdk#1996). It stores event ids and timestamps, not KeyPackage bytes. Shared schema
+  direct-follow availability (mdk#1996). It stores event ids and timestamps for at most 500 slots per account, not
+  KeyPackage bytes. Shared schema
   advances from 4 to 5; older binaries refuse the upgraded database. Downgrade is unsupported.
 - Account migration 0210 adds `cgka_changes_not_delivered`: one row per group change given up after its call
   returned, kept until the user acknowledges it and deleted with its group (mdk#2332). Account schema advances from

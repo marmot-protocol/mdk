@@ -825,6 +825,8 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
             )
             .await
             .map_err(|error| DirectoryError::RelayDirectory(error.to_string()))?;
+        self.journal_key_package_records(account_id_hex, &outcome.records)
+            .await?;
         if key_package_read_page_full(account_id_hex, &outcome.records) {
             return Ok(AvailabilityWrite::unknown(self.directory_freshness().now));
         }
@@ -854,6 +856,8 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                     cached_target: None,
                     wanted: 0,
                 })
+                .await?;
+            self.journal_key_package_records(account_id_hex, &recovered.records)
                 .await?;
             (
                 recovered.records,

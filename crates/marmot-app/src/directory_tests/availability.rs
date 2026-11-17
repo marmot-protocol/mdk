@@ -372,6 +372,78 @@ async fn availability_replacement_fence() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn availability_fetched_malformed_is_journaled() {
+    let (_root, app, accounts, fetcher) = crate::tests::member_resolution_fixture(1, false).await;
+    let owner = app
+        .account_home()
+        .create_account("availability-owner")
+        .unwrap();
+    remember_follows(&app, &owner, vec![accounts[0].account_id_hex.clone()]);
+    let replacement = {
+        let mut replacement = fetcher
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|event| {
+                event.kind == KIND_MARMOT_KEY_PACKAGE && event.pubkey == accounts[0].account_id_hex
+            })
+            .unwrap()
+            .clone();
+        replacement.id = "ff".repeat(32);
+        replacement.created_at = replacement.created_at.saturating_add(1);
+        replacement.content = "not-base64".into();
+        let signed = nostr_sdk::prelude::EventBuilder::new(
+            nostr_sdk::prelude::Kind::from(replacement.kind as u16),
+            replacement.content.clone(),
+        )
+        .tags(
+            replacement
+                .tags
+                .iter()
+                .map(|tag| nostr_sdk::prelude::Tag::parse(tag.clone()).unwrap()),
+        )
+        .custom_created_at(nostr_sdk::prelude::Timestamp::from_secs(
+            replacement.created_at,
+        ))
+        .finalize(
+            &app.account_home()
+                .load_signing_keys(&accounts[0].label)
+                .unwrap(),
+        )
+        .unwrap();
+        transport_nostr_peeler::NostrTransportEvent::from_nostr_event(&signed).unwrap()
+    };
+    fetcher.events.lock().unwrap().push(replacement.clone());
+
+    app.directory()
+        .refresh_follow_availability(&directory_account(&owner))
+        .await
+        .unwrap();
+    assert_eq!(
+        availability_states(&app, &owner)[&accounts[0].account_id_hex],
+        FollowAvailabilityState::Unknown
+    );
+    fetcher
+        .events
+        .lock()
+        .unwrap()
+        .retain(|event| event.id != replacement.id);
+    app.drop_account_caches(&owner.label);
+    app.directory()
+        .reset_availability_for_test(&owner.account_id_hex);
+    app.directory()
+        .refresh_follow_availability(&directory_account(&owner))
+        .await
+        .unwrap();
+    assert_eq!(
+        availability_states(&app, &owner)[&accounts[0].account_id_hex],
+        FollowAvailabilityState::Unknown,
+        "an older relay cannot resurrect a fetched malformed replacement"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn availability_cancel_fence() {
     let (_root, app, accounts, fetcher) = crate::tests::member_resolution_fixture(2, false).await;
     let owner = app
