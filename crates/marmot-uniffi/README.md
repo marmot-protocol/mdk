@@ -1487,6 +1487,11 @@ step-down on Leave. `Marmot.newWithExperimentalDeviceGroups` is now the same ope
 existing hosts keep compiling; new code can use `newWithConfiguration`. Production settlement, retry and recovery
 timing remains unchanged; never enable `test-policy-overrides` in a host artifact.
 
+Ship this version or newer in **every** process that opens the root, a notification service extension or background
+worker included. A process on an older library opens with device groups off: once the account holds or is joining a
+device group, its session fails with `MarmotKitError.Runtime` `experimental_device_groups_required` before anything of
+that account is read, sent or subscribed, so the extension delivers nothing for it until it is updated.
+
 No build flag or separate artifact is needed: `xcframework.sh`, `xcframework-macos.sh` and `kotlin-bindings.sh`
 build one library for every constructor. These local host checks do not package or validate iOS/Android device
 artifacts.
@@ -1507,7 +1512,7 @@ V2 sibling Welcomes; there is no capability negotiation or mixed-old-receiver gu
 
 An admin account's Leave, and its Decline of an invitation that made it an admin, return `AdminCannotSelfRemove` before
 anything is written or sent: when `requires_self_demote_before_leave` is true, call `self_demote_admin` first and then
-Leave or Decline; a last admin first makes another member an admin. With experimental device groups on, User Leave
+Leave or Decline; a last admin first makes another member an admin. With device groups on (the default), User Leave
 instead demotes a nonlast active admin account itself before SelfRemove, `can_leave` includes that Leave and
 `requires_self_demote_before_leave` is false; the last active admin account is refused on all its devices before any new
 choice or departure publication. The coarse chat-list Leave action opens the authoritative command and need not imply
@@ -1563,16 +1568,14 @@ the device group this device trusts, for a Devices screen:
   gave up on a missed Commit, or whose copy is unrecoverable with no automatic rejoin underway, can't catch up, see or
   clear its mark, and is removed at 90 days like one that never came back: offer the reset on `device_group_stalled`
   (below).
-- The list is empty until this device trusts a device group (a single-device account has none), and in ordinary opens
-  without explicit experimental device-group intent.
+- The list is empty until this device trusts a device group (a single-device account has none).
 - The device group's own events never reach hosts. Re-read on `MarmotEventFfi::LinkedDevicesChanged`, which carries no
   device or group identities. With device groups on, it also fires once each time the account's worker opens or reconnects, so it may fire
   with no visible change.
 
 Chat history from another device: each imported `TimelineMessageRecordFfi` names its source in `imported_from`, and
 `chat_history_imports(account_ref)` lists each held chat's history as `Receiving` (`retrying` once an attempt to get its
-bundle failed) or `Imported`. The list is empty and the event silent in ordinary opens without explicit experimental
-device-group intent. Draw "Imported from <device>" where rows change from imported to live, and say "another device" for an empty
+bundle failed) or `Imported`. Draw "Imported from <device>" where rows change from imported to live, and say "another device" for an empty
 `device_label`. Re-read the list on `MarmotEventFfi::ChatHistoryImportsChanged`, which fires whenever its answer
 changes, a source device's rename or removal included; re-read rows on `LinkedDevicesChanged` for their new names.
 
@@ -1636,7 +1639,7 @@ recovery gave up on a change it missed, or its copy is unrecoverable and automat
 see or clear an `Inactive` mark, and its siblings remove it about 90 days after they last heard from it. Offer the reset
 below, then fresh pairing. Re-read on `DeviceLinkChanged`, which fires when it changes.
 
-In an experimental device-group build, offer `reset_device_group_for_repair(account_ref)` only after the user chooses
+Offer `reset_device_group_for_repair(account_ref)` only after the user chooses
 to discard this device's local hidden device-group copy. It keeps account credentials, the stable device slot and
 ordinary chats, history, drafts and settings. It abandons old link-bound preparations; retained shared values and
 security decisions can synchronize again under ordinary rules. It sends no removal and repairs no ordinary-chat
@@ -1665,7 +1668,7 @@ field. Actual app display adoption is separate.
 
 ### Moving this device to another device group
 
-In an experimental device-group build, start the same compared-code linking flow on a device that already trusts a
+Start the same compared-code linking flow on a device that already trusts a
 device group to move only that device. Keep showing the existing group while `DeviceLinkSnapshotFfi.moves` is
 `WaitingForWelcome` or `Joining`. Joining the destination alone does not switch trust: `Made` requires this device's
 first selected authenticated change there. Its trust then switches once, with ordinary full small-state synchronization
@@ -1756,7 +1759,6 @@ once the KeyPackage this device would publish is still unannounced and its slot'
 Inviters stop treating the device as fresh at 30 days, so tell the user. A routine refresh never shows, and neither
 does one that is announced but failing at the relays. Re-read on `MarmotEventFfi::KeyPackageRefreshOverdueChanged`,
 which carries no device or group identities and, with device groups on, also fires once each time the account's worker opens or reconnects.
-It is false in ordinary opens without explicit experimental device-group intent.
 
 ## Unrecognized sign-ins
 
@@ -1786,7 +1788,6 @@ It is false in ordinary opens without explicit experimental device-group intent.
   `check_sign_ins(account_ref)` checks now and returns the list after the check.
 - Re-read on `MarmotEventFfi::UnrecognizedSignInsChanged`, which carries no slots. With device groups on, it also fires once each time the
   account's worker opens or reconnects, so it may fire with no visible change.
-- The list is empty in ordinary opens without explicit experimental device-group intent.
 - `start_fresh(account_ref)` is "No, start fresh" when the user no longer has the devices the first check found: every
   sign-in from before this device is answered `NotNow`, now and when one is listed later. It rejects nothing and
   raises no compromise warning, so one of those devices can still link this one. It is refused before the first check
@@ -1813,12 +1814,11 @@ It is false in ordinary opens without explicit experimental device-group intent.
 - The app writes the wording, and never says the account's devices stopped them.
 - Re-read on `MarmotEventFfi::CompromiseWarningChanged`, which carries no slots. With device groups on, it also fires once each
   time the account's worker opens, so it may fire with no visible change.
-- The list is empty in ordinary opens without explicit experimental device-group intent.
 
 ## Linking a new device
 
 Linking a new device of the account shows the same seven emoji on both devices, and each user confirms. Every call
-returns a `DeviceLinkSnapshotFfi`, and every call requires the explicit experimental build and constructor described above:
+returns a `DeviceLinkSnapshotFfi`; a runtime with device groups off refuses every call with `pairing_unsupported`:
 
 - The new device calls `start_device_link(account_ref)` and shows `new_device`: `WaitingForAnswer` (ask the user to
   open the app on a device already signed in), then `Comparing` with the code. Offer "They match"

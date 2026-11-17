@@ -739,7 +739,7 @@ c_cmd! {
     async fn marmot_remove_members(account_ref: str, group_id_hex: str, member_refs/member_refs_len: str_arr) -> rec(MarmotSendSummary) = remove_members;
 
     /// Leave as the active account. An admin fails with `MARMOT_STATUS_ADMIN_CANNOT_SELF_REMOVE` until
-    /// `marmot_self_demote_admin`; with experimental device groups core demotes eligible admins, leaves matching linked
+    /// `marmot_self_demote_admin`; with device groups on (the default) core demotes eligible admins, leaves matching linked
     /// copies and refuses the last admin. Free with `marmot_send_summary_free`.
     async fn marmot_leave_group(account_ref: str, group_id_hex: str) -> rec(MarmotSendSummary) = leave_group;
 
@@ -992,7 +992,7 @@ c_cmd! {
 
     /// On a new device: ask a device of this account already signed in to
     /// link this one, or move this already-linked device to that group.
-    /// Explicit experimental build and runtime gates are required. Re-read
+    /// Refused (`pairing_unsupported`) only with device groups off. Re-read
     /// on the `DeviceLinkChanged` event; inspect `moves` for Joining/Made.
     /// Free with `marmot_device_link_snapshot_free`.
     async fn marmot_start_device_link(account_ref: str) -> rec(MarmotDeviceLinkSnapshot) = start_device_link;
@@ -1000,7 +1000,7 @@ c_cmd! {
     /// Explicit local device-group reset before fresh code pairing. Keeps
     /// credentials, slot and ordinary chat data; abandons unfinished device
     /// sync without removing any member. Active pairing/Move or unsettled
-    /// native work can refuse indefinitely. Requires experimental gates.
+    /// native work can refuse indefinitely. Refused with device groups off.
     /// Free with `marmot_device_link_snapshot_free`.
     async fn marmot_reset_device_group_for_repair(account_ref: str) -> rec(MarmotDeviceLinkSnapshot) = reset_device_group_for_repair;
 
@@ -1040,7 +1040,7 @@ c_cmd! {
     /// Decline a pending group invite; writes the updated group record
     /// plus the decline publish summary. An invitee the invite made an admin
     /// fails with `MARMOT_STATUS_ADMIN_CANNOT_SELF_REMOVE` until
-    /// `marmot_self_demote_admin`, unless experimental device groups are on.
+    /// `marmot_self_demote_admin`, unless device groups are on (the default).
     /// Free with `marmot_group_invite_decline_result_free`.
     async fn marmot_decline_group_invite(account_ref: str, group_id_hex: str) -> rec(MarmotGroupInviteDeclineResult) = decline_group_invite;
 

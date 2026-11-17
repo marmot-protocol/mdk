@@ -1964,7 +1964,7 @@ Dismiss one "history may be incomplete" notice after the user accepts it; blocks
 MarmotStatus marmot_decline_group_invite(const struct MarmotClient *client, const char *account_ref, const char *group_id_hex, struct MarmotGroupInviteDeclineResult **out);
 ```
 
-Decline a pending group invite; writes the updated group record plus the decline publish summary. An invitee the invite made an admin fails with `MARMOT_STATUS_ADMIN_CANNOT_SELF_REMOVE` until `marmot_self_demote_admin`, unless experimental device groups are on. Free with `marmot_group_invite_decline_result_free`.
+Decline a pending group invite; writes the updated group record plus the decline publish summary. An invitee the invite made an admin fails with `MARMOT_STATUS_ADMIN_CANNOT_SELF_REMOVE` until `marmot_self_demote_admin`, unless device groups are on (the default). Free with `marmot_group_invite_decline_result_free`.
 
 [Shared method and API guidance](../marmot-uniffi/API-REFERENCE.md#marmotdecline_group_invite) · [Header contract](include/marmot.h#L10003)
 
@@ -2930,7 +2930,7 @@ Local-storage KeyPackage inventory with typed durable provenance. Synchronous SQ
 MarmotStatus marmot_leave_group(const struct MarmotClient *client, const char *account_ref, const char *group_id_hex, struct MarmotSendSummary **out);
 ```
 
-Leave as the active account. An admin fails with `MARMOT_STATUS_ADMIN_CANNOT_SELF_REMOVE` until `marmot_self_demote_admin`; with experimental device groups core demotes eligible admins, leaves matching linked copies and refuses the last admin, and failure can retain a recorded Decline or committed demotion. Free with `marmot_send_summary_free`.
+Leave as the active account. An admin fails with `MARMOT_STATUS_ADMIN_CANNOT_SELF_REMOVE` until `marmot_self_demote_admin`; with device groups on (the default) core demotes eligible admins, leaves matching linked copies and refuses the last admin, and failure can retain a recorded Decline or committed demotion. Free with `marmot_send_summary_free`.
 
 [Shared method and API guidance](../marmot-uniffi/API-REFERENCE.md#marmotleave_group) · [Header contract](include/marmot.h#L9114)
 
@@ -5541,7 +5541,7 @@ unknown move/sibling is refused. See [shared move behavior](../marmot-uniffi/REA
 MarmotStatus marmot_reset_device_group_for_repair(const struct MarmotClient *client, const char *account_ref, struct MarmotDeviceLinkSnapshot **out);
 ```
 
-Run the shared explicit local device-group reset on the account worker after user confirmation. Ordinary opens refuse the experimental capability. On success `out` owns a snapshot; release it with `marmot_device_link_snapshot_free`. Follow the [shared reset, data-retention and admission contract](../marmot-uniffi/README.md#explicit-local-device-group-reset-before-fresh-pairing); this action neither removes remote members nor guarantees fresh admission.
+Run the shared explicit local device-group reset on the account worker after user confirmation. Refused with device groups off. On success `out` owns a snapshot; release it with `marmot_device_link_snapshot_free`. Follow the [shared reset, data-retention and admission contract](../marmot-uniffi/README.md#explicit-local-device-group-reset-before-fresh-pairing); this action neither removes remote members nor guarantees fresh admission.
 
 [Header contract](include/marmot.h#L9875)
 

@@ -686,8 +686,8 @@ and should not need it.
 ## Device linking
 
 Device groups are on by default in every `wn`/`wnd` build, with production settlement/retry timing. Export
-`WN_DEVICE_GROUPS=0` for both `wn` and `wnd` (the daemon owns the runtime, and the TUI reads it for Leave) to turn them
-off. A debug build needs the repository's existing [debug-binary stack requirement](../../README.md#development)
+`WN_DEVICE_GROUPS=0` (or `false`, `off`, `no`) for both `wn` and `wnd` (the daemon owns the runtime, and the TUI reads
+it for Leave) to turn them off. A debug build needs the repository's existing [debug-binary stack requirement](../../README.md#development)
 when running `wn`/`wnd` directly:
 
 ```sh

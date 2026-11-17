@@ -423,7 +423,7 @@ targets.
 **Leaving.** An admin account's Leave, including declining a pending invitation that made it an admin, is refused with
 `AdminCannotSelfRemove` before anything is written or sent; the host demotes it first (`self_demote_admin`) and then
 leaves, and a last admin first makes another member an admin. `requires_self_demote_before_leave` says so. With
-experimental device groups on (`MarmotApp::admin_leave_steps_down`), User Leave instead records the leave and lets the
+device groups on (the default; `MarmotApp::admin_leave_steps_down`), User Leave instead records the leave and lets the
 engine step this account down when another active administrator account remains, then request its own leaf's SelfRemove;
 the call returns before the step-down is published. The last active administrator account is refused on all its devices
 before a choice or departure is published (mdk#3014 keeps that automatic step-down off elsewhere). Queued work is
@@ -814,7 +814,7 @@ stays. Already-running bounded crypto work may finish off the worker; it owns no
 cancelled result, and drops its keys with that work. Closing a watch only stops observing. No secret-backed job or
 cursor is persisted or resumed: a later explicit
 attempt supplies words again. Core Rust operation handles and methods are available here; complete UniFFI/C controls,
-provenance DTOs and operation-token codecs remain separate work. Restore uses the same experimental device-group gate
+provenance DTOs and operation-token codecs remain separate work. Restore uses the same device-group gate
 as the writer.
 
 ### Overdue KeyPackage refresh

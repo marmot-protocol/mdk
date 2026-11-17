@@ -185,7 +185,7 @@ Chat-screen DTO changes also use `just uniffi-projections-smoke swift` (requires
 `just uniffi-projections-smoke kotlin` (requires `kotlinc` and `MDK_KOTLIN_CLASSPATH` containing JNA with native
 libraries, Android platform, annotations, and coroutines jars). Options, Details Markdown and
 usage-diagnostics DTO changes use the matching `./crates/marmot-uniffi/<name>-smoke.sh swift|kotlin` with the same
-requirements. `options-smoke.sh swift|kotlin` also opens through the experimental constructor. These host checks
+requirements. `options-smoke.sh swift|kotlin` also opens through the kept experimental alias. These host checks
 do not replace release-artifact or device validation.
 
 Release-artifact checks (after `xcframework.sh`):

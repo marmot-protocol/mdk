@@ -1333,13 +1333,20 @@ fn wn_allow_loopback_blob_endpoints() -> bool {
 }
 
 /// Multi-device (device linking with `wn devices`, the device roster, admin
-/// step-down on Leave) is on unless `WN_DEVICE_GROUPS=0` (or `false`) turns
-/// it off; `wn` and `wnd` must share the setting.
+/// step-down on Leave) is on unless `WN_DEVICE_GROUPS` turns it off; `wn` and
+/// `wnd` must share the setting.
 pub(crate) fn wn_device_groups() -> bool {
-    !matches!(
-        std::env::var("WN_DEVICE_GROUPS").as_deref(),
-        Ok("0") | Ok("false")
-    )
+    device_groups_setting(std::env::var("WN_DEVICE_GROUPS").ok().as_deref())
+}
+
+/// `0`, `false`, `off` or `no` (any case) turns device groups off; anything
+/// else, or no value, leaves them on.
+fn device_groups_setting(value: Option<&str>) -> bool {
+    !value.is_some_and(|value| {
+        ["0", "false", "off", "no"]
+            .iter()
+            .any(|off| value.trim().eq_ignore_ascii_case(off))
+    })
 }
 
 /// Dev/test opt-in for opening relay connections to loopback/private endpoints
@@ -1549,6 +1556,21 @@ mod tests {
     };
 
     use serde_json::json;
+
+    /// `WN_DEVICE_GROUPS` turns device groups off only with an explicit off
+    /// value; unset, `1`, `true` and anything unrecognized leave them on.
+    #[test]
+    fn device_groups_are_on_unless_explicitly_turned_off() {
+        for on in [None, Some("1"), Some("true"), Some("yes"), Some("")] {
+            assert!(super::device_groups_setting(on), "{on:?} keeps them on");
+        }
+        for off in ["0", "false", "FALSE", "off", "Off", "no", " 0 "] {
+            assert!(
+                !super::device_groups_setting(Some(off)),
+                "{off:?} turns them off"
+            );
+        }
+    }
 
     #[test]
     fn chat_projection_emits_empty_defaults_when_no_row() {
