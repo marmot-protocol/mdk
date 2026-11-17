@@ -6115,7 +6115,11 @@ where
                             relay_url: endpoint.0.clone(),
                             reason: error.to_string(),
                         });
-                        fanout.possible_exposure = true;
+                        // See `finish_prepared_legacy_publish`.
+                        if !publish_error_reached_no_relay(&error, std::slice::from_ref(&endpoint))
+                        {
+                            fanout.possible_exposure = true;
+                        }
                         if let Some(target) = fanout
                             .targets
                             .iter_mut()
@@ -7405,16 +7409,31 @@ where
                 StorageError::Busy("injected finish-stage failure".into()),
             )));
         }
-        // Diagnostic only: retain legacy publication's conservative exposure,
-        // retry and rollback decisions below. Its coarse durable prior-attempt
-        // records cannot reconstruct a definitive earlier refusal. A crash
-        // before finish bookkeeping or expired records can hide an earlier
-        // exposure: this diagnosis explains the observed attempt, not delivery.
+        // Diagnostic only: no exposure, retry or rollback decision below reads
+        // it. Legacy publication's coarse durable prior-attempt records cannot
+        // reconstruct a definitive earlier refusal. A crash before finish
+        // bookkeeping or expired records can hide an earlier exposure: this
+        // diagnosis explains the observed attempt, not delivery.
         let oversized = OversizedEvent::of_first_legacy_welcome_attempt(&fanout, &result);
         let report = match result {
             Ok(report) => report,
             Err(error) => {
-                fanout.possible_exposure = true;
+                // An error may follow a send, so it is a possible exposure
+                // unless it proves, for every relay this attempt named, that
+                // nothing was sent, as the host-safety rule's refusal of a
+                // relay does (mdk#3305). That is how a report's per-relay
+                // failures are read, which never set the flag: whether the
+                // adapter answers with a report or an error depends on how
+                // many of the request's relays it could send to, not on what
+                // reached one. The proof covers this attempt only. An earlier
+                // attempt's recorded exposure stays, since nothing clears the
+                // flag, but one a crash hid before its bookkeeping stays
+                // hidden. So the status below still owes the targets this
+                // error left unaccepted, and a pre-mdk#2255 evolution commit
+                // is never rolled back on an error, as before.
+                if !publish_error_reached_no_relay(&error, &retry_endpoints) {
+                    fanout.possible_exposure = true;
+                }
                 // Keep each endpoint's typed cause when the adapter reported
                 // one (mdk#2264); only whole-call errors stay coarse.
                 let endpoint_report = (!error.publish_endpoint_failures().is_empty()).then(|| {
@@ -7506,11 +7525,19 @@ where
                     message_id,
                     reason: error.to_string(),
                 });
+                let retry_deferred = accepted_before < required_acks.max(1)
+                    && fanout.targets.iter().any(|target| {
+                        matches!(
+                            target.state,
+                            TransportFanoutAttemptState::Unattempted
+                                | TransportFanoutAttemptState::AttemptedFailed
+                        )
+                    });
                 return Ok(PublishStatus {
                     met_required_acks: accepted_before >= required_acks.max(1),
                     accepted_by_any_endpoint: accepted_before > 0,
-                    possible_ambiguous_exposure: true,
-                    retry_deferred: false,
+                    possible_ambiguous_exposure: fanout.possible_exposure,
+                    retry_deferred,
                     terminal_failure: false,
                     withdrawn: false,
                     awaits_commit: false,
@@ -8047,6 +8074,25 @@ fn record_failed_application_fanout(
         message_id,
         reason,
     });
+}
+
+/// Whether a failed publish to `attempted` proves its attempt reached no
+/// relay: the error names a failure for every endpoint attempted, and each one
+/// proves nothing of the attempt was sent (mdk#3305). Any other error may have
+/// followed a send.
+fn publish_error_reached_no_relay(
+    error: &TransportAdapterError,
+    attempted: &[TransportEndpoint],
+) -> bool {
+    let failures = error.publish_endpoint_failures();
+    !attempted.is_empty()
+        && attempted.iter().all(|endpoint| {
+            let mut answers = failures
+                .iter()
+                .filter(|failure| &failure.endpoint == endpoint)
+                .peekable();
+            answers.peek().is_some() && answers.all(TransportEndpointFailure::proves_nothing_sent)
+        })
 }
 
 fn apply_report_to_fanout(

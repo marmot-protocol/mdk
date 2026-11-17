@@ -9,6 +9,10 @@
 
 ### Added
 
+- `TransportEndpointFailure::is_endpoint_prohibited` tells an adapter's refusal of the endpoint itself, unsent and not
+  for size, such as the Nostr relay plane's host-safety refusal (mdk#3305).
+  `EventSizeClass::from_rejected_targets` leaves such targets out of its proof: the rest must all refuse the event for
+  size, and at least one must remain.
 - `OutboundFanout::record_stuck` keeps when the session first read a pending commit back past the read-back bound,
   and `stuck_at_ms` reads it (mdk#3460); the session audits the commit stuck once by it. A fanout stored before the
   field reads `None`.

@@ -12,6 +12,15 @@ struct OwedInviteWelcome {
 /// Alice invites carol into a confirmed group. The relay accepts the commit
 /// but not carol's Welcome, so the Welcome stays owed with a retry record.
 async fn owed_invite_welcome(dir: &std::path::Path) -> OwedInviteWelcome {
+    owed_invite_welcome_through(dir, RecordingAdapter::default()).await
+}
+
+/// [`owed_invite_welcome`] through `adapter`, which may answer carol's inbox
+/// (`wss://carol-inbox.example`) its own way first.
+async fn owed_invite_welcome_through(
+    dir: &std::path::Path,
+    adapter: RecordingAdapter,
+) -> OwedInviteWelcome {
     let key = SqlCipherKey::new("marmot welcome withdrawal key").unwrap();
     let mut alice = session(dir.join("alice.sqlite"), &key, b"alice-withdrawal");
     let mut bob = session(dir.join("bob.sqlite"), &key, b"bob-withdrawal");
@@ -35,7 +44,6 @@ async fn owed_invite_welcome(dir: &std::path::Path) -> OwedInviteWelcome {
     alice.confirm_published(create_pending).await.unwrap();
     let group_id = created.group_id;
 
-    let adapter = RecordingAdapter::default();
     adapter.accept_next(1);
     adapter.accept_next(0);
     let policy =
