@@ -319,7 +319,22 @@ async fn recovery_branch_step(
         })
         .await
         .unwrap();
-    runtime.advance_convergence(group).await.unwrap();
+    // Each host advance has a cooperative wall-time budget. Finish the
+    // retained input before asserting the branch, as a scheduled host would.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        runtime.advance_convergence(group).await.unwrap();
+        while runtime.has_pending_convergence_inputs(group).unwrap() {
+            assert_eq!(
+                runtime.prepare_convergence_cutoff_delay_ms(group).unwrap(),
+                Some(0),
+                "zero-quiescence recovery input must retain its due convergence wake"
+            );
+            tokio::task::yield_now().await;
+            runtime.advance_convergence(group).await.unwrap();
+        }
+    })
+    .await
+    .expect("scheduled recovery branch input must settle");
     assert_eq!(
         runtime.session().epoch(group).unwrap(),
         peer.epoch(group).unwrap()
