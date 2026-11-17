@@ -284,7 +284,28 @@ fn shared_file_loss_pages() {
             .unwrap()
     );
 
-    let first = app.attachment_removals(Some(&cursor), 1).unwrap();
+    assert_loss_pages(&app, &cursor);
+}
+
+#[test]
+fn expiry_batch_loss_pages() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
+    for message in ["one", "two"] {
+        seed(&store, message);
+        publish(&app, &request(&app, message));
+    }
+    sql(&store, "UPDATE app_events SET retention_expires_at=20");
+    let cursor = baseline(&app);
+    assert_eq!(
+        app.prune_expired_attachment_acquisitions(20, 64).unwrap(),
+        2
+    );
+    assert_loss_pages(&app, &cursor);
+}
+
+fn assert_loss_pages(app: &SqliteAppStorage, cursor: &str) {
+    let first = app.attachment_removals(Some(cursor), 1).unwrap();
     assert!(first.has_more && !first.reset_required);
     let second = app
         .attachment_removals(Some(&first.next_cursor), 1)
