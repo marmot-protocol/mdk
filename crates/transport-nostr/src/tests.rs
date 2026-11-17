@@ -1990,13 +1990,31 @@ async fn unsafe_group_routes_isolated() {
             },
             required_acks: 1,
         };
-        let result = plane.inner.relay_safety.sanitize_publish_request(request);
+        let offered = request.target.endpoints().to_vec();
+        let result = plane
+            .inner
+            .relay_safety
+            .admit_publish_request(request, None);
+        let refused = |failures: &[TransportEndpointFailure]| {
+            failures
+                .iter()
+                .map(|failure| failure.endpoint.clone())
+                .collect::<Vec<_>>()
+        };
         if all_unsafe {
-            assert!(result.is_err());
+            let Err(TransportAdapterError::PublishEndpoints(failure)) = result else {
+                panic!("a group with no safe relay fails with each refusal: {result:?}");
+            };
+            assert_eq!(refused(&failure.endpoint_failures), unsafe_endpoints);
         } else {
+            let (admitted, failures) = result.unwrap();
+            assert_eq!(admitted.target.endpoints(), std::slice::from_ref(&safe));
             assert_eq!(
-                result.unwrap().target.endpoints(),
-                std::slice::from_ref(&safe)
+                refused(&failures),
+                offered
+                    .into_iter()
+                    .filter(|endpoint| endpoint != &safe)
+                    .collect::<Vec<_>>()
             );
         }
     }

@@ -1765,9 +1765,12 @@ impl EventSizeClass {
 
     /// Classify a complete, distinct target set's explicit size refusals: an
     /// endpoint's terminal answer or the adapter's unexposed refusal against a
-    /// known limit, in any mix. The caller must separately establish zero
-    /// acceptance and no earlier ambiguous exposure; a partial failure list
-    /// cannot establish this proof.
+    /// known limit, in any mix. A target the adapter prohibits
+    /// ([`TransportEndpointFailure::is_endpoint_prohibited`]) is one the event
+    /// never reaches, so it neither proves nor disproves the size, but at
+    /// least one target must refuse it for size (mdk#3305). The caller must
+    /// separately establish zero acceptance and no earlier ambiguous exposure;
+    /// a partial failure list cannot establish this proof.
     pub fn from_rejected_targets(
         targets: &[TransportEndpoint],
         failures: &[TransportEndpointFailure],
@@ -1784,13 +1787,17 @@ impl EventSizeClass {
                 .iter()
                 .filter(|failure| &failure.endpoint == target);
             let failure = matching.next()?;
-            if matching.next().is_some()
-                || !matches!(
-                    failure.kind,
-                    TransportEndpointFailureKind::TerminalRejected
-                        | TransportEndpointFailureKind::NotExposed
-                )
-                || failure.rejection_category != Some(TransportEndpointRejectionCategory::TooLarge)
+            if matching.next().is_some() {
+                return None;
+            }
+            if failure.is_endpoint_prohibited() {
+                continue;
+            }
+            if !matches!(
+                failure.kind,
+                TransportEndpointFailureKind::TerminalRejected
+                    | TransportEndpointFailureKind::NotExposed
+            ) || failure.rejection_category != Some(TransportEndpointRejectionCategory::TooLarge)
             {
                 return None;
             }
@@ -1869,6 +1876,17 @@ impl TransportEndpointFailure {
             TransportEndpointFailureKind::TerminalRejected
             | TransportEndpointFailureKind::PossiblyExposed => false,
         }
+    }
+
+    /// Whether the adapter prohibits the endpoint itself: it refused it before
+    /// sending, for a reason other than the event's size, as the Nostr relay
+    /// plane refuses a relay its host-safety rule rejects (mdk#3276). Such a
+    /// refusal is about the endpoint, not the attempt: the adapter refuses
+    /// every attempt there, and the outbound fanout ends the target on it. So
+    /// the event never reaches that endpoint, and a proof about the relays it
+    /// can reach leaves it out (mdk#3305).
+    pub fn is_endpoint_prohibited(&self) -> bool {
+        self.kind == TransportEndpointFailureKind::NotExposed && !self.is_size_refusal()
     }
 
     /// Whether this failure refuses the event for its size: the endpoint's
@@ -3643,8 +3661,10 @@ mod tests {
     }
 
     /// A refusal before sending against a known limit proves size like a
-    /// relay's size answer does, alone or mixed with relay answers, while an
-    /// unexposed failure of any other cause proves nothing (mdk#2334).
+    /// relay's size answer does, alone or mixed with relay answers (mdk#2334).
+    /// A relay the adapter prohibits, unsent and not for size, is one the
+    /// event never reaches: it neither hides the other relays' proof nor
+    /// stands in for one (mdk#3305).
     #[test]
     fn local_refusals_over_known_limits_prove_size_like_relay_refusals() {
         let a = TransportEndpoint("wss://first.example".into());
@@ -3653,27 +3673,58 @@ mod tests {
         let local = |endpoint: &TransportEndpoint| {
             TransportEndpointFailure::over_known_limit(endpoint.clone(), 70 * 1024)
         };
-        let relay = TransportEndpointFailure {
+        let relay = |category| TransportEndpointFailure {
             pre_send: false,
             endpoint: b.clone(),
-            reason: "relay rejected event (too-large)".into(),
+            reason: "relay rejected event".into(),
             kind: TransportEndpointFailureKind::TerminalRejected,
-            rejection_category: Some(TransportEndpointRejectionCategory::TooLarge),
+            rejection_category: Some(category),
             size_class: Some(EventSizeClass::From64To128Kib),
+        };
+        let prohibited = |endpoint: &TransportEndpoint| TransportEndpointFailure {
+            pre_send: false,
+            endpoint: endpoint.clone(),
+            reason: "relay endpoint refused by the host-safety rule".into(),
+            kind: TransportEndpointFailureKind::NotExposed,
+            rejection_category: None,
+            size_class: None,
         };
         assert_eq!(
             EventSizeClass::from_rejected_targets(&targets, &[local(&a), local(&b)]),
             Some(EventSizeClass::From64To128Kib)
         );
         assert_eq!(
-            EventSizeClass::from_rejected_targets(&targets, &[local(&a), relay]),
+            EventSizeClass::from_rejected_targets(
+                &targets,
+                &[
+                    local(&a),
+                    relay(TransportEndpointRejectionCategory::TooLarge)
+                ]
+            ),
             Some(EventSizeClass::From64To128Kib)
         );
-        let mut offline = local(&b);
-        offline.rejection_category = None;
         assert_eq!(
-            EventSizeClass::from_rejected_targets(&targets, &[local(&a), offline]),
+            EventSizeClass::from_rejected_targets(&targets, &[prohibited(&a), local(&b)]),
+            Some(EventSizeClass::From64To128Kib)
+        );
+        assert_eq!(
+            EventSizeClass::from_rejected_targets(
+                &targets,
+                &[
+                    prohibited(&a),
+                    relay(TransportEndpointRejectionCategory::Blocked)
+                ]
+            ),
             None
+        );
+        assert_eq!(
+            EventSizeClass::from_rejected_targets(&targets, &[prohibited(&a), prohibited(&b)]),
+            None
+        );
+        assert_eq!(
+            EventSizeClass::from_rejected_targets(&targets, &[prohibited(&a)]),
+            None,
+            "a prohibited relay still needs its failure"
         );
     }
 

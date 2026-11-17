@@ -274,7 +274,7 @@ impl RelaySafetyPolicy {
         )
     }
 
-    pub(crate) fn sanitize_publish_request(
+    fn sanitize_publish_request(
         &self,
         mut request: TransportPublishRequest,
     ) -> Result<TransportPublishRequest, String> {

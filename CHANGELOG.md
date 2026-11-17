@@ -87,6 +87,12 @@
 
 ### Fixed
 
+- A relay the host-safety rule refuses no longer reads as one a send may have
+  reached, or hides that a send is too large (#3305). A Welcome whose inbox
+  relays it refuses, on the first attempt or a later retry, no longer counts
+  toward maintenance's ambiguous-exposure total. A commit or message that every
+  other group relay refused for size fails as `EventTooLarge`, as it would
+  without the refused relay.
 - Stop queued detached Welcomes from starting relay publication after their
   native origin loses (#3493). Parked recovery keeps its exact retry for
   canonical re-adoption; terminal loss retires it. Already-started relay I/O

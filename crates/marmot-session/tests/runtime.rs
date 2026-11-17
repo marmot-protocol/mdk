@@ -4661,6 +4661,138 @@ async fn legacy_self_update_fanout_retries_after_lost_confirmation_marker() {
     assert_eq!(last_outcome["event"]["event_age_secs"], 100_000);
 }
 
+/// mdk#3305: a pre-mdk#2255 self-update whose legacy fanout records no
+/// exposure stays pending when a retry's error proves nothing reached any
+/// relay. A crash between an earlier send and its bookkeeping leaves no
+/// record of that send, so this attempt's proof cannot show no member has
+/// the commit, and only an accepting relay or the retention window ends it.
+#[tokio::test]
+async fn legacy_self_update_stays_pending_when_a_retry_reaches_no_relay() {
+    let dir = relaxed_storage_dir().unwrap();
+    let database = dir.path().join("alice.sqlite");
+    let key = SqlCipherKey::new("marmot legacy unsent retry key").unwrap();
+    let mut initial = current_session(database.clone(), &key, b"alice");
+    let group_id = initial
+        .create_group(CreateGroupRequest {
+            name: "legacy unsent retry".into(),
+            description: String::new(),
+            members: Vec::new(),
+            required_features: Vec::new(),
+            app_components: Vec::new(),
+            initial_admins: Vec::new(),
+        })
+        .await
+        .unwrap()
+        .group_id;
+    drop(initial);
+
+    let relay = TransportEndpoint("wss://group.example".into());
+    let adapter = RecordingAdapter::default();
+    let mut runtime = AccountDeviceRuntime::new(
+        current_session(database, &key, b"alice"),
+        adapter.clone(),
+        StaticTransportRouting::new(vec![]).with_group_route(
+            group_id.clone(),
+            group_id.as_slice().to_vec(),
+            vec![relay.clone()],
+        ),
+        RecordingKeyPackages::default(),
+    )
+    .with_maintenance_sources(
+        Arc::new(TestWallClock::new(100_000)),
+        Arc::new(TestMonotonicClock::default()),
+        Arc::new(TestRandom::new(0)),
+    )
+    .with_maintenance_timing(MaintenanceTiming::immediate());
+    // The first send leaves the self-update pending on its frozen fanout.
+    adapter.fail_endpoints_as(
+        vec![relay.clone()],
+        TransportEndpointFailureKind::RetryableUnavailable,
+    );
+    runtime.schedule_manual_self_update(&group_id).unwrap();
+    runtime.run_due_maintenance().await.unwrap();
+    runtime.run_due_maintenance().await.unwrap();
+    let commit = adapter.publishes()[0].message.clone();
+    let evolution = runtime
+        .session()
+        .group_evolutions_for_group(&group_id)
+        .unwrap()
+        .into_iter()
+        .find(|evolution| evolution.signed_message_id.as_ref() == Some(&commit.id))
+        .expect("the self-update evolution");
+    assert!(matches!(
+        runtime.epoch_state(&group_id),
+        Some(cgka_traits::EpochState::PendingPublish(_))
+    ));
+
+    // The pre-migration shape a crash after the send leaves: the legacy
+    // record of the exact commit, with no attempt or exposure recorded.
+    runtime
+        .session()
+        .delete_outbound_fanout(&commit.id)
+        .unwrap();
+    runtime
+        .session()
+        .put_transport_fanout(&cgka_traits::DurableTransportFanout {
+            id: commit.id.clone(),
+            group_id: Some(group_id.clone()),
+            evolution_id: Some(evolution.id.clone()),
+            exact_message: commit.clone(),
+            target: TransportPublishTarget::Group {
+                group_id: group_id.clone(),
+                transport_group_id: group_id.as_slice().to_vec(),
+                endpoints: vec![relay.clone()],
+            },
+            targets: vec![cgka_traits::TransportFanoutTarget {
+                endpoint: relay.clone(),
+                state: cgka_traits::TransportFanoutAttemptState::Unattempted,
+                attempt_count: 0,
+                last_attempt_at: None,
+                failure_code: None,
+            }],
+            required_acks: 1,
+            evolution_confirmed: false,
+            possible_exposure: false,
+            created_at: cgka_traits::Timestamp(100_000),
+            bounded_until: Some(cgka_traits::Timestamp(200_000)),
+        })
+        .unwrap();
+    adapter.fail_endpoints_with_reasons(
+        TransportEndpointFailureKind::NotExposed,
+        vec![(
+            relay.clone(),
+            "relay endpoint refused by the host-safety rule",
+        )],
+    );
+    let before = adapter.publishes().len();
+
+    let effects = runtime.run_due_maintenance().await.unwrap();
+    assert_eq!(
+        adapter.publishes().len(),
+        before + 1,
+        "the commit is retried"
+    );
+    assert_eq!(adapter.publishes().last().unwrap().message, commit);
+    assert!(
+        !effects
+            .pending
+            .iter()
+            .any(|resolution| matches!(resolution, PendingResolution::RolledBack { .. })),
+        "{:?}",
+        effects.pending
+    );
+    assert!(matches!(
+        runtime.epoch_state(&group_id),
+        Some(cgka_traits::EpochState::PendingPublish(_))
+    ));
+    let fanout = runtime
+        .session()
+        .transport_fanout(&commit.id)
+        .unwrap()
+        .unwrap();
+    assert!(!fanout.possible_exposure, "the refusal reached no relay");
+}
+
 /// mdk#2264: a legacy publish that fails on every relay must keep each relay's
 /// cause in the audit log and on the durable fanout, instead of one
 /// `unclassified` adapter row with no relay detail. Founding Welcomes still
