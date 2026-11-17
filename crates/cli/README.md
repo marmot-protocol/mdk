@@ -352,13 +352,13 @@ original `requested_initial_admins`. An unavailable invitee receives no admin ri
 `requires_self_demote_before_leave`, `leave_blocked`, `can_enable_disbanding`, `can_disband`, `disbanding_blockers`,
 per-member `member_actions`). Leave hints use the shared core capability selector and remain advisory; the command
 rechecks current authority. `can_leave` is false for unaccepted invitations and unrecoverable groups.
-`requires_self_demote_before_leave` is true for an admin, including an admin invitee: `groups leave` and
-`groups decline` refuse an admin with `admin_policy` before anything is written or published, until `groups self-demote`;
-the last admin promotes another account first. TUI `L` shows an admin why it cannot leave yet instead of confirming. With
-`WN_DEVICE_GROUPS=1` (see [device linking](#device-linking)) Leave instead demotes an eligible nonlast admin account
-itself before its ordinary departure, so the flag is false there: the last active admin account is refused before a new
-shared invitation choice or departure publication, TUI `L` confirms and invokes the same command, and a committed
-demotion remains if a later departure fails. An admitted Leave can still be settling; success is not proof every device
+Leave demotes an eligible nonlast admin account itself before its ordinary departure, so
+`requires_self_demote_before_leave` is false: the last active admin account is refused before a new shared invitation
+choice or departure publication, TUI `L` confirms and invokes the same command, and a committed demotion remains if a
+later departure fails. With `WN_DEVICE_GROUPS=0` (see [device linking](#device-linking)) the flag is instead true for an
+admin, including an admin invitee: `groups leave` and `groups decline` refuse an admin with `admin_policy` before
+anything is written or published, until `groups self-demote`; the last admin promotes another account first, and TUI `L`
+shows an admin why it cannot leave yet instead of confirming. An admitted Leave can still be settling; success is not proof every device
 departed.
 
 **Retention.** `groups retention <group-hex>` shows the disappearing-message policy (`disappearing_message_secs`,
@@ -685,17 +685,17 @@ and should not need it.
 
 ## Device linking
 
-Every `wn`/`wnd` build includes device groups, off by default. Export `WN_DEVICE_GROUPS=1` for both `wn` and `wnd`
-(the daemon owns the runtime, and the TUI reads it for Leave) to turn them on, with production settlement/retry
-timing. A debug build needs the repository's existing [debug-binary stack requirement](../../README.md#development)
+Device groups are on by default in every `wn`/`wnd` build, with production settlement/retry timing. Export
+`WN_DEVICE_GROUPS=0` (or `false`, `off`, `no`) for both `wn` and `wnd` (the daemon owns the runtime, and the TUI reads
+it for Leave) to turn them off. A debug build needs the repository's existing [debug-binary stack requirement](../../README.md#development)
 when running `wn`/`wnd` directly:
 
 ```sh
-export RUST_MIN_STACK=4194304 WN_DEVICE_GROUPS=1
+export RUST_MIN_STACK=4194304
 cargo build -p wn-cli --bins --locked
 ```
 
-Leave `WN_DEV_SETTLEMENT_QUIESCENCE_MS` and other policy-test overrides unset. Against a `wnd` without `WN_DEVICE_GROUPS=1`,
+Leave `WN_DEV_SETTLEMENT_QUIESCENCE_MS` and other policy-test overrides unset. Against a `wnd` started with `WN_DEVICE_GROUPS=0`,
 `devices link` commands fail with `device group refused: pairing_unsupported` (JSON code `command_failed`) and
 `devices list` shows no devices; `wn daemon status --json` reports the daemon's `device_groups`.
 
@@ -826,7 +826,7 @@ wn daemon stop
 - `wnd` answers on its socket as soon as it binds it, before it has opened its accounts, which the runtime allows 45
   seconds. Meanwhile `wn daemon status` prints `daemon starting` (`"starting": true` in `--json`), `wn daemon stop`
   stops it, and other commands wait until the accounts are open.
-- `wn daemon status --json` includes `device_groups` (whether that `wnd` runs with `WN_DEVICE_GROUPS=1`),
+- `wn daemon status --json` includes `device_groups` (false when that `wnd` runs with `WN_DEVICE_GROUPS=0`),
   `last_runtime_activity`, background `stream_watches`, and a redacted `relay_health`
   object with aggregate relay counts and connection-status buckets. It does not include relay URLs, account ids, group
   ids, subscription ids, or message ids.

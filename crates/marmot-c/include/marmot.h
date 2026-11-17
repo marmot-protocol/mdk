@@ -3143,7 +3143,7 @@ typedef struct MarmotGroupManagementState {
    */
   bool can_leave;
   /**
-   * Whether an admin must self-demote before Leave or Decline; false with experimental device groups on.
+   * Whether an admin must self-demote before Leave or Decline; false with device groups on (the default).
    */
   bool requires_self_demote_before_leave;
   /**
@@ -8025,9 +8025,8 @@ MarmotStatus marmot_client_new_with_configuration(const char *root_path,
                                                   struct MarmotClient **out_client);
 
 /**
- * Open with multi-device on, with the same options and ownership as
- * marmot_client_new_with_configuration. Every library includes it; ordinary
- * constructors keep it off. Use it for every opener of the same root.
+ * The same open as marmot_client_new_with_configuration: every constructor
+ * now opens with multi-device on. Kept so existing hosts keep linking.
  *
  * # Safety
  * Same pointer contracts as marmot_client_new_with_configuration.
@@ -9103,7 +9102,7 @@ MarmotStatus marmot_remove_members(const struct MarmotClient *client,
 
 /**
  * Leave as the active account. An admin fails with `MARMOT_STATUS_ADMIN_CANNOT_SELF_REMOVE` until
- * `marmot_self_demote_admin`; with experimental device groups core demotes eligible admins, leaves matching linked
+ * `marmot_self_demote_admin`; with device groups on (the default) core demotes eligible admins, leaves matching linked
  * copies and refuses the last admin. Free with `marmot_send_summary_free`.
  *
  * # Safety
@@ -9846,7 +9845,7 @@ MarmotStatus marmot_dismiss_compromise_warning(const struct MarmotClient *client
 /**
  * On a new device: ask a device of this account already signed in to
  * link this one, or move this already-linked device to that group.
- * Explicit experimental build and runtime gates are required. Re-read
+ * Refused (`pairing_unsupported`) only with device groups off. Re-read
  * on the `DeviceLinkChanged` event; inspect `moves` for Joining/Made.
  * Free with `marmot_device_link_snapshot_free`.
  *
@@ -9864,7 +9863,7 @@ MarmotStatus marmot_start_device_link(const struct MarmotClient *client,
  * Explicit local device-group reset before fresh code pairing. Keeps
  * credentials, slot and ordinary chat data; abandons unfinished device
  * sync without removing any member. Active pairing/Move or unsettled
- * native work can refuse indefinitely. Requires experimental gates.
+ * native work can refuse indefinitely. Refused with device groups off.
  * Free with `marmot_device_link_snapshot_free`.
  *
  * # Safety
@@ -9992,7 +9991,7 @@ MarmotStatus marmot_accept_group_invite(const struct MarmotClient *client,
  * Decline a pending group invite; writes the updated group record
  * plus the decline publish summary. An invitee the invite made an admin
  * fails with `MARMOT_STATUS_ADMIN_CANNOT_SELF_REMOVE` until
- * `marmot_self_demote_admin`, unless experimental device groups are on.
+ * `marmot_self_demote_admin`, unless device groups are on (the default).
  * Free with `marmot_group_invite_decline_result_free`.
  *
  * # Safety

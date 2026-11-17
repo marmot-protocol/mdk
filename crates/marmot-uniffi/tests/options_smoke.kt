@@ -71,7 +71,7 @@ fun main(args: Array<String>) = runBlocking {
                 session.cancel()
                 check(session.status().state == Nip46StateFfi.CANCELLED)
             }
-            // Every native library opens through the experimental constructor.
+            // The kept experimental alias still opens.
             val experimentalRoot = root.resolve("experimental")
             Marmot.newWithExperimentalDeviceGroups(experimentalRoot.path,
                 listOf("ws://127.0.0.1:1"), copy).use { experimental ->

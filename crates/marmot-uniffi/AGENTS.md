@@ -185,7 +185,7 @@ Chat-screen DTO changes also use `just uniffi-projections-smoke swift` (requires
 `just uniffi-projections-smoke kotlin` (requires `kotlinc` and `MDK_KOTLIN_CLASSPATH` containing JNA with native
 libraries, Android platform, annotations, and coroutines jars). Options, Details Markdown and
 usage-diagnostics DTO changes use the matching `./crates/marmot-uniffi/<name>-smoke.sh swift|kotlin` with the same
-requirements. `options-smoke.sh swift|kotlin` also opens through the experimental constructor. These host checks
+requirements. `options-smoke.sh swift|kotlin` also opens through the kept experimental alias. These host checks
 do not replace release-artifact or device validation.
 
 Release-artifact checks (after `xcframework.sh`):
@@ -206,7 +206,7 @@ macOS release-artifact checks (after `xcframework-macos.sh`, which needs `OTLP_E
 
 For Android NDK prerequisites and initialization see README.md#kotlin--android.
 
-Experimental host-entry owner: `marmot-c/tests/secret_store_client.rs` runs an authenticated two-device link through a
-local WebSocket relay through exported C calls opened with the experimental constructor and no timing overrides; the
-same owner proves ordinary constructors leave device groups off. Keep shared option/open paths and the C options layout
+Device-group host-entry owner: `marmot-c/tests/secret_store_client.rs` runs an authenticated two-device link through a
+local WebSocket relay through exported C calls, one device opened with the ordinary constructor and one with the
+experimental alias, and no timing overrides. Keep shared option/open paths and the C options layout
 unchanged, and never forward `test-policy-overrides` from the packagers.

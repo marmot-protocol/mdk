@@ -5333,15 +5333,16 @@ impl MarmotApp {
     }
 
     /// Refuse to open the session of an account that holds or is joining a
-    /// device group while device groups are off (mdk#3012): an experimental test build's
-    /// root opened by an ordinary constructor, such as a push extension's.
+    /// device group while device groups are off (mdk#3012): a root opened by
+    /// a process with `device_groups` false, such as a push extension built
+    /// against an older library or one that turns them off.
     /// That process could only refuse the device group's messages, and
     /// reading one spends it for every opener of the account. Its drain
     /// would also settle the device group's staged commits and queued
     /// intents without the support they need: a staged commit, with no route
     /// to publish it, is rolled back while its stored fanout still sends it.
-    /// So nothing of the account is hydrated, drained or sent here; the
-    /// experimental constructor opens it.
+    /// So nothing of the account is hydrated, drained or sent here; an app
+    /// with device groups on opens it.
     ///
     /// The account is refused while the engine holds a group a device-group
     /// row names, or waits on a link's Welcome it can still accept. Every

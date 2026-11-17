@@ -5,8 +5,7 @@ session storage, the Nostr MLS peeler, the Nostr transport adapter, and relay-ba
 result as `MarmotApp` / `MarmotAppRuntime`. It sits below presentation layers (`wn`, the UniFFI and C bindings) and above
 the generic account, session, and engine crates. Read this if you are building a host app or binding on top of MDK.
 
-Every build includes device groups; a host turns them on with `MarmotAppConfig::with_device_groups(true)` (off by
-default). An account that holds or is joining a device group opens only with them on: otherwise its session fails with
+Device groups are on by default; a host turns them off with `MarmotAppConfig::with_device_groups(false)`. An account that holds or is joining a device group opens only with them on: otherwise its session fails with
 `AppError::ExperimentalDeviceGroupsRequired` before anything of it is read, sent or subscribed (mdk#3012).
 See [device linking](../cli/README.md#device-linking).
 
@@ -424,7 +423,7 @@ targets.
 **Leaving.** An admin account's Leave, including declining a pending invitation that made it an admin, is refused with
 `AdminCannotSelfRemove` before anything is written or sent; the host demotes it first (`self_demote_admin`) and then
 leaves, and a last admin first makes another member an admin. `requires_self_demote_before_leave` says so. With
-experimental device groups on (`MarmotApp::admin_leave_steps_down`), User Leave instead records the leave and lets the
+device groups on (the default; `MarmotApp::admin_leave_steps_down`), User Leave instead records the leave and lets the
 engine step this account down when another active administrator account remains, then request its own leaf's SelfRemove;
 the call returns before the step-down is published. The last active administrator account is refused on all its devices
 before a choice or departure is published (mdk#3014 keeps that automatic step-down off elsewhere). Queued work is
@@ -680,7 +679,7 @@ A rename and a settings change share one recovery record. Before accepting anoth
 tries the existing recovery of an earlier lost edit and re-reads the roster. Retry `device_group_busy` only while it
 remains unsettled. A successful no-op never leaves an opposite lost intention to apply later. A competing user edit
 of that device wins as a whole, even if it changed a different toggle. Refresh the displayed label and flags on
-`LinkedDevicesChanged`. These commands remain behind the device-group development gate. Custom clients writing post-link settings must adopt
+`LinkedDevicesChanged`. These commands are refused only while the host keeps device groups off. Custom clients writing post-link settings must adopt
 this user-edit marker rule before using the feature; earlier draft writers must update first.
 
 When another of the account's devices removes this one, the account stops on this device once it reads the removal, and
@@ -778,7 +777,7 @@ worker stop/replacement returns `TransportClosed`. Once queued, this caller's wa
 bounds its OS execution opportunity. Manual restore and
 supported lower-level `AppClient` APIs remain independent.
 
-Backup setup and manual restore require `device_groups` (off by default); unsupported setup/restore returns `DeviceGroupRefused("roster_unsupported")`.
+Backup setup and manual restore require `device_groups` (on by default); unsupported setup/restore returns `DeviceGroupRefused("roster_unsupported")`.
 The runtime-wide fact report remains local, and the due-pass wait returns `NotStarted` when device groups are disabled.
 
 ### Manual backup history restore
@@ -815,7 +814,7 @@ stays. Already-running bounded crypto work may finish off the worker; it owns no
 cancelled result, and drops its keys with that work. Closing a watch only stops observing. No secret-backed job or
 cursor is persisted or resumed: a later explicit
 attempt supplies words again. Core Rust operation handles and methods are available here; complete UniFFI/C controls,
-provenance DTOs and operation-token codecs remain separate work. Restore uses the same experimental device-group gate
+provenance DTOs and operation-token codecs remain separate work. Restore uses the same device-group gate
 as the writer.
 
 ### Overdue KeyPackage refresh
@@ -871,7 +870,7 @@ groups on.
 ## Linking a new device
 
 Device linking (mdk#2628) runs through the account runtime. It requires the per-client `device_groups` switch
-(off by default); every call is refused otherwise. Each call returns a `DeviceLinkSnapshot`: the new device's own
+(on by default); every call is refused otherwise. Each call returns a `DeviceLinkSnapshot`: the new device's own
 link (`new_device`) and the prompts for sign-ins this device can link (`prompts`).
 
 - On the new device, `start_device_link` asks a device already signed in to link this one. Its state goes from

@@ -511,14 +511,13 @@ pub unsafe extern "C" fn marmot_client_new_with_configuration(
             options,
             deployment,
             out_client,
-            false,
+            Marmot::new_with_configuration,
         )
     })
 }
 
-/// Open with multi-device on, with the same options and ownership as
-/// marmot_client_new_with_configuration. Every library includes it; ordinary
-/// constructors keep it off. Use it for every opener of the same root.
+/// The same open as marmot_client_new_with_configuration: every constructor
+/// now opens with multi-device on. Kept so existing hosts keep linking.
 ///
 /// # Safety
 /// Same pointer contracts as marmot_client_new_with_configuration.
@@ -539,10 +538,17 @@ pub unsafe extern "C" fn marmot_client_new_with_experimental_device_groups(
             options,
             deployment,
             out_client,
-            true,
+            Marmot::new_with_experimental_device_groups,
         )
     })
 }
+
+/// The UniFFI constructor a configured C open delegates to.
+type ConfiguredConstructor = fn(
+    String,
+    Vec<String>,
+    marmot_uniffi::MarmotOptions,
+) -> Result<Arc<Marmot>, marmot_uniffi::MarmotKitError>;
 
 /// Shared option validation and ownership for every configured open.
 ///
@@ -555,7 +561,7 @@ unsafe fn open_client_with_configuration(
     options: *const MarmotClientOptions,
     deployment: *const deployment::MarmotDeployment,
     out_client: *mut *mut MarmotClient,
-    device_groups: bool,
+    construct: ConfiguredConstructor,
 ) -> MarmotStatus {
     if let Err(status) = unsafe { preflight_out_ptr(out_client) } {
         return status;
@@ -625,11 +631,7 @@ unsafe fn open_client_with_configuration(
                     moderation_report_config: None,
                     deployment,
                 };
-                if device_groups {
-                    Marmot::new_with_experimental_device_groups(root, relays, options)
-                } else {
-                    Marmot::new_with_configuration(root, relays, options)
-                }
+                construct(root, relays, options)
             }
         })
     };

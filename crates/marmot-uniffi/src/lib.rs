@@ -330,22 +330,20 @@ impl Marmot {
         relay_urls: Vec<String>,
         options: MarmotOptions,
     ) -> Result<Arc<Self>, MarmotKitError> {
-        Self::open_with_configuration(root_path, relay_urls, options, false)
+        Self::open_with_configuration(root_path, relay_urls, options)
     }
 
-    /// Open with multi-device on: device linking, the device roster, linked
-    /// devices, backups and admin step-down on Leave. Every native library
-    /// includes it; ordinary constructors keep it off. Takes the same
-    /// `MarmotOptions` and deployment as [`Marmot::new_with_configuration`].
-    /// Use this constructor for every foreground/background opener of the
-    /// same root.
+    /// The same open as [`Marmot::new_with_configuration`]: every constructor
+    /// now opens with multi-device on (device linking, the device roster,
+    /// linked devices, backups and admin step-down on Leave). Kept so
+    /// existing hosts keep compiling.
     #[uniffi::constructor]
     pub fn new_with_experimental_device_groups(
         root_path: String,
         relay_urls: Vec<String>,
         options: MarmotOptions,
     ) -> Result<Arc<Self>, MarmotKitError> {
-        Self::open_with_configuration(root_path, relay_urls, options, true)
+        Self::open_with_configuration(root_path, relay_urls, options)
     }
 
     /// Open with an explicit relay policy and optional host-owned key storage.
@@ -570,9 +568,8 @@ impl Marmot {
         root_path: String,
         relay_urls: Vec<String>,
         options: MarmotOptions,
-        device_groups: bool,
     ) -> Result<Arc<Self>, MarmotKitError> {
-        let config = options.app_config().with_device_groups(device_groups);
+        let config = options.app_config();
         let store = options.secret_store.map(|store| {
             Arc::new(secret_store::ForeignSecretStore::new(store))
                 as Arc<dyn marmot_account::AccountSecretStore>

@@ -1379,7 +1379,7 @@ pub async fn open_message_draft_attachment_handoff( &self, account_ref: String, 
 pub async fn cancel_device_link( &self, account_ref: String, ) -> Result<DeviceLinkSnapshotFfi, MarmotKitError>
 ```
 
-On the new device, request cancellation of the link. This does not guarantee notification of the other device: cancellation while waiting in `Joining` can end locally without sending a cancellation message. Before an authenticated Welcome is admitted, successful cancellation ends `new_device` as `Ended { reason: Cancelled }`. Cancelling while still waiting in `Joining` first withdraws this device's Welcome expectation; if withdrawal fails, the call returns an error and the current worker retries while that in-memory link remains active. After restart, a failed cancellation is not durably retried; its stored Welcome wait can remain active until its deadline. While that wait remains, a new ordinary link can reach confirmation and then end as `LinkFailed`. Cancellation does not undo an already-admitted Welcome: an ordinary link can resolve as `Linked`; for a move, inspect `moves` for the durable outcome. Refused as `MarmotKitError::Runtime` with details `device group refused: pairing_unsupported` unless the explicit experimental build/runtime gates are enabled, or `device group refused: no_link_in_progress` when no link is in progress.
+On the new device, request cancellation of the link. This does not guarantee notification of the other device: cancellation while waiting in `Joining` can end locally without sending a cancellation message. Before an authenticated Welcome is admitted, successful cancellation ends `new_device` as `Ended { reason: Cancelled }`. Cancelling while still waiting in `Joining` first withdraws this device's Welcome expectation; if withdrawal fails, the call returns an error and the current worker retries while that in-memory link remains active. After restart, a failed cancellation is not durably retried; its stored Welcome wait can remain active until its deadline. While that wait remains, a new ordinary link can reach confirmation and then end as `LinkFailed`. Cancellation does not undo an already-admitted Welcome: an ordinary link can resolve as `Linked`; for a move, inspect `moves` for the durable outcome. Refused as `MarmotKitError::Runtime` with details `device group refused: pairing_unsupported` with device groups off, or `device group refused: no_link_in_progress` when no link is in progress.
 
 [Source](src/commands/device_link.rs#L52)
 
@@ -1415,7 +1415,7 @@ On a device already signed in, Not now for the prompt `prompt_id`: the prompt go
 pub async fn device_link_snapshot( &self, account_ref: String, ) -> Result<DeviceLinkSnapshotFfi, MarmotKitError>
 ```
 
-Current linking and durable move progress: `new_device` while this device asked to be linked, `prompts` for the sign-ins it can link, newest last, and `moves` as described in [move guidance](README.md#moving-this-device-to-another-device-group). Each prompt's state says what to show: `Preparing` while the sign-in's KeyPackage is checked, `Comparing` with the code, `CompetingRequests`, `RateLimited` until `retry_at`, `CannotLink` with what its client lacks, `TooManyDevices`, `Linking`, `Linked`, `AddedElsewhere` ("<device_label> was added by <added_by_label>") or `Ended` with a reason. Re-read on `MarmotEventFfi::DeviceLinkChanged`, which also fires each time the account's worker opens or reconnects; unconfirmed comparisons end because their secrets are memory-only, while admitted native/move work keeps its durable owner. Refused when the explicit experimental build/runtime gates are disabled (`pairing_unsupported`). Runs on the account worker and sends what linking owes.
+Current linking and durable move progress: `new_device` while this device asked to be linked, `prompts` for the sign-ins it can link, newest last, and `moves` as described in [move guidance](README.md#moving-this-device-to-another-device-group). Each prompt's state says what to show: `Preparing` while the sign-in's KeyPackage is checked, `Comparing` with the code, `CompetingRequests`, `RateLimited` until `retry_at`, `CannotLink` with what its client lacks, `TooManyDevices`, `Linking`, `Linked`, `AddedElsewhere` ("<device_label> was added by <added_by_label>") or `Ended` with a reason. Re-read on `MarmotEventFfi::DeviceLinkChanged`, which also fires each time the account's worker opens or reconnects; unconfirmed comparisons end because their secrets are memory-only, while admitted native/move work keeps its durable owner. Refused with device groups off (`pairing_unsupported`). Runs on the account worker and sends what linking owes.
 
 [Source](src/commands/device_link.rs#L114)
 
@@ -1452,7 +1452,7 @@ On a device already signed in, Link device for the prompt `prompt_id`, offered w
 pub async fn reset_device_group_for_repair( &self, account_ref: String, ) -> Result<DeviceLinkSnapshotFfi, MarmotKitError>
 ```
 
-After explicit user confirmation, discard only this device's quiet trusted hidden device-group copy before fresh code pairing. Keeps ordinary chat data, drafts/settings, account credentials and stable slot; abandons old link-bound preparations, while shared values and security decisions retain their ordinary synchronization rules. This sends no removal, authenticates no device and repairs no chat membership. Active pairing/Move or unsettled native work returns `device_group_busy` without a deadline; no trusted copy returns `no_device_group`. An unlinked device cannot bypass removal. Cancellation after reset restores nothing, while a fresh already-confirmed link keeps its ordinary durable Welcome wait. Duplicate membership, rejection and capacity can still refuse the new link. Requires the explicit experimental capability/constructor; see [the shared reset contract](README.md#explicit-local-device-group-reset-before-fresh-pairing).
+After explicit user confirmation, discard only this device's quiet trusted hidden device-group copy before fresh code pairing. Keeps ordinary chat data, drafts/settings, account credentials and stable slot; abandons old link-bound preparations, while shared values and security decisions retain their ordinary synchronization rules. This sends no removal, authenticates no device and repairs no chat membership. Active pairing/Move or unsettled native work returns `device_group_busy` without a deadline; no trusted copy returns `no_device_group`. An unlinked device cannot bypass removal. Cancellation after reset restores nothing, while a fresh already-confirmed link keeps its ordinary durable Welcome wait. Duplicate membership, rejection and capacity can still refuse the new link. Refused with device groups off; see [the shared reset contract](README.md#explicit-local-device-group-reset-before-fresh-pairing).
 
 [Source](src/commands/device_link.rs#L28)
 
@@ -1465,7 +1465,7 @@ After explicit user confirmation, discard only this device's quiet trusted hidde
 pub async fn start_device_link( &self, account_ref: String, ) -> Result<DeviceLinkSnapshotFfi, MarmotKitError>
 ```
 
-Ask a device of this account already signed in to link this one, returning its current comparison state. If this device already trusts a different device group, the same flow moves only this device; keep showing the old trust until `snapshot.moves` reports Made, as described in [move guidance](README.md#moving-this-device-to-another-device-group). The request names this device's published KeyPackage, never one this device already joined a group by, so publish one first, and again after such a join (`key_package_not_published`). `new_device` starts at `WaitingForAnswer`: ask the user to open the app on a device already signed in. Once one answers it moves to `Comparing` with the seven emoji both screens show, each with an English `description` for screen readers; offer "They match" (`confirm_device_link_match`) and cancel (`cancel_device_link`). Refresh on `MarmotEventFfi::DeviceLinkChanged`. Refused with `MarmotKitError::Runtime` (details `device group refused: <reason>`) while a link is in progress (`pairing_in_progress`) or the explicit experimental build/runtime gates are disabled (`pairing_unsupported`). Runs on the account worker and sends one gift-wrapped request to the account's relays.
+Ask a device of this account already signed in to link this one, returning its current comparison state. If this device already trusts a different device group, the same flow moves only this device; keep showing the old trust until `snapshot.moves` reports Made, as described in [move guidance](README.md#moving-this-device-to-another-device-group). The request names this device's published KeyPackage, never one this device already joined a group by, so publish one first, and again after such a join (`key_package_not_published`). `new_device` starts at `WaitingForAnswer`: ask the user to open the app on a device already signed in. Once one answers it moves to `Comparing` with the seven emoji both screens show, each with an English `description` for screen readers; offer "They match" (`confirm_device_link_match`) and cancel (`cancel_device_link`). Refresh on `MarmotEventFfi::DeviceLinkChanged`. Refused with `MarmotKitError::Runtime` (details `device group refused: <reason>`) while a link is in progress (`pairing_in_progress`) or device groups are off (`pairing_unsupported`). Runs on the account worker and sends one gift-wrapped request to the account's relays.
 
 [Source](src/commands/device_link.rs#L16)
 
@@ -2072,7 +2072,7 @@ Request removal of selected members; use the detailed variant for operation outc
 pub async fn leave_group( &self, account_ref: String, group_id_hex: String, ) -> Result<SendSummaryFfi, MarmotKitError>
 ```
 
-Queue leaving a group; retained local history is separate from membership. An admin gets `AdminCannotSelfRemove` until `self_demote_admin` (`requires_self_demote_before_leave`); only the experimental device-groups constructor demotes a nonlast admin itself.
+Queue leaving a group; retained local history is separate from membership. An admin gets `AdminCannotSelfRemove` until `self_demote_admin` (`requires_self_demote_before_leave`); with device groups on (the default), core demotes a nonlast admin itself.
 
 [Source](src/commands/group.rs#L923)
 
@@ -2084,7 +2084,7 @@ Queue leaving a group; retained local history is separate from membership. An ad
 pub async fn cancel_leave( &self, account_ref: String, group_id_hex: String, ) -> Result<(), MarmotKitError>
 ```
 
-Cancel this account's blocked leave, on this device only. A leave is blocked when the selected branch makes the account the group's last active admin, so no Commit can finish it; the chat keeps reading as leaving (`leave_request_pending`) with `leave_blocked` set, and hosts offer Cancel while `GroupManagementStateFfi::can_cancel_leave` holds. Cancel makes the chat joined again and the account can send. While the group is still settling, or in any other state, it returns `LeaveNotBlocked`; read the state again before offering Cancel. With experimental device groups on, it leaves the shared Decline alone, so each linked device cancels its own leave.
+Cancel this account's blocked leave, on this device only. A leave is blocked when the selected branch makes the account the group's last active admin, so no Commit can finish it; the chat keeps reading as leaving (`leave_request_pending`) with `leave_blocked` set, and hosts offer Cancel while `GroupManagementStateFfi::can_cancel_leave` holds. Cancel makes the chat joined again and the account can send. While the group is still settling, or in any other state, it returns `LeaveNotBlocked`; read the state again before offering Cancel. With device groups on, it leaves the shared Decline alone, so each linked device cancels its own leave.
 
 [Source](src/commands/group.rs#L943)
 
@@ -2288,7 +2288,7 @@ Accept a pending group invitation.
 pub async fn decline_group_invite( &self, account_ref: String, group_id_hex: String, ) -> Result<GroupInviteDeclineResultFfi, MarmotKitError>
 ```
 
-Decline a pending group invitation. An invitee the invite made an admin gets `AdminCannotSelfRemove` until `self_demote_admin` (`requires_self_demote_before_leave`), unless the experimental device-groups constructor is used.
+Decline a pending group invitation. An invitee the invite made an admin gets `AdminCannotSelfRemove` until `self_demote_admin` (`requires_self_demote_before_leave`), unless device groups are on (the default).
 
 [Source](src/commands/group.rs#L1258)
 
@@ -4684,9 +4684,9 @@ Open with any combination of runtime options, including the required deployment.
 pub fn new_with_experimental_device_groups( root_path: String, relay_urls: Vec<String>, options: MarmotOptions, ) -> Result<Arc<Self>, MarmotKitError>
 ```
 
-Open with device groups on. Every native library includes them; ordinary constructors keep them off. It takes the same `MarmotOptions` and required deployment as `new_with_configuration`, preserving their ordinary meanings and ownership. Use this constructor for every foreground/background opener of the experimental root, a notification service extension included: an ordinary constructor does not open an account that holds or is joining a device group and reports Runtime with `experimental_device_groups_required`; see the [shared host test-build guidance](README.md#experimental-device-group-test-builds). Production timing is unchanged. Device groups are opt-in, not a release default.
+The same open as `new_with_configuration`: every constructor opens with [device groups](README.md#device-groups) on. Kept so existing hosts keep compiling.
 
-[Source](src/lib.rs#L343)
+[Source](src/lib.rs#L341)
 
 ### `Marmot::new_with_options`
 
@@ -4698,7 +4698,7 @@ pub fn new_with_options( root_path: String, relay_urls: Vec<String>, relay_polic
 
 Open with an explicit relay policy and optional host-owned key storage. Existing constructors retain their public-only relay policy.
 
-[Source](src/lib.rs#L354)
+[Source](src/lib.rs#L352)
 
 ### `Marmot::new`
 
@@ -4710,7 +4710,7 @@ pub fn new( root_path: String, relay_urls: Vec<String>, deployment: MarmotDeploy
 
 Open the Marmot app at `root_path`, configured with the given default relay URLs and `deployment`. Account secrets (Nostr private keys) are stored in the platform keyring (Keychain on Apple platforms, Android's native keyring on Android) under the deployment's `keychain_service` — not in a plaintext file. Fallible because initializing the platform secret store can fail or another process may own the same root (`MarmotKitError::RuntimeBusy`). Root ownership is nonblocking and remains held until the final `Marmot`/runtime handle is dropped, even after `Marmot::shutdown`. Call `Marmot::start` before subscribing to events.
 
-[Source](src/lib.rs#L383)
+[Source](src/lib.rs#L381)
 
 ### `Marmot::new_with_secret_store`
 
@@ -4722,7 +4722,7 @@ pub fn new_with_secret_store( root_path: String, relay_urls: Vec<String>, secret
 
 Open the Marmot app with host-supplied account-secret storage instead of the platform keychain. Identical to `Marmot::new` except that every read, write, and removal of an account signing key goes through `secret_store`.
 
-[Source](src/lib.rs#L409)
+[Source](src/lib.rs#L407)
 
 ### `Marmot::new_with_cursor_persistence`
 
@@ -4734,7 +4734,7 @@ pub fn new_with_cursor_persistence( root_path: String, relay_urls: Vec<String>, 
 
 Construct with explicit advancing/frozen relay cursor behavior; new_with_configuration composes this with other options.
 
-[Source](src/lib.rs#L440)
+[Source](src/lib.rs#L438)
 
 ### `Marmot::new_with_client_name`
 
@@ -4746,7 +4746,7 @@ pub fn new_with_client_name( root_path: String, relay_urls: Vec<String>, client_
 
 Open with an optional public client label for new KeyPackage publications. Existing constructors remain untagged. Whitespace-only labels, and labels longer than 64 bytes once trimmed, are omitted rather than truncated. Hosts must supply this on every foreground/background runtime construction.
 
-[Source](src/lib.rs#L461)
+[Source](src/lib.rs#L459)
 
 ### `Marmot::start`
 
@@ -4758,7 +4758,7 @@ pub async fn start(&self) -> Result<(), MarmotKitError>
 
 Bring the runtime to local readiness.
 
-[Source](src/lib.rs#L499)
+[Source](src/lib.rs#L497)
 
 ### `Marmot::shutdown`
 
@@ -4770,7 +4770,7 @@ pub async fn shutdown(&self)
 
 Tear the runtime down. Drops all subscriptions; long-lived `EventsSubscription` / `ChatsSubscription` / etc. instances on the host side will see their `next()` return `None` shortly after.
 
-[Source](src/lib.rs#L511)
+[Source](src/lib.rs#L509)
 
 ### `Marmot::shutdown_and_close`
 
@@ -4782,7 +4782,7 @@ pub async fn shutdown_and_close(&self) -> Result<(), MarmotKitError>
 
 Terminally stop work, close storage and release root ownership; reconstruct before further reads/work.
 
-[Source](src/lib.rs#L547)
+[Source](src/lib.rs#L545)
 
 ### `Marmot::storage_is_closed`
 
@@ -4794,7 +4794,7 @@ pub fn storage_is_closed(&self) -> bool
 
 True once `Marmot::shutdown_and_close` has closed the store. A host can check this to confirm it is safe to be suspended, or to notice it is holding a spent handle and needs a fresh one.
 
-[Source](src/lib.rs#L555)
+[Source](src/lib.rs#L553)
 
 ### `Marmot::is_stopping`
 
@@ -4806,7 +4806,7 @@ pub fn is_stopping(&self) -> bool
 
 True once shutdown has started. Host apps can use this to avoid launching more subscriptions or account work while they are moving to the background.
 
-[Source](src/lib.rs#L562)
+[Source](src/lib.rs#L560)
 
 </details>
 

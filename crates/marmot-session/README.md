@@ -10,8 +10,8 @@ The crate root is the facade: the runtime, its effects, `SessionConfig`, the err
 exposes. The session itself is a private module; the `test-support` feature re-exports it for tests that drive it
 directly.
 
-Every build may advertise the adopted device roster. `marmot-app` advertises it only when the host turns device groups
-on (`MarmotAppConfig::device_groups`, off by default).
+Every build may advertise the adopted device roster. `marmot-app` advertises it unless the host turns device groups
+off (`MarmotAppConfig::device_groups`, on by default).
 See [device linking](../cli/README.md#device-linking).
 
 `PublishFailure::oversized` carries a coarse artifact and event-size class when the complete frozen target set

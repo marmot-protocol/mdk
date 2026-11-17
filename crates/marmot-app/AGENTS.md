@@ -495,7 +495,7 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   Commit per pass. The stall flag on `DeviceLinkSnapshot` changes hosts hear about only through the pairing drive's view
   comparison.
 - Keep device pairing (mdk#2628 item 3.3b) in `src/client/device_pairing.rs` (host DTOs) and
-  `src/client/device_pairing/live.rs` (inert unless the host sets `MarmotAppConfig::device_groups`, off by default). The Welcome peeler opens each gift wrap to the account once and hands
+  `src/client/device_pairing/live.rs` (inert when the host turns `MarmotAppConfig::device_groups` off; on by default). The Welcome peeler opens each gift wrap to the account once and hands
   pairing rumors to the `PairingInbox`; the engine still sees them refused. Pairing secrets (the code, keys and session
   ids) live only in the in-memory `marmot-pairing` sessions: never persist them, and never log them, a slot or a label.
   An existing device answers no request whose slot the roster rejects or this device rejected itself, with or without a
