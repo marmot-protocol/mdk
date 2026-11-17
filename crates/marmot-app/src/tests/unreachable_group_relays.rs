@@ -206,7 +206,8 @@ async fn a_group_relay_the_safety_rule_refuses_is_a_definite_non_delivery() {
 
 /// A group whose relays all fail the host-safety rule can send nothing: a
 /// commit rolls back and a message fails at once, and neither is retried
-/// (mdk#3276).
+/// (mdk#3276). Each fails as having no usable relay, which no retry or relay
+/// answer can change, not as a send relays refused (mdk#3305).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_group_whose_relays_all_fail_the_safety_rule_sends_nothing() {
     let dir = tempfile::tempdir().unwrap();
@@ -230,14 +231,15 @@ async fn a_group_whose_relays_all_fail_the_safety_rule_sends_nothing() {
         .update_group_profile(&group, Some("unsent"), None)
         .await
         .unwrap_err();
-    assert_refused_everywhere(&error);
+    assert!(matches!(error, AppError::NoUsableRelay), "{error:?}");
     let state = client.runtime.epoch_state(&group).unwrap();
     assert!(
         matches!(state, cgka_traits::engine_state::EpochState::Stable { .. }),
         "the unsent commit rolled back: {state:?}"
     );
     assert_eq!(state.epoch(), epoch);
-    assert_refused_everywhere(&client.send(&group, b"unsent").await.unwrap_err());
+    let error = client.send(&group, b"unsent").await.unwrap_err();
+    assert!(matches!(error, AppError::NoUsableRelay), "{error:?}");
 
     assert!(
         !client.runtime.has_pending_outbound_fanouts(&group).unwrap(),

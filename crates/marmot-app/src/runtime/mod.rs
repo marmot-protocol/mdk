@@ -1242,7 +1242,9 @@ pub(crate) fn wipe_failure_reason(err: &AppError) -> String {
             return "transport error".to_owned();
         }
         AppError::TransportClosed => "transport error",
-        AppError::Publish(_) | AppError::EventTooLarge { .. } => "relay publish failed",
+        AppError::Publish(_) | AppError::EventTooLarge { .. } | AppError::NoUsableRelay => {
+            "relay publish failed"
+        }
         AppError::Storage(_) | AppError::Sqlite(_) | AppError::SqlcipherKeyDerivation(_) => {
             "local storage error"
         }

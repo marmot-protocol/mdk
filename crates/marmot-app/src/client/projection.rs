@@ -1531,6 +1531,7 @@ fn read_marker_error_code(error: &AppError) -> &'static str {
         }
         AppError::Publish(_) => "read_marker_failed:publish",
         AppError::EventTooLarge { .. } => "read_marker_failed:event_too_large",
+        AppError::NoUsableRelay => "read_marker_failed:no_usable_relay",
         AppError::MissingDefaultRelays => "read_marker_failed:missing_default_relays",
         AppError::MissingRelayLists(_) => "read_marker_failed:missing_relay_lists",
         AppError::FollowListUnavailable => "read_marker_failed:follow_list_unavailable",

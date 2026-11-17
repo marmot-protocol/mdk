@@ -15,6 +15,9 @@
 
 ### Added
 
+- `MarmotKitError.NoUsableRelay` reports a group send none of whose relays MDK may send to, such as relays at
+  private-network addresses; it was `Publish` before. Nothing was sent, a commit rolled back, and a retry fails the
+  same way while the group's relays stay the same (#3305).
 - `unreactFromMessageMatching(accountRef, groupIdHex, targetMessageId, emoji)`
   removes the account's active events for one exact emoji without removing its
   other emoji. Both removal commands expose `MarmotKitError.ReactionNotFound`

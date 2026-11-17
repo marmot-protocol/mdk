@@ -17,6 +17,8 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Added
 
+- A group send none of whose relays MDK may send to, such as relays at private-network addresses, reports JSON
+  `no_usable_relay` instead of `publish_failed`. Nothing was sent, and a retry fails the same way (#3305).
 - `wn groups pending-commit <group-hex>` shows the group's own commit that has not confirmed yet, `sending` or
   `stuck`, with its relays (mdk#2332). Group changes fail with the JSON error code `group_commit_pending` while it is
   pending, ahead of `group_catching_up` and `group_commit_undelivered`.

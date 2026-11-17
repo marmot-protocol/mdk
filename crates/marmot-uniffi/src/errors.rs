@@ -273,6 +273,10 @@ pub enum MarmotKitError {
         artifact: OversizedArtifactFfi,
         size_class: EventSizeClassFfi,
     },
+    /// MDK may send to none of the group's relays; nothing was sent. Do not
+    /// offer a retry: it fails the same way while those relays stay.
+    #[error("no usable relay")]
+    NoUsableRelay,
     /// No current kind-3 event was found on the account's known outbox/default
     /// relays. Retrying after directory/relay recovery is safe; publishing from
     /// an assumed empty list is not.
@@ -317,11 +321,11 @@ pub enum MarmotKitError {
     /// A signed-out account cannot approve automatic network requests.
     #[error("automatic attachment approval requires a signed-in account")]
     AttachmentAccountSignedOut,
-    /// An account worker's transport catch-up failed (sync error or timeout).
-    /// Distinct, typed variant — separate from [`MarmotKitError::Runtime`] —
-    /// so hosts (notably the NSE wake path) can tell a catch-up failure from
-    /// a generic runtime error; the untyped bucket is what sent an earlier
-    /// investigation chasing the wrong subsystem.
+    /// An account worker's transport catch-up failed (sync error or timeout),
+    /// not a generic runtime error.
+    // Typed, not `Runtime`, so hosts (notably the NSE wake path) can tell the
+    // two apart: the untyped bucket once sent an investigation chasing the
+    // wrong subsystem.
     #[error("account catch-up failed: {details}")]
     AccountCatchUp { details: String },
     #[error("local account is not an admin of group {group_id_hex}")]
@@ -392,11 +396,10 @@ pub enum MarmotKitError {
         member_id_hex: String,
     },
     /// Transient storage lock contention (`SQLITE_BUSY` / "database is locked")
-    /// that survived the storage layer's internal retry-with-backoff. It is a
-    /// distinct, typed variant — separate from [`MarmotKitError::Runtime`] — so
-    /// the app (#484) can recognise a *transient* condition worth a user retry
-    /// or auto-retry instead of string-parsing "database is locked" and
-    /// surfacing it as a fatal "Send failed".
+    /// that survived the storage layer's internal retry-with-backoff. Retry, or
+    /// let the user retry; do not report it as a fatal send failure.
+    // Typed, not `Runtime`, so the app (#484) need not string-parse "database
+    // is locked" to tell a transient condition from a fatal one.
     #[error("storage busy: {details}")]
     StorageBusy { details: String },
     /// The store has been closed by [`Marmot::shutdown_and_close`][crate::Marmot::shutdown_and_close]
@@ -810,6 +813,7 @@ impl From<&AppError> for MarmotKitError {
                 artifact: (*artifact).into(),
                 size_class: (*size_class).into(),
             },
+            AppError::NoUsableRelay => Self::NoUsableRelay,
             AppError::FollowListUnavailable => Self::FollowListUnavailable,
             AppError::FollowListTooLarge => Self::FollowListTooLarge,
             AppError::TransportClosed => Self::TransportClosed,

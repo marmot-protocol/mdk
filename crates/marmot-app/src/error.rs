@@ -258,6 +258,12 @@ pub enum AppError {
         artifact: crate::OversizedArtifact,
         size_class: crate::EventSizeClass,
     },
+    /// The group has no relay this device may send to: the transport refuses
+    /// every relay the send targets before sending anything, as the host-safety
+    /// rule refuses a private-network address (mdk#3276). Nothing was sent, a
+    /// commit rolled back, and a retry is refused the same way (mdk#3305).
+    #[error("no usable relay")]
+    NoUsableRelay,
     #[error("default relays are required to publish account relay lists")]
     MissingDefaultRelays,
     #[error("missing account relay lists: {0:?}")]
@@ -767,6 +773,7 @@ impl AppError {
             Self::AgentStreamInvalidCandidate(_) => "agent_stream_invalid_candidate",
             Self::Publish(_) => "publish",
             Self::EventTooLarge { .. } => "event_too_large",
+            Self::NoUsableRelay => "no_usable_relay",
             Self::MissingDefaultRelays => "missing_default_relays",
             Self::MissingRelayLists(_) => "missing_relay_lists",
             Self::UserBlocked => "user_blocked",

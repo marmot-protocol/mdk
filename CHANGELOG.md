@@ -13,6 +13,12 @@
 
 ### Added
 
+- A group send none of whose relays MDK may send to, such as relays at
+  private-network addresses, fails as a typed no-usable-relay error, not a
+  generic publish failure: `AppError::NoUsableRelay`,
+  `MarmotKitError.NoUsableRelay`, `MARMOT_STATUS_NO_USABLE_RELAY` (133) and
+  the CLI's `no_usable_relay` code. Nothing was sent, and a retry fails the
+  same way while the group's relays stay the same (#3305).
 - MarmotKit and C bindings expose emoji-scoped reaction removal and a typed
   `ReactionNotFound` outcome for local no-match results. Target-wide removal
   remains available (#1963).

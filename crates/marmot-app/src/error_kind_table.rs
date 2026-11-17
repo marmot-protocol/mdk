@@ -332,6 +332,27 @@ pub fn lower_stack_rows() -> Vec<ErrorKindRow> {
     ] {
         rows.push(row(name.into(), error, expected));
     }
+
+    // A group send whose every relay the transport refused before sending, as
+    // the host-safety rule refuses a private-network relay (mdk#3305).
+    rows.push(row(
+        "no usable relay, from the session's publish failures".into(),
+        crate::groups::publish_failure_error(&[marmot_session::PublishFailure {
+            message_id: cgka_traits::MessageId::new(vec![0xab; 32]),
+            reason: "insufficient publish acknowledgements".into(),
+            oversized: None,
+            no_usable_relay: true,
+        }]),
+        HostAnswers {
+            marmotkit: "NoUsableRelay",
+            c_status: "NoUsableRelay",
+            cli_code: "no_usable_relay",
+            sync_class: SyncErrorClass::Unknown,
+            privacy_kind: "no_usable_relay",
+            wipe_reason: "relay publish failed",
+            read_marker_code: "read_marker_failed:no_usable_relay",
+        },
+    ));
     rows
 }
 

@@ -11,6 +11,9 @@
 
 ### Added
 
+- `AppError::NoUsableRelay` reports a group send none of whose relays MDK may send to, such as relays at
+  private-network addresses, in place of `AppError::Publish`; `marmot_session::PublishFailure` gains
+  `no_usable_relay`, set when the transport refused every target of a group send before sending (#3305).
 - Opt-in relay telemetry exports `relay_read_back_requests` and `relay_read_back_found`: device-wide, unlabeled
   counts of the read-back REQs sent for pending commits and of the relays that returned the exact event (mdk#2332).
   `RelayTelemetryRollup` gains the matching fields; struct literals need them or `..Default::default()`.

@@ -239,6 +239,11 @@ pub enum MarmotStatus {
     /// No active reaction matches locally. Refresh authoritative state before
     /// treating absence as convergence; other devices may not have caught up.
     ReactionNotFound = 132,
+    /// The group has no relay this device may send to: MDK refuses every one
+    /// of its relays before sending, as it refuses a private-network address.
+    /// Nothing was sent; a commit rolled back. Retrying fails the same way
+    /// while the group's relays stay the same (mdk#3305).
+    NoUsableRelay = 133,
 }
 
 thread_local! {
@@ -370,6 +375,7 @@ pub(crate) fn status_from_error(err: &MarmotKitError) -> MarmotStatus {
         MarmotKitError::FollowListUnavailable => MarmotStatus::FollowListUnavailable,
         MarmotKitError::FollowListTooLarge => MarmotStatus::FollowListTooLarge,
         MarmotKitError::EventTooLarge { .. } => MarmotStatus::EventTooLarge,
+        MarmotKitError::NoUsableRelay => MarmotStatus::NoUsableRelay,
         MarmotKitError::InvalidChatListQuery { .. } => MarmotStatus::InvalidChatListQuery,
         MarmotKitError::RuntimeBusy => MarmotStatus::RuntimeBusy,
         MarmotKitError::AccountSessionBusy => MarmotStatus::AccountSessionBusy,
@@ -636,6 +642,7 @@ mod tests {
                 group_id_hex: "aa".into(),
             },
             MarmotKitError::ReactionNotFound,
+            MarmotKitError::NoUsableRelay,
             MarmotKitError::MemberNotInGroup {
                 group_id_hex: "aa".into(),
                 member_id_hex: "bb".into(),
@@ -821,6 +828,11 @@ mod tests {
             take_last_error().as_deref(),
             Some("no matching reaction to remove")
         );
+        assert_eq!(
+            status_from_error(&MarmotKitError::NoUsableRelay) as i32,
+            133
+        );
+        assert_eq!(take_last_error().as_deref(), Some("no usable relay"));
         assert_eq!(
             status_from_error(&MarmotKitError::GroupRecoverySourceMismatch {
                 group_id_hex: "aa".into(),

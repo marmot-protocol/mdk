@@ -819,6 +819,13 @@ fn app_error_json(err: &AppError) -> Value {
             "artifact": artifact.as_str(),
             "size_class": size_class.as_str(),
         }),
+        // Every group relay is one MDK refuses to send to, such as a
+        // private-network address; nothing was sent, and a retry fails the same
+        // way while the group's relays stay the same (mdk#3305).
+        AppError::NoUsableRelay => json!({
+            "code": "no_usable_relay",
+            "message": err.to_string(),
+        }),
         AppError::MissingDefaultRelays => json!({
             "code": "missing_default_relays",
             "message": err.to_string(),
