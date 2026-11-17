@@ -114,7 +114,7 @@ EOF
       (cd "$checkout" && OPENCODE_CONFIG_DIR="$config_dir" OPENCODE_DISABLE_PROJECT_CONFIG=1 \
         OPENCODE_DISABLE_CLAUDE_CODE=1 numes run opencode run --standalone --agent review \
         -m "numes/$model#high" "$(cat "$input/prompt.md")") \
-        > "$out_dir/opencode.md" 2>> "$out_dir/opencode.log" || rc=$?
+        < /dev/null > "$out_dir/opencode.md" 2>> "$out_dir/opencode.log" || rc=$?
       if [[ $rc -eq 0 ]] && grep -v '^[[:space:]]*$' "$out_dir/opencode.md" | tail -1 |
         grep -qE '^[[:space:]]*VERDICT: (merge|changes-needed)[[:space:]]*$'; then
         break
