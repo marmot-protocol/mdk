@@ -1245,9 +1245,9 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   writes the survey off the worker); its notices are compared strictly. The oracle runs in this crate's unit tests
   and, through the runner's `CARGO_PKG_NAME`, its integration tests; downstream crates' tests link `test-support`
   too (feature unification) and run without it (`oracle::enabled`). Keep its proof in this crate's suites.
-  A recovery read retains the app's terminal-close latch and checks it after building its account status: a
-  visibility fact fails closed on a storage error, so a close during those facts must return `Closed`, never a
-  successful status with groups or notices silently omitted (mdk#3451).
+  The account recovery-status read retains the app's terminal-close latch and checks it after building its status:
+  a visibility fact fails closed on a storage error, so a close during those facts must make this account-status
+  read return `Closed`, never a successful status with groups or notices silently omitted (mdk#3451).
 - The account reads in `runtime/commands.rs` that answer from A (`read_from_state`) take the worker lane's
   admission, then answer from one version on the caller's task: no I/O, no queue wait. The lane carries a
   `ReadStateReader`, paired with the worker's `ReadStateSender` at spawn. The reader checks
