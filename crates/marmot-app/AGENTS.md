@@ -278,7 +278,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   `runtime/account_worker/sign_in_reads.rs`). The worker detaches its client's reads before its first pass; a directly
   owned `AppClient` reads in place (`check_sign_ins`). The look (`start_sign_in_slot_read`) borrows the client
   immutably and writes nothing; every read starts through `begin_sign_in_slot_read`, which first records the removed
-  slots (above) as its own small write, so a read that fails cannot let maintenance drop a record not saved here. The read runs in a task, and its continuation (`finish_sign_in_slot_read`) runs on the
+  slots (above) as its own small write, and a detached due check records them in `drive_sign_ins` too, before the
+  pass's session maintenance, so neither a failed read nor that pass can drop a record not saved here. The read runs in a task, and its continuation (`finish_sign_in_slot_read`) runs on the
   writer as one `Maintenance` unit against current state. It judges the read only while this device's own KeyPackages
   are as the look found them; after one change it reads once more, and after a second it records nothing and leaves
   the schedule. The scheduled check's tail, the schedule and the rejection commit, runs only while device groups are

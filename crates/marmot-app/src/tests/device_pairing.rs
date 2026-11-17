@@ -889,6 +889,66 @@ async fn a_removed_and_relinked_device_is_not_a_rejected_sign_in() {
     }
 }
 
+/// A removal this device never recorded, as after an upgrade, is recorded by
+/// the maintenance pass that asks the worker for a sign-in read, before that
+/// pass's session maintenance can drop the expired record and before the
+/// read begins.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_detached_check_records_a_removal_before_the_record_can_expire() {
+    let (relay, [mut phone]) = alice_devices::<1>().await;
+    phone.client.check_sign_ins().await.unwrap();
+    let mut laptop = another_alice_device(&relay, &phone).await;
+    let old_slot = laptop.slot_hex();
+    phone.client.check_sign_ins().await.unwrap();
+    let storage = phone.app.account_storage("alice").unwrap().app_storage();
+    let record = storage.sign_in(&old_slot).unwrap().unwrap();
+    let group = link(&relay, &mut phone, &mut laptop, "Laptop").await;
+    phone.client.remove_linked_device(&old_slot).await.unwrap();
+    let old_slot_id: [u8; 32] = hex::decode(&old_slot).unwrap().try_into().unwrap();
+    assert!(
+        phone
+            .roster(&group)
+            .rejected_slots
+            .contains_key(&old_slot_id)
+    );
+
+    // As before migration 0211: no removal recorded, the sign-in still here.
+    storage
+        .execute_batch_for_test(&format!(
+            "DELETE FROM account_sign_in_removals;
+             INSERT INTO account_sign_ins (slot_id_hex, before_this_device, client, appeared_at,
+                 last_published_at, key_package_event_id_hex, key_package_ref_hex, signed_in,
+                 answer, answered_at, roster_pending)
+             VALUES ('{}', 0, '', {}, {}, '{}', '{}', 1, 'none', NULL, 0);",
+            record.slot_id_hex,
+            record.appeared_at,
+            record.last_published_at,
+            record.key_package_event_id_hex,
+            record.key_package_ref_hex,
+        ))
+        .unwrap();
+    phone.client.detach_sign_in_reads();
+    boxed(|| phone.client.drive_sign_ins()).await;
+    assert!(phone.client.take_sign_in_check_request());
+
+    // The pass's session maintenance drops the expired record; the read
+    // comes after.
+    boxed(|| {
+        super::sign_ins::commit_roster(
+            &mut phone.client,
+            &group,
+            vec![DeviceRosterOperationV1::RemoveRejectedSlot(old_slot_id)],
+        )
+    })
+    .await;
+    phone.client.check_sign_ins().await.unwrap();
+    let listed = phone.client.unrecognized_sign_ins().unwrap();
+    assert!(
+        listed.iter().all(|sign_in| sign_in.slot_id_hex != old_slot),
+        "{listed:?}"
+    );
+}
+
 /// A later link adds the new device to the device group in one commit, by a
 /// device that joined through a Welcome. First ready wins: the other
 /// sibling's session ends, and its prompt then says who added the device.

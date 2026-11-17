@@ -283,6 +283,16 @@ impl AppClient {
             if self.sign_in_schedule.detached {
                 // The worker reads beside the writer and runs the rest of
                 // the check, the schedule's included, once the read returns.
+                // Its read begins after this pass, whose session maintenance
+                // can drop an expired `removed` record: record them now.
+                if let Err(error) = self.record_trusted_sign_in_removals() {
+                    tracing::warn!(
+                        target: "marmot_app::client::sign_ins",
+                        method = "drive_sign_ins",
+                        error_kind = error.privacy_safe_kind(),
+                        "could not record removed devices' slots; the check retries"
+                    );
+                }
                 self.sign_in_schedule.requested = true;
             } else {
                 let report = self.check_sign_ins().await;
@@ -330,11 +340,18 @@ impl AppClient {
         if !self.app.device_groups_enabled() {
             return Ok(None);
         }
+        self.record_trusted_sign_in_removals()?;
+        self.start_sign_in_slot_read()
+    }
+
+    /// Record the removed slots of the trusted roster, if this device trusts
+    /// a device group ([`Self::record_sign_in_removals`]).
+    fn record_trusted_sign_in_removals(&mut self) -> Result<(), AppError> {
         if let Some((_, roster)) = self.trusted_device_roster()? {
             let storage = self.app.account_storage(&self.state.label)?.app_storage();
             self.record_sign_in_removals(&storage, &roster)?;
         }
-        self.start_sign_in_slot_read()
+        Ok(())
     }
 
     /// The look before a slot read: this device's own KeyPackages, and the
