@@ -4161,7 +4161,7 @@ async fn the_worker_samples_push_timing_only_while_owed() {
 #[tokio::test(flavor = "current_thread")]
 async fn owed_session_maintenance_retries_15_s_apart_not_back_to_back() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let app = MarmotApp::with_relays(dir.path(), vec![]);
+    let app = relayless_app_without_device_groups(dir.path());
     app.account_home()
         .create_account("alice")
         .expect("create alice");
@@ -4219,8 +4219,17 @@ async fn an_overdue_component_recheck_runs_maintenance_at_most_once_per_15_s() {
     AccountHome::open(root.path())
         .create_account("alice")
         .expect("create alice");
-    let app = MarmotApp::with_relay(root.path(), "wss://relay.example")
-        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+    // Device groups off: their passes keep the 15 s retry owed, which
+    // would leave only the spin for the owed retry to hide.
+    let app = MarmotApp::with_relay_and_config(
+        root.path(),
+        "wss://relay.example",
+        crate::MarmotAppConfig::white_noise()
+            .with_allow_loopback_relay_endpoints(true)
+            .with_open_ranking_provider(None, Vec::new())
+            .with_device_groups(false),
+    )
+    .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
     let runtime = app.runtime();
     runtime.reconcile_accounts().await.expect("alice starts");
     runtime
@@ -4257,7 +4266,7 @@ async fn an_overdue_component_recheck_runs_maintenance_at_most_once_per_15_s() {
 #[tokio::test(flavor = "current_thread")]
 async fn session_maintenance_rereads_its_due_time_after_changes_only() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let app = MarmotApp::with_relays(dir.path(), vec![]);
+    let app = relayless_app_without_device_groups(dir.path());
     app.account_home()
         .create_account("alice")
         .expect("create alice");
@@ -4486,7 +4495,7 @@ async fn work_created_without_a_wake_is_counted_and_run_by_the_watchdog() {
 #[tokio::test(flavor = "current_thread")]
 async fn idle_ticks_take_no_writer_and_spawn_no_housekeeping() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let idle = idle_ticks_run_nothing(MarmotApp::with_relays(dir.path(), vec![])).await;
+    let idle = idle_ticks_run_nothing(relayless_app_without_device_groups(dir.path())).await;
     idle.runtime.shutdown().await;
     assert_eq!(
         idle.app_writes, 0,
@@ -4568,6 +4577,20 @@ struct IdleTicks {
     dispatched_at_startup: u64,
     app_writes: u64,
     session_writes: u64,
+}
+
+/// [`MarmotApp::with_relays`]'s relayless app with device groups explicitly
+/// off: their passes keep session maintenance owed every 15 s, so tests of
+/// when maintenance runs without them say so (mdk#3265).
+fn relayless_app_without_device_groups(root: &std::path::Path) -> MarmotApp {
+    MarmotApp::with_relays_and_config(
+        root,
+        vec![],
+        crate::MarmotAppConfig::white_noise()
+            .with_allow_loopback_relay_endpoints(true)
+            .with_open_ranking_provider(None, Vec::new())
+            .with_device_groups(false),
+    )
 }
 
 /// Runs a fresh account's worker until its startup work settles, then checks
