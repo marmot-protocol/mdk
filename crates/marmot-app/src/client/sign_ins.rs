@@ -297,7 +297,7 @@ impl AppClient {
     /// no account worker owns; the worker runs it beside the writer
     /// ([`Self::start_sign_in_slot_read`], [`Self::finish_sign_in_slot_read`]).
     pub(crate) async fn check_sign_ins(&mut self) -> Result<SignInCheckReport, AppError> {
-        let Some(mut start) = self.start_sign_in_slot_read()? else {
+        let Some(mut start) = self.begin_sign_in_slot_read()? else {
             return Ok(SignInCheckReport::default());
         };
         let mut again = false;
@@ -318,6 +318,23 @@ impl AppClient {
                 }
             }
         }
+    }
+
+    /// Begin a slot read: record the removed slots of the trusted roster
+    /// ([`Self::record_sign_in_removals`]), then take the look
+    /// ([`Self::start_sign_in_slot_read`]). The write comes before the read,
+    /// which can fail, so a removal this device has not recorded yet, as
+    /// after an upgrade, is recorded before the same maintenance pass can
+    /// drop its expired record. It writes only while the roster has one.
+    pub(crate) fn begin_sign_in_slot_read(&mut self) -> Result<Option<SlotReadStart>, AppError> {
+        if !self.app.device_groups_enabled() {
+            return Ok(None);
+        }
+        if let Some((_, roster)) = self.trusted_device_roster()? {
+            let storage = self.app.account_storage(&self.state.label)?.app_storage();
+            self.record_sign_in_removals(&storage, &roster)?;
+        }
+        self.start_sign_in_slot_read()
     }
 
     /// The look before a slot read: this device's own KeyPackages, and the
@@ -363,7 +380,7 @@ impl AppClient {
             if again {
                 return SlotReadEnd::Unjudged;
             }
-            return match self.start_sign_in_slot_read() {
+            return match self.begin_sign_in_slot_read() {
                 Ok(Some(start)) => SlotReadEnd::ReadAgain(Box::new(start)),
                 Ok(None) => SlotReadEnd::Checked(Ok(SignInCheckReport::default())),
                 Err(error) => SlotReadEnd::Checked(Err(error)),
@@ -390,15 +407,8 @@ impl AppClient {
         }
         let roster = trusted.map(|(_, roster)| roster);
         let storage = self.app.account_storage(&self.state.label)?.app_storage();
-        // Before the check adds sign-ins: a removal this device has not
-        // recorded yet, as after an upgrade, keeps its slot's out.
-        if let Some(roster) = roster.as_ref()
-            && storage.record_sign_in_removals(&removed_slots(
-                roster,
-                self.app.config.directory_max_future_skew,
-            ))?
-        {
-            self.unrecognized_sign_ins_changed = true;
+        if let Some(roster) = roster.as_ref() {
+            self.record_sign_in_removals(&storage, roster)?;
         }
         let rejected_here = rejected_slots_here(&storage.sign_ins()?);
 
@@ -906,12 +916,7 @@ impl AppClient {
                 return Ok(());
             };
             let storage = self.app.account_storage(&self.state.label)?.app_storage();
-            if storage.record_sign_in_removals(&removed_slots(
-                &roster,
-                self.app.config.directory_max_future_skew,
-            ))? {
-                self.unrecognized_sign_ins_changed = true;
-            }
+            self.record_sign_in_removals(&storage, &roster)?;
             for record in storage.sign_ins()? {
                 if record.answer == SignInAnswer::Rejected && linked(&record, &roster) {
                     end_rejection(&storage, &record)?;
@@ -934,6 +939,20 @@ impl AppClient {
                 "could not recheck sign-in rejections after a device group change"
             );
         }
+    }
+
+    /// Record each slot `roster` records as `removed`, so its sign-in goes
+    /// and stays gone once the record does ([`removed_slots`]).
+    fn record_sign_in_removals(
+        &mut self,
+        storage: &SqliteAppStorage,
+        roster: &DeviceRosterV1,
+    ) -> Result<(), AppError> {
+        let removed = removed_slots(roster, self.app.config.directory_max_future_skew);
+        if storage.record_sign_in_removals(&removed)? {
+            self.unrecognized_sign_ins_changed = true;
+        }
+        Ok(())
     }
 
     /// Whether this device rejected the sign-in whose KeyPackage it found in
