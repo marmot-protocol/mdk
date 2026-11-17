@@ -41,7 +41,8 @@
 //! - **Removed.** A slot the roster records as `removed` held a device the
 //!   user linked and removed, which answers its sign-in for good: the sign-in
 //!   goes, unless this device rejected it, and once the record expires no
-//!   publication from before the removal lists it again. A removed device
+//!   publication from before the removal, allowing the directory's future
+//!   skew, lists it again. A removed device
 //!   comes back only in a new slot, so a later publication in the old one is
 //!   a new sign-in.
 //! - **Gone.** A sign-in whose slot a complete read finds holding no valid
@@ -392,7 +393,10 @@ impl AppClient {
         // Before the check adds sign-ins: a removal this device has not
         // recorded yet, as after an upgrade, keeps its slot's out.
         if let Some(roster) = roster.as_ref()
-            && storage.record_sign_in_removals(&removed_slots(roster))?
+            && storage.record_sign_in_removals(&removed_slots(
+                roster,
+                self.app.config.directory_max_future_skew,
+            ))?
         {
             self.unrecognized_sign_ins_changed = true;
         }
@@ -902,7 +906,10 @@ impl AppClient {
                 return Ok(());
             };
             let storage = self.app.account_storage(&self.state.label)?.app_storage();
-            if storage.record_sign_in_removals(&removed_slots(&roster))? {
+            if storage.record_sign_in_removals(&removed_slots(
+                &roster,
+                self.app.config.directory_max_future_skew,
+            ))? {
                 self.unrecognized_sign_ins_changed = true;
             }
             for record in storage.sign_ins()? {
@@ -1208,14 +1215,21 @@ fn listed_state(
     Some(waiting)
 }
 
-/// Each slot `roster` records as `removed`, as a sign-in names it, with that
-/// record's `rejected_at`: the user linked the device in it and removed it.
-fn removed_slots(roster: &DeviceRosterV1) -> Vec<(String, u64)> {
+/// Each slot `roster` records as `removed`, as a sign-in names it, with the
+/// time through which a publication there is the removed device's: that
+/// record's `rejected_at`, plus `skew`, the future skew the directory accepts
+/// from a publisher's clock. The user linked the device and removed it.
+fn removed_slots(roster: &DeviceRosterV1, skew: Duration) -> Vec<(String, u64)> {
     roster
         .rejected_slots
         .iter()
         .filter(|(_, rejected)| rejected.reason == RejectedSlotReasonV1::Removed)
-        .map(|(slot, rejected)| (hex::encode(slot), rejected.rejected_at))
+        .map(|(slot, rejected)| {
+            (
+                hex::encode(slot),
+                rejected.rejected_at.saturating_add(skew.as_secs()),
+            )
+        })
         .collect()
 }
 

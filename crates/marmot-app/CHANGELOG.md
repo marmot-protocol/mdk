@@ -102,8 +102,8 @@
 
 - A device the user linked and then removed no longer comes back as a new sign-in once its `removed` roster record
   expires. Every device that trusts the device group records the removal when its roster shows the record, drops the
-  slot's sign-in, and keeps any publication from before the removal from listing it again, a restart included. A later
-  publication in that slot is still a new sign-in. Rejections are unchanged.
+  slot's sign-in, and keeps any publication from before the removal (allowing the directory's future skew) from
+  listing it again, a restart included. A later publication in that slot is still a new sign-in. Rejections are unchanged.
 - With device groups on, an idle maintenance tick takes no writer transaction again (mdk#3479), whether the account
   holds no device group or a settled one: the history-delivery expiry, small-state pass, private KeyPackage upkeep
   and device-inactivity coverage read first and write only when they have work.

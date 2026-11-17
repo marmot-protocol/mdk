@@ -5,9 +5,9 @@
 ### Breaking changes
 
 - Account migration 0211 adds `account_sign_in_removals`: one row per slot the trusted device roster recorded as
-  `removed` on this device, with the later of the record's `rejected_at` and the newest publication the slot's sign-in
-  held then. `SqliteAppStorage::record_sign_in_removals` writes them and deletes those slots' unrejected sign-ins;
-  `record_sign_in_check` adds no sign-in for a publication no later than its slot's removal. Account schema advances
+  `removed` on this device, with the time through which a publication there is the removed device's.
+  `SqliteAppStorage::record_sign_in_removals` writes them and deletes those slots' unrejected sign-ins no later than
+  that; `record_sign_in_check` adds no sign-in for such a publication. Account schema advances
   from 210 to 211; older binaries refuse the upgraded database. Downgrade is unsupported.
 - Account migration 0210 adds `cgka_changes_not_delivered`: one row per group change given up after its call
   returned, kept until the user acknowledges it and deleted with its group (mdk#2332). Account schema advances from
