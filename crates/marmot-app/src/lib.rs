@@ -6124,25 +6124,22 @@ impl MarmotApp {
     /// inviter's rules, and `own_slot` on its own (3.4). A read of the
     /// configured directory relays, when the account lists none, is never
     /// complete: they need not be where its KeyPackages are.
+    #[cfg(all(test, feature = "test-policy-overrides"))]
     pub(crate) async fn read_account_key_package_slots(
         &self,
         label: &str,
         own_slot: Option<&str>,
     ) -> Result<nostr_directory::AccountKeyPackageSlots, AppError> {
-        let (account_id_hex, source_relays, listed) = self
-            .account_key_package_source_relays(label, Vec::new())
-            .await?;
-        let mut slots = self
-            .directory()
-            .read_account_key_package_slots(&account_id_hex, &source_relays, own_slot)
-            .await?;
-        slots.complete &= listed;
-        // A relay's own finished read still shows what that relay serves, so
-        // the relays it found empty stand.
-        if let Some(own_slot) = slots.own_slot.as_mut() {
-            own_slot.complete &= listed;
-        }
-        Ok(slots)
+        let account_id_hex = self.account_home().account(label)?.account_id_hex;
+        read_account_key_package_slots(
+            &self.directory(),
+            &self.relay_plane,
+            &account_id_hex,
+            own_slot,
+            None,
+        )
+        .await
+        .expect("an uncancelled read returns its result")
     }
 
     /// The account id, the relays its KeyPackages are listed from, and
@@ -6153,55 +6150,16 @@ impl MarmotApp {
         label: &str,
         bootstrap_relays: Vec<TransportEndpoint>,
     ) -> Result<(String, Vec<TransportEndpoint>, bool), AppError> {
-        let account = self.account_home().account(label)?;
-        let account_id_hex = account.account_id_hex;
-
-        let has_explicit_bootstrap_relays = !bootstrap_relays.is_empty();
-        let mut relay_lists = if has_explicit_bootstrap_relays {
-            self.directory()
-                .fetch_account_relay_list_status_for_account_id(&account_id_hex, bootstrap_relays)
-                .await?
-        } else {
-            self.directory()
-                .account_relay_list_status_for_account_id(&account_id_hex)?
-        };
-        // Discover the account's NIP-65 list via default relays when it is not
-        // cached yet, mirroring fetch_latest_key_package_for_account_id. We never
-        // normally pull KeyPackage events from the account's own NIP-65 relays.
-        // When that published route exists but every endpoint is unusable, use
-        // the configured directory relays as the same operational fallback used
-        // when local accounts publish a KeyPackage without rewriting NIP-65.
-        if !has_explicit_bootstrap_relays && relay_lists.nip65.relays.is_empty() {
-            let discovery_relays = self.directory().directory_source_relays(&[]);
-            if !discovery_relays.is_empty() {
-                relay_lists = self
-                    .directory()
-                    .fetch_account_relay_list_status_for_account_id(
-                        &account_id_hex,
-                        discovery_relays,
-                    )
-                    .await?;
-            }
-        }
-        let mut source_relays = self.retain_safe_discovered_endpoints(
-            relay_lists
-                .nip65
-                .relays
-                .iter()
-                .cloned()
-                .map(TransportEndpoint)
-                .collect(),
-            "account key package listing",
-        );
-        let listed = !source_relays.is_empty();
-        if !listed {
-            source_relays = self.directory().directory_source_relays(&[]);
-        }
-        if source_relays.is_empty() {
-            return Err(AppError::MissingRelayLists(vec![
-                MissingRelayListKind::Nip65,
-            ]));
-        }
+        let account_id_hex = self.account_home().account(label)?.account_id_hex;
+        let (source_relays, listed) = key_package_source_relays(
+            &self.directory(),
+            &self.relay_plane,
+            &account_id_hex,
+            bootstrap_relays,
+            None,
+        )
+        .await?
+        .expect("an uncancelled lookup returns its relays");
         Ok((account_id_hex, source_relays, listed))
     }
 
@@ -9678,3 +9636,106 @@ pub use runtime::{
     AccountAttachmentCursor, AccountAttachmentEntry, AccountAttachmentPage,
     AccountAttachmentPageRead, AccountAttachmentQuery, AccountAttachmentVersion,
 };
+
+/// Read every KeyPackage slot of `account_id_hex` from the relays its
+/// KeyPackages are listed on. With `cancel`, the read stops between stages
+/// and returns `None`: before each stage starts, and during the slot fetch,
+/// which writes nothing. A relay-list discovery fetch, which writes the
+/// directory's store, runs to its end once it has started (mdk#3466).
+pub(crate) async fn read_account_key_package_slots(
+    directory: &nostr_directory::Directory<MarmotApp>,
+    relay_plane: &MarmotRelayPlane,
+    account_id_hex: &str,
+    own_slot: Option<&str>,
+    cancel: Option<&tokio_util::sync::CancellationToken>,
+) -> Option<Result<nostr_directory::AccountKeyPackageSlots, AppError>> {
+    async {
+        let Some((source_relays, listed)) =
+            key_package_source_relays(directory, relay_plane, account_id_hex, Vec::new(), cancel)
+                .await?
+        else {
+            return Ok(None);
+        };
+        let fetch =
+            directory.read_account_key_package_slots(account_id_hex, &source_relays, own_slot);
+        let mut slots = match cancel {
+            Some(cancel) => tokio::select! {
+                biased;
+                () = cancel.cancelled() => return Ok(None),
+                slots = fetch => slots?,
+            },
+            None => fetch.await?,
+        };
+        slots.complete &= listed;
+        // A relay's own finished read still shows what that relay serves, so
+        // the relays it found empty stand.
+        if let Some(own_slot) = slots.own_slot.as_mut() {
+            own_slot.complete &= listed;
+        }
+        Ok(Some(slots))
+    }
+    .await
+    .transpose()
+}
+
+/// The relays `account_id_hex`'s KeyPackages are listed from, and whether
+/// those are the account's own listed relays rather than the configured
+/// directory relays it falls back to. `None` when `cancel` stopped it
+/// before a stage.
+async fn key_package_source_relays(
+    directory: &nostr_directory::Directory<MarmotApp>,
+    relay_plane: &MarmotRelayPlane,
+    account_id_hex: &str,
+    bootstrap_relays: Vec<TransportEndpoint>,
+    cancel: Option<&tokio_util::sync::CancellationToken>,
+) -> Result<Option<(Vec<TransportEndpoint>, bool)>, AppError> {
+    let cancelled = || cancel.is_some_and(tokio_util::sync::CancellationToken::is_cancelled);
+    if cancelled() {
+        return Ok(None);
+    }
+    let has_explicit_bootstrap_relays = !bootstrap_relays.is_empty();
+    let mut relay_lists = if has_explicit_bootstrap_relays {
+        directory
+            .fetch_account_relay_list_status_for_account_id(account_id_hex, bootstrap_relays)
+            .await?
+    } else {
+        directory.account_relay_list_status_for_account_id(account_id_hex)?
+    };
+    // Discover the account's NIP-65 list via default relays when it is not
+    // cached yet, mirroring fetch_latest_key_package_for_account_id. We never
+    // normally pull KeyPackage events from the account's own NIP-65 relays.
+    // When that published route exists but every endpoint is unusable, use
+    // the configured directory relays as the same operational fallback used
+    // when local accounts publish a KeyPackage without rewriting NIP-65.
+    if !has_explicit_bootstrap_relays && relay_lists.nip65.relays.is_empty() {
+        let discovery_relays = directory.directory_source_relays(&[]);
+        if !discovery_relays.is_empty() {
+            if cancelled() {
+                return Ok(None);
+            }
+            relay_lists = directory
+                .fetch_account_relay_list_status_for_account_id(account_id_hex, discovery_relays)
+                .await?;
+        }
+    }
+    let mut source_relays = relay_plane.retain_safe_discovered_endpoints(
+        relay_lists
+            .nip65
+            .relays
+            .iter()
+            .cloned()
+            .map(TransportEndpoint)
+            .collect(),
+        "account key package listing",
+    );
+    let listed = !source_relays.is_empty();
+    if !listed {
+        source_relays = directory.directory_source_relays(&[]);
+    }
+    if source_relays.is_empty() {
+        return Err(AppError::MissingRelayLists(vec![
+            MissingRelayListKind::Nip65,
+        ]));
+    }
+    Ok(Some((source_relays, listed)))
+}

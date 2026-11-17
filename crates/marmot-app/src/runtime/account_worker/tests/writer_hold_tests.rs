@@ -8,11 +8,12 @@
 //! attempt starts, which no fixture reaches without a test-only seam. An own
 //! echo of a pending commit never reaches ingest on the worker: each publish
 //! pass marks its event seen, so the worker skips the echo, and the echo's
-//! drive of the group's fanouts (#3430) does not run there today. Two more
-//! hold the worker in a command that enters no unit and get no test of
-//! their own: a host-requested sign-in check reads the slots whose read the
-//! maintenance tick's test holds, and an image update awaits a group image
-//! upload, which the plan's hold list leaves out.
+//! drive of the group's fanouts (#3430) does not run there today. An image
+//! update holds the worker in a command that enters no unit and gets no
+//! test of its own: it awaits a group image upload, which the plan's hold
+//! list leaves out. A host-requested sign-in check reads beside the worker,
+//! as the maintenance tick's does (mdk#3466 PR 2); `sign_in_read_tests`
+//! owns what it keeps back.
 //!
 //! Each hold is read from the worker's own series, never from a wall-clock
 //! wait. A held step's span stays in flight. A command queued behind it stays
@@ -29,8 +30,8 @@
 //! Every held set includes an account-key command: a KeyPackage publish,
 //! keyed on the account rather than a group, a peer or a new group. After a
 //! test's PR flips it, that command still waits for the held step (rule 6),
-//! except for hold 4: its flip moves the wave off the worker, which leaves no
-//! held step for the command to wait behind.
+//! except for holds 4 and 8: their flips move the wave and the read off the
+//! worker, which leaves no held step for the command to wait behind.
 //! The media permit hold parks only the media command, so its test holds no
 //! other command.
 
@@ -44,7 +45,10 @@ use super::*;
 
 pub(super) const SETTLE: Duration = Duration::from_secs(10);
 
-fn sample(telemetry: &PerformanceRecorder, operation: RuntimeOp) -> RuntimePerformanceSnapshot {
+pub(super) fn sample(
+    telemetry: &PerformanceRecorder,
+    operation: RuntimeOp,
+) -> RuntimePerformanceSnapshot {
     telemetry
         .snapshot()
         .runtime_operations
@@ -55,7 +59,7 @@ fn sample(telemetry: &PerformanceRecorder, operation: RuntimeOp) -> RuntimePerfo
 
 /// Wait until `ready` holds, checked again at each yield. If it doesn't
 /// hold within the settle bound, the test fails with `what`.
-async fn until(what: &str, mut ready: impl FnMut() -> bool) {
+pub(super) async fn until(what: &str, mut ready: impl FnMut() -> bool) {
     timeout(SETTLE, async {
         while !ready() {
             tokio::task::yield_now().await;
@@ -111,7 +115,7 @@ fn exporter_secret(runtime: &crate::MarmotAppRuntime, group: &GroupId) -> HostCa
     })
 }
 
-fn none_answered(calls: &[HostCall], hold: &str) {
+pub(super) fn none_answered(calls: &[HostCall], hold: &str) {
     let answered = calls.iter().filter(|call| call.is_finished()).count();
     assert_eq!(answered, 0, "{answered} commands answered through {hold}");
 }
@@ -143,7 +147,7 @@ fn mutations_taken_up(
 /// A group event for `group` from another key, tagged as the group's live
 /// traffic is: the worker has no receipt for it, so it admits it as a
 /// delivery. Its content needn't decrypt.
-fn foreign_group_event(
+pub(super) fn foreign_group_event(
     app: &MarmotApp,
     group: &GroupId,
 ) -> transport_nostr_peeler::NostrTransportEvent {
@@ -161,7 +165,7 @@ fn foreign_group_event(
 }
 
 /// Route `event` to the account's worker as a live delivery for `group`.
-fn deliver(
+pub(super) fn deliver(
     app: &MarmotApp,
     account: &marmot_account::AccountSummary,
     group: &GroupId,
@@ -738,87 +742,54 @@ async fn a_held_subscription_refresh_holds_the_media_imeta_tag() {
     runtime.shutdown_and_close().await.unwrap();
 }
 
-/// Hold 8, flipped by step 3 PR 1: a sign-in check reading the account's
-/// KeyPackage slots from its relays keeps the worker inside the maintenance
-/// tick that runs it. Every command waits, a send, a KeyPackage publish and a
-/// read, and so does a delivery. After PR 1 the KeyPackage publish still
-/// waits, as an account-key command (rule 6).
+/// Hold 8, flipped by mdk#3466 PR 2: a scheduled sign-in check reads the
+/// account's KeyPackage slots beside the worker, and its continuation runs
+/// on the worker once the read returns. While the read waits on the relays,
+/// a send, a KeyPackage publish and an account read answer, and a delivery
+/// is ingested. The KeyPackage publish answers too: the read is not on the
+/// worker and parks nothing, so rule 6 has no held step to keep it behind.
 ///
 /// Sign-in checks run only with device groups on.
 #[cfg(feature = "test-policy-overrides")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_held_sign_in_slot_read_holds_every_command_and_a_delivery() {
+async fn a_held_sign_in_slot_read_holds_no_command() {
     let dir = tempfile::tempdir().unwrap();
-    let account = AccountHome::open(dir.path())
-        .create_account("alice")
-        .unwrap();
-    let relay = Arc::new(ScriptedPushRelayClient::default());
-    let app = MarmotApp::with_relay_and_config(
-        dir.path(),
-        "wss://relay.example",
-        crate::MarmotAppConfig::white_noise()
-            .with_allow_loopback_relay_endpoints(true)
-            .with_device_groups(true),
-    )
-    .with_test_relay_client(relay.clone());
-    crate::tests::remember_test_member_inbox(&app, &account.account_id_hex, "wss://relay.example");
-    // Alice's published KeyPackage gives her a slot, which the check reads.
-    let group = {
-        let mut client = app.client("alice").await.unwrap();
-        client.publish_key_package().await.unwrap();
-        client
-            .create_group("other", &[])
-            .await
-            .unwrap()
-            .operation
-            .expect("eligible fixture members")
-    };
-    let delivered = foreign_group_event(&app, &group);
-    let (entered, release) = relay.hold_next_slot_read();
-    let runtime = crate::MarmotAppRuntime::new(app.clone());
-    let telemetry = runtime.shared_services().observer.performance().clone();
-    runtime.reconcile_accounts().await.unwrap();
-    timeout(SETTLE, entered.notified())
-        .await
-        .expect("the first maintenance tick checks for sign-ins");
+    let super::sign_in_read_tests::HeldRead {
+        app,
+        account,
+        runtime,
+        telemetry,
+        group,
+        release,
+        ..
+    } = super::sign_in_read_tests::held_scheduled_read(&dir).await;
     assert_eq!(sample(&telemetry, RuntimeOp::SignInSlotRead).in_flight, 1);
-    assert_eq!(
-        sample(&telemetry, RuntimeOp::WorkerUnitMaintenance).in_flight,
-        1
-    );
     let receives = sample(&telemetry, RuntimeOp::WorkerUnitDelivery);
-    deliver(&app, &account, &group, &delivered);
-    let mutations = sample(&telemetry, RuntimeOp::MutationQueueBehindMaintenance);
-    let reads = sample(&telemetry, RuntimeOp::ReadQueueBehindMaintenance);
-    let waiting = vec![
+    deliver(&app, &account, &group, &foreign_group_event(&app, &group));
+    let unrecognized = {
+        let runtime = runtime.clone();
+        tokio::spawn(async move { runtime.unrecognized_sign_ins("alice").await.map(drop) })
+    };
+    all_answered(vec![
         send(&runtime, &group),
         publish_key_package(&runtime),
-        exporter_secret(&runtime, &group),
-    ];
-    until("each command queues behind the held slot read", || {
-        sample(&telemetry, RuntimeOp::MutationQueueBehindMaintenance).in_flight
-            == mutations.in_flight + 2
-            && sample(&telemetry, RuntimeOp::ReadQueueBehindMaintenance).in_flight
-                == reads.in_flight + 1
+        unrecognized,
+    ])
+    .await;
+    until("the worker ingests a delivery while the read waits", || {
+        sample(&telemetry, RuntimeOp::WorkerUnitDelivery).started > receives.started
     })
     .await;
-    none_answered(&waiting, "a held sign-in slot read");
     assert_eq!(
-        sample(&telemetry, RuntimeOp::WorkerUnitDelivery).started,
-        receives.started,
-        "the worker took a delivery inside a held sign-in check"
+        sample(&telemetry, RuntimeOp::SignInSlotRead).in_flight,
+        1,
+        "the read still waits on the relays"
     );
+    assert!(!super::sign_in_read_tests::baseline_taken(&app));
 
     release.notify_one();
-    all_answered(waiting).await;
-    mutations_taken_up(
-        &telemetry,
-        RuntimeOp::MutationQueueBehindMaintenance,
-        &mutations,
-        2,
-    );
-    until("the worker takes the delivery once the check ends", || {
-        sample(&telemetry, RuntimeOp::WorkerUnitDelivery).started > receives.started
+    until("the read's continuation records the baseline", || {
+        super::sign_in_read_tests::baseline_taken(&app)
     })
     .await;
     runtime.shutdown_and_close().await.unwrap();

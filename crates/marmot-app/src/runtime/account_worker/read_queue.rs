@@ -428,6 +428,69 @@ impl QueuedCommand {
     }
 }
 
+/// What an account worker receives: the host's commands, and the commands
+/// its own timers send (its push and subscription retries) on a channel of
+/// their own. Its own come first, and only the host's can be held back, so
+/// a worker that takes no more host commands still runs its own retries
+/// (mdk#3466).
+pub(crate) struct WorkerInbox {
+    host: mpsc::Receiver<QueuedCommand>,
+    own: mpsc::Receiver<QueuedCommand>,
+}
+
+impl WorkerInbox {
+    /// The inbox over the host's channel, and the worker's own sender.
+    pub(crate) fn new(host: mpsc::Receiver<QueuedCommand>) -> (Self, WorkerCommands) {
+        let (sender, own) = mpsc::channel(8);
+        (Self { host, own }, WorkerCommands::unobserved(sender))
+    }
+
+    /// The next command, the worker's own first. `None` once the host's
+    /// channel has closed and holds nothing.
+    pub(crate) async fn recv(&mut self) -> Option<QueuedCommand> {
+        self.recv_admitting(true).await
+    }
+
+    /// The next command; the host's only when `admit_host`. Pending while
+    /// the host is held back and the worker sends itself nothing.
+    pub(crate) async fn recv_admitting(&mut self, admit_host: bool) -> Option<QueuedCommand> {
+        tokio::select! {
+            biased;
+            Some(command) = self.own.recv() => Some(command),
+            command = self.host.recv(), if admit_host => command,
+            // Held back, with the worker's own channel closed (a test's
+            // inbox): nothing can come.
+            else => std::future::pending().await,
+        }
+    }
+
+    pub(crate) fn try_recv(&mut self) -> Result<QueuedCommand, mpsc::error::TryRecvError> {
+        match self.own.try_recv() {
+            Ok(command) => Ok(command),
+            Err(_) => self.host.try_recv(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.own.len() + self.host.len()
+    }
+
+    /// Whether no command the worker would take now is waiting: its own, and
+    /// the host's while it admits them.
+    pub(crate) fn is_empty_admitting(&self, admit_host: bool) -> bool {
+        self.own.is_empty() && (!admit_host || self.host.is_empty())
+    }
+}
+
+/// A test's receiver as an inbox whose worker sends itself nothing.
+#[cfg(test)]
+impl From<mpsc::Receiver<QueuedCommand>> for WorkerInbox {
+    fn from(host: mpsc::Receiver<QueuedCommand>) -> Self {
+        Self::new(host).0
+    }
+}
+
 /// An account worker's command sender. A host mutation sent through it while
 /// the worker is inside a long unit carries its wait to the worker.
 #[derive(Clone)]
