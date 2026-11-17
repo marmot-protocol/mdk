@@ -153,6 +153,7 @@ where
             prepared,
             message_ids,
             holds: self.detached_welcome_holds.clone(),
+            selection: self.welcome_selection.clone(),
         }
     }
 
@@ -209,7 +210,7 @@ where
             return Ok(());
         }
         let completed = prepared
-            .publish(&self.adapter, self.wall_clock.as_ref(), None)
+            .publish(&self.adapter, self.wall_clock.as_ref(), None, None)
             .await;
         self.finish_welcome_publish(completed, output).await
     }
@@ -323,7 +324,8 @@ where
 
     /// Native selection may yield or be cancelled after changing stored state.
     /// Until it returns, queued attempts must not use their earlier permit.
-    pub(super) fn pause_welcome_publishes(&self) {
+    pub(super) async fn pause_welcome_publishes(&self) -> futures::lock::OwnedMutexGuard<()> {
+        let selection = self.welcome_selection.clone().lock_owned().await;
         let mut holds = self
             .detached_welcome_holds
             .lock()
@@ -333,16 +335,13 @@ where
                 *hold = Some(WelcomeHold::AwaitsCommit);
             }
         }
+        selection
     }
 
     /// Refresh reserved attempts before yielding after native state changes.
     /// An unreadable origin holds its debt rather than allowing stale I/O.
     pub(super) fn refresh_welcome_holds(&self) {
-        let mut holds = self
-            .detached_welcome_holds
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        for (id, hold) in holds.iter_mut() {
+        for id in &self.detached_welcome_publishes {
             let current = self
                 .session
                 .sent_welcome_withdrawn(id)
@@ -354,7 +353,7 @@ where
                         .sent_welcome_awaits_commit(id)
                         .map(|waiting| waiting.then_some(WelcomeHold::AwaitsCommit))
                 });
-            *hold = match current {
+            let hold = match current {
                 Ok(current) => current,
                 Err(error) => {
                     tracing::warn!(
@@ -366,6 +365,12 @@ where
                     Some(WelcomeHold::AwaitsCommit)
                 }
             };
+            *self
+                .detached_welcome_holds
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .get_mut(id)
+                .expect("reserved Welcome has a hold") = hold;
         }
     }
 

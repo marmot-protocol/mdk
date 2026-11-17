@@ -269,15 +269,10 @@ async fn hydrated_recovery_fixture(
 }
 
 #[cfg(feature = "test-policy-overrides")]
-async fn recovery_branch_step(
-    runtime: &mut AccountDeviceRuntime<
-        RecordingAdapter,
-        StaticTransportRouting,
-        RecordingKeyPackages,
-    >,
+async fn recovery_branch_message(
     peer: &mut AccountDeviceSession,
     group: &GroupId,
-) {
+) -> TransportMessage {
     let effects = peer
         .send(SendIntent::SelfUpdate {
             group_id: group.clone(),
@@ -294,6 +289,20 @@ async fn recovery_branch_step(
     msg.envelope = TransportEnvelope::GroupMessage {
         transport_group_id: group.as_slice().to_vec(),
     };
+    msg
+}
+
+#[cfg(feature = "test-policy-overrides")]
+async fn recovery_branch_step(
+    runtime: &mut AccountDeviceRuntime<
+        RecordingAdapter,
+        StaticTransportRouting,
+        RecordingKeyPackages,
+    >,
+    peer: &mut AccountDeviceSession,
+    group: &GroupId,
+) {
+    let msg = recovery_branch_message(peer, group).await;
     runtime
         .ingest_delivery(&TransportDelivery {
             account_id: runtime.self_id(),
@@ -499,6 +508,147 @@ async fn queued_recovery_origin() {
             );
         }
     }
+}
+
+#[cfg(feature = "test-policy-overrides")]
+struct PausedRecoveryPeeler {
+    release: futures::future::Shared<futures::future::BoxFuture<'static, ()>>,
+}
+
+#[cfg(feature = "test-policy-overrides")]
+#[async_trait]
+impl TransportPeeler for PausedRecoveryPeeler {
+    async fn wrap_group_recovery(
+        &self,
+        message: &cgka_traits::GroupRecoveryMessage,
+        recipient: &MemberId,
+    ) -> Result<TransportMessage, PeelerError> {
+        MockPeeler.wrap_group_recovery(message, recipient).await
+    }
+
+    async fn peel_group_message(
+        &self,
+        message: &cgka_traits::peeler::PreparedGroupMessage<'_>,
+        context: &GroupContextSnapshot,
+    ) -> Result<PeeledMessage, PeelerError> {
+        self.release.clone().await;
+        MockPeeler.peel_group_message(message, context).await
+    }
+
+    async fn peel_welcome(&self, message: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
+        MockPeeler.peel_welcome(message).await
+    }
+
+    async fn wrap_group_message(
+        &self,
+        payload: &EncryptedPayload,
+        context: &GroupContextSnapshot,
+    ) -> Result<TransportMessage, PeelerError> {
+        MockPeeler.wrap_group_message(payload, context).await
+    }
+
+    async fn wrap_welcome(
+        &self,
+        payload: &EncryptedPayload,
+        recipient: &MemberId,
+    ) -> Result<TransportMessage, PeelerError> {
+        MockPeeler.wrap_welcome(payload, recipient).await
+    }
+}
+
+#[tokio::test]
+#[cfg(feature = "test-policy-overrides")]
+async fn canonical_wave_waits() {
+    use futures::FutureExt;
+
+    let (dir, session, _, group, _, origin) =
+        hydrated_recovery_fixture(RecoveryFixtureMode::Queued).await;
+    drop(session);
+    let (release, resumed) = tokio::sync::oneshot::channel::<()>();
+    let peeler = PausedRecoveryPeeler {
+        release: async move { resumed.await.unwrap() }.boxed().shared(),
+    };
+    let key = SqlCipherKey::new("hydrated welcome ownership key").unwrap();
+    let session = AccountDeviceSession::open(
+        SessionConfig::new(
+            dir.path().join("alice.sqlite"),
+            SqlCipherKey::new(key.as_secret_str()).unwrap(),
+            pad32(b"hydrated-alice"),
+            Box::new(peeler),
+        )
+        .account_identity_proof_signer(Arc::new(NostrAccountIdentityProofSigner {
+            keys: deterministic_nostr_keys(b"hydrated-alice"),
+        }))
+        .protocol_profile(ProtocolProfile::Current),
+    )
+    .unwrap();
+    let welcomes = session
+        .outstanding_sent_welcomes()
+        .unwrap()
+        .into_iter()
+        .map(|(_, message)| message)
+        .collect::<Vec<_>>();
+    assert_eq!(welcomes.len(), 9);
+    let mut routing = StaticTransportRouting::new(vec![]);
+    for welcome in &welcomes {
+        let TransportEnvelope::Welcome { recipient } = &welcome.envelope else {
+            panic!("recovery Welcome")
+        };
+        routing = routing.with_inbox_route(
+            recipient.clone(),
+            vec![TransportEndpoint("wss://recovery-inbox.example".into())],
+        );
+    }
+    let adapter = RecordingAdapter::default();
+    let mut runtime = AccountDeviceRuntime::new(
+        session,
+        adapter.clone(),
+        routing,
+        RecordingKeyPackages::default(),
+    );
+    let gate = adapter.gate_welcome_publishes();
+    let task = runtime
+        .prepare_welcome_retry_task_with_audit_context(welcomes, Default::default())
+        .unwrap();
+    let mut publishing = Box::pin(task.run());
+    assert!(futures::poll!(publishing.as_mut()).is_pending());
+    assert_eq!(welcome_publishes(&adapter).len(), 8);
+    let mut rival = current_session(dir.path().join("bob.sqlite"), &key, b"hydrated-bob");
+    let delivery = TransportDelivery {
+        account_id: runtime.self_id(),
+        group_id_hint: Some(group.clone()),
+        message: recovery_branch_message(&mut rival, &group).await,
+        received_at: Timestamp(unix_now()),
+        source: TransportDeliverySource {
+            transport: TransportSource("marmot-account-test".into()),
+            plane: TransportDeliveryPlane::Group,
+            endpoint: None,
+            subscription_id: None,
+            wire: None,
+        },
+    };
+    {
+        let mut ingesting = Box::pin(runtime.ingest_delivery(&delivery));
+        assert!(futures::poll!(ingesting.as_mut()).is_pending());
+        gate.release.add_permits(9);
+        assert!(
+            futures::poll!(publishing.as_mut()).is_pending(),
+            "the ninth Welcome waits for native selection, rather than completing as skipped"
+        );
+        assert_eq!(welcome_publishes(&adapter).len(), 8);
+        release.send(()).unwrap();
+        ingesting.await.unwrap();
+    }
+    assert_eq!(
+        runtime.session().stored_message_state(&origin).unwrap(),
+        Some(cgka_traits::MessageState::Processed)
+    );
+    runtime
+        .finish_welcome_publish_task(publishing.await)
+        .await
+        .unwrap();
+    assert_eq!(welcome_publishes(&adapter).len(), 9);
+    assert!(runtime.outstanding_welcome_deliveries().unwrap().is_empty());
 }
 
 #[tokio::test]

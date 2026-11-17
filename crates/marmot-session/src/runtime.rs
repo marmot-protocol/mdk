@@ -316,6 +316,7 @@ pub struct PreparedWelcomePublishTask {
     prepared: PreparedWelcomePublish,
     message_ids: Vec<cgka_traits::MessageId>,
     holds: DetachedWelcomeHolds,
+    selection: Arc<futures::lock::Mutex<()>>,
 }
 
 type DetachedWelcomeHolds =
@@ -364,6 +365,7 @@ impl PreparedWelcomePublishTask {
                     self.adapter.as_ref(),
                     self.wall_clock.as_ref(),
                     Some(&self.holds),
+                    Some(&self.selection),
                 )
                 .await,
             message_ids: self.message_ids,
@@ -386,8 +388,13 @@ impl PreparedWelcomePublish {
         adapter: &dyn TransportAdapter,
         wall_clock: &dyn WallClock,
         holds: Option<&DetachedWelcomeHolds>,
+        selection: Option<&Arc<futures::lock::Mutex<()>>>,
     ) -> CompletedWelcomePublish {
         let publish = |index, attempt: Box<PreparedLegacyPublishAttempt>| async move {
+            let mut selection = match selection {
+                Some(selection) => Some(selection.lock().await),
+                None => None,
+            };
             let mut publishing: Option<futures::future::BoxFuture<'_, _>> = None;
             let result = futures::future::poll_fn(|cx| {
                 if let Some(publishing) = publishing.as_mut() {
@@ -413,6 +420,7 @@ impl PreparedWelcomePublish {
                 let mut future = adapter.publish(attempt.request.clone());
                 let result = future.poll_unpin(cx).map(Ok);
                 publishing = Some(future);
+                drop(selection.take());
                 result
             })
             .await;
@@ -614,6 +622,8 @@ pub struct AccountDeviceRuntime<A, R = StaticTransportRouting, K = NoopKeyPackag
     detached_welcome_publishes: HashSet<cgka_traits::MessageId>,
     /// Current native-origin and explicit holds for reserved relay attempts.
     detached_welcome_holds: DetachedWelcomeHolds,
+    /// Native mutations exclude queued starts until their status refresh.
+    welcome_selection: Arc<futures::lock::Mutex<()>>,
     /// The publish handle detached waves run on, while the host runs every
     /// Welcome wave itself (`set_detached_welcome_waves`).
     detached_welcome_adapter: Option<Arc<dyn TransportAdapter>>,
@@ -699,6 +709,7 @@ where
             pending_leaf_reconciliations: HashMap::new(),
             detached_welcome_publishes: HashSet::new(),
             detached_welcome_holds: DetachedWelcomeHolds::default(),
+            welcome_selection: Arc::default(),
             detached_welcome_adapter: None,
             prepared_welcome_tasks: Vec::new(),
             watched_welcomes: Vec::new(),
@@ -3768,9 +3779,10 @@ where
         };
         let accept_started = Instant::now();
         self.record_commit_refusals_before_disband(&intent)?;
-        self.pause_welcome_publishes();
+        let selection = self.pause_welcome_publishes().await;
         let effects = self.session.send(intent).await;
         self.refresh_welcome_holds();
+        drop(selection);
         let effects = effects?;
         let local_accept_duration = accept_started.elapsed();
         let publish_started = Instant::now();
@@ -3984,7 +3996,7 @@ where
         let mut queue = VecDeque::new();
         output.absorb_session_effects(prepared_effects, &mut queue);
 
-        let rollback_effects = self.session.publish_failed(pending).await?;
+        let rollback_effects = self.fail_session_publish(pending).await?;
         output
             .pending
             .push(PendingResolution::RolledBack { pending });
@@ -4002,7 +4014,7 @@ where
         context: AuditEventContext,
         origin: SendOrigin,
     ) -> AccountResult<SessionEffects> {
-        self.pause_welcome_publishes();
+        let selection = self.pause_welcome_publishes().await;
         let effects = match origin {
             SendOrigin::Host => {
                 self.session
@@ -4012,6 +4024,7 @@ where
             SendOrigin::Automatic => self.session.send_with_audit_context(intent, context).await,
         };
         self.refresh_welcome_holds();
+        drop(selection);
         Ok(effects?)
     }
 
@@ -4162,13 +4175,14 @@ where
             && self.queued_outbound_intents_blocked_by_fanouts(group_id)?;
         // Required publication barriers must not prevent inbound convergence
         // from settling, even while the corresponding relay is unavailable.
-        self.pause_welcome_publishes();
+        let selection = self.pause_welcome_publishes().await;
         let effects = if queued_intents_blocked {
             self.session.advance_convergence_inputs(group_id).await
         } else {
             self.session.advance_convergence(group_id).await
         };
         self.refresh_welcome_holds();
+        drop(selection);
         output.extend(self.publish_session_effects(effects?).await?);
         Ok(output)
     }
@@ -4787,9 +4801,10 @@ where
             return Err(AccountError::WrongAccountDelivery);
         }
         let started = Instant::now();
-        self.pause_welcome_publishes();
+        let selection = self.pause_welcome_publishes().await;
         let ingested = self.session.ingest_delivery(delivery).await;
         self.refresh_welcome_holds();
+        drop(selection);
         let ingested = match ingested {
             Ok(IngestEffects {
                 outcome: IngestOutcome::GroupRecovery { recovery },
@@ -5693,9 +5708,10 @@ where
         const MAX_CONFIRM_ATTEMPTS: u32 = 4;
         let mut attempt = 0;
         loop {
-            self.pause_welcome_publishes();
+            let selection = self.pause_welcome_publishes().await;
             let confirmed = self.session.confirm_published(pending).await;
             self.refresh_welcome_holds();
+            drop(selection);
             match confirmed {
                 Ok(effects) => return Ok(effects),
                 Err(e) if e.is_transient() && attempt + 1 < MAX_CONFIRM_ATTEMPTS => {
@@ -5720,9 +5736,10 @@ where
         const MAX_CONFIRM_ATTEMPTS: u32 = 4;
         let mut attempt = 0;
         loop {
-            self.pause_welcome_publishes();
+            let selection = self.pause_welcome_publishes().await;
             let confirmed = self.session.confirm_published_fanout(pending, fanout).await;
             self.refresh_welcome_holds();
+            drop(selection);
             match confirmed {
                 Ok(effects) => return Ok(effects),
                 Err(e) if e.is_transient() && attempt + 1 < MAX_CONFIRM_ATTEMPTS => {
@@ -5800,7 +5817,7 @@ where
                     self.finish_transport_fanout(&message_id, output).await?;
                 }
             } else if !ambiguous_exposure && !retry_deferred {
-                let effects = self.session.publish_failed(pending).await?;
+                let effects = self.fail_session_publish(pending).await?;
                 output
                     .pending
                     .push(PendingResolution::RolledBack { pending });
@@ -5814,7 +5831,7 @@ where
         // remaining targets continue as an independent durable obligation.
         let mut messages = messages.into_iter();
         let Some(message) = messages.next() else {
-            let effects = self.session.publish_failed(pending).await?;
+            let effects = self.fail_session_publish(pending).await?;
             output
                 .pending
                 .push(PendingResolution::RolledBack { pending });
@@ -5900,7 +5917,7 @@ where
                 return Ok(());
             }
             if !commit_status.possible_ambiguous_exposure && !commit_status.retry_deferred {
-                let effects = self.session.publish_failed(pending).await?;
+                let effects = self.fail_session_publish(pending).await?;
                 output
                     .pending
                     .push(PendingResolution::RolledBack { pending });
@@ -5915,6 +5932,7 @@ where
         if self.session.pending_is_queued_invite(pending)?
             && let Some(oversized) = self.oversized_invite_events(&commit, &welcomes).await
         {
+            let selection = self.pause_welcome_publishes().await;
             let effects = refuse_too_large(
                 &mut self.session,
                 pending,
@@ -5922,7 +5940,10 @@ where
                 oversized,
                 RollbackPass::Staging,
             )
-            .await?;
+            .await;
+            self.refresh_welcome_holds();
+            drop(selection);
+            let effects = effects?;
             output
                 .pending
                 .push(PendingResolution::RolledBack { pending });
@@ -6355,6 +6376,17 @@ where
         }
     }
 
+    async fn fail_session_publish(
+        &mut self,
+        pending: PendingStateRef,
+    ) -> SessionResult<SessionEffects> {
+        let selection = self.pause_welcome_publishes().await;
+        let effects = self.session.publish_failed(pending).await;
+        self.refresh_welcome_holds();
+        drop(selection);
+        effects
+    }
+
     async fn rollback_unstaged_pending(
         &mut self,
         pending: Option<PendingStateRef>,
@@ -6362,7 +6394,7 @@ where
         queue: &mut VecDeque<PublishWork>,
     ) -> AccountResult<()> {
         if let Some(pending) = pending {
-            let effects = self.session.publish_failed(pending).await?;
+            let effects = self.fail_session_publish(pending).await?;
             output
                 .pending
                 .push(PendingResolution::RolledBack { pending });
@@ -6972,8 +7004,11 @@ where
         };
         let mut abandoned = fanout.clone();
         let count = abandoned.abandon_unsent_targets()?;
-        let effects =
-            give_up_unsent_commit(&mut self.session, pending, &mut abandoned, pass).await?;
+        let selection = self.pause_welcome_publishes().await;
+        let effects = give_up_unsent_commit(&mut self.session, pending, &mut abandoned, pass).await;
+        self.refresh_welcome_holds();
+        drop(selection);
+        let effects = effects?;
         *fanout = abandoned;
         self.record_pending_commit_change(fanout, context, PendingCommitChange::GivenUp, now_ms);
         tracing::info!(
@@ -7026,7 +7061,11 @@ where
             && !fanout.possible_exposure()
             && let Some(pending) = fanout.pending_ref()
         {
-            let effects = roll_back_failed_fanout(&mut self.session, pending, fanout, pass).await?;
+            let selection = self.pause_welcome_publishes().await;
+            let effects = roll_back_failed_fanout(&mut self.session, pending, fanout, pass).await;
+            self.refresh_welcome_holds();
+            drop(selection);
+            let effects = effects?;
             output
                 .pending
                 .push(PendingResolution::RolledBack { pending });

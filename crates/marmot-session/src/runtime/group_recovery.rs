@@ -1091,10 +1091,13 @@ where
                 Ok::<_, StorageError>(())
             })
             .map_err(SessionError::from)?;
+        let selection = self.pause_welcome_publishes().await;
         let staged = self
             .session
             .send(SendIntent::RecoverMembers { group_id, members })
             .await;
+        self.refresh_welcome_holds();
+        drop(selection);
         let effects = match staged {
             Ok(effects) => effects,
             Err(error) if recovery_expected_refusal(error.as_engine_error()) => {
@@ -1129,7 +1132,7 @@ where
         });
         if let Err(error) = saved {
             // No transport call has occurred. Roll back the staged MLS change.
-            let rollback = self.session.publish_failed(pending).await?;
+            let rollback = self.fail_session_publish(pending).await?;
             output.extend(self.publish_session_effects(rollback).await?);
             return Err(SessionError::from(error).into());
         }
