@@ -1365,7 +1365,7 @@ async fn onboarding_completed_checkpoint_does_not_hide_or_clear_later_setup() {
         .account_home()
         .complete_account_setup(&id)
         .unwrap();
-    let _storage = manager.app.account_storage(&id).unwrap();
+    crate::tests::account_database_from_an_older_build(&manager.app, &id);
     assert_eq!(
         runtime.account_setup_readiness(&id).unwrap(),
         AccountSetupReadiness::RecoveryRequired

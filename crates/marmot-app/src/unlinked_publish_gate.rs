@@ -127,11 +127,11 @@ impl crate::MarmotApp {
         label: &str,
     ) -> Result<Option<cgka_traits::GroupId>, crate::AppError> {
         use cgka_traits::storage::{GroupStorage as _, StorageError};
-        // An account with no database yet holds no device group. Looking must
-        // not create one: a database that predates the account's first session
-        // open makes that open refuse to mint the KeyPackage slot, so setup ends
-        // in recovery (mdk#3478) and KeyPackage rotation fails (mdk#3477). A path
-        // it cannot tell is absent fails the look, so publishing stays refused.
+        // An account with no database yet holds no device group, so the look
+        // answers without opening one, which would create it (and, for an
+        // external signer, its database secret). Creating it early no longer
+        // misleads the KeyPackage cutover (mdk#3486). A path it cannot tell is
+        // absent fails the look, so publishing stays refused.
         if !self.account_storage_path(label).try_exists()? {
             return Ok(None);
         }

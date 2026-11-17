@@ -6428,7 +6428,6 @@ impl MarmotApp {
         &self,
         label: &str,
     ) -> Result<(), AppError> {
-        let account_storage_preexisted = self.account_storage_path(label).exists();
         let setup_in_progress = self.account_home().account_setup_state(label)?.is_some();
         let storage = self.account_storage(label)?;
         let existing_lifecycle = storage.key_package_lifecycle()?;
@@ -6438,6 +6437,13 @@ impl MarmotApp {
         {
             return Ok(());
         }
+        // A database this build line created empty holds no KeyPackage
+        // published by an older device, whichever read opened it first
+        // (mdk#3486). One whose earlier cutover already chose to fail closed
+        // keeps that choice. A database without that record may be an
+        // upgraded device's, so it is treated as one.
+        let new_account_storage =
+            storage.was_created_empty()? && !self.key_package_cutover_replacement_pending(label);
         let current_cache = self.validated_current_local_key_package(label).is_some();
         match self.reusable_key_package_slot_id(
             label,
@@ -6454,13 +6460,13 @@ impl MarmotApp {
                 }
             }
             Ok(None)
-                if (!account_storage_preexisted || setup_in_progress)
+                if (new_account_storage || setup_in_progress)
                     && storage.stored_key_package_bundles()?.is_empty() =>
             {
                 // Only a newly-created or durably journaled account setup can
                 // mint the first slot without migration evidence. Other
-                // existing databases fail closed even when no private bundles
-                // remain: they may have published under an unrecoverable `d`.
+                // databases fail closed even when no private bundles remain:
+                // they may have published under an unrecoverable `d`.
                 let mut slot = [0u8; 32];
                 OsRng.fill_bytes(&mut slot);
                 storage
@@ -6469,10 +6475,11 @@ impl MarmotApp {
                     return Ok(());
                 }
             }
-            Ok(None) | Err(_) if account_storage_preexisted && !setup_in_progress => {
-                // A database created before the durable setup journal is
-                // ambiguous: it may be an interrupted fresh setup, or an
-                // upgraded device whose published stable slot was lost. Do not
+            Ok(None) | Err(_) if !new_account_storage && !setup_in_progress => {
+                // A database that does not record its empty creation, outside
+                // a journaled setup, is ambiguous: it may be an interrupted
+                // fresh setup, or an upgraded device whose published stable
+                // slot was lost. Do not
                 // mint a second slot. Keep normal account reads available; the
                 // setup publication boundary surfaces the typed recovery state.
                 if self.mark_key_package_cutover_replacement_pending(label) {
@@ -6504,7 +6511,11 @@ impl MarmotApp {
             return Ok(false);
         }
         let storage = self.account_storage(label)?;
-        Ok(storage.key_package_lifecycle()?.is_none()
+        // A database this build line created empty is a new account's, not a
+        // legacy setup's, even when a read opened it before the first session
+        // (mdk#3486).
+        Ok(!storage.was_created_empty()?
+            && storage.key_package_lifecycle()?.is_none()
             && storage.stored_key_package_bundles()?.is_empty())
     }
 
@@ -6936,10 +6947,10 @@ impl MarmotApp {
         #[cfg(test)]
         self.local_open_gates
             .wait(label, AccountStartupStage::AccountState);
-        // Run KeyPackage cutover before any other account-storage access. The
-        // cutover uses pre-existence of the encrypted account database as the
-        // durable distinction between a fresh local account and an upgraded
-        // device whose missing JSON slot must fail closed.
+        // Run KeyPackage cutover before this open's other account-storage
+        // work. It tells a fresh local account from an upgraded device whose
+        // missing JSON slot must fail closed by whether the database records
+        // that it was created empty, so earlier reads do not change its answer.
         self.ensure_strict_cutover_replacement_intent_before_session_open(label)?;
         self.migrate_legacy_account_projection_if_needed(label)?;
         self.account_storage(label)?

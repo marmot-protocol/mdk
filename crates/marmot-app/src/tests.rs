@@ -7659,6 +7659,33 @@ fn fresh_account_persists_its_slot_before_session_open() {
     assert!(app.key_package_cutover_replacement_pending(&account.label));
 }
 
+/// Leave `label`'s account database as an upgraded device's is after this
+/// build first opens it: migrated, with no record that it was created empty.
+pub(crate) fn account_database_from_an_older_build(app: &MarmotApp, label: &str) {
+    app.account_storage(label).unwrap();
+    let path = app.account_storage_path(label);
+    let keys = app.account_home().load_signing_keys(label).unwrap();
+    let key = app
+        .sqlcipher_key(label, &keys, &path, SqlcipherDatabaseKind::Session)
+        .unwrap();
+    let connection = rusqlite::Connection::open(path).unwrap();
+    storage_sqlite::open_hardened_sqlcipher(
+        &connection,
+        &key,
+        storage_sqlite::SqlCipherHardening::cipher_only(),
+    )
+    .unwrap();
+    connection
+        .execute("DELETE FROM cgka_database_origin", [])
+        .unwrap();
+    assert!(
+        !app.account_storage(label)
+            .unwrap()
+            .was_created_empty()
+            .unwrap()
+    );
+}
+
 #[test]
 fn existing_account_database_without_slot_evidence_fails_closed() {
     let directory = tempfile::tempdir().unwrap();
@@ -7668,7 +7695,7 @@ fn existing_account_database_without_slot_evidence_fails_closed() {
 
     // Simulate an upgraded device whose encrypted account database predates
     // lifecycle migration, while its JSON cache and private bundles are gone.
-    app.account_storage(&account.label).unwrap();
+    account_database_from_an_older_build(&app, &account.label);
 
     app.ensure_strict_cutover_replacement_intent_before_session_open(&account.label)
         .unwrap();
@@ -7720,7 +7747,7 @@ async fn legacy_ambiguous_setup_requires_consent_before_reset() {
     let account = home.import_nostr_account(&secret).unwrap();
     let app = MarmotApp::with_relay(directory.path(), "wss://relay.example");
 
-    app.account_storage(&account.label).unwrap();
+    account_database_from_an_older_build(&app, &account.label);
     app.ensure_strict_cutover_replacement_intent_before_session_open(&account.label)
         .unwrap();
     assert!(

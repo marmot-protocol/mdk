@@ -183,6 +183,11 @@ larger data-shape changes. Applied migrations are recorded in `cgka_schema_migra
 applies missing migrations after SQLCipher keying and before storage handles are exposed. Message rows follow
 [storage format v2](../../docs/marmot-architecture/storage-format-v2.md).
 
+`cgka_database_origin` records that an account database was created empty: the runner writes its one row before the
+first migration commits, and only when the ledger is empty. `SqliteAccountStorage::was_created_empty` reads it.
+Databases first migrated by an older build never gain the row, so a caller keying a rule on account age (the app's
+KeyPackage cutover) can tell a new account from an upgraded one however early a read opened its database.
+
 The three app database categories have independent histories, and no runner reads another store's ledger:
 
 | Database | Ledger |

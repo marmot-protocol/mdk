@@ -171,6 +171,9 @@ fn v0_10_4_account_upgrades_without_losing_state_or_raising_notices() {
         store.migration_summary().0,
         MIGRATIONS.len() - V0_10_4_LATEST_MIGRATION
     );
+    // Nothing says an upgraded database was created empty, so callers keep
+    // treating it as one that may hold state from before (mdk#3486).
+    assert!(!store.was_created_empty().unwrap());
     {
         let conn = store.lock().unwrap();
         let ledger = rows(
@@ -186,6 +189,7 @@ fn v0_10_4_account_upgrades_without_losing_state_or_raising_notices() {
         // Same schema as a database created by this build.
         let fresh = SqliteAccountStorage::in_memory().unwrap();
         assert_eq!(schema(&conn), schema(&fresh.lock().unwrap()));
+        assert!(fresh.was_created_empty().unwrap());
         // The member-capability cache v0.10.4 kept is dropped (0121).
         assert!(
             !schema(&conn)
