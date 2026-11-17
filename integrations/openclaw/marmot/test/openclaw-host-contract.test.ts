@@ -275,6 +275,57 @@ afterEach(() => {
 });
 
 /**
+ * The host rejects agent tools a plugin registers without a matching
+ * `contracts.tools` manifest declaration, so tool registration is a manifest
+ * contract rather than an implementation detail of `index.ts`.
+ */
+describe("installed OpenClaw plugin manifest contract", () => {
+  it("registers every declared Marmot agent tool without contract diagnostics", async () => {
+    const root = await mkdtemp(join(tmpdir(), "marmot-host-tool-contract-"));
+    try {
+      const workspaceDir = join(root, "workspace");
+      await mkdir(workspaceDir, { recursive: true, mode: 0o700 });
+      const pluginRoot = await materializeOwnedPluginRoot(root);
+      const manifest = JSON.parse(
+        await readFile(join(pluginRoot, "openclaw.plugin.json"), "utf8"),
+      ) as { contracts?: { tools?: string[] } };
+      const cfg = {
+        plugins: {
+          allow: ["marmot"],
+          load: { paths: [pluginRoot] },
+          entries: { marmot: { enabled: true } },
+        },
+        channels: { marmot: { socketPath: join(root, "wn-agent.sock"), accountIdHex: HEX32("aa") } },
+      };
+      const registry = openClawPluginLoader.loadOpenClawPlugins({
+        config: cfg as never,
+        activationSourceConfig: cfg as never,
+        workspaceDir,
+        onlyPluginIds: ["marmot"],
+        activate: true,
+        loadModules: true,
+        cache: false,
+        mode: "full",
+        throwOnLoadError: true,
+      });
+
+      const registered = registry.tools
+        .filter((entry) => entry.pluginId === "marmot")
+        .flatMap((entry) => entry.names);
+      expect(registered.toSorted()).toEqual(["marmot_group_profile", "marmot_history"]);
+      expect(manifest.contracts?.tools?.toSorted()).toEqual(registered.toSorted());
+      expect(
+        registry.diagnostics.filter(
+          (entry) => entry.pluginId === "marmot" && /contracts\.|Doctor|doctor contract/.test(entry.message ?? ""),
+        ),
+      ).toEqual([]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});
+
+/**
  * Exercise Marmot's production adapters against the installed OpenClaw host.
  * This file is also run by openclaw-host-compat.sh against the pinned beta host.
  */

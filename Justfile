@@ -268,6 +268,16 @@ openclaw-host-compat-test:
 openclaw-dev-script-test:
     integrations/openclaw/marmot/test/dev-scripts.sh
 
+# Fresh install and 0.11.0 upgrade of a plugin tarball through the real `openclaw` CLI.
+# Packs the checkout when no tarball is given; args pass through (e.g. --host-version 2026.11.4).
+openclaw-packaged-install-test *args:
+    cd "{{invocation_directory()}}" && node "{{justfile_directory()}}/integrations/openclaw/marmot/test/packaged-install.ts" {{args}}
+
+# Live release acceptance of a plugin tarball: local relay (Docker), wn-agent, wnd client, OpenClaw gateway.
+openclaw-release-acceptance tarball *args:
+    cargo build -p agent-connector --bin wn-agent -p wn-cli --bin wn --bin wnd
+    cd "{{invocation_directory()}}" && node "{{justfile_directory()}}/integrations/openclaw/marmot/test/release-acceptance.ts" --tarball "{{tarball}}" {{args}}
+
 claude-installer-test:
     integrations/claude/marmot/tests/test_installer.sh
 
