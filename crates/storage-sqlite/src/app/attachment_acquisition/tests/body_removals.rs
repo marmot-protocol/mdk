@@ -251,6 +251,63 @@ fn removal_migration_and_loss() {
 }
 
 #[test]
+fn shared_file_loss_pages() {
+    use media_store::MediaCatalog;
+
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
+    let file = [7u8; 16];
+    store.lock().unwrap().execute(
+        "INSERT INTO media_files(id,file_key,state,category,byte_len,plaintext_digest,created_at,last_used_at)
+         VALUES(?1,zeroblob(32),1,1,?2,?3,12,12)",
+        params![file.as_slice(), BODY.len() as i64, digest().as_slice()],
+    ).unwrap();
+    for message in ["one", "two"] {
+        seed(&store, message);
+        let asset = request(&app, message);
+        publish(&app, &asset);
+        let body = app.legacy_attachment_bodies(1).unwrap().remove(0);
+        store
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO media_file_refs(token,file_id) VALUES(?1,?2)",
+                params![asset.token, file.as_slice()],
+            )
+            .unwrap();
+        assert!(app.drop_migrated_legacy_body(&body).unwrap());
+    }
+    let cursor = baseline(&app);
+    assert!(
+        crate::SqliteMediaCatalog::new(app.clone())
+            .mark_lost(media_store::FileId::from_slice(&file).unwrap())
+            .unwrap()
+    );
+
+    let first = app.attachment_removals(Some(&cursor), 1).unwrap();
+    assert!(first.has_more && !first.reset_required);
+    let second = app
+        .attachment_removals(Some(&first.next_cursor), 1)
+        .unwrap();
+    assert!(!second.has_more && !second.reset_required);
+    let caught_up = app
+        .attachment_removals(Some(&second.next_cursor), 1)
+        .unwrap();
+    assert!(caught_up.removals.is_empty() && !caught_up.has_more && !caught_up.reset_required);
+
+    let mut removals = first.removals;
+    removals.extend(second.removals);
+    removals.sort_by(|left, right| left.message_id_hex.cmp(&right.message_id_hex));
+    assert_eq!(
+        removals,
+        vec![
+            expected("one", AttachmentBodyRemovalState::Unavailable),
+            expected("two", AttachmentBodyRemovalState::Unavailable),
+        ]
+    );
+}
+
+#[test]
 fn removal_waits_for_settlement() {
     let store = SqliteAccountStorage::in_memory().unwrap();
     let app = store.app_storage();

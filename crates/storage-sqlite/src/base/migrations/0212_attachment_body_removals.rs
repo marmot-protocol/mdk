@@ -10,7 +10,7 @@ pub(crate) fn apply(tx: &Transaction<'_>) -> StorageResult<()> {
         );
         INSERT INTO attachment_body_removal_meta(id) VALUES(1);
         CREATE TABLE attachment_body_removals (
-            sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+            sequence INTEGER PRIMARY KEY,
             group_id_hex TEXT NOT NULL,
             message_id_hex TEXT NOT NULL,
             source_message_id_hex TEXT NOT NULL,
@@ -31,8 +31,12 @@ pub(crate) fn apply(tx: &Transaction<'_>) -> StorageResult<()> {
         AND NOT EXISTS(SELECT 1 FROM retained_attachment_files f WHERE f.token=q.token AND f.completed=0))";
     let media = "EXISTS(SELECT 1 FROM media_file_refs mr JOIN media_files mf ON mf.id=mr.file_id
         WHERE mr.token=q.token AND mf.state=1)";
-    let fields = "group_id_hex,message_id_hex,source_message_id_hex,attachment_index,state";
-    let identity = "q.group_id_hex,q.message_id_hex,q.source_message_id_hex,q.attachment_index";
+    let fields =
+        "sequence,group_id_hex,message_id_hex,source_message_id_hex,attachment_index,state";
+    // One high-water snapshot plus a row number also allocates multi-slot losses.
+    let identity =
+        "(SELECT high_water FROM attachment_body_removal_meta WHERE id=1)+row_number() OVER(),
+        q.group_id_hex,q.message_id_hex,q.source_message_id_hex,q.attachment_index";
 
     // The parent is still present here. Child cascades see no acquisition and
     // cannot announce this same loss again, even when app_events was the parent.
