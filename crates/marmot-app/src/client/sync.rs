@@ -6484,6 +6484,7 @@ mod runtime_group_subscription_refresh_tests {
                 });
                 effects.failures.push(marmot_session::PublishFailure {
                     oversized: None,
+                    no_usable_relay: false,
                     message_id: cgka_traits::MessageId::new(vec![0x74; 32]),
                     reason: "primary publication failure".into(),
                 });

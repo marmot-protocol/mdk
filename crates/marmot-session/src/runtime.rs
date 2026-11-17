@@ -5235,6 +5235,7 @@ where
                     let reason = "insufficient publish acknowledgements".to_owned();
                     output.failures.push(PublishFailure {
                         oversized: OversizedEvent::of_fanout(&fanout),
+                        no_usable_relay: has_no_usable_relay(&fanout),
                         message_id: fanout
                             .published_message_id()
                             .unwrap_or_else(|| fanout.message_id())
@@ -6104,6 +6105,7 @@ where
                         if !report.met_required_acks() {
                             output.failures.push(PublishFailure {
                                 oversized: None,
+                                no_usable_relay: false,
                                 message_id: report.message_id.clone(),
                                 reason: "fanout endpoint did not acknowledge".into(),
                             });
@@ -6132,6 +6134,7 @@ where
                         }
                         output.failures.push(PublishFailure {
                             oversized: None,
+                            no_usable_relay: false,
                             message_id: message_id.clone(),
                             reason: "fanout adapter error".into(),
                         });
@@ -6224,6 +6227,7 @@ where
                 Err(error) => {
                     output.failures.push(PublishFailure {
                         oversized: None,
+                        no_usable_relay: false,
                         message_id: message.id,
                         reason: error.to_string(),
                     });
@@ -6692,6 +6696,7 @@ where
                 let reason = "insufficient publish acknowledgements".to_owned();
                 output.failures.push(PublishFailure {
                     oversized: OversizedEvent::of_fanout(&fanout),
+                    no_usable_relay: has_no_usable_relay(&fanout),
                     message_id: report.message_id.clone(),
                     reason: reason.clone(),
                 });
@@ -7185,6 +7190,7 @@ where
                     );
                     output.failures.push(PublishFailure {
                         oversized: None,
+                        no_usable_relay: false,
                         message_id,
                         reason: e.to_string(),
                     });
@@ -7522,6 +7528,7 @@ where
                 );
                 output.failures.push(PublishFailure {
                     oversized,
+                    no_usable_relay: false,
                     message_id,
                     reason: error.to_string(),
                 });
@@ -7614,6 +7621,7 @@ where
             );
             output.failures.push(PublishFailure {
                 oversized,
+                no_usable_relay: false,
                 message_id: report.message_id.clone(),
                 reason: "insufficient publish acknowledgements".into(),
             });
@@ -8364,6 +8372,7 @@ fn refused_before_publishing(
         message_id,
         reason: TransportEndpointFailure::OVER_KNOWN_LIMIT_REASON.to_owned(),
         oversized: Some(oversized),
+        no_usable_relay: false,
     }
 }
 
@@ -8711,6 +8720,12 @@ pub struct PublishFailure {
     /// unknown outcomes. A legacy Welcome's earlier exposure can be unknown.
     /// This is not evidence of delivery or non-delivery and never ends retry work.
     pub oversized: Option<OversizedEvent>,
+    /// The group has no relay this device may send to: the transport refused
+    /// every target of a group send for the endpoint itself before sending
+    /// anything, as the host-safety rule refuses a private-network relay
+    /// (mdk#3276). Nothing was sent, and the outcome is final, since the
+    /// transport refuses every attempt there (mdk#3305).
+    pub no_usable_relay: bool,
 }
 
 pub use cgka_traits::OversizedArtifact;
@@ -8799,6 +8814,25 @@ fn give_up_unsent_commit<'a>(
 pub struct OversizedEvent {
     pub artifact: OversizedArtifact,
     pub size_class: cgka_traits::EventSizeClass,
+}
+
+/// Whether a finished group fanout found no relay this device may send to
+/// (mdk#3305): no target accepted it, none is outstanding, none may hold it,
+/// and the transport refused every target for the endpoint itself before
+/// sending ([`TransportEndpointFailure::is_endpoint_prohibited`]), as the
+/// host-safety rule refuses a private-network relay. The transport refuses
+/// every attempt there, so no retry or relay answer changes the outcome.
+fn has_no_usable_relay(fanout: &OutboundFanout) -> bool {
+    let targets = fanout.request().target.endpoints().len();
+    targets != 0
+        && !fanout.possible_exposure()
+        && fanout.outcome().accepted_targets == 0
+        && fanout.outcome().outstanding_targets == 0
+        && (0..targets).all(|index| {
+            fanout
+                .target_failure(index)
+                .is_some_and(TransportEndpointFailure::is_endpoint_prohibited)
+        })
 }
 
 impl OversizedEvent {

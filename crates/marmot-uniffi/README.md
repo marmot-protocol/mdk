@@ -207,6 +207,12 @@ still succeeds and leaves its list for the next sync. An explicit retry can retu
 the later Welcome failure through its pending query/notice without undoing the Add. No retirement or retry policy
 is added.
 
+`NoUsableRelay` reports a group send none of whose relays MDK may send to: MDK refuses each of them before sending
+anything, as it refuses a relay at a private-network address. Nothing was sent: a commit rolls back, a message
+fails, and MDK retries neither. Retrying fails the same way while the group's relays stay the same, so do not offer
+a plain retry. A send that relays refused themselves still fails as `Publish`, and a send waiting for a relay to
+come back is not an error: MDK keeps sending it.
+
 ### Screen snapshots, paging and ownership
 
 Prepared list/conversation updates are complete replacements for their bounded window.

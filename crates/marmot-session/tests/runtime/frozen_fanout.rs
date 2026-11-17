@@ -742,6 +742,7 @@ async fn terminal_application_fanout_replays_failure_after_restart_before_delete
             message_id: failed_message_id,
             reason,
             oversized,
+            no_usable_relay: false,
         }] if failed_message_id == &message_id
             && reason == "insufficient publish acknowledgements"
             && *oversized == size_class.map(|size_class| marmot_session::OversizedEvent {

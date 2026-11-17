@@ -38,6 +38,10 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ### Added
 
+- `MARMOT_STATUS_NO_USABLE_RELAY` (133) reports a group send none of whose
+  relays MDK may send to, such as relays at private-network addresses; it was
+  `MARMOT_STATUS_PUBLISH` before. Nothing was sent, a commit rolled back, and a
+  retry fails the same way while the group's relays stay the same (#3305).
 - `marmot_unreact_matching` removes the account's active events
   for one exact emoji. Both removal commands return
   `MARMOT_STATUS_REACTION_NOT_FOUND` (132) for a local no-match; refresh

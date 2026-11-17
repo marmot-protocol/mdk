@@ -2619,6 +2619,9 @@ pub(crate) fn fail_if_publish_failed(
 }
 
 pub(crate) fn publish_failure_error(failures: &[marmot_session::PublishFailure]) -> AppError {
+    if !failures.is_empty() && failures.iter().all(|failure| failure.no_usable_relay) {
+        return AppError::NoUsableRelay;
+    }
     if let Some(cause) = failures.first().and_then(|failure| failure.oversized)
         && failures
             .iter()
@@ -2967,6 +2970,7 @@ mod fail_if_publish_failed_tests {
     fn failure(reason: &str) -> PublishFailure {
         PublishFailure {
             oversized: None,
+            no_usable_relay: false,
             message_id: MessageId::new(vec![0xab; 32]),
             reason: reason.to_owned(),
         }
@@ -3064,6 +3068,25 @@ mod fail_if_publish_failed_tests {
         effects.failures.push(failure("relay rejected"));
         let err = fail_if_publish_failed(&effects).unwrap_err();
         assert!(matches!(err, AppError::Publish(_)));
+    }
+
+    // mdk#3305: a send fails as having no usable relay only when every one of
+    // its failures had none; a failure some relay answered keeps the generic
+    // error, which another attempt or relay could change.
+    #[test]
+    fn no_usable_relay_needs_every_failure_to_have_none() {
+        let no_usable_relay = PublishFailure {
+            no_usable_relay: true,
+            ..failure("insufficient publish acknowledgements")
+        };
+        let mut effects = AccountDeviceEffects::default();
+        effects.failures.push(no_usable_relay.clone());
+        let err = fail_if_publish_failed(&effects).unwrap_err();
+        assert!(matches!(err, AppError::NoUsableRelay), "{err:?}");
+
+        effects.failures.push(failure("relay rejected"));
+        let err = fail_if_publish_failed(&effects).unwrap_err();
+        assert!(matches!(err, AppError::Publish(_)), "{err:?}");
     }
 
     #[test]

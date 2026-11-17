@@ -1102,6 +1102,7 @@ async fn termination_then_restoration_preserves_failed_sends_and_archive() {
         if failed {
             effects.failures.push(marmot_session::PublishFailure {
                 oversized: None,
+                no_usable_relay: false,
                 message_id: MessageId::new(vec![0xef; 32]),
                 reason: "unrelated publication failed".into(),
             });
@@ -1345,6 +1346,7 @@ async fn partial_native_projection_retries_without_republishing() {
         if failed_publish {
             effects.failures.push(marmot_session::PublishFailure {
                 oversized: None,
+                no_usable_relay: false,
                 message_id: MessageId::new(vec![0xe4; 32]),
                 reason: "primary failure".into(),
             });

@@ -351,6 +351,13 @@ enum MarmotStatus
    * treating absence as convergence; other devices may not have caught up.
    */
   MARMOT_STATUS_REACTION_NOT_FOUND = 132,
+  /**
+   * The group has no relay this device may send to: MDK refuses every one
+   * of its relays before sending, as it refuses a private-network address.
+   * Nothing was sent; a commit rolled back. Retrying fails the same way
+   * while the group's relays stay the same (mdk#3305).
+   */
+  MARMOT_STATUS_NO_USABLE_RELAY = 133,
 };
 #ifndef __cplusplus
 #if __STDC_VERSION__ >= 202311L

@@ -19487,6 +19487,7 @@ async fn a_publish_failure_in_the_session_event_drain_still_arms_recovery() {
     );
     effects.failures.push(marmot_session::PublishFailure {
         oversized: None,
+        no_usable_relay: false,
         message_id: cgka_traits::MessageId::new(vec![0xab; 32]),
         reason: "injected publish failure".to_owned(),
     });
@@ -19530,6 +19531,7 @@ fn a_refusal_riding_a_rolled_back_publish(
     );
     effects.failures.push(marmot_session::PublishFailure {
         oversized: None,
+        no_usable_relay: false,
         message_id,
         reason: "injected publish failure".to_owned(),
     });
@@ -19808,6 +19810,7 @@ async fn assert_mixed_publish_batch_finalizes_successful_message(
         }],
         failures: vec![marmot_session::PublishFailure {
             oversized: None,
+            no_usable_relay: false,
             message_id: failed_message_id.clone(),
             reason: "unrelated sibling publish failed".to_owned(),
         }],
@@ -20233,6 +20236,7 @@ fn a_refusal_riding_a_confirmed_but_partial_publish(
     );
     effects.failures.push(marmot_session::PublishFailure {
         oversized: None,
+        no_usable_relay: false,
         message_id,
         reason: "insufficient publish acknowledgements".to_owned(),
     });
@@ -20705,6 +20709,7 @@ async fn the_arming_publish_gate_classifies_exactly_as_the_bare_publish_check() 
         .failures
         .push(marmot_session::PublishFailure {
             oversized: None,
+            no_usable_relay: false,
             message_id: cgka_traits::MessageId::new(vec![0xef; 32]),
             reason: "relay rejected".to_owned(),
         });
@@ -24581,6 +24586,7 @@ fn released_transport_is_replayed_after_lost_effect_and_reopen() {
                 );
                 effects.failures.push(marmot_session::PublishFailure {
                     oversized: None,
+                    no_usable_relay: false,
                     message_id: delivery.message.id.clone(),
                     reason: "injected".into(),
                 });

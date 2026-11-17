@@ -92,6 +92,10 @@ The last-error string contains only the coarse artifact and size class; C has no
 For a Welcome, status119 explains the observed attempt, not terminal delivery or proof of no earlier receipt.
 Keep native retry work and confirmed state, including when a crash or expired bookkeeping hides earlier exposure.
 
+`MARMOT_STATUS_NO_USABLE_RELAY` (133) reports the shared [no-usable-relay error](../marmot-uniffi/README.md#runtime-lifecycle-threads-and-errors):
+none of the group's relays is one MDK may send to, so nothing was sent and a retry fails the same way while the
+group's relays stay the same.
+
 ## Rules of the road
 
 - Every fallible function returns `MarmotStatus` (`MARMOT_STATUS_OK` is

@@ -2992,6 +2992,7 @@ fn app_error_kind(error: &AppError) -> &str {
         AppError::InvalidSticker(_) => "invalid_sticker",
         AppError::StickerNotFound => "sticker_not_found",
         AppError::EventTooLarge { .. } => "event_too_large",
+        AppError::NoUsableRelay => "no_usable_relay",
         AppError::StickerRelay(_) => "sticker_relay",
         AppError::StickerImport(_) => "sticker_import",
         AppError::StickerExternalSignerImportUnsupported => {
@@ -3197,7 +3198,8 @@ fn app_error(error: AppError) -> SubjectError {
         | AppError::BlockListUnavailable
         | AppError::BlockPublicationUncertain
         | AppError::ModerationReportingNotConfigured
-        | AppError::InvalidModerationReportConfig(_) => SubjectFailureCategory::Environment,
+        | AppError::InvalidModerationReportConfig(_)
+        | AppError::NoUsableRelay => SubjectFailureCategory::Environment,
     };
     SubjectError::classified(
         category,
