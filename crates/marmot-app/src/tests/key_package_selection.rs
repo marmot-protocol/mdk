@@ -1421,3 +1421,62 @@ async fn availability_expired() {
         nostr_directory::FollowAvailabilityState::Unknown
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn availability_multi_slot() {
+    let (_root, app, accounts, fetcher) = member_resolution_fixture(1, false).await;
+    let owner = app
+        .account_home()
+        .create_account("availability-owner")
+        .unwrap();
+    app.directory()
+        .remember_directory_follow_list_for_test(
+            &owner.account_id_hex,
+            &nostr_directory::FetchedFollowList {
+                follows: vec![accounts[0].account_id_hex.clone()],
+                source_relays: Vec::new(),
+            },
+        )
+        .unwrap();
+    let last_resort = package_expiring_at(&app, &accounts[0], unix_now_seconds() + 3_000, true);
+    let mut publication = member_resolution_key_package_event(&accounts[0], last_resort);
+    publication.id = "bb".repeat(32);
+    let created_at = publication.created_at;
+    let publication_id = publication.id.clone();
+    fetcher.events.lock().unwrap().push(publication);
+    for event in fetcher.events.lock().unwrap().iter_mut() {
+        if event.kind == KIND_MARMOT_KEY_PACKAGE
+            && event.pubkey == accounts[0].account_id_hex
+            && event.id != publication_id
+        {
+            event.created_at = created_at.saturating_sub(1);
+        }
+    }
+
+    let selected = {
+        let events = fetcher.events.lock().unwrap();
+        let publications = events.iter().collect::<Vec<_>>();
+        select(&app, &accounts[0], &publications).unwrap()
+    };
+    assert_eq!(selected.value.len(), 1);
+
+    let status = app
+        .directory()
+        .refresh_follow_availability(&crate::directory_resources::directory_account(&owner))
+        .await
+        .unwrap();
+    assert_eq!(status.ready, 1, "{status:?}");
+    let page = app
+        .directory()
+        .follow_availability_page(
+            &crate::directory_resources::directory_account(&owner),
+            None,
+            100,
+        )
+        .unwrap();
+    assert_eq!(
+        page.rows[0].state,
+        nostr_directory::FollowAvailabilityState::Ready,
+        "a newer last-resort publication must not hide the preferred slot"
+    );
+}

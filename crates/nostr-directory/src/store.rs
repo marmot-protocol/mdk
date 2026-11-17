@@ -305,16 +305,38 @@ impl<R: DirectoryResources> Directory<R> {
                 self.remember_directory_relay_list_event(&account_id_hex, &record)?;
             }
             KIND_MARMOT_KEY_PACKAGE => {
-                self.invalidate_availability(
-                    &account_id_hex,
-                    &record.event.id,
-                    record.event.created_at,
-                )?;
-                let mut fetched = key_package_from_record(record)?;
-                fetched.relay_lists = self
-                    .cached_relay_list_status(&account_id_hex)
-                    .unwrap_or_else(|_| AccountRelayListStatus::empty());
-                self.remember_directory_key_package(&fetched)?;
+                let key_package_id = record.event.tag_value("d").unwrap_or_default();
+                let fetched = key_package_from_record(record.clone());
+                let last_resort = fetched.as_ref().ok().and_then(|fetched| {
+                    cgka_engine::key_package::key_package_metadata(&fetched.key_package)
+                        .ok()
+                        .map(|metadata| metadata.last_resort)
+                });
+                match fetched {
+                    Ok(mut fetched) => {
+                        fetched.relay_lists = self
+                            .cached_relay_list_status(&account_id_hex)
+                            .unwrap_or_else(|_| AccountRelayListStatus::empty());
+                        self.remember_directory_key_package(&fetched)?;
+                        self.invalidate_availability(
+                            &account_id_hex,
+                            key_package_id,
+                            &record.event.id,
+                            record.event.created_at,
+                            last_resort,
+                        )?;
+                    }
+                    Err(error) => {
+                        self.invalidate_availability(
+                            &account_id_hex,
+                            key_package_id,
+                            &record.event.id,
+                            record.event.created_at,
+                            None,
+                        )?;
+                        return Err(error);
+                    }
+                }
             }
             _ => {}
         }

@@ -27,7 +27,8 @@ pub use availability::{
     FOLLOW_AVAILABILITY_TARGET_TIMEOUT, FollowAvailability, FollowAvailabilityPage,
     FollowAvailabilityRefreshPhase, FollowAvailabilityRefreshStatus, FollowAvailabilitySource,
     FollowAvailabilityState, MAX_FOLLOW_AVAILABILITY_PAGE_SIZE,
-    MAX_FOLLOW_AVAILABILITY_RELAY_FETCHES, MAX_FOLLOW_AVAILABILITY_TARGETS,
+    MAX_FOLLOW_AVAILABILITY_RELAY_FETCHES, MAX_FOLLOW_AVAILABILITY_RELAYS_PER_TARGET,
+    MAX_FOLLOW_AVAILABILITY_TARGETS,
 };
 pub use cache::DirectoryCache;
 pub use config::DirectoryConfig;

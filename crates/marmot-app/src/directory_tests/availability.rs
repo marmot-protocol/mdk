@@ -10,7 +10,7 @@ use nostr_directory::{
     MAX_FOLLOW_AVAILABILITY_RELAY_FETCHES, MAX_FOLLOW_AVAILABILITY_TARGETS,
 };
 use nostr_sdk::prelude::FinalizeEvent;
-use transport_nostr_adapter::KIND_MARMOT_KEY_PACKAGE;
+use transport_nostr_adapter::{KIND_MARMOT_KEY_PACKAGE, KIND_NIP65_RELAY_LIST};
 
 use crate::MarmotApp;
 use crate::directory_resources::directory_account;
@@ -61,6 +61,14 @@ async fn availability_mixed_outcomes() {
         .unwrap()
         .as_secs();
     app.directory_test_clock = Some(Arc::new(std::sync::atomic::AtomicU64::new(now)));
+
+    for event in fetcher.events.lock().unwrap().iter_mut() {
+        if event.kind == KIND_NIP65_RELAY_LIST && event.pubkey == accounts[0].account_id_hex {
+            event.tags = (0..20)
+                .map(|index| vec!["r".into(), format!("wss://outbox-{index}.example")])
+                .collect();
+        }
+    }
 
     let missing_publication = {
         let mut events = fetcher.events.lock().unwrap();
@@ -114,7 +122,24 @@ async fn availability_mixed_outcomes() {
         availability_states(&app, &owner)[&accounts[3].account_id_hex],
         FollowAvailabilityState::Unknown
     );
-    assert!(fetcher.requests.lock().unwrap().len() <= 8);
+    assert!(
+        fetcher.requests.lock().unwrap().len()
+            <= nostr_directory::MAX_FOLLOW_AVAILABILITY_RELAY_FETCHES
+    );
+    assert!(
+        fetcher.requests.lock().unwrap().len() <= 4 * 3,
+        "each mixed-outcome target needs at most relay-list, primary, and recovery reads"
+    );
+    assert!(
+        fetcher
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|request| request.endpoints.len()
+                <= nostr_directory::MAX_FOLLOW_AVAILABILITY_RELAYS_PER_TARGET),
+        "advertised relay fan-out must stay within the per-target bound"
+    );
     let negative = app
         .directory()
         .follow_availability_page(&directory_account(&owner), None, 100)
@@ -189,6 +214,7 @@ async fn availability_mixed_outcomes() {
         events.push(replacement.clone());
         replacement
     };
+    let replacement_created_at = replacement.created_at;
     let error = app
         .directory()
         .ingest_directory_relay_event(transport_nostr::DirectoryRelayEventRecord {
@@ -215,6 +241,22 @@ async fn availability_mixed_outcomes() {
         availability_states(&app, &owner)[&accounts[0].account_id_hex],
         FollowAvailabilityState::Unknown,
         "a malformed replacement must suppress the previously ready slot"
+    );
+    fetcher.events.lock().unwrap().retain(|event| {
+        !(event.kind == KIND_MARMOT_KEY_PACKAGE
+            && event.pubkey == accounts[0].account_id_hex
+            && event.created_at == replacement_created_at)
+    });
+    app.directory()
+        .reset_availability_for_test(&owner.account_id_hex);
+    app.directory()
+        .refresh_follow_availability(&directory_account(&owner))
+        .await
+        .unwrap();
+    assert_eq!(
+        availability_states(&app, &owner)[&accounts[0].account_id_hex],
+        FollowAvailabilityState::Unknown,
+        "a stale relay cannot resurrect the superseded package"
     );
 }
 
@@ -289,6 +331,95 @@ async fn availability_cancel_fence() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn availability_detached_wait() {
+    let (_root, app, accounts, fetcher) = crate::tests::member_resolution_fixture(1, false).await;
+    let owner = app
+        .account_home()
+        .create_account("availability-owner")
+        .unwrap();
+    remember_follows(&app, &owner, vec![accounts[0].account_id_hex.clone()]);
+    let (entered, release) = fetcher.hold_fetches();
+    let task_app = app.clone();
+    let task_owner = owner.clone();
+    let leader = tokio::spawn(async move {
+        task_app
+            .directory()
+            .refresh_follow_availability(&directory_account(&task_owner))
+            .await
+    });
+    entered.notified().await;
+    let follower_app = app.clone();
+    let follower_owner = owner.clone();
+    let follower = tokio::spawn(async move {
+        follower_app
+            .directory()
+            .refresh_follow_availability(&directory_account(&follower_owner))
+            .await
+    });
+    leader.abort();
+    release.notify_one();
+    let status = follower.await.unwrap().unwrap();
+    assert_eq!(
+        status.phase,
+        FollowAvailabilityRefreshPhase::Complete,
+        "{status:?}"
+    );
+    assert_eq!(status.ready, 1);
+    assert_eq!(
+        availability_states(&app, &owner)[&accounts[0].account_id_hex],
+        FollowAvailabilityState::Ready
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn availability_cancel_early() {
+    let (_root, app, _accounts, fetcher) = crate::tests::member_resolution_fixture(0, false).await;
+    let owner = app
+        .account_home()
+        .create_account("availability-owner")
+        .unwrap();
+    remember_follows(
+        &app,
+        &owner,
+        (1..=100).map(|index| format!("{index:064x}")).collect(),
+    );
+    let task_app = app.clone();
+    let task_owner = owner.clone();
+    let refresh = tokio::spawn(async move {
+        task_app
+            .directory()
+            .refresh_follow_availability(&directory_account(&task_owner))
+            .await
+    });
+    tokio::task::yield_now().await;
+    let operation_id = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if let Some(operation_id) = app
+                .directory()
+                .follow_availability_status(&owner.account_id_hex)
+                .operation_id
+            {
+                break operation_id;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        app.directory()
+            .cancel_follow_availability(&owner.account_id_hex, operation_id)
+    );
+    let cancelled = tokio::time::timeout(Duration::from_secs(1), refresh)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(cancelled.phase, FollowAvailabilityRefreshPhase::Cancelled);
+    assert!(fetcher.requests.lock().unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn availability_bounds() {
     let (_root, app, _accounts, fetcher) = crate::tests::member_resolution_fixture(0, false).await;
     let owner = app
@@ -308,18 +439,16 @@ async fn availability_bounds() {
     assert_eq!(status.phase, FollowAvailabilityRefreshPhase::Partial);
     assert_eq!(status.total, MAX_FOLLOW_AVAILABILITY_TARGETS as u32);
     assert_eq!(status.completed, MAX_FOLLOW_AVAILABILITY_TARGETS as u32);
-    assert_eq!(status.not_found, MAX_FOLLOW_AVAILABILITY_TARGETS as u32);
+    assert_eq!(status.unknown, MAX_FOLLOW_AVAILABILITY_TARGETS as u32);
     assert!(status.truncated);
-    assert_eq!(
-        fetcher.requests.lock().unwrap().len(),
-        MAX_FOLLOW_AVAILABILITY_RELAY_FETCHES
-    );
+    assert!(fetcher.requests.lock().unwrap().len() <= MAX_FOLLOW_AVAILABILITY_RELAY_FETCHES);
 
     let first = app
         .directory()
         .follow_availability_page(&directory_account(&owner), None, usize::MAX)
         .unwrap();
     assert_eq!(first.rows.len(), MAX_FOLLOW_AVAILABILITY_TARGETS);
+    assert!(first.rows.iter().all(|row| row.checked_at.is_some()));
     let second = app
         .directory()
         .follow_availability_page(
@@ -331,6 +460,24 @@ async fn availability_bounds() {
     assert_eq!(second.rows.len(), 1);
     assert_eq!(second.rows[0].state, FollowAvailabilityState::Unknown);
     assert_eq!(second.next_cursor, None);
+    app.directory()
+        .reset_availability_for_test(&owner.account_id_hex);
+    let remaining = app
+        .directory()
+        .refresh_follow_availability(&directory_account(&owner))
+        .await
+        .unwrap();
+    assert_eq!(remaining.total, MAX_FOLLOW_AVAILABILITY_TARGETS as u32);
+    assert_eq!(remaining.unknown, MAX_FOLLOW_AVAILABILITY_TARGETS as u32);
+    let remaining_page = app
+        .directory()
+        .follow_availability_page(
+            &directory_account(&owner),
+            first.next_cursor.as_deref(),
+            100,
+        )
+        .unwrap();
+    assert!(remaining_page.rows[0].checked_at.is_some());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

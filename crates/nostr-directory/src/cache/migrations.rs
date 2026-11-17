@@ -347,8 +347,8 @@ mod tests {
                 apply: version_2,
             },
             Migration {
-                version: 3,
-                name: "0003_test",
+                version: 4,
+                name: "0004_test",
                 apply: |tx| {
                     tx.execute_batch(
                         "CREATE TABLE rollback_probe (value INTEGER);
@@ -376,7 +376,7 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(count, 2);
+        assert_eq!(count, 3);
     }
 }
 

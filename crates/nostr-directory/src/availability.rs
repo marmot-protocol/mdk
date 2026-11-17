@@ -11,11 +11,12 @@ use std::time::{Duration, Instant};
 use cgka_engine::key_package::key_package_metadata;
 use cgka_traits::TransportEndpoint;
 use futures::StreamExt;
-use rusqlite::params;
+use rusqlite::{OptionalExtension, params};
 use tokio::sync::watch;
 
 use super::cache::DirectoryCache;
 use super::error::{DirectoryError, MissingKeyPackageReason, blocking_directory_task};
+use super::key_package_recovery::KeyPackageRecoveryRequest;
 use super::observer::DirectoryObserver;
 use super::published_records::{
     key_package_queries, key_package_read_page_full, select_key_packages_from_records,
@@ -30,7 +31,8 @@ pub const FOLLOW_AVAILABILITY_TARGET_TIMEOUT: Duration = Duration::from_secs(10)
 pub const FOLLOW_AVAILABILITY_REFRESH_TIMEOUT: Duration = Duration::from_secs(300);
 pub const FOLLOW_AVAILABILITY_REFRESH_CADENCE: Duration = Duration::from_secs(60);
 pub const FOLLOW_AVAILABILITY_NEGATIVE_TTL: Duration = Duration::from_secs(15 * 60);
-pub const MAX_FOLLOW_AVAILABILITY_RELAY_FETCHES: usize = 2 * MAX_FOLLOW_AVAILABILITY_TARGETS;
+pub const MAX_FOLLOW_AVAILABILITY_RELAY_FETCHES: usize = 14 * MAX_FOLLOW_AVAILABILITY_TARGETS;
+pub const MAX_FOLLOW_AVAILABILITY_RELAYS_PER_TARGET: usize = 4;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum FollowAvailabilityState {
@@ -109,25 +111,41 @@ pub(crate) struct FollowAvailabilityRefreshes {
 
 type SharedRefreshes = Arc<Mutex<FollowAvailabilityRefreshes>>;
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
+struct Supersession {
+    key_package_id: String,
+    event_id: String,
+    created_at: u64,
+    last_resort: Option<bool>,
+}
+
+#[derive(Clone, Default)]
 struct AvailabilityWrite {
     state: FollowAvailabilityState,
     checked_at: u64,
     fresh_until: Option<u64>,
     key_package_event_id: Option<String>,
+    key_package_id: Option<String>,
     source: FollowAvailabilitySource,
     failed: bool,
+    superseded: Option<Supersession>,
 }
 
 impl AvailabilityWrite {
     fn unknown(checked_at: u64) -> Self {
+        Self::unknown_with(checked_at, None)
+    }
+
+    fn unknown_with(checked_at: u64, superseded: Option<Supersession>) -> Self {
         Self {
             state: FollowAvailabilityState::Unknown,
             checked_at,
             fresh_until: None,
             key_package_event_id: None,
+            key_package_id: superseded.as_ref().map(|s| s.key_package_id.clone()),
             source: FollowAvailabilitySource::None,
             failed: true,
+            superseded,
         }
     }
 }
@@ -136,8 +154,13 @@ impl DirectoryCache {
     fn direct_follows(&self, account_id_hex: &str) -> Result<Vec<String>, DirectoryError> {
         let conn = self.lock()?;
         let mut statement = conn.prepare(
-            "SELECT follow_account_id_hex FROM directory_user_follows
-             WHERE account_id_hex = ?1 ORDER BY follow_account_id_hex",
+            "SELECT follows.follow_account_id_hex FROM directory_user_follows AS follows
+             LEFT JOIN follow_availability AS availability
+               ON availability.follow_account_id_hex = follows.follow_account_id_hex
+             WHERE follows.account_id_hex = ?1
+             ORDER BY availability.checked_at IS NOT NULL,
+                      availability.checked_at,
+                      follows.follow_account_id_hex",
         )?;
         let rows = statement.query_map([account_id_hex], |row| row.get(0))?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -165,9 +188,10 @@ impl DirectoryCache {
         let changed = self.lock()?.execute(
             "INSERT INTO follow_availability (
                  follow_account_id_hex, state, checked_at, fresh_until,
-                 key_package_event_id, source, updated_at
+                 key_package_event_id, key_package_id, superseded_event_id, superseded_at,
+                 superseded_last_resort, source, updated_at
              )
-             SELECT ?2, ?3, ?4, ?5, ?6, ?7, ?4
+             SELECT ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?4
              WHERE EXISTS (
                  SELECT 1 FROM directory_user_follows
                  WHERE account_id_hex = ?1 AND follow_account_id_hex = ?2
@@ -177,6 +201,10 @@ impl DirectoryCache {
                  checked_at = excluded.checked_at,
                  fresh_until = excluded.fresh_until,
                  key_package_event_id = excluded.key_package_event_id,
+                key_package_id = excluded.key_package_id,
+                 superseded_event_id = excluded.superseded_event_id,
+                 superseded_at = excluded.superseded_at,
+                 superseded_last_resort = excluded.superseded_last_resort,
                  source = excluded.source,
                  updated_at = excluded.updated_at",
             params![
@@ -186,10 +214,37 @@ impl DirectoryCache {
                 value.checked_at as i64,
                 value.fresh_until.map(|timestamp| timestamp as i64),
                 value.key_package_event_id,
+                value.key_package_id,
+                value.superseded.as_ref().map(|s| s.event_id.clone()),
+                value.superseded.as_ref().map(|s| s.created_at as i64),
+                value.superseded.as_ref().and_then(|s| s.last_resort),
                 availability_source_token(value.source),
             ],
         )?;
         Ok(changed != 0)
+    }
+
+    fn supersession(
+        &self,
+        follow_account_id_hex: &str,
+    ) -> Result<Option<Supersession>, DirectoryError> {
+        self.lock()?
+            .query_row(
+                "SELECT key_package_id, superseded_event_id, superseded_at, superseded_last_resort
+                 FROM follow_availability
+                 WHERE follow_account_id_hex = ?1 AND superseded_event_id IS NOT NULL",
+                [follow_account_id_hex],
+                |row| {
+                    Ok(Supersession {
+                        key_package_id: row.get(0)?,
+                        event_id: row.get(1)?,
+                        created_at: row.get::<_, i64>(2)? as u64,
+                        last_resort: row.get::<_, Option<i64>>(3)?.map(|value| value != 0),
+                    })
+                },
+            )
+            .optional()
+            .map_err(DirectoryError::from)
     }
 
     fn follow_availability_page(
@@ -206,7 +261,6 @@ impl DirectoryCache {
                     availability.state, availability.checked_at,
                     availability.fresh_until, availability.key_package_event_id,
                     availability.source,
-                    json_extract(users.key_package_json, '$.key_package_event_id'),
                     json_extract(users.key_package_json, '$.created_at')
              FROM directory_user_follows AS follows
              LEFT JOIN follow_availability AS availability
@@ -232,8 +286,7 @@ impl DirectoryCache {
                     fresh_until: row.get(3)?,
                     key_package_event_id: row.get(4)?,
                     source: row.get(5)?,
-                    current_event_id: row.get(6)?,
-                    current_created_at: row.get(7)?,
+                    current_created_at: row.get(6)?,
                 })
             },
         )?;
@@ -250,17 +303,22 @@ impl DirectoryCache {
     fn invalidate_follow(
         &self,
         follow_account_id_hex: &str,
+        key_package_id: &str,
         event_id: &str,
         created_at: u64,
         now: u64,
+        last_resort: Option<bool>,
     ) -> Result<(), DirectoryError> {
         self.lock()?.execute(
             "UPDATE follow_availability
              SET state = 'unknown', checked_at = ?4, fresh_until = NULL,
-                 key_package_event_id = NULL, source = 0, updated_at = ?4
+                 key_package_event_id = NULL, key_package_id = ?6,
+                 superseded_event_id = ?2,
+                 superseded_at = ?3, superseded_last_resort = ?5,
+                 source = 0, updated_at = ?4
              WHERE follow_account_id_hex = ?1
-               AND key_package_event_id IS NOT NULL
-               AND key_package_event_id != ?2
+               AND (key_package_id IS NULL OR key_package_id = ?6)
+               AND (key_package_event_id IS NULL OR key_package_event_id != ?2)
                AND EXISTS (
                    SELECT 1 FROM directory_users
                    WHERE account_id_hex = ?1
@@ -270,7 +328,9 @@ impl DirectoryCache {
                 follow_account_id_hex,
                 event_id,
                 created_at as i64,
-                now as i64
+                now as i64,
+                last_resort,
+                key_package_id,
             ],
         )?;
         Ok(())
@@ -284,7 +344,6 @@ struct StoredAvailability {
     fresh_until: Option<i64>,
     key_package_event_id: Option<String>,
     source: Option<i64>,
-    current_event_id: Option<String>,
     current_created_at: Option<i64>,
 }
 
@@ -299,8 +358,7 @@ impl StoredAvailability {
         let state = match self.state.as_deref() {
             Some("ready")
                 if fresh_until.is_some_and(|expiry| expiry > now)
-                    && self.key_package_event_id.is_some()
-                    && self.current_event_id == self.key_package_event_id =>
+                    && self.key_package_event_id.is_some() =>
             {
                 FollowAvailabilityState::Ready
             }
@@ -443,20 +501,40 @@ impl<R: DirectoryResources> Directory<R> {
         {
             return false;
         }
-        entry.cancel.send(true).is_ok()
+        entry.cancel.send_replace(true);
+        true
     }
 
     pub(crate) fn invalidate_availability(
         &self,
         account_id_hex: &str,
+        key_package_id: &str,
         event_id: &str,
         created_at: u64,
+        last_resort: Option<bool>,
     ) -> Result<(), DirectoryError> {
         let now = self.directory_freshness().now;
         for cache in self.resources.current_caches()? {
-            cache.invalidate_follow(account_id_hex, event_id, created_at, now)?;
+            cache.invalidate_follow(
+                account_id_hex,
+                key_package_id,
+                event_id,
+                created_at,
+                now,
+                last_resort,
+            )?;
         }
         Ok(())
+    }
+
+    fn availability_supersession(
+        &self,
+        account: &DirectoryAccount,
+        follow_account_id_hex: &str,
+    ) -> Result<Option<Supersession>, DirectoryError> {
+        self.resources
+            .cache_for_account(account)?
+            .supersession(follow_account_id_hex)
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -540,26 +618,35 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                     .map_err(|_| DirectoryError::TransportClosed)?;
             },
             RefreshAdmission::Leader(leader) => {
-                let result = self.run_availability_refresh(account, leader.clone()).await;
-                match result {
-                    Ok(()) => {
-                        let phase = if leader.is_cancelled() {
-                            FollowAvailabilityRefreshPhase::Cancelled
-                        } else if leader.status.borrow().truncated
-                            || leader.status.borrow().failed != 0
-                        {
-                            FollowAvailabilityRefreshPhase::Partial
-                        } else {
-                            FollowAvailabilityRefreshPhase::Complete
-                        };
-                        leader.finish(phase);
+                let directory = self.clone();
+                let account = account.clone();
+                let task_leader = leader.clone();
+                let task = tokio::spawn(async move {
+                    let result = directory
+                        .run_availability_refresh(&account, task_leader.clone())
+                        .await;
+                    match result {
+                        Ok(()) => {
+                            let phase = if task_leader.is_cancelled() {
+                                FollowAvailabilityRefreshPhase::Cancelled
+                            } else if task_leader.status.borrow().truncated
+                                || task_leader.status.borrow().failed != 0
+                            {
+                                FollowAvailabilityRefreshPhase::Partial
+                            } else {
+                                FollowAvailabilityRefreshPhase::Complete
+                            };
+                            task_leader.finish(phase);
+                            Ok(task_leader.status.borrow().clone())
+                        }
+                        Err(error) => {
+                            task_leader.finish(FollowAvailabilityRefreshPhase::Failed);
+                            Err(error)
+                        }
                     }
-                    Err(error) => {
-                        leader.finish(FollowAvailabilityRefreshPhase::Failed);
-                        return Err(error);
-                    }
-                }
-                Ok(leader.status.borrow().clone())
+                });
+                task.await
+                    .map_err(|error| DirectoryError::BlockingTask(error.to_string()))?
             }
         }
     }
@@ -587,6 +674,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
             .into_iter()
             .take(MAX_FOLLOW_AVAILABILITY_TARGETS)
             .collect::<Vec<_>>();
+
         let work = futures::stream::iter(targets.into_iter().map(|follow| {
             let directory = self.clone();
             let account = account.clone();
@@ -595,9 +683,10 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                 if leader.is_cancelled() {
                     return Ok(());
                 }
+                let superseded = directory.availability_supersession(&account, &follow)?;
                 let lookup = tokio::time::timeout(
                     FOLLOW_AVAILABILITY_TARGET_TIMEOUT,
-                    directory.lookup_follow_availability(&follow),
+                    directory.lookup_follow_availability(&follow, superseded.clone()),
                 );
                 tokio::pin!(lookup);
                 let value = tokio::select! {
@@ -606,7 +695,10 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                         Ok(Ok(value)) => value,
                         Ok(Err(error)) if error_is_host_failure(&error) => return Err(error),
                         Ok(Err(_)) | Err(_) => {
-                            AvailabilityWrite::unknown(directory.directory_freshness().now)
+                            AvailabilityWrite::unknown_with(
+                                directory.directory_freshness().now,
+                                superseded.clone(),
+                            )
                         }
                     },
                 };
@@ -631,9 +723,6 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                     )
                 })
                 .await?;
-                if leader.is_cancelled() {
-                    return Ok(());
-                }
                 leader.status.send_if_modified(|status| {
                     status.completed = status.completed.saturating_add(1);
                     match value.state {
@@ -682,24 +771,37 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
     async fn lookup_follow_availability(
         &self,
         account_id_hex: &str,
+        superseded: Option<Supersession>,
     ) -> Result<AvailabilityWrite, DirectoryError> {
         let now = self.directory_freshness().now;
-        let result = self.lookup_availability_inner(account_id_hex).await;
+        let result = self
+            .lookup_availability_inner(account_id_hex, superseded.clone())
+            .await;
         match result {
-            Ok(value) => Ok(value),
+            Ok(mut value) => {
+                if value.state == FollowAvailabilityState::Unknown {
+                    value.superseded = superseded;
+                } else {
+                    value.superseded = None;
+                }
+                Ok(value)
+            }
             Err(error) if error_is_host_failure(&error) => Err(error),
-            Err(_) => Ok(AvailabilityWrite::unknown(now)),
+            Err(_) => Ok(AvailabilityWrite::unknown_with(now, superseded)),
         }
     }
 
     async fn lookup_availability_inner(
         &self,
         account_id_hex: &str,
+        superseded: Option<Supersession>,
     ) -> Result<AvailabilityWrite, DirectoryError> {
         let directory = self.clone();
         let account = account_id_hex.to_owned();
+
         let mut relay_lists =
             blocking_directory_task(move || directory.cached_relay_list_status(&account)).await?;
+
         if relay_lists.nip65.relays.is_empty() {
             relay_lists = self
                 .fetch_relay_list_status(account_id_hex, Vec::new())
@@ -715,16 +817,20 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                 .collect(),
             "follow availability KeyPackage fetch",
         );
+        let discovery_relays = self.directory_source_relays(&[]);
+        let used_safe_nip65 = !source_relays.is_empty();
         if source_relays.is_empty() {
-            source_relays = self.directory_source_relays(&[]);
+            source_relays = discovery_relays.clone();
         }
+        source_relays.truncate(MAX_FOLLOW_AVAILABILITY_RELAYS_PER_TARGET);
         if source_relays.is_empty() {
             return Ok(AvailabilityWrite::unknown(self.directory_freshness().now));
         }
+
         let outcome = self
             .relay_plane
             .fetch_directory_events_with_completion(
-                source_relays,
+                source_relays.clone(),
                 key_package_queries(vec![account_id_hex.to_owned()]),
             )
             .await
@@ -732,13 +838,40 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
         if key_package_read_page_full(account_id_hex, &outcome.records) {
             return Ok(AvailabilityWrite::unknown(self.directory_freshness().now));
         }
-        let selection = select_key_packages_from_records(
+
+        let direct_selection = select_key_packages_from_records(
             account_id_hex,
             &outcome.records,
             self.directory_freshness(),
             None,
         );
+        let (records, freshness, complete_negative) = if direct_selection
+            .as_ref()
+            .is_ok_and(|selection| !selection.value.is_empty())
+        {
+            (outcome.records, self.directory_freshness(), false)
+        } else {
+            let recovered = self
+                .recover_key_package_records(KeyPackageRecoveryRequest {
+                    account: account_id_hex,
+                    searched: &source_relays,
+                    observed: outcome.records,
+                    primary_complete: outcome.complete,
+                    discovery: &discovery_relays,
+                    requirements: None,
+                    cached_target: None,
+                    wanted: 1,
+                })
+                .await?;
+            (
+                recovered.records,
+                recovered.freshness,
+                used_safe_nip65 && recovered.cache_evidence.is_some(),
+            )
+        };
+        let selection = select_key_packages_from_records(account_id_hex, &records, freshness, None);
         let checked_at = self.directory_freshness().now;
+
         match selection {
             Ok(selection) if !selection.value.is_empty() => {
                 let fetched = selection
@@ -746,9 +879,17 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                     .into_iter()
                     .next()
                     .expect("selected package");
+                if let Some(superseded) = &superseded
+                    && !superseded_allows(&fetched, superseded)
+                {
+                    return Ok(AvailabilityWrite::unknown_with(
+                        checked_at,
+                        Some(superseded.clone()),
+                    ));
+                }
                 self.remember_availability(fetched, checked_at).await
             }
-            Ok(selection) if outcome.complete => {
+            Ok(selection) if complete_negative && !selection.rejected_future => {
                 let error = selection.into_value_or_missing(account_id_hex);
                 match error {
                     Err(DirectoryError::MissingKeyPackage { .. }) => Ok(AvailabilityWrite {
@@ -758,8 +899,10 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                             checked_at.saturating_add(FOLLOW_AVAILABILITY_NEGATIVE_TTL.as_secs()),
                         ),
                         key_package_event_id: None,
+                        key_package_id: None,
                         source: FollowAvailabilitySource::Network,
                         failed: false,
+                        superseded: None,
                     }),
                     Err(error) => Err(error),
                     Ok(_) => unreachable!("empty selection reports a missing KeyPackage"),
@@ -769,15 +912,17 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
             Err(DirectoryError::MissingKeyPackage {
                 reason: MissingKeyPackageReason::NotFound | MissingKeyPackageReason::ObsoleteOnly,
                 ..
-            }) if outcome.complete => Ok(AvailabilityWrite {
+            }) if complete_negative => Ok(AvailabilityWrite {
                 state: FollowAvailabilityState::NotFound,
                 checked_at,
                 fresh_until: Some(
                     checked_at.saturating_add(FOLLOW_AVAILABILITY_NEGATIVE_TTL.as_secs()),
                 ),
                 key_package_event_id: None,
+                key_package_id: None,
                 source: FollowAvailabilitySource::Network,
                 failed: false,
+                superseded: None,
             }),
             Err(_) => Ok(AvailabilityWrite::unknown(checked_at)),
         }
@@ -802,8 +947,10 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
             checked_at,
             fresh_until: Some(metadata.not_after),
             key_package_event_id: Some(fetched.key_package_event_id),
+            key_package_id: Some(fetched.key_package_id),
             source: FollowAvailabilitySource::Network,
             failed: false,
+            superseded: None,
         })
     }
 }
@@ -818,6 +965,12 @@ fn error_is_host_failure(error: &DirectoryError) -> bool {
             | DirectoryError::BlockingTask(_)
             | DirectoryError::Resource(_)
     )
+}
+
+fn superseded_allows(fetched: &FetchedKeyPackage, superseded: &Supersession) -> bool {
+    superseded.last_resort == Some(true)
+        || fetched.key_package_event_id == superseded.event_id
+        || fetched.created_at > superseded.created_at
 }
 
 #[cfg(test)]
@@ -870,8 +1023,10 @@ mod tests {
             checked_at,
             fresh_until: Some(fresh_until),
             key_package_event_id: Some(event_id),
+            key_package_id: None,
             source: FollowAvailabilitySource::Network,
             failed: false,
+            superseded: None,
         }
     }
 
@@ -912,8 +1067,10 @@ mod tests {
                         checked_at: 1_000,
                         fresh_until: Some(1_500),
                         key_package_event_id: None,
+                        key_package_id: None,
                         source: FollowAvailabilitySource::Network,
                         failed: false,
+                        superseded: None,
                     },
                 )
                 .unwrap()
@@ -951,6 +1108,16 @@ mod tests {
         assert_eq!(reopened.rows[1].state, FollowAvailabilityState::NotFound);
 
         insert_package(&cache, &ready_id, &"bb".repeat(32), 1_100);
+        cache
+            .invalidate_follow(
+                &ready_id,
+                "slot",
+                &"bb".repeat(32),
+                1_100,
+                1_200,
+                Some(false),
+            )
+            .unwrap();
         assert_eq!(
             cache
                 .follow_availability_page(&owner, None, 1, 1_200)
@@ -1047,5 +1214,33 @@ mod tests {
                 .rows
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn availability_rotation() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = DirectoryCache::open(
+            root.path().join("directory.sqlite3"),
+            &SqlCipherKey::raw([0x53; 32]),
+        )
+        .unwrap();
+        let owner = account_id(1);
+        for index in 1..=101_u8 {
+            let follow = account_id(index);
+            insert_follow(&cache, &owner, &follow, usize::from(index));
+            if index <= 100 {
+                assert!(
+                    cache
+                        .record_follow_availability(
+                            &owner,
+                            &follow,
+                            &AvailabilityWrite::unknown(1_000),
+                        )
+                        .unwrap()
+                );
+            }
+        }
+        let follows = cache.direct_follows(&owner).unwrap();
+        assert_eq!(follows.first(), Some(&account_id(101)));
     }
 }
