@@ -37,5 +37,7 @@ CREATE TABLE public_key_package_eviction_watermarks (
 
 CREATE TABLE public_key_package_eviction_fallback (
     id INTEGER PRIMARY KEY CHECK (id = 1),
+    event_id_hex TEXT NOT NULL,
+    event_created_at INTEGER NOT NULL,
     evicted_at INTEGER NOT NULL
 );

@@ -1445,7 +1445,10 @@ async fn availability_expired() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn availability_obsolete_only() {
-    let (_root, app, account, _fetcher) = legacy_only_fixture().await;
+    let (_root, mut app, account, fetcher) = legacy_only_fixture().await;
+    let now = unix_now_seconds();
+    let clock = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(now));
+    app.directory_test_clock = Some(clock.clone());
     let owner = app
         .account_home()
         .create_account("availability-owner")
@@ -1460,11 +1463,21 @@ async fn availability_obsolete_only() {
         )
         .unwrap();
 
-    let status = app
-        .directory()
-        .refresh_follow_availability(&crate::directory_resources::directory_account(&owner))
-        .await
-        .unwrap();
+    let (entered, release) = fetcher.hold_fetches();
+    let task_app = app.clone();
+    let task_owner = owner.clone();
+    let refresh = tokio::spawn(async move {
+        task_app
+            .directory()
+            .refresh_follow_availability(&crate::directory_resources::directory_account(
+                &task_owner,
+            ))
+            .await
+    });
+    entered.notified().await;
+    clock.store(now + 5, std::sync::atomic::Ordering::SeqCst);
+    release.notify_one();
+    let status = refresh.await.unwrap().unwrap();
     assert_eq!(status.not_found, 1, "{status:?}");
     assert_eq!(
         selection_availability_states(&app, &owner)[&account.account_id_hex],

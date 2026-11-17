@@ -4,7 +4,7 @@
 //! the shared public directory tier. That tier stores only per-slot replacement
 //! metadata; KeyPackage bytes stay in the existing directory record.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -126,6 +126,7 @@ struct AvailabilityWrite {
     key_package_created_at: Option<u64>,
     source: FollowAvailabilitySource,
     failed: bool,
+    observed_event_ids: HashSet<String>,
 }
 
 impl AvailabilityWrite {
@@ -139,6 +140,7 @@ impl AvailabilityWrite {
             key_package_created_at: None,
             source: FollowAvailabilitySource::None,
             failed: true,
+            observed_event_ids: HashSet::new(),
         }
     }
 }
@@ -278,7 +280,7 @@ impl DirectoryCache {
                     shared: None,
                     replacements: Vec::new(),
                     replacement_evicted_at: None,
-                    global_evicted_at: None,
+                    global_eviction: None,
                     barriers: Vec::new(),
                     eviction_watermark: None,
                 })
@@ -297,7 +299,7 @@ impl DirectoryCache {
                 }
                 row.replacement_evicted_at =
                     shared.public_key_package_replacement_evicted_at(&row.account_id_hex)?;
-                row.global_evicted_at = shared.key_package_global_evicted_at()?;
+                row.global_eviction = shared.key_package_global_eviction()?;
                 row.barriers = shared.public_key_package_barriers(&row.account_id_hex)?;
                 row.eviction_watermark =
                     shared.public_key_package_eviction_watermark(&row.account_id_hex)?;
@@ -341,7 +343,7 @@ struct StoredAvailability {
     shared: Option<Publication>,
     replacements: Vec<PublicKeyPackageReplacementRecord>,
     replacement_evicted_at: Option<u64>,
-    global_evicted_at: Option<u64>,
+    global_eviction: Option<PublicKeyPackageBarrierRecord>,
     barriers: Vec<PublicKeyPackageBarrierRecord>,
     eviction_watermark: Option<PublicKeyPackageBarrierRecord>,
 }
@@ -414,7 +416,17 @@ impl StoredAvailability {
                 .is_some_and(|(event_id, created_at)| {
                     barrier_allows(event_id, created_at, barrier)
                 }),
-            None => self.global_evicted_at.is_none(),
+            None => self.global_eviction.as_ref().is_none_or(|barrier| {
+                self.key_package_event_id
+                    .as_ref()
+                    .zip(
+                        self.key_package_created_at
+                            .and_then(|value| u64::try_from(value).ok()),
+                    )
+                    .is_some_and(|(event_id, created_at)| {
+                        barrier_allows(event_id, created_at, barrier)
+                    })
+            }),
         };
         let shared_before_check = self.shared.as_ref().is_none_or(|current| {
             current
@@ -928,6 +940,10 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
         };
         let selection = select_key_packages_from_records(account_id_hex, &records, freshness, None);
         let checked_at = self.directory_freshness().now;
+        let observed_event_ids = records
+            .iter()
+            .map(|record| record.event.id.clone())
+            .collect::<HashSet<_>>();
 
         match selection {
             Ok(selection) if !selection.value.is_empty() => {
@@ -953,6 +969,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                         key_package_created_at: None,
                         source: FollowAvailabilitySource::Network,
                         failed: false,
+                        observed_event_ids: observed_event_ids.clone(),
                     }),
                     Err(error) => Err(error),
                     Ok(_) => unreachable!("empty selection reports a missing KeyPackage"),
@@ -973,6 +990,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                 key_package_created_at: None,
                 source: FollowAvailabilitySource::Network,
                 failed: false,
+                observed_event_ids,
             }),
             Err(_) => Ok(AvailabilityWrite::unknown(checked_at)),
         }
@@ -981,28 +999,21 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
     async fn apply_shared_replacements(
         &self,
         account_id_hex: &str,
-        value: AvailabilityWrite,
+        mut value: AvailabilityWrite,
     ) -> Result<AvailabilityWrite, DirectoryError> {
         if value.state == FollowAvailabilityState::Unknown {
             return Ok(value);
         }
         let directory = self.clone();
         let account = account_id_hex.to_owned();
-        let (replacements, evicted_at, global_evicted_at, barriers, watermark) =
+        let (replacements, global_eviction, barriers, watermark) =
             blocking_directory_task(move || {
                 let shared = directory.resources.shared_storage()?;
                 let replacements = shared.public_key_package_replacements(&account)?;
-                let evicted_at = shared.public_key_package_replacement_evicted_at(&account)?;
-                let global_evicted_at = shared.key_package_global_evicted_at()?;
+                let global_eviction = shared.key_package_global_eviction()?;
                 let barriers = shared.public_key_package_barriers(&account)?;
                 let watermark = shared.public_key_package_eviction_watermark(&account)?;
-                Ok((
-                    replacements,
-                    evicted_at,
-                    global_evicted_at,
-                    barriers,
-                    watermark,
-                ))
+                Ok((replacements, global_eviction, barriers, watermark))
             })
             .await?;
         let current = match value.state {
@@ -1020,7 +1031,9 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                         barrier_allows(event_id, created_at, barrier)
                     }) && match watermark.as_ref() {
                         Some(barrier) => barrier_allows(event_id, created_at, barrier),
-                        None => global_evicted_at.is_none(),
+                        None => global_eviction
+                            .as_ref()
+                            .is_none_or(|barrier| barrier_allows(event_id, created_at, barrier)),
                     } && replacements
                         .iter()
                         .filter(|replacement| {
@@ -1029,21 +1042,29 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                         .all(|replacement| replacement_allows(event_id, created_at, replacement))
                 }),
             FollowAvailabilityState::NotFound => {
-                let checked_at = value.checked_at;
+                let read_started_at = value.checked_at;
+                let covered = |event_id: &str, observed_at: u64| {
+                    observed_at <= read_started_at || value.observed_event_ids.contains(event_id)
+                };
                 replacements
                     .iter()
-                    .all(|replacement| replacement.observed_at <= checked_at)
+                    .all(|replacement| covered(&replacement.event_id_hex, replacement.observed_at))
                     && barriers
                         .iter()
-                        .all(|barrier| barrier.observed_at <= checked_at)
-                    && evicted_at.is_none_or(|evicted_at| evicted_at <= checked_at)
+                        .all(|barrier| covered(&barrier.event_id_hex, barrier.observed_at))
                     && watermark
                         .as_ref()
-                        .is_none_or(|barrier| barrier.observed_at <= checked_at)
+                        .is_none_or(|barrier| covered(&barrier.event_id_hex, barrier.observed_at))
+                    && global_eviction
+                        .as_ref()
+                        .is_none_or(|barrier| covered(&barrier.event_id_hex, barrier.observed_at))
             }
             FollowAvailabilityState::Unknown => true,
         };
         if current {
+            if value.state == FollowAvailabilityState::NotFound {
+                value.checked_at = self.directory_freshness().now;
+            }
             Ok(value)
         } else {
             Ok(AvailabilityWrite::unknown(self.directory_freshness().now))
@@ -1073,6 +1094,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
             key_package_created_at: Some(fetched.created_at),
             source: FollowAvailabilitySource::Network,
             failed: false,
+            observed_event_ids: HashSet::new(),
         })
     }
 }
@@ -1119,10 +1141,7 @@ fn barrier_allows(
             if barrier.deleted_event_id.is_some() {
                 return true;
             }
-            event_id != barrier.event_id_hex
-                && (created_at > barrier.event_created_at
-                    || (created_at == barrier.event_created_at
-                        && event_id < barrier.event_id_hex.as_str()))
+            created_at > barrier.event_created_at
         }
     }
 }
@@ -1182,6 +1201,7 @@ mod tests {
             key_package_created_at: Some(900),
             source: FollowAvailabilitySource::Network,
             failed: false,
+            observed_event_ids: HashSet::new(),
         }
     }
 
@@ -1204,12 +1224,12 @@ mod tests {
             shared: None,
             replacements: Vec::new(),
             replacement_evicted_at: Some(1_100),
-            global_evicted_at: Some(1_100),
+            global_eviction: None,
             barriers: Vec::new(),
             eviction_watermark: Some(PublicKeyPackageBarrierRecord {
                 account_id_hex: account_id(1),
                 key_package_id: "other-slot".into(),
-                event_id_hex: event_id,
+                event_id_hex: "ff".repeat(32),
                 deleted_event_id: None,
                 event_created_at: 900,
                 observed_at: 1_100,
@@ -1229,6 +1249,54 @@ mod tests {
         assert_eq!(
             project_with_watermark(PublicKeyPackageBarrierKind::Deletion),
             FollowAvailabilityState::Unknown
+        );
+    }
+
+    fn project_with_global_eviction(created_at: u64) -> FollowAvailabilityState {
+        let event_id = "aa".repeat(32);
+        StoredAvailability {
+            account_id_hex: account_id(1),
+            state: Some("ready".into()),
+            checked_at: Some(1_000),
+            fresh_until: Some(2_000),
+            key_package_event_id: Some(event_id.clone()),
+            key_package_id: Some("slot".into()),
+            key_package_created_at: Some(created_at as i64),
+            source: Some(1),
+            current: Publication {
+                event_id: Some(event_id.clone()),
+                key_package_id: Some("slot".into()),
+                created_at: Some(created_at as i64),
+            },
+            shared: None,
+            replacements: Vec::new(),
+            replacement_evicted_at: Some(1_100),
+            global_eviction: Some(PublicKeyPackageBarrierRecord {
+                account_id_hex: String::new(),
+                key_package_id: String::new(),
+                event_id_hex: "ff".repeat(32),
+                deleted_event_id: None,
+                event_created_at: 1_000,
+                observed_at: 1_100,
+                kind: PublicKeyPackageBarrierKind::Deletion,
+            }),
+            barriers: Vec::new(),
+            eviction_watermark: None,
+        }
+        .project(1_000)
+        .state
+    }
+
+    #[test]
+    fn global_fallback_allows_newer_publications() {
+        assert_eq!(
+            project_with_global_eviction(1_000),
+            FollowAvailabilityState::Unknown,
+            "an equal-timestamp publication stays fenced"
+        );
+        assert_eq!(
+            project_with_global_eviction(1_001),
+            FollowAvailabilityState::Ready
         );
     }
 
@@ -1273,6 +1341,7 @@ mod tests {
                         key_package_created_at: None,
                         source: FollowAvailabilitySource::Network,
                         failed: false,
+                        observed_event_ids: HashSet::new(),
                     },
                 )
                 .unwrap()

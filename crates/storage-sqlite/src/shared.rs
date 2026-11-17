@@ -395,15 +395,15 @@ impl SqliteSharedStorage {
                 .storage()
     }
 
-    pub fn key_package_global_evicted_at(&self) -> StorageResult<Option<u64>> {
+    pub fn key_package_global_eviction(
+        &self,
+    ) -> StorageResult<Option<PublicKeyPackageBarrierRecord>> {
         self.lock()?
             .query_row_cached(
-                "SELECT evicted_at FROM public_key_package_eviction_fallback WHERE id = 1",
+                "SELECT '', '', event_id_hex, NULL, event_created_at, evicted_at, 'deletion'
+                 FROM public_key_package_eviction_fallback WHERE id = 1",
                 [],
-                |row| {
-                    row.get::<_, i64>(0)
-                        .map(|value| u64::try_from(value).unwrap_or(0))
-                },
+                key_package_barrier_from_row,
             )
             .optional()
             .storage()
@@ -1063,6 +1063,10 @@ fn prune_key_package_barriers(tx: &Transaction<'_>, now: i64) -> StorageResult<(
                 .collect::<StorageResult<Vec<_>>>()?
         };
         for record in pruned {
+            let watermark_deleted_event_id = match record.kind {
+                PublicKeyPackageBarrierKind::Replacement => record.deleted_event_id.clone(),
+                PublicKeyPackageBarrierKind::Deletion => None,
+            };
             tx.execute_cached(
                 "INSERT INTO public_key_package_eviction_watermarks (
                     account_id_hex, key_package_id, event_id_hex, deleted_event_id,
@@ -1085,7 +1089,7 @@ fn prune_key_package_barriers(tx: &Transaction<'_>, now: i64) -> StorageResult<(
                     &record.account_id_hex,
                     &record.key_package_id,
                     &record.event_id_hex,
-                    &record.deleted_event_id,
+                    &watermark_deleted_event_id,
                     u64_to_i64(record.event_created_at)?,
                     now,
                     record.kind.as_str(),
@@ -1113,17 +1117,44 @@ fn prune_key_package_barriers(tx: &Transaction<'_>, now: i64) -> StorageResult<(
         }
     }
     tx.execute_cached(
-        "INSERT INTO public_key_package_eviction_fallback (id, evicted_at)
-         SELECT 1, MAX(evicted_at)
+        "INSERT INTO public_key_package_eviction_fallback (
+            id, event_id_hex, event_created_at, evicted_at
+         )
+         SELECT 1, event_id_hex, event_created_at, evicted_at
          FROM public_key_package_eviction_watermarks
          WHERE account_id_hex IN (
             SELECT account_id_hex FROM public_key_package_eviction_watermarks
             ORDER BY evicted_at DESC, event_created_at DESC, event_id_hex, account_id_hex
             LIMIT -1 OFFSET 1000
          )
-         HAVING COUNT(*) > 0
+         ORDER BY event_created_at DESC, event_id_hex, evicted_at DESC
+         LIMIT 1
          ON CONFLICT(id) DO UPDATE SET
-            evicted_at = MAX(public_key_package_eviction_fallback.evicted_at, excluded.evicted_at)",
+            event_id_hex = excluded.event_id_hex,
+            event_created_at = excluded.event_created_at,
+            evicted_at = MAX(public_key_package_eviction_fallback.evicted_at, excluded.evicted_at)
+         WHERE excluded.event_created_at > public_key_package_eviction_fallback.event_created_at
+            OR (excluded.event_created_at = public_key_package_eviction_fallback.event_created_at
+                AND excluded.event_id_hex <= public_key_package_eviction_fallback.event_id_hex)",
+        [],
+    )
+    .storage()?;
+    tx.execute_cached(
+        "UPDATE public_key_package_eviction_fallback
+         SET evicted_at = MAX(evicted_at, COALESCE((
+            SELECT MAX(evicted_at) FROM public_key_package_eviction_watermarks
+            WHERE account_id_hex IN (
+                SELECT account_id_hex FROM public_key_package_eviction_watermarks
+                ORDER BY evicted_at DESC, event_created_at DESC, event_id_hex, account_id_hex
+                LIMIT -1 OFFSET 1000
+            )), 0))
+         WHERE id = 1 AND EXISTS (
+            SELECT 1 FROM public_key_package_eviction_watermarks
+            WHERE account_id_hex IN (
+                SELECT account_id_hex FROM public_key_package_eviction_watermarks
+                ORDER BY evicted_at DESC, event_created_at DESC, event_id_hex, account_id_hex
+                LIMIT -1 OFFSET 1000
+            ))",
         [],
     )
     .storage()?;
@@ -1696,6 +1727,45 @@ mod tests {
             storage.public_key_package_evicted_at(&account).unwrap(),
             Some(40)
         );
+    }
+
+    #[test]
+    fn pruned_exact_deletions_become_slot_wide_watermark() {
+        let storage = SqliteSharedStorage::in_memory().unwrap();
+        let account = "aa".repeat(32);
+        for (index, created_at) in [100, 200].into_iter().enumerate() {
+            storage
+                .put_public_key_package_barrier(&PublicKeyPackageBarrierRecord {
+                    account_id_hex: account.clone(),
+                    key_package_id: String::new(),
+                    event_id_hex: format!("{:064x}", index + 1),
+                    deleted_event_id: Some(format!("{:064x}", index + 10)),
+                    event_created_at: created_at,
+                    observed_at: created_at,
+                    kind: PublicKeyPackageBarrierKind::Deletion,
+                })
+                .unwrap();
+        }
+        for index in 0..500_u64 {
+            storage
+                .put_public_key_package_barrier(&PublicKeyPackageBarrierRecord {
+                    account_id_hex: account.clone(),
+                    key_package_id: format!("slot-{index:04}"),
+                    event_id_hex: format!("{index:064x}"),
+                    deleted_event_id: None,
+                    event_created_at: 1_000 + index,
+                    observed_at: 1_000 + index,
+                    kind: PublicKeyPackageBarrierKind::Replacement,
+                })
+                .unwrap();
+        }
+        let watermark = storage
+            .public_key_package_eviction_watermark(&account)
+            .unwrap()
+            .unwrap();
+        assert_eq!(watermark.kind, PublicKeyPackageBarrierKind::Deletion);
+        assert_eq!(watermark.deleted_event_id, None);
+        assert_eq!(watermark.event_created_at, 200);
     }
 
     #[test]
