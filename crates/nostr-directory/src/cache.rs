@@ -1636,6 +1636,6 @@ mod tests {
         assert_eq!(entry.follows, vec![bob]);
         assert_eq!(user_count, 1);
         assert!(!legacy_table_exists);
-        assert_eq!(migration_rows(&cache.lock().unwrap()).len(), 2);
+        assert_eq!(migration_rows(&cache.lock().unwrap()).len(), 3);
     }
 }

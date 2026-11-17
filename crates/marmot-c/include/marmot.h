@@ -1170,6 +1170,27 @@ typedef enum MarmotMatchQuality {
   MARMOT_MATCH_QUALITY_CONTAINS,
 } MarmotMatchQuality;
 
+typedef enum MarmotFollowAvailabilityState {
+  MARMOT_FOLLOW_AVAILABILITY_STATE_READY,
+  MARMOT_FOLLOW_AVAILABILITY_STATE_UNKNOWN,
+  MARMOT_FOLLOW_AVAILABILITY_STATE_NOT_FOUND,
+} MarmotFollowAvailabilityState;
+
+typedef enum MarmotFollowAvailabilitySource {
+  MARMOT_FOLLOW_AVAILABILITY_SOURCE_NONE,
+  MARMOT_FOLLOW_AVAILABILITY_SOURCE_NETWORK,
+} MarmotFollowAvailabilitySource;
+
+typedef enum MarmotFollowAvailabilityRefreshPhase {
+  MARMOT_FOLLOW_AVAILABILITY_REFRESH_PHASE_IDLE,
+  MARMOT_FOLLOW_AVAILABILITY_REFRESH_PHASE_RUNNING,
+  MARMOT_FOLLOW_AVAILABILITY_REFRESH_PHASE_COMPLETE,
+  MARMOT_FOLLOW_AVAILABILITY_REFRESH_PHASE_PARTIAL,
+  MARMOT_FOLLOW_AVAILABILITY_REFRESH_PHASE_CANCELLED,
+  MARMOT_FOLLOW_AVAILABILITY_REFRESH_PHASE_THROTTLED,
+  MARMOT_FOLLOW_AVAILABILITY_REFRESH_PHASE_FAILED,
+} MarmotFollowAvailabilityRefreshPhase;
+
 /**
  * Local state of one referenced public event.
  */
@@ -5014,6 +5035,45 @@ typedef struct MarmotCachedIdentityProjectionList {
   struct MarmotCachedIdentityProjection *items;
   uintptr_t len;
 } MarmotCachedIdentityProjectionList;
+
+typedef struct MarmotFollowAvailability {
+  char *account_id_hex;
+  enum MarmotFollowAvailabilityState state;
+  bool has_checked_at;
+  /**
+   *Only meaningful when the matching `has_` flag is set.
+   */
+  uint64_t checked_at;
+  bool has_fresh_until;
+  /**
+   *Only meaningful when the matching `has_` flag is set.
+   */
+  uint64_t fresh_until;
+  char *key_package_event_id;
+  enum MarmotFollowAvailabilitySource source;
+} MarmotFollowAvailability;
+
+typedef struct MarmotFollowAvailabilityPage {
+  struct MarmotFollowAvailability *rows;
+  uintptr_t rows_len;
+  char *next_cursor;
+} MarmotFollowAvailabilityPage;
+
+typedef struct MarmotFollowAvailabilityRefreshStatus {
+  bool has_operation_id;
+  /**
+   *Only meaningful when the matching `has_` flag is set.
+   */
+  uint64_t operation_id;
+  enum MarmotFollowAvailabilityRefreshPhase phase;
+  uint32_t total;
+  uint32_t completed;
+  uint32_t ready;
+  uint32_t unknown;
+  uint32_t not_found;
+  uint32_t failed;
+  bool truncated;
+} MarmotFollowAvailabilityRefreshStatus;
 
 /**
  * One result per requested reference, in request order.
@@ -11568,6 +11628,66 @@ MarmotStatus marmot_cached_identity_projections(const struct MarmotClient *clien
                                                 struct MarmotCachedIdentityProjectionList **out);
 
 /**
+ * Network-free availability of the selected account's direct follows.
+ * Results are keyset-paged by canonical account id, at most 100 rows.
+ * Free with `marmot_follow_availability_page_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_follow_availability_page(const struct MarmotClient *client,
+                                             const char *account_ref,
+                                             const char *after,
+                                             uint32_t limit,
+                                             struct MarmotFollowAvailabilityPage **out);
+
+/**
+ * Refresh at most 100 direct follows with bounded target lookups.
+ * Free with `marmot_follow_availability_refresh_status_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_refresh_follow_availability(const struct MarmotClient *client,
+                                                const char *account_ref,
+                                                struct MarmotFollowAvailabilityRefreshStatus **out);
+
+/**
+ * Current or last direct-follow refresh progress for this account.
+ * Free with `marmot_follow_availability_refresh_status_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_follow_availability_status(const struct MarmotClient *client,
+                                               const char *account_ref,
+                                               struct MarmotFollowAvailabilityRefreshStatus **out);
+
+/**
+ * Cancel only the operation returned by the refresh status API. Returns
+ * false when that operation already finished or a newer one replaced it.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_cancel_follow_availability(const struct MarmotClient *client,
+                                               const char *account_ref,
+                                               uint64_t operation_id,
+                                               bool *out);
+
+/**
  * Network-free cached previews of public events referenced from message
  * content, one row per reference (at most 16) in order. Free with
  * `marmot_public_event_preview_list_free`.
@@ -15956,6 +16076,26 @@ void marmot_installed_custom_emoji_asset_free(struct MarmotInstalledCustomEmojiA
  * `event` must be NULL or an unfreed pointer returned by this library.
  */
 void marmot_event_free(struct MarmotEvent *event);
+
+/**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
+void marmot_follow_availability_page_free(struct MarmotFollowAvailabilityPage *ptr);
+
+/**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
+void marmot_follow_availability_refresh_status_free(struct MarmotFollowAvailabilityRefreshStatus *ptr);
 
 /**
  * Free a value of this type returned by this library. NULL

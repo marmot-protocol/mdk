@@ -260,6 +260,19 @@ event, pre-cache direct follows, and cache profile metadata for those likely con
 directory subscriptions for local accounts and known users so profile, follow-list, relay-list, and KeyPackage updates
 keep warming the cache.
 
+**Direct-follow availability.** `follow_availability_page(account_ref, after, limit)` reads a keyset-paged projection
+of the selected account's direct cached follows without networking. `ready` records a selected current compatible
+KeyPackage and its MLS expiry, not proof that a particular client is installed. `unknown` covers missing, stale,
+incomplete, malformed, replaced, and expired results. A completed clean or obsolete miss is `not_found` for 15
+minutes, with check and expiry timestamps plus network provenance.
+
+`refresh_follow_availability` processes at most 100 follows with four concurrent target lookups, a 10-second target
+deadline, and a five-minute overall deadline. Results persist per target and remain readable while the refresh runs.
+Poll `follow_availability_status` for aggregate progress and call `cancel_follow_availability` with
+the observed operation id to stop it without cancelling a newer operation. Completed refreshes have a 60-second
+cadence. Pages contain at most 100 rows and always join the current follow list, so account switches and unfollows do
+not expose another account's projection.
+
 **Profile sanitization.** Incoming kind `0` strings are sanitized in `nostr-directory`'s `src/records.rs` before they
 are cached:
 

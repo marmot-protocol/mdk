@@ -37,6 +37,12 @@
   the high water captured before reconciliation. Historical states do not
   authorize local byte reads. Identity and cursor Debug output is redacted.
 
+- `followAvailabilityPage`, `refreshFollowAvailability`, `followAvailabilityStatus`, and
+  `cancelFollowAvailability` expose bounded direct-follow Marmot availability with offline paging, typed
+  `ready`/`unknown`/`notFound` states, freshness metadata, partial progress, and operation-matched cancellation
+  (mdk#1996). Availability never asserts which client an account installed. See
+  [Direct-follow availability](README.md#direct-follow-availability). Regenerate Swift and Kotlin bindings with the
+  matching native library.
 - `groupPendingCommit(accountRef, groupIdHex)` returns `GroupPendingCommitFfi`, or nil, for the group's own commit
   that has not confirmed yet, with `GroupPendingCommitStateFfi` `Sending` or `Stuck` (mdk#2332). Group changes fail
   with the new `MarmotKitError::GroupCommitPending { groupIdHex }` while it is pending; handle it where you handle

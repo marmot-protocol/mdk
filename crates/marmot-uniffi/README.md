@@ -20,6 +20,7 @@ Read the documentation at the tag matching your binaries; `master` can describe 
   [identity references and profiles](#identity-references-and-profiles),
   [KeyPackage inventory](#keypackage-inventory), [KeyPackage selection](#keypackage-selection),
   [invitation lookup outcomes](#invitation-lookup-outcomes),
+  [direct-follow availability](#direct-follow-availability),
   [public Nostr event verification](#public-nostr-event-verification),
   [public event previews](#public-event-previews)
 - Screens: [selected chat-list presentation](#selected-chat-list-presentation),
@@ -134,6 +135,26 @@ of the founding state and Welcome; a reused or retried start keeps the existing 
 the start with `updateMessageRetention`, which would overwrite a reused chat's policy.
 See the [exact Rust signature and contract](API-REFERENCE.md#marmotstart_direct_conversation) and the
 [options variant](API-REFERENCE.md#marmotstart_direct_conversation_with_options).
+
+
+### Direct-follow availability
+
+`followAvailabilityPage(accountRef, after, limit)` reads the selected account's direct follows from its encrypted
+cache without networking. Pass the returned `nextCursor` as `after` for the next page; `limit` clamps to 1 through
+100. Rows use canonical account ids and remain stable in keyset order. Keep synchronous page reads off the UI thread.
+
+`ready` means MDK selected a current compatible KeyPackage that has not reached its MLS `not_after`. It does not prove
+that the person installed White Noise or any other client. `unknown` covers absent, stale, incomplete, malformed,
+replaced, deleted, and expired results. A completed clean or obsolete miss is `not_found` for 15 minutes. Each row
+carries its check time, expiry, selected publication id when applicable, and network provenance, never KeyPackage
+bytes.
+
+Call `refreshFollowAvailability(accountRef)` to check at most 100 follows. MDK runs four target lookups at once, with
+a 10-second target deadline, a five-minute overall deadline, and at most two relay fetches per target. Results commit
+per target, so pages can show partial progress while the call runs. Concurrent calls share one refresh and completed
+refreshes have a 60-second cadence. Poll `followAvailabilityStatus` for aggregate counts and pass its
+`operationId` to `cancelFollowAvailability`; a stale or terminal id returns false and cannot cancel a newer
+operation. Cancelling keeps committed rows and does not change account scope.
 
 ### Feature map
 

@@ -143,6 +143,10 @@ impl<R: DirectoryResources> Directory<R> {
         self.directory_freshness()
     }
 
+    pub fn reset_availability_for_test(&self, account_id_hex: &str) {
+        Directory::reset_availability_cadence(self, account_id_hex);
+    }
+
     pub fn remember_directory_user_with_reason_for_test(
         &self,
         account_id_hex: &str,

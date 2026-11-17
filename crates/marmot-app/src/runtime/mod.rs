@@ -5806,6 +5806,61 @@ impl MarmotAppRuntime {
         Ok(follows)
     }
 
+    /// Network-free, keyset-paged availability of this account's direct follows.
+    pub fn follow_availability_page(
+        &self,
+        account_ref: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<crate::FollowAvailabilityPage, AppError> {
+        let account = self.accounts.resolve(account_ref)?;
+        Ok(self.accounts.app.directory().follow_availability_page(
+            &directory_account(&account),
+            after,
+            limit,
+        )?)
+    }
+
+    /// Refresh direct-follow availability without occupying an account worker.
+    pub async fn refresh_follow_availability(
+        &self,
+        account_ref: &str,
+    ) -> Result<crate::FollowAvailabilityRefreshStatus, AppError> {
+        let account = self.accounts.resolve(account_ref)?;
+        Ok(self
+            .accounts
+            .app
+            .directory()
+            .refresh_follow_availability(&directory_account(&account))
+            .await?)
+    }
+
+    pub fn follow_availability_status(
+        &self,
+        account_ref: &str,
+    ) -> Result<crate::FollowAvailabilityRefreshStatus, AppError> {
+        let account = self.accounts.resolve(account_ref)?;
+        Ok(self
+            .accounts
+            .app
+            .directory()
+            .follow_availability_status(&account.account_id_hex))
+    }
+
+    /// Cancel only the operation the caller observed. Committed rows remain readable.
+    pub fn cancel_follow_availability(
+        &self,
+        account_ref: &str,
+        operation_id: u64,
+    ) -> Result<bool, AppError> {
+        let account = self.accounts.resolve(account_ref)?;
+        Ok(self
+            .accounts
+            .app
+            .directory()
+            .cancel_follow_availability(&account.account_id_hex, operation_id))
+    }
+
     /// Network-free cached previews of public events referenced from message
     /// content, one per reference (at most 16) in input order. Unparseable
     /// references come back `Unsupported`. A cold call may open the account's

@@ -1370,3 +1370,54 @@ async fn legacy_slots_never_select_or_mask_current_slots() {
         })
     ));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn availability_expired() {
+    let (_root, app, accounts, fetcher) = member_resolution_fixture(1, false).await;
+    let owner = app
+        .account_home()
+        .create_account("availability-owner")
+        .unwrap();
+    app.directory()
+        .remember_directory_follow_list_for_test(
+            &owner.account_id_hex,
+            &nostr_directory::FetchedFollowList {
+                follows: vec![accounts[0].account_id_hex.clone()],
+                source_relays: Vec::new(),
+            },
+        )
+        .unwrap();
+    let expired = package_expiring_at(&app, &accounts[0], unix_now_seconds() - 1, false);
+    let mut publication = member_resolution_key_package_event(
+        &accounts[0],
+        fresh_key_package_for_account(&app, &accounts[0], false).await,
+    );
+    publication.content = BASE64_STANDARD.encode(expired.bytes());
+    publication.id = "ee".repeat(32);
+    fetcher
+        .events
+        .lock()
+        .unwrap()
+        .retain(|event| event.kind != KIND_MARMOT_KEY_PACKAGE);
+    fetcher.events.lock().unwrap().push(publication);
+
+    let status = app
+        .directory()
+        .refresh_follow_availability(&crate::directory_resources::directory_account(&owner))
+        .await
+        .unwrap();
+    assert_eq!(status.ready, 0);
+    assert_eq!(status.unknown, 1);
+    let page = app
+        .directory()
+        .follow_availability_page(
+            &crate::directory_resources::directory_account(&owner),
+            None,
+            100,
+        )
+        .unwrap();
+    assert_eq!(
+        page.rows[0].state,
+        nostr_directory::FollowAvailabilityState::Unknown
+    );
+}

@@ -305,6 +305,11 @@ impl<R: DirectoryResources> Directory<R> {
                 self.remember_directory_relay_list_event(&account_id_hex, &record)?;
             }
             KIND_MARMOT_KEY_PACKAGE => {
+                self.invalidate_availability(
+                    &account_id_hex,
+                    &record.event.id,
+                    record.event.created_at,
+                )?;
                 let mut fetched = key_package_from_record(record)?;
                 fetched.relay_lists = self
                     .cached_relay_list_status(&account_id_hex)

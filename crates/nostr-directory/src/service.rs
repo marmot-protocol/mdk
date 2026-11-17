@@ -44,6 +44,9 @@ pub struct DirectoryState {
     /// Bounded, process-local composition prewarm. Entries are never durable
     /// directory admission and never reserve or consume a KeyPackage.
     pub(crate) member_key_package_prewarm_cache: Arc<Mutex<MemberKeyPackagePrewarmCache>>,
+    /// Single-flight direct-follow availability refreshes, keyed by account id.
+    pub(crate) follow_availability_refreshes:
+        Arc<Mutex<super::availability::FollowAvailabilityRefreshes>>,
 }
 
 impl<R: DirectoryResources> Directory<R> {

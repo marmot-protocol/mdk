@@ -3,6 +3,7 @@
 //! runtime), so they live with the app rather than in `nostr-directory`.
 //! The directory's own tests stay beside its code.
 
+mod availability;
 mod cached_search;
 mod member_key_packages;
 mod methods;
