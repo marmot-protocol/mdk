@@ -16,7 +16,7 @@ CREATE TABLE public_key_package_barriers (
     deleted_event_id TEXT,
     event_created_at INTEGER NOT NULL,
     observed_at INTEGER NOT NULL,
-    kind TEXT NOT NULL CHECK (kind IN ('replacement', 'deletion')),
+    kind TEXT NOT NULL CHECK (kind IN ('replacement', 'deletion', 'exact_deletion')),
     PRIMARY KEY (account_id_hex, key_package_id, deleted_event_id, kind)
 );
 
@@ -32,12 +32,19 @@ CREATE TABLE public_key_package_eviction_watermarks (
     deleted_event_id TEXT,
     event_created_at INTEGER NOT NULL,
     evicted_at INTEGER NOT NULL,
-    kind TEXT NOT NULL CHECK (kind IN ('replacement', 'deletion'))
+    kind TEXT NOT NULL CHECK (kind IN ('replacement', 'deletion', 'exact_deletion'))
 );
 
 CREATE TABLE public_key_package_eviction_fallback (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     event_id_hex TEXT NOT NULL,
     event_created_at INTEGER NOT NULL,
-    evicted_at INTEGER NOT NULL
+    evicted_at INTEGER NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('replacement', 'deletion', 'exact_deletion'))
+);
+
+-- Orders availability checks against later evidence, even within one second.
+CREATE TABLE public_key_package_evidence_revisions (
+    account_id_hex TEXT PRIMARY KEY,
+    revision INTEGER NOT NULL
 );

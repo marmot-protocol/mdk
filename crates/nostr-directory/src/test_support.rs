@@ -6,6 +6,7 @@
 use std::sync::{Arc, Mutex};
 
 use cgka_traits::TransportEndpoint;
+use rusqlite::OptionalExtension;
 use transport_nostr::{DirectorySyncPlan, MarmotRelayPlane};
 
 use crate::cache::{DirectoryCache, DirectorySearchGraphRecord};
@@ -19,11 +20,28 @@ use crate::records::{
     FetchedFollowList, LocalAccountNames, UserDirectoryLocalAccount, UserDirectoryRecord,
     UserProfileMetadata,
 };
+use crate::resources::DirectoryAccount;
 use crate::resources::{BlockListSink, DirectoryResources};
 use crate::service::{Directory, DirectoryState};
 use crate::sync::DirectorySyncHandle;
 
 impl DirectoryCache {
+    pub fn availability_evidence_revision_for_test(
+        &self,
+        follow_account_id_hex: &str,
+    ) -> Result<i64, DirectoryError> {
+        self.lock()?
+            .query_row(
+                "SELECT evidence_revision FROM follow_availability
+                 WHERE follow_account_id_hex = ?1",
+                [follow_account_id_hex],
+                |row| row.get(0),
+            )
+            .optional()
+            .map(|revision| revision.unwrap_or(0))
+            .map_err(Into::into)
+    }
+
     pub fn search_record_for_test(
         &self,
         account_id_hex: &str,
@@ -145,6 +163,16 @@ impl<R: DirectoryResources> Directory<R> {
 
     pub fn reset_availability_for_test(&self, account_id_hex: &str) {
         Directory::reset_availability_cadence(self, account_id_hex);
+    }
+
+    pub fn availability_evidence_revision_for_test(
+        &self,
+        account: &DirectoryAccount,
+        follow_account_id_hex: &str,
+    ) -> Result<i64, DirectoryError> {
+        self.resources
+            .cache_for_account(account)?
+            .availability_evidence_revision_for_test(follow_account_id_hex)
     }
 
     pub fn remember_directory_user_with_reason_for_test(

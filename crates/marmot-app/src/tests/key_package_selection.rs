@@ -1483,6 +1483,32 @@ async fn availability_obsolete_only() {
         selection_availability_states(&app, &owner)[&account.account_id_hex],
         nostr_directory::FollowAvailabilityState::NotFound
     );
+    let checked_at = app
+        .directory()
+        .follow_availability_page(
+            &crate::directory_resources::directory_account(&owner),
+            None,
+            100,
+        )
+        .unwrap()
+        .rows[0]
+        .checked_at
+        .unwrap();
+    app.shared_storage()
+        .unwrap()
+        .put_public_key_package_replacement(&storage_sqlite::PublicKeyPackageReplacementRecord {
+            account_id_hex: account.account_id_hex.clone(),
+            key_package_id: "later-evidence".into(),
+            event_id_hex: "ff".repeat(32),
+            event_created_at: now + 6,
+            observed_at: checked_at,
+        })
+        .unwrap();
+    assert_eq!(
+        selection_availability_states(&app, &owner)[&account.account_id_hex],
+        nostr_directory::FollowAvailabilityState::Unknown,
+        "evidence written at the completion second invalidates the negative"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1677,6 +1703,19 @@ async fn availability_deleted_stays_not_found() {
         .refresh_follow_availability(&crate::directory_resources::directory_account(&owner))
         .await
         .unwrap();
+    let shared_revision = app
+        .shared_storage()
+        .unwrap()
+        .key_package_evidence_revision(&accounts[0].account_id_hex)
+        .unwrap();
+    let stored_revision = app
+        .directory()
+        .availability_evidence_revision_for_test(
+            &crate::directory_resources::directory_account(&owner),
+            &accounts[0].account_id_hex,
+        )
+        .unwrap();
+    assert_eq!(stored_revision, shared_revision);
     assert_eq!(
         selection_availability_states(&app, &owner)[&accounts[0].account_id_hex],
         nostr_directory::FollowAvailabilityState::NotFound

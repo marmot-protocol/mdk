@@ -9,6 +9,7 @@ CREATE TABLE follow_availability (
     key_package_id TEXT,
     key_package_created_at INTEGER,
     source INTEGER NOT NULL CHECK (source IN (0, 1)),
+    evidence_revision INTEGER NOT NULL DEFAULT 0,
     updated_at INTEGER NOT NULL,
     CHECK (
         (state = 'ready' AND key_package_event_id IS NOT NULL AND fresh_until IS NOT NULL)

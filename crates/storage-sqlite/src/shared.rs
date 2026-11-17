@@ -79,6 +79,7 @@ pub struct PublicKeyPackageReplacementRecord {
 pub enum PublicKeyPackageBarrierKind {
     Replacement,
     Deletion,
+    ExactDeletion,
 }
 
 impl PublicKeyPackageBarrierKind {
@@ -86,6 +87,7 @@ impl PublicKeyPackageBarrierKind {
         match self {
             Self::Replacement => "replacement",
             Self::Deletion => "deletion",
+            Self::ExactDeletion => "exact_deletion",
         }
     }
 }
@@ -300,6 +302,7 @@ impl SqliteSharedStorage {
                 ],
             )
             .storage()?;
+            bump_key_package_revision(&tx, &record.account_id_hex)?;
             prune_key_package_replacements(&tx)?;
             prune_key_package_barriers(&tx, unix_now_seconds_i64())?;
             tx.commit().storage()
@@ -335,6 +338,19 @@ impl SqliteSharedStorage {
             .collect()
     }
 
+    pub fn key_package_evidence_revision(&self, account_id_hex: &str) -> StorageResult<i64> {
+        self.lock()?
+            .query_row_cached(
+                "SELECT revision FROM public_key_package_evidence_revisions
+                 WHERE account_id_hex = ?1",
+                params![account_id_hex],
+                |row| row.get(0),
+            )
+            .optional()
+            .storage()
+            .map(|revision| revision.unwrap_or(0))
+    }
+
     pub fn put_public_key_package_barrier(
         &self,
         record: &PublicKeyPackageBarrierRecord,
@@ -345,6 +361,7 @@ impl SqliteSharedStorage {
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .storage()?;
             write_key_package_barrier(&tx, record)?;
+            bump_key_package_revision(&tx, &record.account_id_hex)?;
             prune_key_package_barriers(&tx, unix_now_seconds_i64())?;
             tx.commit().storage()
         })
@@ -400,7 +417,7 @@ impl SqliteSharedStorage {
     ) -> StorageResult<Option<PublicKeyPackageBarrierRecord>> {
         self.lock()?
             .query_row_cached(
-                "SELECT '', '', event_id_hex, NULL, event_created_at, evicted_at, 'deletion'
+                "SELECT '', '', event_id_hex, NULL, event_created_at, evicted_at, kind
                  FROM public_key_package_eviction_fallback WHERE id = 1",
                 [],
                 key_package_barrier_from_row,
@@ -944,6 +961,7 @@ fn key_package_barrier_from_row(
         kind: match row.get::<_, String>(6)?.as_str() {
             "replacement" => PublicKeyPackageBarrierKind::Replacement,
             "deletion" => PublicKeyPackageBarrierKind::Deletion,
+            "exact_deletion" => PublicKeyPackageBarrierKind::ExactDeletion,
             _ => return Err(rusqlite::Error::InvalidQuery),
         },
     })
@@ -977,6 +995,17 @@ fn write_key_package_barrier(
             u64_to_i64(record.observed_at)?,
             record.kind.as_str(),
         ],
+    )
+    .storage()?;
+    Ok(())
+}
+
+fn bump_key_package_revision(tx: &Transaction<'_>, account_id_hex: &str) -> StorageResult<()> {
+    tx.execute_cached(
+        "INSERT INTO public_key_package_evidence_revisions (account_id_hex, revision)
+         VALUES (?1, 1)
+         ON CONFLICT(account_id_hex) DO UPDATE SET revision = revision + 1",
+        params![account_id_hex],
     )
     .storage()?;
     Ok(())
@@ -1063,9 +1092,11 @@ fn prune_key_package_barriers(tx: &Transaction<'_>, now: i64) -> StorageResult<(
                 .collect::<StorageResult<Vec<_>>>()?
         };
         for record in pruned {
-            let watermark_deleted_event_id = match record.kind {
-                PublicKeyPackageBarrierKind::Replacement => record.deleted_event_id.clone(),
-                PublicKeyPackageBarrierKind::Deletion => None,
+            let (watermark_kind, watermark_deleted_event_id) = match record.kind {
+                PublicKeyPackageBarrierKind::Deletion if record.deleted_event_id.is_some() => {
+                    (PublicKeyPackageBarrierKind::ExactDeletion, None)
+                }
+                _ => (record.kind, record.deleted_event_id.clone()),
             };
             tx.execute_cached(
                 "INSERT INTO public_key_package_eviction_watermarks (
@@ -1083,6 +1114,13 @@ fn prune_key_package_barriers(tx: &Transaction<'_>, now: i64) -> StorageResult<(
                        public_key_package_eviction_watermarks.event_created_at
                     OR (excluded.event_created_at =
                         public_key_package_eviction_watermarks.event_created_at
+                        AND ((excluded.kind = 'exact_deletion'
+                              AND public_key_package_eviction_watermarks.kind != 'exact_deletion')
+                             OR (excluded.kind = 'deletion'
+                                 AND public_key_package_eviction_watermarks.kind = 'replacement')))
+                    OR (excluded.event_created_at =
+                        public_key_package_eviction_watermarks.event_created_at
+                        AND excluded.kind = public_key_package_eviction_watermarks.kind
                         AND excluded.event_id_hex <=
                             public_key_package_eviction_watermarks.event_id_hex)",
                 params![
@@ -1092,7 +1130,7 @@ fn prune_key_package_barriers(tx: &Transaction<'_>, now: i64) -> StorageResult<(
                     &watermark_deleted_event_id,
                     u64_to_i64(record.event_created_at)?,
                     now,
-                    record.kind.as_str(),
+                    watermark_kind.as_str(),
                 ],
             )
             .storage()?;
@@ -1118,9 +1156,9 @@ fn prune_key_package_barriers(tx: &Transaction<'_>, now: i64) -> StorageResult<(
     }
     tx.execute_cached(
         "INSERT INTO public_key_package_eviction_fallback (
-            id, event_id_hex, event_created_at, evicted_at
+            id, event_id_hex, event_created_at, evicted_at, kind
          )
-         SELECT 1, event_id_hex, event_created_at, evicted_at
+         SELECT 1, event_id_hex, event_created_at, evicted_at, kind
          FROM public_key_package_eviction_watermarks
          WHERE account_id_hex IN (
             SELECT account_id_hex FROM public_key_package_eviction_watermarks
@@ -1132,9 +1170,16 @@ fn prune_key_package_barriers(tx: &Transaction<'_>, now: i64) -> StorageResult<(
          ON CONFLICT(id) DO UPDATE SET
             event_id_hex = excluded.event_id_hex,
             event_created_at = excluded.event_created_at,
+            kind = excluded.kind,
             evicted_at = MAX(public_key_package_eviction_fallback.evicted_at, excluded.evicted_at)
          WHERE excluded.event_created_at > public_key_package_eviction_fallback.event_created_at
             OR (excluded.event_created_at = public_key_package_eviction_fallback.event_created_at
+                AND ((excluded.kind = 'exact_deletion'
+                      AND public_key_package_eviction_fallback.kind != 'exact_deletion')
+                     OR (excluded.kind = 'deletion'
+                         AND public_key_package_eviction_fallback.kind = 'replacement')))
+            OR (excluded.event_created_at = public_key_package_eviction_fallback.event_created_at
+                AND excluded.kind = public_key_package_eviction_fallback.kind
                 AND excluded.event_id_hex <= public_key_package_eviction_fallback.event_id_hex)",
         [],
     )
@@ -1763,9 +1808,59 @@ mod tests {
             .public_key_package_eviction_watermark(&account)
             .unwrap()
             .unwrap();
-        assert_eq!(watermark.kind, PublicKeyPackageBarrierKind::Deletion);
+        assert_eq!(watermark.kind, PublicKeyPackageBarrierKind::ExactDeletion);
         assert_eq!(watermark.deleted_event_id, None);
         assert_eq!(watermark.event_created_at, 200);
+    }
+
+    #[test]
+    fn deletion_watermark_wins_equal_timestamp_replacements() {
+        for deletion_first in [true, false] {
+            let storage = SqliteSharedStorage::in_memory().unwrap();
+            let account = "aa".repeat(32);
+            let replacement = PublicKeyPackageBarrierRecord {
+                account_id_hex: account.clone(),
+                key_package_id: "slot".into(),
+                event_id_hex: "aa".repeat(32),
+                deleted_event_id: None,
+                event_created_at: 100,
+                observed_at: 0,
+                kind: PublicKeyPackageBarrierKind::Replacement,
+            };
+            let deletion = PublicKeyPackageBarrierRecord {
+                event_id_hex: "ff".repeat(32),
+                deleted_event_id: Some("bb".repeat(32)),
+                kind: PublicKeyPackageBarrierKind::Deletion,
+                ..replacement.clone()
+            };
+            let records = if deletion_first {
+                [deletion, replacement]
+            } else {
+                [replacement, deletion]
+            };
+            for record in records {
+                storage.put_public_key_package_barrier(&record).unwrap();
+            }
+            for index in 0..500_u64 {
+                storage
+                    .put_public_key_package_barrier(&PublicKeyPackageBarrierRecord {
+                        account_id_hex: account.clone(),
+                        key_package_id: format!("slot-{index:04}"),
+                        event_id_hex: format!("{index:064x}"),
+                        deleted_event_id: None,
+                        event_created_at: 1_000 + index,
+                        observed_at: 1_000 + index,
+                        kind: PublicKeyPackageBarrierKind::Replacement,
+                    })
+                    .unwrap();
+            }
+            let watermark = storage
+                .public_key_package_eviction_watermark(&account)
+                .unwrap()
+                .unwrap();
+            assert_eq!(watermark.kind, PublicKeyPackageBarrierKind::ExactDeletion);
+            assert_eq!(watermark.deleted_event_id, None);
+        }
     }
 
     #[test]
