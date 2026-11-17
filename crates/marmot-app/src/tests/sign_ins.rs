@@ -7,7 +7,7 @@ use std::collections::BTreeSet;
 
 use super::canonical_membership::{deliver_events, deliver_new, published_key_package};
 use super::*;
-use crate::client::sign_ins::SlotOutcome;
+use crate::client::sign_ins::{SlotOutcome, SlotReadEnd};
 use crate::{
     CompromiseWarningReason, ConfirmedDeviceLink, SignInResponse, UnrecognizedSignIn,
     UnrecognizedSignInState,
@@ -1993,4 +1993,116 @@ async fn next_sign_ins_changed(
     })
     .await
     .expect("UnrecognizedSignInsChanged");
+}
+
+/// Start a check's read on `client` and run it beside the client to its
+/// end, as the account worker does.
+async fn spawned_read(
+    start: crate::client::sign_ins::SlotReadStart,
+) -> (
+    crate::client::sign_ins::RunningSlotRead,
+    crate::client::sign_ins::SlotReadResult,
+) {
+    let mut read = start.spawn();
+    let result = read.result().await;
+    (read, result)
+}
+
+/// S1 (mdk#3466): a read beside the writer is judged only against the
+/// KeyPackages this device had when it started. The phone rotates its
+/// KeyPackage while its read runs, so the read returns a publication of its
+/// own slot that the snapshot lacks; the continuation reads again rather
+/// than taking it for a foreign publication and replacing it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_read_whose_own_key_packages_changed_reads_again() {
+    let account = Account::new(1, true);
+    let relay = &account.relay;
+    let mut phone = account.open(0).await;
+    published_key_package(&mut phone, relay).await;
+
+    let start = phone.start_sign_in_slot_read().unwrap().unwrap();
+    phone.rotate_key_package().await.unwrap();
+    let (read, result) = spawned_read(start).await;
+    let SlotReadEnd::ReadAgain(again) = phone
+        .finish_sign_in_slot_read(read.into_own(), result, false)
+        .await
+    else {
+        panic!("a read whose own KeyPackages changed reads again");
+    };
+    let (read, result) = spawned_read(*again).await;
+    let SlotReadEnd::Checked(report) = phone
+        .finish_sign_in_slot_read(read.into_own(), result, true)
+        .await
+    else {
+        panic!("an unchanged second read is judged");
+    };
+    let report = report.unwrap();
+    assert_eq!(
+        report.slots.get(&own_slot(&phone)),
+        Some(&SlotOutcome::OwnSlot)
+    );
+    assert!(!report.foreign.replacing);
+    assert!(listed(&mut phone).is_empty());
+}
+
+/// S1's double change: this device's own KeyPackages change during the
+/// read and again during the read after it, so the check records nothing.
+/// The phone's first check would have taken its baseline.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_read_changed_twice_records_nothing() {
+    let account = Account::new(1, true);
+    let relay = &account.relay;
+    let mut phone = account.open(0).await;
+    published_key_package(&mut phone, relay).await;
+
+    let start = phone.start_sign_in_slot_read().unwrap().unwrap();
+    phone.rotate_key_package().await.unwrap();
+    let (read, result) = spawned_read(start).await;
+    let SlotReadEnd::ReadAgain(again) = phone
+        .finish_sign_in_slot_read(read.into_own(), result, false)
+        .await
+    else {
+        panic!("a read whose own KeyPackages changed reads again");
+    };
+    phone.rotate_key_package().await.unwrap();
+    let (read, result) = spawned_read(*again).await;
+    assert!(matches!(
+        phone
+            .finish_sign_in_slot_read(read.into_own(), result, true)
+            .await,
+        SlotReadEnd::Unjudged
+    ));
+    let storage = phone.app.account_storage("alice").unwrap().app_storage();
+    assert_eq!(storage.sign_in_baseline().unwrap(), None);
+    assert!(phone.compromise_warning().unwrap().is_empty());
+}
+
+/// S3 and T3 (mdk#3466): a check's look changes nothing of the account, and
+/// its read, beside the writer, writes none of the inputs whose answers are
+/// reused while a write count is unchanged, the owned KeyPackage list's and
+/// the recovery answer's. The look borrows the client immutably, so it
+/// changes nothing in memory either.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_look_and_the_read_write_nothing_of_the_account() {
+    let account = Account::new(1, true);
+    let relay = &account.relay;
+    let mut phone = account.open(0).await;
+    published_key_package(&mut phone, relay).await;
+    let counts = |phone: &AppClient| {
+        (
+            phone.engine_storage.write_count(),
+            phone.engine_storage.key_package_write_count(),
+            phone.engine_storage.recovery_notice_write_count(),
+        )
+    };
+    let storage = phone.app.account_storage("alice").unwrap().app_storage();
+    let before = counts(&phone);
+
+    let start = phone.start_sign_in_slot_read().unwrap().unwrap();
+    assert_eq!(counts(&phone), before, "the look writes nothing");
+    assert_eq!(storage.sign_in_baseline().unwrap(), None);
+    let (_, result) = spawned_read(start).await;
+    result.unwrap();
+    assert_eq!(counts(&phone), before, "the read writes no counted input");
+    assert_eq!(storage.sign_in_baseline().unwrap(), None);
 }

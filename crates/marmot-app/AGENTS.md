@@ -271,6 +271,32 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   signature key is not this device's (`ForeignOwnSlotKeyPackage`, 3.7b): this device made a KeyPackage exactly when it
   carries its signature key, which never rotates, so a backup restore, a pre-group KeyPackage or a republished copy
   never warns. Only the device that found it warns.
+- Read a sign-in check's slots beside the account worker (mdk#3466, `client/sign_ins.rs`,
+  `runtime/account_worker/sign_in_reads.rs`). The worker detaches its client's reads before its first pass; a directly
+  owned `AppClient` reads in place (`check_sign_ins`). The look (`start_sign_in_slot_read`) borrows the client
+  immutably and writes nothing. The read runs in a task, and its continuation (`finish_sign_in_slot_read`) runs on the
+  writer as one `Maintenance` unit against current state. It judges the read only while this device's own KeyPackages
+  are as the look found them; after one change it reads once more, and after a second it records nothing and leaves
+  the schedule. The scheduled check's tail, the schedule and the rejection commit, runs only while device groups are
+  on and maintenance is not paused. The worker holds at most one read per client, which the scheduled check and a host
+  check share. A sign-in nudge that arrives during a read waits for its continuation and then brings the next check
+  forward, since the read may have started before what nudged it. A waiting host check keeps its place: each later
+  command that names no existing group (`waits_behind_sign_in_check`) parks in order, up to `PARKED_LIMIT`, after
+  which the worker takes no more host commands; group commands and the worker's own work go ahead, and its timers'
+  retries come through their own channel (`WorkerInbox`). The read task keeps these:
+  - T1: it holds the directory's handle, the relay plane for its endpoint filter, the account id, this device's slot
+    and its telemetry step, and nothing of the client.
+  - T2: it reaches the directory only through its public API: the cached relay-list read, the discovery fetch, which
+    writes only through the directory's own store, and the slot fetch.
+  - T3: it writes no input of the owned KeyPackage list's or the recovery answer's write count.
+  - L1: before the worker replaces its client it cancels the read; a waiting host check keeps its place, and the next
+    client reads again.
+  - L2: shutdown, sign-out and unlink cancel the read and wait for its task (`SignInReads::end`). At runtime shutdown
+    that comes after the Welcome waves' bounded wait (L3); the read gets no wait of its own. Cancellation stops it
+    between stages; a relay-list read or discovery fetch already started finishes, and at the slot fetch it stops
+    waiting, while the relay plane finishes the fetch it shares with any identical request. A waiting host check, and
+    each parked command, gets the error a queued command gets. A worker aborted at shutdown's timeout drops its reads
+    unended, and a dropped read cancels itself and aborts its task (`RunningSlotRead`).
 - Cleanup after removed devices (`src/client/device_removal.rs`, mdk#2628 3.6b, mdk#2761) runs for every gone slot: one
   the trusted roster records as `removed`, read by its record's key, and, only while the device group is settled
   (stable, no convergence input left), one the roster lists no device in that has a tag signature key the engine
@@ -1336,11 +1362,14 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
 - `src/runtime/`: `worker_startup.rs` (per-account startup admission and retry backoff),
   `account_worker/recovery_credits.rs` (process-wide recovery credit pool), `account_worker/read_queue.rs` (host-read
   and mutation queue-wait telemetry: `ReadReply`, the read classes, the worker-unit gauge with its unit durations and
-  over-budget counts, and the lane's A reader, mdk#3273; observes only, never reorders;
+  over-budget counts, and the lane's A reader, mdk#3273; observes only, never reorders; and `WorkerInbox`, the
+  host's channel beside the worker's own, mdk#3466;
   `account_worker/tests/writer_hold_tests.rs` pins the writer holds that step 3 of the runtime-concurrency pass
   removes; its module doc lists the holds pinned elsewhere or not at all), `account_worker/welcome_runs.rs` (the
   worker's running Welcome waves and the `Drain`s and pending-deliveries reads that wait for them, mdk#3466; `account_worker/tests/welcome_wave_tests.rs`
-  owns what the worker decides of a wave), `conversation_window.rs`, `chat_list_window.rs`,
+  owns what the worker decides of a wave), `account_worker/sign_in_reads.rs` (the worker's sign-in slot read and the
+  host check that keeps its place behind it, mdk#3466; `account_worker/tests/sign_in_read_tests.rs` owns what the
+  worker decides of a read), `conversation_window.rs`, `chat_list_window.rs`,
   `presentation.rs`, `presented_chat_list.rs`, `account_attention.rs` (presentation windows and account-switcher
   attention), `chat_list_selection.rs` (select-all IDs and revalidation), `user_blocks.rs`, `moderation.rs` (reports, admin labels and operator moderation reports),
   `local_submissions.rs`,

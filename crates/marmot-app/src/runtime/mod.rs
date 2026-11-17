@@ -8151,7 +8151,6 @@ impl AccountManager {
                             unit: unit.clone(),
                             read_state: read_state_tx,
                         },
-                        WorkerCommands::unobserved(command_tx.clone()),
                         command_rx,
                         ready_tx,
                         startup_progress.clone(),

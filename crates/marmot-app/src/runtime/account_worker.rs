@@ -5,12 +5,13 @@ mod attachments;
 mod read_queue;
 pub(crate) mod recovery_credits;
 mod schedule;
+mod sign_in_reads;
 mod welcome_runs;
 
 use read_queue::run_as_account_worker;
 pub(crate) use read_queue::{
-    QueuedCommand, ReadClass, ReadReply, UnitKind, WorkerCommands, WorkerLane, WorkerReply,
-    WorkerUnit, WorkerUnitGauge, observe_on_account_worker,
+    QueuedCommand, ReadClass, ReadReply, UnitKind, WorkerCommands, WorkerInbox, WorkerLane,
+    WorkerReply, WorkerUnit, WorkerUnitGauge, observe_on_account_worker,
 };
 #[cfg(test)]
 pub(crate) use read_queue::{TestWorkerReceiver, test_worker_channel, test_worker_queue};
@@ -1111,7 +1112,6 @@ fn install_storage_telemetry(
 
 pub(crate) fn spawn_app_runtime_account_worker(
     runtime: AccountWorkerRuntime,
-    command_tx: WorkerCommands,
     commands: mpsc::Receiver<QueuedCommand>,
     ready: oneshot::Sender<Result<(), AppError>>,
     startup_progress: AccountStartupProgress,
@@ -1120,14 +1120,7 @@ pub(crate) fn spawn_app_runtime_account_worker(
     let telemetry = runtime.shared.observer.performance().clone();
     tokio::spawn(run_as_account_worker(
         telemetry,
-        run_app_runtime_account_worker(
-            runtime,
-            command_tx,
-            commands,
-            ready,
-            startup_progress,
-            shutdown,
-        ),
+        run_app_runtime_account_worker(runtime, commands, ready, startup_progress, shutdown),
     ))
 }
 
@@ -1148,12 +1141,14 @@ fn stop_recovery_runner<'a>(
 
 async fn run_app_runtime_account_worker(
     runtime: AccountWorkerRuntime,
-    command_tx: WorkerCommands,
-    mut commands: mpsc::Receiver<QueuedCommand>,
+    host_commands: mpsc::Receiver<QueuedCommand>,
     ready: oneshot::Sender<Result<(), AppError>>,
     startup_progress: AccountStartupProgress,
     mut shutdown: oneshot::Receiver<()>,
 ) {
+    // The worker's own timers send on a channel of their own, so its
+    // retries run even while it takes no host command (mdk#3466).
+    let (mut commands, command_tx) = WorkerInbox::new(host_commands);
     let worker_started_at = Instant::now();
     let mut ready = Some(ready);
     let AccountWorkerRuntime {
@@ -1635,6 +1630,10 @@ async fn run_app_runtime_account_worker(
     // What the runner's survey finds catching up; only a runner changes it.
     // Each client has its own, so a reconnect subscribes again.
     let mut recovery_catching_up = client.routing.subscribe_recovery_runner_catching_up();
+    // The sign-in slot read runs beside the writer, and a host check keeps
+    // its place while it waits (mdk#3466).
+    client.detach_sign_in_reads();
+    let mut sign_in_reads = sign_in_reads::SignInReads::default();
     let mut pending = deferred
         .into_iter()
         .map(|deferred_command| match deferred_command {
@@ -1648,7 +1647,8 @@ async fn run_app_runtime_account_worker(
         })
         .collect::<VecDeque<_>>();
     // Skip only media waiting for capacity; retain FIFO order among the rest.
-    while let Some(index) = ready_command_index(&pending, &media_http) {
+    while let Some(index) = ready_command_index(&pending, &media_http, sign_in_reads.holds_place())
+    {
         let (command, wait) = pending
             .remove(index)
             .expect("selected pending command exists")
@@ -1670,6 +1670,19 @@ async fn run_app_runtime_account_worker(
                     },
                 )
                 .await;
+            }
+            AccountWorkerCommand::CheckSignIns { respond } => {
+                wait.take_up();
+                if let Some(settled) = sign_in_reads.check_now(&mut client, respond) {
+                    finish_sign_in_check(
+                        &mut client,
+                        settled,
+                        &shared,
+                        &events,
+                        &account_id_hex,
+                        &account_label,
+                    );
+                }
             }
             AccountWorkerCommand::PublishSetupKeyPackage { respond }
                 if setup_key_package_result.is_some() =>
@@ -1779,6 +1792,18 @@ async fn run_app_runtime_account_worker(
             stop_recovery_runner(&mut recovery_runner, &mut client).await;
             stop_unlinked_worker(&mut client, unlinked).await;
             break 'worker;
+        }
+        // Take the scheduled sign-in check the last unit asked for, and
+        // read again for a host check whose read a replacement dropped.
+        if let Some(settled) = sign_in_reads.adopt(&mut client) {
+            finish_sign_in_check(
+                &mut client,
+                settled,
+                &shared,
+                &events,
+                &account_id_hex,
+                &account_label,
+            );
         }
         // Re-arm the schedule from whichever path ran the recovery seam or
         // the post-join advance since the last turn. Pausing or resuming
@@ -1945,7 +1970,20 @@ async fn run_app_runtime_account_worker(
         // A changes with no write when a time-bound answer in it expires: wake
         // then, and the loop top publishes it (mdk#3273).
         let read_state_deadline = client.read_state_deadline();
-        let ready_command = ready_command_index(&pending, &media_http);
+        let ready_command = ready_command_index(&pending, &media_http, sign_in_reads.holds_place());
+        // Commands parked behind a waiting host check are not waiting
+        // commands: group commands and the worker's own work go ahead of them.
+        // At the parked bound the worker takes no more host commands until
+        // the host check is answered; its own sends still come in.
+        let parked = if sign_in_reads.holds_place() {
+            pending
+                .iter()
+                .filter(|queued| queued.command().waits_behind_sign_in_check())
+                .count()
+        } else {
+            0
+        };
+        let admit_host_commands = parked < sign_in_reads::PARKED_LIMIT;
         let scheduled_at = schedule.next_at(TokioInstant::now(), crate::unix_now_seconds());
         #[cfg(test)]
         tests::secondary_retry_scheduler_tests::record_turn(
@@ -2097,10 +2135,17 @@ async fn run_app_runtime_account_worker(
             }
             // Alternate a command and a ready recovery quantum. A permanently
             // nonempty command channel must not starve group convergence.
+            // The sign-in slot read returned: its continuation runs on the
+            // writer, against current state, as one unit.
+            read = sign_in_reads.next(), if sign_in_reads.is_running() => {
+                let _unit = unit.enter(WorkerUnit::Maintenance);
+                let settled = sign_in_reads.settle(&mut client, read).await;
+                finish_sign_in_check(&mut client, settled, &shared, &events, &account_id_hex, &account_label);
+            }
             command = async {
                 match ready_command.and_then(|index| pending.remove(index)) {
                     Some(command) => Some(command),
-                    None => commands.recv().await,
+                    None => commands.recv_admitting(admit_host_commands).await,
                 }
             }, if !yield_to_convergence || !scheduled_convergence.has_ready() || scheduled_convergence_held_for_test(&account_id_hex) => {
                 yield_to_convergence = true;
@@ -2108,7 +2153,21 @@ async fn run_app_runtime_account_worker(
                     Some((command, wait)) => {
                         #[cfg(test)]
                         tests::secondary_retry_scheduler_tests::record_command(&account_id_hex, &command);
+                        // A host check waits: a command that names no group
+                        // keeps its order behind it. Parked commands are not
+                        // ready until the check is answered.
+                        if sign_in_reads.holds_place() && command.waits_behind_sign_in_check() {
+                            pending.push_back(QueuedCommand::from_parts(command, wait));
+                            continue;
+                        }
                         let command = match command {
+                            AccountWorkerCommand::CheckSignIns { respond } => {
+                                wait.take_up();
+                                if let Some(settled) = sign_in_reads.check_now(&mut client, respond) {
+                                    finish_sign_in_check(&mut client, settled, &shared, &events, &account_id_hex, &account_label);
+                                }
+                                continue;
+                            }
                             AccountWorkerCommand::Drain { respond } => {
                                 wait.take_up();
                                 // It waits for every Welcome wave started before it.
@@ -2217,11 +2276,14 @@ async fn run_app_runtime_account_worker(
             // command/convergence alternation, including blocked predecessors.
             _ = tokio::time::sleep_until(local_submission_retry_at),
                 if local_submission_service_owed && local_submission_due
-                    && pending.is_empty() && commands.is_empty()
+                    && pending.len() == parked
+                    && commands.is_empty_admitting(admit_host_commands)
                     && !lifecycle.is_stopping() => {
                 // Recheck after polling the deadline: a buffered command may
                 // have arrived while the normal command arm was fairness-gated.
-                if !pending.is_empty() || !commands.is_empty() { continue 'worker; }
+                if pending.len() > parked || !commands.is_empty_admitting(admit_host_commands) {
+                    continue 'worker;
+                }
                 let retry = publish_next_local_submission(
                     &mut client, &app, &shared, &unit, &events,
                     &account_id_hex, &account_label,
@@ -2577,6 +2639,9 @@ async fn run_app_runtime_account_worker(
                         // Its turns need this client; the reopened one gets
                         // a runner of its own.
                         stop_recovery_runner(&mut recovery_runner, &mut client).await;
+                        // A read belongs to its client: a waiting host check
+                        // keeps its place, and the new client reads again.
+                        sign_in_reads.replace();
                         // A outlives the client: its successor continues
                         // the versions (mdk#3273).
                         let mut read_state = client.take_read_state();
@@ -2800,6 +2865,7 @@ async fn run_app_runtime_account_worker(
                         };
                         relay_config_work = RelayConfigWork::Ready;
                         replay_changes = client.adapter.replay_changes().await;
+                        client.detach_sign_in_reads();
                         recovery_runner = client.spawn_recovery_runner().await;
                         recovery_catching_up =
                             client.routing.subscribe_recovery_runner_catching_up();
@@ -2858,7 +2924,8 @@ async fn run_app_runtime_account_worker(
             _ = local_submission_wakeups.changed() => { local_submission_due = true; }
             _ = tokio::time::sleep_until(local_submission_retry_at),
                 if local_submission_due && (!local_submission_service_owed
-                    || (pending.is_empty() && commands.is_empty())) => {
+                    || (pending.len() == parked
+                        && commands.is_empty_admitting(admit_host_commands))) => {
                 let retry = publish_next_local_submission(
                     &mut client, &app, &shared, &unit, &events,
                     &account_id_hex, &account_label,
@@ -3172,6 +3239,9 @@ async fn run_app_runtime_account_worker(
     }
     // No Welcome wave outlives the worker; its Welcomes stay owed.
     welcome_runs.end().await;
+    // A waiting host check gets the error a queued command gets; no read
+    // outlives the worker.
+    sign_in_reads.end().await;
     // Each exit that still held the client stopped the runner on it; any
     // other exit's drop aborts the task and refunds the attempts it left
     // open. What a quantum staged stays durable.
@@ -3563,7 +3633,7 @@ struct AccountWorkerCatchUpContext<'a> {
 async fn handle_account_worker_catch_up(
     client: &mut AppClient,
     respond: oneshot::Sender<Result<(), AccountCatchUpFailure>>,
-    commands: &mut mpsc::Receiver<QueuedCommand>,
+    commands: &mut WorkerInbox,
     pending: &mut VecDeque<QueuedCommand>,
     context: AccountWorkerCatchUpContext<'_>,
 ) {
@@ -3906,7 +3976,7 @@ fn run_legacy_message_promotion_batch_with(
 async fn run_startup_hydration_pipeline(
     app: &MarmotApp,
     client: &mut AppClient,
-    commands: &mut mpsc::Receiver<QueuedCommand>,
+    commands: &mut WorkerInbox,
     deferred: &mut Vec<DeferredStartupCommand>,
     events: &broadcast::Sender<MarmotAppEvent>,
     account_id_hex: &str,
@@ -4767,15 +4837,21 @@ fn spawn_media_http<T>(
     });
 }
 
+/// The first pending command that may run: media wait for capacity, and
+/// while a host sign-in check waits (`sign_in_held`), commands that name no
+/// group wait behind it.
 fn ready_command_index(
     pending: &VecDeque<QueuedCommand>,
     media_http: &MediaHttpContext,
+    sign_in_held: bool,
 ) -> Option<usize> {
     let has_capacity =
         !media_http.permits.is_closed() && media_http.permits.available_permits() != 0;
-    pending
-        .iter()
-        .position(|queued| has_capacity || !queued.command().needs_media_slot())
+    pending.iter().position(|queued| {
+        let command = queued.command();
+        (has_capacity || !command.needs_media_slot())
+            && !(sign_in_held && command.waits_behind_sign_in_check())
+    })
 }
 
 fn reserve_media_http(media_http: &MediaHttpContext) -> OwnedSemaphorePermit {
@@ -5106,7 +5182,7 @@ fn publish_before_unit(
 async fn defer_commands_until<Fut>(
     published: Option<watch::Receiver<Arc<crate::client::read_state::ReadState>>>,
     work: Fut,
-    commands: &mut mpsc::Receiver<QueuedCommand>,
+    commands: &mut WorkerInbox,
     pending: &mut VecDeque<QueuedCommand>,
     mut send_waiting: Option<oneshot::Sender<()>>,
 ) -> Fut::Output
@@ -5238,7 +5314,7 @@ fn acknowledge_hydration(
 }
 
 struct AccountWorkerCommandContext<'a> {
-    commands: &'a mut mpsc::Receiver<QueuedCommand>,
+    commands: &'a mut WorkerInbox,
     pending: &'a mut VecDeque<QueuedCommand>,
     app: &'a MarmotApp,
     events: &'a broadcast::Sender<MarmotAppEvent>,
@@ -5251,6 +5327,24 @@ struct AccountWorkerCommandContext<'a> {
     /// it waits on it.
     recovery_runner: Option<&'a mut SpawnedRunner>,
     unit: &'a WorkerUnitGauge,
+}
+
+/// Publish what a sign-in check changed, and answer the host check it
+/// settled, as the `CheckSignIns` command answered when it ran inline.
+fn finish_sign_in_check(
+    client: &mut AppClient,
+    settled: sign_in_reads::Settled,
+    shared: &RuntimeSharedServices,
+    events: &broadcast::Sender<MarmotAppEvent>,
+    account_id_hex: &str,
+    account_label: &str,
+) {
+    publish_client_pending_applied_summary(client, events, account_id_hex, account_label);
+    publish_account_level_changes(client, events, account_id_hex, account_label);
+    if let sign_in_reads::Settled::Answer(respond, result) = settled {
+        let permit = shared.observer.product().permit();
+        let _ = respond_diagnosed(shared, permit.as_ref(), respond, result, client);
+    }
 }
 
 // Keep response ownership and error classification outside the large async dispatch
@@ -6418,6 +6512,9 @@ fn account_worker_command_future<'a>(
             let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result, client);
             true
         }),
+        // The worker answers a host check through its sign-in reads before it
+        // dispatches a command (`sign_in_reads`), so no worker path reaches
+        // this arm; it keeps today's inline check for any that would.
         AccountWorkerCommand::CheckSignIns { respond } => Box::pin(async move {
             let result = client.check_sign_ins_now().await;
             publish_account_level_changes(client, events, account_id_hex, account_label);
@@ -9321,6 +9418,8 @@ mod tests {
     mod resource_bounds_tests;
     pub(super) mod secondary_retry_scheduler_tests;
     mod selective_history_tests;
+    #[cfg(feature = "test-policy-overrides")]
+    mod sign_in_read_tests;
     pub(super) mod welcome_wave_tests;
     mod worker_recovery_resume_tests;
     mod writer_hold_tests;
@@ -9466,7 +9565,8 @@ mod tests {
             .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
         let client = publishing_client(&app).await;
         for published in [publish_before_unit(&client), None] {
-            let (commands, mut receiver) = test_worker_queue(8);
+            let (commands, receiver) = test_worker_queue(8);
+            let mut receiver = WorkerInbox::from(receiver);
             let (respond, response) = ReadReply::unobserved();
             commands
                 .try_send(AccountWorkerCommand::CaptureConversation {
@@ -9520,7 +9620,8 @@ mod tests {
             .unwrap();
         let published = publish_before_unit(&client);
         let version = published.as_ref().unwrap().borrow().version;
-        let (commands, mut receiver) = test_worker_queue(8);
+        let (commands, receiver) = test_worker_queue(8);
+        let mut receiver = WorkerInbox::from(receiver);
         let (respond, mut mutation) = oneshot::channel();
         commands
             .try_send(AccountWorkerCommand::ConnectivityRestored { respond })
@@ -9600,7 +9701,8 @@ mod tests {
                 .awaiting_hydration(std::slice::from_ref(&group)),
             std::slice::from_ref(&group)
         );
-        let (commands, mut receiver) = test_worker_queue(8);
+        let (commands, receiver) = test_worker_queue(8);
+        let mut receiver = WorkerInbox::from(receiver);
         let (respond, forgotten) = oneshot::channel();
         commands
             .try_send(AccountWorkerCommand::ForgetGroupLocal {
@@ -9669,7 +9771,8 @@ mod tests {
             .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
         let client = publishing_client(&app).await;
         let published = publish_before_unit(&client);
-        let (commands, mut receiver) = test_worker_queue(8);
+        let (commands, receiver) = test_worker_queue(8);
+        let mut receiver = WorkerInbox::from(receiver);
         let mut pending = VecDeque::new();
         let (respond, mut before) = oneshot::channel();
         pending.push_back(QueuedCommand::unobserved(
@@ -10530,7 +10633,6 @@ mod tests {
                 unit: Arc::default(),
                 read_state: read_state_tx,
             },
-            commands.clone(),
             receiver,
             ready,
             AccountStartupProgress::new(shared.observer.performance().clone(), Arc::default()),
