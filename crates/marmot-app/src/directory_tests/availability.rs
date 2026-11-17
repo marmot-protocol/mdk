@@ -738,6 +738,25 @@ async fn availability_shared_replacement() {
         FollowAvailabilityState::Unknown,
         "journal-only malformed replacements survive cache eviction"
     );
+    for index in 0..500_u64 {
+        shared
+            .put_public_key_package_replacement(
+                &storage_sqlite::PublicKeyPackageReplacementRecord {
+                    account_id_hex: followed.clone(),
+                    key_package_id: format!("later-{index:04}"),
+                    event_id_hex: format!("{index:064x}"),
+                    event_created_at: package.created_at + 200 + index,
+                    observed_at: package.created_at + 200 + index,
+                },
+            )
+            .unwrap();
+    }
+    app.drop_account_caches(&owner.label);
+    assert_eq!(
+        availability_states(&app, &owner)[&followed],
+        FollowAvailabilityState::Unknown,
+        "cap eviction cannot resurrect a ready row whose barrier was evicted"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

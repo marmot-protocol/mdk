@@ -7,3 +7,7 @@ CREATE TABLE directory_key_package_replacements (
     observed_at INTEGER NOT NULL,
     PRIMARY KEY (account_id_hex, key_package_id)
 );
+CREATE TABLE directory_key_package_evictions (
+    account_id_hex TEXT PRIMARY KEY NOT NULL,
+    evicted_at INTEGER NOT NULL
+);

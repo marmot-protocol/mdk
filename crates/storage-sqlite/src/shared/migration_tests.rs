@@ -299,6 +299,7 @@ fn fresh_schema_matches_frozen_contract_and_has_independent_ledger() {
     }
     reference.execute_batch(include_str!("v5.sql")).unwrap();
     assert!(table_matches(&conn, &reference, "directory_key_package_replacements").unwrap());
+    assert!(table_matches(&conn, &reference, "directory_key_package_evictions").unwrap());
     for other in ["cgka_schema_migrations", "app_cache_schema_migrations"] {
         assert!(!table_exists(&conn, other).unwrap());
     }
@@ -539,4 +540,5 @@ fn key_package_replacement_migration_upgrades_v4_once() {
     let reference = Connection::open_in_memory().unwrap();
     reference.execute_batch(include_str!("v5.sql")).unwrap();
     assert!(table_matches(&conn, &reference, "directory_key_package_replacements").unwrap());
+    assert!(table_matches(&conn, &reference, "directory_key_package_evictions").unwrap());
 }

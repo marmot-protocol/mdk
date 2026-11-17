@@ -13,7 +13,7 @@ use std::time::Duration;
 use crate::base::connection::{CloseableConnection, ConnectionGuard};
 use crate::{
     base::connection::retry_on_busy, bool_i64, optional_u64_to_i64, u64_to_i64, unix_now_ms,
-    usize_to_i64,
+    unix_now_seconds, usize_to_i64,
 };
 use cgka_traits::storage::{StorageError, StorageResult};
 use rusqlite::{OptionalExtension, TransactionBehavior, params, params_from_iter};
@@ -74,6 +74,7 @@ pub struct PublicKeyPackageReplacementRecord {
     pub observed_at: u64,
 }
 
+const KEY_PACKAGE_REPLACEMENT_GLOBAL_CAP: i64 = 1_000;
 const KEY_PACKAGE_REPLACEMENT_CAP: i64 = 500;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -267,17 +268,64 @@ impl SqliteSharedStorage {
                 ],
             )
             .storage()?;
-            tx.execute_cached(
-                "DELETE FROM directory_key_package_replacements
+            let pruned = tx
+                .execute_cached(
+                    "DELETE FROM directory_key_package_replacements
                  WHERE account_id_hex = ?1 AND key_package_id NOT IN (
                      SELECT key_package_id FROM directory_key_package_replacements
                      WHERE account_id_hex = ?1
                      ORDER BY observed_at DESC, event_created_at DESC, event_id_hex, key_package_id
                      LIMIT ?2
                  )",
-                params![&record.account_id_hex, KEY_PACKAGE_REPLACEMENT_CAP],
+                    params![&record.account_id_hex, KEY_PACKAGE_REPLACEMENT_CAP],
+                )
+                .storage()?;
+            let evicted_at = u64_to_i64(unix_now_seconds())?;
+            if pruned != 0 {
+                tx.execute_cached(
+                    "INSERT INTO directory_key_package_evictions VALUES (?1, ?2)
+                     ON CONFLICT(account_id_hex) DO UPDATE SET
+                         evicted_at = MAX(evicted_at, excluded.evicted_at)",
+                    params![&record.account_id_hex, evicted_at],
+                )
+                .storage()?;
+            }
+            let evicted_accounts = {
+                let mut statement = tx
+                    .prepare_cached(
+                        "SELECT DISTINCT account_id_hex FROM directory_key_package_replacements
+                     WHERE rowid NOT IN (
+                         SELECT rowid FROM directory_key_package_replacements
+                         ORDER BY observed_at DESC, event_created_at DESC, event_id_hex
+                         LIMIT ?1
+                     )",
+                    )
+                    .storage()?;
+                statement
+                    .query_map([KEY_PACKAGE_REPLACEMENT_GLOBAL_CAP], |row| row.get(0))
+                    .storage()?
+                    .collect::<Result<Vec<String>, _>>()
+                    .storage()?
+            };
+            tx.execute_cached(
+                "DELETE FROM directory_key_package_replacements
+                 WHERE rowid NOT IN (
+                     SELECT rowid FROM directory_key_package_replacements
+                     ORDER BY observed_at DESC, event_created_at DESC, event_id_hex
+                     LIMIT ?1
+                 )",
+                [KEY_PACKAGE_REPLACEMENT_GLOBAL_CAP],
             )
             .storage()?;
+            for account in evicted_accounts {
+                tx.execute_cached(
+                    "INSERT INTO directory_key_package_evictions VALUES (?1, ?2)
+                     ON CONFLICT(account_id_hex) DO UPDATE SET
+                         evicted_at = MAX(evicted_at, excluded.evicted_at)",
+                    params![account, evicted_at],
+                )
+                .storage()?;
+            }
             tx.commit().storage()?;
             Ok(())
         })
@@ -310,6 +358,22 @@ impl SqliteSharedStorage {
             .storage()?
             .map(|row| row.storage())
             .collect()
+    }
+
+    pub fn public_key_package_replacement_evicted_at(
+        &self,
+        account_id_hex: &str,
+    ) -> StorageResult<Option<u64>> {
+        self.lock()?
+            .query_row_cached(
+                "SELECT evicted_at FROM directory_key_package_evictions
+                 WHERE account_id_hex = ?1",
+                [account_id_hex],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .storage()
+            .map(|value| value.and_then(|value| u64::try_from(value).ok()))
     }
 
     pub fn put_public_directory_user(
@@ -1364,6 +1428,12 @@ mod tests {
         let records = storage
             .public_key_package_replacements(&account_id_hex)
             .unwrap();
+        assert!(
+            storage
+                .public_key_package_replacement_evicted_at(&account_id_hex)
+                .unwrap()
+                .is_some()
+        );
         assert_eq!(records.len(), KEY_PACKAGE_REPLACEMENT_CAP as usize);
         assert!(
             !records
@@ -1375,6 +1445,52 @@ mod tests {
                 .iter()
                 .any(|record| record.key_package_id == "slot-0500")
         );
+    }
+
+    #[test]
+    fn key_package_replacements_are_globally_bounded() {
+        let storage = SqliteSharedStorage::in_memory().unwrap();
+        for account in ["aa".repeat(32), "bb".repeat(32)] {
+            for index in 0..KEY_PACKAGE_REPLACEMENT_CAP as u64 {
+                storage
+                    .put_public_key_package_replacement(&PublicKeyPackageReplacementRecord {
+                        account_id_hex: account.clone(),
+                        key_package_id: format!("slot-{index:04}"),
+                        event_id_hex: format!("{index:064x}"),
+                        event_created_at: index,
+                        observed_at: index,
+                    })
+                    .unwrap();
+            }
+        }
+        storage
+            .put_public_key_package_replacement(&PublicKeyPackageReplacementRecord {
+                account_id_hex: "cc".repeat(32),
+                key_package_id: "latest".into(),
+                event_id_hex: "ff".repeat(32),
+                event_created_at: 1_000,
+                observed_at: 1_000,
+            })
+            .unwrap();
+        let count: i64 = storage
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM directory_key_package_replacements",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, KEY_PACKAGE_REPLACEMENT_GLOBAL_CAP);
+        let first_evicted = storage
+            .public_key_package_replacement_evicted_at(&"aa".repeat(32))
+            .unwrap()
+            .is_some();
+        let second_evicted = storage
+            .public_key_package_replacement_evicted_at(&"bb".repeat(32))
+            .unwrap()
+            .is_some();
+        assert!(first_evicted || second_evicted);
     }
 
     #[test]

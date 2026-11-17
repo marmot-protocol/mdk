@@ -44,12 +44,11 @@ Over-budget published member routes remain account-local and do not renew prewar
 
 `refresh_follow_availability` checks at most 100 direct follows, four at a time, with a 10-second target deadline and
 a five-minute overall deadline. Each target uses at most two relay fetch calls: relay-list discovery when no safe
-NIP-65 route is cached, then a KeyPackage/deletion read. A completed clean or obsolete miss stays `not_found` for 15
-minutes. Incomplete or malformed reads stay `unknown`. Results commit per target, repeated calls share an active
-refresh, and completed refreshes have a 60-second cadence. `follow_availability_page` returns up to 100 rows in
-account-id keyset order, hides unfollows, and downgrades expired or replaced positives to `unknown`. Negatives are
-dated from the start of their read, so a replacement observed during that read downgrades them to `unknown`.
-account-id keyset order, hides unfollows, and downgrades expired or replaced positives to `unknown`.
+NIP-65 route is cached, then a KeyPackage/deletion read. A completed clean miss with no observed publications stays
+`not_found` for 15 minutes. Incomplete, malformed, deleted or replaced reads stay `unknown`. Results commit per target,
+repeated calls share an active refresh, and completed refreshes have a 60-second cadence. `follow_availability_page`
+returns up to 100 rows in account-id keyset order and hides unfollows. Expired or replaced positives and any negative
+with replacement or eviction evidence downgrade to `unknown`.
 
 The crate's API is what its root re-exports, plus the `config` and `error` modules. The `test-support` feature adds
 the hooks `marmot-app`'s directory tests use; production builds never enable it.

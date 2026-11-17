@@ -1243,9 +1243,12 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                     .or_default()
                     .push(record);
             }
-            for (account_id, records) in &records_by_author {
-                self.journal_key_package_records(account_id, records)
-                    .await?;
+            for index in &indices {
+                let account_id = &targets[*index].account_id_hex;
+                if let Some(records) = records_by_author.get(account_id) {
+                    self.journal_key_package_records(account_id, records)
+                        .await?;
+                }
             }
             for index in indices {
                 let account_id = &targets[index].account_id_hex;

@@ -514,9 +514,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                 key_package_id: record.event.tag_value("d").unwrap_or_default().to_owned(),
                 event_id_hex: record.event.id.clone(),
                 event_created_at: record.event.created_at,
-                // Unselected fetch evidence preserves the last live or selected
-                // observation. A later live sighting advances it in the store.
-                observed_at: 0,
+                observed_at: freshness.now,
             })
             .collect::<Vec<_>>();
         if replacements.is_empty() {

@@ -274,6 +274,7 @@ impl DirectoryCache {
                     },
                     shared: None,
                     replacements: Vec::new(),
+                    replacement_evicted_at: None,
                 })
             },
         )?;
@@ -288,6 +289,8 @@ impl DirectoryCache {
                 if !matches!(row.state.as_deref(), Some("ready" | "not_found")) {
                     continue;
                 }
+                row.replacement_evicted_at =
+                    shared.public_key_package_replacement_evicted_at(&row.account_id_hex)?;
                 row.replacements = shared.public_key_package_replacements(&row.account_id_hex)?;
                 if let Some(record) = shared.public_directory_user(&row.account_id_hex)?
                     && let Some(json) = record.key_package_json
@@ -327,6 +330,7 @@ struct StoredAvailability {
     current: Publication,
     shared: Option<Publication>,
     replacements: Vec<PublicKeyPackageReplacementRecord>,
+    replacement_evicted_at: Option<u64>,
 }
 
 impl StoredAvailability {
@@ -351,33 +355,40 @@ impl StoredAvailability {
         };
         let current_publication_allows = publication_allows(&self.current)
             && self.shared.as_ref().is_none_or(publication_allows);
-        let replacement_allows = self
+        let selected_slot_journaled = self
             .replacements
             .iter()
-            .filter(|replacement| Some(&replacement.key_package_id) == self.key_package_id.as_ref())
-            .all(|replacement| {
-                let Some(event_id) = self.key_package_event_id.as_ref() else {
-                    return false;
-                };
-                let Some(created_at) = self
-                    .key_package_created_at
-                    .and_then(|value| u64::try_from(value).ok())
-                else {
-                    return false;
-                };
-                replacement_allows(event_id, created_at, replacement)
-            });
+            .any(|replacement| Some(&replacement.key_package_id) == self.key_package_id.as_ref());
+        let replacement_allows = (selected_slot_journaled || self.replacement_evicted_at.is_none())
+            && self
+                .replacements
+                .iter()
+                .filter(|replacement| {
+                    Some(&replacement.key_package_id) == self.key_package_id.as_ref()
+                })
+                .all(|replacement| {
+                    let Some(event_id) = self.key_package_event_id.as_ref() else {
+                        return false;
+                    };
+                    let Some(created_at) = self
+                        .key_package_created_at
+                        .and_then(|value| u64::try_from(value).ok())
+                    else {
+                        return false;
+                    };
+                    replacement_allows(event_id, created_at, replacement)
+                });
         let shared_before_check = self.shared.as_ref().is_none_or(|current| {
             current
                 .created_at
                 .and_then(|value| u64::try_from(value).ok())
                 <= checked_at
         });
-        let replacements_before_check = checked_at.is_some_and(|checked_at| {
-            self.replacements
-                .iter()
-                .all(|replacement| replacement.observed_at < checked_at)
-        });
+        let replacements_before_check = self.replacements.is_empty()
+            && checked_at.is_some_and(|checked_at| {
+                self.replacement_evicted_at
+                    .is_none_or(|evicted_at| evicted_at < checked_at)
+            });
         let negative_is_current = self
             .current
             .created_at
@@ -927,11 +938,11 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
         }
         let directory = self.clone();
         let account = account_id_hex.to_owned();
-        let replacements = blocking_directory_task(move || {
-            Ok(directory
-                .resources
-                .shared_storage()?
-                .public_key_package_replacements(&account)?)
+        let (replacements, evicted_at) = blocking_directory_task(move || {
+            let shared = directory.resources.shared_storage()?;
+            let replacements = shared.public_key_package_replacements(&account)?;
+            let evicted_at = shared.public_key_package_replacement_evicted_at(&account)?;
+            Ok((replacements, evicted_at))
         })
         .await?;
         let current = match value.state {
@@ -940,16 +951,23 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                 .as_deref()
                 .zip(value.key_package_created_at)
                 .is_some_and(|(event_id, created_at)| {
-                    replacements
-                        .iter()
-                        .filter(|replacement| {
-                            Some(&replacement.key_package_id) == value.key_package_id.as_ref()
-                        })
-                        .all(|replacement| replacement_allows(event_id, created_at, replacement))
+                    let selected_slot_journaled = replacements.iter().any(|replacement| {
+                        Some(&replacement.key_package_id) == value.key_package_id.as_ref()
+                    });
+                    (selected_slot_journaled || evicted_at.is_none())
+                        && replacements
+                            .iter()
+                            .filter(|replacement| {
+                                Some(&replacement.key_package_id) == value.key_package_id.as_ref()
+                            })
+                            .all(|replacement| {
+                                replacement_allows(event_id, created_at, replacement)
+                            })
                 }),
-            FollowAvailabilityState::NotFound => replacements
-                .iter()
-                .all(|replacement| replacement.observed_at < value.checked_at),
+            FollowAvailabilityState::NotFound => {
+                replacements.is_empty()
+                    && evicted_at.is_none_or(|evicted_at| evicted_at < value.checked_at)
+            }
             FollowAvailabilityState::Unknown => true,
         };
         if current {

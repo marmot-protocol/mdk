@@ -1498,16 +1498,6 @@ async fn availability_recovery_stays_bounded() {
         )
         .unwrap();
 
-    let package_ids = fetcher
-        .events
-        .lock()
-        .unwrap()
-        .iter()
-        .filter(|event| {
-            event.kind == KIND_MARMOT_KEY_PACKAGE && event.pubkey == accounts[0].account_id_hex
-        })
-        .map(|event| event.id.clone())
-        .collect::<Vec<_>>();
     for event in fetcher.events.lock().unwrap().iter_mut() {
         if event.kind == transport_nostr_adapter::KIND_NIP65_RELAY_LIST
             && event.pubkey == accounts[0].account_id_hex
@@ -1517,13 +1507,9 @@ async fn availability_recovery_stays_bounded() {
                 .collect();
         }
     }
-    let mut deletion_tags = package_ids
-        .into_iter()
-        .map(|id| vec!["e".into(), id])
-        .collect::<Vec<_>>();
-    deletion_tags.push(vec!["k".into(), KIND_MARMOT_KEY_PACKAGE.to_string()]);
-    let deletion = signed_deletion(&app, &accounts[0], deletion_tags, unix_now_seconds() + 10);
-    fetcher.events.lock().unwrap().push(deletion);
+    fetcher.events.lock().unwrap().retain(|event| {
+        !(event.kind == KIND_MARMOT_KEY_PACKAGE && event.pubkey == accounts[0].account_id_hex)
+    });
 
     let status = app
         .directory()
@@ -1554,7 +1540,7 @@ async fn availability_recovery_stays_bounded() {
     );
     let checked_at = page.rows[0].checked_at.unwrap();
     let shared = app.shared_storage().unwrap();
-    let mut replacement = storage_sqlite::PublicKeyPackageReplacementRecord {
+    let replacement = storage_sqlite::PublicKeyPackageReplacementRecord {
         account_id_hex: accounts[0].account_id_hex.clone(),
         key_package_id: "negative-probe".into(),
         event_id_hex: "ee".repeat(32),
@@ -1576,34 +1562,5 @@ async fn availability_recovery_stays_bounded() {
             .state,
         nostr_directory::FollowAvailabilityState::Unknown,
         "a replacement observed after the read started invalidates the negative"
-    );
-
-    replacement.event_created_at = 1;
-    replacement.observed_at = checked_at - 1;
-    replacement.event_id_hex = "dd".repeat(32);
-    shared
-        .put_public_key_package_replacement(&replacement)
-        .unwrap();
-    let replacements = shared
-        .public_key_package_replacements(&accounts[0].account_id_hex)
-        .unwrap();
-    assert!(
-        replacements
-            .iter()
-            .all(|record| record.observed_at < checked_at),
-        "{replacements:?}"
-    );
-    assert_eq!(
-        app.directory()
-            .follow_availability_page(
-                &crate::directory_resources::directory_account(&owner),
-                None,
-                100,
-            )
-            .unwrap()
-            .rows[0]
-            .state,
-        nostr_directory::FollowAvailabilityState::NotFound,
-        "a replacement observed before the read started preserves the negative"
     );
 }
