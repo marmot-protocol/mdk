@@ -5,8 +5,8 @@ use std::time::{Duration, Instant};
 
 use nostr_directory::MEMBER_PREWARM_CACHE_TTL;
 use nostr_directory::MemberResolutionPurpose;
-use nostr_sdk::prelude::FinalizeEvent;
 use nostr_directory::{MemberResolutionOutcome, MemberResolutionPolicy, MemberResolutionStatus};
+use nostr_sdk::prelude::FinalizeEvent;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn partial_members_stay_fresh() {

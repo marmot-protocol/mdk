@@ -298,8 +298,14 @@ fn fresh_schema_matches_frozen_contract_and_has_independent_ledger() {
         assert!(table_matches(&conn, &reference, table).unwrap());
     }
     reference.execute_batch(include_str!("v5.sql")).unwrap();
-    assert!(table_matches(&conn, &reference, "directory_key_package_replacements").unwrap());
-    assert!(table_matches(&conn, &reference, "directory_key_package_evictions").unwrap());
+    for table in [
+        "directory_key_package_replacements",
+        "public_key_package_barriers",
+        "public_key_package_eviction_watermarks",
+        "public_key_package_eviction_fallback",
+    ] {
+        assert!(table_matches(&conn, &reference, table).unwrap(), "{table}");
+    }
     for other in ["cgka_schema_migrations", "app_cache_schema_migrations"] {
         assert!(!table_exists(&conn, other).unwrap());
     }
@@ -524,7 +530,14 @@ fn presentation_migration_preserves_existing_usage_settings_and_cached_profiles(
 fn key_package_replacement_migration_upgrades_v4_once() {
     let mut conn = Connection::open_in_memory().unwrap();
     run(&mut conn, &MIGRATIONS[..4]).unwrap();
-    assert!(!table_exists(&conn, "directory_key_package_replacements").unwrap());
+    for table in [
+        "directory_key_package_replacements",
+        "public_key_package_barriers",
+        "public_key_package_eviction_watermarks",
+        "public_key_package_eviction_fallback",
+    ] {
+        assert!(!table_exists(&conn, table).unwrap(), "{table}");
+    }
 
     run_all(&mut conn).unwrap();
     run_all(&mut conn).unwrap();
@@ -539,6 +552,12 @@ fn key_package_replacement_migration_upgrades_v4_once() {
     assert_eq!(name, "0005_key_package_replacements");
     let reference = Connection::open_in_memory().unwrap();
     reference.execute_batch(include_str!("v5.sql")).unwrap();
-    assert!(table_matches(&conn, &reference, "directory_key_package_replacements").unwrap());
-    assert!(table_matches(&conn, &reference, "directory_key_package_evictions").unwrap());
+    for table in [
+        "directory_key_package_replacements",
+        "public_key_package_barriers",
+        "public_key_package_eviction_watermarks",
+        "public_key_package_eviction_fallback",
+    ] {
+        assert!(table_matches(&conn, &reference, table).unwrap(), "{table}");
+    }
 }

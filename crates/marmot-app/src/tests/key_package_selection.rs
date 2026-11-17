@@ -1,7 +1,11 @@
 use super::invite_recovery::package_expiring_at;
 use super::*;
 use crate::key_package_records::select_key_packages_from_records;
-use nostr_directory::{KEY_PACKAGE_FRESHNESS, KeyPackageSelection, MAX_KEY_PACKAGES_PER_ACCOUNT};
+use nostr_directory::{
+    FollowAvailabilityState, KEY_PACKAGE_FRESHNESS, KeyPackageSelection,
+    MAX_KEY_PACKAGES_PER_ACCOUNT,
+};
+use std::collections::BTreeMap;
 
 fn candidate(
     account: &AccountSummary,
@@ -59,6 +63,23 @@ fn selected(
 
 fn ids(events: &[&NostrTransportEvent]) -> Vec<String> {
     events.iter().map(|event| event.id.clone()).collect()
+}
+
+fn selection_availability_states(
+    app: &MarmotApp,
+    owner: &AccountSummary,
+) -> BTreeMap<String, FollowAvailabilityState> {
+    app.directory()
+        .follow_availability_page(
+            &crate::directory_resources::directory_account(owner),
+            None,
+            100,
+        )
+        .unwrap()
+        .rows
+        .into_iter()
+        .map(|row| (row.account_id_hex, row.state))
+        .collect()
 }
 
 fn signed_deletion(
@@ -1562,5 +1583,78 @@ async fn availability_recovery_stays_bounded() {
             .state,
         nostr_directory::FollowAvailabilityState::Unknown,
         "a replacement observed after the read started invalidates the negative"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn availability_deleted_stays_unknown() {
+    let (_root, app, accounts, fetcher) = member_resolution_fixture(1, false).await;
+    let owner = app
+        .account_home()
+        .create_account("availability-owner")
+        .unwrap();
+    app.directory()
+        .remember_directory_follow_list_for_test(
+            &owner.account_id_hex,
+            &nostr_directory::FetchedFollowList {
+                follows: vec![accounts[0].account_id_hex.clone()],
+                source_relays: Vec::new(),
+            },
+        )
+        .unwrap();
+    app.directory()
+        .refresh_follow_availability(&crate::directory_resources::directory_account(&owner))
+        .await
+        .unwrap();
+
+    let selected = app
+        .directory()
+        .follow_availability_page(
+            &crate::directory_resources::directory_account(&owner),
+            None,
+            100,
+        )
+        .unwrap()
+        .rows[0]
+        .key_package_event_id
+        .clone()
+        .unwrap();
+    let deletion = signed_deletion(
+        &app,
+        &accounts[0],
+        vec![
+            vec!["e".into(), selected],
+            vec!["k".into(), KIND_MARMOT_KEY_PACKAGE.to_string()],
+        ],
+        unix_now_seconds() + 10,
+    );
+    fetcher.events.lock().unwrap().push(deletion.clone());
+    app.directory()
+        .reset_availability_for_test(&owner.account_id_hex);
+    app.directory()
+        .refresh_follow_availability(&crate::directory_resources::directory_account(&owner))
+        .await
+        .unwrap();
+    assert_eq!(
+        selection_availability_states(&app, &owner)[&accounts[0].account_id_hex],
+        nostr_directory::FollowAvailabilityState::Unknown
+    );
+
+    fetcher
+        .events
+        .lock()
+        .unwrap()
+        .retain(|event| event.id != deletion.id);
+    app.drop_account_caches(&owner.label);
+    app.directory()
+        .reset_availability_for_test(&owner.account_id_hex);
+    app.directory()
+        .refresh_follow_availability(&crate::directory_resources::directory_account(&owner))
+        .await
+        .unwrap();
+    assert_eq!(
+        selection_availability_states(&app, &owner)[&accounts[0].account_id_hex],
+        nostr_directory::FollowAvailabilityState::Unknown,
+        "a stale relay cannot resurrect a deleted package"
     );
 }

@@ -19,6 +19,10 @@
   `MarmotKitError.NoUsableRelay`, `MARMOT_STATUS_NO_USABLE_RELAY` (133) and
   the CLI's `no_usable_relay` code. Nothing was sent, and a retry fails the
   same way while the group's relays stay the same (#3305).
+- Rust, UniFFI, and C expose bounded availability for the selected account's direct follows (#1996).
+  `follow_availability_page` reads the persisted projection without network I/O;
+  `refresh_follow_availability` checks at most 100 follows and reports partial progress.
+  Availability records usable KeyPackage state and freshness, not which app an account installed.
 - MarmotKit and C bindings expose emoji-scoped reaction removal and a typed
   `ReactionNotFound` outcome for local no-match results. Target-wide removal
   remains available (#1963).

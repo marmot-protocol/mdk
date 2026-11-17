@@ -30,6 +30,49 @@ use super::records::{
 use super::resources::DirectoryResources;
 use super::{Directory, DirectoryCache};
 
+fn deletion_barriers(
+    record: &RelayEventRecord,
+) -> Vec<storage_sqlite::PublicKeyPackageBarrierRecord> {
+    let account_id_hex = record.event.pubkey.clone();
+    record
+        .event
+        .tags
+        .iter()
+        .filter(|tag| tag[0] == "a")
+        .filter_map(|tag| {
+            let mut parts = tag[1].splitn(3, ':');
+            let kind = parts.next()?.parse::<u64>().ok()?;
+            let author = parts.next()?;
+            let slot = parts.next()?;
+            (kind == KIND_MARMOT_KEY_PACKAGE && author == account_id_hex).then_some(
+                storage_sqlite::PublicKeyPackageBarrierRecord {
+                    account_id_hex: account_id_hex.clone(),
+                    key_package_id: slot.to_owned(),
+                    event_id_hex: record.event.id.clone(),
+                    deleted_event_id: None,
+                    event_created_at: record.event.created_at,
+                    observed_at: 0,
+                },
+            )
+        })
+        .chain(
+            record
+                .event
+                .tags
+                .iter()
+                .filter(|tag| tag[0] == "e")
+                .map(|tag| storage_sqlite::PublicKeyPackageBarrierRecord {
+                    account_id_hex: account_id_hex.clone(),
+                    key_package_id: String::new(),
+                    event_id_hex: record.event.id.clone(),
+                    deleted_event_id: Some(tag[1].clone()),
+                    event_created_at: record.event.created_at,
+                    observed_at: 0,
+                }),
+        )
+        .collect()
+}
+
 impl<R: DirectoryResources> Directory<R> {
     pub(super) async fn journal_key_package_records(
         &self,
@@ -53,7 +96,21 @@ impl<R: DirectoryResources> Directory<R> {
                 observed_at: freshness.now,
             })
             .collect::<Vec<_>>();
-        if replacements.is_empty() {
+        let barriers = records
+            .iter()
+            .filter(|record| {
+                record.event.kind == 5
+                    && record.event.pubkey == account_id_hex
+                    && freshness.accepts(record)
+                    && record.event.to_verified_nostr_event().is_ok()
+            })
+            .flat_map(deletion_barriers)
+            .map(|mut barrier| {
+                barrier.observed_at = freshness.now;
+                barrier
+            })
+            .collect::<Vec<_>>();
+        if replacements.is_empty() && barriers.is_empty() {
             return Ok(());
         }
         let directory = self.clone();
@@ -61,6 +118,9 @@ impl<R: DirectoryResources> Directory<R> {
             let shared = directory.resources.shared_storage()?;
             for replacement in replacements {
                 shared.put_public_key_package_replacement(&replacement)?;
+            }
+            for barrier in barriers {
+                shared.put_public_key_package_barrier(&barrier)?;
             }
             Ok(())
         })
@@ -369,6 +429,13 @@ impl<R: DirectoryResources> Directory<R> {
                     .cached_relay_list_status(&account_id_hex)
                     .unwrap_or_else(|_| AccountRelayListStatus::empty());
                 self.remember_directory_key_package(&fetched)?;
+            }
+            5 => {
+                for barrier in deletion_barriers(&record) {
+                    self.resources
+                        .shared_storage()?
+                        .put_public_key_package_barrier(&barrier)?;
+                }
             }
             _ => {}
         }
