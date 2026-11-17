@@ -143,12 +143,16 @@ where
         let message_ids = prepared.network_message_ids();
         self.detached_welcome_publishes
             .extend(message_ids.iter().cloned());
+        self.detached_welcome_holds
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .extend(message_ids.iter().cloned().map(|id| (id, None)));
         PreparedWelcomePublishTask {
             adapter,
             wall_clock: self.wall_clock.clone(),
             prepared,
             message_ids,
-            withdrawals: self.detached_welcome_withdrawals.clone(),
+            holds: self.detached_welcome_holds.clone(),
         }
     }
 
@@ -173,13 +177,13 @@ where
     /// cancelled or panics. Durable fanout remains retryable.
     #[doc(hidden)]
     pub fn abandon_welcome_publish_task(&mut self, message_ids: &[cgka_traits::MessageId]) {
-        let mut withdrawals = self
-            .detached_welcome_withdrawals
+        let mut holds = self
+            .detached_welcome_holds
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         for message_id in message_ids {
             self.detached_welcome_publishes.remove(message_id);
-            withdrawals.remove(message_id);
+            holds.remove(message_id);
         }
     }
 
@@ -317,6 +321,54 @@ where
         }
     }
 
+    /// Native selection may yield or be cancelled after changing stored state.
+    /// Until it returns, queued attempts must not use their earlier permit.
+    pub(super) fn pause_welcome_publishes(&self) {
+        let mut holds = self
+            .detached_welcome_holds
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        for hold in holds.values_mut() {
+            if *hold != Some(WelcomeHold::Withdrawn) {
+                *hold = Some(WelcomeHold::AwaitsCommit);
+            }
+        }
+    }
+
+    /// Refresh reserved attempts before yielding after native state changes.
+    /// An unreadable origin holds its debt rather than allowing stale I/O.
+    pub(super) fn refresh_welcome_holds(&self) {
+        let mut holds = self
+            .detached_welcome_holds
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        for (id, hold) in holds.iter_mut() {
+            let current = self
+                .session
+                .sent_welcome_withdrawn(id)
+                .and_then(|withdrawn| {
+                    if withdrawn {
+                        return Ok(Some(WelcomeHold::Withdrawn));
+                    }
+                    self.session
+                        .sent_welcome_awaits_commit(id)
+                        .map(|waiting| waiting.then_some(WelcomeHold::AwaitsCommit))
+                });
+            *hold = match current {
+                Ok(current) => current,
+                Err(error) => {
+                    tracing::warn!(
+                        target: TRACE_TARGET,
+                        method = "refresh_welcome_holds",
+                        transient = error.is_transient(),
+                        "detached Welcome held until its origin is readable"
+                    );
+                    Some(WelcomeHold::AwaitsCommit)
+                }
+            };
+        }
+    }
+
     /// Why a Welcome must not reach a relay now, checked by both places that
     /// publish one: the publish preparation step and maintenance's retry of a
     /// stored fanout. A row it cannot read holds the Welcome, so nothing that
@@ -418,10 +470,10 @@ where
             // A detached wave holds the Welcome and its record: it skips the
             // attempt if not started, and the next maintenance pass drops the
             // record.
-            self.detached_welcome_withdrawals
+            self.detached_welcome_holds
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
-                .insert(message_id.clone());
+                .insert(message_id.clone(), Some(WelcomeHold::Withdrawn));
         } else {
             self.session.delete_transport_fanout(message_id)?;
         }
