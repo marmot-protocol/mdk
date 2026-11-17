@@ -1285,3 +1285,45 @@ async fn rejoin_deferred_coordinator() {
     ));
     assert!(!accepted.left_object_unpersisted);
 }
+
+/// mdk#3265: the run renews a recipient request once it expires, so a request
+/// whose last retry falls after its expiry is due at its expiry, before and
+/// after that passes, not at the late retry and not never.
+#[tokio::test]
+async fn rejoin_expiry_is_due_before_a_later_retry() {
+    let mut peers = recovery_peers(0).await;
+    peers.recipient.prepare_group_recovery().unwrap();
+    let path = peers._dir.path().join("bob.sqlite");
+    let key = SqlCipherKey::new("live recovery cancellation key").unwrap();
+    drop(peers.recipient);
+    let expires_at = {
+        let storage = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+        let mut row = storage.list_group_recoveries().unwrap().remove(0);
+        assert_eq!(row.role, storage_sqlite::GroupRecoveryRole::Recipient);
+        row.retry_at = row.expires_at + 60;
+        storage.put_group_recovery(&row).unwrap();
+        row.expires_at
+    };
+    let recipient = eligibility_runtime(
+        nostr_device_session(path, &key, b"cancel-bob"),
+        peers.coordinator.self_id(),
+        peers.wall.clone(),
+        peers.bob_adapter.clone(),
+        RecordingKeyPackages::default(),
+    );
+    assert!(peers.wall.now().0 < expires_at);
+    let due = recipient.maintenance_due(&[]).unwrap();
+    assert_eq!(due.at, Some(cgka_traits::Timestamp(expires_at)), "{due:?}");
+
+    peers.wall.set(expires_at + 1);
+    let due = recipient.maintenance_due(&[]).unwrap();
+    assert_eq!(due.at, Some(cgka_traits::Timestamp(expires_at)), "{due:?}");
+
+    // The run at that time renews the request.
+    let mut recipient = recipient;
+    recipient.prepare_group_recovery().unwrap();
+    let storage = SqliteAccountStorage::open_encrypted(peers._dir.path().join("bob.sqlite"), &key)
+        .unwrap();
+    let renewed = storage.list_group_recoveries().unwrap().remove(0);
+    assert!(renewed.expires_at > expires_at + 1, "{renewed:?}");
+}
