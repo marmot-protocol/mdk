@@ -1,5 +1,5 @@
-//! Manage storage (mdk#2314 step 5): usage, largest-first listings and
-//! their opaque paging handles. Never persist or log the handles.
+//! Attachment storage usage, largest-first listings and durable body-removal
+//! pages. Listing handles are ephemeral; removal cursors can be persisted.
 use super::AttachmentLocalTargetFfi;
 use marmot_app as app;
 use std::sync::Arc;
@@ -241,9 +241,146 @@ impl RetainedAttachmentsPageFfi {
     }
 }
 
+/// Historical reason an attachment's retained body became unavailable.
+/// This does not grant access to bytes or describe current authorization.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum AttachmentBodyRemovalStateFfi {
+    CleanedBySetting,
+    Removed,
+    CompletedUnretained,
+    Unavailable,
+}
+
+impl From<app::AttachmentBodyRemovalState> for AttachmentBodyRemovalStateFfi {
+    fn from(value: app::AttachmentBodyRemovalState) -> Self {
+        match value {
+            app::AttachmentBodyRemovalState::CleanedBySetting => Self::CleanedBySetting,
+            app::AttachmentBodyRemovalState::Removed => Self::Removed,
+            app::AttachmentBodyRemovalState::CompletedUnretained => Self::CompletedUnretained,
+            app::AttachmentBodyRemovalState::Unavailable => Self::Unavailable,
+        }
+    }
+}
+
+/// Original source-slot identity for evicting host-owned attachment derivatives.
+#[derive(Clone, uniffi::Record)]
+pub struct AttachmentBodyRemovalFfi {
+    pub group_id_hex: String,
+    pub message_id_hex: String,
+    pub source_message_id_hex: String,
+    pub attachment_index: u32,
+    pub state: AttachmentBodyRemovalStateFfi,
+}
+
+impl std::fmt::Debug for AttachmentBodyRemovalFfi {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AttachmentBodyRemovalFfi")
+            .field("state", &self.state)
+            .finish_non_exhaustive()
+    }
+}
+
+impl From<app::AttachmentBodyRemoval> for AttachmentBodyRemovalFfi {
+    fn from(value: app::AttachmentBodyRemoval) -> Self {
+        Self {
+            group_id_hex: value.group_id_hex,
+            message_id_hex: value.message_id_hex,
+            source_message_id_hex: value.source_message_id_hex,
+            attachment_index: value.attachment_index,
+            state: value.state.into(),
+        }
+    }
+}
+
+/// Bounded durable removal page. Persist `next_cursor` only after processing
+/// removals, or after reconciling the cache when `reset_required` is true.
+#[derive(Clone, uniffi::Record)]
+pub struct AttachmentBodyRemovalPageFfi {
+    pub removals: Vec<AttachmentBodyRemovalFfi>,
+    pub next_cursor: String,
+    pub reset_required: bool,
+    pub has_more: bool,
+}
+
+impl std::fmt::Debug for AttachmentBodyRemovalPageFfi {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AttachmentBodyRemovalPageFfi")
+            .field("removal_count", &self.removals.len())
+            .field("reset_required", &self.reset_required)
+            .field("has_more", &self.has_more)
+            .finish_non_exhaustive()
+    }
+}
+
+impl From<app::AttachmentBodyRemovalPage> for AttachmentBodyRemovalPageFfi {
+    fn from(value: app::AttachmentBodyRemovalPage) -> Self {
+        Self {
+            removals: value.removals.into_iter().map(Into::into).collect(),
+            next_cursor: value.next_cursor,
+            reset_required: value.reset_required,
+            has_more: value.has_more,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn body_removal_page_maps_safely() {
+        let states = [
+            (
+                app::AttachmentBodyRemovalState::CleanedBySetting,
+                AttachmentBodyRemovalStateFfi::CleanedBySetting,
+            ),
+            (
+                app::AttachmentBodyRemovalState::Removed,
+                AttachmentBodyRemovalStateFfi::Removed,
+            ),
+            (
+                app::AttachmentBodyRemovalState::CompletedUnretained,
+                AttachmentBodyRemovalStateFfi::CompletedUnretained,
+            ),
+            (
+                app::AttachmentBodyRemovalState::Unavailable,
+                AttachmentBodyRemovalStateFfi::Unavailable,
+            ),
+        ];
+        let page = AttachmentBodyRemovalPageFfi::from(app::AttachmentBodyRemovalPage {
+            removals: states
+                .iter()
+                .map(|(state, _)| app::AttachmentBodyRemoval {
+                    group_id_hex: "private-group".into(),
+                    message_id_hex: "private-message".into(),
+                    source_message_id_hex: "private-source".into(),
+                    attachment_index: 19,
+                    state: *state,
+                })
+                .collect(),
+            next_cursor: "private-cursor".into(),
+            reset_required: false,
+            has_more: true,
+        });
+        assert_eq!(page.removals.len(), 4);
+        assert_eq!(page.next_cursor, "private-cursor");
+        assert!(!page.reset_required && page.has_more);
+        for (removal, (_, expected_state)) in page.removals.iter().zip(states) {
+            assert_eq!(removal.state, expected_state);
+            assert_eq!(removal.group_id_hex, "private-group");
+            assert_eq!(removal.message_id_hex, "private-message");
+            assert_eq!(removal.source_message_id_hex, "private-source");
+            assert_eq!(removal.attachment_index, 19);
+            assert_eq!(
+                format!("{removal:?}"),
+                format!("AttachmentBodyRemovalFfi {{ state: {expected_state:?}, .. }}")
+            );
+        }
+        assert_eq!(
+            format!("{page:?}"),
+            "AttachmentBodyRemovalPageFfi { removal_count: 4, reset_required: false, has_more: true, .. }"
+        );
+    }
 
     fn chat(group: &str, bytes: u64) -> app::ChatAttachmentUsage {
         app::ChatAttachmentUsage {

@@ -2054,6 +2054,11 @@ usage and largest-first listings, removes attachments in bulk and sets the opt-i
 defaults on with bounded per-account policy. Native progress snapshots/subscriptions
 and durable cancellation, retry, remove and download-again controls use the same source slots.
 
+For host-owned thumbnails and other derivatives, `attachmentRemovals` returns
+bounded source-slot removal identities with a durable cursor. A reset requires
+full cache reconciliation before saving the cursor captured by that response;
+see the [removal journal contract](ATTACHMENT-ACCESS.md#derivative-cache-removal-journal).
+
 ## Audit v5 recording and delivery
 
 v5 replaces v4 as the audit format. `AuditLogSettingsFfi.enabled` remains the recording opt-in.

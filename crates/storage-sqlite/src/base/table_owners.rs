@@ -123,6 +123,8 @@ pub(crate) const TABLE_OWNERS: &[(&str, Side)] = &[
     ("app_sticker_packs", Side::App),
     ("app_stickers", Side::App),
     ("attachment_acquisition", Side::App),
+    ("attachment_body_removal_meta", Side::App),
+    ("attachment_body_removals", Side::App),
     ("attachment_chunk_bodies", Side::App),
     ("attachment_download_policy", Side::App),
     ("attachment_history", Side::App),

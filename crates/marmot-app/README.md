@@ -520,6 +520,31 @@ Encrypted group images differ: no endpoint is stored in group state, so upload a
 deployment's `group_image_endpoint`. Clients configured with different values therefore look for group images in
 different places; re-setting the group image republishes it to the current endpoint.
 
+### Attachment derivative eviction
+
+`MarmotAppRuntime::attachment_removals(account_ref, cursor, limit)` reads
+historical body removals without starting acquisition, a worker, or network
+activity. Each record identifies the group, message, original source message,
+and attachment index, with a `CleanedBySetting`, `Removed`,
+`CompletedUnretained`, or `Unavailable` state. Expiry records follow native
+cleanup; attachment reads still enforce the deadline immediately.
+
+Keep one cursor per account-device store. Pages contain at most `limit`
+records (`1..=256`), and the journal retains the latest 4,096 records.
+
+1. Read with your saved cursor, or `None` on first use.
+2. If `reset_required`, keep the returned cursor while reconciling every
+   derivative against fresh native attachment state. Save that cursor after
+   reconciliation, then read from it to catch concurrent removals.
+3. Otherwise, evict each listed derivative before saving `next_cursor`.
+   Repeat while `has_more`.
+
+Evictions must be idempotent. A record describes a past loss, so a body may
+have been downloaded again by the time you apply it. Never use the journal
+to authorize a derivative read; retain the fresh native-state check.
+An interrupted eviction can replay its page. A cursor from another store,
+a store reset, or trimmed history requires full reconciliation.
+
 ## Custom emoji sets
 
 `MarmotApp` reads NIP-51 emoji sets (kind 30030) so a host can offer opt-in custom emoji. Every network step is a

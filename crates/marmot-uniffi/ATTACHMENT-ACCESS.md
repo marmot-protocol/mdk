@@ -182,6 +182,48 @@ C hosts use `marmot_attachment_storage_usage`, `marmot_attachment_storage_by_cha
 `marmot_remove_attachments_older_than`, `marmot_attachment_keep_media` and
 `marmot_set_attachment_keep_media`, freeing results with the matching `*_free` functions.
 
+## Derivative-cache removal journal
+
+`attachment_removals` / `attachmentRemovals(accountRef, cursor, limit)`
+reads a durable, account-scoped journal without downloading or reading bodies.
+The limit is 1..=256. `AttachmentBodyRemovalPageFfi` contains `removals`, an opaque
+string `next_cursor`, `reset_required`, and `has_more`. Unlike attachment-history
+or storage-list handles, this cursor can be persisted across runtime restarts.
+Keep it with the derivative cache for that account and never log it or identities.
+
+Each `AttachmentBodyRemovalFfi` identifies the original source slot with
+`group_id_hex`, `message_id_hex`, `source_message_id_hex`, and `attachment_index`.
+Its `AttachmentBodyRemovalStateFfi` is `CleanedBySetting`, `Removed`,
+`CompletedUnretained`, or `Unavailable`. These are historical loss records,
+including setting cleanup, explicit or bulk removal, message deletion/expiry,
+and completed downloads that could not be retained. They are not a current
+availability snapshot: the same attachment may have been downloaded again.
+Evict host-owned thumbnails and other derivatives idempotently by source slot.
+Continue using local-asset lookup and validated reads as the authority for bytes.
+
+1. On first use, call with no cursor to capture the current high water. The
+   response has no removals and `reset_required=true`.
+2. Reconcile the entire derivative cache against current local availability,
+   then persist the cursor captured **before** reconciliation. Never capture a
+   replacement cursor after reconciliation: that can skip concurrent removals.
+3. Pass the saved cursor on later calls. Evict every returned identity before
+   persisting `next_cursor`. Continue while `has_more`; retain the returned
+   cursor even when the page is empty. Replayed eviction after a crash is safe.
+4. If `reset_required` is true again, repeat full reconciliation using that
+   response's captured cursor, then resume incremental reads.
+
+The journal retains at most 4,096 records. A cursor whose history was trimmed,
+belongs to another store/incarnation, or is otherwise unrecognized returns a
+fresh captured high water with no removals and `reset_required=true`. Malformed
+cursors can fail the call. A reset must not be treated as an empty incremental
+page. The journal does not retain attachment bodies or extend their lifetime.
+
+C hosts call `marmot_attachment_removals` off the UI thread. The nullable
+cursor input is borrowed for the call; copy a page's `next_cursor` before freeing
+or persisting it. `marmot_body_removal_page_free` releases the page,
+its nested removal array, all identity strings, and the cursor. Do not free
+embedded records or strings separately.
+
 ## Transfer progress and controls (C8-D2)
 
 `attachmentTransferSnapshot` and `subscribeAttachmentTransfers` accept the same bounded

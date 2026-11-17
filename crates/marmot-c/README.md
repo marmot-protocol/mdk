@@ -304,6 +304,14 @@ window as `MarmotAttachmentKeepMedia` discriminants; attachments it removes read
 while passing its `next_cursor`, then free the page. Calls block. See the
 [shared contract](../marmot-uniffi/ATTACHMENT-ACCESS.md#manage-storage).
 
+`marmot_attachment_removals(client, account_ref, cursor, limit, out)` reads
+durable removal pages for host-owned derivative caches. The cursor is a borrowed
+nullable string, not a storage-list handle. Copy `next_cursor` before freeing
+the page with `marmot_body_removal_page_free`; it deep-frees the
+nested array and strings. Calls block. Follow the shared
+[reset and reconciliation contract](../marmot-uniffi/ATTACHMENT-ACCESS.md#derivative-cache-removal-journal)
+before persisting cursors.
+
 ## Custom reaction artwork
 
 `marmot_reaction_attachment` performs a bounded local lookup using the exact

@@ -98,6 +98,7 @@ pub(crate) use conversation_window::{SendCapture, publish_conversation_captures_
 pub(crate) mod attachment_controls;
 pub(crate) mod attachment_permission;
 pub use attachment_controls::{
+    AttachmentBodyRemoval, AttachmentBodyRemovalPage, AttachmentBodyRemovalState,
     AttachmentControl, AttachmentDownloadPolicy, AttachmentTransferState, AttachmentTransferStatus,
     RuntimeAttachmentTransferSubscription,
 };

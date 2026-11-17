@@ -401,6 +401,8 @@ mod migration_0209_file_backed_draft_attachments;
 mod migration_0210_changes_not_delivered;
 #[path = "migrations/0211_sign_in_removals.rs"]
 mod migration_0211_sign_in_removals;
+#[path = "migrations/0212_attachment_body_removals.rs"]
+mod migration_0212_attachment_body_removals;
 
 const MIGRATIONS: &[Migration] = &[
     Migration {
@@ -1521,6 +1523,12 @@ const MIGRATIONS: &[Migration] = &[
         name: "0211_sign_in_removals",
         suspend_foreign_keys: &[],
         apply: migration_0211_sign_in_removals::apply,
+    },
+    Migration {
+        version: 212,
+        name: "0212_attachment_body_removals",
+        suspend_foreign_keys: &[],
+        apply: migration_0212_attachment_body_removals::apply,
     },
 ];
 

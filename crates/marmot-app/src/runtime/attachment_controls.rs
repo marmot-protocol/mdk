@@ -6,6 +6,7 @@ use crate::{AppError, CursorPersistence, MarmotAppConfig};
 use cgka_traits::GroupId;
 use std::{sync::Arc, time::Duration};
 pub use storage_sqlite::{
+    AttachmentBodyRemoval, AttachmentBodyRemovalPage, AttachmentBodyRemovalState,
     AttachmentDownloadPolicy, AttachmentTransferState, AttachmentTransferStatus,
 };
 use tokio::sync::{Mutex, broadcast, watch};
@@ -96,6 +97,27 @@ fn validate_policy(policy: &AttachmentDownloadPolicy) -> Result<(), AppError> {
 }
 
 impl MarmotAppRuntime {
+    /// Read 1..=256 historical body removals for one account without starting
+    /// a worker or network activity. Persist the next cursor only after applying
+    /// the page's evictions. Records do not authorize attachment reads.
+    ///
+    /// A missing, expired, or other-store cursor returns `reset_required` and
+    /// a fresh cursor. Capture that cursor before reconciling all derivatives,
+    /// then resume from it so removals during reconciliation are not missed.
+    pub async fn attachment_removals(
+        &self,
+        account_ref: &str,
+        cursor: Option<String>,
+        limit: u32,
+    ) -> Result<AttachmentBodyRemovalPage, AppError> {
+        self.attachment_read(account_ref, move |storage, _| {
+            Ok(storage
+                .app_storage()
+                .attachment_removals(cursor.as_deref(), limit as usize)?)
+        })
+        .await
+    }
+
     pub async fn attachment_download_policy(
         &self,
         account_ref: &str,

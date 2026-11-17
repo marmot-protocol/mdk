@@ -771,6 +771,32 @@ Cheap local refresh signal, including for a fully loaded or empty library. Compa
 <details>
 <summary>commands/attachment_storage.rs</summary>
 
+### `Marmot::attachment_removals`
+
+**Current.**
+
+```rust
+pub async fn attachment_removals( &self, account_ref: String, cursor: Option<String>, limit: u32, ) -> Result<AttachmentBodyRemovalPageFfi, MarmotKitError>
+```
+
+Read up to 1..=256 durable account-scoped attachment-body removal identities for
+host-owned derivative eviction. The page contains `removals`, `next_cursor`,
+`reset_required`, and `has_more`. Each removal carries the original
+`group_id_hex`, `message_id_hex`, `source_message_id_hex`, `attachment_index`,
+and historical `state` (`CleanedBySetting`, `Removed`, `CompletedUnretained`,
+or `Unavailable`), not current byte-read authorization.
+
+A missing cursor captures the current high water with no records and
+`reset_required=true`. Reconcile the entire derivative cache before persisting
+that captured cursor. Trimmed or unrecognized cursors, including another
+store/incarnation's cursor, require the same reset; malformed cursors can fail.
+Otherwise evict returned identities idempotently before persisting `next_cursor`
+and continue while `has_more`. Cursors are durable strings and must not be logged.
+The journal retains at most 4,096 records. This local query neither downloads nor
+reads bodies. See the [reconciliation contract](ATTACHMENT-ACCESS.md#derivative-cache-removal-journal).
+
+[Source](src/commands/attachment_storage.rs#L138)
+
 ### `Marmot::attachment_storage_usage`
 
 **Current.**
@@ -781,7 +807,7 @@ pub async fn attachment_storage_usage( &self, account_ref: String, ) -> Result<A
 
 Account-wide attachment storage for a Manage storage screen: `media_bytes` (media-store files, a file shared by several attachments counted once), `legacy_bytes` (bodies still in the account database; they move to the media store in the background), `attachment_count`, the database's `database_bytes` and `database_free_bytes`, and `migration` with `migration_bytes`: where moving legacy bodies into the media store stands (`Running` with the bytes left, `Paused` with the free space it still needs, `NotNeeded`, `Complete`, or `Compacting` while the database returns its free pages to the filesystem, with the other figures from just before), and `cache_bytes`: the avatar and group-image cache, which `clear_avatar_cache` empties and which is fetched again on demand. Reads no bodies and starts no worker. See [Manage storage](ATTACHMENT-ACCESS.md#manage-storage).
 
-[Source](src/commands/attachment_storage.rs#L15)
+[Source](src/commands/attachment_storage.rs#L16)
 
 ### `Marmot::attachment_storage_by_chat`
 
@@ -793,7 +819,7 @@ pub async fn attachment_storage_by_chat( &self, account_ref: String, limit: u32,
 
 Chats by retained attachment bytes, largest first, `limit` 1..=256 per page; pass the page's `next_cursor` to continue, and stop when it is absent (the last page may be empty). A stored file counts once per chat however many of its attachments share it; content shared with other chats counts in each, so per-chat totals can add up to more than `media_bytes`. Cursors are opaque handles: never persist them, and start over after a removal.
 
-[Source](src/commands/attachment_storage.rs#L28)
+[Source](src/commands/attachment_storage.rs#L29)
 
 ### `Marmot::largest_retained_attachments`
 
@@ -805,7 +831,7 @@ pub async fn largest_retained_attachments( &self, account_ref: String, group_id_
 
 Retained attachments, largest first, `limit` 1..=256 per page, optionally within one chat (`group_id_hex`); continue with `next_cursor` as for `attachment_storage_by_chat`. Each entry's `target` works with `attachment_local_assets` (for an opaque reference to pass to `control_attachment` Remove) and `open_attachment_handoff`; `media_type` and `file_name` come from the published descriptor and are empty when it does not parse.
 
-[Source](src/commands/attachment_storage.rs#L48)
+[Source](src/commands/attachment_storage.rs#L49)
 
 ### `Marmot::remove_chat_attachments`
 
@@ -817,7 +843,7 @@ pub async fn remove_chat_attachments( &self, account_ref: String, group_id_hex: 
 
 Removes every retained attachment in one chat and returns how many it removed. Each removal is exactly `control_attachment` Remove: the attachment shows as removed and download-again stays allowed. Media-store files the removal releases are deleted before this returns, so their space frees at once; legacy database bodies free database pages, which return to the filesystem only when the database is compacted. Refresh usage and listings afterwards.
 
-[Source](src/commands/attachment_storage.rs#L72)
+[Source](src/commands/attachment_storage.rs#L73)
 
 ### `Marmot::remove_attachments_older_than`
 
@@ -829,7 +855,7 @@ pub async fn remove_attachments_older_than( &self, account_ref: String, received
 
 Removes retained attachments of messages received before `received_before` (Unix seconds, the message's received time), across the account or within one chat (`group_id_hex`), with the same semantics and immediate reclaim as `remove_chat_attachments`. Returns how many it removed.
 
-[Source](src/commands/attachment_storage.rs#L87)
+[Source](src/commands/attachment_storage.rs#L88)
 
 ### `Marmot::attachment_keep_media`
 
@@ -841,7 +867,7 @@ pub async fn attachment_keep_media( &self, account_ref: String, ) -> Result<Atta
 
 Reads the account's "Keep media" setting for a settings screen: `Forever` (the default) unless the user chose `OneYear`, `SixMonths` or `ThirtyDays`. The setting is per account on this device and is not synced to the account's other devices. Local read; needs no started runtime.
 
-[Source](src/commands/attachment_storage.rs#L102)
+[Source](src/commands/attachment_storage.rs#L103)
 
 ### `Marmot::set_attachment_keep_media`
 
@@ -853,7 +879,7 @@ pub async fn set_attachment_keep_media( &self, account_ref: String, keep: Attach
 
 Stores the account's "Keep media" setting, then removes every retained attachment already past the new window before returning, and returns how many it removed so the host can confirm what was freed. Age is the message's received time, or the user's last explicit download of that attachment when later. Removed attachments read `CleanedBySetting` in transfer snapshots, distinct from `Removed` (removed by you); `download_attachment_again` works for both. Media-store space is freed before this returns. While the runtime runs, the account worker applies the window at start and hourly as attachments age, and automatic downloads of attachments past it are skipped, or dropped if already queued but unfinished (they count toward the returned number and read `CleanedBySetting` too). `Forever` removes nothing. Ask the user to confirm before shortening the window: Blossom servers may no longer hold old media, so a removed attachment may not download again.
 
-[Source](src/commands/attachment_storage.rs#L121)
+[Source](src/commands/attachment_storage.rs#L122)
 
 </details>
 

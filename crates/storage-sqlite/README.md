@@ -140,6 +140,18 @@ preconditions: this read is not an atomic authorization for a later write.
 
 ## Migrations
 
+Migration 0212 adds the account-local attachment body-removal journal. `attachment_removals(cursor, limit)`
+returns at most 256 ordered identities and historical reasons: `CleanedBySetting`, `Removed`,
+`CompletedUnretained`, or `Unavailable`. The journal retains 4,096 records and commits each record with its
+removal or completed-unretained settlement. Moving a legacy body into a ready media file produces no removal.
+An absent, unknown, other-store, reset-store, or trimmed cursor returns no records, a fresh high-water cursor,
+and `reset_required=true`. Capture that cursor before reconciling derivative caches and persist it only after
+reconciliation; replay subsequent pages until `has_more=false`. Cursors survive reopening the account database.
+These records do not authorize reading bytes: local reads still check the current source, visibility, and expiry.
+Expiry notifications follow actual acquisition cleanup, not the exact wall-clock deadline. The query starts no
+worker and reads only the bounded journal and singleton metadata. Older binaries reject schema 212; downgrade
+is unsupported.
+
 Migration 0208 repairs retained NIP-22 comments (kind 1111 with any lowercase `k` value that parses as a Rust `u64`).
 It restores their first lowercase `e` parent, media metadata and accepted author edits, admits their attachment sources
 and backfills missing attachment slots. Encrypted-media-v1 and v2 source-epoch references make cached secrets

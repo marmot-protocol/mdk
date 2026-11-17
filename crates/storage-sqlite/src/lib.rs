@@ -59,6 +59,7 @@ pub use app::attachment_acquisition::{
     ATTACHMENT_ACQUISITION_BATCH_LIMIT, ATTACHMENT_CHECKPOINT_BYTES, ATTACHMENT_REMOVAL_BATCH,
     ATTACHMENT_STAGING_CHUNK_BYTES, AttachmentAcquisition, AttachmentAcquisitionSource,
     AttachmentAcquisitionState, AttachmentAcquisitionStatus, AttachmentAssetRef,
+    AttachmentBodyRemoval, AttachmentBodyRemovalPage, AttachmentBodyRemovalState,
     AttachmentCheckpoint, AttachmentDemand, AttachmentKeepMedia, AttachmentMigrationState,
     AttachmentPartial, AttachmentPartialIdentity, AttachmentPermissionCategory,
     AttachmentPublication, AttachmentPublishResult, AttachmentRemoval, AttachmentStorageUsage,

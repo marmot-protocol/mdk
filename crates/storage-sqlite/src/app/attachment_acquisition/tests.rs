@@ -4131,6 +4131,7 @@ fn preparation_parks_due_jobs_whose_source_became_ineligible() {
     }
 }
 
+mod body_removals;
 mod outgoing;
 mod outgoing_files;
 mod outgoing_media;

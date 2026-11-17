@@ -1,6 +1,7 @@
 use crate::conversions::{
-    AttachmentKeepMediaFfi, AttachmentStorageUsageFfi, ChatStorageCursor, ChatStoragePageFfi,
-    RetainedAttachmentsCursor, RetainedAttachmentsPageFfi, group_id_from_hex,
+    AttachmentBodyRemovalPageFfi, AttachmentKeepMediaFfi, AttachmentStorageUsageFfi,
+    ChatStorageCursor, ChatStoragePageFfi, RetainedAttachmentsCursor, RetainedAttachmentsPageFfi,
+    group_id_from_hex,
 };
 use crate::{Marmot, MarmotKitError};
 use std::sync::Arc;
@@ -127,6 +128,24 @@ impl Marmot {
             .runtime
             .set_attachment_keep_media(&account_ref, keep.into())
             .await?)
+    }
+
+    /// Local durable body-removal journal, `limit` 1..=256. A missing or
+    /// invalidated cursor returns a captured high-water cursor and requires
+    /// full derivative-cache reconciliation before that cursor is persisted.
+    /// Otherwise evict each identity idempotently, persist `next_cursor`, and
+    /// continue while `has_more`. Historical states never authorize byte reads.
+    pub async fn attachment_removals(
+        &self,
+        account_ref: String,
+        cursor: Option<String>,
+        limit: u32,
+    ) -> Result<AttachmentBodyRemovalPageFfi, MarmotKitError> {
+        Ok(self
+            .runtime
+            .attachment_removals(&account_ref, cursor, limit)
+            .await?
+            .into())
     }
 }
 

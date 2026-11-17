@@ -26,6 +26,15 @@
   other emoji. Both removal commands expose `MarmotKitError.ReactionNotFound`
   for a local no-match; refresh authoritative state before treating it as
   convergence (#1963).
+
+- `attachment_removals(account_ref, cursor, limit)` exposes durable bounded
+  source-slot removal identities for host derivative caches (mdk#3491), with
+  `AttachmentBodyRemovalFfi`, `AttachmentBodyRemovalStateFfi`, and
+  `AttachmentBodyRemovalPageFfi`. Persist the returned cursor after eviction;
+  first-use or invalidated cursors require full cache reconciliation against
+  the high water captured before reconciliation. Historical states do not
+  authorize local byte reads. Identity and cursor Debug output is redacted.
+
 - `groupPendingCommit(accountRef, groupIdHex)` returns `GroupPendingCommitFfi`, or nil, for the group's own commit
   that has not confirmed yet, with `GroupPendingCommitStateFfi` `Sending` or `Stuck` (mdk#2332). Group changes fail
   with the new `MarmotKitError::GroupCommitPending { groupIdHex }` while it is pending; handle it where you handle
