@@ -2456,6 +2456,8 @@ impl MarmotApp {
             audit,
             #[cfg(test)]
             test_fail_roster_read: false,
+            #[cfg(test)]
+            test_fail_epoch_gap_read: false,
             recovery_owner,
             history_recovery: client::history_recovery::HistoryRecovery::new(
                 client::history_recovery::HistoryRecoveryState {

@@ -147,6 +147,71 @@ where
         Ok(GroupRejoinStatus::Pending { attempts: 0 })
     }
 
+    /// When group recovery next has work, in unix seconds (mdk#3265), and
+    /// whether a coordinator still has a grant or publication under way,
+    /// which is advanced once per run and retried every 15 s while it lasts.
+    /// It mirrors what [`Self::prepare_group_recovery`] does with each record:
+    /// a live request is retried at its `retry_at`, and one past its expiry
+    /// still has work then — a recipient is renewed, or parked once out of
+    /// attempts, and a coordinator is deleted once its commit cooldown has
+    /// also passed. A publication is retried at its `retry_at` whatever its
+    /// expiry, and a completed commit that was withdrawn is owed until it is
+    /// published again. `None` when no record has work.
+    pub(super) fn group_recovery_due(&self) -> AccountResult<(Option<u64>, bool)> {
+        if self.maintenance_paused {
+            return Ok((None, false));
+        }
+        let now = self.wall_clock.now().0;
+        let records = self
+            .session
+            .storage
+            .list_group_recoveries()
+            .map_err(SessionError::from)?;
+        let mut next = None::<u64>;
+        let mut coordinating = false;
+        for record in &records {
+            // The run retries a request only before it expires, and never
+            // one that is complete, parked or out of attempts.
+            let retried = record.expires_at > now
+                && record.retry_at < record.expires_at
+                && !matches!(record.phase, Phase::Complete | Phase::Parked);
+            let at = match record.role {
+                Role::Recipient if record.phase == Phase::Parked => continue,
+                Role::Recipient if record.total_attempts >= MAX_RECIPIENT_ATTEMPTS => {
+                    record.expires_at
+                }
+                Role::Recipient if retried => record.retry_at,
+                Role::Recipient => record.expires_at,
+                // Quarantine keeps publication debt, but the run neither
+                // retries nor deletes the record.
+                Role::Coordinator if self.recovery_group_quarantined(&record.group_id) => continue,
+                Role::Coordinator if record.phase == Phase::Publishing => {
+                    coordinating = true;
+                    record.retry_at
+                }
+                Role::Coordinator => {
+                    // Only a live grant is staged, so only it is under way.
+                    // A completed commit that was withdrawn is published
+                    // again on the next run, until the record is deleted.
+                    coordinating |= (record.phase == Phase::Grant && record.expires_at > now)
+                        || (record.phase == Phase::Complete
+                            && self.recovery_commit_withdrawn(record)?);
+                    if retried {
+                        record.retry_at
+                    } else {
+                        record.expires_at.max(
+                            record
+                                .commit_started_at
+                                .map_or(0, |start| start.saturating_add(COMMIT_COOLDOWN_SECS)),
+                        )
+                    }
+                }
+            };
+            next = Some(next.map_or(at, |next| next.min(at)));
+        }
+        Ok((next, coordinating))
+    }
+
     /// Reserve one bounded recovery turn before the host resolves inbox routes.
     /// Cancellation retains the durable retry deadline, never a reusable permit.
     pub fn prepare_group_recovery(&mut self) -> AccountResult<Vec<MemberId>> {

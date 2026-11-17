@@ -78,6 +78,8 @@ use crate::time::{
 mod device_roster;
 pub use device_roster::{DeviceRosterEdit, DeviceRosterEditBlocked, DeviceSelfReport};
 mod device_tag_key;
+mod maintenance_due;
+pub use maintenance_due::MaintenanceDue;
 mod own_slot;
 pub use own_slot::{ForeignSlotOutcome, ForeignSlotPublication};
 mod private_key_packages;
@@ -724,6 +726,13 @@ where
         self
     }
 
+    /// Replace the monotonic clock in place, for tests that drive a worker
+    /// which owns its runtime.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_monotonic_clock_for_test(&mut self, monotonic_clock: Arc<dyn MonotonicClock>) {
+        self.monotonic_clock = monotonic_clock;
+    }
+
     /// Replace the maintenance scheduling windows. Production runtimes keep
     /// [`MaintenanceTiming::default`]; this exists for test harnesses only.
     pub fn with_maintenance_timing(mut self, timing: MaintenanceTiming) -> Self {
@@ -1272,6 +1281,12 @@ where
 
     pub fn put_outbound_fanout(&self, fanout: &OutboundFanout) -> SessionResult<()> {
         self.session.put_outbound_fanout(fanout)
+    }
+
+    /// Whether any stored Welcome is a rejoin offer, which maintenance
+    /// retries while it lasts (mdk#3265).
+    pub fn has_rejoin_offers(&self) -> SessionResult<bool> {
+        self.session.has_rejoin_offers()
     }
 
     pub async fn retry_rejoins_after_trusted_removal(&mut self) -> SessionResult<bool> {

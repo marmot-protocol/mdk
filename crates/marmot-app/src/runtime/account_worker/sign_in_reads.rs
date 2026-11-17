@@ -301,6 +301,7 @@ impl AccountWorkerCommand {
             Self::HoldMediaHttp { .. }
             | Self::UnhydratedGroupCount { .. }
             | Self::UnlinkDeviceForTest { .. }
+            | Self::OverdueComponentRecheckForTest { .. }
             | Self::RecoveryRunnerPassForTest { .. }
             | Self::SubscribeReadStateForTest { .. } => false,
             // Account, KeyPackage, device, backup, push, relay and lifecycle

@@ -34,10 +34,10 @@ pub use runtime::{
     AccountDeviceEffects, AccountDeviceRuntime, AccountIngestEffects, AccountIngestPhase,
     CompletedWelcomePublishTask, DeviceRosterEdit, DeviceRosterEditBlocked, DeviceSelfReport,
     FailedApplicationMessage, ForeignSlotOutcome, ForeignSlotPublication, GroupMaintenanceRows,
-    GroupRejoinStatus, MaintenanceActivity, MaintenanceAttemptDuration, MaintenanceTiming,
-    OversizedArtifact, OversizedEvent, PendingCommit, PendingCommitState, PendingResolution,
-    PreparedSessionCommit, PreparedSessionSend, PreparedWelcomePublishTask, PublishFailure,
-    PublishedApplicationMessage, UndeliveredCommit, UnresolvedApplicationMessage,
+    GroupRejoinStatus, MaintenanceActivity, MaintenanceAttemptDuration, MaintenanceDue,
+    MaintenanceTiming, OversizedArtifact, OversizedEvent, PendingCommit, PendingCommitState,
+    PendingResolution, PreparedSessionCommit, PreparedSessionSend, PreparedWelcomePublishTask,
+    PublishFailure, PublishedApplicationMessage, UndeliveredCommit, UnresolvedApplicationMessage,
     UnresolvedPublish, UnresolvedPublishReason, WallClockWindow, WelcomeDeliveryFailure,
 };
 pub use session::{

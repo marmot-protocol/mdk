@@ -2106,3 +2106,35 @@ async fn the_look_and_the_read_write_nothing_of_the_account() {
     assert_eq!(counts(&phone), before, "the read writes no counted input");
     assert_eq!(storage.sign_in_baseline().unwrap(), None);
 }
+
+/// Session maintenance wakes the worker's KeyPackage catch-up only when it
+/// changed what the catch-up reads, so the catch-up's own deadline decides
+/// otherwise once maintenance leaves the tick (mdk#2923, mdk#3265). A run
+/// with nothing to change leaves the flag clear; one that publishes a
+/// replacement KeyPackage sets it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn maintenance_wakes_the_key_package_catch_up_only_when_its_answer_changes() {
+    let account = Account::new(1, true);
+    let mut phone = account.open(0).await;
+    published_key_package(&mut phone, &account.relay).await;
+    phone.run_due_maintenance().await.unwrap();
+
+    phone.key_package_lifecycle_changed = false;
+    phone.run_due_maintenance().await.unwrap();
+    assert!(
+        !phone.key_package_lifecycle_changed,
+        "nothing changed, so the catch-up waits for its deadline"
+    );
+
+    let slot = own_slot(&phone);
+    let forged_at = published_at(&phone) + 2;
+    publish_into_slot(&account, &slot, "not a key package", forged_at);
+    phone.check_sign_ins().await.unwrap();
+    phone.key_package_lifecycle_changed = false;
+    phone.run_due_maintenance().await.unwrap();
+    assert!(published_at(&phone) > forged_at, "a replacement went out");
+    assert!(
+        phone.key_package_lifecycle_changed,
+        "the replacement changed what the catch-up reads"
+    );
+}
