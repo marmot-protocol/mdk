@@ -10,23 +10,27 @@
 //! Every wave belongs to one client generation. Before the worker replaces
 //! its client it cancels that client's waves and settles each on it
 //! ([`WelcomeRuns::settle_all`]). Before the worker returns it cancels every
-//! wave and waits for its task to end ([`WelcomeRuns::end`]).
+//! wave and waits for its task to end ([`WelcomeRuns::end`]). On runtime
+//! shutdown it first settles each wave whose task ends within the shutdown
+//! bound ([`WelcomeRuns::settle_until`], L3).
 //!
 //! A read of the pending deliveries waits as a `Drain` does, beside the
 //! writer, so it answers with each earlier wave's first attempt settled, as
 //! it did when the worker published Welcomes inline. Each wait answers
 //! where its last wave settles: on the writer once the wave settles, or on
-//! the replaced client before the worker drops it. A wait whose waves settle
-//! as shutdown begins may answer with its result, or with a storage error
-//! once `shutdown_and_close` has closed storage: whether a reply wins over
-//! shutdown is not a host contract. A wait still parked when the worker
-//! returns gets the error a queued command gets ([`WelcomeRuns::end`]).
+//! the replaced client before the worker drops it. At runtime shutdown a
+//! wait whose waves settle within the bound answers with its result, or
+//! with a storage error once `shutdown_and_close` has closed storage:
+//! whether a reply wins over shutdown is not a host contract. A wait still
+//! parked when the worker returns gets the error a queued command gets
+//! ([`WelcomeRuns::end`]).
 
 use futures::StreamExt;
 use futures::future::BoxFuture;
 use futures::stream::FuturesUnordered;
 use tokio::sync::oneshot;
 use tokio::task::{AbortHandle, JoinError};
+use tokio::time::{Instant as TokioInstant, timeout_at};
 
 use cgka_traits::MessageId;
 use marmot_session::CompletedWelcomePublishTask;
@@ -193,6 +197,23 @@ impl WelcomeRuns {
         }
         self.in_flight.clear();
         self.answer_waiting(client, shared);
+    }
+
+    /// On runtime shutdown, before [`Self::end`]: settle each wave on
+    /// `client` as its task ends, until none runs or `deadline` passes, and
+    /// answer the waits each settle completes (L3). A founding wave's
+    /// push-share retry is left for the next start.
+    pub(super) async fn settle_until(
+        &mut self,
+        client: &mut AppClient,
+        shared: &RuntimeSharedServices,
+        deadline: TokioInstant,
+    ) {
+        self.adopt(client);
+        while let Ok(Some(ended)) = timeout_at(deadline, self.running.next()).await {
+            self.settle(client, ended).await;
+            self.answer_waiting(client, shared);
+        }
     }
 
     /// When the worker returns: cancel every wave and wait for its task to
