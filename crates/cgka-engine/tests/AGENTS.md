@@ -66,6 +66,10 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
   `observed_selfremove_proposal_delays_commit_then_retains_outbound_app_messages` owns due automatic maintenance
   before a public send prepares its wire, plus pre-due sendability and ordered retained sends after confirmation.
 
+  A Welcome into a forgotten group, judged by the delivery's authenticated time and sender, and the rule that a refused
+  delivery leaves the same Welcome joinable (mdk#3514): `SealingPeeler` surfaces the sender and time a gift wrap
+  authenticates for the deliveries a test seals with `WelcomeSeals`, and nothing for any other.
+
 - **File:** `invite_leave/admin_leave.rs`
   - **Owns:** `StepDownAndLeave`: an admin's leave request is durable before anything is published and the re-drive
     stages its step-down, then its SelfRemove; a refused step-down is staged again; the last active admin is refused

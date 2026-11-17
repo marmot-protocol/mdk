@@ -564,7 +564,7 @@ impl<S: StorageProvider> Engine<S> {
             },
             origin: msg.clone(),
         };
-        let content_id = crate::group_lifecycle::welcome_content_dedup_id(&peeled)?;
+        let content_id = crate::welcome_content::WelcomeContentId::of(&peeled)?;
         let joined = self
             .do_join_welcome(
                 msg.clone(),

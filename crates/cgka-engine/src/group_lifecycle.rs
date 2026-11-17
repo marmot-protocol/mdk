@@ -14,6 +14,7 @@ use crate::capabilities::{
 use crate::device_tag::{OwnDeviceTag, own_device_slot};
 use crate::engine::Engine;
 use crate::provider::EngineOpenMlsProvider;
+use crate::welcome_content::WelcomeContentId;
 use crate::wire_format::{
     PURE_PLAINTEXT_WIRE_FORMAT_POLICY, default_sender_ratchet_configuration, join_config,
 };
@@ -34,7 +35,7 @@ use cgka_traits::message::{MessageRecord, MessageState, StoredMessagePayload};
 use cgka_traits::storage::{StorageError, StorageProvider};
 use cgka_traits::transport::{EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage};
 use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
-use cgka_traits::welcome::{PendingWelcome, RejoinWelcome};
+use cgka_traits::welcome::PendingWelcome;
 use marmot_forensics::AuditEventKind;
 use openmls::group::{MlsGroup, MlsGroupCreateConfig};
 use openmls::messages::proposals::{AppDataUpdateProposal, Proposal};
@@ -115,19 +116,6 @@ fn persist_new_group_maintenance<S: StorageProvider>(
         })?;
     }
     Ok(())
-}
-
-pub(crate) fn welcome_content_dedup_id(
-    peeled: &cgka_traits::ingest::PeeledMessage,
-) -> Result<cgka_traits::types::MessageId, EngineError> {
-    match &peeled.content {
-        cgka_traits::ingest::PeeledContent::Welcome { bytes, .. } => {
-            Ok(crate::message_processor::content_dedup_id(bytes))
-        }
-        _ => Err(EngineError::Peeler(
-            cgka_traits::error::PeelerError::Malformed("peeled content was not a Welcome".into()),
-        )),
-    }
 }
 
 /// Receiving flow step 2 (`protocol-core/joining.md`): a delivery joins only
@@ -1347,7 +1335,7 @@ impl<S: StorageProvider> Engine<S> {
             .peel_welcome(&welcome)
             .await
             .map_err(EngineError::Peeler)?;
-        let content_id = welcome_content_dedup_id(&peeled)?;
+        let content_id = WelcomeContentId::of(&peeled)?;
         self.join_peeled_welcome_with_consent(
             welcome,
             peeled,
@@ -1360,14 +1348,9 @@ impl<S: StorageProvider> Engine<S> {
 
     /// Reject only the selected offer. Redelivery cannot re-open it.
     pub fn decline_group_rejoin(&mut self, welcome_id: &MessageId) -> Result<(), EngineError> {
-        self.storage
-            .with_transaction(|storage| -> Result<(), EngineError> {
-                let candidate = storage.take_welcome(welcome_id)?;
-                let rejoin = candidate.rejoin.ok_or(EngineError::InvalidWelcome)?;
-                storage.put_ingress_dedup_marker(welcome_id)?;
-                storage.put_ingress_dedup_marker(&rejoin.content_id)?;
-                Ok(())
-            })
+        self.storage.with_transaction(|storage| {
+            crate::welcome_content::decline_rejoin_offer(storage, welcome_id)
+        })
     }
 
     /// Real implementation of `CgkaEngine::join_welcome`.
@@ -1385,7 +1368,7 @@ impl<S: StorageProvider> Engine<S> {
     pub(crate) async fn do_join_welcome(
         &mut self,
         welcome_msg: TransportMessage,
-        prepeeled: Option<(cgka_traits::ingest::PeeledMessage, MessageId)>,
+        prepeeled: Option<(cgka_traits::ingest::PeeledMessage, WelcomeContentId)>,
         route: WelcomeRoute,
     ) -> Result<GroupId, EngineError> {
         // 1. Dedupe. The ingest-path welcome handler already guards with
@@ -1436,33 +1419,24 @@ impl<S: StorageProvider> Engine<S> {
                     .peel_welcome(&welcome_msg)
                     .await
                     .map_err(EngineError::Peeler)?;
-                let content_id = welcome_content_dedup_id(&peeled)?;
+                let content_id = WelcomeContentId::of(&peeled)?;
                 (peeled, content_id)
             }
         };
-        if self.storage.has_ingress_dedup_marker(&content_id)? {
+        if content_id.is_settled(&self.storage)? {
             self.storage.put_ingress_dedup_marker(&welcome_id)?;
             return Err(EngineError::WelcomeAlreadyProcessed);
         }
 
         let result = self
-            .do_join_peeled_welcome(welcome_msg, peeled, content_id.clone(), route)
+            .do_join_peeled_welcome(welcome_msg, peeled, content_id, route)
             .await;
-        match &result {
-            Ok(_) => {}
-            Err(error) if terminal_welcome_error(error) => {
-                // A sibling Welcome refused for its carrier's date refuses
-                // that carrier only; every other refusal is the Welcome's.
-                let content_refused = !matches!(error, EngineError::SiblingWelcomePredatesForget);
-                self.storage.with_transaction(|storage| {
-                    storage.put_ingress_dedup_marker(&welcome_id)?;
-                    if content_refused {
-                        storage.put_ingress_dedup_marker(&content_id)?;
-                    }
-                    Ok::<_, EngineError>(())
-                })?;
-            }
-            Err(_) => {}
+        if let Err(error) = &result
+            && terminal_welcome_error(error)
+        {
+            // A refusal settles this delivery, never the Welcome: another
+            // delivery of the same bytes is judged afresh (`welcome_content`).
+            self.storage.put_ingress_dedup_marker(&welcome_id)?;
         }
         result
     }
@@ -1471,7 +1445,7 @@ impl<S: StorageProvider> Engine<S> {
         &mut self,
         welcome_msg: TransportMessage,
         peeled: cgka_traits::ingest::PeeledMessage,
-        content_id: MessageId,
+        content_id: WelcomeContentId,
         route: WelcomeRoute,
     ) -> Result<GroupId, EngineError> {
         self.join_peeled_welcome_with_consent(welcome_msg, peeled, content_id, None, route)
@@ -1483,7 +1457,7 @@ impl<S: StorageProvider> Engine<S> {
         &mut self,
         welcome_msg: TransportMessage,
         peeled: cgka_traits::ingest::PeeledMessage,
-        content_id: MessageId,
+        content_id: WelcomeContentId,
         consent: Option<(&GroupId, &[u8])>,
         route: WelcomeRoute,
     ) -> Result<GroupId, EngineError> {
@@ -1934,12 +1908,11 @@ impl<S: StorageProvider> Engine<S> {
                     group_id: group_id.clone(),
                     welcome_bytes: serde_json::to_vec(&welcome_msg)
                         .map_err(|error| EngineError::Serialize(error.to_string()))?,
-                    rejoin: Some(RejoinWelcome {
-                        content_id: content_id.clone(),
-                        epoch: EpochId(mls_group.epoch().as_u64()),
-                        welcomer: welcome_sender_id.clone(),
+                    rejoin: Some(content_id.rejoin_offer(
+                        EpochId(mls_group.epoch().as_u64()),
+                        welcome_sender_id.clone(),
                         local_state_token,
-                    }),
+                    )),
                 });
                 // Roll back ALL tentative state including KeyPackage consumption.
                 return Err(rejoin_confirmation_required());
@@ -2059,31 +2032,13 @@ impl<S: StorageProvider> Engine<S> {
                 return Err(EngineError::UnexpectedDeviceGroupWelcome);
             }
 
-            for candidate in storage.list_welcomes()? {
-                if candidate.group_id == group_id
-                    && let Some(rejoin) = candidate.rejoin
-                {
-                    storage.take_welcome(&candidate.message_id)?;
-                    storage.put_ingress_dedup_marker(&candidate.message_id)?;
-                    storage.put_ingress_dedup_marker(&rejoin.content_id)?;
-                }
-            }
-
-            // Direct join callers need the same durable dedup disposition as
-            // the transport-ingest path.
-            let payload = StoredMessagePayload::raw_transport(welcome_msg)
-                .encode()
-                .map_err(|e| EngineError::Serialize(format!("{e:?}")))?;
-            storage.put_message(&MessageRecord {
-                id: welcome_id.clone(),
-                group_id: group_id.clone(),
-                epoch: EpochId(mls_group.epoch().as_u64()),
-                state: MessageState::Processed,
-                payload,
-                deferred_peel: None,
-            })?;
-            storage.put_ingress_dedup_marker(&welcome_id)?;
-            storage.put_ingress_dedup_marker(&content_id)?;
+            crate::welcome_content::record_join(
+                storage,
+                welcome_msg,
+                content_id,
+                &group_id,
+                EpochId(mls_group.epoch().as_u64()),
+            )?;
             storage.put_pending_application_event(
                 &cgka_traits::engine::GroupEvent::GroupJoined {
                     group_id: group_id.clone(),

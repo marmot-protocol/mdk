@@ -89,6 +89,7 @@ pub mod snapshot_guard;
 pub(crate) mod test_crash_hooks;
 pub mod update_group_data;
 pub mod upgrade;
+mod welcome_content;
 pub mod wire_format;
 
 pub use convergence_clock::{

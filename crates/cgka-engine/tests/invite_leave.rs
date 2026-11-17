@@ -255,6 +255,88 @@ impl TransportPeeler for MockPeeler {
     }
 }
 
+/// What a Nostr gift wrap authenticates about one Welcome delivery: the
+/// seal's signer and the rumor's `created_at`. A test seals each delivery it
+/// makes; [`SealingPeeler`] surfaces those and, like `MockPeeler`, nothing
+/// for any other delivery.
+#[derive(Clone, Default)]
+struct WelcomeSeals(
+    std::sync::Arc<std::sync::Mutex<std::collections::HashMap<MessageId, (MemberId, Timestamp)>>>,
+);
+
+impl WelcomeSeals {
+    /// A new delivery of `welcome`'s bytes to `recipient`, sealed by `sender`
+    /// at `created_at`.
+    fn deliver(
+        &self,
+        welcome: &TransportMessage,
+        recipient: &MemberId,
+        sender: MemberId,
+        created_at: Timestamp,
+    ) -> TransportMessage {
+        let delivery = TransportMessage {
+            id: MessageId::new(rand::random::<[u8; 32]>().to_vec()),
+            envelope: TransportEnvelope::Welcome {
+                recipient: recipient.clone(),
+            },
+            ..welcome.clone()
+        };
+        self.0
+            .lock()
+            .unwrap()
+            .insert(delivery.id.clone(), (sender, created_at));
+        delivery
+    }
+}
+
+struct SealingPeeler(WelcomeSeals);
+
+#[async_trait]
+impl TransportPeeler for SealingPeeler {
+    async fn wrap_group_recovery(
+        &self,
+        message: &cgka_traits::GroupRecoveryMessage,
+        recipient: &cgka_traits::MemberId,
+    ) -> Result<cgka_traits::TransportMessage, cgka_traits::PeelerError> {
+        MockPeeler.wrap_group_recovery(message, recipient).await
+    }
+
+    async fn peel_group_message(
+        &self,
+        msg: &cgka_traits::peeler::PreparedGroupMessage<'_>,
+        ctx: &GroupContextSnapshot,
+    ) -> Result<PeeledMessage, PeelerError> {
+        MockPeeler.peel_group_message(msg, ctx).await
+    }
+
+    async fn peel_welcome(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
+        let mut peeled = MockPeeler.peel_welcome(msg).await?;
+        if let Some((sender, sealed_at)) = self.0.0.lock().unwrap().get(&msg.id).cloned() {
+            peeled.sender = Some(sender);
+            if let PeeledContent::Welcome { created_at, .. } = &mut peeled.content {
+                *created_at = Some(sealed_at);
+            }
+        }
+        Ok(peeled)
+    }
+
+    async fn wrap_group_message(
+        &self,
+        payload: &EncryptedPayload,
+        ctx: &GroupContextSnapshot,
+    ) -> Result<TransportMessage, PeelerError> {
+        MockPeeler.wrap_group_message(payload, ctx).await
+    }
+
+    async fn wrap_welcome(
+        &self,
+        payload: &EncryptedPayload,
+        recipient: &MemberId,
+    ) -> Result<TransportMessage, PeelerError> {
+        MockPeeler.wrap_welcome(payload, recipient).await
+    }
+}
+
 fn selfremove_registry() -> FeatureRegistry {
     let mut r = FeatureRegistry::new();
     r.register(
@@ -276,12 +358,20 @@ fn build_client_on_storage(
     id: &[u8],
     storage: SqliteAccountStorage,
 ) -> Engine<SqliteAccountStorage> {
+    build_client_with_peeler(id, storage, Box::new(MockPeeler))
+}
+
+fn build_client_with_peeler(
+    id: &[u8],
+    storage: SqliteAccountStorage,
+    peeler: Box<dyn TransportPeeler>,
+) -> Engine<SqliteAccountStorage> {
     EngineBuilder::new(storage)
         .legacy_compatibility_profile()
         .identity(pad32(id))
         .account_identity_proof_signer(proof_signer(id))
         .feature_registry(selfremove_registry())
-        .peeler(Box::new(MockPeeler))
+        .peeler(peeler)
         .build()
         .unwrap()
 }
@@ -289,6 +379,18 @@ fn build_client_on_storage(
 fn build_with_storage(id: &[u8]) -> (Engine<SqliteAccountStorage>, SqliteAccountStorage) {
     let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let engine = build_client_on_storage(id, storage.clone());
+    (engine, storage)
+}
+
+/// A client whose transport authenticates the Welcome deliveries `seals`
+/// seals.
+fn build_sealed_with_storage(
+    id: &[u8],
+    seals: &WelcomeSeals,
+) -> (Engine<SqliteAccountStorage>, SqliteAccountStorage) {
+    let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
+    let engine =
+        build_client_with_peeler(id, storage.clone(), Box::new(SealingPeeler(seals.clone())));
     (engine, storage)
 }
 
@@ -7339,10 +7441,15 @@ fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     out
 }
 
+/// A forgotten group takes only a Welcome its author dated after the forget.
+/// A delivery without an authenticated time, or dated at the forget, is
+/// refused, and the refusal is that delivery's alone: the author's delivery
+/// of the same Welcome dated after the forget still joins (mdk#3514).
 #[tokio::test]
 async fn forgotten_group_rejects_welcome_without_authenticated_creation_time() {
+    let seals = WelcomeSeals::default();
     let mut alice = build_client(b"alice");
-    let (mut bob, storage) = build_with_storage(b"bob");
+    let (mut bob, storage) = build_sealed_with_storage(b"bob", &seals);
     let key_package = bob.fresh_key_package().await.unwrap();
     let (group_id, created) = alice
         .create_group(CreateGroupRequest {
@@ -7364,19 +7471,152 @@ async fn forgotten_group_rejects_welcome_without_authenticated_creation_time() {
     };
     alice.confirm_published(pending).await.unwrap();
     assert!(bob.forget_group_local(&group_id).unwrap());
-    let cutoff = storage.group_local_reset_cutoff(&group_id).unwrap();
-    let mut welcome = welcomes.remove(0);
-    // The mock transport supplies no authenticated inner time. A later outer
-    // time must not substitute for it, even though the MLS Welcome is valid.
-    welcome.timestamp = Timestamp(u64::MAX);
+    let cutoff = storage
+        .group_local_reset_cutoff(&group_id)
+        .unwrap()
+        .expect("the forget dates a cutoff");
+    let welcome = welcomes.remove(0);
+    // This delivery is not sealed, so it has no authenticated inner time. A
+    // later outer time must not substitute for it, even though the MLS
+    // Welcome is valid.
+    let unsealed = TransportMessage {
+        timestamp: Timestamp(u64::MAX),
+        ..welcome.clone()
+    };
     assert!(matches!(
-        bob.join_welcome(welcome).await,
+        bob.join_welcome(unsealed).await,
+        Err(cgka_traits::EngineError::InvalidWelcome)
+    ));
+    let at_the_forget = seals.deliver(&welcome, &bob.self_id(), alice.self_id(), cutoff);
+    assert!(matches!(
+        bob.join_welcome(at_the_forget).await,
         Err(cgka_traits::EngineError::InvalidWelcome)
     ));
     assert!(storage.is_group_forgotten(&group_id).unwrap());
-    assert_eq!(storage.group_local_reset_cutoff(&group_id).unwrap(), cutoff);
+    assert_eq!(
+        storage.group_local_reset_cutoff(&group_id).unwrap(),
+        Some(cutoff)
+    );
     assert!(storage.list_groups().unwrap().is_empty());
     assert!(bob.drain_events().is_empty());
+
+    let after_the_forget = seals.deliver(
+        &welcome,
+        &bob.self_id(),
+        alice.self_id(),
+        Timestamp(cutoff.0 + 1),
+    );
+    assert_eq!(bob.join_welcome(after_the_forget).await.unwrap(), group_id);
+    assert_eq!(
+        bob.epoch(&group_id).unwrap(),
+        alice.epoch(&group_id).unwrap()
+    );
+}
+
+/// Every invitee of one Commit receives the same Welcome bytes, so a
+/// co-invitee can rewrap them to a member who forgot the group (mdk#3514).
+/// Dated after the forget, the rewrap fails the check that its sender wrote
+/// the Welcome. That refusal is the rewrap's alone: the inviter's own
+/// delivery of the same Welcome still joins.
+#[tokio::test]
+async fn a_co_invitees_rewrap_leaves_the_inviters_welcome_joinable() {
+    let seals = WelcomeSeals::default();
+    let mut alice = build_client(b"alice");
+    let mut bob = build_client(b"bob");
+    let (mut carol, carol_storage) = build_sealed_with_storage(b"carol", &seals);
+
+    // Carol joins the group, then forgets it on her device.
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+    let (group_id, created) = alice
+        .create_group(CreateGroupRequest {
+            name: "rewrapped invitation".into(),
+            description: String::new(),
+            members: vec![carol_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let SendResult::GroupCreated {
+        pending,
+        mut welcomes,
+    } = created
+    else {
+        panic!("group creation");
+    };
+    alice.confirm_published(pending).await.unwrap();
+    carol.join_welcome(welcomes.remove(0)).await.unwrap();
+    assert!(carol.forget_group_local(&group_id).unwrap());
+    let cutoff = carol_storage
+        .group_local_reset_cutoff(&group_id)
+        .unwrap()
+        .expect("the forget dates a cutoff");
+
+    // Alice removes Carol, then adds her back with Bob in one Commit.
+    let SendResult::GroupEvolution { pending, .. } = alice
+        .send(SendIntent::RemoveMembers {
+            group_id: group_id.clone(),
+            members: vec![carol.self_id()],
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("removal commit");
+    };
+    alice.confirm_published(pending).await.unwrap();
+    let SendResult::GroupEvolution {
+        pending,
+        mut welcomes,
+        ..
+    } = alice
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![
+                carol.fresh_key_package().await.unwrap(),
+                bob.fresh_key_package().await.unwrap(),
+            ],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("invite commit");
+    };
+    alice.confirm_published(pending).await.unwrap();
+    let for_carol = take_welcome_for(&mut welcomes, &carol.self_id());
+    let for_bob = take_welcome_for(&mut welcomes, &bob.self_id());
+    assert_eq!(for_bob.payload, for_carol.payload);
+
+    // Bob seals his copy to Carol with his own key, dated after the forget.
+    let rewrap = seals.deliver(
+        &for_bob,
+        &carol.self_id(),
+        bob.self_id(),
+        Timestamp(cutoff.0 + 1),
+    );
+    assert_eq!(
+        carol.ingest(rewrap).await.unwrap(),
+        IngestOutcome::Ignored {
+            category: cgka_traits::ingest::InputRejectionCategory::InvalidEncoding
+        }
+    );
+    assert!(carol_storage.list_groups().unwrap().is_empty());
+
+    let from_alice = seals.deliver(
+        &for_carol,
+        &carol.self_id(),
+        alice.self_id(),
+        Timestamp(cutoff.0 + 1),
+    );
+    assert_eq!(
+        carol.ingest(from_alice).await.unwrap(),
+        IngestOutcome::Processed
+    );
+    assert_eq!(
+        carol.epoch(&group_id).unwrap(),
+        alice.epoch(&group_id).unwrap()
+    );
 }
 
 /// A removed copy retains inbound traffic, bounded by the ring.

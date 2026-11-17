@@ -4064,8 +4064,8 @@ async fn join_welcome_dedup_survives_engine_rebuild_on_same_storage() {
 
 #[tokio::test]
 async fn join_welcome_rejected_when_client_no_longer_supports_required_capability() {
-    // Direct refusal marks its content terminal, so each route needs its own
-    // genuine Welcome and KeyPackage rather than replaying the other refusal.
+    // Each route refuses its own genuine Welcome, then joins it after an
+    // upgrade.
     for through_ingest in [false, true] {
         assert_required_capability_welcome_refusal(through_ingest).await;
     }
@@ -4079,7 +4079,9 @@ async fn assert_required_capability_welcome_refusal(through_ingest: bool) {
     // alice's invite (which requires it) passes. carol then downgrades: she
     // rebuilds her engine on the same storage with an empty feature registry,
     // so her runtime no longer supports SelfRemove. Joining the group must now
-    // be rejected.
+    // be rejected. The refusal is this build's, not the Welcome's (mdk#3514):
+    // once carol upgrades again, alice's next delivery of the same Welcome
+    // joins.
     let mut alice = build_client(b"alice", selfremove_registry());
     let carol_storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let mut capable_carol =
@@ -4103,6 +4105,10 @@ async fn assert_required_capability_welcome_refusal(through_ingest: bool) {
             welcomes.into_iter().next().unwrap()
         }
         other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    let resend = TransportMessage {
+        id: MessageId::new(b"alice-resends-the-same-welcome".to_vec()),
+        ..welcome.clone()
     };
     drop(capable_carol);
 
@@ -4158,6 +4164,22 @@ async fn assert_required_capability_welcome_refusal(through_ingest: bool) {
             .expect("rejected-Welcome storage remains readable")
             .is_none(),
         "a rejected Welcome must roll back the newly stored OpenMLS group"
+    );
+
+    drop(downgraded_carol);
+    let mut upgraded_carol =
+        build_client_on_storage(b"carol", selfremove_registry(), carol_storage.clone());
+    if through_ingest {
+        assert_eq!(
+            upgraded_carol.ingest(resend).await.unwrap(),
+            cgka_traits::ingest::IngestOutcome::Processed
+        );
+    } else {
+        assert_eq!(upgraded_carol.join_welcome(resend).await.unwrap(), group_id);
+    }
+    assert_eq!(
+        upgraded_carol.epoch(&group_id).unwrap(),
+        alice.epoch(&group_id).unwrap()
     );
 }
 
