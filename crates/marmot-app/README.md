@@ -679,7 +679,7 @@ A rename and a settings change share one recovery record. Before accepting anoth
 tries the existing recovery of an earlier lost edit and re-reads the roster. Retry `device_group_busy` only while it
 remains unsettled. A successful no-op never leaves an opposite lost intention to apply later. A competing user edit
 of that device wins as a whole, even if it changed a different toggle. Refresh the displayed label and flags on
-`LinkedDevicesChanged`. These commands remain behind the device-group development gate. Custom clients writing post-link settings must adopt
+`LinkedDevicesChanged`. These commands are refused only while the host keeps device groups off. Custom clients writing post-link settings must adopt
 this user-edit marker rule before using the feature; earlier draft writers must update first.
 
 When another of the account's devices removes this one, the account stops on this device once it reads the removal, and
