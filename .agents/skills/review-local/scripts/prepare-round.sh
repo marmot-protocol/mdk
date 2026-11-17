@@ -98,8 +98,10 @@ fi
 
 tmp_root="${TMPDIR:-/tmp}"
 tmp_root="${tmp_root%/}"
-review_dir="$(mktemp -d "$tmp_root/review-local.XXXXXX")"
-out_dir="$(mktemp -d "$tmp_root/review-out.XXXXXX")"
+# Physical paths: OpenCode resolves /var to /private/var on macOS, and its
+# allow rule for the input directory must match the path the prompt names.
+review_dir="$(cd "$(mktemp -d "$tmp_root/review-local.XXXXXX")" && pwd -P)"
+out_dir="$(cd "$(mktemp -d "$tmp_root/review-out.XXXXXX")" && pwd -P)"
 # A failure past this point would leave worktrees registered in the repository
 # under a path nobody was told; remove the partial round.
 trap 'bash "$script_dir/cleanup-round.sh" "$review_dir" >&2; rmdir "$out_dir"' ERR

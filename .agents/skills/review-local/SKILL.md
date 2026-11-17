@@ -45,7 +45,8 @@ with equivalent restrictions.
 
 **Fallback.** When a seat cannot run because its product is out of usage (its
 log shows a usage or rate limit, or the user tells you it is out), use
-`opencode` in its place; if you are OpenCode yourself, use `cursor`. Tell the
+`opencode` in its place. If you are OpenCode yourself, use the one seat not
+yet in the round when it is outside your model family; otherwise stop. Tell the
 user which seat you replaced and why. If the other seat already finished on
 the same `HEAD_SHA`, its verdict stands: prepare a round with the replacement
 alone (`prepare-round.sh opencode --context ...`). The `opencode` seat tries
