@@ -38,6 +38,13 @@
 //!   rejected stays up, saying so, until dismissed. That answer holds only
 //!   while the roster does: a sign-in dismissed here is listed again once the
 //!   roster has no entry for its slot.
+//! - **Removed.** A slot the roster records as `removed` held a device the
+//!   user linked and removed, which answers its sign-in for good: the sign-in
+//!   goes, unless this device rejected it, and once the record expires no
+//!   publication from before the removal, allowing the directory's future
+//!   skew, lists it again. A removed device
+//!   comes back only in a new slot, so a later publication in the old one is
+//!   a new sign-in.
 //! - **Gone.** A sign-in whose slot a complete read finds holding no valid
 //!   KeyPackage, fresh or not, stays listed, marked as no longer signed in.
 //!   A stale publication never signs a slot out, and only a complete read
@@ -276,6 +283,16 @@ impl AppClient {
             if self.sign_in_schedule.detached {
                 // The worker reads beside the writer and runs the rest of
                 // the check, the schedule's included, once the read returns.
+                // Its read begins after this pass, whose session maintenance
+                // can drop an expired `removed` record: record them now.
+                if let Err(error) = self.record_trusted_sign_in_removals() {
+                    tracing::warn!(
+                        target: "marmot_app::client::sign_ins",
+                        method = "drive_sign_ins",
+                        error_kind = error.privacy_safe_kind(),
+                        "could not record removed devices' slots; the check retries"
+                    );
+                }
                 self.sign_in_schedule.requested = true;
             } else {
                 let report = self.check_sign_ins().await;
@@ -290,7 +307,7 @@ impl AppClient {
     /// no account worker owns; the worker runs it beside the writer
     /// ([`Self::start_sign_in_slot_read`], [`Self::finish_sign_in_slot_read`]).
     pub(crate) async fn check_sign_ins(&mut self) -> Result<SignInCheckReport, AppError> {
-        let Some(mut start) = self.start_sign_in_slot_read()? else {
+        let Some(mut start) = self.begin_sign_in_slot_read()? else {
             return Ok(SignInCheckReport::default());
         };
         let mut again = false;
@@ -311,6 +328,30 @@ impl AppClient {
                 }
             }
         }
+    }
+
+    /// Begin a slot read: record the removed slots of the trusted roster
+    /// ([`Self::record_sign_in_removals`]), then take the look
+    /// ([`Self::start_sign_in_slot_read`]). The write comes before the read,
+    /// which can fail, so a removal this device has not recorded yet, as
+    /// after an upgrade, is recorded before the same maintenance pass can
+    /// drop its expired record. It writes only while the roster has one.
+    pub(crate) fn begin_sign_in_slot_read(&mut self) -> Result<Option<SlotReadStart>, AppError> {
+        if !self.app.device_groups_enabled() {
+            return Ok(None);
+        }
+        self.record_trusted_sign_in_removals()?;
+        self.start_sign_in_slot_read()
+    }
+
+    /// Record the removed slots of the trusted roster, if this device trusts
+    /// a device group ([`Self::record_sign_in_removals`]).
+    fn record_trusted_sign_in_removals(&mut self) -> Result<(), AppError> {
+        if let Some((_, roster)) = self.trusted_device_roster()? {
+            let storage = self.app.account_storage(&self.state.label)?.app_storage();
+            self.record_sign_in_removals(&storage, &roster)?;
+        }
+        Ok(())
     }
 
     /// The look before a slot read: this device's own KeyPackages, and the
@@ -356,7 +397,7 @@ impl AppClient {
             if again {
                 return SlotReadEnd::Unjudged;
             }
-            return match self.start_sign_in_slot_read() {
+            return match self.begin_sign_in_slot_read() {
                 Ok(Some(start)) => SlotReadEnd::ReadAgain(Box::new(start)),
                 Ok(None) => SlotReadEnd::Checked(Ok(SignInCheckReport::default())),
                 Err(error) => SlotReadEnd::Checked(Err(error)),
@@ -383,6 +424,9 @@ impl AppClient {
         }
         let roster = trusted.map(|(_, roster)| roster);
         let storage = self.app.account_storage(&self.state.label)?.app_storage();
+        if let Some(roster) = roster.as_ref() {
+            self.record_sign_in_removals(&storage, roster)?;
+        }
         let rejected_here = rejected_slots_here(&storage.sign_ins()?);
 
         let mut report = SignInCheckReport {
@@ -881,12 +925,15 @@ impl AppClient {
     /// the roster again, so one the roster lost is committed anew. A rejection
     /// settled from another device's commit is lost if that commit later
     /// loses convergence, and that device may never come back to repair it.
+    /// A slot the roster records as `removed` is recorded here, so its
+    /// sign-in goes and stays gone once the record does.
     pub(crate) fn recheck_sign_in_rejections(&mut self) {
         let ended = self.trusted_device_roster().and_then(|roster| {
             let Some((_, roster)) = roster else {
                 return Ok(());
             };
             let storage = self.app.account_storage(&self.state.label)?.app_storage();
+            self.record_sign_in_removals(&storage, &roster)?;
             for record in storage.sign_ins()? {
                 if record.answer == SignInAnswer::Rejected && linked(&record, &roster) {
                     end_rejection(&storage, &record)?;
@@ -909,6 +956,20 @@ impl AppClient {
                 "could not recheck sign-in rejections after a device group change"
             );
         }
+    }
+
+    /// Record each slot `roster` records as `removed`, so its sign-in goes
+    /// and stays gone once the record does ([`removed_slots`]).
+    fn record_sign_in_removals(
+        &mut self,
+        storage: &SqliteAppStorage,
+        roster: &DeviceRosterV1,
+    ) -> Result<(), AppError> {
+        let removed = removed_slots(roster, self.app.config.directory_max_future_skew);
+        if storage.record_sign_in_removals(&removed)? {
+            self.unrecognized_sign_ins_changed = true;
+        }
+        Ok(())
     }
 
     /// Whether this device rejected the sign-in whose KeyPackage it found in
@@ -1188,6 +1249,24 @@ fn listed_state(
             .then_some(UnrecognizedSignInState::RejectedElsewhere);
     }
     Some(waiting)
+}
+
+/// Each slot `roster` records as `removed`, as a sign-in names it, with the
+/// time through which a publication there is the removed device's: that
+/// record's `rejected_at`, plus `skew`, the future skew the directory accepts
+/// from a publisher's clock. The user linked the device and removed it.
+fn removed_slots(roster: &DeviceRosterV1, skew: Duration) -> Vec<(String, u64)> {
+    roster
+        .rejected_slots
+        .iter()
+        .filter(|(_, rejected)| rejected.reason == RejectedSlotReasonV1::Removed)
+        .map(|(slot, rejected)| {
+            (
+                hex::encode(slot),
+                rejected.rejected_at.saturating_add(skew.as_secs()),
+            )
+        })
+        .collect()
 }
 
 /// Whether the roster holds `record`'s slot as a device: the user confirmed

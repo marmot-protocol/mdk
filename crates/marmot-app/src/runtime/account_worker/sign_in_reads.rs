@@ -70,7 +70,7 @@ impl SignInReads {
         if client.take_sign_in_check_request() {
             match &mut self.read {
                 Some(read) => read.scheduled = true,
-                None => match client.start_sign_in_slot_read() {
+                None => match client.begin_sign_in_slot_read() {
                     Ok(Some(start)) => self.start(client, start, false, true, Instant::now()),
                     // Device groups went off: today's check does nothing.
                     Ok(None) => {}
@@ -86,8 +86,8 @@ impl SignInReads {
     }
 
     /// The host asks for a check now. It joins the read in flight, or
-    /// starts one after the look, which changes nothing; the look's early
-    /// answers are given at once.
+    /// starts one after the look, which changes nothing but the removed
+    /// slots it records first; the look's early answers are given at once.
     pub(super) fn check_now(
         &mut self,
         client: &mut AppClient,
@@ -99,7 +99,7 @@ impl SignInReads {
             self.host = Some(respond);
             return None;
         }
-        match client.start_sign_in_slot_read() {
+        match client.begin_sign_in_slot_read() {
             Ok(Some(start)) => {
                 self.host = Some(respond);
                 self.start(client, start, false, false, Instant::now());

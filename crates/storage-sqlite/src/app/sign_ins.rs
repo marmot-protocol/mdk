@@ -148,6 +148,17 @@ impl SqliteAppStorage {
         let mut changed = false;
         for observed in check.unrecognized {
             let published_at = u64_to_i64(observed.published_at)?;
+            let removed_device: bool = tx
+                .query_row_cached(
+                    "SELECT EXISTS(SELECT 1 FROM account_sign_in_removals
+                         WHERE slot_id_hex = ?1 AND removed_at >= ?2)",
+                    params![observed.slot_id_hex, published_at],
+                    |row| row.get(0),
+                )
+                .storage()?;
+            if removed_device {
+                continue;
+            }
             changed |= tx
                 .execute_cached(
                     UPSERT_SIGN_IN,
@@ -195,6 +206,46 @@ impl SqliteAppStorage {
                 .storage()?;
                 changed = true;
             }
+        }
+        tx.commit().storage()?;
+        Ok(changed)
+    }
+
+    /// Record each of `removed`, a slot the trusted roster records as
+    /// `removed` with the time through which a publication there is the
+    /// removed device's: the user linked that device and then removed it.
+    /// The slot's sign-in, unless this device rejected it or it holds a later
+    /// publication, is answered by that link and removal and goes, and a
+    /// later check adds none for a publication no later than that time,
+    /// after the roster drops the record too. A later publication is a new
+    /// sign-in. Returns whether a sign-in went.
+    pub fn record_sign_in_removals(&self, removed: &[(String, u64)]) -> StorageResult<bool> {
+        if removed.is_empty() {
+            return Ok(false);
+        }
+        let mut conn = self.lock()?;
+        let tx = conn.transaction().storage()?;
+        let mut changed = false;
+        for (slot_id_hex, removed_at) in removed {
+            // A time past `i64::MAX` saturates: another device wrote it.
+            let removed_at = i64::try_from(*removed_at).unwrap_or(i64::MAX);
+            tx.execute_cached(
+                "INSERT INTO account_sign_in_removals (slot_id_hex, removed_at) VALUES (?1, ?2)
+                 ON CONFLICT(slot_id_hex) DO UPDATE SET removed_at = excluded.removed_at
+                 WHERE excluded.removed_at > removed_at",
+                params![slot_id_hex, removed_at],
+            )
+            .storage()?;
+            changed |= tx
+                .execute_cached(
+                    "DELETE FROM account_sign_ins
+                     WHERE slot_id_hex = ?1 AND answer != 'rejected'
+                         AND last_published_at <= (SELECT removed_at FROM account_sign_in_removals
+                                                   WHERE slot_id_hex = ?1)",
+                    params![slot_id_hex],
+                )
+                .storage()?
+                != 0;
         }
         tx.commit().storage()?;
         Ok(changed)
@@ -671,6 +722,53 @@ mod tests {
                 .answer_sign_in("bb", &[Unanswered], Dismissed, 500)
                 .unwrap()
         );
+    }
+
+    /// A removed device's sign-in goes, and its publications through the
+    /// removal never bring it back; a later one is a new sign-in, whether
+    /// this device stored it before or after it learned of the removal. A
+    /// rejection stays.
+    #[test]
+    fn a_removed_devices_sign_in_goes_until_the_slot_publishes_again() {
+        let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
+        check(
+            &store,
+            &[
+                observed("aa", 30, "e1"),
+                observed("bb", 10, "e2"),
+                observed("cc", 70, "e4"),
+            ],
+            true,
+            100,
+        );
+        assert!(
+            store
+                .answer_sign_in("bb", &[Unanswered], Rejected, 100)
+                .unwrap()
+        );
+        assert!(!store.record_sign_in_removals(&[]).unwrap());
+        // `cc` was removed at 40 and published again at 70, which this
+        // device saw before the removal reached it.
+        assert!(
+            store
+                .record_sign_in_removals(
+                    &[("aa".into(), 40), ("bb".into(), 40), ("cc".into(), 40),]
+                )
+                .unwrap()
+        );
+        assert_eq!(store.sign_in("aa").unwrap(), None);
+        assert_eq!(store.sign_in("bb").unwrap().unwrap().answer, Rejected);
+        assert_eq!(store.sign_in("cc").unwrap().unwrap().answer, Unanswered);
+
+        // The removed device's publication through the removal stays out.
+        assert!(!check(&store, &[observed("aa", 40, "e1")], false, 200));
+        assert_eq!(store.sign_in("aa").unwrap(), None);
+        assert!(check(&store, &[observed("aa", 60, "e3")], false, 300));
+        let row = store.sign_in("aa").unwrap().unwrap();
+        assert_eq!((row.answer, row.appeared_at), (Unanswered, 60));
+        // A roster that restores the record leaves the later sign-in.
+        assert!(!store.record_sign_in_removals(&[("aa".into(), 40)]).unwrap());
+        assert!(store.sign_in("aa").unwrap().is_some());
     }
 
     /// Starting fresh answers Not now for every device the first check
