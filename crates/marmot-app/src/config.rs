@@ -177,8 +177,7 @@ pub struct MarmotAppConfig {
     /// Whether this device advertises the device roster
     /// (`marmot.account.device-roster.v1`), so it can create and join its
     /// account's device group (mdk#2628 item 3.1) and link other devices of
-    /// the account. Off by default: every build includes multi-device, and a
-    /// host opts in here.
+    /// the account. On by default; a host turns it off here.
     pub device_groups: bool,
     /// Dev/test-only override that fails invite local projection refresh.
     /// Honored only with `test-policy-overrides`; this proves a canonical
@@ -273,7 +272,7 @@ impl Default for MarmotAppConfig {
             dev_maintenance_timing: None,
             dev_startup_hydration_batch_delay_ms: None,
             dev_fail_create_local_projection: false,
-            device_groups: false,
+            device_groups: true,
             dev_fail_invite_local_refresh: false,
             dev_epoch_stall_wedge_rearm_interval_ms: None,
             dev_fail_sync_before_delivery: None,
@@ -437,7 +436,7 @@ impl MarmotAppConfig {
     }
 
     /// Turn multi-device (device roster, device linking, device groups) on or
-    /// off for this device. Off by default.
+    /// off for this device. On by default.
     pub fn with_device_groups(mut self, enabled: bool) -> Self {
         self.device_groups = enabled;
         self

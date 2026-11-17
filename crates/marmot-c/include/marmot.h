@@ -8025,9 +8025,8 @@ MarmotStatus marmot_client_new_with_configuration(const char *root_path,
                                                   struct MarmotClient **out_client);
 
 /**
- * Open with multi-device on, with the same options and ownership as
- * marmot_client_new_with_configuration. Every library includes it; ordinary
- * constructors keep it off. Use it for every opener of the same root.
+ * The same open as marmot_client_new_with_configuration: every constructor
+ * now opens with multi-device on. Kept so existing hosts keep linking.
  *
  * # Safety
  * Same pointer contracts as marmot_client_new_with_configuration.

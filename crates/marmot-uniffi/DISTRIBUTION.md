@@ -10,9 +10,8 @@ Remove any host-owned copy of `CancellablePresentedChatList.swift` when adopting
 will reject the duplicate methods. The existing Swift asset hash covers the generated bindings and adapters together;
 there is no extra support-file download.
 
-Published release and snapshot assets include device groups; hosts turn them on with the
-[experimental constructor](README.md#experimental-device-group-test-builds). There is no separate device-group
-artifact. Never add policy-test timing overrides to a host artifact.
+Published release and snapshot assets include [device groups](README.md#device-groups), and every constructor
+turns them on. There is no separate device-group artifact. Never add policy-test timing overrides to a host artifact.
 
 ## Apple privacy migration
 

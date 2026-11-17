@@ -11,9 +11,10 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Changed
 
-- Every `wn`/`wnd` build includes multi-device (mdk#2628); `--features dev-device-groups` is gone. Export
-  `WN_DEVICE_GROUPS=1` for `wn` and `wnd` to turn device groups on: `wn devices` linking, the device roster and admin
-  step-down on Leave in the CLI and TUI. Without it they stay off, as before.
+- Every `wn`/`wnd` build includes multi-device (mdk#2628), on by default; `--features dev-device-groups` is gone.
+  `wn devices` linking, the device roster and admin step-down on Leave work in the CLI and TUI without setup, so
+  `groups management` reports `requires_self_demote_before_leave` false for a nonlast admin. Export
+  `WN_DEVICE_GROUPS=0` for both `wn` and `wnd` to turn device groups off.
 
 ### Added
 

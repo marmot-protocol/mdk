@@ -66,13 +66,13 @@ behavior and JSON fields are documented in the README; the rules below are the o
 - Other namespaces: `chats`, `follows`, `profile`, `relays`, `settings`, `users`, `notifications`, `stream`, `debug`,
   `usage-diagnostics`, `tui`.
 - `devices` (list and start/status/confirm-match/approve/cancel) uses the existing daemon-owned runtime and refuses
-  local execution. Device groups are on only when `WN_DEVICE_GROUPS=1` reaches `wnd` (and the TUI, for Leave). Do not add a CLI pairing store. Other account commands
+  local execution. Device groups are on unless `WN_DEVICE_GROUPS=0` reaches `wnd` (and the TUI, for Leave). Do not add a CLI pairing store. Other account commands
   retain one-shot worker behavior; the documented dev-testing limit requires a persistent matching daemon and explicit
   `--socket`/`WN_SOCKET` selection to prevent fallback. A one-shot worker can answer a pending request and lose its
   unconfirmed session on exit. Both user confirmations remain separate. Core owns authentication, roster state and
   validation; commands only render it. Existing-device Not now is not exposed; cancel is requester-only.
   The real daemon/CLI owner in `tests/cli.rs` (`devices_link_across_daemon_commands_at_production_timing`) runs in a
-  separate CI step with `WN_DEVICE_GROUPS=1` and without policy overrides;
+  separate CI step without policy overrides;
   local two-process coverage is not D66 VM/device acceptance. That owner covers default/opt-out settings and
   actual plain list/comparison output. The private formatter unit in `commands/devices.rs` owns untrusted
   AddedElsewhere labels and actionable CannotLink details without a three-device fixture.

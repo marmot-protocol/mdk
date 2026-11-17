@@ -71,7 +71,7 @@ struct OptionsSmoke {
         precondition(session.status().state == .disconnected)
         session.cancel()
         precondition(session.status().state == .cancelled)
-        // Every native library opens through the experimental constructor.
+        // The kept experimental alias still opens.
         let experimentalRoot = root.appendingPathComponent("experimental")
         let experimental = try Marmot.newWithExperimentalDeviceGroups(
             rootPath: experimentalRoot.path, relayUrls: ["ws://127.0.0.1:1"], options: copy

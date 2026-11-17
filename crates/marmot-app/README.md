@@ -5,8 +5,7 @@ session storage, the Nostr MLS peeler, the Nostr transport adapter, and relay-ba
 result as `MarmotApp` / `MarmotAppRuntime`. It sits below presentation layers (`wn`, the UniFFI and C bindings) and above
 the generic account, session, and engine crates. Read this if you are building a host app or binding on top of MDK.
 
-Every build includes device groups; a host turns them on with `MarmotAppConfig::with_device_groups(true)` (off by
-default). An account that holds or is joining a device group opens only with them on: otherwise its session fails with
+Device groups are on by default; a host turns them off with `MarmotAppConfig::with_device_groups(false)`. An account that holds or is joining a device group opens only with them on: otherwise its session fails with
 `AppError::ExperimentalDeviceGroupsRequired` before anything of it is read, sent or subscribed (mdk#3012).
 See [device linking](../cli/README.md#device-linking).
 
@@ -778,7 +777,7 @@ worker stop/replacement returns `TransportClosed`. Once queued, this caller's wa
 bounds its OS execution opportunity. Manual restore and
 supported lower-level `AppClient` APIs remain independent.
 
-Backup setup and manual restore require `device_groups` (off by default); unsupported setup/restore returns `DeviceGroupRefused("roster_unsupported")`.
+Backup setup and manual restore require `device_groups` (on by default); unsupported setup/restore returns `DeviceGroupRefused("roster_unsupported")`.
 The runtime-wide fact report remains local, and the due-pass wait returns `NotStarted` when device groups are disabled.
 
 ### Manual backup history restore
@@ -871,7 +870,7 @@ groups on.
 ## Linking a new device
 
 Device linking (mdk#2628) runs through the account runtime. It requires the per-client `device_groups` switch
-(off by default); every call is refused otherwise. Each call returns a `DeviceLinkSnapshot`: the new device's own
+(on by default); every call is refused otherwise. Each call returns a `DeviceLinkSnapshot`: the new device's own
 link (`new_device`) and the prompts for sign-ins this device can link (`prompts`).
 
 - On the new device, `start_device_link` asks a device already signed in to link this one. Its state goes from

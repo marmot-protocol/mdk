@@ -156,9 +156,7 @@ pub(crate) enum Command {
         )]
         default_account_relays: Vec<String>,
     },
-    #[command(
-        about = "Link and list this account's devices (requires wnd with WN_DEVICE_GROUPS=1)"
-    )]
+    #[command(about = "Link and list this account's devices (requires wnd)")]
     Devices {
         #[command(subcommand)]
         command: DevicesCommand,

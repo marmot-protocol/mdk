@@ -10,8 +10,11 @@
 - Every MarmotKit library includes multi-device (mdk#2628). The `dev-device-groups` Cargo feature, the
   `--dev-device-groups` flag of `xcframework.sh`, `xcframework-macos.sh`, `kotlin-bindings.sh` and `options-smoke.sh`,
   and the `output-dev-device-groups/` directory are gone; ordinary build commands produce the library both constructors
-  use. `newWithExperimentalDeviceGroups` turns device groups on in any library and no longer fails with
-  `experimental_device_groups_unavailable`; ordinary constructors still keep them off.
+  use. `newWithExperimentalDeviceGroups` no longer fails with `experimental_device_groups_unavailable`.
+- Every constructor opens with device groups on, so `newWithConfiguration` now links devices, lists linked devices,
+  runs backups and steps a nonlast admin down on Leave (`requiresSelfDemoteBeforeLeave` is false).
+  `newWithExperimentalDeviceGroups` is now the same open, kept so existing hosts keep compiling. There is no binding
+  switch to turn device groups off.
 
 ### Added
 

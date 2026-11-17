@@ -475,8 +475,9 @@ fn relay_pair_json(first: &TestRelay, second: &TestRelay) -> Value {
     serde_json::json!([first.url(), second.url()])
 }
 
-/// A `wn` or `wnd` process with device groups off unless the test turns them
-/// on: it never inherits `WN_DEVICE_GROUPS` from the developer's shell.
+/// A `wn` or `wnd` process with device groups at their default (on) unless the
+/// test turns them off: it never inherits `WN_DEVICE_GROUPS` from the
+/// developer's shell.
 fn cli_binary(program: &str) -> Command {
     let mut command = Command::new(program);
     command.env_remove("WN_DEVICE_GROUPS");
@@ -10062,9 +10063,9 @@ fn groups_recovery_quarantine_welcome_and_management_inspection_have_stable_cont
     assert_eq!(alice_management["is_last_admin"], true);
     assert_eq!(alice_management["can_invite"], true);
     assert_eq!(alice_management["can_leave"], false);
-    // Leave steps an admin down itself only with device groups on
-    // (`WN_DEVICE_GROUPS`, mdk#3014); this daemon leaves them off.
-    assert_eq!(alice_management["requires_self_demote_before_leave"], true);
+    // Leave steps an admin down itself with device groups on (the default,
+    // mdk#3014), so the host need not demote first.
+    assert_eq!(alice_management["requires_self_demote_before_leave"], false);
     assert_eq!(alice_management["lifecycle_state"], "stable");
     assert_eq!(alice_management["disbanding"], false);
     assert_eq!(
@@ -10571,7 +10572,7 @@ fn groups_add_members_can_assign_initial_admins_in_one_commit() {
 }
 
 /// A local CLI/daemon regression, not D66's separate VM/device acceptance.
-/// Compile this owner without policy overrides so `WN_DEVICE_GROUPS` and
+/// Compile this owner without policy overrides so default device groups and
 /// production settlement, persistent SAS session and two confirmations run.
 #[cfg(not(feature = "test-policy-overrides"))]
 #[test]
@@ -10676,7 +10677,6 @@ fn devices_link_across_daemon_commands_at_production_timing() {
                         .arg("--default-account-relays")
                         .arg(relay.url())
                         .env("WN_ALLOW_LOOPBACK_RELAYS", "1")
-                        .env("WN_DEVICE_GROUPS", "1")
                         .env_remove("WN_DEV_SETTLEMENT_QUIESCENCE_MS")
                 })
             })

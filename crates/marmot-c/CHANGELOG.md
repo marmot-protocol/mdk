@@ -33,8 +33,12 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   rebuild clients with the matching header and library.
 - Every library build includes multi-device (mdk#2628). The `dev-device-groups` Cargo feature,
   `c-bindings.sh --dev-device-groups` and `output-dev-device-groups/` are gone.
-  `marmot_client_new_with_experimental_device_groups` turns device groups on in any library and no longer returns
-  `MARMOT_STATUS_RUNTIME` for an unavailable build; ordinary constructors still keep them off.
+  `marmot_client_new_with_experimental_device_groups` no longer returns `MARMOT_STATUS_RUNTIME` for an unavailable
+  build.
+- Every constructor opens with device groups on, so `marmot_client_new_with_configuration` now links devices, lists
+  linked devices, runs backups and steps a nonlast admin down on Leave.
+  `marmot_client_new_with_experimental_device_groups` is now the same open, kept so existing hosts keep linking. There
+  is no C switch to turn device groups off.
 
 ### Added
 

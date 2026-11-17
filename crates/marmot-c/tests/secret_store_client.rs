@@ -543,7 +543,7 @@ mod experimental_host {
     }
 
     #[test]
-    fn experimental_c_hosts_link_real_devices_while_ordinary_opens_stay_disabled() {
+    fn c_hosts_link_real_devices_through_either_constructor() {
         // A composed host lifecycle uses its own 8 MiB caller and runtime
         // threads, matching the existing composed whole-app test budget.
         std::thread::Builder::new()
@@ -599,15 +599,15 @@ mod experimental_host {
                     .unwrap();
                 let relay_url = CString::new(runtime.block_on(relay.url()).to_string()).unwrap();
                 let relays = [relay_url.as_ptr()];
-                let roots: [_; 3] = std::array::from_fn(|_| tempfile::tempdir().unwrap());
-                let vaults: [_; 3] = std::array::from_fn(|_| Vault::default());
-                let mut clients = [std::ptr::null_mut(); 3];
+                let roots: [_; 2] = std::array::from_fn(|_| tempfile::tempdir().unwrap());
+                let vaults: [_; 2] = std::array::from_fn(|_| Vault::default());
+                let mut clients = [std::ptr::null_mut(); 2];
                 let identity =
                     CString::new(Keys::generate().secret_key().to_bech32().unwrap()).unwrap();
                 let mut account = None;
                 let mut deployment = std::ptr::null_mut();
                 check(unsafe { marmot_c::deployment::marmot_deployment_neutral(&mut deployment) });
-                for index in 0..3 {
+                for index in 0..2 {
                     let path = CString::new(roots[index].path().to_str().unwrap()).unwrap();
                     let store = store(&vaults[index]);
                     let options = options(&store);
@@ -648,70 +648,16 @@ mod experimental_host {
                     }
                     account = Some(this_account);
                     unsafe { marmot_account_summary_free(summary) };
-                    if index == 0 {
-                        let mut refused = std::ptr::dangling_mut();
-                        assert_ne!(
-                            unsafe {
-                                marmot_start_device_link(
-                                    clients[0],
-                                    account.as_ref().unwrap().as_ptr(),
-                                    &mut refused,
-                                )
-                            },
-                            MarmotStatus::Ok
-                        );
-                        assert!(
-                            refused.is_null(),
-                            "ordinary constructor does not activate the capability"
-                        );
-                        let detail = marmot_c::marmot_last_error_message();
-                        assert!(
-                            unsafe { CStr::from_ptr(detail) }
-                                .to_str()
-                                .unwrap()
-                                .contains("pairing_unsupported")
-                        );
-                        unsafe { marmot_c::marmot_string_free(detail) };
-                        refused = std::ptr::dangling_mut();
-                        assert_ne!(
-                            unsafe {
-                                marmot_reset_device_group_for_repair(
-                                    clients[0],
-                                    account.as_ref().unwrap().as_ptr(),
-                                    &mut refused,
-                                )
-                            },
-                            MarmotStatus::Ok
-                        );
-                        assert!(
-                            refused.is_null(),
-                            "ordinary opens also refuse explicit reset"
-                        );
-                        let detail = marmot_c::marmot_last_error_message();
-                        assert!(
-                            unsafe { CStr::from_ptr(detail) }
-                                .to_str()
-                                .unwrap()
-                                .contains("pairing_unsupported")
-                        );
-                        unsafe { marmot_c::marmot_string_free(detail) };
-                        check(unsafe {
-                            marmot_c::commands::marmot_client_shutdown_and_close(clients[0])
-                        });
-                        unsafe { marmot_client_free(clients[0]) };
-                        clients[0] = std::ptr::null_mut();
-                        assert!(vaults[0].destroyed.load(Ordering::SeqCst));
-                    }
                 }
                 unsafe { marmot_c::deployment::marmot_deployment_free(deployment) };
                 let account = account.unwrap();
                 let mut started = std::ptr::null_mut();
                 check(unsafe {
-                    marmot_start_device_link(clients[2], account.as_ptr(), &mut started)
+                    marmot_start_device_link(clients[1], account.as_ptr(), &mut started)
                 });
                 unsafe { marmot_device_link_snapshot_free(started) };
                 let (prompt_id, existing_code) = wait(|| {
-                    let value = snapshot(clients[1], &account);
+                    let value = snapshot(clients[0], &account);
                     let result = if unsafe { (*value).prompts_len } == 0 {
                         &[]
                     } else {
@@ -734,7 +680,7 @@ mod experimental_host {
                     result
                 });
                 let new_code = wait(|| {
-                    let value = snapshot(clients[2], &account);
+                    let value = snapshot(clients[1], &account);
                     let result = match unsafe { (*value).new_device.as_ref() } {
                         Some(MarmotNewDeviceLinkState::Comparing { code, code_len }) => Some(
                             unsafe { std::slice::from_raw_parts(*code, *code_len) }
@@ -754,12 +700,12 @@ mod experimental_host {
                 );
                 let mut value = std::ptr::null_mut();
                 check(unsafe {
-                    marmot_confirm_device_link_match(clients[2], account.as_ptr(), &mut value)
+                    marmot_confirm_device_link_match(clients[1], account.as_ptr(), &mut value)
                 });
                 unsafe { marmot_device_link_snapshot_free(value) };
                 check(unsafe {
                     marmot_link_device(
-                        clients[1],
+                        clients[0],
                         account.as_ptr(),
                         prompt_id.as_ptr(),
                         c"linked host".as_ptr(),
@@ -770,8 +716,8 @@ mod experimental_host {
                 });
                 unsafe { marmot_device_link_snapshot_free(value) };
                 wait(|| {
-                    let existing = snapshot(clients[1], &account);
-                    let new = snapshot(clients[2], &account);
+                    let existing = snapshot(clients[0], &account);
+                    let new = snapshot(clients[1], &account);
                     let existing_linked = if unsafe { (*existing).prompts_len } == 0 {
                         &[]
                     } else {
@@ -793,12 +739,12 @@ mod experimental_host {
                 });
                 let mut reset = std::ptr::null_mut();
                 check(unsafe {
-                    marmot_reset_device_group_for_repair(clients[2], account.as_ptr(), &mut reset)
+                    marmot_reset_device_group_for_repair(clients[1], account.as_ptr(), &mut reset)
                 });
                 assert!(!reset.is_null());
                 assert!(unsafe { (*reset).new_device.is_null() });
                 unsafe { marmot_device_link_snapshot_free(reset) };
-                for (index, client) in clients.into_iter().enumerate().skip(1) {
+                for (index, client) in clients.into_iter().enumerate() {
                     check(unsafe { marmot_c::commands::marmot_client_shutdown_and_close(client) });
                     unsafe { marmot_client_free(client) };
                     assert!(vaults[index].destroyed.load(Ordering::SeqCst));

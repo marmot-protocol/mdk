@@ -18,7 +18,7 @@ per feature.
 - [Relay liveness](#relay-liveness)
 - [NIP-46 accounts](#nip-46-accounts)
 - Feature notes: [runtime construction](#runtime-construction),
-  [experimental device-group test builds](#experimental-device-group-test-builds),
+  [device groups](#device-groups),
   [discarding a failed send](#discarding-a-failed-send), [local sends](#local-sends),
   [attachment handoff leases](#attachment-handoff-leases), [attachment storage](#attachment-storage),
   [custom reaction artwork](#custom-reaction-artwork), [sticker pack sharing](#sticker-pack-sharing),
@@ -267,18 +267,14 @@ Existing constructors keep their public-only policy. Loopback broker access
 requires a separate publisher trust opt-in; neither permits private or
 link-local endpoints. Local insecure trust is intended only for tests.
 
-## Experimental device-group test builds
+<a id="experimental-device-group-test-builds"></a>
 
-Follow the [shared build and constructor guidance](../marmot-uniffi/README.md#experimental-device-group-test-builds).
-`marmot_client_new_with_experimental_device_groups` takes the same arguments and unchanged `MarmotClientOptions`
-layout as `marmot_client_new_with_configuration`, and every library build has it. Required output validation and
-clearing happen first; secret-store callback ownership transfers only on successful construction. A push extension or
-background worker on an experimental root needs this constructor too: under `marmot_client_new_with_configuration`, an
-account that holds or is joining a device group does not open, and its calls return `MARMOT_STATUS_RUNTIME` with
-`experimental_device_groups_required`.
+## Device groups
 
-The ordinary `./crates/marmot-c/c-bindings.sh` build serves both constructors; there is no separate device-group
-artifact.
+Every constructor opens with device groups on; see the [shared guidance](../marmot-uniffi/README.md#device-groups).
+`marmot_client_new_with_experimental_device_groups` is now the same open as `marmot_client_new_with_configuration`,
+kept so existing hosts keep linking. The ordinary `./crates/marmot-c/c-bindings.sh` build serves every constructor;
+there is no separate device-group artifact.
 
 ## Attachment handoff leases
 

@@ -6,8 +6,11 @@
 
 - Every build includes multi-device (mdk#2628). The `dev-device-groups` and `unreleased-device-pairing` Cargo
   features are gone: `marmot-pairing` is always linked and the engine may always advertise the device roster.
-  `MarmotAppConfig::dev_device_groups` / `with_dev_device_groups` are renamed `device_groups` / `with_device_groups`;
-  they stay off by default and now take effect in every build. Struct literals and builder calls need the new name.
+  `MarmotAppConfig::dev_device_groups` / `with_dev_device_groups` are renamed `device_groups` / `with_device_groups`
+  and take effect in every build. Struct literals and builder calls need the new name.
+- Device groups are on by default (`MarmotAppConfig::device_groups` defaults to true): the device roster is
+  advertised, device linking, linked devices and backups work, and Leave steps a nonlast admin down itself. A host
+  that must stay off sets `with_device_groups(false)` in every opener of a root.
 
 ### Added
 

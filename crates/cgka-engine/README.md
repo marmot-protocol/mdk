@@ -6,8 +6,8 @@ for Marmot. Read this if you are building on the engine directly or changing how
 The engine sits above OpenMLS, governs commit sequencing, adjudicates forks through distributed convergence, enforces
 MIP-03 admin rules, and returns typed outcomes for every ingest path.
 
-Every build may advertise the adopted device roster. `marmot-app` advertises it only when the host turns device groups
-on (`MarmotAppConfig::device_groups`, off by default).
+Every build may advertise the adopted device roster. `marmot-app` advertises it unless the host turns device groups
+off (`MarmotAppConfig::device_groups`, on by default).
 See [device linking](../cli/README.md#device-linking).
 
 ## Contents

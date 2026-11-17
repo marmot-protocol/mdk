@@ -1332,21 +1332,21 @@ fn wn_allow_loopback_blob_endpoints() -> bool {
     )
 }
 
+/// Multi-device (device linking with `wn devices`, the device roster, admin
+/// step-down on Leave) is on unless `WN_DEVICE_GROUPS=0` (or `false`) turns
+/// it off; `wn` and `wnd` must share the setting.
+pub(crate) fn wn_device_groups() -> bool {
+    !matches!(
+        std::env::var("WN_DEVICE_GROUPS").as_deref(),
+        Ok("0") | Ok("false")
+    )
+}
+
 /// Dev/test opt-in for opening relay connections to loopback/private endpoints
 /// (e.g. a local `nostr-rs-relay` or an in-process `MockRelay`). Production
 /// installs leave `WN_ALLOW_LOOPBACK_RELAYS` unset, so the relay-safety
 /// chokepoint rejects non-public relay hosts. Mirrors
 /// `WN_ALLOW_LOOPBACK_BLOB_ENDPOINTS`.
-/// `WN_DEVICE_GROUPS=1` turns multi-device on (device linking with
-/// `wn devices`, the device roster, admin step-down on Leave). Every build
-/// includes it; `wn` and `wnd` must share the setting.
-pub(crate) fn wn_device_groups() -> bool {
-    matches!(
-        std::env::var("WN_DEVICE_GROUPS").as_deref(),
-        Ok("1") | Ok("true")
-    )
-}
-
 fn wn_allow_loopback_relays() -> bool {
     matches!(
         std::env::var("WN_ALLOW_LOOPBACK_RELAYS").as_deref(),
