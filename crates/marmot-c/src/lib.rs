@@ -511,6 +511,7 @@ pub unsafe extern "C" fn marmot_client_new_with_configuration(
             options,
             deployment,
             out_client,
+            Marmot::new_with_configuration,
         )
     })
 }
@@ -537,9 +538,17 @@ pub unsafe extern "C" fn marmot_client_new_with_experimental_device_groups(
             options,
             deployment,
             out_client,
+            Marmot::new_with_experimental_device_groups,
         )
     })
 }
+
+/// The UniFFI constructor a configured C open delegates to.
+type ConfiguredConstructor = fn(
+    String,
+    Vec<String>,
+    marmot_uniffi::MarmotOptions,
+) -> Result<Arc<Marmot>, marmot_uniffi::MarmotKitError>;
 
 /// Shared option validation and ownership for every configured open.
 ///
@@ -552,6 +561,7 @@ unsafe fn open_client_with_configuration(
     options: *const MarmotClientOptions,
     deployment: *const deployment::MarmotDeployment,
     out_client: *mut *mut MarmotClient,
+    construct: ConfiguredConstructor,
 ) -> MarmotStatus {
     if let Err(status) = unsafe { preflight_out_ptr(out_client) } {
         return status;
@@ -621,7 +631,7 @@ unsafe fn open_client_with_configuration(
                     moderation_report_config: None,
                     deployment,
                 };
-                Marmot::new_with_configuration(root, relays, options)
+                construct(root, relays, options)
             }
         })
     };
