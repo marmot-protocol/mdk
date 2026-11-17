@@ -7,6 +7,7 @@ CREATE TABLE follow_availability (
     fresh_until INTEGER,
     key_package_event_id TEXT,
     key_package_id TEXT,
+    key_package_created_at INTEGER,
     superseded_event_id TEXT,
     superseded_at INTEGER,
     superseded_last_resort INTEGER,

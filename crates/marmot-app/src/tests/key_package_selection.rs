@@ -1480,3 +1480,62 @@ async fn availability_multi_slot() {
         "a newer last-resort publication must not hide the preferred slot"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn availability_recovery_stays_bounded() {
+    let (_root, app, accounts, fetcher) = member_resolution_fixture(1, false).await;
+    let owner = app
+        .account_home()
+        .create_account("availability-owner")
+        .unwrap();
+    app.directory()
+        .remember_directory_follow_list_for_test(
+            &owner.account_id_hex,
+            &nostr_directory::FetchedFollowList {
+                follows: vec![accounts[0].account_id_hex.clone()],
+                source_relays: Vec::new(),
+            },
+        )
+        .unwrap();
+
+    let package_ids = fetcher
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|event| {
+            event.kind == KIND_MARMOT_KEY_PACKAGE && event.pubkey == accounts[0].account_id_hex
+        })
+        .map(|event| event.id.clone())
+        .collect::<Vec<_>>();
+    for event in fetcher.events.lock().unwrap().iter_mut() {
+        if event.kind == transport_nostr_adapter::KIND_NIP65_RELAY_LIST
+            && event.pubkey == accounts[0].account_id_hex
+        {
+            event.tags = (0..20)
+                .map(|index| vec!["r".into(), format!("wss://outbox-{index}.example")])
+                .collect();
+        }
+    }
+    let mut deletion_tags = package_ids
+        .into_iter()
+        .map(|id| vec!["e".into(), id])
+        .collect::<Vec<_>>();
+    deletion_tags.push(vec!["k".into(), KIND_MARMOT_KEY_PACKAGE.to_string()]);
+    let deletion = signed_deletion(&app, &accounts[0], deletion_tags, unix_now_seconds() + 10);
+    fetcher.events.lock().unwrap().push(deletion);
+
+    let status = app
+        .directory()
+        .refresh_follow_availability(&crate::directory_resources::directory_account(&owner))
+        .await
+        .unwrap();
+    assert_eq!(status.not_found, 1, "{status:?}");
+    let requests = fetcher.requests.lock().unwrap();
+    assert!(requests.len() <= 2, "{}", requests.len());
+    assert!(
+        requests.iter().all(|request| request.endpoints.len()
+            <= nostr_directory::MAX_FOLLOW_AVAILABILITY_RELAYS_PER_TARGET),
+        "recovery must not widen the per-target relay set"
+    );
+}

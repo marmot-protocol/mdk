@@ -347,6 +347,11 @@ mod tests {
                 apply: version_2,
             },
             Migration {
+                version: 3,
+                name: MIGRATIONS[2].name,
+                apply: version_3,
+            },
+            Migration {
                 version: 4,
                 name: "0004_test",
                 apply: |tx| {
@@ -359,7 +364,8 @@ mod tests {
                 },
             },
         ];
-        assert!(run(&mut conn, &migrations).is_err());
+        let error = run(&mut conn, &migrations).unwrap_err();
+        assert!(error.to_string().contains("injected failure"));
         assert!(!DirectoryCache::table_exists_locked(&conn, "rollback_probe").unwrap());
         let count: i64 = conn
             .query_row(

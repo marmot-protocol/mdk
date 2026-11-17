@@ -127,8 +127,8 @@ async fn availability_mixed_outcomes() {
             <= nostr_directory::MAX_FOLLOW_AVAILABILITY_RELAY_FETCHES
     );
     assert!(
-        fetcher.requests.lock().unwrap().len() <= 4 * 3,
-        "each mixed-outcome target needs at most relay-list, primary, and recovery reads"
+        fetcher.requests.lock().unwrap().len() <= 4 * 2,
+        "each target needs at most relay-list and primary KeyPackage reads"
     );
     assert!(
         fetcher
@@ -258,6 +258,117 @@ async fn availability_mixed_outcomes() {
         FollowAvailabilityState::Unknown,
         "a stale relay cannot resurrect the superseded package"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn availability_replacement_fence() {
+    let (_root, app, accounts, fetcher) = crate::tests::member_resolution_fixture(1, false).await;
+    let owner = app
+        .account_home()
+        .create_account("availability-owner")
+        .unwrap();
+    remember_follows(&app, &owner, vec![accounts[0].account_id_hex.clone()]);
+    app.directory()
+        .refresh_follow_availability(&directory_account(&owner))
+        .await
+        .unwrap();
+    assert_eq!(
+        availability_states(&app, &owner)[&accounts[0].account_id_hex],
+        FollowAvailabilityState::Ready
+    );
+
+    app.directory()
+        .reset_availability_for_test(&owner.account_id_hex);
+    let (entered, release) = fetcher.hold_fetches();
+    let task_app = app.clone();
+    let task_owner = owner.clone();
+    let refresh = tokio::spawn(async move {
+        task_app
+            .directory()
+            .refresh_follow_availability(&directory_account(&task_owner))
+            .await
+    });
+    entered.notified().await;
+
+    let replacement = {
+        let mut replacement = fetcher
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|event| {
+                event.kind == KIND_MARMOT_KEY_PACKAGE && event.pubkey == accounts[0].account_id_hex
+            })
+            .unwrap()
+            .clone();
+        replacement.id = "ff".repeat(32);
+        replacement.created_at = replacement.created_at.saturating_add(1);
+        replacement.content = "not-base64".into();
+        let signed = nostr_sdk::prelude::EventBuilder::new(
+            nostr_sdk::prelude::Kind::from(replacement.kind as u16),
+            replacement.content.clone(),
+        )
+        .tags(
+            replacement
+                .tags
+                .iter()
+                .map(|tag| nostr_sdk::prelude::Tag::parse(tag.clone()).unwrap()),
+        )
+        .custom_created_at(nostr_sdk::prelude::Timestamp::from_secs(
+            replacement.created_at,
+        ))
+        .finalize(
+            &app.account_home()
+                .load_signing_keys(&accounts[0].label)
+                .unwrap(),
+        )
+        .unwrap();
+        transport_nostr_peeler::NostrTransportEvent::from_nostr_event(&signed).unwrap()
+    };
+    assert!(
+        app.directory()
+            .ingest_directory_relay_event(transport_nostr::DirectoryRelayEventRecord {
+                endpoints: Vec::new(),
+                event: replacement,
+            })
+            .is_err()
+    );
+    release.notify_one();
+    let status = refresh.await.unwrap().unwrap();
+    assert_eq!(status.ready, 0, "{status:?}");
+    assert_eq!(
+        availability_states(&app, &owner)[&accounts[0].account_id_hex],
+        FollowAvailabilityState::Unknown,
+        "a refresh cannot overwrite a replacement received during its fetch"
+    );
+
+    let stale = fetcher
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|event| {
+            event.kind == KIND_MARMOT_KEY_PACKAGE && event.pubkey == accounts[0].account_id_hex
+        })
+        .unwrap()
+        .clone();
+    fetcher.events.lock().unwrap().extend(std::iter::repeat_n(
+        stale,
+        transport_nostr_adapter::RELAY_REPLAY_PAGE_LIMIT,
+    ));
+    for _ in 0..2 {
+        app.directory()
+            .reset_availability_for_test(&owner.account_id_hex);
+        app.directory()
+            .refresh_follow_availability(&directory_account(&owner))
+            .await
+            .unwrap();
+        assert_eq!(
+            availability_states(&app, &owner)[&accounts[0].account_id_hex],
+            FollowAvailabilityState::Unknown,
+            "an incomplete read must preserve the replacement barrier"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
