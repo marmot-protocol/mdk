@@ -66,6 +66,15 @@ pub struct PublicDirectoryProfileRecord {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PublicKeyPackageReplacementRecord {
+    pub account_id_hex: String,
+    pub key_package_id: String,
+    pub event_id_hex: String,
+    pub event_created_at: u64,
+    pub observed_at: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StoredRelayTelemetrySettings {
     pub export_enabled: bool,
     pub export_interval_seconds: u64,
@@ -211,6 +220,70 @@ impl SqliteSharedStorage {
         Ok(Self {
             conn: Arc::new(CloseableConnection::new(conn, CLOSED_DETAIL)),
         })
+    }
+
+    pub fn put_public_key_package_replacement(
+        &self,
+        record: &PublicKeyPackageReplacementRecord,
+    ) -> StorageResult<()> {
+        retry_on_busy(|| {
+            self.lock()?
+                .execute_cached(
+                    "INSERT INTO directory_key_package_replacements (
+                        account_id_hex, key_package_id, event_id_hex,
+                        event_created_at, observed_at
+                     )
+                     VALUES (?1, ?2, ?3, ?4, ?5)
+                     ON CONFLICT(account_id_hex, key_package_id) DO UPDATE SET
+                        event_id_hex = excluded.event_id_hex,
+                        event_created_at = excluded.event_created_at,
+                        observed_at = excluded.observed_at
+                     WHERE excluded.event_created_at >
+                           directory_key_package_replacements.event_created_at
+                        OR (excluded.event_created_at =
+                            directory_key_package_replacements.event_created_at
+                            AND excluded.event_id_hex <
+                                directory_key_package_replacements.event_id_hex)",
+                    params![
+                        &record.account_id_hex,
+                        &record.key_package_id,
+                        &record.event_id_hex,
+                        u64_to_i64(record.event_created_at)?,
+                        u64_to_i64(record.observed_at)?,
+                    ],
+                )
+                .storage()?;
+            Ok(())
+        })
+    }
+
+    pub fn public_key_package_replacements(
+        &self,
+        account_id_hex: &str,
+    ) -> StorageResult<Vec<PublicKeyPackageReplacementRecord>> {
+        let conn = self.lock()?;
+        let mut statement = conn
+            .prepare_cached(
+                "SELECT account_id_hex, key_package_id, event_id_hex,
+                        event_created_at, observed_at
+                 FROM directory_key_package_replacements
+                 WHERE account_id_hex = ?1
+                 ORDER BY key_package_id",
+            )
+            .storage()?;
+        statement
+            .query_map(params![account_id_hex], |row| {
+                Ok(PublicKeyPackageReplacementRecord {
+                    account_id_hex: row.get(0)?,
+                    key_package_id: row.get(1)?,
+                    event_id_hex: row.get(2)?,
+                    event_created_at: row.get::<_, i64>(3)?.try_into().unwrap_or(0),
+                    observed_at: row.get::<_, i64>(4)?.try_into().unwrap_or(0),
+                })
+            })
+            .storage()?
+            .map(|row| row.storage())
+            .collect()
     }
 
     pub fn put_public_directory_user(
@@ -1160,6 +1233,127 @@ mod tests {
     }
 
     #[test]
+    fn key_package_replacements_keep_nip01_winner_and_isolate_slots() {
+        let storage = SqliteSharedStorage::in_memory().unwrap();
+        let account_id_hex = "aa".repeat(32);
+        let mut winner = PublicKeyPackageReplacementRecord {
+            account_id_hex: account_id_hex.clone(),
+            key_package_id: "slot-b".into(),
+            event_id_hex: "bb".repeat(32),
+            event_created_at: 20,
+            observed_at: 2,
+        };
+        storage
+            .put_public_key_package_replacement(&PublicKeyPackageReplacementRecord {
+                event_id_hex: "dd".repeat(32),
+                event_created_at: 10,
+                observed_at: 1,
+                ..winner.clone()
+            })
+            .unwrap();
+        storage.put_public_key_package_replacement(&winner).unwrap();
+        for loser in [
+            PublicKeyPackageReplacementRecord {
+                event_id_hex: "00".repeat(32),
+                event_created_at: 19,
+                observed_at: 100,
+                ..winner.clone()
+            },
+            PublicKeyPackageReplacementRecord {
+                event_id_hex: "cc".repeat(32),
+                observed_at: 101,
+                ..winner.clone()
+            },
+        ] {
+            storage.put_public_key_package_replacement(&loser).unwrap();
+            assert_eq!(
+                storage
+                    .public_key_package_replacements(&account_id_hex)
+                    .unwrap(),
+                [winner.clone()]
+            );
+        }
+
+        winner.event_id_hex = "aa".repeat(32);
+        winner.observed_at = 0;
+        storage.put_public_key_package_replacement(&winner).unwrap();
+        storage
+            .put_public_key_package_replacement(&PublicKeyPackageReplacementRecord {
+                observed_at: 102,
+                ..winner.clone()
+            })
+            .unwrap();
+
+        let other_slot = PublicKeyPackageReplacementRecord {
+            key_package_id: "slot-a".into(),
+            event_id_hex: "ee".repeat(32),
+            event_created_at: 5,
+            observed_at: 4,
+            ..winner.clone()
+        };
+        let other_account = PublicKeyPackageReplacementRecord {
+            account_id_hex: "ff".repeat(32),
+            event_id_hex: "ff".repeat(32),
+            event_created_at: 1,
+            observed_at: 5,
+            ..winner.clone()
+        };
+        storage
+            .put_public_key_package_replacement(&other_account)
+            .unwrap();
+        storage
+            .put_public_key_package_replacement(&other_slot)
+            .unwrap();
+
+        assert_eq!(
+            storage
+                .public_key_package_replacements(&account_id_hex)
+                .unwrap(),
+            [other_slot, winner]
+        );
+        assert_eq!(
+            storage
+                .public_key_package_replacements(&other_account.account_id_hex)
+                .unwrap(),
+            [other_account]
+        );
+    }
+
+    #[test]
+    fn key_package_replacements_survive_reopen_without_package_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shared.sqlite3");
+        let storage = SqliteSharedStorage::open(&path).unwrap();
+        let record = PublicKeyPackageReplacementRecord {
+            account_id_hex: "aa".repeat(32),
+            key_package_id: "slot".into(),
+            event_id_hex: "bb".repeat(32),
+            event_created_at: 20,
+            observed_at: 30,
+        };
+        storage.put_public_key_package_replacement(&record).unwrap();
+        storage.close().unwrap();
+
+        let storage = SqliteSharedStorage::open(&path).unwrap();
+        assert_eq!(
+            storage
+                .public_key_package_replacements(&record.account_id_hex)
+                .unwrap(),
+            [record]
+        );
+        assert_eq!(
+            storage.table_columns("directory_key_package_replacements"),
+            [
+                "account_id_hex",
+                "key_package_id",
+                "event_id_hex",
+                "event_created_at",
+                "observed_at"
+            ]
+        );
+    }
+
+    #[test]
     fn relay_telemetry_settings_default_and_persist() {
         let storage = SqliteSharedStorage::in_memory().unwrap();
 
@@ -1258,7 +1452,7 @@ mod migration_contract_tests {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap();
-        assert_eq!(row, (4, "0004_audit_log_retention".into()));
+        assert_eq!(row, (5, "0005_key_package_replacements".into()));
     }
 
     #[test]

@@ -8,9 +8,6 @@ CREATE TABLE follow_availability (
     key_package_event_id TEXT,
     key_package_id TEXT,
     key_package_created_at INTEGER,
-    superseded_event_id TEXT,
-    superseded_at INTEGER,
-    superseded_last_resort INTEGER,
     source INTEGER NOT NULL CHECK (source IN (0, 1)),
     updated_at INTEGER NOT NULL,
     CHECK (

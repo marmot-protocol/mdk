@@ -122,6 +122,17 @@ impl<R: DirectoryResources> Directory<R> {
         &self,
         fetched: &FetchedKeyPackage,
     ) -> Result<(), DirectoryError> {
+        self.resources
+            .shared_storage()?
+            .put_public_key_package_replacement(
+                &storage_sqlite::PublicKeyPackageReplacementRecord {
+                    account_id_hex: fetched.account_id_hex.clone(),
+                    key_package_id: fetched.key_package_id.clone(),
+                    event_id_hex: fetched.key_package_event_id.clone(),
+                    event_created_at: fetched.created_at,
+                    observed_at: self.directory_freshness().now,
+                },
+            )?;
         self.update_directory_entry(&fetched.account_id_hex, |entry| {
             entry.relay_lists =
                 merge_relay_list_status(entry.relay_lists.clone(), fetched.relay_lists.clone());
@@ -306,37 +317,22 @@ impl<R: DirectoryResources> Directory<R> {
             }
             KIND_MARMOT_KEY_PACKAGE => {
                 let key_package_id = record.event.tag_value("d").unwrap_or_default();
-                let fetched = key_package_from_record(record.clone());
-                let last_resort = fetched.as_ref().ok().and_then(|fetched| {
-                    cgka_engine::key_package::key_package_metadata(&fetched.key_package)
-                        .ok()
-                        .map(|metadata| metadata.last_resort)
-                });
-                match fetched {
-                    Ok(mut fetched) => {
-                        fetched.relay_lists = self
-                            .cached_relay_list_status(&account_id_hex)
-                            .unwrap_or_else(|_| AccountRelayListStatus::empty());
-                        self.remember_directory_key_package(&fetched)?;
-                        self.invalidate_availability(
-                            &account_id_hex,
-                            key_package_id,
-                            &record.event.id,
-                            record.event.created_at,
-                            last_resort,
-                        )?;
-                    }
-                    Err(error) => {
-                        self.invalidate_availability(
-                            &account_id_hex,
-                            key_package_id,
-                            &record.event.id,
-                            record.event.created_at,
-                            None,
-                        )?;
-                        return Err(error);
-                    }
-                }
+                self.resources
+                    .shared_storage()?
+                    .put_public_key_package_replacement(
+                        &storage_sqlite::PublicKeyPackageReplacementRecord {
+                            account_id_hex: account_id_hex.clone(),
+                            key_package_id: key_package_id.to_owned(),
+                            event_id_hex: record.event.id.clone(),
+                            event_created_at: record.event.created_at,
+                            observed_at: self.directory_freshness().now,
+                        },
+                    )?;
+                let mut fetched = key_package_from_record(record)?;
+                fetched.relay_lists = self
+                    .cached_relay_list_status(&account_id_hex)
+                    .unwrap_or_else(|_| AccountRelayListStatus::empty());
+                self.remember_directory_key_package(&fetched)?;
             }
             _ => {}
         }

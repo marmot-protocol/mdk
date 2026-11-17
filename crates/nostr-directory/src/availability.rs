@@ -1,8 +1,9 @@
 //! Bounded, account-local Marmot availability for direct follows.
 //!
 //! The cache belongs to the selected local account, so these rows never enter
-//! the shared public directory tier. Only publication metadata is persisted;
-//! KeyPackage bytes stay in the existing directory record.
+//! The cache belongs to the selected local account, so follow rows never enter
+//! the shared public directory tier. That tier stores only per-slot replacement
+//! metadata; KeyPackage bytes stay in the existing directory record.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -11,8 +12,8 @@ use std::time::{Duration, Instant};
 use cgka_engine::key_package::key_package_metadata;
 use cgka_traits::TransportEndpoint;
 use futures::StreamExt;
-use rusqlite::{OptionalExtension, params};
-use storage_sqlite::SqliteSharedStorage;
+use rusqlite::params;
+use storage_sqlite::{PublicKeyPackageReplacementRecord, SqliteSharedStorage};
 use tokio::sync::watch;
 
 use super::cache::DirectoryCache;
@@ -113,14 +114,6 @@ pub(crate) struct FollowAvailabilityRefreshes {
 type SharedRefreshes = Arc<Mutex<FollowAvailabilityRefreshes>>;
 
 #[derive(Clone, Default)]
-struct Supersession {
-    key_package_id: String,
-    event_id: String,
-    created_at: u64,
-    last_resort: Option<bool>,
-}
-
-#[derive(Clone, Default)]
 struct AvailabilityWrite {
     state: FollowAvailabilityState,
     checked_at: u64,
@@ -130,25 +123,19 @@ struct AvailabilityWrite {
     key_package_created_at: Option<u64>,
     source: FollowAvailabilitySource,
     failed: bool,
-    superseded: Option<Supersession>,
 }
 
 impl AvailabilityWrite {
     fn unknown(checked_at: u64) -> Self {
-        Self::unknown_with(checked_at, None)
-    }
-
-    fn unknown_with(checked_at: u64, superseded: Option<Supersession>) -> Self {
         Self {
             state: FollowAvailabilityState::Unknown,
             checked_at,
             fresh_until: None,
             key_package_event_id: None,
-            key_package_id: superseded.as_ref().map(|s| s.key_package_id.clone()),
+            key_package_id: None,
             key_package_created_at: None,
             source: FollowAvailabilitySource::None,
             failed: true,
-            superseded,
         }
     }
 }
@@ -192,9 +179,9 @@ impl DirectoryCache {
             "INSERT INTO follow_availability (
                  follow_account_id_hex, state, checked_at, fresh_until,
                  key_package_event_id, key_package_id, key_package_created_at,
-                 superseded_event_id, superseded_at, superseded_last_resort, source, updated_at
+                 source, updated_at
              )
-             SELECT ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?4
+             SELECT ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?4
              WHERE EXISTS (
                  SELECT 1 FROM directory_user_follows
                  WHERE account_id_hex = ?1 AND follow_account_id_hex = ?2
@@ -206,29 +193,8 @@ impl DirectoryCache {
                  key_package_event_id = excluded.key_package_event_id,
                  key_package_id = excluded.key_package_id,
                  key_package_created_at = excluded.key_package_created_at,
-                 superseded_event_id = excluded.superseded_event_id,
-                 superseded_at = excluded.superseded_at,
-                 superseded_last_resort = excluded.superseded_last_resort,
                  source = excluded.source,
-                 updated_at = excluded.updated_at
-             WHERE follow_availability.superseded_event_id IS excluded.superseded_event_id
-                OR (
-                    excluded.state = 'ready'
-                    AND (
-                        follow_availability.key_package_id IS NOT excluded.key_package_id
-                        OR follow_availability.superseded_last_resort = 1
-                        OR follow_availability.superseded_event_id = excluded.key_package_event_id
-                        OR follow_availability.superseded_at < excluded.key_package_created_at
-                        OR (
-                            follow_availability.superseded_at = excluded.key_package_created_at
-                            AND follow_availability.superseded_event_id > excluded.key_package_event_id
-                        )
-                    )
-                )
-                OR (
-                    excluded.state = 'not_found'
-                    AND follow_availability.superseded_at <= excluded.checked_at
-                )",
+                 updated_at = excluded.updated_at",
             params![
                 account_id_hex,
                 follow_account_id_hex,
@@ -240,38 +206,11 @@ impl DirectoryCache {
                 value
                     .key_package_created_at
                     .map(|timestamp| timestamp as i64),
-                value.superseded.as_ref().map(|s| s.event_id.clone()),
-                value.superseded.as_ref().map(|s| s.created_at as i64),
-                value.superseded.as_ref().and_then(|s| s.last_resort),
                 availability_source_token(value.source),
             ],
         )?;
         Ok(changed != 0)
     }
-
-    fn supersession(
-        &self,
-        follow_account_id_hex: &str,
-    ) -> Result<Option<Supersession>, DirectoryError> {
-        self.lock()?
-            .query_row(
-                "SELECT key_package_id, superseded_event_id, superseded_at, superseded_last_resort
-                 FROM follow_availability
-                 WHERE follow_account_id_hex = ?1 AND superseded_event_id IS NOT NULL",
-                [follow_account_id_hex],
-                |row| {
-                    Ok(Supersession {
-                        key_package_id: row.get(0)?,
-                        event_id: row.get(1)?,
-                        created_at: row.get::<_, i64>(2)? as u64,
-                        last_resort: row.get::<_, Option<i64>>(3)?.map(|value| value != 0),
-                    })
-                },
-            )
-            .optional()
-            .map_err(DirectoryError::from)
-    }
-
     #[cfg(test)]
     fn follow_availability_page(
         &self,
@@ -334,6 +273,7 @@ impl DirectoryCache {
                         created_at: row.get(10)?,
                     },
                     shared: None,
+                    replacements: Vec::new(),
                 })
             },
         )?;
@@ -345,69 +285,26 @@ impl DirectoryCache {
             .flatten();
         if let Some(shared) = shared {
             for row in &mut stored {
-                if row.state.as_deref() != Some("ready") {
+                if !matches!(row.state.as_deref(), Some("ready" | "not_found")) {
                     continue;
                 }
-                let Some(record) = shared.public_directory_user(&row.account_id_hex)? else {
-                    continue;
-                };
-                let Some(json) = record.key_package_json else {
-                    continue;
-                };
-                let package: DirectoryKeyPackage = serde_json::from_str(&json)?;
-                if package.key_package_event_id.is_empty() {
-                    continue;
+                row.replacements = shared.public_key_package_replacements(&row.account_id_hex)?;
+                if let Some(record) = shared.public_directory_user(&row.account_id_hex)?
+                    && let Some(json) = record.key_package_json
+                {
+                    let package: DirectoryKeyPackage = serde_json::from_str(&json)?;
+                    if !package.key_package_event_id.is_empty() {
+                        row.shared = Some(Publication {
+                            event_id: Some(package.key_package_event_id),
+                            key_package_id: Some(package.key_package_id),
+                            created_at: Some(package.created_at as i64),
+                        });
+                    }
                 }
-                row.shared = Some(Publication {
-                    event_id: Some(package.key_package_event_id),
-                    key_package_id: Some(package.key_package_id),
-                    created_at: Some(package.created_at as i64),
-                });
             }
         }
         let rows = stored.into_iter().map(|row| row.project(now)).collect();
         Ok(FollowAvailabilityPage { rows, next_cursor })
-    }
-
-    fn invalidate_follow(
-        &self,
-        follow_account_id_hex: &str,
-        key_package_id: &str,
-        event_id: &str,
-        created_at: u64,
-        now: u64,
-        last_resort: Option<bool>,
-    ) -> Result<(), DirectoryError> {
-        self.lock()?.execute(
-            "UPDATE follow_availability
-             SET state = 'unknown', checked_at = ?4, fresh_until = NULL,
-                 key_package_event_id = NULL, key_package_id = ?6,
-                 superseded_event_id = ?2,
-                 superseded_at = ?3, superseded_last_resort = ?5,
-                 source = 0, updated_at = ?4
-             WHERE follow_account_id_hex = ?1
-               AND (key_package_id IS NULL OR key_package_id = ?6)
-               AND (key_package_event_id IS NULL OR key_package_event_id != ?2)
-               AND (
-                   superseded_at IS NULL
-                   OR superseded_at < ?3
-                   OR (superseded_at = ?3 AND superseded_event_id > ?2)
-               )
-               AND EXISTS (
-                   SELECT 1 FROM directory_users
-                   WHERE account_id_hex = ?1
-                     AND COALESCE(json_extract(key_package_json, '$.created_at'), 0) <= ?3
-               )",
-            params![
-                follow_account_id_hex,
-                event_id,
-                created_at as i64,
-                now as i64,
-                last_resort,
-                key_package_id,
-            ],
-        )?;
-        Ok(())
     }
 }
 
@@ -429,6 +326,7 @@ struct StoredAvailability {
     source: Option<i64>,
     current: Publication,
     shared: Option<Publication>,
+    replacements: Vec<PublicKeyPackageReplacementRecord>,
 }
 
 impl StoredAvailability {
@@ -453,21 +351,50 @@ impl StoredAvailability {
         };
         let current_publication_allows = publication_allows(&self.current)
             && self.shared.as_ref().is_none_or(publication_allows);
+        let replacement_allows = self
+            .replacements
+            .iter()
+            .filter(|replacement| Some(&replacement.key_package_id) == self.key_package_id.as_ref())
+            .all(|replacement| {
+                let Some(event_id) = self.key_package_event_id.as_ref() else {
+                    return false;
+                };
+                let Some(created_at) = self
+                    .key_package_created_at
+                    .and_then(|value| u64::try_from(value).ok())
+                else {
+                    return false;
+                };
+                replacement_allows(event_id, created_at, replacement)
+            });
+        let shared_before_check = self.shared.as_ref().is_none_or(|current| {
+            current
+                .created_at
+                .and_then(|value| u64::try_from(value).ok())
+                <= checked_at
+        });
+        let replacements_before_check = checked_at.is_some_and(|checked_at| {
+            self.replacements
+                .iter()
+                .all(|replacement| replacement.observed_at < checked_at)
+        });
+        let negative_is_current = self
+            .current
+            .created_at
+            .and_then(|value| u64::try_from(value).ok())
+            <= checked_at
+            && shared_before_check
+            && replacements_before_check;
         let state = match self.state.as_deref() {
             Some("ready")
                 if fresh_until.is_some_and(|expiry| expiry > now)
                     && self.key_package_event_id.is_some()
-                    && current_publication_allows =>
+                    && current_publication_allows
+                    && replacement_allows =>
             {
                 FollowAvailabilityState::Ready
             }
-            Some("not_found")
-                if self
-                    .current
-                    .created_at
-                    .and_then(|value| u64::try_from(value).ok())
-                    < checked_at =>
-            {
+            Some("not_found") if negative_is_current => {
                 if fresh_until.is_some_and(|expiry| expiry > now) {
                     FollowAvailabilityState::NotFound
                 } else {
@@ -612,39 +539,6 @@ impl<R: DirectoryResources> Directory<R> {
         entry.cancel.send_replace(true);
         true
     }
-
-    pub(crate) fn invalidate_availability(
-        &self,
-        account_id_hex: &str,
-        key_package_id: &str,
-        event_id: &str,
-        created_at: u64,
-        last_resort: Option<bool>,
-    ) -> Result<(), DirectoryError> {
-        let now = self.directory_freshness().now;
-        for cache in self.resources.current_caches()? {
-            cache.invalidate_follow(
-                account_id_hex,
-                key_package_id,
-                event_id,
-                created_at,
-                now,
-                last_resort,
-            )?;
-        }
-        Ok(())
-    }
-
-    fn availability_supersession(
-        &self,
-        account: &DirectoryAccount,
-        follow_account_id_hex: &str,
-    ) -> Result<Option<Supersession>, DirectoryError> {
-        self.resources
-            .cache_for_account(account)?
-            .supersession(follow_account_id_hex)
-    }
-
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn reset_availability_cadence(&self, account_id_hex: &str) {
         if let Some(entry) = self
@@ -791,10 +685,9 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                 if leader.is_cancelled() {
                     return Ok(());
                 }
-                let superseded = directory.availability_supersession(&account, &follow)?;
                 let lookup = tokio::time::timeout(
                     FOLLOW_AVAILABILITY_TARGET_TIMEOUT,
-                    directory.lookup_follow_availability(&follow, superseded.clone()),
+                    directory.lookup_follow_availability(&follow),
                 );
                 tokio::pin!(lookup);
                 let value = tokio::select! {
@@ -803,10 +696,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                         Ok(Ok(value)) => value,
                         Ok(Err(error)) if error_is_host_failure(&error) => return Err(error),
                         Ok(Err(_)) | Err(_) => {
-                            AvailabilityWrite::unknown_with(
-                                directory.directory_freshness().now,
-                                superseded.clone(),
-                            )
+                            AvailabilityWrite::unknown(directory.directory_freshness().now)
                         }
                     },
                 };
@@ -881,34 +771,21 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
     async fn lookup_follow_availability(
         &self,
         account_id_hex: &str,
-        superseded: Option<Supersession>,
     ) -> Result<AvailabilityWrite, DirectoryError> {
         let now = self.directory_freshness().now;
-        let result = self
-            .lookup_availability_inner(account_id_hex, superseded.clone())
-            .await;
+        let result = self.lookup_availability_inner(account_id_hex).await;
         match result {
-            Ok(mut value) => {
-                if value.state == FollowAvailabilityState::Unknown {
-                    if let Some(superseded) = &superseded {
-                        value.key_package_id = Some(superseded.key_package_id.clone());
-                    }
-                    value.superseded = superseded;
-                } else {
-                    value.superseded = None;
-                }
-                Ok(value)
-            }
+            Ok(value) => self.apply_shared_replacements(account_id_hex, value).await,
             Err(error) if error_is_host_failure(&error) => Err(error),
-            Err(_) => Ok(AvailabilityWrite::unknown_with(now, superseded)),
+            Err(_) => Ok(AvailabilityWrite::unknown(now)),
         }
     }
 
     async fn lookup_availability_inner(
         &self,
         account_id_hex: &str,
-        superseded: Option<Supersession>,
     ) -> Result<AvailabilityWrite, DirectoryError> {
+        let read_started_at = self.directory_freshness().now;
         let directory = self.clone();
         let account = account_id_hex.to_owned();
 
@@ -994,14 +871,6 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                     .into_iter()
                     .next()
                     .expect("selected package");
-                if let Some(superseded) = &superseded
-                    && !superseded_allows(&fetched, superseded)
-                {
-                    return Ok(AvailabilityWrite::unknown_with(
-                        checked_at,
-                        Some(superseded.clone()),
-                    ));
-                }
                 self.remember_availability(fetched, checked_at).await
             }
             Ok(selection) if complete_negative && !selection.rejected_future => {
@@ -1009,16 +878,16 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                 match error {
                     Err(DirectoryError::MissingKeyPackage { .. }) => Ok(AvailabilityWrite {
                         state: FollowAvailabilityState::NotFound,
-                        checked_at,
+                        checked_at: read_started_at,
                         fresh_until: Some(
-                            checked_at.saturating_add(FOLLOW_AVAILABILITY_NEGATIVE_TTL.as_secs()),
+                            read_started_at
+                                .saturating_add(FOLLOW_AVAILABILITY_NEGATIVE_TTL.as_secs()),
                         ),
                         key_package_event_id: None,
                         key_package_id: None,
                         key_package_created_at: None,
                         source: FollowAvailabilitySource::Network,
                         failed: false,
-                        superseded: None,
                     }),
                     Err(error) => Err(error),
                     Ok(_) => unreachable!("empty selection reports a missing KeyPackage"),
@@ -1030,18 +899,59 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                 ..
             }) if complete_negative => Ok(AvailabilityWrite {
                 state: FollowAvailabilityState::NotFound,
-                checked_at,
+                checked_at: read_started_at,
                 fresh_until: Some(
-                    checked_at.saturating_add(FOLLOW_AVAILABILITY_NEGATIVE_TTL.as_secs()),
+                    read_started_at.saturating_add(FOLLOW_AVAILABILITY_NEGATIVE_TTL.as_secs()),
                 ),
                 key_package_event_id: None,
                 key_package_id: None,
                 key_package_created_at: None,
                 source: FollowAvailabilitySource::Network,
                 failed: false,
-                superseded: None,
             }),
             Err(_) => Ok(AvailabilityWrite::unknown(checked_at)),
+        }
+    }
+
+    async fn apply_shared_replacements(
+        &self,
+        account_id_hex: &str,
+        value: AvailabilityWrite,
+    ) -> Result<AvailabilityWrite, DirectoryError> {
+        if value.state == FollowAvailabilityState::Unknown {
+            return Ok(value);
+        }
+        let directory = self.clone();
+        let account = account_id_hex.to_owned();
+        let replacements = blocking_directory_task(move || {
+            Ok(directory
+                .resources
+                .shared_storage()?
+                .public_key_package_replacements(&account)?)
+        })
+        .await?;
+        let current = match value.state {
+            FollowAvailabilityState::Ready => value
+                .key_package_event_id
+                .as_deref()
+                .zip(value.key_package_created_at)
+                .is_some_and(|(event_id, created_at)| {
+                    replacements
+                        .iter()
+                        .filter(|replacement| {
+                            Some(&replacement.key_package_id) == value.key_package_id.as_ref()
+                        })
+                        .all(|replacement| replacement_allows(event_id, created_at, replacement))
+                }),
+            FollowAvailabilityState::NotFound => replacements
+                .iter()
+                .all(|replacement| replacement.observed_at < value.checked_at),
+            FollowAvailabilityState::Unknown => true,
+        };
+        if current {
+            Ok(value)
+        } else {
+            Ok(AvailabilityWrite::unknown(self.directory_freshness().now))
         }
     }
 
@@ -1068,7 +978,6 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
             key_package_created_at: Some(fetched.created_at),
             source: FollowAvailabilitySource::Network,
             failed: false,
-            superseded: None,
         })
     }
 }
@@ -1085,15 +994,15 @@ fn error_is_host_failure(error: &DirectoryError) -> bool {
     )
 }
 
-fn superseded_allows(fetched: &FetchedKeyPackage, superseded: &Supersession) -> bool {
-    if fetched.key_package_id != superseded.key_package_id {
-        return true;
-    }
-    superseded.last_resort == Some(true)
-        || fetched.key_package_event_id == superseded.event_id
-        || fetched.created_at > superseded.created_at
-        || (fetched.created_at == superseded.created_at
-            && fetched.key_package_event_id < superseded.event_id)
+fn replacement_allows(
+    event_id: &str,
+    created_at: u64,
+    replacement: &PublicKeyPackageReplacementRecord,
+) -> bool {
+    event_id == replacement.event_id_hex
+        || created_at > replacement.event_created_at
+        || (created_at == replacement.event_created_at
+            && event_id < replacement.event_id_hex.as_str())
 }
 
 #[cfg(test)]
@@ -1151,7 +1060,6 @@ mod tests {
             key_package_created_at: Some(900),
             source: FollowAvailabilitySource::Network,
             failed: false,
-            superseded: None,
         }
     }
 
@@ -1196,7 +1104,6 @@ mod tests {
                         key_package_created_at: None,
                         source: FollowAvailabilitySource::Network,
                         failed: false,
-                        superseded: None,
                     },
                 )
                 .unwrap()
@@ -1234,26 +1141,6 @@ mod tests {
         assert_eq!(reopened.rows[1].state, FollowAvailabilityState::NotFound);
 
         insert_package(&cache, &ready_id, &"bb".repeat(32), 1_100);
-        cache
-            .invalidate_follow(
-                &ready_id,
-                "slot",
-                &"bb".repeat(32),
-                1_100,
-                1_200,
-                Some(false),
-            )
-            .unwrap();
-        assert_eq!(
-            cache
-                .follow_availability_page(&owner, None, 1, 1_200)
-                .unwrap()
-                .rows[0]
-                .state,
-            FollowAvailabilityState::Unknown,
-            "a cached replacement invalidates the previous ready row"
-        );
-        insert_package(&cache, &ready_id, &event_id, 900);
         let expiring_id = account_id(5);
         insert_follow(&cache, &owner, &expiring_id, 3);
         insert_package(&cache, &expiring_id, &"dd".repeat(32), 900);
@@ -1334,195 +1221,6 @@ mod tests {
             )
             .unwrap();
         assert_eq!(orphaned, 0);
-    }
-
-    #[test]
-    fn availability_commit_guards() {
-        let root = tempfile::tempdir().unwrap();
-        let cache = DirectoryCache::open(
-            root.path().join("directory.sqlite3"),
-            &SqlCipherKey::raw([0x54; 32]),
-        )
-        .unwrap();
-        let owner = account_id(1);
-        let follow = account_id(2);
-        let other = account_id(3);
-        insert_follow(&cache, &owner, &follow, 0);
-        insert_follow(&cache, &owner, &other, 1);
-        insert_package(&cache, &follow, &"aa".repeat(32), 900);
-        insert_package(&cache, &other, &"aa".repeat(32), 900);
-        let selected = ready(1_000, 2_000, "aa".repeat(32));
-        assert!(
-            cache
-                .record_follow_availability(&owner, &follow, &selected)
-                .unwrap()
-        );
-
-        cache
-            .invalidate_follow(&follow, "slot", &"cc".repeat(32), 1_200, 1_300, Some(false))
-            .unwrap();
-        cache
-            .invalidate_follow(&follow, "slot", &"bb".repeat(32), 1_100, 1_300, Some(false))
-            .unwrap();
-        let barrier = cache.supersession(&follow).unwrap().unwrap();
-        assert_eq!(barrier.event_id, "cc".repeat(32));
-        assert!(
-            !cache
-                .record_follow_availability(&owner, &follow, &selected)
-                .unwrap(),
-            "a stale refresh cannot overwrite a newer replacement"
-        );
-        let unknown = AvailabilityWrite::unknown_with(1_400, Some(barrier.clone()));
-        assert!(
-            cache
-                .record_follow_availability(&owner, &follow, &unknown)
-                .unwrap()
-        );
-        assert_eq!(
-            cache.supersession(&follow).unwrap().unwrap().event_id,
-            barrier.event_id
-        );
-
-        insert_package(&cache, &follow, &"cc".repeat(32), 1_200);
-        let replacement = AvailabilityWrite {
-            key_package_event_id: Some("cc".repeat(32)),
-            key_package_created_at: Some(1_200),
-            ..selected.clone()
-        };
-        assert!(
-            cache
-                .record_follow_availability(&owner, &follow, &replacement)
-                .unwrap(),
-            "the valid replacement can clear its own barrier"
-        );
-        assert_eq!(
-            cache
-                .follow_availability_page(&owner, None, 1, 1_500)
-                .unwrap()
-                .rows[0]
-                .state,
-            FollowAvailabilityState::Ready
-        );
-
-        assert!(
-            cache
-                .record_follow_availability(&owner, &other, &selected)
-                .unwrap()
-        );
-        insert_package(&cache, &other, &"bb".repeat(32), 1_000);
-        assert_eq!(
-            cache
-                .follow_availability_page(&owner, None, 100, 1_500)
-                .unwrap()
-                .rows[1]
-                .state,
-            FollowAvailabilityState::Unknown,
-            "a cached newer publication in the same slot suppresses ready"
-        );
-        cache
-            .lock()
-            .unwrap()
-            .execute(
-                "UPDATE directory_users
-                 SET key_package_json = json_set(key_package_json, '$.key_package_id', 'other')
-                 WHERE account_id_hex = ?1",
-                [other],
-            )
-            .unwrap();
-        assert_eq!(
-            cache
-                .follow_availability_page(&owner, None, 100, 1_500)
-                .unwrap()
-                .rows[1]
-                .state,
-            FollowAvailabilityState::Ready,
-            "a publication in another slot does not suppress ready"
-        );
-    }
-
-    #[test]
-    fn availability_barrier_is_slot_scoped() {
-        let root = tempfile::tempdir().unwrap();
-        let cache = DirectoryCache::open(
-            root.path().join("directory.sqlite3"),
-            &SqlCipherKey::raw([0x55; 32]),
-        )
-        .unwrap();
-        let owner = account_id(1);
-        let follow = account_id(2);
-        insert_follow(&cache, &owner, &follow, 0);
-        insert_package(&cache, &follow, &"aa".repeat(32), 900);
-        let selected = ready(1_000, 2_000, "aa".repeat(32));
-        assert!(
-            cache
-                .record_follow_availability(&owner, &follow, &selected)
-                .unwrap()
-        );
-        cache
-            .invalidate_follow(&follow, "slot", &"bb".repeat(32), 1_200, 1_300, Some(false))
-            .unwrap();
-        cache
-            .lock()
-            .unwrap()
-            .execute(
-                "UPDATE directory_users
-                 SET key_package_json = json_set(
-                     key_package_json,
-                     '$.key_package_id', 'other',
-                     '$.key_package_event_id', ?2
-                 )
-                 WHERE account_id_hex = ?1",
-                params![follow, "cc".repeat(32)],
-            )
-            .unwrap();
-        let other_slot = AvailabilityWrite {
-            key_package_event_id: Some("cc".repeat(32)),
-            key_package_id: Some("other".into()),
-            ..selected
-        };
-        assert!(
-            cache
-                .record_follow_availability(&owner, &follow, &other_slot)
-                .unwrap(),
-            "a barrier in one slot must not block another slot"
-        );
-        assert_eq!(
-            cache
-                .follow_availability_page(&owner, None, 1, 1_500)
-                .unwrap()
-                .rows[0]
-                .state,
-            FollowAvailabilityState::Ready
-        );
-
-        cache
-            .invalidate_follow(
-                &follow,
-                "other",
-                &"bb".repeat(32),
-                1_200,
-                1_300,
-                Some(false),
-            )
-            .unwrap();
-        let not_found = AvailabilityWrite {
-            state: FollowAvailabilityState::NotFound,
-            checked_at: 1_300,
-            fresh_until: Some(2_000),
-            key_package_event_id: None,
-            key_package_id: None,
-            key_package_created_at: None,
-            source: FollowAvailabilitySource::Network,
-            failed: false,
-            superseded: None,
-        };
-        assert!(
-            cache
-                .record_follow_availability(&owner, &follow, &not_found)
-                .unwrap(),
-            "a complete clean miss clears the replacement barrier"
-        );
-        assert!(cache.supersession(&follow).unwrap().is_none());
     }
 
     #[test]

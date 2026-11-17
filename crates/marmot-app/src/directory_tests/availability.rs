@@ -613,6 +613,7 @@ async fn availability_shared_replacement() {
     let mut record = shared.public_directory_user(&followed).unwrap().unwrap();
     let mut package: nostr_directory::DirectoryKeyPackage =
         serde_json::from_str(record.key_package_json.as_deref().unwrap()).unwrap();
+    let selected_slot = package.key_package_id.clone();
     package.created_at += 1;
     package.key_package_event_id = "ff".repeat(32);
     record.key_package_json = Some(serde_json::to_string(&package).unwrap());
@@ -632,6 +633,38 @@ async fn availability_shared_replacement() {
         availability_states(&app, &owner)[&followed],
         FollowAvailabilityState::Ready,
         "a shared publication in another slot does not suppress ready"
+    );
+
+    shared
+        .put_public_key_package_replacement(&storage_sqlite::PublicKeyPackageReplacementRecord {
+            account_id_hex: followed.clone(),
+            key_package_id: "unrelated-slot".into(),
+            event_id_hex: "ee".repeat(32),
+            event_created_at: package.created_at + 100,
+            observed_at: package.created_at + 100,
+        })
+        .unwrap();
+    app.drop_account_caches(&owner.label);
+    assert_eq!(
+        availability_states(&app, &owner)[&followed],
+        FollowAvailabilityState::Ready,
+        "a replacement in another slot does not suppress ready"
+    );
+
+    shared
+        .put_public_key_package_replacement(&storage_sqlite::PublicKeyPackageReplacementRecord {
+            account_id_hex: followed.clone(),
+            key_package_id: selected_slot,
+            event_id_hex: "dd".repeat(32),
+            event_created_at: package.created_at + 100,
+            observed_at: package.created_at + 100,
+        })
+        .unwrap();
+    app.drop_account_caches(&owner.label);
+    assert_eq!(
+        availability_states(&app, &owner)[&followed],
+        FollowAvailabilityState::Unknown,
+        "journal-only malformed replacements survive cache eviction"
     );
 }
 

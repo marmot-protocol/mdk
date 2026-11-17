@@ -1538,4 +1538,62 @@ async fn availability_recovery_stays_bounded() {
             <= nostr_directory::MAX_FOLLOW_AVAILABILITY_RELAYS_PER_TARGET),
         "recovery must not widen the per-target relay set"
     );
+    drop(requests);
+
+    let page = app
+        .directory()
+        .follow_availability_page(
+            &crate::directory_resources::directory_account(&owner),
+            None,
+            100,
+        )
+        .unwrap();
+    assert_eq!(
+        page.rows[0].state,
+        nostr_directory::FollowAvailabilityState::NotFound
+    );
+    let checked_at = page.rows[0].checked_at.unwrap();
+    let shared = app.shared_storage().unwrap();
+    let mut replacement = storage_sqlite::PublicKeyPackageReplacementRecord {
+        account_id_hex: accounts[0].account_id_hex.clone(),
+        key_package_id: "device".into(),
+        event_id_hex: "ee".repeat(32),
+        event_created_at: 0,
+        observed_at: checked_at + 1,
+    };
+    shared
+        .put_public_key_package_replacement(&replacement)
+        .unwrap();
+    assert_eq!(
+        app.directory()
+            .follow_availability_page(
+                &crate::directory_resources::directory_account(&owner),
+                None,
+                100,
+            )
+            .unwrap()
+            .rows[0]
+            .state,
+        nostr_directory::FollowAvailabilityState::Unknown,
+        "a replacement observed after the read started invalidates the negative"
+    );
+
+    replacement.event_created_at = 1;
+    replacement.observed_at = checked_at - 1;
+    shared
+        .put_public_key_package_replacement(&replacement)
+        .unwrap();
+    assert_eq!(
+        app.directory()
+            .follow_availability_page(
+                &crate::directory_resources::directory_account(&owner),
+                None,
+                100,
+            )
+            .unwrap()
+            .rows[0]
+            .state,
+        nostr_directory::FollowAvailabilityState::NotFound,
+        "a replacement observed before the read started preserves the negative"
+    );
 }

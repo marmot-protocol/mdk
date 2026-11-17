@@ -15,7 +15,7 @@ MDK that host is [`marmot-app`](../marmot-app), which re-exports the directory's
   database keeps.
 - **Direct-follow availability.** A selected account's cached kind:3 follows projected as `ready`, `unknown`, or a
   temporary `not_found`, with publication and freshness metadata but no KeyPackage bytes. Refresh is bounded and
-  cancellable; paged reads use only that account's encrypted cache.
+  cancellable; paged reads use that account's encrypted cache plus shared per-slot replacement metadata.
 - **Member KeyPackage resolution.** Resolving a whole roster before a group create or invite: canonical ids, relay
   discovery, and every valid, fresh KeyPackage of each account (one per device, at most 20), skipping those the
   account asked to delete, with bounded recovery when the first relays don't answer.
@@ -47,6 +47,8 @@ a five-minute overall deadline. Each target uses at most two relay fetch calls: 
 NIP-65 route is cached, then a KeyPackage/deletion read. A completed clean or obsolete miss stays `not_found` for 15
 minutes. Incomplete or malformed reads stay `unknown`. Results commit per target, repeated calls share an active
 refresh, and completed refreshes have a 60-second cadence. `follow_availability_page` returns up to 100 rows in
+account-id keyset order, hides unfollows, and downgrades expired or replaced positives to `unknown`. Negatives are
+dated from the start of their read, so a replacement observed during that read downgrades them to `unknown`.
 account-id keyset order, hides unfollows, and downgrades expired or replaced positives to `unknown`.
 
 The crate's API is what its root re-exports, plus the `config` and `error` modules. The `test-support` feature adds
