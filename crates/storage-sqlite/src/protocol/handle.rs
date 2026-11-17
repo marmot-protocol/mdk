@@ -84,6 +84,14 @@ impl SqliteAccountStorage {
         (self.migrations_applied, self.migration_duration)
     }
 
+    /// Whether this database was created empty by a build that records it,
+    /// whichever open created it. False for a database first migrated by an
+    /// older build, even one that is still empty: nothing then says it holds
+    /// no state from before.
+    pub fn was_created_empty(&self) -> StorageResult<bool> {
+        crate::base::migrations::created_empty(&*self.lock()?)
+    }
+
     /// Export one group's convergence/OpenMLS state, including any durable
     /// convergence pass, for a sensitive test-only replay capsule.
     #[cfg(feature = "test-conformance-replay")]

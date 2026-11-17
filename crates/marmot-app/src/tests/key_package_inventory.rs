@@ -15,10 +15,10 @@ use super::{
     MemberResolutionDirectoryFetcher, ScriptedPushRelayClient, fresh_key_package_for_account,
     key_package_cache_exists, write_key_package_cache,
 };
-use crate::runtime::{AccountSetupRequest, SignOutOptions};
+use crate::runtime::{AccountSetupReadiness, AccountSetupRequest, SignOutOptions};
 use crate::{
-    AccountKeyPackageLocalState, KeyPackageDeletionTarget, MarmotApp, MarmotAppRuntime,
-    MarmotRelayPlane,
+    AccountKeyPackageLocalState, KeyPackageDeletionTarget, MarmotApp, MarmotAppConfig,
+    MarmotAppRuntime, MarmotRelayPlane,
 };
 
 const DIRECTORY: &str = "wss://directory.example";
@@ -759,6 +759,66 @@ async fn local_inventory_reports_current_then_retained_after_rotation() {
     assert!(retained.record.key_package_event_id.is_empty());
     assert_eq!(key_package_fetches(&fetcher), 0);
     runtime.shutdown().await;
+}
+
+/// A host that reads a new account's local inventory before anything opens its
+/// session creates the account's database with that read. The account stays a
+/// new one: setup asks for no recovery and rotation publishes a KeyPackage in a
+/// freshly minted slot, with device groups off or on (mdk#3486).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inventory_read_before_the_first_session_leaves_rotation_working() {
+    for device_groups in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let home = AccountHome::open(directory.path());
+        let account = home.create_account("alice").unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let app = MarmotApp::with_relays_and_account_home_and_config(
+            directory.path(),
+            vec![DIRECTORY.into()],
+            home,
+            MarmotAppConfig::white_noise().with_device_groups(device_groups),
+        )
+        .with_test_relay_client(relay.clone());
+        let runtime = MarmotAppRuntime::new(app.clone());
+
+        assert!(
+            runtime
+                .local_account_key_packages(&account.label)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(app.account_storage_path(&account.label).exists());
+        assert_eq!(
+            runtime.account_setup_readiness(&account.label).unwrap(),
+            AccountSetupReadiness::NetworkReady,
+            "device groups {device_groups}"
+        );
+
+        let rotated = runtime
+            .rotate_key_package(&account.label)
+            .await
+            .unwrap_or_else(|error| panic!("device groups {device_groups}: {error}"));
+        let published = published_key_package_events(&relay);
+        assert!(!published.is_empty(), "device groups {device_groups}");
+        let slot = runtime
+            .key_package_maintenance_status(&account.label)
+            .await
+            .unwrap()
+            .unwrap()
+            .stable_slot_id;
+        assert_eq!(slot.len(), 64);
+        assert!(
+            published.iter().all(|event| event
+                .tags
+                .iter()
+                .any(
+                    |tag| tag.first().is_some_and(|name| name == "d") && tag.get(1) == Some(&slot)
+                )),
+            "KeyPackages go out in the minted slot (device groups {device_groups})"
+        );
+        assert!(rotated > 0);
+        runtime.shutdown().await;
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

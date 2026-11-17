@@ -14,7 +14,8 @@ pub(crate) enum Side {
 }
 
 pub(crate) const TABLE_OWNERS: &[(&str, Side)] = &[
-    // The migration ledger.
+    // The migration ledger, and whether the database was created empty.
+    ("cgka_database_origin", Side::Base),
     ("cgka_schema_migrations", Side::Base),
     // The engine: `cgka_*`, OpenMLS values, the engine-to-app outbox and local forgets.
     ("cgka_account_device_history_keys", Side::Protocol),

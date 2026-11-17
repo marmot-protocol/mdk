@@ -1586,6 +1586,7 @@ fn run_with_summary_observed(
     ensure_ordered(migrations)?;
     reconcile_legacy_migration_names(connection, migrations)?;
     reject_unknown_future_migrations(connection, migrations)?;
+    record_empty_creation(connection)?;
 
     let mut applied = 0;
     for migration in migrations {
@@ -1628,7 +1629,39 @@ CREATE TABLE IF NOT EXISTS cgka_schema_migrations (
     name TEXT NOT NULL,
     applied_at_unix_seconds INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS cgka_database_origin (
+    id INTEGER PRIMARY KEY CHECK (id = 1)
+);
 "#,
+        )
+        .storage()
+}
+
+/// Record, before the first migration commits, that this database was created
+/// empty. Its one row says so; a database first migrated by a build that did
+/// not record this has an empty table, whatever it holds, so callers treat it
+/// as possibly older than any rule they key on creation. An open that ends
+/// between this commit and the first migration's finds the ledger still empty
+/// and writes nothing new.
+fn record_empty_creation(connection: &mut Connection) -> StorageResult<()> {
+    let tx = connection.transaction().storage()?;
+    tx.execute(
+        "INSERT OR IGNORE INTO cgka_database_origin (id)
+         SELECT 1 WHERE NOT EXISTS (SELECT 1 FROM cgka_schema_migrations)",
+        [],
+    )
+    .storage()?;
+    tx.commit().storage()
+}
+
+/// Whether `connection`'s database was created empty by a build that records
+/// it ([`record_empty_creation`]).
+pub(crate) fn created_empty(connection: &Connection) -> StorageResult<bool> {
+    connection
+        .query_row(
+            "SELECT EXISTS (SELECT 1 FROM cgka_database_origin WHERE id = 1)",
+            [],
+            |row| row.get(0),
         )
         .storage()
 }
@@ -1884,6 +1917,20 @@ mod tests {
     const TEST_DATABASE_KEY: &str = "storage format migration crash key";
     const V0_9_12_FIXTURE_KEY: &str = "mdk storage v1 fixture key";
     const V0_9_12_FIXTURE: &[u8] = include_bytes!("../../fixtures/storage-v1-v0.9.12.bin");
+
+    /// A database records that it was created empty before its first migration
+    /// commits, so opens that end before or after that migration leave the
+    /// record for the open that finishes the schema (mdk#3486). The v0.10.4
+    /// upgrade test proves an older database gains no record.
+    #[test]
+    fn empty_creation_is_recorded_before_an_interrupted_first_open_ends() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        run(&mut conn, &[]).unwrap();
+        assert!(created_empty(&conn).unwrap());
+        run(&mut conn, &MIGRATIONS[..1]).unwrap();
+        run(&mut conn, MIGRATIONS).unwrap();
+        assert!(created_empty(&conn).unwrap());
+    }
 
     /// Legacy provenance remains label-only; settings were not part of its
     /// intention and must never be synthesized by upgrading a database.
