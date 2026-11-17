@@ -35,7 +35,8 @@ import { isDeepStrictEqual } from "node:util";
 const PLUGIN_DIR = resolve(import.meta.dirname, "..");
 const REPO_ROOT = resolve(PLUGIN_DIR, "..", "..", "..");
 const EXPECTED_TOOLS = ["marmot_group_profile", "marmot_history"];
-// The last release whose plugin predates the Doctor contract and tool declarations.
+// The release the reported blocked upgrade started from. Every plugin release up to 0.17.0 lacks the
+// Doctor contract and tool declarations; the pending-record path depends on an existing install, not its version.
 const PREVIOUS_RELEASE = {
   version: "0.11.0",
   url: "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.11.0/openclaw-marmot-plugin-0.11.0.tgz",
