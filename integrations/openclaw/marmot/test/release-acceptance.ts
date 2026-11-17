@@ -476,7 +476,7 @@ async function main(): Promise<void> {
     check(seen.errors.length === 0, "scripted agent turn failed", seen.errors);
     check(seen.replied, "the agent turn never reached the reply step");
 
-    check(seen.promptGroupIdHex === groupIdHex, "conversation chat_id is not the Marmot group id", { prompt: seen.promptGroupIdHex, group: groupIdHex });
+    check(seen.promptGroupIdHex === groupIdHex, "conversation chat_id is not the Marmot group id");
     const [, history, exact, invalid, rename] = seen.toolResults;
     check(history?.dispatchedTool === "marmot_history" && history.ok === true && Array.isArray(history.messages), "marmot_history page failed", history);
     check(exact?.dispatchedTool === "marmot_history" && exact.ok === true && JSON.stringify(exact).includes(scenario.clientText), "marmot_history exact lookup failed", exact);
@@ -490,7 +490,7 @@ async function main(): Promise<void> {
     console.log(`ok release acceptance on OpenClaw ${hostVersion} with ${options.tarball}`);
     console.log(`   capability directory lists ${TOOLS.join(", ")}; tool_search returned ${seen.searchedTools.join(", ")}`);
     console.log("   history page, exact-message lookup, profile validation, and disposable-group rename passed");
-    console.log(`   reply reached the White Noise client (${String(reply.message_id ?? reply.id ?? "").slice(0, 8)}…); group renamed: ${Boolean(renamed)}`);
+    console.log(`   reply reached the White Noise client: ${Boolean(reply)}; group renamed: ${Boolean(renamed)}`);
   } catch (error) {
     failed = true;
     console.error((error as Error).message);
