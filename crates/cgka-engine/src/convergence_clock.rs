@@ -27,6 +27,8 @@ pub struct SystemConvergenceClock {
     started_at: Instant,
 }
 
+// The system clock itself (see clippy.toml).
+#[allow(clippy::disallowed_methods)]
 impl Default for SystemConvergenceClock {
     fn default() -> Self {
         Self {
@@ -35,6 +37,8 @@ impl Default for SystemConvergenceClock {
     }
 }
 
+// The system clock itself (see clippy.toml).
+#[allow(clippy::disallowed_methods)]
 impl ConvergenceClock for SystemConvergenceClock {
     fn now(&self) -> ConvergenceTime {
         ConvergenceTime {

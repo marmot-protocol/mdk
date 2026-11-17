@@ -184,6 +184,11 @@ These tests cover the engine boundary with one or a few `Engine<SqliteAccountSto
 SQLite and a mock peeler: command validation, snapshot persistence, processed-message idempotency, restart behavior,
 and the exact outputs of a single engine call. [`tests/AGENTS.md`](tests/AGENTS.md) maps the files.
 
+The engine takes its time from the builder, so a test moves time instead of sleeping.
+`EngineBuilder::monotonic_clock` sets the clock that times budgets such as the 500 ms background convergence budget,
+`maintenance_sources` sets the wall clock that dates stored records, and `convergence_clock` sets the convergence
+scheduler's clock. An engine built without them runs on the system clocks.
+
 Multi-client behavior is covered by the [conformance simulator](../cgka-conformance-simulator/README.md), which drives
 real engines through an in-memory transport bus with the Nostr peeler and checks they converge after realistic delivery
 faults. Use this crate's tests to prove an engine method does the right thing; use the simulator to prove many engines still

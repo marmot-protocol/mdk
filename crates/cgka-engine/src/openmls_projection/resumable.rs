@@ -1,48 +1,72 @@
 //! Cooperative candidate reconstruction. Scratch progress is memory-only;
 //! every return to a caller occurs after restoring the live database state.
 use super::*;
+use cgka_traits::maintenance::MonotonicClock;
 use std::collections::VecDeque;
-use web_time::Instant;
+use std::time::Duration;
 
 #[cfg(test)]
 thread_local! {
     pub(super) static REPLAY_FINGERPRINT_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// Scheduling allowance, independent of the cumulative anti-amplification budget.
-/// A started slice always finishes one probe even if preparation used its time.
-pub(crate) struct ReplaySlice {
-    deadline: Option<Instant>,
-    limit: usize,
-    started: usize,
-    started_at: Instant,
+/// Stands still at zero. An unlimited slice runs on it, having no deadline
+/// to reach.
+pub(super) struct StoppedClock;
+
+impl MonotonicClock for StoppedClock {
+    fn elapsed(&self) -> Duration {
+        Duration::ZERO
+    }
 }
 
-impl ReplaySlice {
-    pub(crate) fn new(deadline: Instant, limit: usize) -> Self {
+/// Scheduling allowance, independent of the cumulative anti-amplification budget.
+/// A started slice always finishes one probe even if preparation used its time.
+/// `deadline` and `started_at` are readings of `clock`.
+pub(crate) struct ReplaySlice<'a> {
+    clock: &'a dyn MonotonicClock,
+    deadline: Option<Duration>,
+    limit: usize,
+    started: usize,
+    started_at: Duration,
+}
+
+impl<'a> ReplaySlice<'a> {
+    pub(crate) fn new(clock: &'a dyn MonotonicClock, deadline: Duration, limit: usize) -> Self {
         Self {
+            clock,
             deadline: Some(deadline),
             limit: limit.max(1),
             started: 0,
-            started_at: Instant::now(),
+            started_at: clock.elapsed(),
         }
     }
     pub(super) fn unlimited() -> Self {
         Self {
+            clock: &StoppedClock,
             deadline: None,
             limit: usize::MAX,
             started: 0,
-            started_at: Instant::now(),
+            started_at: Duration::ZERO,
         }
     }
     fn start_probe(&mut self) -> bool {
         if self.started != 0
-            && (self.started >= self.limit || self.deadline.is_some_and(|d| Instant::now() >= d))
+            && (self.started >= self.limit
+                || self.deadline.is_some_and(|d| self.clock.elapsed() >= d))
         {
             return false;
         }
         self.started += 1;
         true
+    }
+    fn elapsed_ms(&self) -> u64 {
+        self.clock
+            .elapsed()
+            .saturating_sub(self.started_at)
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX)
     }
 }
 
@@ -104,7 +128,7 @@ impl CandidateSearch {
         own_commits: &PrevalidatedOwnCommits,
         profile_policy: ReplayProfilePolicy,
         budget: &mut ReplayBudget,
-        slice: &mut ReplaySlice,
+        slice: &mut ReplaySlice<'_>,
     ) -> Result<bool, OpenMlsProjectionError> {
         loop {
             let Some((path, mut index, mut extended)) = self
@@ -381,7 +405,7 @@ pub(crate) fn canonicalize_stored_slice<S: StorageProvider>(
     options: StoredCanonicalizationOptions<'_>,
     pass_generation: u64,
     slot: &mut Option<CanonicalReplay>,
-    slice: &mut ReplaySlice,
+    slice: &mut ReplaySlice<'_>,
 ) -> Result<Option<CanonicalizationResult>, OpenMlsProjectionError> {
     if storage.mls_write_generation().is_none() {
         *slot = None;
@@ -509,7 +533,7 @@ pub(crate) fn canonicalize_stored_slice<S: StorageProvider>(
         method = "canonicalize_stored_slice",
         slice_probes = slice.started as u64,
         total_probes = work.budget.consumed,
-        duration_ms = slice.started_at.elapsed().as_millis() as u64,
+        duration_ms = slice.elapsed_ms(),
         complete = matches!(&result, Ok(Some(true))),
         "candidate reconstruction slice restored"
     );
@@ -600,7 +624,7 @@ pub(crate) fn candidate_peel_slice<S: StorageProvider>(
     profile_policy: ReplayProfilePolicy,
     max_contexts: usize,
     slot: &mut Option<PeelReplay>,
-    slice: &mut ReplaySlice,
+    slice: &mut ReplaySlice<'_>,
 ) -> Result<Option<CandidateBranchPeel>, CandidateBranchPeelFailure> {
     let fail = |error| CandidateBranchPeelFailure::new(error, 0);
     if storage.mls_write_generation().is_none() {
@@ -715,7 +739,7 @@ pub(crate) fn candidate_peel_slice<S: StorageProvider>(
         method = "candidate_peel_slice",
         slice_probes = slice.started as u64,
         total_probes = work.budget.consumed,
-        duration_ms = slice.started_at.elapsed().as_millis() as u64,
+        duration_ms = slice.elapsed_ms(),
         complete = matches!(&result, Ok(Some(true))),
         "candidate reconstruction slice restored"
     );

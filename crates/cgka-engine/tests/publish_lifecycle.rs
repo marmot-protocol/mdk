@@ -678,6 +678,7 @@ async fn own_disband_realized_from_its_checkpoint_writes_the_members_it_ends() {
         &gid,
         &selection,
         policy.convergence.max_rewind_commits,
+        Timestamp(1),
     )
     .expect("the disband is realized from its checkpoint");
 

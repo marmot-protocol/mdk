@@ -96,8 +96,8 @@ pub use convergence_clock::{
     ConvergenceClock, ConvergenceTime, ManualConvergenceClock, SystemConvergenceClock,
 };
 pub use engine::{
-    Ciphersuite, DEFAULT_CIPHERSUITE, Engine, EngineBuilder, OwedSiblingWelcome,
-    SiblingWelcomeResendOutcome,
+    Ciphersuite, DEFAULT_CIPHERSUITE, Engine, EngineBuilder, OsMaintenanceRandom,
+    OwedSiblingWelcome, SiblingWelcomeResendOutcome, SystemMonotonicClock, SystemWallClock,
 };
 pub use engine_metrics::{
     EngineMetrics, EngineMetricsSnapshot, HistogramBucket, HistogramSnapshot,

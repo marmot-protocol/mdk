@@ -119,8 +119,9 @@ It must not own MLS internals, transport event parsing, SQLCipher key derivation
     and outstanding targets keep their association; new repair cannot bypass them. First accepted publication is
     durably observed with its fanout before projection; an old accepted row with unknown timing stays unknown.
     The request and hand-off checks read device tags through `member_device_tag_claim_at`.
-- `time.rs` — injectable wall clock, monotonic clock, and maintenance randomness (`SystemWallClock`,
-  `SystemMonotonicClock`, `OsMaintenanceRandom`). Persist wall-clock values and sampled jitter; use monotonic time only
+- `time.rs` — injectable wall clock, monotonic clock, and maintenance randomness. The system implementations
+  (`SystemWallClock`, `SystemMonotonicClock`, `OsMaintenanceRandom`) are the engine's, re-exported; define none here
+  (mdk#3496). Persist wall-clock values and sampled jitter; use monotonic time only
   for in-process windows and timeouts.
 
 Tests: `tests/runtime.rs` plus `tests/runtime/` (frozen fanout, KeyPackage generator upgrade, component migration,

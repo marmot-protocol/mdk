@@ -2761,10 +2761,7 @@ impl<S: StorageProvider> Engine<S> {
             .converge_stored_openmls_messages_with_deadline(
                 &group_id,
                 now,
-                Some(
-                    web_time::Instant::now()
-                        + std::time::Duration::from_millis(super::BACKGROUND_CONVERGENCE_BUDGET_MS),
-                ),
+                Some(self.background_slice_deadline()),
             )
             .map_err(|e| EngineError::Backend(format!("converge: {e}")))?;
         Ok(convergence_ingest_outcome(

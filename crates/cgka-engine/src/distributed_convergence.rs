@@ -1703,12 +1703,7 @@ impl<S: StorageProvider> Engine<S> {
         self.converge_stored_openmls_messages_with_deadline(
             group_id,
             self.convergence_now(),
-            Some(
-                web_time::Instant::now()
-                    + std::time::Duration::from_millis(
-                        crate::message_processor::BACKGROUND_CONVERGENCE_BUDGET_MS,
-                    ),
-            ),
+            Some(self.background_slice_deadline()),
         )
     }
 
@@ -1720,11 +1715,13 @@ impl<S: StorageProvider> Engine<S> {
         self.converge_stored_openmls_messages_with_deadline(group_id, now, None)
     }
 
+    /// `deadline` is a reading of the engine's monotonic clock; `None` runs
+    /// the pass without yielding on time.
     pub(crate) fn converge_stored_openmls_messages_with_deadline(
         &mut self,
         group_id: &GroupId,
         now: ConvergenceTime,
-        deadline: Option<web_time::Instant>,
+        deadline: Option<std::time::Duration>,
     ) -> Result<CanonicalizationResult, OpenMlsProjectionError> {
         let now_ms = now.monotonic_ms;
         // A convergence pass over a seeded-but-unhydrated group promotes it
@@ -2115,7 +2112,7 @@ impl<S: StorageProvider> Engine<S> {
         previous_tip: EpochId,
         policy: CanonicalizationPolicy,
         now: ConvergenceTime,
-        deadline: Option<web_time::Instant>,
+        deadline: Option<std::time::Duration>,
         retained_anchor_epoch: u64,
         run_id: &str,
     ) -> Result<FrozenPassResolution, ConvergencePassFailure> {
@@ -2193,6 +2190,7 @@ impl<S: StorageProvider> Engine<S> {
                 pass.generation,
                 &mut continuation,
                 &mut crate::openmls_projection::ReplaySlice::new(
+                    self.monotonic.as_ref(),
                     deadline,
                     self.replay_slice_probe_limit,
                 ),
@@ -2420,7 +2418,10 @@ impl<S: StorageProvider> Engine<S> {
                     &self.rewinds,
                     group_id,
                     &result,
-                    max_retained_anchor_rewind,
+                    crate::openmls_projection::AnchorRetention {
+                        max_rewind: max_retained_anchor_rewind,
+                        applied_at: self.wall_clock.now(),
+                    },
                     replay_profile_policy,
                     sibling_context.as_ref(),
                 )?;

@@ -6,6 +6,8 @@ use super::{
     CANDIDATE_REPLAY_BUDGET_FLOOR, CANDIDATE_REPLAY_BUDGET_SLACK, CandidateBranchPeel,
     ReplayProfilePolicy, candidate_branch_peel, own_commit_checkpoint_id,
 };
+// Stands still at zero: a zero deadline has passed, and a later one never comes.
+use super::resumable::StoppedClock;
 use crate::account_identity_proof::{AccountIdentityProofRequest, AccountIdentityProofSigner};
 use crate::convergence::V1_MAX_REWIND_COMMITS;
 use crate::message_processor::MAX_CANDIDATE_BRANCH_PEEL_CONTEXTS;
@@ -16,6 +18,7 @@ use cgka_traits::engine::{CgkaEngine, CreateGroupRequest, SendIntent, SendResult
 use cgka_traits::error::PeelerError;
 use cgka_traits::group_context::GroupContextSnapshot;
 use cgka_traits::ingest::{PeeledContent, PeeledMessage};
+use cgka_traits::maintenance::MonotonicClock as _;
 use cgka_traits::message::{MessageRecord, MessageState, StoredMessagePayload};
 use cgka_traits::peeler::TransportPeeler;
 use cgka_traits::storage::{
@@ -34,6 +37,7 @@ use openmls_rust_crypto::RustCrypto;
 use openmls_traits::OpenMlsProvider as _;
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
+use std::time::Duration;
 use storage_sqlite::SqliteAccountStorage;
 use tls_codec::{Deserialize as _, Serialize as _};
 
@@ -660,7 +664,7 @@ fn sliced_peel(
             ReplayProfilePolicy::default(),
             MAX_CANDIDATE_BRANCH_PEEL_CONTEXTS,
             &mut slot,
-            &mut super::ReplaySlice::new(std::time::Instant::now(), 1),
+            &mut super::ReplaySlice::new(&StoppedClock, Duration::ZERO, 1),
         )
         .expect("a halted survey is a complete result, not a storage error");
         assert_eq!(replay_state(storage, group_id), before);
@@ -892,10 +896,7 @@ async fn resumable_search_matches_original_bfs_without_repeating_probes() {
                     &inputs.own_commits,
                     ReplayProfilePolicy::default(),
                     &mut budget,
-                    &mut super::ReplaySlice::new(
-                        std::time::Instant::now() + std::time::Duration::from_secs(30),
-                        limit,
-                    ),
+                    &mut super::ReplaySlice::new(&StoppedClock, Duration::MAX, limit),
                 )
                 .unwrap();
             assert!(budget.consumed - consumed <= limit as u64);
@@ -1009,10 +1010,7 @@ async fn resumable_selection_and_peeling_restore_historical_state_and_match_comp
                 Default::default(),
                 1,
                 &mut slot,
-                &mut super::ReplaySlice::new(
-                    std::time::Instant::now() + std::time::Duration::from_secs(30),
-                    limit,
-                ),
+                &mut super::ReplaySlice::new(&StoppedClock, Duration::MAX, limit),
             )
             .unwrap();
             assert!(storage.list_queued_outbound_intents(&group_id).unwrap() == queued);
@@ -1057,10 +1055,7 @@ async fn resumable_selection_and_peeling_restore_historical_state_and_match_comp
             ReplayProfilePolicy::default(),
             8,
             &mut slot,
-            &mut super::ReplaySlice::new(
-                std::time::Instant::now() + std::time::Duration::from_secs(30),
-                1,
-            ),
+            &mut super::ReplaySlice::new(&StoppedClock, Duration::MAX, 1),
         )
         .unwrap();
         slices += 1;
@@ -1203,7 +1198,7 @@ async fn resumable_frozen_membership_ignores_later_arrivals_and_new_pass_discard
             options.clone(),
             generation,
             slot,
-            &mut super::ReplaySlice::new(std::time::Instant::now(), 1),
+            &mut super::ReplaySlice::new(&StoppedClock, Duration::ZERO, 1),
         )
     };
     let mut slot = None;
@@ -1276,7 +1271,7 @@ async fn resumable_invalidation_restart_panic_and_cumulative_budget_preserve_sta
             options,
             1,
             slot,
-            &mut super::ReplaySlice::new(std::time::Instant::now(), 32),
+            &mut super::ReplaySlice::new(&StoppedClock, Duration::ZERO, 32),
         )
     };
     assert!(advance(&mut slot, Default::default()).unwrap().is_none());
@@ -1418,6 +1413,7 @@ async fn candidate_reconstruction_measurement() {
             )
             .unwrap();
             let mut sliced_budget = super::ReplayBudget::for_pass(messages.len(), 64);
+            let clock = crate::SystemMonotonicClock::default();
             let sliced_start = std::time::Instant::now();
             let mut slice_times = Vec::new();
             loop {
@@ -1431,7 +1427,8 @@ async fn candidate_reconstruction_measurement() {
                         ReplayProfilePolicy::default(),
                         &mut sliced_budget,
                         &mut super::ReplaySlice::new(
-                            start + std::time::Duration::from_millis(500),
+                            &clock,
+                            clock.elapsed() + Duration::from_millis(500),
                             32,
                         ),
                     )
@@ -1812,6 +1809,7 @@ async fn own_checkpoint_apply_parity() {
         &group_id,
         &selected,
         V1_MAX_REWIND_COMMITS,
+        Timestamp(1),
     )
     .expect("an accepted own/remote/own branch must apply");
     assert_eq!(replay_state(&storage, &group_id).1, expected);
@@ -1881,6 +1879,7 @@ async fn own_checkpoint_checks_parent() {
         &group_id,
         &selected,
         V1_MAX_REWIND_COMMITS,
+        Timestamp(1),
     );
     assert!(
         matches!(&applied, Err(super::OpenMlsProjectionError::Replay(reason))
@@ -1979,11 +1978,13 @@ async fn check_restored_tip(
         selected.accepted_commits,
         vec![hex::encode(commit.id.as_slice())]
     );
+    let applied_at = Timestamp(1_700_000_000);
     super::apply_openmls_canonicalization_result(
         &storage,
         &group_id,
         &selected,
         V1_MAX_REWIND_COMMITS,
+        applied_at,
     )
     .unwrap();
     assert_eq!(replay_state(&storage, &group_id).1, expected);
@@ -1995,6 +1996,10 @@ async fn check_restored_tip(
         .unwrap();
     assert_eq!(obligations.len(), 1);
     let mut completed = obligations.into_iter().next().unwrap();
+    assert_eq!(
+        completed.created_at, applied_at,
+        "the rotation is dated by the apply's caller, not by the system clock"
+    );
     completed.phase = cgka_traits::maintenance::MaintenancePhase::Complete;
     maintenance.put_maintenance_obligation(&completed).unwrap();
     storage
@@ -2005,6 +2010,7 @@ async fn check_restored_tip(
         &group_id,
         &selected,
         V1_MAX_REWIND_COMMITS,
+        Timestamp(applied_at.0 + 60),
     )
     .unwrap();
     assert_eq!(
@@ -2206,6 +2212,7 @@ async fn check_restored_tip(
         &group_id,
         &unchanged,
         V1_MAX_REWIND_COMMITS,
+        Timestamp(1),
     )
     .unwrap();
     assert_eq!(
@@ -2401,6 +2408,7 @@ async fn own_private_checkpoint_refused() {
         &group_id,
         &selected,
         V1_MAX_REWIND_COMMITS,
+        Timestamp(1),
     );
     assert!(matches!(
         apply,
@@ -2520,6 +2528,7 @@ async fn own_pathless_replay() {
         &group_id,
         &selected,
         V1_MAX_REWIND_COMMITS,
+        Timestamp(1),
     )
     .expect("authenticated pathless own commit must apply through its checkpoint");
     assert_eq!(replay_state(&storage, &group_id).1, expected);
@@ -2673,7 +2682,7 @@ async fn a_lost_own_commit_checkpoint_halts_enumeration_and_keeps_the_fork() {
                     Default::default(),
                     1,
                     &mut slot,
-                    &mut super::ReplaySlice::new(std::time::Instant::now(), 1),
+                    &mut super::ReplaySlice::new(&StoppedClock, Duration::ZERO, 1),
                 )
                 .expect("missing checkpoint has a complete canonicalization verdict");
                 assert_eq!(replay_state(&alice_storage, &group_id), before);
@@ -2712,6 +2721,7 @@ async fn a_lost_own_commit_checkpoint_halts_enumeration_and_keeps_the_fork() {
         &group_id,
         &selected,
         V1_MAX_REWIND_COMMITS,
+        Timestamp(1),
     );
     assert!(matches!(
         applied,
@@ -2937,10 +2947,7 @@ async fn an_evicted_candidate_is_silent_and_preserves_readable_rivals() {
             ReplayProfilePolicy::default(),
             MAX_CANDIDATE_BRANCH_PEEL_CONTEXTS,
             &mut slot,
-            &mut super::ReplaySlice::new(
-                std::time::Instant::now() + std::time::Duration::from_secs(30),
-                1,
-            ),
+            &mut super::ReplaySlice::new(&StoppedClock, Duration::MAX, 1),
         )
         .expect("an evicted candidate cannot fail a sliced survey");
         slices += 1;

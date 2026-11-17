@@ -2482,6 +2482,7 @@ async fn own_commit_checkpoint_survives_rival_anchor_overwrite_and_restart() {
         &group_id,
         &selection,
         policy.convergence.max_rewind_commits,
+        Timestamp(1),
     )
     .expect_err("a mismatched checkpoint authenticator must abort apply");
     assert!(matches!(

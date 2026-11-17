@@ -98,7 +98,9 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
 
 - **File:** `deferred_peel_lifecycle.rs`
   - **Owns:** Durable deferred retry lifecycles, generation barriers, capacity limits, live historical-context reuse and invalidation,
-    foreground budgets, and background work/time budgets with restart and eventual-completion checks. Also the
+    foreground budgets, and background work/time budgets with restart and eventual-completion checks. The time
+    budget runs out on a manual monotonic clock that each peel moves forward (`EngineBuilder::monotonic_clock`,
+    mdk#3496); those tests do not sleep. Also the
     publish-cycle replay's cost: rows it keeps parked are not lineage-classified, and each retained anchor's context
     is derived once per replay rather than once per row. A retry that re-defers a row at a new epoch records no
     `peel_deferred -> peel_deferred` audit row. Returned peeler infrastructure faults preserve raw bytes, return

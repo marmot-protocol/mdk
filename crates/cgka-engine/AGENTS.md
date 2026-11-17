@@ -38,7 +38,7 @@ Each module's top-level rustdoc is the source of truth; this is an index.
 
 | Module | Owns |
 | --- | --- |
-| `engine.rs` | `Engine<S>`, `EngineBuilder`, `CgkaEngine` impl, `drain_events` / `drain_auto_publish` / `drain_auto_proposals` queues |
+| `engine.rs` | `Engine<S>`, `EngineBuilder`, `CgkaEngine` impl, `drain_events` / `drain_auto_publish` / `drain_auto_proposals` queues, and the system clocks and randomness an engine runs on unless the builder is given others (`SystemWallClock`, `SystemMonotonicClock`, `OsMaintenanceRandom`) |
 | `identity.rs` | Local signer + credential bundle; `member_id_of_processed_message` / `member_id_of_sender` chokepoints |
 | `provider.rs` | Ad-hoc `OpenMlsProvider` adapter composed from crypto + storage |
 | `feature_registry.rs` | Runtime feature → capability-requirement registry |
@@ -209,9 +209,10 @@ peel runs. `Engine::retry_deferred_peels` offers those contexts to every retaine
 
 **Background budgets and resumable reconstruction** (concepts in README).
 
-- One host background advance shares a 64-row allowance and cooperative 500-ms budget. Explicit-time entry points keep
-  the row allowance without a wall deadline; foreground preflight and send budgets keep their own semantics. Return
-  pending only at complete operation boundaries; never cancel a snapshot guard or advance a partially tried generation.
+- One host background advance shares a 64-row allowance and cooperative 500-ms budget, timed on the engine's
+  monotonic clock. Explicit-time entry points keep the row allowance without a deadline; foreground preflight and send
+  budgets keep their own semantics. Return pending only at complete operation boundaries; never cancel a snapshot
+  guard or advance a partially tried generation.
 - Historical anchor peel contexts live in `DeferredPeelGroupState::past_peel_contexts`, shared by live ingest, the
   sweep and `replay_buffered_messages`. Canonical changes drop them; candidate-generation turnover alone does not.
   Reuse requires `StorageProvider::past_peel_context_generation`, covering MLS writes and snapshot replacement/pruning;
@@ -237,6 +238,13 @@ peel runs. `Engine::retry_deferred_peels` offers those contexts to every retaine
 
 ## Invariants
 
+- **Time enters through the engine's clocks (mdk#3496).** In-process budgets, deadlines and duration metrics read
+  `Engine::monotonic` (`EngineBuilder::monotonic_clock`); timestamps read `wall_clock`; convergence scheduling reads
+  `convergence_clock`. Code with no engine in scope takes the reading as an argument: `ReplaySlice` a
+  `&dyn MonotonicClock`, `Identity::load_or_generate` and canonical apply a `Timestamp`. `Instant::now` and
+  `SystemTime::now` are disallowed methods (`clippy.toml`), allowed only in the system clock implementations and in
+  `key_package.rs::lifetime_clock_now`, which has to agree with the system clock OpenMLS checks a KeyPackage lifetime
+  against. A test that needs time to pass moves a manual clock; it does not sleep.
 - **Native member recovery retains its publication owner.** `maintenance.rs` owns source/grant validation and
   atomic `RecoverMembers` preparation; `engine.rs` restores its exact artifacts during hydration. `Preparing`
   proves no publication handle escaped and may roll back. `Prepared`/`Attempting` retain exact Commit/Welcome bytes

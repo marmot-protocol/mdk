@@ -221,7 +221,7 @@ impl<S: StorageProvider> Engine<S> {
                 == cgka_traits::group::ProtocolProfile::Current,
         };
         for (index, message) in messages.into_iter().enumerate() {
-            if index != 0 && execution.exhausted() {
+            if index != 0 && execution.exhausted(self.monotonic.elapsed()) {
                 break;
             }
             execution.consume_row();
