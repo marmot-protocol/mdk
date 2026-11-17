@@ -1535,7 +1535,7 @@ fn ingest_discovered_sets(
     let mut seen = HashSet::new();
     let mut discovered = 0;
     let mut updated = 0;
-    for event in events.into_iter().take(MAX_DISCOVERY_EMOJI_SETS * 2) {
+    for event in events {
         if event.kind != Kind::Custom(EMOJI_SET_KIND) {
             continue;
         }
