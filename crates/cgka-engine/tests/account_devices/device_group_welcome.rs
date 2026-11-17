@@ -57,18 +57,28 @@ async fn the_link_welcome_joins_and_consumes_its_expectation() {
     assert_eq!(expectation_of(&laptop), None, "the join consumed it");
 }
 
+/// The refusal is the delivery's, not the Welcome's (mdk#3514): one that
+/// arrives before the link is confirmed joins from the existing device's next
+/// delivery once it is.
 #[tokio::test]
 async fn a_device_group_welcome_no_link_expects_is_refused() {
     let mut phone = roster_device(b"alice");
     let mut laptop = roster_device(b"alice");
     let key_package = laptop.engine.fresh_key_package().await.unwrap();
-    let welcome = found_under_chosen(&mut phone, key_package).await;
+    let welcome = found_under_chosen(&mut phone, key_package.clone()).await;
 
     assert_eq!(
         join_outcome(&mut laptop, &welcome).await,
         refused(InputRejectionCategory::AuthorizationFailed)
     );
     assert!(!holds(&laptop, &chosen()));
+
+    expect_link_welcome(&mut laptop, &chosen(), &phone, &key_package);
+    let resend = TransportMessage {
+        id: MessageId::new(b"phone-resends-the-link-welcome".to_vec()),
+        ..welcome
+    };
+    assert_joins(&mut laptop, &resend, &chosen(), &phone).await;
 }
 
 /// Someone holding the account key reads the confirmed group id, founds

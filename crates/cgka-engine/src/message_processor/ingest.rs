@@ -18,6 +18,7 @@ use crate::openmls_projection::{
 use crate::pending_commit_guard::PendingCommitCleanupGuard;
 use crate::provider::EngineOpenMlsProvider;
 use crate::snapshot_guard::{RewindSite, SnapshotRollbackGuard};
+use crate::welcome_content::WelcomeContentId;
 use cgka_traits::app_event::AppMessageRetentionDecision;
 use cgka_traits::engine::{AutoPublish, GroupEvent, GroupStateChange};
 use cgka_traits::error::{EngineError, PeelerError};
@@ -413,13 +414,13 @@ impl<S: StorageProvider> Engine<S> {
     /// (`group_lifecycle::joined_welcome_names_another_key_package`).
     fn joined_welcome_names_another_key_package(
         &self,
-        content_id: Option<&MessageId>,
+        content_id: Option<&WelcomeContentId>,
         claimed: Option<&MessageId>,
     ) -> Result<bool, EngineError> {
         let Some(content_id) = content_id else {
             return Ok(false);
         };
-        if claimed.is_none() || !self.storage.has_ingress_dedup_marker(content_id)? {
+        if claimed.is_none() || !content_id.is_settled(&self.storage)? {
             return Ok(false);
         }
         let lifecycle = match self.storage.maintenance_storage() {
@@ -461,7 +462,7 @@ impl<S: StorageProvider> Engine<S> {
             result => result.map_err(EngineError::Peeler),
         };
         let prepared = peeled.and_then(|peeled| {
-            let content_id = group_lifecycle::welcome_content_dedup_id(&peeled)?;
+            let content_id = WelcomeContentId::of(&peeled)?;
             Ok((peeled, content_id))
         });
         let content_id = prepared
@@ -505,7 +506,7 @@ impl<S: StorageProvider> Engine<S> {
     pub(crate) fn welcome_join_outcome(
         &mut self,
         msg: &TransportMessage,
-        content_id: Option<MessageId>,
+        content_id: Option<WelcomeContentId>,
         key_package_claim: Option<MessageId>,
         joined: Result<GroupId, EngineError>,
     ) -> Result<IngestOutcome, EngineError> {
@@ -538,7 +539,7 @@ impl<S: StorageProvider> Engine<S> {
                     candidate
                         .rejoin
                         .as_ref()
-                        .is_some_and(|rejoin| rejoin.content_id == content_id)
+                        .is_some_and(|rejoin| content_id.offered_by(rejoin))
                 }) {
                     Ok(IngestOutcome::LocalState {
                         state: LocalIngestState::RejoinConfirmationRequired,
