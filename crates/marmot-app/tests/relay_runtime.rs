@@ -2505,9 +2505,13 @@ async fn app_runtime_create_identity_bootstraps_managed_account_and_key_package(
             .count(),
         1
     );
+    // At most one relay-list/follow-list fetch, plus the background sign-in
+    // check's read of this account's KeyPackage slots, which device groups
+    // (on by default) start at the worker's first maintenance pass. That
+    // read does not block setup, so it may or may not have completed here.
     let relay_health = runtime.shared_services().relay_plane().relay_health().await;
     assert!(
-        relay_health.directory_completed_fetches <= 1,
+        relay_health.directory_completed_fetches <= 2,
         "generated setup must not add synchronous relay-list/follow-list refetches; observed {} directory fetches",
         relay_health.directory_completed_fetches,
     );
