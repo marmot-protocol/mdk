@@ -235,7 +235,7 @@ final class NativeHostSmoke: XCTestCase {
 
   private func lowerNativeString(_ value: String) -> RustBuffer {
     Array(value.utf8).withUnsafeBufferPointer { bytes in
-      var status = RustCallStatus()
+      var status = RustCallStatus(code: 0, errorBuf: .init(capacity: 0, len: 0, data: nil))
       let buffer = ffi_marmot_uniffi_rustbuffer_from_bytes(
         ForeignBytes(len: Int32(bytes.count), data: bytes.baseAddress), &status)
       precondition(status.code == 0, "Native argument allocation failed")
