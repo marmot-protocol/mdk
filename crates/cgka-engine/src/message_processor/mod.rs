@@ -80,7 +80,6 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
-use web_time::Instant;
 
 /// Committed terminal cleanup awaiting in-memory reconciliation.
 #[must_use = "finish local termination only after its storage transaction commits"]
@@ -289,8 +288,9 @@ pub(crate) const MAX_DEFERRED_ROWS_PER_SWEEP: usize = 64;
 /// replayed ring lands in.
 pub(crate) const MAX_RETAINED_ROWS_PER_REMOVED_GROUP: usize = 4 * MAX_DEFERRED_ROWS_PER_SWEEP;
 
-/// Cooperative budget for one background convergence call. Stop only between
-/// complete row/MLS operations; never cancel a live snapshot rollback guard.
+/// Cooperative budget for one background convergence call, on the engine's
+/// monotonic clock. Stop only between complete row/MLS operations; never
+/// cancel a live snapshot rollback guard.
 pub const BACKGROUND_CONVERGENCE_BUDGET_MS: u64 = 500;
 
 /// Secondary scheduling bound inside candidate reconstruction. This does not
@@ -583,9 +583,10 @@ impl DeferredPeelWorkResult {
     }
 }
 
+/// Readings of the engine's monotonic clock come in as `now`.
 struct ForegroundPeelBudget {
     remaining_time: Duration,
-    phase_started: Option<Instant>,
+    phase_started: Option<Duration>,
     budget_ms: u64,
     rows_remaining: usize,
 }
@@ -600,27 +601,29 @@ impl ForegroundPeelBudget {
         }
     }
 
-    fn start_phase(&mut self) {
+    fn start_phase(&mut self, now: Duration) {
         debug_assert!(self.phase_started.is_none());
-        self.phase_started = Some(Instant::now());
+        self.phase_started = Some(now);
     }
 
-    fn finish_phase(&mut self) {
+    fn finish_phase(&mut self, now: Duration) {
         if let Some(started) = self.phase_started.take() {
-            self.remaining_time = self.remaining_time.saturating_sub(started.elapsed());
+            self.remaining_time = self
+                .remaining_time
+                .saturating_sub(now.saturating_sub(started));
         }
     }
 
-    fn remaining(&self) -> Option<Duration> {
+    fn remaining(&self, now: Duration) -> Option<Duration> {
         let elapsed = self
             .phase_started
-            .map_or(Duration::ZERO, |started| started.elapsed());
+            .map_or(Duration::ZERO, |started| now.saturating_sub(started));
         let remaining = self.remaining_time.saturating_sub(elapsed);
         (!remaining.is_zero()).then_some(remaining)
     }
 
-    fn exhausted(&self) -> bool {
-        self.rows_remaining == 0 || self.remaining().is_none()
+    fn exhausted(&self, now: Duration) -> bool {
+        self.rows_remaining == 0 || self.remaining(now).is_none()
     }
 
     fn consume_row(&mut self) {
@@ -628,24 +631,26 @@ impl ForegroundPeelBudget {
     }
 }
 
+/// `now` and a background `deadline` are readings of the engine's monotonic
+/// clock.
 enum DeferredPeelExecution<'a> {
     Foreground(&'a mut ForegroundPeelBudget),
     Background {
-        deadline: Option<Instant>,
+        deadline: Option<Duration>,
         rows_remaining: usize,
     },
 }
 
 impl DeferredPeelExecution<'_> {
-    fn start_phase(&mut self) {
+    fn start_phase(&mut self, now: Duration) {
         if let Self::Foreground(budget) = self {
-            budget.start_phase();
+            budget.start_phase(now);
         }
     }
 
-    fn finish_phase(&mut self) {
+    fn finish_phase(&mut self, now: Duration) {
         if let Self::Foreground(budget) = self {
-            budget.finish_phase();
+            budget.finish_phase(now);
         }
     }
 
@@ -656,15 +661,13 @@ impl DeferredPeelExecution<'_> {
         }
     }
 
-    fn exhausted(&self) -> bool {
+    fn exhausted(&self, now: Duration) -> bool {
         match self {
-            Self::Foreground(budget) => budget.exhausted(),
+            Self::Foreground(budget) => budget.exhausted(now),
             Self::Background {
                 deadline,
                 rows_remaining,
-            } => {
-                *rows_remaining == 0 || deadline.is_some_and(|deadline| Instant::now() >= deadline)
-            }
+            } => *rows_remaining == 0 || deadline.is_some_and(|deadline| now >= deadline),
         }
     }
 
@@ -677,16 +680,16 @@ impl DeferredPeelExecution<'_> {
         }
     }
 
-    fn replay_deadline(&self) -> Option<Instant> {
+    fn replay_deadline(&self) -> Option<Duration> {
         match self {
             Self::Background { deadline, .. } => *deadline,
             Self::Foreground(_) => None,
         }
     }
 
-    fn remaining(&self) -> Option<Duration> {
+    fn remaining(&self, now: Duration) -> Option<Duration> {
         match self {
-            Self::Foreground(budget) => budget.remaining(),
+            Self::Foreground(budget) => budget.remaining(now),
             Self::Background { .. } => None,
         }
     }
@@ -1085,15 +1088,10 @@ impl<S: StorageProvider> Engine<S> {
             return Ok(queued);
         }
 
-        let prepare_started = Instant::now();
+        let prepare_started = self.monotonic.elapsed();
         let result = self.do_send_ready(intent).await;
-        self.engine_metrics.note_outbound_wire_prepare_ms(
-            prepare_started
-                .elapsed()
-                .as_millis()
-                .try_into()
-                .unwrap_or(u64::MAX),
-        );
+        self.engine_metrics
+            .note_outbound_wire_prepare_ms(self.elapsed_ms_since(prepare_started));
         result
     }
 
@@ -1296,6 +1294,14 @@ impl<S: StorageProvider> Engine<S> {
         Ok(group_id)
     }
 
+    /// When a background convergence slice that starts now must yield, on
+    /// the monotonic clock.
+    pub(crate) fn background_slice_deadline(&self) -> Duration {
+        self.monotonic
+            .elapsed()
+            .saturating_add(Duration::from_millis(BACKGROUND_CONVERGENCE_BUDGET_MS))
+    }
+
     pub(crate) async fn advance_convergence_and_drain_queued(
         &mut self,
         group_id: &GroupId,
@@ -1303,7 +1309,7 @@ impl<S: StorageProvider> Engine<S> {
         self.converge_and_drain_with_deadline(
             group_id,
             self.convergence_now_ms(),
-            Some(Instant::now() + Duration::from_millis(BACKGROUND_CONVERGENCE_BUDGET_MS)),
+            Some(self.background_slice_deadline()),
         )
         .await
     }
@@ -1323,7 +1329,7 @@ impl<S: StorageProvider> Engine<S> {
         &mut self,
         group_id: &GroupId,
         now_ms: u64,
-        deadline: Option<Instant>,
+        deadline: Option<Duration>,
     ) -> Result<Vec<SendResult>, EngineError> {
         if !self.prepare_convergence_input_advance(group_id)? {
             return Ok(Vec::new());
@@ -1390,17 +1396,12 @@ impl<S: StorageProvider> Engine<S> {
             }
             self.engine_metrics
                 .note_queued_outbound_wait_ms(now_ms.saturating_sub(record.created_at_ms));
-            let prepare_started = Instant::now();
+            let prepare_started = self.monotonic.elapsed();
             let prepared = self
                 .do_send_ready_with_reissue_attempts(record.intent.clone(), record.reissue_attempts)
                 .await;
-            self.engine_metrics.note_outbound_wire_prepare_ms(
-                prepare_started
-                    .elapsed()
-                    .as_millis()
-                    .try_into()
-                    .unwrap_or(u64::MAX),
-            );
+            self.engine_metrics
+                .note_outbound_wire_prepare_ms(self.elapsed_ms_since(prepare_started));
             let result = match prepared {
                 Ok(result) => result,
                 Err(error) => {
@@ -1958,7 +1959,7 @@ impl<S: StorageProvider> Engine<S> {
         self.advance_convergence_inputs_with_deadline(
             group_id,
             now_ms,
-            Some(Instant::now() + Duration::from_millis(BACKGROUND_CONVERGENCE_BUDGET_MS)),
+            Some(self.background_slice_deadline()),
         )
         .await
     }
@@ -1967,9 +1968,9 @@ impl<S: StorageProvider> Engine<S> {
     ///
     /// This lower-level form is used by deterministic harnesses. Hosts should
     /// normally call [`Self::advance_convergence_inputs`] so the engine owns
-    /// the convergence clock and applies its cooperative wall-time budget.
-    /// This form shares the same row allowance but never consults elapsed real
-    /// time: `false` leaves durable work for a later deterministic tick.
+    /// the convergence clock and applies its cooperative time budget. This
+    /// form shares the same row allowance but never consults elapsed time:
+    /// `false` leaves durable work for a later deterministic tick.
     pub async fn advance_convergence_inputs_until_settled(
         &mut self,
         group_id: &GroupId,
@@ -1983,7 +1984,7 @@ impl<S: StorageProvider> Engine<S> {
         &mut self,
         group_id: &GroupId,
         now_ms: u64,
-        deadline: Option<Instant>,
+        deadline: Option<Duration>,
     ) -> Result<bool, EngineError> {
         let mut execution = DeferredPeelExecution::Background {
             deadline,
@@ -2056,7 +2057,7 @@ impl<S: StorageProvider> Engine<S> {
             .is_some_and(|state| state.yield_for_transport_redelivery);
         for _ in 0..MAX_CONVERGENCE_REPROCESSING_PASSES {
             if matches!(execution, DeferredPeelExecution::Background { .. })
-                && execution.exhausted()
+                && execution.exhausted(self.monotonic.elapsed())
             {
                 self.schedule_pending_convergence_group(group_id);
                 return Ok(AdvanceConvergenceStatus::Pending);
@@ -2075,7 +2076,7 @@ impl<S: StorageProvider> Engine<S> {
             }
             let peel_generation_active = self.storage.deferred_peel_generation(group_id)?.is_some();
             if self.has_unresolved_convergence_inputs(group_id)? && !peel_generation_active {
-                let convergence_started = Instant::now();
+                let convergence_started = self.monotonic.elapsed();
                 let result = self
                     .converge_stored_openmls_messages_with_deadline(
                         group_id,
@@ -2088,11 +2089,7 @@ impl<S: StorageProvider> Engine<S> {
                     .map_err(|e| EngineError::Backend(format!("converge inputs: {e}")))?;
                 if record_outbound_phases {
                     self.engine_metrics.note_outbound_required_convergence_ms(
-                        convergence_started
-                            .elapsed()
-                            .as_millis()
-                            .try_into()
-                            .unwrap_or(u64::MAX),
+                        self.elapsed_ms_since(convergence_started),
                     );
                 }
                 if result.convergence_status != crate::canonicalization::ConvergenceStatus::Settled
@@ -2103,11 +2100,11 @@ impl<S: StorageProvider> Engine<S> {
                 // an inbound-only follow-up pass. Retry one deferred-peel sweep
                 // first so newly available canonical context is visible. Return
                 // to the drain only when that durable slot actually exists.
-                execution.start_phase();
+                execution.start_phase(self.monotonic.elapsed());
                 let peel = self
                     .retry_deferred_peels_with_execution(group_id, &mut execution)
                     .await;
-                execution.finish_phase();
+                execution.finish_phase(self.monotonic.elapsed());
                 let peel = peel?;
                 if peel.status == DeferredPeelWorkStatus::BudgetExhausted {
                     self.schedule_pending_convergence_group(group_id);
@@ -2130,11 +2127,11 @@ impl<S: StorageProvider> Engine<S> {
                 continue;
             }
 
-            execution.start_phase();
+            execution.start_phase(self.monotonic.elapsed());
             let peel = self
                 .retry_deferred_peels_with_execution(group_id, &mut execution)
                 .await;
-            execution.finish_phase();
+            execution.finish_phase(self.monotonic.elapsed());
             let peel = peel?;
             match peel.status {
                 DeferredPeelWorkStatus::BudgetExhausted => {
@@ -2534,7 +2531,7 @@ impl<S: StorageProvider> Engine<S> {
 
     fn note_foreground_deferred_phase(
         &mut self,
-        started: Instant,
+        started: Duration,
         budget_ms: Option<u64>,
         rows_attempted: usize,
         backlog: usize,
@@ -2547,13 +2544,13 @@ impl<S: StorageProvider> Engine<S> {
             foreground = budget_ms.is_some(),
             rows_attempted = rows_attempted as u64,
             backlog = backlog as u64,
-            duration_ms = started.elapsed().as_millis() as u64,
+            duration_ms = self.elapsed_ms_since(started),
             outcome = ?outcome,
             "deferred-peel slice outcome"
         );
         if let Some(budget_ms) = budget_ms {
             self.engine_metrics.note_outbound_deferred_peel(
-                started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
+                self.elapsed_ms_since(started),
                 rows_attempted,
                 backlog,
                 outcome,
@@ -2623,14 +2620,15 @@ impl<S: StorageProvider> Engine<S> {
         group_id: &GroupId,
         execution: &mut DeferredPeelExecution<'_>,
     ) -> Result<DeferredPeelWorkResult, EngineError> {
-        let sweep_started = Instant::now();
+        let sweep_started = self.monotonic.elapsed();
         // The background deadline is cooperative: a started row always finishes.
         // Give a slice that started with available time the same guarantee when
         // its synchronous preparation uses the quantum. Otherwise a slow storage
         // read repeats forever without ever reaching one durable row attempt.
         // Foreground preflight and already-expired slices retain strict checks.
         let mut finish_one_background_row =
-            matches!(execution, DeferredPeelExecution::Background { .. }) && !execution.exhausted();
+            matches!(execution, DeferredPeelExecution::Background { .. })
+                && !execution.exhausted(self.monotonic.elapsed());
         self.engine_metrics.note_deferred_peel_sweep();
         let foreground_budget_ms = match execution {
             DeferredPeelExecution::Foreground(budget) => Some(budget.budget_ms),
@@ -2687,11 +2685,11 @@ impl<S: StorageProvider> Engine<S> {
             method = "retry_deferred_peels",
             phase = "metadata_loaded",
             backlog = deferred.len() as u64,
-            duration_ms = sweep_started.elapsed().as_millis() as u64,
-            budget_exhausted = execution.exhausted(),
+            duration_ms = self.elapsed_ms_since(sweep_started),
+            budget_exhausted = execution.exhausted(self.monotonic.elapsed()),
             "deferred-peel preparation"
         );
-        if execution.exhausted() && !finish_one_background_row {
+        if execution.exhausted(self.monotonic.elapsed()) && !finish_one_background_row {
             self.note_foreground_deferred_phase(
                 sweep_started,
                 foreground_budget_ms,
@@ -2755,7 +2753,7 @@ impl<S: StorageProvider> Engine<S> {
             });
         }
 
-        if execution.exhausted() && !finish_one_background_row {
+        if execution.exhausted(self.monotonic.elapsed()) && !finish_one_background_row {
             self.note_foreground_deferred_phase(
                 sweep_started,
                 foreground_budget_ms,
@@ -2787,7 +2785,7 @@ impl<S: StorageProvider> Engine<S> {
         if !due.is_empty() {
             let mut released = 0usize;
             for metadata in &due {
-                if execution.exhausted() && !finish_one_background_row {
+                if execution.exhausted(self.monotonic.elapsed()) && !finish_one_background_row {
                     break;
                 }
                 finish_one_background_row = false;
@@ -2867,8 +2865,8 @@ impl<S: StorageProvider> Engine<S> {
             method = "retry_deferred_peels",
             phase = "fingerprint_loaded",
             backlog = total as u64,
-            duration_ms = sweep_started.elapsed().as_millis() as u64,
-            budget_exhausted = execution.exhausted(),
+            duration_ms = self.elapsed_ms_since(sweep_started),
+            budget_exhausted = execution.exhausted(self.monotonic.elapsed()),
             "deferred-peel preparation"
         );
         let unattempted = deferred
@@ -2912,7 +2910,7 @@ impl<S: StorageProvider> Engine<S> {
             .or_default()
             .sweep_count += 1;
 
-        if execution.exhausted() && !finish_one_background_row {
+        if execution.exhausted(self.monotonic.elapsed()) && !finish_one_background_row {
             self.note_foreground_deferred_phase(
                 sweep_started,
                 foreground_budget_ms,
@@ -2958,7 +2956,7 @@ impl<S: StorageProvider> Engine<S> {
             self.clear_completed_candidate_cache(group_id);
             self.engine_metrics
                 .note_deferred_peel_candidate_cache_miss();
-            let candidate_enumeration_started = Instant::now();
+            let candidate_enumeration_started = self.monotonic.elapsed();
             let past_contexts = self
                 .deferred_peel
                 .get(group_id)
@@ -3009,11 +3007,7 @@ impl<S: StorageProvider> Engine<S> {
                 Err(failure) => {
                     self.engine_metrics
                         .note_deferred_peel_candidate_enumeration(
-                            candidate_enumeration_started
-                                .elapsed()
-                                .as_millis()
-                                .try_into()
-                                .unwrap_or(u64::MAX),
+                            self.elapsed_ms_since(candidate_enumeration_started),
                             std::iter::empty(),
                             failure.replay_probe_count,
                         );
@@ -3027,11 +3021,7 @@ impl<S: StorageProvider> Engine<S> {
                     return Err(failure.error);
                 }
             };
-            let candidate_enumeration_ms = candidate_enumeration_started
-                .elapsed()
-                .as_millis()
-                .try_into()
-                .unwrap_or(u64::MAX);
+            let candidate_enumeration_ms = self.elapsed_ms_since(candidate_enumeration_started);
             self.engine_metrics
                 .note_deferred_peel_candidate_enumeration(
                     candidate_enumeration_ms,
@@ -3083,7 +3073,7 @@ impl<S: StorageProvider> Engine<S> {
         let past_contexts = self.past_peel_contexts(group_id);
         let sweep = crate::message_processor::ingest::DeferredPeelSweep::over_branches(&peel)
             .with_past_contexts(past_contexts.as_deref());
-        let preparation_ms = sweep_started.elapsed().as_millis() as u64;
+        let preparation_ms = self.elapsed_ms_since(sweep_started);
 
         let mut progressed = 0usize;
         let mut terminal = 0usize;
@@ -3091,7 +3081,7 @@ impl<S: StorageProvider> Engine<S> {
         let mut timed_out = false;
         let mut contexts_invalidated = false;
         for metadata in unattempted.into_iter().take(row_limit) {
-            if execution.exhausted() && !finish_one_background_row {
+            if execution.exhausted(self.monotonic.elapsed()) && !finish_one_background_row {
                 timed_out = true;
                 break;
             }
@@ -3127,8 +3117,9 @@ impl<S: StorageProvider> Engine<S> {
             }
             execution.consume_row();
             attempted += 1;
+            let remaining = execution.remaining(self.monotonic.elapsed());
             let reingest = self.reingest_deferred_peel_row(group_id, &record, sweep);
-            let result = if let Some(remaining) = execution.remaining() {
+            let result = if let Some(remaining) = remaining {
                 match crate::deadline::timeout(remaining, reingest).await {
                     Ok(result) => result,
                     Err(_) => {
@@ -3234,11 +3225,7 @@ impl<S: StorageProvider> Engine<S> {
         } else {
             DeferredPeelWorkStatus::Complete
         };
-        let duration_ms = sweep_started
-            .elapsed()
-            .as_millis()
-            .try_into()
-            .unwrap_or(u64::MAX);
+        let duration_ms = self.elapsed_ms_since(sweep_started);
         self.note_foreground_deferred_phase(
             sweep_started,
             foreground_budget_ms,
@@ -3384,7 +3371,7 @@ impl<S: StorageProvider> Engine<S> {
     fn candidate_branch_peel_with_deadline(
         &mut self,
         group_id: &GroupId,
-        deadline: Option<Instant>,
+        deadline: Option<Duration>,
     ) -> Result<
         Option<crate::openmls_projection::CandidateBranchPeel>,
         DeferredPeelCandidateEnumerationFailure,
@@ -3420,6 +3407,7 @@ impl<S: StorageProvider> Engine<S> {
             MAX_CANDIDATE_BRANCH_PEEL_CONTEXTS,
             &mut continuation,
             &mut crate::openmls_projection::ReplaySlice::new(
+                self.monotonic.as_ref(),
                 deadline,
                 self.replay_slice_probe_limit,
             ),
@@ -4260,7 +4248,7 @@ impl<S: StorageProvider> Engine<S> {
         intent: SendIntent,
         reissue_attempts: u32,
     ) -> Result<SendResult, EngineError> {
-        let queue_started = Instant::now();
+        let queue_started = self.monotonic.elapsed();
         let record =
             self.prepare_queued_outbound_intent(group_id.clone(), intent, reissue_attempts)?;
         let intent_id = record.id.clone();
@@ -4282,13 +4270,8 @@ impl<S: StorageProvider> Engine<S> {
             group_id,
             intent_id,
         };
-        self.engine_metrics.note_outbound_queue_accept_ms(
-            queue_started
-                .elapsed()
-                .as_millis()
-                .try_into()
-                .unwrap_or(u64::MAX),
-        );
+        self.engine_metrics
+            .note_outbound_queue_accept_ms(self.elapsed_ms_since(queue_started));
         Ok(result)
     }
 
@@ -4393,7 +4376,10 @@ impl<S: StorageProvider> Engine<S> {
     ) -> Result<bool, EngineError> {
         use ingest::GroupMessageIngestOutcome::{Deferred, Outcome};
 
-        if execution.as_ref().is_some_and(|budget| budget.exhausted()) {
+        if execution
+            .as_ref()
+            .is_some_and(|budget| budget.exhausted(self.monotonic.elapsed()))
+        {
             return Ok(false);
         }
         // Only states the loop below can act on; the storage backend skips
@@ -4422,7 +4408,7 @@ impl<S: StorageProvider> Engine<S> {
             if let Some(budget) = execution.as_mut() {
                 // Admission above reserves one complete row: preparation may
                 // consume the deadline, but must not cause endless empty turns.
-                if index != 0 && budget.exhausted() {
+                if index != 0 && budget.exhausted(self.monotonic.elapsed()) {
                     return Ok(false);
                 }
                 budget.consume_row();
@@ -4776,7 +4762,7 @@ mod deferred_peel_accounting_tests {
         };
         engine.storage.put_message(&record).unwrap();
         engine.pending_confirmation_replays.insert(group_id.clone());
-        for (deadline, rows_remaining) in [(Some(Instant::now()), 64), (None, 0)] {
+        for (deadline, rows_remaining) in [(Some(Duration::ZERO), 64), (None, 0)] {
             let mut execution = DeferredPeelExecution::Background {
                 deadline,
                 rows_remaining,
@@ -4800,7 +4786,7 @@ mod deferred_peel_accounting_tests {
                 &group_id,
                 0,
                 DeferredPeelExecution::Background {
-                    deadline: Some(Instant::now()),
+                    deadline: Some(Duration::ZERO),
                     rows_remaining: MAX_DEFERRED_ROWS_PER_SWEEP,
                 },
             )
@@ -5169,7 +5155,7 @@ mod deferred_peel_accounting_tests {
             }
             for remaining in (0..3).rev() {
                 let mut execution = DeferredPeelExecution::Background {
-                    deadline: Some(Instant::now()),
+                    deadline: Some(Duration::ZERO),
                     rows_remaining,
                 };
                 engine

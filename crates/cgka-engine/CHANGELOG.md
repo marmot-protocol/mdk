@@ -7,9 +7,16 @@
 - `Engine::publish_failed_fanout`, `publish_not_delivered` and `publish_refused_as_too_large` take a `RollbackPass`
   (mdk#2332). On `RollbackPass::Later`, a host change the fanout names is recorded as not delivered and announced
   with `GroupChangeNotDelivered`; a retired queued intent is recorded on any pass.
+- `Identity::load_or_generate` and `openmls_projection::apply_openmls_canonicalization_result` take the wall-clock
+  time from their caller, as a `Timestamp`, instead of reading the system clock (mdk#3496). It dates a newly signed
+  account identity proof and the replay-rotation obligations an apply creates.
 
 ### Added
 
+- `EngineBuilder::monotonic_clock` installs the `MonotonicClock` that times the engine's in-process budgets,
+  deadlines and duration metrics, so a test moves time forward without sleeping (mdk#3496). An engine built without
+  it runs on the new `SystemMonotonicClock`. `SystemWallClock` and `OsMaintenanceRandom`, the other defaults, are
+  public, and all three are re-exported from the crate root.
 - `Engine::send_host_change_with_audit_context` sends a host's group change, and `host_change_kind` names the change
   a pending commit carries, for its fanout to store (mdk#2332).
 - `Engine::publish_not_delivered` rolls back a pending commit the session gave up because it reached no relay
@@ -27,6 +34,8 @@
 
 ### Changed
 
+- A newly signed account identity proof and a replay-rotation obligation are dated by the engine's wall clock
+  (`EngineBuilder::maintenance_sources`), no longer by the system clock whatever the builder was given (mdk#3496).
 - Every fanout rollback (`publish_failed_with_fanout`, `publish_refused_as_too_large`, `publish_not_delivered`) now
   also refuses a fanout a target may hold (`OutboundFanout::possible_exposure`), so a commit a relay may have kept
   never rolls back (mdk#1577, mdk#2332).

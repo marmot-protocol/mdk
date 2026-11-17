@@ -864,6 +864,7 @@ async fn run_child_case(database: &Path) {
             &group_id,
             &result,
             policy.convergence.max_rewind_commits,
+            Timestamp(1),
         )
         .expect("historical apply reaches selected crash point");
     } else if crash_point.as_deref() == Some(LEGACY_PAST_PEEL_POINT) {

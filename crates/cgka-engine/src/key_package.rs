@@ -163,6 +163,9 @@ fn lifetime_change<T>(
 }
 
 /// Seconds since the Unix epoch on the clock OpenMLS checks lifetimes against.
+// OpenMLS reads the system clock there, and this has to agree with it, so it
+// cannot read the engine's injected wall clock (see clippy.toml).
+#[allow(clippy::disallowed_methods)]
 fn lifetime_clock_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

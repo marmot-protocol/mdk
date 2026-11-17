@@ -1241,6 +1241,7 @@ async fn stored_openmls_canonicalization_applies_selected_branch_to_retained_gro
         CanonicalizationPolicy::default()
             .convergence
             .max_rewind_commits,
+        Timestamp(1),
     )
     .expect("selected OpenMLS branch applies");
 
@@ -1344,6 +1345,7 @@ async fn retained_anchor_late_commit_within_horizon_is_resolved() {
         &group_id,
         &first_result,
         policy.convergence.max_rewind_commits,
+        Timestamp(1),
     )
     .expect("online branch applies and retains epoch 1");
     assert_eq!(stored_openmls_epoch(carol.storage(), &group_id), 2);
@@ -1374,6 +1376,7 @@ async fn retained_anchor_late_commit_within_horizon_is_resolved() {
         &group_id,
         &late_result,
         policy.convergence.max_rewind_commits,
+        Timestamp(1),
     )
     .expect("selected retained-anchor branch applies");
 
@@ -1449,6 +1452,7 @@ async fn retained_anchor_missing_anchor_reports_error_without_mutation() {
         &group_id,
         &first_result,
         policy.convergence.max_rewind_commits,
+        Timestamp(1),
     )
     .expect("online branch applies and retains epoch 1");
     carol
@@ -1558,6 +1562,7 @@ async fn retained_anchor_commit_beyond_anchor_is_invalidated() {
         &group_id,
         &david_result,
         policy.convergence.max_rewind_commits,
+        Timestamp(1),
     )
     .expect("david branch applies");
     alice.confirm(alice_pending).await;
@@ -1589,6 +1594,7 @@ async fn retained_anchor_commit_beyond_anchor_is_invalidated() {
         &group_id,
         &eve_result,
         policy.convergence.max_rewind_commits,
+        Timestamp(1),
     )
     .expect("eve branch applies and prunes epoch 1");
     assert_eq!(stored_openmls_epoch(carol.storage(), &group_id), 3);
@@ -1701,6 +1707,7 @@ async fn openmls_canonicalization_apply_rolls_back_when_selected_path_fails() {
         CanonicalizationPolicy::default()
             .convergence
             .max_rewind_commits,
+        Timestamp(1),
     )
     .expect_err("conflicting same-epoch commits cannot both apply");
 

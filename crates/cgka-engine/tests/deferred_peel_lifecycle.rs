@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use cgka_engine::canonicalization::CanonicalizationPolicy;
 use cgka_engine::message_processor::MAX_PEEL_DEFERRED_ROWS_PER_GROUP;
 use cgka_engine::openmls_projection::project_mls_message;
-use cgka_engine::{Engine, EngineBuilder, ManualConvergenceClock};
+use cgka_engine::{Engine, EngineBuilder, ManualConvergenceClock, SystemMonotonicClock};
 use cgka_traits::app_components::{
     AppComponentData, NOSTR_ROUTING_COMPONENT_ID, NostrRoutingV1, default_group_components,
     encode_nostr_routing_v1,
@@ -24,6 +24,7 @@ use cgka_traits::group_context::GroupContextSnapshot;
 use cgka_traits::ingest::{
     InboundResourceLimit, IngestOutcome, PeeledContent, PeeledMessage, StaleReason,
 };
+use cgka_traits::maintenance::MonotonicClock;
 use cgka_traits::message::MessageState;
 use cgka_traits::peeler::TransportPeeler;
 #[cfg(feature = "test-policy-overrides")]
@@ -40,6 +41,7 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use storage_sqlite::SqliteAccountStorage;
 
 mod support;
@@ -278,14 +280,33 @@ struct NotifyEpochGatePeeler {
     block_on_attempt: Arc<AtomicU64>,
 }
 
+/// Monotonic clock that moves only when a test advances it.
+#[derive(Default)]
+struct ManualMonotonicClock(AtomicU64);
+
+impl ManualMonotonicClock {
+    fn advance_ms(&self, ms: u64) {
+        self.0.fetch_add(ms, Ordering::SeqCst);
+    }
+}
+
+impl MonotonicClock for ManualMonotonicClock {
+    fn elapsed(&self) -> Duration {
+        Duration::from_millis(self.0.load(Ordering::SeqCst))
+    }
+}
+
 /// Epoch-faithful peeler that can suspend before any supplied context is
 /// attempted. Used to cancel a sweep after candidate enumeration but before a
-/// deferred row receives a definitive result.
+/// deferred row receives a definitive result. Each peel also moves `clock`
+/// forward by `peel_cost_ms`, so an engine built on that clock sees a slow
+/// peel without anything sleeping.
 #[derive(Clone)]
 struct CancellableEpochSealedPeeler {
     blocked: Arc<AtomicBool>,
     blocked_attempts: Arc<AtomicU64>,
-    delay_ms: Arc<AtomicU64>,
+    clock: Arc<ManualMonotonicClock>,
+    peel_cost_ms: Arc<AtomicU64>,
 }
 
 impl CancellableEpochSealedPeeler {
@@ -293,7 +314,8 @@ impl CancellableEpochSealedPeeler {
         Self {
             blocked: Arc::new(AtomicBool::new(false)),
             blocked_attempts: Arc::new(AtomicU64::new(0)),
-            delay_ms: Arc::new(AtomicU64::new(0)),
+            clock: Arc::new(ManualMonotonicClock::default()),
+            peel_cost_ms: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -332,10 +354,8 @@ impl TransportPeeler for CancellableEpochSealedPeeler {
             self.blocked_attempts.fetch_add(1, Ordering::SeqCst);
             std::future::pending::<()>().await;
         }
-        let delay_ms = self.delay_ms.load(Ordering::SeqCst);
-        if delay_ms > 0 {
-            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-        }
+        self.clock
+            .advance_ms(self.peel_cost_ms.load(Ordering::SeqCst));
         EpochSealedPeeler.peel_group_message(msg, ctx).await
     }
 
@@ -520,13 +540,19 @@ fn build_epoch_sealed_client_with_storage(
     name: &[u8],
     storage: SqliteAccountStorage,
 ) -> Engine<SqliteAccountStorage> {
-    build_epoch_sealed_client_with_storage_and_peeler(name, storage, EpochSealedPeeler)
+    build_epoch_sealed_client_with_storage_and_peeler(
+        name,
+        storage,
+        EpochSealedPeeler,
+        Arc::new(SystemMonotonicClock::default()),
+    )
 }
 
 fn build_epoch_sealed_client_with_storage_and_peeler<P>(
     name: &[u8],
     storage: SqliteAccountStorage,
     peeler: P,
+    monotonic: Arc<dyn MonotonicClock>,
 ) -> Engine<SqliteAccountStorage>
 where
     P: TransportPeeler + 'static,
@@ -539,6 +565,7 @@ where
         .account_identity_proof_signer(proof_signer(name))
         .supported_app_components(supported_components)
         .peeler(Box::new(peeler))
+        .monotonic_clock(monotonic)
         .build()
         .unwrap();
     engine
@@ -768,12 +795,20 @@ async fn contested_rival_app_backlog(
     GroupId,
     Engine<SqliteAccountStorage>,
 ) {
-    contested_rival_app_backlog_with_peeler(backlog, EpochSealedPeeler).await
+    contested_rival_app_backlog_with_peeler(
+        backlog,
+        EpochSealedPeeler,
+        Arc::new(SystemMonotonicClock::default()),
+    )
+    .await
 }
 
+/// The incumbent, whose engine the tests drive, peels with `incumbent_peeler`
+/// and reads `incumbent_monotonic`.
 async fn contested_rival_app_backlog_with_peeler<P>(
     backlog: usize,
     incumbent_peeler: P,
+    incumbent_monotonic: Arc<dyn MonotonicClock>,
 ) -> (
     Engine<SqliteAccountStorage>,
     SqliteAccountStorage,
@@ -788,6 +823,7 @@ where
         b"candidate-cache-incumbent",
         incumbent_storage.clone(),
         incumbent_peeler,
+        incumbent_monotonic,
     );
     let (mut rival, _rival_storage) = build_epoch_sealed_client(b"candidate-cache-rival");
     let (mut david, _david_storage) = build_epoch_sealed_client(b"candidate-cache-david");
@@ -1233,7 +1269,7 @@ async fn restart_discards_candidate_context_cache_and_recomputes_once() {
 async fn cancelled_sweep_keeps_untried_rows_eligible_and_reuses_enumeration() {
     let peeler = CancellableEpochSealedPeeler::new();
     let (mut incumbent, storage, group_id, _same_branch_peer) =
-        contested_rival_app_backlog_with_peeler(192, peeler.clone()).await;
+        contested_rival_app_backlog_with_peeler(192, peeler.clone(), peeler.clock.clone()).await;
 
     peeler.block();
     let cancelled = tokio::time::timeout(
@@ -4421,19 +4457,16 @@ async fn background_advance_bounds_work_across_sweeps_and_resumes_after_restart(
 
 /// A slow but finite peeler must finish its current row and then give control
 /// back to the host, rather than using the whole 64-row allowance past deadline.
+/// Each peel moves the engine's clock 40 ms, so the 500 ms background budget
+/// runs out with nothing sleeping.
 #[tokio::test]
 async fn background_advance_yields_on_elapsed_budget_without_abandoning_rows() {
     let peeler = CancellableEpochSealedPeeler::new();
     let (mut engine, storage, group_id, _peer) =
-        contested_rival_app_backlog_with_peeler(64, peeler.clone()).await;
-    peeler.delay_ms.store(40, Ordering::SeqCst);
-    tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        engine.advance_convergence(&group_id),
-    )
-    .await
-    .expect("background call should stop cooperatively")
-    .unwrap();
+        contested_rival_app_backlog_with_peeler(64, peeler.clone(), peeler.clock.clone()).await;
+    // Setup peels cost nothing, so the clock still reads zero here.
+    peeler.peel_cost_ms.store(40, Ordering::SeqCst);
+    engine.advance_convergence(&group_id).await.unwrap();
     let remaining = storage
         .list_messages_in_states(&group_id, &[MessageState::PeelDeferred], EpochId(0))
         .unwrap()
@@ -4442,7 +4475,23 @@ async fn background_advance_yields_on_elapsed_budget_without_abandoning_rows() {
         (1..64).contains(&remaining),
         "elapsed budget must return with partial durable progress: {remaining}"
     );
-    peeler.delay_ms.store(0, Ordering::SeqCst);
+
+    // The slice ran until the budget was gone, and its last row is the one
+    // that was under way when it ran out: no row started after that.
+    let budget = Duration::from_millis(500);
+    let spent = peeler.clock.elapsed();
+    let rows_done = u32::try_from(64 - remaining).unwrap();
+    let last_row_started = spent - spent / rows_done;
+    assert!(
+        spent >= budget,
+        "the slice stopped {spent:?} in, before its budget ran out"
+    );
+    assert!(
+        last_row_started < budget,
+        "a row started {last_row_started:?} in, after the budget ran out"
+    );
+
+    peeler.peel_cost_ms.store(0, Ordering::SeqCst);
     for _ in 0..8 {
         engine.advance_convergence(&group_id).await.unwrap();
         if storage
@@ -4457,13 +4506,14 @@ async fn background_advance_yields_on_elapsed_budget_without_abandoning_rows() {
 }
 
 /// Explicit-time callers must finish the same row slice even when peels take
-/// longer than the production wall budget. The next slice remains row-bounded.
+/// longer than the production budget: here every peel moves the engine's clock
+/// a second, twice the budget. The next slice remains row-bounded.
 #[tokio::test]
 async fn explicit_time_advance_ignores_wall_budget_but_keeps_row_bound() {
     let peeler = CancellableEpochSealedPeeler::new();
     let (mut engine, storage, group_id, _peer) =
-        contested_rival_app_backlog_with_peeler(96, peeler.clone()).await;
-    peeler.delay_ms.store(10, Ordering::SeqCst);
+        contested_rival_app_backlog_with_peeler(96, peeler.clone(), peeler.clock.clone()).await;
+    peeler.peel_cost_ms.store(1_000, Ordering::SeqCst);
     engine
         .advance_convergence_inputs_until_settled(&group_id, 1_000_000)
         .await
@@ -4474,9 +4524,9 @@ async fn explicit_time_advance_ignores_wall_budget_but_keeps_row_bound() {
         .len();
     assert_eq!(
         remaining, 32,
-        "elapsed wall time must not change the 64-row slice"
+        "elapsed time must not change the 64-row slice"
     );
-    peeler.delay_ms.store(0, Ordering::SeqCst);
+    peeler.peel_cost_ms.store(0, Ordering::SeqCst);
     for _ in 0..8 {
         engine
             .advance_convergence_inputs_until_settled(&group_id, 1_000_000)

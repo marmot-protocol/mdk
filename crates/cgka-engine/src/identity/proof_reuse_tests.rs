@@ -6,6 +6,7 @@ use std::sync::Mutex;
 use storage_sqlite::{SqlCipherKey, SqliteAccountStorage};
 
 const SUITE: Ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
+const OPENED_AT: Timestamp = Timestamp(1_700_000_000);
 
 struct Signer {
     keys: Keys,
@@ -30,6 +31,7 @@ impl Signer {
             self.identity(),
             store,
             ProtocolProfile::Current,
+            OPENED_AT,
             self,
         )
     }
@@ -61,20 +63,12 @@ fn component(identity: &Identity) -> &[u8] {
 }
 
 #[test]
-fn old_proof_keeps_original_timestamp_and_new_proof_uses_unix_seconds() {
+fn old_proof_keeps_original_timestamp_and_new_proof_takes_the_callers() {
     let store = SqliteAccountStorage::in_memory().unwrap();
     let signer = Signer::new();
-    let before = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
     let identity = signer.open(&store).unwrap();
-    let after = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
     let request = signer.requests.lock().unwrap()[0].clone();
-    assert!((before..=after).contains(&request.created_at));
+    assert_eq!(request.created_at, OPENED_AT.0);
     let old = crate::account_identity_proof::account_identity_proof_component(
         &signer.identity(),
         &identity.signer.to_public_vec(),
@@ -192,6 +186,7 @@ fn current_and_legacy_proof_domains_remain_separate() {
         signer.identity(),
         &store,
         ProtocolProfile::Legacy,
+        OPENED_AT,
         &signer,
     )
     .unwrap();
@@ -223,6 +218,7 @@ fn invalid_new_signature_is_never_persisted_or_returned() {
             identity.clone(),
             &store,
             ProtocolProfile::Current,
+            OPENED_AT,
             &InvalidSigner,
         )
         .is_err()
@@ -262,6 +258,7 @@ fn failed_proof_persistence_reopens_with_the_same_key_and_retries_acquisition() 
                 signer.identity(),
                 &store,
                 ProtocolProfile::Current,
+                OPENED_AT,
                 &ClosingSigner {
                     inner: &signer,
                     store: &store

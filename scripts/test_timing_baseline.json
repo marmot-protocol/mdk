@@ -83,7 +83,6 @@
       "sleep": 2
     },
     "crates/cgka-engine/tests/deferred_peel_lifecycle.rs": {
-      "sleep": 1,
       "short_timeout": 1
     },
     "crates/cgka-engine/tests/publish_lifecycle.rs": {

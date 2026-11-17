@@ -16,7 +16,7 @@ use cgka_traits::error::EngineError;
 use cgka_traits::group::{Member, ProtocolProfile};
 use cgka_traits::message::{MessageState, OwnApplicationConvergenceStamp, StoredMessagePayload};
 use cgka_traits::storage::{RosterTagKey, StorageError, StorageProvider};
-use cgka_traits::transport::{TransportEnvelope, TransportMessage};
+use cgka_traits::transport::{Timestamp, TransportEnvelope, TransportMessage};
 use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
 use openmls::group::{
     MlsGroup, MlsGroupStateError, ProcessMessageError, ResolveAppDataCommitError, StageCommitError,
@@ -1124,7 +1124,9 @@ fn materialize_openmls_candidate_paths_budgeted<S: StorageProvider>(
             ));
         }
         budget.consume()?;
+        // Test-only probe measurement (see clippy.toml).
         #[cfg(test)]
+        #[allow(clippy::disallowed_methods)]
         let probe_started = std::time::Instant::now();
         let replay = replay_openmls_messages_prevalidated_output(
             storage,
@@ -2803,6 +2805,8 @@ fn probe_candidate_path<S: StorageProvider>(
 
 /// Apply the selected stored branch with rollback protection and retain replay anchors.
 /// Returns the stable public replay observations; engine presentation deltas stay internal.
+/// `applied_at` is the caller's wall-clock time; it dates the replay-rotation
+/// obligations the apply creates.
 /// The roster tag keys the apply collects are dropped too: only the engine's
 /// convergence pass records them (`roster_tag_keys.rs`). Standalone callers
 /// hold no engine session: on a backend without atomic group savepoints, a
@@ -2813,13 +2817,17 @@ pub fn apply_openmls_canonicalization_result<S: StorageProvider>(
     group_id: &GroupId,
     result: &CanonicalizationResult,
     max_retained_anchor_rewind: u64,
+    applied_at: Timestamp,
 ) -> Result<Vec<OpenMlsReplayObservation>, OpenMlsProjectionError> {
     apply_openmls_canonicalization_result_with_profile_policy(
         storage,
         &Rewinds::default(),
         group_id,
         result,
-        max_retained_anchor_rewind,
+        AnchorRetention {
+            max_rewind: max_retained_anchor_rewind,
+            applied_at,
+        },
         ReplayProfilePolicy::default(),
         None,
     )
@@ -2835,10 +2843,11 @@ pub(crate) fn apply_openmls_canonicalization_result_with_profile_policy<S: Stora
     rewinds: &Rewinds,
     group_id: &GroupId,
     result: &CanonicalizationResult,
-    max_retained_anchor_rewind: u64,
+    retention: AnchorRetention,
     profile_policy: ReplayProfilePolicy,
     sibling_context: Option<&crate::membership_effects::SiblingSelfRemovalContext>,
 ) -> Result<OpenMlsApplyOutput, OpenMlsProjectionError> {
+    let max_retained_anchor_rewind = retention.max_rewind;
     let current_record = storage.get_group(group_id)?;
     let current_epoch = current_record.epoch.0;
     // The selected branch's already-applied prefix — leading `Processed`
@@ -2908,7 +2917,7 @@ pub(crate) fn apply_openmls_canonicalization_result_with_profile_policy<S: Stora
             &replay_messages,
             &own_commits,
             ReplayAcceptance {
-                retain_anchors: Some(max_retained_anchor_rewind),
+                retain_anchors: Some(retention),
                 sibling_context,
                 known_departures: Some(&current_record.self_removed_sibling_slots),
             },
@@ -3300,10 +3309,19 @@ fn oldest_retained_epoch(retained_epoch: u64, max_retained_anchor_rewind: u64) -
     retained_epoch.saturating_sub(max_retained_anchor_rewind)
 }
 
+/// What a durable apply retains: replay anchors `max_rewind` epochs back,
+/// and the wall-clock time it runs at, which dates the replay-rotation
+/// obligations it creates.
+#[derive(Clone, Copy)]
+pub(crate) struct AnchorRetention {
+    pub(crate) max_rewind: u64,
+    pub(crate) applied_at: Timestamp,
+}
+
 /// Inputs owned by the selected-apply transaction, never by candidate probes.
 #[derive(Clone, Copy)]
 struct ReplayAcceptance<'a> {
-    retain_anchors: Option<u64>,
+    retain_anchors: Option<AnchorRetention>,
     sibling_context: Option<&'a crate::membership_effects::SiblingSelfRemovalContext>,
     known_departures: Option<&'a BTreeSet<cgka_traits::app_components::DeviceSlotId>>,
 }
@@ -3952,7 +3970,8 @@ fn process_openmls_messages_inner<S: StorageProvider>(
     profile_policy: ReplayProfilePolicy,
     accepted: Option<ReplayAcceptance<'_>>,
 ) -> Result<OpenMlsReplayOutput, OpenMlsProjectionError> {
-    let retain_replayed_anchors = accepted.and_then(|accepted| accepted.retain_anchors);
+    let retention = accepted.and_then(|accepted| accepted.retain_anchors);
+    let retain_replayed_anchors = retention.map(|retention| retention.max_rewind);
     let sibling_context = accepted.and_then(|accepted| accepted.sibling_context);
     let reject_legacy_group_additions = profile_policy.reject_legacy_group_additions
         && storage
@@ -4116,9 +4135,15 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                 committer: stamp.committer.as_slice().to_vec(),
                 consumed_proposal_refs: stamp.consumed_proposal_refs.clone(),
             });
-            if let Some(max_rewind) = retain_replayed_anchors {
-                crate::maintenance::require_replay_rotation(storage, group_id, &mls_group)
-                    .map_err(|error| OpenMlsProjectionError::Storage(format!("{error:?}")))?;
+            if let Some(AnchorRetention {
+                max_rewind,
+                applied_at,
+            }) = retention
+            {
+                crate::maintenance::require_replay_rotation(
+                    storage, group_id, &mls_group, applied_at,
+                )
+                .map_err(|error| OpenMlsProjectionError::Storage(format!("{error:?}")))?;
                 roster_tag_keys.extend(crate::roster_tag_keys::roster_tag_keys(&mls_group));
                 let intermediate = OpenMlsReplayOutput {
                     observations: Vec::new(),

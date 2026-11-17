@@ -26,7 +26,6 @@ use openmls::prelude::{MlsGroup, MlsMessageBodyIn, MlsMessageIn};
 use openmls_traits::OpenMlsProvider as _;
 use sha2::{Digest, Sha256};
 use tls_codec::{Deserialize as _, Serialize as _};
-use web_time::{SystemTime, UNIX_EPOCH};
 
 const REPLAY_ROTATION_PREFIX: &[u8] = b"marmot-replay-rotation-v1/";
 
@@ -80,10 +79,12 @@ pub(crate) fn prune_replay_rotations<S: StorageProvider>(
 /// Called only by canonical apply, inside its rollback unit, never by probes.
 /// Keep the obligation even after completion: revisiting this epoch must not
 /// reuse its sender ratchet. Ordinary phase changes cannot release this gate.
+/// `created_at` is the apply's wall-clock time.
 pub(crate) fn require_replay_rotation<S: StorageProvider>(
     storage: &S,
     group_id: &GroupId,
     group: &MlsGroup,
+    created_at: Timestamp,
 ) -> Result<(), EngineError> {
     let maintenance = storage
         .maintenance_storage()
@@ -97,18 +98,12 @@ pub(crate) fn require_replay_rotation<S: StorageProvider>(
         .ok_or_else(|| EngineError::Backend("group has no local leaf".into()))?
         .tls_serialize_detached()
         .map_err(|error| EngineError::Serialize(format!("{error:?}")))?;
-    let now = Timestamp(
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs(),
-    );
     maintenance.put_maintenance_obligation(&MaintenanceObligation {
         id,
         group_id: group_id.clone(),
         trigger: MaintenanceTrigger::Manual,
         phase: MaintenancePhase::Retry,
-        created_at: now,
+        created_at,
         operational_target_at: None,
         overdue: false,
         eose_deadline_at: None,

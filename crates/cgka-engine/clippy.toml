@@ -12,8 +12,18 @@
 # its OpenMLS state is that anchor's too (mdk#3280). A load that may skip the
 # check (hydration, a cleanup of state its own operation made, code inside a
 # rewind window or an already gated pass) allows this lint and says why.
+#
+# Engine code reads time through its injected clocks: `Engine::monotonic` for
+# in-process budgets, deadlines and duration metrics, `wall_clock` for
+# timestamps, `convergence_clock` for convergence scheduling. Code with no
+# engine in scope takes the reading as an argument (mdk#3496). Only the system
+# clock implementations allow this lint, and `key_package::lifetime_clock_now`,
+# which has to agree with the clock OpenMLS checks a KeyPackage lifetime
+# against.
 disallowed-methods = [
     { path = "cgka_traits::storage::GroupStorage::get_group", reason = "read through Engine::live_group_record or Engine::stored_group_record, which refuse a quarantined group" },
     { path = "cgka_traits::storage::GroupStorage::list_group_records", reason = "a listing includes quarantined groups; filter them or read through Engine::live_group_record" },
     { path = "openmls::group::MlsGroup::load", reason = "load through Engine::load_mls_group_in, which refuses a group whose rewind restore failed" },
+    { path = "std::time::Instant::now", reason = "read Engine::monotonic, or take a MonotonicClock reading as an argument" },
+    { path = "std::time::SystemTime::now", reason = "read Engine::wall_clock, or take a Timestamp as an argument" },
 ]

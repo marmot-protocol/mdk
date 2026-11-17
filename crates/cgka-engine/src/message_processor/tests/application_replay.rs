@@ -114,7 +114,7 @@ async fn measure_negative_application_discovery_prefix() {
             .drain_canonical_applications(
                 &group,
                 &mut DeferredPeelExecution::Background {
-                    deadline: Some(Instant::now()),
+                    deadline: Some(Duration::ZERO),
                     rows_remaining: 0,
                 },
             )

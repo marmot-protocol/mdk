@@ -9,6 +9,7 @@ use cgka_traits::group::{Group, ProtocolProfile};
 use cgka_traits::storage::{
     AccountDeviceSignerBinding, StorageProvider as CgkaStorageProvider, StorageResult,
 };
+use cgka_traits::transport::Timestamp;
 use cgka_traits::types::MemberId;
 use openmls::extensions::Extensions;
 use openmls::group::MlsGroup;
@@ -18,7 +19,6 @@ use openmls::prelude::{
 };
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_traits::types::Ciphersuite;
-use web_time::{SystemTime, UNIX_EPOCH};
 
 /// Bundle of everything needed to sign + identify the local client.
 pub struct Identity {
@@ -33,11 +33,14 @@ pub struct Identity {
 impl Identity {
     /// Load or create an identity with a basic credential whose `identity`
     /// field carries `identity_bytes` (opaque — typically a stable pubkey).
+    /// A proof signed here is dated `created_at`; a stored proof that still
+    /// validates keeps its own timestamp.
     pub fn load_or_generate<S>(
         ciphersuite: Ciphersuite,
         identity_bytes: Vec<u8>,
         storage: &S,
         protocol_profile: ProtocolProfile,
+        created_at: Timestamp,
         proof_signer: &dyn crate::account_identity_proof::AccountIdentityProofSigner,
     ) -> Result<Self, String>
     where
@@ -97,17 +100,13 @@ impl Identity {
                 proof.clone(),
             )
         } else {
-            let created_at = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_err(|error| format!("system clock precedes Unix epoch: {error}"))?
-                .as_secs();
             let proof = crate::account_identity_proof::account_identity_proof_material(
                 &identity_bytes,
                 &binding.mls_signature_public_key,
                 ciphersuite,
                 scheme,
                 protocol_profile,
-                created_at,
+                created_at.0,
                 proof_signer,
             )
             .map_err(|e| e.to_string())?;
