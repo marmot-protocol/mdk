@@ -5,7 +5,11 @@
 //! `TransportPeeler`; actual network publish and relay sync stay above this
 //! module.
 
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+    sync::Arc,
+};
 
 // Engine items the session's API exposes, re-exported so hosts need not name
 // the engine (mdk#2602).
@@ -50,8 +54,8 @@ use cgka_traits::maintenance::{
 };
 use cgka_traits::peeler::TransportPeeler;
 use cgka_traits::storage::{
-    DeviceGroupWelcomeExpectation, MaintenanceStorage, OutboundFanoutStorage, RosterTagKey,
-    StorageError,
+    DeviceGroupWelcomeExpectation, MaintenanceStorage, MessageStorage, OutboundFanoutStorage,
+    RosterTagKey, StorageError,
 };
 use cgka_traits::transport::{Timestamp, TransportMessage};
 use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
@@ -72,6 +76,23 @@ mod device_group_moves;
 const TRACE_TARGET: &str = "marmot_session::session";
 
 pub type SessionResult<T> = Result<T, SessionError>;
+
+/// Why a Welcome is not published (see `welcome_hold`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum WelcomeHold {
+    /// Withdrawn, or retired with its rolled-back commit: never published
+    /// again, and nothing is owed.
+    Withdrawn,
+    /// Staged with its unconfirmed invite commit: held until the commit
+    /// confirms and promotes it (mdk#2726).
+    AwaitsCommit,
+    /// A device link's Welcome whose new device stopped waiting for it: never
+    /// published again, and nothing is owed (mdk#2628 D40).
+    Expired,
+}
+
+pub(super) type DetachedWelcomeHolds =
+    Arc<std::sync::Mutex<HashMap<MessageId, Option<WelcomeHold>>>>;
 
 /// A session failure. Every one is an engine error, so callers classify it by
 /// what it is rather than by the layer that met it.
@@ -290,6 +311,9 @@ pub struct AccountDeviceSession {
     /// whether a group is live (mdk#2602).
     pub(super) storage: SqliteAccountStorage,
     pub(super) recovery_peeler: Arc<dyn TransportPeeler>,
+    pub(super) detached_welcome_publishes: HashSet<MessageId>,
+    pub(super) detached_welcome_holds: DetachedWelcomeHolds,
+    pub(super) welcome_selection: Arc<futures::lock::Mutex<()>>,
     /// The audit log's one recorder. The engine holds a clone from build, and
     /// the runtime and the app take their own from [`Self::audit_recorder`].
     audit: SharedRecorder,
@@ -572,6 +596,9 @@ impl AccountDeviceSession {
             engine,
             storage: maintenance_storage,
             recovery_peeler,
+            detached_welcome_publishes: HashSet::new(),
+            detached_welcome_holds: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            welcome_selection: Arc::new(futures::lock::Mutex::new(())),
             audit,
             open_timings,
         })
@@ -841,7 +868,34 @@ impl AccountDeviceSession {
 
     /// Abandon a group locally without sending a leave or disband.
     pub fn forget_group_local(&mut self, group_id: &GroupId) -> SessionResult<bool> {
-        Ok(self.engine.forget_group_local(group_id)?)
+        let shared_holds = self.detached_welcome_holds.clone();
+        let mut holds = shared_holds
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        // Forget deletes these rows, so capture their ids while their group
+        // association is still readable. Borrow ids rather than copying them.
+        let mut forgotten = Vec::new();
+        for id in &self.detached_welcome_publishes {
+            match self.storage.get_message(id) {
+                Ok(record) if &record.group_id == group_id => forgotten.push(id),
+                Ok(_) | Err(StorageError::NotFound) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        let result = self.engine.forget_group_local(group_id);
+        if result.is_ok() {
+            for id in forgotten {
+                *holds.get_mut(id).expect("reserved Welcome has a hold") =
+                    Some(WelcomeHold::Withdrawn);
+            }
+        }
+        for id in &self.detached_welcome_publishes {
+            let hold = holds.get_mut(id).expect("reserved Welcome has a hold");
+            if *hold != Some(WelcomeHold::Withdrawn) {
+                *hold = self.read_welcome_hold(id);
+            }
+        }
+        Ok(result?)
     }
 
     pub fn group_record(&self, group_id: &GroupId) -> SessionResult<Group> {
@@ -905,6 +959,83 @@ impl AccountDeviceSession {
         Ok(self.engine.outbound_welcome_status(id, now)?)
     }
 
+    /// Native selection may yield or be cancelled after changing stored state.
+    /// Until it returns, queued attempts must not use their earlier permit.
+    async fn pause_welcome_publishes(&self) -> futures::lock::OwnedMutexGuard<()> {
+        let selection = self.welcome_selection.clone().lock_owned().await;
+        self.hold_welcome_publishes();
+        selection
+    }
+
+    fn hold_welcome_publishes(&self) {
+        let mut holds = self
+            .detached_welcome_holds
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        for hold in holds.values_mut() {
+            if *hold != Some(WelcomeHold::Withdrawn) {
+                *hold = Some(WelcomeHold::AwaitsCommit);
+            }
+        }
+    }
+
+    /// Refresh reserved attempts before yielding after native state changes.
+    /// An unreadable origin holds its debt rather than allowing stale I/O.
+    pub(super) fn refresh_welcome_holds(&self) {
+        for id in &self.detached_welcome_publishes {
+            let hold = self.read_welcome_hold(id);
+            let mut holds = self
+                .detached_welcome_holds
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let current = holds.get_mut(id).expect("reserved Welcome has a hold");
+            if *current != Some(WelcomeHold::Withdrawn) {
+                *current = hold;
+            }
+        }
+    }
+
+    fn read_welcome_hold(&self, id: &MessageId) -> Option<WelcomeHold> {
+        let current = self.sent_welcome_withdrawn(id).and_then(|withdrawn| {
+            if withdrawn {
+                return Ok(Some(WelcomeHold::Withdrawn));
+            }
+            self.sent_welcome_awaits_commit(id)
+                .map(|waiting| waiting.then_some(WelcomeHold::AwaitsCommit))
+        });
+        match current {
+            Ok(current) => current,
+            Err(error) => {
+                tracing::warn!(
+                    target: TRACE_TARGET,
+                    method = "refresh_welcome_holds",
+                    transient = error.is_transient(),
+                    "detached Welcome held until its origin is readable"
+                );
+                Some(WelcomeHold::AwaitsCommit)
+            }
+        }
+    }
+
+    /// The adapter holds this mutex through its first poll. Keep it locked
+    /// through a synchronous mutation and reconciliation, so a task cannot
+    /// mistake a temporary hold for its final disposition. These paths do not
+    /// await; unlike async selection, their SQLite work runs under the lock.
+    fn with_welcome_publishes_paused<T>(&mut self, operation: impl FnOnce(&mut Self) -> T) -> T {
+        let shared_holds = self.detached_welcome_holds.clone();
+        let mut holds = shared_holds
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let result = operation(self);
+        for id in &self.detached_welcome_publishes {
+            let hold = holds.get_mut(id).expect("reserved Welcome has a hold");
+            if *hold != Some(WelcomeHold::Withdrawn) {
+                *hold = self.read_welcome_hold(id);
+            }
+        }
+        result
+    }
+
     /// See `Engine::sent_welcome_deliver_until`.
     pub fn sent_welcome_deliver_until(&self, id: &MessageId) -> SessionResult<Option<Timestamp>> {
         Ok(self.engine.sent_welcome_deliver_until(id)?)
@@ -933,7 +1064,17 @@ impl AccountDeviceSession {
 
     /// See `Engine::withdraw_sent_welcome`.
     pub fn withdraw_sent_welcome(&self, id: &MessageId) -> SessionResult<WelcomeWithdrawal> {
-        Ok(self.engine.withdraw_sent_welcome(id)?)
+        let mut holds = self
+            .detached_welcome_holds
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let withdrawal = self.engine.withdraw_sent_welcome(id)?;
+        if withdrawal != WelcomeWithdrawal::AlreadyDelivered
+            && let Some(hold) = holds.get_mut(id)
+        {
+            *hold = Some(WelcomeHold::Withdrawn);
+        }
+        Ok(withdrawal)
     }
 
     /// See `Engine::sent_welcomes_for_key_package`.
@@ -971,7 +1112,9 @@ impl AccountDeviceSession {
     /// beyond the crash-recovery already performed at open, never re-joins, and
     /// never discards local history.
     pub fn retry_hydrate_quarantined_group(&mut self, group_id: &GroupId) -> SessionResult<bool> {
-        Ok(self.engine.retry_hydrate_quarantined_group(group_id)?)
+        self.with_welcome_publishes_paused(|session| {
+            Ok(session.engine.retry_hydrate_quarantined_group(group_id)?)
+        })
     }
 
     /// Group ids the session-open cheap pass seeded whose full hydration has
@@ -986,11 +1129,13 @@ impl AccountDeviceSession {
     /// when hydration failed and the group moved to the quarantine surface —
     /// the same terminal state an open-time hydration failure produces.
     pub fn ensure_group_hydrated(&mut self, group_id: &GroupId) -> SessionResult<bool> {
-        match self.engine.ensure_hydrated(group_id) {
-            Ok(()) => Ok(true),
-            Err(EngineError::UnknownGroup(_)) => Ok(false),
-            Err(other) => Err(other.into()),
-        }
+        self.with_welcome_publishes_paused(|session| {
+            match session.engine.ensure_hydrated(group_id) {
+                Ok(()) => Ok(true),
+                Err(EngineError::UnknownGroup(_)) => Ok(false),
+                Err(other) => Err(other.into()),
+            }
+        })
     }
 
     /// One bounded background-pipeline step (mdk#1161): fully hydrate up to
@@ -1024,10 +1169,10 @@ impl AccountDeviceSession {
         }
         let mut progress = HydrationProgress::default();
         for group_id in batch {
-            match self.engine.ensure_hydrated(&group_id) {
-                Ok(()) => progress.hydrated += 1,
-                Err(EngineError::UnknownGroup(_)) => progress.quarantined += 1,
-                Err(other) => return Err(other.into()),
+            match self.ensure_group_hydrated(&group_id) {
+                Ok(true) => progress.hydrated += 1,
+                Ok(false) => progress.quarantined += 1,
+                Err(other) => return Err(other),
             }
         }
         progress.remaining = self.engine.unhydrated_group_ids().len();
@@ -1250,7 +1395,10 @@ impl AccountDeviceSession {
             initial_admin_count = req.initial_admins.len(),
             "creating group"
         );
-        let (group_id, result) = self.engine.create_group(req).await?;
+        let _selection = self.pause_welcome_publishes().await;
+        let result = self.engine.create_group(req).await;
+        self.refresh_welcome_holds();
+        let (group_id, result) = result?;
         let effects = self.collect_effects(vec![result]);
         tracing::debug!(
             target: TRACE_TARGET,
@@ -1275,7 +1423,8 @@ impl AccountDeviceSession {
             initial_admin_count = req.initial_admins.len(),
             "creating group"
         );
-        let (group_id, result) = self
+        let _selection = self.pause_welcome_publishes().await;
+        let result = self
             .engine
             .create_group_with_optional_app_components_and_audit_context(
                 req,
@@ -1283,7 +1432,9 @@ impl AccountDeviceSession {
                 welcome_check,
                 Some(context),
             )
-            .await?;
+            .await;
+        self.refresh_welcome_holds();
+        let (group_id, result) = result?;
         tracing::debug!(
             target: TRACE_TARGET,
             method = "create_group_with_audit_context",
@@ -1302,7 +1453,8 @@ impl AccountDeviceSession {
         welcome_check: Option<&dyn cgka_traits::WelcomeSizeCheck>,
         context: AuditEventContext,
     ) -> SessionResult<CreateGroupEffects> {
-        let (group_id, result) = self
+        let _selection = self.pause_welcome_publishes().await;
+        let result = self
             .engine
             .create_group_with_siblings_and_audit_context(
                 request,
@@ -1311,7 +1463,9 @@ impl AccountDeviceSession {
                 welcome_check,
                 Some(context),
             )
-            .await?;
+            .await;
+        self.refresh_welcome_holds();
+        let (group_id, result) = result?;
         let effects = self.collect_effects(vec![result]);
         Ok(CreateGroupEffects { group_id, effects })
     }
@@ -1332,7 +1486,8 @@ impl AccountDeviceSession {
             invitee_count = req.members.len(),
             "creating group under a chosen id"
         );
-        let (group_id, result) = self
+        let _selection = self.pause_welcome_publishes().await;
+        let result = self
             .engine
             .create_group_with_chosen_id_and_audit_context(
                 req,
@@ -1341,7 +1496,9 @@ impl AccountDeviceSession {
                 welcome_deliver_until,
                 Some(context),
             )
-            .await?;
+            .await;
+        self.refresh_welcome_holds();
+        let (group_id, result) = result?;
         let effects = self.collect_effects(vec![result]);
         Ok(CreateGroupEffects { group_id, effects })
     }
@@ -1353,7 +1510,10 @@ impl AccountDeviceSession {
             intent_kind = send_intent_kind(&intent),
             "sending local intent"
         );
-        let result = self.engine.send(intent).await?;
+        let _selection = self.pause_welcome_publishes().await;
+        let result = self.engine.send(intent).await;
+        self.refresh_welcome_holds();
+        let result = result?;
         tracing::debug!(
             target: TRACE_TARGET,
             method = "send",
@@ -1374,10 +1534,13 @@ impl AccountDeviceSession {
             intent_kind = send_intent_kind(&intent),
             "sending local intent"
         );
+        let _selection = self.pause_welcome_publishes().await;
         let result = self
             .engine
             .send_with_audit_context(intent, Some(context))
-            .await?;
+            .await;
+        self.refresh_welcome_holds();
+        let result = result?;
         tracing::debug!(
             target: TRACE_TARGET,
             method = "send_with_audit_context",
@@ -1401,10 +1564,13 @@ impl AccountDeviceSession {
             intent_kind = send_intent_kind(&intent),
             "sending host group change"
         );
+        let _selection = self.pause_welcome_publishes().await;
         let result = self
             .engine
             .send_host_change_with_audit_context(intent, Some(context))
-            .await?;
+            .await;
+        self.refresh_welcome_holds();
+        let result = result?;
         tracing::debug!(
             target: TRACE_TARGET,
             method = "send_host_change_with_audit_context",
@@ -1425,10 +1591,13 @@ impl AccountDeviceSession {
             method = "queue_app_message_with_audit_context",
             "durably queueing local application-message intent"
         );
+        let _selection = self.pause_welcome_publishes().await;
         let result = self
             .engine
             .queue_app_message_with_audit_context(group_id, payload, Some(context))
-            .await?;
+            .await;
+        self.refresh_welcome_holds();
+        let result = result?;
         Ok(self.collect_effects(vec![result]))
     }
 
@@ -1439,7 +1608,10 @@ impl AccountDeviceSession {
             method = "ingest",
             "ingesting transport message"
         );
-        let outcome = self.engine.ingest(msg).await?;
+        let _selection = self.pause_welcome_publishes().await;
+        let outcome = self.engine.ingest(msg).await;
+        self.refresh_welcome_holds();
+        let outcome = outcome?;
         let left_object_unpersisted = self.engine.last_ingest_left_object_unpersisted();
         tracing::debug!(
             target: TRACE_TARGET,
@@ -1469,10 +1641,13 @@ impl AccountDeviceSession {
             "ingesting transport delivery"
         );
         let transport_context = audit_transport_context(delivery.source.clone());
+        let _selection = self.pause_welcome_publishes().await;
         let outcome = self
             .engine
             .ingest_with_audit_context(&delivery.message, Some(transport_context))
-            .await?;
+            .await;
+        self.refresh_welcome_holds();
+        let outcome = outcome?;
         if matches!(&outcome, IngestOutcome::GroupRecovery { .. }) {
             return Ok(IngestEffects {
                 outcome,
@@ -1512,10 +1687,13 @@ impl AccountDeviceSession {
         welcome: &SiblingWelcome,
         created_at: Option<Timestamp>,
     ) -> SessionResult<SiblingWelcomeJoin> {
+        let _selection = self.pause_welcome_publishes().await;
         let outcome = self
             .engine
             .join_sibling_welcome(message_id, welcome, created_at)
-            .await?;
+            .await;
+        self.refresh_welcome_holds();
+        let outcome = outcome?;
         tracing::debug!(
             target: TRACE_TARGET,
             method = "join_sibling_welcome",
@@ -1644,7 +1822,10 @@ impl AccountDeviceSession {
             method = "advance_convergence",
             "advancing convergence"
         );
-        let results = self.engine.advance_convergence(group_id).await?;
+        let _selection = self.pause_welcome_publishes().await;
+        let results = self.engine.advance_convergence(group_id).await;
+        self.refresh_welcome_holds();
+        let results = results?;
         tracing::debug!(
             target: TRACE_TARGET,
             method = "advance_convergence",
@@ -1673,7 +1854,10 @@ impl AccountDeviceSession {
             method = "advance_convergence_inputs",
             "advancing convergence inputs without draining queued outbound intents"
         );
-        let settled = self.engine.advance_convergence_inputs(group_id).await?;
+        let _selection = self.pause_welcome_publishes().await;
+        let settled = self.engine.advance_convergence_inputs(group_id).await;
+        self.refresh_welcome_holds();
+        let settled = settled?;
         tracing::debug!(
             target: TRACE_TARGET,
             method = "advance_convergence_inputs",
@@ -1694,7 +1878,9 @@ impl AccountDeviceSession {
 
     /// See `Engine::retry_failed_convergence_pass` (mdk#2684).
     pub fn retry_failed_convergence_pass(&mut self, group_id: &GroupId) -> SessionResult<bool> {
-        Ok(self.engine.retry_failed_convergence_pass(group_id)?)
+        self.with_welcome_publishes_paused(|session| {
+            Ok(session.engine.retry_failed_convergence_pass(group_id)?)
+        })
     }
 
     /// See `Engine::is_queued_outbound_intent`.
@@ -1712,10 +1898,12 @@ impl AccountDeviceSession {
         &mut self,
         group_id: &GroupId,
     ) -> SessionResult<Option<u64>> {
-        Ok(CgkaEngine::prepare_convergence_cutoff_delay_ms(
-            &mut self.engine,
-            group_id,
-        )?)
+        self.with_welcome_publishes_paused(|session| {
+            Ok(CgkaEngine::prepare_convergence_cutoff_delay_ms(
+                &mut session.engine,
+                group_id,
+            )?)
+        })
     }
 
     pub fn deferred_peel_cutoff_delay_ms(
@@ -1746,7 +1934,10 @@ impl AccountDeviceSession {
     }
 
     pub async fn retry_rejoins_after_trusted_removal(&mut self) -> SessionResult<bool> {
-        Ok(self.engine.retry_rejoins_after_trusted_removal().await?)
+        let _selection = self.pause_welcome_publishes().await;
+        let result = self.engine.retry_rejoins_after_trusted_removal().await;
+        self.refresh_welcome_holds();
+        Ok(result?)
     }
 
     pub fn pending_group_rejoins_for(
@@ -1774,7 +1965,10 @@ impl AccountDeviceSession {
         welcome_id: &MessageId,
         token: &[u8],
     ) -> SessionResult<GroupId> {
-        Ok(self.engine.confirm_group_rejoin(welcome_id, token).await?)
+        let _selection = self.pause_welcome_publishes().await;
+        let result = self.engine.confirm_group_rejoin(welcome_id, token).await;
+        self.refresh_welcome_holds();
+        Ok(result?)
     }
 
     pub fn decline_group_rejoin(&mut self, welcome_id: &MessageId) -> SessionResult<()> {
@@ -1816,7 +2010,7 @@ impl AccountDeviceSession {
 
     /// See `Engine::cancel_leave`.
     pub fn cancel_leave(&mut self, group_id: &GroupId) -> SessionResult<()> {
-        Ok(self.engine.cancel_leave(group_id)?)
+        self.with_welcome_publishes_paused(|session| Ok(session.engine.cancel_leave(group_id)?))
     }
 
     /// See `Engine::scheduled_self_remove_auto_commit_delay_ms`.
@@ -1850,7 +2044,10 @@ impl AccountDeviceSession {
             method = "confirm_published",
             "confirming published state"
         );
-        let event = self.engine.confirm_published(pending).await?;
+        let _selection = self.pause_welcome_publishes().await;
+        let event = self.engine.confirm_published(pending).await;
+        self.refresh_welcome_holds();
+        let event = event?;
         let mut effects = self.collect_effects(vec![]);
         if !effects.events.contains(&event) {
             effects.events.insert(0, event);
@@ -1868,10 +2065,10 @@ impl AccountDeviceSession {
         pending: PendingStateRef,
         fanout: &mut OutboundFanout,
     ) -> SessionResult<SessionEffects> {
-        let event = self
-            .engine
-            .confirm_published_fanout(pending, fanout)
-            .await?;
+        let _selection = self.pause_welcome_publishes().await;
+        let event = self.engine.confirm_published_fanout(pending, fanout).await;
+        self.refresh_welcome_holds();
+        let event = event?;
         let mut effects = self.collect_effects(vec![]);
         if !effects.events.contains(&event) {
             effects.events.insert(0, event);
@@ -1888,7 +2085,10 @@ impl AccountDeviceSession {
             method = "publish_failed",
             "recording publish failure"
         );
-        self.engine.publish_failed(pending).await?;
+        let _selection = self.pause_welcome_publishes().await;
+        let result = self.engine.publish_failed(pending).await;
+        self.refresh_welcome_holds();
+        result?;
         tracing::debug!(
             target: TRACE_TARGET,
             method = "publish_failed",
@@ -1905,9 +2105,13 @@ impl AccountDeviceSession {
         fanout: &mut OutboundFanout,
         pass: RollbackPass,
     ) -> SessionResult<SessionEffects> {
-        self.engine
+        let _selection = self.pause_welcome_publishes().await;
+        let result = self
+            .engine
             .publish_failed_fanout(pending, fanout, pass)
-            .await?;
+            .await;
+        self.refresh_welcome_holds();
+        result?;
         Ok(self.collect_effects(vec![]))
     }
 
@@ -1919,9 +2123,13 @@ impl AccountDeviceSession {
         fanout: &mut OutboundFanout,
         pass: RollbackPass,
     ) -> SessionResult<SessionEffects> {
-        self.engine
+        let _selection = self.pause_welcome_publishes().await;
+        let result = self
+            .engine
             .publish_not_delivered(pending, fanout, pass)
-            .await?;
+            .await;
+        self.refresh_welcome_holds();
+        result?;
         Ok(self.collect_effects(vec![]))
     }
 
@@ -1935,9 +2143,13 @@ impl AccountDeviceSession {
         size_class: cgka_traits::EventSizeClass,
         pass: RollbackPass,
     ) -> SessionResult<SessionEffects> {
-        self.engine
+        let _selection = self.pause_welcome_publishes().await;
+        let result = self
+            .engine
             .publish_refused_as_too_large(pending, fanout, artifact, size_class, pass)
-            .await?;
+            .await;
+        self.refresh_welcome_holds();
+        result?;
         Ok(self.collect_effects(vec![]))
     }
 

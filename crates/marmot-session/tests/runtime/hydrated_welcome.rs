@@ -1,225 +1,204 @@
-// Native preparation deliberately stops before transport publication, then reopens
-// the encrypted account as the runtime's first user operation.
-#[derive(Clone, Copy)]
-enum RecoveryFixtureMode {
-    Staged,
-    Confirmed,
-    Superseded,
-    Terminal,
-}
+include!("../support/hydrated_recovery.rs");
 
-async fn hydrated_recovery_fixture(
-    mode: RecoveryFixtureMode,
-) -> (
-    tempfile::TempDir,
-    AccountDeviceSession,
-    GroupId,
-    GroupId,
-    TransportMessage,
-) {
-    use cgka_engine::EngineBuilder;
-    use cgka_traits::StorageProvider;
-    use cgka_traits::engine::{CgkaEngine, SendResult};
-    use cgka_traits::group_recovery::{GroupMemberRecovery, group_recovery_grant_bytes};
-    use cgka_traits::storage::AccountDeviceSignerStorage;
-    use openmls_basic_credential::SignatureKeyPair;
-    use openmls_traits::signatures::Signer as _;
+#[tokio::test]
+#[cfg(feature = "test-policy-overrides")]
+async fn queued_recovery_origin() {
+    use marmot_session::CanonicalizationPolicy;
 
-    let dir = relaxed_storage_dir().unwrap();
-    let key = SqlCipherKey::new("hydrated welcome ownership key").unwrap();
-    let build = |name: &[u8], storage: SqliteAccountStorage| {
-        EngineBuilder::new(storage)
-            .identity(pad32(name))
-            .account_identity_proof_signer(Arc::new(NostrAccountIdentityProofSigner {
-                keys: deterministic_nostr_keys(name),
-            }))
-            .peeler(Box::new(MockPeeler))
-            .build()
-            .unwrap()
-    };
-    let path = dir.path().join("alice.sqlite");
-    let storage = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
-    let target_storage =
-        SqliteAccountStorage::open_encrypted(dir.path().join("bob.sqlite"), &key).unwrap();
-    let mut alice = build(b"hydrated-alice", storage.clone());
-    let mut bob = build(b"hydrated-bob", target_storage.clone());
-    let request = |name: &str, members| CreateGroupRequest {
-        name: name.into(),
-        description: String::new(),
-        members,
-        required_features: vec![],
-        app_components: vec![],
-        initial_admins: vec![],
-    };
-    let (a, _) = alice.create_group(request("A", vec![])).await.unwrap();
-    let (b, created) = alice
-        .create_group(request("B", vec![bob.fresh_key_package().await.unwrap()]))
-        .await
-        .unwrap();
-    let SendResult::FoundingGroupCreated { mut welcomes } = created else {
-        panic!("founding group")
-    };
-    let founding = welcomes.remove(0);
-    bob.join_welcome(founding.clone()).await.unwrap();
-    alice.mark_sent_welcome_delivered(&founding.id).unwrap();
-    let source = alice
-        .group_recovery_source(&b, &bob.self_id(), &bob.own_recovery_key_hash(&b).unwrap())
-        .unwrap();
-    let mut grant = GroupMemberRecovery {
-        member: bob.self_id(),
-        source,
-        key_package: bob.fresh_key_package().await.unwrap(),
-        request_id: [87; 32],
-        expires_at: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs()
-            + 3600,
-        device_signature: vec![],
-    };
-    let binding = target_storage
-        .account_device_signer(&grant.member)
-        .unwrap()
-        .unwrap();
-    let signer = SignatureKeyPair::read(
-        target_storage.mls_storage(),
-        &binding.mls_signature_public_key,
-        cgka_engine::DEFAULT_CIPHERSUITE.signature_algorithm(),
-    )
-    .unwrap();
-    grant.device_signature = signer
-        .sign(
-            &group_recovery_grant_bytes(
-                &b,
-                &alice.self_id(),
-                &grant.request_id,
-                grant.expires_at,
-                &grant.source,
-                &grant.key_package,
-            )
-            .unwrap(),
-        )
-        .unwrap();
-    let SendResult::GroupEvolution {
-        mut welcomes,
-        pending,
-        msg,
-    } = alice
-        .send(SendIntent::RecoverMembers {
-            group_id: b.clone(),
-            members: vec![grant],
-        })
-        .await
-        .unwrap()
-    else {
-        panic!("native recovery")
-    };
-    let welcome = welcomes.remove(0);
-    if !matches!(mode, RecoveryFixtureMode::Staged) {
-        alice.confirm_published(pending).await.unwrap();
-        assert!(
-            alice
-                .outstanding_sent_welcomes()
-                .unwrap()
-                .iter()
-                .any(|(_, owed)| owed.id == welcome.id)
-        );
-        drop(alice);
-        // A real failed delivery owns a durable retry before the fork. It must
-        // not publish later merely because it retained the exact old bytes.
-        let adapter = RecordingAdapter::default();
-        adapter.accept_only_endpoints(vec![]);
-        let mut runtime = AccountDeviceRuntime::new(
-            current_session(&path, &key, b"hydrated-alice"),
-            adapter,
-            StaticTransportRouting::new(vec![]).with_inbox_route(
-                bob.self_id(),
-                vec![TransportEndpoint("wss://recovery-inbox.example".into())],
-            ),
-            RecordingKeyPackages::default(),
-        );
-        runtime
-            .publish_welcome_messages_with_audit_context(
-                vec![welcome.clone()],
-                Some(b.clone()),
-                Default::default(),
-            )
-            .await
+    for terminal in [false, true] {
+        let (dir, mut session, _, group, _, origin) =
+            hydrated_recovery_fixture(RecoveryFixtureMode::Queued).await;
+        session
+            .set_convergence_policy(CanonicalizationPolicy {
+                settlement_quiescence_ms: 0,
+                ..CanonicalizationPolicy::default()
+            })
             .unwrap();
-        assert!(
-            runtime
-                .session()
-                .transport_fanout(&welcome.id)
-                .unwrap()
-                .is_some()
+        let key = SqlCipherKey::new("hydrated welcome ownership key").unwrap();
+        let mut rival = current_session(dir.path().join("bob.sqlite"), &key, b"hydrated-bob");
+        let mut witness =
+            current_session(dir.path().join("peer-8.sqlite"), &key, b"hydrated-peer-8");
+        let welcomes = session
+            .outstanding_sent_welcomes()
+            .unwrap()
+            .into_iter()
+            .map(|(_, welcome)| welcome)
+            .collect::<Vec<_>>();
+        assert_eq!(welcomes.len(), 9);
+        let queued = welcomes[8].clone();
+        let mut routing = StaticTransportRouting::new(vec![]).with_group_route(
+            group.clone(),
+            group.as_slice().to_vec(),
+            vec![TransportEndpoint("wss://recovery-group.example".into())],
         );
-        drop(runtime);
-        alice = build(b"hydrated-alice", storage.clone());
-        alice.hydrate_all_stored_groups().unwrap();
-    }
-    if matches!(
-        mode,
-        RecoveryFixtureMode::Superseded | RecoveryFixtureMode::Terminal
-    ) {
-        use cgka_traits::MessageStorage;
-        // Bob never saw the recovery Commit. His longer authenticated branch
-        // wins even though the recovery is an admin Commit.
-        let rounds = match mode {
-            RecoveryFixtureMode::Terminal => 2 + cgka_engine::convergence::V1_MAX_REWIND_COMMITS,
-            _ => 2,
-        };
-        for _ in 0..rounds {
-            let SendResult::GroupEvolution {
-                msg: rival,
-                pending,
-                ..
-            } = bob
-                .send(SendIntent::SelfUpdate {
-                    group_id: b.clone(),
-                })
-                .await
-                .unwrap()
-            else {
-                panic!("rival self-update")
+        for welcome in &welcomes {
+            let TransportEnvelope::Welcome { recipient } = &welcome.envelope else {
+                panic!("native recovery Welcome")
             };
-            bob.confirm_published(pending).await.unwrap();
-            alice
-                .buffer_openmls_convergence_message_at(&b, rival, 500)
-                .unwrap();
-            let selected = alice
-                .converge_stored_openmls_messages_at(&b, 1_000_000)
-                .unwrap();
-            assert_eq!(
-                selected.convergence_status,
-                cgka_engine::canonicalization::ConvergenceStatus::Settled
+            routing = routing.with_inbox_route(
+                recipient.clone(),
+                vec![TransportEndpoint("wss://recovery-inbox.example".into())],
             );
         }
-        assert_eq!(alice.epoch(&b).unwrap(), bob.epoch(&b).unwrap());
-        // This peeler's transport id differs from its MLS content digest.
-        // Own confirmation and convergence update the returned exact id.
-        let commit = storage.get_message(&msg.id).unwrap();
-        let expected = match mode {
-            RecoveryFixtureMode::Terminal => cgka_traits::MessageState::EpochInvalidated,
-            _ => cgka_traits::MessageState::ConvergenceDeferred,
+        let adapter = RecordingAdapter::default();
+        let wall = Arc::new(TestWallClock::new(unix_now()));
+        let mut runtime = AccountDeviceRuntime::new(
+            session,
+            adapter.clone(),
+            routing,
+            RecordingKeyPackages::default(),
+        )
+        .with_maintenance_sources(
+            wall.clone(),
+            Arc::new(TestMonotonicClock::default()),
+            Arc::new(TestRandom::new(0)),
+        );
+        runtime.set_detached_welcome_waves(true);
+        assert_eq!(
+            runtime.session().stored_message_state(&origin).unwrap(),
+            Some(cgka_traits::MessageState::Processed)
+        );
+        let gate = adapter.gate_welcome_publishes();
+        let task = runtime
+            .prepare_welcome_retry_task_with_audit_context(welcomes, Default::default())
+            .unwrap();
+        assert_eq!(task.message_ids().len(), 9);
+        let frozen = runtime
+            .session()
+            .transport_fanout(&queued.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(frozen.exact_message, queued);
+        let running = tokio::spawn(task.run());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while gate.active.load(Ordering::SeqCst) < 8 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("eight Welcome publishes fill the bounded worker set");
+        assert_eq!(welcome_publishes(&adapter).len(), 8);
+        let rounds = if terminal {
+            2 + cgka_engine::convergence::V1_MAX_REWIND_COMMITS
+        } else {
+            2
+        };
+        for _ in 0..rounds {
+            recovery_branch_step(&mut runtime, &mut rival, &group).await;
+        }
+        let lost = if terminal {
+            cgka_traits::MessageState::EpochInvalidated
+        } else {
+            cgka_traits::MessageState::ConvergenceDeferred
         };
         assert_eq!(
-            commit.state, expected,
-            "the native branch must reach the requested loss boundary"
+            runtime.session().stored_message_state(&origin).unwrap(),
+            Some(lost)
         );
-        // Drop the native event queue rather than synthesizing a withdrawal:
-        // session reopen must derive the Welcome's eligibility from storage.
+        gate.release.add_permits(9);
+        let finished = runtime
+            .finish_welcome_publish_task(running.await.unwrap())
+            .await
+            .unwrap();
+        assert!(finished.welcome_failures.is_empty());
+        let published = welcome_publishes(&adapter);
+        assert_eq!(published.len(), 8);
+        assert!(published.iter().all(|welcome| welcome.id != queued.id));
+        assert!(runtime.outstanding_welcome_deliveries().unwrap().is_empty());
+        if terminal {
+            assert!(
+                runtime
+                    .prepare_welcome_retry_task_with_audit_context(
+                        vec![queued.clone()],
+                        Default::default()
+                    )
+                    .unwrap()
+                    .message_ids()
+                    .is_empty()
+            );
+            wall.set(wall.now().0 + 100);
+            runtime.run_due_maintenance().await.unwrap();
+            assert_eq!(welcome_publishes(&adapter).len(), 8);
+            assert!(
+                runtime
+                    .session()
+                    .transport_fanout(&queued.id)
+                    .unwrap()
+                    .is_none()
+            );
+        } else {
+            let parked = runtime
+                .session()
+                .transport_fanout(&queued.id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(parked, frozen);
+            assert_eq!(
+                runtime.session().stored_message_state(&queued.id).unwrap(),
+                Some(cgka_traits::MessageState::Sent)
+            );
+            assert!(
+                runtime
+                    .session()
+                    .sent_welcome_awaits_commit(&queued.id)
+                    .unwrap()
+            );
+            let error = runtime.redeliver_welcome(&queued.id).await.unwrap_err();
+            assert!(matches!(
+                error.as_engine_error(),
+                Some(cgka_traits::EngineError::Backend(reason))
+                    if reason == "stored Welcome origin is not canonical"
+            ));
+            assert_eq!(welcome_publishes(&adapter).len(), 8);
+            for _ in 0..2 {
+                recovery_branch_step(&mut runtime, &mut witness, &group).await;
+                if runtime.session().stored_message_state(&origin).unwrap()
+                    == Some(cgka_traits::MessageState::Processed)
+                {
+                    break;
+                }
+            }
+            assert_eq!(
+                runtime.session().stored_message_state(&origin).unwrap(),
+                Some(cgka_traits::MessageState::Processed)
+            );
+            assert!(
+                runtime
+                    .outstanding_welcome_deliveries()
+                    .unwrap()
+                    .iter()
+                    .any(|(_, welcome)| welcome == &queued)
+            );
+            runtime.redeliver_welcome(&queued.id).await.unwrap();
+            let retried = welcome_publishes(&adapter);
+            assert_eq!(retried.len(), 9);
+            assert_eq!(retried[8], queued);
+            assert!(
+                runtime
+                    .outstanding_welcome_deliveries()
+                    .unwrap()
+                    .iter()
+                    .all(|(_, welcome)| welcome.id != queued.id)
+            );
+        }
     }
-    drop(alice);
-    drop(bob);
-    drop(storage);
-    drop(target_storage);
-    let reopened = current_session(&path, &key, b"hydrated-alice");
-    (dir, reopened, a, b, welcome)
+}
+
+#[tokio::test]
+#[cfg(feature = "test-policy-overrides")]
+async fn canonical_wave_waits() {
+    native_wave_waits(RecoveryPeelerGate::Peel).await;
+}
+
+#[tokio::test]
+#[cfg(feature = "test-policy-overrides")]
+async fn direct_send_wave_waits() {
+    native_wave_waits(RecoveryPeelerGate::Wrap).await;
 }
 
 #[tokio::test]
 async fn hydrated_welcome_stays_owned() {
-    let (_dir, session, a, b, welcome) =
+    let (_dir, session, a, b, welcome, _) =
         hydrated_recovery_fixture(RecoveryFixtureMode::Staged).await;
     let adapter = RecordingAdapter::default();
     let a_endpoint = TransportEndpoint("wss://hydrated-a.example".into());
@@ -284,7 +263,7 @@ async fn lost_recovery_hides_welcome() {
         RecoveryFixtureMode::Superseded,
         RecoveryFixtureMode::Terminal,
     ] {
-        let (_dir, session, _a, b, welcome) = hydrated_recovery_fixture(mode).await;
+        let (_dir, session, _a, b, welcome, _) = hydrated_recovery_fixture(mode).await;
         let adapter = RecordingAdapter::default();
         let wall = Arc::new(TestWallClock::new(unix_now()));
         let mut runtime = AccountDeviceRuntime::new(
@@ -369,7 +348,7 @@ async fn lost_recovery_hides_welcome() {
 
 #[tokio::test]
 async fn recovery_welcome_reopens() {
-    let (_dir, session, _a, _b, welcome) =
+    let (_dir, session, _a, _b, welcome, _) =
         hydrated_recovery_fixture(RecoveryFixtureMode::Confirmed).await;
     let adapter = RecordingAdapter::default();
     let mut runtime = AccountDeviceRuntime::new(
@@ -421,7 +400,7 @@ async fn recovery_ingest_drains_native() {
     }
 
     for mode in [OpenMode::Eager, OpenMode::Deferred] {
-        let (dir, session, _, group, welcome) =
+        let (dir, session, _, group, welcome, _) =
             hydrated_recovery_fixture(RecoveryFixtureMode::Staged).await;
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

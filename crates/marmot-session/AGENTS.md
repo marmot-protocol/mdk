@@ -92,8 +92,10 @@ It must not own MLS internals, transport event parsing, SQLCipher key derivation
     With `set_detached_welcome_waves` on (the app's account worker, mdk#3466), every Welcome wave with a relay
     attempt to make is prepared and reserved on the runtime, and left for the host to run beside it
     (`take_prepared_welcome_tasks`): a founding create's, a host's owed Welcomes, the confirming pass's released
-    ones, maintenance's watched release and the startup retry. The task holds only the adapter, the clock and the
-    prepared attempts. The host finishes it in input order (`finish_welcome_publish_task`), after dropping the
+    ones, maintenance's watched release and the startup retry. The task holds the adapter, clock and prepared
+    attempts, plus the session-owned Welcome holds and native-selection gate. Each queued adapter start waits for native
+    selection to finish and checks its current hold; already-started I/O continues. The host finishes it in input
+    order (`finish_welcome_publish_task`), after dropping the
     results of a group it no longer shows (`CompletedWelcomePublishTask::drop_gone_groups`), or abandons it
     (`abandon_welcome_publish_task`), which releases only the reservation. Prepare has already stored each
     Welcome's exact signed bytes and endpoint snapshot as a transport fanout, with no relay attempt on any endpoint,
@@ -132,6 +134,8 @@ multi-device Welcome delivery, Welcome withdrawal, staged and owed Welcome deliv
 - Keep SQLCipher keys app-provided. Do not add key derivation or recovery here.
 - Keep transport-specific code out. Inject a `TransportPeeler`; Nostr crates are dev-dependencies only.
 - Surface engine effects as app events plus publishable transport work.
+- Own detached Welcome admission in the session. Every native-selection entry point, including roster sends and
+  direct session calls, excludes queued adapter starts until its Welcome holds are refreshed.
 - `open` validates profile and convergence policy before opening storage or hydrating; keep new open-time checks
   ahead of any durable mutation.
 - `SessionConfig::with_storage` runs the session on a host-opened connection so the host can close it at a known

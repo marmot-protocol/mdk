@@ -13,7 +13,7 @@ pub enum AccountIngestPhase {
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use cgka_engine::RollbackPass;
@@ -65,10 +65,10 @@ use crate::routing::{
     publish_target_relay_urls,
 };
 use crate::session::{
-    AccountDeviceSession, CanonicalGroupMembership, CreateGroupEffects, GroupAuthorityView,
-    HydrationProgress, IngestEffects, KeyPackageMetadata, KeyPackageRequirements, PublishWork,
-    QueuedIntentRef, SessionConfig, SessionEffects, SessionError, SessionOpenTimings,
-    SessionResult, WelcomeWithdrawal,
+    AccountDeviceSession, CanonicalGroupMembership, CreateGroupEffects, DetachedWelcomeHolds,
+    GroupAuthorityView, HydrationProgress, IngestEffects, KeyPackageMetadata,
+    KeyPackageRequirements, PublishWork, QueuedIntentRef, SessionConfig, SessionEffects,
+    SessionError, SessionOpenTimings, SessionResult, WelcomeHold, WelcomeWithdrawal,
 };
 use crate::time::{
     MaintenanceRandom, MonotonicClock, OsMaintenanceRandom, SystemMonotonicClock, SystemWallClock,
@@ -86,8 +86,6 @@ mod removed_slot_expiry;
 mod sign_in_rejection;
 mod slot_announcement;
 mod welcome_delivery;
-
-use welcome_delivery::WelcomeHold;
 
 const TRACE_TARGET: &str = "marmot_session::runtime";
 const WELCOME_PUBLISH_CONCURRENCY: usize = 8;
@@ -315,10 +313,9 @@ pub struct PreparedWelcomePublishTask {
     wall_clock: Arc<dyn WallClock>,
     prepared: PreparedWelcomePublish,
     message_ids: Vec<cgka_traits::MessageId>,
-    withdrawals: DetachedWelcomeWithdrawals,
+    holds: DetachedWelcomeHolds,
+    selection: Arc<futures::lock::Mutex<()>>,
 }
-
-type DetachedWelcomeWithdrawals = Arc<Mutex<HashSet<cgka_traits::MessageId>>>;
 
 /// Opaque relay results from [`PreparedWelcomePublishTask::run`].
 #[doc(hidden)]
@@ -362,7 +359,8 @@ impl PreparedWelcomePublishTask {
                 .publish(
                     self.adapter.as_ref(),
                     self.wall_clock.as_ref(),
-                    Some(&self.withdrawals),
+                    Some(&self.holds),
+                    Some(&self.selection),
                 )
                 .await,
             message_ids: self.message_ids,
@@ -378,31 +376,50 @@ impl PreparedWelcomePublish {
             .collect()
     }
 
-    /// `withdrawals` names Welcomes withdrawn after preparation; one whose
-    /// relay attempt has not started is skipped and reported withdrawn, and
-    /// so is one whose delivery deadline passed while it waited for a slot.
+    /// Check the owner's current hold before starting each queued attempt.
+    /// Already-started relay I/O still completes under its original contract.
     async fn publish(
         mut self,
         adapter: &dyn TransportAdapter,
         wall_clock: &dyn WallClock,
-        withdrawals: Option<&Mutex<HashSet<cgka_traits::MessageId>>>,
+        holds: Option<&DetachedWelcomeHolds>,
+        selection: Option<&Arc<futures::lock::Mutex<()>>>,
     ) -> CompletedWelcomePublish {
         let publish = |index, attempt: Box<PreparedLegacyPublishAttempt>| async move {
-            let expired = attempt
-                .deliver_until
-                .is_some_and(|deliver_until| wall_clock.now() >= deliver_until);
-            if expired
-                || withdrawals.is_some_and(|withdrawals| {
-                    withdrawals
-                        .lock()
-                        .unwrap_or_else(|error| error.into_inner())
-                        .contains(&attempt.message_id)
-                })
-            {
-                return (index, attempt, None);
-            }
-            let result = adapter.publish(attempt.request.clone()).await;
-            (index, attempt, Some(result))
+            let mut selection = match selection {
+                Some(selection) => Some(selection.lock().await),
+                None => None,
+            };
+            let mut publishing: Option<futures::future::BoxFuture<'_, _>> = None;
+            let result = futures::future::poll_fn(|cx| {
+                if let Some(publishing) = publishing.as_mut() {
+                    return publishing.poll_unpin(cx).map(Ok);
+                }
+                // Keep the permit locked through the adapter's first poll:
+                // native selection cannot revoke it between check and start.
+                let holds =
+                    holds.map(|holds| holds.lock().unwrap_or_else(|error| error.into_inner()));
+                let hold = if attempt
+                    .deliver_until
+                    .is_some_and(|deliver_until| wall_clock.now() >= deliver_until)
+                {
+                    Some(WelcomeHold::Expired)
+                } else {
+                    holds
+                        .as_ref()
+                        .and_then(|holds| holds.get(&attempt.message_id).copied().flatten())
+                };
+                if let Some(hold) = hold {
+                    return std::task::Poll::Ready(Err(hold));
+                }
+                let mut future = adapter.publish(attempt.request.clone());
+                let result = future.poll_unpin(cx).map(Ok);
+                publishing = Some(future);
+                drop(selection.take());
+                result
+            })
+            .await;
+            (index, attempt, result)
         };
         let mut in_flight = FuturesUnordered::new();
         while in_flight.len() < WELCOME_PUBLISH_CONCURRENCY {
@@ -413,8 +430,14 @@ impl PreparedWelcomePublish {
         }
         while let Some((index, attempt, result)) = in_flight.next().await {
             self.completions[index] = Some(match result {
-                Some(result) => LegacyPublishCompletion::Network(attempt, result),
-                None => LegacyPublishCompletion::Complete(PublishStatus {
+                Ok(result) => LegacyPublishCompletion::Network(attempt, result),
+                Err(WelcomeHold::AwaitsCommit) => {
+                    LegacyPublishCompletion::Complete(PublishStatus {
+                        awaits_commit: true,
+                        ..PublishStatus::default()
+                    })
+                }
+                Err(_) => LegacyPublishCompletion::Complete(PublishStatus {
                     withdrawn: true,
                     ..PublishStatus::default()
                 }),
@@ -587,14 +610,6 @@ pub struct AccountDeviceRuntime<A, R = StaticTransportRouting, K = NoopKeyPackag
     /// Secondary maintenance writes must not discard committed session effects.
     /// Keep their group-scoped reconciliation owned until a quiet retry succeeds.
     pending_leaf_reconciliations: HashMap<GroupId, Option<Timestamp>>,
-    /// Exact Welcome events whose relay-only publish phase currently runs
-    /// outside the serialized account owner. Other maintenance/manual retry
-    /// paths skip these ids until their results are reconciled, preventing two
-    /// concurrent publications of the same retained event.
-    detached_welcome_publishes: HashSet<cgka_traits::MessageId>,
-    /// Detached Welcomes withdrawn after their task was prepared. The task
-    /// skips each one whose relay attempt has not started.
-    detached_welcome_withdrawals: DetachedWelcomeWithdrawals,
     /// The publish handle detached waves run on, while the host runs every
     /// Welcome wave itself (`set_detached_welcome_waves`).
     detached_welcome_adapter: Option<Arc<dyn TransportAdapter>>,
@@ -678,8 +693,6 @@ where
             maintenance_quiet_monotonic: HashMap::new(),
             component_migration_checked_at: HashMap::new(),
             pending_leaf_reconciliations: HashMap::new(),
-            detached_welcome_publishes: HashSet::new(),
-            detached_welcome_withdrawals: DetachedWelcomeWithdrawals::default(),
             detached_welcome_adapter: None,
             prepared_welcome_tasks: Vec::new(),
             watched_welcomes: Vec::new(),
@@ -2679,6 +2692,7 @@ where
     ) -> AccountResult<AccountDeviceEffects> {
         use sha2::{Digest, Sha256};
 
+        self.session.refresh_welcome_holds();
         self.sweep_expired_key_package_private_material()?;
         self.reconcile_confirmed_own_leaf_rotations(&[]);
         let mut output = AccountDeviceEffects::default();
@@ -4871,6 +4885,8 @@ where
         queue: &mut VecDeque<PublishWork>,
         context: Option<AuditEventContext>,
     ) -> AccountResult<()> {
+        // Reconcile cancelled native work before consuming a restored batch.
+        self.session.refresh_welcome_holds();
         while let Some(work) = queue.pop_front() {
             match work {
                 PublishWork::ApplicationMessage {
@@ -5986,7 +6002,7 @@ where
         message_id: &cgka_traits::MessageId,
         output: &mut AccountDeviceEffects,
     ) -> AccountResult<()> {
-        if self.detached_welcome_publishes.contains(message_id) {
+        if self.session.detached_welcome_publishes.contains(message_id) {
             return Ok(());
         }
         let Some(mut fanout) = self.session.transport_fanout(message_id)? else {
@@ -7045,7 +7061,11 @@ where
         retry_immediately: bool,
     ) -> AccountResult<PreparedLegacyPublish> {
         let message_id = message.id.clone();
-        if self.detached_welcome_publishes.contains(&message_id) {
+        if self
+            .session
+            .detached_welcome_publishes
+            .contains(&message_id)
+        {
             return Ok(PreparedLegacyPublish::Complete(PublishStatus {
                 retry_deferred: true,
                 ..PublishStatus::default()

@@ -84,6 +84,10 @@
 
 ### Fixed
 
+- Stop queued detached Welcomes from starting relay publication after their
+  native origin loses (#3493). Parked recovery keeps its exact retry for
+  canonical re-adoption; terminal loss retires it. Already-started relay I/O
+  still completes.
 - Stop a retried emoji-set install from deleting emoji the user already has
   (#3464). Reinstalling the installed version keeps each image whose download
   fails, and the result's `skipped` list names only entries left without an

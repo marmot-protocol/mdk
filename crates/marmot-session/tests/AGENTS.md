@@ -38,6 +38,9 @@ and uses `synchronous=NORMAL`; it does not establish production `FULL` or power-
 `support/openmls_state.rs` deletes a closed account's OpenMLS group state, keeping its Marmot record and fanouts, so a
 runtime test can reopen a group whose hydration quarantines it. Only the runtime binary routes it.
 
+`support/hydrated_recovery.rs` holds native recovery setup, paused-wave harnesses and shared wave-gate assertions.
+`runtime/hydrated_welcome.rs` includes it in the same private scope and declares the tests that invoke those scenarios.
+
 Keep the ignored `send_skips_slow_relay` body and its native `tempfile::tempdir` path unchanged. Required nextest runs
 isolate each test; a fresh process selecting only that diagnostic retains dependent storage defaults. A mixed run
 passing `--include-ignored` to the Rust test harness shares settings with relaxed cases and cannot guarantee those defaults.
