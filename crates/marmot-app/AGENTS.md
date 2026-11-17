@@ -252,9 +252,10 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   cannot name is rejected on this device only. A rejection names the slot alone (`rejected_slot`), never its KeyPackage:
   the account key can copy any KeyPackage, a real device's included, into a slot the user rejects. A slot the trusted
   roster lists as a device is known, regardless of its published KeyPackage (D81). Hosts read the list as
-  `unrecognized_sign_ins`. A slot the trusted roster records as `removed` is recorded locally at every recheck and
-  check (`record_sign_in_removals`), through the record's `rejected_at` plus the directory's future skew: its unrejected
-  sign-in goes, and no publication through then lists it again once the record expires; a later one is a new sign-in. A check or answer that changes it, and every roster change
+  `unrecognized_sign_ins`. A slot the trusted roster records as `removed` is recorded locally at every recheck, before
+  every slot read and when a read is judged (`record_sign_in_removals`), through the record's `rejected_at` plus the
+  directory's future skew: its unrejected sign-in goes, and no publication through then lists it again once the record
+  expires; a later one is a new sign-in. A check or answer that changes it, and every roster change
   (`note_device_roster_changed`), sets `unrecognized_sign_ins_changed`, drained at the device-group seams into one
   payload-free `UnrecognizedSignInsChanged`; every client opens with it set.
   Start fresh (D54, `start_fresh`) answers every before-this-device sign-in Not now, including baseline slots listed
@@ -276,7 +277,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
 - Read a sign-in check's slots beside the account worker (mdk#3466, `client/sign_ins.rs`,
   `runtime/account_worker/sign_in_reads.rs`). The worker detaches its client's reads before its first pass; a directly
   owned `AppClient` reads in place (`check_sign_ins`). The look (`start_sign_in_slot_read`) borrows the client
-  immutably and writes nothing. The read runs in a task, and its continuation (`finish_sign_in_slot_read`) runs on the
+  immutably and writes nothing; every read starts through `begin_sign_in_slot_read`, which first records the removed
+  slots (above) as its own small write, so a read that fails cannot let maintenance drop a record not saved here. The read runs in a task, and its continuation (`finish_sign_in_slot_read`) runs on the
   writer as one `Maintenance` unit against current state. It judges the read only while this device's own KeyPackages
   are as the look found them; after one change it reads once more, and after a second it records nothing and leaves
   the schedule. The scheduled check's tail, the schedule and the rejection commit, runs only while device groups are
