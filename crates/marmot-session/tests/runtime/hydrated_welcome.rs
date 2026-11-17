@@ -511,7 +511,16 @@ async fn queued_recovery_origin() {
 }
 
 #[cfg(feature = "test-policy-overrides")]
+#[derive(Clone, Copy)]
+enum RecoveryPeelerGate {
+    Peel,
+    Wrap,
+}
+
+#[cfg(feature = "test-policy-overrides")]
 struct PausedRecoveryPeeler {
+    gate: RecoveryPeelerGate,
+    entered: Arc<AtomicBool>,
     release: futures::future::Shared<futures::future::BoxFuture<'static, ()>>,
 }
 
@@ -531,7 +540,10 @@ impl TransportPeeler for PausedRecoveryPeeler {
         message: &cgka_traits::peeler::PreparedGroupMessage<'_>,
         context: &GroupContextSnapshot,
     ) -> Result<PeeledMessage, PeelerError> {
-        self.release.clone().await;
+        if matches!(self.gate, RecoveryPeelerGate::Peel) {
+            self.entered.store(true, Ordering::SeqCst);
+            self.release.clone().await;
+        }
         MockPeeler.peel_group_message(message, context).await
     }
 
@@ -544,6 +556,10 @@ impl TransportPeeler for PausedRecoveryPeeler {
         payload: &EncryptedPayload,
         context: &GroupContextSnapshot,
     ) -> Result<TransportMessage, PeelerError> {
+        if matches!(self.gate, RecoveryPeelerGate::Wrap) {
+            self.entered.store(true, Ordering::SeqCst);
+            self.release.clone().await;
+        }
         MockPeeler.wrap_group_message(payload, context).await
     }
 
@@ -559,13 +575,27 @@ impl TransportPeeler for PausedRecoveryPeeler {
 #[tokio::test]
 #[cfg(feature = "test-policy-overrides")]
 async fn canonical_wave_waits() {
+    native_wave_waits(RecoveryPeelerGate::Peel).await;
+}
+
+#[tokio::test]
+#[cfg(feature = "test-policy-overrides")]
+async fn direct_send_wave_waits() {
+    native_wave_waits(RecoveryPeelerGate::Wrap).await;
+}
+
+#[cfg(feature = "test-policy-overrides")]
+async fn native_wave_waits(native_gate: RecoveryPeelerGate) {
     use futures::FutureExt;
 
     let (dir, session, _, group, _, origin) =
         hydrated_recovery_fixture(RecoveryFixtureMode::Queued).await;
     drop(session);
     let (release, resumed) = tokio::sync::oneshot::channel::<()>();
+    let entered = Arc::new(AtomicBool::new(false));
     let peeler = PausedRecoveryPeeler {
+        gate: native_gate,
+        entered: entered.clone(),
         release: async move { resumed.await.unwrap() }.boxed().shared(),
     };
     let key = SqlCipherKey::new("hydrated welcome ownership key").unwrap();
@@ -608,28 +638,60 @@ async fn canonical_wave_waits() {
     );
     let gate = adapter.gate_welcome_publishes();
     let task = runtime
-        .prepare_welcome_retry_task_with_audit_context(welcomes, Default::default())
+        .prepare_welcome_retry_task_with_audit_context(welcomes.clone(), Default::default())
         .unwrap();
     let mut publishing = Box::pin(task.run());
     assert!(futures::poll!(publishing.as_mut()).is_pending());
     assert_eq!(welcome_publishes(&adapter).len(), 8);
-    let mut rival = current_session(dir.path().join("bob.sqlite"), &key, b"hydrated-bob");
-    let delivery = TransportDelivery {
-        account_id: runtime.self_id(),
-        group_id_hint: Some(group.clone()),
-        message: recovery_branch_message(&mut rival, &group).await,
-        received_at: Timestamp(unix_now()),
-        source: TransportDeliverySource {
-            transport: TransportSource("marmot-account-test".into()),
-            plane: TransportDeliveryPlane::Group,
-            endpoint: None,
-            subscription_id: None,
-            wire: None,
-        },
+    let delivery = match native_gate {
+        RecoveryPeelerGate::Peel => {
+            let mut rival = current_session(dir.path().join("bob.sqlite"), &key, b"hydrated-bob");
+            Some(TransportDelivery {
+                account_id: runtime.self_id(),
+                group_id_hint: Some(group.clone()),
+                message: recovery_branch_message(&mut rival, &group).await,
+                received_at: Timestamp(unix_now()),
+                source: TransportDeliverySource {
+                    transport: TransportSource("marmot-account-test".into()),
+                    plane: TransportDeliveryPlane::Group,
+                    endpoint: None,
+                    subscription_id: None,
+                    wire: None,
+                },
+            })
+        }
+        RecoveryPeelerGate::Wrap => None,
     };
-    {
-        let mut ingesting = Box::pin(runtime.ingest_delivery(&delivery));
-        assert!(futures::poll!(ingesting.as_mut()).is_pending());
+    let original_epoch = runtime.session().epoch(&group).unwrap();
+    let staged = {
+        let mut selecting = Box::pin(async {
+            match native_gate {
+                RecoveryPeelerGate::Peel => {
+                    runtime
+                        .ingest_delivery(delivery.as_ref().unwrap())
+                        .await
+                        .unwrap();
+                    None
+                }
+                RecoveryPeelerGate::Wrap => {
+                    let effects = runtime
+                        .session_mut()
+                        .send(SendIntent::SelfUpdate {
+                            group_id: group.clone(),
+                        })
+                        .await
+                        .unwrap();
+                    let PublishWork::GroupEvolution { pending, .. } =
+                        effects.publish.into_iter().next().unwrap()
+                    else {
+                        panic!("direct native self-update")
+                    };
+                    Some(pending)
+                }
+            }
+        });
+        assert!(futures::poll!(selecting.as_mut()).is_pending());
+        assert!(entered.load(Ordering::SeqCst));
         gate.release.add_permits(9);
         assert!(
             futures::poll!(publishing.as_mut()).is_pending(),
@@ -637,8 +699,8 @@ async fn canonical_wave_waits() {
         );
         assert_eq!(welcome_publishes(&adapter).len(), 8);
         release.send(()).unwrap();
-        ingesting.await.unwrap();
-    }
+        selecting.await
+    };
     assert_eq!(
         runtime.session().stored_message_state(&origin).unwrap(),
         Some(cgka_traits::MessageState::Processed)
@@ -647,8 +709,16 @@ async fn canonical_wave_waits() {
         .finish_welcome_publish_task(publishing.await)
         .await
         .unwrap();
-    assert_eq!(welcome_publishes(&adapter).len(), 9);
+    let published = welcome_publishes(&adapter);
+    assert_eq!(published.len(), welcomes.len());
+    for welcome in welcomes {
+        assert!(published.contains(&welcome));
+    }
     assert!(runtime.outstanding_welcome_deliveries().unwrap().is_empty());
+    if let Some(pending) = staged {
+        runtime.session_mut().publish_failed(pending).await.unwrap();
+        assert_eq!(runtime.session().epoch(&group).unwrap(), original_epoch);
+    }
 }
 
 #[tokio::test]

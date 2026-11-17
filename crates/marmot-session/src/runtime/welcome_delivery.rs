@@ -11,20 +11,6 @@
 use super::*;
 use crate::session::OutboundWelcomeStatus;
 
-/// Why a Welcome is not published (see `welcome_hold`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum WelcomeHold {
-    /// Withdrawn, or retired with its rolled-back commit: never published
-    /// again, and nothing is owed.
-    Withdrawn,
-    /// Staged with its unconfirmed invite commit: held until the commit
-    /// confirms and promotes it (mdk#2726).
-    AwaitsCommit,
-    /// A device link's Welcome whose new device stopped waiting for it: never
-    /// published again, and nothing is owed (mdk#2628 D40).
-    Expired,
-}
-
 impl<A, R, K> AccountDeviceRuntime<A, R, K>
 where
     A: TransportAdapter,
@@ -141,9 +127,11 @@ where
         prepared: PreparedWelcomePublish,
     ) -> PreparedWelcomePublishTask {
         let message_ids = prepared.network_message_ids();
-        self.detached_welcome_publishes
+        self.session
+            .detached_welcome_publishes
             .extend(message_ids.iter().cloned());
-        self.detached_welcome_holds
+        self.session
+            .detached_welcome_holds
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .extend(message_ids.iter().cloned().map(|id| (id, None)));
@@ -152,8 +140,8 @@ where
             wall_clock: self.wall_clock.clone(),
             prepared,
             message_ids,
-            holds: self.detached_welcome_holds.clone(),
-            selection: self.welcome_selection.clone(),
+            holds: self.session.detached_welcome_holds.clone(),
+            selection: self.session.welcome_selection.clone(),
         }
     }
 
@@ -179,11 +167,12 @@ where
     #[doc(hidden)]
     pub fn abandon_welcome_publish_task(&mut self, message_ids: &[cgka_traits::MessageId]) {
         let mut holds = self
+            .session
             .detached_welcome_holds
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         for message_id in message_ids {
-            self.detached_welcome_publishes.remove(message_id);
+            self.session.detached_welcome_publishes.remove(message_id);
             holds.remove(message_id);
         }
     }
@@ -322,58 +311,6 @@ where
         }
     }
 
-    /// Native selection may yield or be cancelled after changing stored state.
-    /// Until it returns, queued attempts must not use their earlier permit.
-    pub(super) async fn pause_welcome_publishes(&self) -> futures::lock::OwnedMutexGuard<()> {
-        let selection = self.welcome_selection.clone().lock_owned().await;
-        let mut holds = self
-            .detached_welcome_holds
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        for hold in holds.values_mut() {
-            if *hold != Some(WelcomeHold::Withdrawn) {
-                *hold = Some(WelcomeHold::AwaitsCommit);
-            }
-        }
-        selection
-    }
-
-    /// Refresh reserved attempts before yielding after native state changes.
-    /// An unreadable origin holds its debt rather than allowing stale I/O.
-    pub(super) fn refresh_welcome_holds(&self) {
-        for id in &self.detached_welcome_publishes {
-            let current = self
-                .session
-                .sent_welcome_withdrawn(id)
-                .and_then(|withdrawn| {
-                    if withdrawn {
-                        return Ok(Some(WelcomeHold::Withdrawn));
-                    }
-                    self.session
-                        .sent_welcome_awaits_commit(id)
-                        .map(|waiting| waiting.then_some(WelcomeHold::AwaitsCommit))
-                });
-            let hold = match current {
-                Ok(current) => current,
-                Err(error) => {
-                    tracing::warn!(
-                        target: TRACE_TARGET,
-                        method = "refresh_welcome_holds",
-                        transient = error.is_transient(),
-                        "detached Welcome held until its origin is readable"
-                    );
-                    Some(WelcomeHold::AwaitsCommit)
-                }
-            };
-            *self
-                .detached_welcome_holds
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .get_mut(id)
-                .expect("reserved Welcome has a hold") = hold;
-        }
-    }
-
     /// Why a Welcome must not reach a relay now, checked by both places that
     /// publish one: the publish preparation step and maintenance's retry of a
     /// stored fanout. A row it cannot read holds the Welcome, so nothing that
@@ -424,7 +361,7 @@ where
         // A detached wave holds this Welcome: it is the Welcome's one
         // publisher, and until it settles the Welcome is in flight, not
         // undelivered.
-        if self.detached_welcome_publishes.contains(message_id) {
+        if self.session.detached_welcome_publishes.contains(message_id) {
             return Ok(output);
         }
         // `stored_sent_welcome` only returns welcome envelopes.
@@ -471,15 +408,9 @@ where
         if withdrawal == WelcomeWithdrawal::AlreadyDelivered {
             return Ok(withdrawal);
         }
-        if self.detached_welcome_publishes.contains(message_id) {
-            // A detached wave holds the Welcome and its record: it skips the
-            // attempt if not started, and the next maintenance pass drops the
-            // record.
-            self.detached_welcome_holds
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .insert(message_id.clone(), Some(WelcomeHold::Withdrawn));
-        } else {
+        // A reserved wave owns its fanout until finish; maintenance prunes
+        // the withdrawn retry after that reservation is released.
+        if !self.session.detached_welcome_publishes.contains(message_id) {
             self.session.delete_transport_fanout(message_id)?;
         }
         Ok(withdrawal)
@@ -673,7 +604,7 @@ where
                 .outbound_welcome_status(&id, self.wall_clock.now())
                 .and_then(|status| {
                     let held = matches!(status, OutboundWelcomeStatus::Owed { .. })
-                        && (self.detached_welcome_publishes.contains(&id)
+                        && (self.session.detached_welcome_publishes.contains(&id)
                             || self.session.transport_fanout(&id)?.is_some());
                     Ok((status, held))
                 });

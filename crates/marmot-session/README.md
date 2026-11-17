@@ -52,6 +52,7 @@ the default.
   for retry without withholding confirmed effects, including when recovery-control ingest resumes publication.
 - Holds queued detached Welcome attempts while their native origin is noncanonical. Parked recovery retains its exact
   retry for canonical re-adoption; terminal loss retires it. Already-started relay I/O still completes.
+  The session owns admission across native mutations, including roster sends and direct session calls.
 - Keeps a confirmed fanout scheduler-visible while linked Welcomes still await publication bookkeeping. Its retry
   cutoff follows the Welcomes' durable endpoint backoff; work without a stored cutoff uses the ordinary retry delay.
   Welcome backoff does not postpone earlier-ready group work. Unmet quorum or pending MLS confirmation blocks later

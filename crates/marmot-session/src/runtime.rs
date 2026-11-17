@@ -13,7 +13,7 @@ pub enum AccountIngestPhase {
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use cgka_engine::RollbackPass;
@@ -65,10 +65,10 @@ use crate::routing::{
     publish_target_relay_urls,
 };
 use crate::session::{
-    AccountDeviceSession, CanonicalGroupMembership, CreateGroupEffects, GroupAuthorityView,
-    HydrationProgress, IngestEffects, KeyPackageMetadata, KeyPackageRequirements, PublishWork,
-    QueuedIntentRef, SessionConfig, SessionEffects, SessionError, SessionOpenTimings,
-    SessionResult, WelcomeWithdrawal,
+    AccountDeviceSession, CanonicalGroupMembership, CreateGroupEffects, DetachedWelcomeHolds,
+    GroupAuthorityView, HydrationProgress, IngestEffects, KeyPackageMetadata,
+    KeyPackageRequirements, PublishWork, QueuedIntentRef, SessionConfig, SessionEffects,
+    SessionError, SessionOpenTimings, SessionResult, WelcomeHold, WelcomeWithdrawal,
 };
 use crate::time::{
     MaintenanceRandom, MonotonicClock, OsMaintenanceRandom, SystemMonotonicClock, SystemWallClock,
@@ -86,8 +86,6 @@ mod removed_slot_expiry;
 mod sign_in_rejection;
 mod slot_announcement;
 mod welcome_delivery;
-
-use welcome_delivery::WelcomeHold;
 
 const TRACE_TARGET: &str = "marmot_session::runtime";
 const WELCOME_PUBLISH_CONCURRENCY: usize = 8;
@@ -319,9 +317,6 @@ pub struct PreparedWelcomePublishTask {
     selection: Arc<futures::lock::Mutex<()>>,
 }
 
-type DetachedWelcomeHolds =
-    Arc<Mutex<HashMap<cgka_traits::MessageId, Option<welcome_delivery::WelcomeHold>>>>;
-
 /// Opaque relay results from [`PreparedWelcomePublishTask::run`].
 #[doc(hidden)]
 pub struct CompletedWelcomePublishTask {
@@ -436,7 +431,7 @@ impl PreparedWelcomePublish {
         while let Some((index, attempt, result)) = in_flight.next().await {
             self.completions[index] = Some(match result {
                 Ok(result) => LegacyPublishCompletion::Network(attempt, result),
-                Err(welcome_delivery::WelcomeHold::AwaitsCommit) => {
+                Err(WelcomeHold::AwaitsCommit) => {
                     LegacyPublishCompletion::Complete(PublishStatus {
                         awaits_commit: true,
                         ..PublishStatus::default()
@@ -615,15 +610,6 @@ pub struct AccountDeviceRuntime<A, R = StaticTransportRouting, K = NoopKeyPackag
     /// Secondary maintenance writes must not discard committed session effects.
     /// Keep their group-scoped reconciliation owned until a quiet retry succeeds.
     pending_leaf_reconciliations: HashMap<GroupId, Option<Timestamp>>,
-    /// Exact Welcome events whose relay-only publish phase currently runs
-    /// outside the serialized account owner. Other maintenance/manual retry
-    /// paths skip these ids until their results are reconciled, preventing two
-    /// concurrent publications of the same retained event.
-    detached_welcome_publishes: HashSet<cgka_traits::MessageId>,
-    /// Current native-origin and explicit holds for reserved relay attempts.
-    detached_welcome_holds: DetachedWelcomeHolds,
-    /// Native mutations exclude queued starts until their status refresh.
-    welcome_selection: Arc<futures::lock::Mutex<()>>,
     /// The publish handle detached waves run on, while the host runs every
     /// Welcome wave itself (`set_detached_welcome_waves`).
     detached_welcome_adapter: Option<Arc<dyn TransportAdapter>>,
@@ -707,9 +693,6 @@ where
             maintenance_quiet_monotonic: HashMap::new(),
             component_migration_checked_at: HashMap::new(),
             pending_leaf_reconciliations: HashMap::new(),
-            detached_welcome_publishes: HashSet::new(),
-            detached_welcome_holds: DetachedWelcomeHolds::default(),
-            welcome_selection: Arc::default(),
             detached_welcome_adapter: None,
             prepared_welcome_tasks: Vec::new(),
             watched_welcomes: Vec::new(),
@@ -2709,7 +2692,7 @@ where
     ) -> AccountResult<AccountDeviceEffects> {
         use sha2::{Digest, Sha256};
 
-        self.refresh_welcome_holds();
+        self.session.refresh_welcome_holds();
         self.sweep_expired_key_package_private_material()?;
         self.reconcile_confirmed_own_leaf_rotations(&[]);
         let mut output = AccountDeviceEffects::default();
@@ -3779,11 +3762,7 @@ where
         };
         let accept_started = Instant::now();
         self.record_commit_refusals_before_disband(&intent)?;
-        let selection = self.pause_welcome_publishes().await;
-        let effects = self.session.send(intent).await;
-        self.refresh_welcome_holds();
-        drop(selection);
-        let effects = effects?;
+        let effects = self.session.send(intent).await?;
         let local_accept_duration = accept_started.elapsed();
         let publish_started = Instant::now();
         let mut output = self.publish_session_effects(effects).await?;
@@ -3996,7 +3975,7 @@ where
         let mut queue = VecDeque::new();
         output.absorb_session_effects(prepared_effects, &mut queue);
 
-        let rollback_effects = self.fail_session_publish(pending).await?;
+        let rollback_effects = self.session.publish_failed(pending).await?;
         output
             .pending
             .push(PendingResolution::RolledBack { pending });
@@ -4014,18 +3993,18 @@ where
         context: AuditEventContext,
         origin: SendOrigin,
     ) -> AccountResult<SessionEffects> {
-        let selection = self.pause_welcome_publishes().await;
-        let effects = match origin {
+        Ok(match origin {
             SendOrigin::Host => {
                 self.session
                     .send_host_change_with_audit_context(intent, context)
-                    .await
+                    .await?
             }
-            SendOrigin::Automatic => self.session.send_with_audit_context(intent, context).await,
-        };
-        self.refresh_welcome_holds();
-        drop(selection);
-        Ok(effects?)
+            SendOrigin::Automatic => {
+                self.session
+                    .send_with_audit_context(intent, context)
+                    .await?
+            }
+        })
     }
 
     /// Confirm an outbound intent's commit without waiting for Welcome fanout,
@@ -4175,15 +4154,12 @@ where
             && self.queued_outbound_intents_blocked_by_fanouts(group_id)?;
         // Required publication barriers must not prevent inbound convergence
         // from settling, even while the corresponding relay is unavailable.
-        let selection = self.pause_welcome_publishes().await;
         let effects = if queued_intents_blocked {
-            self.session.advance_convergence_inputs(group_id).await
+            self.session.advance_convergence_inputs(group_id).await?
         } else {
-            self.session.advance_convergence(group_id).await
+            self.session.advance_convergence(group_id).await?
         };
-        self.refresh_welcome_holds();
-        drop(selection);
-        output.extend(self.publish_session_effects(effects?).await?);
+        output.extend(self.publish_session_effects(effects).await?);
         Ok(output)
     }
 
@@ -4801,11 +4777,7 @@ where
             return Err(AccountError::WrongAccountDelivery);
         }
         let started = Instant::now();
-        let selection = self.pause_welcome_publishes().await;
-        let ingested = self.session.ingest_delivery(delivery).await;
-        self.refresh_welcome_holds();
-        drop(selection);
-        let ingested = match ingested {
+        let ingested = match self.session.ingest_delivery(delivery).await {
             Ok(IngestEffects {
                 outcome: IngestOutcome::GroupRecovery { recovery },
                 ..
@@ -4913,9 +4885,8 @@ where
         queue: &mut VecDeque<PublishWork>,
         context: Option<AuditEventContext>,
     ) -> AccountResult<()> {
-        // Native branch selection precedes this batch. Notify detached waves
-        // before any publication below can yield to their queued attempts.
-        self.refresh_welcome_holds();
+        // Reconcile cancelled native work before consuming a restored batch.
+        self.session.refresh_welcome_holds();
         while let Some(work) = queue.pop_front() {
             match work {
                 PublishWork::ApplicationMessage {
@@ -5708,11 +5679,7 @@ where
         const MAX_CONFIRM_ATTEMPTS: u32 = 4;
         let mut attempt = 0;
         loop {
-            let selection = self.pause_welcome_publishes().await;
-            let confirmed = self.session.confirm_published(pending).await;
-            self.refresh_welcome_holds();
-            drop(selection);
-            match confirmed {
+            match self.session.confirm_published(pending).await {
                 Ok(effects) => return Ok(effects),
                 Err(e) if e.is_transient() && attempt + 1 < MAX_CONFIRM_ATTEMPTS => {
                     attempt += 1;
@@ -5736,11 +5703,7 @@ where
         const MAX_CONFIRM_ATTEMPTS: u32 = 4;
         let mut attempt = 0;
         loop {
-            let selection = self.pause_welcome_publishes().await;
-            let confirmed = self.session.confirm_published_fanout(pending, fanout).await;
-            self.refresh_welcome_holds();
-            drop(selection);
-            match confirmed {
+            match self.session.confirm_published_fanout(pending, fanout).await {
                 Ok(effects) => return Ok(effects),
                 Err(e) if e.is_transient() && attempt + 1 < MAX_CONFIRM_ATTEMPTS => {
                     attempt += 1;
@@ -5817,7 +5780,7 @@ where
                     self.finish_transport_fanout(&message_id, output).await?;
                 }
             } else if !ambiguous_exposure && !retry_deferred {
-                let effects = self.fail_session_publish(pending).await?;
+                let effects = self.session.publish_failed(pending).await?;
                 output
                     .pending
                     .push(PendingResolution::RolledBack { pending });
@@ -5831,7 +5794,7 @@ where
         // remaining targets continue as an independent durable obligation.
         let mut messages = messages.into_iter();
         let Some(message) = messages.next() else {
-            let effects = self.fail_session_publish(pending).await?;
+            let effects = self.session.publish_failed(pending).await?;
             output
                 .pending
                 .push(PendingResolution::RolledBack { pending });
@@ -5917,7 +5880,7 @@ where
                 return Ok(());
             }
             if !commit_status.possible_ambiguous_exposure && !commit_status.retry_deferred {
-                let effects = self.fail_session_publish(pending).await?;
+                let effects = self.session.publish_failed(pending).await?;
                 output
                     .pending
                     .push(PendingResolution::RolledBack { pending });
@@ -5932,7 +5895,6 @@ where
         if self.session.pending_is_queued_invite(pending)?
             && let Some(oversized) = self.oversized_invite_events(&commit, &welcomes).await
         {
-            let selection = self.pause_welcome_publishes().await;
             let effects = refuse_too_large(
                 &mut self.session,
                 pending,
@@ -5940,10 +5902,7 @@ where
                 oversized,
                 RollbackPass::Staging,
             )
-            .await;
-            self.refresh_welcome_holds();
-            drop(selection);
-            let effects = effects?;
+            .await?;
             output
                 .pending
                 .push(PendingResolution::RolledBack { pending });
@@ -6043,7 +6002,7 @@ where
         message_id: &cgka_traits::MessageId,
         output: &mut AccountDeviceEffects,
     ) -> AccountResult<()> {
-        if self.detached_welcome_publishes.contains(message_id) {
+        if self.session.detached_welcome_publishes.contains(message_id) {
             return Ok(());
         }
         let Some(mut fanout) = self.session.transport_fanout(message_id)? else {
@@ -6376,17 +6335,6 @@ where
         }
     }
 
-    async fn fail_session_publish(
-        &mut self,
-        pending: PendingStateRef,
-    ) -> SessionResult<SessionEffects> {
-        let selection = self.pause_welcome_publishes().await;
-        let effects = self.session.publish_failed(pending).await;
-        self.refresh_welcome_holds();
-        drop(selection);
-        effects
-    }
-
     async fn rollback_unstaged_pending(
         &mut self,
         pending: Option<PendingStateRef>,
@@ -6394,7 +6342,7 @@ where
         queue: &mut VecDeque<PublishWork>,
     ) -> AccountResult<()> {
         if let Some(pending) = pending {
-            let effects = self.fail_session_publish(pending).await?;
+            let effects = self.session.publish_failed(pending).await?;
             output
                 .pending
                 .push(PendingResolution::RolledBack { pending });
@@ -7004,11 +6952,8 @@ where
         };
         let mut abandoned = fanout.clone();
         let count = abandoned.abandon_unsent_targets()?;
-        let selection = self.pause_welcome_publishes().await;
-        let effects = give_up_unsent_commit(&mut self.session, pending, &mut abandoned, pass).await;
-        self.refresh_welcome_holds();
-        drop(selection);
-        let effects = effects?;
+        let effects =
+            give_up_unsent_commit(&mut self.session, pending, &mut abandoned, pass).await?;
         *fanout = abandoned;
         self.record_pending_commit_change(fanout, context, PendingCommitChange::GivenUp, now_ms);
         tracing::info!(
@@ -7061,11 +7006,7 @@ where
             && !fanout.possible_exposure()
             && let Some(pending) = fanout.pending_ref()
         {
-            let selection = self.pause_welcome_publishes().await;
-            let effects = roll_back_failed_fanout(&mut self.session, pending, fanout, pass).await;
-            self.refresh_welcome_holds();
-            drop(selection);
-            let effects = effects?;
+            let effects = roll_back_failed_fanout(&mut self.session, pending, fanout, pass).await?;
             output
                 .pending
                 .push(PendingResolution::RolledBack { pending });
@@ -7120,7 +7061,11 @@ where
         retry_immediately: bool,
     ) -> AccountResult<PreparedLegacyPublish> {
         let message_id = message.id.clone();
-        if self.detached_welcome_publishes.contains(&message_id) {
+        if self
+            .session
+            .detached_welcome_publishes
+            .contains(&message_id)
+        {
             return Ok(PreparedLegacyPublish::Complete(PublishStatus {
                 retry_deferred: true,
                 ..PublishStatus::default()
