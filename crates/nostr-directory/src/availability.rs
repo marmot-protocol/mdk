@@ -13,7 +13,8 @@ use cgka_traits::TransportEndpoint;
 use futures::StreamExt;
 use rusqlite::params;
 use storage_sqlite::{
-    PublicKeyPackageBarrierRecord, PublicKeyPackageReplacementRecord, SqliteSharedStorage,
+    PublicKeyPackageBarrierKind, PublicKeyPackageBarrierRecord, PublicKeyPackageReplacementRecord,
+    SqliteSharedStorage,
 };
 
 use tokio::sync::watch;
@@ -277,6 +278,7 @@ impl DirectoryCache {
                     shared: None,
                     replacements: Vec::new(),
                     replacement_evicted_at: None,
+                    global_evicted_at: None,
                     barriers: Vec::new(),
                     eviction_watermark: None,
                 })
@@ -295,6 +297,7 @@ impl DirectoryCache {
                 }
                 row.replacement_evicted_at =
                     shared.public_key_package_replacement_evicted_at(&row.account_id_hex)?;
+                row.global_evicted_at = shared.key_package_global_evicted_at()?;
                 row.barriers = shared.public_key_package_barriers(&row.account_id_hex)?;
                 row.eviction_watermark =
                     shared.public_key_package_eviction_watermark(&row.account_id_hex)?;
@@ -338,6 +341,7 @@ struct StoredAvailability {
     shared: Option<Publication>,
     replacements: Vec<PublicKeyPackageReplacementRecord>,
     replacement_evicted_at: Option<u64>,
+    global_evicted_at: Option<u64>,
     barriers: Vec<PublicKeyPackageBarrierRecord>,
     eviction_watermark: Option<PublicKeyPackageBarrierRecord>,
 }
@@ -364,29 +368,22 @@ impl StoredAvailability {
         };
         let current_publication_allows = publication_allows(&self.current)
             && self.shared.as_ref().is_none_or(publication_allows);
-        let selected_slot_journaled = self
+        let replacement_allows = self
             .replacements
             .iter()
-            .any(|replacement| Some(&replacement.key_package_id) == self.key_package_id.as_ref());
-        let replacement_allows = (selected_slot_journaled || self.replacement_evicted_at.is_none())
-            && self
-                .replacements
-                .iter()
-                .filter(|replacement| {
-                    Some(&replacement.key_package_id) == self.key_package_id.as_ref()
-                })
-                .all(|replacement| {
-                    let Some(event_id) = self.key_package_event_id.as_ref() else {
-                        return false;
-                    };
-                    let Some(created_at) = self
-                        .key_package_created_at
-                        .and_then(|value| u64::try_from(value).ok())
-                    else {
-                        return false;
-                    };
-                    replacement_allows(event_id, created_at, replacement)
-                });
+            .filter(|replacement| Some(&replacement.key_package_id) == self.key_package_id.as_ref())
+            .all(|replacement| {
+                let Some(event_id) = self.key_package_event_id.as_ref() else {
+                    return false;
+                };
+                let Some(created_at) = self
+                    .key_package_created_at
+                    .and_then(|value| u64::try_from(value).ok())
+                else {
+                    return false;
+                };
+                replacement_allows(event_id, created_at, replacement)
+            });
         let barrier_allows_for_selected = self
             .barriers
             .iter()
@@ -406,30 +403,40 @@ impl StoredAvailability {
                 };
                 barrier_allows(event_id, created_at, barrier)
             });
-        let watermark_allows = self.eviction_watermark.as_ref().is_none_or(|barrier| {
-            if barrier.deleted_event_id.is_none()
-                && Some(&barrier.key_package_id) != self.key_package_id.as_ref()
-            {
-                return true;
-            }
-            let Some(event_id) = self.key_package_event_id.as_ref() else {
-                return false;
-            };
-            let Some(created_at) = self
-                .key_package_created_at
-                .and_then(|value| u64::try_from(value).ok())
-            else {
-                return false;
-            };
-            barrier_allows(event_id, created_at, barrier)
-        });
+        let watermark_allows = match self.eviction_watermark.as_ref() {
+            Some(barrier) => self
+                .key_package_event_id
+                .as_ref()
+                .zip(
+                    self.key_package_created_at
+                        .and_then(|value| u64::try_from(value).ok()),
+                )
+                .is_some_and(|(event_id, created_at)| {
+                    barrier_allows(event_id, created_at, barrier)
+                }),
+            None => self.global_evicted_at.is_none(),
+        };
         let shared_before_check = self.shared.as_ref().is_none_or(|current| {
             current
                 .created_at
                 .and_then(|value| u64::try_from(value).ok())
                 <= checked_at
         });
-        let replacements_before_check = self.replacements.is_empty() && self.barriers.is_empty();
+        let replacements_before_check = self
+            .replacements
+            .iter()
+            .all(|replacement| Some(replacement.observed_at) <= checked_at)
+            && self
+                .barriers
+                .iter()
+                .all(|barrier| Some(barrier.observed_at) <= checked_at)
+            && self
+                .replacement_evicted_at
+                .is_none_or(|evicted_at| Some(evicted_at) <= checked_at)
+            && self
+                .eviction_watermark
+                .as_ref()
+                .is_none_or(|barrier| Some(barrier.observed_at) <= checked_at);
         let negative_is_current = self
             .current
             .created_at
@@ -981,51 +988,59 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
         }
         let directory = self.clone();
         let account = account_id_hex.to_owned();
-        let (replacements, evicted_at, barriers, watermark) = blocking_directory_task(move || {
-            let shared = directory.resources.shared_storage()?;
-            let replacements = shared.public_key_package_replacements(&account)?;
-            let evicted_at = shared.public_key_package_replacement_evicted_at(&account)?;
-            let barriers = shared.public_key_package_barriers(&account)?;
-            let watermark = shared.public_key_package_eviction_watermark(&account)?;
-            Ok((replacements, evicted_at, barriers, watermark))
-        })
-        .await?;
+        let (replacements, evicted_at, global_evicted_at, barriers, watermark) =
+            blocking_directory_task(move || {
+                let shared = directory.resources.shared_storage()?;
+                let replacements = shared.public_key_package_replacements(&account)?;
+                let evicted_at = shared.public_key_package_replacement_evicted_at(&account)?;
+                let global_evicted_at = shared.key_package_global_evicted_at()?;
+                let barriers = shared.public_key_package_barriers(&account)?;
+                let watermark = shared.public_key_package_eviction_watermark(&account)?;
+                Ok((
+                    replacements,
+                    evicted_at,
+                    global_evicted_at,
+                    barriers,
+                    watermark,
+                ))
+            })
+            .await?;
         let current = match value.state {
             FollowAvailabilityState::Ready => value
                 .key_package_event_id
                 .as_deref()
                 .zip(value.key_package_created_at)
                 .is_some_and(|(event_id, created_at)| {
-                    let selected_slot_journaled = replacements.iter().any(|replacement| {
-                        Some(&replacement.key_package_id) == value.key_package_id.as_ref()
-                    });
-                    (selected_slot_journaled || evicted_at.is_none())
-                        && barriers.iter().all(|barrier| {
-                            if barrier.deleted_event_id.is_none()
-                                && Some(&barrier.key_package_id) != value.key_package_id.as_ref()
-                            {
-                                return true;
-                            }
-                            barrier_allows(event_id, created_at, barrier)
+                    barriers.iter().all(|barrier| {
+                        if barrier.deleted_event_id.is_none()
+                            && Some(&barrier.key_package_id) != value.key_package_id.as_ref()
+                        {
+                            return true;
+                        }
+                        barrier_allows(event_id, created_at, barrier)
+                    }) && match watermark.as_ref() {
+                        Some(barrier) => barrier_allows(event_id, created_at, barrier),
+                        None => global_evicted_at.is_none(),
+                    } && replacements
+                        .iter()
+                        .filter(|replacement| {
+                            Some(&replacement.key_package_id) == value.key_package_id.as_ref()
                         })
-                        && watermark.as_ref().is_none_or(|barrier| {
-                            if barrier.deleted_event_id.is_none()
-                                && Some(&barrier.key_package_id) != value.key_package_id.as_ref()
-                            {
-                                return true;
-                            }
-                            barrier_allows(event_id, created_at, barrier)
-                        })
-                        && replacements
-                            .iter()
-                            .filter(|replacement| {
-                                Some(&replacement.key_package_id) == value.key_package_id.as_ref()
-                            })
-                            .all(|replacement| {
-                                replacement_allows(event_id, created_at, replacement)
-                            })
+                        .all(|replacement| replacement_allows(event_id, created_at, replacement))
                 }),
-            FollowAvailabilityState::NotFound => replacements.is_empty() && barriers.is_empty(),
+            FollowAvailabilityState::NotFound => {
+                let checked_at = value.checked_at;
+                replacements
+                    .iter()
+                    .all(|replacement| replacement.observed_at <= checked_at)
+                    && barriers
+                        .iter()
+                        .all(|barrier| barrier.observed_at <= checked_at)
+                    && evicted_at.is_none_or(|evicted_at| evicted_at <= checked_at)
+                    && watermark
+                        .as_ref()
+                        .is_none_or(|barrier| barrier.observed_at <= checked_at)
+            }
             FollowAvailabilityState::Unknown => true,
         };
         if current {
@@ -1090,15 +1105,26 @@ fn barrier_allows(
     created_at: u64,
     barrier: &PublicKeyPackageBarrierRecord,
 ) -> bool {
-    if barrier.deleted_event_id.as_deref() == Some(event_id) {
-        return false;
+    match barrier.kind {
+        PublicKeyPackageBarrierKind::Replacement => {
+            event_id == barrier.event_id_hex
+                || created_at > barrier.event_created_at
+                || (created_at == barrier.event_created_at
+                    && event_id < barrier.event_id_hex.as_str())
+        }
+        PublicKeyPackageBarrierKind::Deletion => {
+            if barrier.deleted_event_id.as_deref() == Some(event_id) {
+                return false;
+            }
+            if barrier.deleted_event_id.is_some() {
+                return true;
+            }
+            event_id != barrier.event_id_hex
+                && (created_at > barrier.event_created_at
+                    || (created_at == barrier.event_created_at
+                        && event_id < barrier.event_id_hex.as_str()))
+        }
     }
-    if barrier.deleted_event_id.is_some() {
-        return true;
-    }
-    event_id != barrier.event_id_hex
-        && (created_at > barrier.event_created_at
-            || (created_at == barrier.event_created_at && event_id < barrier.event_id_hex.as_str()))
 }
 
 #[cfg(test)]
@@ -1157,6 +1183,53 @@ mod tests {
             source: FollowAvailabilitySource::Network,
             failed: false,
         }
+    }
+
+    fn project_with_watermark(kind: PublicKeyPackageBarrierKind) -> FollowAvailabilityState {
+        let event_id = "aa".repeat(32);
+        StoredAvailability {
+            account_id_hex: account_id(1),
+            state: Some("ready".into()),
+            checked_at: Some(1_000),
+            fresh_until: Some(2_000),
+            key_package_event_id: Some(event_id.clone()),
+            key_package_id: Some("slot".into()),
+            key_package_created_at: Some(900),
+            source: Some(1),
+            current: Publication {
+                event_id: Some(event_id.clone()),
+                key_package_id: Some("slot".into()),
+                created_at: Some(900),
+            },
+            shared: None,
+            replacements: Vec::new(),
+            replacement_evicted_at: Some(1_100),
+            global_evicted_at: Some(1_100),
+            barriers: Vec::new(),
+            eviction_watermark: Some(PublicKeyPackageBarrierRecord {
+                account_id_hex: account_id(1),
+                key_package_id: "other-slot".into(),
+                event_id_hex: event_id,
+                deleted_event_id: None,
+                event_created_at: 900,
+                observed_at: 1_100,
+                kind,
+            }),
+        }
+        .project(1_000)
+        .state
+    }
+
+    #[test]
+    fn watermarks_cover_lost_slots_without_blocking_live_replacements() {
+        assert_eq!(
+            project_with_watermark(PublicKeyPackageBarrierKind::Replacement),
+            FollowAvailabilityState::Ready
+        );
+        assert_eq!(
+            project_with_watermark(PublicKeyPackageBarrierKind::Deletion),
+            FollowAvailabilityState::Unknown
+        );
     }
 
     #[test]

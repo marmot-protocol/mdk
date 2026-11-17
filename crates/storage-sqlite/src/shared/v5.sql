@@ -16,11 +16,12 @@ CREATE TABLE public_key_package_barriers (
     deleted_event_id TEXT,
     event_created_at INTEGER NOT NULL,
     observed_at INTEGER NOT NULL,
-    PRIMARY KEY (account_id_hex, key_package_id, deleted_event_id)
+    kind TEXT NOT NULL CHECK (kind IN ('replacement', 'deletion')),
+    PRIMARY KEY (account_id_hex, key_package_id, deleted_event_id, kind)
 );
 
 CREATE UNIQUE INDEX public_key_package_slot_barriers
-    ON public_key_package_barriers (account_id_hex, key_package_id)
+    ON public_key_package_barriers (account_id_hex, key_package_id, kind)
     WHERE deleted_event_id IS NULL;
 
 -- One retained eviction fence per account, with a global conservative fallback.
@@ -30,7 +31,8 @@ CREATE TABLE public_key_package_eviction_watermarks (
     event_id_hex TEXT NOT NULL,
     deleted_event_id TEXT,
     event_created_at INTEGER NOT NULL,
-    evicted_at INTEGER NOT NULL
+    evicted_at INTEGER NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('replacement', 'deletion'))
 );
 
 CREATE TABLE public_key_package_eviction_fallback (

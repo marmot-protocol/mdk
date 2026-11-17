@@ -1444,6 +1444,35 @@ async fn availability_expired() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn availability_obsolete_only() {
+    let (_root, app, account, _fetcher) = legacy_only_fixture().await;
+    let owner = app
+        .account_home()
+        .create_account("availability-owner")
+        .unwrap();
+    app.directory()
+        .remember_directory_follow_list_for_test(
+            &owner.account_id_hex,
+            &nostr_directory::FetchedFollowList {
+                follows: vec![account.account_id_hex.clone()],
+                source_relays: Vec::new(),
+            },
+        )
+        .unwrap();
+
+    let status = app
+        .directory()
+        .refresh_follow_availability(&crate::directory_resources::directory_account(&owner))
+        .await
+        .unwrap();
+    assert_eq!(status.not_found, 1, "{status:?}");
+    assert_eq!(
+        selection_availability_states(&app, &owner)[&account.account_id_hex],
+        nostr_directory::FollowAvailabilityState::NotFound
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn availability_multi_slot() {
     let (_root, app, accounts, fetcher) = member_resolution_fixture(1, false).await;
     let owner = app
@@ -1587,7 +1616,7 @@ async fn availability_recovery_stays_bounded() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn availability_deleted_stays_unknown() {
+async fn availability_deleted_stays_not_found() {
     let (_root, app, accounts, fetcher) = member_resolution_fixture(1, false).await;
     let owner = app
         .account_home()
@@ -1637,7 +1666,7 @@ async fn availability_deleted_stays_unknown() {
         .unwrap();
     assert_eq!(
         selection_availability_states(&app, &owner)[&accounts[0].account_id_hex],
-        nostr_directory::FollowAvailabilityState::Unknown
+        nostr_directory::FollowAvailabilityState::NotFound
     );
 
     fetcher

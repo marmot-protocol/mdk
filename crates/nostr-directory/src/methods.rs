@@ -839,18 +839,22 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
     ) -> Result<Vec<RelayEventRecord>, DirectoryError> {
         let public_key =
             PublicKey::parse(account_id_hex).map_err(|_| DirectoryError::InvalidPublicKey)?;
+        let account = public_key.to_hex();
         let source_relays = self.directory_source_relays(source_relays);
-        self.relay_plane
+        let records = self
+            .relay_plane
             .fetch_directory_events(
                 source_relays,
                 vec![DirectoryEventQuery::new(
                     KIND_MARMOT_KEY_PACKAGE,
-                    vec![public_key.to_hex()],
+                    vec![account.clone()],
                     limit,
                 )],
             )
             .await
-            .map_err(|e| DirectoryError::RelayDirectory(format!("fetch key packages: {e}")))
+            .map_err(|e| DirectoryError::RelayDirectory(format!("fetch key packages: {e}")))?;
+        self.journal_key_package_records(&account, &records).await?;
+        Ok(records)
     }
 
     /// Read every KeyPackage slot of `account_id_hex` from `source_relays`
@@ -885,6 +889,8 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
             )
             .await
             .map_err(|e| DirectoryError::RelayDirectory(format!("fetch key packages: {e}")))?;
+        self.journal_key_package_records(&account, &outcome.records)
+            .await?;
         Ok(account_key_package_slots_from_records(
             &account,
             &outcome.records,

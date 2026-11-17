@@ -75,6 +75,21 @@ pub struct PublicKeyPackageReplacementRecord {
     pub observed_at: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PublicKeyPackageBarrierKind {
+    Replacement,
+    Deletion,
+}
+
+impl PublicKeyPackageBarrierKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Replacement => "replacement",
+            Self::Deletion => "deletion",
+        }
+    }
+}
+
 /// Supersession metadata without KeyPackage bytes. A target fences that exact
 /// publication; no target fences the slot through `event_created_at`.
 /// All timestamps are Unix seconds.
@@ -86,6 +101,7 @@ pub struct PublicKeyPackageBarrierRecord {
     pub deleted_event_id: Option<String>,
     pub event_created_at: u64,
     pub observed_at: u64,
+    pub kind: PublicKeyPackageBarrierKind,
 }
 
 const KEY_PACKAGE_REPLACEMENT_GLOBAL_CAP: i64 = 1_000;
@@ -342,10 +358,10 @@ impl SqliteSharedStorage {
         let mut statement = conn
             .prepare_cached(
                 "SELECT account_id_hex, key_package_id, event_id_hex,
-                        deleted_event_id, event_created_at, observed_at
-                 FROM public_key_package_barriers
-                 WHERE account_id_hex = ?1
-                 ORDER BY key_package_id, deleted_event_id",
+                                        deleted_event_id, event_created_at, observed_at, kind
+                                 FROM public_key_package_barriers
+                                 WHERE account_id_hex = ?1
+                                 ORDER BY key_package_id, deleted_event_id",
             )
             .storage()?;
         statement
@@ -365,7 +381,7 @@ impl SqliteSharedStorage {
                 .query_row_cached(
                     "SELECT COALESCE(
                         (SELECT MAX(observed_at) FROM public_key_package_barriers
-                         WHERE account_id_hex = ?1),
+                     WHERE account_id_hex = ?1),
                         (SELECT evicted_at FROM public_key_package_eviction_watermarks
                          WHERE account_id_hex = ?1),
                         (SELECT evicted_at FROM public_key_package_eviction_fallback WHERE id = 1))",
@@ -377,6 +393,20 @@ impl SqliteSharedStorage {
                     },
                 )
                 .storage()
+    }
+
+    pub fn key_package_global_evicted_at(&self) -> StorageResult<Option<u64>> {
+        self.lock()?
+            .query_row_cached(
+                "SELECT evicted_at FROM public_key_package_eviction_fallback WHERE id = 1",
+                [],
+                |row| {
+                    row.get::<_, i64>(0)
+                        .map(|value| u64::try_from(value).unwrap_or(0))
+                },
+            )
+            .optional()
+            .storage()
     }
 
     pub fn public_key_package_replacement_evicted_at(
@@ -394,9 +424,9 @@ impl SqliteSharedStorage {
         self.lock()?
             .query_row_cached(
                 "SELECT account_id_hex, key_package_id, event_id_hex,
-                        deleted_event_id, event_created_at, evicted_at
-                 FROM public_key_package_eviction_watermarks
-                 WHERE account_id_hex = ?1",
+                                        deleted_event_id, event_created_at, evicted_at, kind
+                                 FROM public_key_package_eviction_watermarks
+                                 WHERE account_id_hex = ?1",
                 params![account_id_hex],
                 key_package_barrier_from_row,
             )
@@ -911,6 +941,11 @@ fn key_package_barrier_from_row(
         deleted_event_id: row.get(3)?,
         event_created_at: u64::try_from(row.get::<_, i64>(4)?).unwrap_or(0),
         observed_at: u64::try_from(row.get::<_, i64>(5)?).unwrap_or(0),
+        kind: match row.get::<_, String>(6)?.as_str() {
+            "replacement" => PublicKeyPackageBarrierKind::Replacement,
+            "deletion" => PublicKeyPackageBarrierKind::Deletion,
+            _ => return Err(rusqlite::Error::InvalidQuery),
+        },
     })
 }
 
@@ -921,8 +956,8 @@ fn write_key_package_barrier(
     tx.execute_cached(
         "INSERT INTO public_key_package_barriers (
             account_id_hex, key_package_id, event_id_hex, deleted_event_id,
-            event_created_at, observed_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            event_created_at, observed_at, kind
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
          ON CONFLICT DO UPDATE SET
             event_id_hex = excluded.event_id_hex,
             event_created_at = excluded.event_created_at,
@@ -940,6 +975,7 @@ fn write_key_package_barrier(
             &record.deleted_event_id,
             u64_to_i64(record.event_created_at)?,
             u64_to_i64(record.observed_at)?,
+            record.kind.as_str(),
         ],
     )
     .storage()?;
@@ -979,6 +1015,7 @@ fn prune_key_package_replacements(tx: &Transaction<'_>) -> StorageResult<()> {
                         deleted_event_id: None,
                         event_created_at: u64::try_from(row.get::<_, i64>(3)?).unwrap_or(0),
                         observed_at: u64::try_from(row.get::<_, i64>(4)?).unwrap_or(0),
+                        kind: PublicKeyPackageBarrierKind::Replacement,
                     })
                 })
                 .storage()?
@@ -1001,21 +1038,21 @@ fn prune_key_package_replacements(tx: &Transaction<'_>) -> StorageResult<()> {
 fn prune_key_package_barriers(tx: &Transaction<'_>, now: i64) -> StorageResult<()> {
     for query in [
         "SELECT account_id_hex, key_package_id, event_id_hex,
-                deleted_event_id, event_created_at, observed_at
-         FROM (
-            SELECT *, ROW_NUMBER() OVER (
-                PARTITION BY account_id_hex
-                ORDER BY observed_at DESC, event_created_at DESC, event_id_hex,
-                         key_package_id, deleted_event_id
-            ) AS retention_position
-            FROM public_key_package_barriers
-         ) WHERE retention_position > 500",
+                        deleted_event_id, event_created_at, observed_at, kind
+                 FROM (
+                    SELECT *, ROW_NUMBER() OVER (
+                        PARTITION BY account_id_hex
+                        ORDER BY observed_at DESC, event_created_at DESC, event_id_hex,
+                                 key_package_id, deleted_event_id
+                    ) AS retention_position
+                    FROM public_key_package_barriers
+                 ) WHERE retention_position > 500",
         "SELECT account_id_hex, key_package_id, event_id_hex,
-                deleted_event_id, event_created_at, observed_at
-         FROM public_key_package_barriers
-         ORDER BY observed_at DESC, event_created_at DESC, event_id_hex,
-                  account_id_hex, key_package_id, deleted_event_id
-         LIMIT -1 OFFSET 1000",
+                        deleted_event_id, event_created_at, observed_at, kind
+                 FROM public_key_package_barriers
+                 ORDER BY observed_at DESC, event_created_at DESC, event_id_hex,
+                          account_id_hex, key_package_id, deleted_event_id
+                 LIMIT -1 OFFSET 1000",
     ] {
         let pruned = {
             let mut statement = tx.prepare_cached(query).storage()?;
@@ -1029,13 +1066,14 @@ fn prune_key_package_barriers(tx: &Transaction<'_>, now: i64) -> StorageResult<(
             tx.execute_cached(
                 "INSERT INTO public_key_package_eviction_watermarks (
                     account_id_hex, key_package_id, event_id_hex, deleted_event_id,
-                    event_created_at, evicted_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                    event_created_at, evicted_at, kind
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
                  ON CONFLICT(account_id_hex) DO UPDATE SET
                     key_package_id = excluded.key_package_id,
                     event_id_hex = excluded.event_id_hex,
                     deleted_event_id = excluded.deleted_event_id,
                     event_created_at = excluded.event_created_at,
+                    kind = excluded.kind,
                     evicted_at = MAX(public_key_package_eviction_watermarks.evicted_at, excluded.evicted_at)
                  WHERE excluded.event_created_at >
                        public_key_package_eviction_watermarks.event_created_at
@@ -1050,6 +1088,7 @@ fn prune_key_package_barriers(tx: &Transaction<'_>, now: i64) -> StorageResult<(
                     &record.deleted_event_id,
                     u64_to_i64(record.event_created_at)?,
                     now,
+                    record.kind.as_str(),
                 ],
             )
             .storage()?;
@@ -1062,11 +1101,12 @@ fn prune_key_package_barriers(tx: &Transaction<'_>, now: i64) -> StorageResult<(
             tx.execute_cached(
                 "DELETE FROM public_key_package_barriers
                  WHERE account_id_hex = ?1 AND key_package_id = ?2
-                   AND deleted_event_id IS ?3",
+                   AND deleted_event_id IS ?3 AND kind = ?4",
                 params![
                     &record.account_id_hex,
                     &record.key_package_id,
                     &record.deleted_event_id,
+                    record.kind.as_str(),
                 ],
             )
             .storage()?;
@@ -1557,6 +1597,7 @@ mod tests {
             deleted_event_id: None,
             event_created_at: index,
             observed_at: index,
+            kind: PublicKeyPackageBarrierKind::Replacement,
         }
     }
 
@@ -1573,6 +1614,7 @@ mod tests {
             event_id_hex: "bb".repeat(32),
             event_created_at: 20,
             observed_at: 2,
+            kind: PublicKeyPackageBarrierKind::Deletion,
             ..key_package_barrier(&account, 0)
         };
         let exact = PublicKeyPackageBarrierRecord {
@@ -1808,8 +1850,8 @@ mod tests {
                 VALUES(0) UNION ALL SELECT id + 1 FROM ids WHERE id < 999
              )
              INSERT INTO public_key_package_eviction_watermarks
-                (account_id_hex, key_package_id, event_id_hex, event_created_at, evicted_at)
-             SELECT printf('wm-%04d', id), 'slot', 'ee', 1, 1 FROM ids;",
+                (account_id_hex, key_package_id, event_id_hex, event_created_at, evicted_at, kind)
+             SELECT printf('wm-%04d', id), 'slot', 'ee', 1, 1, 'replacement' FROM ids;",
             )
             .unwrap();
         storage.put_public_key_package_barrier(&recreated).unwrap();
@@ -1840,8 +1882,8 @@ mod tests {
             .unwrap()
             .execute_batch(
                 "INSERT INTO public_key_package_eviction_watermarks
-                (account_id_hex, key_package_id, event_id_hex, event_created_at, evicted_at)
-             VALUES ('older', 'slot', 'dd', 0, 0);",
+                (account_id_hex, key_package_id, event_id_hex, event_created_at, evicted_at, kind)
+             VALUES ('older', 'slot', 'dd', 0, 0, 'replacement');",
             )
             .unwrap();
         storage.put_public_key_package_barrier(&recreated).unwrap();
@@ -2159,6 +2201,7 @@ mod tests {
             deleted_event_id: Some(record.event_id_hex.clone()),
             event_created_at: 25,
             observed_at: 31,
+            kind: PublicKeyPackageBarrierKind::Deletion,
         };
         storage.put_public_key_package_barrier(&barrier).unwrap();
         storage.close().unwrap();
@@ -2195,6 +2238,7 @@ mod tests {
                 "deleted_event_id",
                 "event_created_at",
                 "observed_at",
+                "kind",
             ]
         );
         assert_eq!(
@@ -2206,6 +2250,7 @@ mod tests {
                 "deleted_event_id",
                 "event_created_at",
                 "evicted_at",
+                "kind",
             ]
         );
     }

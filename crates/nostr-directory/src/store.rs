@@ -38,9 +38,9 @@ fn deletion_barriers(
         .event
         .tags
         .iter()
-        .filter(|tag| tag[0] == "a")
+        .filter(|tag| tag.first().is_some_and(|name| name == "a"))
         .filter_map(|tag| {
-            let mut parts = tag[1].splitn(3, ':');
+            let mut parts = tag.get(1)?.splitn(3, ':');
             let kind = parts.next()?.parse::<u64>().ok()?;
             let author = parts.next()?;
             let slot = parts.next()?;
@@ -48,6 +48,7 @@ fn deletion_barriers(
                 storage_sqlite::PublicKeyPackageBarrierRecord {
                     account_id_hex: account_id_hex.clone(),
                     key_package_id: slot.to_owned(),
+                    kind: storage_sqlite::PublicKeyPackageBarrierKind::Deletion,
                     event_id_hex: record.event.id.clone(),
                     deleted_event_id: None,
                     event_created_at: record.event.created_at,
@@ -60,14 +61,17 @@ fn deletion_barriers(
                 .event
                 .tags
                 .iter()
-                .filter(|tag| tag[0] == "e")
-                .map(|tag| storage_sqlite::PublicKeyPackageBarrierRecord {
-                    account_id_hex: account_id_hex.clone(),
-                    key_package_id: String::new(),
-                    event_id_hex: record.event.id.clone(),
-                    deleted_event_id: Some(tag[1].clone()),
-                    event_created_at: record.event.created_at,
-                    observed_at: 0,
+                .filter(|tag| tag.first().is_some_and(|name| name == "e"))
+                .filter_map(|tag| {
+                    Some(storage_sqlite::PublicKeyPackageBarrierRecord {
+                        account_id_hex: account_id_hex.clone(),
+                        key_package_id: String::new(),
+                        kind: storage_sqlite::PublicKeyPackageBarrierKind::Deletion,
+                        event_id_hex: record.event.id.clone(),
+                        deleted_event_id: Some(tag.get(1)?.clone()),
+                        event_created_at: record.event.created_at,
+                        observed_at: 0,
+                    })
                 }),
         )
         .collect()
@@ -646,3 +650,24 @@ pub fn hydrate_directory_record(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod deletion_barrier_tests {
+    use super::*;
+    use transport_nostr_peeler::NostrTransportEvent;
+
+    #[test]
+    fn deletion_barriers_ignore_empty_and_incomplete_tags() {
+        let record = RelayEventRecord {
+            endpoints: Vec::new(),
+            event: NostrTransportEvent::new_unsigned(
+                "11".repeat(32),
+                5,
+                vec![vec![], vec!["e".into()], vec!["a".into()]],
+                String::new(),
+            ),
+        };
+
+        assert!(deletion_barriers(&record).is_empty());
+    }
+}
