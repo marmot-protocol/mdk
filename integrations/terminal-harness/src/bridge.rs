@@ -3227,6 +3227,9 @@ mod tests {
     #[derive(Default)]
     struct RecordingBackend {
         invocations: Mutex<Vec<Invocation>>,
+        /// Signalled after each recorded invocation; `notify_one` keeps a
+        /// permit, so a waiter that arrives late still wakes.
+        invoked: tokio::sync::Notify,
     }
 
     #[derive(Debug)]
@@ -3340,6 +3343,7 @@ mod tests {
             _tx: mpsc::Sender<RunnerEvent>,
         ) -> std::result::Result<Outcome, RunFailure> {
             self.invocations.lock().await.push(invocation);
+            self.invoked.notify_one();
             Ok(Outcome {
                 observed_session: None,
                 exit_code: Some(0),
@@ -4373,6 +4377,93 @@ mod tests {
             |record| record.cwd.as_deref() == Some(repo.canonicalize().unwrap().as_path())
         ));
         drop(invocations);
+        server.abort();
+    }
+
+    /// The tests above hand `reply_to` straight to `handle_message`. This one
+    /// enters at `dispatch_event`, the boundary that originally dropped the
+    /// snapshot, with the shared rich-context golden events.
+    #[tokio::test]
+    async fn dispatch_event_carries_golden_reply_context_to_backend() {
+        let fixture = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../fixtures/agent-control-v2-rich-context.json"),
+        )
+        .unwrap();
+        let events: Vec<AgentControlEvent> = serde_json::from_str(&fixture).unwrap();
+        let replies: Vec<AgentControlEvent> = events
+            .into_iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    AgentControlEvent::InboundMessage {
+                        reply_to: Some(_),
+                        ..
+                    }
+                )
+            })
+            .collect();
+        // Available (with an attachment), missing, deleted, invalidated.
+        assert_eq!(replies.len(), 4);
+
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let mut config = test_config(root.path());
+        config
+            .allowed_senders
+            .insert("c".repeat(64).to_ascii_lowercase());
+        let server = spawn_final_server(&config.socket);
+        let backend = Arc::new(RecordingBackend::default());
+        let ctx = test_context_with_backend(root.path(), &home, config, backend.clone());
+        ctx.sessions
+            .set_workdir(&"b".repeat(32), home.clone())
+            .await
+            .unwrap();
+
+        for (index, event) in replies.into_iter().enumerate() {
+            let AgentControlEvent::InboundMessage {
+                message,
+                reply_to: Some(reply),
+                ..
+            } = event.clone()
+            else {
+                unreachable!("filtered to reply-bearing inbound messages");
+            };
+            assert!(matches!(
+                dispatch_event(ctx.clone(), event).await,
+                DispatchOutcome::Continue
+            ));
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while backend.invocations.lock().await.len() <= index {
+                    backend.invoked.notified().await;
+                }
+            })
+            .await
+            .expect("backend invocation for dispatched reply");
+
+            let invocations = backend.invocations.lock().await;
+            let prompt = &invocations[index].prompt;
+            assert_eq!(
+                prompt,
+                &format!(
+                    "{}{}",
+                    apply_reply_context(&reply, &message.text),
+                    crate::group_profile::INSTRUCTIONS
+                )
+            );
+            assert_eq!(prompt.matches(REPLY_CONTEXT_PREFIX).count(), 1);
+            let fact = rendered_reply_fact(prompt);
+            assert_eq!(fact["message_id_hex"], reply.message_id_hex);
+            assert_eq!(fact["availability"], serde_json::json!(reply.availability));
+            if reply.availability == AgentControlReferencedMessageAvailability::Available {
+                assert_eq!(fact["text_excerpt"], "Here is the original image.");
+                assert_eq!(fact["attachments"][0]["file_name"], "diagram.png");
+            } else {
+                assert!(fact["text_excerpt"].is_null());
+                assert_eq!(fact["attachments"], serde_json::json!([]));
+            }
+        }
         server.abort();
     }
 
