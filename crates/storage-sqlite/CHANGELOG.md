@@ -4,6 +4,8 @@
 
 ### Breaking changes
 
+- Account migration 0212 adds the bounded attachment body-removal journal (mdk#3491). Older binaries refuse
+  schema 212; downgrade is unsupported.
 - Account migration 0211 adds `account_sign_in_removals`: one row per slot the trusted device roster recorded as
   `removed` on this device, with the time through which a publication there is the removed device's.
   `SqliteAppStorage::record_sign_in_removals` writes them and deletes those slots' unrejected sign-ins no later than
@@ -30,6 +32,10 @@
 
 ### Added
 
+- `SqliteAppStorage::attachment_removals(cursor, limit)` returns durable, ordered removal identities and
+  reasons for derivative-cache eviction (mdk#3491). Pages hold up to 256 records; the journal holds 4,096.
+  First use, store reset, and trimmed history require reconciliation from a captured high-water cursor.
+  Local-byte reads remain the authorization boundary.
 - File-backed composer-draft attachments (#3431, migration 0209): a
   `message_draft_attachments` row can own a staged media file
   (`message_draft_attachment_stage`, a `StageTarget`) instead of holding bytes,

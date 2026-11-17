@@ -1184,6 +1184,10 @@ pub use legacy_migration::{
 };
 mod keep_media;
 pub use keep_media::AttachmentKeepMedia;
+mod body_removals;
+pub use body_removals::{
+    AttachmentBodyRemoval, AttachmentBodyRemovalPage, AttachmentBodyRemovalState,
+};
 mod storage_usage;
 pub use storage_usage::{
     ATTACHMENT_REMOVAL_BATCH, AttachmentRemoval, AttachmentStorageUsage, ChatAttachmentUsage,
