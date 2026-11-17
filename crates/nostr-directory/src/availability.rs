@@ -12,6 +12,7 @@ use cgka_engine::key_package::key_package_metadata;
 use cgka_traits::TransportEndpoint;
 use futures::StreamExt;
 use rusqlite::{OptionalExtension, params};
+use storage_sqlite::SqliteSharedStorage;
 use tokio::sync::watch;
 
 use super::cache::DirectoryCache;
@@ -22,7 +23,7 @@ use super::published_records::{
     key_package_queries, key_package_read_page_full, select_key_packages_from_records,
 };
 use super::resources::{DirectoryAccount, DirectoryResources};
-use super::{Directory, FetchedKeyPackage};
+use super::{Directory, DirectoryKeyPackage, FetchedKeyPackage};
 
 pub const MAX_FOLLOW_AVAILABILITY_TARGETS: usize = 100;
 pub const MAX_FOLLOW_AVAILABILITY_PAGE_SIZE: usize = 100;
@@ -214,7 +215,8 @@ impl DirectoryCache {
                 OR (
                     excluded.state = 'ready'
                     AND (
-                        follow_availability.superseded_last_resort = 1
+                        follow_availability.key_package_id IS NOT excluded.key_package_id
+                        OR follow_availability.superseded_last_resort = 1
                         OR follow_availability.superseded_event_id = excluded.key_package_event_id
                         OR follow_availability.superseded_at < excluded.key_package_created_at
                         OR (
@@ -222,6 +224,10 @@ impl DirectoryCache {
                             AND follow_availability.superseded_event_id > excluded.key_package_event_id
                         )
                     )
+                )
+                OR (
+                    excluded.state = 'not_found'
+                    AND follow_availability.superseded_at <= excluded.checked_at
                 )",
             params![
                 account_id_hex,
@@ -266,12 +272,24 @@ impl DirectoryCache {
             .map_err(DirectoryError::from)
     }
 
+    #[cfg(test)]
     fn follow_availability_page(
         &self,
         account_id_hex: &str,
         after: Option<&str>,
         limit: usize,
         now: u64,
+    ) -> Result<FollowAvailabilityPage, DirectoryError> {
+        self.follow_availability_page_with_shared(account_id_hex, after, limit, now, None)
+    }
+
+    fn follow_availability_page_with_shared(
+        &self,
+        account_id_hex: &str,
+        after: Option<&str>,
+        limit: usize,
+        now: u64,
+        shared: Option<&SqliteSharedStorage>,
     ) -> Result<FollowAvailabilityPage, DirectoryError> {
         let limit = limit.clamp(1, MAX_FOLLOW_AVAILABILITY_PAGE_SIZE);
         let conn = self.lock()?;
@@ -310,9 +328,12 @@ impl DirectoryCache {
                     key_package_id: row.get(5)?,
                     key_package_created_at: row.get(6)?,
                     source: row.get(7)?,
-                    current_key_package_id: row.get(8)?,
-                    current_event_id: row.get(9)?,
-                    current_created_at: row.get(10)?,
+                    current: Publication {
+                        key_package_id: row.get(8)?,
+                        event_id: row.get(9)?,
+                        created_at: row.get(10)?,
+                    },
+                    shared: None,
                 })
             },
         )?;
@@ -322,6 +343,28 @@ impl DirectoryCache {
         let next_cursor = has_more
             .then(|| stored.last().map(|row| row.account_id_hex.clone()))
             .flatten();
+        if let Some(shared) = shared {
+            for row in &mut stored {
+                if row.state.as_deref() != Some("ready") {
+                    continue;
+                }
+                let Some(record) = shared.public_directory_user(&row.account_id_hex)? else {
+                    continue;
+                };
+                let Some(json) = record.key_package_json else {
+                    continue;
+                };
+                let package: DirectoryKeyPackage = serde_json::from_str(&json)?;
+                if package.key_package_event_id.is_empty() {
+                    continue;
+                }
+                row.shared = Some(Publication {
+                    event_id: Some(package.key_package_event_id),
+                    key_package_id: Some(package.key_package_id),
+                    created_at: Some(package.created_at as i64),
+                });
+            }
+        }
         let rows = stored.into_iter().map(|row| row.project(now)).collect();
         Ok(FollowAvailabilityPage { rows, next_cursor })
     }
@@ -368,6 +411,13 @@ impl DirectoryCache {
     }
 }
 
+#[derive(Default)]
+struct Publication {
+    event_id: Option<String>,
+    key_package_id: Option<String>,
+    created_at: Option<i64>,
+}
+
 struct StoredAvailability {
     account_id_hex: String,
     state: Option<String>,
@@ -377,9 +427,8 @@ struct StoredAvailability {
     key_package_id: Option<String>,
     key_package_created_at: Option<i64>,
     source: Option<i64>,
-    current_key_package_id: Option<String>,
-    current_event_id: Option<String>,
-    current_created_at: Option<i64>,
+    current: Publication,
+    shared: Option<Publication>,
 }
 
 impl StoredAvailability {
@@ -390,16 +439,20 @@ impl StoredAvailability {
             Some(1) => FollowAvailabilitySource::Network,
             _ => FollowAvailabilitySource::None,
         };
-        let other_slot = self.key_package_id.is_some()
-            && self.current_key_package_id.is_some()
-            && self.key_package_id != self.current_key_package_id;
-        let current_is_not_newer = match (self.current_created_at, self.key_package_created_at) {
-            (Some(current), Some(selected)) => current <= selected,
-            _ => true,
+        let publication_allows = |current: &Publication| {
+            let other_slot = self.key_package_id.is_some()
+                && current.key_package_id.is_some()
+                && self.key_package_id != current.key_package_id;
+            let current_is_not_newer = match (current.created_at, self.key_package_created_at) {
+                (Some(current), Some(selected)) => current <= selected,
+                _ => true,
+            };
+            current.event_id.is_some()
+                && (other_slot
+                    || (current.event_id == self.key_package_event_id && current_is_not_newer))
         };
-        let current_publication_allows = self.current_event_id.is_some()
-            && (other_slot
-                || (self.current_event_id == self.key_package_event_id && current_is_not_newer));
+        let current_publication_allows = publication_allows(&self.current)
+            && self.shared.as_ref().is_none_or(publication_allows);
         let state = match self.state.as_deref() {
             Some("ready")
                 if fresh_until.is_some_and(|expiry| expiry > now)
@@ -410,7 +463,8 @@ impl StoredAvailability {
             }
             Some("not_found")
                 if self
-                    .current_created_at
+                    .current
+                    .created_at
                     .and_then(|value| u64::try_from(value).ok())
                     < checked_at =>
             {
@@ -517,7 +571,14 @@ impl<R: DirectoryResources> Directory<R> {
     ) -> Result<FollowAvailabilityPage, DirectoryError> {
         let now = self.directory_freshness().now;
         let cache = self.resources.cache_for_account(account)?;
-        cache.follow_availability_page(&account.account_id_hex, after, limit, now)
+        let shared = self.resources.shared_storage()?;
+        cache.follow_availability_page_with_shared(
+            &account.account_id_hex,
+            after,
+            limit,
+            now,
+            Some(&shared),
+        )
     }
 
     pub fn follow_availability_status(
@@ -791,9 +852,6 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                     if value.failed || !committed {
                         status.failed = status.failed.saturating_add(1);
                     }
-                    if !committed {
-                        status.truncated = true;
-                    }
                     true
                 });
                 Ok(())
@@ -1028,6 +1086,9 @@ fn error_is_host_failure(error: &DirectoryError) -> bool {
 }
 
 fn superseded_allows(fetched: &FetchedKeyPackage, superseded: &Supersession) -> bool {
+    if fetched.key_package_id != superseded.key_package_id {
+        return true;
+    }
     superseded.last_resort == Some(true)
         || fetched.key_package_event_id == superseded.event_id
         || fetched.created_at > superseded.created_at
@@ -1377,6 +1438,91 @@ mod tests {
             FollowAvailabilityState::Ready,
             "a publication in another slot does not suppress ready"
         );
+    }
+
+    #[test]
+    fn availability_barrier_is_slot_scoped() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = DirectoryCache::open(
+            root.path().join("directory.sqlite3"),
+            &SqlCipherKey::raw([0x55; 32]),
+        )
+        .unwrap();
+        let owner = account_id(1);
+        let follow = account_id(2);
+        insert_follow(&cache, &owner, &follow, 0);
+        insert_package(&cache, &follow, &"aa".repeat(32), 900);
+        let selected = ready(1_000, 2_000, "aa".repeat(32));
+        assert!(
+            cache
+                .record_follow_availability(&owner, &follow, &selected)
+                .unwrap()
+        );
+        cache
+            .invalidate_follow(&follow, "slot", &"bb".repeat(32), 1_200, 1_300, Some(false))
+            .unwrap();
+        cache
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE directory_users
+                 SET key_package_json = json_set(
+                     key_package_json,
+                     '$.key_package_id', 'other',
+                     '$.key_package_event_id', ?2
+                 )
+                 WHERE account_id_hex = ?1",
+                params![follow, "cc".repeat(32)],
+            )
+            .unwrap();
+        let other_slot = AvailabilityWrite {
+            key_package_event_id: Some("cc".repeat(32)),
+            key_package_id: Some("other".into()),
+            ..selected
+        };
+        assert!(
+            cache
+                .record_follow_availability(&owner, &follow, &other_slot)
+                .unwrap(),
+            "a barrier in one slot must not block another slot"
+        );
+        assert_eq!(
+            cache
+                .follow_availability_page(&owner, None, 1, 1_500)
+                .unwrap()
+                .rows[0]
+                .state,
+            FollowAvailabilityState::Ready
+        );
+
+        cache
+            .invalidate_follow(
+                &follow,
+                "other",
+                &"bb".repeat(32),
+                1_200,
+                1_300,
+                Some(false),
+            )
+            .unwrap();
+        let not_found = AvailabilityWrite {
+            state: FollowAvailabilityState::NotFound,
+            checked_at: 1_300,
+            fresh_until: Some(2_000),
+            key_package_event_id: None,
+            key_package_id: None,
+            key_package_created_at: None,
+            source: FollowAvailabilitySource::Network,
+            failed: false,
+            superseded: None,
+        };
+        assert!(
+            cache
+                .record_follow_availability(&owner, &follow, &not_found)
+                .unwrap(),
+            "a complete clean miss clears the replacement barrier"
+        );
+        assert!(cache.supersession(&follow).unwrap().is_none());
     }
 
     #[test]

@@ -592,6 +592,50 @@ async fn availability_bounds() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn availability_shared_replacement() {
+    let (_root, app, accounts, _fetcher) = crate::tests::member_resolution_fixture(1, false).await;
+    let owner = app
+        .account_home()
+        .create_account("availability-owner")
+        .unwrap();
+    let followed = accounts[0].account_id_hex.clone();
+    remember_follows(&app, &owner, vec![followed.clone()]);
+    app.directory()
+        .refresh_follow_availability(&directory_account(&owner))
+        .await
+        .unwrap();
+    assert_eq!(
+        availability_states(&app, &owner)[&followed],
+        FollowAvailabilityState::Ready
+    );
+
+    let shared = app.shared_storage().unwrap();
+    let mut record = shared.public_directory_user(&followed).unwrap().unwrap();
+    let mut package: nostr_directory::DirectoryKeyPackage =
+        serde_json::from_str(record.key_package_json.as_deref().unwrap()).unwrap();
+    package.created_at += 1;
+    package.key_package_event_id = "ff".repeat(32);
+    record.key_package_json = Some(serde_json::to_string(&package).unwrap());
+    shared.put_public_directory_user(&record).unwrap();
+    app.drop_account_caches(&owner.label);
+    assert_eq!(
+        availability_states(&app, &owner)[&followed],
+        FollowAvailabilityState::Unknown,
+        "a newer shared publication suppresses a stale local ready row"
+    );
+
+    package.key_package_id = "other-slot".into();
+    record.key_package_json = Some(serde_json::to_string(&package).unwrap());
+    shared.put_public_directory_user(&record).unwrap();
+    app.drop_account_caches(&owner.label);
+    assert_eq!(
+        availability_states(&app, &owner)[&followed],
+        FollowAvailabilityState::Ready,
+        "a shared publication in another slot does not suppress ready"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn availability_account_isolation() {
     let (_root, app, accounts, _fetcher) = crate::tests::member_resolution_fixture(1, false).await;
     let first = app.account_home().create_account("first-owner").unwrap();
