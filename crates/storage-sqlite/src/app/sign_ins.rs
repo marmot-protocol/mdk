@@ -148,6 +148,17 @@ impl SqliteAppStorage {
         let mut changed = false;
         for observed in check.unrecognized {
             let published_at = u64_to_i64(observed.published_at)?;
+            let removed_device: bool = tx
+                .query_row_cached(
+                    "SELECT EXISTS(SELECT 1 FROM account_sign_in_removals
+                         WHERE slot_id_hex = ?1 AND removed_at >= ?2)",
+                    params![observed.slot_id_hex, published_at],
+                    |row| row.get(0),
+                )
+                .storage()?;
+            if removed_device {
+                continue;
+            }
             changed |= tx
                 .execute_cached(
                     UPSERT_SIGN_IN,
@@ -195,6 +206,50 @@ impl SqliteAppStorage {
                 .storage()?;
                 changed = true;
             }
+        }
+        tx.commit().storage()?;
+        Ok(changed)
+    }
+
+    /// Record each of `removed`, a slot the trusted roster records as
+    /// `removed` with that record's `rejected_at`: the user linked the device
+    /// in it and then removed it. Its sign-in, unless this device rejected
+    /// it, is answered by that link and removal and goes, and a later check
+    /// adds none for a publication in the slot no later than the removal or
+    /// the newest publication this device had seen there, after the roster
+    /// drops the record too. A later publication is a new sign-in. Returns
+    /// whether a sign-in went.
+    pub fn record_sign_in_removals(&self, removed: &[(String, u64)]) -> StorageResult<bool> {
+        if removed.is_empty() {
+            return Ok(false);
+        }
+        let mut conn = self.lock()?;
+        let tx = conn.transaction().storage()?;
+        let mut changed = false;
+        for (slot_id_hex, rejected_at) in removed {
+            // Only the first record takes the sign-in's publication: one
+            // newer than a record a later roster restores is a new sign-in.
+            tx.execute_cached(
+                "INSERT INTO account_sign_in_removals (slot_id_hex, removed_at)
+                 VALUES (?1, MAX(?2, COALESCE(
+                     (SELECT last_published_at FROM account_sign_ins WHERE slot_id_hex = ?1),
+                     0)))
+                 ON CONFLICT(slot_id_hex) DO UPDATE SET removed_at = ?2
+                 WHERE ?2 > removed_at",
+                // A time past `i64::MAX` saturates: another device wrote it.
+                params![slot_id_hex, i64::try_from(*rejected_at).unwrap_or(i64::MAX)],
+            )
+            .storage()?;
+            changed |= tx
+                .execute_cached(
+                    "DELETE FROM account_sign_ins
+                     WHERE slot_id_hex = ?1 AND answer != 'rejected'
+                         AND last_published_at <= (SELECT removed_at FROM account_sign_in_removals
+                                                   WHERE slot_id_hex = ?1)",
+                    params![slot_id_hex],
+                )
+                .storage()?
+                != 0;
         }
         tx.commit().storage()?;
         Ok(changed)
@@ -671,6 +726,42 @@ mod tests {
                 .answer_sign_in("bb", &[Unanswered], Dismissed, 500)
                 .unwrap()
         );
+    }
+
+    /// A removed device's sign-in goes, and its publications from before the
+    /// removal never bring it back; a later one is a new sign-in, which a
+    /// record the roster restores does not take. A rejection stays.
+    #[test]
+    fn a_removed_devices_sign_in_goes_until_the_slot_publishes_again() {
+        let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
+        check(
+            &store,
+            &[observed("aa", 50, "e1"), observed("bb", 10, "e2")],
+            true,
+            100,
+        );
+        assert!(
+            store
+                .answer_sign_in("bb", &[Unanswered], Rejected, 100)
+                .unwrap()
+        );
+        assert!(!store.record_sign_in_removals(&[]).unwrap());
+        // A removal decided by a clock behind the slot's publication.
+        assert!(
+            store
+                .record_sign_in_removals(&[("aa".into(), 40), ("bb".into(), 40)])
+                .unwrap()
+        );
+        assert_eq!(store.sign_in("aa").unwrap(), None);
+        assert_eq!(store.sign_in("bb").unwrap().unwrap().answer, Rejected);
+
+        assert!(!check(&store, &[observed("aa", 50, "e1")], false, 200));
+        assert_eq!(store.sign_in("aa").unwrap(), None);
+        assert!(check(&store, &[observed("aa", 60, "e3")], false, 300));
+        let row = store.sign_in("aa").unwrap().unwrap();
+        assert_eq!((row.answer, row.appeared_at), (Unanswered, 60));
+        assert!(!store.record_sign_in_removals(&[("aa".into(), 40)]).unwrap());
+        assert!(store.sign_in("aa").unwrap().is_some());
     }
 
     /// Starting fresh answers Not now for every device the first check

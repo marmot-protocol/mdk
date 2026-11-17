@@ -38,6 +38,12 @@
 //!   rejected stays up, saying so, until dismissed. That answer holds only
 //!   while the roster does: a sign-in dismissed here is listed again once the
 //!   roster has no entry for its slot.
+//! - **Removed.** A slot the roster records as `removed` held a device the
+//!   user linked and removed, which answers its sign-in for good: the sign-in
+//!   goes, unless this device rejected it, and once the record expires no
+//!   publication from before the removal lists it again. A removed device
+//!   comes back only in a new slot, so a later publication in the old one is
+//!   a new sign-in.
 //! - **Gone.** A sign-in whose slot a complete read finds holding no valid
 //!   KeyPackage, fresh or not, stays listed, marked as no longer signed in.
 //!   A stale publication never signs a slot out, and only a complete read
@@ -383,6 +389,13 @@ impl AppClient {
         }
         let roster = trusted.map(|(_, roster)| roster);
         let storage = self.app.account_storage(&self.state.label)?.app_storage();
+        // Before the check adds sign-ins: a removal this device has not
+        // recorded yet, as after an upgrade, keeps its slot's out.
+        if let Some(roster) = roster.as_ref()
+            && storage.record_sign_in_removals(&removed_slots(roster))?
+        {
+            self.unrecognized_sign_ins_changed = true;
+        }
         let rejected_here = rejected_slots_here(&storage.sign_ins()?);
 
         let mut report = SignInCheckReport {
@@ -881,12 +894,17 @@ impl AppClient {
     /// the roster again, so one the roster lost is committed anew. A rejection
     /// settled from another device's commit is lost if that commit later
     /// loses convergence, and that device may never come back to repair it.
+    /// A slot the roster records as `removed` is recorded here, so its
+    /// sign-in goes and stays gone once the record does.
     pub(crate) fn recheck_sign_in_rejections(&mut self) {
         let ended = self.trusted_device_roster().and_then(|roster| {
             let Some((_, roster)) = roster else {
                 return Ok(());
             };
             let storage = self.app.account_storage(&self.state.label)?.app_storage();
+            if storage.record_sign_in_removals(&removed_slots(&roster))? {
+                self.unrecognized_sign_ins_changed = true;
+            }
             for record in storage.sign_ins()? {
                 if record.answer == SignInAnswer::Rejected && linked(&record, &roster) {
                     end_rejection(&storage, &record)?;
@@ -1188,6 +1206,17 @@ fn listed_state(
             .then_some(UnrecognizedSignInState::RejectedElsewhere);
     }
     Some(waiting)
+}
+
+/// Each slot `roster` records as `removed`, as a sign-in names it, with that
+/// record's `rejected_at`: the user linked the device in it and removed it.
+fn removed_slots(roster: &DeviceRosterV1) -> Vec<(String, u64)> {
+    roster
+        .rejected_slots
+        .iter()
+        .filter(|(_, rejected)| rejected.reason == RejectedSlotReasonV1::Removed)
+        .map(|(slot, rejected)| (hex::encode(slot), rejected.rejected_at))
+        .collect()
 }
 
 /// Whether the roster holds `record`'s slot as a device: the user confirmed

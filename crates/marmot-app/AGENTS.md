@@ -252,7 +252,9 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   cannot name is rejected on this device only. A rejection names the slot alone (`rejected_slot`), never its KeyPackage:
   the account key can copy any KeyPackage, a real device's included, into a slot the user rejects. A slot the trusted
   roster lists as a device is known, regardless of its published KeyPackage (D81). Hosts read the list as
-  `unrecognized_sign_ins`. A check or answer that changes it, and every roster change
+  `unrecognized_sign_ins`. A slot the trusted roster records as `removed` is recorded locally at every recheck and
+  check (`record_sign_in_removals`): its unrejected sign-in goes, and no publication from before the removal lists it
+  again once the record expires; a later one is a new sign-in. A check or answer that changes it, and every roster change
   (`note_device_roster_changed`), sets `unrecognized_sign_ins_changed`, drained at the device-group seams into one
   payload-free `UnrecognizedSignInsChanged`; every client opens with it set.
   Start fresh (D54, `start_fresh`) answers every before-this-device sign-in Not now, including baseline slots listed

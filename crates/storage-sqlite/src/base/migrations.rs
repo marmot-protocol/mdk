@@ -399,6 +399,8 @@ mod migration_0208_nip22_comments;
 mod migration_0209_file_backed_draft_attachments;
 #[path = "migrations/0210_changes_not_delivered.rs"]
 mod migration_0210_changes_not_delivered;
+#[path = "migrations/0211_sign_in_removals.rs"]
+mod migration_0211_sign_in_removals;
 
 const MIGRATIONS: &[Migration] = &[
     Migration {
@@ -1513,6 +1515,12 @@ const MIGRATIONS: &[Migration] = &[
         name: "0210_changes_not_delivered",
         suspend_foreign_keys: &[],
         apply: migration_0210_changes_not_delivered::apply,
+    },
+    Migration {
+        version: 211,
+        name: "0211_sign_in_removals",
+        suspend_foreign_keys: &[],
+        apply: migration_0211_sign_in_removals::apply,
     },
 ];
 

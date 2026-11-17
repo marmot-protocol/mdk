@@ -857,6 +857,36 @@ async fn a_removed_and_relinked_device_is_not_a_rejected_sign_in() {
                 && sign_in.slot_id_hex != relinked.slot_hex()),
         "{listed:?}"
     );
+
+    // The `removed` record goes (its expiry), and the laptop's publication
+    // from before its removal is still served: the user linked and removed
+    // that device, so it is no new sign-in, now or after a restart.
+    boxed(|| {
+        super::sign_ins::commit_roster(
+            &mut phone.client,
+            &group,
+            vec![DeviceRosterOperationV1::RemoveRejectedSlot(old_slot_id)],
+        )
+    })
+    .await;
+    assert!(
+        !phone
+            .roster(&group)
+            .rejected_slots
+            .contains_key(&old_slot_id)
+    );
+    for reopened in [false, true] {
+        if reopened {
+            phone = reopen(phone).await;
+        }
+        phone.client.check_sign_ins().await.unwrap();
+        let listed = phone.client.unrecognized_sign_ins().unwrap();
+        assert!(
+            listed.iter().all(|sign_in| sign_in.slot_id_hex != old_slot),
+            "{listed:?}"
+        );
+        assert_eq!(phone.client.compromise_warning().unwrap(), []);
+    }
 }
 
 /// A later link adds the new device to the device group in one commit, by a
