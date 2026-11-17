@@ -109,6 +109,7 @@ impl<R: DirectoryResources> Directory<R> {
                 .await
                 .map_err(DirectoryError::RelayDirectory)?;
             observed.extend(outcome.records);
+            self.journal_key_package_records(account, &observed).await?;
             package_coverage &= outcome.complete;
         }
         let routes = distinct_recovery_routes(searched.iter().chain(&supplementary));

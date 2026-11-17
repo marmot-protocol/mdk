@@ -13,7 +13,7 @@ use transport_nostr_adapter::{
     KIND_MARMOT_INBOX_RELAY_LIST, KIND_MARMOT_KEY_PACKAGE, KIND_NIP65_RELAY_LIST,
 };
 
-use super::error::DirectoryError;
+use super::error::{DirectoryError, blocking_directory_task};
 use super::ids::{
     normalize_account_ids, npub_for_account_id, npub_for_account_id_lossy, parse_account_id_hex,
 };
@@ -31,6 +31,42 @@ use super::resources::DirectoryResources;
 use super::{Directory, DirectoryCache};
 
 impl<R: DirectoryResources> Directory<R> {
+    pub(super) async fn journal_key_package_records(
+        &self,
+        account_id_hex: &str,
+        records: &[RelayEventRecord],
+    ) -> Result<(), DirectoryError> {
+        let freshness = self.directory_freshness();
+        let replacements = records
+            .iter()
+            .filter(|record| {
+                record.event.kind == KIND_MARMOT_KEY_PACKAGE
+                    && record.event.pubkey == account_id_hex
+                    && freshness.accepts(record)
+                    && record.event.to_verified_nostr_event().is_ok()
+            })
+            .map(|record| storage_sqlite::PublicKeyPackageReplacementRecord {
+                account_id_hex: account_id_hex.to_owned(),
+                key_package_id: record.event.tag_value("d").unwrap_or_default().to_owned(),
+                event_id_hex: record.event.id.clone(),
+                event_created_at: record.event.created_at,
+                observed_at: freshness.now,
+            })
+            .collect::<Vec<_>>();
+        if replacements.is_empty() {
+            return Ok(());
+        }
+        let directory = self.clone();
+        blocking_directory_task(move || {
+            let shared = directory.resources.shared_storage()?;
+            for replacement in replacements {
+                shared.put_public_key_package_replacement(&replacement)?;
+            }
+            Ok(())
+        })
+        .await
+    }
+
     pub fn local_accounts_by_id(
         &self,
     ) -> Result<HashMap<String, LocalAccountNames>, DirectoryError> {
