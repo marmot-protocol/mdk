@@ -1749,7 +1749,7 @@ async fn recovery_runner_empty_sweeps_without_a_tail_finish_as_the_clock_advance
     let host = TestHost::new(
         &account,
         &clock,
-        vec![required(&route, &endpoints)],
+        vec![shared(&route, &endpoints)],
         &relays.each_ref(),
     );
     let (mut runner, handle) = runner(&host, test_policy());
