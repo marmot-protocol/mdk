@@ -445,10 +445,10 @@ impl TailSource {
 struct Tails(BTreeMap<UnitKey, u64>);
 
 impl LiveTailRead for Tails {
-    fn owed_until(&self, route: &Route, relay: &str, now: u64) -> u64 {
+    fn history_end(&self, route: &Route, relay: &str) -> Option<u64> {
         self.0
             .get(&unit_key(route, relay))
-            .map_or(now, |from| from.saturating_sub(1).min(now))
+            .map(|from| from.saturating_sub(1))
     }
 }
 
@@ -1125,7 +1125,7 @@ impl TestHost {
     }
 
     async fn survey(&self, policy: RecoveryRunnerPolicy) -> Survey {
-        self.debt_turn(move |turn| survey(turn, &policy, &Stalled::default()))
+        self.debt_turn(move |turn| survey(turn, &policy, &Stalled::default(), None))
             .await
             .unwrap()
             .unwrap()
@@ -1253,7 +1253,6 @@ impl RunnerHost for TestHost {
         let answer = turn(&DebtTurn {
             app: &self.app,
             routes: &routes,
-            fetch_until: now,
             now,
             tails: &*tails,
             live_counts: &counts,
@@ -1899,7 +1898,8 @@ async fn recovery_runner_serves_held_groups_first_then_small_debts_and_every_gro
     let clock = Clock::new();
     let t0 = clock.now();
     let (large, small, held) = (group(1), group(2), group(3));
-    // An event an hour throughout each route's initial window.
+    // An event an hour everywhere: sixty days for the large group, an hour
+    // for the small one and two for the held one.
     let mut events = every([1; 32], t0 - 60 * DAY, t0, HOUR);
     events.extend(every([2; 32], t0 - HOUR, t0, HOUR));
     events.extend(every([3; 32], t0 - 2 * HOUR, t0, HOUR));
@@ -1917,7 +1917,9 @@ async fn recovery_runner_serves_held_groups_first_then_small_debts_and_every_gro
         .to_vec();
     routes[1].best_effort = vec![OTHER_RELAY.to_owned()];
     let host = TestHost::new(&account, &clock, routes, &[&relay, &other]);
-    // The held route finishes in one quantum. The others keep competing.
+    // The held group's tail stands, so its first quantum ends its debt. No
+    // other tail stands: the large and small groups owe their newest seconds
+    // again after every quantum, so the small debt never runs out.
     host.tails.stand(&held, RELAY, t0);
     let (mut runner, handle) = runner(&host, test_policy());
     handle.set_hints(PriorityHints {
@@ -1936,18 +1938,6 @@ async fn recovery_runner_serves_held_groups_first_then_small_debts_and_every_gro
         assert_eq!(summary.outcome, Outcome::Advanced);
         assert_eq!(summary.key.relay, RELAY);
         served.push(name(&summary.key.route));
-        if summary.key.route == small {
-            // New evidence reopens a small historical range. Keep the unit
-            // eligible each round without depending on wall-clock polling.
-            account
-                .app
-                .uncover_recovery_coverage(
-                    std::slice::from_ref(&small),
-                    t0 - 10,
-                    storage_sqlite::CopyFloorReason::Clamp,
-                )
-                .unwrap();
-        }
     }
 
     // The held group goes first although it owes more than the small one.
@@ -1981,12 +1971,19 @@ async fn recovery_runner_serves_an_open_conversation_before_smaller_debts() {
     ];
     let host = TestHost::new(&account, &clock, routes, &[&relay]);
     for route in [&open, &closed] {
-        host.tails.stand(route, RELAY, t0);
+        host.tails.stand(route, RELAY, t0 + 1);
     }
-    let (mut runner, _handle) = runner(&host, test_policy());
+    let (mut runner, handle) = runner(&host, test_policy());
 
     // Without the window the hour would go first, as the smaller debt.
     assert_eq!(ran(runner.step().await).key.route, open);
+    // New evidence for the open conversation arrives after this background
+    // window began, while the closed conversation still has work queued.
+    clock.advance(5);
+    host.tails.lapse(&open, RELAY);
+    handle.bump();
+    assert_eq!(ran(runner.step().await).key.route, open);
+    assert_eq!(account.covered_through(&open, RELAY), clock.now());
     assert_eq!(ran(runner.step().await).key.route, closed);
 }
 
@@ -2914,6 +2911,7 @@ fn recovery_runner_sizes_a_route_last_seen_empty_by_its_span() {
         key: unit_key(route, RELAY),
         group_id: None,
         best_effort: false,
+        fetch_until: None,
         owed_seconds,
         position: 0,
         last_served_at: None,
@@ -4910,7 +4908,15 @@ async fn recovery_runner_suspends_an_unrecoverable_groups_route() {
     let policy = test_policy();
     assert!(
         host.debt_turn(move |turn| {
-            select::begin(turn, &key, false, Some(caps(500, true)), true, &policy)
+            select::begin(
+                turn,
+                &key,
+                false,
+                Some(caps(500, true)),
+                true,
+                &policy,
+                None,
+            )
         })
         .await
         .unwrap()

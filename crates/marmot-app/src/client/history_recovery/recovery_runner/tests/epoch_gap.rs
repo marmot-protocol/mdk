@@ -57,6 +57,7 @@ async fn epoch_gap_empty_sweeps_finish_as_the_clock_advances() {
         assert_eq!(queries[0].until, start);
     }
     clock.advance_to(due);
+    host.tails.stand(&route, OTHER_RELAY, due + 1);
     assert_eq!(ran(owner.step().await).outcome, Outcome::Advanced);
     assert_eq!(
         account
@@ -67,6 +68,17 @@ async fn epoch_gap_empty_sweeps_finish_as_the_clock_advances() {
             .visits,
         2
     );
+
+    // One relay reconnects and a different standing tail silently lapses
+    // while the other six are still being drained. Both expose fresh debt.
+    clock.advance(3);
+    host.connect(RELAY);
+    host.tails.lapse(&route, OTHER_RELAY);
+    run_until_idle(&mut owner, 12).await;
+    for (index, relay) in relays.iter().enumerate() {
+        let end = if index < 2 { clock.now() } else { due };
+        assert_eq!(relay.queries().last().unwrap().until, end);
+    }
 }
 
 // Paused time tests local-drain pacing without waiting on wall time.

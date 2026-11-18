@@ -18,20 +18,19 @@ use crate::client::history_recovery::recovery_coverage::LiveTails;
 
 /// One worker turn's read of the live tails.
 pub(crate) trait LiveTailRead: Send + Sync {
-    /// The last second the ledger must prove on `relay` for `route` at `now`:
-    /// the second before a standing tail starts there, else `now`.
-    fn owed_until(&self, route: &TransportReconciliationRoute, relay: &str, now: u64) -> u64;
+    /// Last second owed before a standing tail or the end of a bounded
+    /// collection. Without either, the history goal grows with the clock.
+    fn history_end(&self, route: &TransportReconciliationRoute, relay: &str) -> Option<u64>;
+
+    fn owed_until(&self, route: &TransportReconciliationRoute, relay: &str, now: u64) -> u64 {
+        self.history_end(route, relay)
+            .map_or(now, |end| end.min(now))
+    }
 
     /// Whether `route`'s joined copy is still collecting its post-join
     /// history, for the audit.
     fn collecting(&self, _route: &TransportReconciliationRoute) -> bool {
         false
-    }
-}
-
-impl LiveTailRead for LiveTails {
-    fn owed_until(&self, route: &TransportReconciliationRoute, relay: &str, now: u64) -> u64 {
-        LiveTails::owed_until(self, route, relay, now)
     }
 }
 
@@ -71,12 +70,11 @@ struct PostJoinTails {
 }
 
 impl LiveTailRead for PostJoinTails {
-    fn owed_until(&self, route: &TransportReconciliationRoute, relay: &str, now: u64) -> u64 {
+    fn history_end(&self, route: &TransportReconciliationRoute, relay: &str) -> Option<u64> {
         self.collecting
             .get(route)
             .copied()
-            .unwrap_or_else(|| self.live.owed_until(route, relay, now))
-            .min(now)
+            .or_else(|| self.live.history_end(route, relay))
     }
 
     fn collecting(&self, route: &TransportReconciliationRoute) -> bool {

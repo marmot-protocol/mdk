@@ -124,7 +124,6 @@ impl AppClient {
                 app,
                 routes: &routes,
                 inbox: [0; 32],
-                fetch_until: now,
                 now,
                 tails: &*tails,
                 live_counts: &[],
@@ -142,13 +141,12 @@ impl AppClient {
 pub(super) struct RepairTails(pub(super) u64);
 
 impl super::tails::LiveTailRead for RepairTails {
-    fn owed_until(
+    fn history_end(
         &self,
         _route: &storage_sqlite::TransportReconciliationRoute,
         _relay: &str,
-        now: u64,
-    ) -> u64 {
-        self.0.min(now)
+    ) -> Option<u64> {
+        Some(self.0)
     }
 }
 

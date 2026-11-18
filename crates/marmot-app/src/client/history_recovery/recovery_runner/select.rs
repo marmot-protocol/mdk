@@ -38,6 +38,8 @@ pub(super) struct Candidate {
     /// The MLS group its route carries, for the audit.
     pub(super) group_id: Option<Vec<u8>>,
     pub(super) best_effort: bool,
+    /// Finite upper bound for passive epoch-gap acquisition, if any.
+    pub(super) fetch_until: Option<u64>,
     /// Seconds owed after the live tail.
     pub(super) owed_seconds: u64,
     /// The first owed second: where this relay stands on its route.
@@ -249,12 +251,20 @@ pub(super) fn cooldown_until(
     Ok(until)
 }
 
+/// Current durable visits, and the first observation of each unit without a
+/// standing tail during this background drain.
+type VisitWindows<'a> = (
+    &'a BTreeMap<Vec<u8>, u64>,
+    &'a mut super::epoch_gap::BackgroundWindows,
+);
+
 /// Survey every unit of the current routes that owes anything after its live
 /// tail. `stalled` is what admission cannot drain now. Writes nothing.
 pub(super) fn survey(
     turn: &DebtTurn<'_>,
     policy: &RecoveryRunnerPolicy,
     stalled: &Stalled,
+    mut windows: Option<VisitWindows<'_>>,
 ) -> StorageResult<Survey> {
     let app = turn.app;
     let now = turn.now;
@@ -263,11 +273,42 @@ pub(super) fn survey(
         .filter(|until| *until > now);
     let mut cooldowns = BTreeMap::new();
     let mut admission = Admission::new(turn);
+    let fenced = admission.fenced_routes()?;
+    let mut current_windows = super::epoch_gap::BackgroundWindows::new();
     let mut candidates = Vec::new();
     let mut catching_up = BTreeSet::new();
     for route in turn.routes {
         for (relay, best_effort) in route.relays() {
-            let owed_until = turn.owed_until(route, relay).min(turn.fetch_until);
+            let unit_key = || UnitKey {
+                route: route.route.clone(),
+                relay: relay.to_owned(),
+            };
+            let history_end = turn.tails.history_end(&route.route, relay);
+            // Only open-ended gap work needs a limit independent of the
+            // clock. Live capture evidence can extend it through its own end.
+            let fetch_until = windows.as_ref().and_then(|(visits, previous)| {
+                let group = route.group_id.as_ref()?;
+                let visit = visits.get(group)?;
+                if route.goal_until.is_some() || history_end.is_some() {
+                    return None;
+                }
+                let key = unit_key();
+                let until = previous
+                    .get(group)
+                    .and_then(|units| units.get(&key))
+                    .copied()
+                    .unwrap_or(now)
+                    .max(*visit)
+                    .max(fenced.get(&route.route).copied().unwrap_or(0));
+                current_windows
+                    .entry(group.clone())
+                    .or_default()
+                    .insert(key, until);
+                Some(until)
+            });
+            let owed_until = turn
+                .checked_until(route)
+                .min(history_end.or(fetch_until).unwrap_or(now));
             let debt = app.recovery_unit_debt(&route.route, relay, owed_until)?;
             let Some(first) = debt.first() else {
                 continue;
@@ -286,10 +327,7 @@ pub(super) fn survey(
                 }
             };
             let cooldown = cooldown_until(app, &mut cooldowns, relay, now)?;
-            let key = UnitKey {
-                route: route.route.clone(),
-                relay: relay.to_owned(),
-            };
+            let key = unit_key();
             // Nothing is fetched for a group admission cannot drain, and
             // staging holds a relay back until the group's laggard advances or
             // leaves the admission frontier.
@@ -304,6 +342,7 @@ pub(super) fn survey(
                 key,
                 group_id: route.group_id.clone(),
                 best_effort,
+                fetch_until,
                 owed_seconds,
                 position: first.since_seconds,
                 last_served_at: unit.as_ref().and_then(|unit| unit.last_served_at_seconds),
@@ -312,6 +351,9 @@ pub(super) fn survey(
                 recheck: false,
             });
         }
+    }
+    if let Some((_, previous)) = &mut windows {
+        **previous = current_windows;
     }
     let probe_due = app
         .pending_recovery_probes()?
@@ -329,7 +371,7 @@ pub(super) fn survey(
         candidates,
         rechecks: recheck::survey(turn, policy, stalled, &mut admission)?,
         paused_until,
-        fenced: admission.fenced_routes()?,
+        fenced: fenced.into_keys().collect(),
         window: turn
             .routes
             .iter()
@@ -531,6 +573,7 @@ pub(super) fn begin(
     caps: Option<RelayCaps>,
     compares: bool,
     policy: &RecoveryRunnerPolicy,
+    fetch_until: Option<u64>,
 ) -> StorageResult<Option<SweepPlan>> {
     let app = turn.app;
     let now = turn.now;
@@ -572,7 +615,8 @@ pub(super) fn begin(
         return Ok(None);
     }
     let mark = app.recovery_coverage_mark()?;
-    let owed_until = turn.owed_until(route, &key.relay).min(turn.fetch_until);
+    let owed_until = turn.owed_until(route, &key.relay);
+    let owed_until = fetch_until.map_or(owed_until, |until| until.min(owed_until));
     let mut ranges = Vec::new();
     for debt in app.recovery_unit_debt(&key.route, &key.relay, owed_until)? {
         if let Some(cursor) = app.recovery_unit_cursor(
