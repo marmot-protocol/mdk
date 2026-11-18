@@ -97,20 +97,13 @@ impl GroupFacts for LiveFacts<'_> {
     /// [`AppClient::group_unrecoverable`], which reads a group it cannot
     /// read as recoverable.
     fn unrecoverable(&self, group_id: &[u8]) -> Fact {
-        match self
+        let group_id = GroupId::new(group_id.to_vec());
+        let record = self
             .0
             .runtime
-            .group_record(&GroupId::new(group_id.to_vec()))
-        {
-            Ok(group) => Fact {
-                value: group.unrecoverable,
-                settled: true,
-            },
-            Err(error) => Fact {
-                value: false,
-                settled: settled_failure(&AppError::from(error)),
-            },
-        }
+            .group_record(&group_id)
+            .map_err(AppError::from);
+        self.0.unrecoverable_fact(&group_id, record.as_ref())
     }
 
     fn stamp(&self, _: &[u8]) -> Option<ChangeStamp> {
@@ -250,6 +243,46 @@ fn shown(notice: &RejoinNotice, facts: &dyn GroupFacts) -> bool {
 }
 
 impl AppClient {
+    /// Whether `group_id`'s copy is Unrecoverable, given the engine's
+    /// `record` of it. A seeded group the engine has not hydrated yet, as
+    /// at startup and on a reconnect's reopen, has no engine record yet;
+    /// its stored record carries the mark and needs no hydration. Any other
+    /// group whose record fails reads as recoverable.
+    pub(crate) fn unrecoverable_fact(
+        &self,
+        group_id: &GroupId,
+        record: Result<&cgka_traits::group::Group, &AppError>,
+    ) -> Fact {
+        let not_hydrated = |error: &AppError| {
+            matches!(
+                error.as_engine_error(),
+                Some(cgka_traits::error::EngineError::GroupNotHydrated(_))
+            )
+        };
+        match record {
+            Ok(group) => Fact {
+                value: group.unrecoverable,
+                settled: true,
+            },
+            Err(error) if not_hydrated(error) => {
+                match cgka_traits::GroupStorage::get_group(&self.engine_storage, group_id) {
+                    Ok(group) => Fact {
+                        value: group.unrecoverable,
+                        settled: true,
+                    },
+                    Err(_) => Fact {
+                        value: false,
+                        settled: false,
+                    },
+                }
+            }
+            Err(error) => Fact {
+                value: false,
+                settled: settled_failure(error),
+            },
+        }
+    }
+
     /// Every current occurrence: parked obligations oldest first, then
     /// rejoins oldest first.
     pub(crate) fn history_notices(&self) -> Result<Vec<HistoryNotice>, AppError> {

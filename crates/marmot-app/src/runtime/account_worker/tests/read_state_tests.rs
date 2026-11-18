@@ -2,10 +2,15 @@
 //! PR 2). A host that awaited a mutation's reply, or saw an event, reads at
 //! least the state it describes: the worker's two exits, `reply` and `emit`,
 //! publish A before the answer or event leaves, and every reply and event in
-//! the worker goes through one of them or names why it does not.
+//! the worker goes through one of them or names why it does not. The backup
+//! restore watch wakes only once A holds the status it announces.
 
 use super::*;
 use crate::client::read_state::{ReadState, UploadsInFlight, read_state_channel};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// How long a step of the restore watch test may take.
+const SETTLE: Duration = Duration::from_secs(30);
 
 /// A client that publishes A, with the receiver a host would read.
 async fn publishing_client(app: &MarmotApp) -> (AppClient, watch::Receiver<Arc<ReadState>>) {
@@ -224,4 +229,292 @@ async fn a_discarded_sends_removal_is_heard_by_its_reply() {
     });
     assert!(heard, "the removal is out when the reply arrives");
     runtime.shutdown().await;
+}
+
+/// Holds a restore's backup pointer read while `holding`, so the restore
+/// stays in Discovering until cancelled or released.
+struct HeldPointerFetcher {
+    relay: Arc<ScriptedPushRelayClient>,
+    holding: AtomicBool,
+    /// How many pointer reads reached the hold.
+    entered: watch::Sender<usize>,
+    release: tokio::sync::Notify,
+}
+
+impl HeldPointerFetcher {
+    async fn hold(&self, request: &transport_nostr::DirectoryFetchRequest) {
+        if !request
+            .queries
+            .iter()
+            .any(|query| query.kind == crate::client::backup_writer::KIND_BACKUP_POINTER)
+        {
+            return;
+        }
+        let released = self.release.notified();
+        tokio::pin!(released);
+        released.as_mut().enable();
+        if !self.holding.load(Ordering::SeqCst) {
+            return;
+        }
+        self.entered.send_modify(|entered| *entered += 1);
+        released.await;
+    }
+}
+
+#[async_trait::async_trait]
+impl transport_nostr::DirectoryRelayFetcher for HeldPointerFetcher {
+    async fn fetch_directory_events(
+        &self,
+        request: transport_nostr::DirectoryFetchRequest,
+    ) -> Result<Vec<transport_nostr::DirectoryRelayEventRecord>, String> {
+        self.hold(&request).await;
+        self.relay.fetch_directory_events(request).await
+    }
+
+    async fn fetch_directory_events_with_completion(
+        &self,
+        request: transport_nostr::DirectoryFetchRequest,
+    ) -> Result<transport_nostr::DirectoryFetchOutcome, String> {
+        self.hold(&request).await;
+        self.relay
+            .fetch_directory_events_with_completion(request)
+            .await
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Observer {
+    /// A task on the runtime the worker runs on.
+    SameRuntime,
+    /// A host thread, as a binding's `next()` polls on the caller and its
+    /// status call is spawned onto the runtime.
+    HostThread,
+}
+
+/// What a host saw: the status the watch woke with, the status it read
+/// right after, and how long after the wake a read first matched it.
+type Observation = (
+    crate::BackupRestoreStatus,
+    crate::BackupRestoreStatus,
+    Duration,
+);
+
+/// How long after `woke_at` the status read first reaches `woke`.
+async fn caught_up(
+    runtime: &crate::MarmotAppRuntime,
+    woke: &crate::BackupRestoreStatus,
+    woke_at: std::time::Instant,
+) -> Duration {
+    loop {
+        let read = runtime.backup_restore_status("alice").await.unwrap();
+        if read.revision >= woke.revision || woke_at.elapsed() > Duration::from_secs(5) {
+            return woke_at.elapsed();
+        }
+        tokio::task::yield_now().await;
+    }
+}
+
+/// Park an observer on `watch` (marked seen first); it wakes on the next
+/// change, even one made before it waits, reads `backup_restore_status` at
+/// once, and hands the watch back.
+async fn park_observer(
+    runtime: &crate::MarmotAppRuntime,
+    mut watch: crate::BackupRestoreWatch,
+    observer: Observer,
+) -> tokio::sync::oneshot::Receiver<(crate::BackupRestoreWatch, Observation)> {
+    drop(watch.receiver.borrow_and_update());
+    let (done, observed) = oneshot::channel();
+    let (parked, is_parked) = oneshot::channel();
+    match observer {
+        Observer::SameRuntime => {
+            let runtime = runtime.clone();
+            tokio::spawn(async move {
+                parked.send(()).unwrap();
+                let woke = watch.changed().await.unwrap();
+                let woke_at = std::time::Instant::now();
+                let read = runtime.backup_restore_status("alice").await.unwrap();
+                let lag = caught_up(&runtime, &woke, woke_at).await;
+                let _ = done.send((watch, (woke, read, lag)));
+            });
+        }
+        Observer::HostThread => {
+            let runtime = runtime.clone();
+            let handle = tokio::runtime::Handle::current();
+            std::thread::spawn(move || {
+                let host = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                host.block_on(async move {
+                    parked.send(()).unwrap();
+                    let woke = watch.changed().await.unwrap();
+                    let woke_at = std::time::Instant::now();
+                    let reader = runtime.clone();
+                    let read = handle
+                        .spawn(async move { reader.backup_restore_status("alice").await })
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    let target = woke.clone();
+                    let lag = handle
+                        .spawn(async move { caught_up(&runtime, &target, woke_at).await })
+                        .await
+                        .unwrap();
+                    let _ = done.send((watch, (woke, read, lag)));
+                });
+            });
+        }
+    }
+    is_parked.await.unwrap();
+    observed
+}
+
+/// Whether the status read after the wake is older than the wake's.
+fn stale((woke, read, _): &Observation) -> bool {
+    read.revision < woke.revision
+}
+
+/// The restore watch is an exit from the account worker: it wakes only once
+/// A holds the status it announces, so a host that reads the status when the
+/// watch wakes reads that status, never the one before. A status a host
+/// missed this way stays on screen: no further wake follows the final
+/// Cancelled or Complete. Checked for begin (wakes on Discovering), cancel
+/// (wakes on Cancelled) and completion (the discovery finishing), over many
+/// rounds, from a task on the worker's runtime and from a host thread.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_backup_restore_watch_wakes_once_the_status_reads_its_change() {
+    const ROUNDS: usize = 40;
+    const WORDS: &str = "abandon abandon abandon abandon abandon abandon abandon abandon \
+                         abandon abandon abandon about";
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let fetcher = Arc::new(HeldPointerFetcher {
+        relay: relay.clone(),
+        holding: AtomicBool::new(true),
+        entered: watch::Sender::new(0),
+        release: tokio::sync::Notify::new(),
+    });
+    let mut app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    app.relay_plane = crate::MarmotRelayPlane::new_with_directory_fetcher_for_test(
+        None,
+        relay.clone(),
+        fetcher.clone(),
+        app.config.allow_loopback_relay_endpoints,
+    );
+    let runtime = crate::MarmotAppRuntime::new(app);
+    runtime.reconcile_accounts().await.unwrap();
+    crate::worker_fences::worker_startup_finished(&runtime, "alice")
+        .await
+        .unwrap();
+    let mut watch = runtime.watch_backup_restore("alice").await.unwrap();
+
+    // (observer, step) -> (stale, total)
+    let mut tally: std::collections::BTreeMap<(String, &str), (usize, usize)> =
+        std::collections::BTreeMap::new();
+    let mut examples: Vec<String> = Vec::new();
+    let mut lags: Vec<Duration> = Vec::new();
+    let mut record = |observer: Observer, step: &'static str, observation: &Observation| {
+        let entry = tally.entry((format!("{observer:?}"), step)).or_default();
+        entry.1 += 1;
+        lags.push(observation.2);
+        if stale(observation) {
+            entry.0 += 1;
+            if examples.len() < 6 {
+                examples.push(format!(
+                    "{observer:?}/{step}: woke {:?}@{} read {:?}@{}",
+                    observation.0.phase,
+                    observation.0.revision,
+                    observation.1.phase,
+                    observation.1.revision
+                ));
+            }
+        }
+    };
+    let wait_entered = |count: usize| {
+        let mut entered = fetcher.entered.subscribe();
+        async move {
+            timeout(SETTLE, entered.wait_for(|entered| *entered >= count))
+                .await
+                .expect("the restore's pointer read reaches the hold")
+                .unwrap();
+        }
+    };
+
+    for round in 0..ROUNDS {
+        let observer = if round % 2 == 0 {
+            Observer::HostThread
+        } else {
+            Observer::SameRuntime
+        };
+        // Begin: the watch wakes on Discovering.
+        let observed = park_observer(&runtime, watch, observer).await;
+        let entered_before = *fetcher.entered.borrow();
+        let operation = runtime
+            .begin_backup_restore("alice", crate::BackupRestoreWords::new(WORDS.to_owned()))
+            .await
+            .unwrap()
+            .operation
+            .unwrap();
+        let (returned, observation) = timeout(SETTLE, observed).await.unwrap().unwrap();
+        watch = returned;
+        record(observer, "begin", &observation);
+        if round == 0 {
+            // The relay plane coalesces later rounds' identical pointer reads
+            // onto the one held here, so only the first one reaches it.
+            wait_entered(entered_before + 1).await;
+        }
+
+        if round % 4 < 2 {
+            // Cancel: the watch wakes on Cancelled.
+            let observed = park_observer(&runtime, watch, observer).await;
+            assert!(
+                runtime
+                    .cancel_backup_restore("alice", operation)
+                    .await
+                    .unwrap(),
+                "the held restore is still running"
+            );
+            let (returned, observation) = timeout(SETTLE, observed).await.unwrap().unwrap();
+            watch = returned;
+            assert_eq!(observation.0.phase, crate::BackupRestorePhase::Cancelled);
+            record(observer, "cancel", &observation);
+        } else {
+            // Completion: release the pointer read; the worker settles the
+            // discovery off a media completion.
+            let observed = park_observer(&runtime, watch, observer).await;
+            fetcher.holding.store(false, Ordering::SeqCst);
+            fetcher.release.notify_waiters();
+            let (returned, observation) = timeout(SETTLE, observed).await.unwrap().unwrap();
+            watch = returned;
+            record(observer, "complete", &observation);
+            fetcher.holding.store(true, Ordering::SeqCst);
+        }
+        // Let the worker settle the round before the next begin.
+        crate::worker_fences::worker_round_trip(&runtime, "alice")
+            .await
+            .unwrap();
+    }
+    fetcher.holding.store(false, Ordering::SeqCst);
+    fetcher.release.notify_waiters();
+    runtime.shutdown().await;
+
+    let total_stale: usize = tally.values().map(|(stale, _)| stale).sum();
+    let summary = tally
+        .iter()
+        .map(|((observer, step), (stale, total))| format!("{observer}/{step}: {stale}/{total}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    lags.sort();
+    assert_eq!(
+        total_stale,
+        0,
+        "a status read on the watch's wake read the previous status: {summary}; \
+         {examples:?}; wake-to-A lag median {:?} max {:?}",
+        lags[lags.len() / 2],
+        lags[lags.len() - 1]
+    );
 }

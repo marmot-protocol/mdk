@@ -4325,7 +4325,9 @@ where
     /// or that a group relay refused and the user has not acknowledged, oldest
     /// first, and the wall-clock window the list holds in without a write.
     /// The gate refuses a group change while any of them gates, and the
-    /// self-update hold waits on each one's own `since` (mdk#2333).
+    /// self-update hold waits on each one's own `since` (mdk#2333). Empty
+    /// for a group the engine has not hydrated yet, whose fanouts stay
+    /// frozen until it is: hydrate it first to learn what it owes.
     pub fn undelivered_commits_in(
         &self,
         group_id: &GroupId,
@@ -4334,7 +4336,8 @@ where
         let now = self.wall_clock.now();
         let mut changes_at: Option<Timestamp> = None;
         // The ungated lists: the group-scoped lookup fails for a stored group
-        // the engine has not hydrated yet, which has nothing owed to report.
+        // the engine has not hydrated yet. Such a group may still owe a
+        // commit; its fanouts below are listed only once it is hydrated.
         let loaded;
         let rows = match rows {
             Some(rows) => rows,

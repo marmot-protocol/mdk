@@ -86,7 +86,7 @@ use cgka_traits::app_components::{
     DEVICE_ROSTER_COMPONENT_ID, DeviceRosterV1, DeviceSlotId, RejectedSlotReasonV1, RejectedSlotV1,
 };
 use cgka_traits::storage::MaintenanceStorage as _;
-use cgka_traits::{MessageId, Timestamp, TransportEndpoint};
+use cgka_traits::{MessageId, Timestamp, TransportEndpoint, TransportFanoutAttemptState};
 use marmot_session::{ForeignSlotOutcome, ForeignSlotPublication};
 use nostr_directory::{AccountKeyPackageSlots, Directory, OwnSlotRead};
 use storage_sqlite::{ObservedSignIn, SignInAnswer, SignInCheck, SignInRecord, SqliteAppStorage};
@@ -254,12 +254,15 @@ impl SignInNudges {
 }
 
 /// This device's slot, every publication it made that may still be served
-/// there, by event id, and the relays its current one went to.
+/// there, by event id, the relays its current one went to, and which of
+/// them accepted it. A relay that accepts it while a read is out may have
+/// answered that read before it did, so the read is not judged.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct OwnKeyPackages {
     slot: Option<String>,
     events: BTreeSet<String>,
     targets: Vec<TransportEndpoint>,
+    accepted: Vec<TransportEndpoint>,
 }
 
 impl AppClient {
@@ -1047,6 +1050,12 @@ impl AppClient {
             // its slot empty: there is no slot of its own to read yet.
             slot: Some(lifecycle.stable_slot_id).filter(|slot| !slot.is_empty()),
             events,
+            accepted: lifecycle
+                .publication_targets
+                .iter()
+                .filter(|target| target.state == TransportFanoutAttemptState::Accepted)
+                .map(|target| target.endpoint.clone())
+                .collect(),
             targets: lifecycle
                 .publication_targets
                 .into_iter()

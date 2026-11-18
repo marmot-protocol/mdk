@@ -1585,8 +1585,9 @@ fn group_entry(
     // `host_may_see_group`, which hides the group when the check fails,
     // keeping whether it did: the entry is then not reusable.
     let device_group = client.is_device_group(group_id);
-    // The engine record gives whether the group's copy is Unrecoverable and
-    // its recovery status, which reads it once, as `group_recovery_status`.
+    // The engine record gives whether the group's copy is Unrecoverable (a
+    // group not hydrated yet reads its stored record) and its recovery
+    // status, which reads it once, as `group_recovery_status`.
     let engine_record = client
         .runtime
         .group_record(group_id)
@@ -1596,16 +1597,7 @@ fn group_entry(
             value: matches!(device_group, Ok(false)),
             settled: device_group.is_ok(),
         },
-        unrecoverable: match &engine_record {
-            Ok(group) => Fact {
-                value: group.unrecoverable,
-                settled: true,
-            },
-            Err(error) => Fact {
-                value: false,
-                settled: settled_failure(error),
-            },
-        },
+        unrecoverable: client.unrecoverable_fact(group_id, engine_record.as_ref()),
     };
     // The recovery read fails first, then the record, as today's read. A
     // failed status depends on no clock reading, and is never reused.
@@ -1774,14 +1766,15 @@ impl AppClient {
     /// Continue publishing A on a client that replaced the one `slot` was
     /// taken from. Every answer rebuilds at the next publish: the new
     /// client's write counts start over, so no stamp taken on the old one
-    /// may be compared with them.
+    /// may be compared with them. Nothing publishes here: the reopened
+    /// client's groups are seeded, not hydrated, so A keeps the old
+    /// client's last version until the worker has drained their hydration.
     pub(crate) fn resume_read_state(&mut self, slot: Option<Box<ReadStateSlot>>) {
         if let Some(slot) = slot {
             slot.lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .forget_inputs();
             self.read_state = Some(slot);
-            self.publish_read_state();
         }
     }
 

@@ -2856,9 +2856,13 @@ async fn run_app_runtime_account_worker(
                                     // eagerly here — the steady-state loop
                                     // below answers reads live and must not
                                     // hand out not-hydrated errors after a
-                                    // mid-session reconnect (mdk#1161).
+                                    // mid-session reconnect (mdk#1161). The
+                                    // reads that answer from A must not
+                                    // either: A shows the reopened client
+                                    // only once it is drained.
                                     if let Err(err) = drain_deferred_hydration(&mut reopened).await
                                     {
+                                        read_state = reopened.take_read_state();
                                         publish_app_runtime_account_error(
                                             Emit::Quiescent(&reopened),
                                             &events,
@@ -2869,10 +2873,10 @@ async fn run_app_runtime_account_worker(
                                                 &err,
                                             ),
                                         );
-                                        read_state = reopened.take_read_state();
                                         drop(reopened);
                                         continue;
                                     }
+                                    reopened.publish_read_state();
                                     // Reconnect restores transport activation
                                     // and subscriptions, then resumes the live
                                     // receive tail. Do not block the command

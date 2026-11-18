@@ -4255,21 +4255,50 @@ async fn local_ready_queued_send_ordering_body() {
     .await
     .expect("initial activation should be in flight");
 
-    let first_runtime = runtime.clone();
-    let first_group = group_id.clone();
-    let first = tokio::spawn(async move {
-        first_runtime
-            .send_message("alice", &first_group, b"first queued".to_vec())
-            .await
-    });
-    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    let second_runtime = runtime.clone();
-    let second_group = group_id.clone();
-    let second = tokio::spawn(async move {
-        second_runtime
-            .send_message("alice", &second_group, b"second queued".to_vec())
-            .await
-    });
+    // Each send is in the worker's queue before the next is made, and both
+    // before startup sync ends. Held startup sync defers them, and their
+    // replay answers both before the worker serves anything the failed
+    // activation schedules: a group-subscription refresh served first would
+    // take the subscribe held below, which waits for both answers.
+    let admitted_sends = || {
+        runtime
+            .app_performance_snapshot()
+            .runtime_operations
+            .into_iter()
+            .find(|snapshot| snapshot.operation == RuntimePerformanceOperation::SendAdmission)
+            .map_or(0, |snapshot| snapshot.completed)
+    };
+    let spawn_send = |plaintext: &'static [u8]| {
+        let send_runtime = runtime.clone();
+        let send_group = group_id.clone();
+        tokio::spawn(async move {
+            send_runtime
+                .send_message("alice", &send_group, plaintext.to_vec())
+                .await
+        })
+    };
+    let sends_admitted = |count: u64| {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async move {
+            while admitted_sends() < count {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+    };
+    let first = spawn_send(b"first queued");
+    sends_admitted(1)
+        .await
+        .expect("the first send reaches the worker's queue");
+    let second = spawn_send(b"second queued");
+    sends_admitted(2)
+        .await
+        .expect("the second send reaches the worker's queue");
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        crate::worker_fences::startup_sync_took_queued_commands(&runtime, "alice"),
+    )
+    .await
+    .expect("held startup sync takes the queued sends")
+    .unwrap();
 
     relay.block_next_subscribe();
     relay.release_subscribe();
