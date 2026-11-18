@@ -742,13 +742,13 @@ pub(crate) struct ScriptedPushRelayClient {
 pub(crate) struct MemberResolutionDirectoryFetcher {
     pub(crate) requests: std::sync::Mutex<Vec<transport_nostr::DirectoryFetchRequest>>,
     pub(super) events: std::sync::Mutex<Vec<NostrTransportEvent>>,
-    events_by_endpoint:
+    pub(crate) events_by_endpoint:
         std::sync::Mutex<std::collections::HashMap<String, Vec<NostrTransportEvent>>>,
-    reject_multi_author: std::sync::atomic::AtomicBool,
+    pub(crate) reject_multi_author: std::sync::atomic::AtomicBool,
     key_packages_only_in_single_author: std::sync::Mutex<std::collections::HashSet<String>>,
     key_packages_only_in_multi_author: std::sync::Mutex<std::collections::HashSet<String>>,
     pub(super) failing_single_author: std::sync::Mutex<Option<String>>,
-    stalled_endpoint: std::sync::Mutex<Option<String>>,
+    pub(crate) stalled_endpoint: std::sync::Mutex<Option<String>>,
     incomplete_endpoint: std::sync::Mutex<Option<String>>,
     incomplete_query_kind: std::sync::Mutex<Option<u64>>,
     failing_endpoint: std::sync::Mutex<Option<String>>,
@@ -763,9 +763,22 @@ pub(crate) struct MemberResolutionDirectoryFetcher {
         )>,
     >,
     fail_all: std::sync::atomic::AtomicBool,
+    /// Fetches left unanswered, as a relay that takes the REQ and never
+    /// reaches EOSE. A held fetch stays pending until the test ends.
+    never_answered: std::sync::Mutex<Option<Box<HeldFetch>>>,
 }
 
+type HeldFetch = dyn Fn(&transport_nostr::DirectoryFetchRequest) -> bool + Send + Sync;
+
 impl MemberResolutionDirectoryFetcher {
+    /// Leave every later fetch that `held` matches unanswered.
+    pub(crate) fn never_answer(
+        &self,
+        held: impl Fn(&transport_nostr::DirectoryFetchRequest) -> bool + Send + Sync + 'static,
+    ) {
+        *self.never_answered.lock().unwrap() = Some(Box::new(held));
+    }
+
     pub(crate) fn hold_fetches(
         &self,
     ) -> (
@@ -830,6 +843,15 @@ impl transport_nostr::DirectoryRelayFetcher for MemberResolutionDirectoryFetcher
         request: transport_nostr::DirectoryFetchRequest,
     ) -> Result<Vec<transport_nostr::DirectoryRelayEventRecord>, String> {
         self.requests.lock().unwrap().push(request.clone());
+        let never_answered = self
+            .never_answered
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|held| held(&request));
+        if never_answered {
+            std::future::pending::<()>().await;
+        }
         let gate = {
             let mut fetch_gate = self.fetch_gate.lock().unwrap();
             let gate_kind = *self.fetch_gate_kind.lock().unwrap();
