@@ -117,6 +117,338 @@ fn valid_v2_imeta_tag() -> Vec<String> {
     tag
 }
 
+fn valid_view_once_imeta_tag() -> Vec<String> {
+    let mut tag = valid_v2_imeta_tag();
+    tag[1] = "v encrypted-media-view-once-v1".to_owned();
+    tag
+}
+
+fn view_once_image(format: image::ImageFormat, width: u32, height: u32) -> Vec<u8> {
+    let image = image::DynamicImage::new_rgb8(width, height);
+    let mut encoded = std::io::Cursor::new(Vec::new());
+    image.write_to(&mut encoded, format).unwrap();
+    encoded.into_inner()
+}
+
+#[test]
+fn view_once_strict_refs() {
+    let tag = valid_view_once_imeta_tag();
+    let reference = parse_media_attachment(&tag, Some(4), false).unwrap();
+    assert_eq!(reference.version, "encrypted-media-view-once-v1");
+    assert_eq!(
+        EncryptedMediaVersion::ViewOnceV1.component_id(),
+        GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID
+    );
+    for extra in ["dim ", "dim 1x1", "thumbhash ", "thumbhash preview"] {
+        let mut bad = tag.clone();
+        bad.push(extra.to_owned());
+        let error = parse_media_attachment(&bad, Some(4), false).unwrap_err();
+        assert_eq!(
+            error,
+            MediaAttachmentRejection::malformed(
+                "view-once media must not contain dimensions or previews"
+            )
+        );
+    }
+    for (field, replacement, reason) in [
+        (
+            6,
+            "m Image/PNG".to_owned(),
+            "media type is not canonical for encrypted-media-v2",
+        ),
+        (
+            7,
+            format!("filename {}", "x".repeat(256)),
+            "media file name must be 1..255 UTF-8 bytes and contain no NUL",
+        ),
+        (
+            6,
+            "m application/pdf".to_owned(),
+            "view-once media type is not supported",
+        ),
+    ] {
+        let mut bad = tag.clone();
+        bad[field] = replacement;
+        let error = parse_media_attachment(&bad, Some(4), false).unwrap_err();
+        assert!(error.detail.contains(reason), "{error:?}");
+    }
+}
+
+#[test]
+fn view_once_crypto_domain() {
+    let secret = [7_u8; 32];
+    let vector = derive_media_file_key(
+        &secret,
+        EncryptedMediaVersion::ViewOnceV1,
+        &[0x22; 32],
+        "image/jpeg",
+        " Photo.JPG ",
+    )
+    .unwrap();
+    assert_eq!(
+        hex::encode(vector),
+        "1088ea50e7e32ce200fad1c4a4168e93f5f9736d4b050f9b7fb382b3274f8ce3"
+    );
+    let plaintext = view_once_image(image::ImageFormat::Png, 1, 1);
+    let hash: [u8; 32] = Sha256::digest(&plaintext).into();
+    let mut reference =
+        parse_media_attachment(&valid_view_once_imeta_tag(), Some(4), false).unwrap();
+    reference.plaintext_sha256 = hex::encode(hash);
+    let key = derive_media_file_key(
+        &secret,
+        EncryptedMediaVersion::ViewOnceV1,
+        &hash,
+        "image/png",
+        &reference.file_name,
+    )
+    .unwrap();
+    let aad = media_aad(
+        EncryptedMediaVersion::ViewOnceV1,
+        &hash,
+        "image/png",
+        &reference.file_name,
+    );
+    assert!(aad.starts_with(b"encrypted-media-view-once-v1\0"));
+    let nonce = media_nonce_from_reference(&reference).unwrap();
+    let mut ciphertext = plaintext.clone();
+    ChaCha20Poly1305::new_from_slice(&key)
+        .unwrap()
+        .encrypt_in_place(Nonce::from_slice(&nonce), &aad, &mut ciphertext)
+        .unwrap();
+    reference.ciphertext_sha256 = hex::encode(Sha256::digest(&ciphertext));
+    reference.locators[0].value = format!("https://media.example/{}", reference.ciphertext_sha256);
+    let opened = super::crypto::decrypt_claimed_view_once(
+        &reference,
+        &secret,
+        ciphertext.clone(),
+        ClaimedViewOnceConsumption::DurablyClaimed,
+    )
+    .unwrap();
+    assert_eq!(&*opened, &plaintext);
+    let v2_key = derive_media_file_key(
+        &secret,
+        EncryptedMediaVersion::V2,
+        &hash,
+        "image/png",
+        &reference.file_name,
+    )
+    .unwrap();
+    let v2_aad = media_aad(
+        EncryptedMediaVersion::V2,
+        &hash,
+        "image/png",
+        &reference.file_name,
+    );
+    assert_ne!(key, v2_key);
+    for (attack_key, attack_aad) in [(&v2_key, &v2_aad), (&key, &v2_aad), (&v2_key, &aad)] {
+        let mut stripped = ciphertext.clone();
+        assert_eq!(
+            ChaCha20Poly1305::new_from_slice(attack_key)
+                .unwrap()
+                .decrypt_in_place(Nonce::from_slice(&nonce), attack_aad, &mut stripped),
+            Err(chacha20poly1305::aead::Error)
+        );
+    }
+    reference.version = ENCRYPTED_MEDIA_FORMAT_V2.to_owned();
+    let error = super::crypto::decrypt_claimed_view_once(
+        &reference,
+        &secret,
+        ciphertext,
+        ClaimedViewOnceConsumption::DurablyClaimed,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(error, AppError::InvalidEncryptedMedia(reason) if reason == "claimed download requires view-once media")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ordinary_refuses_view_once() {
+    let reference = parse_media_attachment(&valid_view_once_imeta_tag(), Some(4), false).unwrap();
+    let error = download_encrypted_media(reference, &[7; 32], &[], &[], false)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, AppError::InvalidEncryptedMedia(reason) if reason == "view-once media requires a durable consumption claim")
+    );
+}
+
+#[test]
+fn view_once_image_bounds() {
+    use super::view_once_content::validate_view_once_content;
+    for (format, mime) in [
+        (image::ImageFormat::Png, "image/png"),
+        (image::ImageFormat::Jpeg, "image/jpeg"),
+        (image::ImageFormat::Gif, "image/gif"),
+        (image::ImageFormat::WebP, "image/webp"),
+    ] {
+        let bytes = view_once_image(format, 2, 3);
+        validate_view_once_content(&bytes, mime).unwrap();
+        let wrong_mime = if mime == "image/png" {
+            "image/jpeg"
+        } else {
+            "image/png"
+        };
+        assert!(
+            matches!(validate_view_once_content(&bytes, wrong_mime), Err(AppError::InvalidEncryptedMedia(reason)) if reason == "view-once media type does not match its bytes")
+        );
+    }
+    let png = view_once_image(image::ImageFormat::Png, 2, 3);
+    assert!(
+        matches!(validate_view_once_content(&png[..png.len() / 2], "image/png"), Err(AppError::InvalidEncryptedMedia(reason)) if reason.contains("invalid") || reason.contains("fully decoded"))
+    );
+    let oversized = view_once_image(image::ImageFormat::Png, 8193, 1);
+    assert!(
+        matches!(validate_view_once_content(&oversized, "image/png"), Err(AppError::InvalidEncryptedMedia(reason)) if reason.contains("invalid") || reason.contains("dimensions exceed limits"))
+    );
+    assert!(
+        matches!(validate_view_once_content(b"not an image", "image/png"), Err(AppError::InvalidEncryptedMedia(reason)) if reason == "view-once media type does not match its bytes")
+    );
+    assert!(
+        matches!(validate_view_once_content(b"", "video/mp4"), Err(AppError::InvalidEncryptedMedia(reason)) if reason == "view-once media exceeds its size limit")
+    );
+    let oversized = vec![0; super::view_once_content::MAX_VIEW_ONCE_BYTES + 1];
+    assert!(
+        matches!(validate_view_once_content(&oversized, "video/mp4"), Err(AppError::InvalidEncryptedMedia(reason)) if reason == "view-once media exceeds its size limit")
+    );
+}
+
+#[test]
+fn view_once_animation_bounds() {
+    let mut bytes = Vec::new();
+    {
+        let mut encoder = image::codecs::gif::GifEncoder::new(&mut bytes);
+        for _ in 0..257 {
+            encoder
+                .encode_frame(image::Frame::new(image::RgbaImage::new(1, 1)))
+                .unwrap();
+        }
+    }
+    assert!(
+        matches!(super::view_once_content::validate_view_once_content(&bytes, "image/gif"), Err(AppError::InvalidEncryptedMedia(reason)) if reason == "view-once animation exceeds frame limit")
+    );
+}
+
+fn view_once_mp4_box(kind: &[u8; 4], body: &[u8]) -> Vec<u8> {
+    let mut bytes = ((body.len() + 8) as u32).to_be_bytes().to_vec();
+    bytes.extend_from_slice(kind);
+    bytes.extend_from_slice(body);
+    bytes
+}
+
+fn view_once_mp4_vector() -> Vec<u8> {
+    // AVC configuration and the complete 16x16 black IDR sample from libx264.
+    let avcc =
+        hex::decode("0142c00affe100156742c00ada7b011000000300100000030020f1226a01000568ce0f2c80")
+            .unwrap();
+    let sample = hex::decode("0000000e658884057fffff0f45000142df80").unwrap();
+    let ftyp = view_once_mp4_box(b"ftyp", b"isom\0\0\x02\0isomiso2avc1mp41");
+    let offset = (ftyp.len() + 8) as u32;
+    let mut entry = vec![0; 78];
+    entry[7] = 1;
+    entry[24..26].copy_from_slice(&16_u16.to_be_bytes());
+    entry[26..28].copy_from_slice(&16_u16.to_be_bytes());
+    entry.extend(view_once_mp4_box(b"avcC", &avcc));
+    let mut stsd = vec![0, 0, 0, 0, 0, 0, 0, 1];
+    stsd.extend(view_once_mp4_box(b"avc1", &entry));
+    let stts: Vec<_> = [0_u32, 1, 1, 1]
+        .into_iter()
+        .flat_map(u32::to_be_bytes)
+        .collect();
+    let stsc: Vec<_> = [0_u32, 1, 1, 1, 1]
+        .into_iter()
+        .flat_map(u32::to_be_bytes)
+        .collect();
+    let stsz: Vec<_> = [0_u32, sample.len() as u32, 1]
+        .into_iter()
+        .flat_map(u32::to_be_bytes)
+        .collect();
+    let stco: Vec<_> = [0_u32, 1, offset]
+        .into_iter()
+        .flat_map(u32::to_be_bytes)
+        .collect();
+    let mut stbl = view_once_mp4_box(b"stsd", &stsd);
+    for (kind, body) in [
+        (b"stts", stts),
+        (b"stsc", stsc),
+        (b"stsz", stsz),
+        (b"stco", stco),
+    ] {
+        stbl.extend(view_once_mp4_box(kind, &body));
+    }
+    let mut dref = vec![0, 0, 0, 0, 0, 0, 0, 1];
+    dref.extend(view_once_mp4_box(b"url ", &[0, 0, 0, 1]));
+    let mut minf = view_once_mp4_box(b"dinf", &view_once_mp4_box(b"dref", &dref));
+    minf.extend(view_once_mp4_box(b"stbl", &stbl));
+    let mut mdhd = vec![0; 24];
+    mdhd[15] = 1;
+    let mut hdlr = vec![0; 24];
+    hdlr[8..12].copy_from_slice(b"vide");
+    let mut mdia = view_once_mp4_box(b"mdhd", &mdhd);
+    mdia.extend(view_once_mp4_box(b"hdlr", &hdlr));
+    mdia.extend(view_once_mp4_box(b"minf", &minf));
+    let mut tkhd = vec![0; 84];
+    tkhd[76..80].copy_from_slice(&(16_u32 << 16).to_be_bytes());
+    tkhd[80..84].copy_from_slice(&(16_u32 << 16).to_be_bytes());
+    let mut trak = view_once_mp4_box(b"tkhd", &tkhd);
+    trak.extend(view_once_mp4_box(b"mdia", &mdia));
+    let mut mvhd = vec![0; 100];
+    mvhd[15] = 1;
+    let mut moov = view_once_mp4_box(b"mvhd", &mvhd);
+    moov.extend(view_once_mp4_box(b"trak", &trak));
+    let mut bytes = ftyp;
+    bytes.extend(view_once_mp4_box(b"mdat", &sample));
+    bytes.extend(view_once_mp4_box(b"moov", &moov));
+    bytes
+}
+
+#[test]
+fn view_once_mp4_bounds() {
+    use super::view_once_content::validate_view_once_content;
+    let bytes = view_once_mp4_vector();
+    validate_view_once_content(&bytes, "video/mp4").unwrap();
+    let mut invalid_nal = bytes.clone();
+    let mdat = invalid_nal
+        .windows(4)
+        .position(|value| value == b"mdat")
+        .unwrap();
+    invalid_nal[mdat + 8] = 0xff;
+    assert!(
+        matches!(validate_view_once_content(&invalid_nal, "video/mp4"), Err(AppError::InvalidEncryptedMedia(reason)) if reason == "view-once AVC sample has unsupported NAL content")
+    );
+    let mut outside = bytes.clone();
+    let stco = outside
+        .windows(4)
+        .position(|value| value == b"stco")
+        .unwrap();
+    outside[stco + 12..stco + 16].copy_from_slice(&1_u32.to_be_bytes());
+    assert!(
+        matches!(validate_view_once_content(&outside, "video/mp4"), Err(AppError::InvalidEncryptedMedia(reason)) if reason == "view-once MP4 sample points outside media data")
+    );
+    let mut dimensions = bytes.clone();
+    let avc1 = dimensions
+        .windows(4)
+        .rposition(|value| value == b"avc1")
+        .unwrap();
+    dimensions[avc1 + 28..avc1 + 30].copy_from_slice(&8193_u16.to_be_bytes());
+    assert!(
+        matches!(validate_view_once_content(&dimensions, "video/mp4"), Err(AppError::InvalidEncryptedMedia(reason)) if reason == "view-once media dimensions exceed limits")
+    );
+    let mut codec = bytes.clone();
+    codec[avc1..avc1 + 4].copy_from_slice(b"hvc1");
+    assert!(
+        matches!(validate_view_once_content(&codec, "video/mp4"), Err(AppError::InvalidEncryptedMedia(reason)) if reason == "view-once MP4 video codec is not supported")
+    );
+    assert!(
+        matches!(validate_view_once_content(&bytes[..bytes.len() - 1], "video/mp4"), Err(AppError::InvalidEncryptedMedia(reason)) if reason == "view-once MP4 has truncated boxes")
+    );
+    let mut fragmented = bytes;
+    fragmented.extend(view_once_mp4_box(b"moof", &[]));
+    assert!(
+        matches!(validate_view_once_content(&fragmented, "video/mp4"), Err(AppError::InvalidEncryptedMedia(reason)) if reason == "view-once fragmented MP4 is not supported")
+    );
+}
+
 #[test]
 fn encrypted_media_v2_media_type_profile_is_exact() {
     assert_eq!(
@@ -1573,7 +1905,14 @@ fn media_fetch_candidates_deduplicate_non_adjacent_fallback_urls() {
         base_url: "https://media.example".to_owned(),
     }];
 
-    let candidates = encrypted_media_fetch_candidates(&reference, &fallback);
+    let transport = BlossomHttpTransport::new(false);
+    let candidates = plan_media_fetch(&reference, &fallback, &[], &transport)
+        .into_iter()
+        .map(|candidate| match candidate {
+            MediaFetchCandidate::Ready(url) => url,
+            _ => panic!("valid fixture destination must be fetchable"),
+        })
+        .collect::<Vec<_>>();
 
     assert_eq!(candidates.len(), 2);
     assert_eq!(candidates[0], duplicate_url);

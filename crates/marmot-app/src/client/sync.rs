@@ -6862,6 +6862,7 @@ mod tests {
                 Some(cgka_traits::app_event::AppMessageRetentionDecision {
                     retention_seconds: 1,
                     expires_at: Some(2),
+                    view_once: None,
                 }),
             )
             .unwrap();

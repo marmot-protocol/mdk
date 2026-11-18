@@ -38,8 +38,10 @@ pub enum GroupMessageMetadata {
         /// The sender-authenticated `created_at` from the inner app event.
         inner_created_at: u64,
         /// The active group message-retention duration, in seconds. `None` and
-        /// `Some(0)` both mean transport expiration is disabled.
+        /// `Some(0)` disable this timer, not an absolute per-message cap.
         retention_seconds: Option<u64>,
+        /// Absolute authenticated per-message cap, independent of group timer.
+        absolute_expires_at: Option<u64>,
     },
     /// MLS group-state history: commits and proposals. Transport expiration
     /// MUST NOT be attached to these messages.
@@ -47,10 +49,15 @@ pub enum GroupMessageMetadata {
 }
 
 impl GroupMessageMetadata {
-    pub fn application(inner_created_at: u64, retention_seconds: Option<u64>) -> Self {
+    pub fn application(
+        inner_created_at: u64,
+        retention_seconds: Option<u64>,
+        absolute_expires_at: Option<u64>,
+    ) -> Self {
         Self::Application {
             inner_created_at,
             retention_seconds,
+            absolute_expires_at,
         }
     }
 
@@ -80,20 +87,17 @@ impl GroupMessageMetadata {
         let Self::Application {
             inner_created_at,
             retention_seconds,
+            absolute_expires_at,
         } = self
         else {
             return None;
         };
-        let Some(retention_seconds) = retention_seconds else {
-            return None;
-        };
-        if *retention_seconds == 0 {
-            return None;
-        }
-        // Expiration is only a transport hint. If the sum is not
-        // representable, the hint is undefined and must be omitted without
-        // rejecting the otherwise-valid application message.
-        inner_created_at.checked_add(*retention_seconds)
+        crate::app_event::AppMessageRetentionDecision::with_absolute_expiry(
+            *inner_created_at,
+            retention_seconds.unwrap_or(0),
+            *absolute_expires_at,
+        )
+        .expires_at
     }
 }
 

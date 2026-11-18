@@ -191,6 +191,7 @@ fn prepared_conversion_reuses_rows_and_text_but_keeps_all_visible_changes() {
         reply_row,
         |row| {
             row.reply_preview = Some(app::TimelineReplyPreview {
+                view_once: None,
                 message_id_hex: "reply-source".into(),
                 sender: "bob".into(),
                 plaintext: "visible reply **new**".into(),
@@ -526,6 +527,29 @@ fn prepared_conversion_refreshes_report_indicator_without_reparsing_text() {
         row.has_reports = reported;
         let converted = cache.row(&row, false);
         assert_eq!(converted.has_reports, reported);
+        assert_eq!(wire(converted), wire(presented_timeline(&row, false)));
+        assert_eq!((cache.conversions, cache.parses), (index + 1, 1));
+    }
+}
+
+#[test]
+fn prepared_view_once_refresh() {
+    let mut row = record(0);
+    let mut cache = ConversationConversionCache::default();
+    for (index, (state, expected)) in [
+        (app::ViewOnceState::Unopened, ViewOnceStateFfi::Unopened),
+        (app::ViewOnceState::Consumed, ViewOnceStateFfi::Consumed),
+        (app::ViewOnceState::Expired, ViewOnceStateFfi::Expired),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        row.view_once = Some(app::StoredViewOncePresentation {
+            state,
+            unopened_expires_at: 1234,
+        });
+        let converted = cache.row(&row, false);
+        assert_eq!(converted.view_once.as_ref().unwrap().state, expected);
         assert_eq!(wire(converted), wire(presented_timeline(&row, false)));
         assert_eq!((cache.conversions, cache.parses), (index + 1, 1));
     }

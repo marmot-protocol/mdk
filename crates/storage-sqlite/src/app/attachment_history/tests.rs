@@ -314,6 +314,7 @@ fn production_projection_rebuild_invalidation_expiry_and_encrypted_reopen() {
             Some(AppMessageRetentionDecision {
                 retention_seconds: 10,
                 expires_at: Some(20),
+                view_once: None,
             }),
             None,
         )
@@ -382,6 +383,7 @@ fn production_projection_rebuild_invalidation_expiry_and_encrypted_reopen() {
             Some(AppMessageRetentionDecision {
                 retention_seconds: 10,
                 expires_at: Some(20),
+                view_once: None,
             }),
             None,
         )
@@ -1010,6 +1012,7 @@ fn reaction_attachment_sources_follow_event_lifecycle_without_timeline_rows() {
         Some(cgka_traits::app_event::AppMessageRetentionDecision {
             retention_seconds: 10,
             expires_at: Some(20),
+            view_once: None,
         }),
     )
     .unwrap();

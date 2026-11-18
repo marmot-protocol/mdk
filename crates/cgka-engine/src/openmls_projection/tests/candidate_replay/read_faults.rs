@@ -127,6 +127,7 @@ async fn read_wrapper(site: ReadSite) {
     let process = || {
         process_openmls_messages_inner(
             &storage,
+            &crate::snapshot_guard::Rewinds::default(),
             &group,
             std::slice::from_ref(&commit),
             &own,
@@ -287,6 +288,7 @@ async fn authenticated_own_checkpoint_reload_failure_is_infrastructure() {
         storage.with_group_savepoint(&group, "read-fault-owner", |storage| {
             process_openmls_messages_inner(
                 storage,
+                &crate::snapshot_guard::Rewinds::default(),
                 &group,
                 std::slice::from_ref(&msg),
                 &own,
@@ -316,4 +318,53 @@ async fn authenticated_own_checkpoint_reload_failure_is_infrastructure() {
     .unwrap();
     assert_eq!(native.epoch().as_u64(), source_epoch + 1);
     reopened.close().unwrap();
+}
+
+#[tokio::test]
+async fn retained_policy_read_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("retained-policy-read.sqlite");
+    let key = SqlCipherKey::raw([0x75; 32]);
+    let storage = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    let mut author = build_client_with_storage(b"retained-policy-author", storage.clone());
+    let (mut peer, _) = build_client(b"retained-policy-peer");
+    let group = group_with(&mut author, &mut [&mut peer]).await;
+    let source_epoch = storage.get_group(&group).unwrap().epoch;
+    let sql = observer(&path, &key);
+    let (_, source_context) = native_context(&sql, &group);
+    let SendResult::GroupEvolution { pending, .. } = author
+        .send(SendIntent::SelfUpdate {
+            group_id: group.clone(),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("a SelfUpdate must prepare a Commit")
+    };
+    author.confirm_published(pending).await.unwrap();
+    let (_, live_context) = native_context(&sql, &group);
+    assert_ne!(source_context, live_context);
+    sql.execute_batch(&format!(
+        "CREATE TRIGGER fail_retained_policy AFTER INSERT ON openmls_values
+         WHEN NEW.label = X'{}' AND NEW.value = X'{}'
+         BEGIN UPDATE openmls_values SET value = X'ff'
+         WHERE storage_key = NEW.storage_key; END;",
+        hex::encode(b"GroupContext"),
+        hex::encode(&source_context),
+    ))
+    .unwrap();
+    assert!(matches!(
+        author.view_once_required_at(&group, source_epoch),
+        Err(cgka_traits::error::EngineError::Storage(
+            cgka_traits::storage::StorageError::Backend(_)
+        ))
+    ));
+    assert_eq!(native_context(&sql, &group).1, live_context);
+    sql.execute_batch("DROP TRIGGER fail_retained_policy")
+        .unwrap();
+    assert!(!author.view_once_required_at(&group, source_epoch).unwrap());
+    assert_eq!(native_context(&sql, &group).1, live_context);
+    drop(sql);
+    drop(author);
+    storage.close().unwrap();
 }

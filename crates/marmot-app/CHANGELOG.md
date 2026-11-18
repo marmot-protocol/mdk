@@ -4,6 +4,9 @@
 
 ### Breaking changes
 
+- App message events no longer expose source-epoch media exporters (#1327).
+  Use media APIs rather than deriving attachment keys from host events.
+  Timeline and reply records gain content-free `view_once` presentation data.
 - Every build includes multi-device (mdk#2628). The `dev-device-groups` and `unreleased-device-pairing` Cargo
   features are gone: `marmot-pairing` is always linked and the engine may always advertise the device roster.
   `MarmotAppConfig::dev_device_groups` / `with_dev_device_groups` are renamed `device_groups` / `with_device_groups`
@@ -17,6 +20,15 @@
 - `AppError::NoUsableRelay` reports a group send none of whose relays MDK may send to, such as relays at
   private-network addresses, in place of `AppError::Publish`; `marmot_session::PublishFailure` gains
   `no_usable_relay`, set when the transport refused every target of a group send before sending (#3305).
+- Negotiated view-once image/video send and durable per-account-device consume
+  APIs (#1327). Claims precede ciphertext transfer; failure after claim stays
+  consumed. One bounded viewer permits 1 MiB reads for at most 60 seconds,
+  subject to earlier expiry or source revocation. Ordinary media/history paths
+  expose no usable view-once references. Host copies and physical erasure remain
+  outside the guarantee. The worker publishes sent and consumed timeline and window
+  updates even if the caller cancels while ciphertext transfer is in flight.
+  Unfetchable locator metadata refuses before claim; restoring current policy
+  can make the original unclaimed message eligible again.
 - Opt-in relay telemetry exports `relay_read_back_requests` and `relay_read_back_found`: device-wide, unlabeled
   counts of the read-back REQs sent for pending commits and of the relays that returned the exact event (mdk#2332).
   `RelayTelemetryRollup` gains the matching fields; struct literals need them or `..Default::default()`.

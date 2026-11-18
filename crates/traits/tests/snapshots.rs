@@ -691,6 +691,10 @@ fn snapshot_send_intents() {
         SendIntent::EnableAccountDevices { group_id: gid() }
     );
     insta::assert_json_snapshot!(
+        "intent_enable_view_once",
+        SendIntent::EnableViewOnce { group_id: gid() }
+    );
+    insta::assert_json_snapshot!(
         "intent_link_device",
         SendIntent::LinkDevice {
             group_id: gid(),

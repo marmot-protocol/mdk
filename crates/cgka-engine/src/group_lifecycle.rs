@@ -8,6 +8,7 @@
 
 use std::collections::BTreeSet;
 
+use crate::app_components::OwnPackageOnceData;
 use crate::capabilities::{
     capabilities_of_key_package, extension_from_group_capabilities, leaf_capabilities,
 };
@@ -1549,14 +1550,22 @@ impl<S: StorageProvider> Engine<S> {
             // rather than enumerating, JSON-decoding, and re-hashing
             // every stored bundle on each join.
             let mut consumed_key_package_ref = None;
+            let mut own_package_data = OwnPackageOnceData::Absent;
             for secret in welcome.secrets() {
                 let reference = secret.new_member();
                 let bundle: Option<KeyPackageBundle> =
                     OpenMlsStorageProvider::key_package(provider.storage(), &reference).map_err(
                         |error| EngineError::Backend(format!("key_package lookup: {error:?}")),
                     )?;
-                if bundle.is_some() {
+                if let Some(bundle) = bundle {
                     consumed_key_package_ref = Some(reference.as_slice().to_vec());
+                    own_package_data = if crate::app_components::carries_view_once_data(
+                        bundle.key_package().extensions().app_data_dictionary(),
+                    ) {
+                        OwnPackageOnceData::Present
+                    } else {
+                        OwnPackageOnceData::Absent
+                    };
                     break;
                 }
             }
@@ -1811,6 +1820,7 @@ impl<S: StorageProvider> Engine<S> {
             crate::app_components::validate_joined_group_invariants(
                 &mls_group,
                 group_info_app_data.as_ref(),
+                own_package_data,
             )
             .map_err(|_| EngineError::InvalidWelcome)?;
 

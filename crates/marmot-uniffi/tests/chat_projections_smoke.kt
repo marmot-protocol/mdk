@@ -84,7 +84,7 @@ fun main() {
         }
     }
     for (source in DeletionSourceFfi.entries) {
-        val preview = TimelineReplyPreviewFfi("deleted", "author", "", MarkdownDocumentFfi(emptyList(), false, byteArrayOf()),
+        val preview = TimelineReplyPreviewFfi(null, "deleted", "author", "", MarkdownDocumentFfi(emptyList(), false, byteArrayOf()),
             9u, null, null, emptyList(), null, true, source, null)
         val copy = FfiConverterTypeTimelineReplyPreviewFfi.lift(FfiConverterTypeTimelineReplyPreviewFfi.lower(preview))
         check(copy.deletionSource == source && copy.deleted && copy.plaintext.isEmpty())

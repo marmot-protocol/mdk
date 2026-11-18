@@ -235,8 +235,8 @@ int main(int argc, char **argv) {
     check(st == MARMOT_STATUS_OK, "runtime backup facts need no account worker");
     MarmotBackgroundBackupOutcome backup = MARMOT_BACKGROUND_BACKUP_OUTCOME_FINISHED_ATTEMPT;
     st = marmot_run_due_backup_pass(client, "no-account", &backup);
-    check(st == MARMOT_STATUS_OK && backup == MARMOT_BACKGROUND_BACKUP_OUTCOME_NOT_STARTED,
-          "disabled background backup returns its completion enum without a worker");
+    check(st == MARMOT_STATUS_UNKNOWN_ACCOUNT,
+          "background backup rejects an unknown account");
 
     st = marmot_record_host_performance(client,
         MARMOT_HOST_PERFORMANCE_OPERATION_CONVERSATION_COMPOSER_READY, 125,

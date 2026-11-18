@@ -148,6 +148,7 @@ pub(crate) fn send_intent_kind_str(intent: &SendIntent) -> &'static str {
         SendIntent::UpdateGroupData { .. } => "update_group_data",
         SendIntent::EnableDisbanding { .. } => "enable_disbanding",
         SendIntent::EnableAccountDevices { .. } => "enable_account_devices",
+        SendIntent::EnableViewOnce { .. } => "enable_view_once",
         SendIntent::LinkDevice { .. } => "link_device",
         SendIntent::UnlinkDevice { .. } => "unlink_device",
         SendIntent::ImportDeviceGroupRejections { .. } => "import_device_group_rejections",
@@ -179,6 +180,7 @@ pub(crate) fn send_intent_group_id(intent: &SendIntent) -> cgka_traits::GroupId 
         | SendIntent::UpdateGroupData { group_id, .. }
         | SendIntent::EnableDisbanding { group_id }
         | SendIntent::EnableAccountDevices { group_id }
+        | SendIntent::EnableViewOnce { group_id }
         | SendIntent::LinkDevice { group_id, .. }
         | SendIntent::UnlinkDevice { group_id, .. }
         | SendIntent::ImportDeviceGroupRejections { group_id, .. }

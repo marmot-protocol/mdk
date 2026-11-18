@@ -24,6 +24,8 @@ const PLENTY: u64 = 1 << 40;
 struct Fixture {
     _dir: tempfile::TempDir,
     client: AppClient,
+    account_id_hex: String,
+    events: broadcast::Sender<MarmotAppEvent>,
     storage: SqliteAccountStorage,
     policy: storage_sqlite::AttachmentDownloadPolicy,
     shared: RuntimeSharedServices,
@@ -98,9 +100,12 @@ async fn fixture(
         .set_attachment_download_policy(&policy, now)
         .unwrap();
     let (http, completions) = context();
+    let account_id_hex = app.account_home().account("alice").unwrap().account_id_hex;
     Fixture {
         _dir: dir,
         client,
+        account_id_hex,
+        events: broadcast::channel(1).0,
         storage,
         policy,
         shared: RuntimeSharedServices::default(),
@@ -180,7 +185,16 @@ impl Fixture {
     async fn park_and_hold(&mut self, requests: &AtomicUsize) -> u64 {
         let done = self.completion().await;
         let headroom = parked_headroom(&done);
-        complete_media_http(&mut self.client, done, &self.shared, &self.http).await;
+        complete_media_http(
+            &mut self.client,
+            done,
+            &self.shared,
+            &self.http,
+            &self.events,
+            &self.account_id_hex,
+            "alice",
+        )
+        .await;
         assert_eq!(self.state(), AttachmentTransferState::StorageBlocked);
         let parked_requests = requests.load(Ordering::SeqCst);
         for _ in 0..3 {
@@ -212,13 +226,31 @@ impl Fixture {
             ),
             "explicit bodies above the transfer limit stream through the file sink"
         );
-        complete_media_http(&mut self.client, done, &self.shared, &self.http).await;
+        complete_media_http(
+            &mut self.client,
+            done,
+            &self.shared,
+            &self.http,
+            &self.events,
+            &self.account_id_hex,
+            "alice",
+        )
+        .await;
         let retained = self.completion().await;
         assert!(matches!(
             retained.completion,
             MediaHttpCompletion::AttachmentRetained { result: Ok(()), .. }
         ));
-        complete_media_http(&mut self.client, retained, &self.shared, &self.http).await;
+        complete_media_http(
+            &mut self.client,
+            retained,
+            &self.shared,
+            &self.http,
+            &self.events,
+            &self.account_id_hex,
+            "alice",
+        )
+        .await;
         self.assert_ready(plain);
     }
     /// Drive an in-memory completion to `Ready` and return its buffer capacity.
@@ -551,7 +583,16 @@ async fn interrupted_download_retries_with_its_checkpoint_credited() {
             ..
         }
     ));
-    complete_media_http(&mut fixture.client, done, &fixture.shared, &fixture.http).await;
+    complete_media_http(
+        &mut fixture.client,
+        done,
+        &fixture.shared,
+        &fixture.http,
+        &fixture.events,
+        &fixture.account_id_hex,
+        "alice",
+    )
+    .await;
     let saved = fixture
         .storage
         .app_storage()
@@ -666,22 +707,41 @@ async fn unknown_length_parks_record_the_proven_need_and_back_off() {
                 assert!(*headroom > target, "{headroom} after {target}");
                 target = *headroom;
                 parks += 1;
-                complete_media_http(&mut fixture.client, done, &fixture.shared, &fixture.http)
-                    .await;
+                complete_media_http(
+                    &mut fixture.client,
+                    done,
+                    &fixture.shared,
+                    &fixture.http,
+                    &fixture.events,
+                    &fixture.account_id_hex,
+                    "alice",
+                )
+                .await;
                 assert_eq!(fixture.state(), AttachmentTransferState::StorageBlocked);
             }
             MediaHttpCompletion::Attachment {
                 result: Ok(crate::client::AcquiredMediaBody::File(_)),
                 ..
             } => {
-                complete_media_http(&mut fixture.client, done, &fixture.shared, &fixture.http)
-                    .await;
+                complete_media_http(
+                    &mut fixture.client,
+                    done,
+                    &fixture.shared,
+                    &fixture.http,
+                    &fixture.events,
+                    &fixture.account_id_hex,
+                    "alice",
+                )
+                .await;
                 let retained = fixture.completion().await;
                 complete_media_http(
                     &mut fixture.client,
                     retained,
                     &fixture.shared,
                     &fixture.http,
+                    &fixture.events,
+                    &fixture.account_id_hex,
+                    "alice",
                 )
                 .await;
                 fixture.assert_ready(&plain);
@@ -827,7 +887,16 @@ async fn park_mid_transfer() -> MidTransferPark {
         .attachment_partial_bytes_for_test()
         .unwrap();
     assert!(saved >= 6 * MIB && saved < total, "saved {saved}");
-    complete_media_http(&mut fixture.client, done, &fixture.shared, &fixture.http).await;
+    complete_media_http(
+        &mut fixture.client,
+        done,
+        &fixture.shared,
+        &fixture.http,
+        &fixture.events,
+        &fixture.account_id_hex,
+        "alice",
+    )
+    .await;
     assert_eq!(fixture.state(), AttachmentTransferState::StorageBlocked);
     MidTransferPark {
         fixture,
@@ -926,7 +995,16 @@ async fn a_refused_checkpoint_write_parks_instead_of_retrying() {
         2 * plain.len() as u64 - MIB,
         "the rest of the body beyond the saved prefix, and its store file"
     );
-    complete_media_http(&mut fixture.client, done, &fixture.shared, &fixture.http).await;
+    complete_media_http(
+        &mut fixture.client,
+        done,
+        &fixture.shared,
+        &fixture.http,
+        &fixture.events,
+        &fixture.account_id_hex,
+        "alice",
+    )
+    .await;
     assert_eq!(fixture.state(), AttachmentTransferState::StorageBlocked);
     assert_eq!(fixture.status().retry_at, None, "no retry timer runs");
     server.abort();
@@ -994,7 +1072,16 @@ async fn pressure_after_the_body_arrives_parks_with_a_complete_checkpoint_and_re
         2 * plain.len() as u64 - 2 * MIB,
         "pressure after the body arrived parks with what is not yet on disk"
     );
-    complete_media_http(&mut fixture.client, done, &fixture.shared, &fixture.http).await;
+    complete_media_http(
+        &mut fixture.client,
+        done,
+        &fixture.shared,
+        &fixture.http,
+        &fixture.events,
+        &fixture.account_id_hex,
+        "alice",
+    )
+    .await;
     assert_eq!(fixture.state(), AttachmentTransferState::StorageBlocked);
     fixture.tick().await;
     assert!(fixture.completions.try_recv().is_err());
@@ -1193,13 +1280,25 @@ async fn file_publication_onto_a_full_disk_parks_until_room_returns() {
         }
     ));
     fixture.media().simulate_full_disk_for_test(true);
-    complete_media_http(&mut fixture.client, done, &fixture.shared, &fixture.http).await;
+    complete_media_http(
+        &mut fixture.client,
+        done,
+        &fixture.shared,
+        &fixture.http,
+        &fixture.events,
+        &fixture.account_id_hex,
+        "alice",
+    )
+    .await;
     let retained = fixture.completion().await;
     complete_media_http(
         &mut fixture.client,
         retained,
         &fixture.shared,
         &fixture.http,
+        &fixture.events,
+        &fixture.account_id_hex,
+        "alice",
     )
     .await;
     assert_eq!(fixture.state(), AttachmentTransferState::StorageBlocked);
@@ -1282,7 +1381,16 @@ async fn transfer_subscribers_see_park_and_readmission_without_the_active_refres
     fixture.tick().await;
     let done = fixture.completion().await;
     parked_headroom(&done);
-    complete_media_http(&mut fixture.client, done, &fixture.shared, &fixture.http).await;
+    complete_media_http(
+        &mut fixture.client,
+        done,
+        &fixture.shared,
+        &fixture.http,
+        &fixture.events,
+        &fixture.account_id_hex,
+        "alice",
+    )
+    .await;
     let started = tokio::time::Instant::now();
     loop {
         let frame = tokio::time::timeout(Duration::from_secs(10), stream.next())

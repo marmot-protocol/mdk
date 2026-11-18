@@ -619,6 +619,7 @@ typedef enum MarmotAppProtocolProfile {
 typedef enum MarmotEncryptedMediaVersion {
   MARMOT_ENCRYPTED_MEDIA_VERSION_V1,
   MARMOT_ENCRYPTED_MEDIA_VERSION_V2,
+  MARMOT_ENCRYPTED_MEDIA_VERSION_VIEW_ONCE_V1,
 } MarmotEncryptedMediaVersion;
 
 /**
@@ -1273,6 +1274,17 @@ typedef enum MarmotRetentionSweepStatus {
 } MarmotRetentionSweepStatus;
 
 /**
+ * Local account-device state; no consumption receipt is broadcast.
+ */
+typedef enum MarmotViewOnceState {
+  MARMOT_VIEW_ONCE_STATE_UNOPENED,
+  MARMOT_VIEW_ONCE_STATE_CONSUMED,
+  MARMOT_VIEW_ONCE_STATE_EXPIRED,
+  MARMOT_VIEW_ONCE_STATE_SENT,
+  MARMOT_VIEW_ONCE_STATE_UNAVAILABLE,
+} MarmotViewOnceState;
+
+/**
  * NIP-88 poll selection mode.
  */
 typedef enum MarmotPollType {
@@ -1533,6 +1545,18 @@ typedef enum MarmotConversationAnchorKind {
   MARMOT_CONVERSATION_ANCHOR_KIND_RECOVERED_NEXT,
   MARMOT_CONVERSATION_ANCHOR_KIND_RECOVERED_PREVIOUS,
 } MarmotConversationAnchorKind;
+
+/**
+ * Reason explicit group activation cannot proceed.
+ */
+typedef enum MarmotViewOnceActivationRefusal {
+  MARMOT_VIEW_ONCE_ACTIVATION_REFUSAL_NOT_ADMIN,
+  MARMOT_VIEW_ONCE_ACTIVATION_REFUSAL_ALREADY_REQUIRED,
+  MARMOT_VIEW_ONCE_ACTIVATION_REFUSAL_LEGACY_PROFILE,
+  MARMOT_VIEW_ONCE_ACTIVATION_REFUSAL_UNSUPPORTED_LEAF,
+  MARMOT_VIEW_ONCE_ACTIVATION_REFUSAL_ENCRYPTED_MEDIA_V2_NOT_REQUIRED,
+  MARMOT_VIEW_ONCE_ACTIVATION_REFUSAL_CARRIES_DATA,
+} MarmotViewOnceActivationRefusal;
 
 typedef enum MarmotAttachmentAcquisitionMode {
   MARMOT_ATTACHMENT_ACQUISITION_MODE_NATIVE_AUTOMATIC,
@@ -2049,6 +2073,11 @@ typedef struct MarmotTimelineSubscription MarmotTimelineSubscription;
  * at its next checkpoint.
  */
 typedef struct MarmotUserSearchSubscription MarmotUserSearchSubscription;
+
+/**
+ * Opaque viewer. Never free concurrently with any call using this handle.
+ */
+typedef struct MarmotViewOnceViewer MarmotViewOnceViewer;
 
 /**
  * `has_secret_for_label` / `has_secret_for_account_id`: write nonzero to
@@ -5603,6 +5632,14 @@ typedef struct MarmotTimelineMessageQuery {
 } MarmotTimelineMessageQuery;
 
 /**
+ * Content-free timeline placeholder. No usable media reference is included.
+ */
+typedef struct MarmotViewOncePresentation {
+  enum MarmotViewOnceState state;
+  uint64_t unopened_expires_at;
+} MarmotViewOncePresentation;
+
+/**
  * One ordered poll option with its current authenticated vote count.
  */
 typedef struct MarmotPollOptionResult {
@@ -5635,6 +5672,7 @@ typedef struct MarmotPollProjection {
  * Preview of the message a timeline row replies to.
  */
 typedef struct MarmotTimelineReplyPreview {
+  struct MarmotViewOncePresentation *view_once;
   char *message_id_hex;
   char *sender;
   char *plaintext;
@@ -5725,6 +5763,7 @@ typedef struct MarmotHistoryImportProvenance {
  * One materialized timeline row.
  */
 typedef struct MarmotTimelineMessageRecord {
+  struct MarmotViewOncePresentation *view_once;
   char *message_id_hex;
   bool has_reports;
   struct MarmotPollProjection *poll;
@@ -7879,6 +7918,49 @@ typedef struct MarmotStickerList {
   struct MarmotSticker *items;
   uintptr_t len;
 } MarmotStickerList;
+
+/**
+ * Borrowed input, copied before send. MDK cannot erase the caller's original bytes.
+ */
+typedef struct MarmotViewOnceMediaRequest {
+  const uint8_t *plaintext;
+  uintptr_t plaintext_len;
+  const char *media_type;
+  uint64_t unopened_expires_at;
+  /**
+   * Nullable endpoint override.
+   */
+  const char *blossom_server;
+} MarmotViewOnceMediaRequest;
+
+/**
+ * Result of an irreversible local claim. Opened transfers an independently owned viewer.
+ */
+typedef enum MarmotViewOnceConsumeOutcome_Tag {
+  MARMOT_VIEW_ONCE_CONSUME_OUTCOME_OPENED,
+  MARMOT_VIEW_ONCE_CONSUME_OUTCOME_CONSUMED,
+  MARMOT_VIEW_ONCE_CONSUME_OUTCOME_EXPIRED,
+  MARMOT_VIEW_ONCE_CONSUME_OUTCOME_UNAVAILABLE,
+} MarmotViewOnceConsumeOutcome_Tag;
+
+typedef struct MarmotViewOnceConsumeOutcome_Opened_Body {
+  struct MarmotViewOnceViewer *viewer;
+} MarmotViewOnceConsumeOutcome_Opened_Body;
+
+typedef struct MarmotViewOnceConsumeOutcome {
+  MarmotViewOnceConsumeOutcome_Tag tag;
+  union {
+    MarmotViewOnceConsumeOutcome_Opened_Body OPENED;
+  };
+} MarmotViewOnceConsumeOutcome;
+
+/**
+ * One bounded plaintext chunk. Freed bytes are erased in MDK's allocation, not host copies.
+ */
+typedef struct MarmotViewOnceBytes {
+  uint8_t *data;
+  uintptr_t len;
+} MarmotViewOnceBytes;
 
 typedef struct MarmotAttachmentDownloadPolicy {
   bool automatic;
@@ -16926,6 +17008,107 @@ void marmot_public_event_preview_list_free(struct MarmotPublicEventPreviewList *
  * this library.
  */
 void marmot_native_startup_snapshot_free(struct MarmotNativeStartupSnapshot *ptr);
+
+/**
+ * Activate negotiated view-once support; out uses marmot_send_summary_free.
+ * # Safety
+ * Client and strings must be live; out writable. No concurrent frees.
+ */
+MarmotStatus marmot_enable_view_once(const struct MarmotClient *client,
+                                     const char *account_ref,
+                                     const char *group_id_hex,
+                                     struct MarmotSendSummary **out);
+
+/**
+ * Return has_refusal=0 when activation is allowed. refusal is meaningful only when set.
+ * # Safety
+ * Client and strings must be live; both outputs writable. No concurrent frees.
+ */
+MarmotStatus marmot_view_once_refusal(const struct MarmotClient *client,
+                                      const char *account_ref,
+                                      const char *group_id_hex,
+                                      uint8_t *has_refusal,
+                                      enum MarmotViewOnceActivationRefusal *refusal);
+
+/**
+ * Send one image/video, without returning a reusable media reference.
+ * # Safety
+ * Client, strings, request and input bytes valid until return; out writable. No concurrent frees.
+ */
+MarmotStatus marmot_send_view_once_media(const struct MarmotClient *client,
+                                         const char *account_ref,
+                                         const char *group_id_hex,
+                                         const struct MarmotViewOnceMediaRequest *request,
+                                         struct MarmotSendSummary **out);
+
+/**
+ * Claim before decrypting. Failure after claim remains consumed. Opened viewer uses marmot_view_once_viewer_free.
+ * # Safety
+ * Client and strings must be live; out writable. No concurrent frees.
+ */
+MarmotStatus marmot_consume_view_once(const struct MarmotClient *client,
+                                      const char *account_ref,
+                                      const char *group_id_hex,
+                                      const char *message_id,
+                                      uint32_t attachment_index,
+                                      struct MarmotViewOnceConsumeOutcome *out);
+
+/**
+ * Read local state without decrypting or claiming.
+ * # Safety
+ * Client and strings must be live; out writable. No concurrent frees.
+ */
+MarmotStatus marmot_view_once_state(const struct MarmotClient *client,
+                                    const char *account_ref,
+                                    const char *group_id_hex,
+                                    const char *message_id,
+                                    uint32_t attachment_index,
+                                    enum MarmotViewOnceState *out);
+
+/**
+ * Read at most 1 MiB. NULL out on success means closed, expired, revoked, or end of input.
+ * # Safety
+ * Viewer must be live, its client runtime alive, and out writable. No concurrent free.
+ */
+MarmotStatus marmot_view_once_viewer_read(const struct MarmotViewOnceViewer *viewer,
+                                          uint64_t offset,
+                                          uint32_t limit,
+                                          struct MarmotViewOnceBytes **out);
+
+/**
+ * Revoke plaintext immediately without freeing the handle.
+ * # Safety
+ * Viewer must be live. No concurrent free.
+ */
+MarmotStatus marmot_view_once_viewer_close(const struct MarmotViewOnceViewer *viewer);
+
+/**
+ * Return the original plaintext length.
+ * # Safety
+ * Viewer must be live; out writable. No concurrent free.
+ */
+MarmotStatus marmot_view_once_viewer_size(const struct MarmotViewOnceViewer *viewer, uint64_t *out);
+
+/**
+ * Return an owned MIME string, freed with marmot_string_free.
+ * # Safety
+ * Viewer must be live; out writable. No concurrent free.
+ */
+MarmotStatus marmot_view_once_viewer_type(const struct MarmotViewOnceViewer *viewer, char **out);
+
+/**
+ * Close and free an opened viewer. NULL is accepted.
+ * # Safety
+ * Viewer must be NULL or returned by consume, not freed, and all viewer calls finished.
+ */
+void marmot_view_once_viewer_free(struct MarmotViewOnceViewer *viewer);
+
+/**
+ * Erase and free an MDK-returned chunk. NULL is accepted; host copies are unaffected.
+ * # Safety
+ * Bytes must be NULL or returned by read, and not previously freed.
+ */
+void marmot_view_once_bytes_free(struct MarmotViewOnceBytes *bytes);
 
 /**
  * Free a value of this type returned by this library. NULL

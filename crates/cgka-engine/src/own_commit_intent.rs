@@ -99,6 +99,7 @@ impl<S: StorageProvider> Engine<S> {
             | SendIntent::RemoveOwnAccountDevices { .. }
             | SendIntent::EnableDisbanding { .. }
             | SendIntent::EnableAccountDevices { .. }
+            | SendIntent::EnableViewOnce { .. }
             | SendIntent::LinkDevice { .. }
             | SendIntent::UnlinkDevice { .. }
             | SendIntent::RecordRemovedSlot { .. }

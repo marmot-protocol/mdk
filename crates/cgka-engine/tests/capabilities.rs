@@ -2103,6 +2103,602 @@ async fn account_devices_becomes_eligible_only_for_explicit_activation() {
     assert_eq!(after.required_capabilities, before.required_capabilities);
 }
 
+enum OnceSupport {
+    Advertised,
+    Missing,
+}
+
+fn view_once_client(
+    id: &[u8],
+    support: OnceSupport,
+) -> (Engine<SqliteAccountStorage>, SqliteAccountStorage) {
+    use cgka_traits::app_components::{
+        GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID, VIEW_ONCE_COMPONENT_ID,
+    };
+    let mut supported = default_group_components();
+    supported.insert(GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID);
+    supported.insert(cgka_traits::app_components::GROUP_MESSAGE_RETENTION_COMPONENT_ID);
+    if matches!(support, OnceSupport::Advertised) {
+        supported.insert(VIEW_ONCE_COMPONENT_ID);
+    }
+    let mut registry = FeatureRegistry::new();
+    registry.register(
+        Feature("view-once"),
+        CapabilityRequirement {
+            requires: Capability::AppComponent(VIEW_ONCE_COMPONENT_ID),
+            level: RequirementLevel::Optional,
+            description: "explicit activation",
+        },
+    );
+    let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
+    let engine = EngineBuilder::new(storage.clone())
+        .identity(pad32(id))
+        .account_identity_proof_signer(proof_signer(id))
+        .feature_registry(registry)
+        .supported_app_components(supported)
+        .peeler(Box::new(MockPeeler))
+        .build()
+        .unwrap();
+    (engine, storage)
+}
+
+fn view_once_group_request(members: Vec<cgka_traits::KeyPackage>) -> CreateGroupRequest {
+    use cgka_traits::app_components::{
+        EncryptedMediaPolicyV2, GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
+        encode_encrypted_media_policy_v2,
+    };
+    CreateGroupRequest {
+        name: "view-once negotiation".into(),
+        description: String::new(),
+        members,
+        required_features: vec![],
+        initial_admins: vec![],
+        app_components: vec![AppComponentData {
+            component_id: GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
+            data: encode_encrypted_media_policy_v2(
+                &EncryptedMediaPolicyV2::blossom_default(["https://example.com".into()]).unwrap(),
+            )
+            .unwrap(),
+        }],
+    }
+}
+
+fn view_once_test_event(
+    author: &MemberId,
+    created_at: u64,
+    deadline: u64,
+) -> cgka_traits::MarmotAppEvent {
+    use cgka_traits::app_components::{VIEW_ONCE_MARKER_VERSION, VIEW_ONCE_MEDIA_FORMAT};
+    cgka_traits::MarmotAppEvent::new(
+        hex::encode(author.as_slice()),
+        created_at,
+        9,
+        vec![
+            vec![
+                "view-once".into(),
+                VIEW_ONCE_MARKER_VERSION.into(),
+                deadline.to_string(),
+            ],
+            vec![
+                "imeta".into(),
+                format!("v {VIEW_ONCE_MEDIA_FORMAT}"),
+                "locator blossom-v1 https://example.com/blob".into(),
+                format!("ciphertext_sha256 {}", "ab".repeat(32)),
+                format!("plaintext_sha256 {}", "cd".repeat(32)),
+                format!("nonce {}", "ef".repeat(12)),
+                "m image/png".into(),
+                "filename photo.png".into(),
+            ],
+        ],
+        "",
+    )
+}
+
+fn raw_once_application(
+    storage: &SqliteAccountStorage,
+    sender: &MemberId,
+    group: &GroupId,
+    payload: &[u8],
+) -> TransportMessage {
+    use cgka_traits::storage::{AccountDeviceSignerStorage, StorageProvider};
+    use openmls_traits::OpenMlsProvider as _;
+    use tls_codec::Serialize as _;
+    let crypto = openmls_rust_crypto::RustCrypto::default();
+    let provider = cgka_engine::provider::EngineOpenMlsProvider::<SqliteAccountStorage>::new(
+        &crypto,
+        storage.mls_storage(),
+    );
+    let mut mls = openmls::group::MlsGroup::load(
+        provider.storage(),
+        &openmls::group::GroupId::from_slice(group.as_slice()),
+    )
+    .unwrap()
+    .unwrap();
+    let binding = storage.account_device_signer(sender).unwrap().unwrap();
+    let signer = openmls_basic_credential::SignatureKeyPair::read(
+        storage.mls_storage(),
+        &binding.mls_signature_public_key,
+        cgka_engine::DEFAULT_CIPHERSUITE.signature_algorithm(),
+    )
+    .unwrap();
+    let payload = mls
+        .create_message(&provider, &signer, payload)
+        .unwrap()
+        .tls_serialize_detached()
+        .unwrap();
+    TransportMessage {
+        id: hash_id(&payload),
+        payload,
+        timestamp: Timestamp(0),
+        causal_deps: vec![],
+        source: TransportSource("raw-once-application".into()),
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group.as_slice().to_vec(),
+        },
+    }
+}
+
+#[tokio::test]
+async fn view_once_witness_parity() {
+    use cgka_engine::openmls_projection::{
+        OpenMlsCandidatePath, OpenMlsReplayObservation, materialize_openmls_candidate_paths,
+    };
+    use cgka_traits::engine::{GroupEvent, SendIntent};
+    use cgka_traits::ingest::{IngestOutcome, InputRejectionCategory};
+    let (mut alice, sender_storage) =
+        view_once_client(b"once-policy-author", OnceSupport::Advertised);
+    let (mut bob, recipient_storage) =
+        view_once_client(b"once-policy-recipient", OnceSupport::Advertised);
+    let (group, created) = alice
+        .create_group(view_once_group_request(vec![
+            bob.fresh_key_package().await.unwrap(),
+        ]))
+        .await
+        .unwrap();
+    let SendResult::FoundingGroupCreated { mut welcomes } = created else {
+        panic!("founding group")
+    };
+    bob.join_welcome(welcomes.remove(0)).await.unwrap();
+    for intent in [
+        SendIntent::EnableViewOnce {
+            group_id: group.clone(),
+        },
+        SendIntent::SelfUpdate {
+            group_id: group.clone(),
+        },
+    ] {
+        let source_epoch = alice.epoch(&group).unwrap();
+        let required = alice.view_once_required_at(&group, source_epoch).unwrap();
+        let template = view_once_test_event(&alice.self_id(), 100, 160);
+        let rebuild = |tags, content| {
+            cgka_traits::MarmotAppEvent::new(template.pubkey.clone(), 100, 9, tags, content)
+                .encode()
+                .unwrap()
+        };
+        let mut cases = vec![(template.encode().unwrap(), true)];
+        let mut tags = template.tags.clone();
+        tags.push(tags[0].clone());
+        cases.push((rebuild(tags, ""), true));
+        let mut tags = template.tags.clone();
+        tags[0][2] = "100".into();
+        cases.push((rebuild(tags, ""), true));
+        let mut tags = template.tags.clone();
+        tags[1].retain(|field| !field.starts_with("nonce "));
+        cases.push((rebuild(tags, ""), true));
+        cases.push((rebuild(vec![template.tags[1].clone()], ""), true));
+        cases.push((rebuild(template.tags.clone(), "forbidden caption"), true));
+        let mut forged = template.clone();
+        forged.pubkey = hex::encode(bob.self_id().as_slice());
+        cases.push((
+            cgka_traits::MarmotAppEvent::new(forged.pubkey, 100, 9, forged.tags, "")
+                .encode()
+                .unwrap(),
+            false,
+        ));
+        let mut bad_hash = template.clone();
+        bad_hash.id = "00".repeat(32);
+        cases.push((bad_hash.encode().unwrap(), false));
+        cases.push((b"not JSON".to_vec(), false));
+        // A second valid source-epoch message arrives only after the Commit.
+        cases.push((
+            view_once_test_event(&alice.self_id(), 101, 160)
+                .encode()
+                .unwrap(),
+            true,
+        ));
+        let messages: Vec<_> = cases
+            .iter()
+            .map(|(payload, _)| {
+                raw_once_application(&sender_storage, &alice.self_id(), &group, payload)
+            })
+            .collect();
+        let evolution = alice.send(intent).await.unwrap();
+        let SendResult::GroupEvolution {
+            mut msg, pending, ..
+        } = evolution
+        else {
+            panic!("source advance")
+        };
+        alice.confirm_published(pending).await.unwrap();
+        msg.envelope = TransportEnvelope::GroupMessage {
+            transport_group_id: group.as_slice().to_vec(),
+        };
+        let mut candidate = messages.clone();
+        candidate.push(msg.clone());
+        let materialized = materialize_openmls_candidate_paths(
+            &recipient_storage,
+            &group,
+            &[OpenMlsCandidatePath {
+                branch_id: "media-policy".into(),
+                messages: candidate,
+            }],
+        )
+        .unwrap();
+        assert_eq!(materialized.len(), 1);
+        assert_eq!(materialized[0].tip_epoch, source_epoch.0 + 1);
+        let observations = &materialized[0].observations;
+        assert_eq!(
+            observations
+                .iter()
+                .filter(|row| matches!(row, OpenMlsReplayObservation::ApplicationProcessed { .. }))
+                .count(),
+            cases.iter().filter(|(_, valid)| *valid).count()
+        );
+        for ((payload, valid), message) in cases.iter().zip(&messages) {
+            let id = hex::encode(message.id.as_slice());
+            let observation = observations
+                .iter()
+                .find(|row| match row {
+                    OpenMlsReplayObservation::ApplicationProcessed { message_id, .. }
+                    | OpenMlsReplayObservation::Ignored { message_id, .. } => message_id == &id,
+                    _ => false,
+                })
+                .unwrap();
+            if *valid {
+                let OpenMlsReplayObservation::ApplicationProcessed {
+                    payload: received,
+                    source_epoch: epoch,
+                    ..
+                } = observation
+                else {
+                    panic!("media policy removed a witness")
+                };
+                assert_eq!(received, payload);
+                assert_eq!(*epoch, source_epoch.0);
+            } else {
+                assert!(matches!(
+                    observation,
+                    OpenMlsReplayObservation::Ignored { .. }
+                ));
+            }
+        }
+        bob.drain_events();
+        for ((payload, valid), message) in cases[..cases.len() - 1].iter().zip(&messages) {
+            let outcome = bob.ingest(message.clone()).await.unwrap();
+            if *valid {
+                assert_eq!(outcome, IngestOutcome::Processed);
+                let delivered = bob.drain_events();
+                assert!(delivered.iter().any(|row| matches!(row, GroupEvent::MessageReceived { payload: received, epoch, .. } if received == payload && *epoch == source_epoch)));
+            } else {
+                assert_eq!(
+                    outcome,
+                    IngestOutcome::Ignored {
+                        category: InputRejectionCategory::InvalidEncoding
+                    }
+                );
+                assert!(
+                    !bob.drain_events()
+                        .iter()
+                        .any(|row| matches!(row, GroupEvent::MessageReceived { .. }))
+                );
+            }
+        }
+        bob.ingest(msg).await.unwrap();
+        assert_eq!(
+            bob.converge_stored_openmls_messages_at(&group, 2_000_000 + source_epoch.0 * 2_000_000)
+                .unwrap()
+                .convergence_status,
+            ConvergenceStatus::Settled
+        );
+        assert_eq!(
+            bob.view_once_required_at(&group, source_epoch).unwrap(),
+            required
+        );
+        assert!(
+            bob.view_once_required_at(&group, bob.epoch(&group).unwrap())
+                .unwrap()
+        );
+        assert!(
+            !bob.view_once_required_at(&group, cgka_traits::EpochId(u64::MAX))
+                .unwrap()
+        );
+        bob.drain_events();
+        let delayed = messages.last().unwrap().clone();
+        bob.buffer_openmls_convergence_message_at(&group, delayed, 1_000)
+            .unwrap();
+        bob.advance_convergence_inputs_until_settled(
+            &group,
+            8_000_000 + source_epoch.0 * 2_000_000,
+        )
+        .await
+        .unwrap();
+        assert!(bob.drain_events().iter().any(|row| matches!(row, GroupEvent::MessageReceived { payload, epoch, .. } if payload == &cases.last().unwrap().0 && *epoch == source_epoch)));
+        assert_eq!(
+            bob.view_once_required_at(&group, source_epoch).unwrap(),
+            required
+        );
+    }
+}
+
+#[tokio::test]
+async fn view_once_activation_contract() {
+    use cgka_traits::app_components::{
+        APP_COMPONENTS_COMPONENT_ID, VIEW_ONCE_COMPONENT_ID, encode_components_list,
+    };
+    use cgka_traits::engine::SendIntent;
+    use cgka_traits::error::ViewOnceActivationRefusal;
+    let (mut alice, _) = view_once_client(b"once-alice", OnceSupport::Advertised);
+    let (gid, created) = alice
+        .create_group(view_once_group_request(vec![]))
+        .await
+        .unwrap();
+    assert!(matches!(created, SendResult::FoundingGroupCreated { .. }));
+    assert!(
+        !alice
+            .view_once_required_at(&gid, alice.epoch(&gid).unwrap())
+            .unwrap()
+    );
+    assert_eq!(alice.view_once_activation_refusal(&gid).unwrap(), None);
+    assert!(
+        !alice
+            .upgradeable_capabilities(&gid)
+            .unwrap()
+            .app_components
+            .contains(VIEW_ONCE_COMPONENT_ID)
+    );
+    let event = view_once_test_event(&alice.self_id(), 100, 160);
+    let send = || SendIntent::AppMessage {
+        group_id: gid.clone(),
+        payload: event.encode().unwrap(),
+        expected_epoch: None,
+    };
+    assert!(matches!(alice.send(send()).await,
+        Err(EngineError::InvalidAppMessagePayload(reason)) if reason == "view-once is not required at the source epoch"));
+    let enabled = alice
+        .send(SendIntent::EnableViewOnce {
+            group_id: gid.clone(),
+        })
+        .await
+        .unwrap();
+    let SendResult::GroupEvolution { pending, .. } = enabled else {
+        panic!("activation must prepare one commit")
+    };
+    alice.confirm_published(pending).await.unwrap();
+    assert!(
+        alice
+            .view_once_required_at(&gid, alice.epoch(&gid).unwrap())
+            .unwrap()
+    );
+    assert_eq!(
+        alice.view_once_activation_refusal(&gid).unwrap(),
+        Some(ViewOnceActivationRefusal::AlreadyRequired)
+    );
+    let sent = alice.send(send()).await.unwrap();
+    let SendResult::ApplicationMessage { retention, .. } = sent else {
+        panic!("negotiated media send")
+    };
+    assert_eq!(retention.expires_at, Some(160));
+    assert_eq!(retention.retention_seconds, 0);
+    let data_error = alice
+        .send(SendIntent::UpdateAppComponents {
+            group_id: gid.clone(),
+            updates: vec![AppComponentData {
+                component_id: VIEW_ONCE_COMPONENT_ID,
+                data: vec![],
+            }],
+        })
+        .await;
+    assert!(matches!(
+        data_error,
+        Err(EngineError::NoDataAppComponent {
+            component_id: VIEW_ONCE_COMPONENT_ID
+        })
+    ));
+    let mut required = alice
+        .group_record(&gid)
+        .unwrap()
+        .required_capabilities
+        .app_components;
+    required.ids.remove(&VIEW_ONCE_COMPONENT_ID);
+    let removal = alice
+        .send(SendIntent::UpdateAppComponents {
+            group_id: gid.clone(),
+            updates: vec![AppComponentData {
+                component_id: APP_COMPONENTS_COMPONENT_ID,
+                data: encode_components_list(&required.ids),
+            }],
+        })
+        .await;
+    assert!(
+        matches!(removal, Err(EngineError::Other(reason)) if reason == "view-once cannot be un-required")
+    );
+    assert!(
+        alice
+            .view_once_required_at(&gid, alice.epoch(&gid).unwrap())
+            .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn view_once_activation_guards() {
+    use cgka_traits::engine::SendIntent;
+    use cgka_traits::error::ViewOnceActivationRefusal as Refusal;
+    let (mut alice, _) = view_once_client(b"once-admin", OnceSupport::Advertised);
+    let (mut bob, _) = view_once_client(b"once-unsupported", OnceSupport::Missing);
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let (gid, _) = alice
+        .create_group(view_once_group_request(vec![bob_kp]))
+        .await
+        .unwrap();
+    assert_eq!(
+        alice.view_once_activation_refusal(&gid).unwrap(),
+        Some(Refusal::UnsupportedLeaf)
+    );
+    let before = alice.epoch(&gid).unwrap();
+    assert!(matches!(
+        alice
+            .send(SendIntent::EnableViewOnce {
+                group_id: gid.clone()
+            })
+            .await,
+        Err(EngineError::ViewOnceActivationRefused {
+            reason: Refusal::UnsupportedLeaf,
+            ..
+        })
+    ));
+    assert_eq!(alice.epoch(&gid).unwrap(), before);
+    let mut request = view_once_group_request(vec![]);
+    request.app_components.clear();
+    let (without_v2, _) = alice.create_group(request).await.unwrap();
+    assert_eq!(
+        alice.view_once_activation_refusal(&without_v2).unwrap(),
+        Some(Refusal::EncryptedMediaV2NotRequired)
+    );
+    assert!(matches!(
+        alice
+            .send(SendIntent::EnableViewOnce {
+                group_id: without_v2
+            })
+            .await,
+        Err(EngineError::ViewOnceActivationRefused {
+            reason: Refusal::EncryptedMediaV2NotRequired,
+            ..
+        })
+    ));
+}
+
+#[tokio::test]
+async fn view_once_source_expiry() {
+    use cgka_traits::app_components::GROUP_MESSAGE_RETENTION_COMPONENT_ID;
+    use cgka_traits::engine::{GroupEvent, SendIntent};
+    let (mut alice, _) = view_once_client(b"once-delayed-author", OnceSupport::Advertised);
+    let (mut bob, _) = view_once_client(b"once-delayed-recipient", OnceSupport::Advertised);
+    let mut request = view_once_group_request(vec![bob.fresh_key_package().await.unwrap()]);
+    request.app_components.push(AppComponentData {
+        component_id: GROUP_MESSAGE_RETENTION_COMPONENT_ID,
+        data: 30u64.to_be_bytes().to_vec(),
+    });
+    let (gid, created) = alice.create_group(request).await.unwrap();
+    let SendResult::FoundingGroupCreated { mut welcomes } = created else {
+        panic!("current founding group")
+    };
+    bob.join_welcome(welcomes.remove(0)).await.unwrap();
+    let route = |message: TransportMessage| TransportMessage {
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: gid.as_slice().to_vec(),
+        },
+        ..message
+    };
+    let enabled = alice
+        .send(SendIntent::EnableViewOnce {
+            group_id: gid.clone(),
+        })
+        .await
+        .unwrap();
+    let SendResult::GroupEvolution { msg, pending, .. } = enabled else {
+        panic!("activation commit")
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.ingest(route(msg)).await.unwrap();
+    assert_eq!(
+        bob.converge_stored_openmls_messages_at(&gid, 1_000_000)
+            .unwrap()
+            .convergence_status,
+        ConvergenceStatus::Settled
+    );
+    assert!(
+        bob.view_once_required_at(&gid, bob.epoch(&gid).unwrap())
+            .unwrap()
+    );
+    bob.drain_events();
+
+    let mut applications = Vec::new();
+    for created_at in [100, 101] {
+        let event = view_once_test_event(&alice.self_id(), created_at, 160);
+        let result = alice
+            .send(SendIntent::AppMessage {
+                group_id: gid.clone(),
+                payload: event.encode().unwrap(),
+                expected_epoch: None,
+            })
+            .await
+            .unwrap();
+        let SendResult::ApplicationMessage { msg, retention, .. } = result else {
+            panic!("once application")
+        };
+        assert_eq!(retention.expires_at, Some(created_at + 30));
+        applications.push(route(msg));
+    }
+    let disable = alice
+        .send(SendIntent::UpdateAppComponents {
+            group_id: gid.clone(),
+            updates: vec![AppComponentData {
+                component_id: GROUP_MESSAGE_RETENTION_COMPONENT_ID,
+                data: 0u64.to_be_bytes().to_vec(),
+            }],
+        })
+        .await
+        .unwrap();
+    let SendResult::GroupEvolution { msg, pending, .. } = disable else {
+        panic!("timer commit")
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.ingest(route(msg)).await.unwrap();
+    // The first application is retained beside the pending commit; the second
+    // arrives after selection advanced the materialized state past its source.
+    bob.ingest(applications.remove(0)).await.unwrap();
+    let mut delivered = bob.drain_events();
+    assert_eq!(
+        bob.converge_stored_openmls_messages_at(&gid, 2_000_000)
+            .unwrap()
+            .convergence_status,
+        ConvergenceStatus::Settled
+    );
+    delivered.extend(bob.drain_events());
+    bob.ingest(applications.remove(0)).await.unwrap();
+    delivered.extend(bob.drain_events());
+    let mut decisions: Vec<_> = delivered
+        .into_iter()
+        .filter_map(|event| match event {
+            GroupEvent::MessageReceived {
+                retention: Some(decision),
+                ..
+            } => Some(decision),
+            _ => None,
+        })
+        .collect();
+    decisions.sort_by_key(|decision| decision.expires_at);
+    assert_eq!(
+        decisions,
+        vec![
+            cgka_traits::AppMessageRetentionDecision {
+                retention_seconds: 30,
+                expires_at: Some(130),
+                view_once: Some(cgka_traits::app_event::ViewOncePolicy {
+                    unopened_expires_at: 160,
+                }),
+            },
+            cgka_traits::AppMessageRetentionDecision {
+                retention_seconds: 30,
+                expires_at: Some(131),
+                view_once: Some(cgka_traits::app_event::ViewOncePolicy {
+                    unopened_expires_at: 160,
+                }),
+            },
+        ]
+    );
+}
+
 /// Metadata filtering expands implicit MLS support without accepting explicit
 /// default advertisements, and retains the requirement owner's profile/suite.
 #[tokio::test]

@@ -35,6 +35,7 @@
 mod account_devices_activation;
 pub mod account_identity_proof;
 pub mod app_components;
+mod view_once;
 
 pub(crate) mod app_payload;
 pub(crate) mod audit_helpers;

@@ -788,6 +788,28 @@ pub(crate) enum AccountWorkerCommand {
         request: crate::media::file_transfer::MediaUploadPayload,
         respond: oneshot::Sender<Result<MediaUploadResult, AppError>>,
     },
+    ViewOnceActivation {
+        group_id: GroupId,
+        respond: oneshot::Sender<Result<Option<crate::ViewOnceActivationRefusal>, AppError>>,
+    },
+    EnableViewOnce {
+        group_id: GroupId,
+        respond: oneshot::Sender<Result<SendSummary, AppError>>,
+    },
+    SendViewOnce {
+        admission: OwnedSemaphorePermit,
+        group_id: GroupId,
+        request: crate::ViewOnceMediaRequest,
+        respond: oneshot::Sender<Result<SendSummary, AppError>>,
+    },
+    ConsumeViewOnce {
+        admission: OwnedSemaphorePermit,
+        group_id: GroupId,
+        message_id: String,
+        attachment_index: u32,
+        permit: crate::view_once::ViewOncePermit,
+        respond: oneshot::Sender<Result<crate::ViewOnceConsumeOutcome, AppError>>,
+    },
     DownloadMedia {
         admission: OwnedSemaphorePermit,
         group_id: GroupId,
@@ -1014,6 +1036,8 @@ impl AccountWorkerCommand {
             Self::UploadPreparedGroupImage { .. }
             | Self::DownloadGroupImage { .. }
             | Self::UploadMedia { .. }
+            | Self::SendViewOnce { .. }
+            | Self::ConsumeViewOnce { .. }
             | Self::DownloadMedia { .. } => true,
             #[cfg(test)]
             Self::HoldMediaHttp { .. } => true,
@@ -2170,8 +2194,10 @@ async fn run_app_runtime_account_worker(
             done = media_http_rx.recv() => {
                 match done {
                     Some(done) => {
-                        let history_unsettled =
-                            complete_media_http(&mut client, done, &shared, &media_http).await;
+                        let history_unsettled = complete_media_http(
+                            &mut client, done, &shared, &media_http,
+                            &events, &account_id_hex, &account_label,
+                        ).await;
                         // A finished upload can send its message, which can
                         // leave relay retries the plan does not know yet.
                         maintenance_due_dirty = true;
@@ -5149,6 +5175,18 @@ fn store_acquired_avatar(
 }
 
 enum MediaHttpCompletion {
+    ViewOnceSend {
+        group_id: GroupId,
+        expires_at: u64,
+        result: Result<MediaAttachmentReference, AppError>,
+        respond: oneshot::Sender<Result<SendSummary, AppError>>,
+    },
+    ViewOnceConsume {
+        group_id: GroupId,
+        message_id: String,
+        result: Result<crate::ViewOnceConsumeOutcome, AppError>,
+        respond: oneshot::Sender<Result<crate::ViewOnceConsumeOutcome, AppError>>,
+    },
     AttachmentRetained {
         result: Result<(), AppError>,
         background_permit: OwnedSemaphorePermit,
@@ -5367,6 +5405,9 @@ async fn complete_media_http(
     done: MediaHttpDone,
     shared: &RuntimeSharedServices,
     media_http: &MediaHttpContext,
+    events: &broadcast::Sender<MarmotAppEvent>,
+    account_id_hex: &str,
+    account_label: &str,
 ) -> bool {
     let MediaHttpDone {
         permit,
@@ -5377,6 +5418,46 @@ async fn complete_media_http(
         cancellation.discard();
     }
     match completion {
+        MediaHttpCompletion::ViewOnceSend {
+            group_id,
+            expires_at,
+            result,
+            respond,
+        } => {
+            let result = match result {
+                Ok(reference) => {
+                    client
+                        .finish_view_once_send(&group_id, reference, expires_at, |update| {
+                            publish_app_runtime_projection_update(
+                                Emit::Unpublished(Unpublished::LocalEcho),
+                                events,
+                                account_id_hex,
+                                account_label,
+                                update,
+                            );
+                        })
+                        .await
+                }
+                Err(error) => Err(error),
+            };
+            let _ = reply(respond, result, client);
+        }
+        MediaHttpCompletion::ViewOnceConsume {
+            group_id,
+            message_id,
+            result,
+            respond,
+        } => {
+            publish_view_once_change(
+                client,
+                events,
+                account_id_hex,
+                account_label,
+                &group_id,
+                &message_id,
+            );
+            let _ = reply(respond, result, client);
+        }
         MediaHttpCompletion::HistoryUpload(outcome) => {
             let settled = client.finish_history_upload(outcome).await;
             drop(permit);
@@ -7660,6 +7741,126 @@ fn account_worker_command_future<'a>(
             let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result, client);
             true
         }),
+        AccountWorkerCommand::ViewOnceActivation { group_id, respond } => Box::pin(async move {
+            let result = client
+                .runtime
+                .ensure_group_hydrated(&group_id)
+                .map_err(AppError::from)
+                .and_then(|_| client.view_once_activation_refusal(&group_id));
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result, client);
+            true
+        }),
+        AccountWorkerCommand::EnableViewOnce { group_id, respond } => Box::pin(async move {
+            let result = client.enable_view_once(&group_id).await;
+            if result.is_ok() {
+                publish_app_runtime_group_state_updated(
+                    Emit::Quiescent(client),
+                    events,
+                    account_id_hex,
+                    account_label,
+                    &group_id,
+                );
+            }
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result, client);
+            true
+        }),
+        AccountWorkerCommand::SendViewOnce {
+            admission,
+            group_id,
+            request,
+            respond,
+        } => Box::pin(async move {
+            let permit = reserve_media_http(media_http);
+            drop(admission);
+            let expires_at = request.unopened_expires_at;
+            match client.prepare_view_once_send(&group_id, request).await {
+                Ok(http) => spawn_media_http(media_http, permit, http.run(), move |result| {
+                    MediaHttpCompletion::ViewOnceSend {
+                        group_id,
+                        expires_at,
+                        result,
+                        respond,
+                    }
+                }),
+                Err(error) => {
+                    let _ = respond_diagnosed(
+                        shared,
+                        storage_permit.as_ref(),
+                        respond,
+                        Err(error),
+                        client,
+                    );
+                }
+            }
+            true
+        }),
+        AccountWorkerCommand::ConsumeViewOnce {
+            admission,
+            group_id,
+            message_id,
+            attachment_index,
+            permit,
+            respond,
+        } => Box::pin(async move {
+            let media_permit = reserve_media_http(media_http);
+            drop(admission);
+            if respond.is_closed() {
+                return true;
+            }
+            let prepared = client
+                .runtime
+                .ensure_group_hydrated(&group_id)
+                .map_err(AppError::from)
+                .and_then(|_| {
+                    client.prepare_view_once_consume(
+                        &group_id,
+                        &message_id,
+                        attachment_index,
+                        permit,
+                    )
+                });
+            match prepared {
+                Ok(crate::client::view_once::ViewOncePreparation::Ready(http)) => {
+                    spawn_media_http(media_http, media_permit, http.run(), move |result| {
+                        MediaHttpCompletion::ViewOnceConsume {
+                            group_id,
+                            message_id,
+                            result,
+                            respond,
+                        }
+                    });
+                }
+                Ok(crate::client::view_once::ViewOncePreparation::Terminal(outcome)) => {
+                    publish_view_once_change(
+                        client,
+                        events,
+                        account_id_hex,
+                        account_label,
+                        &group_id,
+                        &message_id,
+                    );
+                    let _ = reply(respond, Ok(outcome), client);
+                }
+                Err(error) => {
+                    publish_view_once_change(
+                        client,
+                        events,
+                        account_id_hex,
+                        account_label,
+                        &group_id,
+                        &message_id,
+                    );
+                    let _ = respond_diagnosed(
+                        shared,
+                        storage_permit.as_ref(),
+                        respond,
+                        Err(error),
+                        client,
+                    );
+                }
+            }
+            true
+        }),
         AccountWorkerCommand::BuildMediaImetaTag {
             group_id,
             reference,
@@ -9401,6 +9602,58 @@ fn publish_app_runtime_summary_with_v5_at(
         runtime_summary_message_ref(summary),
         publication,
     );
+}
+
+fn publish_view_once_change(
+    client: &AppClient,
+    events: &broadcast::Sender<MarmotAppEvent>,
+    account_id_hex: &str,
+    account_label: &str,
+    group_id: &GroupId,
+    message_id: &str,
+) {
+    let group_id_hex = hex::encode(group_id.as_slice());
+    let update = (|| -> Result<_, AppError> {
+        let Some(row) = client
+            .app
+            .account_storage(account_label)?
+            .app_storage()
+            .timeline_message(&group_id_hex, message_id)?
+        else {
+            return Ok(None);
+        };
+        client
+            .app
+            .app_projection_update(
+                account_label,
+                storage_sqlite::TimelineProjectionUpdate {
+                    group_id_hex,
+                    messages: vec![row.clone()],
+                    changes: vec![storage_sqlite::TimelineMessageChange::Upsert {
+                        trigger: storage_sqlite::TimelineUpdateTrigger::MessageEditedOrReprojected,
+                        message: Box::new(row),
+                    }],
+                },
+            )
+            .map(Some)
+    })();
+    if let Ok(Some(update)) = update {
+        publish_app_runtime_projection_update(
+            Emit::Quiescent(client),
+            events,
+            account_id_hex,
+            account_label,
+            update,
+        );
+    } else {
+        publish_app_runtime_group_state_updated(
+            Emit::Quiescent(client),
+            events,
+            account_id_hex,
+            account_label,
+            group_id,
+        );
+    }
 }
 
 pub(super) fn publish_app_runtime_projection_update(
@@ -11335,11 +11588,15 @@ mod tests {
             },
         };
 
+        let account_id_hex = app.account_home().account("alice").unwrap().account_id_hex;
         complete_media_http(
             &mut client,
             done,
             &RuntimeSharedServices::default(),
             &media_http,
+            &broadcast::channel(1).0,
+            &account_id_hex,
+            "alice",
         )
         .await;
 

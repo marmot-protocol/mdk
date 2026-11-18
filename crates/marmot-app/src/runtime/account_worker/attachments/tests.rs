@@ -2068,7 +2068,15 @@ pub(super) async fn complete_and_settle(
         &done.completion,
         MediaHttpCompletion::Attachment { result: Ok(_), .. }
     );
-    complete_media_http(client, done, shared, http).await;
+    let label = client.state.label.clone();
+    let account_id_hex = client
+        .app
+        .account_home()
+        .account(&label)
+        .unwrap()
+        .account_id_hex;
+    let (events, _) = broadcast::channel(1);
+    complete_media_http(client, done, shared, http, &events, &account_id_hex, &label).await;
     if publishes {
         let retained = tokio::time::timeout(Duration::from_secs(60), completions.recv())
             .await
@@ -2078,7 +2086,16 @@ pub(super) async fn complete_and_settle(
             retained.completion,
             MediaHttpCompletion::AttachmentRetained { .. }
         ));
-        complete_media_http(client, retained, shared, http).await;
+        complete_media_http(
+            client,
+            retained,
+            shared,
+            http,
+            &events,
+            &account_id_hex,
+            &label,
+        )
+        .await;
     }
 }
 

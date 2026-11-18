@@ -41,6 +41,7 @@ Read the documentation at the tag matching your binaries; `master` can describe 
   [stickers](#stickers), [emoji sets](#emoji-sets),
   [history may be incomplete notices](#history-may-be-incomplete-notices)
 - Media: [file-backed media upload](#file-backed-media-upload),
+  [view-once media](#view-once-media),
   [account attachment history](#account-attachment-history),
   [bounded attachment history](#bounded-attachment-history), [local attachment access](#local-attachment-access)
 - Audit logs: [audit v5 recording and delivery](#audit-v5-recording-and-delivery),
@@ -1986,6 +1987,54 @@ until acknowledged: no later change, and no timer, ends it. The same
 `acknowledge_group_commit_undelivered` call dismisses every refusal in the group for good,
 across restarts too, so hosts can also call it from a "dismiss" action. A host can offer
 to proceed, or to ask an admin to change the group's relays.
+
+## View-once media
+
+An admin calls `viewOnceActivationRefusal` before offering `enableViewOnce`.
+Activation requires every leaf to advertise support and encrypted-media V2 to
+remain required. Activation is irreversible. The outer expiry hint exposes the
+selected deadline to relays and may identify view-once use when it shortens
+group retention or retention is disabled. `sendViewOnceMedia` sends one
+image or video of at most 64 MiB with an absolute unopened deadline no more
+than 45 days after creation. It accepts no caption or preview and returns no
+reusable media reference. Ordinary media APIs reject `ViewOnceV1`.
+
+The receiver also stores a 45-day cap from its first-admission wall-clock
+reading. Clock errors and later correction can change the true elapsed
+lifetime; this is not a trusted-time guarantee. Admission and consumption
+records survive ordinary history cleanup with retained epoch-secret access.
+Arbitrary erasure or corruption of that evidence is outside the intact-state
+guarantee, as is whole-database rollback.
+
+MDK accepts PNG, JPEG, GIF, WebP, and non-fragmented MP4 with AVC/H.264 video
+and optional AAC audio. It fully decodes bounded images and validates MP4
+structure, sample tables, codec declarations, and AVC dimensions. The host owns
+bounded video decoding and display. Clear or drop the host's input and draft
+after sending. Never automatically resend an invalidated view-once message;
+another send requires an explicit user action and creates a new opening.
+
+Timeline rows and reply previews expose `viewOnce` with a local state and effective deadline,
+not a downloadable reference. Call `consumeViewOnce` only on an explicit user
+open action. `Opened` owns a `ViewOnceViewerFfi`; other outcomes are `Consumed`,
+`Expired`, or `Unavailable`. The durable claim precedes ciphertext transfer and
+decryption. Transfer failure can consume the opening without display. Failure,
+cancellation, or process exit after claim does not permit another open.
+Consumption is per receiving account-device, without broadcasts or receipts.
+The blob server can still observe the opening attempt's fetch time, network
+address, and authentication metadata; this does not prove successful display.
+
+Read the viewer in chunks of at most 1 MiB and call `revoke` when playback ends.
+Only one viewer per account-device is allowed. Its 60-second monotonic budget
+starts before the durable claim and includes fetching, decryption, and validation.
+Tell senders and recipients that opening is an attempt: a slow transfer may
+consume the budget without display, and a long video may not play in full.
+Start the host's display timeout at the user's open action, not when `Opened`
+arrives. Clear the display on timeout, deletion, withdrawal, or account/group teardown.
+MDK rechecks access on reads and revokes the viewer on account teardown. Dropping the binding object
+closes the core viewer synchronously. Returned bytes are host-owned copies:
+closing or freeing a viewer cannot erase them, decoder buffers, screenshots,
+camera captures, or copies retained by a modified host. Whole-database rollback
+is not prevented. MDK does not delete reusable epoch secrets or remote shared blobs.
 
 ## File-backed media upload
 

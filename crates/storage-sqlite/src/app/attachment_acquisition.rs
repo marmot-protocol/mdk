@@ -169,7 +169,8 @@ pub(crate) const RETAINED_BYTE_LEN: &str = "coalesce((SELECT mf.byte_len FROM me
 const SOURCE_MATCH: &str = "EXISTS(SELECT 1 FROM attachment_history h
  WHERE h.group_id_hex=q.group_id_hex AND h.message_id_hex=q.message_id_hex
  AND h.attachment_index=q.attachment_index AND h.source_message_id_hex=q.source_message_id_hex
- AND h.source_epoch=q.source_epoch AND h.slot_json=q.slot_json AND h.visible=1)";
+ AND h.source_epoch=q.source_epoch AND h.slot_json=q.slot_json AND h.visible=1)
+ AND NOT EXISTS(SELECT 1 FROM view_once_consumption v WHERE v.group_id_hex=q.group_id_hex AND v.message_id_hex=q.message_id_hex)";
 const ACCEPTED: &str = "EXISTS(SELECT 1 FROM account_groups g
  WHERE g.group_id_hex=q.group_id_hex AND g.pending_confirmation=0)";
 
@@ -345,6 +346,7 @@ impl SqliteAppStorage {
                  JOIN account_groups g USING(group_id_hex)
                  WHERE h.group_id_hex=?1 AND h.message_id_hex=?2 AND h.attachment_index=?3
                    AND h.visible=1 AND h.source_epoch IS NOT NULL AND g.pending_confirmation=0
+                   AND NOT EXISTS(SELECT 1 FROM view_once_consumption v WHERE v.group_id_hex=h.group_id_hex AND v.message_id_hex=h.message_id_hex)
                    AND (a.retention_expires_at IS NULL OR a.retention_expires_at>?4)",
                 params![group, message, index, now],
                 |r| Ok((

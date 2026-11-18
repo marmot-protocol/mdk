@@ -2288,6 +2288,7 @@ pub(crate) fn decode_received_event(
     // that version boundary instead of applying V2 behavior to legacy traffic.
     if (event.kind == MARMOT_APP_EVENT_KIND_CHAT
         || crate::messages::is_nip22_comment(event.kind, &event.tags))
+        && !crate::view_once::is_view_once(&event.tags)
         && !media_imeta_tags_preserve_message(&event.tags, allow_loopback_http)
     {
         tracing::warn!(
@@ -2415,7 +2416,12 @@ pub(crate) fn observe_event(
             // Gossip remains available to native ingestion, but must never enter
             // the host message summary, including a partially applied batch.
             if !crate::notifications::is_push_gossip_kind(message.kind) {
-                summary.messages.push(message.clone());
+                let mut host_message = message.clone();
+                crate::view_once::redact_fields(
+                    &mut host_message.plaintext,
+                    &mut host_message.tags,
+                );
+                summary.messages.push(host_message);
             }
             summary.events.push(host_group_event(event));
             Some(message)
@@ -2442,16 +2448,25 @@ pub(crate) fn observe_event(
 /// removed.
 pub(crate) fn host_group_event(event: &GroupEvent) -> GroupEvent {
     match event {
-        GroupEvent::MessageReceived {
-            sender_leaf_index: Some(_),
-            ..
-        } => {
+        GroupEvent::MessageReceived { .. } => {
             let mut event = event.clone();
             if let GroupEvent::MessageReceived {
-                sender_leaf_index, ..
+                sender_leaf_index,
+                payload,
+                encrypted_media_secret,
+                ..
             } = &mut event
             {
                 *sender_leaf_index = None;
+                // The app caches this carrier internally. An ordinary message must not
+                // hand hosts the exporter that can also open view-once files in its epoch.
+                *encrypted_media_secret = None;
+                if MarmotInnerEvent::decode(payload)
+                    .is_ok_and(|inner| crate::view_once::is_view_once(&inner.tags))
+                {
+                    // No redacted bytes are represented as an authenticated inner event.
+                    zeroize::Zeroize::zeroize(payload);
+                }
             }
             event
         }

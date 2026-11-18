@@ -78,6 +78,7 @@ const LEGACY_PUSH_OWNER_PROOF_EVENT_KIND: u16 = 450;
 const PUSH_RECORD_DOMAIN: &str = "marmot-push-token-record-v1";
 const PUSH_REMOVAL_DOMAIN: &str = "marmot-push-token-removal-v1";
 const NOTIFICATION_VERSION_TAG: &str = "v";
+const VIEW_ONCE_NOTIFICATION_LABEL: &str = "View-once media";
 /// Bounded recent-history window used to rebuild missed notifications after
 /// broadcast lag. Large enough to cover a slow consumer, small enough that
 /// recovery stays a snapshot rather than a full-history hydrate.
@@ -2158,7 +2159,9 @@ fn notification_update_from_message(
     };
     // Durable mute silences everything except a direct mention of this account.
     let is_from_self = event.message.sender == event.account_id_hex;
-    let is_mention = notification_is_mention(&event.message, &event.account_id_hex, is_from_self);
+    let mut protected = is_view_once_notice(&event.message);
+    let is_mention =
+        !protected && notification_is_mention(&event.message, &event.account_id_hex, is_from_self);
     if muted && !is_mention {
         return Ok(None);
     }
@@ -2169,15 +2172,12 @@ fn notification_update_from_message(
     // removed text, so a reaction can't leak it into a preview. Notify only the
     // target's author; if this account didn't author it, or the target is gone
     // (authorship unverifiable), emit nothing.
-    let reaction_target = if event.message.kind == MARMOT_APP_EVENT_KIND_REACTION {
-        match tag_value(&event.message.tags, EVENT_REF_TAG) {
-            Some(target_id) => {
-                app.reaction_target(&event.account_label, &group_id_hex, target_id)?
-            }
-            None => None,
-        }
-    } else {
-        None
+    let reaction_target_id = (event.message.kind == MARMOT_APP_EVENT_KIND_REACTION)
+        .then(|| tag_value(&event.message.tags, EVENT_REF_TAG))
+        .flatten();
+    let reaction_target = match reaction_target_id {
+        Some(target_id) => app.reaction_target(&event.account_label, &group_id_hex, target_id)?,
+        None => None,
     };
     if event.message.kind == MARMOT_APP_EVENT_KIND_REACTION
         && reaction_target
@@ -2187,8 +2187,35 @@ fn notification_update_from_message(
     {
         return Ok(None);
     }
-    let (reaction_emoji, reacted_to_preview) =
-        reaction_notification_fields(&event.message, reaction_target.as_ref());
+    protected |= reaction_target
+        .as_ref()
+        .is_some_and(|target| target.view_once);
+    for tag in &event.message.tags {
+        if !matches!(tag.first().map(String::as_str), Some("e" | "E" | "q")) {
+            continue;
+        }
+        let Some(target_id) = tag.get(1) else {
+            continue;
+        };
+        if reaction_target_id == Some(target_id.as_str()) {
+            continue;
+        }
+        if protected {
+            break;
+        }
+        protected = app
+            .reaction_target(&event.account_label, &group_id_hex, target_id)?
+            .is_some_and(|target| target.view_once);
+    }
+    let (reaction_emoji, reacted_to_preview) = if protected {
+        (
+            None,
+            (event.message.kind == MARMOT_APP_EVENT_KIND_REACTION)
+                .then(|| VIEW_ONCE_NOTIFICATION_LABEL.to_owned()),
+        )
+    } else {
+        reaction_notification_fields(&event.message, reaction_target.as_ref())
+    };
     Ok(Some(NotificationUpdate {
         notification_key: format!(
             "message:{}:{}",
@@ -2206,8 +2233,16 @@ fn notification_update_from_message(
         message_id_hex: Some(event.message.message_id_hex.clone()),
         sender,
         receiver,
-        preview_text: preview_text_for_message(&event.message),
-        sticker: crate::sticker_ref_from_message(&event.message),
+        preview_text: if protected {
+            Some(VIEW_ONCE_NOTIFICATION_LABEL.to_owned())
+        } else {
+            preview_text_for_kind(event.message.kind, &event.message.plaintext)
+        },
+        sticker: if protected {
+            None
+        } else {
+            crate::sticker_ref_from_message(&event.message)
+        },
         reaction_emoji,
         reacted_to_preview,
         timestamp_ms: unix_now_ms(),
@@ -2287,8 +2322,8 @@ fn group_name(group: Option<&AppGroupRecord>) -> Option<String> {
         .filter(|name| !name.is_empty())
 }
 
-fn preview_text_for_message(message: &ReceivedMessage) -> Option<String> {
-    preview_text_for_kind(message.kind, &message.plaintext)
+fn is_view_once_notice(message: &ReceivedMessage) -> bool {
+    crate::view_once::is_view_once(&message.tags)
 }
 
 fn notification_is_mention(
@@ -2342,7 +2377,8 @@ pub(crate) fn message_text_mentions_account(
         .any(|mentioned| mentioned.eq_ignore_ascii_case(account_id_hex))
 }
 
-/// Shared preview rule for an inner app event's kind/plaintext. Push-gossip
+/// Render content only after the caller excludes view-once sources and targets.
+/// Push-gossip
 /// kinds, device-group kinds and blank text never produce a preview.
 /// Structured agent kinds expose only approved text/status fields;
 /// group-system rows expose supported parsed text only, so their JSON envelope
@@ -2387,13 +2423,17 @@ fn structured_agent_preview(plaintext: &str, fields: &[&str]) -> Option<String> 
 /// Shape the (emoji, preview) pair for a reaction from its already-resolved
 /// timeline target. Emoji is the trimmed event content. Preview is `None` for a
 /// `deleted`/`invalidated` target so removed text never reaches a preview;
-/// otherwise the normal preview rule applies. Pure; returns display text only.
+/// view-once targets use a content-free label. Otherwise the normal preview
+/// rule applies. Pure; returns display text only.
 fn reaction_notification_fields(
     message: &ReceivedMessage,
     target: Option<&TimelineMessageTarget>,
 ) -> (Option<String>, Option<String>) {
     if message.kind != MARMOT_APP_EVENT_KIND_REACTION {
         return (None, None);
+    }
+    if target.is_some_and(|target| target.view_once && !target.deleted && !target.invalidated) {
+        return (None, Some(VIEW_ONCE_NOTIFICATION_LABEL.to_owned()));
     }
     let reaction_emoji = {
         let trimmed = message.plaintext.trim();

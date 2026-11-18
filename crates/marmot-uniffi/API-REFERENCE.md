@@ -2790,6 +2790,96 @@ How many chats this device is in can't take any device of this account: they don
 <details>
 <summary>commands/media.rs</summary>
 
+### `Marmot::enable_view_once`
+
+```rust
+pub async fn enable_view_once( &self, account_ref: String, group_id_hex: String, ) -> Result<SendSummaryFfi, MarmotKitError>
+```
+
+Require negotiated view-once support. Activation is admin-only and irreversible; check `view_once_activation_refusal` before offering it.
+
+[Source](src/commands/media.rs#L41)
+
+### `Marmot::view_once_activation_refusal`
+
+```rust
+pub async fn view_once_activation_refusal( &self, account_ref: String, group_id_hex: String, ) -> Result<Option<ViewOnceActivationRefusalFfi>, MarmotKitError>
+```
+
+Return an activation refusal, or None when activation is allowed. Reasons include unsupported leaves, missing required V2, legacy profile, existing activation, non-admin caller, and malformed component data.
+
+[Source](src/commands/media.rs#L55)
+
+### `Marmot::send_view_once_media`
+
+```rust
+pub async fn send_view_once_media( &self, account_ref: String, group_id_hex: String, request: ViewOnceMediaRequestFfi, ) -> Result<SendSummaryFfi, MarmotKitError>
+```
+
+Send one bounded image or video with an absolute unopened deadline. No caption, preview, or reusable reference is returned. See [view-once ownership and privacy](README.md#view-once-media).
+
+[Source](src/commands/media.rs#L69)
+
+### `Marmot::consume_view_once`
+
+```rust
+pub async fn consume_view_once( &self, account_ref: String, group_id_hex: String, message_id: String, attachment_index: u32, ) -> Result<ViewOnceConsumeOutcomeFfi, MarmotKitError>
+```
+
+Irreversibly claim before decrypting. Opened owns an opaque viewer; Consumed, Expired, and Unavailable carry no plaintext. Cancellation and failures after claim do not reopen the message. Call only after an explicit user action.
+
+[Source](src/commands/media.rs#L85)
+
+### `Marmot::view_once_state`
+
+```rust
+pub async fn view_once_state( &self, account_ref: String, group_id_hex: String, message_id: String, attachment_index: u32, ) -> Result<ViewOnceStateFfi, MarmotKitError>
+```
+
+Read content-free local account-device state without claiming or decrypting. Timeline and reply `view_once` fields carry the same typed state and unopened deadline.
+
+[Source](src/commands/media.rs#L101)
+
+### `ViewOnceViewerFfi::read`
+
+```rust
+pub async fn read( &self, offset: u64, limit: u32, ) -> Result<Option<Vec<u8>>, crate::MarmotKitError>
+```
+
+Read at most 1 MiB after rechecking access. None means no bytes are available. Returned bytes are host-owned copies and cannot be erased by closing the viewer. See [viewer limits](README.md#view-once-media).
+
+[Source](src/conversions/media.rs#L106)
+
+### `ViewOnceViewerFfi::revoke`
+
+```rust
+pub fn revoke(&self)
+```
+
+Synchronously revoke the viewer and release MDK-owned plaintext. Idempotent. Dropping the last binding owner also closes it; neither action erases host-owned copies or restores consumption eligibility.
+
+[Source](src/conversions/media.rs#L118)
+
+### `ViewOnceViewerFfi::size_bytes`
+
+```rust
+pub fn size_bytes(&self) -> u64
+```
+
+Return the original plaintext byte count without reading bytes.
+
+[Source](src/conversions/media.rs#L121)
+
+### `ViewOnceViewerFfi::media_type`
+
+```rust
+pub fn media_type(&self) -> String
+```
+
+Return the validated MIME type without reading bytes.
+
+[Source](src/conversions/media.rs#L124)
+
 ### `parse_media_imeta_tag`
 
 **Current free function.** Generated Swift/Kotlin name: `parseMediaImetaTag`.
@@ -2800,7 +2890,7 @@ pub fn parse_media_imeta_tag( tag: MessageTagFfi, source_epoch: u64, ) -> Result
 
 Parse one authenticated encrypted-media `imeta` tag using MDK's frozen V1 or current V2 validation rules.
 
-[Source](src/commands/media.rs#L26)
+[Source](src/commands/media.rs#L28)
 
 ### `Marmot::build_media_imeta_tag`
 
@@ -2812,7 +2902,7 @@ pub async fn build_media_imeta_tag( &self, account_ref: String, group_id_hex: St
 
 Build one outbound encrypted-media `imeta` tag without publishing it.
 
-[Source](src/commands/media.rs#L43)
+[Source](src/commands/media.rs#L121)
 
 ### `Marmot::send_media_attachments`
 
@@ -2824,7 +2914,7 @@ pub async fn send_media_attachments( &self, account_ref: String, group_id_hex: S
 
 Send already-uploaded encrypted media attachments as a kind-9 chat carrying ordered NIP-92 `imeta` tags. Preserve each upload's local `source_epoch_identity`; missing provenance or a changed upload branch requires a fresh upload.
 
-[Source](src/commands/media.rs#L61)
+[Source](src/commands/media.rs#L140)
 
 ### `Marmot::send_tagged_media`
 
@@ -2836,7 +2926,7 @@ pub async fn send_tagged_media( &self, account_ref: String, group_id_hex: String
 
 `send_media_attachments` plus application tags on the same kind-9. For NIP-30 custom emoji, upload the image with `upload_media(send = false)`, then send its reference with an `["emoji", shortcode, reference.locators[0].value]` tag; receivers match the tag URL to the `imeta` locator and render that attachment inline. Preserve the returned reference's `source_epoch_identity`: sending requires the upload's exact branch, not only its epoch number. Missing provenance requires a fresh upload. Same tag limits as `send_tagged_text`. `upload_media` with `MediaUploadRequestFfi.message_tags` and `send = true` is the one-call equivalent.
 
-[Source](src/commands/media.rs#L85)
+[Source](src/commands/media.rs#L167)
 
 ### `Marmot::send_media_reference`
 
@@ -2848,7 +2938,7 @@ pub async fn send_media_reference( &self, account_ref: String, group_id_hex: Str
 
 Backward-compatible single-attachment send helper. Prefer `send_media_attachments` for new callers so one chat can carry ordered mixed media attachments.
 
-[Source](src/commands/media.rs#L139)
+[Source](src/commands/media.rs#L227)
 
 ### `Marmot::upload_media`
 
@@ -2860,7 +2950,7 @@ pub async fn upload_media( &self, account_ref: String, group_id_hex: String, req
 
 Encrypt plaintext attachments, upload the ciphertext blobs, and optionally send the resulting media references into the group. Upload references include local `source_epoch_identity`; preserve it unchanged when saving or sending them. Each body is first kept in the account's encrypted media store, so the sender reads its own attachments locally once the message is confirmed; a body the disk cannot hold beyond the attachment policy's `disk_reserve` fails with `StorageFull` before anything is uploaded.
 
-[Source](src/commands/media.rs#L155)
+[Source](src/commands/media.rs#L243)
 
 ### `Marmot::upload_media_files`
 
@@ -2874,7 +2964,7 @@ File-backed `upload_media` for large attachments. Each `source_path` (a regular 
 
 File-backed uploads have no fixed worker-response timeout; per-endpoint network deadlines still apply. Cancellation observed before message admission starts prevents publication. Admission is not interruptible once started, including while durable acceptance is pending.
 
-[Source](src/commands/media.rs#L182)
+[Source](src/commands/media.rs#L270)
 
 ### `Marmot::upload_message_draft_attachments`
 
@@ -2886,7 +2976,7 @@ pub async fn upload_message_draft_attachments( &self, account_ref: String, revis
 
 `upload_media_files` for a draft's own attachments: encrypts and uploads the attachments `attachment_ids` names (1..=64 distinct ids, in that order) from the copies the draft holds, inline or file-backed, so the host never re-reads or re-sends large bodies. Upload only: pass the returned references, in order, to `send_message_draft` with the same revision; they carry the draft's descriptors and the staged bodies' `plaintext_sha256`, and durable acceptance clears the draft, releasing its files. `revision` must be current when the bodies are read. `blossom_server` overrides the group's endpoints. Progress, cancellation, the batch bound, `StorageFull` and server fallback are as for `upload_media_files`; the draft and its files are untouched by the upload.
 
-[Source](src/commands/media.rs#L209)
+[Source](src/commands/media.rs#L297)
 
 ### `Marmot::download_media`
 
@@ -2898,7 +2988,7 @@ pub async fn download_media( &self, account_ref: String, group_id_hex: String, r
 
 Fetch an encrypted media blob and decrypt it using the group's encrypted media component secret.
 
-[Source](src/commands/media.rs#L240)
+[Source](src/commands/media.rs#L328)
 
 ### `Marmot::list_media`
 
@@ -2910,7 +3000,7 @@ pub fn list_media( &self, account_ref: String, group_id_hex: String, limit: Opti
 
 Typed media references projected from group message history. Host apps can pass a returned `reference` back to `download_media`.
 
-[Source](src/commands/media.rs#L261)
+[Source](src/commands/media.rs#L350)
 
 </details>
 
@@ -2999,7 +3089,7 @@ pub async fn react_with_media( &self, account_ref: String, group_id_hex: String,
 
 React with a custom emoji image. `emoji` is the reaction content (e.g. `:shortcode:`), `attachments` are already-uploaded references emitted as `imeta` on the kind-7, and `tags` name them (NIP-30 `["emoji", shortcode, url]`). The reaction retains its media epoch secret like a chat, so the image stays decryptable after the group advances. Preserve the returned reference's `source_epoch_identity`; missing provenance or a changed upload branch requires a fresh upload. Same tag limits as `send_tagged_text`; repeating an existing reaction with the same content is a no-op.
 
-[Source](src/commands/media.rs#L111)
+[Source](src/commands/media.rs#L196)
 
 ### `Marmot::unreact_from_message`
 
@@ -4560,7 +4650,7 @@ pub fn new() -> std::sync::Arc<Self>
 
 Create one control per file-backed operation; it is never reused across operations.
 
-[Source](src/conversions/media.rs#L383)
+[Source](src/conversions/media.rs#L532)
 
 ### `MediaFileTransferControlFfi::cancel`
 
@@ -4572,7 +4662,7 @@ pub fn cancel(&self)
 
 Request cancellation. Preparation, body transfer and server fallback stop at the next chunk; nothing is published when cancellation is observed before message admission starts. Admission is not interruptible once started, even before durable acceptance returns; cancellation cannot retract an admitted message.
 
-[Source](src/conversions/media.rs#L389)
+[Source](src/conversions/media.rs#L538)
 
 ### `MediaFileTransferControlFfi::is_cancelled`
 
@@ -4584,7 +4674,7 @@ pub fn is_cancelled(&self) -> bool
 
 Whether `cancel` was called. It is not an outcome: await the operation's result.
 
-[Source](src/conversions/media.rs#L393)
+[Source](src/conversions/media.rs#L542)
 
 ### `MediaFileTransferControlFfi::processed_bytes`
 
@@ -4596,7 +4686,7 @@ pub fn processed_bytes(&self) -> u64
 
 Monotonic local work counter across the copy into the encrypted media store, the digest pass and the transfer of the current attachment. Not a percentage or a delivery signal.
 
-[Source](src/conversions/media.rs#L397)
+[Source](src/conversions/media.rs#L546)
 
 ### `max_file_media_ciphertext_bytes`
 
@@ -4608,7 +4698,7 @@ pub fn max_file_media_ciphertext_bytes() -> u64
 
 Per-batch ciphertext ceiling for file-backed uploads (an implementation resource bound, not protocol).
 
-[Source](src/conversions/media.rs#L405)
+[Source](src/conversions/media.rs#L554)
 
 </details>
 
@@ -4702,7 +4792,7 @@ pub fn new_with_configuration( root_path: String, relay_urls: Vec<String>, optio
 
 Open with any combination of runtime options, including the required deployment. The other constructors are wrappers around this entry point and take the deployment as their last argument.
 
-[Source](src/lib.rs#L328)
+[Source](src/lib.rs#L330)
 
 ### `Marmot::new_with_experimental_device_groups`
 
@@ -4712,7 +4802,7 @@ pub fn new_with_experimental_device_groups( root_path: String, relay_urls: Vec<S
 
 The same open as `new_with_configuration`: every constructor opens with [device groups](README.md#device-groups) on. Kept so existing hosts keep compiling.
 
-[Source](src/lib.rs#L341)
+[Source](src/lib.rs#L343)
 
 ### `Marmot::new_with_options`
 
@@ -4724,7 +4814,7 @@ pub fn new_with_options( root_path: String, relay_urls: Vec<String>, relay_polic
 
 Open with an explicit relay policy and optional host-owned key storage. Existing constructors retain their public-only relay policy.
 
-[Source](src/lib.rs#L352)
+[Source](src/lib.rs#L354)
 
 ### `Marmot::new`
 
@@ -4736,7 +4826,7 @@ pub fn new( root_path: String, relay_urls: Vec<String>, deployment: MarmotDeploy
 
 Open the Marmot app at `root_path`, configured with the given default relay URLs and `deployment`. Account secrets (Nostr private keys) are stored in the platform keyring (Keychain on Apple platforms, Android's native keyring on Android) under the deployment's `keychain_service` — not in a plaintext file. Fallible because initializing the platform secret store can fail or another process may own the same root (`MarmotKitError::RuntimeBusy`). Root ownership is nonblocking and remains held until the final `Marmot`/runtime handle is dropped, even after `Marmot::shutdown`. Call `Marmot::start` before subscribing to events.
 
-[Source](src/lib.rs#L381)
+[Source](src/lib.rs#L383)
 
 ### `Marmot::new_with_secret_store`
 
@@ -4748,7 +4838,7 @@ pub fn new_with_secret_store( root_path: String, relay_urls: Vec<String>, secret
 
 Open the Marmot app with host-supplied account-secret storage instead of the platform keychain. Identical to `Marmot::new` except that every read, write, and removal of an account signing key goes through `secret_store`.
 
-[Source](src/lib.rs#L407)
+[Source](src/lib.rs#L409)
 
 ### `Marmot::new_with_cursor_persistence`
 
@@ -4760,7 +4850,7 @@ pub fn new_with_cursor_persistence( root_path: String, relay_urls: Vec<String>, 
 
 Construct with explicit advancing/frozen relay cursor behavior; new_with_configuration composes this with other options.
 
-[Source](src/lib.rs#L438)
+[Source](src/lib.rs#L440)
 
 ### `Marmot::new_with_client_name`
 
@@ -4772,7 +4862,7 @@ pub fn new_with_client_name( root_path: String, relay_urls: Vec<String>, client_
 
 Open with an optional public client label for new KeyPackage publications. Existing constructors remain untagged. Whitespace-only labels, and labels longer than 64 bytes once trimmed, are omitted rather than truncated. Hosts must supply this on every foreground/background runtime construction.
 
-[Source](src/lib.rs#L459)
+[Source](src/lib.rs#L461)
 
 ### `Marmot::start`
 
@@ -4784,7 +4874,7 @@ pub async fn start(&self) -> Result<(), MarmotKitError>
 
 Bring the runtime to local readiness.
 
-[Source](src/lib.rs#L497)
+[Source](src/lib.rs#L499)
 
 ### `Marmot::shutdown`
 
@@ -4796,7 +4886,7 @@ pub async fn shutdown(&self)
 
 Tear the runtime down. Drops all subscriptions; long-lived `EventsSubscription` / `ChatsSubscription` / etc. instances on the host side will see their `next()` return `None` shortly after.
 
-[Source](src/lib.rs#L509)
+[Source](src/lib.rs#L511)
 
 ### `Marmot::shutdown_and_close`
 
@@ -4808,7 +4898,7 @@ pub async fn shutdown_and_close(&self) -> Result<(), MarmotKitError>
 
 Terminally stop work, close storage and release root ownership; reconstruct before further reads/work.
 
-[Source](src/lib.rs#L545)
+[Source](src/lib.rs#L547)
 
 ### `Marmot::storage_is_closed`
 
@@ -4820,7 +4910,7 @@ pub fn storage_is_closed(&self) -> bool
 
 True once `Marmot::shutdown_and_close` has closed the store. A host can check this to confirm it is safe to be suspended, or to notice it is holding a spent handle and needs a fresh one.
 
-[Source](src/lib.rs#L553)
+[Source](src/lib.rs#L555)
 
 ### `Marmot::is_stopping`
 
@@ -4832,7 +4922,7 @@ pub fn is_stopping(&self) -> bool
 
 True once shutdown has started. Host apps can use this to avoid launching more subscriptions or account work while they are moving to the background.
 
-[Source](src/lib.rs#L560)
+[Source](src/lib.rs#L562)
 
 </details>
 

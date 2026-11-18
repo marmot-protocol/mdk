@@ -65,6 +65,15 @@ describe an older package; that does not make it eligible for a new membership o
 
 ## Promoting state-bearing app components
 
+View-once media uses the no-data component `marmot.group.view-once.v1` (`0x8010`).
+Advertising support does not activate it, and generic capability upgrades never add it.
+`view_once_activation_refusal` reports eligibility; `SendIntent::EnableViewOnce` prepares
+one admin commit after every leaf advertises support and encrypted-media-v2 is required.
+Publish and confirm that commit through the normal lifecycle. The requirement cannot be
+removed. `view_once_required_at(group, epoch)` checks the authenticated source epoch, not merely
+the current group's requirements. Application admission and retention
+read the authenticated source epoch, including retained anchors for delayed messages.
+
 `upgrade_group_capabilities` only promotes state-bearing app components whose optional state already exists in the
 GroupContext. Use two published commits:
 

@@ -8,7 +8,9 @@ use crate::Marmot;
 use crate::conversions::{
     MediaAttachmentReferenceFfi, MediaDownloadResultFfi, MediaFileTransferControlFfi,
     MediaFileUploadRequestFfi, MediaRecordFfi, MediaUploadRequestFfi, MediaUploadResultFfi,
-    MessageDraftRevisionFfi, MessageTagFfi, SendSummaryFfi, group_id_from_hex, media_records_ffi,
+    MessageDraftRevisionFfi, MessageTagFfi, SendSummaryFfi, ViewOnceActivationRefusalFfi,
+    ViewOnceConsumeOutcomeFfi, ViewOnceMediaRequestFfi, ViewOnceStateFfi, group_id_from_hex,
+    media_records_ffi,
 };
 use crate::errors::MarmotKitError;
 
@@ -35,6 +37,82 @@ pub fn parse_media_imeta_tag(
 #[marmot_uniffi_macros::on_tokio_runtime]
 #[uniffi::export]
 impl Marmot {
+    /// Require negotiated view-once support for this group. Activation is irreversible.
+    pub async fn enable_view_once(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+    ) -> Result<SendSummaryFfi, MarmotKitError> {
+        let group = group_id_from_hex(&group_id_hex)?;
+        Ok(self
+            .runtime
+            .enable_view_once(&account_ref, &group)
+            .await?
+            .into())
+    }
+
+    /// Explain why view-once activation is unavailable. None means activation is allowed.
+    pub async fn view_once_activation_refusal(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+    ) -> Result<Option<ViewOnceActivationRefusalFfi>, MarmotKitError> {
+        let group = group_id_from_hex(&group_id_hex)?;
+        Ok(self
+            .runtime
+            .view_once_activation_refusal(&account_ref, &group)
+            .await?
+            .map(Into::into))
+    }
+
+    /// Encrypt, upload, and send one view-once image or video without exposing a reusable reference.
+    pub async fn send_view_once_media(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+        request: ViewOnceMediaRequestFfi,
+    ) -> Result<SendSummaryFfi, MarmotKitError> {
+        let request = marmot_app::ViewOnceMediaRequest::from(request);
+        let group = group_id_from_hex(&group_id_hex)?;
+        Ok(self
+            .runtime
+            .send_view_once_media(&account_ref, &group, request)
+            .await?
+            .into())
+    }
+
+    /// Claim before decrypting. Cancellation or failure after claim still consumes the message.
+    pub async fn consume_view_once(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+        message_id: String,
+        attachment_index: u32,
+    ) -> Result<ViewOnceConsumeOutcomeFfi, MarmotKitError> {
+        let group = group_id_from_hex(&group_id_hex)?;
+        Ok(self
+            .runtime
+            .consume_view_once(&account_ref, &group, &message_id, attachment_index)
+            .await?
+            .into())
+    }
+
+    /// Read the content-free local account-device state without consuming the message.
+    pub async fn view_once_state(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+        message_id: String,
+        attachment_index: u32,
+    ) -> Result<ViewOnceStateFfi, MarmotKitError> {
+        let group = group_id_from_hex(&group_id_hex)?;
+        Ok(self
+            .runtime
+            .view_once_state(&account_ref, &group, &message_id, attachment_index)
+            .await?
+            .into())
+    }
+
     /// Build one outbound encrypted-media `imeta` tag without publishing it.
     ///
     /// The account worker derives the target group's actual media profile and
@@ -46,6 +124,7 @@ impl Marmot {
         group_id_hex: String,
         reference: MediaAttachmentReferenceFfi,
     ) -> Result<MessageTagFfi, MarmotKitError> {
+        ordinary_media_reference(&reference)?;
         let group_id = group_id_from_hex(&group_id_hex)?;
         let values = self
             .runtime
@@ -65,6 +144,9 @@ impl Marmot {
         attachments: Vec<MediaAttachmentReferenceFfi>,
         caption: Option<String>,
     ) -> Result<SendSummaryFfi, MarmotKitError> {
+        for reference in &attachments {
+            ordinary_media_reference(reference)?;
+        }
         let group_id = group_id_from_hex(&group_id_hex)?;
         let summary = self
             .runtime
@@ -90,6 +172,9 @@ impl Marmot {
         caption: Option<String>,
         tags: Vec<Vec<String>>,
     ) -> Result<SendSummaryFfi, MarmotKitError> {
+        for reference in &attachments {
+            ordinary_media_reference(reference)?;
+        }
         let group_id = group_id_from_hex(&group_id_hex)?;
         let summary = self
             .runtime
@@ -117,6 +202,9 @@ impl Marmot {
         tags: Vec<Vec<String>>,
         attachments: Vec<MediaAttachmentReferenceFfi>,
     ) -> Result<SendSummaryFfi, MarmotKitError> {
+        for reference in &attachments {
+            ordinary_media_reference(reference)?;
+        }
         let group_id = group_id_from_hex(&group_id_hex)?;
         let summary = self
             .runtime
@@ -243,6 +331,7 @@ impl Marmot {
         group_id_hex: String,
         reference: MediaAttachmentReferenceFfi,
     ) -> Result<MediaDownloadResultFfi, MarmotKitError> {
+        ordinary_media_reference(&reference)?;
         let group_id = group_id_from_hex(&group_id_hex)?;
         let download = self
             .runtime
@@ -289,6 +378,16 @@ fn media_reference_error(error: marmot_app::AppError) -> MarmotKitError {
         }
         other => other.into(),
     }
+}
+
+fn ordinary_media_reference(reference: &MediaAttachmentReferenceFfi) -> Result<(), MarmotKitError> {
+    if reference.version == crate::conversions::EncryptedMediaVersionFfi::ViewOnceV1 {
+        return Err(MarmotKitError::MediaAttachmentRejected {
+            kind: crate::conversions::MediaAttachmentRejectionKindFfi::UnsupportedFormat,
+            details: "media version is not supported".to_owned(),
+        });
+    }
+    Ok(())
 }
 
 #[cfg(test)]

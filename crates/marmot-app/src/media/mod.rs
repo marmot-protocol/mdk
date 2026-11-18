@@ -7,7 +7,7 @@ use bytes::Bytes;
 use cgka_traits::app_components::{
     BLOSSOM_LOCATOR_KIND_V1, ENCRYPTED_MEDIA_FORMAT_V1, ENCRYPTED_MEDIA_FORMAT_V2,
     GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID, GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
-    canonicalize_marmot_media_type,
+    VIEW_ONCE_MEDIA_FORMAT, canonicalize_marmot_media_type,
 };
 use chacha20poly1305::aead::AeadInPlace;
 use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce};
@@ -32,10 +32,12 @@ pub(crate) mod handoff;
 pub(crate) mod legacy_migration;
 pub(crate) mod outgoing;
 pub(crate) mod storage_compaction;
+pub(crate) use crypto::ClaimedViewOnceConsumption;
 pub(crate) use crypto::media_hash_from_reference;
 pub(crate) use crypto::{MediaKey, media_file_key_for_reference};
 mod group_image;
 mod host_safety;
+pub(crate) mod view_once_content;
 
 use blossom::{blossom_content_hash_from_url, upload_blossom_blob_with_content_type};
 pub(crate) use blossom::{
@@ -138,15 +140,15 @@ impl MediaDownloadBenchmarkTransport {
             source_epoch: 0,
             source_epoch_identity: None,
         };
-        fetch_encrypted_media_blob_classified(
+        let candidates = plan_media_fetch(
             &reference,
             &[],
             &[BLOSSOM_LOCATOR_KIND_V1.to_owned()],
             &self.0,
-            Some(&telemetry),
-        )
-        .await
-        .map_err(AttachmentDownloadFailure::into_error)
+        );
+        fetch_media_candidates(&reference, candidates, &self.0, Some(&telemetry))
+            .await
+            .map_err(AttachmentDownloadFailure::into_error)
     }
 }
 
@@ -214,6 +216,7 @@ pub const ENCRYPTED_MEDIA_VERSION: &str = ENCRYPTED_MEDIA_FORMAT_V1;
 pub enum EncryptedMediaVersion {
     V1,
     V2,
+    ViewOnceV1,
 }
 
 impl EncryptedMediaVersion {
@@ -221,6 +224,7 @@ impl EncryptedMediaVersion {
         match self {
             Self::V1 => ENCRYPTED_MEDIA_FORMAT_V1,
             Self::V2 => ENCRYPTED_MEDIA_FORMAT_V2,
+            Self::ViewOnceV1 => VIEW_ONCE_MEDIA_FORMAT,
         }
     }
 
@@ -228,6 +232,7 @@ impl EncryptedMediaVersion {
         match self {
             Self::V1 => GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID,
             Self::V2 => GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
+            Self::ViewOnceV1 => GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
         }
     }
 
@@ -235,6 +240,7 @@ impl EncryptedMediaVersion {
         match value {
             ENCRYPTED_MEDIA_FORMAT_V1 => Ok(Self::V1),
             ENCRYPTED_MEDIA_FORMAT_V2 => Ok(Self::V2),
+            VIEW_ONCE_MEDIA_FORMAT => Ok(Self::ViewOnceV1),
             _ => Err(AppError::InvalidAppMessagePayload(
                 "media version is not supported".into(),
             )),
@@ -585,7 +591,7 @@ impl MediaAttachmentReference {
                     "media file name cannot be empty",
                 ));
             }
-            EncryptedMediaVersion::V2
+            EncryptedMediaVersion::V2 | EncryptedMediaVersion::ViewOnceV1
                 if self.file_name.is_empty()
                     || self.file_name.len() > 255
                     || self.file_name.contains('\0') =>
@@ -601,7 +607,7 @@ impl MediaAttachmentReference {
                 canonical_media_type_v1(&self.media_type)
                     .map_err(MediaAttachmentRejection::malformed_from)?;
             }
-            EncryptedMediaVersion::V2 => {
+            EncryptedMediaVersion::V2 | EncryptedMediaVersion::ViewOnceV1 => {
                 let canonical = canonical_media_type_v2(&self.media_type)
                     .map_err(MediaAttachmentRejection::malformed_from)?;
                 if canonical != self.media_type {
@@ -610,6 +616,15 @@ impl MediaAttachmentReference {
                     ));
                 }
             }
+        }
+        if version == EncryptedMediaVersion::ViewOnceV1 {
+            if self.dim.is_some() || self.thumbhash.is_some() {
+                return Err(MediaAttachmentRejection::malformed(
+                    "view-once media must not contain dimensions or previews",
+                ));
+            }
+            view_once_content::validate_view_once_media_type(&self.media_type)
+                .map_err(MediaAttachmentRejection::malformed_from)?;
         }
         Ok(())
     }
@@ -751,16 +766,120 @@ pub(crate) struct MediaOperationPolicy<'a> {
     pub(crate) allow_loopback_http: bool,
 }
 
+/// Validate, encrypt and upload one bounded body without retaining plaintext.
+pub(crate) async fn upload_view_once_media(
+    mut request: crate::ViewOnceMediaRequest,
+    source_epoch: u64,
+    media_secret: &[u8],
+    signer: &dyn MarmotNostrSigner,
+    policy: MediaOperationPolicy<'_>,
+    transport: &BlossomHttpTransport,
+) -> Result<MediaUploadAttachmentResult, AppError> {
+    if policy.version != EncryptedMediaVersion::ViewOnceV1 {
+        return Err(AppError::InvalidEncryptedMedia(
+            "view-once upload requires its negotiated profile".into(),
+        ));
+    }
+    let upload_servers = upload_servers(request.blossom_server.take(), policy)?;
+    let media_type = canonical_media_type_v2(&request.media_type)?;
+    let plaintext = zeroize::Zeroizing::new(std::mem::take(&mut request.plaintext));
+    let media_secret = zeroize::Zeroizing::new(media_secret.to_vec());
+    let (encrypted, mut reference) = tokio::task::spawn_blocking(move || {
+        let mut encrypted = plaintext;
+        view_once_content::validate_view_once_content(&encrypted, &media_type)?;
+        let file_name = match media_type.as_str() {
+            "image/png" => "view-once.png",
+            "image/jpeg" => "view-once.jpg",
+            "image/gif" => "view-once.gif",
+            "image/webp" => "view-once.webp",
+            "video/mp4" => "view-once.mp4",
+            _ => {
+                return Err(AppError::InvalidEncryptedMedia(
+                    "view-once media type is not supported".into(),
+                ));
+            }
+        }
+        .to_owned();
+        let plaintext_hash: [u8; 32] = Sha256::digest(&*encrypted).into();
+        let mut nonce = [0_u8; 12];
+        OsRng.fill_bytes(&mut nonce);
+        let key = zeroize::Zeroizing::new(derive_media_file_key(
+            &media_secret,
+            EncryptedMediaVersion::ViewOnceV1,
+            &plaintext_hash,
+            &media_type,
+            &file_name,
+        )?);
+        let aad = media_aad(
+            EncryptedMediaVersion::ViewOnceV1,
+            &plaintext_hash,
+            &media_type,
+            &file_name,
+        );
+        let cipher = ChaCha20Poly1305::new_from_slice(key.as_slice())
+            .map_err(|_| AppError::InvalidEncryptedMedia("invalid media key length".into()))?;
+        cipher
+            .encrypt_in_place(Nonce::from_slice(&nonce), &aad, &mut *encrypted)
+            .map_err(|_| AppError::InvalidEncryptedMedia("media encryption failed".into()))?;
+        let reference = MediaAttachmentReference {
+            locators: Vec::new(),
+            ciphertext_sha256: hex::encode(Sha256::digest(&*encrypted)),
+            plaintext_sha256: hex::encode(plaintext_hash),
+            nonce_hex: hex::encode(nonce),
+            file_name,
+            media_type,
+            version: VIEW_ONCE_MEDIA_FORMAT.to_owned(),
+            source_epoch,
+            source_epoch_identity: None,
+            dim: None,
+            thumbhash: None,
+        };
+        Ok::<_, AppError>((std::mem::take(&mut *encrypted), reference))
+    })
+    .await
+    .map_err(|_| AppError::InvalidEncryptedMedia("view-once encode task failed".into()))??;
+    let encrypted_size_bytes = encrypted.len() as u64;
+    let url = upload_blossom_blob_with_fallback(
+        &upload_servers,
+        Bytes::from(encrypted),
+        &reference.ciphertext_sha256,
+        signer,
+        transport,
+    )
+    .await?;
+    reference.locators.push(MediaLocator {
+        kind: BLOSSOM_LOCATOR_KIND_V1.to_owned(),
+        value: url,
+    });
+    reference.validate_outbound(
+        policy.version,
+        policy.allowed_locator_kinds,
+        policy.allow_loopback_http,
+    )?;
+    Ok(MediaUploadAttachmentResult {
+        reference,
+        encrypted_size_bytes,
+    })
+}
+
 /// Encrypts and uploads an in-memory batch. A send stages each body in the
 /// media store first (mdk#2314); this never keeps a copy of its own.
 pub(crate) async fn upload_encrypted_media(
-    request: MediaUploadRequest,
+    mut request: MediaUploadRequest,
     source_epoch: u64,
     media_secret: &[u8],
     signer: &dyn MarmotNostrSigner,
     policy: MediaOperationPolicy<'_>,
     transport: &BlossomHttpTransport,
 ) -> Result<MediaUploadResult, AppError> {
+    if policy.version == EncryptedMediaVersion::ViewOnceV1 {
+        for attachment in &mut request.attachments {
+            zeroize::Zeroize::zeroize(&mut attachment.plaintext);
+        }
+        return Err(AppError::InvalidEncryptedMedia(
+            "view-once upload requires its zeroizing entrypoint".into(),
+        ));
+    }
     if request.attachments.is_empty() {
         return Err(AppError::InvalidEncryptedMedia(
             "media upload requires at least one attachment".into(),
@@ -852,12 +971,14 @@ async fn upload_encrypted_media_attachment(
     validate_media_plaintext_len(request.plaintext.len() as u64)?;
     let file_name = match policy.version {
         EncryptedMediaVersion::V1 => request.file_name.trim().to_owned(),
-        EncryptedMediaVersion::V2 => request.file_name,
+        EncryptedMediaVersion::V2 | EncryptedMediaVersion::ViewOnceV1 => request.file_name,
     };
     validate_outbound_file_name(&file_name, policy.version)?;
     let media_type = match policy.version {
         EncryptedMediaVersion::V1 => canonical_media_type_v1(&request.media_type)?,
-        EncryptedMediaVersion::V2 => canonical_media_type_v2(&request.media_type)?,
+        EncryptedMediaVersion::V2 | EncryptedMediaVersion::ViewOnceV1 => {
+            canonical_media_type_v2(&request.media_type)?
+        }
     };
     let plaintext_hash: [u8; 32] = Sha256::digest(&request.plaintext).into();
     let plaintext_sha256 = hex::encode(plaintext_hash);
@@ -1050,6 +1171,36 @@ pub(crate) async fn download_encrypted_media(
     .await
 }
 
+/// Fetch into bounded memory only after an irreversible storage claim.
+pub(crate) async fn download_claimed_view_once(
+    reference: MediaAttachmentReference,
+    media_secret: &[u8],
+    candidates: Vec<MediaFetchCandidate>,
+    transport: &BlossomHttpTransport,
+    claim: ClaimedViewOnceConsumption,
+) -> Result<zeroize::Zeroizing<Vec<u8>>, AppError> {
+    reference.validate(transport.allow_loopback_http)?;
+    if EncryptedMediaVersion::parse(&reference.version)? != EncryptedMediaVersion::ViewOnceV1 {
+        return Err(AppError::InvalidEncryptedMedia(
+            "claimed download requires view-once media".into(),
+        ));
+    }
+    let mut transport = transport
+        .clone()
+        .with_download_limit((view_once_content::MAX_VIEW_ONCE_BYTES + 16) as u64);
+    // A once claim must never create a resumable/retained plaintext publication.
+    transport.resume = None;
+    let encrypted = fetch_media_candidates(&reference, candidates, &transport, None)
+        .await
+        .map_err(AttachmentDownloadFailure::into_error)?;
+    let media_secret = zeroize::Zeroizing::new(media_secret.to_vec());
+    tokio::task::spawn_blocking(move || {
+        crypto::decrypt_claimed_view_once(&reference, &media_secret, encrypted, claim)
+    })
+    .await
+    .map_err(|_| AppError::MediaDownloadFailed("view-once decode task failed".into()))?
+}
+
 /// Retry policy internal to acquisition. The public API retains its established
 /// structural / unfetchable / download-failed error classes.
 #[derive(Debug)]
@@ -1123,21 +1274,29 @@ pub(crate) async fn download_encrypted_media_classified(
         .map_err(|e| AttachmentDownloadFailure::Stop(e.into()))?;
     let version = EncryptedMediaVersion::parse(&reference.version)
         .map_err(AttachmentDownloadFailure::Stop)?;
-    let encrypted = fetch_encrypted_media_blob_classified(
+    if version == EncryptedMediaVersion::ViewOnceV1 {
+        return Err(AttachmentDownloadFailure::Stop(
+            AppError::InvalidEncryptedMedia(
+                "view-once media requires a durable consumption claim".into(),
+            ),
+        ));
+    }
+    let candidates = plan_media_fetch(
         &reference,
         fallback_endpoints,
         allowed_locator_kinds,
         transport,
-        telemetry,
-    )
-    .await?;
+    );
+    let encrypted = fetch_media_candidates(&reference, candidates, transport, telemetry).await?;
     let plaintext_hash =
         media_hash_from_reference(&reference).map_err(AttachmentDownloadFailure::Stop)?;
     let media_type = match version {
         EncryptedMediaVersion::V1 => canonical_media_type_v1(&reference.media_type)
             .map_err(AttachmentDownloadFailure::Stop)?,
-        EncryptedMediaVersion::V2 => canonical_media_type_v2(&reference.media_type)
-            .map_err(AttachmentDownloadFailure::Stop)?,
+        EncryptedMediaVersion::V2 | EncryptedMediaVersion::ViewOnceV1 => {
+            canonical_media_type_v2(&reference.media_type)
+                .map_err(AttachmentDownloadFailure::Stop)?
+        }
     };
     let nonce = media_nonce_from_reference(&reference).map_err(AttachmentDownloadFailure::Stop)?;
     let file_key = zeroize::Zeroizing::new(
@@ -1266,47 +1425,23 @@ async fn fetch_encrypted_media_blob_with_observer(
     transport: &BlossomHttpTransport,
     telemetry: Option<&PerformanceRecorder>,
 ) -> Result<Vec<u8>, AppError> {
-    fetch_encrypted_media_blob_classified(
+    let candidates = plan_media_fetch(
         reference,
         fallback_endpoints,
         allowed_locator_kinds,
         transport,
-        telemetry,
-    )
-    .await
-    .map_err(AttachmentDownloadFailure::into_error)
+    );
+    fetch_media_candidates(reference, candidates, transport, telemetry)
+        .await
+        .map_err(AttachmentDownloadFailure::into_error)
 }
 
-async fn fetch_encrypted_media_blob_classified(
+async fn fetch_media_candidates(
     reference: &MediaAttachmentReference,
-    fallback_endpoints: &[crate::AppBlobEndpoint],
-    allowed_locator_kinds: &[String],
+    candidates: Vec<MediaFetchCandidate>,
     transport: &BlossomHttpTransport,
     telemetry: Option<&PerformanceRecorder>,
 ) -> Result<Vec<u8>, AttachmentDownloadFailure> {
-    // Fetchability is judged against CURRENT policy + current client support.
-    // This client only fetches `blossom-v1`, so if the group's current policy
-    // does not allow `blossom-v1` there is no fetchable locator and the
-    // reference degrades to unfetchable (not invalid): the reference may still
-    // be valid and the message delivered, only the blob is unreachable here.
-    if !locator_kind_allowed(BLOSSOM_LOCATOR_KIND_V1, allowed_locator_kinds) {
-        return Err(
-            AppError::MediaUnfetchable("media reference has no supported locators".into()).into(),
-        );
-    }
-    let mut candidates = encrypted_media_fetch_candidates(reference, fallback_endpoints);
-    // Host safety is client destination policy, judged before any dial: a
-    // loopback-HTTP candidate is valid component state but unusable in a
-    // production build, and a private/link-local/special-use literal host is
-    // never dialed. Skip such candidates rather than GETting them. The
-    // candidate may come from a remote-admin policy endpoint or a
-    // sender-chosen locator, so the gate applies to both. What survives is
-    // fetchable under policy; anything that then fails is a download failure.
-    candidates.retain(|candidate| {
-        url::Url::parse(candidate).is_ok_and(|url| {
-            validate_blossom_fetch_url(&url, transport.allow_loopback_http).is_ok()
-        })
-    });
     if candidates.is_empty() {
         return Err(
             AppError::MediaUnfetchable("media reference has no supported locators".into()).into(),
@@ -1321,9 +1456,9 @@ async fn fetch_encrypted_media_blob_classified(
     let download_deadline = tokio::time::Instant::now() + transport.transfer_timeout();
     for (index, candidate) in candidates.into_iter().enumerate() {
         let candidate_started = Instant::now();
-        match blossom_content_hash_from_url(&candidate) {
-            Some(hash) if hash == expected_hash => {}
-            Some(_) => {
+        let candidate = match candidate {
+            MediaFetchCandidate::Ready(url) => url,
+            MediaFetchCandidate::HashMismatch => {
                 // A URL that commits to a different blob cannot serve this
                 // reference: the locator is unusable, so this candidate is
                 // unfetchable rather than a failed download.
@@ -1341,7 +1476,7 @@ async fn fetch_encrypted_media_blob_classified(
                 );
                 continue;
             }
-            None => {
+            MediaFetchCandidate::HashMissing => {
                 record_candidate_failure(
                     &mut last_error,
                     AppError::MediaUnfetchable(
@@ -1356,7 +1491,7 @@ async fn fetch_encrypted_media_blob_classified(
                 );
                 continue;
             }
-        }
+        };
         if download_deadline
             .saturating_duration_since(tokio::time::Instant::now())
             .is_zero()
@@ -1528,25 +1663,51 @@ fn record_locator_failover_if_needed(
     }
 }
 
-fn encrypted_media_fetch_candidates(
+pub(crate) enum MediaFetchCandidate {
+    Ready(String),
+    HashMismatch,
+    HashMissing,
+}
+
+/// Plan without I/O, retaining refusals for the existing failover accounting.
+pub(crate) fn plan_media_fetch(
     reference: &MediaAttachmentReference,
     fallback_endpoints: &[crate::AppBlobEndpoint],
-) -> Vec<String> {
-    let mut candidates = reference
+    allowed_locator_kinds: &[String],
+    transport: &BlossomHttpTransport,
+) -> Vec<MediaFetchCandidate> {
+    if !locator_kind_allowed(BLOSSOM_LOCATOR_KIND_V1, allowed_locator_kinds) {
+        return Vec::new();
+    }
+    let mut seen = std::collections::HashSet::new();
+    reference
         .locators
         .iter()
         .filter(|locator| locator.kind == BLOSSOM_LOCATOR_KIND_V1)
         .map(|locator| locator.value.clone())
-        .collect::<Vec<_>>();
-    candidates.extend(
-        fallback_endpoints
-            .iter()
-            .filter(|endpoint| endpoint.locator_kind == BLOSSOM_LOCATOR_KIND_V1)
-            .map(|endpoint| blossom_blob_url(&endpoint.base_url, &reference.ciphertext_sha256)),
-    );
-    let mut seen = std::collections::HashSet::new();
-    candidates.retain(|candidate| seen.insert(candidate.clone()));
-    candidates
+        .chain(
+            fallback_endpoints
+                .iter()
+                .filter(|endpoint| endpoint.locator_kind == BLOSSOM_LOCATOR_KIND_V1)
+                .map(|endpoint| blossom_blob_url(&endpoint.base_url, &reference.ciphertext_sha256)),
+        )
+        .filter_map(|candidate| {
+            if !seen.insert(candidate.clone()) {
+                return None;
+            }
+            let url = url::Url::parse(&candidate).ok()?;
+            if validate_blossom_fetch_url(&url, transport.allow_loopback_http).is_err() {
+                return None;
+            }
+            Some(match blossom_content_hash_from_url(&candidate) {
+                Some(hash) if hash.eq_ignore_ascii_case(&reference.ciphertext_sha256) => {
+                    MediaFetchCandidate::Ready(candidate)
+                }
+                Some(_) => MediaFetchCandidate::HashMismatch,
+                None => MediaFetchCandidate::HashMissing,
+            })
+        })
+        .collect()
 }
 
 /// Parse one authenticated `imeta` tag into a validated reference, or the
@@ -1819,7 +1980,7 @@ fn validate_outbound_file_name(
 ) -> Result<(), AppError> {
     let valid = match version {
         EncryptedMediaVersion::V1 => !file_name.trim().is_empty(),
-        EncryptedMediaVersion::V2 => {
+        EncryptedMediaVersion::V2 | EncryptedMediaVersion::ViewOnceV1 => {
             !file_name.is_empty() && file_name.len() <= 255 && !file_name.contains('\0')
         }
     };
@@ -1828,7 +1989,7 @@ fn validate_outbound_file_name(
     } else {
         Err(AppError::InvalidEncryptedMedia(match version {
             EncryptedMediaVersion::V1 => "media file name cannot be empty".into(),
-            EncryptedMediaVersion::V2 => {
+            EncryptedMediaVersion::V2 | EncryptedMediaVersion::ViewOnceV1 => {
                 "media file name must be 1..255 UTF-8 bytes and contain no NUL".into()
             }
         }))

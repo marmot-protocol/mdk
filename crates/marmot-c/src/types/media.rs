@@ -81,6 +81,9 @@ impl MarmotMediaAttachmentReference {
                 MarmotEncryptedMediaVersion::V2 => {
                     marmot_uniffi::conversions::EncryptedMediaVersionFfi::V2
                 }
+                MarmotEncryptedMediaVersion::ViewOnceV1 => {
+                    marmot_uniffi::conversions::EncryptedMediaVersionFfi::ViewOnceV1
+                }
             },
             source_epoch: self.source_epoch,
             source_epoch_identity: unsafe { optional_str(self.source_epoch_identity) }?,

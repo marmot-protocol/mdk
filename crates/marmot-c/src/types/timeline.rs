@@ -21,6 +21,7 @@ use super::media::MarmotMediaAttachmentOutcome;
 use crate::MarmotStatus;
 use crate::macros::{c_enum, c_mirror};
 use crate::memory::{CFree, c_bool, free_c_string, optional_str, owned_c_string};
+use crate::view_once::MarmotViewOncePresentation;
 
 /// Timeline read query. Borrowed input to `marmot_timeline_messages`;
 /// NULL string fields and `has_x == false` scalars mean "unset".
@@ -159,6 +160,7 @@ c_mirror! {
 c_mirror! {
     /// Preview of the message a timeline row replies to.
     MarmotTimelineReplyPreview from TimelineReplyPreviewFfi {
+        opt_rec view_once: MarmotViewOncePresentation,
         str message_id_hex,
         str sender,
         str plaintext,
@@ -240,6 +242,7 @@ c_mirror! {
     /// One materialized timeline row.
     MarmotTimelineMessageRecord from TimelineMessageRecordFfi,
     free marmot_timeline_message_record_free {
+        opt_rec view_once: MarmotViewOncePresentation,
         str message_id_hex,
         copy has_reports: bool,
         opt_rec poll: MarmotPollProjection,
@@ -485,6 +488,35 @@ c_mirror! {
 #[cfg(test)]
 mod edit_tests {
     use super::*;
+
+    #[test]
+    fn view_once_chunks_deep_free() {
+        use crate::view_once::{
+            MarmotViewOnceBytes, MarmotViewOnceState, marmot_view_once_bytes_free,
+        };
+        let _guard = crate::memory::audit::test_lock();
+        #[cfg(feature = "alloc-audit")]
+        let before = crate::memory::audit::live_allocations();
+        let presentation =
+            MarmotViewOncePresentation::from(marmot_uniffi::ViewOncePresentationFfi {
+                state: marmot_uniffi::ViewOnceStateFfi::Expired,
+                unopened_expires_at: 1234,
+            });
+        assert!(matches!(presentation.state, MarmotViewOnceState::Expired));
+        assert_eq!(presentation.unopened_expires_at, 1234);
+        let (data, len) = crate::memory::owned_vec(vec![1_u8, 2, 3, 4]);
+        let chunk = crate::memory::boxed(MarmotViewOnceBytes { data, len });
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts((*chunk).data, (*chunk).len) },
+            &[1, 2, 3, 4]
+        );
+        unsafe {
+            marmot_view_once_bytes_free(chunk);
+            marmot_view_once_bytes_free(std::ptr::null_mut());
+        }
+        #[cfg(feature = "alloc-audit")]
+        assert_eq!(crate::memory::audit::live_allocations(), before);
+    }
 
     #[test]
     fn timeline_query_inputs() {

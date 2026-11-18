@@ -56,6 +56,7 @@ fn setup() -> (tempfile::TempDir, MarmotApp, ChatPresentationInput) {
 fn message(group: &str, sender: &str) -> TimelineMessageRecord {
     TimelineMessageRecord {
         client_token: None,
+        view_once: None,
         has_reports: false,
         group_system: None,
         poll: None,
@@ -268,6 +269,7 @@ fn conversation_dictionary_includes_former_members_replies_mentions_and_peer() {
     row.reply_preview = Some(TimelineReplyPreview {
         message_id_hex: "03".repeat(32),
         sender: reply.clone(),
+        view_once: None,
         plaintext: "earlier".into(),
         tags: Vec::new(),
         kind: 9,
@@ -630,6 +632,7 @@ fn conversation_reply_mentions_have_independent_limits_and_complete_identities()
     row.reply_preview = Some(TimelineReplyPreview {
         message_id_hex: "03".repeat(32),
         sender: reply_author.clone(),
+        view_once: None,
         plaintext: reply_ids
             .iter()
             .map(|id| format!("@{}", npub_for_account_id(id).unwrap()))

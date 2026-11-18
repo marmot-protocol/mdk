@@ -90,7 +90,7 @@ struct ChatProjectionsSmoke {
             }
         }
         for source in [DeletionSourceFfi.author, .admin, .unknown] {
-            let preview = TimelineReplyPreviewFfi(messageIdHex: "deleted", sender: "author", plaintext: "",
+            let preview = TimelineReplyPreviewFfi(viewOnce: nil, messageIdHex: "deleted", sender: "author", plaintext: "",
                 contentTokens: MarkdownDocumentFfi(blocks: [], truncated: false, blankLinesBefore: Data()), kind: 9, sticker: nil,
                 mediaJson: nil, media: [], agentTextStreamJson: nil, deleted: true, deletionSource: source, invalidationStatus: nil)
             let copy = try FfiConverterTypeTimelineReplyPreviewFfi.lift(FfiConverterTypeTimelineReplyPreviewFfi.lower(preview))

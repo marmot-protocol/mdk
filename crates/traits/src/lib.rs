@@ -62,7 +62,7 @@ pub use app_event::{
     MARMOT_APP_EVENT_KIND_REACTION, MarmotAppEvent, MarmotAppEventError, QUOTE_REF_TAG,
     STREAM_BROKER_TAG, STREAM_CHUNKS_TAG, STREAM_FINAL_KIND_TAG, STREAM_HASH_TAG,
     STREAM_PARENT_TAG, STREAM_ROUTE_TAG, STREAM_START_TAG, STREAM_TAG, STREAM_TYPE_TAG,
-    canonical_event_id, group_system_canonical_id, group_system_event_material,
+    ViewOncePolicy, canonical_event_id, group_system_canonical_id, group_system_event_material,
 };
 pub use capabilities::{
     Capability, CapabilityRequirement, Feature, FeatureStatus, GroupCapabilities, RequirementLevel,

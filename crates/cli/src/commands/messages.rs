@@ -1101,6 +1101,7 @@ mod tests {
         .unwrap();
         let message = TimelineMessageRecord {
             client_token: None,
+            view_once: None,
             has_reports: false,
             group_system: None,
             poll: None,
@@ -1160,6 +1161,7 @@ mod tests {
         let sender = "aa".repeat(32);
         let record = |recipient_confirmed| TimelineMessageRecord {
             client_token: None,
+            view_once: None,
             has_reports: false,
             group_system: None,
             poll: None,

@@ -45,12 +45,14 @@ pub(crate) fn validate_locator(
                     ))
                 })?;
             }
-            EncryptedMediaVersion::V2 if !matches!(url.scheme(), "http" | "https") => {
+            EncryptedMediaVersion::V2 | EncryptedMediaVersion::ViewOnceV1
+                if !matches!(url.scheme(), "http" | "https") =>
+            {
                 return Err(AppError::InvalidAppMessagePayload(
                     "Blossom media locator URL scheme must be http or https".into(),
                 ));
             }
-            EncryptedMediaVersion::V2 => {}
+            EncryptedMediaVersion::V2 | EncryptedMediaVersion::ViewOnceV1 => {}
         }
     }
     Ok(())

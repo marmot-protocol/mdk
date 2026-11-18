@@ -565,11 +565,18 @@ pub(crate) async fn download_file(
     let plaintext_hash = super::crypto::media_hash_from_reference(&reference)?;
     let nonce = super::crypto::media_nonce_from_reference(&reference)?;
     let version = super::EncryptedMediaVersion::parse(&reference.version)?;
+    if version == super::EncryptedMediaVersion::ViewOnceV1 {
+        return Err(super::AttachmentDownloadFailure::Stop(
+            AppError::InvalidEncryptedMedia(
+                "view-once media requires a durable consumption claim".into(),
+            ),
+        ));
+    }
     let media_type = match version {
         super::EncryptedMediaVersion::V1 => {
             super::crypto::canonical_media_type_v1(&reference.media_type)?
         }
-        super::EncryptedMediaVersion::V2 => {
+        super::EncryptedMediaVersion::V2 | super::EncryptedMediaVersion::ViewOnceV1 => {
             super::crypto::canonical_media_type_v2(&reference.media_type)?
         }
     };

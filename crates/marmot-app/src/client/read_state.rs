@@ -1718,6 +1718,7 @@ impl AppClient {
     /// a host event, and on a catch-up drain turn. A no-op without a
     /// publisher, and when nothing changed since the last publish.
     pub(crate) fn publish_read_state(&self) {
+        self.app.view_once_sessions.revalidate(&self.state.label);
         let Some(slot) = self.read_state.as_ref() else {
             return;
         };

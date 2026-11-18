@@ -405,6 +405,8 @@ mod migration_0211_sign_in_removals;
 mod migration_0212_attachment_body_removals;
 #[path = "migrations/0213_epoch_gap_visit_window.rs"]
 mod migration_0213_epoch_gap_visit_window;
+#[path = "migrations/0214_view_once_consumption.rs"]
+mod migration_0214_view_once_consumption;
 
 const MIGRATIONS: &[Migration] = &[
     Migration {
@@ -1537,6 +1539,12 @@ const MIGRATIONS: &[Migration] = &[
         name: "0213_epoch_gap_visit_window",
         suspend_foreign_keys: &[],
         apply: migration_0213_epoch_gap_visit_window::apply,
+    },
+    Migration {
+        version: 214,
+        name: "0214_view_once_consumption",
+        suspend_foreign_keys: &[],
+        apply: migration_0214_view_once_consumption::apply,
     },
 ];
 

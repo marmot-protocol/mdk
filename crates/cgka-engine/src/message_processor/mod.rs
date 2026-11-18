@@ -1079,6 +1079,9 @@ impl<S: StorageProvider> Engine<S> {
             if matches!(&intent, SendIntent::EnableAccountDevices { .. }) {
                 self.check_account_devices_activation(&group_id)?;
             }
+            if matches!(&intent, SendIntent::EnableViewOnce { .. }) {
+                self.check_view_once_activation(&group_id)?;
+            }
             // So is a KeyPackage it carries; see `check_queued_key_packages`.
             self.check_queued_key_packages(&intent)?;
             // And a same-account Add's siblings; see `check_queued_sibling_add`.
@@ -4644,6 +4647,7 @@ fn send_intent_group_id(intent: &SendIntent) -> &GroupId {
         | SendIntent::UpdateGroupData { group_id, .. }
         | SendIntent::EnableDisbanding { group_id }
         | SendIntent::EnableAccountDevices { group_id }
+        | SendIntent::EnableViewOnce { group_id }
         | SendIntent::LinkDevice { group_id, .. }
         | SendIntent::UnlinkDevice { group_id, .. }
         | SendIntent::ImportDeviceGroupRejections { group_id, .. }
@@ -4674,6 +4678,7 @@ pub(crate) fn is_fair_scheduled_intent(
         | SendIntent::UpdateGroupData { .. }
         | SendIntent::EnableDisbanding { .. }
         | SendIntent::EnableAccountDevices { .. }
+        | SendIntent::EnableViewOnce { .. }
         | SendIntent::LinkDevice { .. }
         | SendIntent::UnlinkDevice { .. }
         | SendIntent::RecordRemovedSlot { .. }

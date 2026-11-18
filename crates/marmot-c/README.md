@@ -24,6 +24,7 @@ per feature.
   [custom reaction artwork](#custom-reaction-artwork), [sticker pack sharing](#sticker-pack-sharing),
   [emoji set installs](#emoji-set-installs),
   [file-backed media upload](#file-backed-media-upload),
+  [view-once media](#view-once-media),
   [account attachment history](#account-attachment-history),
   [public event verification](#public-event-verification), [host performance stages](#host-performance-stages),
   [Markdown rendering](#markdown-rendering), [identity references and pseudonyms](#identity-references-and-pseudonyms),
@@ -359,6 +360,25 @@ cannot hold returns `MARMOT_STATUS_STORAGE_FULL` before any upload.
 File-backed calls have no fixed worker-response timeout; per-endpoint network
 deadlines still apply. Cancellation observed before message admission starts
 prevents publication; admission is not interruptible once started.
+
+## View-once media
+
+The [shared view-once contract](../marmot-uniffi/README.md#view-once-media) applies.
+`marmot_send_view_once_media` borrows a `MarmotViewOnceMediaRequest` until return.
+`marmot_consume_view_once` fills a caller-owned tagged outcome by value. `Opened`
+transfers an independently owned `MarmotViewOnceViewer`; free it with
+`marmot_view_once_viewer_free`, which closes the core viewer synchronously.
+`marmot_view_once_viewer_close` revokes it without freeing the handle. Never
+free concurrently with any call using that handle. Keep the originating client
+runtime alive until viewer reads finish.
+
+`marmot_view_once_viewer_read` returns a nullable `MarmotViewOnceBytes` pointer.
+NULL with OK means no bytes are available. Free each chunk with
+`marmot_view_once_bytes_free`, which erases that MDK allocation before release.
+This does not erase host or decoder copies. MIME strings use `marmot_string_free`.
+All calls block; use a non-UI thread. Send and consume outputs are validated
+before any upload or irreversible claim. Timeline and reply `view_once` records
+are owned and freed by their enclosing timeline output.
 
 ## Account attachment history
 

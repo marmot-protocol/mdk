@@ -11,6 +11,7 @@
 //! attachment's key from the epoch's media secret. The sender puts each
 //! attachment's own key in the bundle instead, and the receiver keeps it with
 //! the message for downloads and for passing the history on.
+//! View-once events and their keys never travel in history or backups.
 
 use super::AppClient;
 use crate::history_bundle::{
@@ -119,6 +120,7 @@ impl AppClient {
     /// a group-system row (those are local to each device), a chat message or comment
     /// whose encrypted-media reference the live path would reject, and each
     /// attachment key that names none of its message's attachments.
+    /// View-once events, including malformed policies, are dropped with all keys.
     fn import_chat_history(
         &mut self,
         group_id: &GroupId,
@@ -273,7 +275,7 @@ pub(crate) fn export_history(
             for row in page {
                 let position = ChatPosition::of_row(&row);
                 let event = match row.event {
-                    Some(event) => {
+                    Some(event) if matches!(event.event.view_once_policy(), Ok(None)) => {
                         let keys = attachment_keys(
                             &storage,
                             group_id_hex,
@@ -283,7 +285,7 @@ pub(crate) fn export_history(
                         )?;
                         Some(BundledEvent::exported(event, row.source_epoch, keys))
                     }
-                    None => None,
+                    _ => None,
                 };
                 if !bundle.take(position.clone(), event) {
                     return Ok(finish(bundle));
@@ -328,15 +330,15 @@ pub(crate) fn newest_bundles_start(
 }
 
 fn importable(event: &ImportedAppEvent, allow_loopback_http: bool) -> bool {
-    let id = MarmotAppEvent::new(
+    let inner = MarmotAppEvent::new(
         &event.sender,
         event.created_at,
         event.kind,
         event.tags.clone(),
         &event.plaintext,
-    )
-    .id;
-    id == event.message_id_hex
+    );
+    matches!(inner.view_once_policy(), Ok(None))
+        && inner.id == event.message_id_hex
         && event.kind != MARMOT_APP_EVENT_KIND_GROUP_SYSTEM
         && !super::device_group::is_device_group_kind(event.kind)
         && (!(event.kind == MARMOT_APP_EVENT_KIND_CHAT
@@ -352,10 +354,11 @@ fn chat_media_references(
     epoch: u64,
     allow_loopback_http: bool,
 ) -> Vec<MediaAttachmentReference> {
-    if !matches!(
-        kind,
-        MARMOT_APP_EVENT_KIND_CHAT | MARMOT_APP_EVENT_KIND_REACTION
-    ) && !is_nip22_comment(kind, tags)
+    if crate::view_once::is_view_once(tags)
+        || (!matches!(
+            kind,
+            MARMOT_APP_EVENT_KIND_CHAT | MARMOT_APP_EVENT_KIND_REACTION
+        ) && !is_nip22_comment(kind, tags))
     {
         return Vec::new();
     }

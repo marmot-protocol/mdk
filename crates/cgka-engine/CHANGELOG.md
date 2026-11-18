@@ -17,6 +17,11 @@
   deadlines and duration metrics, so a test moves time forward without sleeping (mdk#3496). An engine built without
   it runs on the new `SystemMonotonicClock`. `SystemWallClock` and `OsMaintenanceRandom`, the other defaults, are
   public, and all three are re-exported from the crate root.
+- Explicit view-once activation through `SendIntent::EnableViewOnce`, requiring
+  every leaf's support and encrypted-media V2 (#1327). Activation is irreversible.
+  `view_once_required_at(group, epoch)` checks authenticated source-epoch policy.
+  Media-policy failures do not invalidate authenticated application witnesses;
+  historical storage failures propagate instead of discarding a candidate.
 - `Engine::send_host_change_with_audit_context` sends a host's group change, and `host_change_kind` names the change
   a pending commit carries, for its fanout to store (mdk#2332).
 - `Engine::publish_not_delivered` rolls back a pending commit the session gave up because it reached no relay

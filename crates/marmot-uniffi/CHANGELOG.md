@@ -4,6 +4,10 @@
 
 ### Breaking changes
 
+- Timeline rows and reply previews gain typed `view_once` placeholders.
+  `EncryptedMediaVersionFfi` adds `ViewOnceV1`, refused by ordinary media APIs.
+  Regenerate Swift and Kotlin bindings with the matching native library (#1327).
+
 - `AppMessageRecordFfi` gains `invalidated: Bool`, true when a raw row is retained only as an invalidated tombstone
   (#3411). `messages` and message-subscription snapshots expose the stored flag. Code that constructs the record
   directly must pass `invalidated`. Regenerate Swift and Kotlin bindings with the matching native library.
@@ -35,6 +39,9 @@
   the high water captured before reconciliation. Historical states do not
   authorize local byte reads. Identity and cursor Debug output is redacted.
 
+- Explicit view-once group activation, bounded image/video send, durable local
+  consume/state APIs, and an opaque viewer with bounded reads and explicit `revoke`.
+  Host-owned plaintext copies cannot be recalled or erased by MDK (#1327).
 - `groupPendingCommit(accountRef, groupIdHex)` returns `GroupPendingCommitFfi`, or nil, for the group's own commit
   that has not confirmed yet, with `GroupPendingCommitStateFfi` `Sending` or `Stuck` (mdk#2332). Group changes fail
   with the new `MarmotKitError::GroupCommitPending { groupIdHex }` while it is pending; handle it where you handle

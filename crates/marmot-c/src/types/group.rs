@@ -239,6 +239,7 @@ c_enum! {
     MarmotEncryptedMediaVersion from EncryptedMediaVersionFfi {
         V1,
         V2,
+        ViewOnceV1,
     }
 }
 

@@ -354,7 +354,10 @@ impl StoredAppMessageRecord {
 const APP_EVENT_REPLAY_COLUMNS: &str = "message_id_hex, direction, group_id_hex, sender, plaintext, \
      kind, tags_json, source_epoch, retention_seconds, retention_expires_at, recorded_at, \
      received_at, insert_order, moderation_grant, invalidated, authority_state, \
-     authority_context";
+     authority_context, (SELECT v.policy_expires_at FROM view_once_consumption v \
+     WHERE v.group_id_hex=app_events.group_id_hex AND v.message_id_hex=app_events.message_id_hex \
+     AND v.eligible=1 AND v.source_epoch=app_events.source_epoch \
+     AND v.source_message_id_hex IS app_events.source_message_id_hex AND v.sender=app_events.sender)";
 
 /// The ONE ascending order for the raw-event replay surface (recovery / lag
 /// replay), shared by [`SqliteAppStorage::app_messages`] and — via
@@ -4029,6 +4032,14 @@ fn app_message_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredAppMe
     let retention_expires_at = row
         .get::<_, Option<i64>>(9)?
         .and_then(|expires_at| expires_at.try_into().ok());
+    let view_once = row
+        .get::<_, Option<i64>>(17)?
+        .and_then(|deadline| u64::try_from(deadline).ok())
+        .map(
+            |unopened_expires_at| cgka_traits::app_event::ViewOncePolicy {
+                unopened_expires_at,
+            },
+        );
     let authority = if row.get::<_, i64>(15)? == 2 {
         let context = row.get::<_, Vec<u8>>(16)?;
         let source_context = context.try_into().map_err(|_| {
@@ -4064,6 +4075,7 @@ fn app_message_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredAppMe
             cgka_traits::app_event::AppMessageRetentionDecision {
                 retention_seconds,
                 expires_at: retention_expires_at,
+                view_once,
             }
         }),
         recorded_at: row.get::<_, i64>(10)?.try_into().unwrap_or_default(),
