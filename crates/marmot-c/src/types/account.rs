@@ -221,12 +221,12 @@ c_mirror! {
     /// Structured result of the destructive sign-out-and-wipe.
     MarmotWipeOutcome from WipeOutcomeFfi,
     free marmot_wipe_outcome_free {
-        /// Active MLS groups whose local leave call succeeded, not confirmed removal,
-        /// except a chat whose leave the sign-out waits for (an admin chat the
-        /// account steps down in, or one this device was already leaving), which
-        /// counts only once this device sees its removal (mdk#2818).
-        /// A chat this device is no longer in, its copy removed or disbanded, is
-        /// neither counted nor reported as a failure.
+        /// Active MLS groups whose member Leave completed its submission.
+        /// Queued member Leaves appear in group_leave_failures.
+        /// An admin Leave or an already pending Leave counts once the device
+        /// sees its removal. A peer must commit a member's SelfRemove to remove it.
+        /// Chats already removed from this device or disbanded are skipped.
+        /// Local cleanup still runs when a group leave is unfinished.
         copy groups_left: u32,
         vec group_leave_failures/group_leave_failures_len: MarmotGroupLeaveFailure,
         /// `1` when a relay accepted the deletion of this device's

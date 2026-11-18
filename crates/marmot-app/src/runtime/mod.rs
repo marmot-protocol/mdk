@@ -1078,12 +1078,11 @@ pub struct ManagedAccount {
 /// [`MarmotAppRuntime::sign_out_and_wipe`]).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WipeOutcome {
-    /// Active MLS groups whose local leave call succeeded, not confirmed removal,
-    /// except a chat whose leave the sign-out waits for (an admin chat the
-    /// account steps down in, or one this device was already leaving), which
-    /// counts only once this device sees its removal (mdk#2818).
-    /// A chat this device is no longer in, its copy removed or disbanded, is
-    /// neither counted nor reported as a failure.
+    /// Active MLS groups whose member Leave completed its submission.
+    /// Queued member Leaves appear in `group_leave_failures`.
+    /// An admin Leave or an already pending Leave counts once the device
+    /// sees its removal. A peer must commit a member's SelfRemove to remove it.
+    /// Chats already removed from this device or disbanded are skipped.
     pub groups_left: u32,
     /// Per-group leave failures. Best-effort: the wipe does not abort on these.
     pub group_leave_failures: Vec<GroupLeaveFailure>,
@@ -5187,6 +5186,8 @@ impl MarmotAppRuntime {
     ///    each counts as left only once this device sees the commit that
     ///    removes it (mdk#2818). It keeps its leaf, and reports why, in any
     ///    other chat its account is an active admin of.
+    ///    A new member Leave still in the outbound queue is reported as
+    ///    unfinished before the wipe proceeds.
     /// 2. Best-effort deletion of this device's KeyPackage slot, always (no
     ///    toggle): one kind 5 naming only that slot, so the account's other
     ///    devices keep theirs.
@@ -5327,6 +5328,12 @@ impl MarmotAppRuntime {
                 {
                     Ok(SignOutLeave::Left) => outcome.groups_left += 1,
                     Ok(SignOutLeave::Recorded) => waiting.push((group_id, group_id_hex)),
+                    Ok(SignOutLeave::Unfinished) => {
+                        outcome.group_leave_failures.push(GroupLeaveFailure {
+                            group_id_hex,
+                            reason: "leave was still queued".to_owned(),
+                        });
+                    }
                     Ok(SignOutLeave::Kept(kept)) => {
                         outcome.group_leave_failures.push(GroupLeaveFailure {
                             group_id_hex,

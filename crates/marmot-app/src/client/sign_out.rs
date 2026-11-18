@@ -70,8 +70,10 @@ pub(crate) enum SiblingSignOut {
 /// What stage 1 of `sign_out_and_wipe` did with one chat.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum SignOutLeave {
-    /// This device's leave went through the ordinary leave path.
+    /// The ordinary Leave completed its submission.
     Left,
+    /// This sign-out left the ordinary Leave in the outbound queue.
+    Unfinished,
     /// Its leave is recorded and the engine carries it out: this sign-out
     /// sent `StepDownAndLeave` to a chat its account administers with
     /// another account, or the device was already leaving the chat. The chat
