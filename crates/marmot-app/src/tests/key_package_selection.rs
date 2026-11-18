@@ -1903,6 +1903,18 @@ async fn availability_deleted_stays_not_found() {
         nostr_directory::FollowAvailabilityState::NotFound
     );
 
+    app.directory()
+        .ingest_directory_relay_event(transport_nostr::DirectoryRelayEventRecord {
+            endpoints: Vec::new(),
+            event: deletion.clone(),
+        })
+        .unwrap();
+    assert_eq!(
+        selection_availability_states(&app, &owner)[&accounts[0].account_id_hex],
+        nostr_directory::FollowAvailabilityState::NotFound,
+        "replaying the same deletion must not invalidate the negative"
+    );
+
     fetcher
         .events
         .lock()

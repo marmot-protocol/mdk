@@ -119,6 +119,8 @@ pub struct PublicKeyPackageEvidenceSnapshot {
 
 const KEY_PACKAGE_REPLACEMENT_GLOBAL_CAP: i64 = 1_000;
 const KEY_PACKAGE_REPLACEMENT_CAP: i64 = 500;
+const KEY_PACKAGE_EVIDENCE_MAX_AGE_SECS: i64 = 30 * 24 * 60 * 60;
+const KEY_PACKAGE_EVIDENCE_FUTURE_SKEW_SECS: i64 = 5 * 60;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StoredRelayTelemetrySettings {
@@ -277,43 +279,38 @@ impl SqliteSharedStorage {
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .storage()?;
-            tx.execute_cached(
-                "INSERT INTO directory_key_package_replacements (
-                    account_id_hex, key_package_id, event_id_hex,
-                    event_created_at, observed_at
-                 )
-                 VALUES (?1, ?2, ?3, ?4, ?5)
-                 ON CONFLICT(account_id_hex, key_package_id) DO UPDATE SET
-                    event_id_hex = excluded.event_id_hex,
-                    event_created_at = excluded.event_created_at,
-                    observed_at = CASE
-                        WHEN directory_key_package_replacements.event_id_hex = excluded.event_id_hex
-                        THEN MAX(
-                            directory_key_package_replacements.observed_at,
-                            excluded.observed_at
-                        )
-                        ELSE excluded.observed_at
-                    END
-                 WHERE excluded.event_created_at >
-                       directory_key_package_replacements.event_created_at
-                    OR (excluded.event_created_at =
-                        directory_key_package_replacements.event_created_at
-                        AND excluded.event_id_hex <
-                            directory_key_package_replacements.event_id_hex)
-                    OR (excluded.event_id_hex =
-                        directory_key_package_replacements.event_id_hex
-                        AND excluded.observed_at >
-                            directory_key_package_replacements.observed_at)",
-                params![
-                    &record.account_id_hex,
-                    &record.key_package_id,
-                    &record.event_id_hex,
-                    u64_to_i64(record.event_created_at)?,
-                    u64_to_i64(record.observed_at)?,
-                ],
-            )
-            .storage()?;
-            bump_key_package_revision(&tx, &record.account_id_hex)?;
+            let changed = tx.execute_cached(
+                    "INSERT INTO directory_key_package_replacements (
+                        account_id_hex, key_package_id, event_id_hex,
+                        event_created_at, observed_at
+                     )
+                     VALUES (?1, ?2, ?3, ?4, ?5)
+                     ON CONFLICT(account_id_hex, key_package_id) DO UPDATE SET
+                        event_id_hex = excluded.event_id_hex,
+                        event_created_at = excluded.event_created_at,
+                        observed_at = CASE
+                            WHEN directory_key_package_replacements.event_id_hex = excluded.event_id_hex
+                            THEN directory_key_package_replacements.observed_at
+                            ELSE excluded.observed_at
+                        END
+                     WHERE excluded.event_created_at >
+                           directory_key_package_replacements.event_created_at
+                        OR (excluded.event_created_at =
+                            directory_key_package_replacements.event_created_at
+                            AND excluded.event_id_hex <
+                                directory_key_package_replacements.event_id_hex)",
+                    params![
+                        &record.account_id_hex,
+                        &record.key_package_id,
+                        &record.event_id_hex,
+                        u64_to_i64(record.event_created_at)?,
+                        u64_to_i64(record.observed_at)?,
+                    ],
+                )
+                .storage()?;
+            if changed != 0 {
+                bump_key_package_revision(&tx, &record.account_id_hex)?;
+            }
             prune_key_package_replacements(&tx)?;
             prune_key_package_barriers(&tx, unix_now_seconds_i64())?;
             tx.commit().storage()
@@ -400,8 +397,9 @@ impl SqliteSharedStorage {
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .storage()?;
-            write_key_package_barrier(&tx, record)?;
-            bump_key_package_revision(&tx, &record.account_id_hex)?;
+            if write_key_package_barrier(&tx, record)? {
+                bump_key_package_revision(&tx, &record.account_id_hex)?;
+            }
             prune_key_package_barriers(&tx, unix_now_seconds_i64())?;
             tx.commit().storage()
         })
@@ -1027,34 +1025,33 @@ fn key_package_barrier_from_row(
 fn write_key_package_barrier(
     tx: &Transaction<'_>,
     record: &PublicKeyPackageBarrierRecord,
-) -> StorageResult<()> {
-    tx.execute_cached(
-        "INSERT INTO public_key_package_barriers (
+) -> StorageResult<bool> {
+    let changed = tx
+        .execute_cached(
+            "INSERT INTO public_key_package_barriers (
             account_id_hex, key_package_id, event_id_hex, deleted_event_id,
             event_created_at, observed_at, kind
          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
          ON CONFLICT DO UPDATE SET
             event_id_hex = excluded.event_id_hex,
             event_created_at = excluded.event_created_at,
-            observed_at = CASE
-                WHEN excluded.event_id_hex = public_key_package_barriers.event_id_hex
-                THEN MAX(public_key_package_barriers.observed_at, excluded.observed_at)
-                ELSE excluded.observed_at END
-         WHERE excluded.event_created_at > public_key_package_barriers.event_created_at
+            observed_at = excluded.observed_at
+         WHERE (excluded.event_created_at > public_key_package_barriers.event_created_at
             OR (excluded.event_created_at = public_key_package_barriers.event_created_at
-                AND excluded.event_id_hex <= public_key_package_barriers.event_id_hex)",
-        params![
-            &record.account_id_hex,
-            &record.key_package_id,
-            &record.event_id_hex,
-            &record.deleted_event_id,
-            u64_to_i64(record.event_created_at)?,
-            u64_to_i64(record.observed_at)?,
-            record.kind.as_str(),
-        ],
-    )
-    .storage()?;
-    Ok(())
+                AND excluded.event_id_hex <= public_key_package_barriers.event_id_hex))
+            AND excluded.event_id_hex <> public_key_package_barriers.event_id_hex",
+            params![
+                &record.account_id_hex,
+                &record.key_package_id,
+                &record.event_id_hex,
+                &record.deleted_event_id,
+                u64_to_i64(record.event_created_at)?,
+                u64_to_i64(record.observed_at)?,
+                record.kind.as_str(),
+            ],
+        )
+        .storage()?;
+    Ok(changed != 0)
 }
 
 fn bump_key_package_revision(tx: &Transaction<'_>, account_id_hex: &str) -> StorageResult<()> {
@@ -1076,6 +1073,13 @@ fn bump_key_package_revision(tx: &Transaction<'_>, account_id_hex: &str) -> Stor
 }
 
 fn prune_key_package_replacements(tx: &Transaction<'_>) -> StorageResult<()> {
+    let stale_before = unix_now_seconds_i64()
+        .saturating_sub(KEY_PACKAGE_EVIDENCE_MAX_AGE_SECS + KEY_PACKAGE_EVIDENCE_FUTURE_SKEW_SECS);
+    tx.execute_cached(
+        "DELETE FROM directory_key_package_replacements WHERE event_created_at <= ?1",
+        [stale_before],
+    )
+    .storage()?;
     for (query, cap) in [
         (
             "SELECT account_id_hex, key_package_id, event_id_hex, event_created_at, observed_at
@@ -1129,6 +1133,15 @@ fn prune_key_package_replacements(tx: &Transaction<'_>) -> StorageResult<()> {
 }
 
 fn prune_key_package_barriers(tx: &Transaction<'_>, now: i64) -> StorageResult<()> {
+    let stale_before = now
+        .saturating_sub(KEY_PACKAGE_EVIDENCE_MAX_AGE_SECS + KEY_PACKAGE_EVIDENCE_FUTURE_SKEW_SECS);
+    for statement in [
+        "DELETE FROM public_key_package_barriers WHERE event_created_at <= ?1",
+        "DELETE FROM public_key_package_eviction_watermarks WHERE event_created_at <= ?1",
+        "DELETE FROM public_key_package_eviction_fallback WHERE event_created_at <= ?1",
+    ] {
+        tx.execute_cached(statement, [stale_before]).storage()?;
+    }
     for query in [
         "SELECT account_id_hex, key_package_id, event_id_hex,
                         deleted_event_id, event_created_at, observed_at, kind
@@ -1740,13 +1753,19 @@ mod tests {
         );
     }
 
+    fn fresh_timestamp(offset: u64) -> u64 {
+        static BASE: std::sync::LazyLock<u64> =
+            std::sync::LazyLock::new(|| unix_now_seconds_i64().max(0) as u64);
+        *BASE + offset
+    }
+
     fn key_package_barrier(account: &str, index: u64) -> PublicKeyPackageBarrierRecord {
         PublicKeyPackageBarrierRecord {
             account_id_hex: account.into(),
             key_package_id: format!("slot-{index:04}"),
             event_id_hex: format!("{index:064x}"),
             deleted_event_id: None,
-            event_created_at: index,
+            event_created_at: fresh_timestamp(index),
             observed_at: index,
             kind: PublicKeyPackageBarrierKind::Replacement,
         }
@@ -1756,6 +1775,7 @@ mod tests {
     fn key_package_barriers_keep_nip01_winners_per_slot_and_target() {
         let storage = SqliteSharedStorage::in_memory().unwrap();
         let account = "aa".repeat(32);
+        let base = fresh_timestamp(0);
         assert_eq!(
             storage.public_key_package_evicted_at(&account).unwrap(),
             None
@@ -1763,7 +1783,7 @@ mod tests {
         let initial = PublicKeyPackageBarrierRecord {
             key_package_id: "slot-b".into(),
             event_id_hex: "bb".repeat(32),
-            event_created_at: 20,
+            event_created_at: base + 20,
             observed_at: 2,
             kind: PublicKeyPackageBarrierKind::Deletion,
             ..key_package_barrier(&account, 0)
@@ -1781,7 +1801,7 @@ mod tests {
         }
         let mut slot_winner = PublicKeyPackageBarrierRecord {
             event_id_hex: "cc".repeat(32),
-            event_created_at: 21,
+            event_created_at: base + 21,
             observed_at: 4,
             ..initial.clone()
         };
@@ -1791,7 +1811,7 @@ mod tests {
         for loser in [
             PublicKeyPackageBarrierRecord {
                 event_id_hex: "00".repeat(32),
-                event_created_at: 20,
+                event_created_at: base + 20,
                 observed_at: 100,
                 ..slot_winner.clone()
             },
@@ -1833,6 +1853,7 @@ mod tests {
         storage
             .put_public_key_package_barrier(&other_account)
             .unwrap();
+        slot_winner.observed_at = 4;
         assert_eq!(
             storage.public_key_package_barriers(&account).unwrap(),
             [other_slot, slot_winner, exact_winner, other_target]
@@ -1845,7 +1866,7 @@ mod tests {
         );
         assert_eq!(
             storage.public_key_package_evicted_at(&account).unwrap(),
-            Some(40)
+            Some(8)
         );
     }
 
@@ -1853,7 +1874,10 @@ mod tests {
     fn pruned_exact_deletions_become_slot_wide_watermark() {
         let storage = SqliteSharedStorage::in_memory().unwrap();
         let account = "aa".repeat(32);
-        for (index, created_at) in [100, 200].into_iter().enumerate() {
+        for (index, created_at) in [fresh_timestamp(100), fresh_timestamp(200)]
+            .into_iter()
+            .enumerate()
+        {
             storage
                 .put_public_key_package_barrier(&PublicKeyPackageBarrierRecord {
                     account_id_hex: account.clone(),
@@ -1861,7 +1885,7 @@ mod tests {
                     event_id_hex: format!("{:064x}", index + 1),
                     deleted_event_id: Some(format!("{:064x}", index + 10)),
                     event_created_at: created_at,
-                    observed_at: created_at,
+                    observed_at: 100 + index as u64,
                     kind: PublicKeyPackageBarrierKind::Deletion,
                 })
                 .unwrap();
@@ -1873,7 +1897,7 @@ mod tests {
                     key_package_id: format!("slot-{index:04}"),
                     event_id_hex: format!("{index:064x}"),
                     deleted_event_id: None,
-                    event_created_at: 1_000 + index,
+                    event_created_at: fresh_timestamp(1_000 + index),
                     observed_at: 1_000 + index,
                     kind: PublicKeyPackageBarrierKind::Replacement,
                 })
@@ -1885,13 +1909,13 @@ mod tests {
             .unwrap();
         assert_eq!(watermark.kind, PublicKeyPackageBarrierKind::ExactDeletion);
         assert_eq!(watermark.deleted_event_id, None);
-        assert_eq!(watermark.event_created_at, 200);
+        assert_eq!(watermark.event_created_at, fresh_timestamp(200));
     }
 
     #[test]
     fn deletion_watermark_wins_mixed_timestamp_replacements() {
         for deletion_first in [true, false] {
-            for replacement_created_at in [100, 200] {
+            for replacement_created_at in [fresh_timestamp(100), fresh_timestamp(200)] {
                 let storage = SqliteSharedStorage::in_memory().unwrap();
                 let account = "aa".repeat(32);
                 let replacement = PublicKeyPackageBarrierRecord {
@@ -1906,7 +1930,7 @@ mod tests {
                 let deletion = PublicKeyPackageBarrierRecord {
                     event_id_hex: "ff".repeat(32),
                     deleted_event_id: Some("bb".repeat(32)),
-                    event_created_at: 100,
+                    event_created_at: fresh_timestamp(100),
                     kind: PublicKeyPackageBarrierKind::Deletion,
                     ..replacement.clone()
                 };
@@ -1925,7 +1949,7 @@ mod tests {
                             key_package_id: format!("slot-{index:04}"),
                             event_id_hex: format!("{index:064x}"),
                             deleted_event_id: None,
-                            event_created_at: 1_000 + index,
+                            event_created_at: fresh_timestamp(1_000 + index),
                             observed_at: 1_000 + index,
                             kind: PublicKeyPackageBarrierKind::Replacement,
                         })
@@ -1951,7 +1975,7 @@ mod tests {
             if index < 3 {
                 record.event_id_hex = ["cc", "aa", "bb"][index as usize].repeat(32);
                 record.deleted_event_id = Some(format!("{index:064x}"));
-                record.event_created_at = 50;
+                record.event_created_at = fresh_timestamp(50);
             } else {
                 record.event_created_at += 100;
             }
@@ -1967,7 +1991,7 @@ mod tests {
         assert_eq!(watermark.key_package_id, "slot-0001");
         assert_eq!(watermark.event_id_hex, "aa".repeat(32));
         assert_eq!(watermark.deleted_event_id, Some(format!("{:064x}", 1)));
-        assert_eq!(watermark.event_created_at, 50);
+        assert_eq!(watermark.event_created_at, fresh_timestamp(50));
         assert!((before..=unix_now_seconds_i64() as u64).contains(&watermark.observed_at));
         assert_eq!(
             storage.public_key_package_evicted_at(&account).unwrap(),
@@ -1975,7 +1999,7 @@ mod tests {
         );
 
         let older = PublicKeyPackageBarrierRecord {
-            event_created_at: 40,
+            event_created_at: fresh_timestamp(40),
             observed_at: 0,
             ..key_package_barrier(&account, 503)
         };
@@ -2034,7 +2058,7 @@ mod tests {
         let account = "aa".repeat(32);
         storage
             .put_public_key_package_barrier(&PublicKeyPackageBarrierRecord {
-                event_created_at: 2000,
+                event_created_at: fresh_timestamp(2_000),
                 observed_at: 1,
                 ..key_package_barrier(&account, 0)
             })
@@ -2049,7 +2073,7 @@ mod tests {
             .public_key_package_eviction_watermark(&account)
             .unwrap()
             .unwrap();
-        assert_eq!(watermark.event_created_at, 2000);
+        assert_eq!(watermark.event_created_at, fresh_timestamp(2_000));
         assert_eq!(
             storage.public_key_package_evicted_at(&account).unwrap(),
             Some(watermark.observed_at)
@@ -2061,7 +2085,7 @@ mod tests {
             Some(watermark.observed_at)
         );
         let recreated = PublicKeyPackageBarrierRecord {
-            event_created_at: 1999,
+            event_created_at: fresh_timestamp(1_999),
             observed_at: 10_000,
             ..key_package_barrier(&account, 0)
         };
@@ -2088,13 +2112,14 @@ mod tests {
         storage
             .lock()
             .unwrap()
-            .execute_batch(
+            .execute(
                 "WITH RECURSIVE ids(id) AS (
                 VALUES(0) UNION ALL SELECT id + 1 FROM ids WHERE id < 999
              )
              INSERT INTO public_key_package_eviction_watermarks
                 (account_id_hex, key_package_id, event_id_hex, event_created_at, evicted_at, kind)
-             SELECT printf('wm-%04d', id), 'slot', 'ee', 1, 1, 'replacement' FROM ids;",
+             SELECT printf('wm-%04d', id), 'slot', 'ee', ?1, 1, 'replacement' FROM ids;",
+                params![fresh_timestamp(1) as i64],
             )
             .unwrap();
         storage.put_public_key_package_barrier(&recreated).unwrap();
@@ -2158,7 +2183,7 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .event_created_at,
-            2000
+            fresh_timestamp(2_000)
         );
         assert_eq!(
             storage.public_key_package_barriers(&account).unwrap(),
@@ -2170,17 +2195,18 @@ mod tests {
     fn key_package_replacements_keep_nip01_winner_and_isolate_slots() {
         let storage = SqliteSharedStorage::in_memory().unwrap();
         let account_id_hex = "aa".repeat(32);
+        let base = fresh_timestamp(0);
         let mut winner = PublicKeyPackageReplacementRecord {
             account_id_hex: account_id_hex.clone(),
             key_package_id: "slot-b".into(),
             event_id_hex: "bb".repeat(32),
-            event_created_at: 20,
+            event_created_at: base + 20,
             observed_at: 2,
         };
         storage
             .put_public_key_package_replacement(&PublicKeyPackageReplacementRecord {
                 event_id_hex: "dd".repeat(32),
-                event_created_at: 10,
+                event_created_at: base + 10,
                 observed_at: 1,
                 ..winner.clone()
             })
@@ -2189,7 +2215,7 @@ mod tests {
         for loser in [
             PublicKeyPackageReplacementRecord {
                 event_id_hex: "00".repeat(32),
-                event_created_at: 19,
+                event_created_at: base + 19,
                 observed_at: 100,
                 ..winner.clone()
             },
@@ -2217,19 +2243,17 @@ mod tests {
                 ..winner.clone()
             })
             .unwrap();
-        winner.observed_at = 102;
-
         let other_slot = PublicKeyPackageReplacementRecord {
             key_package_id: "slot-a".into(),
             event_id_hex: "ee".repeat(32),
-            event_created_at: 5,
+            event_created_at: base + 5,
             observed_at: 4,
             ..winner.clone()
         };
         let other_account = PublicKeyPackageReplacementRecord {
             account_id_hex: "ff".repeat(32),
             event_id_hex: "ff".repeat(32),
-            event_created_at: 1,
+            event_created_at: base + 1,
             observed_at: 5,
             ..winner.clone()
         };
@@ -2255,6 +2279,50 @@ mod tests {
     }
 
     #[test]
+    fn stale_key_package_evidence_does_not_reach_watermarks() {
+        let storage = SqliteSharedStorage::in_memory().unwrap();
+        let account = "aa".repeat(32);
+        storage
+            .put_public_key_package_replacement(&PublicKeyPackageReplacementRecord {
+                account_id_hex: account.clone(),
+                key_package_id: "stale".into(),
+                event_id_hex: "bb".repeat(32),
+                event_created_at: 0,
+                observed_at: 0,
+            })
+            .unwrap();
+        assert!(
+            storage
+                .public_key_package_replacements(&account)
+                .unwrap()
+                .is_empty()
+        );
+        storage
+            .put_public_key_package_barrier(&PublicKeyPackageBarrierRecord {
+                account_id_hex: account.clone(),
+                key_package_id: "stale".into(),
+                event_id_hex: "cc".repeat(32),
+                deleted_event_id: None,
+                event_created_at: 0,
+                observed_at: 0,
+                kind: PublicKeyPackageBarrierKind::Replacement,
+            })
+            .unwrap();
+        assert!(
+            storage
+                .public_key_package_barriers(&account)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            storage
+                .public_key_package_eviction_watermark(&account)
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
     fn key_package_replacements_are_bounded_per_account() {
         let storage = SqliteSharedStorage::in_memory().unwrap();
         let account_id_hex = "aa".repeat(32);
@@ -2264,7 +2332,7 @@ mod tests {
                     account_id_hex: account_id_hex.clone(),
                     key_package_id: format!("slot-{index:04}"),
                     event_id_hex: format!("{index:064x}"),
-                    event_created_at: index,
+                    event_created_at: fresh_timestamp(index),
                     observed_at: index,
                 })
                 .unwrap();
@@ -2301,7 +2369,7 @@ mod tests {
                         account_id_hex: account.clone(),
                         key_package_id: format!("slot-{index:04}"),
                         event_id_hex: format!("{index:064x}"),
-                        event_created_at: index,
+                        event_created_at: fresh_timestamp(index),
                         observed_at: index,
                     })
                     .unwrap();
@@ -2312,7 +2380,7 @@ mod tests {
                 account_id_hex: "cc".repeat(32),
                 key_package_id: "latest".into(),
                 event_id_hex: "ff".repeat(32),
-                event_created_at: 1_000,
+                event_created_at: fresh_timestamp(1_000),
                 observed_at: 1_000,
             })
             .unwrap();
@@ -2380,8 +2448,8 @@ mod tests {
              )
              INSERT INTO directory_key_package_replacements
                 (account_id_hex, key_package_id, event_id_hex, event_created_at, observed_at)
-             SELECT ?1, printf('slot-%04d', id), printf('%064x', id), id, id + 1000 FROM ids",
-                params![&other_account],
+             SELECT ?1, printf('slot-%04d', id), printf('%064x', id), ?2 + id, id + 1000 FROM ids",
+                params![&other_account, fresh_timestamp(0) as i64],
             )
             .unwrap();
         let final_account = "cc".repeat(32);
@@ -2390,7 +2458,7 @@ mod tests {
                 account_id_hex: final_account.clone(),
                 key_package_id: "slot".into(),
                 event_id_hex: "ff".repeat(32),
-                event_created_at: 2000,
+                event_created_at: fresh_timestamp(2_000),
                 observed_at: 2000,
             })
             .unwrap();
@@ -2451,12 +2519,13 @@ mod tests {
         let path = dir.path().join("shared.sqlite3");
         let storage = SqliteSharedStorage::open(&path).unwrap();
         let account = "aa".repeat(32);
+        let base = fresh_timestamp(0);
         storage
             .put_public_key_package_replacement(&PublicKeyPackageReplacementRecord {
                 account_id_hex: account.clone(),
                 key_package_id: "slot".into(),
                 event_id_hex: "bb".repeat(32),
-                event_created_at: 20,
+                event_created_at: base + 20,
                 observed_at: 30,
             })
             .unwrap();
@@ -2467,10 +2536,11 @@ mod tests {
             format!(
                 "INSERT INTO directory_key_package_replacements (
                      account_id_hex, key_package_id, event_id_hex, event_created_at, observed_at
-                 ) VALUES ('{account}', 'later', '{}', 21, 31);
+                 ) VALUES ('{account}', 'later', '{}', {}, 31);
                  UPDATE public_key_package_evidence_revisions SET revision = 2
                  WHERE account_id_hex = '{account}';",
                 "cc".repeat(32),
+                base + 21,
             ),
         );
         let snapshot = storage.key_package_evidence_snapshot(&account).unwrap();
@@ -2486,11 +2556,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("shared.sqlite3");
         let storage = SqliteSharedStorage::open(&path).unwrap();
+        let base = fresh_timestamp(0);
         let record = PublicKeyPackageReplacementRecord {
             account_id_hex: "aa".repeat(32),
             key_package_id: "slot".into(),
             event_id_hex: "bb".repeat(32),
-            event_created_at: 20,
+            event_created_at: base + 20,
             observed_at: 30,
         };
         storage.put_public_key_package_replacement(&record).unwrap();
@@ -2499,7 +2570,7 @@ mod tests {
             key_package_id: record.key_package_id.clone(),
             event_id_hex: "cc".repeat(32),
             deleted_event_id: Some(record.event_id_hex.clone()),
-            event_created_at: 25,
+            event_created_at: base + 25,
             observed_at: 31,
             kind: PublicKeyPackageBarrierKind::Deletion,
         };

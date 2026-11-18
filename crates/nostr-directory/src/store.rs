@@ -430,7 +430,9 @@ impl<R: DirectoryResources> Directory<R> {
     }
 
     /// Ingest authenticated directory data. Invalid or future-dated events
-    /// are ignored before either directory store is changed.
+    /// are ignored before either directory store is changed. KeyPackage content
+    /// validation follows the shared journal write so malformed replacements
+    /// still fence stale availability.
     pub fn ingest_directory_relay_event(
         &self,
         record: RelayEventRecord,

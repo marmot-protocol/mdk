@@ -662,16 +662,6 @@ impl<R: DirectoryResources> Directory<R> {
     }
 
     fn begin_availability_refresh(&self, account_id_hex: &str) -> RefreshAdmission {
-        #[cfg(any(test, feature = "test-support"))]
-        if let Some(notify) = self
-            .state
-            .availability_admission
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .as_ref()
-        {
-            notify.notify_waiters();
-        }
         let mut operations = self
             .state
             .follow_availability_refreshes
@@ -680,7 +670,18 @@ impl<R: DirectoryResources> Directory<R> {
         if let Some(entry) = operations.by_account.get(account_id_hex) {
             let status = entry.status.borrow().clone();
             if status.phase == FollowAvailabilityRefreshPhase::Running {
-                return RefreshAdmission::Follower(entry.status.subscribe());
+                let updates = entry.status.subscribe();
+                #[cfg(any(test, feature = "test-support"))]
+                if let Some(notify) = self
+                    .state
+                    .availability_admission
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .as_ref()
+                {
+                    notify.notify_one();
+                }
+                return RefreshAdmission::Follower(updates);
             }
             if entry
                 .finished_at
