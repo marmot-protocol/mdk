@@ -873,6 +873,77 @@ async fn a_released_row_older_than_this_copys_welcome_raises_no_refusal() {
         "only the row that could plausibly be this copy's history announces its release"
     );
 }
+
+/// The application's release journal honours the same decision (mdk#3536).
+///
+/// Consuming the journal on the next receipt sync or account open arms an
+/// epoch gap from each release it holds, the durable twin of the refusal
+/// event. A row that may predate this copy's Welcome must not arm one there
+/// either, or the newly linked device reports it cannot catch up and holds the
+/// device-group work its KeyPackage handoff waits on (mdk#3535). The release
+/// is otherwise unchanged: the id still comes back for redelivery.
+#[tokio::test]
+async fn a_released_row_older_than_this_copys_welcome_arms_no_epoch_gap() {
+    let (mut alice, mut bob, bob_storage, group_id) = alice_and_a_removed_bob(b"journal").await;
+
+    let welcome = readd(&mut alice, &mut bob, &group_id, WELCOME_CREATED_AT).await;
+    bob.join_welcome(welcome).await.unwrap();
+    bob.drain_events();
+    // From here on an application owns this database's released messages.
+    bob_storage
+        .app_storage()
+        .ensure_account_projection("bob")
+        .unwrap();
+    assert!(
+        bob_storage
+            .consume_released_transport_receipts()
+            .unwrap()
+            .is_empty()
+    );
+
+    let _withheld = evolve(
+        &mut alice,
+        SendIntent::SelfUpdate {
+            group_id: group_id.clone(),
+        },
+    )
+    .await;
+    let predating = route_at(
+        chat(&mut alice, &group_id, "from before this copy").await,
+        &group_id,
+        WELCOME_CREATED_AT,
+    );
+    bob.set_deferred_peel_residence_ms(0);
+    assert!(matches!(
+        bob.ingest(predating.clone()).await.unwrap(),
+        IngestOutcome::TransportDeferred { .. }
+    ));
+    for _ in 0..8 {
+        bob.retry_deferred_peels(&group_id).await.unwrap();
+        if deferred_rows(&bob_storage, &group_id) == 0 {
+            break;
+        }
+    }
+    assert_eq!(
+        deferred_rows(&bob_storage, &group_id),
+        0,
+        "the row is released"
+    );
+
+    assert_eq!(
+        bob_storage.consume_released_transport_receipts().unwrap(),
+        vec![predating.id],
+        "and its id comes back for redelivery"
+    );
+    assert!(
+        bob_storage
+            .app_storage()
+            .pending_epoch_backfill_intents()
+            .unwrap()
+            .is_empty(),
+        "but it arms no epoch gap"
+    );
+}
 fn unix_seconds_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

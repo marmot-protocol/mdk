@@ -64,8 +64,14 @@ engine effects. The empty-journal path remains a bounded existence query, withou
 rebuilding the seen ring/index or loading all backfill intents. Consumption
 again removes both durable receipts (including an intervening stale checkpoint),
 arms the existing durable group backfill intent, and acknowledges the journal
-in one transaction. The caller then clears its in-memory seen ring/index
-synchronously, before any await or fallible operation. Process death before
+in one transaction. Migration `0215_released_receipt_stall_evidence` records
+whether each release is stall evidence: the engine releases a row that may
+predate this copy's Welcome through
+`release_message_for_replay_without_stall_evidence`, and consumption retires it
+like any other but arms no backfill from it. An id released again before
+consumption counts if either release did, at that release's epoch. The caller
+then clears its in-memory seen ring/index synchronously, before any await or
+fallible operation. Process death before
 consumption leaves the journal; death after acknowledgment leaves clean disk
 receipts and durable backfill. Neither case relies on delivery of the engine's
 in-memory `TransportObjectResourceRefused` event. Completing an older backfill

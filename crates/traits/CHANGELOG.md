@@ -9,6 +9,9 @@
 
 ### Added
 
+- `MessageStorage::release_message_for_replay_without_stall_evidence` releases a row the engine judged not to be
+  evidence of missing history, such as traffic that may predate this copy's Welcome (mdk#3536). It defaults to
+  `release_message_for_replay`; a backend that turns releases into an epoch-gap backfill must not raise one from it.
 - `TransportEndpointFailure::is_endpoint_prohibited` tells an adapter's refusal of the endpoint itself, unsent and not
   for size, such as the Nostr relay plane's host-safety refusal (mdk#3305).
   `EventSizeClass::from_rejected_targets` leaves such targets out of its proof: the rest must all refuse the event for
