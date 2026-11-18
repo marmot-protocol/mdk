@@ -753,7 +753,7 @@ pub(crate) fn retire_commits_superseded_by_replacement_welcome<S: StorageProvide
 ) -> Result<Vec<(MessageId, EpochId)>, cgka_traits::error::EngineError> {
     let mut retired = Vec::new();
     for record in storage.list_messages(group_id, EpochId(0))? {
-        if !unresolved_commit_state(record.state) {
+        if record.state != MessageState::Sent && !unresolved_commit_state(record.state) {
             continue;
         }
         // Fail open on unreadable rows, exactly as the stale-deferred sweep
@@ -1537,6 +1537,9 @@ fn seed_stored_openmls_graph_inputs<S: StorageProvider>(
         let source_epoch = projection.source_epoch;
         match projection.kind {
             OpenMlsContentKind::Commit => {
+                if !OPENMLS_COMMIT_INPUT_STATES.contains(&record.state) {
+                    continue;
+                }
                 let Some(source_epoch) = source_epoch else {
                     continue;
                 };
@@ -3560,11 +3563,8 @@ fn required_capabilities_from_group(
 /// convergence pass builds — the unresolved canonicalization inputs plus
 /// already-applied (`Processed`) rows, which are re-admitted for scoring.
 ///
-/// The single owner of that classification. `seed_stored_openmls_graph_inputs`
-/// exists so no caller re-derives it; anything that must agree with the graph's
-/// membership (the deferred-peel sweep's context fingerprint, for one) calls
-/// this rather than restating the match. A restatement drifts silently: the
-/// graph and its describer disagree, and nothing fails.
+/// Proposals and applications can contribute while still `Sent`. Commit-only
+/// scans use [`OPENMLS_COMMIT_INPUT_STATES`] to exclude unpublished staging rows.
 pub(crate) fn record_state_can_contribute_to_openmls_graph(state: MessageState) -> bool {
     OPENMLS_GRAPH_INPUT_STATES.contains(&state)
 }
@@ -3581,14 +3581,19 @@ pub(crate) const OPENMLS_GRAPH_INPUT_STATES: [MessageState; 5] = [
     MessageState::Processed,
 ];
 
+/// A locally authored Commit is stored as `Sent` before publication and
+/// transitions to `Processed` on confirmation. A rollback (including one
+/// during hydration) can leave that `Sent` row for own-echo detection. It
+/// cannot witness a branch, even if another envelope holds the same MLS bytes.
+pub(crate) const OPENMLS_COMMIT_INPUT_STATES: [MessageState; 4] = [
+    MessageState::Created,
+    MessageState::Retryable,
+    MessageState::ConvergenceDeferred,
+    MessageState::Processed,
+];
+
 pub(crate) fn unresolved_commit_state(state: MessageState) -> bool {
-    matches!(
-        state,
-        MessageState::Sent
-            | MessageState::Created
-            | MessageState::Retryable
-            | MessageState::ConvergenceDeferred
-    )
+    state != MessageState::Processed && OPENMLS_COMMIT_INPUT_STATES.contains(&state)
 }
 
 fn message_state_for_dropped_reason(reason: DroppedMessageReason) -> MessageState {
@@ -5102,7 +5107,6 @@ mod unresolved_commit_state_tests {
     #[test]
     fn processed_is_not_an_unresolved_commit_state() {
         for state in [
-            MessageState::Sent,
             MessageState::Created,
             MessageState::Retryable,
             MessageState::ConvergenceDeferred,

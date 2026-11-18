@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use cgka_traits::convergence_pass::{ConvergencePassMember, ConvergencePassMemberRole};
 use cgka_traits::message::MessageState;
 
-use crate::openmls_projection::OpenMlsContentKind;
+use crate::openmls_projection::{OPENMLS_COMMIT_INPUT_STATES, OpenMlsContentKind};
 
 pub(crate) fn role_for_content_kind(kind: OpenMlsContentKind) -> Option<ConvergencePassMemberRole> {
     match kind {
@@ -36,6 +36,9 @@ impl ClassifiedConvergenceInput {
         state: MessageState,
         digest: [u8; 32],
     ) -> Option<Self> {
+        if kind == OpenMlsContentKind::Commit && !OPENMLS_COMMIT_INPUT_STATES.contains(&state) {
+            return None;
+        }
         Some(Self {
             role: role_for_content_kind(kind)?,
             source_epoch,

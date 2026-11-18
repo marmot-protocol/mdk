@@ -1390,7 +1390,7 @@ impl<S: StorageProvider> Engine<S> {
             .storage
             .list_openmls_messages_in_states(
                 group_id,
-                &crate::openmls_projection::OPENMLS_GRAPH_INPUT_STATES,
+                &crate::openmls_projection::OPENMLS_COMMIT_INPUT_STATES,
                 EpochId(floor),
                 OpenMlsContentFilter::Commits,
             )

@@ -307,6 +307,13 @@ async fn reopen_after_crash_during_publish_recovers_stranded_pending_commit() {
         "expected PendingCommitRecovered at the pre-stage epoch, got events: {events:?}"
     );
 
+    assert_eq!(
+        alice
+            .prepare_convergence_cutoff_delay_ms(&group_id)
+            .unwrap(),
+        None,
+        "the abandoned invite must not open a convergence pass"
+    );
     // The group is back at the pre-stage epoch with the staged invite dropped.
     assert_eq!(alice.epoch(&group_id).unwrap(), EpochId(1));
     assert_eq!(
