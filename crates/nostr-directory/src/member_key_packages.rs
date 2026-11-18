@@ -89,6 +89,29 @@ mod tests {
         assert!(!cache.order.contains(&newest));
     }
 
+    /// A read queued behind one that answers at the cut-off never starts:
+    /// the cut-off wins over the answer, and a passed cut-off polls nothing.
+    #[tokio::test(start_paused = true)]
+    async fn a_passed_cut_off_starts_no_queued_read() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let cut_off = tokio::time::Instant::now() + Duration::from_secs(1);
+        let started = Arc::new(AtomicUsize::new(0));
+        let reads = (0..2).map(|_| {
+            let started = Arc::clone(&started);
+            async move {
+                started.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep_until(cut_off).await;
+            }
+        });
+        let mut reads = stream::iter(reads).buffer_unordered(1);
+
+        assert!(next_before(&mut reads, Some(cut_off)).await.is_none());
+        assert!(next_before(&mut reads, Some(cut_off)).await.is_none());
+        assert_eq!(started.load(Ordering::SeqCst), 1);
+    }
+
     #[test]
     fn partial_errors_keep_internal() {
         use cgka_traits::error::EngineError;
@@ -296,18 +319,20 @@ impl PartialCutOffs {
     }
 }
 
-/// The stream's next item, or `None` once it ends or `cut_off` passes. An
-/// item already waiting when the cut-off passes is still taken: taking it
-/// waits for nothing, and each later step keeps its own cut-off.
+/// The stream's next item, or `None` once it ends or `cut_off` passes. The
+/// cut-off wins: once it has passed the stream is not polled again, because
+/// polling a buffered stream starts its queued reads, and a read started
+/// then would run on unawaited beside the steps after it.
 async fn next_before<S: Stream + Unpin>(
     stream: &mut S,
     cut_off: Option<tokio::time::Instant>,
 ) -> Option<S::Item> {
     match cut_off {
-        Some(cut_off) => tokio::time::timeout_at(cut_off, stream.next())
-            .await
-            .ok()
-            .flatten(),
+        Some(cut_off) => tokio::select! {
+            biased;
+            () = tokio::time::sleep_until(cut_off) => None,
+            item = stream.next() => item,
+        },
         None => stream.next().await,
     }
 }
@@ -1052,10 +1077,6 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                 }
             })
             .collect();
-        let fetched_outbox = outbox_groups
-            .iter()
-            .flat_map(|(_, indices)| indices.iter().copied())
-            .collect::<Vec<_>>();
         let outbox_hop = self
             .resolve_relay_list_hop(
                 targets,
@@ -1063,11 +1084,9 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                 cut_offs.map(|cut_offs| cut_offs.outbox_hop),
             )
             .await?;
-        unfinished.extend(
-            fetched_outbox
-                .into_iter()
-                .filter(|index| !outbox_hop.cleared.contains(index)),
-        );
+        unfinished.extend(attempted_outbox.iter().copied().filter(|index| {
+            !invalid_outboxes.contains(index) && !outbox_hop.cleared.contains(index)
+        }));
         let completed_outbox = outbox_hop.completed;
         let completed = completed_discovery
             .iter()
