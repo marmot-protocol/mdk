@@ -165,6 +165,16 @@ impl<R: DirectoryResources> Directory<R> {
         Directory::reset_availability_cadence(self, account_id_hex);
     }
 
+    pub fn notify_availability_admission_for_test(&self) -> Arc<tokio::sync::Notify> {
+        let notify = Arc::new(tokio::sync::Notify::new());
+        *self
+            .state
+            .availability_admission
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some(notify.clone());
+        notify
+    }
+
     pub fn availability_evidence_revision_for_test(
         &self,
         account: &DirectoryAccount,

@@ -531,6 +531,7 @@ async fn availability_detached_wait() {
             .await
     });
     entered.notified().await;
+    let admitted = app.directory().notify_availability_admission_for_test();
     let follower_app = app.clone();
     let follower_owner = owner.clone();
     let follower = tokio::spawn(async move {
@@ -539,6 +540,7 @@ async fn availability_detached_wait() {
             .refresh_follow_availability(&directory_account(&follower_owner))
             .await
     });
+    admitted.notified().await;
     leader.abort();
     release.notify_one();
     let status = follower.await.unwrap().unwrap();
@@ -556,16 +558,13 @@ async fn availability_detached_wait() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn availability_cancel_early() {
-    let (_root, app, _accounts, fetcher) = crate::tests::member_resolution_fixture(0, false).await;
+    let (_root, app, accounts, fetcher) = crate::tests::member_resolution_fixture(1, false).await;
     let owner = app
         .account_home()
         .create_account("availability-owner")
         .unwrap();
-    remember_follows(
-        &app,
-        &owner,
-        (1..=100).map(|index| format!("{index:064x}")).collect(),
-    );
+    remember_follows(&app, &owner, vec![accounts[0].account_id_hex.clone()]);
+    let (entered, release) = fetcher.hold_fetches();
     let task_app = app.clone();
     let task_owner = owner.clone();
     let refresh = tokio::spawn(async move {
@@ -574,32 +573,25 @@ async fn availability_cancel_early() {
             .refresh_follow_availability(&directory_account(&task_owner))
             .await
     });
-    tokio::task::yield_now().await;
-    let operation_id = tokio::time::timeout(Duration::from_secs(1), async {
-        loop {
-            if let Some(operation_id) = app
-                .directory()
-                .follow_availability_status(&owner.account_id_hex)
-                .operation_id
-            {
-                break operation_id;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap();
+    entered.notified().await;
+    let operation_id = app
+        .directory()
+        .follow_availability_status(&owner.account_id_hex)
+        .operation_id
+        .unwrap();
     assert!(
         app.directory()
             .cancel_follow_availability(&owner.account_id_hex, operation_id)
     );
+    release.notify_one();
     let cancelled = tokio::time::timeout(Duration::from_secs(1), refresh)
         .await
         .unwrap()
         .unwrap()
         .unwrap();
     assert_eq!(cancelled.phase, FollowAvailabilityRefreshPhase::Cancelled);
-    assert!(fetcher.requests.lock().unwrap().is_empty());
+    assert!(!fetcher.requests.lock().unwrap().is_empty());
+
     let retried = app
         .directory()
         .refresh_follow_availability(&directory_account(&owner))

@@ -43,6 +43,7 @@ The directory of other people's public Nostr data (step 3 of the 2026-10 archite
 | `src/previews.rs` | Verified previews of `nostr:` references, stored in the directory cache (tests in `src/previews/tests.rs`). |
 | `src/reference.rs` | The shared Nostr reference decoder (`decode_reference`, context gating, bounded errors, length budgets). |
 | `src/sync.rs` | The directory-subscription sync worker and plan. |
+| `src/availability.rs` | Direct-follow availability: the account-local projection, bounded single-flight refresh, operation-matched cancellation, and read-time fencing against the shared KeyPackage journal. |
 | `src/cache.rs`, `src/cache/` | The per-account SQLCipher cache: its numbered migration runner (`cache/migrations.rs`), frozen schemas (`cache/v1.sql`, `cache/v2.sql`, `cache/v3.sql`), and populated/interrupted-upgrade tests (`cache/assurance_tests.rs`, fixture `cache/fixtures/pre_ledger.sql`). |
 
 ## Rules

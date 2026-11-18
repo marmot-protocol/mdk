@@ -47,6 +47,8 @@ pub struct DirectoryState {
     /// Single-flight direct-follow availability refreshes, keyed by account id.
     pub(crate) follow_availability_refreshes:
         Arc<Mutex<super::availability::FollowAvailabilityRefreshes>>,
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) availability_admission: Arc<Mutex<Option<Arc<tokio::sync::Notify>>>>,
 }
 
 impl<R: DirectoryResources> Directory<R> {
