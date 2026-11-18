@@ -422,6 +422,58 @@ async fn live_directory_forgery_cannot_change_persisted_metadata() {
     .await
     .expect("a live deletion must reach the shared availability barriers");
 
+    let revision_before = app
+        .shared_storage()
+        .unwrap()
+        .key_package_evidence_revision(&author)
+        .unwrap();
+    let barrier_count = app
+        .shared_storage()
+        .unwrap()
+        .public_key_package_barriers(&author)
+        .unwrap()
+        .len();
+    let unrelated = EventBuilder::new(Kind::from(5), "")
+        .tags([
+            Tag::parse(["e", "bb".repeat(32).as_str()]).unwrap(),
+            Tag::parse(["k", "1"]).unwrap(),
+        ])
+        .custom_created_at(Timestamp::from_secs(stamp + 5))
+        .finalize(&keys)
+        .unwrap();
+    let fence = EventBuilder::new(Kind::Metadata, r#"{"name":"after-unrelated"}"#)
+        .custom_created_at(Timestamp::from_secs(stamp + 6))
+        .finalize(&fence_keys)
+        .unwrap();
+    send_frames.send(vec![unrelated, fence]).await.unwrap();
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if app
+                .directory()
+                .directory_entry_for_account_id(&fence_author)
+                .unwrap()
+                .and_then(|entry| entry.profile)
+                .and_then(|profile| profile.name)
+                .as_deref()
+                == Some("after-unrelated")
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the unrelated deletion must drain");
+    let shared = app.shared_storage().unwrap();
+    assert_eq!(
+        shared.key_package_evidence_revision(&author).unwrap(),
+        revision_before
+    );
+    assert_eq!(
+        shared.public_key_package_barriers(&author).unwrap().len(),
+        barrier_count
+    );
+
     let expected = app
         .directory()
         .directory_entry_for_account_id(&author)

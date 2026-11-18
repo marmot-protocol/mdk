@@ -1739,6 +1739,104 @@ async fn availability_recovery_stays_bounded() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn availability_discovery_is_bounded() {
+    let (_root, app, accounts, fetcher) = member_resolution_fixture_with_relays(
+        1,
+        false,
+        (0..5)
+            .map(|index| format!("wss://directory-{index}.example"))
+            .collect(),
+    )
+    .await;
+    let owner = app
+        .account_home()
+        .create_account("availability-owner")
+        .unwrap();
+    app.directory()
+        .remember_directory_follow_list_for_test(
+            &owner.account_id_hex,
+            &nostr_directory::FetchedFollowList {
+                follows: vec![accounts[0].account_id_hex.clone()],
+                source_relays: Vec::new(),
+            },
+        )
+        .unwrap();
+    let status = app
+        .directory()
+        .refresh_follow_availability(&crate::directory_resources::directory_account(&owner))
+        .await
+        .unwrap();
+    assert_eq!(status.ready, 1, "{status:?}");
+    let requests = fetcher.requests.lock().unwrap();
+    assert!(requests.iter().any(|request| {
+        request
+            .queries
+            .iter()
+            .any(|query| query.kind == transport_nostr_adapter::KIND_NIP65_RELAY_LIST)
+    }));
+    assert!(
+        requests.iter().all(|request| request.endpoints.len()
+            <= nostr_directory::MAX_FOLLOW_AVAILABILITY_RELAYS_PER_TARGET),
+        "discovery must be bounded before its first fetch"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn availability_unusable_cached_route_rediscovers() {
+    let (_root, app, accounts, fetcher) = member_resolution_fixture(1, false).await;
+    let owner = app
+        .account_home()
+        .create_account("availability-owner")
+        .unwrap();
+    let account = &accounts[0];
+    let mut relay_list = fetcher
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|event| event.kind == transport_nostr_adapter::KIND_NIP65_RELAY_LIST)
+        .unwrap()
+        .clone();
+    relay_list.tags = vec![vec!["r".into(), "ws://127.0.0.1:9999".into()]];
+    let package = fetcher
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|event| event.kind == KIND_MARMOT_KEY_PACKAGE)
+        .unwrap()
+        .clone();
+    *fetcher.events.lock().unwrap() = vec![relay_list.clone()];
+    app.directory()
+        .fetch_account_relay_list_status_for_account_id(&account.account_id_hex, Vec::new())
+        .await
+        .unwrap();
+
+    relay_list.created_at += 1;
+    relay_list.tags = vec![vec!["r".into(), "wss://usable.example".into()]];
+    {
+        let mut by_endpoint = fetcher.events_by_endpoint.lock().unwrap();
+        by_endpoint.insert("wss://directory.example".into(), vec![relay_list]);
+        by_endpoint.insert("wss://usable.example".into(), vec![package]);
+    }
+    app.directory()
+        .remember_directory_follow_list_for_test(
+            &owner.account_id_hex,
+            &nostr_directory::FetchedFollowList {
+                follows: vec![account.account_id_hex.clone()],
+                source_relays: Vec::new(),
+            },
+        )
+        .unwrap();
+    let status = app
+        .directory()
+        .refresh_follow_availability(&crate::directory_resources::directory_account(&owner))
+        .await
+        .unwrap();
+    assert_eq!(status.ready, 1, "{status:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn availability_deleted_stays_not_found() {
     let (_root, app, accounts, fetcher) = member_resolution_fixture(1, false).await;
     let owner = app

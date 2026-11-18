@@ -8154,6 +8154,24 @@ pub(crate) async fn member_resolution_fixture(
     Vec<AccountSummary>,
     Arc<MemberResolutionDirectoryFetcher>,
 ) {
+    member_resolution_fixture_with_relays(
+        count,
+        split_relays,
+        vec!["wss://directory.example".into()],
+    )
+    .await
+}
+
+pub(crate) async fn member_resolution_fixture_with_relays(
+    count: usize,
+    split_relays: bool,
+    directory_relays: Vec<String>,
+) -> (
+    tempfile::TempDir,
+    MarmotApp,
+    Vec<AccountSummary>,
+    Arc<MemberResolutionDirectoryFetcher>,
+) {
     let directory = tempfile::tempdir().unwrap();
     let home = AccountHome::open(directory.path());
     let accounts = (0..count)
@@ -8161,7 +8179,7 @@ pub(crate) async fn member_resolution_fixture(
         .collect::<Vec<_>>();
     let fetcher = Arc::new(MemberResolutionDirectoryFetcher::default());
     let relay = Arc::new(ScriptedPushRelayClient::default());
-    let mut app = MarmotApp::with_relay(directory.path(), "wss://directory.example")
+    let mut app = MarmotApp::with_relays(directory.path(), directory_relays)
         .with_test_relay_client(relay.clone());
     for (index, account) in accounts.iter().enumerate() {
         let key_package = fresh_key_package_for_account(&app, account, false).await;

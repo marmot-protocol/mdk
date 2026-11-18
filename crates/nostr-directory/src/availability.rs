@@ -900,11 +900,6 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
         let mut relay_lists =
             blocking_directory_task(move || directory.cached_relay_list_status(&account)).await?;
 
-        if relay_lists.nip65.relays.is_empty() {
-            relay_lists = self
-                .fetch_relay_list_status(account_id_hex, Vec::new())
-                .await?;
-        }
         let mut source_relays = self.relay_plane.retain_safe_discovered_endpoints(
             relay_lists
                 .nip65
@@ -915,6 +910,25 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                 .collect(),
             "follow availability KeyPackage fetch",
         );
+        if source_relays.is_empty() {
+            relay_lists = self
+                .fetch_relay_list_status_with_cap(
+                    account_id_hex,
+                    Vec::new(),
+                    Some(MAX_FOLLOW_AVAILABILITY_RELAYS_PER_TARGET),
+                )
+                .await?;
+            source_relays = self.relay_plane.retain_safe_discovered_endpoints(
+                relay_lists
+                    .nip65
+                    .relays
+                    .iter()
+                    .cloned()
+                    .map(TransportEndpoint)
+                    .collect(),
+                "follow availability KeyPackage fetch",
+            );
+        }
         let discovery_relays = self.directory_source_relays(&[]);
         let used_safe_nip65 = !source_relays.is_empty();
         if source_relays.is_empty() {

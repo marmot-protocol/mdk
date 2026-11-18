@@ -122,10 +122,23 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
         account_id_hex: &str,
         bootstrap_relays: Vec<TransportEndpoint>,
     ) -> Result<AccountRelayListStatus, DirectoryError> {
+        self.fetch_relay_list_status_with_cap(account_id_hex, bootstrap_relays, None)
+            .await
+    }
+
+    pub(crate) async fn fetch_relay_list_status_with_cap(
+        &self,
+        account_id_hex: &str,
+        bootstrap_relays: Vec<TransportEndpoint>,
+        cap: Option<usize>,
+    ) -> Result<AccountRelayListStatus, DirectoryError> {
         let public_key =
             PublicKey::parse(account_id_hex).map_err(|_| DirectoryError::InvalidPublicKey)?;
         let account_id_hex = public_key.to_hex();
-        let bootstrap_relays = self.directory_source_relays(&bootstrap_relays);
+        let mut bootstrap_relays = self.directory_source_relays(&bootstrap_relays);
+        if let Some(cap) = cap {
+            bootstrap_relays.truncate(cap);
+        }
         let freshness = self.directory_freshness();
         let records = self
             .relay_plane

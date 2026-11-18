@@ -34,6 +34,14 @@ fn deletion_barriers(
     record: &RelayEventRecord,
 ) -> Vec<storage_sqlite::PublicKeyPackageBarrierRecord> {
     let account_id_hex = record.event.pubkey.clone();
+    let targets_key_packages = record.event.tags.iter().any(|tag| {
+        tag.first().is_some_and(|name| name == "k")
+            && tag.get(1).and_then(|value| value.parse::<u64>().ok())
+                == Some(KIND_MARMOT_KEY_PACKAGE)
+    });
+    if !targets_key_packages {
+        return Vec::new();
+    }
     record
         .event
         .tags
@@ -435,7 +443,9 @@ impl<R: DirectoryResources> Directory<R> {
                 self.remember_directory_key_package(&fetched)?;
             }
             5 => {
-                for barrier in deletion_barriers(&record) {
+                let observed_at = self.directory_freshness().now;
+                for mut barrier in deletion_barriers(&record) {
+                    barrier.observed_at = observed_at;
                     self.resources
                         .shared_storage()?
                         .put_public_key_package_barrier(&barrier)?;
