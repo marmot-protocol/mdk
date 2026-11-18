@@ -249,7 +249,7 @@
       "sleep": 1
     },
     "crates/marmot-app/src/tests.rs": {
-      "sleep": 47,
+      "sleep": 46,
       "short_timeout": 6
     },
     "crates/marmot-app/src/tests/canonical_membership.rs": {
