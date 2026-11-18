@@ -2850,7 +2850,6 @@ async fn run_app_runtime_account_worker(
                                     install_storage_telemetry(&reopened, shared.observer.performance());
                                     reopened.runtime_telemetry = Some(shared.observer.performance().clone());
                                     reopened.history_recovery.set_recovery_credits(shared.recovery_credit_pool());
-                                    reopened.resume_read_state(read_state.take());
                                     // A reconnect open is deferred like the
                                     // startup open; drain the hydration
                                     // eagerly here — the steady-state loop
@@ -2858,11 +2857,10 @@ async fn run_app_runtime_account_worker(
                                     // hand out not-hydrated errors after a
                                     // mid-session reconnect (mdk#1161). The
                                     // reads that answer from A must not
-                                    // either: A shows the reopened client
+                                    // either: A moves to the reopened client
                                     // only once it is drained.
                                     if let Err(err) = drain_deferred_hydration(&mut reopened).await
                                     {
-                                        read_state = reopened.take_read_state();
                                         publish_app_runtime_account_error(
                                             Emit::Quiescent(&reopened),
                                             &events,
@@ -2876,7 +2874,7 @@ async fn run_app_runtime_account_worker(
                                         drop(reopened);
                                         continue;
                                     }
-                                    reopened.publish_read_state();
+                                    reopened.resume_read_state(read_state.take());
                                     // Reconnect restores transport activation
                                     // and subscriptions, then resumes the live
                                     // receive tail. Do not block the command

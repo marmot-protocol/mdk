@@ -1768,15 +1768,16 @@ impl AppClient {
     /// Continue publishing A on a client that replaced the one `slot` was
     /// taken from. Every answer rebuilds at the next publish: the new
     /// client's write counts start over, so no stamp taken on the old one
-    /// may be compared with them. Nothing publishes here: the reopened
-    /// client's groups are seeded, not hydrated, so A keeps the old
-    /// client's last version until the worker has drained their hydration.
+    /// may be compared with them. The worker resumes A only on a client
+    /// whose deferred hydration it has drained, so A never shows a group a
+    /// reopen only seeded.
     pub(crate) fn resume_read_state(&mut self, slot: Option<Box<ReadStateSlot>>) {
         if let Some(slot) = slot {
             slot.lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .forget_inputs();
             self.read_state = Some(slot);
+            self.publish_read_state();
         }
     }
 
