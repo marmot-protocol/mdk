@@ -46,7 +46,25 @@ fn deletion_barriers(
             && tag.get(1).and_then(|value| value.parse::<u64>().ok())
                 == Some(KIND_MARMOT_KEY_PACKAGE)
     });
-    if evidence_scope == DeletionEvidenceScope::KeyPackageQuery && !targets_key_packages {
+    let has_kind_hint = record
+        .event
+        .tags
+        .iter()
+        .any(|tag| tag.first().is_some_and(|name| name == "k"));
+    let has_event_target = record
+        .event
+        .tags
+        .iter()
+        .any(|tag| tag.first().is_some_and(|name| name == "e"));
+    let has_address_target = record
+        .event
+        .tags
+        .iter()
+        .any(|tag| tag.first().is_some_and(|name| name == "a"));
+    if evidence_scope == DeletionEvidenceScope::KeyPackageQuery
+        && !targets_key_packages
+        && (has_kind_hint || !(has_event_target || has_address_target))
+    {
         return Vec::new();
     }
     record
@@ -59,8 +77,8 @@ fn deletion_barriers(
             let kind = parts.next()?.parse::<u64>().ok()?;
             let author = parts.next()?;
             let slot = parts.next()?;
-            (kind == KIND_MARMOT_KEY_PACKAGE && author == account_id_hex).then_some(
-                storage_sqlite::PublicKeyPackageBarrierRecord {
+            (kind == KIND_MARMOT_KEY_PACKAGE && author.eq_ignore_ascii_case(&account_id_hex))
+                .then_some(storage_sqlite::PublicKeyPackageBarrierRecord {
                     account_id_hex: account_id_hex.clone(),
                     key_package_id: slot.to_owned(),
                     kind: storage_sqlite::PublicKeyPackageBarrierKind::Deletion,
@@ -68,8 +86,7 @@ fn deletion_barriers(
                     deleted_event_id: None,
                     event_created_at: record.event.created_at,
                     observed_at: 0,
-                },
-            )
+                })
         })
         .chain(
             record
@@ -83,7 +100,7 @@ fn deletion_barriers(
                         key_package_id: String::new(),
                         kind: storage_sqlite::PublicKeyPackageBarrierKind::Deletion,
                         event_id_hex: record.event.id.clone(),
-                        deleted_event_id: Some(tag.get(1)?.clone()),
+                        deleted_event_id: Some(tag.get(1)?.to_ascii_lowercase()),
                         event_created_at: record.event.created_at,
                         observed_at: 0,
                     })

@@ -1250,7 +1250,11 @@ fn barrier_allows(
                     && event_id < barrier.event_id_hex.as_str())
         }
         PublicKeyPackageBarrierKind::Deletion => {
-            if barrier.deleted_event_id.as_deref() == Some(event_id) {
+            if barrier
+                .deleted_event_id
+                .as_deref()
+                .is_some_and(|deleted| deleted.eq_ignore_ascii_case(event_id))
+            {
                 return false;
             }
             if barrier.deleted_event_id.is_some() {

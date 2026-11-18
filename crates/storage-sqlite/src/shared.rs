@@ -1136,9 +1136,15 @@ fn prune_key_package_barriers(tx: &Transaction<'_>, now: i64) -> StorageResult<(
     let stale_before = now
         .saturating_sub(KEY_PACKAGE_EVIDENCE_MAX_AGE_SECS + KEY_PACKAGE_EVIDENCE_FUTURE_SKEW_SECS);
     for statement in [
-        "DELETE FROM public_key_package_barriers WHERE event_created_at <= ?1",
-        "DELETE FROM public_key_package_eviction_watermarks WHERE event_created_at <= ?1",
-        "DELETE FROM public_key_package_eviction_fallback WHERE event_created_at <= ?1",
+        "DELETE FROM public_key_package_barriers
+         WHERE (deleted_event_id IS NOT NULL AND observed_at <= ?1)
+            OR (deleted_event_id IS NULL AND event_created_at <= ?1)",
+        "DELETE FROM public_key_package_eviction_watermarks
+         WHERE (kind = 'exact_deletion' AND evicted_at <= ?1)
+            OR (kind <> 'exact_deletion' AND event_created_at <= ?1)",
+        "DELETE FROM public_key_package_eviction_fallback
+         WHERE (kind = 'exact_deletion' AND evicted_at <= ?1)
+            OR (kind <> 'exact_deletion' AND event_created_at <= ?1)",
     ] {
         tx.execute_cached(statement, [stale_before]).storage()?;
     }
@@ -1790,10 +1796,12 @@ mod tests {
         };
         let exact = PublicKeyPackageBarrierRecord {
             deleted_event_id: Some("11".repeat(32)),
+            observed_at: fresh_timestamp(8),
             ..initial.clone()
         };
         let other_target = PublicKeyPackageBarrierRecord {
             deleted_event_id: Some("22".repeat(32)),
+            observed_at: fresh_timestamp(8),
             ..initial.clone()
         };
         for record in [&initial, &exact, &other_target] {
@@ -1835,7 +1843,7 @@ mod tests {
             .unwrap();
         let exact_winner = PublicKeyPackageBarrierRecord {
             event_id_hex: "aa".repeat(32),
-            observed_at: 8,
+            observed_at: fresh_timestamp(8),
             ..exact
         };
         storage
@@ -1866,7 +1874,7 @@ mod tests {
         );
         assert_eq!(
             storage.public_key_package_evicted_at(&account).unwrap(),
-            Some(8)
+            Some(fresh_timestamp(8))
         );
     }
 
@@ -1885,7 +1893,7 @@ mod tests {
                     event_id_hex: format!("{:064x}", index + 1),
                     deleted_event_id: Some(format!("{:064x}", index + 10)),
                     event_created_at: created_at,
-                    observed_at: 100 + index as u64,
+                    observed_at: fresh_timestamp(100 + index as u64),
                     kind: PublicKeyPackageBarrierKind::Deletion,
                 })
                 .unwrap();
@@ -1898,7 +1906,7 @@ mod tests {
                     event_id_hex: format!("{index:064x}"),
                     deleted_event_id: None,
                     event_created_at: fresh_timestamp(1_000 + index),
-                    observed_at: 1_000 + index,
+                    observed_at: fresh_timestamp(1_000 + index),
                     kind: PublicKeyPackageBarrierKind::Replacement,
                 })
                 .unwrap();
@@ -1931,6 +1939,7 @@ mod tests {
                     event_id_hex: "ff".repeat(32),
                     deleted_event_id: Some("bb".repeat(32)),
                     event_created_at: fresh_timestamp(100),
+                    observed_at: fresh_timestamp(0),
                     kind: PublicKeyPackageBarrierKind::Deletion,
                     ..replacement.clone()
                 };
@@ -1950,7 +1959,7 @@ mod tests {
                             event_id_hex: format!("{index:064x}"),
                             deleted_event_id: None,
                             event_created_at: fresh_timestamp(1_000 + index),
-                            observed_at: 1_000 + index,
+                            observed_at: fresh_timestamp(1_000 + index),
                             kind: PublicKeyPackageBarrierKind::Replacement,
                         })
                         .unwrap();
@@ -1979,6 +1988,7 @@ mod tests {
             } else {
                 record.event_created_at += 100;
             }
+            record.observed_at = fresh_timestamp(index);
             storage.put_public_key_package_barrier(&record).unwrap();
         }
         let retained = storage.public_key_package_barriers(&account).unwrap();
@@ -1995,7 +2005,7 @@ mod tests {
         assert!((before..=unix_now_seconds_i64() as u64).contains(&watermark.observed_at));
         assert_eq!(
             storage.public_key_package_evicted_at(&account).unwrap(),
-            Some(502)
+            Some(fresh_timestamp(502))
         );
 
         let older = PublicKeyPackageBarrierRecord {
@@ -2320,6 +2330,47 @@ mod tests {
                 .unwrap(),
             None
         );
+
+        let event_account = "ee".repeat(32);
+        let event_barrier = PublicKeyPackageBarrierRecord {
+            account_id_hex: event_account.clone(),
+            key_package_id: String::new(),
+            event_id_hex: "ff".repeat(32),
+            deleted_event_id: Some("12".repeat(32)),
+            event_created_at: 0,
+            observed_at: unix_now_seconds_i64() as u64,
+            kind: PublicKeyPackageBarrierKind::Deletion,
+        };
+        storage
+            .put_public_key_package_barrier(&event_barrier)
+            .unwrap();
+        assert_eq!(
+            storage.public_key_package_barriers(&event_account).unwrap(),
+            [event_barrier]
+        );
+
+        let exact_account = "dd".repeat(32);
+        let evicted_at = unix_now_seconds_i64();
+        storage
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO public_key_package_eviction_watermarks (
+                    account_id_hex, key_package_id, event_id_hex,
+                    event_created_at, evicted_at, kind
+                 ) VALUES (?1, 'slot', 'ee', 0, ?2, 'exact_deletion')",
+                params![&exact_account, evicted_at],
+            )
+            .unwrap();
+        storage
+            .put_public_key_package_barrier(&key_package_barrier(&exact_account, 1))
+            .unwrap();
+        let exact = storage
+            .public_key_package_eviction_watermark(&exact_account)
+            .unwrap()
+            .unwrap();
+        assert_eq!(exact.kind, PublicKeyPackageBarrierKind::ExactDeletion);
+        assert_eq!(exact.observed_at, evicted_at as u64);
     }
 
     #[test]
@@ -2571,7 +2622,7 @@ mod tests {
             event_id_hex: "cc".repeat(32),
             deleted_event_id: Some(record.event_id_hex.clone()),
             event_created_at: base + 25,
-            observed_at: 31,
+            observed_at: fresh_timestamp(31),
             kind: PublicKeyPackageBarrierKind::Deletion,
         };
         storage.put_public_key_package_barrier(&barrier).unwrap();

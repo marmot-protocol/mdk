@@ -1837,6 +1837,82 @@ async fn availability_unusable_cached_route_rediscovers() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn availability_live_deletions_are_fenced() {
+    let (_root, app, accounts, _fetcher) = member_resolution_fixture(2, false).await;
+    let owner = app
+        .account_home()
+        .create_account("availability-live-delete-owner")
+        .unwrap();
+    app.directory()
+        .remember_directory_follow_list_for_test(
+            &owner.account_id_hex,
+            &nostr_directory::FetchedFollowList {
+                follows: accounts
+                    .iter()
+                    .map(|account| account.account_id_hex.clone())
+                    .collect(),
+                source_relays: Vec::new(),
+            },
+        )
+        .unwrap();
+    app.directory()
+        .refresh_follow_availability(&crate::directory_resources::directory_account(&owner))
+        .await
+        .unwrap();
+    let rows = app
+        .directory()
+        .follow_availability_page(
+            &crate::directory_resources::directory_account(&owner),
+            None,
+            100,
+        )
+        .unwrap()
+        .rows;
+    let selected = |index: usize| {
+        rows.iter()
+            .find(|row| row.account_id_hex == accounts[index].account_id_hex)
+            .unwrap()
+            .key_package_event_id
+            .clone()
+            .unwrap()
+    };
+    let event_deletion = signed_deletion(
+        &app,
+        &accounts[0],
+        vec![vec!["e".into(), selected(0).to_ascii_uppercase()]],
+        unix_now_seconds() + 10,
+    );
+    let address_deletion = signed_deletion(
+        &app,
+        &accounts[1],
+        vec![vec![
+            "a".into(),
+            format!(
+                "30443:{}:{}-slot",
+                accounts[1].account_id_hex.to_ascii_uppercase(),
+                accounts[1].label
+            ),
+        ]],
+        unix_now_seconds() + 11,
+    );
+    for deletion in [event_deletion, address_deletion] {
+        app.directory()
+            .ingest_directory_relay_event(transport_nostr::DirectoryRelayEventRecord {
+                endpoints: Vec::new(),
+                event: deletion,
+            })
+            .unwrap();
+    }
+    let states = selection_availability_states(&app, &owner);
+    for account in accounts {
+        assert_eq!(
+            states[&account.account_id_hex],
+            nostr_directory::FollowAvailabilityState::Unknown
+        );
+    }
+}
+
+#[tokio::test]
 async fn availability_deleted_stays_not_found() {
     let (_root, app, accounts, fetcher) = member_resolution_fixture(1, false).await;
     let owner = app
@@ -1873,7 +1949,7 @@ async fn availability_deleted_stays_not_found() {
         &app,
         &accounts[0],
         vec![
-            vec!["e".into(), selected],
+            vec!["e".into(), selected.clone()],
             vec!["k".into(), KIND_MARMOT_KEY_PACKAGE.to_string()],
         ],
         unix_now_seconds() + 10,
