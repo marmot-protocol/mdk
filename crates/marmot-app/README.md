@@ -736,10 +736,11 @@ remains an admin.
 
 Sibling assistance requires a trusted device group with another Active or Inactive device and this device's own
 roster entry already carrying its tag signature key. It applies only to chats that support same-account device
-removal and have the required tagged leaves. `groups_left_to_siblings` counts chats handed off to siblings.
-A queued member Leave appears in `group_leave_failures`. A peer commits a member's SelfRemove to remove
-this device. The call still attempts local account deletion. Show the unfinished chats and use
-`local_cleanup.completed` to report whether the account was erased on this device.
+removal and have the required tagged leaves. `groups_left_to_siblings` records a handoff, not confirmation that removal
+completed. Outside admin chats, `groups_left` counts successful local leave calls, not confirmed membership removal. The call still attempts
+local account deletion when remote departure fails: show the chats in `group_leave_failures` and check
+`local_cleanup.completed` separately. Completed local cleanup does not prove this device left every chat.
+A queued member Leave appears in `group_leave_failures`.
 
 An account that cannot run a worker here (signed out, lacking its registered external signer, or excluded by
 onboarding's worker gate) signs out on its own immediately. Unfinished onboarding that runs setup traffic but still

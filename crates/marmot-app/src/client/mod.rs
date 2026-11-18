@@ -4018,18 +4018,19 @@ impl AppClient {
                 return Err(err);
             }
         };
-        let queued_for_sign_out =
-            matches!(reason, AccountLeaveReason::SignOut) && !effects.queued.is_empty();
+        let summary = if matches!(reason, AccountLeaveReason::SignOut) {
+            sign_out::member_leave_send_summary(&effects)
+        } else {
+            send_summary_from_effects(&effects)
+        };
+        let queued_for_sign_out = matches!(reason, AccountLeaveReason::SignOut)
+            && summary.accept_disposition == cgka_traits::SendAcceptDisposition::AcceptedPending;
         if !queued_for_sign_out {
             self.record_human_action_succeeded(group_id, &audit_context, &effects);
         }
         self.remember_published_reports(&effects);
         self.save_state_with_pending_local_group_deletion_frontier_clears()?;
-        let mut summary = send_summary_from_effects(&effects);
         if queued_for_sign_out {
-            // A different publish can be acknowledged in the same pass.
-            // This Leave is still queued and the wipe can discard it.
-            summary.accept_disposition = cgka_traits::SendAcceptDisposition::AcceptedPending;
             return Ok(summary);
         }
         // A local leave / decline is a voluntary departure, recorded as `Left`
