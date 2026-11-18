@@ -1,6 +1,6 @@
 ---
 title: Account history recovery
-updated: 2026-11-09
+updated: 2026-11-18
 status: Design (v2), being implemented. Replaces the 22 recovery design, ledger and qualification notes.
 ---
 
@@ -1150,7 +1150,11 @@ revision, shown while the group has a current route that is not suspended. Rejoi
 not written to the forensic audit, whose recovery vocabulary has no rejoin cause. Each survey
 publishes the routes with a required unit still catching up; the account's recovery status
 reads that, and a change in it or in the notices is one `RecoveryStatusChanged`. Which of a
-route's relays still owe is no part of it, since hosts see only groups and the inbox.
+route's relays still owe is no part of it, since hosts see only groups and the inbox. The cue
+tracks the route set, so it can still prompt a read that returns the same status: a hidden
+device group's route entering or leaving the set, a second route of a group already listed, or
+the first survey finding nothing. Comparing what hosts see before announcing would drop the cue
+for a change a later survey undid, which a host may already have read.
 
 ## What gets deleted
 
