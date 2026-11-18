@@ -8882,10 +8882,10 @@ impl AppTransportRouting {
         self.inner.recovery_runner_catching_up.clone()
     }
 
-    /// A receiver that changes whenever the routes the runner finds catching
-    /// up do: a route's first unit starts owing, or its last one stops owing,
-    /// breaks or is re-armed. A change on one relay while another still owes
-    /// the route is none.
+    /// A receiver that changes whenever the published value does: the first
+    /// survey replaces `None` (an empty set included), and a later one
+    /// publishes only when the set of routes with a required unit catching
+    /// up changes. Which of a route's relays owe is not part of it.
     fn subscribe_recovery_runner_catching_up(
         &self,
     ) -> tokio::sync::watch::Receiver<

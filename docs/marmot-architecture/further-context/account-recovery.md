@@ -927,9 +927,13 @@ relay disconnects. The runner reads them through the live boundary's own query
 grow with the clock, and a background drain over slow relays would never finish: each answer
 leaves the next second owed on the relays already served (mdk#3538). So a background drain
 takes each such unit's endpoint when it first observes it, and its own requests cannot extend
-it. The window ends when the runner goes idle; a wake, a hint change, a reconnect of the unit's
-relay, newly staged history in its group, or a due timer starts a drain that owes through then.
-An explicit pass or repair reads debt through its own time.
+it. Every window ends when the runner goes idle, is woken or gets new hints, and the next drain
+owes through its own first look. Within a drain, a reconnect renews only its relay's windows,
+newly staged history renews only its group's (or the inbox's), and an epoch-gap visit or a
+live fence can raise an endpoint to its own end. Nothing polls such a unit on a timer of its
+own: once its window is proved, newer history waits for a wake, a reconnect, another unit's due
+time or an explicit `sync()`. Explicit passes and repairs use no window: a pass still stops
+before a healthy tail, and a repair reads through its request time.
 Units are served by class: held groups, then open conversation windows and the inbox, then the
 rest, then best-effort relays. Within a class each eligible unit runs once per round, smallest
 route debt first, so a large group is served every round. The runner sleeps until a bump, a

@@ -882,7 +882,9 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   through the window the drain first observed it in (`select::BackgroundWindows`, mdk#3538): its own answers
   never extend it, so slow relays cannot keep a drain from ending. The windows clear when the runner idles, on
   a wake or hint change, and per group (or the inbox) on newly staged history; a lost tail or relay reconnect
-  renews that unit's. Never poll a tail-less route on a timer of its own; explicit passes and repairs read through now.
+  renews that unit's. Never poll a tail-less route on a timer of its own: once its window is proved, newer
+  history there waits for one of those or an explicit `sync()`. Explicit passes and repairs use no window; a
+  pass still stops before a healthy tail, and a repair reads through its request time.
   A separate durable budget keyed by the missing epoch survives restart: partial sweep progress and same-epoch
   ticket revisions never reset it. Complete visits without actual epoch recovery back off using the existing
   unit policy and eventually park the EpochGap visibly. Explicit repair resets the budget; a higher stalled
