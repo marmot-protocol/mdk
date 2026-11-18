@@ -7089,14 +7089,13 @@ mod tests {
         );
     }
 
-    /// A refusal of traffic stamped near this copy's Welcome is no more stall
-    /// evidence than its retention would have been (mdk#3536). A newly linked
-    /// device's first sweep can fill the retained backlog with the group's
-    /// pre-Welcome history, and arming from the next refusal would report the
-    /// device stalled at the epoch it joined at. A refusal stamped past the
-    /// margin still arms.
+    /// A refusal arms its epoch gap even when it is stamped near this copy's
+    /// Welcome, where a retained deferral would not count (mdk#3536). The
+    /// engine kept nothing, and a refused recovery fetch leaves its second
+    /// covered, so the gap is what fetches the event again once the backlog
+    /// drains.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_refusal_near_this_copys_welcome_arms_no_epoch_gap() {
+    async fn a_refusal_near_this_copys_welcome_still_arms_an_epoch_gap() {
         use cgka_traits::ingest::{InboundResourceLimit, IngestOutcome};
         use cgka_traits::storage::GroupStorage;
         let dir = tempfile::tempdir().unwrap();
@@ -7123,34 +7122,17 @@ mod tests {
         let mut record = storage.get_group(&group).unwrap();
         record.local_copy_welcome_created_at = Some(cgka_traits::transport::Timestamp(welcome_at));
         storage.put_group(&record).unwrap();
-        let refused = IngestOutcome::ResourceRefused {
-            group_id: group.clone(),
-            resource: InboundResourceLimit::TransportDeferredCapacity,
-        };
 
         client.detect_epoch_stall(
             Some(group.clone()),
-            "history",
-            &refused,
+            "near-the-welcome",
+            &IngestOutcome::ResourceRefused {
+                group_id: group.clone(),
+                resource: InboundResourceLimit::TransportDeferredCapacity,
+            },
             cgka_traits::transport::Timestamp(welcome_at - 60),
         );
-        assert!(
-            !client.has_pending_epoch_backfill(),
-            "a refused piece of pre-Welcome history is not evidence this device is behind"
-        );
-
-        client.detect_epoch_stall(
-            Some(group.clone()),
-            "live",
-            &refused,
-            cgka_traits::transport::Timestamp(
-                welcome_at + cgka_traits::group::PRE_WELCOME_CLOCK_SKEW_SECS,
-            ),
-        );
-        assert!(
-            client.has_pending_epoch_backfill(),
-            "a refusal from this copy's own era is still a stall signal"
-        );
+        assert!(client.has_pending_epoch_backfill());
     }
 
     /// A commit or retry can release several retained messages in one effects batch.

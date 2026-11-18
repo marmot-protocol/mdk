@@ -13,12 +13,11 @@
 //!
 //! This drives `AppClient::next_event` directly (the worker's exact call, at
 //! `account_worker.rs`) rather than through the full runtime. The observable is
-//! precisely "did `next_event` return", which a runtime-level harness cannot
-//! see: it exercises the cold-boot catch-up seam (the recovery seam after the
-//! initial `sync()`), not the live
-//! `next_event` seam this test pins. Before the guard learned about
-//! `epoch_backfill_pending` this call hangs, and the timeout below is the RED
-//! signal.
+//! "did `next_event` return with an empty summary". That is weaker than the
+//! guard it was written for: the convergence a retained undecryptable row
+//! schedules also makes `next_event` return, so this test does not isolate the
+//! `epoch_backfill_pending` branch, and it does not prove the burst armed the
+//! backfill.
 
 // Test fixtures dial local relays directly; the proxy policy is crate-private.
 #![allow(clippy::disallowed_methods)]
@@ -44,10 +43,8 @@ use transport_nostr_peeler::{NOSTR_GROUP_CONTENT_MIN_LEN, NostrTransportEvent};
 /// arms a full-history epoch-gap backfill.
 const BACKFILL_THRESHOLD: usize = 8;
 
-/// How long the arming `next_event` call is allowed to run before the test
-/// gives up. With the fix it returns as soon as the threshold-crossing delivery
-/// arms the backfill; without it the call blocks forever on the next
-/// `receive()`, and this bound is the RED failure.
+/// How long the `next_event` call is allowed to run before the test gives up;
+/// a call that blocks on the next `receive()` fails here.
 const NEXT_EVENT_DEADLINE: Duration = Duration::from_secs(10);
 
 /// Deadline for bob's welcome to arrive and the group to become live.
@@ -108,11 +105,11 @@ async fn publish_garbage_group_message_at(
         .expect("publish garbage kind-445 test event");
 }
 
-/// A live delivery that arms the epoch-gap backfill but yields no visible
-/// summary content must still make `next_event` return, so the worker reaches
-/// its recovery seam (`refresh_recovery_at_seam`).
+/// A burst of undecryptable live traffic that yields no visible summary
+/// content still makes `next_event` return, so the worker reaches its recovery
+/// seam (`refresh_recovery_at_seam`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn next_event_returns_when_a_live_delivery_arms_the_epoch_backfill() {
+async fn next_event_returns_after_an_undecryptable_live_burst() {
     storage_sqlite::relax_storage_for_test_process();
     let (_relay, url) = mock_relay().await;
 
