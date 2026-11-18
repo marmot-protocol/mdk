@@ -45,7 +45,8 @@ Over-budget published member routes remain account-local and do not renew prewar
 `refresh_follow_availability` checks at most 100 direct follows, four at a time, with a 10-second target deadline and
 a five-minute overall deadline. Each target uses at most two relay fetch calls: relay-list discovery when no safe
 NIP-65 route is cached, then a KeyPackage/deletion read. A completed clean miss with no observed publications stays
-`not_found` for 15 minutes. Incomplete, malformed, deleted or replaced reads stay `unknown`. Results commit per target,
+`not_found` for 15 minutes. A completed clean, deleted, or obsolete read uses the same state. Incomplete, malformed,
+replaced or expired reads stay `unknown`. Results commit per target,
 repeated calls share an active refresh, and completed refreshes have a 60-second cadence. `follow_availability_page`
 returns up to 100 rows in account-id keyset order and hides unfollows. Expired or replaced positives and any negative
 with replacement or eviction evidence downgrade to `unknown`.

@@ -227,6 +227,15 @@ async fn live_directory_forgery_cannot_change_persisted_metadata() {
     };
     let initial = records(stamp, false);
     let newer = records(stamp + 1, true);
+    let deleted_event_id = "aa".repeat(32);
+    let deletion = EventBuilder::new(Kind::from(5), "")
+        .tags([
+            Tag::parse(["e", &deleted_event_id]).unwrap(),
+            Tag::parse(["k", "30443"]).unwrap(),
+        ])
+        .custom_created_at(Timestamp::from_secs(stamp + 4))
+        .finalize(&keys)
+        .unwrap();
     let (send_frames, mut frames) = mpsc::channel::<Vec<Event>>(4);
     let (ready, registered) = oneshot::channel();
     let server = tokio::spawn(async move {
@@ -278,7 +287,7 @@ async fn live_directory_forgery_cannot_change_persisted_metadata() {
                 batches: vec![DirectorySyncBatch {
                     subscription_id: "directory_identity_regression".into(),
                     authors: vec![author.clone(), fence_author.clone()],
-                    kinds: vec![0, 3, 10002, 10050],
+                    kinds: vec![0, 3, 5, 10002, 10050],
                     since: None,
                 }],
             },
@@ -394,6 +403,25 @@ async fn live_directory_forgery_cannot_change_persisted_metadata() {
             );
         }
     }
+    send_frames.send(vec![deletion]).await.unwrap();
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let barriers = app
+                .shared_storage()
+                .unwrap()
+                .public_key_package_barriers(&author)
+                .unwrap();
+            if barriers.iter().any(|barrier| {
+                barrier.deleted_event_id.as_deref() == Some(deleted_event_id.as_str())
+            }) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("a live deletion must reach the shared availability barriers");
+
     let expected = app
         .directory()
         .directory_entry_for_account_id(&author)

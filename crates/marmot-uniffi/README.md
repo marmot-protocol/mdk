@@ -145,7 +145,7 @@ cache without networking. Pass the returned `nextCursor` as `after` for the next
 
 `ready` means MDK selected a current compatible KeyPackage that has not reached its MLS `not_after`. It does not prove
 that the person installed White Noise or any other client. `unknown` covers absent, stale, incomplete, malformed,
-replaced, deleted, and expired results. A completed clean or obsolete miss is `not_found` for 15 minutes. Each row
+replaced, and expired results. A completed clean, deleted, or obsolete miss is `not_found` for 15 minutes. Each row
 carries its check time, expiry, selected publication id when applicable, and network provenance, never KeyPackage
 bytes.
 
@@ -1135,6 +1135,7 @@ bytes encoded as hex, not fixed-size transport routing ids. Keep filters and ord
 
 `TimelineMessagesSubscription::next()` returns the complete bounded window on
 every update. Its conversion cache avoids reparsing unchanged rows, but those
+replaced, and expired results. A completed clean, deleted, or obsolete miss is `not_found` for 15 minutes. Each row
 rows still get cloned and serialized across FFI. `next_update()` returns raw
 projection deltas, or a replacement `Page` after a refresh. These methods consume
 the same stream; use only one per subscription. Delta consumers must maintain

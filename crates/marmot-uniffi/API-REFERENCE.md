@@ -1614,7 +1614,7 @@ Bounded local cached-identity page for many account IDs.
 pub fn follow_availability_page( &self, account_ref: String, after: Option<String>, limit: u32, ) -> Result<conversions::FollowAvailabilityPageFfi, MarmotKitError>
 ```
 
-Read the selected account's direct follows from its encrypted cache without networking. Results use canonical account ids in keyset order. Pass `next_cursor` as `after` for the next page; `limit` clamps to 1 through 100. Keep this synchronous SQLCipher read off the UI thread. `ready` means a current compatible KeyPackage has not expired, not that a particular client is installed. `unknown` covers missing, stale, incomplete, malformed, replaced, deleted, and expired results. A completed clean or obsolete miss is `not_found` for 15 minutes.
+Read the selected account's direct follows from its encrypted cache without networking. Results use canonical account ids in keyset order. Pass `next_cursor` as `after` for the next page; `limit` clamps to 1 through 100. Keep this synchronous SQLCipher read off the UI thread. `ready` means a current compatible KeyPackage has not expired, not that a particular client is installed. `unknown` covers missing, stale, incomplete, malformed, replaced, and expired results. A completed clean, deleted, or obsolete miss is `not_found` for 15 minutes.
 
 [Source](src/commands/directory.rs#L123)
 
@@ -5720,6 +5720,7 @@ Network-free read of cached public Nostr events referenced from message content,
 pub async fn resolve_public_event_preview( &self, account_ref: String, reference: String, ) -> Result<PublicEventPreviewFfi, MarmotKitError>
 ```
 
+Keep this synchronous SQLCipher read off the UI thread. `ready` means a current compatible KeyPackage has not expired, not that a particular client is installed. `unknown` covers missing, stale, incomplete, malformed, replaced, and expired results. A completed clean, deleted, or obsolete miss is `not_found` for 15 minutes.
 Fetch one referenced event from at most two safe relay hints plus the configured directory relays when it is missing or stale, store it if it verifies and matches, and return the resulting local state. An event-ID preview never refetches once every relay answered the fetch that cached it; otherwise, and for `naddr` previews, it refetches after 30 minutes. `naddr` keeps the newest version. Author-signed NIP-09 deletions apply in either tag form: an `e` tag removes that event (an `naddr` falls back to the previous version), an `a` tag removes every version up to its timestamp. Calls within 30 seconds of a finished fetch for the same reference return local state without network I/O, as does any call while the row is fresh, so call it for every reference a screen shows. A failed or empty fetch keeps prior content and stores no miss.
 
 [Source](src/commands/public_event_preview.rs#L83)

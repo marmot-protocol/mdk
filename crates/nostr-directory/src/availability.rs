@@ -574,6 +574,10 @@ impl RefreshLeader {
         let mut operations = self.operations.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(entry) = operations.by_account.get_mut(&self.account_id_hex)
             && entry.status.borrow().operation_id == Some(self.operation_id)
+            && matches!(
+                phase,
+                FollowAvailabilityRefreshPhase::Complete | FollowAvailabilityRefreshPhase::Partial
+            )
         {
             entry.finished_at = Some(Instant::now());
         }

@@ -29,6 +29,7 @@ pub(crate) const DIRECTORY_SYNC_USER_BATCH_SIZE: usize = 200;
 /// (mdk#687). See [`DIRECTORY_SYNC_LOCAL_ACCOUNT_KINDS`].
 pub(crate) const DIRECTORY_SYNC_KINDS: &[u64] = &[
     KIND_NOSTR_METADATA,
+    5, // NIP-09 deletions fence KeyPackage availability.
     KIND_NIP65_RELAY_LIST,
     KIND_MARMOT_INBOX_RELAY_LIST,
     KIND_MARMOT_KEY_PACKAGE,
@@ -42,6 +43,7 @@ pub(crate) const DIRECTORY_SYNC_LOCAL_ACCOUNT_KINDS: &[u64] = &[
     MUTE_LIST_KIND,
     KIND_NOSTR_METADATA,
     KIND_NOSTR_CONTACT_LIST,
+    5, // NIP-09 deletions fence KeyPackage availability.
     KIND_NIP65_RELAY_LIST,
     KIND_MARMOT_INBOX_RELAY_LIST,
     KIND_MARMOT_KEY_PACKAGE,

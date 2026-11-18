@@ -600,6 +600,12 @@ async fn availability_cancel_early() {
         .unwrap();
     assert_eq!(cancelled.phase, FollowAvailabilityRefreshPhase::Cancelled);
     assert!(fetcher.requests.lock().unwrap().is_empty());
+    let retried = app
+        .directory()
+        .refresh_follow_availability(&directory_account(&owner))
+        .await
+        .unwrap();
+    assert_ne!(retried.phase, FollowAvailabilityRefreshPhase::Throttled);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
