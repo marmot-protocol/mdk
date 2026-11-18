@@ -4266,7 +4266,7 @@ async fn local_ready_queued_send_ordering_body() {
             .runtime_operations
             .into_iter()
             .find(|snapshot| snapshot.operation == RuntimePerformanceOperation::SendAdmission)
-            .map_or(0, |snapshot| snapshot.completed)
+            .map_or(0, |snapshot| snapshot.successes)
     };
     let spawn_send = |plaintext: &'static [u8]| {
         let send_runtime = runtime.clone();
