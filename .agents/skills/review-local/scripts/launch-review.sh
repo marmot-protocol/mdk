@@ -48,8 +48,8 @@ case "$seat" in
   codex)
     # --ignore-user-config also drops ~/.codex's reasoning effort, which
     # leaves the seat at none (seen 2026-11-17); set it here.
-    model=gpt-6.1-sol
-    codex exec --ignore-user-config -c model_reasoning_effort='"max"' \
+    model=gpt-6.2-sol
+    codex exec --ignore-user-config -c model_reasoning_effort='"xhigh"' \
       -s read-only -m "$model" \
       -C "$checkout" -o "$out_dir/codex.md" - \
       < "$input/prompt.md" > "$out_dir/codex.log" 2>&1 || rc=$?

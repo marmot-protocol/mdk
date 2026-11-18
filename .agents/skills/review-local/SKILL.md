@@ -2,7 +2,7 @@
 name: review-local
 description: >-
   Get two independent, read-only reviews of the current branch's committed
-  local diff from the two agent seats that are not you (Codex GPT-6.1 Sol,
+  local diff from the two agent seats that are not you (Codex GPT-6.2 Sol,
   Claude Opus 5.5, newest Cursor Grok high-fast), before any PR exists, with
   free Numes models in OpenCode as the fallback when a seat is out of usage.
   Then answer their findings. Nothing is posted to GitHub. Use from
@@ -23,7 +23,7 @@ Nothing goes to GitHub. The round covers one commit on your machine.
 
 | Seat | Model |
 | --- | --- |
-| `codex` | `gpt-6.1-sol` |
+| `codex` | `gpt-6.2-sol` |
 | `claude` | `claude-opus-5-5` (not the `opus` alias) |
 | `cursor` | the newest `grok-*-high-fast` in `agent --list-models`, resolved at launch |
 | `opencode` | fallback only, through `numes run opencode`: the first of Kimi K3.1 Pro, GLM 5.3 Flash, DeepSeek V4.1 Flash, Nemotron 3 Ultra (all `:free`, `#high`) that finishes with a verdict |
