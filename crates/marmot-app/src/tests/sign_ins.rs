@@ -2077,6 +2077,78 @@ async fn a_read_changed_twice_records_nothing() {
     assert!(phone.compromise_warning().unwrap().is_empty());
 }
 
+/// S1 for an acceptance (mdk#3466): a read beside the writer finds this
+/// device's slot empty at a relay that had not accepted its current
+/// publication. While the read is out, the writer's maintenance resends that
+/// same publication and the relay accepts it. The empty answer is from
+/// before the acceptance, so the continuation reads again rather than
+/// pairing it with the acceptance and replacing a KeyPackage the relay
+/// serves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_empty_read_from_before_an_acceptance_makes_no_refill() {
+    let account = Account::new(1, true);
+    let mut phone = account.open(0).await;
+    published_key_package(&mut phone, &account.relay).await;
+    // As the account worker does: a due check reads beside the writer, so
+    // the writer's maintenance pass does not read in place.
+    phone.detach_sign_in_reads();
+    let slot = own_slot(&phone);
+    let published = publish_two_days_ago(&phone);
+    // The relay never took this publication: its one attempt failed, and it
+    // serves nothing in the slot. Its retry is due.
+    {
+        let storage = phone.app.account_storage("alice").unwrap();
+        let mut lifecycle = storage.key_package_lifecycle().unwrap().unwrap();
+        assert!(!lifecycle.publication_targets.is_empty());
+        for target in &mut lifecycle.publication_targets {
+            target.state = cgka_traits::TransportFanoutAttemptState::AttemptedFailed;
+            target.attempt_count = 1;
+            target.last_attempt_at = Some(cgka_traits::Timestamp(published));
+        }
+        storage.put_key_package_lifecycle(&lifecycle).unwrap();
+    }
+    relay_empties_slot(&account.relay, &slot);
+
+    let start = phone.start_sign_in_slot_read().unwrap().unwrap();
+    let (read, result) = spawned_read(start).await;
+    phone.run_due_maintenance().await.unwrap();
+    assert!(
+        relay_serves_slot(&account.relay, &slot),
+        "the retry reached the relay"
+    );
+    assert_eq!(published_at(&phone), published, "the same publication");
+
+    let report = match phone
+        .finish_sign_in_slot_read(read.into_own(), result, false)
+        .await
+    {
+        SlotReadEnd::Checked(report) => report,
+        SlotReadEnd::ReadAgain(again) => {
+            let (read, result) = spawned_read(*again).await;
+            let SlotReadEnd::Checked(report) = phone
+                .finish_sign_in_slot_read(read.into_own(), result, true)
+                .await
+            else {
+                panic!("an unchanged second read is judged");
+            };
+            report
+        }
+        SlotReadEnd::Unjudged => panic!("one change leaves the read judged"),
+    };
+    // An answered check that asks for no refill; a failed read proves nothing.
+    let refilling = report.map(|report| report.refilling);
+    assert!(
+        matches!(refilling, Ok(false)),
+        "a stale empty read asked to replace a KeyPackage the relay serves: {refilling:?}"
+    );
+    phone.run_due_maintenance().await.unwrap();
+    assert_eq!(
+        published_at(&phone),
+        published,
+        "no KeyPackage replaced the one the relay serves"
+    );
+}
+
 /// S3 and T3 (mdk#3466): a check's look changes nothing of the account, and
 /// its read, beside the writer, writes none of the inputs whose answers are
 /// reused while a write count is unchanged, the owned KeyPackage list's and

@@ -2073,11 +2073,15 @@ impl AccountManager {
         account_ref: &str,
         group_id: &GroupId,
     ) -> Result<Option<crate::GroupCommitDelivery>, AppError> {
-        self.read_from_state(
-            account_ref,
+        let lane = self.worker_lane(account_ref).await?;
+        self.read_group_from_state(
+            &lane,
             ReadClass::R3,
             StateRead::Diagnosed,
-            |state| state.group_commit_delivery(group_id),
+            Admission::Queue,
+            std::slice::from_ref(group_id),
+            HydrationFailure::Ignored,
+            |state| async move { reissue(state.group_commit_delivery(group_id)) },
             |respond| AccountWorkerCommand::GroupCommitDelivery {
                 group_id: group_id.clone(),
                 respond,
@@ -3347,11 +3351,15 @@ impl AccountManager {
         account_ref: &str,
         group_id: &GroupId,
     ) -> Result<cgka_traits::GroupMaintenanceStatus, AppError> {
-        self.read_from_state(
-            account_ref,
+        let lane = self.worker_lane(account_ref).await?;
+        self.read_group_from_state(
+            &lane,
             ReadClass::R3,
             StateRead::Diagnosed,
-            |state| state.maintenance_status(group_id),
+            Admission::Queue,
+            std::slice::from_ref(group_id),
+            HydrationFailure::Ignored,
+            |state| async move { reissue(state.maintenance_status(group_id)) },
             |respond| AccountWorkerCommand::MaintenanceStatus {
                 group_id: group_id.clone(),
                 respond,

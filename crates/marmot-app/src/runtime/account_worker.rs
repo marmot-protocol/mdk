@@ -2850,17 +2850,19 @@ async fn run_app_runtime_account_worker(
                                     install_storage_telemetry(&reopened, shared.observer.performance());
                                     reopened.runtime_telemetry = Some(shared.observer.performance().clone());
                                     reopened.history_recovery.set_recovery_credits(shared.recovery_credit_pool());
-                                    reopened.resume_read_state(read_state.take());
                                     // A reconnect open is deferred like the
                                     // startup open; drain the hydration
                                     // eagerly here — the steady-state loop
                                     // below answers reads live and must not
                                     // hand out not-hydrated errors after a
-                                    // mid-session reconnect (mdk#1161).
+                                    // mid-session reconnect (mdk#1161). The
+                                    // reads that answer from A must not
+                                    // either: A moves to the reopened client
+                                    // only once it is drained.
                                     if let Err(err) = drain_deferred_hydration(&mut reopened).await
                                     {
                                         publish_app_runtime_account_error(
-                                            Emit::Quiescent(&reopened),
+                                            Emit::Unpublished(Unpublished::ReopenNotDrained),
                                             &events,
                                             &account_id_hex,
                                             &account_label,
@@ -2869,10 +2871,10 @@ async fn run_app_runtime_account_worker(
                                                 &err,
                                             ),
                                         );
-                                        read_state = reopened.take_read_state();
                                         drop(reopened);
                                         continue;
                                     }
+                                    reopened.resume_read_state(read_state.take());
                                     // Reconnect restores transport activation
                                     // and subscriptions, then resumes the live
                                     // receive tail. Do not block the command
@@ -9855,6 +9857,10 @@ pub(crate) enum Unpublished {
     /// A host call that wrote off the worker, such as a local send's
     /// admission: what it changed is not an input of A.
     OffWorker,
+    /// A reconnect whose reopened client did not drain its hydration: A
+    /// keeps the previous client's last version, and the reopened client
+    /// never publishes.
+    ReopenNotDrained,
 }
 
 /// Send one host event from the account worker, publishing A first at a

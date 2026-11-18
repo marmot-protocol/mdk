@@ -988,11 +988,15 @@ impl AppClient {
 
     /// Whether the group's local copy is Unrecoverable, which suspends its
     /// recovery (mdk#2660 section 6). A group whose record cannot be read is
-    /// not suspended.
+    /// not suspended; one not hydrated yet reads its stored record
+    /// ([`Self::unrecoverable_fact`]).
     pub(crate) fn group_unrecoverable(&self, group_id: &[u8]) -> bool {
-        self.runtime
-            .group_record(&cgka_traits::GroupId::new(group_id.to_vec()))
-            .is_ok_and(|group| group.unrecoverable)
+        let group_id = cgka_traits::GroupId::new(group_id.to_vec());
+        let record = self
+            .runtime
+            .group_record(&group_id)
+            .map_err(crate::AppError::from);
+        self.unrecoverable_fact(&group_id, record.as_ref()).value
     }
 
     fn coverage_storage(&self) -> Result<storage_sqlite::SqliteAccountStorage, AppError> {

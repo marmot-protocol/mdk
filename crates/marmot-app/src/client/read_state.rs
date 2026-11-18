@@ -577,12 +577,13 @@ impl ReadState {
         self.account.backup_restore_status.clone()
     }
 
-    /// `WatchBackupRestore`: a receiver of the client's progress channel
-    /// that has seen the status published here, as subscribing at this
-    /// publish gave. A change sent since then is still news to it.
+    /// `WatchBackupRestore`: a watch of the client's progress channel that
+    /// has seen the status published here, even before the channel
+    /// announces it. A change sent since then is still news to it.
     pub(crate) fn watch_backup_restore(&self) -> BackupRestoreWatch {
         BackupRestoreWatch {
             receiver: self.account.backup_restore_updates.clone(),
+            seen: self.account.backup_restore_status.clone(),
         }
     }
 }
@@ -1585,8 +1586,9 @@ fn group_entry(
     // `host_may_see_group`, which hides the group when the check fails,
     // keeping whether it did: the entry is then not reusable.
     let device_group = client.is_device_group(group_id);
-    // The engine record gives whether the group's copy is Unrecoverable and
-    // its recovery status, which reads it once, as `group_recovery_status`.
+    // The engine record gives whether the group's copy is Unrecoverable (a
+    // group not hydrated yet reads its stored record) and its recovery
+    // status, which reads it once, as `group_recovery_status`.
     let engine_record = client
         .runtime
         .group_record(group_id)
@@ -1596,16 +1598,7 @@ fn group_entry(
             value: matches!(device_group, Ok(false)),
             settled: device_group.is_ok(),
         },
-        unrecoverable: match &engine_record {
-            Ok(group) => Fact {
-                value: group.unrecoverable,
-                settled: true,
-            },
-            Err(error) => Fact {
-                value: false,
-                settled: settled_failure(error),
-            },
-        },
+        unrecoverable: client.unrecoverable_fact(group_id, engine_record.as_ref()),
     };
     // The recovery read fails first, then the record, as today's read. A
     // failed status depends on no clock reading, and is never reused.
@@ -1659,6 +1652,7 @@ fn group_entry(
         record: record.clone(),
     };
     let reusable = device_group.is_ok()
+        && recovery_facts.unrecoverable.settled
         && settled(&answers.roster_revision)
         && settled(&answers.members)
         && settled(&answers.standing)
@@ -1774,7 +1768,9 @@ impl AppClient {
     /// Continue publishing A on a client that replaced the one `slot` was
     /// taken from. Every answer rebuilds at the next publish: the new
     /// client's write counts start over, so no stamp taken on the old one
-    /// may be compared with them.
+    /// may be compared with them. The worker resumes A only on a client
+    /// whose deferred hydration it has drained, so A never shows a group a
+    /// reopen only seeded.
     pub(crate) fn resume_read_state(&mut self, slot: Option<Box<ReadStateSlot>>) {
         if let Some(slot) = slot {
             slot.lock()
@@ -2874,6 +2870,38 @@ mod tests {
         let mut watch = state.watch_backup_restore();
         assert!(watch.receiver.has_changed().unwrap());
         assert_eq!(watch.changed().await.unwrap(), later);
+
+        // A version is published before the channel announces its status.
+        // A watch handed out from it in between has seen that status: it
+        // shows it, and its announcement is no news. Only a later one is.
+        use futures::FutureExt as _;
+        let announced = BackupRestoreStatus {
+            phase: crate::BackupRestorePhase::Cancelled,
+            revision: 3,
+            ..Default::default()
+        };
+        let state = ReadState {
+            version: 2,
+            valid_until: None,
+            account: Arc::new(AccountAnswers {
+                backup_restore_status: announced.clone(),
+                backup_restore_updates: updates.subscribe(),
+                ..empty_account_answers()
+            }),
+            groups: Arc::default(),
+        };
+        let mut watch = state.watch_backup_restore();
+        assert_eq!(watch.snapshot(), announced);
+        updates.send_replace(announced.clone());
+        assert!(watch.changed().now_or_never().is_none());
+        assert_eq!(watch.snapshot(), announced);
+        let next = BackupRestoreStatus {
+            phase: crate::BackupRestorePhase::Discovering,
+            revision: 4,
+            ..Default::default()
+        };
+        updates.send_replace(next.clone());
+        assert_eq!(watch.changed().await.unwrap(), next);
     }
 
     /// A read whose groups come from stored rows waits for a version that

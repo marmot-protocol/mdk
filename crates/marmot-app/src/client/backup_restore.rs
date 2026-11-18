@@ -88,19 +88,35 @@ pub struct BackupHistoryAvailability {
 /// This handle owns no database lease, words or archive key.
 pub struct BackupRestoreWatch {
     pub(crate) receiver: tokio::sync::watch::Receiver<BackupRestoreStatus>,
+    /// The newest status this watch was handed out at or has shown. The
+    /// published read state holds a status before the channel announces it,
+    /// so a watch handed out from it can be ahead of its channel; an
+    /// announcement of this status or an older one is no news to it.
+    pub(crate) seen: BackupRestoreStatus,
 }
 
 impl BackupRestoreWatch {
     pub fn snapshot(&self) -> BackupRestoreStatus {
-        self.receiver.borrow().clone()
+        let current = self.receiver.borrow();
+        if current.revision > self.seen.revision {
+            current.clone()
+        } else {
+            self.seen.clone()
+        }
     }
 
     pub async fn changed(&mut self) -> Result<BackupRestoreStatus, AppError> {
-        self.receiver
-            .changed()
-            .await
-            .map_err(|_| AppError::TransportClosed)?;
-        Ok(self.receiver.borrow_and_update().clone())
+        loop {
+            self.receiver
+                .changed()
+                .await
+                .map_err(|_| AppError::TransportClosed)?;
+            let status = self.receiver.borrow_and_update().clone();
+            if status.revision > self.seen.revision {
+                self.seen = status.clone();
+                return Ok(status);
+            }
+        }
     }
 }
 
@@ -205,11 +221,6 @@ impl BackupRestore {
     /// (mdk#2923).
     pub(crate) fn waiting(&self) -> bool {
         self.job.is_some()
-    }
-
-    fn publish(&mut self) {
-        self.status.revision = self.status.revision.wrapping_add(1);
-        self.updates.send_replace(self.status.clone());
     }
 }
 
@@ -452,7 +463,7 @@ impl AppClient {
             revision,
             ..Default::default()
         };
-        self.backup_restore.publish();
+        self.publish_backup_restore();
         Ok(self.backup_restore.status.clone())
     }
 
@@ -467,8 +478,19 @@ impl AppClient {
         }
         self.backup_restore.job = None;
         self.backup_restore.status.phase = BackupRestorePhase::Cancelled;
-        self.backup_restore.publish();
+        self.publish_backup_restore();
         true
+    }
+
+    /// Announce the restore's new status on its watch. A holds it first,
+    /// as for anything that leaves the account worker: a host that reads
+    /// the status when the watch wakes reads this one, never the one before.
+    fn publish_backup_restore(&mut self) {
+        let restore = &mut self.backup_restore;
+        restore.status.revision = restore.status.revision.wrapping_add(1);
+        self.publish_read_state();
+        let restore = &self.backup_restore;
+        restore.updates.send_replace(restore.status.clone());
     }
 
     pub(crate) fn backup_restore_status(&self) -> BackupRestoreStatus {
@@ -476,9 +498,9 @@ impl AppClient {
     }
 
     pub(crate) fn watch_backup_restore(&self) -> BackupRestoreWatch {
-        BackupRestoreWatch {
-            receiver: self.backup_restore.updates.subscribe(),
-        }
+        let receiver = self.backup_restore.updates.subscribe();
+        let seen = receiver.borrow().clone();
+        BackupRestoreWatch { receiver, seen }
     }
 
     /// No account projection or other device's account membership proves this
@@ -569,7 +591,7 @@ impl AppClient {
     pub(crate) fn publish_backup_restore_availability(&mut self) {
         if self.backup_restore.availability_changed {
             self.backup_restore.availability_changed = false;
-            self.backup_restore.publish();
+            self.publish_backup_restore();
         }
     }
 
@@ -578,7 +600,7 @@ impl AppClient {
         if result.is_err() {
             self.backup_restore.job = None;
             self.backup_restore.status.phase = BackupRestorePhase::Unavailable;
-            self.backup_restore.publish();
+            self.publish_backup_restore();
         }
         result
     }
@@ -626,7 +648,7 @@ impl AppClient {
         let Some(kind) = kind else {
             self.backup_restore.status.phase =
                 completed_phase(&self.backup_restore.status, job.discovery_complete);
-            self.backup_restore.publish();
+            self.publish_backup_restore();
             return Ok(None);
         };
         let work = BackupRestoreWork {
@@ -659,7 +681,7 @@ impl AppClient {
                 // catalog and release the ephemeral secrets for manual retry.
                 if !discovery.complete && discovery.created_at.is_none() {
                     self.backup_restore.status.phase = BackupRestorePhase::Unavailable;
-                    self.backup_restore.publish();
+                    self.publish_backup_restore();
                     return;
                 }
                 job.discovery_complete = discovery.complete;
@@ -687,7 +709,7 @@ impl AppClient {
                 if let Err(error) = result {
                     self.restore_failure(&error);
                     self.backup_restore.status.phase = BackupRestorePhase::Unavailable;
-                    self.backup_restore.publish();
+                    self.publish_backup_restore();
                     return;
                 }
                 job.pending = entries.into();
@@ -696,7 +718,7 @@ impl AppClient {
             RestoreDone::Discover(Err(error)) => {
                 self.restore_failure(&error);
                 self.backup_restore.status.phase = BackupRestorePhase::Unavailable;
-                self.backup_restore.publish();
+                self.publish_backup_restore();
                 return;
             }
             RestoreDone::Head { entry, result } => {
@@ -785,7 +807,7 @@ impl AppClient {
         } else {
             self.backup_restore.job = Some(job);
         }
-        self.backup_restore.publish();
+        self.publish_backup_restore();
     }
 
     fn accept_restore_head(

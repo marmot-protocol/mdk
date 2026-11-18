@@ -3,7 +3,8 @@
 //! answers from the version the worker acknowledges with. Groups await
 //! hydration only while startup's hydration pipeline runs, so these tests
 //! hold that pipeline with its batch-delay knob and read through the host
-//! wrappers of a real account worker.
+//! wrappers of a real account worker. The account reads that answer from A
+//! answer as the hydrated groups would, in that window and in a reconnect's.
 use super::*;
 use cgka_traits::storage::GroupStorage;
 
@@ -251,10 +252,10 @@ fn note_recovered(
     }
 }
 
-/// The latest version of alice's read state the worker has published.
-async fn published_read_state(
+/// A receiver of every version of alice's read state the worker publishes.
+async fn read_state_receiver(
     runtime: &crate::MarmotAppRuntime,
-) -> Arc<crate::client::read_state::ReadState> {
+) -> watch::Receiver<Arc<crate::client::read_state::ReadState>> {
     let (respond, subscription) = oneshot::channel();
     runtime
         .accounts
@@ -264,8 +265,14 @@ async fn published_read_state(
         .send(AccountWorkerCommand::SubscribeReadStateForTest { respond })
         .await
         .unwrap();
-    let published = subscription.await.unwrap().expect("the worker publishes A");
-    published.borrow().clone()
+    subscription.await.unwrap().expect("the worker publishes A")
+}
+
+/// The latest version of alice's read state the worker has published.
+async fn published_read_state(
+    runtime: &crate::MarmotAppRuntime,
+) -> Arc<crate::client::read_state::ReadState> {
+    read_state_receiver(runtime).await.borrow().clone()
 }
 
 /// Waits for the first batch to report a recovered commit.
@@ -692,4 +699,258 @@ async fn co_members_leave_out_a_group_whose_row_save_failed_across_a_restart() {
         "once the reconcile saves its row, the group counts"
     );
     runtime.shutdown().await;
+}
+
+const RELAY_A: &str = "wss://relay-a.example";
+const RELAY_B: &str = "wss://relay-b.example";
+
+/// alice's groups, as a hydrated account answers about them: relay B still
+/// owes `owed`'s last own commit, `quiet` answers its maintenance status,
+/// `damaged`'s hydration quarantines it, and `halted`'s copy is
+/// Unrecoverable, which hides its re-join notice. Each read names its own
+/// group, so no read hydrates the group another one reads.
+struct HeldGroups {
+    owed: GroupId,
+    quiet: GroupId,
+    damaged: GroupId,
+}
+
+async fn held_groups(dir: &tempfile::TempDir, relay: Arc<ScriptedPushRelayClient>) -> HeldGroups {
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let fixture = MarmotApp::with_relays(dir.path(), vec![RELAY_A.to_owned(), RELAY_B.to_owned()])
+        .with_test_relay_client(relay.clone());
+    let mut client = fixture.client("alice").await.unwrap();
+    let mut groups = Vec::new();
+    for name in ["owed", "quiet", "damaged", "halted"] {
+        groups.push(
+            client
+                .create_group(name, &[])
+                .await
+                .unwrap()
+                .operation
+                .expect("a group with no other members"),
+        );
+    }
+    let [owed, quiet, damaged, halted] = groups.try_into().unwrap();
+    relay.make_endpoints_unavailable(&[RELAY_B]);
+    client
+        .update_group_profile(&owed, Some("owed"), None)
+        .await
+        .unwrap();
+    assert!(
+        client.group_commit_delivery(&owed).unwrap().is_some(),
+        "relay B owes the commit"
+    );
+    let route = client
+        .recovery_runner_routes()
+        .into_iter()
+        .find(|route| route.group_id.as_deref() == Some(halted.as_slice()))
+        .unwrap()
+        .route;
+    drop(client);
+    let storage = fixture.account_storage("alice").unwrap();
+    let now = crate::unix_now_seconds();
+    assert!(
+        storage
+            .app_storage()
+            .settle_recovery_rejoin(&storage_sqlite::RecoveryRejoin {
+                group_id: halted.as_slice(),
+                install_epoch: 99,
+                routes: &[(route, vec![RELAY_A.to_owned()])],
+                floor_seconds: now - 24 * 60 * 60,
+                now_seconds: now,
+            })
+            .unwrap()
+    );
+    let mut record = storage.get_group(&halted).unwrap();
+    record.unrecoverable = true;
+    storage.put_group(&record).unwrap();
+    // A protocol profile the stored MLS group does not carry fails its
+    // hydration, which quarantines it.
+    let mut record = storage.get_group(&damaged).unwrap();
+    assert_ne!(
+        record.protocol_profile,
+        cgka_traits::group::ProtocolProfile::Legacy
+    );
+    record.protocol_profile = cgka_traits::group::ProtocolProfile::Legacy;
+    storage.put_group(&record).unwrap();
+    HeldGroups {
+        owed,
+        quiet,
+        damaged,
+    }
+}
+
+/// The account reads that answer from A about `owed`, `quiet` and the
+/// account's groups. Read while the worker holds groups unhydrated, they must answer
+/// as they do once those groups are hydrated, no earlier than the worker
+/// queue answered before they moved to A. The oracle compares A with a live
+/// read at the same moment, so it cannot see an answer given too early.
+#[derive(Debug, PartialEq)]
+struct AccountReads {
+    delivery: Result<Option<crate::GroupCommitDelivery>, String>,
+    maintenance: Result<cgka_traits::GroupMaintenanceStatus, String>,
+    quarantined: Result<Vec<String>, String>,
+    notices: Result<Vec<crate::HistoryNotice>, String>,
+    /// The account recovery status's notices. Its catching-up groups move
+    /// with the recovery runner's surveys, which land off the worker.
+    recovery_notices: Result<Vec<crate::HistoryNotice>, String>,
+}
+
+impl AccountReads {
+    async fn read(runtime: &crate::MarmotAppRuntime, groups: &HeldGroups) -> Self {
+        fn shown<T>(result: Result<T, AppError>) -> Result<T, String> {
+            result.map_err(|error| format!("{error:?}"))
+        }
+        within_hold("an account read", async {
+            Self {
+                delivery: shown(runtime.group_commit_delivery("alice", &groups.owed).await),
+                maintenance: shown(runtime.maintenance_status("alice", &groups.quiet).await),
+                quarantined: shown(
+                    runtime
+                        .quarantined_groups("alice")
+                        .await
+                        .map(|groups| groups.into_iter().map(|group| group.group_id_hex).collect()),
+                ),
+                notices: shown(runtime.history_notices("alice").await),
+                recovery_notices: shown(
+                    runtime
+                        .account_recovery_status("alice")
+                        .await
+                        .map(|status| status.notices),
+                ),
+            }
+        })
+        .await
+    }
+}
+
+/// While startup's hydration pipeline has not reached alice's groups, the
+/// account reads answer as the hydrated groups do: commit delivery and
+/// maintenance status hydrate the group they name, and the recovery
+/// notices read an unhydrated group's Unrecoverable mark from its stored
+/// record. The quarantine list grows as the pipeline goes, as it did before
+/// these reads moved to A, so this window leaves it out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn account_reads_during_startup_hydration_answer_as_hydrated_groups() {
+    let dir = tempfile::tempdir().unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let groups = held_groups(&dir, relay.clone()).await;
+    let runtime = crate::MarmotAppRuntime::new(
+        MarmotApp::with_relays_and_config(
+            dir.path(),
+            vec![RELAY_A.to_owned(), RELAY_B.to_owned()],
+            crate::MarmotAppConfig::white_noise()
+                .with_dev_startup_hydration_batch_delay_ms(BATCH_HOLD_MS),
+        )
+        .with_test_relay_client(relay),
+    );
+    runtime.reconcile_accounts().await.unwrap();
+    let opened = published_read_state(&runtime).await;
+    let all = opened.groups.keys().cloned().collect::<Vec<_>>();
+    assert_eq!(
+        opened.awaiting_hydration(&all).len(),
+        all.len(),
+        "every group awaits hydration when read"
+    );
+
+    let mut held = AccountReads::read(&runtime, &groups).await;
+    for group in &all {
+        let _ = within_hold("a group read", runtime.group_members("alice", group)).await;
+    }
+    let mut hydrated = AccountReads::read(&runtime, &groups).await;
+    assert_eq!(hydration_attempts(&runtime), 1, "the pipeline stayed held");
+    runtime.shutdown().await;
+
+    assert!(
+        matches!(hydrated.delivery, Ok(Some(_))) && hydrated.maintenance.is_ok(),
+        "the hydrated baseline: {hydrated:?}"
+    );
+    assert_eq!(
+        hydrated.quarantined,
+        Ok(vec![hex::encode(groups.damaged.as_slice())])
+    );
+    held.quarantined = Ok(Vec::new());
+    hydrated.quarantined = Ok(Vec::new());
+    assert_eq!(held, hydrated, "answered before the groups were hydrated");
+}
+
+/// A reconnect reopens the account's client with its groups seeded but not
+/// hydrated, and drains their hydration before it serves anything. The
+/// account reads answer from A meanwhile, so A shows the reopened client
+/// only once it is drained (mdk#1161): held in the reopened client's
+/// transport activation, after the drain, every read answers as it did
+/// before the reconnect.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn account_reads_during_a_reconnect_answer_as_hydrated_groups() {
+    let dir = tempfile::tempdir().unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let groups = held_groups(&dir, relay.clone()).await;
+    let runtime = crate::MarmotAppRuntime::new(
+        MarmotApp::with_relays(dir.path(), vec![RELAY_A.to_owned(), RELAY_B.to_owned()])
+            .with_test_relay_client(relay.clone()),
+    );
+    runtime.reconcile_accounts().await.unwrap();
+    crate::worker_fences::worker_startup_finished(&runtime, "alice")
+        .await
+        .unwrap();
+    let before = AccountReads::read(&runtime, &groups).await;
+    let published = read_state_receiver(&runtime).await;
+
+    // Hold the reopened client's inbox subscribe, which its transport
+    // activation makes once the drain has run. Armed before the reconnect,
+    // so the worker cannot get past it first.
+    let alice = AccountHome::open(dir.path()).account("alice").unwrap();
+    relay.block_account_inbox_subscribe(hex::decode(&alice.account_id_hex).unwrap());
+    let mut events = runtime.subscribe();
+    runtime
+        .shared_services()
+        .relay_plane()
+        .simulate_notification_consumer_exit_for_test();
+    timeout(Duration::from_secs(30), async {
+        loop {
+            match events.recv().await {
+                Ok(crate::MarmotAppEvent::AccountError(error))
+                    if error.message.starts_with("runtime receive failed") =>
+                {
+                    break;
+                }
+                Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Err(broadcast::error::RecvError::Closed) => {
+                    panic!("runtime events closed before the failed receive")
+                }
+            }
+        }
+    })
+    .await
+    .expect("the consumer exit fails the worker's receive");
+    timeout(Duration::from_secs(30), relay.wait_for_blocked_subscribe())
+        .await
+        .expect("the reopened client's activation subscribes");
+    let window = published.borrow().clone();
+    let during = AccountReads::read(&runtime, &groups).await;
+    relay.release_subscribe();
+    timeout(
+        Duration::from_secs(30),
+        crate::worker_fences::worker_round_trip(&runtime, "alice"),
+    )
+    .await
+    .expect("the worker answers once the reconnect completes")
+    .unwrap();
+    runtime.shutdown().await;
+
+    assert!(
+        matches!(before.delivery, Ok(Some(_)))
+            && before.maintenance.is_ok()
+            && before.quarantined == Ok(vec![hex::encode(groups.damaged.as_slice())]),
+        "the hydrated baseline: {before:?}"
+    );
+    assert_eq!(during, before, "answered during the reconnect");
+    let all = window.groups.keys().cloned().collect::<Vec<_>>();
+    assert!(
+        window.awaiting_hydration(&all).is_empty(),
+        "A showed the reopened client before its drain"
+    );
 }

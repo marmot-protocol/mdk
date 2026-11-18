@@ -1298,10 +1298,11 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   `runtime-latency-telemetry.md`'s "Host read classes"; don't move a multi-device read (mdk#2628) without Jeff.
 - The group reads (`read_group_from_state`) answer the same way, with one exception, the hydration request. When the
   version shows a named group awaiting hydration (`GroupAnswers::awaits_hydration`, only during startup's hydration
-  pipeline), the read sends `HydrateGroups` for those groups and answers from the version the worker acknowledges with
-  (`HydrationAck`), so it waits as long as the worker read did, and only for an unhydrated group. The request takes the
-  queue position of a command accepted at that moment, deferred commands included, so it never runs ahead of an accepted
-  forget: the main loop runs both in order, the hydration phase runs both at their positions (so a forget served there
+  pipeline: a reconnect publishes its reopened client only once `drain_deferred_hydration` has run), the read sends
+  `HydrateGroups` for those groups and answers from the version the worker acknowledges with (`HydrationAck`), so it
+  waits as long as the worker read did, and only for an unhydrated group. The request takes the queue position of a
+  command accepted at that moment, deferred commands included, so it never runs ahead of an accepted forget: the main
+  loop runs both in order, the hydration phase runs both at their positions (so a forget served there
   before its group's batch drops the group first; one still queued when that batch starts runs after it), and a unit
   that holds the client acknowledges it from the version published before the unit when no named group awaits hydration
   there (`acknowledge_from_published`), else defers it in order. A delete still waits for the hydration phase to end:
