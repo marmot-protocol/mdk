@@ -4245,42 +4245,22 @@ async fn local_ready_queued_send_ordering_body() {
     drop(setup_client);
     let publishes_before_runtime = relay.published_event_ids().len();
 
-    relay.block_and_fail_next_subscribe();
+    // Refuse the group route for the whole outage: activation then fails at
+    // once instead of parking the serialized worker, so each send is accepted
+    // as it arrives and the test, not task scheduling, fixes their order.
+    relay.refuse_group_subscribes(true);
     let runtime = MarmotAppRuntime::new(app.clone());
     runtime.reconcile_accounts().await.unwrap();
-    tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        relay.wait_for_blocked_subscribe(),
-    )
-    .await
-    .expect("initial activation should be in flight");
-
-    let first_runtime = runtime.clone();
-    let first_group = group_id.clone();
-    let first = tokio::spawn(async move {
-        first_runtime
-            .send_message("alice", &first_group, b"first queued".to_vec())
+    for plaintext in ["first queued", "second queued"] {
+        let send = runtime
+            .send_message("alice", &group_id, plaintext.as_bytes().to_vec())
             .await
-    });
-    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    let second_runtime = runtime.clone();
-    let second_group = group_id.clone();
-    let second = tokio::spawn(async move {
-        second_runtime
-            .send_message("alice", &second_group, b"second queued".to_vec())
-            .await
-    });
-
-    relay.block_next_subscribe();
-    relay.release_subscribe();
-    assert!(first.await.unwrap().is_ok());
-    assert!(second.await.unwrap().is_ok());
-    tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        relay.wait_for_blocked_subscribe(),
-    )
-    .await
-    .expect("background transport reactivation should be attempted");
+            .unwrap();
+        assert_eq!(
+            send.accept_disposition,
+            cgka_traits::SendAcceptDisposition::AcceptedPending
+        );
+    }
 
     let group_id_hex = hex::encode(group_id.as_slice());
     let pending = app
@@ -4301,8 +4281,7 @@ async fn local_ready_queued_send_ordering_body() {
                 && message.invalidation_status.is_none()),
         "both accepted sends must remain pending before activation recovers"
     );
-
-    relay.release_subscribe();
+    relay.refuse_group_subscribes(false);
     tokio::time::timeout(std::time::Duration::from_secs(8), async {
         loop {
             let timeline = app
