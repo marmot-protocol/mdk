@@ -17,10 +17,6 @@ use storage_sqlite::{RecoveryCause, RecoveryEligibility, TRANSPORT_RECONCILIATIO
 use super::admission::{Admission, Stalled};
 use super::{DebtTurn, RecoveryRunnerPolicy, sooner};
 
-/// Per-unit endpoints for passive background work. A new staged event can
-/// renew its own group's endpoints, and a reconnect only its relay's.
-pub(super) type BackgroundWindows = BTreeMap<Vec<u8>, BTreeMap<super::UnitKey, u64>>;
-
 /// A newly opened visit needs ordinary debt selection before more admission;
 /// otherwise ready local history can keep draining in bounded worker batches.
 #[derive(Default)]

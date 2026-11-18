@@ -876,9 +876,15 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   account answer it the same way. The catching-up status stays empty until a runner surveys.
   `epoch_gap` gives unresolved durable epoch gaps bounded return visits, including non-NIP-77 relays. Visits
   reopen only that group's retention-bounded goals and use ordinary quanta, credits, staging and account caps.
-  A visit persists the second it began. On its open-ended routes, a passive background fetch stays within the
-  window observed on a wake. A lost tail or relay reconnect renews that unit's window. Live fences and finite
-  targets keep their normal priority and other groups continue to read their current debt.
+  A visit persists the second it began, and the background window below reaches at least it. Live fences and
+  finite targets keep their normal priority and other groups continue to read their current debt.
+  Every background unit without a standing tail or a retained goal end (any route, the inbox too) owes only
+  through the window the drain first observed it in (`select::BackgroundWindows`, mdk#3538): its own answers
+  never extend it, so slow relays cannot keep a drain from ending. The windows clear when the runner idles, on
+  a wake or hint change, and per group (or the inbox) on newly staged history; a lost tail or relay reconnect
+  renews that unit's. Never poll a tail-less route on a timer of its own: once its window is proved, newer
+  history there waits for one of those or an explicit `sync()`. Explicit passes and repairs use no window; a
+  pass still stops before a healthy tail, and a repair reads through its request time.
   A separate durable budget keyed by the missing epoch survives restart: partial sweep progress and same-epoch
   ticket revisions never reset it. Complete visits without actual epoch recovery back off using the existing
   unit policy and eventually park the EpochGap visibly. Explicit repair resets the budget; a higher stalled
@@ -971,9 +977,10 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   Only the caller's cancel trips the bound's stop, which only preempts: the caller decides `Cancelled` first, as
   today (`serve_repair`). Verdicts are today's, never `Ok`, leave a suspended group's routes out, and need something
   judged: no covered window without a non-suspended route, each with a required relay. A verdict waits for a re-check
-  only where `recheck::owed`, the survey's own predicate, owes one. Each survey publishes the required units still catching up
+  only where `recheck::owed`, the survey's own predicate, owes one. Each survey publishes the routes with a required unit still catching up
   (`RunnerHost::surveyed`) into `AppTransportRouting`'s catching-up watch: the only source of the account recovery
-  status and the worker's `RecoveryStatusChanged` cue. A broken unit, probing or not, is never catching up. The
+  status and the worker's `RecoveryStatusChanged` cue. It never says which of a route's relays owe, since hosts
+  see only groups and the inbox (mdk#3538). A broken unit, probing or not, is never catching up. The
   coverage ledger raises no notice: neither a broken unit's park nor a route's remainder is evidence that messages
   are missing (decided with Jeff, 2026-11-13; mdk#3308). Keep `HistoryNoticeCause::UnprovenHistory` for
   compatibility, never emitted. A broken unit probes quietly instead: every debt turn first arms the probes whose

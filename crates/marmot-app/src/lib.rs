@@ -8704,10 +8704,10 @@ struct SharedAppRouting {
     /// settled yet. `None` until a runner tracks them, so nothing is kept
     /// while none runs.
     route_changes: Mutex<Option<RouteChanges>>,
-    /// What the account's recovery runner last found catching up; `None`
-    /// until one has surveyed.
+    /// The routes the account's recovery runner last found catching up;
+    /// `None` until one has surveyed.
     recovery_runner_catching_up: tokio::sync::watch::Sender<
-        Option<std::collections::BTreeSet<client::history_recovery::recovery_runner::UnitKey>>,
+        Option<std::collections::BTreeSet<storage_sqlite::TransportReconciliationRoute>>,
     >,
 }
 
@@ -8877,17 +8877,19 @@ impl AppTransportRouting {
     fn recovery_runner_catching_up(
         &self,
     ) -> tokio::sync::watch::Sender<
-        Option<std::collections::BTreeSet<client::history_recovery::recovery_runner::UnitKey>>,
+        Option<std::collections::BTreeSet<storage_sqlite::TransportReconciliationRoute>>,
     > {
         self.inner.recovery_runner_catching_up.clone()
     }
 
-    /// A receiver that changes whenever what the runner finds catching up
-    /// does: a unit starts or stops owing, breaks or is re-armed.
+    /// A receiver that changes whenever the published value does: the first
+    /// survey replaces `None` (an empty set included), and a later one
+    /// publishes only when the set of routes with a required unit catching
+    /// up changes. Which of a route's relays owe is not part of it.
     fn subscribe_recovery_runner_catching_up(
         &self,
     ) -> tokio::sync::watch::Receiver<
-        Option<std::collections::BTreeSet<client::history_recovery::recovery_runner::UnitKey>>,
+        Option<std::collections::BTreeSet<storage_sqlite::TransportReconciliationRoute>>,
     > {
         self.inner.recovery_runner_catching_up.subscribe()
     }

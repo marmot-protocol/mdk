@@ -1,6 +1,6 @@
 ---
 title: Account history recovery
-updated: 2026-11-09
+updated: 2026-11-18
 status: Design (v2), being implemented. Replaces the 22 recovery design, ledger and qualification notes.
 ---
 
@@ -923,7 +923,17 @@ deadline.
 Debt subtracts the healthy live tails. They are a process-local query that every debt turn
 asks again and nothing keeps across an await, since a tail can lapse with no event when its
 relay disconnects. The runner reads them through the live boundary's own query
-(`AppClient::live_tails`).
+(`AppClient::live_tails`). Without a standing tail or a retained goal end, a unit's debt would
+grow with the clock, and a background drain over slow relays would never finish: each answer
+leaves the next second owed on the relays already served (mdk#3538). So a background drain
+takes each such unit's endpoint when it first observes it, and its own requests cannot extend
+it. Every window ends when the runner goes idle, is woken or gets new hints, and the next drain
+owes through its own first look. Within a drain, a reconnect renews only its relay's windows,
+newly staged history renews only its group's (or the inbox's), and an epoch-gap visit or a
+live fence can raise an endpoint to its own end. Nothing polls such a unit on a timer of its
+own: once its window is proved, newer history waits for a wake, a reconnect, another unit's due
+time or an explicit `sync()`. Explicit passes and repairs use no window: a pass still stops
+before a healthy tail, and a repair reads through its request time.
 Units are served by class: held groups, then open conversation windows and the inbox, then the
 rest, then best-effort relays. Within a class each eligible unit runs once per round, smallest
 route debt first, so a large group is served every round. The runner sleeps until a bump, a
@@ -996,8 +1006,8 @@ An unresolved durable epoch gap additionally authorizes bounded return visits to
 including on relays without NIP-77. A rejoined group's visits start no lower than its rejoin's floor. This handles a commit published with an old timestamp after an earlier sweep.
 The existing runner reopens those goals and resumes ordinary comparison or sweep quanta under the same credits,
 staging bounds and account budgets. Each visit checks history through its start time, including after restart.
-On a gap route without a standing live tail, the background runner takes a finite endpoint when it first observes
-that unit. Its own completed requests cannot extend the window. A later visit, recovery wake or reconnect can
+On a gap route without a standing live tail, the background runner's window (see the live
+tails above) reaches at least the visit's start. A later visit, recovery wake or reconnect can
 collect newer history. Other chats keep their ordinary priority and live fences retain their authority. A completed visit that leaves the epoch missing waits 30 seconds before the
 next, doubling the delay under the existing unit policy. A visit ends when each source has covered its range
 or failed off the admission frontier; a failed source's range remains owed and its unit backoff still applies.
@@ -1142,8 +1152,13 @@ maintenance or known-event parks an upgrade kept) and for rejoins. A rejoin is o
 `BeforeRejoin` notice for its group, whose id is a hash of the group with the notice's
 revision, shown while the group has a current route that is not suspended. Rejoin notices are
 not written to the forensic audit, whose recovery vocabulary has no rejoin cause. Each survey
-publishes the required units still catching up; the account's recovery status reads that, and
-a change in it or in the notices is one `RecoveryStatusChanged`.
+publishes the routes with a required unit still catching up; the account's recovery status
+reads that, and a change in it or in the notices is one `RecoveryStatusChanged`. Which of a
+route's relays still owe is no part of it, since hosts see only groups and the inbox. The cue
+tracks the route set, so it can still prompt a read that returns the same status: a hidden
+device group's route entering or leaving the set, a second route of a group already listed, or
+the first survey finding nothing. Comparing what hosts see before announcing would drop the cue
+for a change a later survey undid, which a host may already have read.
 
 ## What gets deleted
 
