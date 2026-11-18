@@ -5116,6 +5116,7 @@ mod unresolved_commit_state_tests {
                 "{state:?} is an unresolved commit input and must stay one"
             );
         }
+        assert!(!unresolved_commit_state(MessageState::Sent));
         assert!(
             !unresolved_commit_state(MessageState::Processed),
             "an already-applied commit must never be reported unresolved: two \
