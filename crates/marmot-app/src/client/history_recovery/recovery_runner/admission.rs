@@ -335,12 +335,19 @@ impl<'t> Admission<'t> {
     /// still holds the group's shared frontier, so the fence waits on it too.
     pub(super) fn fenced_routes(
         &mut self,
-    ) -> StorageResult<BTreeSet<TransportReconciliationRoute>> {
-        let mut routes = BTreeSet::new();
+    ) -> StorageResult<BTreeMap<TransportReconciliationRoute, u64>> {
+        let mut routes = BTreeMap::new();
         for key in self.fence_groups()? {
             let group = self.group(&key)?;
-            if group.release_before().is_some() {
-                routes.extend(group.routes.iter().cloned());
+            let until = group
+                .members
+                .iter()
+                .filter(|member| member.holds_live_frames().is_some())
+                .flat_map(|member| &member.fences)
+                .map(|range| range.until_seconds)
+                .max();
+            if let Some(until) = until {
+                routes.extend(group.routes.iter().cloned().map(|route| (route, until)));
             }
         }
         Ok(routes)

@@ -43,25 +43,20 @@ type GenerationKey = (String, String, ReplaySourceGeneration);
 /// for replay, which its REQ will not deliver again.
 ///
 /// Debt that drives work (a unit's debt, its derived cursor, the capture
-/// fence) is the ledger's debt through [`LiveTails::owed_until`], read from
+/// fence) is the ledger's debt through its standing live tail, read from
 /// [`AppClient::live_tails`].
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct LiveTails(BTreeMap<(TransportReconciliationRoute, String), u64>);
 
-impl LiveTails {
-    /// The last second the ledger must prove on `relay` for `route` at
-    /// `now`: the second before a live tail starts there, else `now`.
-    pub(crate) fn owed_until(
-        &self,
-        route: &TransportReconciliationRoute,
-        relay: &str,
-        now: u64,
-    ) -> u64 {
+impl super::recovery_runner::LiveTailRead for LiveTails {
+    fn history_end(&self, route: &TransportReconciliationRoute, relay: &str) -> Option<u64> {
         self.0
             .get(&(route.clone(), relay.to_owned()))
-            .map_or(now, |since| since.saturating_sub(1).min(now))
+            .map(|since| since.saturating_sub(1))
     }
+}
 
+impl LiveTails {
     fn start(&mut self, route: &TransportReconciliationRoute, relay: &str, since: u64) {
         self.0
             .entry((route.clone(), relay.to_owned()))

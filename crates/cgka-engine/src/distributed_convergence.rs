@@ -1390,7 +1390,7 @@ impl<S: StorageProvider> Engine<S> {
             .storage
             .list_openmls_messages_in_states(
                 group_id,
-                &crate::openmls_projection::OPENMLS_GRAPH_INPUT_STATES,
+                &crate::openmls_projection::OPENMLS_COMMIT_INPUT_STATES,
                 EpochId(floor),
                 OpenMlsContentFilter::Commits,
             )
@@ -2834,8 +2834,8 @@ impl<S: StorageProvider> Engine<S> {
             // call. Production emits it from
             // `append_missing_parent_deferred_commits`, over the stored commits
             // the candidate-path BFS could not materialize; that set is filtered
-            // by `unresolved_commit_state`, which admits `Sent`, `Created`,
-            // `Retryable`, and `ConvergenceDeferred` and excludes `Processed`.
+            // by `unresolved_commit_state`, which admits `Created`, `Retryable`,
+            // and `ConvergenceDeferred` and excludes `Processed`.
             // So a `MissingCandidateParent` deferral can never name a commit
             // this device previously applied — the commit has no applied
             // notifications to withdraw, and widening this filter to it would

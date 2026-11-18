@@ -3518,9 +3518,15 @@ impl AppClient {
             }
             Some(kept) => return Ok(sign_out::SignOutLeave::Kept(kept)),
         };
-        self.leave_group_for_reason(group_id, reason).await?;
+        let summary = self.leave_group_for_reason(group_id, reason).await?;
         Ok(match reason {
             AccountLeaveReason::SignOutAsAdmin => sign_out::SignOutLeave::Recorded,
+            AccountLeaveReason::SignOut
+                if summary.accept_disposition
+                    == cgka_traits::SendAcceptDisposition::AcceptedPending =>
+            {
+                sign_out::SignOutLeave::Unfinished
+            }
             _ => sign_out::SignOutLeave::Left,
         })
     }
@@ -4014,9 +4020,21 @@ impl AppClient {
                 return Err(err);
             }
         };
-        self.record_human_action_succeeded(group_id, &audit_context, &effects);
+        let summary = if matches!(reason, AccountLeaveReason::SignOut) {
+            sign_out::member_leave_send_summary(&effects)
+        } else {
+            send_summary_from_effects(&effects)
+        };
+        let queued_for_sign_out = matches!(reason, AccountLeaveReason::SignOut)
+            && summary.accept_disposition == cgka_traits::SendAcceptDisposition::AcceptedPending;
+        if !queued_for_sign_out {
+            self.record_human_action_succeeded(group_id, &audit_context, &effects);
+        }
         self.remember_published_reports(&effects);
         self.save_state_with_pending_local_group_deletion_frontier_clears()?;
+        if queued_for_sign_out {
+            return Ok(summary);
+        }
         // A local leave / decline is a voluntary departure, recorded as `Left`
         // so the chat list can distinguish it from an involuntary removal. The
         // inbound `observe_account_device_effects` path records this for an
@@ -4039,7 +4057,7 @@ impl AppClient {
                 SelfMembership::Left,
             )?;
         }
-        Ok(send_summary_from_effects(&effects))
+        Ok(summary)
     }
 
     /// One-time open/upgrade backfill of `account_groups.self_membership`.

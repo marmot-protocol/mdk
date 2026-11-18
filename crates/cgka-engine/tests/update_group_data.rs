@@ -1881,6 +1881,11 @@ async fn update_group_data_publish_failed_rolls_back() {
         ]))
     );
     alice.publish_failed(pending).await.unwrap();
+    assert_eq!(
+        alice.prepare_convergence_cutoff_delay_ms(&gid).unwrap(),
+        None
+    );
+    converge_buffered_commit(&mut alice, &gid);
     assert_eq!(alice.epoch(&gid).unwrap().0, 1);
 
     assert_profile(&alice, &gid, "original", "orig description");
@@ -1898,6 +1903,52 @@ async fn update_group_data_publish_failed_rolls_back() {
     }
     assert_eq!(alice.epoch(&gid).unwrap().0, 2);
     assert_profile(&alice, &gid, "kept", "orig description");
+}
+
+/// A retried admin step-down has the same MLS bytes in a fresh transport
+/// envelope. Only the confirmed copy can represent this epoch transition.
+#[tokio::test]
+async fn confirmed_step_down_survives_convergence_after_a_refused_copy() {
+    let (mut alice, storage, mut bob, _, gid) =
+        create_admin_pair_with_peeler(ephemeral_peeler).await;
+    let parent = alice.epoch(&gid).unwrap();
+    alice
+        .send(SendIntent::StepDownAndLeave {
+            group_id: gid.clone(),
+        })
+        .await
+        .unwrap();
+    alice.advance_convergence(&gid).await.unwrap();
+    let refused = alice.drain_auto_publish().pop().unwrap();
+    alice.publish_failed(refused.pending).await.unwrap();
+
+    alice.advance_convergence(&gid).await.unwrap();
+    let accepted = alice.drain_auto_publish().pop().unwrap();
+    assert_eq!(accepted.msg.payload, refused.msg.payload);
+    assert_ne!(accepted.msg.id, refused.msg.id);
+    alice.confirm_published(accepted.pending).await.unwrap();
+    bob.ingest(route_to_group(&accepted.msg, &gid))
+        .await
+        .unwrap();
+    converge_buffered_commit(&mut bob, &gid);
+
+    alice.prepare_convergence_cutoff_delay_ms(&gid).unwrap();
+    converge_buffered_commit(&mut alice, &gid);
+    alice.advance_convergence(&gid).await.unwrap();
+    assert!(
+        alice.drain_auto_publish().is_empty(),
+        "step-down already confirmed"
+    );
+    assert_eq!(alice.epoch(&gid).unwrap().0, parent.0 + 1);
+    assert_eq!(alice.epoch(&gid).unwrap(), bob.epoch(&gid).unwrap());
+    assert_eq!(
+        alice.admin_pubkeys(&gid).unwrap(),
+        bob.admin_pubkeys(&gid).unwrap()
+    );
+    assert_eq!(
+        storage.get_message(&accepted.msg.id).unwrap().state,
+        MessageState::Processed
+    );
 }
 
 // ── Validation ──────────────────────────────────────────────────────────────

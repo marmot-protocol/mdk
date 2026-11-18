@@ -2375,8 +2375,12 @@ impl<S: StorageProvider> Engine<S> {
     /// rewind `do_publish_failed` performs). The MLS group returns to its
     /// pre-stage epoch, we re-derive the Marmot record from that cleared
     /// state, and we surface a typed `PendingCommitRecovered` event so the
-    /// application can run a recovery / resync path — if relays accepted the
-    /// commit before the crash, this device is now behind and must catch up.
+    /// application can run a recovery / resync path. The session runtime
+    /// persists a pending fanout before sending, so hydration restores that
+    /// publication for resolution. A host that publishes without durable
+    /// fanout can lose the confirmation of an accepted commit here. Its
+    /// retained sent IDs suppress relay echoes, so backfill of the same
+    /// commit alone cannot establish the new epoch.
     ///
     /// **Unowned member-removing commits are deliberately left untouched.** A surviving
     /// pending commit is NOT a reliable crash signal on its own: a deferred

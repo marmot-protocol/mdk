@@ -288,6 +288,7 @@ async fn restart_goal_survey(client: &mut AppClient) -> super::super::select::Su
                     &turn,
                     &RecoveryRunnerPolicy::default(),
                     &super::super::admission::Stalled::default(),
+                    None,
                 )
             })
             .await
@@ -1072,6 +1073,7 @@ async fn failed_route_goal_writes(failed_steps: usize) {
                 turn,
                 &RecoveryRunnerPolicy::default(),
                 &super::super::admission::Stalled::default(),
+                None,
             )
         }),
     )

@@ -17,7 +17,7 @@ use cgka_engine::key_package::key_package_metadata;
 use cgka_traits::TransportEndpoint;
 use cgka_traits::engine::KeyPackage;
 use cgka_traits::group::ProtocolProfile;
-use futures::{StreamExt, TryStreamExt, stream};
+use futures::{Stream, StreamExt, future, stream};
 use nostr_sdk::prelude::PublicKey;
 use transport_nostr_adapter::{KIND_MARMOT_INBOX_RELAY_LIST, KIND_NIP65_RELAY_LIST};
 
@@ -42,6 +42,23 @@ const MEMBER_RESOLUTION_FALLBACK_CONCURRENCY: usize = 8;
 // scoped deletion proof share one deadline. No per-route or candidate retry
 // renews it; slow/incomplete coverage remains retryable rather than absence.
 const MEMBER_RESOLUTION_DEADLINE: Duration = Duration::from_secs(50);
+/// The longest one directory read waits: transport-nostr opens a connection
+/// for each read (at most 5 s) and waits at most 3 s for a REQ's EOSE.
+/// Relay-list and KeyPackage reads each send one REQ.
+const MEMBER_RESOLUTION_READ_WORST: Duration = Duration::from_secs(8);
+/// Under Partial, how long after the start each step that waits for the whole
+/// set may wait. At its cut-off the members that cleared the step go on and
+/// the rest report `Incomplete`. A step that ends sooner leaves its time to
+/// the steps after it. Each cut-off leaves every later step one wave at its
+/// worst: a discovery hop is a batch read and its single-author retry, a
+/// KeyPackage batch is one read, and the single-author read that decides a
+/// member is one more. Atomic resolution has no cut-offs.
+const PARTIAL_KEY_PACKAGE_BATCH_CUT_OFF: Duration =
+    MEMBER_RESOLUTION_DEADLINE.saturating_sub(MEMBER_RESOLUTION_READ_WORST);
+const PARTIAL_OUTBOX_HOP_CUT_OFF: Duration =
+    PARTIAL_KEY_PACKAGE_BATCH_CUT_OFF.saturating_sub(MEMBER_RESOLUTION_READ_WORST);
+const PARTIAL_FIRST_HOP_CUT_OFF: Duration =
+    PARTIAL_OUTBOX_HOP_CUT_OFF.saturating_sub(MEMBER_RESOLUTION_READ_WORST.saturating_mul(2));
 const RELAY_LIST_EVENTS_PER_AUTHOR: usize = 4;
 const MEMBER_PREWARM_CACHE_LIMIT: usize = 256;
 pub const MEMBER_PREWARM_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
@@ -70,6 +87,29 @@ mod tests {
             Instant::now() - MEMBER_PREWARM_CACHE_TTL - Duration::from_secs(1);
         assert!(cache.get(&newest).is_none());
         assert!(!cache.order.contains(&newest));
+    }
+
+    /// A read queued behind one that answers at the cut-off never starts,
+    /// however the stream is polled once the cut-off has passed.
+    #[tokio::test(start_paused = true)]
+    async fn no_read_starts_after_its_cut_off() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let cut_off = tokio::time::Instant::now() + Duration::from_secs(1);
+        let started = Arc::new(AtomicUsize::new(0));
+        let reads = (0..2).map(|_| {
+            let started = Arc::clone(&started);
+            started_before(Some(cut_off), async move {
+                started.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep_until(cut_off).await;
+            })
+        });
+        let mut reads = stream::iter(reads).buffer_unordered(1);
+
+        assert_eq!(reads.next().await, Some(Some(())));
+        assert_eq!(reads.next().await, Some(None));
+        assert_eq!(started.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -246,6 +286,66 @@ struct MemberTarget {
 struct RelayListResolution {
     completed: HashSet<usize>,
     errors: Vec<(usize, DirectoryError)>,
+    /// Members a cut-off stopped before their discovery finished. Their relay
+    /// lists may be a discovery-only snapshot.
+    unfinished: HashSet<usize>,
+}
+
+/// What one metadata hop settled.
+#[derive(Default)]
+struct HopProgress {
+    /// Members whose result arrived before the hop's cut-off.
+    cleared: HashSet<usize>,
+    /// Cleared members whose read was complete and not from the future.
+    completed: HashSet<usize>,
+}
+
+/// Under [`MemberResolutionPolicy::Partial`], when each step that waits for
+/// the whole set stops waiting.
+#[derive(Clone, Copy)]
+struct PartialCutOffs {
+    first_hop: tokio::time::Instant,
+    outbox_hop: tokio::time::Instant,
+    key_package_batches: tokio::time::Instant,
+}
+
+impl PartialCutOffs {
+    fn after(started: tokio::time::Instant) -> Self {
+        Self {
+            first_hop: started + PARTIAL_FIRST_HOP_CUT_OFF,
+            outbox_hop: started + PARTIAL_OUTBOX_HOP_CUT_OFF,
+            key_package_batches: started + PARTIAL_KEY_PACKAGE_BATCH_CUT_OFF,
+        }
+    }
+}
+
+/// The stream's next item, or `None` once it ends or `cut_off` passes. An
+/// item already waiting at the cut-off is still taken: its read had started
+/// before the cut-off, and no read starts after it ([`started_before`]).
+async fn next_before<S: Stream + Unpin>(
+    stream: &mut S,
+    cut_off: Option<tokio::time::Instant>,
+) -> Option<S::Item> {
+    match cut_off {
+        Some(cut_off) => tokio::time::timeout_at(cut_off, stream.next())
+            .await
+            .ok()
+            .flatten(),
+        None => stream.next().await,
+    }
+}
+
+/// `read`'s result, or `None` without starting it once `cut_off` has passed.
+/// Every read of a step with a cut-off goes through this, so a read queued in
+/// a buffered stream never starts late, however late the stream is polled.
+async fn started_before<T>(
+    cut_off: Option<tokio::time::Instant>,
+    read: impl Future<Output = T>,
+) -> Option<T> {
+    if cut_off.is_some_and(|cut_off| tokio::time::Instant::now() >= cut_off) {
+        return None;
+    }
+    Some(read.await)
 }
 
 pub struct ResolvedMemberKeyPackages {
@@ -368,13 +468,17 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
         let observation =
             self.resources
                 .begin(ObservedFamily::KeyPackage, "lookup", ObservedUnit::Action);
-        let deadline = tokio::time::Instant::now() + MEMBER_RESOLUTION_DEADLINE;
+        let started = tokio::time::Instant::now();
+        let deadline = started + MEMBER_RESOLUTION_DEADLINE;
+        let cut_offs =
+            (policy == MemberResolutionPolicy::Partial).then(|| PartialCutOffs::after(started));
         let result = self
             .resolve_member_key_packages_inner(
                 &member_refs,
                 purpose,
                 requirements,
                 deadline,
+                cut_offs,
                 policy,
             )
             .await;
@@ -391,13 +495,16 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
 
     /// Both network stages share `deadline`. A member whose lookup had not
     /// finished when it passed reports `DirectoryLookupIncomplete`; members
-    /// already decided keep their outcome.
+    /// already decided keep their outcome. Under Partial, each step that
+    /// waits for the whole set also stops at its cut-off, and the members it
+    /// had not cleared report `DirectoryLookupIncomplete`.
     async fn resolve_member_key_packages_inner(
         &self,
         member_refs: &[String],
         purpose: MemberResolutionPurpose,
         requirements: Option<&cgka_engine::key_package::KeyPackageRequirements>,
         deadline: tokio::time::Instant,
+        cut_offs: Option<PartialCutOffs>,
         policy: MemberResolutionPolicy,
     ) -> Result<ResolvedMemberKeyPackages, DirectoryError> {
         let directory_observation = self
@@ -491,42 +598,48 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
             .filter(|index| !reused_prewarmed_routes.contains(index))
             .collect::<Vec<_>>();
         // Unfinished relay lists cannot support any KeyPackage verdict.
-        let (relay_lists_completed, relay_lists_finished, finished) = match tokio::time::timeout_at(
-            deadline,
-            self.resolve_missing_relay_lists(&mut targets, &relay_list_unresolved),
-        )
-        .await
-        {
-            Ok(resolution) => {
-                let RelayListResolution { completed, errors } = resolution?;
-                for (index, error) in errors {
-                    outcomes[index] = Some(Err(error));
-                }
-                let key_package_unresolved = (0..targets.len())
-                    .filter(|index| outcomes[*index].is_none())
-                    .collect::<Vec<_>>();
-                let finished = match tokio::time::timeout_at(
-                    deadline,
-                    self.resolve_missing_key_packages(
-                        &targets,
-                        &key_package_unresolved,
-                        &mut outcomes,
-                        purpose,
-                        requirements,
-                    ),
-                )
-                .await
-                {
-                    Ok(result) => {
-                        result?;
-                        true
+        let (relay_lists_completed, relay_lists_unfinished, finished) =
+            match tokio::time::timeout_at(
+                deadline,
+                self.resolve_missing_relay_lists(&mut targets, &relay_list_unresolved, cut_offs),
+            )
+            .await
+            {
+                Ok(resolution) => {
+                    let RelayListResolution {
+                        completed,
+                        errors,
+                        unfinished,
+                    } = resolution?;
+                    for (index, error) in errors {
+                        outcomes[index] = Some(Err(error));
                     }
-                    Err(_) => false,
-                };
-                (completed, true, finished)
-            }
-            Err(_) => (HashSet::new(), false, false),
-        };
+                    let key_package_unresolved = (0..targets.len())
+                        .filter(|index| outcomes[*index].is_none())
+                        .collect::<Vec<_>>();
+                    let finished = match tokio::time::timeout_at(
+                        deadline,
+                        self.resolve_missing_key_packages(
+                            &targets,
+                            &key_package_unresolved,
+                            &mut outcomes,
+                            purpose,
+                            requirements,
+                            cut_offs.map(|cut_offs| cut_offs.key_package_batches),
+                        ),
+                    )
+                    .await
+                    {
+                        Ok(result) => {
+                            result?;
+                            true
+                        }
+                        Err(_) => false,
+                    };
+                    (completed, Some(unfinished), finished)
+                }
+                Err(_) => (HashSet::new(), None, false),
+            };
         if !finished {
             for (target, outcome) in targets.iter().zip(&mut outcomes) {
                 outcome.get_or_insert_with(|| {
@@ -583,11 +696,16 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
             }));
         }
         match purpose {
-            // A cancelled relay-list stage may hold a discovery-only snapshot.
-            MemberResolutionPurpose::Commit | MemberResolutionPurpose::CommitFresh
-                if !relay_lists_finished => {}
+            // A cancelled relay-list stage may hold a discovery-only snapshot,
+            // and so may a member a cut-off stopped.
             MemberResolutionPurpose::Commit | MemberResolutionPurpose::CommitFresh => {
-                for target in &targets {
+                for (index, target) in targets.iter().enumerate() {
+                    if relay_lists_unfinished
+                        .as_ref()
+                        .is_none_or(|unfinished| unfinished.contains(&index))
+                    {
+                        continue;
+                    }
                     if !target.relay_lists.nip65.relays.is_empty()
                         || !target.relay_lists.inbox.relays.is_empty()
                         || target.relay_lists.nip65.created_at > 0
@@ -741,11 +859,14 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
     /// Run one metadata hop with identical batching, partial-record retention,
     /// and bounded per-author fallback on both discovery and advertised relays.
     /// Completion belongs to this hop only; callers reconcile hops separately.
+    /// Each member's result is kept as it arrives, and at `cut_off` the hop
+    /// stops waiting for the rest.
     async fn resolve_relay_list_hop(
         &self,
         targets: &mut [MemberTarget],
         groups: Vec<(Vec<TransportEndpoint>, Vec<usize>)>,
-    ) -> Result<HashSet<usize>, DirectoryError> {
+        cut_off: Option<tokio::time::Instant>,
+    ) -> Result<HopProgress, DirectoryError> {
         let specs = groups
             .into_iter()
             .flat_map(|(endpoints, indices)| {
@@ -762,82 +883,100 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
             })
             .collect::<Vec<_>>();
         let directory = self.clone();
+        // One item per reply: a batch that answered, or one member's
+        // single-author retry. A read that would start after the cut-off does
+        // not start, and its members are left uncleared.
         let work = specs.into_iter().map(move |(endpoints, members)| {
             let directory = directory.clone();
-            async move {
-                let authors = members.iter().map(|(_, id)| id.clone()).collect::<Vec<_>>();
-                let queries = [KIND_NIP65_RELAY_LIST, KIND_MARMOT_INBOX_RELAY_LIST]
-                    .into_iter()
-                    .map(|kind| {
-                        DirectoryEventQuery::new(
-                            kind,
-                            authors.clone(),
-                            authors.len() * RELAY_LIST_EVENTS_PER_AUTHOR,
-                        )
-                    })
-                    .collect();
-                let outcome = directory
-                    .relay_plane
-                    .fetch_directory_events_with_completion(endpoints.clone(), queries)
-                    .await
-                    .map_err(DirectoryError::RelayDirectory)?;
-                if members.len() == 1 || outcome.complete {
-                    return Ok(members
+            Box::pin(
+                stream::once(started_before(cut_off, async move {
+                    let authors = members.iter().map(|(_, id)| id.clone()).collect::<Vec<_>>();
+                    let queries = [KIND_NIP65_RELAY_LIST, KIND_MARMOT_INBOX_RELAY_LIST]
                         .into_iter()
-                        .map(|(index, _)| (index, endpoints.clone(), outcome.clone()))
-                        .collect::<Vec<_>>());
-                }
-                // CLOSED and other incomplete outcomes need the same fallback
-                // as a rejected batch. Retain positive records when the
-                // single-author retry is also incomplete.
-                stream::iter(members.into_iter().map(|(index, account_id)| {
-                    let directory = directory.clone();
-                    let endpoints = endpoints.clone();
-                    let mut records = outcome
-                        .records
-                        .iter()
-                        .filter(|record| record.event.pubkey == account_id)
-                        .cloned()
-                        .collect::<Vec<_>>();
-                    async move {
-                        let queries = [KIND_NIP65_RELAY_LIST, KIND_MARMOT_INBOX_RELAY_LIST]
-                            .into_iter()
-                            .map(|kind| {
-                                DirectoryEventQuery::new(
-                                    kind,
-                                    vec![account_id.clone()],
-                                    RELAY_LIST_EVENTS_PER_AUTHOR,
-                                )
-                            })
-                            .collect();
-                        let retry = directory
-                            .relay_plane
-                            .fetch_directory_events_with_completion(endpoints.clone(), queries)
-                            .await
-                            .map_err(DirectoryError::RelayDirectory)?;
-                        records.extend(retry.records);
-                        Ok::<_, DirectoryError>((
-                            index,
-                            endpoints,
-                            DirectoryFetchOutcome {
-                                records,
-                                complete: retry.complete,
-                                complete_endpoints: retry.complete_endpoints,
-                            },
-                        ))
-                    }
+                        .map(|kind| {
+                            DirectoryEventQuery::new(
+                                kind,
+                                authors.clone(),
+                                authors.len() * RELAY_LIST_EVENTS_PER_AUTHOR,
+                            )
+                        })
+                        .collect();
+                    let outcome = directory
+                        .relay_plane
+                        .fetch_directory_events_with_completion(endpoints.clone(), queries)
+                        .await
+                        .map_err(DirectoryError::RelayDirectory);
+                    (directory, endpoints, members, outcome)
                 }))
-                .buffer_unordered(MEMBER_RESOLUTION_FALLBACK_CONCURRENCY)
-                .try_collect::<Vec<_>>()
-                .await
-            }
+                .filter_map(future::ready)
+                .flat_map(move |(directory, endpoints, members, outcome)| {
+                    let outcome = match outcome {
+                        Ok(outcome) => outcome,
+                        Err(error) => return stream::iter(vec![Err(error)]).left_stream(),
+                    };
+                    if members.len() == 1 || outcome.complete {
+                        let reply = members
+                            .into_iter()
+                            .map(|(index, _)| (index, endpoints.clone(), outcome.clone()))
+                            .collect::<Vec<_>>();
+                        return stream::iter(vec![Ok(reply)]).left_stream();
+                    }
+                    // CLOSED and other incomplete outcomes need the same
+                    // fallback as a rejected batch. Retain positive records
+                    // when the single-author retry is also incomplete.
+                    stream::iter(members.into_iter().map(move |(index, account_id)| {
+                        let directory = directory.clone();
+                        let endpoints = endpoints.clone();
+                        let mut records = outcome
+                            .records
+                            .iter()
+                            .filter(|record| record.event.pubkey == account_id)
+                            .cloned()
+                            .collect::<Vec<_>>();
+                        started_before(cut_off, async move {
+                            let queries = [KIND_NIP65_RELAY_LIST, KIND_MARMOT_INBOX_RELAY_LIST]
+                                .into_iter()
+                                .map(|kind| {
+                                    DirectoryEventQuery::new(
+                                        kind,
+                                        vec![account_id.clone()],
+                                        RELAY_LIST_EVENTS_PER_AUTHOR,
+                                    )
+                                })
+                                .collect();
+                            let retry = directory
+                                .relay_plane
+                                .fetch_directory_events_with_completion(endpoints.clone(), queries)
+                                .await
+                                .map_err(DirectoryError::RelayDirectory)?;
+                            records.extend(retry.records);
+                            Ok::<_, DirectoryError>(vec![(
+                                index,
+                                endpoints,
+                                DirectoryFetchOutcome {
+                                    records,
+                                    complete: retry.complete,
+                                    complete_endpoints: retry.complete_endpoints,
+                                },
+                            )])
+                        })
+                    }))
+                    .buffer_unordered(MEMBER_RESOLUTION_FALLBACK_CONCURRENCY)
+                    .filter_map(future::ready)
+                    .right_stream()
+                }),
+            )
         });
-        let results = stream::iter(work)
-            .buffer_unordered(MEMBER_RESOLUTION_RELAY_CONCURRENCY)
-            .try_collect::<Vec<_>>()
-            .await?;
-        let mut completed = HashSet::new();
-        for (index, endpoints, outcome) in results.into_iter().flatten() {
+        let mut results = stream::iter(work).flatten_unordered(MEMBER_RESOLUTION_RELAY_CONCURRENCY);
+        // Keep each reply as it arrives, and judge them all when the hop ends,
+        // as Atomic always has: a relay list's freshness is read then.
+        let mut received = Vec::new();
+        while let Some(reply) = next_before(&mut results, cut_off).await {
+            received.extend(reply?);
+        }
+        drop(results);
+        let mut progress = HopProgress::default();
+        for (index, endpoints, outcome) in received {
             let account_id = targets[index].account_id_hex.clone();
             targets[index].relay_records.extend(
                 outcome
@@ -850,6 +989,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                 targets[index].relay_records.clone(),
                 &endpoints,
             );
+            progress.cleared.insert(index);
             if outcome.complete
                 && !fresh_relay_list_status_from_records(
                     &account_id,
@@ -858,16 +998,17 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                 )
                 .rejected_future
             {
-                completed.insert(index);
+                progress.completed.insert(index);
             }
         }
-        Ok(completed)
+        Ok(progress)
     }
 
     async fn resolve_missing_relay_lists(
         &self,
         targets: &mut [MemberTarget],
         unresolved: &[usize],
+        cut_offs: Option<PartialCutOffs>,
     ) -> Result<RelayListResolution, DirectoryError> {
         let needs_discovery = unresolved.to_vec();
         if needs_discovery.is_empty() {
@@ -877,9 +1018,21 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
         if endpoints.is_empty() {
             return Ok(RelayListResolution::default());
         }
-        let completed_discovery = self
-            .resolve_relay_list_hop(targets, vec![(endpoints.clone(), needs_discovery.clone())])
+        let first_hop = self
+            .resolve_relay_list_hop(
+                targets,
+                vec![(endpoints.clone(), needs_discovery.clone())],
+                cut_offs.map(|cut_offs| cut_offs.first_hop),
+            )
             .await?;
+        let completed_discovery = first_hop.completed;
+        // Only Partial resolution has cut-offs, so only it leaves members
+        // unfinished. They go no further.
+        let mut unfinished = needs_discovery
+            .iter()
+            .copied()
+            .filter(|index| !first_hop.cleared.contains(index))
+            .collect::<HashSet<_>>();
         let incomplete_discovery = needs_discovery
             .iter()
             .copied()
@@ -890,6 +1043,9 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
         // only commit-purpose resolution persists the observed metadata.
         let mut by_outboxes = BTreeMap::<Vec<TransportEndpoint>, Vec<usize>>::new();
         for index in needs_discovery.iter().copied() {
+            if unfinished.contains(&index) {
+                continue;
+            }
             let outbox_endpoints = self.relay_plane.retain_safe_discovered_endpoints(
                 targets[index]
                     .relay_lists
@@ -918,7 +1074,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
             .copied()
             .collect::<HashSet<_>>();
         let mut invalid_outboxes = HashSet::new();
-        let outbox_groups = by_outboxes
+        let outbox_groups: Vec<_> = by_outboxes
             .into_iter()
             .filter_map(|(endpoints, indices)| {
                 match self
@@ -933,7 +1089,17 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                 }
             })
             .collect();
-        let completed_outbox = self.resolve_relay_list_hop(targets, outbox_groups).await?;
+        let outbox_hop = self
+            .resolve_relay_list_hop(
+                targets,
+                outbox_groups,
+                cut_offs.map(|cut_offs| cut_offs.outbox_hop),
+            )
+            .await?;
+        unfinished.extend(attempted_outbox.iter().copied().filter(|index| {
+            !invalid_outboxes.contains(index) && !outbox_hop.cleared.contains(index)
+        }));
+        let completed_outbox = outbox_hop.completed;
         let completed = completed_discovery
             .iter()
             .copied()
@@ -942,7 +1108,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
         let errors = needs_discovery
             .into_iter()
             .filter(|index| {
-                if invalid_outboxes.contains(index) {
+                if unfinished.contains(index) || invalid_outboxes.contains(index) {
                     return true;
                 }
                 let has_inbox = !self
@@ -971,7 +1137,11 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                 (index, DirectoryError::DirectoryLookupIncomplete(account))
             })
             .collect();
-        Ok(RelayListResolution { completed, errors })
+        Ok(RelayListResolution {
+            completed,
+            errors,
+            unfinished,
+        })
     }
 
     async fn resolve_missing_key_packages(
@@ -981,6 +1151,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
         outcomes: &mut [Option<Result<Vec<KeyPackage>, DirectoryError>>],
         purpose: MemberResolutionPurpose,
         requirements: Option<&cgka_engine::key_package::KeyPackageRequirements>,
+        batch_cut_off: Option<tokio::time::Instant>,
     ) -> Result<(), DirectoryError> {
         let defaults = self.directory_source_relays(&[]);
         let mut by_endpoints = BTreeMap::<Vec<TransportEndpoint>, Vec<usize>>::new();
@@ -1043,7 +1214,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
             .into_iter()
             .map(move |(indices, endpoints, queries)| {
                 let directory = directory.clone();
-                async move {
+                started_before(batch_cut_off, async move {
                     let result = directory
                         .relay_plane
                         .fetch_directory_events_with_completion(endpoints, queries)
@@ -1051,16 +1222,18 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                         .map(|outcome| outcome.records)
                         .map_err(DirectoryError::RelayDirectory);
                     (indices, result)
-                }
+                })
             });
         // Record each outcome as it arrives: when the shared deadline cancels
-        // this stage, members already decided keep their outcome.
-        let mut batches =
-            stream::iter(requests).buffer_unordered(MEMBER_RESOLUTION_RELAY_CONCURRENCY);
+        // this stage, members already decided keep their outcome. A batch
+        // that would start after the cut-off does not start.
+        let mut batches = stream::iter(requests)
+            .buffer_unordered(MEMBER_RESOLUTION_RELAY_CONCURRENCY)
+            .filter_map(future::ready);
 
-        let mut fallback = Vec::new();
+        // Members whose batch read could not decide them, with what it saw.
         let mut fallback_records = BTreeMap::new();
-        while let Some((indices, result)) = batches.next().await {
+        while let Some((indices, result)) = next_before(&mut batches, batch_cut_off).await {
             let records = result?;
             let multiple_authors = indices.len() > 1;
             let mut records_by_author = BTreeMap::<_, Vec<_>>::new();
@@ -1107,18 +1280,27 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                     // too, and recovery reports it incomplete. Keep observed slot replacements
                     // when combining the refetch.
                     _ => {
-                        fallback.push(index);
                         fallback_records.insert(index, account_records);
                     }
                 }
             }
         }
 
-        fallback.sort_unstable();
-        fallback.dedup();
-        let fallback_specs = fallback
+        drop(batches);
+        // Every member asked for has an outcome or a fallback once its batch
+        // answers, so a member with neither is in a batch the Partial cut-off
+        // left unanswered.
+        for &index in unresolved {
+            if outcomes[index].is_none() && !fallback_records.contains_key(&index) {
+                outcomes[index] = Some(Err(DirectoryError::DirectoryLookupIncomplete(
+                    targets[index].account_id_hex.clone(),
+                )));
+            }
+        }
+
+        let fallback_specs = fallback_records
             .into_iter()
-            .filter_map(|index| {
+            .filter_map(|(index, observed_records)| {
                 let target = targets[index].clone();
                 let mut endpoints = self.relay_plane.retain_safe_discovered_endpoints(
                     target
@@ -1134,12 +1316,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                 if endpoints.is_empty() {
                     endpoints.clone_from(&defaults);
                 }
-                (!endpoints.is_empty()).then_some((
-                    index,
-                    target,
-                    endpoints,
-                    fallback_records.remove(&index).unwrap_or_default(),
-                ))
+                (!endpoints.is_empty()).then_some((index, target, endpoints, observed_records))
             })
             .collect::<Vec<_>>();
         let directory = self.clone();

@@ -70,8 +70,10 @@ pub(crate) enum SiblingSignOut {
 /// What stage 1 of `sign_out_and_wipe` did with one chat.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum SignOutLeave {
-    /// This device's leave went through the ordinary leave path.
+    /// The ordinary Leave completed its submission.
     Left,
+    /// This sign-out left the ordinary Leave in the outbound queue.
+    Unfinished,
     /// Its leave is recorded and the engine carries it out: this sign-out
     /// sent `StepDownAndLeave` to a chat its account administers with
     /// another account, or the device was already leaving the chat. The chat
@@ -81,6 +83,17 @@ pub(crate) enum SignOutLeave {
     /// This device keeps its leaf: its account is an active admin there
     /// and cannot step down from this device (mdk#2818).
     Kept(SignOutAdminKeep),
+}
+
+/// The generic summary can count a different publish in the same pass.
+pub(super) fn member_leave_send_summary(
+    effects: &marmot_session::AccountDeviceEffects,
+) -> crate::SendSummary {
+    let mut summary = crate::groups::send_summary_from_effects(effects);
+    if !effects.queued.is_empty() {
+        summary.accept_disposition = cgka_traits::SendAcceptDisposition::AcceptedPending;
+    }
+    summary
 }
 
 /// Where an admin's sign-out leave from one chat stands, as
@@ -655,4 +668,44 @@ fn staying_siblings<'a>(
                 )
         })
         .map(|(slot, _)| *slot)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::member_leave_send_summary;
+    use cgka_traits::{
+        GroupId, MessageId, SendAcceptDisposition, TransportEndpoint, TransportEndpointReceipt,
+        TransportPublishReport,
+    };
+    use marmot_session::{AccountDeviceEffects, QueuedIntentRef};
+
+    #[test]
+    fn queued_member_leave_takes_precedence_over_an_unrelated_receipt() {
+        let effects = AccountDeviceEffects {
+            queued: vec![QueuedIntentRef {
+                group_id: GroupId::new(vec![1; 16]),
+                intent_id: MessageId::new(vec![2; 32]),
+            }],
+            reports: vec![TransportPublishReport {
+                message_id: MessageId::new(vec![3; 32]),
+                accepted: vec![TransportEndpointReceipt {
+                    endpoint: TransportEndpoint("wss://relay.example".into()),
+                    accepted_at: None,
+                    ack_kind: None,
+                }],
+                failed: Vec::new(),
+                required_acks: 1,
+            }],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            crate::groups::send_summary_from_effects(&effects).accept_disposition,
+            SendAcceptDisposition::Published,
+        );
+        assert_eq!(
+            member_leave_send_summary(&effects).accept_disposition,
+            SendAcceptDisposition::AcceptedPending,
+        );
+    }
 }

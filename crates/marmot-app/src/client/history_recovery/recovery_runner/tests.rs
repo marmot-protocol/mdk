@@ -445,10 +445,10 @@ impl TailSource {
 struct Tails(BTreeMap<UnitKey, u64>);
 
 impl LiveTailRead for Tails {
-    fn owed_until(&self, route: &Route, relay: &str, now: u64) -> u64 {
+    fn history_end(&self, route: &Route, relay: &str) -> Option<u64> {
         self.0
             .get(&unit_key(route, relay))
-            .map_or(now, |from| from.saturating_sub(1).min(now))
+            .map(|from| from.saturating_sub(1))
     }
 }
 
@@ -1125,7 +1125,7 @@ impl TestHost {
     }
 
     async fn survey(&self, policy: RecoveryRunnerPolicy) -> Survey {
-        self.debt_turn(move |turn| survey(turn, &policy, &Stalled::default()))
+        self.debt_turn(move |turn| survey(turn, &policy, &Stalled::default(), None))
             .await
             .unwrap()
             .unwrap()
@@ -1971,12 +1971,19 @@ async fn recovery_runner_serves_an_open_conversation_before_smaller_debts() {
     ];
     let host = TestHost::new(&account, &clock, routes, &[&relay]);
     for route in [&open, &closed] {
-        host.tails.stand(route, RELAY, t0);
+        host.tails.stand(route, RELAY, t0 + 1);
     }
-    let (mut runner, _handle) = runner(&host, test_policy());
+    let (mut runner, handle) = runner(&host, test_policy());
 
     // Without the window the hour would go first, as the smaller debt.
     assert_eq!(ran(runner.step().await).key.route, open);
+    // New evidence for the open conversation arrives after this background
+    // window began, while the closed conversation still has work queued.
+    clock.advance(5);
+    host.tails.lapse(&open, RELAY);
+    handle.bump();
+    assert_eq!(ran(runner.step().await).key.route, open);
+    assert_eq!(account.covered_through(&open, RELAY), clock.now());
     assert_eq!(ran(runner.step().await).key.route, closed);
 }
 
@@ -2904,6 +2911,7 @@ fn recovery_runner_sizes_a_route_last_seen_empty_by_its_span() {
         key: unit_key(route, RELAY),
         group_id: None,
         best_effort: false,
+        fetch_until: None,
         owed_seconds,
         position: 0,
         last_served_at: None,
@@ -4900,7 +4908,15 @@ async fn recovery_runner_suspends_an_unrecoverable_groups_route() {
     let policy = test_policy();
     assert!(
         host.debt_turn(move |turn| {
-            select::begin(turn, &key, false, Some(caps(500, true)), true, &policy)
+            select::begin(
+                turn,
+                &key,
+                false,
+                Some(caps(500, true)),
+                true,
+                &policy,
+                None,
+            )
         })
         .await
         .unwrap()

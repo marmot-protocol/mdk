@@ -8,6 +8,7 @@ use storage_sqlite::{
 };
 
 use crate::client::AppClient;
+use crate::client::history_recovery::recovery_runner::LiveTailRead;
 use crate::tests::{ScriptedPushRelayClient, client_on_app_relay_plane};
 use crate::unix_now_seconds;
 

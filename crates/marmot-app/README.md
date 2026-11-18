@@ -740,6 +740,7 @@ removal and have the required tagged leaves. `groups_left_to_siblings` records a
 completed. Outside admin chats, `groups_left` counts successful local leave calls, not confirmed membership removal. The call still attempts
 local account deletion when remote departure fails: show the chats in `group_leave_failures` and check
 `local_cleanup.completed` separately. Completed local cleanup does not prove this device left every chat.
+A queued member Leave appears in `group_leave_failures`.
 
 An account that cannot run a worker here (signed out, lacking its registered external signer, or excluded by
 onboarding's worker gate) signs out on its own immediately. Unfinished onboarding that runs setup traffic but still

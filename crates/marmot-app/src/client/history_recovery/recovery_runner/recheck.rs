@@ -140,6 +140,7 @@ pub(super) fn survey(
                 key,
                 group_id: route.group_id.clone(),
                 best_effort: false,
+                fetch_until: None,
                 owed_seconds: to_check,
                 position: start(now, pass),
                 last_served_at: unit.as_ref().and_then(|unit| unit.last_served_at_seconds),

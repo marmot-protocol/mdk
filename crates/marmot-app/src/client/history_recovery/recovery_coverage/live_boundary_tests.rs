@@ -16,6 +16,7 @@ use super::{
     retention_floor,
 };
 use crate::client::history_recovery::recovery_runner::LiveFence;
+use crate::client::history_recovery::recovery_runner::LiveTailRead;
 use crate::unix_now_seconds;
 
 const HOUR: u64 = 60 * 60;
