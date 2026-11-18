@@ -337,9 +337,9 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   461, 473, 475, 476, 477), the one list: `observe_event` drops one received in any other group before the host summary and the
   stored projection, the notification preview refuses it, and the custom path rejects it as reserved. The engine
   withdraws a message by message id alone (an own send's transport id, a received message's content id), so a kind
-  whose withdrawal a feature acts on is normally listed in `withdrawal_handled`. Kind 477 records an outgoing
-  carrier for prompt resend. Incoming inventory pages record the carrier atomically with the page and invalidate
-  it before acknowledging withdrawal. Outgoing withdrawal and the other recorded kinds are dispatched in
+  whose withdrawal a feature acts on is listed in `withdrawal_handled`. Kind 477 additionally records an incoming
+  carrier atomically with its page. Invalidate a matching page before acknowledging withdrawal, including when the
+  bounded kind index has expired. Other withdrawals, including outgoing kind 477, are dispatched in
   `device_group_message_withdrawn`. Each such message is recorded with its kind in `device_group_messages` when sent
   (before the send; its message id is filled in from whichever drain's effects publish it, in
   `retain_effect_projection`) and when read. Records go after a week or past 4,096, so a feature also acts on a

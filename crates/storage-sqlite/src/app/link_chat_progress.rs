@@ -186,14 +186,15 @@ impl SqliteAppStorage {
     }
 
     /// Invalidate a withdrawn observation without accepting a stale revision.
-    pub fn withdraw_link_chat_page(&self, group: &str, message: &[u8]) -> StorageResult<()> {
-        self.lock()?
+    /// Returns whether the carrier belonged to a currently selected incoming page.
+    pub fn withdraw_link_chat_page(&self, group: &str, message: &[u8]) -> StorageResult<bool> {
+        let changed = self.lock()?
             .execute_cached(
                 "UPDATE link_chat_report_pages SET message_id=NULL WHERE group_id=?1 AND message_id=?2",
                 params![group, message],
             )
             .storage()?;
-        Ok(())
+        Ok(changed != 0)
     }
 
     /// Bound retained link inventories to the direct post-link window.

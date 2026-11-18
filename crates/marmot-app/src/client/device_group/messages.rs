@@ -163,13 +163,14 @@ impl AppClient {
         {
             // The page and its carrier are recorded atomically. Retry a failed
             // invalidation before the projection acknowledges the withdrawal.
-            self.app
+            if self
+                .app
                 .account_storage(&self.state.label)?
                 .app_storage()
-                .withdraw_link_chat_page(
-                    &hex::encode(group_id.as_slice()),
-                    message_id.as_slice(),
-                )?;
+                .withdraw_link_chat_page(&hex::encode(group_id.as_slice()), message_id.as_slice())?
+            {
+                return Ok(());
+            }
             self.device_group_message_withdrawn(group_id, message_id);
             return Ok(());
         }
@@ -360,7 +361,7 @@ impl AppClient {
             .map_err(|error| AppError::InvalidAppMessagePayload(error.to_string()))?;
         // Recorded before the send: the message it becomes is filled in from
         // the effects of whichever drain publishes it.
-        if withdrawal_handled(kind) || kind == KIND_LINK_CHAT_INVENTORY {
+        if withdrawal_handled(kind) {
             self.record_device_group_message(group_id, &event.id, None, kind)?;
         }
         let effects = self
@@ -516,6 +517,9 @@ impl AppClient {
 fn withdrawal_handled(kind: u64) -> bool {
     matches!(
         kind,
-        KIND_HISTORY_DELIVERY | KIND_SMALL_STATE_UPDATE | KIND_SMALL_STATE_BROADCAST_REQUEST
+        KIND_LINK_CHAT_INVENTORY
+            | KIND_HISTORY_DELIVERY
+            | KIND_SMALL_STATE_UPDATE
+            | KIND_SMALL_STATE_BROADCAST_REQUEST
     )
 }

@@ -3012,6 +3012,14 @@ async fn a_withdrawn_link_chat_inventory_is_repaired_after_reopen() {
             .unwrap()
     };
     let (revision, carrier) = current(&laptop);
+    let storage = laptop.app.account_storage("alice").unwrap().app_storage();
+    let request_owed = || {
+        storage
+            .small_state_schedule()
+            .unwrap()
+            .is_some_and(|s| s.request_owed)
+    };
+    assert!(!request_owed());
     let event = |id| GroupEvent::AppMessageInvalidated {
         group_id: group.clone(),
         message_id: cgka_traits::MessageId::new(id),
@@ -3023,6 +3031,10 @@ async fn a_withdrawn_link_chat_inventory_is_repaired_after_reopen() {
         .client
         .observe_device_group_event(&event(carrier))
         .unwrap();
+    assert!(
+        !request_owed(),
+        "an inventory withdrawal owes no small-state broadcast"
+    );
     assert!(laptop.op(DeviceLinkOp::Read).await.chat_progress.is_empty());
     let mut phone = reopen(phone).await;
     passes(&relay, &mut [&mut phone, &mut laptop], 2).await;

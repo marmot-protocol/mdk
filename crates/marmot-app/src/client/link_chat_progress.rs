@@ -384,7 +384,16 @@ impl AppClient {
 
 #[cfg(test)]
 mod tests {
-    use super::chat_token;
+    use super::{InventoryPage, chat_token};
+
+    #[test]
+    fn wire_inventory_rejects_duplicate_fields() {
+        let content = r#"{"v":1,"to":"ab","link":"cd","revision":1,"expires_at":1,"total":1,"total":0,"page":0,"chats":""}"#;
+        assert!(
+            serde_json::from_str::<InventoryPage>(content)
+                .is_err_and(|error| error.to_string().contains("duplicate field"))
+        );
+    }
 
     #[test]
     fn chat_token_matches_the_device_group_wire_vector() {
