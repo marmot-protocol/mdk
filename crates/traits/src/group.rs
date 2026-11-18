@@ -210,10 +210,11 @@ impl Group {
     /// hours behind the moment the message actually went out — so a `true`
     /// here is a guess, not a verdict.
     ///
-    /// Every caller must therefore be one for which a wrong guess costs
-    /// nothing in either direction. Today that is two: dropping one piece of
-    /// stall evidence, and suppressing a refusal notification for a release
-    /// that happens either way. Never gate persistence, decryption, retry, or
+    /// Callers may therefore let it decide only what counts as recovery
+    /// evidence: dropping a piece of stall evidence, and suppressing the
+    /// refusal notification and epoch-gap arm for a release that happens
+    /// either way. A wrong guess there can delay a stall's detection but loses
+    /// no message. Never gate persistence, decryption, retry, redelivery, or
     /// any terminal classification on it.
     pub fn transport_message_predates_local_copy(
         &self,

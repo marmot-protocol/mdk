@@ -27324,8 +27324,8 @@ pub(crate) mod limited_relay;
 ///
 /// The signal is deliberately soft: an application message carries its sender's
 /// compose time, so a message drained from the offline outbox can look old
-/// while being perfectly live. Dropping one piece of stall evidence is free —
-/// every other undecryptable message that device receives still arms.
+/// while being perfectly live. Wrongly dropping such evidence loses no message;
+/// it delays a stall's detection until traffic stamped past the margin arrives.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn undecryptable_traffic_older_than_this_copys_welcome_does_not_arm_a_backfill() {
     use cgka_traits::storage::GroupStorage;
@@ -27375,6 +27375,67 @@ async fn undecryptable_traffic_older_than_this_copys_welcome_does_not_arm_a_back
     assert!(
         client.has_pending_epoch_backfill(),
         "undecryptable traffic from this copy's own era is still a stall signal",
+    );
+}
+
+/// A refusal of traffic stamped near this copy's Welcome is no more stall
+/// evidence than its retention would have been (mdk#3536). A newly linked
+/// device's first sweep can fill the retained backlog with the group's
+/// pre-Welcome history; the next such delivery is refused, and arming an
+/// epoch gap from it would report the device stalled at the epoch it joined
+/// at. A refusal stamped past the margin still arms.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refusal_near_this_copys_welcome_does_not_arm_a_backfill() {
+    use cgka_traits::storage::GroupStorage;
+    let dir = tempfile::tempdir().unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let (app, mut client, route) =
+        undecryptable_probe_route(&dir, &relay, MarmotAppConfig::white_noise()).await;
+    let storage = app.account_storage("alice").unwrap();
+    let welcome_at = crate::unix_now_seconds();
+    let mut record = storage.get_group(&route.group_id).unwrap();
+    record.local_copy_welcome_created_at = Some(cgka_traits::transport::Timestamp(welcome_at));
+    storage.put_group(&record).unwrap();
+
+    let history = welcome_at - 60;
+    for row in 0..cgka_engine::message_processor::MAX_PEEL_DEFERRED_ROWS_PER_GROUP {
+        client
+            .ingest_received_delivery(route.probe(history, &format!("history-{row}")))
+            .await
+            .expect("a retained undecryptable object completes its ingest pass");
+    }
+    let refused = route.probe(history, "history-refused");
+    let refused_id = hex::encode(refused.message.id.as_slice());
+    client
+        .ingest_received_delivery(refused)
+        .await
+        .expect("a refused object completes its ingest pass");
+    assert_eq!(
+        recorded_ingest_outcomes(&app, &refused_id),
+        vec!["resource_refused".to_owned()],
+        "the backlog is full, so the next object is refused",
+    );
+    assert!(
+        !client.has_pending_epoch_backfill(),
+        "a refused piece of pre-Welcome history is not evidence this device is behind",
+    );
+
+    let live = route.probe(
+        welcome_at + cgka_traits::group::PRE_WELCOME_CLOCK_SKEW_SECS,
+        "live-refused",
+    );
+    let live_id = hex::encode(live.message.id.as_slice());
+    client
+        .ingest_received_delivery(live)
+        .await
+        .expect("a refused object completes its ingest pass");
+    assert_eq!(
+        recorded_ingest_outcomes(&app, &live_id),
+        vec!["resource_refused".to_owned()],
+    );
+    assert!(
+        client.has_pending_epoch_backfill(),
+        "a refusal from this copy's own era is still a stall signal",
     );
 }
 

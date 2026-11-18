@@ -802,7 +802,7 @@ async fn unopenable_traffic_from_an_epoch_this_copy_has_not_reached_still_defers
 /// recovery evidence and arms a history backfill from. For traffic older than
 /// this copy's Welcome that backfill can only re-fetch history this copy can
 /// never open, so the release happens either way and only the announcement is
-/// suppressed — a decision that costs nothing when the guess is wrong.
+/// suppressed — a wrong guess delays recovery evidence but loses no message.
 #[tokio::test]
 async fn a_released_row_older_than_this_copys_welcome_raises_no_refusal() {
     let (mut alice, mut bob, bob_storage, group_id) = alice_and_a_removed_bob(b"release").await;

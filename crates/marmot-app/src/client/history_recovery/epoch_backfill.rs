@@ -220,12 +220,14 @@ impl AppClient {
             // and never will. Unopenable, but not evidence this device is
             // behind — and a backfill armed from it could only re-fetch more of
             // the same. Land the epoch like every other non-evidence outcome
-            // below and stop there. Soft by design: an application message
-            // carries its sender's compose time, so a message drained from the
-            // offline outbox can look old while being live. Dropping one piece
-            // of evidence costs nothing, because every other undecryptable
-            // message this device receives still arms.
-            IngestOutcome::TransportDeferred { .. }
+            // below and stop there. A refusal of such traffic, once a first
+            // sweep has filled the retained backlog, is no more evidence than
+            // its retention would have been; the engine still leaves it
+            // fetchable. Soft by design: an application message carries its
+            // sender's compose time, so a message drained from the offline
+            // outbox can look old while being live, and dropping it as
+            // evidence costs a stall that only later traffic can reveal.
+            IngestOutcome::TransportDeferred { .. } | IngestOutcome::ResourceRefused { .. }
                 if record.transport_message_predates_local_copy(transport_at) =>
             {
                 self.history_recovery

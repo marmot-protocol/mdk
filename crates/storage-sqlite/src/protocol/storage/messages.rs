@@ -1652,15 +1652,19 @@ mod tests {
 
         let db = SharedDatabase::new();
         let releaser = db.open();
-        let app = releaser.app_storage();
-        app.ensure_account_projection("app-owner").unwrap();
         releaser.put_group(&sample_group(gid(1), 3, 0)).unwrap();
-        // A gap at this epoch that recovery settled: a release arm reopens it.
-        app.arm_epoch_backfill_intents(&[crate::StoredEpochBackfillIntent {
-            group_id_hex: hex::encode(gid(1).as_slice()),
-            stalled_epoch: 3,
-        }])
-        .unwrap();
+        {
+            // Scoped: the app handle shares the releaser's connection, which
+            // must be closed before the reopen below.
+            let app = releaser.app_storage();
+            app.ensure_account_projection("app-owner").unwrap();
+            // A gap at this epoch that recovery settled: a release arm reopens it.
+            app.arm_epoch_backfill_intents(&[crate::StoredEpochBackfillIntent {
+                group_id_hex: hex::encode(gid(1).as_slice()),
+                stalled_epoch: 3,
+            }])
+            .unwrap();
+        }
         let settled = |store: &SqliteAccountStorage| {
             store
                 .lock()

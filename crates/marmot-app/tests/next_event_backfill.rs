@@ -169,8 +169,9 @@ async fn next_event_returns_when_a_live_delivery_arms_the_epoch_backfill() {
     // messages at bob's live epoch. Present-dated so they clear any since floor
     // and reach bob's live subscription; distinct markers make distinct event
     // ids, hence distinct undecryptables at the one stalled epoch. None produces
-    // a visible `MarmotAppEvent`, so the summary stays empty across all of them
-    // and only the armed backfill can force the return. Stamped past the
+    // a visible `MarmotAppEvent`, so the summary stays empty across all of
+    // them. The convergence a retained row schedules can also force the
+    // return, so this pins the empty summary, not the arm itself. Stamped past the
     // clock-skew margin after bob's Welcome: traffic within it may be the
     // group's pre-Welcome history, which is not stall evidence.
     let created_at = test_unix_now_seconds() + cgka_traits::group::PRE_WELCOME_CLOCK_SKEW_SECS;
