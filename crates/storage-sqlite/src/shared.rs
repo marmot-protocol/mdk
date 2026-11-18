@@ -17,7 +17,9 @@ use crate::{
     usize_to_i64,
 };
 use cgka_traits::storage::{StorageError, StorageResult};
-use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params, params_from_iter};
+use rusqlite::{
+    Connection, OptionalExtension, Transaction, TransactionBehavior, params, params_from_iter,
+};
 
 const SHARED_BUSY_TIMEOUT_MS: u64 = 5_000;
 
@@ -104,6 +106,15 @@ pub struct PublicKeyPackageBarrierRecord {
     pub event_created_at: u64,
     pub observed_at: u64,
     pub kind: PublicKeyPackageBarrierKind,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PublicKeyPackageEvidenceSnapshot {
+    pub replacements: Vec<PublicKeyPackageReplacementRecord>,
+    pub global_eviction: Option<PublicKeyPackageBarrierRecord>,
+    pub barriers: Vec<PublicKeyPackageBarrierRecord>,
+    pub watermark: Option<PublicKeyPackageBarrierRecord>,
+    pub revision: i64,
 }
 
 const KEY_PACKAGE_REPLACEMENT_GLOBAL_CAP: i64 = 1_000;
@@ -313,7 +324,13 @@ impl SqliteSharedStorage {
         &self,
         account_id_hex: &str,
     ) -> StorageResult<Vec<PublicKeyPackageReplacementRecord>> {
-        let conn = self.lock()?;
+        Self::read_key_package_replacements(&*self.lock()?, account_id_hex)
+    }
+
+    fn read_key_package_replacements(
+        conn: &Connection,
+        account_id_hex: &str,
+    ) -> StorageResult<Vec<PublicKeyPackageReplacementRecord>> {
         let mut statement = conn
             .prepare_cached(
                 "SELECT account_id_hex, key_package_id, event_id_hex,
@@ -339,16 +356,39 @@ impl SqliteSharedStorage {
     }
 
     pub fn key_package_evidence_revision(&self, account_id_hex: &str) -> StorageResult<i64> {
-        self.lock()?
-            .query_row_cached(
-                "SELECT revision FROM public_key_package_evidence_revisions
-                 WHERE account_id_hex = ?1",
-                params![account_id_hex],
-                |row| row.get(0),
-            )
-            .optional()
-            .storage()
-            .map(|revision| revision.unwrap_or(0))
+        Self::read_key_package_evidence_revision(&*self.lock()?, account_id_hex)
+    }
+
+    fn read_key_package_evidence_revision(
+        conn: &Connection,
+        account_id_hex: &str,
+    ) -> StorageResult<i64> {
+        conn.query_row_cached(
+            "SELECT revision FROM public_key_package_evidence_revisions
+             WHERE account_id_hex = ?1",
+            params![account_id_hex],
+            |row| row.get(0),
+        )
+        .optional()
+        .storage()
+        .map(|revision| revision.unwrap_or(0))
+    }
+
+    pub fn key_package_evidence_snapshot(
+        &self,
+        account_id_hex: &str,
+    ) -> StorageResult<PublicKeyPackageEvidenceSnapshot> {
+        let mut conn = self.lock()?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Deferred)
+            .storage()?;
+        Ok(PublicKeyPackageEvidenceSnapshot {
+            replacements: Self::read_key_package_replacements(&tx, account_id_hex)?,
+            global_eviction: Self::read_key_package_global_eviction(&tx)?,
+            barriers: Self::read_key_package_barriers(&tx, account_id_hex)?,
+            watermark: Self::read_key_package_eviction_watermark(&tx, account_id_hex)?,
+            revision: Self::read_key_package_evidence_revision(&tx, account_id_hex)?,
+        })
     }
 
     pub fn put_public_key_package_barrier(
@@ -371,14 +411,20 @@ impl SqliteSharedStorage {
         &self,
         account_id_hex: &str,
     ) -> StorageResult<Vec<PublicKeyPackageBarrierRecord>> {
-        let conn = self.lock()?;
+        Self::read_key_package_barriers(&*self.lock()?, account_id_hex)
+    }
+
+    fn read_key_package_barriers(
+        conn: &Connection,
+        account_id_hex: &str,
+    ) -> StorageResult<Vec<PublicKeyPackageBarrierRecord>> {
         let mut statement = conn
             .prepare_cached(
                 "SELECT account_id_hex, key_package_id, event_id_hex,
-                                        deleted_event_id, event_created_at, observed_at, kind
-                                 FROM public_key_package_barriers
-                                 WHERE account_id_hex = ?1
-                                 ORDER BY key_package_id, deleted_event_id",
+                        deleted_event_id, event_created_at, observed_at, kind
+                 FROM public_key_package_barriers
+                 WHERE account_id_hex = ?1
+                 ORDER BY key_package_id, deleted_event_id",
             )
             .storage()?;
         statement
@@ -415,15 +461,20 @@ impl SqliteSharedStorage {
     pub fn key_package_global_eviction(
         &self,
     ) -> StorageResult<Option<PublicKeyPackageBarrierRecord>> {
-        self.lock()?
-            .query_row_cached(
-                "SELECT '', '', event_id_hex, NULL, event_created_at, evicted_at, kind
-                 FROM public_key_package_eviction_fallback WHERE id = 1",
-                [],
-                key_package_barrier_from_row,
-            )
-            .optional()
-            .storage()
+        Self::read_key_package_global_eviction(&*self.lock()?)
+    }
+
+    fn read_key_package_global_eviction(
+        conn: &Connection,
+    ) -> StorageResult<Option<PublicKeyPackageBarrierRecord>> {
+        conn.query_row_cached(
+            "SELECT '', '', event_id_hex, NULL, event_created_at, evicted_at, kind
+             FROM public_key_package_eviction_fallback WHERE id = 1",
+            [],
+            key_package_barrier_from_row,
+        )
+        .optional()
+        .storage()
     }
 
     pub fn public_key_package_replacement_evicted_at(
@@ -438,17 +489,23 @@ impl SqliteSharedStorage {
         &self,
         account_id_hex: &str,
     ) -> StorageResult<Option<PublicKeyPackageBarrierRecord>> {
-        self.lock()?
-            .query_row_cached(
-                "SELECT account_id_hex, key_package_id, event_id_hex,
-                                        deleted_event_id, event_created_at, evicted_at, kind
-                                 FROM public_key_package_eviction_watermarks
-                                 WHERE account_id_hex = ?1",
-                params![account_id_hex],
-                key_package_barrier_from_row,
-            )
-            .optional()
-            .storage()
+        Self::read_key_package_eviction_watermark(&*self.lock()?, account_id_hex)
+    }
+
+    fn read_key_package_eviction_watermark(
+        conn: &Connection,
+        account_id_hex: &str,
+    ) -> StorageResult<Option<PublicKeyPackageBarrierRecord>> {
+        conn.query_row_cached(
+            "SELECT account_id_hex, key_package_id, event_id_hex,
+                    deleted_event_id, event_created_at, evicted_at, kind
+             FROM public_key_package_eviction_watermarks
+             WHERE account_id_hex = ?1",
+            params![account_id_hex],
+            key_package_barrier_from_row,
+        )
+        .optional()
+        .storage()
     }
 
     pub fn put_public_directory_user(
@@ -1110,19 +1167,17 @@ fn prune_key_package_barriers(tx: &Transaction<'_>, now: i64) -> StorageResult<(
                     event_created_at = excluded.event_created_at,
                     kind = excluded.kind,
                     evicted_at = MAX(public_key_package_eviction_watermarks.evicted_at, excluded.evicted_at)
-                 WHERE excluded.event_created_at >
-                       public_key_package_eviction_watermarks.event_created_at
-                    OR (excluded.event_created_at =
-                        public_key_package_eviction_watermarks.event_created_at
-                        AND ((excluded.kind = 'exact_deletion'
-                              AND public_key_package_eviction_watermarks.kind != 'exact_deletion')
-                             OR (excluded.kind = 'deletion'
-                                 AND public_key_package_eviction_watermarks.kind = 'replacement')))
-                    OR (excluded.event_created_at =
-                        public_key_package_eviction_watermarks.event_created_at
-                        AND excluded.kind = public_key_package_eviction_watermarks.kind
-                        AND excluded.event_id_hex <=
-                            public_key_package_eviction_watermarks.event_id_hex)",
+                 WHERE excluded.kind = 'exact_deletion'
+                    OR (public_key_package_eviction_watermarks.kind != 'exact_deletion'
+                        AND (excluded.event_created_at >
+                                 public_key_package_eviction_watermarks.event_created_at
+                             OR (excluded.event_created_at =
+                                 public_key_package_eviction_watermarks.event_created_at
+                                 AND ((excluded.kind = 'deletion'
+                                       AND public_key_package_eviction_watermarks.kind = 'replacement')
+                                      OR (excluded.kind = public_key_package_eviction_watermarks.kind
+                                          AND excluded.event_id_hex <=
+                                              public_key_package_eviction_watermarks.event_id_hex)))))",
                 params![
                     &record.account_id_hex,
                     &record.key_package_id,
@@ -1172,15 +1227,14 @@ fn prune_key_package_barriers(tx: &Transaction<'_>, now: i64) -> StorageResult<(
             event_created_at = excluded.event_created_at,
             kind = excluded.kind,
             evicted_at = MAX(public_key_package_eviction_fallback.evicted_at, excluded.evicted_at)
-         WHERE excluded.event_created_at > public_key_package_eviction_fallback.event_created_at
-            OR (excluded.event_created_at = public_key_package_eviction_fallback.event_created_at
-                AND ((excluded.kind = 'exact_deletion'
-                      AND public_key_package_eviction_fallback.kind != 'exact_deletion')
-                     OR (excluded.kind = 'deletion'
-                         AND public_key_package_eviction_fallback.kind = 'replacement')))
-            OR (excluded.event_created_at = public_key_package_eviction_fallback.event_created_at
-                AND excluded.kind = public_key_package_eviction_fallback.kind
-                AND excluded.event_id_hex <= public_key_package_eviction_fallback.event_id_hex)",
+         WHERE excluded.kind = 'exact_deletion'
+            OR (public_key_package_eviction_fallback.kind != 'exact_deletion'
+                AND (excluded.event_created_at > public_key_package_eviction_fallback.event_created_at
+                     OR (excluded.event_created_at = public_key_package_eviction_fallback.event_created_at
+                         AND ((excluded.kind = 'deletion'
+                               AND public_key_package_eviction_fallback.kind = 'replacement')
+                              OR (excluded.kind = public_key_package_eviction_fallback.kind
+                                  AND excluded.event_id_hex <= public_key_package_eviction_fallback.event_id_hex)))))",
         [],
     )
     .storage()?;
@@ -1210,6 +1264,20 @@ fn prune_key_package_barriers(tx: &Transaction<'_>, now: i64) -> StorageResult<(
             ORDER BY evicted_at DESC, event_created_at DESC, event_id_hex, account_id_hex
             LIMIT -1 OFFSET 1000
          )",
+        [],
+    )
+    .storage()?;
+    tx.execute_cached(
+        "DELETE FROM public_key_package_evidence_revisions
+         WHERE NOT EXISTS (
+             SELECT 1 FROM directory_key_package_replacements
+             WHERE account_id_hex = public_key_package_evidence_revisions.account_id_hex)
+           AND NOT EXISTS (
+             SELECT 1 FROM public_key_package_barriers
+             WHERE account_id_hex = public_key_package_evidence_revisions.account_id_hex)
+           AND NOT EXISTS (
+             SELECT 1 FROM public_key_package_eviction_watermarks
+             WHERE account_id_hex = public_key_package_evidence_revisions.account_id_hex)",
         [],
     )
     .storage()?;
@@ -1814,52 +1882,55 @@ mod tests {
     }
 
     #[test]
-    fn deletion_watermark_wins_equal_timestamp_replacements() {
+    fn deletion_watermark_wins_mixed_timestamp_replacements() {
         for deletion_first in [true, false] {
-            let storage = SqliteSharedStorage::in_memory().unwrap();
-            let account = "aa".repeat(32);
-            let replacement = PublicKeyPackageBarrierRecord {
-                account_id_hex: account.clone(),
-                key_package_id: "slot".into(),
-                event_id_hex: "aa".repeat(32),
-                deleted_event_id: None,
-                event_created_at: 100,
-                observed_at: 0,
-                kind: PublicKeyPackageBarrierKind::Replacement,
-            };
-            let deletion = PublicKeyPackageBarrierRecord {
-                event_id_hex: "ff".repeat(32),
-                deleted_event_id: Some("bb".repeat(32)),
-                kind: PublicKeyPackageBarrierKind::Deletion,
-                ..replacement.clone()
-            };
-            let records = if deletion_first {
-                [deletion, replacement]
-            } else {
-                [replacement, deletion]
-            };
-            for record in records {
-                storage.put_public_key_package_barrier(&record).unwrap();
-            }
-            for index in 0..500_u64 {
-                storage
-                    .put_public_key_package_barrier(&PublicKeyPackageBarrierRecord {
-                        account_id_hex: account.clone(),
-                        key_package_id: format!("slot-{index:04}"),
-                        event_id_hex: format!("{index:064x}"),
-                        deleted_event_id: None,
-                        event_created_at: 1_000 + index,
-                        observed_at: 1_000 + index,
-                        kind: PublicKeyPackageBarrierKind::Replacement,
-                    })
+            for replacement_created_at in [100, 200] {
+                let storage = SqliteSharedStorage::in_memory().unwrap();
+                let account = "aa".repeat(32);
+                let replacement = PublicKeyPackageBarrierRecord {
+                    account_id_hex: account.clone(),
+                    key_package_id: "slot".into(),
+                    event_id_hex: "aa".repeat(32),
+                    deleted_event_id: None,
+                    event_created_at: replacement_created_at,
+                    observed_at: 0,
+                    kind: PublicKeyPackageBarrierKind::Replacement,
+                };
+                let deletion = PublicKeyPackageBarrierRecord {
+                    event_id_hex: "ff".repeat(32),
+                    deleted_event_id: Some("bb".repeat(32)),
+                    event_created_at: 100,
+                    kind: PublicKeyPackageBarrierKind::Deletion,
+                    ..replacement.clone()
+                };
+                let records = if deletion_first {
+                    [deletion, replacement]
+                } else {
+                    [replacement, deletion]
+                };
+                for record in records {
+                    storage.put_public_key_package_barrier(&record).unwrap();
+                }
+                for index in 0..500_u64 {
+                    storage
+                        .put_public_key_package_barrier(&PublicKeyPackageBarrierRecord {
+                            account_id_hex: account.clone(),
+                            key_package_id: format!("slot-{index:04}"),
+                            event_id_hex: format!("{index:064x}"),
+                            deleted_event_id: None,
+                            event_created_at: 1_000 + index,
+                            observed_at: 1_000 + index,
+                            kind: PublicKeyPackageBarrierKind::Replacement,
+                        })
+                        .unwrap();
+                }
+                let watermark = storage
+                    .public_key_package_eviction_watermark(&account)
+                    .unwrap()
                     .unwrap();
+                assert_eq!(watermark.kind, PublicKeyPackageBarrierKind::ExactDeletion);
+                assert_eq!(watermark.deleted_event_id, None);
             }
-            let watermark = storage
-                .public_key_package_eviction_watermark(&account)
-                .unwrap()
-                .unwrap();
-            assert_eq!(watermark.kind, PublicKeyPackageBarrierKind::ExactDeletion);
-            assert_eq!(watermark.deleted_event_id, None);
         }
     }
 
@@ -2344,6 +2415,42 @@ mod tests {
                 key_package_barrier(&account, 1),
             ]
         );
+    }
+
+    #[test]
+    fn key_package_evidence_snapshot_is_atomic() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shared.sqlite3");
+        let storage = SqliteSharedStorage::open(&path).unwrap();
+        let account = "aa".repeat(32);
+        storage
+            .put_public_key_package_replacement(&PublicKeyPackageReplacementRecord {
+                account_id_hex: account.clone(),
+                key_package_id: "slot".into(),
+                event_id_hex: "bb".repeat(32),
+                event_created_at: 20,
+                observed_at: 30,
+            })
+            .unwrap();
+        interleave(
+            &storage,
+            &path,
+            "SELECT revision FROM public_key_package_evidence_revisions",
+            format!(
+                "INSERT INTO directory_key_package_replacements (
+                     account_id_hex, key_package_id, event_id_hex, event_created_at, observed_at
+                 ) VALUES ('{account}', 'later', '{}', 21, 31);
+                 UPDATE public_key_package_evidence_revisions SET revision = 2
+                 WHERE account_id_hex = '{account}';",
+                "cc".repeat(32),
+            ),
+        );
+        let snapshot = storage.key_package_evidence_snapshot(&account).unwrap();
+        assert_eq!(snapshot.replacements.len(), 1);
+        assert_eq!(snapshot.revision, 1);
+        let next = storage.key_package_evidence_snapshot(&account).unwrap();
+        assert_eq!(next.replacements.len(), 2);
+        assert_eq!(next.revision, 2);
     }
 
     #[test]

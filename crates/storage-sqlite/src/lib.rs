@@ -205,8 +205,9 @@ pub use protocol::storage::messages::StorageFormatBenchSizes;
 pub use shared::{
     DirectoryPresentation, DirectoryPresentationChanges, PublicDirectoryProfileRecord,
     PublicDirectoryUserRecord, PublicKeyPackageBarrierKind, PublicKeyPackageBarrierRecord,
-    PublicKeyPackageReplacementRecord, SqliteSharedStorage, StoredAuditLogRetention,
-    StoredAuditLogSettings, StoredRelayTelemetrySettings, StoredUsageDiagnosticsSettings,
+    PublicKeyPackageEvidenceSnapshot, PublicKeyPackageReplacementRecord, SqliteSharedStorage,
+    StoredAuditLogRetention, StoredAuditLogSettings, StoredRelayTelemetrySettings,
+    StoredUsageDiagnosticsSettings,
 };
 
 pub use app::transport::agent_stream_sequences::{

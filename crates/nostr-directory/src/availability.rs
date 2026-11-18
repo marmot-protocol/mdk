@@ -13,8 +13,8 @@ use cgka_traits::TransportEndpoint;
 use futures::StreamExt;
 use rusqlite::params;
 use storage_sqlite::{
-    PublicKeyPackageBarrierKind, PublicKeyPackageBarrierRecord, PublicKeyPackageReplacementRecord,
-    SqliteSharedStorage,
+    PublicKeyPackageBarrierKind, PublicKeyPackageBarrierRecord, PublicKeyPackageEvidenceSnapshot,
+    PublicKeyPackageReplacementRecord, SqliteSharedStorage,
 };
 
 use tokio::sync::watch;
@@ -306,13 +306,12 @@ impl DirectoryCache {
                 }
                 row.replacement_evicted_at =
                     shared.public_key_package_replacement_evicted_at(&row.account_id_hex)?;
-                row.global_eviction = shared.key_package_global_eviction()?;
-                row.shared_evidence_revision =
-                    Some(shared.key_package_evidence_revision(&row.account_id_hex)?);
-                row.barriers = shared.public_key_package_barriers(&row.account_id_hex)?;
-                row.eviction_watermark =
-                    shared.public_key_package_eviction_watermark(&row.account_id_hex)?;
-                row.replacements = shared.public_key_package_replacements(&row.account_id_hex)?;
+                let snapshot = shared.key_package_evidence_snapshot(&row.account_id_hex)?;
+                row.global_eviction = snapshot.global_eviction;
+                row.shared_evidence_revision = Some(snapshot.revision);
+                row.barriers = snapshot.barriers;
+                row.eviction_watermark = snapshot.watermark;
+                row.replacements = snapshot.replacements;
                 if let Some(record) = shared.public_directory_user(&row.account_id_hex)?
                     && let Some(json) = record.key_package_json
                 {
@@ -459,9 +458,16 @@ impl StoredAvailability {
             && shared_before_check
             && replacements_before_check
             && self.evidence_revision == self.shared_evidence_revision.unwrap_or(0);
+        let publication_fresh = self
+            .key_package_created_at
+            .and_then(|value| u64::try_from(value).ok())
+            .is_some_and(|created_at| {
+                created_at.saturating_add(KEY_PACKAGE_FRESHNESS.as_secs()) > now
+            });
         let state = match self.state.as_deref() {
             Some("ready")
                 if fresh_until.is_some_and(|expiry| expiry > now)
+                    && publication_fresh
                     && self.key_package_event_id.is_some()
                     && current_publication_allows
                     && replacement_allows
@@ -1012,49 +1018,48 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
         account_id_hex: &str,
         mut value: AvailabilityWrite,
     ) -> Result<AvailabilityWrite, DirectoryError> {
-        dbg!(value.state, value.evidence_revision);
+        
         if value.state == FollowAvailabilityState::Unknown {
             return Ok(value);
         }
         let directory = self.clone();
         let account = account_id_hex.to_owned();
-        let (replacements, global_eviction, barriers, watermark, evidence_revision) =
-            blocking_directory_task(move || {
-                let shared = directory.resources.shared_storage()?;
-                let replacements = shared.public_key_package_replacements(&account)?;
-                let global_eviction = shared.key_package_global_eviction()?;
-                let barriers = shared.public_key_package_barriers(&account)?;
-                let watermark = shared.public_key_package_eviction_watermark(&account)?;
-                let evidence_revision = shared.key_package_evidence_revision(&account)?;
-                Ok((
-                    replacements,
-                    global_eviction,
-                    barriers,
-                    watermark,
-                    evidence_revision,
-                ))
-            })
-            .await?;
+        let PublicKeyPackageEvidenceSnapshot {
+            replacements,
+            global_eviction,
+            barriers,
+            watermark,
+            revision: evidence_revision,
+        } = blocking_directory_task(move || {
+            Ok(directory
+                .resources
+                .shared_storage()?
+                .key_package_evidence_snapshot(&account)?)
+        })
+        .await?;
         let now = self.directory_freshness().now;
-        let current =
-            match value.state {
-                FollowAvailabilityState::Ready => value
-                    .key_package_event_id
-                    .as_deref()
-                    .zip(value.key_package_created_at)
-                    .is_some_and(|(event_id, created_at)| {
-                        barriers.iter().all(|barrier| {
+        let current = match value.state {
+            FollowAvailabilityState::Ready => value
+                .key_package_event_id
+                .as_deref()
+                .zip(value.key_package_created_at)
+                .is_some_and(|(event_id, created_at)| {
+                    created_at.saturating_add(KEY_PACKAGE_FRESHNESS.as_secs()) > now
+                        && barriers.iter().all(|barrier| {
                             if barrier.deleted_event_id.is_none()
                                 && Some(&barrier.key_package_id) != value.key_package_id.as_ref()
                             {
                                 return true;
                             }
                             barrier_allows(event_id, created_at, barrier)
-                        }) && watermark.as_ref().is_none_or(|barrier| {
+                        })
+                        && watermark.as_ref().is_none_or(|barrier| {
                             watermark_allows(event_id, created_at, now, barrier)
-                        }) && global_eviction.as_ref().is_none_or(|barrier| {
+                        })
+                        && global_eviction.as_ref().is_none_or(|barrier| {
                             watermark_allows(event_id, created_at, now, barrier)
-                        }) && replacements
+                        })
+                        && replacements
                             .iter()
                             .filter(|replacement| {
                                 Some(&replacement.key_package_id) == value.key_package_id.as_ref()
@@ -1062,26 +1067,27 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                             .all(|replacement| {
                                 replacement_allows(event_id, created_at, replacement)
                             })
-                    }),
-                FollowAvailabilityState::NotFound => {
-                    let read_started_at = value.checked_at;
-                    let covered = |event_id: &str, observed_at: u64| {
-                        observed_at < read_started_at || value.observed_event_ids.contains(event_id)
-                    };
-                    replacements.iter().all(|replacement| {
-                        covered(&replacement.event_id_hex, replacement.observed_at)
-                    }) && barriers
+                }),
+            FollowAvailabilityState::NotFound => {
+                let read_started_at = value.checked_at;
+                let covered = |event_id: &str, observed_at: u64| {
+                    observed_at < read_started_at || value.observed_event_ids.contains(event_id)
+                };
+                replacements
+                    .iter()
+                    .all(|replacement| covered(&replacement.event_id_hex, replacement.observed_at))
+                    && barriers
                         .iter()
                         .all(|barrier| covered(&barrier.event_id_hex, barrier.observed_at))
-                        && watermark.as_ref().is_none_or(|barrier| {
-                            covered(&barrier.event_id_hex, barrier.observed_at)
-                        })
-                        && global_eviction.as_ref().is_none_or(|barrier| {
-                            covered(&barrier.event_id_hex, barrier.observed_at)
-                        })
-                }
-                FollowAvailabilityState::Unknown => true,
-            };
+                    && watermark
+                        .as_ref()
+                        .is_none_or(|barrier| covered(&barrier.event_id_hex, barrier.observed_at))
+                    && global_eviction
+                        .as_ref()
+                        .is_none_or(|barrier| covered(&barrier.event_id_hex, barrier.observed_at))
+            }
+            FollowAvailabilityState::Unknown => true,
+        };
         if current {
             if value.state == FollowAvailabilityState::NotFound {
                 value.checked_at = self.directory_freshness().now;
@@ -1100,7 +1106,12 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
     ) -> Result<AvailabilityWrite, DirectoryError> {
         let metadata = key_package_metadata(&fetched.key_package)
             .map_err(|error| DirectoryError::InvalidKeyPackageEvent(error.to_string()))?;
-        if metadata.not_after <= checked_at {
+        let fresh_until = metadata.not_after.min(
+            fetched
+                .created_at
+                .saturating_add(KEY_PACKAGE_FRESHNESS.as_secs()),
+        );
+        if fresh_until <= checked_at {
             return Ok(AvailabilityWrite::unknown(checked_at));
         }
         let directory = self.clone();
@@ -1110,7 +1121,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
         Ok(AvailabilityWrite {
             state: FollowAvailabilityState::Ready,
             checked_at,
-            fresh_until: Some(metadata.not_after),
+            fresh_until: Some(fresh_until),
             key_package_event_id: Some(fetched.key_package_event_id),
             key_package_id: Some(fetched.key_package_id),
             key_package_created_at: Some(fetched.created_at),
@@ -1295,13 +1306,13 @@ mod tests {
         );
     }
 
-    fn project_with_global_eviction(created_at: u64) -> FollowAvailabilityState {
+    fn project_with_global_eviction(created_at: u64, now: u64) -> FollowAvailabilityState {
         let event_id = "aa".repeat(32);
         StoredAvailability {
             account_id_hex: account_id(1),
             state: Some("ready".into()),
             checked_at: Some(1_000),
-            fresh_until: Some(2_000),
+            fresh_until: Some((now + 1_000) as i64),
             key_package_event_id: Some(event_id.clone()),
             key_package_id: Some("slot".into()),
             key_package_created_at: Some(created_at as i64),
@@ -1336,20 +1347,28 @@ mod tests {
                 kind: PublicKeyPackageBarrierKind::Replacement,
             }),
         }
-        .project(1_000)
+        .project(now)
         .state
     }
 
     #[test]
     fn global_fallback_allows_newer_publications() {
         assert_eq!(
-            project_with_global_eviction(1_000),
+            project_with_global_eviction(1_000, 1_000),
             FollowAvailabilityState::Unknown,
             "an equal-timestamp publication stays fenced"
         );
         assert_eq!(
-            project_with_global_eviction(1_001),
+            project_with_global_eviction(1_001, 1_000),
             FollowAvailabilityState::Ready
+        );
+    }
+
+    #[test]
+    fn expired_fence_does_not_restore_stale_ready() {
+        assert_eq!(
+            project_with_global_eviction(1_000, 1_000 + KEY_PACKAGE_FRESHNESS.as_secs()),
+            FollowAvailabilityState::Unknown
         );
     }
 

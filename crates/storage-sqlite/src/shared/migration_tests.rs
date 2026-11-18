@@ -303,6 +303,7 @@ fn fresh_schema_matches_frozen_contract_and_has_independent_ledger() {
         "public_key_package_barriers",
         "public_key_package_eviction_watermarks",
         "public_key_package_eviction_fallback",
+        "public_key_package_evidence_revisions",
     ] {
         assert!(table_matches(&conn, &reference, table).unwrap(), "{table}");
     }
@@ -535,6 +536,7 @@ fn key_package_replacement_migration_upgrades_v4_once() {
         "public_key_package_barriers",
         "public_key_package_eviction_watermarks",
         "public_key_package_eviction_fallback",
+        "public_key_package_evidence_revisions",
     ] {
         assert!(!table_exists(&conn, table).unwrap(), "{table}");
     }
@@ -557,6 +559,7 @@ fn key_package_replacement_migration_upgrades_v4_once() {
         "public_key_package_barriers",
         "public_key_package_eviction_watermarks",
         "public_key_package_eviction_fallback",
+        "public_key_package_evidence_revisions",
     ] {
         assert!(table_matches(&conn, &reference, table).unwrap(), "{table}");
     }
