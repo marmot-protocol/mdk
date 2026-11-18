@@ -1289,7 +1289,7 @@ impl ScriptedPushRelayClient {
         (entered, release)
     }
 
-    fn block_account_inbox_subscribe(&self, account_id: Vec<u8>) {
+    pub(crate) fn block_account_inbox_subscribe(&self, account_id: Vec<u8>) {
         *self.block_account_subscribe.lock().unwrap() = Some(account_id);
     }
 

@@ -899,6 +899,11 @@ async fn account_reads_during_a_reconnect_answer_as_hydrated_groups() {
     let before = AccountReads::read(&runtime, &groups).await;
     let published = read_state_receiver(&runtime).await;
 
+    // Hold the reopened client's inbox subscribe, which its transport
+    // activation makes once the drain has run. Armed before the reconnect,
+    // so the worker cannot get past it first.
+    let alice = AccountHome::open(dir.path()).account("alice").unwrap();
+    relay.block_account_inbox_subscribe(hex::decode(&alice.account_id_hex).unwrap());
     let mut events = runtime.subscribe();
     runtime
         .shared_services()
@@ -921,9 +926,6 @@ async fn account_reads_during_a_reconnect_answer_as_hydrated_groups() {
     })
     .await
     .expect("the consumer exit fails the worker's receive");
-    // The old client is gone; the next subscribe is the reopened client's
-    // transport activation, which runs after the drain.
-    relay.block_next_subscribe();
     timeout(Duration::from_secs(30), relay.wait_for_blocked_subscribe())
         .await
         .expect("the reopened client's activation subscribes");

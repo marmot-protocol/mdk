@@ -2862,7 +2862,7 @@ async fn run_app_runtime_account_worker(
                                     if let Err(err) = drain_deferred_hydration(&mut reopened).await
                                     {
                                         publish_app_runtime_account_error(
-                                            Emit::Quiescent(&reopened),
+                                            Emit::Unpublished(Unpublished::ReopenNotDrained),
                                             &events,
                                             &account_id_hex,
                                             &account_label,
@@ -9857,6 +9857,10 @@ pub(crate) enum Unpublished {
     /// A host call that wrote off the worker, such as a local send's
     /// admission: what it changed is not an input of A.
     OffWorker,
+    /// A reconnect whose reopened client did not drain its hydration: A
+    /// keeps the previous client's last version, and the reopened client
+    /// never publishes.
+    ReopenNotDrained,
 }
 
 /// Send one host event from the account worker, publishing A first at a
