@@ -27311,7 +27311,8 @@ mod conversation_cold_open;
 #[path = "../tests/support/limited_relay.rs"]
 pub(crate) mod limited_relay;
 
-/// Undecryptable traffic older than this copy's Welcome is not stall evidence.
+/// Undecryptable traffic older than this copy's Welcome, or within the clock-skew
+/// margin after it, is not stall evidence.
 ///
 /// The detector's undecryptable signal means "this device is behind the group".
 /// After a join — and especially after a re-add, where the relay serves the
@@ -27354,14 +27355,33 @@ async fn undecryptable_traffic_older_than_this_copys_welcome_does_not_arm_a_back
         !client.has_pending_epoch_backfill(),
         "traffic this copy was never able to open is not evidence it is behind",
     );
+    // A busy group's last minutes before the Welcome, and siblings still
+    // sending under the epoch before this copy's just after it, are history
+    // too (mdk#3536): a freshly linked device must not report itself stalled
+    // at the epoch it joined at.
+    let around_the_welcome = welcome_at - 60;
+    for probe in 0..crate::client::history_recovery::epoch_stall::EPOCH_STALL_BACKFILL_THRESHOLD {
+        client
+            .ingest_received_delivery(route.probe(
+                around_the_welcome + 30 * probe as u64,
+                &format!("linking-{probe}"),
+            ))
+            .await
+            .expect("a retained undecryptable object completes its ingest pass");
+    }
+    assert!(
+        !client.has_pending_epoch_backfill(),
+        "history stamped within the skew margin of the Welcome is not evidence either",
+    );
 
     // The same device, the same group, the same undecryptable outcome — only
     // the envelope time differs — still arms.
     for probe in 0..crate::client::history_recovery::epoch_stall::EPOCH_STALL_BACKFILL_THRESHOLD {
         client
-            .ingest_received_delivery(
-                route.probe(welcome_at + probe as u64, &format!("live-{probe}")),
-            )
+            .ingest_received_delivery(route.probe(
+                welcome_at + cgka_traits::group::PRE_WELCOME_CLOCK_SKEW_SECS + probe as u64,
+                &format!("live-{probe}"),
+            ))
             .await
             .expect("a retained undecryptable object completes its ingest pass");
     }

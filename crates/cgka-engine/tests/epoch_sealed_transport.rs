@@ -552,6 +552,10 @@ async fn a_reopened_row_this_copy_can_no_longer_peel_lands_in_the_deferred_peel_
 
 /// Wall-clock second the re-add Welcome in the tests below is minted at.
 const WELCOME_CREATED_AT: u64 = 1_700_000_000;
+/// The first envelope time that is not possibly this copy's pre-Welcome
+/// history (`Group::transport_message_predates_local_copy`).
+const PAST_THE_WELCOME_MARGIN: u64 =
+    WELCOME_CREATED_AT + cgka_traits::group::PRE_WELCOME_CLOCK_SKEW_SECS;
 
 /// Route a group message and stamp the envelope time the transport carries.
 fn route_at(msg: TransportMessage, group_id: &GroupId, at: u64) -> TransportMessage {
@@ -824,7 +828,7 @@ async fn a_released_row_older_than_this_copys_welcome_raises_no_refusal() {
     let live = route_at(
         chat(&mut alice, &group_id, "from after this copy").await,
         &group_id,
-        WELCOME_CREATED_AT + 60,
+        PAST_THE_WELCOME_MARGIN + 60,
     );
     // Their residence budget is spent the moment they are retained.
     bob.set_deferred_peel_residence_ms(0);
@@ -905,8 +909,10 @@ async fn a_welcome_dated_in_the_future_is_clamped_to_this_devices_clock() {
         !bob_storage
             .get_group(&group_id)
             .unwrap()
-            .transport_message_predates_local_copy(cgka_traits::transport::Timestamp(recorded.0)),
-        "and nothing arriving now may look like this copy's history"
+            .transport_message_predates_local_copy(cgka_traits::transport::Timestamp(
+                recorded.0 + cgka_traits::group::PRE_WELCOME_CLOCK_SKEW_SECS
+            )),
+        "and nothing arriving once the skew margin has passed may look like this copy's history"
     );
 }
 
@@ -940,12 +946,12 @@ async fn deferred_stall_evidence_lists_current_epoch_rows_newer_than_the_welcome
     let first = route_at(
         chat(&mut alice, &group_id, "first after this copy").await,
         &group_id,
-        WELCOME_CREATED_AT + 60,
+        PAST_THE_WELCOME_MARGIN + 60,
     );
     let second = route_at(
         chat(&mut alice, &group_id, "second after this copy").await,
         &group_id,
-        WELCOME_CREATED_AT + 90,
+        PAST_THE_WELCOME_MARGIN + 90,
     );
     for msg in [&predating, &first, &second] {
         assert!(matches!(
@@ -977,7 +983,7 @@ async fn deferred_stall_evidence_lists_current_epoch_rows_newer_than_the_welcome
         evidence
             .rows
             .iter()
-            .all(|row| row.transport_timestamp.0 > WELCOME_CREATED_AT),
+            .all(|row| row.transport_timestamp.0 > PAST_THE_WELCOME_MARGIN),
         "each row carries its transport timestamp"
     );
 
