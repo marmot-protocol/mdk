@@ -1054,8 +1054,11 @@ impl<S: StorageProvider> Engine<S> {
         // release journal's backfill arm, are dropped, which is why
         // a timestamp is allowed to decide it at all. It is a compose-time
         // value for application messages and this seam cannot tell those from
-        // commits, so being wrong here must stay free, and here it is: the row
-        // is released either way, and the id stays eligible for redelivery.
+        // commits, so being wrong here must lose nothing, and it does not: the
+        // row is released either way, the id stays eligible for redelivery,
+        // and the host still re-owes it (through the recovery inventory, or
+        // the journal's arm where none placed it). A wrong guess can only
+        // delay a stall's detection until traffic past the margin arrives.
         let predates_this_copy = self.released_row_predates_local_copy(record);
         let released_as = if predates_this_copy {
             crate::message_disposition::MessageDisposition::PredatesLocalCopy

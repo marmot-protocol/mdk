@@ -185,22 +185,23 @@ async fn next_event_returns_when_a_live_delivery_arms_the_epoch_backfill() {
         .await;
     }
 
-    // The threshold-crossing delivery arms the backfill with an empty summary.
-    // With the guard fix `next_event` returns here; without it the call blocks
-    // on the next `receive()` and this timeout is the RED failure.
+    // The threshold-crossing delivery arms the backfill with an empty summary,
+    // and the convergence a retained row schedules can force the same return,
+    // so this observes only that `next_event` returns rather than blocking on
+    // the next `receive()`.
     let summary = timeout(NEXT_EVENT_DEADLINE, bob.next_event())
         .await
-        .expect("next_event must return once a live delivery arms the epoch backfill")
+        .expect("next_event must return after the undecryptable burst")
         .expect("next_event should not error");
 
-    // The return is driven purely by the armed backfill: the undecryptable
-    // probes carry no visible content, so an empty summary is the expected and
-    // harmless payload the worker forwards to `publish_app_runtime_summary`.
+    // The undecryptable probes carry no visible content, so an empty summary is
+    // the expected and harmless payload the worker forwards to
+    // `publish_app_runtime_summary`.
     assert!(
         summary.joined_groups.is_empty()
             && summary.messages.is_empty()
             && summary.events.is_empty(),
         "the arming deliveries are undecryptable and must not surface visible \
-         summary content; the return is forced by the armed backfill alone",
+         summary content",
     );
 }

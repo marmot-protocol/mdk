@@ -7089,6 +7089,70 @@ mod tests {
         );
     }
 
+    /// A refusal of traffic stamped near this copy's Welcome is no more stall
+    /// evidence than its retention would have been (mdk#3536). A newly linked
+    /// device's first sweep can fill the retained backlog with the group's
+    /// pre-Welcome history, and arming from the next refusal would report the
+    /// device stalled at the epoch it joined at. A refusal stamped past the
+    /// margin still arms.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refusal_near_this_copys_welcome_arms_no_epoch_gap() {
+        use cgka_traits::ingest::{InboundResourceLimit, IngestOutcome};
+        use cgka_traits::storage::GroupStorage;
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let app = MarmotApp::with_relay_and_config(
+            dir.path(),
+            "wss://relay.example",
+            crate::MarmotAppConfig::white_noise(),
+        )
+        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+        let mut client = client_on_app_relay_plane(&app, "alice").await;
+        let group = client
+            .create_group("refused", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
+        // Model a Welcome-installed copy; one this device created has no
+        // Welcome time to compare against.
+        let storage = app.account_storage("alice").unwrap();
+        let welcome_at = crate::unix_now_seconds();
+        let mut record = storage.get_group(&group).unwrap();
+        record.local_copy_welcome_created_at = Some(cgka_traits::transport::Timestamp(welcome_at));
+        storage.put_group(&record).unwrap();
+        let refused = IngestOutcome::ResourceRefused {
+            group_id: group.clone(),
+            resource: InboundResourceLimit::TransportDeferredCapacity,
+        };
+
+        client.detect_epoch_stall(
+            Some(group.clone()),
+            "history",
+            &refused,
+            cgka_traits::transport::Timestamp(welcome_at - 60),
+        );
+        assert!(
+            !client.has_pending_epoch_backfill(),
+            "a refused piece of pre-Welcome history is not evidence this device is behind"
+        );
+
+        client.detect_epoch_stall(
+            Some(group.clone()),
+            "live",
+            &refused,
+            cgka_traits::transport::Timestamp(
+                welcome_at + cgka_traits::group::PRE_WELCOME_CLOCK_SKEW_SECS,
+            ),
+        );
+        assert!(
+            client.has_pending_epoch_backfill(),
+            "a refusal from this copy's own era is still a stall signal"
+        );
+    }
+
     /// A commit or retry can release several retained messages in one effects batch.
     /// Each row needs its own source identity, including when no relay envelope
     /// triggered the batch. Replay must remain idempotent across observation seams.

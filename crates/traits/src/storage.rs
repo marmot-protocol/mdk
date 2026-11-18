@@ -421,8 +421,10 @@ pub trait MessageStorage {
     /// The release itself is identical: the same receipt obsolescence, and the
     /// id stays eligible for exact-id redelivery. A backend that turns its
     /// release evidence into a recovery demand (an epoch-gap backfill) must not
-    /// raise one from this release alone. The default delegates, so a backend
-    /// that does not distinguish keeps the conservative behavior.
+    /// raise one from this release as stall evidence. It may still raise one
+    /// when that demand is the only thing that re-owes the released message.
+    /// The default delegates, so a backend that does not distinguish keeps the
+    /// conservative behavior.
     fn release_message_for_replay_without_stall_evidence(
         &self,
         record: &MessageRecord,

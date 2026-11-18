@@ -23,7 +23,7 @@ use cgka_traits::ingest::IngestOutcome;
 use cgka_traits::message::{MessageState, StoredMessagePayload};
 use cgka_traits::storage::{GroupStorage, MessageStorage};
 use cgka_traits::transport::{Timestamp, TransportEnvelope, TransportMessage};
-use cgka_traits::types::{EpochId, GroupId, MemberId};
+use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
 use std::collections::HashMap;
 use storage_sqlite::SqliteAccountStorage;
 
@@ -908,16 +908,33 @@ async fn a_released_row_older_than_this_copys_welcome_arms_no_epoch_gap() {
         },
     )
     .await;
-    let predating = route_at(
-        chat(&mut alice, &group_id, "from before this copy").await,
-        &group_id,
-        WELCOME_CREATED_AT,
-    );
+    let predating = TransportMessage {
+        // A transport event id, as the app's recovery inventory keys it.
+        id: MessageId::new(vec![0x5a; 32]),
+        ..route_at(
+            chat(&mut alice, &group_id, "from before this copy").await,
+            &group_id,
+            WELCOME_CREATED_AT,
+        )
+    };
     bob.set_deferred_peel_residence_ms(0);
     assert!(matches!(
         bob.ingest(predating.clone()).await.unwrap(),
         IngestOutcome::TransportDeferred { .. }
     ));
+    // The app places a retained delivery in its recovery inventory. Once the
+    // row is released, that inventory row re-owes the message; an epoch gap
+    // re-owes only a release that has none.
+    bob_storage
+        .app_storage()
+        .record_reconciliation_items(std::iter::once((
+            &storage_sqlite::TransportReconciliationRoute::Group([7; 32]),
+            &storage_sqlite::TransportReconciliationItem {
+                event_id: predating.id.as_slice().try_into().unwrap(),
+                created_at: unix_seconds_now(),
+            },
+        )))
+        .unwrap();
     for _ in 0..8 {
         bob.retry_deferred_peels(&group_id).await.unwrap();
         if deferred_rows(&bob_storage, &group_id) == 0 {

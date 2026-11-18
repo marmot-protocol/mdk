@@ -338,6 +338,15 @@ impl SqliteAccountStorage {
                 && !invalidated
             {
                 crate::cross::release::invalidate_recovery_inventory(&conn)?;
+                // No inventory row placed this message on a route and second,
+                // so no coverage was reopened for it: only the epoch gap the
+                // journal arms still owes its redelivery, whatever the engine
+                // judged about it as stall evidence.
+                conn.execute_cached(
+                    "UPDATE cgka_released_transport_receipts SET stall_evidence = 1 WHERE id = ?1",
+                    [record.id.as_slice()],
+                )
+                .storage()?;
             }
             conn.execute_cached(
                 "UPDATE cgka_released_transport_receipts SET inventory_invalidated=1 WHERE id=?1",
@@ -1644,8 +1653,9 @@ mod tests {
     /// A release the engine judged not to be stall evidence (traffic that may
     /// predate this copy's Welcome, mdk#3536) is still a release: consuming it
     /// retires both receipt stores again and hands the id back for redelivery.
-    /// It arms no epoch gap, though, and reopens none recovery already settled,
-    /// including when a later open of the database consumes it.
+    /// It arms no epoch gap, though, including when a later open of the
+    /// database consumes it: the inventory row that placed it re-owes its
+    /// second instead.
     #[test]
     fn a_release_that_is_not_stall_evidence_retires_receipts_but_arms_no_epoch_gap() {
         use crate::protocol::storage::write_contention::SharedDatabase;
@@ -1653,38 +1663,14 @@ mod tests {
         let db = SharedDatabase::new();
         let releaser = db.open();
         releaser.put_group(&sample_group(gid(1), 3, 0)).unwrap();
-        {
-            // Scoped: the app handle shares the releaser's connection, which
-            // must be closed before the reopen below.
-            let app = releaser.app_storage();
-            app.ensure_account_projection("app-owner").unwrap();
-            // A gap at this epoch that recovery settled: a release arm reopens it.
-            app.arm_epoch_backfill_intents(&[crate::StoredEpochBackfillIntent {
-                group_id_hex: hex::encode(gid(1).as_slice()),
-                stalled_epoch: 3,
-            }])
-            .unwrap();
-        }
-        let settled = |store: &SqliteAccountStorage| {
-            store
-                .lock()
-                .unwrap()
-                .query_row(
-                    "SELECT state, revision FROM account_recovery_obligations",
-                    [],
-                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
-                )
-                .unwrap()
-        };
         releaser
-            .lock()
-            .unwrap()
-            .execute_batch("UPDATE account_recovery_obligations SET state = 1")
+            .app_storage()
+            .ensure_account_projection("app-owner")
             .unwrap();
-        let before = settled(&releaser);
         let mut record = sample_message(MessageId::new(vec![42; 32]), gid(1), 3);
         record.state = MessageState::PeelDeferred;
         releaser.put_message(&record).unwrap();
+        inventory(&releaser, &record.id);
         releaser
             .release_message_for_replay_without_stall_evidence(&record)
             .unwrap();
@@ -1719,14 +1705,16 @@ mod tests {
             "the id is still eligible for redelivery"
         );
         assert_eq!(seen(&reopened), 0, "its stale receipt is retired");
-        assert_eq!(settled(&reopened), before, "no gap is reopened");
-        assert!(
-            reopened
-                .app_storage()
-                .pending_epoch_backfill_intents()
-                .unwrap()
-                .is_empty()
-        );
+        let obligations: i64 = reopened
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM account_recovery_obligations",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(obligations, 0, "no epoch gap is armed");
     }
 
     /// An id released twice before the journal is consumed is stall evidence
@@ -1740,11 +1728,13 @@ mod tests {
                 .ensure_account_projection("app-owner")
                 .unwrap();
             store.put_group(&sample_group(gid(1), 5, 0)).unwrap();
+            let id = MessageId::new(vec![1; 32]);
             for evidence in [evidence_first, !evidence_first] {
                 let epoch = if evidence { 2 } else { 5 };
-                let mut record = sample_message(mid(1), gid(1), epoch);
+                let mut record = sample_message(id.clone(), gid(1), epoch);
                 record.state = MessageState::PeelDeferred;
                 store.put_message(&record).unwrap();
+                inventory(&store, &id);
                 if evidence {
                     store.release_message_for_replay(&record).unwrap();
                 } else {
@@ -1755,7 +1745,7 @@ mod tests {
             }
             assert_eq!(
                 store.consume_released_transport_receipts().unwrap(),
-                vec![mid(1)]
+                vec![id]
             );
             let armed: Vec<_> = store
                 .app_storage()
@@ -1766,6 +1756,54 @@ mod tests {
                 .collect();
             assert_eq!(armed, vec![2], "evidence first: {evidence_first}");
         }
+    }
+
+    /// Places a retained message on a route and second in the recovery
+    /// inventory, as the app does when it admits the delivery.
+    fn inventory(store: &SqliteAccountStorage, id: &MessageId) {
+        store
+            .app_storage()
+            .record_reconciliation_items(std::iter::once((
+                &crate::TransportReconciliationRoute::Group([7; 32]),
+                &crate::TransportReconciliationItem {
+                    event_id: id.as_slice().try_into().unwrap(),
+                    created_at: crate::unix_now_seconds(),
+                },
+            )))
+            .unwrap();
+    }
+
+    /// A release reopens its message's route and second only through the
+    /// inventory rows that placed it there, and that inventory write is
+    /// best-effort. Without one, the epoch gap the journal arms is the only
+    /// thing left that owes the message's redelivery, so it arms even for a
+    /// release the engine judged not to be stall evidence.
+    #[test]
+    fn a_release_no_inventory_placed_still_arms_its_epoch_gap() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        store
+            .app_storage()
+            .ensure_account_projection("app-owner")
+            .unwrap();
+        store.put_group(&sample_group(gid(1), 3, 0)).unwrap();
+        let mut record = sample_message(MessageId::new(vec![1; 32]), gid(1), 3);
+        record.state = MessageState::PeelDeferred;
+        store.put_message(&record).unwrap();
+        store
+            .release_message_for_replay_without_stall_evidence(&record)
+            .unwrap();
+        assert_eq!(
+            store.consume_released_transport_receipts().unwrap(),
+            vec![record.id]
+        );
+        let armed: Vec<_> = store
+            .app_storage()
+            .pending_epoch_backfill_intents()
+            .unwrap()
+            .into_iter()
+            .map(|intent| intent.stalled_epoch)
+            .collect();
+        assert_eq!(armed, vec![3]);
     }
 
     #[test]

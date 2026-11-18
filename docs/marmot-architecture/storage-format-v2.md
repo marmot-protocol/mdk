@@ -68,7 +68,8 @@ in one transaction. Migration `0215_released_receipt_stall_evidence` records
 whether each release is stall evidence: the engine releases a row that may
 predate this copy's Welcome through
 `release_message_for_replay_without_stall_evidence`, and consumption retires it
-like any other but arms no backfill from it. An id released again before
+like any other but arms no backfill from it, unless no recovery inventory row
+placed it: that backfill is then all that re-owes its redelivery. An id released again before
 consumption counts if either release did, at that release's epoch. The caller
 then clears its in-memory seen ring/index synchronously, before any await or
 fallible operation. Process death before
