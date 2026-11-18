@@ -4,6 +4,8 @@
 
 ### Breaking changes
 
+- Account migration 0213 persists the end of each epoch-gap visit (#3538). Older binaries refuse an upgraded
+  database. Callers constructing `RecoveryEpochGapRetry` must supply `visit_until_seconds`.
 - Account migration 0212 adds the bounded attachment body-removal journal (mdk#3491). Older binaries refuse
   schema 212; downgrade is unsupported.
 - Account migration 0211 adds `account_sign_in_removals`: one row per slot the trusted device roster recorded as
