@@ -1669,6 +1669,14 @@ async fn availability_recovery_stays_bounded() {
         )
         .unwrap();
 
+    let omitted = fetcher
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|event| event.kind == KIND_MARMOT_KEY_PACKAGE)
+        .unwrap()
+        .clone();
     for event in fetcher.events.lock().unwrap().iter_mut() {
         if event.kind == transport_nostr_adapter::KIND_NIP65_RELAY_LIST
             && event.pubkey == accounts[0].account_id_hex
@@ -1679,15 +1687,21 @@ async fn availability_recovery_stays_bounded() {
         }
     }
     fetcher.events.lock().unwrap().retain(|event| {
-        !(event.kind == KIND_MARMOT_KEY_PACKAGE && event.pubkey == accounts[0].account_id_hex)
+        event.kind != KIND_MARMOT_KEY_PACKAGE || event.pubkey != accounts[0].account_id_hex
     });
+    fetcher
+        .events_by_endpoint
+        .lock()
+        .unwrap()
+        .insert("wss://outbox-4.example".into(), vec![omitted]);
 
     let status = app
         .directory()
         .refresh_follow_availability(&crate::directory_resources::directory_account(&owner))
         .await
         .unwrap();
-    assert_eq!(status.not_found, 1, "{status:?}");
+    assert_eq!(status.unknown, 1, "{status:?}");
+    assert_eq!(status.not_found, 0, "{status:?}");
     let requests = fetcher.requests.lock().unwrap();
     assert!(requests.len() <= 2, "{}", requests.len());
     assert!(
@@ -1707,32 +1721,8 @@ async fn availability_recovery_stays_bounded() {
         .unwrap();
     assert_eq!(
         page.rows[0].state,
-        nostr_directory::FollowAvailabilityState::NotFound
-    );
-    let checked_at = page.rows[0].checked_at.unwrap();
-    let shared = app.shared_storage().unwrap();
-    let replacement = storage_sqlite::PublicKeyPackageReplacementRecord {
-        account_id_hex: accounts[0].account_id_hex.clone(),
-        key_package_id: "negative-probe".into(),
-        event_id_hex: "ee".repeat(32),
-        event_created_at: 0,
-        observed_at: checked_at + 1,
-    };
-    shared
-        .put_public_key_package_replacement(&replacement)
-        .unwrap();
-    assert_eq!(
-        app.directory()
-            .follow_availability_page(
-                &crate::directory_resources::directory_account(&owner),
-                None,
-                100,
-            )
-            .unwrap()
-            .rows[0]
-            .state,
         nostr_directory::FollowAvailabilityState::Unknown,
-        "a replacement observed after the read started invalidates the negative"
+        "a package on an omitted relay cannot support a clean negative"
     );
 }
 

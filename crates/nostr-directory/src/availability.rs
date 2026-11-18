@@ -231,7 +231,7 @@ impl DirectoryCache {
         limit: usize,
         now: u64,
     ) -> Result<FollowAvailabilityPage, DirectoryError> {
-        self.follow_availability_page_with_shared(account_id_hex, after, limit, now, None)
+        self.follow_availability_page_with_shared(account_id_hex, after, limit, now, 0, None)
     }
 
     fn follow_availability_page_with_shared(
@@ -240,6 +240,7 @@ impl DirectoryCache {
         after: Option<&str>,
         limit: usize,
         now: u64,
+        future_skew_secs: u64,
         shared: Option<&SqliteSharedStorage>,
     ) -> Result<FollowAvailabilityPage, DirectoryError> {
         let limit = limit.clamp(1, MAX_FOLLOW_AVAILABILITY_PAGE_SIZE);
@@ -343,7 +344,10 @@ impl DirectoryCache {
                 }
             }
         }
-        let rows = stored.into_iter().map(|row| row.project(now)).collect();
+        let rows = stored
+            .into_iter()
+            .map(|row| row.project(now, future_skew_secs))
+            .collect();
         Ok(FollowAvailabilityPage { rows, next_cursor })
     }
 }
@@ -377,7 +381,7 @@ struct StoredAvailability {
 }
 
 impl StoredAvailability {
-    fn project(self, now: u64) -> FollowAvailability {
+    fn project(self, now: u64, future_skew_secs: u64) -> FollowAvailability {
         let checked_at = self.checked_at.and_then(|value| u64::try_from(value).ok());
         let fresh_until = self.fresh_until.and_then(|value| u64::try_from(value).ok());
         let source = match self.source {
@@ -441,7 +445,7 @@ impl StoredAvailability {
                         .and_then(|value| u64::try_from(value).ok()),
                 )
                 .is_some_and(|(event_id, created_at)| {
-                    watermark_allows(event_id, created_at, now, barrier)
+                    watermark_allows(event_id, created_at, now, future_skew_secs, barrier)
                 })
         };
         let watermark_allows = self.eviction_watermark.as_ref().is_none_or(selected_allows)
@@ -603,6 +607,7 @@ impl<R: DirectoryResources> Directory<R> {
             after,
             limit,
             now,
+            self.config.max_future_skew.as_secs(),
             Some(&shared),
         )
     }
@@ -912,6 +917,9 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
             source_relays = discovery_relays.clone();
         }
         source_relays.truncate(MAX_FOLLOW_AVAILABILITY_RELAYS_PER_TARGET);
+        let coverage_truncated =
+            used_safe_nip65 && source_relays.len() > MAX_FOLLOW_AVAILABILITY_RELAYS_PER_TARGET;
+        source_relays.truncate(MAX_FOLLOW_AVAILABILITY_RELAYS_PER_TARGET);
         if source_relays.is_empty() {
             return Ok(AvailabilityWrite::unknown(self.directory_freshness().now));
         }
@@ -972,7 +980,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
             (
                 recovered.records,
                 recovered.freshness,
-                used_safe_nip65 && recovered.cache_evidence.is_some(),
+                used_safe_nip65 && !coverage_truncated && recovered.cache_evidence.is_some(),
             )
         };
         let selection = select_key_packages_from_records(account_id_hex, &records, freshness, None);
@@ -1081,6 +1089,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
         })
         .await?;
         let now = self.directory_freshness().now;
+        let future_skew_secs = self.config.max_future_skew.as_secs();
         let current = match value.state {
             FollowAvailabilityState::Ready => value
                 .key_package_event_id
@@ -1097,10 +1106,10 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                             barrier_allows(event_id, created_at, barrier)
                         })
                         && watermark.as_ref().is_none_or(|barrier| {
-                            watermark_allows(event_id, created_at, now, barrier)
+                            watermark_allows(event_id, created_at, now, future_skew_secs, barrier)
                         })
                         && global_eviction.as_ref().is_none_or(|barrier| {
-                            watermark_allows(event_id, created_at, now, barrier)
+                            watermark_allows(event_id, created_at, now, future_skew_secs, barrier)
                         })
                         && replacements
                             .iter()
@@ -1229,6 +1238,7 @@ fn watermark_allows(
     event_id: &str,
     created_at: u64,
     now: u64,
+    future_skew_secs: u64,
     barrier: &PublicKeyPackageBarrierRecord,
 ) -> bool {
     if barrier
@@ -1237,6 +1247,9 @@ fn watermark_allows(
         <= now
     {
         return true;
+    }
+    if barrier.kind == PublicKeyPackageBarrierKind::ExactDeletion {
+        return created_at > barrier.observed_at.saturating_add(future_skew_secs);
     }
     barrier_allows(event_id, created_at, barrier)
 }
@@ -1335,7 +1348,7 @@ mod tests {
                 kind,
             }),
         }
-        .project(1_000)
+        .project(1_000, 0)
         .state
     }
 
@@ -1392,7 +1405,7 @@ mod tests {
                 kind: PublicKeyPackageBarrierKind::Replacement,
             }),
         }
-        .project(now)
+        .project(now, 0)
         .state
     }
 
@@ -1428,17 +1441,20 @@ mod tests {
             observed_at: 1_000,
             kind: PublicKeyPackageBarrierKind::ExactDeletion,
         };
-        assert!(watermark_allows("bb", 1_001, 1_000, &barrier));
+        assert!(!watermark_allows("cc", 1_200, 1_000, 300, &barrier));
+        assert!(watermark_allows("bb", 1_301, 1_000, 300, &barrier));
         assert!(!watermark_allows(
             "aa",
             100,
             1_000 + KEY_PACKAGE_FRESHNESS.as_secs() - 1,
+            300,
             &barrier,
         ));
         assert!(watermark_allows(
             "aa",
             100,
             1_000 + KEY_PACKAGE_FRESHNESS.as_secs(),
+            300,
             &barrier,
         ));
     }
