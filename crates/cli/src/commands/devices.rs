@@ -184,7 +184,7 @@ fn snapshot_json(snapshot: DeviceLinkSnapshot) -> Value {
         })).collect::<Vec<_>>();
         json!({"move_id":movement.move_id,"state":state,"old_siblings":old_siblings,"overridden_rejection_slots":movement.overridden_rejection_slots})
     }).collect::<Vec<_>>();
-    json!({"new_device":new_device,"prompts":prompts,"moves":moves,"device_group_stalled":snapshot.device_group_stalled})
+    json!({"new_device":new_device,"prompts":prompts,"moves":moves,"chat_progress":snapshot.chat_progress,"device_group_stalled":snapshot.device_group_stalled})
 }
 
 fn snapshot_plain(snapshot: &Value) -> String {
@@ -224,6 +224,19 @@ fn snapshot_plain(snapshot: &Value) -> String {
         {
             lines.push("a confirmed destination link overrode an earlier rejection".to_owned());
         }
+    }
+    for progress in snapshot["chat_progress"].as_array().into_iter().flatten() {
+        let action = if progress["on_new_device"] == true {
+            "join"
+        } else {
+            "add"
+        };
+        lines.push(format!(
+            "{} of {} chats left to {action} for {}",
+            progress["remaining"],
+            progress["total"],
+            progress["slot_id_hex"].as_str().unwrap_or_default()
+        ));
     }
     if snapshot["device_group_stalled"].as_bool() == Some(true) {
         lines.push(
@@ -317,6 +330,7 @@ mod tests {
             ],
             moves: Vec::new(),
             device_group_stalled: false,
+            chat_progress: Vec::new(),
         });
         assert!(
             json["prompts"][0]["device_label"] == device_label,

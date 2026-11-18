@@ -895,6 +895,13 @@ groups on.
 
 ## Linking a new device
 
+After pairing reaches `Linked`, read `chat_progress` on each `DeviceLinkChanged`. Each entry identifies the new device by
+`slot_id_hex`. On the approver, `remaining` counts eligible chats that still need an Add. On the new device,
+`on_new_device` is true and `remaining` counts expected chats that have yet to join locally. Show the joining banner while
+that count is positive. Zero means complete for the reported `total`. The total can change as the approver's chats change.
+An absent entry means progress is unavailable, including before a complete report arrives, with older peers, after opt-out,
+or when the direct-add window expires. History import and chats known only to other siblings have their own lifecycles.
+
 Device linking (mdk#2628) runs through the account runtime. It requires the per-client `device_groups` switch
 (on by default); every call is refused otherwise. Each call returns a `DeviceLinkSnapshot`: the new device's own
 link (`new_device`) and the prompts for sign-ins this device can link (`prompts`).

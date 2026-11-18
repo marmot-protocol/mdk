@@ -210,6 +210,14 @@ pub(super) enum SiblingWelcomeAdmission {
     Admitted(StashedSiblingWelcome),
 }
 
+/// What can supply the private KeyPackage for this sibling in this chat.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum ChatStockSupport {
+    Held,
+    Advertised,
+    Unsupported,
+}
+
 impl AppClient {
     /// Answer a sibling's request by issuing what it wants. Upkeep sends the
     /// hand-offs. A request answered before issues nothing, and so does one
@@ -782,9 +790,9 @@ impl AppClient {
             });
         let mut selection = PrivateKeyPackageSelection::default();
         for chat in chats {
-            match self.chat_wants_compatible_stock(&chat, exchange, sibling, now, &mut selection) {
-                Ok(true) => return true,
-                Ok(false) => {}
+            match self.chat_stock_support(&chat, exchange, sibling, now, &mut selection) {
+                Ok(ChatStockSupport::Advertised) => return true,
+                Ok(_) => {}
                 Err(error) => {
                     first_error.get_or_insert(error);
                 }
@@ -801,14 +809,14 @@ impl AppClient {
         false
     }
 
-    fn chat_wants_compatible_stock(
+    pub(super) fn chat_stock_support(
         &self,
         chat: &GroupId,
         exchange: &Exchange,
         sibling: &DeviceSlotId,
         now: u64,
         selection: &mut PrivateKeyPackageSelection,
-    ) -> Result<bool, AppError> {
+    ) -> Result<ChatStockSupport, AppError> {
         let requirements = self
             .runtime
             .invite_key_package_requirements(chat)
@@ -818,12 +826,17 @@ impl AppClient {
             .compatible_records(&requirements, &BTreeSet::new(), now)
             .is_empty()
         {
-            return Ok(false);
+            return Ok(ChatStockSupport::Held);
         }
-        Ok(self
+        let advertised = self
             .runtime
             .sibling_leaf_supports(&exchange.group_id, &exchange.roster, sibling, &requirements)
-            .map_err(marmot_session::SessionError::from)?)
+            .map_err(marmot_session::SessionError::from)?;
+        Ok(if advertised {
+            ChatStockSupport::Advertised
+        } else {
+            ChatStockSupport::Unsupported
+        })
     }
 
     pub(crate) fn prepared_private_key_packages<'a>(

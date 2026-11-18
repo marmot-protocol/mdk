@@ -1586,6 +1586,9 @@ async fn a_declined_generation_holds_automatic_adds_until_a_later_accept() {
     })
     .await;
     let mut selection = Default::default();
+    // The direct scan may publish its updated inventory. A subsequent gap
+    // pass must publish no claim for either declined chat.
+    let before = relay.published_event_ids().len();
     boxed(|| phone.client.fill_sibling_chat_gaps(&[], 10, &mut selection)).await;
     assert_eq!(
         taken_from(&phone, &laptop),
@@ -1596,7 +1599,7 @@ async fn a_declined_generation_holds_automatic_adds_until_a_later_accept() {
     assert_eq!(
         relay.published_event_ids().len(),
         before,
-        "no new Add or claim on the automatic Add paths"
+        "no new Add or claim on the gap-filling path"
     );
     assert_eq!(held_from(&phone, &laptop), held);
     assert_eq!(taken_from(&phone, &laptop), 0);
@@ -1769,6 +1772,9 @@ async fn a_sibling_fills_missing_chats_while_the_approver_is_offline() {
     assert!(chats.iter().all(|chat| joined(&laptop, chat)));
 
     link(&relay, &mut phone, &mut tablet, "Tablet").await;
+    // Publish the approver's inventory before it goes offline. The laptop
+    // can then do every Add and the tablet still recognizes completion.
+    passes(&relay, &mut [&mut phone], 1).await;
     hold_key_packages(&relay, &mut laptop, &mut tablet).await;
     laptop
         .client
@@ -1798,6 +1804,15 @@ async fn a_sibling_fills_missing_chats_while_the_approver_is_offline() {
     })
     .await
     .expect("the online sibling fills both missing chats");
+    assert_eq!(
+        tablet.op(DeviceLinkOp::Read).await.chat_progress,
+        vec![crate::LinkChatProgress {
+            slot_id_hex: tablet.slot_hex(),
+            on_new_device: true,
+            total: 2,
+            remaining: 0,
+        }]
+    );
     assert_eq!(taken_from(&laptop, &tablet), chats.len());
 
     passes(&relay, &mut [&mut phone, &mut tablet, &mut laptop], 3).await;
@@ -2370,6 +2385,14 @@ async fn recovering_a_quarantined_chat_wakes_gap_filling() {
     let mut phone = reopen(phone).await;
     assert_eq!(phone.client.quarantined_groups().len(), 1);
     assert_eq!(taken_from(&phone, &laptop), 0);
+    phone
+        .client
+        .add_linked_devices_to_chats(&[], &mut Default::default())
+        .await;
+    let progress = laptop.step(&relay).await.chat_progress;
+    assert_eq!(progress.len(), 1);
+    assert_eq!((progress[0].total, progress[0].remaining), (0, 0));
+
     let pin = phone.client.runtime.epoch_pin(&group).unwrap();
     phone
         .client
@@ -2388,6 +2411,14 @@ async fn recovering_a_quarantined_chat_wakes_gap_filling() {
         .await;
     assert_eq!(taken_from(&phone, &laptop), 1);
     assert_eq!(leaves_of(&phone, &laptop, &chat, &group), 1);
+    phone
+        .client
+        .add_linked_devices_to_chats(&[], &mut Default::default())
+        .await;
+    passes(&relay, &mut [&mut laptop], 2).await;
+    let progress = laptop.op(DeviceLinkOp::Read).await.chat_progress;
+    assert_eq!(progress.len(), 1);
+    assert_eq!((progress[0].total, progress[0].remaining), (1, 0));
 }
 
 /// With "add to all my chats" off, the new device is added to no chat,
@@ -2404,6 +2435,8 @@ async fn a_new_device_without_add_to_all_my_chats_is_added_to_none() {
     passes(&relay, &mut [&mut phone, &mut laptop], 4).await;
 
     assert!(held_from(&phone, &laptop) > 0);
+    assert!(phone.op(DeviceLinkOp::Read).await.chat_progress.is_empty());
+    assert!(laptop.op(DeviceLinkOp::Read).await.chat_progress.is_empty());
     assert_eq!(taken_from(&phone, &laptop), 0);
     assert!(!chats.iter().any(|chat| joined(&laptop, chat)));
 }
@@ -2550,6 +2583,9 @@ async fn a_chat_closed_to_linked_devices_is_counted_and_takes_no_key_package() {
     assert_eq!(phone.client.chats_closed_to_linked_devices().unwrap(), 1);
     passes(&relay, &mut [&mut phone, &mut laptop], 5).await;
 
+    let progress = laptop.op(DeviceLinkOp::Read).await.chat_progress;
+    assert_eq!(progress.len(), 1);
+    assert_eq!((progress[0].total, progress[0].remaining), (1, 0));
     assert!(joined(&laptop, &open));
     assert!(!joined(&laptop, &closed));
     assert_eq!(leaves_of(&phone, &laptop, &closed, &group), 0);
@@ -2914,12 +2950,124 @@ async fn a_pass_adds_the_new_device_to_at_most_its_cap_of_chats() {
     first.push(false);
     assert_eq!(added, first, "the chat the list shows last waits");
 
+    // Deliver the first batch. Hold all subsequent publications away from
+    // the laptop until the phone has confirmed its final Add.
+    passes(&relay, &mut [&mut laptop], 2).await;
+    let slot = laptop.slot_hex();
+    let expected = |on_new_device, remaining| {
+        vec![crate::LinkChatProgress {
+            slot_id_hex: slot.clone(),
+            on_new_device,
+            total: chats.len() as u32,
+            remaining,
+        }]
+    };
+    assert_eq!(
+        laptop.op(DeviceLinkOp::Read).await.chat_progress,
+        expected(true, 1)
+    );
+
     phone.client.run_due_maintenance().await.unwrap();
     assert!(
         chats
             .iter()
             .all(|chat| leaves_of(&phone, &laptop, chat, &group) == 1)
     );
+
+    assert_eq!(
+        phone.op(DeviceLinkOp::Read).await.chat_progress,
+        expected(false, 0)
+    );
+    let mut laptop = reopen(laptop).await;
+    assert_eq!(
+        laptop.op(DeviceLinkOp::Read).await.chat_progress,
+        expected(true, 1)
+    );
+    laptop.client.take_device_link_changed();
+    passes(&relay, &mut [&mut laptop], 2).await;
+    laptop.client.drive_device_pairing().await;
+    assert!(laptop.client.take_device_link_changed());
+    assert_eq!(
+        laptop.op(DeviceLinkOp::Read).await.chat_progress,
+        expected(true, 0)
+    );
+    assert!(chats.iter().all(|chat| joined(&laptop, chat)));
+}
+
+/// Withdrawing the sole carrier makes the view unknown until the approver
+/// repeats the inventory. Reopening the sender also repairs missing delivery.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_withdrawn_link_chat_inventory_is_repaired_after_reopen() {
+    use cgka_traits::engine::{AppMessageInvalidationReason, GroupEvent};
+    let (relay, [mut phone, mut laptop]) = alice_devices::<2>().await;
+    let group = link(&relay, &mut phone, &mut laptop, "Laptop").await;
+    passes(&relay, &mut [&mut phone, &mut laptop], 3).await;
+    let current = |device: &Device| {
+        account_database(&device.app)
+            .query_row(
+                "SELECT revision,message_id FROM link_chat_report_pages WHERE page=0",
+                [],
+                |row| Ok((row.get::<_, u32>(0)?, row.get::<_, Vec<u8>>(1)?)),
+            )
+            .unwrap()
+    };
+    let (revision, carrier) = current(&laptop);
+    let storage = laptop.app.account_storage("alice").unwrap().app_storage();
+    let request_owed = || {
+        storage
+            .small_state_schedule()
+            .unwrap()
+            .is_some_and(|s| s.request_owed)
+    };
+    assert!(!request_owed());
+    let event = |id| GroupEvent::AppMessageInvalidated {
+        group_id: group.clone(),
+        message_id: cgka_traits::MessageId::new(id),
+        epoch: EpochId(0),
+        reason: AppMessageInvalidationReason::LosingBranch,
+        decrypted_payload_ref: None,
+    };
+    laptop
+        .client
+        .observe_device_group_event(&event(carrier))
+        .unwrap();
+    assert!(
+        !request_owed(),
+        "an inventory withdrawal owes no small-state broadcast"
+    );
+    assert!(laptop.op(DeviceLinkOp::Read).await.chat_progress.is_empty());
+    let mut phone = reopen(phone).await;
+    passes(&relay, &mut [&mut phone, &mut laptop], 2).await;
+    let progress = laptop.op(DeviceLinkOp::Read).await.chat_progress;
+    assert_eq!(progress.len(), 1);
+    assert_eq!((progress[0].total, progress[0].remaining), (0, 0));
+    let (repaired, carrier) = current(&laptop);
+    assert_eq!(repaired, revision);
+
+    // Sender and receiver refer to the same publication by different ids.
+    let sender_id = phone
+        .app
+        .account_storage("alice")
+        .unwrap()
+        .app_storage()
+        .device_group_messages()
+        .unwrap()
+        .into_iter()
+        .rfind(|(.., kind)| *kind == 477)
+        .unwrap()
+        .2
+        .unwrap();
+    phone
+        .client
+        .observe_device_group_event(&event(hex::decode(sender_id).unwrap()))
+        .unwrap();
+    laptop
+        .client
+        .observe_device_group_event(&event(carrier))
+        .unwrap();
+    assert!(laptop.op(DeviceLinkOp::Read).await.chat_progress.is_empty());
+    passes(&relay, &mut [&mut phone, &mut laptop], 1).await;
+    assert_eq!(laptop.op(DeviceLinkOp::Read).await.chat_progress, progress);
 }
 
 /// The old-chat opt-out does not exclude a linked sibling from a new

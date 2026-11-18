@@ -280,7 +280,7 @@ pub use client::device_group::{LinkedDevice, LinkedDeviceStatus};
 pub use client::device_pairing::{
     DeviceGroupMoveSibling, DeviceGroupMoveState, DeviceGroupMoveView, DeviceLinkChoices,
     DeviceLinkEmoji, DeviceLinkEndReason, DeviceLinkOp, DeviceLinkPrompt, DeviceLinkPromptState,
-    DeviceLinkSnapshot, NewDeviceLinkState,
+    DeviceLinkSnapshot, LinkChatProgress, NewDeviceLinkState,
 };
 pub use client::history_imports::{ChatHistoryImport, ChatHistoryImportState};
 pub use client::sign_ins::{SignInResponse, UnrecognizedSignIn, UnrecognizedSignInState};
@@ -2525,6 +2525,7 @@ impl MarmotApp {
             compromise_warning_changed: true,
             compromise_warning_gather_due: true,
             device_link_changed: true,
+            link_chat_progress: Default::default(),
             chat_history_imports_changed: true,
             history_imports_inputs: None,
             listed_history_imports: Vec::new(),

@@ -98,6 +98,7 @@ pub(crate) mod history_recovery;
 mod invitation_decisions;
 use invitation_decisions::AccountLeaveReason;
 mod invite_recovery;
+mod link_chat_progress;
 pub(crate) mod linked_device_chats;
 mod private_key_packages;
 mod projection;
@@ -893,6 +894,7 @@ pub struct AppClient {
     /// client just opened, ending any link in progress. The same seams drain
     /// it into one `DeviceLinkChanged`.
     pub(crate) device_link_changed: bool,
+    pub(crate) link_chat_progress: link_chat_progress::LinkChatProgressState,
     /// The client just opened, so the device-group seams announce
     /// `ChatHistoryImportsChanged` once whatever the answer (mdk#2628 4.2d).
     pub(crate) chat_history_imports_changed: bool,

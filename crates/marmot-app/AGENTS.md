@@ -334,10 +334,12 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   (add a feature's kinds there), and one sender read, `ensure_sent_by`, from the sending leaf's device tag (mdk#2628
   D33). A message from an earlier epoch is read from that epoch's retained anchor, so one older than the retained
   anchors has no readable sender. List every kind sent only in a device group in `is_device_group_kind` (457, 458, 459, 460,
-  461, 473, 475, 476), the one list: `observe_event` drops one received in any other group before the host summary and the
+  461, 473, 475, 476, 477), the one list: `observe_event` drops one received in any other group before the host summary and the
   stored projection, the notification preview refuses it, and the custom path rejects it as reserved. The engine
   withdraws a message by message id alone (an own send's transport id, a received message's content id), so a kind
-  whose withdrawal a feature acts on is listed in `withdrawal_handled` and dispatched in
+  whose withdrawal a feature acts on is listed in `withdrawal_handled`. Kind 477 additionally records an incoming
+  carrier atomically with its page. Invalidate a matching page before acknowledging withdrawal, including when the
+  bounded kind index has expired. Other withdrawals, including outgoing kind 477, are dispatched in
   `device_group_message_withdrawn`. Each such message is recorded with its kind in `device_group_messages` when sent
   (before the send; its message id is filled in from whichever drain's effects publish it, in
   `retain_effect_projection`) and when read. Records go after a week or past 4,096, so a feature also acts on a
@@ -410,6 +412,10 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   Never retain a selection context across maintenance passes.
   `chats_closed_to_linked_devices` counts the chats that take no same-account Add at all. Add at most
   `LINK_CHAT_ADDS_PER_PASS` chats a pass.
+- Report post-link chat progress from the direct Add scan through `client/link_chat_progress.rs`. Send kind 477 only
+  after a complete scan. Bind its inventory to the original confirmed KeyPackageRef. On the receiver, match complete
+  inventories against joined local chats and announce changes through `DeviceLinkChanged`. A published Add, Welcome,
+  or history delivery cannot establish the new device's local membership.
 - Fill missing sibling chat memberships in `client/sibling_chat_gaps.rs` (mdk#2628 3.5e, D82–D84), through
   kind-458 advisory claims and the existing private Add path. Claim content must match its canonical bytes; a leaving
   device neither claims nor suppresses another claimant. Claims are transient, expire from their original event time

@@ -719,6 +719,10 @@ the [shared contract](../marmot-uniffi/README.md#compromise-warning).
 
 ## Linking a new device
 
+Read `chat_progress` and `chat_progress_len` on the returned snapshot. For an entry with `on_new_device` set, show the
+joining banner while `remaining` is positive. On the approver the count measures Adds still owed. An empty list means
+progress is unavailable. Re-read on `MARMOT_EVENT_DEVICE_LINK_CHANGED`.
+
 `marmot_start_device_link`, `marmot_confirm_device_link_match` and `marmot_cancel_device_link` (on the new device),
 `marmot_link_device` and `marmot_decline_device_link` (on a device already signed in) and
 `marmot_device_link_snapshot` each block on the account worker and write an owned `MarmotDeviceLinkSnapshot`; free it

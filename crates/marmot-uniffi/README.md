@@ -1818,6 +1818,13 @@ which carries no device or group identities and, with device groups on, also fir
 
 ## Linking a new device
 
+After pairing reaches `Linked`, read `chat_progress` on each `DeviceLinkChanged`. Each entry identifies the new device by
+`slot_id_hex`. On the approver, `remaining` counts eligible chats that still need an Add. On the new device,
+`on_new_device` is true and `remaining` counts expected chats that have yet to join locally. Show the joining banner while
+that count is positive. Zero means complete for the reported `total`. The total can change as the approver's chats change.
+An absent entry means progress is unavailable, including before a complete report arrives, with older peers, after opt-out,
+or when the direct-add window expires. History import and chats known only to other siblings have their own lifecycles.
+
 Linking a new device of the account shows the same seven emoji on both devices, and each user confirms. Every call
 returns a `DeviceLinkSnapshotFfi`; a runtime with device groups off refuses every call with `pairing_unsupported`:
 
