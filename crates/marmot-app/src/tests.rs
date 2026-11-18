@@ -4354,19 +4354,19 @@ async fn locally_queued_send_restart_body() {
         .expect("eligible fixture members");
     drop(setup_client);
 
-    relay.block_and_fail_next_subscribe();
+    // Every activation needs this group's route. Keep it unavailable through
+    // shutdown so a background retry cannot drain the queued send.
+    relay.refuse_group_subscribes(true);
     let first_runtime = MarmotAppRuntime::new(app.clone());
     first_runtime.reconcile_accounts().await.unwrap();
-    relay.wait_for_blocked_subscribe().await;
-    let send_runtime = first_runtime.clone();
-    let send_group = group_id.clone();
-    let send = tokio::spawn(async move {
-        send_runtime
-            .send_message("alice", &send_group, b"survives restart".to_vec())
-            .await
-    });
-    relay.release_subscribe();
-    assert!(send.await.unwrap().is_ok());
+    let send = first_runtime
+        .send_message("alice", &group_id, b"survives restart".to_vec())
+        .await
+        .unwrap();
+    assert_eq!(
+        send.accept_disposition,
+        cgka_traits::SendAcceptDisposition::AcceptedPending
+    );
     first_runtime.shutdown().await;
 
     let group_id_hex = hex::encode(group_id.as_slice());
@@ -4387,6 +4387,7 @@ async fn locally_queued_send_restart_body() {
     // Fail the restarted worker's first activation too. Hydration must still
     // wake the durable queue, and its convergence timer must reactivate the
     // account without any new user command or inbound event.
+    relay.refuse_group_subscribes(false);
     relay.block_and_fail_next_subscribe();
     let restarted_runtime = MarmotAppRuntime::new(app.clone());
     restarted_runtime.reconcile_accounts().await.unwrap();
