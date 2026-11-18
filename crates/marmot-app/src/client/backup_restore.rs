@@ -88,19 +88,35 @@ pub struct BackupHistoryAvailability {
 /// This handle owns no database lease, words or archive key.
 pub struct BackupRestoreWatch {
     pub(crate) receiver: tokio::sync::watch::Receiver<BackupRestoreStatus>,
+    /// The newest status this watch was handed out at or has shown. The
+    /// published read state holds a status before the channel announces it,
+    /// so a watch handed out from it can be ahead of its channel; an
+    /// announcement of this status or an older one is no news to it.
+    pub(crate) seen: BackupRestoreStatus,
 }
 
 impl BackupRestoreWatch {
     pub fn snapshot(&self) -> BackupRestoreStatus {
-        self.receiver.borrow().clone()
+        let current = self.receiver.borrow();
+        if current.revision > self.seen.revision {
+            current.clone()
+        } else {
+            self.seen.clone()
+        }
     }
 
     pub async fn changed(&mut self) -> Result<BackupRestoreStatus, AppError> {
-        self.receiver
-            .changed()
-            .await
-            .map_err(|_| AppError::TransportClosed)?;
-        Ok(self.receiver.borrow_and_update().clone())
+        loop {
+            self.receiver
+                .changed()
+                .await
+                .map_err(|_| AppError::TransportClosed)?;
+            let status = self.receiver.borrow_and_update().clone();
+            if status.revision > self.seen.revision {
+                self.seen = status.clone();
+                return Ok(status);
+            }
+        }
     }
 }
 
@@ -482,9 +498,9 @@ impl AppClient {
     }
 
     pub(crate) fn watch_backup_restore(&self) -> BackupRestoreWatch {
-        BackupRestoreWatch {
-            receiver: self.backup_restore.updates.subscribe(),
-        }
+        let receiver = self.backup_restore.updates.subscribe();
+        let seen = receiver.borrow().clone();
+        BackupRestoreWatch { receiver, seen }
     }
 
     /// No account projection or other device's account membership proves this

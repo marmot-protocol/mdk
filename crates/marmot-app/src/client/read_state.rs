@@ -577,17 +577,14 @@ impl ReadState {
         self.account.backup_restore_status.clone()
     }
 
-    /// `WatchBackupRestore`: a receiver of the client's progress channel
-    /// that has seen the status published here. A change sent since then is
-    /// still news to it. The status is published before the watch announces
-    /// it, so the receiver this version took can be one announcement behind.
+    /// `WatchBackupRestore`: a watch of the client's progress channel that
+    /// has seen the status published here, even before the channel
+    /// announces it. A change sent since then is still news to it.
     pub(crate) fn watch_backup_restore(&self) -> BackupRestoreWatch {
-        let mut receiver = self.account.backup_restore_updates.clone();
-        let seen = receiver.borrow_and_update().revision;
-        if seen > self.account.backup_restore_status.revision {
-            receiver.mark_changed();
+        BackupRestoreWatch {
+            receiver: self.account.backup_restore_updates.clone(),
+            seen: self.account.backup_restore_status.clone(),
         }
-        BackupRestoreWatch { receiver }
     }
 }
 
@@ -2873,8 +2870,10 @@ mod tests {
         assert!(watch.receiver.has_changed().unwrap());
         assert_eq!(watch.changed().await.unwrap(), later);
 
-        // A version built before the watch announced its status took a
-        // receiver that had not seen it: that status is no news either.
+        // A version is published before the channel announces its status.
+        // A watch handed out from it in between has seen that status: it
+        // shows it, and its announcement is no news. Only a later one is.
+        use futures::FutureExt as _;
         let announced = BackupRestoreStatus {
             phase: crate::BackupRestorePhase::Cancelled,
             revision: 3,
@@ -2890,8 +2889,18 @@ mod tests {
             }),
             groups: Arc::default(),
         };
-        updates.send_replace(announced);
-        assert!(!state.watch_backup_restore().receiver.has_changed().unwrap());
+        let mut watch = state.watch_backup_restore();
+        assert_eq!(watch.snapshot(), announced);
+        updates.send_replace(announced.clone());
+        assert!(watch.changed().now_or_never().is_none());
+        assert_eq!(watch.snapshot(), announced);
+        let next = BackupRestoreStatus {
+            phase: crate::BackupRestorePhase::Discovering,
+            revision: 4,
+            ..Default::default()
+        };
+        updates.send_replace(next.clone());
+        assert_eq!(watch.changed().await.unwrap(), next);
     }
 
     /// A read whose groups come from stored rows waits for a version that
