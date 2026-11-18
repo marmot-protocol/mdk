@@ -259,3 +259,38 @@ async fn recovery_runner_never_fences_the_inbox() {
     ));
     assert!(account.fences().is_empty());
 }
+
+/// The inbox owes only through each background drain's window too (mdk#3538),
+/// and is admitted behind its furthest-behind relay. A relay that renews its
+/// window and stages a newer wrap renews the other relay's window as well, so
+/// the drain reaches the wrap's second there before it ends, rather than
+/// leaving the wrap staged until some later wake.
+// A paused clock (current-thread only) moves only when the test advances it.
+#[tokio::test(start_paused = true)]
+async fn recovery_runner_admits_an_inbox_wrap_a_renewed_window_staged() {
+    let account = account();
+    let clock = Clock::new();
+    let start = clock.now();
+    let quiet = ModelRelay::new(RELAY, caps(500, true)).build();
+    let renewed = ModelRelay::new(OTHER_RELAY, caps(500, true))
+        .with_events(vec![wrap(INBOX_KEY, start + 2)])
+        .build();
+    let host = TestHost::new(
+        &account,
+        &clock,
+        vec![required(&Route::Inbox, &[RELAY, OTHER_RELAY])],
+        &[&quiet, &renewed],
+    );
+    account.goal(&Route::Inbox, start - 100);
+    let (mut runner, _handle) = runner(&host, test_policy());
+
+    assert_eq!(ran(runner.step().await).key.relay, RELAY);
+    assert_eq!(account.covered_through(&Route::Inbox, RELAY), start);
+    clock.advance(2);
+    host.connect(OTHER_RELAY);
+    run_until_idle(&mut runner, 8).await;
+
+    assert_eq!(account.staged_events(&Route::Inbox), 0);
+    assert_eq!(account.admitted_events(), 1);
+    assert_eq!(account.covered_through(&Route::Inbox, RELAY), start + 2);
+}

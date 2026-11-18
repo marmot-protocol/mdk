@@ -1218,9 +1218,10 @@ impl<H: RunnerHost> RecoveryRunner<H> {
     }
 
     /// Other sources must be able to reach newly staged history on the
-    /// group's admission frontier, including a recheck's late findings.
+    /// admission frontier of its group (or the inbox), including a recheck's
+    /// late findings.
     fn refresh_staged_group(&mut self, candidate: &Candidate, report: &quantum::QuantumReport) {
-        if report.events_staged > 0 && candidate.group_id.is_some() {
+        if report.events_staged > 0 {
             self.windows.remove(&candidate.group_id);
         }
     }

@@ -881,8 +881,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   Every background unit without a standing tail or a retained goal end (any route, the inbox too) owes only
   through the window the drain first observed it in (`select::BackgroundWindows`, mdk#3538): its own answers
   never extend it, so slow relays cannot keep a drain from ending. The windows clear when the runner idles, on
-  a wake or hint change, and per group on newly staged history; a lost tail or relay reconnect renews that
-  unit's. Never poll a tail-less route on a timer of its own; explicit passes and repairs read through now.
+  a wake or hint change, and per group (or the inbox) on newly staged history; a lost tail or relay reconnect
+  renews that unit's. Never poll a tail-less route on a timer of its own; explicit passes and repairs read through now.
   A separate durable budget keyed by the missing epoch survives restart: partial sweep progress and same-epoch
   ticket revisions never reset it. Complete visits without actual epoch recovery back off using the existing
   unit policy and eventually park the EpochGap visibly. Explicit repair resets the budget; a higher stalled
