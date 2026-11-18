@@ -4465,13 +4465,12 @@ async fn locally_queued_send_restart_body() {
     })
     .await
     .expect("hydrated queue should publish after background reactivation");
+    restarted_runtime.shutdown().await;
     assert_eq!(
         relay.published_event_ids().len() - publishes_before_restart,
         1,
         "restart recovery must publish the logical message exactly once"
     );
-
-    restarted_runtime.shutdown().await;
 }
 
 async fn disable_native_push_removal_body() {

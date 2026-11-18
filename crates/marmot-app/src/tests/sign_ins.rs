@@ -2135,13 +2135,17 @@ async fn an_empty_read_from_before_an_acceptance_makes_no_refill() {
         }
         SlotReadEnd::Unjudged => panic!("one change leaves the read judged"),
     };
+    // An answered check that asks for no refill; a failed read proves nothing.
     let refilling = report.map(|report| report.refilling);
+    assert!(
+        matches!(refilling, Ok(false)),
+        "a stale empty read asked to replace a KeyPackage the relay serves: {refilling:?}"
+    );
     phone.run_due_maintenance().await.unwrap();
     assert_eq!(
         published_at(&phone),
         published,
-        "a stale empty read replaced a KeyPackage the relay serves \
-         (report refilling: {refilling:?})"
+        "no KeyPackage replaced the one the relay serves"
     );
 }
 
