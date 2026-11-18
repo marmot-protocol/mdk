@@ -129,6 +129,7 @@ struct AvailabilityWrite {
     failed: bool,
     observed_event_ids: HashSet<String>,
     evidence_revision: i64,
+    alternatives: Vec<FetchedKeyPackage>,
 }
 
 impl AvailabilityWrite {
@@ -144,6 +145,7 @@ impl AvailabilityWrite {
             failed: true,
             observed_event_ids: HashSet::new(),
             evidence_revision: 0,
+            alternatives: Vec::new(),
         }
     }
 }
@@ -304,9 +306,24 @@ impl DirectoryCache {
                 if !matches!(row.state.as_deref(), Some("ready" | "not_found")) {
                     continue;
                 }
-                row.replacement_evicted_at =
-                    shared.public_key_package_replacement_evicted_at(&row.account_id_hex)?;
                 let snapshot = shared.key_package_evidence_snapshot(&row.account_id_hex)?;
+                row.replacement_evicted_at = snapshot
+                    .barriers
+                    .iter()
+                    .map(|barrier| barrier.observed_at)
+                    .max()
+                    .or_else(|| {
+                        snapshot
+                            .watermark
+                            .as_ref()
+                            .map(|barrier| barrier.observed_at)
+                    })
+                    .or_else(|| {
+                        snapshot
+                            .global_eviction
+                            .as_ref()
+                            .map(|barrier| barrier.observed_at)
+                    });
                 row.global_eviction = snapshot.global_eviction;
                 row.shared_evidence_revision = Some(snapshot.revision);
                 row.barriers = snapshot.barriers;
@@ -857,7 +874,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
         let now = self.directory_freshness().now;
         let result = self.lookup_availability_inner(account_id_hex).await;
         match result {
-            Ok(value) => self.apply_shared_replacements(account_id_hex, value).await,
+            Ok(value) => self.apply_shared_candidates(account_id_hex, value).await,
             Err(error) if error_is_host_failure(&error) => Err(error),
             Err(_) => Ok(AvailabilityWrite::unknown(now)),
         }
@@ -962,12 +979,12 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
         let checked_at = self.directory_freshness().now;
         match selection {
             Ok(selection) if !selection.value.is_empty() => {
-                let fetched = selection
-                    .value
-                    .into_iter()
-                    .next()
-                    .expect("selected package");
-                self.remember_availability(fetched, checked_at).await
+                let mut candidates = selection.value.into_iter();
+                let first = candidates.next().expect("selected package");
+                let alternatives = candidates.collect();
+                let mut value = self.remember_availability(first, checked_at).await?;
+                value.alternatives = alternatives;
+                Ok(value)
             }
             Ok(selection) if complete_negative && !selection.rejected_future => {
                 let error = selection.into_value_or_missing(account_id_hex);
@@ -986,6 +1003,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                         failed: false,
                         observed_event_ids: observed_event_ids.clone(),
                         evidence_revision: 0,
+                        alternatives: Vec::new(),
                     }),
                     Err(error) => Err(error),
                     Ok(_) => unreachable!("empty selection reports a missing KeyPackage"),
@@ -1008,9 +1026,35 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                 failed: false,
                 observed_event_ids,
                 evidence_revision: 0,
+                alternatives: Vec::new(),
             }),
             Err(_) => Ok(AvailabilityWrite::unknown(checked_at)),
         }
+    }
+
+    async fn apply_shared_candidates(
+        &self,
+        account_id_hex: &str,
+        mut value: AvailabilityWrite,
+    ) -> Result<AvailabilityWrite, DirectoryError> {
+        let checked_at = value.checked_at;
+        let alternatives = std::mem::take(&mut value.alternatives);
+        let first = self
+            .apply_shared_replacements(account_id_hex, value)
+            .await?;
+        if first.state == FollowAvailabilityState::Ready || alternatives.is_empty() {
+            return Ok(first);
+        }
+        for fetched in alternatives {
+            let candidate = self.remember_availability(fetched, checked_at).await?;
+            let candidate = self
+                .apply_shared_replacements(account_id_hex, candidate)
+                .await?;
+            if candidate.state == FollowAvailabilityState::Ready {
+                return Ok(candidate);
+            }
+        }
+        Ok(first)
     }
 
     async fn apply_shared_replacements(
@@ -1018,7 +1062,6 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
         account_id_hex: &str,
         mut value: AvailabilityWrite,
     ) -> Result<AvailabilityWrite, DirectoryError> {
-        
         if value.state == FollowAvailabilityState::Unknown {
             return Ok(value);
         }
@@ -1129,6 +1172,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
             failed: false,
             observed_event_ids: HashSet::new(),
             evidence_revision: 0,
+            alternatives: Vec::new(),
         })
     }
 }
@@ -1177,7 +1221,7 @@ fn barrier_allows(
             }
             created_at > barrier.event_created_at
         }
-        PublicKeyPackageBarrierKind::ExactDeletion => false,
+        PublicKeyPackageBarrierKind::ExactDeletion => created_at > barrier.observed_at,
     }
 }
 
@@ -1254,6 +1298,7 @@ mod tests {
             failed: false,
             observed_event_ids: HashSet::new(),
             evidence_revision: 0,
+            alternatives: Vec::new(),
         }
     }
 
@@ -1383,6 +1428,7 @@ mod tests {
             observed_at: 1_000,
             kind: PublicKeyPackageBarrierKind::ExactDeletion,
         };
+        assert!(watermark_allows("bb", 1_001, 1_000, &barrier));
         assert!(!watermark_allows(
             "aa",
             100,
@@ -1440,6 +1486,7 @@ mod tests {
                         failed: false,
                         observed_event_ids: HashSet::new(),
                         evidence_revision: 0,
+                        alternatives: Vec::new(),
                     },
                 )
                 .unwrap()

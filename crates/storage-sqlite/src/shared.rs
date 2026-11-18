@@ -1059,9 +1059,16 @@ fn write_key_package_barrier(
 
 fn bump_key_package_revision(tx: &Transaction<'_>, account_id_hex: &str) -> StorageResult<()> {
     tx.execute_cached(
+        "INSERT INTO public_key_package_evidence_clock (id, revision)
+         VALUES (1, 1)
+         ON CONFLICT(id) DO UPDATE SET revision = revision + 1",
+        [],
+    )
+    .storage()?;
+    tx.execute_cached(
         "INSERT INTO public_key_package_evidence_revisions (account_id_hex, revision)
-         VALUES (?1, 1)
-         ON CONFLICT(account_id_hex) DO UPDATE SET revision = revision + 1",
+         SELECT ?1, revision FROM public_key_package_evidence_clock WHERE id = 1
+         ON CONFLICT(account_id_hex) DO UPDATE SET revision = excluded.revision",
         params![account_id_hex],
     )
     .storage()?;
@@ -2415,6 +2422,27 @@ mod tests {
                 key_package_barrier(&account, 1),
             ]
         );
+    }
+
+    #[test]
+    fn evidence_revisions_do_not_repeat_after_pruning() {
+        let storage = SqliteSharedStorage::in_memory().unwrap();
+        let account = "aa".repeat(32);
+        let mut conn = storage.lock().unwrap();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        bump_key_package_revision(&tx, &account).unwrap();
+        let first = SqliteSharedStorage::read_key_package_evidence_revision(&tx, &account).unwrap();
+        tx.execute(
+            "DELETE FROM public_key_package_evidence_revisions WHERE account_id_hex = ?1",
+            [&account],
+        )
+        .unwrap();
+        bump_key_package_revision(&tx, &account).unwrap();
+        let second =
+            SqliteSharedStorage::read_key_package_evidence_revision(&tx, &account).unwrap();
+        assert!(second > first, "{first} then {second}");
     }
 
     #[test]

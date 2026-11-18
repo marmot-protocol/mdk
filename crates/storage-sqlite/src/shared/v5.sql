@@ -48,3 +48,9 @@ CREATE TABLE public_key_package_evidence_revisions (
     account_id_hex TEXT PRIMARY KEY,
     revision INTEGER NOT NULL
 );
+
+-- Store-wide counter keeps revisions unique when per-account rows are pruned.
+CREATE TABLE public_key_package_evidence_clock (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    revision INTEGER NOT NULL
+);

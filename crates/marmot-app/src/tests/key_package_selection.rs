@@ -1571,6 +1571,88 @@ async fn availability_multi_slot() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn availability_fenced_first_slot_uses_alternative() {
+    let (_root, app, accounts, fetcher) = member_resolution_fixture(1, false).await;
+    let owner = app
+        .account_home()
+        .create_account("availability-owner")
+        .unwrap();
+    app.directory()
+        .remember_directory_follow_list_for_test(
+            &owner.account_id_hex,
+            &nostr_directory::FetchedFollowList {
+                follows: vec![accounts[0].account_id_hex.clone()],
+                source_relays: Vec::new(),
+            },
+        )
+        .unwrap();
+    let first = fetcher
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|event| event.kind == KIND_MARMOT_KEY_PACKAGE)
+        .unwrap()
+        .clone();
+    let mut second = member_resolution_key_package_event(
+        &accounts[0],
+        device_package(&app, &accounts[0], false),
+    );
+    second.tags.iter_mut().find(|tag| tag[0] == "d").unwrap()[1] = "second-slot".into();
+    let second = EventBuilder::new(
+        Kind::Custom(KIND_MARMOT_KEY_PACKAGE as u16),
+        second.content.clone(),
+    )
+    .tags(second.tags.into_iter().map(|tag| Tag::parse(tag).unwrap()))
+    .custom_created_at(NostrTimestamp::from_secs(
+        first.created_at.saturating_sub(1),
+    ))
+    .finalize(
+        &app.account_home()
+            .load_signing_keys(&accounts[0].label)
+            .unwrap(),
+    )
+    .unwrap();
+    let second = NostrTransportEvent::from_nostr_event(&second).unwrap();
+    let second_id = second.id.clone();
+    fetcher.events.lock().unwrap().push(second);
+    let now = unix_now_seconds();
+    app.shared_storage()
+        .unwrap()
+        .put_public_key_package_replacement(&storage_sqlite::PublicKeyPackageReplacementRecord {
+            account_id_hex: accounts[0].account_id_hex.clone(),
+            key_package_id: first.tag_value("d").unwrap().to_owned(),
+            event_id_hex: "ff".repeat(32),
+            event_created_at: now + 100,
+            observed_at: now,
+        })
+        .unwrap();
+
+    let status = app
+        .directory()
+        .refresh_follow_availability(&crate::directory_resources::directory_account(&owner))
+        .await
+        .unwrap();
+    assert_eq!(status.ready, 1, "{status:?}");
+    let page = app
+        .directory()
+        .follow_availability_page(
+            &crate::directory_resources::directory_account(&owner),
+            None,
+            100,
+        )
+        .unwrap();
+    assert_eq!(
+        page.rows[0].state,
+        nostr_directory::FollowAvailabilityState::Ready
+    );
+    assert_eq!(
+        page.rows[0].key_package_event_id.as_deref(),
+        Some(second_id.as_str())
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn availability_recovery_stays_bounded() {
     let (_root, app, accounts, fetcher) = member_resolution_fixture(1, false).await;
     let owner = app
