@@ -761,13 +761,17 @@ async fn availability_shared_replacement() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn availability_live_replacement_survives_pruning() {
-    let (_root, app, accounts, _fetcher) = crate::tests::member_resolution_fixture(1, false).await;
+    let (_root, mut app, accounts, _fetcher) =
+        crate::tests::member_resolution_fixture(1, false).await;
     let owner = app
         .account_home()
         .create_account("availability-owner")
         .unwrap();
     let followed = accounts[0].account_id_hex.clone();
     remember_follows(&app, &owner, vec![followed.clone()]);
+    let now = crate::unix_now_seconds();
+    let clock = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(now - 1));
+    app.directory_test_clock = Some(clock.clone());
     app.directory()
         .refresh_follow_availability(&directory_account(&owner))
         .await
@@ -786,7 +790,6 @@ async fn availability_live_replacement_survives_pruning() {
         .clone()
         .unwrap();
     let shared = app.shared_storage().unwrap();
-    let now = crate::unix_now_seconds();
     for index in 0..500_u64 {
         shared
             .put_public_key_package_replacement(
@@ -794,7 +797,7 @@ async fn availability_live_replacement_survives_pruning() {
                     account_id_hex: followed.clone(),
                     key_package_id: format!("later-{index:04}"),
                     event_id_hex: format!("{index:064x}"),
-                    event_created_at: now + index,
+                    event_created_at: now.saturating_sub(1).saturating_add(index),
                     observed_at: now + index,
                 },
             )
@@ -807,12 +810,20 @@ async fn availability_live_replacement_survives_pruning() {
         "a retained replacement barrier accepts the same live event"
     );
 
+    clock.store(now + 1, std::sync::atomic::Ordering::SeqCst);
     app.directory()
         .reset_availability_for_test(&owner.account_id_hex);
     app.directory()
         .refresh_follow_availability(&directory_account(&owner))
         .await
         .unwrap();
+    assert!(
+        shared
+            .public_key_package_barriers(&followed)
+            .unwrap()
+            .iter()
+            .any(|barrier| barrier.event_id_hex == selected)
+    );
     for index in 0..500_u64 {
         shared
             .put_public_key_package_barrier(&storage_sqlite::PublicKeyPackageBarrierRecord {
@@ -830,7 +841,13 @@ async fn availability_live_replacement_survives_pruning() {
         .public_key_package_eviction_watermark(&followed)
         .unwrap()
         .unwrap();
-    assert_eq!(watermark.event_id_hex, selected);
+    let barriers = shared.public_key_package_barriers(&followed).unwrap();
+    assert_eq!(barriers.len(), 500);
+    assert!(
+        !barriers
+            .iter()
+            .any(|barrier| barrier.event_id_hex == selected)
+    );
     assert_eq!(
         watermark.kind,
         storage_sqlite::PublicKeyPackageBarrierKind::Replacement

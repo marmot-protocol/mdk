@@ -1686,14 +1686,26 @@ async fn availability_recovery_stays_bounded() {
                 .collect();
         }
     }
-    fetcher.events.lock().unwrap().retain(|event| {
-        event.kind != KIND_MARMOT_KEY_PACKAGE || event.pubkey != accounts[0].account_id_hex
-    });
-    fetcher
-        .events_by_endpoint
+    let relay_list = fetcher
+        .events
         .lock()
         .unwrap()
-        .insert("wss://outbox-4.example".into(), vec![omitted]);
+        .iter()
+        .find(|event| event.kind == transport_nostr_adapter::KIND_NIP65_RELAY_LIST)
+        .unwrap()
+        .clone();
+    fetcher.events.lock().unwrap().retain(|event| {
+        event.kind != KIND_MARMOT_KEY_PACKAGE
+            && event.kind != transport_nostr_adapter::KIND_NIP65_RELAY_LIST
+    });
+    {
+        let mut by_endpoint = fetcher.events_by_endpoint.lock().unwrap();
+        by_endpoint.insert("wss://directory.example".into(), vec![relay_list]);
+        for index in 0..4 {
+            by_endpoint.insert(format!("wss://outbox-{index}.example"), Vec::new());
+        }
+        by_endpoint.insert("wss://outbox-4.example".into(), vec![omitted]);
+    }
 
     let status = app
         .directory()

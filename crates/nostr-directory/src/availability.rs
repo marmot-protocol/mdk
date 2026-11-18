@@ -916,7 +916,6 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
         if source_relays.is_empty() {
             source_relays = discovery_relays.clone();
         }
-        source_relays.truncate(MAX_FOLLOW_AVAILABILITY_RELAYS_PER_TARGET);
         let coverage_truncated =
             used_safe_nip65 && source_relays.len() > MAX_FOLLOW_AVAILABILITY_RELAYS_PER_TARGET;
         source_relays.truncate(MAX_FOLLOW_AVAILABILITY_RELAYS_PER_TARGET);
@@ -1244,6 +1243,7 @@ fn watermark_allows(
     if barrier
         .observed_at
         .saturating_add(KEY_PACKAGE_FRESHNESS.as_secs())
+        .saturating_add(future_skew_secs)
         <= now
     {
         return true;
@@ -1446,14 +1446,14 @@ mod tests {
         assert!(!watermark_allows(
             "aa",
             100,
-            1_000 + KEY_PACKAGE_FRESHNESS.as_secs() - 1,
+            1_000 + KEY_PACKAGE_FRESHNESS.as_secs() + 299,
             300,
             &barrier,
         ));
         assert!(watermark_allows(
             "aa",
             100,
-            1_000 + KEY_PACKAGE_FRESHNESS.as_secs(),
+            1_000 + KEY_PACKAGE_FRESHNESS.as_secs() + 300,
             300,
             &barrier,
         ));
