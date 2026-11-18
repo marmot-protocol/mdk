@@ -30,8 +30,15 @@ use super::records::{
 use super::resources::DirectoryResources;
 use super::{Directory, DirectoryCache};
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DeletionEvidenceScope {
+    KeyPackageQuery,
+    ScopedTarget,
+}
+
 fn deletion_barriers(
     record: &RelayEventRecord,
+    evidence_scope: DeletionEvidenceScope,
 ) -> Vec<storage_sqlite::PublicKeyPackageBarrierRecord> {
     let account_id_hex = record.event.pubkey.clone();
     let targets_key_packages = record.event.tags.iter().any(|tag| {
@@ -39,7 +46,7 @@ fn deletion_barriers(
             && tag.get(1).and_then(|value| value.parse::<u64>().ok())
                 == Some(KIND_MARMOT_KEY_PACKAGE)
     });
-    if !targets_key_packages {
+    if evidence_scope == DeletionEvidenceScope::KeyPackageQuery && !targets_key_packages {
         return Vec::new();
     }
     record
@@ -91,6 +98,33 @@ impl<R: DirectoryResources> Directory<R> {
         account_id_hex: &str,
         records: &[RelayEventRecord],
     ) -> Result<(), DirectoryError> {
+        self.journal_key_package_records_with_scope(
+            account_id_hex,
+            records,
+            DeletionEvidenceScope::KeyPackageQuery,
+        )
+        .await
+    }
+
+    pub(super) async fn journal_scoped_deletion_records(
+        &self,
+        account_id_hex: &str,
+        records: &[RelayEventRecord],
+    ) -> Result<(), DirectoryError> {
+        self.journal_key_package_records_with_scope(
+            account_id_hex,
+            records,
+            DeletionEvidenceScope::ScopedTarget,
+        )
+        .await
+    }
+
+    async fn journal_key_package_records_with_scope(
+        &self,
+        account_id_hex: &str,
+        records: &[RelayEventRecord],
+        evidence_scope: DeletionEvidenceScope,
+    ) -> Result<(), DirectoryError> {
         let freshness = self.directory_freshness();
         let replacements = records
             .iter()
@@ -116,7 +150,7 @@ impl<R: DirectoryResources> Directory<R> {
                     && freshness.accepts(record)
                     && record.event.to_verified_nostr_event().is_ok()
             })
-            .flat_map(deletion_barriers)
+            .flat_map(|record| deletion_barriers(record, evidence_scope))
             .map(|mut barrier| {
                 barrier.observed_at = freshness.now;
                 barrier
@@ -444,7 +478,9 @@ impl<R: DirectoryResources> Directory<R> {
             }
             5 => {
                 let observed_at = self.directory_freshness().now;
-                for mut barrier in deletion_barriers(&record) {
+                for mut barrier in
+                    deletion_barriers(&record, DeletionEvidenceScope::KeyPackageQuery)
+                {
                     barrier.observed_at = observed_at;
                     self.resources
                         .shared_storage()?
@@ -678,6 +714,6 @@ mod deletion_barrier_tests {
             ),
         };
 
-        assert!(deletion_barriers(&record).is_empty());
+        assert!(deletion_barriers(&record, DeletionEvidenceScope::KeyPackageQuery).is_empty());
     }
 }

@@ -246,7 +246,7 @@ impl<R: DirectoryResources> Directory<R> {
         // Scoped discoveries are not included in the returned package records.
         // Persist even incomplete reads before selection or a later error can
         // discard their positive deletion evidence.
-        self.journal_key_package_records(account, &outcome.records)
+        self.journal_scoped_deletion_records(account, &outcome.records)
             .await?;
         deletions.extend(outcome.records);
         Ok(outcome.complete)
