@@ -6,7 +6,7 @@ use std::ffi::c_char;
 use marmot_uniffi::conversions::{
     DeviceGroupMoveSiblingFfi, DeviceGroupMoveStateFfi, DeviceGroupMoveViewFfi, DeviceLinkEmojiFfi,
     DeviceLinkEndReasonFfi, DeviceLinkPromptFfi, DeviceLinkPromptStateFfi, DeviceLinkSnapshotFfi,
-    NewDeviceLinkStateFfi,
+    LinkChatProgressFfi, NewDeviceLinkStateFfi,
 };
 
 use crate::macros::{c_enum, c_mirror};
@@ -243,6 +243,17 @@ c_mirror! {
 }
 
 c_mirror! {
+    /// Progress for one approved link. On the new device, remaining counts
+    /// expected chats still to join. On its approver it counts missing Adds.
+    MarmotLinkChatProgress from LinkChatProgressFfi {
+        str slot_id_hex,
+        copy on_new_device: bool,
+        copy total: u32,
+        copy remaining: u32,
+    }
+}
+
+c_mirror! {
     /// Linking as this device shows it. `new_device` is NULL unless this
     /// device asked to be linked; `prompts` lists the sign-ins it can link.
     /// `device_group_stalled` says this device can no longer catch up with
@@ -254,6 +265,7 @@ c_mirror! {
         vec prompts/prompts_len: MarmotDeviceLinkPrompt,
         vec moves/moves_len: MarmotDeviceGroupMoveView,
         copy device_group_stalled: bool,
+        vec chat_progress/chat_progress_len: MarmotLinkChatProgress,
     }
 }
 
@@ -301,6 +313,7 @@ mod tests {
                 prompts: Vec::new(),
                 moves: Vec::new(),
                 device_group_stalled: false,
+                chat_progress: Vec::new(),
             }));
             unsafe {
                 assert!(!(*snapshot).new_device.is_null());
@@ -368,6 +381,12 @@ mod tests {
                 overridden_rejection_slots: vec!["cd".repeat(32)],
             }],
             device_group_stalled: true,
+            chat_progress: vec![LinkChatProgressFfi {
+                slot_id_hex: "aa".repeat(32),
+                on_new_device: true,
+                total: 42,
+                remaining: 1,
+            }],
         }));
         unsafe {
             assert!((*snapshot).new_device.is_null());

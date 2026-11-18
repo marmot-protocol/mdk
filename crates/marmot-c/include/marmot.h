@@ -3815,6 +3815,17 @@ typedef struct MarmotDeviceGroupMoveView {
 } MarmotDeviceGroupMoveView;
 
 /**
+ * Progress for one approved link. On the new device, remaining counts
+ * expected chats still to join. On its approver it counts missing Adds.
+ */
+typedef struct MarmotLinkChatProgress {
+  char *slot_id_hex;
+  bool on_new_device;
+  uint32_t total;
+  uint32_t remaining;
+} MarmotLinkChatProgress;
+
+/**
  * Linking as this device shows it. `new_device` is NULL unless this
  * device asked to be linked; `prompts` lists the sign-ins it can link.
  * `device_group_stalled` says this device can no longer catch up with
@@ -3828,6 +3839,8 @@ typedef struct MarmotDeviceLinkSnapshot {
   struct MarmotDeviceGroupMoveView *moves;
   uintptr_t moves_len;
   bool device_group_stalled;
+  struct MarmotLinkChatProgress *chat_progress;
+  uintptr_t chat_progress_len;
 } MarmotDeviceLinkSnapshot;
 
 /**

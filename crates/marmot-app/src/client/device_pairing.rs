@@ -190,6 +190,17 @@ pub struct DeviceGroupMoveView {
     pub overridden_rejection_slots: Vec<String>,
 }
 
+/// Progress of one approved link. On the new device, remaining counts
+/// expected chats it has yet to join. On its approver it counts missing Adds.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct LinkChatProgress {
+    /// The newly linked device's slot, including on that device itself.
+    pub slot_id_hex: String,
+    pub on_new_device: bool,
+    pub total: u32,
+    pub remaining: u32,
+}
+
 /// Linking as this device shows it: its own new-device session, if any, and
 /// the prompts for sign-ins it can link.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -204,6 +215,8 @@ pub struct DeviceLinkSnapshot {
     /// heard from it. Offer [`DeviceLinkOp::ResetForRepair`] followed by
     /// fresh pairing.
     pub device_group_stalled: bool,
+    /// Current, approver-scoped inventories. An absent entry means unavailable.
+    pub chat_progress: Vec<LinkChatProgress>,
 }
 
 impl DeviceLinkSnapshot {

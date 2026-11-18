@@ -3,7 +3,7 @@
 use marmot_app::{
     DeviceGroupMoveSibling, DeviceGroupMoveState, DeviceGroupMoveView, DeviceLinkEmoji,
     DeviceLinkEndReason, DeviceLinkPrompt, DeviceLinkPromptState, DeviceLinkSnapshot,
-    NewDeviceLinkState,
+    LinkChatProgress, NewDeviceLinkState,
 };
 
 /// One emoji of the code.
@@ -255,6 +255,27 @@ impl From<DeviceGroupMoveView> for DeviceGroupMoveViewFfi {
     }
 }
 
+/// Eligible chats on the approving device. On the new device, remaining counts
+/// chats still to join. On the approver it counts Adds still owed.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct LinkChatProgressFfi {
+    pub slot_id_hex: String,
+    pub on_new_device: bool,
+    pub total: u32,
+    pub remaining: u32,
+}
+
+impl From<LinkChatProgress> for LinkChatProgressFfi {
+    fn from(value: LinkChatProgress) -> Self {
+        Self {
+            slot_id_hex: value.slot_id_hex,
+            on_new_device: value.on_new_device,
+            total: value.total,
+            remaining: value.remaining,
+        }
+    }
+}
+
 /// Linking as this device shows it: its own new-device link, if any, and
 /// the prompts for sign-ins it can link.
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
@@ -266,6 +287,8 @@ pub struct DeviceLinkSnapshotFfi {
     /// `reset_device_group_for_repair` followed by fresh pairing.
     #[uniffi(default = false)]
     pub device_group_stalled: bool,
+    #[uniffi(default = [])]
+    pub chat_progress: Vec<LinkChatProgressFfi>,
 }
 
 impl From<DeviceLinkSnapshot> for DeviceLinkSnapshotFfi {
@@ -275,6 +298,7 @@ impl From<DeviceLinkSnapshot> for DeviceLinkSnapshotFfi {
             prompts: value.prompts.into_iter().map(Into::into).collect(),
             moves: value.moves.into_iter().map(Into::into).collect(),
             device_group_stalled: value.device_group_stalled,
+            chat_progress: value.chat_progress.into_iter().map(Into::into).collect(),
         }
     }
 }

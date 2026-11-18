@@ -731,6 +731,9 @@ their own distinct slots. `devices link cancel` cancels on the new device. Appro
 adding to existing chats and bringing history; `--no-add-to-all-chats` and `--no-bring-history` opt out individually.
 No command creates or authenticates a device by its account key alone.
 
+The link status JSON includes `chat_progress` for each recent approved link. On the new device, `remaining` counts chats
+still joining. On its approver, it counts Adds still owed. An empty list means progress is unavailable.
+
 Running the same `devices link start` flow on an already linked device moves only that device to the destination's
 device group. `link status` adds `moves[]`: Joining still trusts the old group; Made is the trust switch after the new
 device's first selected change. Old siblings remain local recognition hints, not automatic links. A known failed link

@@ -323,6 +323,19 @@ async fn a_first_link_creates_the_device_group_with_the_chosen_label_and_setting
     laptop.step(&relay).await;
     let joins = laptop.app.account_storage("alice").unwrap().app_storage();
     assert!(joins.device_group_joins().unwrap().is_empty());
+    // No message from an older or offline approver and an authenticated
+    // report of zero eligible chats are different answers.
+    assert!(laptop.op(DeviceLinkOp::Read).await.chat_progress.is_empty());
+    boxed(|| phone.client.run_due_maintenance()).await.unwrap();
+    assert_eq!(
+        laptop.step(&relay).await.chat_progress,
+        vec![crate::LinkChatProgress {
+            slot_id_hex: laptop.slot_hex(),
+            on_new_device: true,
+            total: 0,
+            remaining: 0,
+        }]
+    );
 }
 
 /// A real made link can disappear from the approver's selected roster. Its

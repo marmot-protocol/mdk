@@ -43,6 +43,7 @@ use marmot_session::{
 
 use super::device_slot;
 use crate::client::AppClient;
+use crate::client::link_chat_progress::KIND_LINK_CHAT_INVENTORY;
 use crate::client::private_key_packages::SiblingWelcomeAdmission;
 use crate::client::sibling_chat_gaps::KIND_GAP_FILL_CLAIM;
 use crate::history_delivery::KIND_HISTORY_DELIVERY;
@@ -63,6 +64,7 @@ pub(crate) fn is_device_group_kind(kind: u64) -> bool {
     matches!(
         kind,
         KIND_DEVICE_HEARTBEAT
+            | KIND_LINK_CHAT_INVENTORY
             | KIND_GAP_FILL_CLAIM
             | KIND_PRIVATE_KEY_PACKAGE_REQUEST
             | KIND_PRIVATE_KEY_PACKAGE_HAND_OFF
@@ -159,6 +161,15 @@ impl AppClient {
             ..
         } = event
         {
+            // The page and its carrier are recorded atomically. Retry a failed
+            // invalidation before the projection acknowledges the withdrawal.
+            self.app
+                .account_storage(&self.state.label)?
+                .app_storage()
+                .withdraw_link_chat_page(
+                    &hex::encode(group_id.as_slice()),
+                    message_id.as_slice(),
+                )?;
             self.device_group_message_withdrawn(group_id, message_id);
             return Ok(());
         }
@@ -178,6 +189,16 @@ impl AppClient {
         };
         let sender = (*epoch, *sender_leaf_index);
         let result = match message.kind {
+            KIND_LINK_CHAT_INVENTORY => {
+                if !message.tags.is_empty() {
+                    return Ok(());
+                }
+                match self.receive_link_chat_page(group_id, message_id, sender, &message.content) {
+                    Err(error @ AppError::DeviceGroupRefused(_)) => Err(error),
+                    Err(error) => return Err(error),
+                    result => result,
+                }
+            }
             KIND_DEVICE_HEARTBEAT => {
                 self.receive_device_heartbeat(group_id, sender, message.created_at)
             }

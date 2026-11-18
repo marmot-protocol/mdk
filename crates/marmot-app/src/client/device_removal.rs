@@ -650,24 +650,40 @@ impl AppClient {
     /// quarantined. Chats not hydrated yet are left to a later pass rather
     /// than hydrated here, ahead of the background order.
     pub(super) fn sibling_commit_chats(&self) -> Vec<GroupId> {
+        self.sibling_commit_chat_scan().0
+    }
+
+    /// A partial scan can drive individual Adds, but cannot declare how many
+    /// chats a newly linked device should expect.
+    pub(super) fn sibling_commit_chat_scan(&self) -> (Vec<GroupId>, bool) {
         let unhydrated = self
             .runtime
             .unhydrated_group_ids()
             .into_iter()
             .collect::<HashSet<_>>();
-        self.state
-            .groups
-            .iter()
-            .filter_map(|group| hex::decode(&group.group_id_hex).ok().map(GroupId::new))
-            .filter(|group_id| {
-                !unhydrated.contains(group_id)
-                    // Fails closed: a group whose kind cannot be read is
-                    // left alone.
-                    && self.is_device_group(group_id).ok() == Some(false)
-                    && !super::group_is_terminal(&self.runtime, group_id)
-                    && !super::group_is_quarantined(&self.runtime, group_id)
-            })
-            .collect()
+        let mut complete = true;
+        let mut chats = Vec::new();
+        for record in &self.state.groups {
+            let Ok(bytes) = hex::decode(&record.group_id_hex) else {
+                complete = false;
+                continue;
+            };
+            let chat = GroupId::new(bytes);
+            if unhydrated.contains(&chat) || super::group_is_quarantined(&self.runtime, &chat) {
+                complete = false;
+                continue;
+            }
+            match self.is_device_group(&chat) {
+                Ok(true) => {}
+                Ok(false) => match self.runtime.group_record(&chat) {
+                    Ok(group) if !group.is_terminal() => chats.push(chat),
+                    Ok(_) => {}
+                    Err(_) => complete = false,
+                },
+                Err(_) => complete = false,
+            }
+        }
+        (chats, complete)
     }
 
     /// The signature keys of this account's leaves in `chat_id` whose device

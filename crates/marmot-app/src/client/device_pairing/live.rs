@@ -2182,6 +2182,7 @@ impl AppClient {
             prompts,
             moves: self.device_group_move_views()?,
             device_group_stalled: self.device_group_stalled()?,
+            chat_progress: self.link_chat_progress_views(now)?,
         })
     }
 }

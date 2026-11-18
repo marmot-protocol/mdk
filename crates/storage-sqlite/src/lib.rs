@@ -122,6 +122,7 @@ pub use app::history_deliveries::{
     HISTORY_DELIVERY_RETENTION_SECS, OwedHistoryDelivery, ParkedBundle, ParkedHistoryChat,
     ParkedHistoryDelivery,
 };
+pub use app::link_chat_progress::{LinkChatPage, LinkChatReport, ReceivedLinkChatReport};
 pub use app::message_drafts::{
     ChatListDraftVersion, MessageDraftAttachmentFileMeta, MessageDraftAttachmentRead,
     MessageDraftAttachmentStage, MessageDraftRevision, MessageDraftRevisionError,
