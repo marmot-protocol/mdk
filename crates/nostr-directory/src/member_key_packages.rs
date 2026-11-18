@@ -17,7 +17,7 @@ use cgka_engine::key_package::key_package_metadata;
 use cgka_traits::TransportEndpoint;
 use cgka_traits::engine::KeyPackage;
 use cgka_traits::group::ProtocolProfile;
-use futures::{Stream, StreamExt, stream};
+use futures::{Stream, StreamExt, future, stream};
 use nostr_sdk::prelude::PublicKey;
 use transport_nostr_adapter::{KIND_MARMOT_INBOX_RELAY_LIST, KIND_NIP65_RELAY_LIST};
 
@@ -89,10 +89,10 @@ mod tests {
         assert!(!cache.order.contains(&newest));
     }
 
-    /// A read queued behind one that answers at the cut-off never starts:
-    /// the cut-off wins over the answer, and a passed cut-off polls nothing.
+    /// A read queued behind one that answers at the cut-off never starts,
+    /// however the stream is polled once the cut-off has passed.
     #[tokio::test(start_paused = true)]
-    async fn a_passed_cut_off_starts_no_queued_read() {
+    async fn no_read_starts_after_its_cut_off() {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -100,15 +100,15 @@ mod tests {
         let started = Arc::new(AtomicUsize::new(0));
         let reads = (0..2).map(|_| {
             let started = Arc::clone(&started);
-            async move {
+            started_before(Some(cut_off), async move {
                 started.fetch_add(1, Ordering::SeqCst);
                 tokio::time::sleep_until(cut_off).await;
-            }
+            })
         });
         let mut reads = stream::iter(reads).buffer_unordered(1);
 
-        assert!(next_before(&mut reads, Some(cut_off)).await.is_none());
-        assert!(next_before(&mut reads, Some(cut_off)).await.is_none());
+        assert_eq!(reads.next().await, Some(Some(())));
+        assert_eq!(reads.next().await, Some(None));
         assert_eq!(started.load(Ordering::SeqCst), 1);
     }
 
@@ -319,22 +319,33 @@ impl PartialCutOffs {
     }
 }
 
-/// The stream's next item, or `None` once it ends or `cut_off` passes. The
-/// cut-off wins: once it has passed the stream is not polled again, because
-/// polling a buffered stream starts its queued reads, and a read started
-/// then would run on unawaited beside the steps after it.
+/// The stream's next item, or `None` once it ends or `cut_off` passes. An
+/// item already waiting at the cut-off is still taken: its read had started
+/// before the cut-off, and no read starts after it ([`started_before`]).
 async fn next_before<S: Stream + Unpin>(
     stream: &mut S,
     cut_off: Option<tokio::time::Instant>,
 ) -> Option<S::Item> {
     match cut_off {
-        Some(cut_off) => tokio::select! {
-            biased;
-            () = tokio::time::sleep_until(cut_off) => None,
-            item = stream.next() => item,
-        },
+        Some(cut_off) => tokio::time::timeout_at(cut_off, stream.next())
+            .await
+            .ok()
+            .flatten(),
         None => stream.next().await,
     }
+}
+
+/// `read`'s result, or `None` without starting it once `cut_off` has passed.
+/// Every read of a step with a cut-off goes through this, so a read queued in
+/// a buffered stream never starts late, however late the stream is polled.
+async fn started_before<T>(
+    cut_off: Option<tokio::time::Instant>,
+    read: impl Future<Output = T>,
+) -> Option<T> {
+    if cut_off.is_some_and(|cut_off| tokio::time::Instant::now() >= cut_off) {
+        return None;
+    }
+    Some(read.await)
 }
 
 pub struct ResolvedMemberKeyPackages {
@@ -872,12 +883,13 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
             })
             .collect::<Vec<_>>();
         let directory = self.clone();
-        // One stream of member results per batch, so a member's result is
-        // seen when it arrives rather than when its whole batch finishes.
+        // One item per reply: a batch that answered, or one member's
+        // single-author retry. A read that would start after the cut-off does
+        // not start, and its members are left uncleared.
         let work = specs.into_iter().map(move |(endpoints, members)| {
             let directory = directory.clone();
             Box::pin(
-                stream::once(async move {
+                stream::once(started_before(cut_off, async move {
                     let authors = members.iter().map(|(_, id)| id.clone()).collect::<Vec<_>>();
                     let queries = [KIND_NIP65_RELAY_LIST, KIND_MARMOT_INBOX_RELAY_LIST]
                         .into_iter()
@@ -895,20 +907,19 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                         .await
                         .map_err(DirectoryError::RelayDirectory);
                     (directory, endpoints, members, outcome)
-                })
-                .flat_map(|(directory, endpoints, members, outcome)| {
+                }))
+                .filter_map(future::ready)
+                .flat_map(move |(directory, endpoints, members, outcome)| {
                     let outcome = match outcome {
                         Ok(outcome) => outcome,
                         Err(error) => return stream::iter(vec![Err(error)]).left_stream(),
                     };
                     if members.len() == 1 || outcome.complete {
-                        return stream::iter(
-                            members
-                                .into_iter()
-                                .map(|(index, _)| Ok((index, endpoints.clone(), outcome.clone())))
-                                .collect::<Vec<_>>(),
-                        )
-                        .left_stream();
+                        let reply = members
+                            .into_iter()
+                            .map(|(index, _)| (index, endpoints.clone(), outcome.clone()))
+                            .collect::<Vec<_>>();
+                        return stream::iter(vec![Ok(reply)]).left_stream();
                     }
                     // CLOSED and other incomplete outcomes need the same
                     // fallback as a rejected batch. Retain positive records
@@ -922,7 +933,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                             .filter(|record| record.event.pubkey == account_id)
                             .cloned()
                             .collect::<Vec<_>>();
-                        async move {
+                        started_before(cut_off, async move {
                             let queries = [KIND_NIP65_RELAY_LIST, KIND_MARMOT_INBOX_RELAY_LIST]
                                 .into_iter()
                                 .map(|kind| {
@@ -939,7 +950,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                                 .await
                                 .map_err(DirectoryError::RelayDirectory)?;
                             records.extend(retry.records);
-                            Ok::<_, DirectoryError>((
+                            Ok::<_, DirectoryError>(vec![(
                                 index,
                                 endpoints,
                                 DirectoryFetchOutcome {
@@ -947,10 +958,11 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                                     complete: retry.complete,
                                     complete_endpoints: retry.complete_endpoints,
                                 },
-                            ))
-                        }
+                            )])
+                        })
                     }))
                     .buffer_unordered(MEMBER_RESOLUTION_FALLBACK_CONCURRENCY)
+                    .filter_map(future::ready)
                     .right_stream()
                 }),
             )
@@ -959,8 +971,8 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
         // Keep each reply as it arrives, and judge them all when the hop ends,
         // as Atomic always has: a relay list's freshness is read then.
         let mut received = Vec::new();
-        while let Some(result) = next_before(&mut results, cut_off).await {
-            received.push(result?);
+        while let Some(reply) = next_before(&mut results, cut_off).await {
+            received.extend(reply?);
         }
         drop(results);
         let mut progress = HopProgress::default();
@@ -1202,7 +1214,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
             .into_iter()
             .map(move |(indices, endpoints, queries)| {
                 let directory = directory.clone();
-                async move {
+                started_before(batch_cut_off, async move {
                     let result = directory
                         .relay_plane
                         .fetch_directory_events_with_completion(endpoints, queries)
@@ -1210,14 +1222,16 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                         .map(|outcome| outcome.records)
                         .map_err(DirectoryError::RelayDirectory);
                     (indices, result)
-                }
+                })
             });
         // Record each outcome as it arrives: when the shared deadline cancels
-        // this stage, members already decided keep their outcome.
-        let mut batches =
-            stream::iter(requests).buffer_unordered(MEMBER_RESOLUTION_RELAY_CONCURRENCY);
+        // this stage, members already decided keep their outcome. A batch
+        // that would start after the cut-off does not start.
+        let mut batches = stream::iter(requests)
+            .buffer_unordered(MEMBER_RESOLUTION_RELAY_CONCURRENCY)
+            .filter_map(future::ready);
 
-        let mut fallback = Vec::new();
+        // Members whose batch read could not decide them, with what it saw.
         let mut fallback_records = BTreeMap::new();
         while let Some((indices, result)) = next_before(&mut batches, batch_cut_off).await {
             let records = result?;
@@ -1266,7 +1280,6 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                     // too, and recovery reports it incomplete. Keep observed slot replacements
                     // when combining the refetch.
                     _ => {
-                        fallback.push(index);
                         fallback_records.insert(index, account_records);
                     }
                 }
@@ -1285,11 +1298,9 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
             }
         }
 
-        fallback.sort_unstable();
-        fallback.dedup();
-        let fallback_specs = fallback
+        let fallback_specs = fallback_records
             .into_iter()
-            .filter_map(|index| {
+            .filter_map(|(index, observed_records)| {
                 let target = targets[index].clone();
                 let mut endpoints = self.relay_plane.retain_safe_discovered_endpoints(
                     target
@@ -1305,12 +1316,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                 if endpoints.is_empty() {
                     endpoints.clone_from(&defaults);
                 }
-                (!endpoints.is_empty()).then_some((
-                    index,
-                    target,
-                    endpoints,
-                    fallback_records.remove(&index).unwrap_or_default(),
-                ))
+                (!endpoints.is_empty()).then_some((index, target, endpoints, observed_records))
             })
             .collect::<Vec<_>>();
         let directory = self.clone();
