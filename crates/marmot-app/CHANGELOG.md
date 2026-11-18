@@ -4,6 +4,8 @@
 
 ### Breaking changes
 
+- DeviceLinkSnapshot gains `chat_progress`. It reports remaining eligible Adds on the approver and remaining local joins on the new device (#3532). Update Rust struct literals.
+
 - Every build includes multi-device (mdk#2628). The `dev-device-groups` and `unreleased-device-pairing` Cargo
   features are gone: `marmot-pairing` is always linked and the engine may always advertise the device roster.
   `MarmotAppConfig::dev_device_groups` / `with_dev_device_groups` are renamed `device_groups` / `with_device_groups`

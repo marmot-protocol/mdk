@@ -669,7 +669,10 @@ impl AppClient {
                 continue;
             };
             let chat = GroupId::new(bytes);
-            if unhydrated.contains(&chat) || super::group_is_quarantined(&self.runtime, &chat) {
+            if super::group_is_quarantined(&self.runtime, &chat) {
+                continue;
+            }
+            if unhydrated.contains(&chat) {
                 complete = false;
                 continue;
             }
@@ -678,7 +681,11 @@ impl AppClient {
                 Ok(false) => match self.runtime.group_record(&chat) {
                     Ok(group) if !group.is_terminal() => chats.push(chat),
                     Ok(_) => {}
-                    Err(_) => complete = false,
+                    Err(_) => {
+                        // Preserve the candidate for existing removal and gap-fill callers.
+                        complete = false;
+                        chats.push(chat);
+                    }
                 },
                 Err(_) => complete = false,
             }

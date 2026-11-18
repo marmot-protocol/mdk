@@ -11,6 +11,8 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Changed
 
+- Device-link status shows remaining chats on each device and includes per-link counts in the JSON `chat_progress` field (#3532).
+
 - Every `wn`/`wnd` build includes multi-device (mdk#2628), on by default; `--features dev-device-groups` is gone.
   `wn devices` linking, the device roster and admin step-down on Leave work in the CLI and TUI without setup, so
   `groups management` reports `requires_self_demote_before_leave` false for a nonlast admin. Export

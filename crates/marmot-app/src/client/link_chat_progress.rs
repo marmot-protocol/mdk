@@ -2,7 +2,9 @@
 //! advisory: it cannot cause a join, spend a KeyPackage, or import history.
 use std::collections::HashMap;
 
-use cgka_traits::app_components::{DeviceEntryV1, DeviceSlotId, DeviceStatusV1};
+use cgka_traits::app_components::{
+    DeviceEntryV1, DeviceSlotId, DeviceStatusV1, encode_component_vectors,
+};
 use cgka_traits::{EpochId, GroupId, MessageId};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -36,8 +38,7 @@ struct InventoryPage {
 fn chat_token(link: &[u8], chat: &[u8]) -> [u8; 32] {
     let mut digest = Sha256::new();
     digest.update(b"marmot.link-chat-inventory.v1");
-    digest.update(link);
-    digest.update(chat);
+    digest.update(encode_component_vectors(&[link, chat]));
     digest.finalize().into()
 }
 
@@ -61,6 +62,7 @@ struct Publication {
     revision: u32,
     next_page: usize,
     due: u64,
+    repeat_after: u64,
 }
 
 fn participating(entry: &DeviceEntryV1) -> bool {
@@ -124,10 +126,12 @@ impl AppClient {
                 revision,
                 next_page: 0,
                 due: 0,
+                repeat_after: RESEND_SECS,
             });
             if restart {
                 cursor.next_page = 0;
                 cursor.due = 0;
+                cursor.repeat_after = RESEND_SECS;
             }
             cursor.report = report;
             cursor.revision = revision;
@@ -169,12 +173,24 @@ impl AppClient {
         {
             cursor.next_page = (page + 1) % pages;
             cursor.due = if cursor.next_page == 0 {
-                now.saturating_add(RESEND_SECS)
+                let due = now.saturating_add(cursor.repeat_after);
+                cursor.repeat_after = (cursor.repeat_after * 4).min(24 * RESEND_SECS);
+                due
             } else {
                 now
             };
         }
         Ok(())
+    }
+
+    pub(super) fn repeat_withdrawn_link_chat_reports(&mut self, group: &GroupId) {
+        for ((id, _), publication) in &mut self.link_chat_progress.links {
+            if id == group {
+                publication.next_page = 0;
+                publication.due = 0;
+                publication.repeat_after = RESEND_SECS;
+            }
+        }
     }
 
     pub(super) fn receive_link_chat_page(
@@ -213,7 +229,7 @@ impl AppClient {
         } else {
             (total - page.page as usize * PAGE_SIZE).min(PAGE_SIZE)
         };
-        if page.chats.len() != count * 64 {
+        if page.chats.len() != count * 64 || page.chats.bytes().any(|b| b.is_ascii_uppercase()) {
             return Ok(());
         }
         let Some(exchange) = self.device_group_exchange()? else {
@@ -363,5 +379,20 @@ impl AppClient {
             total,
             remaining: total.saturating_sub(joined as u32),
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::chat_token;
+
+    #[test]
+    fn chat_token_matches_the_device_group_wire_vector() {
+        let link: Vec<u8> = (0..32).collect();
+        let group: Vec<u8> = (0..64).collect();
+        assert_eq!(
+            hex::encode(chat_token(&link, &group)),
+            "40851b595a738955daa54e7b6bf77c5b9314d4a62af3559982f4c06192cea75b"
+        );
     }
 }

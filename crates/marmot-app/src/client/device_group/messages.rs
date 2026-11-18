@@ -194,8 +194,9 @@ impl AppClient {
                     return Ok(());
                 }
                 match self.receive_link_chat_page(group_id, message_id, sender, &message.content) {
-                    Err(error @ AppError::DeviceGroupRefused(_)) => Err(error),
-                    Err(error) => return Err(error),
+                    Err(error) if !matches!(error, AppError::DeviceGroupRefused(_)) => {
+                        return Err(error);
+                    }
                     result => result,
                 }
             }
@@ -359,7 +360,7 @@ impl AppClient {
             .map_err(|error| AppError::InvalidAppMessagePayload(error.to_string()))?;
         // Recorded before the send: the message it becomes is filled in from
         // the effects of whichever drain publishes it.
-        if withdrawal_handled(kind) {
+        if withdrawal_handled(kind) || kind == KIND_LINK_CHAT_INVENTORY {
             self.record_device_group_message(group_id, &event.id, None, kind)?;
         }
         let effects = self
@@ -406,6 +407,10 @@ impl AppClient {
             .and_then(|kind| match kind {
                 Some(kind @ (KIND_SMALL_STATE_UPDATE | KIND_SMALL_STATE_BROADCAST_REQUEST)) => {
                     self.small_state_message_withdrawn(group_id, kind)
+                }
+                Some(KIND_LINK_CHAT_INVENTORY) => {
+                    self.repeat_withdrawn_link_chat_reports(group_id);
+                    Ok(())
                 }
                 Some(KIND_HISTORY_DELIVERY) => {
                     self.history_delivery_withdrawn(group_id, message_id)

@@ -2385,6 +2385,14 @@ async fn recovering_a_quarantined_chat_wakes_gap_filling() {
     let mut phone = reopen(phone).await;
     assert_eq!(phone.client.quarantined_groups().len(), 1);
     assert_eq!(taken_from(&phone, &laptop), 0);
+    phone
+        .client
+        .add_linked_devices_to_chats(&[], &mut Default::default())
+        .await;
+    let progress = laptop.step(&relay).await.chat_progress;
+    assert_eq!(progress.len(), 1);
+    assert_eq!((progress[0].total, progress[0].remaining), (0, 0));
+
     let pin = phone.client.runtime.epoch_pin(&group).unwrap();
     phone
         .client
@@ -2403,6 +2411,14 @@ async fn recovering_a_quarantined_chat_wakes_gap_filling() {
         .await;
     assert_eq!(taken_from(&phone, &laptop), 1);
     assert_eq!(leaves_of(&phone, &laptop, &chat, &group), 1);
+    phone
+        .client
+        .add_linked_devices_to_chats(&[], &mut Default::default())
+        .await;
+    passes(&relay, &mut [&mut laptop], 2).await;
+    let progress = laptop.op(DeviceLinkOp::Read).await.chat_progress;
+    assert_eq!(progress.len(), 1);
+    assert_eq!((progress[0].total, progress[0].remaining), (1, 0));
 }
 
 /// With "add to all my chats" off, the new device is added to no chat,
@@ -2976,6 +2992,70 @@ async fn a_pass_adds_the_new_device_to_at_most_its_cap_of_chats() {
         expected(true, 0)
     );
     assert!(chats.iter().all(|chat| joined(&laptop, chat)));
+}
+
+/// Withdrawing the sole carrier makes the view unknown until the approver
+/// repeats the inventory. Reopening the sender also repairs missing delivery.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_withdrawn_link_chat_inventory_is_repaired_after_reopen() {
+    use cgka_traits::engine::{AppMessageInvalidationReason, GroupEvent};
+    let (relay, [mut phone, mut laptop]) = alice_devices::<2>().await;
+    let group = link(&relay, &mut phone, &mut laptop, "Laptop").await;
+    passes(&relay, &mut [&mut phone, &mut laptop], 3).await;
+    let current = |device: &Device| {
+        account_database(&device.app)
+            .query_row(
+                "SELECT revision,message_id FROM link_chat_report_pages WHERE page=0",
+                [],
+                |row| Ok((row.get::<_, u32>(0)?, row.get::<_, Vec<u8>>(1)?)),
+            )
+            .unwrap()
+    };
+    let (revision, carrier) = current(&laptop);
+    let event = |id| GroupEvent::AppMessageInvalidated {
+        group_id: group.clone(),
+        message_id: cgka_traits::MessageId::new(id),
+        epoch: EpochId(0),
+        reason: AppMessageInvalidationReason::LosingBranch,
+        decrypted_payload_ref: None,
+    };
+    laptop
+        .client
+        .observe_device_group_event(&event(carrier))
+        .unwrap();
+    assert!(laptop.op(DeviceLinkOp::Read).await.chat_progress.is_empty());
+    let mut phone = reopen(phone).await;
+    passes(&relay, &mut [&mut phone, &mut laptop], 2).await;
+    let progress = laptop.op(DeviceLinkOp::Read).await.chat_progress;
+    assert_eq!(progress.len(), 1);
+    assert_eq!((progress[0].total, progress[0].remaining), (0, 0));
+    let (repaired, carrier) = current(&laptop);
+    assert_eq!(repaired, revision);
+
+    // Sender and receiver refer to the same publication by different ids.
+    let sender_id = phone
+        .app
+        .account_storage("alice")
+        .unwrap()
+        .app_storage()
+        .device_group_messages()
+        .unwrap()
+        .into_iter()
+        .rfind(|(.., kind)| *kind == 477)
+        .unwrap()
+        .2
+        .unwrap();
+    phone
+        .client
+        .observe_device_group_event(&event(hex::decode(sender_id).unwrap()))
+        .unwrap();
+    laptop
+        .client
+        .observe_device_group_event(&event(carrier))
+        .unwrap();
+    assert!(laptop.op(DeviceLinkOp::Read).await.chat_progress.is_empty());
+    passes(&relay, &mut [&mut phone, &mut laptop], 1).await;
+    assert_eq!(laptop.op(DeviceLinkOp::Read).await.chat_progress, progress);
 }
 
 /// The old-chat opt-out does not exclude a linked sibling from a new

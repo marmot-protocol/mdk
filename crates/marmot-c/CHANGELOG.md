@@ -9,6 +9,8 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ### Breaking changes
 
+- `MarmotDeviceLinkSnapshot` gains trailing `chat_progress` and `chat_progress_len` fields. Rebuild clients with the matching header and library (#3532).
+
 - `MarmotOnboardingRelayTagChange` gains a trailing `removal_reason`
   (`MarmotOnboardingRelayRemovalReason`), set on every removed entry (#3449).
   Its layout and the `changes` array stride changed: rebuild clients with the

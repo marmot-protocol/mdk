@@ -4,6 +4,8 @@
 
 ### Breaking changes
 
+- Account migration 0213 persists link chat progress across restarts. Older binaries refuse schema 213 (#3532).
+
 - Account migration 0212 adds the bounded attachment body-removal journal (mdk#3491). Older binaries refuse
   schema 212; downgrade is unsupported.
 - Account migration 0211 adds `account_sign_in_removals`: one row per slot the trusted device roster recorded as
