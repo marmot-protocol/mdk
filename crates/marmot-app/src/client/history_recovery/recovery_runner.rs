@@ -292,9 +292,9 @@ pub(crate) trait RunnerHost: Send + Sync + 'static {
     fn transport_stopping(&self) -> bool {
         false
     }
-    /// What the last survey found still catching up, for the account's
+    /// The routes the last survey found still catching up, for the account's
     /// recovery status. Called after every survey; the host keeps the last.
-    fn surveyed(&self, catching_up: BTreeSet<UnitKey>);
+    fn surveyed(&self, catching_up: BTreeSet<TransportReconciliationRoute>);
 }
 
 /// A quantum the relay plane's shutdown cut is preempted, not refused: the
@@ -559,8 +559,8 @@ pub(crate) struct RecoveryRunner<H> {
     policy: RecoveryRunnerPolicy,
     credits: Arc<RecoveryCreditPool>,
     signals: Arc<Signals>,
-    // Bounds passive polling only for gap units without a standing live tail.
-    gap_windows: epoch_gap::BackgroundWindows,
+    // Bounds passive polling for units without a standing live tail.
+    windows: select::BackgroundWindows,
     wake: watch::Receiver<u64>,
     hints: watch::Receiver<PriorityHints>,
     passes: mpsc::Receiver<Request>,
@@ -616,7 +616,7 @@ impl<H: RunnerHost> RecoveryRunner<H> {
             policy,
             credits,
             signals: signals.clone(),
-            gap_windows: BTreeMap::new(),
+            windows: BTreeMap::new(),
             wake: wake.subscribe(),
             hints,
             passes,
@@ -657,7 +657,7 @@ impl<H: RunnerHost> RecoveryRunner<H> {
         loop {
             if let Ok(request) = self.passes.try_recv() {
                 self.serve(request).await;
-                self.gap_windows.clear();
+                self.windows.clear();
                 continue;
             }
             let next_due = match self.step().await {
@@ -721,11 +721,11 @@ impl<H: RunnerHost> RecoveryRunner<H> {
         let woken = self.wake.borrow_and_update().has_changed();
         let reprioritized = self.hints.borrow_and_update().has_changed();
         if woken || reprioritized {
-            self.gap_windows.clear();
+            self.windows.clear();
         }
         let step = self.step_within(None, true).await;
         if matches!(step, Step::Idle { .. }) {
-            self.gap_windows.clear();
+            self.windows.clear();
         }
         step
     }
@@ -781,7 +781,7 @@ impl<H: RunnerHost> RecoveryRunner<H> {
         let suspended = Arc::clone(&self.suspended);
         let races = Arc::clone(&self.unwritten_races);
         let background = pass.is_none();
-        let mut windows = std::mem::take(&mut self.gap_windows);
+        let mut windows = std::mem::take(&mut self.windows);
         let (mut survey, epoch_gap_due, windows) = match self
             .debt_turn(pass, move |turn| {
                 // Each row is written where what it records is: whatever
@@ -827,7 +827,7 @@ impl<H: RunnerHost> RecoveryRunner<H> {
                 };
             }
         };
-        self.gap_windows = windows;
+        self.windows = windows;
         let admission_due = sooner(admission_due, epoch_gap_due);
         self.host.surveyed(std::mem::take(&mut survey.catching_up));
         let now = self.host.now_seconds();
@@ -1220,10 +1220,8 @@ impl<H: RunnerHost> RecoveryRunner<H> {
     /// Other sources must be able to reach newly staged history on the
     /// group's admission frontier, including a recheck's late findings.
     fn refresh_staged_group(&mut self, candidate: &Candidate, report: &quantum::QuantumReport) {
-        if report.events_staged > 0
-            && let Some(group) = &candidate.group_id
-        {
-            self.gap_windows.remove(group);
+        if report.events_staged > 0 && candidate.group_id.is_some() {
+            self.windows.remove(&candidate.group_id);
         }
     }
 
@@ -1291,7 +1289,7 @@ impl<H: RunnerHost> RecoveryRunner<H> {
                 Some(Ok(())) => {
                     self.reconnect_failures = 0;
                     self.memory.relay_reconnected(&relay);
-                    for units in self.gap_windows.values_mut() {
+                    for units in self.windows.values_mut() {
                         units.retain(|key, _| key.relay != relay);
                     }
                 }

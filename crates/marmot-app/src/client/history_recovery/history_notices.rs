@@ -17,7 +17,6 @@ use storage_sqlite::{
 };
 
 use crate::client::AppClient;
-use crate::client::history_recovery::recovery_runner::UnitKey;
 use crate::client::read_state::settled_failure;
 use crate::history_notices::{
     decode_notice_id, encode_notice_id, history_notice, rejoin_group_tag,
@@ -148,7 +147,9 @@ pub(crate) struct GroupNotices {
 /// groups catching up than answers built before it without either being
 /// wrong. Only a survey that changed the set counts: the runner sends none
 /// that would not (mdk#3273).
-pub(crate) struct SurveyMark(tokio::sync::watch::Receiver<Option<BTreeSet<UnitKey>>>);
+pub(crate) struct SurveyMark(
+    tokio::sync::watch::Receiver<Option<BTreeSet<TransportReconciliationRoute>>>,
+);
 
 impl SurveyMark {
     /// Whether a survey changed what is catching up since the read. A
@@ -295,18 +296,18 @@ impl AppClient {
     }
 
     /// Read what the recovery answers come from ([`RecoveryRead`]). The
-    /// routes are read only when a rejoin notice or a unit catching up needs
+    /// routes are read only when a rejoin notice or a route catching up needs
     /// them, and without any group's record.
     pub(crate) fn read_recovery(&self) -> Result<RecoveryRead, AppError> {
         let app = self.app.account_storage(&self.state.label)?.app_storage();
         let parked = app.parked_recovery_obligations()?;
         let rejoin_rows = app.recovery_rejoin_notices()?;
         let mut survey = self.routing.subscribe_recovery_runner_catching_up();
-        let units = survey
+        let surveyed = survey
             .borrow_and_update()
             .clone()
-            .filter(|units| !units.is_empty());
-        let routes = if rejoin_rows.is_empty() && units.is_none() {
+            .filter(|surveyed| !surveyed.is_empty());
+        let routes = if rejoin_rows.is_empty() && surveyed.is_none() {
             BTreeMap::new()
         } else {
             self.current_route_groups().into_iter().collect()
@@ -340,10 +341,10 @@ impl AppClient {
         }
         let mut catching_up = BTreeSet::new();
         let mut inbox_catching_up = false;
-        for unit in units.into_iter().flatten() {
-            if unit.route == TransportReconciliationRoute::Inbox {
+        for route in surveyed.into_iter().flatten() {
+            if route == TransportReconciliationRoute::Inbox {
                 inbox_catching_up = true;
-            } else if let Some(Some(group_id)) = routes.get(&unit.route) {
+            } else if let Some(Some(group_id)) = routes.get(&route) {
                 catching_up.insert(group_id.clone());
             }
         }

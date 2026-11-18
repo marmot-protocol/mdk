@@ -33,7 +33,7 @@ use transport_nostr_peeler::NostrTransportEvent;
 
 use super::{
     Admitted, DebtTurn, OpenAttempts, PassBound, PassReport, RecoveryRunner, RecoveryRunnerHandle,
-    RecoveryRunnerPolicy, RepairEnd, RunnerHost, TARGET, UnitKey, WorkerTurn,
+    RecoveryRunnerPolicy, RepairEnd, RunnerHost, TARGET, WorkerTurn,
 };
 use crate::MarmotApp;
 use crate::client::sync::{InventoryRecord, RecoveredDelivery, TRANSPORT_RECONCILIATION_QUANTUM};
@@ -82,9 +82,9 @@ pub(crate) struct AccountRunnerHost {
     /// The account's public key, its inbox's `#p`. An account id that is no
     /// 32-byte key has no inbox the runner can ask for.
     inbox: Option<[u8; 32]>,
-    /// Where the account's recovery status reads what the runner's last
-    /// survey found catching up.
-    catching_up: watch::Sender<Option<BTreeSet<UnitKey>>>,
+    /// Where the account's recovery status reads the routes the runner's
+    /// last survey found catching up.
+    catching_up: watch::Sender<Option<BTreeSet<TransportReconciliationRoute>>>,
     /// The account's relay pool. An account whose transport has not
     /// registered yet has none, so each debt turn looks again until it does.
     relay_client: Mutex<Option<NostrSdkRelayClient>>,
@@ -342,7 +342,7 @@ impl RunnerHost for AccountRunnerHost {
         self.relay_plane.is_shutting_down()
     }
 
-    fn surveyed(&self, catching_up: BTreeSet<UnitKey>) {
+    fn surveyed(&self, catching_up: BTreeSet<TransportReconciliationRoute>) {
         self.catching_up.send_if_modified(|last| {
             let changed = last.as_ref() != Some(&catching_up);
             if changed {

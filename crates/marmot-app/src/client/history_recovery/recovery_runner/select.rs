@@ -38,7 +38,8 @@ pub(super) struct Candidate {
     /// The MLS group its route carries, for the audit.
     pub(super) group_id: Option<Vec<u8>>,
     pub(super) best_effort: bool,
-    /// Finite upper bound for passive epoch-gap acquisition, if any.
+    /// Finite upper bound for passive acquisition without a standing tail, if
+    /// any.
     pub(super) fetch_until: Option<u64>,
     /// Seconds owed after the live tail.
     pub(super) owed_seconds: u64,
@@ -68,10 +69,11 @@ pub(super) struct Survey {
     pub(super) fenced: BTreeSet<TransportReconciliationRoute>,
     /// The routes whose group has a conversation window open.
     pub(super) window: BTreeSet<TransportReconciliationRoute>,
-    /// The required units still catching up: they owe history after their
-    /// live tails and are neither broken (even while probing) nor suspended
-    /// ([`RunnerHost::surveyed`](super::RunnerHost)).
-    pub(super) catching_up: BTreeSet<UnitKey>,
+    /// The routes with a required unit still catching up: it owes history
+    /// after its live tail and is neither broken (even while probing) nor
+    /// suspended ([`RunnerHost::surveyed`](super::RunnerHost)). Hosts see
+    /// only routes, so which of a route's relays still owe is left out.
+    pub(super) catching_up: BTreeSet<TransportReconciliationRoute>,
     /// When the earliest timed probe of a broken unit on a relay a current,
     /// unsuspended route requires falls due. Its unit is blocked until a debt
     /// turn arms it, so an idle runner wakes for it.
@@ -251,12 +253,14 @@ pub(super) fn cooldown_until(
     Ok(until)
 }
 
+/// Per-unit endpoints for passive background work, by the MLS group its
+/// route carries (`None` for the inbox). A new staged event can renew its own
+/// group's endpoints, and a reconnect only its relay's.
+pub(super) type BackgroundWindows = BTreeMap<Option<Vec<u8>>, BTreeMap<UnitKey, u64>>;
+
 /// Current durable visits, and the first observation of each unit without a
 /// standing tail during this background drain.
-type VisitWindows<'a> = (
-    &'a BTreeMap<Vec<u8>, u64>,
-    &'a mut super::epoch_gap::BackgroundWindows,
-);
+type VisitWindows<'a> = (&'a BTreeMap<Vec<u8>, u64>, &'a mut BackgroundWindows);
 
 /// Survey every unit of the current routes that owes anything after its live
 /// tail. `stalled` is what admission cannot drain now. Writes nothing.
@@ -274,7 +278,7 @@ pub(super) fn survey(
     let mut cooldowns = BTreeMap::new();
     let mut admission = Admission::new(turn);
     let fenced = admission.fenced_routes()?;
-    let mut current_windows = super::epoch_gap::BackgroundWindows::new();
+    let mut current_windows = BackgroundWindows::new();
     let mut candidates = Vec::new();
     let mut catching_up = BTreeSet::new();
     for route in turn.routes {
@@ -284,21 +288,24 @@ pub(super) fn survey(
                 relay: relay.to_owned(),
             };
             let history_end = turn.tails.history_end(&route.route, relay);
-            // Only open-ended gap work needs a limit independent of the
-            // clock. Live capture evidence can extend it through its own end.
+            // Open-ended work needs a limit independent of the clock, or a
+            // drain over slow relays never ends: each answer leaves the next
+            // second owed on the relays already served (mdk#3538). A unit
+            // owes through where this drain first saw it; an epoch-gap visit
+            // and live capture evidence can extend that through their ends.
             let fetch_until = windows.as_ref().and_then(|(visits, previous)| {
-                let group = route.group_id.as_ref()?;
-                let visit = visits.get(group)?;
                 if route.goal_until.is_some() || history_end.is_some() {
                     return None;
                 }
+                let group = &route.group_id;
+                let visit = group.as_ref().and_then(|group| visits.get(group));
                 let key = unit_key();
                 let until = previous
                     .get(group)
                     .and_then(|units| units.get(&key))
                     .copied()
                     .unwrap_or(now)
-                    .max(*visit)
+                    .max(visit.copied().unwrap_or(0))
                     .max(fenced.get(&route.route).copied().unwrap_or(0));
                 current_windows
                     .entry(group.clone())
@@ -336,7 +343,7 @@ pub(super) fn survey(
             // A probe is quiet: one quantum that re-parks or re-arms, never
             // a catch-up the account's status shows.
             if !best_effort && !parked && !suspended(route) {
-                catching_up.insert(key.clone());
+                catching_up.insert(route.route.clone());
             }
             candidates.push(Candidate {
                 key,

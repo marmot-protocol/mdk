@@ -12,7 +12,7 @@ use storage_sqlite::{
 };
 
 use crate::client::history_recovery::history_notices::LiveFacts;
-use crate::client::history_recovery::recovery_runner::{RecoveryRunnerPolicy, UnitKey};
+use crate::client::history_recovery::recovery_runner::RecoveryRunnerPolicy;
 use crate::history_notices::{encode_notice_id, ledger_route_tag};
 use crate::tests::{ScriptedPushRelayClient, client_on_app_relay_plane};
 use crate::{AccountRecoveryStatus, AppClient, MarmotApp};
@@ -114,19 +114,16 @@ fn park_on(app: &SqliteAppStorage, route: &TransportReconciliationRoute, relay: 
     assert!(matches!(unit.state, RecoveryUnitState::Broken(_)));
 }
 
-/// What the runner's survey would publish: these units catching up.
-pub(super) fn catching_up(client: &AppClient, units: &[&TransportReconciliationRoute]) {
-    let units = units
+/// What the runner's survey would publish: these routes catching up.
+pub(super) fn catching_up(client: &AppClient, routes: &[&TransportReconciliationRoute]) {
+    let routes = routes
         .iter()
-        .map(|route| UnitKey {
-            route: (*route).clone(),
-            relay: RELAY.to_owned(),
-        })
+        .map(|route| (*route).clone())
         .collect::<BTreeSet<_>>();
     client
         .routing
         .recovery_runner_catching_up()
-        .send_replace(Some(units));
+        .send_replace(Some(routes));
 }
 
 /// Neither a broken unit's park, on a group route or the inbox, nor a
@@ -235,10 +232,7 @@ async fn the_answers_mark_a_survey_that_lands_after_them() {
     assert!(!answers.survey().landed_since());
     let published = answers.account_status(&LiveFacts(&client)).unwrap();
     assert_eq!(published, client.account_recovery_status().unwrap());
-    let same = BTreeSet::from([UnitKey {
-        route: route.clone(),
-        relay: RELAY.to_owned(),
-    }]);
+    let same = BTreeSet::from([route.clone()]);
     let sent = client
         .routing
         .recovery_runner_catching_up()
