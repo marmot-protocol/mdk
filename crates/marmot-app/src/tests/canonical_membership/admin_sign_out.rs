@@ -5,8 +5,20 @@
 //! step-down happens anyway, since the device wipes once its sign-out ends.
 
 use super::*;
+use crate::runtime::account_worker::HELD_SCHEDULED_CONVERGENCE_ACCOUNTS;
 
 const RELAY: &str = "wss://relay.example";
+
+struct HeldDrain(String);
+
+impl Drop for HeldDrain {
+    fn drop(&mut self) {
+        HELD_SCHEDULED_CONVERGENCE_ACCOUNTS
+            .lock()
+            .unwrap()
+            .remove(&self.0);
+    }
+}
 
 /// alice signs out through a managed runtime; bob is a separate app the
 /// test drives by hand. Separate apps share no live relay, so the test
@@ -20,11 +32,16 @@ struct AdminSignOut {
     alice_cursor: usize,
     alice_id: String,
     chat: GroupId,
+    _held_drain: Option<HeldDrain>,
     _dirs: [tempfile::TempDir; 2],
 }
 
 impl AdminSignOut {
     async fn new() -> Self {
+        Self::with_alice_role(true).await
+    }
+
+    async fn with_alice_role(alice_admin: bool) -> Self {
         let relay = Arc::new(ScriptedPushRelayClient::default());
         let alice_dir = tempfile::tempdir().unwrap();
         let bob_dir = tempfile::tempdir().unwrap();
@@ -38,16 +55,26 @@ impl AdminSignOut {
             .account_id_hex;
         let alice_app = app_at(&alice_dir, relay.clone());
         let bob_app = app_at(&bob_dir, relay.clone());
-        remember_test_member_inbox(&alice_app, &bob_id, RELAY);
         let mut bob = bob_app.client("bob").await.unwrap();
-        bob.publish_key_package().await.unwrap();
         let mut alice = alice_app.client("alice").await.unwrap();
-        let chat = alice
+        let (creator, invitee, invitee_id) = if alice_admin {
+            remember_test_member_inbox(&alice_app, &bob_id, RELAY);
+            (&mut alice, &mut bob, &bob_id)
+        } else {
+            remember_test_member_inbox(&bob_app, &alice_id, RELAY);
+            (&mut bob, &mut alice, &alice_id)
+        };
+        invitee.publish_key_package().await.unwrap();
+        let chat = creator
             .create_group_with_options(
-                "co-admin chat",
-                &[&bob_id],
+                "sign-out chat",
+                &[invitee_id],
                 crate::AppCreateGroupOptions {
-                    initial_admins: vec![bob_id.clone()],
+                    initial_admins: if alice_admin {
+                        vec![bob_id.clone()]
+                    } else {
+                        Vec::new()
+                    },
                     ..Default::default()
                 },
             )
@@ -55,9 +82,46 @@ impl AdminSignOut {
             .unwrap()
             .operation
             .expect("eligible fixture members");
-        let mut bob_cursor = 0;
-        deliver_new(&mut bob, &relay, &mut bob_cursor).await;
-        bob.accept_group_invite(&chat).unwrap();
+        let mut invitee_cursor = 0;
+        deliver_new(invitee, &relay, &mut invitee_cursor).await;
+        invitee.accept_group_invite(&chat).unwrap();
+        let bob_cursor = if alice_admin {
+            invitee_cursor
+        } else {
+            relay.published_events.lock().unwrap().len()
+        };
+        let held_drain = if alice_admin {
+            None
+        } else {
+            // A real earlier send leaves the worker nowhere to send its
+            // SelfRemove except behind that send in the durable queue.
+            let event = build_inner_event(
+                &AppMessageIntent::Chat {
+                    content: "queued before leaving".to_owned(),
+                },
+                &alice_id,
+                unix_now_seconds(),
+            )
+            .unwrap();
+            alice
+                .record_send_intent_projection(&chat, &alice_id, &event)
+                .unwrap();
+            let effects = alice
+                .runtime
+                .queue_app_message_with_audit_context(
+                    chat.clone(),
+                    event.encode().unwrap(),
+                    Default::default(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(effects.queued.len(), 1);
+            HELD_SCHEDULED_CONVERGENCE_ACCOUNTS
+                .lock()
+                .unwrap()
+                .insert(alice_id.clone());
+            Some(HeldDrain(alice_id.clone()))
+        };
         drop(alice);
         let runtime = MarmotAppRuntime::new(alice_app.clone());
         runtime.reconcile_accounts().await.unwrap();
@@ -72,6 +136,7 @@ impl AdminSignOut {
             alice_cursor,
             alice_id,
             chat,
+            _held_drain: held_drain,
             _dirs: [alice_dir, bob_dir],
         }
     }
@@ -137,6 +202,46 @@ impl AdminSignOut {
         let runtime = self.runtime.clone();
         tokio::spawn(async move { runtime.sign_out_and_wipe("alice").await })
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn signing_out_reports_a_queued_member_leave_as_unfinished() {
+    let test = AdminSignOut::with_alice_role(false).await;
+    let before = test.published();
+    let group_hex = hex::encode(test.chat.as_slice());
+    test.relay.block_next_publish_of_kind(5);
+    let mut wipe = test.sign_out();
+    tokio::select! {
+        outcome = &mut wipe => panic!("expected the KeyPackage deletion before cleanup: {outcome:?}"),
+        blocked = tokio::time::timeout(Duration::from_secs(5), test.relay.wait_for_blocked_publish()) => blocked.unwrap(),
+    }
+    assert_eq!(
+        test.alice_app
+            .stored_group_self_membership("alice", &group_hex)
+            .unwrap(),
+        Some(SelfMembership::Member),
+    );
+    test.relay.release_publish();
+    let outcome = wipe.await.unwrap().unwrap();
+
+    assert_eq!(
+        outcome.groups_left, 0,
+        "the member's Leave was still queued"
+    );
+    let [failure] = outcome.group_leave_failures.as_slice() else {
+        panic!("the unfinished leave must be reported: {outcome:?}");
+    };
+    assert_eq!(failure.group_id_hex, hex::encode(test.chat.as_slice()));
+    assert_eq!(failure.reason, "leave was still queued");
+    assert!(outcome.local_cleanup.completed);
+    assert!(test.alice_app.account_home().accounts().unwrap().is_empty());
+    assert!(
+        test.relay.published_events.lock().unwrap()[before..]
+            .iter()
+            .all(|event| event.kind != 445),
+        "the relay did not receive the Leave"
+    );
+    test.runtime.shutdown().await;
 }
 
 /// With bob online, alice's sign-out sends her step-down and then her
