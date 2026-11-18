@@ -1566,8 +1566,9 @@ mod tests {
     fn overwritten_payload_changes_peel_context_fingerprint() {
         let (_storage, mut engine, group_id) = engine_with_stored_group();
         let raw_row = transport_message(b"memo-overwritten-id", b"opaque-transport-bytes");
+        // Hold the state at Created so only the incoming row's payload changes.
         engine
-            .persist_transport_message(&raw_row, &group_id, EpochId(3), MessageState::Sent)
+            .persist_transport_message(&raw_row, &group_id, EpochId(3), MessageState::Created)
             .unwrap();
 
         let before = engine.deferred_peel_context(&group_id).unwrap();
@@ -1579,7 +1580,7 @@ mod tests {
             ..raw_row
         };
         engine
-            .persist_openmls_wire_message(&commit_row, &group_id, EpochId(3), MessageState::Sent)
+            .persist_openmls_wire_message(&commit_row, &group_id, EpochId(3), MessageState::Created)
             .unwrap();
 
         let after = engine.deferred_peel_context(&group_id).unwrap();

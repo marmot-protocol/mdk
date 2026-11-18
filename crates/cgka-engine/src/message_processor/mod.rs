@@ -3692,7 +3692,7 @@ impl<S: StorageProvider> Engine<S> {
     ) -> Result<Vec<CommitEdge>, EngineError> {
         let records = self.storage.list_openmls_messages_in_states(
             group_id,
-            &crate::openmls_projection::OPENMLS_GRAPH_INPUT_STATES,
+            &crate::openmls_projection::OPENMLS_COMMIT_INPUT_STATES,
             EpochId(0),
             OpenMlsContentFilter::Commits,
         )?;
