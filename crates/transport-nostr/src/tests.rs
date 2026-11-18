@@ -5195,12 +5195,14 @@ async fn directory_sync_keeps_filter_for_subscription_created_before_later_error
                 subscription_id: subscription_id.clone(),
                 authors: vec![author.clone()],
                 kinds: vec![0],
+                reference: None,
                 since: None,
             },
             DirectorySyncBatch {
                 subscription_id: "directory_users_1_invalid".to_owned(),
                 authors: vec!["not-a-public-key".to_owned()],
                 kinds: vec![0],
+                reference: None,
                 since: None,
             },
         ],
@@ -5299,12 +5301,14 @@ async fn directory_endpoint_change_retries_a_batch_left_pending_by_partial_failu
                 subscription_id: "directory_users_alice".to_owned(),
                 authors: vec![alice.public_key().to_hex()],
                 kinds: vec![0],
+                reference: None,
                 since: None,
             },
             DirectorySyncBatch {
                 subscription_id: "directory_users_bob".to_owned(),
                 authors: vec![bob_author],
                 kinds: vec![0],
+                reference: None,
                 since: None,
             },
         ],
@@ -5643,6 +5647,7 @@ async fn directory_live_auth_challenge(deny_read: bool) {
                     subscription_id: "directory_users_auth".to_owned(),
                     authors: vec![keys.public_key().to_hex()],
                     kinds: vec![0],
+                    reference: None,
                     since: None,
                 }],
             },
@@ -5738,12 +5743,12 @@ async fn directory_auth_required_blocks_only_the_rejecting_endpoint() {
     assert!(directory.mark_auth_required(id, blocked.as_str()).await);
     assert!(
         !directory
-            .accepts_live_event_from(id, blocked.as_str(), &author, 0)
+            .accepts_live_event_from(id, blocked.as_str(), &author, 0, &[])
             .await
     );
     assert!(
         directory
-            .accepts_live_event_from(id, healthy.as_str(), &author, 0)
+            .accepts_live_event_from(id, healthy.as_str(), &author, 0, &[])
             .await
     );
     let stats = directory.stats().await;
@@ -7112,6 +7117,7 @@ async fn directory_wire_rejects_forgery_when_verified_ids_outlive_seen_state() {
                     subscription_id: "directory_cache_divergence".into(),
                     authors: vec![keys.public_key().to_hex()],
                     kinds: vec![0],
+                    reference: None,
                     since: None,
                 }],
             },
@@ -7243,6 +7249,7 @@ async fn dropping_the_last_plane_handle_releases_its_transport() {
                     subscription_id: "dropped_plane".into(),
                     authors: vec![keys.public_key().to_hex()],
                     kinds: vec![0],
+                    reference: None,
                     since: None,
                 }],
             },

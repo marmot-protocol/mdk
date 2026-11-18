@@ -29,7 +29,6 @@ pub(crate) const DIRECTORY_SYNC_USER_BATCH_SIZE: usize = 200;
 /// (mdk#687). See [`DIRECTORY_SYNC_LOCAL_ACCOUNT_KINDS`].
 pub(crate) const DIRECTORY_SYNC_KINDS: &[u64] = &[
     KIND_NOSTR_METADATA,
-    5, // NIP-09 deletions fence KeyPackage availability.
     KIND_NIP65_RELAY_LIST,
     KIND_MARMOT_INBOX_RELAY_LIST,
     KIND_MARMOT_KEY_PACKAGE,
@@ -43,7 +42,6 @@ pub(crate) const DIRECTORY_SYNC_LOCAL_ACCOUNT_KINDS: &[u64] = &[
     MUTE_LIST_KIND,
     KIND_NOSTR_METADATA,
     KIND_NOSTR_CONTACT_LIST,
-    5, // NIP-09 deletions fence KeyPackage availability.
     KIND_NIP65_RELAY_LIST,
     KIND_MARMOT_INBOX_RELAY_LIST,
     KIND_MARMOT_KEY_PACKAGE,
@@ -189,6 +187,7 @@ fn plan_directory_sync_with_batch_size(
         "local",
         &local_account_ids,
         DIRECTORY_SYNC_LOCAL_ACCOUNT_KINDS,
+        None,
         since,
         batch_size,
     );
@@ -197,9 +196,27 @@ fn plan_directory_sync_with_batch_size(
         "users",
         &remote_user_ids,
         DIRECTORY_SYNC_KINDS,
+        None,
         since,
         batch_size,
     );
+
+    // Regular kind-5 events are unbounded per author. Keep them out of the
+    // replaceable-kind batches and require the KeyPackage kind hint.
+    for (group, account_ids) in [
+        ("local-deletions", &local_account_ids),
+        ("users-deletions", &remote_user_ids),
+    ] {
+        extend_directory_sync_batches(
+            &mut batches,
+            group,
+            account_ids,
+            &[5],
+            Some(('k', KIND_MARMOT_KEY_PACKAGE.to_string())),
+            since,
+            batch_size,
+        );
+    }
 
     DirectorySyncPlan {
         endpoints,
@@ -213,6 +230,7 @@ fn extend_directory_sync_batches(
     group: &str,
     account_ids: &[String],
     kinds: &[u64],
+    reference: Option<(char, String)>,
     since: Option<u64>,
     batch_size: usize,
 ) {
@@ -222,6 +240,7 @@ fn extend_directory_sync_batches(
             subscription_id: directory_subscription_id(group, index, &authors),
             authors,
             kinds: kinds.to_vec(),
+            reference: reference.clone(),
             since,
         });
     }
@@ -508,11 +527,19 @@ mod tests {
             vec![TransportEndpoint("wss://relay.example".to_owned())]
         );
         assert_eq!(plan.watched_user_count, 3);
-        assert_eq!(plan.batches.len(), 2);
+        assert_eq!(plan.batches.len(), 4);
         assert_eq!(plan.batches[0].authors, vec![account_id(1), account_id(2)]);
         assert_eq!(plan.batches[1].authors, vec![account_id(3)]);
         assert_eq!(plan.batches[0].kinds, DIRECTORY_SYNC_KINDS);
         assert_eq!(plan.batches[0].since, Some(100));
+        for batch in &plan.batches[2..] {
+            assert_eq!(batch.kinds, [5]);
+            assert_eq!(
+                batch.reference,
+                Some(('k', KIND_MARMOT_KEY_PACKAGE.to_string()))
+            );
+            assert_eq!(batch.since, Some(100));
+        }
         assert!(!plan.batches[0].subscription_id.contains(&account_id(1)));
         assert_ne!(
             plan.batches[0].subscription_id,

@@ -241,25 +241,44 @@ async fn live_directory_forgery_cannot_change_persisted_metadata() {
     let server = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
         let mut socket = accept_async(stream).await.unwrap();
-        let subscription = loop {
+        let mut regular_subscription = None;
+        let mut deletion_subscription = None;
+        while regular_subscription.is_none() || deletion_subscription.is_none() {
             let message = socket.next().await.unwrap().unwrap();
             let Message::Text(text) = message else {
                 continue;
             };
             let request: serde_json::Value = serde_json::from_str(&text).unwrap();
             if request[0] == "REQ" {
-                break request[1].as_str().unwrap().to_owned();
+                let subscription = request[1].as_str().unwrap().to_owned();
+                let is_deletion = request[2]["kinds"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|kind| kind.as_u64() == Some(5));
+                if is_deletion {
+                    deletion_subscription = Some(subscription.clone());
+                } else {
+                    regular_subscription = Some(subscription.clone());
+                }
+                socket
+                    .send(Message::Text(
+                        serde_json::json!(["EOSE", subscription]).to_string().into(),
+                    ))
+                    .await
+                    .unwrap();
             }
-        };
-        socket
-            .send(Message::Text(
-                serde_json::json!(["EOSE", subscription]).to_string().into(),
-            ))
-            .await
-            .unwrap();
+        }
+        let regular_subscription = regular_subscription.unwrap();
+        let deletion_subscription = deletion_subscription.unwrap();
         ready.send(()).unwrap();
         while let Some(batch) = frames.recv().await {
             for event in batch {
+                let subscription = if event.kind == Kind::from(5) {
+                    &deletion_subscription
+                } else {
+                    &regular_subscription
+                };
                 socket
                     .send(Message::Text(
                         serde_json::json!(["EVENT", subscription, event])
@@ -284,12 +303,22 @@ async fn live_directory_forgery_cannot_change_persisted_metadata() {
             DirectorySyncPlan {
                 endpoints: vec![endpoint],
                 watched_user_count: 2,
-                batches: vec![DirectorySyncBatch {
-                    subscription_id: "directory_identity_regression".into(),
-                    authors: vec![author.clone(), fence_author.clone()],
-                    kinds: vec![0, 3, 5, 10002, 10050],
-                    since: None,
-                }],
+                batches: vec![
+                    DirectorySyncBatch {
+                        subscription_id: "directory_identity_regression".into(),
+                        authors: vec![author.clone(), fence_author.clone()],
+                        kinds: vec![0, 3, 10002, 10050],
+                        reference: None,
+                        since: None,
+                    },
+                    DirectorySyncBatch {
+                        subscription_id: "directory_identity_deletions".into(),
+                        authors: vec![author.clone(), fence_author.clone()],
+                        kinds: vec![5],
+                        reference: Some(('k', 30443.to_string())),
+                        since: None,
+                    },
+                ],
             },
             false,
         )
@@ -434,10 +463,7 @@ async fn live_directory_forgery_cannot_change_persisted_metadata() {
         .unwrap()
         .len();
     let unrelated = EventBuilder::new(Kind::from(5), "")
-        .tags([
-            Tag::parse(["e", "bb".repeat(32).as_str()]).unwrap(),
-            Tag::parse(["k", "1"]).unwrap(),
-        ])
+        .tags([Tag::parse(["e", "bb".repeat(32).as_str()]).unwrap()])
         .custom_created_at(Timestamp::from_secs(stamp + 5))
         .finalize(&keys)
         .unwrap();

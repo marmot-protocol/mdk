@@ -19,7 +19,7 @@ use futures::{FutureExt, Stream, StreamExt, stream::FuturesUnordered};
 use nostr_sdk::NotificationUpdate;
 use nostr_sdk::prelude::{
     Client as NostrSdkClient, ClientNotification, Filter, Kind, PublicKey, RelayMessage, RelayUrl,
-    SubscriptionId, Timestamp as NostrTimestamp,
+    SingleLetterTag, SubscriptionId, Timestamp as NostrTimestamp,
 };
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
@@ -2270,8 +2270,9 @@ impl MarmotRelayPlane {
             // Canonical lowercase hex matches the `event.pubkey` form a forwarded
             // SDK event carries, so the membership check is exact.
             let filter_authors = authors.iter().map(PublicKey::to_hex).collect::<Vec<_>>();
-            let validation_filter =
+            let mut validation_filter =
                 DirectorySubscriptionFilter::new(filter_authors, batch.kinds.clone());
+            validation_filter.reference = batch.reference.clone();
             desired.insert(batch.subscription_id.clone(), validation_filter.clone());
             if !to_add.contains(&batch.subscription_id) {
                 continue;
@@ -2280,10 +2281,21 @@ impl MarmotRelayPlane {
                 .directory
                 .clear_auth_required(&batch.subscription_id)
                 .await;
-            let mut filter = Filter::new()
-                .authors(authors)
-                .kinds(kinds)
-                .limit(batch.authors.len().saturating_mul(batch.kinds.len()).max(1));
+            let mut filter =
+                Filter::new()
+                    .authors(authors)
+                    .kinds(kinds)
+                    .limit(if batch.reference.is_some() {
+                        batch.authors.len().max(1)
+                    } else {
+                        batch.authors.len().saturating_mul(batch.kinds.len()).max(1)
+                    });
+            if let Some((name, value)) = &batch.reference {
+                filter = filter.custom_tag(
+                    SingleLetterTag::from_char(*name).map_err(|_| "invalid reference tag")?,
+                    value.clone(),
+                );
+            }
             if let Some(since) = batch.since {
                 filter = filter.since(NostrTimestamp::from_secs(since));
             }
@@ -2964,6 +2976,7 @@ fn spawn_directory_notification_forwarder(
                                 relay_url.as_str(),
                                 &event.pubkey,
                                 event.kind,
+                                &event.tags,
                             )
                             .await
                     {
