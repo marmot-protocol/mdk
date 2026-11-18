@@ -267,7 +267,7 @@ pub(super) fn survey(
     let mut catching_up = BTreeSet::new();
     for route in turn.routes {
         for (relay, best_effort) in route.relays() {
-            let owed_until = turn.owed_until(route, relay);
+            let owed_until = turn.owed_until(route, relay).min(turn.fetch_until);
             let debt = app.recovery_unit_debt(&route.route, relay, owed_until)?;
             let Some(first) = debt.first() else {
                 continue;
@@ -572,7 +572,7 @@ pub(super) fn begin(
         return Ok(None);
     }
     let mark = app.recovery_coverage_mark()?;
-    let owed_until = turn.owed_until(route, &key.relay);
+    let owed_until = turn.owed_until(route, &key.relay).min(turn.fetch_until);
     let mut ranges = Vec::new();
     for debt in app.recovery_unit_debt(&key.route, &key.relay, owed_until)? {
         if let Some(cursor) = app.recovery_unit_cursor(

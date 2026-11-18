@@ -179,6 +179,9 @@ pub(crate) struct WorkerTurn<'a> {
 /// live tails and live counts read for this turn alone.
 #[derive(Clone, Copy)]
 pub(crate) struct DebtTurn<'a> {
+    /// Latest second this acquisition pass may request. Admission and fences
+    /// still read all current debt.
+    pub(crate) fetch_until: u64,
     pub(crate) app: &'a SqliteAppStorage,
     /// The account's current routes, as of this turn.
     pub(crate) routes: &'a [RunnerRoute],
@@ -564,6 +567,8 @@ pub(crate) struct RecoveryRunner<H> {
     passes: mpsc::Receiver<Request>,
     cancel: CancellationToken,
     memory: Memory,
+    /// A background wake drains a finite history window over many quanta.
+    background_until: Option<u64>,
     admission: admission::Memory,
     /// Surveys that failed in a row, for the runner's own local backoff.
     survey_failures: u32,
@@ -619,6 +624,7 @@ impl<H: RunnerHost> RecoveryRunner<H> {
             passes,
             cancel: cancel.clone(),
             memory: Memory::default(),
+            background_until: None,
             admission: admission::Memory::default(),
             survey_failures: 0,
             reconnect_failures: 0,
@@ -654,10 +660,15 @@ impl<H: RunnerHost> RecoveryRunner<H> {
         loop {
             if let Ok(request) = self.passes.try_recv() {
                 self.serve(request).await;
+                self.background_until = None;
                 continue;
             }
-            self.wake.borrow_and_update();
-            self.hints.borrow_and_update();
+            // Keep wakes received while draining this window pending. They may
+            // authorize work newer than its endpoint when we reach idle.
+            if self.background_until.is_none() {
+                self.wake.borrow_and_update();
+                self.hints.borrow_and_update();
+            }
             let next_due = match self.step().await {
                 Step::Stopped => break,
                 Step::Ran(_) | Step::Raced => continue,
@@ -699,6 +710,7 @@ impl<H: RunnerHost> RecoveryRunner<H> {
         T: Send + 'static,
     {
         let until = pass.and_then(|bound| bound.repair_until);
+        let background_until = self.background_until.filter(|_| pass.is_none());
         self.host
             .debt_turn(move |turn| {
                 if let Some(until) = until {
@@ -708,7 +720,10 @@ impl<H: RunnerHost> RecoveryRunner<H> {
                         ..*turn
                     })
                 } else {
-                    run(turn)
+                    run(&DebtTurn {
+                        fetch_until: background_until.unwrap_or(turn.now),
+                        ..*turn
+                    })
                 }
             })
             .await
@@ -716,7 +731,13 @@ impl<H: RunnerHost> RecoveryRunner<H> {
 
     /// One step: admit, then select, credit, begin, quantum, stage, settle.
     pub(crate) async fn step(&mut self) -> Step {
-        self.step_within(None, true).await
+        self.background_until
+            .get_or_insert_with(|| self.host.now_seconds());
+        let step = self.step_within(None, true).await;
+        if matches!(step, Step::Idle { .. }) {
+            self.background_until = None;
+        }
+        step
     }
 
     /// One explicit pass in place, as a directly owned client's `sync()` and
@@ -1278,6 +1299,11 @@ impl<H: RunnerHost> RecoveryRunner<H> {
             }
         };
         if !moved.is_empty() {
+            // Reading the connection feed consumes its wake. Include history
+            // through this reconnect even when it came mid-batch.
+            if let Some(until) = &mut self.background_until {
+                *until = self.host.now_seconds();
+            }
             self.reconnected().extend(moved);
         }
     }

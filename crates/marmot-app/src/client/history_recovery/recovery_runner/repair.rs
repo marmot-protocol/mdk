@@ -124,6 +124,7 @@ impl AppClient {
                 app,
                 routes: &routes,
                 inbox: [0; 32],
+                fetch_until: now,
                 now,
                 tails: &*tails,
                 live_counts: &[],

@@ -1253,6 +1253,7 @@ impl RunnerHost for TestHost {
         let answer = turn(&DebtTurn {
             app: &self.app,
             routes: &routes,
+            fetch_until: now,
             now,
             tails: &*tails,
             live_counts: &counts,
@@ -1898,8 +1899,7 @@ async fn recovery_runner_serves_held_groups_first_then_small_debts_and_every_gro
     let clock = Clock::new();
     let t0 = clock.now();
     let (large, small, held) = (group(1), group(2), group(3));
-    // An event an hour everywhere: sixty days for the large group, an hour
-    // for the small one and two for the held one.
+    // An event an hour throughout each route's initial window.
     let mut events = every([1; 32], t0 - 60 * DAY, t0, HOUR);
     events.extend(every([2; 32], t0 - HOUR, t0, HOUR));
     events.extend(every([3; 32], t0 - 2 * HOUR, t0, HOUR));
@@ -1917,9 +1917,7 @@ async fn recovery_runner_serves_held_groups_first_then_small_debts_and_every_gro
         .to_vec();
     routes[1].best_effort = vec![OTHER_RELAY.to_owned()];
     let host = TestHost::new(&account, &clock, routes, &[&relay, &other]);
-    // The held group's tail stands, so its first quantum ends its debt. No
-    // other tail stands: the large and small groups owe their newest seconds
-    // again after every quantum, so the small debt never runs out.
+    // The held route finishes in one quantum. The others keep competing.
     host.tails.stand(&held, RELAY, t0);
     let (mut runner, handle) = runner(&host, test_policy());
     handle.set_hints(PriorityHints {
@@ -1938,6 +1936,18 @@ async fn recovery_runner_serves_held_groups_first_then_small_debts_and_every_gro
         assert_eq!(summary.outcome, Outcome::Advanced);
         assert_eq!(summary.key.relay, RELAY);
         served.push(name(&summary.key.route));
+        if summary.key.route == small {
+            // New evidence reopens a small historical range. Keep the unit
+            // eligible each round without depending on wall-clock polling.
+            account
+                .app
+                .uncover_recovery_coverage(
+                    std::slice::from_ref(&small),
+                    t0 - 10,
+                    storage_sqlite::CopyFloorReason::Clamp,
+                )
+                .unwrap();
+        }
     }
 
     // The held group goes first although it owes more than the small one.

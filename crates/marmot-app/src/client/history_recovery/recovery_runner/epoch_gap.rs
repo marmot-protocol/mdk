@@ -93,12 +93,16 @@ pub(super) fn advance(
             let mut answered = false;
             for (route, (_, since)) in routes.iter().zip(&floors) {
                 let since = (*since).max(copy_floor);
+                // If retention overtook the entire visit during an outage,
+                // require evidence at the surviving floor. An empty interval
+                // would otherwise count as an answered relay.
+                let visit_until = state.visit_until_seconds.max(since);
                 for relay in &route.required {
                     let covered = app.recovery_coverage_covers(
                         &route.route,
                         std::slice::from_ref(relay),
                         since,
-                        turn.owed_until(route, relay),
+                        turn.owed_until(route, relay).min(visit_until),
                     )?;
                     answered |= covered;
                     if !covered && !admission.source_left_frontier(route, relay)? {
@@ -114,6 +118,12 @@ pub(super) fn advance(
             // unrelated staging cannot starve its next visit. Failed sources
             // do not obstruct a healthy sweep, but an outage with no completed
             // source leaves this visit in progress across backoff and restart.
+            // A visit can be opened by admission after this background batch
+            // started. If its endpoint is newer, resume with a fresh window
+            // when this batch has drained.
+            if state.visit_until_seconds.min(turn.now) > turn.fetch_until {
+                next = sooner(next, Some(turn.now));
+            }
             if !complete || !answered {
                 continue;
             }
@@ -141,7 +151,12 @@ pub(super) fn advance(
                 next = sooner(next, Some(state.next_retry_at_seconds));
                 continue;
             }
-            started |= app.begin_recovery_epoch_gap_retry(demand.ticket, &floors, turn.now)?;
+            if app.begin_recovery_epoch_gap_retry(demand.ticket, &floors, turn.now)? {
+                started = true;
+                if turn.now > turn.fetch_until {
+                    next = sooner(next, Some(turn.now));
+                }
+            }
         }
     }
     Ok(Advanced {

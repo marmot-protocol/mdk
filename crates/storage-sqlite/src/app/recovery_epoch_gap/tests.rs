@@ -114,6 +114,7 @@ fn epoch_gap_visits_survive_reopen_and_fence_stale_or_duplicate_work() {
             in_progress: false,
             exhausted: false,
             next_retry_at_seconds: 1030,
+            visit_until_seconds: 1000,
         })
     );
     app.arm_epoch_backfill_intents(std::slice::from_ref(&intent))
@@ -151,13 +152,8 @@ fn epoch_gap_visits_survive_reopen_and_fence_stale_or_duplicate_work() {
 
     let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
     let app = store.app_storage();
-    assert_eq!(
-        app.recovery_epoch_gap_retry(ticket)
-            .unwrap()
-            .unwrap()
-            .visits,
-        2
-    );
+    let resumed = app.recovery_epoch_gap_retry(ticket).unwrap().unwrap();
+    assert_eq!((resumed.visits, resumed.visit_until_seconds), (2, 1030));
     assert!(
         !app.begin_recovery_epoch_gap_retry(ticket, &floors, 1040)
             .unwrap()

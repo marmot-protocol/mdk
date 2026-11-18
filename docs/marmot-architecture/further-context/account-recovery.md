@@ -995,7 +995,9 @@ own retry state. These values are decision A20.
 An unresolved durable epoch gap additionally authorizes bounded return visits to that group's retained goals,
 including on relays without NIP-77. A rejoined group's visits start no lower than its rejoin's floor. This handles a commit published with an old timestamp after an earlier sweep.
 The existing runner reopens those goals and resumes ordinary comparison or sweep quanta under the same credits,
-staging bounds and account budgets. A completed visit that leaves the epoch missing waits 30 seconds before the
+staging bounds and account budgets. Each visit checks history through its start time, including after restart.
+A background wake also takes one upper time limit for the fetches it initiates. Completing one fetch does not extend
+that limit for the next relay. A later wake or due retry can collect newer history. A completed visit that leaves the epoch missing waits 30 seconds before the
 next, doubling the delay under the existing unit policy. A visit ends when each source has covered its range
 or failed off the admission frontier; a failed source's range remains owed and its unit backoff still applies.
 Thus an unavailable relay cannot prevent return visits to healthy relays. After six unsuccessful visits the EpochGap

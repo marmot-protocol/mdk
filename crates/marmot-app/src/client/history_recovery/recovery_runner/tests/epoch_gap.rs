@@ -2,6 +2,73 @@
 
 use super::*;
 
+/// Eight quiet relays answer in turn while the wall clock moves. With no live
+/// tail to cap history, the next second must not keep this visit fetching.
+#[tokio::test(start_paused = true)]
+async fn epoch_gap_empty_sweeps_finish_as_the_clock_advances() {
+    let account = account();
+    account
+        .fault_connection()
+        .execute_batch("INSERT INTO cgka_groups (id,epoch,record) VALUES (x'0a',1,x'00');")
+        .unwrap();
+    let clock = Clock::new();
+    let route = group(1);
+    let start = clock.now();
+    account.goal(&route, start - 100);
+    let endpoints = [
+        RELAY,
+        OTHER_RELAY,
+        "wss://c.example",
+        "wss://d.example",
+        "wss://e.example",
+        "wss://f.example",
+        "wss://g.example",
+        "wss://h.example",
+    ];
+    let mut owned = required(&route, &endpoints);
+    owned.group_id = Some(vec![0x0a]);
+    let relays = endpoints.map(|url| ModelRelay::new(url, caps(500, false)).build());
+    let host = TestHost::new(&account, &clock, vec![owned], &relays.each_ref());
+    account
+        .app
+        .arm_epoch_backfill_intents(&[storage_sqlite::StoredEpochBackfillIntent {
+            group_id_hex: "0a".into(),
+            stalled_epoch: 1,
+        }])
+        .unwrap();
+    let ticket = account.app.pending_recovery_demands().unwrap()[0].ticket;
+    let (mut owner, _) = runner(&host, test_policy());
+    for _ in &relays {
+        assert_eq!(ran(owner.step().await).outcome, Outcome::Advanced);
+        clock.advance(1);
+    }
+    let due = idle(owner.step().await).expect("the unresolved visit backs off");
+    let state = account
+        .app
+        .recovery_epoch_gap_retry(ticket)
+        .unwrap()
+        .unwrap();
+    assert!(!state.in_progress && state.visits == 1);
+    assert_eq!(due, state.next_retry_at_seconds);
+    assert!(due > clock.now());
+    for relay in &relays {
+        let queries = relay.queries();
+        assert_eq!(queries.len(), 1);
+        assert_eq!(queries[0].until, start);
+    }
+    clock.advance_to(due);
+    assert_eq!(ran(owner.step().await).outcome, Outcome::Advanced);
+    assert_eq!(
+        account
+            .app
+            .recovery_epoch_gap_retry(ticket)
+            .unwrap()
+            .unwrap()
+            .visits,
+        2
+    );
+}
+
 // Paused time tests local-drain pacing without waiting on wall time.
 #[tokio::test(start_paused = true)]
 async fn epoch_gap_visit_waits_for_its_releasable_history() {
