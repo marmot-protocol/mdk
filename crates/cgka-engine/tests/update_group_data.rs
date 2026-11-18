@@ -1881,7 +1881,10 @@ async fn update_group_data_publish_failed_rolls_back() {
         ]))
     );
     alice.publish_failed(pending).await.unwrap();
-    alice.prepare_convergence_cutoff_delay_ms(&gid).unwrap();
+    assert_eq!(
+        alice.prepare_convergence_cutoff_delay_ms(&gid).unwrap(),
+        None
+    );
     converge_buffered_commit(&mut alice, &gid);
     assert_eq!(alice.epoch(&gid).unwrap().0, 1);
 
