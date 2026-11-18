@@ -382,8 +382,9 @@ runner supplies validated facts and owns execution policy. Design:
   prune parks only from that mark up, so a goal widened back below it parks nothing twice; loss lowers the mark to its
   floor. A released receipt below the window changes nothing in the ledger (its coverage stays until the prune), so only loss parks debt from below it. The recovery
   runner schedules on it.
-- **Epoch-gap return visits (`recovery_epoch_gap.rs`, migration 0150).** An unresolved missing epoch has a durable
-  visit count, active-visit marker, exhaustion state and next retry time. Beginning a visit and reopening its
+- **Epoch-gap return visits (`recovery_epoch_gap.rs`, migrations 0150 and 0213).** An unresolved missing epoch has a durable
+  visit count, active-visit marker, history endpoint, exhaustion state and next retry time. The endpoint is the
+  second the visit began. An unfinished visit from an older version gets the upgrade time. Beginning a visit and reopening its
   retained goals commit together. Restart resumes ledger progress; observations and revised tickets at the same
   epoch preserve the budget. A higher missing epoch or explicit repair can start a fresh budget. Exhaustion
   parks the existing EpochGap obligation without claiming coverage or MLS recovery. Storage schedules nothing;

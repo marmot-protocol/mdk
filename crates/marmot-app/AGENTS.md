@@ -870,6 +870,9 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   account answer it the same way. The catching-up status stays empty until a runner surveys.
   `epoch_gap` gives unresolved durable epoch gaps bounded return visits, including non-NIP-77 relays. Visits
   reopen only that group's retention-bounded goals and use ordinary quanta, credits, staging and account caps.
+  A visit persists the second it began. On its open-ended routes, a passive background fetch stays within the
+  window observed on a wake. A lost tail or relay reconnect renews that unit's window. Live fences and finite
+  targets keep their normal priority and other groups continue to read their current debt.
   A separate durable budget keyed by the missing epoch survives restart: partial sweep progress and same-epoch
   ticket revisions never reset it. Complete visits without actual epoch recovery back off using the existing
   unit policy and eventually park the EpochGap visibly. Explicit repair resets the budget; a higher stalled

@@ -559,6 +559,8 @@ pub(crate) struct RecoveryRunner<H> {
     policy: RecoveryRunnerPolicy,
     credits: Arc<RecoveryCreditPool>,
     signals: Arc<Signals>,
+    // Bounds passive polling only for gap units without a standing live tail.
+    gap_windows: epoch_gap::BackgroundWindows,
     wake: watch::Receiver<u64>,
     hints: watch::Receiver<PriorityHints>,
     passes: mpsc::Receiver<Request>,
@@ -614,6 +616,7 @@ impl<H: RunnerHost> RecoveryRunner<H> {
             policy,
             credits,
             signals: signals.clone(),
+            gap_windows: BTreeMap::new(),
             wake: wake.subscribe(),
             hints,
             passes,
@@ -654,10 +657,9 @@ impl<H: RunnerHost> RecoveryRunner<H> {
         loop {
             if let Ok(request) = self.passes.try_recv() {
                 self.serve(request).await;
+                self.gap_windows.clear();
                 continue;
             }
-            self.wake.borrow_and_update();
-            self.hints.borrow_and_update();
             let next_due = match self.step().await {
                 Step::Stopped => break,
                 Step::Ran(_) | Step::Raced => continue,
@@ -716,7 +718,16 @@ impl<H: RunnerHost> RecoveryRunner<H> {
 
     /// One step: admit, then select, credit, begin, quantum, stage, settle.
     pub(crate) async fn step(&mut self) -> Step {
-        self.step_within(None, true).await
+        let woken = self.wake.borrow_and_update().has_changed();
+        let reprioritized = self.hints.borrow_and_update().has_changed();
+        if woken || reprioritized {
+            self.gap_windows.clear();
+        }
+        let step = self.step_within(None, true).await;
+        if matches!(step, Step::Idle { .. }) {
+            self.gap_windows.clear();
+        }
+        step
     }
 
     /// One explicit pass in place, as a directly owned client's `sync()` and
@@ -769,7 +780,9 @@ impl<H: RunnerHost> RecoveryRunner<H> {
         let policy = self.policy;
         let suspended = Arc::clone(&self.suspended);
         let races = Arc::clone(&self.unwritten_races);
-        let (mut survey, epoch_gap_due) = match self
+        let background = pass.is_none();
+        let mut windows = std::mem::take(&mut self.gap_windows);
+        let (mut survey, epoch_gap_due, windows) = match self
             .debt_turn(pass, move |turn| {
                 // Each row is written where what it records is: whatever
                 // fails later in the turn, none of them is written again.
@@ -786,9 +799,14 @@ impl<H: RunnerHost> RecoveryRunner<H> {
                     // does records every route it finds suspended.
                     *suspended = None;
                 }
-                let due = epoch_gap::advance(turn, &policy, &stalled)?.next_due;
-                let survey = select::survey(turn, &policy, &stalled)?;
-                Ok((survey, due))
+                let visits = epoch_gap::advance(turn, &policy, &stalled)?;
+                let survey = select::survey(
+                    turn,
+                    &policy,
+                    &stalled,
+                    background.then_some((&visits.visit_ends, &mut windows)),
+                )?;
+                Ok((survey, visits.next_due, windows))
             })
             .await
         {
@@ -809,6 +827,7 @@ impl<H: RunnerHost> RecoveryRunner<H> {
                 };
             }
         };
+        self.gap_windows = windows;
         let admission_due = sooner(admission_due, epoch_gap_due);
         self.host.surveyed(std::mem::take(&mut survey.catching_up));
         let now = self.host.now_seconds();
@@ -875,7 +894,15 @@ impl<H: RunnerHost> RecoveryRunner<H> {
         let repair = pass.is_some_and(|bound| bound.repair_until.is_some());
         let (plan, fetch_audit) = match self
             .debt_turn(pass, move |turn| {
-                let plan = select::begin(turn, &key, best_effort, caps, compares, &policy);
+                let plan = select::begin(
+                    turn,
+                    &key,
+                    best_effort,
+                    caps,
+                    compares,
+                    &policy,
+                    candidate.fetch_until,
+                );
                 // A best-effort relay is charged nothing.
                 if let Ok(Some(plan)) = &plan
                     && !plan.best_effort
@@ -1005,6 +1032,7 @@ impl<H: RunnerHost> RecoveryRunner<H> {
             }
         };
         let now = self.host.now_seconds();
+        self.refresh_staged_group(&candidate, &report);
         self.memory
             .settled(&candidate, Some(&report), outcome, now, &self.policy);
         tracing::debug!(
@@ -1157,6 +1185,7 @@ impl<H: RunnerHost> RecoveryRunner<H> {
             }
         };
         let now = self.host.now_seconds();
+        self.refresh_staged_group(&candidate, &report);
         self.memory.recheck_settled(
             &candidate.key,
             settled.moved,
@@ -1186,6 +1215,16 @@ impl<H: RunnerHost> RecoveryRunner<H> {
             outcome: settled.outcome,
             recheck: true,
         })
+    }
+
+    /// Other sources must be able to reach newly staged history on the
+    /// group's admission frontier, including a recheck's late findings.
+    fn refresh_staged_group(&mut self, candidate: &Candidate, report: &quantum::QuantumReport) {
+        if report.events_staged > 0
+            && let Some(group) = &candidate.group_id
+        {
+            self.gap_windows.remove(group);
+        }
     }
 
     /// The begin turn found `candidate` owing nothing, or no longer eligible:
@@ -1252,6 +1291,9 @@ impl<H: RunnerHost> RecoveryRunner<H> {
                 Some(Ok(())) => {
                     self.reconnect_failures = 0;
                     self.memory.relay_reconnected(&relay);
+                    for units in self.gap_windows.values_mut() {
+                        units.retain(|key, _| key.relay != relay);
+                    }
                 }
             }
         }

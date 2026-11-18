@@ -17,6 +17,8 @@ pub struct RecoveryEpochGapRetry {
     pub visits: u64,
     /// Its uncovered ledger ranges are still being swept/admitted.
     pub in_progress: bool,
+    /// Last history second this visit was opened to check.
+    pub visit_until_seconds: u64,
     /// No more automatic visits at this epoch without explicit repair.
     pub exhausted: bool,
     /// The next visit's durable earliest start; zero during a visit.
@@ -37,7 +39,7 @@ impl SqliteAppStorage {
         let row = self
             .lock()?
             .query_row_cached(
-                "SELECT r.visits,r.in_progress,r.next_retry_at_seconds,r.exhausted
+                "SELECT r.visits,r.in_progress,r.next_retry_at_seconds,r.exhausted,r.visit_until_seconds
              FROM account_recovery_epoch_gap_retries r JOIN account_recovery_obligations o
                  ON o.id=r.obligation_id AND o.stalled_epoch=r.stalled_epoch
              WHERE o.id=?1 AND o.revision=?2 AND o.cause=1 AND o.state=0",
@@ -48,14 +50,16 @@ impl SqliteAppStorage {
                         row.get::<_, bool>(1)?,
                         row.get::<_, i64>(2)?,
                         row.get::<_, bool>(3)?,
+                        row.get::<_, i64>(4)?,
                     ))
                 },
             )
             .optional()
             .storage()?;
-        row.map(|(visits, in_progress, next, exhausted)| {
+        row.map(|(visits, in_progress, next, exhausted, until)| {
             Ok(RecoveryEpochGapRetry {
                 visits: i64_to_u64(visits)?,
+                visit_until_seconds: i64_to_u64(until)?,
                 in_progress,
                 exhausted,
                 next_retry_at_seconds: i64_to_u64(next)?,
@@ -119,14 +123,15 @@ impl SqliteAppStorage {
             self.lock()?
                 .execute_cached(
                     "INSERT INTO account_recovery_epoch_gap_retries
-                 (obligation_id,stalled_epoch,visits,in_progress,exhausted,next_retry_at_seconds)
-                 VALUES (?1,?2,?3,1,0,0) ON CONFLICT(obligation_id) DO UPDATE SET
+                 (obligation_id,stalled_epoch,visits,in_progress,exhausted,next_retry_at_seconds,visit_until_seconds)
+                 VALUES (?1,?2,?3,1,0,0,?4) ON CONFLICT(obligation_id) DO UPDATE SET
                  stalled_epoch=excluded.stalled_epoch,visits=excluded.visits,
-                 in_progress=1,exhausted=0,next_retry_at_seconds=0",
+                 in_progress=1,exhausted=0,next_retry_at_seconds=0,visit_until_seconds=excluded.visit_until_seconds",
                     params![
                         ticket.id.as_slice(),
                         epoch,
-                        integer(visits)?
+                        integer(visits)?,
+                        integer(now_seconds)?
                     ],
                 )
                 .storage()?;
