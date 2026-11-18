@@ -705,10 +705,13 @@ const RELAY_A: &str = "wss://relay-a.example";
 const RELAY_B: &str = "wss://relay-b.example";
 
 /// alice's groups, as a hydrated account answers about them: relay B still
-/// owes `owed`'s last own commit, `damaged`'s hydration quarantines it, and
-/// `halted`'s copy is Unrecoverable, which hides its re-join notice.
+/// owes `owed`'s last own commit, `quiet` answers its maintenance status,
+/// `damaged`'s hydration quarantines it, and `halted`'s copy is
+/// Unrecoverable, which hides its re-join notice. Each read names its own
+/// group, so no read hydrates the group another one reads.
 struct HeldGroups {
     owed: GroupId,
+    quiet: GroupId,
     damaged: GroupId,
 }
 
@@ -720,7 +723,7 @@ async fn held_groups(dir: &tempfile::TempDir, relay: Arc<ScriptedPushRelayClient
         .with_test_relay_client(relay.clone());
     let mut client = fixture.client("alice").await.unwrap();
     let mut groups = Vec::new();
-    for name in ["owed", "damaged", "halted"] {
+    for name in ["owed", "quiet", "damaged", "halted"] {
         groups.push(
             client
                 .create_group(name, &[])
@@ -730,7 +733,7 @@ async fn held_groups(dir: &tempfile::TempDir, relay: Arc<ScriptedPushRelayClient
                 .expect("a group with no other members"),
         );
     }
-    let [owed, damaged, halted] = groups.try_into().unwrap();
+    let [owed, quiet, damaged, halted] = groups.try_into().unwrap();
     relay.make_endpoints_unavailable(&[RELAY_B]);
     client
         .update_group_profile(&owed, Some("owed"), None)
@@ -773,11 +776,15 @@ async fn held_groups(dir: &tempfile::TempDir, relay: Arc<ScriptedPushRelayClient
     );
     record.protocol_profile = cgka_traits::group::ProtocolProfile::Legacy;
     storage.put_group(&record).unwrap();
-    HeldGroups { owed, damaged }
+    HeldGroups {
+        owed,
+        quiet,
+        damaged,
+    }
 }
 
-/// The account reads that answer from A about `owed` and the account's
-/// groups. Read while the worker holds groups unhydrated, they must answer
+/// The account reads that answer from A about `owed`, `quiet` and the
+/// account's groups. Read while the worker holds groups unhydrated, they must answer
 /// as they do once those groups are hydrated, no earlier than the worker
 /// queue answered before they moved to A. The oracle compares A with a live
 /// read at the same moment, so it cannot see an answer given too early.
@@ -793,14 +800,14 @@ struct AccountReads {
 }
 
 impl AccountReads {
-    async fn read(runtime: &crate::MarmotAppRuntime, owed: &GroupId) -> Self {
+    async fn read(runtime: &crate::MarmotAppRuntime, groups: &HeldGroups) -> Self {
         fn shown<T>(result: Result<T, AppError>) -> Result<T, String> {
             result.map_err(|error| format!("{error:?}"))
         }
         within_hold("an account read", async {
             Self {
-                delivery: shown(runtime.group_commit_delivery("alice", owed).await),
-                maintenance: shown(runtime.maintenance_status("alice", owed).await),
+                delivery: shown(runtime.group_commit_delivery("alice", &groups.owed).await),
+                maintenance: shown(runtime.maintenance_status("alice", &groups.quiet).await),
                 quarantined: shown(
                     runtime
                         .quarantined_groups("alice")
@@ -849,11 +856,11 @@ async fn account_reads_during_startup_hydration_answer_as_hydrated_groups() {
         "every group awaits hydration when read"
     );
 
-    let mut held = AccountReads::read(&runtime, &groups.owed).await;
+    let mut held = AccountReads::read(&runtime, &groups).await;
     for group in &all {
         let _ = within_hold("a group read", runtime.group_members("alice", group)).await;
     }
-    let mut hydrated = AccountReads::read(&runtime, &groups.owed).await;
+    let mut hydrated = AccountReads::read(&runtime, &groups).await;
     assert_eq!(hydration_attempts(&runtime), 1, "the pipeline stayed held");
     runtime.shutdown().await;
 
@@ -889,7 +896,7 @@ async fn account_reads_during_a_reconnect_answer_as_hydrated_groups() {
     crate::worker_fences::worker_startup_finished(&runtime, "alice")
         .await
         .unwrap();
-    let before = AccountReads::read(&runtime, &groups.owed).await;
+    let before = AccountReads::read(&runtime, &groups).await;
     let published = read_state_receiver(&runtime).await;
 
     let mut events = runtime.subscribe();
@@ -921,7 +928,7 @@ async fn account_reads_during_a_reconnect_answer_as_hydrated_groups() {
         .await
         .expect("the reopened client's activation subscribes");
     let window = published.borrow().clone();
-    let during = AccountReads::read(&runtime, &groups.owed).await;
+    let during = AccountReads::read(&runtime, &groups).await;
     relay.release_subscribe();
     timeout(
         Duration::from_secs(30),

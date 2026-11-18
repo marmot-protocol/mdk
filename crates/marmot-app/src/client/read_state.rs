@@ -578,12 +578,16 @@ impl ReadState {
     }
 
     /// `WatchBackupRestore`: a receiver of the client's progress channel
-    /// that has seen the status published here, as subscribing at this
-    /// publish gave. A change sent since then is still news to it.
+    /// that has seen the status published here. A change sent since then is
+    /// still news to it. The status is published before the watch announces
+    /// it, so the receiver this version took can be one announcement behind.
     pub(crate) fn watch_backup_restore(&self) -> BackupRestoreWatch {
-        BackupRestoreWatch {
-            receiver: self.account.backup_restore_updates.clone(),
+        let mut receiver = self.account.backup_restore_updates.clone();
+        let seen = receiver.borrow_and_update().revision;
+        if seen > self.account.backup_restore_status.revision {
+            receiver.mark_changed();
         }
+        BackupRestoreWatch { receiver }
     }
 }
 
@@ -1651,6 +1655,7 @@ fn group_entry(
         record: record.clone(),
     };
     let reusable = device_group.is_ok()
+        && recovery_facts.unrecoverable.settled
         && settled(&answers.roster_revision)
         && settled(&answers.members)
         && settled(&answers.standing)
@@ -2867,6 +2872,26 @@ mod tests {
         let mut watch = state.watch_backup_restore();
         assert!(watch.receiver.has_changed().unwrap());
         assert_eq!(watch.changed().await.unwrap(), later);
+
+        // A version built before the watch announced its status took a
+        // receiver that had not seen it: that status is no news either.
+        let announced = BackupRestoreStatus {
+            phase: crate::BackupRestorePhase::Cancelled,
+            revision: 3,
+            ..Default::default()
+        };
+        let state = ReadState {
+            version: 2,
+            valid_until: None,
+            account: Arc::new(AccountAnswers {
+                backup_restore_status: announced.clone(),
+                backup_restore_updates: updates.subscribe(),
+                ..empty_account_answers()
+            }),
+            groups: Arc::default(),
+        };
+        updates.send_replace(announced);
+        assert!(!state.watch_backup_restore().receiver.has_changed().unwrap());
     }
 
     /// A read whose groups come from stored rows waits for a version that
