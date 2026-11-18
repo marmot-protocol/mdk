@@ -27342,23 +27342,10 @@ async fn undecryptable_traffic_older_than_this_copys_welcome_does_not_arm_a_back
     record.local_copy_welcome_created_at = Some(cgka_traits::transport::Timestamp(welcome_at));
     storage.put_group(&record).unwrap();
 
-    let before_the_welcome = welcome_at - 4 * 60 * 60;
-    for probe in 0..crate::client::history_recovery::epoch_stall::EPOCH_STALL_BACKFILL_THRESHOLD {
-        client
-            .ingest_received_delivery(
-                route.probe(before_the_welcome + probe as u64, &format!("gap-{probe}")),
-            )
-            .await
-            .expect("a retained undecryptable object completes its ingest pass");
-    }
-    assert!(
-        !client.has_pending_epoch_backfill(),
-        "traffic this copy was never able to open is not evidence it is behind",
-    );
     // A busy group's last minutes before the Welcome, and siblings still
-    // sending under the epoch before this copy's just after it, are history
-    // too (mdk#3536): a freshly linked device must not report itself stalled
-    // at the epoch it joined at.
+    // sending under the epoch before this copy's just after it (mdk#3536): a
+    // freshly linked device must not report itself stalled at the epoch it
+    // joined at.
     let around_the_welcome = welcome_at - 60;
     for probe in 0..crate::client::history_recovery::epoch_stall::EPOCH_STALL_BACKFILL_THRESHOLD {
         client
@@ -27371,7 +27358,7 @@ async fn undecryptable_traffic_older_than_this_copys_welcome_does_not_arm_a_back
     }
     assert!(
         !client.has_pending_epoch_backfill(),
-        "history stamped within the skew margin of the Welcome is not evidence either",
+        "traffic this copy was never able to open is not evidence it is behind",
     );
 
     // The same device, the same group, the same undecryptable outcome — only

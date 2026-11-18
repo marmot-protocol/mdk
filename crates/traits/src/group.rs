@@ -234,8 +234,11 @@ impl Group {
 /// is enough to report it as unable to catch up and to hold its device-group
 /// work, the private KeyPackages that adding it to chats waits on included
 /// (mdk#3536, mdk#3535). Dropping evidence from the first minutes of this
-/// copy's own epochs only delays a real stall's detection: every later
-/// undecryptable message this device receives still arms.
+/// copy's own epochs is the cheaper error, but not free: messages stamped in
+/// that window never count, then or after a restart, so a commit missed just
+/// after joining is detected only from undecryptable traffic stamped after the
+/// margin. A group that falls quiet right after such a miss raises no stall
+/// until it speaks again.
 ///
 /// Five minutes is the sender-clock tolerance this project already assumes
 /// elsewhere — `marmot-app`'s transport cursor allows the same drift. That

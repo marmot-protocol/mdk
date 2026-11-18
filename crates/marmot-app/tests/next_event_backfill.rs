@@ -170,8 +170,10 @@ async fn next_event_returns_when_a_live_delivery_arms_the_epoch_backfill() {
     // and reach bob's live subscription; distinct markers make distinct event
     // ids, hence distinct undecryptables at the one stalled epoch. None produces
     // a visible `MarmotAppEvent`, so the summary stays empty across all of them
-    // and only the armed backfill can force the return.
-    let created_at = test_unix_now_seconds();
+    // and only the armed backfill can force the return. Stamped past the
+    // clock-skew margin after bob's Welcome: traffic within it may be the
+    // group's pre-Welcome history, which is not stall evidence.
+    let created_at = test_unix_now_seconds() + cgka_traits::group::PRE_WELCOME_CLOCK_SKEW_SECS;
     for arm in 0..BACKFILL_THRESHOLD {
         publish_garbage_group_message_at(
             &url,
