@@ -275,6 +275,21 @@ async fn composition_prewarm_route_reuse_preserves_original_freshness_deadline()
 
 /// The whole resolution budget, as callers see it.
 const RESOLUTION_BUDGET: Duration = Duration::from_secs(50);
+/// Under Partial, when each step that waits for the whole set stops waiting.
+/// Each cut-off leaves every later step one worst-case wave of 8 s reads.
+const FIRST_HOP_CUT_OFF: Duration = Duration::from_secs(18);
+const OUTBOX_HOP_CUT_OFF: Duration = Duration::from_secs(34);
+const KEY_PACKAGE_BATCH_CUT_OFF: Duration = Duration::from_secs(42);
+
+/// On the paused clock, with every other read answered at once, a resolution
+/// held at one step ends at that step's cut-off. Tokio rounds a deadline up
+/// to its next millisecond.
+fn assert_ends_at(elapsed: Duration, cut_off: Duration) {
+    assert!(
+        (cut_off..cut_off + Duration::from_millis(10)).contains(&elapsed),
+        "ended at {elapsed:?}, cut-off {cut_off:?}"
+    );
+}
 
 /// Resolves `members` for a commit while every fetch `held` matches goes
 /// unanswered: first under Partial, then the same set under Atomic. Atomic
@@ -399,7 +414,63 @@ fn partial_resolution_passes_a_held_first_hop_batch() {
         ));
         expected.push(outcome(&prewarmed, MemberResolutionStatus::Selected));
         assert_eq!(outcomes, expected);
-        assert!(elapsed < RESOLUTION_BUDGET, "{elapsed:?}");
+        assert_ends_at(elapsed, FIRST_HOP_CUT_OFF);
+    });
+}
+
+/// A first-hop batch that comes back incomplete falls back to one read per
+/// author, and each member goes on when its own read answers: a member whose
+/// retry answered is selected while its batch-mate's retry is still held.
+#[test]
+fn partial_resolution_keeps_a_finished_retry_beside_a_held_one() {
+    // Pauses the clock, which Tokio allows only on one thread.
+    crate::tests::run_composed_app_runtime_test_on_one_thread("held-retry", || async {
+        let (_directory, app, accounts, fetcher) =
+            crate::tests::member_resolution_fixture(3, false).await;
+        // Every multi-author query fails, so the first hop's one batch is
+        // incomplete and each of its authors gets a single-author retry.
+        fetcher
+            .reject_multi_author
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let held_author = accounts[1].account_id_hex.clone();
+        let members = accounts
+            .iter()
+            .map(|account| account.account_id_hex.clone())
+            .collect::<Vec<_>>();
+
+        let (outcomes, elapsed) = resolve_past_held_fetch(
+            &app,
+            &fetcher,
+            &accounts[0].label,
+            members,
+            move |request| {
+                asks_for(
+                    request,
+                    transport_nostr_adapter::KIND_NIP65_RELAY_LIST,
+                    "wss://directory.example",
+                ) && request.queries[0].authors == [held_author.clone()]
+            },
+        )
+        .await;
+
+        assert_eq!(
+            outcomes,
+            vec![
+                outcome(
+                    &accounts[0].account_id_hex,
+                    MemberResolutionStatus::Selected
+                ),
+                outcome(
+                    &accounts[1].account_id_hex,
+                    MemberResolutionStatus::Incomplete
+                ),
+                outcome(
+                    &accounts[2].account_id_hex,
+                    MemberResolutionStatus::Selected
+                ),
+            ]
+        );
+        assert_ends_at(elapsed, FIRST_HOP_CUT_OFF);
     });
 }
 
@@ -448,7 +519,7 @@ fn partial_resolution_passes_a_held_outbox_hop() {
                 outcome(&without_package, MemberResolutionStatus::MissingKeyPackage),
             ]
         );
-        assert!(elapsed < RESOLUTION_BUDGET, "{elapsed:?}");
+        assert_ends_at(elapsed, OUTBOX_HOP_CUT_OFF);
         let remembered_inbox = |account: &str| {
             app.directory()
                 .directory_entry_for_account_id(account)
@@ -507,6 +578,6 @@ fn partial_resolution_passes_a_held_key_package_batch() {
                 ),
             ]
         );
-        assert!(elapsed < RESOLUTION_BUDGET, "{elapsed:?}");
+        assert_ends_at(elapsed, KEY_PACKAGE_BATCH_CUT_OFF);
     });
 }
