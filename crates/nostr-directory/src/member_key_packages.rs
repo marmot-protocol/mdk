@@ -296,7 +296,9 @@ impl PartialCutOffs {
     }
 }
 
-/// The stream's next item, or `None` once it ends or `cut_off` passes.
+/// The stream's next item, or `None` once it ends or `cut_off` passes. An
+/// item already waiting when the cut-off passes is still taken: taking it
+/// waits for nothing, and each later step keeps its own cut-off.
 async fn next_before<S: Stream + Unpin>(
     stream: &mut S,
     cut_off: Option<tokio::time::Instant>,
@@ -929,9 +931,15 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
             )
         });
         let mut results = stream::iter(work).flatten_unordered(MEMBER_RESOLUTION_RELAY_CONCURRENCY);
-        let mut progress = HopProgress::default();
+        // Keep each reply as it arrives, and judge them all when the hop ends,
+        // as Atomic always has: a relay list's freshness is read then.
+        let mut received = Vec::new();
         while let Some(result) = next_before(&mut results, cut_off).await {
-            let (index, endpoints, outcome) = result?;
+            received.push(result?);
+        }
+        drop(results);
+        let mut progress = HopProgress::default();
+        for (index, endpoints, outcome) in received {
             let account_id = targets[index].account_id_hex.clone();
             targets[index].relay_records.extend(
                 outcome
@@ -1170,11 +1178,6 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                 (indices, endpoints, key_package_queries(authors))
             })
             .collect::<Vec<_>>();
-        // Members whose batch has not answered.
-        let mut unanswered = request_specs
-            .iter()
-            .flat_map(|(indices, _, _)| indices.iter().copied())
-            .collect::<HashSet<_>>();
         let directory = self.clone();
         let requests = request_specs
             .into_iter()
@@ -1208,7 +1211,6 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                     .push(record);
             }
             for index in indices {
-                unanswered.remove(&index);
                 let account_id = &targets[index].account_id_hex;
                 let account_records = records_by_author.remove(account_id).unwrap_or_default();
                 let selected = select_key_packages_from_records(
@@ -1253,11 +1255,15 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
         }
 
         drop(batches);
-        // Only the Partial cut-off leaves a batch unanswered here.
-        for index in unanswered {
-            outcomes[index] = Some(Err(DirectoryError::DirectoryLookupIncomplete(
-                targets[index].account_id_hex.clone(),
-            )));
+        // Every member asked for has an outcome or a fallback once its batch
+        // answers, so a member with neither is in a batch the Partial cut-off
+        // left unanswered.
+        for &index in unresolved {
+            if outcomes[index].is_none() && !fallback_records.contains_key(&index) {
+                outcomes[index] = Some(Err(DirectoryError::DirectoryLookupIncomplete(
+                    targets[index].account_id_hex.clone(),
+                )));
+            }
         }
 
         fallback.sort_unstable();

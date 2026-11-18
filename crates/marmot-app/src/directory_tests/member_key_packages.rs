@@ -474,6 +474,94 @@ fn partial_resolution_keeps_a_finished_retry_beside_a_held_one() {
     });
 }
 
+/// A metadata hop judges its relay lists when it ends, as it did before cut-offs:
+/// a list that arrives a little past the allowed clock skew still counts if
+/// the clock has caught up by the time the hop's slowest reply lands.
+#[test]
+fn a_hop_judges_relay_list_freshness_when_it_ends() {
+    // Pauses the clock, which Tokio allows only on one thread.
+    crate::tests::run_composed_app_runtime_test_on_one_thread("hop-freshness", || async {
+        // Member 0 publishes on split-a, member 1 on split-b.
+        let (_directory, mut app, accounts, fetcher) =
+            crate::tests::member_resolution_fixture(2, true).await;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let clock = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(now));
+        app.directory_test_clock = Some(clock.clone());
+        // Member 0 has no inbox list, so whether its lookup finished decides
+        // its verdict. Its outbox serves a newer relay list dated five
+        // seconds past the five-minute skew.
+        let member = accounts[0].account_id_hex.clone();
+        let mut events = fetcher.events.lock().unwrap().clone();
+        events.retain(|event| {
+            !(event.pubkey == member
+                && event.kind == transport_nostr_adapter::KIND_MARMOT_INBOX_RELAY_LIST)
+        });
+        let mut ahead = events
+            .iter()
+            .find(|event| {
+                event.pubkey == member
+                    && event.kind == transport_nostr_adapter::KIND_NIP65_RELAY_LIST
+            })
+            .unwrap()
+            .clone();
+        ahead.created_at = now + 5 * 60 + 5;
+        let mut split_a = events.clone();
+        split_a.push(ahead);
+        fetcher.events_by_endpoint.lock().unwrap().extend([
+            ("wss://directory.example".to_owned(), events.clone()),
+            ("wss://split-a.example".to_owned(), split_a),
+            ("wss://split-b.example".to_owned(), events),
+        ]);
+        // Member 1's outbox answers 100 ms late, and the clock moves ten
+        // seconds before it does.
+        *fetcher.stalled_endpoint.lock().unwrap() = Some("wss://split-b.example".to_owned());
+        let requirements = crate::tests::client_on_app_relay_plane(&app, &accounts[0].label)
+            .await
+            .runtime
+            .create_key_package_requirements(&cgka_traits::engine::CreateGroupRequest {
+                name: "hop freshness".into(),
+                description: String::new(),
+                members: Vec::new(),
+                required_features: Vec::new(),
+                app_components: Vec::new(),
+                initial_admins: Vec::new(),
+            })
+            .unwrap();
+        tokio::time::pause();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            clock.fetch_add(10, std::sync::atomic::Ordering::SeqCst);
+        });
+
+        let atomic = app
+            .directory()
+            .resolve_compatible_member_key_packages(
+                accounts
+                    .iter()
+                    .map(|account| account.account_id_hex.clone())
+                    .collect(),
+                &requirements,
+                MemberResolutionPurpose::Commit,
+                MemberResolutionPolicy::Atomic,
+            )
+            .await;
+
+        // The finished lookup gives a verdict: member 0 has no inbox route.
+        assert!(
+            matches!(
+                atomic,
+                Err(nostr_directory::error::DirectoryError::MissingMemberInboxRoute(ref account))
+                    if *account == member
+            ),
+            "{:?}",
+            atomic.as_ref().err()
+        );
+    });
+}
+
 /// An outbox hop that never answers holds only the members routed there.
 /// A member whose discovery finished has its relay lists remembered even
 /// though it has no KeyPackage; the held member's discovery-only snapshot is

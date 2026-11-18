@@ -742,13 +742,13 @@ pub(crate) struct ScriptedPushRelayClient {
 pub(crate) struct MemberResolutionDirectoryFetcher {
     pub(crate) requests: std::sync::Mutex<Vec<transport_nostr::DirectoryFetchRequest>>,
     pub(super) events: std::sync::Mutex<Vec<NostrTransportEvent>>,
-    events_by_endpoint:
+    pub(crate) events_by_endpoint:
         std::sync::Mutex<std::collections::HashMap<String, Vec<NostrTransportEvent>>>,
     pub(crate) reject_multi_author: std::sync::atomic::AtomicBool,
     key_packages_only_in_single_author: std::sync::Mutex<std::collections::HashSet<String>>,
     key_packages_only_in_multi_author: std::sync::Mutex<std::collections::HashSet<String>>,
     pub(super) failing_single_author: std::sync::Mutex<Option<String>>,
-    stalled_endpoint: std::sync::Mutex<Option<String>>,
+    pub(crate) stalled_endpoint: std::sync::Mutex<Option<String>>,
     incomplete_endpoint: std::sync::Mutex<Option<String>>,
     incomplete_query_kind: std::sync::Mutex<Option<u64>>,
     failing_endpoint: std::sync::Mutex<Option<String>>,
