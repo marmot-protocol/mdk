@@ -1634,6 +1634,7 @@ async fn message_subscription_recv_ends_when_runtime_shutdown_begins() {
 fn timeline_test_record(message_id_hex: &str, timeline_at: u64) -> TimelineMessageRecord {
     TimelineMessageRecord {
         client_token: None,
+        view_once: None,
         has_reports: false,
         group_system: None,
         poll: None,

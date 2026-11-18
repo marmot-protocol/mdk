@@ -632,12 +632,20 @@ fn backfill_authority_request(conn: &Connection, event: &RawAppEvent) -> Storage
     let payload = inner
         .encode()
         .map_err(|e| StorageError::Backend(e.to_string()))?;
-    let (seconds, expires_at): (Option<i64>, Option<i64>) = conn.query_row_cached(
-        "SELECT retention_seconds,retention_expires_at FROM app_events WHERE group_id_hex=?1 AND message_id_hex=?2",
-        params![event.group_id_hex,event.message_id_hex],|r|Ok((r.get(0)?,r.get(1)?)),
+    let (seconds, expires_at, view_once): (Option<i64>, Option<i64>, Option<i64>) = conn.query_row_cached(
+        "SELECT retention_seconds,retention_expires_at,(SELECT v.policy_expires_at FROM view_once_consumption v WHERE v.group_id_hex=a.group_id_hex AND v.message_id_hex=a.message_id_hex AND v.eligible=1 AND v.source_epoch=a.source_epoch AND v.source_message_id_hex IS a.source_message_id_hex AND v.sender=a.sender) FROM app_events a WHERE group_id_hex=?1 AND message_id_hex=?2",
+        params![event.group_id_hex,event.message_id_hex],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
     ).storage()?;
     let seconds = seconds.map(i64_to_u64).transpose()?;
     let expires_at = expires_at.map(i64_to_u64).transpose()?;
+    let view_once = view_once
+        .map(i64_to_u64)
+        .transpose()?
+        .map(
+            |unopened_expires_at| cgka_traits::app_event::ViewOncePolicy {
+                unopened_expires_at,
+            },
+        );
     let request = PendingAppMessageAuthority {
         group_id: cgka_traits::GroupId::new(group.clone()),
         message_id: cgka_traits::MessageId::new(source.clone()),
@@ -647,6 +655,7 @@ fn backfill_authority_request(conn: &Connection, event: &RawAppEvent) -> Storage
         retention: seconds.map(|retention_seconds| AppMessageRetentionDecision {
             retention_seconds,
             expires_at,
+            view_once,
         }),
     };
     let record = crate::serialize(&request)?;
@@ -1022,6 +1031,7 @@ mod tests {
             Some(AppMessageRetentionDecision {
                 retention_seconds: 10,
                 expires_at: Some(11),
+                view_once: None,
             }),
             None,
         )

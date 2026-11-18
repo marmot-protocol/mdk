@@ -41,6 +41,7 @@ pub(crate) mod stickers;
 pub(crate) mod storage_compaction;
 pub(crate) mod timeline;
 pub(crate) mod transport;
+pub(crate) mod view_once;
 pub(crate) mod worker_due;
 
 pub(crate) mod sibling_welcome_resends;

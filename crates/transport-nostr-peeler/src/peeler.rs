@@ -900,23 +900,34 @@ mod tests {
             HashMap::from([(DEFAULT_EXPORTER_LABEL.to_string(), vec![0x7a; 32])]),
             Some(group_id.clone()),
         );
-        let wrapped = NostrMlsPeeler::default()
-            .wrap_group_message_with_metadata(
-                &EncryptedPayload {
-                    ciphertext: b"inner mls bytes".to_vec(),
-                    aad: vec![],
-                },
-                &ctx,
-                &GroupMessageMetadata::application(1_700_000_000, Some(60)),
-            )
-            .await
-            .expect("wrap succeeds");
+        for (retention, cap, expected) in [
+            (Some(60), None, "1700000060"),
+            (None, Some(1_700_000_120), "1700000120"),
+            (Some(0), Some(1_700_000_120), "1700000120"),
+            (Some(60), Some(1_700_000_120), "1700000060"),
+            (Some(600), Some(1_700_000_120), "1700000120"),
+            (Some(u64::MAX), Some(1_700_000_120), "1700000120"),
+        ] {
+            let wrapped = NostrMlsPeeler::default()
+                .wrap_group_message_with_metadata(
+                    &EncryptedPayload {
+                        ciphertext: b"inner mls bytes".to_vec(),
+                        aad: vec![],
+                    },
+                    &ctx,
+                    &GroupMessageMetadata::application(1_700_000_000, retention, cap),
+                )
+                .await
+                .expect("wrap succeeds");
 
-        let event = NostrTransportEvent::from_transport_message(&wrapped).expect("payload parses");
-        let expected_group_id = hex::encode(group_id);
-        assert_eq!(event.tag_value("h"), Some(expected_group_id.as_str()));
-        assert_eq!(event.tag_value(EXPIRATION_TAG), Some("1700000060"));
-        assert_eq!(event.tag_values(EXPIRATION_TAG).len(), 1);
+            let event =
+                NostrTransportEvent::from_transport_message(&wrapped).expect("payload parses");
+            let expected_group_id = hex::encode(&group_id);
+            assert_eq!(event.tag_value("h"), Some(expected_group_id.as_str()));
+            assert_eq!(event.created_at, 1_700_000_000);
+            assert_eq!(event.tag_value(EXPIRATION_TAG), Some(expected));
+            assert_eq!(event.tag_values(EXPIRATION_TAG).len(), 1);
+        }
     }
 
     /// The bound is exact for an event whose timestamps are as wide as a `u64`
@@ -952,12 +963,15 @@ mod tests {
             (0, GroupMessageMetadata::commit_or_proposal()),
             (
                 1,
-                GroupMessageMetadata::application(1_700_000_000, Some(60)),
+                GroupMessageMetadata::application(1_700_000_000, Some(60), None),
             ),
-            (2, GroupMessageMetadata::application(1_700_000_000, None)),
+            (
+                2,
+                GroupMessageMetadata::application(1_700_000_000, None, None),
+            ),
             (
                 65_000,
-                GroupMessageMetadata::application(1_700_000_000, Some(60)),
+                GroupMessageMetadata::application(1_700_000_000, Some(60), None),
             ),
         ] {
             let wrapped = NostrMlsPeeler::default()
@@ -1005,7 +1019,7 @@ mod tests {
                         aad: vec![],
                     },
                     &ctx,
-                    &GroupMessageMetadata::application(created_at, Some(retention_seconds)),
+                    &GroupMessageMetadata::application(created_at, Some(retention_seconds), None),
                 )
                 .await
                 .expect("wrap succeeds");
@@ -1041,7 +1055,7 @@ mod tests {
                     aad: vec![],
                 },
                 &ctx,
-                &GroupMessageMetadata::application(inner_created_at, None),
+                &GroupMessageMetadata::application(inner_created_at, None, None),
             )
             .await
             .expect("wrap succeeds");
@@ -1059,8 +1073,8 @@ mod tests {
         );
         for metadata in [
             GroupMessageMetadata::commit_or_proposal(),
-            GroupMessageMetadata::application(1_700_000_000, None),
-            GroupMessageMetadata::application(1_700_000_000, Some(0)),
+            GroupMessageMetadata::application(1_700_000_000, None, None),
+            GroupMessageMetadata::application(1_700_000_000, Some(0), None),
         ] {
             let wrapped = NostrMlsPeeler::default()
                 .wrap_group_message_with_metadata(
@@ -1094,7 +1108,7 @@ mod tests {
                     aad: vec![],
                 },
                 &ctx,
-                &GroupMessageMetadata::application(u64::MAX, Some(1)),
+                &GroupMessageMetadata::application(u64::MAX, Some(1), None),
             )
             .await
             .expect("an optional expiration overflow does not reject the message");

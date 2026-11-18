@@ -19,7 +19,7 @@ use cgka_traits::agent_text_stream::{
 };
 use cgka_traits::app_components::{
     ACCOUNT_DEVICES_COMPONENT_ID, AGENT_TEXT_STREAM_QUIC_COMPONENT_ID, DEVICE_ROSTER_COMPONENT_ID,
-    NostrRoutingV1, default_group_components,
+    NostrRoutingV1, VIEW_ONCE_COMPONENT_ID, default_group_components,
 };
 #[allow(deprecated)]
 pub use cgka_traits::app_components::{
@@ -74,6 +74,13 @@ use transport_nostr_adapter::{
 use transport_nostr_peeler::{NostrMlsPeeler, NostrTransportEvent};
 
 mod close_registry;
+mod view_once;
+pub use cgka_traits::app_components::ViewOnceActivationRefusal;
+pub use storage_sqlite::{StoredViewOncePresentation, ViewOnceState};
+pub use view_once::{
+    MAX_VIEW_ONCE_READ_BYTES, VIEW_ONCE_VIEWER_SECONDS, ViewOnceConsumeOutcome,
+    ViewOnceMediaRequest, ViewOnceViewer,
+};
 mod unlinked_publish_gate;
 mod user_blocks;
 pub use runtime::RuntimeBlockListSubscription;
@@ -674,6 +681,7 @@ pub struct MarmotApp {
     /// Closers for handles outside the storage caches; `close_storage` runs
     /// them all.
     close_registry: Arc<close_registry::CloseRegistry>,
+    view_once_sessions: Arc<view_once::ViewOnceSessions>,
     account_session_owners: Arc<Mutex<HashSet<String>>>,
     directory_caches: Arc<Mutex<HashMap<String, DirectoryCache>>>,
     /// What the directory keeps between calls; [`Self::directory`] shares it
@@ -2014,6 +2022,7 @@ impl MarmotApp {
             notification_dispatches: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             account_home: AccountHome::open(&root),
             root,
+            view_once_sessions: Arc::default(),
             root_runtime_lease: Arc::new(Mutex::new(None)),
             onboarding_transactions: Arc::default(),
             storage_closed: Arc::new(AtomicBool::new(false)),
@@ -2141,6 +2150,7 @@ impl MarmotApp {
             #[cfg(test)]
             notification_dispatches: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             root: root.as_ref().to_path_buf(),
+            view_once_sessions: Arc::default(),
             root_runtime_lease: Arc::new(Mutex::new(None)),
             onboarding_transactions: Arc::default(),
             storage_closed: Arc::new(AtomicBool::new(false)),
@@ -7587,9 +7597,15 @@ impl MarmotApp {
         // Keep source/retention and chat-list refresh atomic: a refresh failure
         // must leave the accepted fanout able to reconstruct its completion.
         let storage = self.account_storage(label)?;
+        let mut event = stored_app_event_from_projection(message, received_at);
+        if view_once::is_view_once(&event.tags)
+            && event.sender == self.account_home().account(label)?.account_id_hex
+        {
+            event.direction = "sent".into();
+        }
         let update = cgka_traits::StorageProvider::with_transaction(&storage, |storage| {
             let storage_update = storage.app_storage().record_app_event_with_source(
-                &stored_app_event_from_projection(message, received_at),
+                &event,
                 message.retention,
                 message.authority,
             )?;
@@ -7647,9 +7663,15 @@ impl MarmotApp {
     ) -> Result<AppProjectionUpdate, AppError> {
         let now = unix_now_seconds();
         let storage = self.account_storage(label)?;
+        let mut event = stored_app_event_from_projection(message, now);
+        if view_once::is_view_once(&event.tags)
+            && event.sender == self.account_home().account(label)?.account_id_hex
+        {
+            event.direction = "sent".into();
+        }
         let update = cgka_traits::StorageProvider::with_transaction(&storage, |storage| {
             let storage_update = storage.app_storage().record_app_event_with_source(
-                &stored_app_event_from_projection(message, now),
+                &event,
                 message.retention,
                 message.authority,
             )?;
@@ -8245,6 +8267,7 @@ impl MarmotApp {
             stores.remove(label);
             self.close_registry.close(&media_close_key(label));
         }
+        self.close_registry.close(&view_once::close_key(label));
         self.legacy_media_migrations
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -8478,6 +8501,7 @@ impl MarmotApp {
         // negotiation: each group's required component id selects exactly one.
         components.insert(GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID);
         components.insert(GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID);
+        components.insert(VIEW_ONCE_COMPONENT_ID);
         // A new group requires account-devices when every founding device
         // advertises it (mdk#2628, item 2.3); an existing group gains it only
         // through an admin's activation (item 2.4). Advertising it makes

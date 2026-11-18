@@ -109,6 +109,7 @@ fn reports_the_device(error: &EngineError) -> bool {
         | EngineError::DisbandingUnsupportedMembers { .. }
         | EngineError::DisbandingNotEnabled { .. }
         | EngineError::AccountDevicesActivationRefused { .. }
+        | EngineError::ViewOnceActivationRefused { .. }
         | EngineError::UnsupportedCiphersuite { .. }
         | EngineError::InvalidAppMessagePayload(_)
         | EngineError::InvalidAccountIdentityProof(_)

@@ -274,14 +274,15 @@ impl<S: StorageProvider> Engine<S> {
             if already_required.contains(&cap) {
                 continue;
             }
-            // Requiring account-devices is an explicit admin decision that a
-            // group can never undo (account-devices-v1.md, "Activation in an
-            // existing group"), so an upgrade never adds it by itself.
-            if cap
-                == Capability::AppComponent(
-                    cgka_traits::app_components::ACCOUNT_DEVICES_COMPONENT_ID,
+            // These irreversible profiles require explicit admin activation;
+            // a generic capability upgrade never turns them on.
+            if matches!(
+                cap,
+                Capability::AppComponent(
+                    cgka_traits::app_components::ACCOUNT_DEVICES_COMPONENT_ID
+                        | cgka_traits::app_components::VIEW_ONCE_COMPONENT_ID
                 )
-            {
+            ) {
                 continue;
             }
             if leaves.iter().all(|caps| caps.contains(&cap)) {

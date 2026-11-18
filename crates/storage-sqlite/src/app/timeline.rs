@@ -35,7 +35,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use crate::{
     SQLITE_BIND_PARAMETER_CHUNK, SqliteAppStorage, SqliteResultExt,
     app::encrypted_media_secrets::{
-        encrypted_media_component_ids, encrypted_media_secret_reference_epochs_for_message_tx,
+        encrypted_media_secret_reference_epochs_for_message_tx,
         replace_encrypted_media_secret_references_for_parts_tx,
         replace_encrypted_media_secret_references_tx,
         retire_unreferenced_encrypted_media_secret_epochs_tx,
@@ -263,6 +263,8 @@ impl DeletionSource {
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TimelineMessageRecord {
+    #[serde(default)]
+    pub view_once: Option<crate::StoredViewOncePresentation>,
     /// Opaque device-local submission identity. Never reconstructed from tags.
     #[serde(default)]
     pub client_token: Option<String>,
@@ -357,6 +359,8 @@ impl TimelineMessageRecord {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TimelineReplyPreview {
+    #[serde(default)]
+    pub view_once: Option<crate::StoredViewOncePresentation>,
     pub message_id_hex: String,
     pub sender: String,
     pub plaintext: String,
@@ -407,6 +411,7 @@ pub struct TimelinePage {
 /// preview by callers that honor `deleted`/`invalidated`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TimelineMessageTarget {
+    pub view_once: bool,
     pub sender: String,
     pub plaintext: String,
     pub kind: u64,
@@ -513,7 +518,6 @@ struct PollResponseCandidate {
 struct PrunedAppEvent {
     message_id_hex: String,
     kind: u64,
-    source_epoch: Option<u64>,
     tags: Vec<Vec<String>>,
     /// The stored tags no longer decode, so `tags` holds only what
     /// [`recovered_app_event_tags_tx`] found of them.
@@ -660,18 +664,30 @@ impl SqliteAppStorage {
             if updated == 0 {
                 return Ok(None);
             }
+            crate::app::view_once::finalize_tx(&conn, group_id_hex, message_id_hex, retention)?;
+            crate::app::view_once::cap_retention_tx(&conn, group_id_hex, message_id_hex)?;
             let (kind, tags) = app_event_projection_parts_tx(&conn, group_id_hex, message_id_hex)?
                 .ok_or_else(|| {
                     StorageError::Backend("finalized app event row missing after update".to_owned())
                 })?;
-            replace_encrypted_media_secret_references_for_parts_tx(
-                &conn,
-                group_id_hex,
-                message_id_hex,
-                kind,
-                Some(source_epoch),
-                &tags,
-            )?;
+            let terminal_once =
+                crate::app::view_once::presentation_tx(&conn, group_id_hex, message_id_hex)?
+                    .is_some_and(|presentation| {
+                        matches!(
+                            presentation.state,
+                            crate::ViewOnceState::Consumed | crate::ViewOnceState::Expired
+                        )
+                    });
+            if !terminal_once {
+                replace_encrypted_media_secret_references_for_parts_tx(
+                    &conn,
+                    group_id_hex,
+                    message_id_hex,
+                    kind,
+                    Some(source_epoch),
+                    &tags,
+                )?;
+            }
             let affected_message_ids = affected_timeline_message_ids_for_parts_tx(
                 &conn,
                 group_id_hex,
@@ -721,6 +737,23 @@ impl SqliteAppStorage {
     ) -> StorageResult<TimelineProjectionUpdate> {
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
+            let terminal_once = crate::app::view_once::record_tx(&conn, event, retention)?;
+            let redacted_event;
+            let event = if terminal_once {
+                redacted_event = StoredAppEvent {
+                    plaintext: String::new(),
+                    tags: crate::app::view_once::placeholder_tags(
+                        crate::app::view_once::presentation_tx(
+                            &conn,
+                            &event.group_id_hex,
+                            &event.message_id_hex,
+                        )?
+                        .map(|presentation| presentation.unopened_expires_at),
+                    ),
+                    ..event.clone()
+                };
+                &redacted_event
+            } else { event };
             // Only erased targets with retained moderation evidence have a
             // replay fence here; ordinary dedup and expiry belong to ingress.
             let expired_target = match event.kind {
@@ -842,6 +875,7 @@ impl SqliteAppStorage {
                 ],
             )
             .storage()?;
+            crate::app::view_once::cap_retention_tx(&conn, &event.group_id_hex, &event.message_id_hex)?;
             if let Some(authority) = authority {
                 if let Some(authority) = authority {
                     conn.execute_cached(
@@ -873,7 +907,9 @@ impl SqliteAppStorage {
                 removal_validation::record(&conn, event)?;
             }
             reports::rescrub_control(&conn, &event.group_id_hex, &event.message_id_hex)?;
-            replace_encrypted_media_secret_references_tx(&conn, event)?;
+            if !terminal_once {
+                replace_encrypted_media_secret_references_tx(&conn, event)?;
+            }
             upsert_message_modifier_edges_tx(&conn, event)?;
             for message_id in &affected_message_ids {
                 upsert_message_timeline_projection_for_message_tx(
@@ -1779,13 +1815,15 @@ impl SqliteAppStorage {
     ) -> StorageResult<Option<TimelineMessageTarget>> {
         let conn = self.lock()?;
         conn.query_row_cached(
-            "SELECT sender, plaintext, kind, deleted, invalidation_status
+            "SELECT sender, plaintext, kind, deleted, invalidation_status,
+                    EXISTS(SELECT 1 FROM view_once_consumption v WHERE v.group_id_hex=?1 AND v.message_id_hex=?2)
              FROM visible_message_timeline
              WHERE group_id_hex = ?1 AND message_id_hex = ?2
              LIMIT 1",
             params![group_id_hex, message_id_hex],
             |row| {
                 Ok(TimelineMessageTarget {
+                    view_once: row.get(5)?,
                     sender: row.get(0)?,
                     plaintext: row.get(1)?,
                     kind: row.get::<_, i64>(2)?.try_into().unwrap_or_default(),
@@ -1889,6 +1927,7 @@ pub(crate) fn secure_prune_expired_app_events_tx(
         1,
         "secure_delete must be ON before the prune transaction is opened"
     );
+    crate::app::view_once::expire_tx(tx, now)?;
     let pruned_events = expired_app_events_tx(tx, group_id_hex, now)?;
     secure_prune_selected_app_events_tx(
         tx,
@@ -1915,7 +1954,7 @@ pub(crate) fn discard_failed_send_tx(
     // clears `local_publish_failed` there while `app_events` keeps it.
     let event = tx
         .query_row_cached(
-            "SELECT source.message_id_hex, source.kind, source.source_epoch, source.tags_json
+            "SELECT source.message_id_hex, source.kind, source.tags_json
              FROM message_timeline AS timeline
              JOIN app_events AS source
                ON source.group_id_hex = timeline.group_id_hex
@@ -2003,21 +2042,12 @@ fn secure_prune_selected_app_events_tx(
                 .extend(tag_values(&event.tags, EVENT_REF_TAG).map(ToOwned::to_owned));
         }
         collect_media_ciphertext_hashes(&event.tags, &mut media_ciphertext_sha256);
-        // Recorded ownership survives damaged tags, including a comment's k tag.
-        if event.tags_damaged || event.kind == NIP22_COMMENT_KIND {
-            retiring_media_epochs.extend(encrypted_media_secret_reference_epochs_for_message_tx(
-                tx,
-                group_id_hex,
-                &event.message_id_hex,
-            )?);
-        } else if matches!(
-            event.kind,
-            MARMOT_APP_EVENT_KIND_CHAT | MARMOT_APP_EVENT_KIND_REACTION
-        ) && !encrypted_media_component_ids(&event.tags).is_empty()
-            && let Some(source_epoch) = event.source_epoch
-        {
-            retiring_media_epochs.insert(u64_to_i64(source_epoch)?);
-        }
+        // Recorded ownership survives tag damage and content erasure.
+        retiring_media_epochs.extend(encrypted_media_secret_reference_epochs_for_message_tx(
+            tx,
+            group_id_hex,
+            &event.message_id_hex,
+        )?);
         affected_message_ids.extend(affected_timeline_message_ids_for_pruned_event_tx(
             tx,
             group_id_hex,
@@ -2752,6 +2782,14 @@ fn app_events_targeting_message_tx(
 }
 
 fn upsert_message_timeline_row_tx(tx: &Connection, row: &TimelineRow) -> StorageResult<()> {
+    let once_metadata =
+        crate::app::view_once::presentation_tx(tx, &row.group_id_hex, &row.message_id_hex)?;
+    let once = once_metadata.is_some() || crate::app::view_once::is_view_once(&row.tags);
+    let safe_tags = once.then(|| {
+        crate::app::view_once::placeholder_tags(
+            once_metadata.map(|metadata| metadata.unopened_expires_at),
+        )
+    });
     tx.execute_cached(
         "INSERT INTO message_timeline (
             group_id_hex, message_id_hex, source_message_id_hex, source_epoch, direction, sender,
@@ -2788,19 +2826,19 @@ fn upsert_message_timeline_row_tx(tx: &Connection, row: &TimelineRow) -> Storage
             optional_u64_to_i64(row.source_epoch)?,
             &row.direction,
             &row.sender,
-            &row.plaintext,
+            if once { "" } else { &row.plaintext },
             u64_to_i64(row.kind)?,
-            tags_json(&row.tags)?,
+            tags_json(safe_tags.as_deref().unwrap_or(&row.tags))?,
             u64_to_i64(row.timeline_at)?,
             u64_to_i64(row.received_at)?,
-            &row.reply_to_message_id_hex,
-            optional_value_json(&row.media)?,
-            optional_value_json(&row.agent_text_stream)?,
-            reaction_summary_json(&row.reactions)?,
+            if once { None } else { row.reply_to_message_id_hex.as_ref() },
+            if once { None } else { optional_value_json(&row.media)? },
+            if once { None } else { optional_value_json(&row.agent_text_stream)? },
+            if once { reaction_summary_json(&TimelineReactionSummary::default())? } else { reaction_summary_json(&row.reactions)? },
             if row.deleted { 1_i64 } else { 0_i64 },
             &row.deleted_by_message_id_hex,
             &row.invalidation_status,
-            row.edit.as_ref().map(serde_json::to_string).transpose().map_err(|e| StorageError::Serialization(e.to_string()))?,
+            if once { None } else { row.edit.as_ref().map(serde_json::to_string).transpose().map_err(|e| StorageError::Serialization(e.to_string()))? },
             row.deletion_source.as_str(),
             row.recipient_confirmed,
         ],
@@ -2902,7 +2940,7 @@ fn app_events_before_cutoff_tx(
 ) -> StorageResult<Vec<PrunedAppEvent>> {
     let mut stmt = tx
         .prepare_cached(
-            "SELECT message_id_hex, kind, source_epoch, tags_json
+            "SELECT message_id_hex, kind, tags_json
              FROM app_events
              WHERE group_id_hex = ?1
                AND recorded_at < ?2
@@ -2925,7 +2963,7 @@ fn expired_app_events_tx(
 ) -> StorageResult<Vec<PrunedAppEvent>> {
     let mut stmt = tx
         .prepare_cached(
-            "SELECT message_id_hex, kind, source_epoch, tags_json
+            "SELECT message_id_hex, kind, tags_json
              FROM app_events
              WHERE group_id_hex = ?1
                AND retention_expires_at IS NOT NULL
@@ -3034,13 +3072,10 @@ fn app_event_tags_damaged_tx(
 }
 
 fn pruned_app_event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PrunedAppEvent> {
-    let tags = decode_app_event_tags(row, 3)?;
+    let tags = decode_app_event_tags(row, 2)?;
     Ok(PrunedAppEvent {
         message_id_hex: row.get(0)?,
         kind: row.get::<_, i64>(1)?.try_into().unwrap_or_default(),
-        source_epoch: row
-            .get::<_, Option<i64>>(2)?
-            .and_then(|value| value.try_into().ok()),
         tags_damaged: tags.is_none(),
         tags: tags.unwrap_or_default(),
     })
@@ -4709,7 +4744,8 @@ pub(super) fn is_nip22_comment(kind: u64, tags: &[Vec<String>]) -> bool {
 }
 
 fn is_editable_message(kind: u64, tags: &[Vec<String>]) -> bool {
-    kind == MARMOT_APP_EVENT_KIND_CHAT || is_nip22_comment(kind, tags)
+    !crate::app::view_once::is_view_once(tags)
+        && (kind == MARMOT_APP_EVENT_KIND_CHAT || is_nip22_comment(kind, tags))
 }
 
 fn timeline_row_from_chat(event: &RawAppEvent) -> TimelineRow {
@@ -4832,6 +4868,9 @@ fn invalidation_status(event: &RawAppEvent) -> String {
 }
 
 fn media_metadata(tags: &[Vec<String>]) -> Option<Value> {
+    if crate::app::view_once::is_view_once(tags) {
+        return None;
+    }
     let imeta = tags
         .iter()
         .filter(|tag| tag.first().is_some_and(|name| name == "imeta"))
@@ -4948,6 +4987,7 @@ fn visible_timeline_record(
 fn timeline_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TimelineMessageRecord> {
     let deleted = row.get::<_, bool>(17)?;
     Ok(TimelineMessageRecord {
+        view_once: None,
         client_token: row.get("client_token")?,
         has_reports: false,
         group_system: crate::app::group_system::projected_group_system(
@@ -5274,6 +5314,13 @@ fn hydrate_timeline_presentation(
     messages: &mut [TimelineMessageRecord],
 ) -> StorageResult<()> {
     reports::hydrate(conn, messages)?;
+    for message in messages.iter_mut() {
+        message.view_once = crate::app::view_once::presentation_tx(
+            conn,
+            &message.group_id_hex,
+            &message.message_id_hex,
+        )?;
+    }
     filter_blocked_reactions(conn, messages)?;
     hydrate_polls(conn, messages)?;
     let targets = messages
@@ -5373,7 +5420,12 @@ fn load_reply_previews(
                 .storage()?
                 .collect::<Result<Vec<_>, _>>()
                 .storage()?;
-            for preview in rows {
+            for mut preview in rows {
+                preview.view_once = crate::app::view_once::presentation_tx(
+                    conn,
+                    &group_id_hex,
+                    &preview.message_id_hex,
+                )?;
                 group_previews.insert(preview.message_id_hex.clone(), preview);
             }
         }
@@ -5383,6 +5435,7 @@ fn load_reply_previews(
 
 fn reply_preview_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TimelineReplyPreview> {
     Ok(TimelineReplyPreview {
+        view_once: None,
         message_id_hex: row.get(0)?,
         sender: row.get(1)?,
         plaintext: row.get(2)?,

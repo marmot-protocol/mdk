@@ -4,6 +4,65 @@ use sha2::Sha256;
 use super::{EncryptedMediaVersion, MediaAttachmentReference};
 use crate::AppError;
 
+/// The caller has irreversibly claimed this authenticated attachment in storage.
+/// Never construct this for preview, automatic acquisition, or retained media.
+pub(crate) enum ClaimedViewOnceConsumption {
+    DurablyClaimed,
+}
+
+pub(crate) fn decrypt_claimed_view_once(
+    reference: &MediaAttachmentReference,
+    media_secret: &[u8],
+    encrypted: Vec<u8>,
+    _claim: ClaimedViewOnceConsumption,
+) -> Result<zeroize::Zeroizing<Vec<u8>>, AppError> {
+    use chacha20poly1305::aead::{AeadInPlace, KeyInit};
+    use chacha20poly1305::{ChaCha20Poly1305, Nonce};
+    use sha2::Digest;
+    use zeroize::Zeroizing;
+
+    let mut plaintext = Zeroizing::new(encrypted);
+    if EncryptedMediaVersion::parse(&reference.version)? != EncryptedMediaVersion::ViewOnceV1 {
+        return Err(AppError::InvalidEncryptedMedia(
+            "claimed download requires view-once media".into(),
+        ));
+    }
+    reference.validate(false)?;
+    if plaintext.len() < 16 || plaintext.len() > super::view_once_content::MAX_VIEW_ONCE_BYTES + 16
+    {
+        return Err(AppError::InvalidEncryptedMedia(
+            "view-once media exceeds its size limit".into(),
+        ));
+    }
+    if !super::encrypted_media_hash_matches(&plaintext, &reference.ciphertext_sha256) {
+        return Err(AppError::MediaDownloadFailed(
+            "encrypted blob hash does not match media reference".into(),
+        ));
+    }
+    let hash = media_hash_from_reference(reference)?;
+    let nonce = media_nonce_from_reference(reference)?;
+    let key = Zeroizing::new(media_file_key_for_reference(media_secret, reference)?);
+    let aad = media_aad(
+        EncryptedMediaVersion::ViewOnceV1,
+        &hash,
+        &reference.media_type,
+        &reference.file_name,
+    );
+    let cipher = ChaCha20Poly1305::new_from_slice(key.as_slice())
+        .map_err(|_| AppError::InvalidEncryptedMedia("invalid media key length".into()))?;
+    cipher
+        .decrypt_in_place(Nonce::from_slice(&nonce), &aad, &mut *plaintext)
+        .map_err(|_| AppError::MediaDownloadFailed("media decryption failed".into()))?;
+    let actual: [u8; 32] = Sha256::digest(&*plaintext).into();
+    if actual != hash {
+        return Err(AppError::MediaDownloadFailed(
+            "media plaintext hash does not match reference".into(),
+        ));
+    }
+    super::view_once_content::validate_view_once_content(&plaintext, &reference.media_type)?;
+    Ok(plaintext)
+}
+
 pub(crate) fn canonical_media_type_v1(value: &str) -> Result<String, AppError> {
     // Frozen V1 uses Rust's complete ASCII-whitespace set, including VT.
     let media_type = value
@@ -135,7 +194,9 @@ pub(crate) fn media_file_key_for_reference(
     let version = EncryptedMediaVersion::parse(&reference.version)?;
     let media_type = match version {
         EncryptedMediaVersion::V1 => canonical_media_type_v1(&reference.media_type)?,
-        EncryptedMediaVersion::V2 => canonical_media_type_v2(&reference.media_type)?,
+        EncryptedMediaVersion::V2 | EncryptedMediaVersion::ViewOnceV1 => {
+            canonical_media_type_v2(&reference.media_type)?
+        }
     };
     derive_media_file_key(
         media_secret,

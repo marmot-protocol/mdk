@@ -1736,6 +1736,7 @@ fn timeline_target(kind: u64, plaintext: &str) -> TimelineMessageTarget {
         kind,
         deleted: false,
         invalidated: false,
+        view_once: false,
     }
 }
 
@@ -2157,6 +2158,130 @@ fn reaction_message_carries_emoji_and_resolved_target_preview() {
     // Emoji is trimmed; preview comes from the resolved live target row.
     assert_eq!(emoji.as_deref(), Some("👍"));
     assert_eq!(preview.as_deref(), Some("the original message"));
+}
+
+#[test]
+fn view_once_alerts_hide_content() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    let account = app.account_home().create_account("alice").unwrap();
+    let peer = "bb".repeat(32);
+    let group = cgka_traits::GroupId::new(vec![0xEE; 32]);
+    let group_hex = hex::encode(group.as_slice());
+    let mut resolver = NotificationResolver::default();
+    seed_group_state_resolver(&app, &mut resolver, "alice", &group_hex, Some(&peer), false);
+    let tags = vec![
+        vec!["view-once".into(), "view-once-v1".into(), "3600".into()],
+        vec![
+            "imeta".into(),
+            "v encrypted-media-view-once-v1".into(),
+            "m image/jpeg".into(),
+            "filename private-photo.jpg".into(),
+            format!("plaintext_sha256 {}", "11".repeat(32)),
+            format!("ciphertext_sha256 {}", "33".repeat(32)),
+            format!("nonce {}", "44".repeat(12)),
+            format!(
+                "locator blossom-v1 https://media.example/{}",
+                "33".repeat(32)
+            ),
+        ],
+    ];
+    let valid =
+        cgka_traits::MarmotAppEvent::new(&peer, 0, MARMOT_APP_EVENT_KIND_CHAT, tags.clone(), "");
+    assert_eq!(
+        valid
+            .view_once_policy()
+            .unwrap()
+            .unwrap()
+            .unopened_expires_at,
+        3600
+    );
+    let mut unknown_marker = tags.clone();
+    unknown_marker[0][1] = "unknown-version".into();
+    let mut unknown_profile = tags[1].clone();
+    unknown_profile[1] = "v encrypted-media-view-once-v999".into();
+    let mut bare_profile = tags[1].clone();
+    bare_profile[1] = "v encrypted-media-view-once".into();
+    for (tags, content) in [
+        (tags.clone(), ""),
+        (tags.clone(), "private caption"),
+        (vec![tags[1].clone()], "stripped marker caption"),
+        (vec![unknown_profile], "unknown profile caption"),
+        (vec![bare_profile], "bare profile caption"),
+        (unknown_marker, "unknown policy caption"),
+        (vec![tags[0].clone()], "missing attachment caption"),
+    ] {
+        let mut message = received_chat(content, tags.clone());
+        message.sender = peer.clone();
+        let mut event = RuntimeMessageReceived {
+            account_label: "alice".into(),
+            account_id_hex: account.account_id_hex.clone(),
+            message,
+        };
+        let alert = notification_update_from_message(&app, &mut resolver, &event)
+            .unwrap()
+            .expect("content-free once notification");
+        assert_eq!(alert.preview_text.as_deref(), Some("View-once media"));
+        assert_eq!(alert.sticker, None);
+        assert_eq!(alert.reaction_emoji, None);
+        assert_eq!(alert.reacted_to_preview, None);
+        crate::view_once::redact_fields(&mut event.message.plaintext, &mut event.message.tags);
+        let redacted = notification_update_from_message(&app, &mut resolver, &event)
+            .unwrap()
+            .expect("redacted host messages remain protected");
+        assert_eq!(redacted.preview_text.as_deref(), Some("View-once media"));
+        assert_eq!(redacted.sticker, None);
+
+        let target = cgka_traits::MarmotAppEvent::new(
+            &account.account_id_hex,
+            0,
+            MARMOT_APP_EVENT_KIND_CHAT,
+            tags,
+            content,
+        );
+        app.record_account_app_event(
+            "alice",
+            &crate::AppMessageProjection {
+                authority: None,
+                message_id_hex: target.id.clone(),
+                source_message_id_hex: Some(target.id.clone()),
+                direction: "received".into(),
+                group_id_hex: group_hex.clone(),
+                sender: target.pubkey,
+                plaintext: target.content,
+                kind: target.kind,
+                tags: target.tags,
+                source_epoch: Some(1),
+                retention: None,
+                recorded_at: Some(0),
+                origin_commit_id: None,
+                moderation_grant: false,
+            },
+        )
+        .unwrap();
+        for kind in [MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_REACTION] {
+            let mut indirect = received_reaction("private reply or reaction text", &target.id);
+            indirect.kind = kind;
+            let alert = notification_update_from_message(
+                &app,
+                &mut resolver,
+                &RuntimeMessageReceived {
+                    account_label: "alice".into(),
+                    account_id_hex: account.account_id_hex.clone(),
+                    message: indirect,
+                },
+            )
+            .unwrap()
+            .expect("content-free indirect once notification");
+            assert_eq!(alert.preview_text.as_deref(), Some("View-once media"));
+            assert_eq!(alert.sticker, None);
+            assert_eq!(alert.reaction_emoji, None);
+            assert_eq!(
+                alert.reacted_to_preview.as_deref(),
+                (kind == MARMOT_APP_EVENT_KIND_REACTION).then_some("View-once media")
+            );
+        }
+    }
 }
 
 #[test]

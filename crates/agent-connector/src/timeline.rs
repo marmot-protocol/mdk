@@ -236,6 +236,7 @@ mod tests {
     fn record() -> TimelineMessageRecord {
         TimelineMessageRecord {
             client_token: None,
+            view_once: None,
             has_reports: false,
             group_system: None,
             poll: None,

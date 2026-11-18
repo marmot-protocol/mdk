@@ -236,6 +236,8 @@ pub(crate) const TABLE_OWNERS: &[(&str, Side)] = &[
     ("user_block_list", Side::App),
     ("user_block_publication", Side::App),
     ("user_blocks", Side::App),
+    ("view_once_clock", Side::App),
+    ("view_once_consumption", Side::App),
 ];
 
 pub(crate) fn owner(table: &str) -> Option<Side> {

@@ -11,11 +11,11 @@ use cgka_traits::app_components::{
     GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID, GROUP_LIFECYCLE_COMPONENT_ID,
     GROUP_MESSAGE_RETENTION_COMPONENT_ID, GROUP_PROFILE_COMPONENT_ID, GroupLifecycleV1,
     GroupProfileV1, MAX_LEAVES_PER_ACCOUNT, NOSTR_ROUTING_COMPONENT_ID, NostrRoutingV1,
-    PROTOCOL_OWNED_APP_COMPONENT_IDS, SAFE_AAD_COMPONENT_ID, apply_device_roster_update_v1,
-    decode_components_list, decode_device_roster_v1, decode_encrypted_media_policy_v1,
-    decode_encrypted_media_policy_v2, decode_group_avatar_url_v1, decode_group_blossom_image_v1,
-    decode_group_lifecycle_v1, decode_group_profile_v1, decode_nostr_routing_v1,
-    decode_quic_varint, encode_component_vectors, encode_components_list,
+    PROTOCOL_OWNED_APP_COMPONENT_IDS, SAFE_AAD_COMPONENT_ID, VIEW_ONCE_COMPONENT_ID,
+    apply_device_roster_update_v1, decode_components_list, decode_device_roster_v1,
+    decode_encrypted_media_policy_v1, decode_encrypted_media_policy_v2, decode_group_avatar_url_v1,
+    decode_group_blossom_image_v1, decode_group_lifecycle_v1, decode_group_profile_v1,
+    decode_nostr_routing_v1, decode_quic_varint, encode_component_vectors, encode_components_list,
     encode_group_lifecycle_v1, encode_group_profile_v1,
 };
 use cgka_traits::error::EngineError;
@@ -56,7 +56,8 @@ pub const CURRENT_PROFILE_LEAF_ONLY_APP_COMPONENTS: [AppComponentId; 1] =
 /// (app-components/README.md, "Placement"). A group that requires one carries
 /// no GroupContext state for it; the component's own rules say what an entry
 /// under its id means.
-const NO_DATA_APP_COMPONENTS: [AppComponentId; 1] = [ACCOUNT_DEVICES_COMPONENT_ID];
+const NO_DATA_APP_COMPONENTS: [AppComponentId; 2] =
+    [ACCOUNT_DEVICES_COMPONENT_ID, VIEW_ONCE_COMPONENT_ID];
 
 /// Protocol components whose data lives only in LeafNodes and that no group
 /// may require (device-tag-v1.md, "Registry"). Unlike the account proof, a
@@ -69,7 +70,7 @@ const NEVER_REQUIRED_APP_COMPONENTS: [AppComponentId; 1] = [DEVICE_TAG_COMPONENT
 /// its KeyPackages and leaves. A protocol id outside this list is refused by
 /// [`validate_supported_app_components`]: advertising a component tells other
 /// clients this one enforces its rules, and a group may then require it.
-const ADVERTISABLE_PROTOCOL_APP_COMPONENTS: [AppComponentId; 14] = [
+const ADVERTISABLE_PROTOCOL_APP_COMPONENTS: [AppComponentId; 15] = [
     APP_COMPONENTS_COMPONENT_ID,
     GROUP_PROFILE_COMPONENT_ID,
     GROUP_BLOSSOM_IMAGE_COMPONENT_ID,
@@ -84,6 +85,7 @@ const ADVERTISABLE_PROTOCOL_APP_COMPONENTS: [AppComponentId; 14] = [
     GROUP_LIFECYCLE_COMPONENT_ID,
     ACCOUNT_DEVICES_COMPONENT_ID,
     DEVICE_ROSTER_COMPONENT_ID,
+    VIEW_ONCE_COMPONENT_ID,
 ];
 
 /// Refuse to advertise a protocol-owned component this engine does not
@@ -643,9 +645,29 @@ fn authorize_proposal(
                         "app_components_require_never_required_component",
                     ));
                 }
+                if proposed_required
+                    .as_ref()
+                    .is_some_and(|ids| !ids.contains(VIEW_ONCE_COMPONENT_ID))
+                    && group_requires_view_once(mls_group).map_err(|_| {
+                        StandaloneProposalRejection::invalid("proposal_group_state_invalid")
+                    })?
+                {
+                    return Err(StandaloneProposalRejection::invalid(
+                        "app_components_unrequire_view_once",
+                    ));
+                }
                 // account-devices-v1.md, "Data": no AppDataUpdate targets the
                 // component once its source state requires it. "Removal": no
                 // proposal drops it from the required list either.
+                if update.component_id() == VIEW_ONCE_COMPONENT_ID
+                    && group_requires_view_once(mls_group).map_err(|_| {
+                        StandaloneProposalRejection::invalid("proposal_group_state_invalid")
+                    })?
+                {
+                    return Err(StandaloneProposalRejection::invalid(
+                        "view_once_data_forbidden",
+                    ));
+                }
                 let unrequires = proposed_required
                     .as_ref()
                     .is_some_and(|ids| !ids.contains(ACCOUNT_DEVICES_COMPONENT_ID));
@@ -709,6 +731,16 @@ fn authorize_proposal(
             {
                 return Err(StandaloneProposalRejection::invalid(
                     "group_context_extensions_change_device_roster_requirement",
+                ));
+            }
+            if standalone
+                && !proposed_required.contains(VIEW_ONCE_COMPONENT_ID)
+                && group_requires_view_once(mls_group).map_err(|_| {
+                    StandaloneProposalRejection::invalid("proposal_group_state_invalid")
+                })?
+            {
+                return Err(StandaloneProposalRejection::invalid(
+                    "group_context_extensions_unrequire_view_once",
                 ));
             }
             // account-devices-v1.md, "Removal": a group that requires the
@@ -840,6 +872,9 @@ fn validate_group_context_extension_proposal(
     validate_device_roster_state(extensions, &required_components, leaves.iter()).map_err(
         |_| StandaloneProposalRejection::invalid("group_context_extensions_device_roster_invalid"),
     )?;
+    validate_view_once_state(extensions, &required_components, leaves.iter()).map_err(|_| {
+        StandaloneProposalRejection::invalid("group_context_extensions_view_once_invalid")
+    })?;
     Ok(required_components)
 }
 
@@ -1080,7 +1115,14 @@ pub(crate) fn validate_current_profile_group_invariants(
     let leaves = ratchet_tree_leaves(group.export_ratchet_tree())?;
     validate_resulting_leaf_capabilities(leaves.iter(), group.extensions(), &required_components)?;
     validate_account_devices_state(group.extensions(), &required_components, &leaves)?;
+    validate_view_once_state(group.extensions(), &required_components, &leaves)?;
     validate_device_roster_state(group.extensions(), &required_components, &leaves)
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum OwnPackageOnceData {
+    Absent,
+    Present,
 }
 
 /// Receiving-flow step 7 (`protocol-core/joining.md`) for the state a Welcome
@@ -1089,11 +1131,22 @@ pub(crate) fn validate_current_profile_group_invariants(
 /// requires the component, the GroupInfo carries no entry under its id.
 /// `group_info_app_data` is the GroupInfo's `app_data_dictionary`, which the
 /// caller reads before OpenMLS stages the Welcome and drops the GroupInfo.
+/// Required view-once also forbids data in the GroupInfo and the exact own
+/// KeyPackage whose bundle OpenMLS consumes, read before processing the Welcome.
 pub(crate) fn validate_joined_group_invariants(
     joined: &MlsGroup,
     group_info_app_data: Option<&AppDataDictionaryExtension>,
+    own_package_data: OwnPackageOnceData,
 ) -> Result<(), EngineError> {
     validate_current_profile_group_invariants(joined)?;
+    if (matches!(own_package_data, OwnPackageOnceData::Present)
+        || carries_view_once_data(group_info_app_data))
+        && group_requires_view_once(joined)?
+    {
+        return Err(EngineError::NoDataAppComponent {
+            component_id: VIEW_ONCE_COMPONENT_ID,
+        });
+    }
     if carries_account_devices_data(group_info_app_data) && group_requires_account_devices(joined)?
     {
         return Err(EngineError::Other(
@@ -1121,9 +1174,87 @@ pub(crate) fn validate_current_profile_invariants_for_staged_commit(
     validate_resulting_leaf_capabilities(leaves.iter(), extensions, &required_components)?;
     validate_account_devices_transition(group, staged, &required_components)?;
     validate_account_devices_state(extensions, &required_components, &leaves)?;
+    validate_view_once_transition(group, staged, &required_components)?;
+    validate_view_once_state(extensions, &required_components, &leaves)?;
     validate_device_roster_transition(group, &required_components)?;
     validate_device_roster_state(extensions, &required_components, &leaves)?;
     validate_group_lifecycle_transition(group, staged, committer_index)
+}
+
+pub(crate) fn carries_view_once_data(dictionary: Option<&AppDataDictionaryExtension>) -> bool {
+    dictionary.is_some_and(|ext| ext.dictionary().contains(&VIEW_ONCE_COMPONENT_ID))
+}
+
+pub(crate) fn group_requires_view_once(group: &MlsGroup) -> Result<bool, EngineError> {
+    Ok(
+        crate::account_identity_proof::protocol_profile_of_group(group)?
+            == ProtocolProfile::Current
+            && required_app_components_of_group(group)?.contains(VIEW_ONCE_COMPONENT_ID),
+    )
+}
+
+fn validate_view_once_state<'a>(
+    extensions: &Extensions<GroupContext>,
+    required: &AppComponentSet,
+    leaves: impl IntoIterator<Item = &'a LeafNode>,
+) -> Result<(), EngineError> {
+    if !required.contains(VIEW_ONCE_COMPONENT_ID) {
+        return Ok(());
+    }
+    if carries_view_once_data(extensions.app_data_dictionary())
+        || leaves
+            .into_iter()
+            .any(|leaf| carries_view_once_data(leaf.extensions().app_data_dictionary()))
+    {
+        return Err(EngineError::NoDataAppComponent {
+            component_id: VIEW_ONCE_COMPONENT_ID,
+        });
+    }
+    if !required.contains(GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID) {
+        return Err(EngineError::Other(
+            "view-once requires encrypted-media-v2".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_view_once_transition(
+    parent: &MlsGroup,
+    staged: &StagedCommit,
+    required: &AppComponentSet,
+) -> Result<(), EngineError> {
+    let parent_requires = group_requires_view_once(parent)?;
+    let required_after = required.contains(VIEW_ONCE_COMPONENT_ID);
+    if parent_requires && !required_after {
+        return Err(EngineError::Other("view-once cannot be un-required".into()));
+    }
+    if !required_after {
+        return Ok(());
+    }
+    if staged
+        .queued_proposals()
+        .any(|queued| match queued.proposal() {
+            Proposal::AppDataUpdate(update) if update.component_id() == VIEW_ONCE_COMPONENT_ID => {
+                parent_requires
+                    || !matches!(update.operation(), AppDataUpdateOperation::Remove)
+                    || !carries_view_once_data(parent.extensions().app_data_dictionary())
+            }
+            _ => false,
+        })
+        || staged.add_proposals().any(|add| {
+            carries_view_once_data(
+                add.add_proposal()
+                    .key_package()
+                    .extensions()
+                    .app_data_dictionary(),
+            )
+        })
+    {
+        return Err(EngineError::NoDataAppComponent {
+            component_id: VIEW_ONCE_COMPONENT_ID,
+        });
+    }
+    Ok(())
 }
 
 /// Whether `group` requires `marmot.group.account-devices.v1`. A group on
@@ -2063,6 +2194,9 @@ fn app_component_bytes(mls_group: &MlsGroup, component_id: AppComponentId) -> Op
 pub(crate) fn refuse_local_group_context_entry(
     component_id: AppComponentId,
 ) -> Result<(), EngineError> {
+    if component_id == VIEW_ONCE_COMPONENT_ID {
+        return Err(EngineError::NoDataAppComponent { component_id });
+    }
     if NEVER_REQUIRED_APP_COMPONENTS.contains(&component_id) {
         return Err(EngineError::Other(format!(
             "app component {component_id:#06x} lives only in LeafNodes and cannot be set in \
@@ -2074,9 +2208,6 @@ pub(crate) fn refuse_local_group_context_entry(
 
 fn validate_initial_app_component(component: &AppComponentData) -> Result<(), EngineError> {
     refuse_local_group_context_entry(component.component_id)?;
-    // A no-data component has no entry for a client to create
-    // (app-components/README.md, "Placement"); the engine decides whether a
-    // group requires it.
     if NO_DATA_APP_COMPONENTS.contains(&component.component_id) {
         return Err(EngineError::NoDataAppComponent {
             component_id: component.component_id,
@@ -2610,6 +2741,59 @@ mod tests {
                 "{error}"
             );
         }
+    }
+
+    #[test]
+    fn once_data_requires_activation() {
+        let mandatory = [
+            GROUP_ADMIN_POLICY_COMPONENT_ID,
+            ACCOUNT_IDENTITY_PROOF_COMPONENT_ID,
+        ];
+        let mut extensions = current_profile_extensions(
+            mandatory,
+            true,
+            false,
+            &[ExtensionType::AppDataDictionary],
+            &[ProposalType::AppDataUpdate],
+        );
+        let mut dictionary = extensions
+            .app_data_dictionary()
+            .unwrap()
+            .dictionary()
+            .clone();
+        dictionary.insert(VIEW_ONCE_COMPONENT_ID, vec![0x77; 8]);
+        extensions
+            .add_or_replace(Extension::AppDataDictionary(
+                AppDataDictionaryExtension::new(dictionary),
+            ))
+            .unwrap();
+        let required =
+            validate_current_profile_group_context(&extensions, "optional once").unwrap();
+        assert_eq!(required.ids, BTreeSet::from(mandatory));
+        validate_view_once_state(&extensions, &required, std::iter::empty()).unwrap();
+        assert_eq!(
+            extensions
+                .app_data_dictionary()
+                .unwrap()
+                .dictionary()
+                .get(&VIEW_ONCE_COMPONENT_ID),
+            Some(&[0x77; 8][..])
+        );
+        let mut activated = required;
+        activated.insert(VIEW_ONCE_COMPONENT_ID);
+        activated.insert(GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID);
+        assert!(matches!(
+            validate_view_once_state(&extensions, &activated, std::iter::empty()),
+            Err(EngineError::NoDataAppComponent {
+                component_id: VIEW_ONCE_COMPONENT_ID
+            })
+        ));
+        assert!(matches!(
+            refuse_local_group_context_entry(VIEW_ONCE_COMPONENT_ID),
+            Err(EngineError::NoDataAppComponent {
+                component_id: VIEW_ONCE_COMPONENT_ID
+            })
+        ));
     }
 
     #[test]

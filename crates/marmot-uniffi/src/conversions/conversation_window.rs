@@ -395,7 +395,7 @@ pub struct ConversationWindowSnapshotFfi {
 // Borrow raw rows and retain only custom-event tags and chat NIP-30 `emoji` tags in the
 // FFI presentation. MDK-owned tags and full reactor collections use prepared references.
 fn conversation_sticker_ref(row: &app::TimelineMessageRecord) -> Option<app::AppStickerRef> {
-    if row.deleted {
+    if row.deleted || row.view_once.is_some() {
         None
     } else {
         app::sticker_ref_from_tags(row.kind, &row.tags)
@@ -404,7 +404,7 @@ fn conversation_sticker_ref(row: &app::TimelineMessageRecord) -> Option<app::App
 
 fn presented_custom_tags(row: &app::TimelineMessageRecord) -> Cow<'_, [Vec<String>]> {
     // Defence in depth for in-memory records that did not cross the storage read boundary.
-    if row.deleted {
+    if row.deleted || row.view_once.is_some() {
         return Cow::Borrowed(&[]);
     }
     if !app::is_reserved_app_event_kind(row.kind) {
@@ -439,6 +439,7 @@ fn presented_timeline_with_tokens(
 ) -> TimelineMessageRecordFfi {
     TimelineMessageRecordFfi {
         client_token: row.client_token.clone(),
+        view_once: row.view_once.clone().map(Into::into),
         has_reports: row.has_reports,
         poll: row.poll.clone().map(Into::into),
         edit: row.edit.clone().map(Into::into),
@@ -460,7 +461,11 @@ fn presented_timeline_with_tokens(
         reply_to_message_id_hex: row.reply_to_message_id_hex.clone(),
         reply_preview: row.reply_preview.clone().map(Into::into),
         media_json: None,
-        media: super::media::timeline_media_outcomes_ffi(&row.media, row.source_epoch),
+        media: if row.view_once.is_some() {
+            vec![]
+        } else {
+            super::media::timeline_media_outcomes_ffi(&row.media, row.source_epoch)
+        },
         agent_text_stream_json: row.agent_text_stream.as_ref().map(ToString::to_string),
         group_system: if trusted {
             row.group_system.clone().map(Into::into)
@@ -597,6 +602,7 @@ impl ConversationConversionCache {
         }
         let source = app::TimelineMessageRecord {
             client_token: row.client_token.clone(),
+            view_once: row.view_once.clone(),
             message_id_hex: row.message_id_hex.clone(),
             source_message_id_hex: row.source_message_id_hex.clone(),
             source_epoch: row.source_epoch,
@@ -667,6 +673,7 @@ impl ConversationConversionCache {
 fn visible_row_key(row: &app::TimelineMessageRecord, trusted: bool) -> impl PartialEq + '_ {
     let app::TimelineMessageRecord {
         client_token,
+        view_once,
         message_id_hex,
         source_message_id_hex,
         source_epoch,
@@ -732,6 +739,7 @@ fn visible_row_key(row: &app::TimelineMessageRecord, trusted: bool) -> impl Part
             recipient_confirmed,
             imported_from,
             history_import_provenance,
+            view_once,
         ),
     )
 }
@@ -849,6 +857,7 @@ mod tests {
         .unwrap();
         let mut record = app::TimelineMessageRecord {
             client_token: None,
+            view_once: None,
             has_reports: false,
             group_system: Some({
                 let mut event =

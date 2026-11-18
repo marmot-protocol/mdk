@@ -484,11 +484,79 @@ async fn an_imported_photo_comes_with_its_attachment_key() {
             .is_err()
     );
 
+    let mut once_imeta = reference.imeta_tag();
+    *once_imeta
+        .iter_mut()
+        .find(|field| field.starts_with("v "))
+        .unwrap() = "v encrypted-media-view-once-v1".into();
+    let created_at = unix_now_seconds();
+    let marker = vec![
+        "view-once".into(),
+        "view-once-v1".into(),
+        (created_at + 3600).to_string(),
+    ];
+    let mut unknown_marker = marker.clone();
+    unknown_marker[1] = "unknown-version".into();
+    let alice_id = app.account_home().account("alice").unwrap().account_id_hex;
+    let once_events = [
+        (vec![marker.clone(), once_imeta.clone()], ""),
+        (vec![unknown_marker, once_imeta.clone()], ""),
+        (vec![once_imeta.clone()], ""),
+        (vec![marker.clone(), reference.imeta_tag()], ""),
+        (vec![marker, once_imeta], "forbidden caption"),
+    ]
+    .map(|(tags, content)| {
+        MarmotAppEvent::new(
+            &alice_id,
+            created_at,
+            MARMOT_APP_EVENT_KIND_CHAT,
+            tags,
+            content,
+        )
+    });
+    assert_eq!(
+        once_events[0]
+            .view_once_policy()
+            .unwrap()
+            .unwrap()
+            .unopened_expires_at,
+        created_at + 3600
+    );
+    for event in &once_events {
+        app.record_account_app_event(
+            "alice",
+            &crate::AppMessageProjection {
+                authority: None,
+                message_id_hex: event.id.clone(),
+                source_message_id_hex: Some(event.id.clone()),
+                direction: "received".into(),
+                group_id_hex: chat_hex.clone(),
+                sender: event.pubkey.clone(),
+                plaintext: event.content.clone(),
+                kind: event.kind,
+                tags: event.tags.clone(),
+                source_epoch: Some(epoch),
+                retention: None,
+                recorded_at: Some(created_at),
+                origin_commit_id: None,
+                moderation_grant: false,
+            },
+        )
+        .unwrap();
+    }
+
     let mut bundle = alice
         .export_chat_history(&chat, None, HISTORY_BUNDLE_MAX_PLAINTEXT)
         .unwrap()
         .unwrap()
         .bundle;
+    assert!(
+        bundle
+            .events
+            .iter()
+            .all(|event| once_events.iter().all(|once| event.event.id != once.id)),
+        "the shared sibling/backup exporter omits once events, including malformed policies"
+    );
     for id in [&reaction, &comment] {
         assert_eq!(
             bundle
@@ -534,12 +602,47 @@ async fn an_imported_photo_comes_with_its_attachment_key() {
             ciphertext_sha256: "44".repeat(32),
             key: "55".repeat(32),
         });
+    for event in &once_events {
+        let position = ChatPosition::of(event, epoch);
+        bundle.from = bundle.from.clone().min(position.clone());
+        bundle.to = bundle.to.clone().max(position);
+        bundle.events.push(BundledEvent {
+            event: event.clone(),
+            epoch,
+            retention: None,
+            grant: None,
+            keys: Some(vec![crate::history_bundle::FileKey {
+                ciphertext_sha256: ciphertext_sha256.clone(),
+                key: file_key.clone(),
+            }]),
+        });
+    }
     bob.dev_import_history_bundle(&chat, &PHONE_SLOT, &sealed(&bundle))
         .unwrap()
         .expect("the photo is new");
 
     let storage = app.account_storage("bob").unwrap();
     let storage = storage.app_storage();
+    for event in &once_events {
+        assert_eq!(
+            storage.timeline_message(&chat_hex, &event.id).unwrap(),
+            None,
+            "portable history cannot create a once message"
+        );
+        assert!(
+            storage
+                .imported_media_file_keys(&chat_hex, &event.id)
+                .unwrap()
+                .is_empty(),
+            "portable history cannot import a once attachment key"
+        );
+        assert_eq!(
+            storage
+                .app_event_import_provenance(&chat_hex, &event.id)
+                .unwrap(),
+            None
+        );
+    }
     assert_eq!(
         storage
             .imported_media_file_keys(&chat_hex, &photo)

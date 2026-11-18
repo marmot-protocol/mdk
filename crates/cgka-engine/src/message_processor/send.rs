@@ -208,6 +208,7 @@ impl<S: StorageProvider> Engine<S> {
             SendIntent::EnableAccountDevices { group_id } => {
                 self.do_enable_account_devices(group_id).await
             }
+            SendIntent::EnableViewOnce { group_id } => self.do_enable_view_once(group_id).await,
             SendIntent::LinkDevice {
                 group_id,
                 key_package,
@@ -1475,6 +1476,14 @@ impl<S: StorageProvider> Engine<S> {
 
         let app_event =
             crate::app_payload::validate_app_payload_for_sender(&payload, self.identity.self_id())?;
+        let view_once = app_event
+            .view_once_policy()
+            .map_err(|error| EngineError::InvalidAppMessagePayload(error.to_string()))?;
+        if view_once.is_some() && !crate::app_components::group_requires_view_once(&mls_group)? {
+            return Err(EngineError::InvalidAppMessagePayload(
+                "view-once is not required at the source epoch".into(),
+            ));
+        }
         let authority = if cgka_traits::reporting::requires_source_authority(app_event.kind) {
             Some(crate::app_payload::source_authority(
                 &mls_group,
@@ -1500,12 +1509,20 @@ impl<S: StorageProvider> Engine<S> {
         };
         let source_retention_seconds =
             crate::app_components::message_retention_seconds_of_group(&mls_group)?;
-        let retention = cgka_traits::app_event::AppMessageRetentionDecision::new(
+        let absolute_expires_at = view_once.map(|policy| policy.unopened_expires_at);
+        let retention = cgka_traits::AppMessageRetentionDecision {
+            view_once,
+            ..cgka_traits::AppMessageRetentionDecision::with_absolute_expiry(
+                app_event.created_at,
+                source_retention_seconds.unwrap_or(0),
+                absolute_expires_at,
+            )
+        };
+        let wrap_metadata = GroupMessageMetadata::application(
             app_event.created_at,
-            source_retention_seconds.unwrap_or(0),
+            source_retention_seconds,
+            absolute_expires_at,
         );
-        let wrap_metadata =
-            GroupMessageMetadata::application(app_event.created_at, source_retention_seconds);
 
         // `create_message` ratchets the sender secret tree and writes it back;
         // one transaction turns that write's two autocommits into one COMMIT

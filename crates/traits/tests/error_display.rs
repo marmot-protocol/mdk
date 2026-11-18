@@ -41,6 +41,11 @@ fn engine_error_display_does_not_expose_group_or_member_ids() {
             group_id: group_id.clone(),
         }
         .to_string(),
+        EngineError::ViewOnceActivationRefused {
+            group_id: group_id.clone(),
+            reason: cgka_traits::error::ViewOnceActivationRefusal::UnsupportedLeaf,
+        }
+        .to_string(),
         EngineError::QueuedOutboundAtCapacity {
             group_id: group_id.clone(),
         }

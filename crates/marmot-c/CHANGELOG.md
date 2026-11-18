@@ -9,6 +9,11 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ### Breaking changes
 
+- `MarmotTimelineMessageRecord` and `MarmotTimelineReplyPreview` gain typed
+  `view_once` placeholders. Both layouts and enclosing array strides change.
+  `MarmotEncryptedMediaVersion` adds `ViewOnceV1`. Rebuild with matching headers
+  and libraries; ordinary media APIs reject the new profile (#1327).
+
 - `MarmotOnboardingRelayTagChange` gains a trailing `removal_reason`
   (`MarmotOnboardingRelayRemovalReason`), set on every removed entry (#3449).
   Its layout and the `changes` array stride changed: rebuild clients with the
@@ -60,6 +65,9 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   reconciliation before saving their captured cursor; journal states never
   authorize byte reads. Use matching generated headers and libraries.
 
+- View-once activation, send, consume/state and opaque viewer APIs. Consume
+  transfers an opened viewer by value; viewer free closes it. Chunk free erases
+  its MDK allocation, without claiming erasure of host-owned copies (#1327).
 - `marmot_group_pending_commit` returns a `MarmotGroupPendingCommit` (free with
   `marmot_group_pending_commit_free`) for the group's own commit that has not
   confirmed yet, with `MarmotGroupPendingCommitState` (mdk#2332). Group changes

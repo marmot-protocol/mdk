@@ -217,6 +217,7 @@ pub struct TimelineMessageQueryFfi {
 
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct TimelineReplyPreviewFfi {
+    pub view_once: Option<super::ViewOncePresentationFfi>,
     pub message_id_hex: String,
     pub sender: String,
     pub plaintext: String,
@@ -240,13 +241,18 @@ pub struct TimelineReplyPreviewFfi {
 }
 
 impl From<TimelineReplyPreview> for TimelineReplyPreviewFfi {
-    fn from(value: TimelineReplyPreview) -> Self {
+    fn from(mut value: TimelineReplyPreview) -> Self {
+        if value.view_once.is_some() {
+            value.media = None;
+            value.tags.clear();
+        }
         let content_tokens = markdown_content_tokens(value.kind, &value.plaintext);
         let media = timeline_media_outcomes_ffi(&value.media, value.source_epoch);
         let sticker = super::sticker::presented_sticker_ref(value.kind, &value.tags, value.deleted);
         Self {
             message_id_hex: value.message_id_hex,
             sender: value.sender,
+            view_once: value.view_once.map(Into::into),
             plaintext: value.plaintext,
             content_tokens,
             kind: value.kind,
@@ -325,6 +331,7 @@ impl From<AppGroupSystemEvent> for GroupSystemEventFfi {
 
 #[derive(Clone, uniffi::Record)]
 pub struct TimelineMessageRecordFfi {
+    pub view_once: Option<super::ViewOncePresentationFfi>,
     /// Opaque local submission token; absent for remote or legacy messages.
     pub client_token: Option<String>,
     pub has_reports: bool,
@@ -419,13 +426,18 @@ impl std::fmt::Debug for TimelineMessageRecordFfi {
 }
 
 impl From<TimelineMessageRecord> for TimelineMessageRecordFfi {
-    fn from(value: TimelineMessageRecord) -> Self {
+    fn from(mut value: TimelineMessageRecord) -> Self {
+        if value.view_once.is_some() {
+            value.media = None;
+            value.tags.clear();
+        }
         let content_tokens = markdown_content_tokens(value.kind, &value.plaintext);
         let group_system = value.group_system;
         let media = timeline_media_outcomes_ffi(&value.media, value.source_epoch);
         let sticker = super::sticker::presented_sticker_ref(value.kind, &value.tags, value.deleted);
         Self {
             client_token: value.client_token,
+            view_once: value.view_once.map(Into::into),
             has_reports: value.has_reports,
             poll: value.poll.map(Into::into),
             message_id_hex: value.message_id_hex,
@@ -951,6 +963,7 @@ mod tests {
     ) -> TimelineMessageRecord {
         TimelineMessageRecord {
             client_token: None,
+            view_once: None,
             has_reports: false,
             group_system: None,
             poll: None,
@@ -1132,6 +1145,33 @@ mod tests {
     }
 
     #[test]
+    fn view_once_hides_refs() {
+        let presentation = marmot_app::StoredViewOncePresentation {
+            state: marmot_app::ViewOnceState::Consumed,
+            unopened_expires_at: 1234,
+        };
+        let media = Some(imeta_metadata(&[imeta_tag(0x22, "video/mp4", "clip.mp4")]));
+        let mut reply = reply_preview(9, sticker_tag(), false);
+        reply.view_once = Some(presentation.clone());
+        reply.media = media.clone();
+        let mut source = record_with_media(Some(7), media, Some(reply));
+        source.view_once = Some(presentation);
+        source.tags = sticker_tag();
+        let row = TimelineMessageRecordFfi::from(source);
+        let state = row.view_once.unwrap();
+        assert_eq!(state.state, super::super::ViewOnceStateFfi::Consumed);
+        assert_eq!(state.unopened_expires_at, 1234);
+        assert!(row.tags.is_empty() && row.media.is_empty());
+        assert!(row.media_json.is_none() && row.sticker.is_none());
+        let reply = row.reply_preview.unwrap();
+        assert_eq!(
+            reply.view_once.unwrap().state,
+            super::super::ViewOnceStateFfi::Consumed
+        );
+        assert!(reply.media.is_empty() && reply.media_json.is_none() && reply.sticker.is_none());
+    }
+
+    #[test]
     fn timeline_message_record_ffi_preserves_retention_states_without_recomputation() {
         let legacy: TimelineMessageRecordFfi = record_with_media(Some(7), None, None).into();
         assert_eq!(legacy.source_epoch, Some(7));
@@ -1156,6 +1196,7 @@ mod tests {
     #[test]
     fn timeline_reply_preview_ffi_resolves_media_with_its_own_source_epoch() {
         let preview = TimelineReplyPreview {
+            view_once: None,
             message_id_hex: "parent".to_owned(),
             sender: "bob".to_owned(),
             plaintext: "original".to_owned(),
@@ -1193,6 +1234,7 @@ mod tests {
 
     fn reply_preview(kind: u64, tags: Vec<Vec<String>>, deleted: bool) -> TimelineReplyPreview {
         TimelineReplyPreview {
+            view_once: None,
             message_id_hex: "parent".to_owned(),
             sender: "bob".to_owned(),
             plaintext: String::new(),

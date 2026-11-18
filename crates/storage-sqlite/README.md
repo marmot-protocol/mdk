@@ -140,6 +140,23 @@ preconditions: this read is not an atomic authorization for a later write.
 
 ## Migrations
 
+Migration 0214 adds the account-device's permanent view-once consumption records and wall-clock high-water.
+`claim_view_once` validates the authenticated inner event and current source, then commits consumption and reference
+erasure together before returning its descriptor. A failed download or viewer cannot retry that claim. History deletion,
+local group clear, replay, and projection rebuild do not erase terminal records; only a full account-device wipe does.
+Unclaimed availability follows the live source, deletion, and membership projections. Restoring an authenticated source
+keeps its original receipt cap; revocation of an already-opened viewer stays permanent. Malformed and unsupported
+historical records remain unavailable.
+First-admission caps, including unopened messages, commit before visibility and survive cleanup with retained secret
+access. The 45-day cap uses the admission-time local wall clock, not trusted UTC; clock errors can change true elapsed
+lifetime. Arbitrary erasure of admission evidence while retaining keys is outside the intact-state guarantee.
+Ordinary attachment access, galleries, and portable history cannot acquire these references. Timeline and reply previews
+carry `StoredViewOncePresentation` with no media, caption, or attachment descriptor. Consumption does not remove shared
+epoch secrets or ordinary retained file ownership. These local records do not prevent restoring an older whole database.
+Placeholder tags contain only stored deadline metadata or a one-field protected classification, never rejected marker
+fields. Durable epoch ownership survives consumption and replay; ordinary retention retires a cached secret only after
+its final source reference is pruned.
+
 Migration 0212 adds the account-local attachment body-removal journal. `attachment_removals(cursor, limit)`
 returns at most 256 ordered identities and historical reasons: `CleanedBySetting`, `Removed`,
 `CompletedUnretained`, or `Unavailable`. The journal retains 4,096 records and commits each record with its

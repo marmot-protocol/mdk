@@ -1906,6 +1906,269 @@ async fn a_joined_state_breaking_the_rules_is_refused() {
 
 // ── Same-account Commits ────────────────────────────────────────────────────
 
+mod once_welcome {
+    use super::*;
+    use cgka_traits::app_components::{
+        EncryptedMediaPolicyV2, GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID, VIEW_ONCE_COMPONENT_ID,
+        encode_encrypted_media_policy_v2,
+    };
+
+    #[derive(Clone, Copy)]
+    enum OnceActivation {
+        Optional,
+        Required,
+    }
+
+    enum OncePackageLocation {
+        KeyPackage,
+        Leaf,
+    }
+
+    fn once_device(account: &[u8]) -> Device {
+        device_advertising(
+            account,
+            &[
+                GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
+                VIEW_ONCE_COMPONENT_ID,
+            ],
+            Box::<MockPeeler>::default(),
+        )
+    }
+
+    async fn once_group(alice: &mut Device, activation: OnceActivation) -> GroupId {
+        let (gid, _) = alice
+            .engine
+            .create_group(CreateGroupRequest {
+                name: "once Welcome".into(),
+                description: String::new(),
+                members: vec![],
+                required_features: vec![],
+                initial_admins: vec![],
+                app_components: vec![AppComponentData {
+                    component_id: GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
+                    data: encode_encrypted_media_policy_v2(
+                        &EncryptedMediaPolicyV2::blossom_default(["https://example.com".into()])
+                            .unwrap(),
+                    )
+                    .unwrap(),
+                }],
+            })
+            .await
+            .unwrap();
+        if matches!(activation, OnceActivation::Required) {
+            let result = alice
+                .engine
+                .send(SendIntent::EnableViewOnce {
+                    group_id: gid.clone(),
+                })
+                .await
+                .unwrap();
+            let SendResult::GroupEvolution { pending, .. } = result else {
+                panic!("activation commit")
+            };
+            alice.engine.confirm_published(pending).await.unwrap();
+        }
+        assert_eq!(
+            alice
+                .engine
+                .view_once_required_at(&gid, alice.engine.epoch(&gid).unwrap())
+                .unwrap(),
+            matches!(activation, OnceActivation::Required)
+        );
+        gid
+    }
+
+    fn once_key_package(
+        device: &Device,
+        template: &KeyPackage,
+        location: OncePackageLocation,
+    ) -> KeyPackage {
+        let template = parse_key_package(template);
+        let leaf = template.leaf_node();
+        let mut leaf_extensions = leaf.extensions().clone();
+        let mut builder = MlsKeyPackage::builder();
+        if matches!(location, OncePackageLocation::Leaf) {
+            let mut dictionary = leaf_extensions
+                .app_data_dictionary()
+                .unwrap()
+                .dictionary()
+                .clone();
+            dictionary.insert(VIEW_ONCE_COMPONENT_ID, vec![0x77]);
+            leaf_extensions
+                .add_or_replace(Extension::AppDataDictionary(
+                    AppDataDictionaryExtension::new(dictionary),
+                ))
+                .unwrap();
+        } else {
+            let mut dictionary = AppDataDictionary::default();
+            dictionary.insert(VIEW_ONCE_COMPONENT_ID, vec![0x77]);
+            let entry = Extension::AppDataDictionary(AppDataDictionaryExtension::new(dictionary));
+            builder = builder.key_package_extensions(Extensions::from_vec(vec![entry]).unwrap());
+        }
+        let crypto = RustCrypto::default();
+        let provider = EngineOpenMlsProvider::<SqliteAccountStorage>::new(
+            &crypto,
+            device.storage.mls_storage(),
+        );
+        let bundle = builder
+            .leaf_node_capabilities(leaf.capabilities().clone())
+            .leaf_node_extensions(leaf_extensions)
+            .build(
+                DEFAULT_CIPHERSUITE,
+                &provider,
+                &device_signer(device),
+                CredentialWithKey {
+                    credential: leaf.credential().clone(),
+                    signature_key: leaf.signature_key().clone(),
+                },
+            )
+            .unwrap();
+        KeyPackage::new(
+            MlsMessageOut::from(bundle.key_package().clone())
+                .tls_serialize_detached()
+                .unwrap(),
+        )
+        .with_protocol_profile(ProtocolProfile::Current)
+    }
+
+    #[tokio::test]
+    async fn once_welcome_state_data() {
+        for activation in [OnceActivation::Optional, OnceActivation::Required] {
+            let mut alice = once_device(b"once-welcome-author");
+            let gid = once_group(&mut alice, activation).await;
+            for location in ["GroupContext", "GroupInfo", "LeafNode"] {
+                let mut bob = once_device(b"once-welcome-recipient");
+                let clean = bob.engine.fresh_key_package().await.unwrap();
+                let kp = if location == "LeafNode" {
+                    once_key_package(&bob, &clean, OncePackageLocation::Leaf)
+                } else {
+                    clean.clone()
+                };
+                let app_data = if location == "GroupContext" {
+                    vec![AppDataUpdateProposal::update(
+                        VIEW_ONCE_COMPONENT_ID,
+                        vec![0x77],
+                    )]
+                } else {
+                    vec![]
+                };
+                let group_info = if location == "GroupInfo" {
+                    let mut dictionary = AppDataDictionary::default();
+                    dictionary.insert(VIEW_ONCE_COMPONENT_ID, vec![0x77]);
+                    vec![Extension::AppDataDictionary(
+                        AppDataDictionaryExtension::new(dictionary),
+                    )]
+                } else {
+                    vec![]
+                };
+                let welcome = crafted_welcome(
+                    &alice,
+                    &gid,
+                    std::slice::from_ref(&kp),
+                    app_data,
+                    group_info,
+                    &bob,
+                );
+                if matches!(activation, OnceActivation::Required) {
+                    assert!(
+                        matches!(
+                            bob.engine.join_welcome(welcome).await,
+                            Err(EngineError::InvalidWelcome)
+                        ),
+                        "{location}"
+                    );
+                    let record = bob.engine.group_record(&gid);
+                    assert!(record.is_err(), "{record:?}");
+                    assert!(
+                        !bob.engine
+                            .drain_events()
+                            .iter()
+                            .any(|event| matches!(event, GroupEvent::GroupJoined { .. }))
+                    );
+                    let welcome = crafted_welcome(
+                        &alice,
+                        &gid,
+                        std::slice::from_ref(&clean),
+                        vec![],
+                        vec![],
+                        &bob,
+                    );
+                    assert_joins(&mut bob, &welcome, &gid, &alice).await;
+                } else {
+                    assert_joins(&mut bob, &welcome, &gid, &alice).await;
+                    assert!(
+                        !bob.engine
+                            .view_once_required_at(&gid, bob.engine.epoch(&gid).unwrap())
+                            .unwrap()
+                    );
+                    if location == "GroupContext" {
+                        assert_eq!(
+                            bob.engine
+                                .app_component(&gid, VIEW_ONCE_COMPONENT_ID)
+                                .unwrap(),
+                            Some(vec![0x77])
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn once_welcome_own_package() {
+        for activation in [OnceActivation::Optional, OnceActivation::Required] {
+            let mut alice = once_device(b"once-kp-author");
+            let gid = once_group(&mut alice, activation).await;
+            let mut bob = once_device(b"once-kp-recipient");
+            let clean = bob.engine.fresh_key_package().await.unwrap();
+            let planted = once_key_package(&bob, &clean, OncePackageLocation::KeyPackage);
+            let welcome = crafted_welcome(
+                &alice,
+                &gid,
+                std::slice::from_ref(&planted),
+                vec![],
+                vec![],
+                &bob,
+            );
+            if matches!(activation, OnceActivation::Required) {
+                assert!(matches!(
+                    bob.engine.join_welcome(welcome).await,
+                    Err(EngineError::InvalidWelcome)
+                ));
+                let record = bob.engine.group_record(&gid);
+                assert!(record.is_err(), "{record:?}");
+                assert!(
+                    !bob.engine
+                        .drain_events()
+                        .iter()
+                        .any(|event| matches!(event, GroupEvent::GroupJoined { .. }))
+                );
+                let welcome = crafted_welcome(
+                    &alice,
+                    &gid,
+                    std::slice::from_ref(&clean),
+                    vec![],
+                    vec![],
+                    &bob,
+                );
+                assert_joins(&mut bob, &welcome, &gid, &alice).await;
+                assert!(
+                    bob.engine
+                        .view_once_required_at(&gid, bob.engine.epoch(&gid).unwrap())
+                        .unwrap()
+                );
+            } else {
+                assert_joins(&mut bob, &welcome, &gid, &alice).await;
+                assert!(
+                    !bob.engine
+                        .view_once_required_at(&gid, bob.engine.epoch(&gid).unwrap())
+                        .unwrap()
+                );
+            }
+        }
+    }
+}
+
 /// alice founds the group and is its only admin; bob joins on two devices and
 /// carol on one. Every device advertises 0x800d; the group requires it when
 /// `require` is set.

@@ -9,10 +9,150 @@ use marmot_app::{
 
 use super::account::SendSummaryFfi;
 
+/// Plaintext input for one image or video. Host-owned copies are not erased by MDK.
+#[derive(uniffi::Record)]
+pub struct ViewOnceMediaRequestFfi {
+    pub plaintext: Vec<u8>,
+    pub media_type: String,
+    pub unopened_expires_at: u64,
+    pub blossom_server: Option<String>,
+}
+redact!(ViewOnceMediaRequestFfi);
+
+impl From<ViewOnceMediaRequestFfi> for marmot_app::ViewOnceMediaRequest {
+    fn from(value: ViewOnceMediaRequestFfi) -> Self {
+        Self {
+            plaintext: value.plaintext,
+            media_type: value.media_type,
+            unopened_expires_at: value.unopened_expires_at,
+            blossom_server: value.blossom_server,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum ViewOnceStateFfi {
+    Unopened,
+    Consumed,
+    Expired,
+    Sent,
+    Unavailable,
+}
+impl From<marmot_app::ViewOnceState> for ViewOnceStateFfi {
+    fn from(value: marmot_app::ViewOnceState) -> Self {
+        match value {
+            marmot_app::ViewOnceState::Unopened => Self::Unopened,
+            marmot_app::ViewOnceState::Consumed => Self::Consumed,
+            marmot_app::ViewOnceState::Expired => Self::Expired,
+            marmot_app::ViewOnceState::Sent => Self::Sent,
+            marmot_app::ViewOnceState::Unavailable => Self::Unavailable,
+        }
+    }
+}
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct ViewOncePresentationFfi {
+    pub state: ViewOnceStateFfi,
+    pub unopened_expires_at: u64,
+}
+impl From<marmot_app::StoredViewOncePresentation> for ViewOncePresentationFfi {
+    fn from(value: marmot_app::StoredViewOncePresentation) -> Self {
+        Self {
+            state: value.state.into(),
+            unopened_expires_at: value.unopened_expires_at,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum ViewOnceActivationRefusalFfi {
+    NotAdmin,
+    AlreadyRequired,
+    LegacyProfile,
+    UnsupportedLeaf,
+    EncryptedMediaV2NotRequired,
+    CarriesData,
+}
+impl From<marmot_app::ViewOnceActivationRefusal> for ViewOnceActivationRefusalFfi {
+    fn from(value: marmot_app::ViewOnceActivationRefusal) -> Self {
+        match value {
+            marmot_app::ViewOnceActivationRefusal::NotAdmin => Self::NotAdmin,
+            marmot_app::ViewOnceActivationRefusal::AlreadyRequired => Self::AlreadyRequired,
+            marmot_app::ViewOnceActivationRefusal::LegacyProfile => Self::LegacyProfile,
+            marmot_app::ViewOnceActivationRefusal::UnsupportedLeaf => Self::UnsupportedLeaf,
+            marmot_app::ViewOnceActivationRefusal::EncryptedMediaV2NotRequired => {
+                Self::EncryptedMediaV2NotRequired
+            }
+            marmot_app::ViewOnceActivationRefusal::CarriesData => Self::CarriesData,
+        }
+    }
+}
+
+/// Opaque, revocable viewer. Closing never makes the message consumable again.
+#[derive(uniffi::Object)]
+pub struct ViewOnceViewerFfi {
+    pub(crate) inner: std::sync::Arc<marmot_app::ViewOnceViewer>,
+}
+redact!(ViewOnceViewerFfi);
+impl Drop for ViewOnceViewerFfi {
+    fn drop(&mut self) {
+        self.inner.close();
+    }
+}
+#[marmot_uniffi_macros::on_tokio_runtime]
+#[uniffi::export]
+impl ViewOnceViewerFfi {
+    /// Read at most 1 MiB. None means closed, expired, revoked, or end of input.
+    /// Returned bytes belong to the host; MDK cannot erase those copies.
+    pub async fn read(
+        &self,
+        offset: u64,
+        limit: u32,
+    ) -> Result<Option<Vec<u8>>, crate::MarmotKitError> {
+        Ok(self
+            .inner
+            .read(offset, limit)
+            .await?
+            .map(|mut bytes| std::mem::take(&mut *bytes)))
+    }
+    /// Revoke this viewer immediately and release its MDK-owned plaintext.
+    pub fn revoke(&self) {
+        self.inner.close();
+    }
+    pub fn size_bytes(&self) -> u64 {
+        self.inner.size_bytes()
+    }
+    pub fn media_type(&self) -> String {
+        self.inner.media_type().to_owned()
+    }
+}
+
+#[derive(uniffi::Enum)]
+pub enum ViewOnceConsumeOutcomeFfi {
+    Opened {
+        viewer: std::sync::Arc<ViewOnceViewerFfi>,
+    },
+    Consumed,
+    Expired,
+    Unavailable,
+}
+impl From<marmot_app::ViewOnceConsumeOutcome> for ViewOnceConsumeOutcomeFfi {
+    fn from(value: marmot_app::ViewOnceConsumeOutcome) -> Self {
+        match value {
+            marmot_app::ViewOnceConsumeOutcome::Opened { viewer } => Self::Opened {
+                viewer: std::sync::Arc::new(ViewOnceViewerFfi { inner: viewer }),
+            },
+            marmot_app::ViewOnceConsumeOutcome::Consumed => Self::Consumed,
+            marmot_app::ViewOnceConsumeOutcome::Expired => Self::Expired,
+            marmot_app::ViewOnceConsumeOutcome::Unavailable => Self::Unavailable,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
 pub enum EncryptedMediaVersionFfi {
     V1,
     V2,
+    ViewOnceV1,
 }
 
 impl From<EncryptedMediaVersion> for EncryptedMediaVersionFfi {
@@ -20,6 +160,7 @@ impl From<EncryptedMediaVersion> for EncryptedMediaVersionFfi {
         match value {
             EncryptedMediaVersion::V1 => Self::V1,
             EncryptedMediaVersion::V2 => Self::V2,
+            EncryptedMediaVersion::ViewOnceV1 => Self::ViewOnceV1,
         }
     }
 }
@@ -29,6 +170,7 @@ impl From<EncryptedMediaVersionFfi> for EncryptedMediaVersion {
         match value {
             EncryptedMediaVersionFfi::V1 => Self::V1,
             EncryptedMediaVersionFfi::V2 => Self::V2,
+            EncryptedMediaVersionFfi::ViewOnceV1 => Self::ViewOnceV1,
         }
     }
 }
@@ -79,6 +221,15 @@ impl TryFrom<MediaAttachmentReference> for MediaAttachmentReferenceFfi {
     type Error = AppError;
 
     fn try_from(value: MediaAttachmentReference) -> Result<Self, Self::Error> {
+        let version = EncryptedMediaVersion::parse(&value.version)?;
+        if version == EncryptedMediaVersion::ViewOnceV1 {
+            return Err(AppError::MediaAttachmentRejected(
+                MediaAttachmentRejection {
+                    kind: MediaAttachmentRejectionKind::UnsupportedFormat,
+                    detail: "media version is not supported".to_owned(),
+                },
+            ));
+        }
         Ok(Self {
             locators: value.locators.into_iter().map(Into::into).collect(),
             ciphertext_sha256: value.ciphertext_sha256,
@@ -86,7 +237,7 @@ impl TryFrom<MediaAttachmentReference> for MediaAttachmentReferenceFfi {
             nonce_hex: value.nonce_hex,
             file_name: value.file_name,
             media_type: value.media_type,
-            version: EncryptedMediaVersion::parse(&value.version)?.into(),
+            version: version.into(),
             source_epoch: value.source_epoch,
             source_epoch_identity: value.source_epoch_identity,
             dim: value.dim,
@@ -211,9 +362,7 @@ impl From<MediaAttachmentOutcome> for MediaAttachmentOutcomeFfi {
                     attachment_index,
                     reference,
                 },
-                // The shared parser only accepts versions this build types, so
-                // this is unreachable for projected content; keep the reason
-                // rather than dropping the attachment if it ever fires.
+                // View-once references are never usable through ordinary media outputs.
                 Err(_) => Self::Rejected {
                     attachment_index,
                     rejection: MediaAttachmentRejectionFfi {
@@ -533,6 +682,25 @@ pub(crate) fn timeline_media_outcomes_ffi(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn view_once_input_is_redacted() {
+        let request = ViewOnceMediaRequestFfi {
+            plaintext: b"private-viewer-bytes".to_vec(),
+            media_type: "image/private-type".into(),
+            unopened_expires_at: 1234,
+            blossom_server: Some("https://private-endpoint.example".into()),
+        };
+        assert_eq!(format!("{request:?}"), "ViewOnceMediaRequestFfi { .. }");
+        let core = marmot_app::ViewOnceMediaRequest::from(request);
+        assert_eq!(core.plaintext, b"private-viewer-bytes");
+        assert_eq!(core.media_type, "image/private-type");
+        assert_eq!(core.unopened_expires_at, 1234);
+        assert_eq!(
+            core.blossom_server.as_deref(),
+            Some("https://private-endpoint.example")
+        );
+    }
 
     #[test]
     fn file_debug_hides_paths() {
@@ -943,6 +1111,26 @@ mod tests {
             MediaAttachmentReferenceFfi::try_from(app.clone()),
             Err(AppError::InvalidAppMessagePayload(details)) if details == "media version is not supported"
         ));
+        let mut once = app.clone();
+        once.version = EncryptedMediaVersion::ViewOnceV1.as_str().to_owned();
+        once.media_type = "image/png".to_owned();
+        once.file_name = "image.png".to_owned();
+        assert!(matches!(
+            MediaAttachmentReferenceFfi::try_from(once.clone()),
+            Err(AppError::MediaAttachmentRejected(rejection))
+                if rejection.kind == MediaAttachmentRejectionKind::UnsupportedFormat
+                    && rejection.detail == "media version is not supported"
+        ));
+        let once = MediaAttachmentOutcomeFfi::from(MediaAttachmentOutcome::Accepted {
+            attachment_index: 4,
+            reference: Box::new(once),
+        });
+        let (index, rejection) = rejected(&once);
+        assert_eq!(index, 4);
+        assert_eq!(
+            rejection.kind,
+            MediaAttachmentRejectionKindFfi::UnsupportedFormat
+        );
         // The outcome conversion keeps the attachment visible with a typed
         // reason instead of dropping it.
         let outcome = MediaAttachmentOutcomeFfi::from(MediaAttachmentOutcome::Accepted {

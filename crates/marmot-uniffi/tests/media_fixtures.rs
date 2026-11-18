@@ -75,6 +75,7 @@ fn fixture_rejection_kind(case: &serde_json::Value) -> MediaAttachmentRejectionK
 /// crate-private helper.
 fn projected_outcome(tag: &[String], source_epoch: u64) -> MediaAttachmentOutcomeFfi {
     let preview: TimelineReplyPreviewFfi = TimelineReplyPreview {
+        view_once: None,
         message_id_hex: "aa".repeat(32),
         sender: "bb".repeat(32),
         plaintext: "caption".to_owned(),

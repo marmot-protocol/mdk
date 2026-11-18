@@ -525,6 +525,7 @@ mod tests {
     #[test]
     fn timeline_message_record_ffi_preserves_materialized_metadata() {
         let record = TimelineMessageRecord {
+            view_once: None,
             client_token: None,
             has_reports: false,
             group_system: None,
@@ -545,6 +546,7 @@ mod tests {
             received_at: 11,
             reply_to_message_id_hex: Some("parent".to_owned()),
             reply_preview: Some(TimelineReplyPreview {
+                view_once: None,
                 message_id_hex: "parent".to_owned(),
                 sender: "bb".repeat(32),
                 plaintext: "parent text".to_owned(),
@@ -659,6 +661,7 @@ mod tests {
         .to_content()
         .unwrap();
         let record = TimelineMessageRecord {
+            view_once: None,
             client_token: None,
             has_reports: false,
             group_system: Some({
@@ -719,6 +722,7 @@ mod tests {
     #[test]
     fn timeline_message_record_ffi_ignores_malformed_group_system_payload() {
         let record = TimelineMessageRecord {
+            view_once: None,
             client_token: None,
             has_reports: false,
             group_system: None,

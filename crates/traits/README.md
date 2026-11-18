@@ -33,7 +33,9 @@ between engine, peeler, transport adapter, storage, and caller imports from here
   `EncryptedMediaPolicyV1`, current `BlobStoreEndpointV2` / `EncryptedMediaPolicyV2`), plus the public-IP / loopback
   host classifiers used by the dial-safety rules.
 - `MarmotAppEvent` — the typed application-message event — and the poll (NIP-88 profile) and group-report
-  interpretations carried in app messages.
+  interpretations carried in app messages. `view_once_policy` validates the protected media envelope;
+  `retention_decision` caps the source-epoch timer at its absolute unopened deadline. Malformed or
+  stripped markers never become ordinary reusable media.
 - Capability negotiation types: `Capability`, `Feature`, `RequirementLevel`, `CapabilityRequirement`,
   `GroupCapabilities`, `FeatureStatus`.
 - `GroupContextSnapshot` — the cross-boundary group-context view.

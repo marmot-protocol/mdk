@@ -1141,7 +1141,9 @@ struct MockBlossom {
 #[derive(Default)]
 struct BlossomLedger {
     puts: AtomicUsize,
+    put_started: Notify,
     gets: AtomicUsize,
+    get_started: Notify,
     heads: AtomicUsize,
     uploaded_bytes: AtomicUsize,
     response_bytes: AtomicUsize,
@@ -1361,6 +1363,7 @@ async fn mock_blossom() -> MockBlossom {
                 match (method.as_str(), path.as_str()) {
                     ("PUT", "/upload") => {
                         ledger.puts.fetch_add(1, Ordering::SeqCst);
+                        ledger.put_started.notify_waiters();
                         ledger
                             .uploaded_bytes
                             .fetch_add(body.len(), Ordering::SeqCst);
@@ -1393,6 +1396,7 @@ async fn mock_blossom() -> MockBlossom {
                     }
                     ("GET", blob_path) => {
                         ledger.gets.fetch_add(1, Ordering::SeqCst);
+                        ledger.get_started.notify_waiters();
                         if ledger.deny_reads.load(Ordering::SeqCst) {
                             write_http_response(&mut stream, 410, "text/plain", b"denied").await;
                             return;
@@ -10031,6 +10035,478 @@ async fn tagged_upload_and_text_reach_peer() {
     assert_eq!(received.plaintext, "with an effect");
     assert!(received.tags.contains(&effects[0]));
     runtime.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn view_once_runtime_lifecycle() {
+    use marmot_app::{ViewOnceConsumeOutcome, ViewOnceMediaRequest, ViewOnceState};
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, url) = mock_app(&dir).await;
+    let blossom = mock_blossom().await;
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let setup = AccountSetupRequest {
+        default_relays: vec![endpoint(&url)],
+        bootstrap_relays: vec![endpoint(&url)],
+        publish_initial_key_package: true,
+        ..Default::default()
+    };
+    let alice = create_network_ready_identity(&runtime, setup.relay_options_only())
+        .await
+        .account;
+    let bob = create_network_ready_identity(&runtime, setup.relay_options_only())
+        .await
+        .account;
+    let carol = create_network_ready_identity(&runtime, setup).await.account;
+    let a = &alice.account_id_hex;
+    let b = &bob.account_id_hex;
+    let c = &carol.account_id_hex;
+    let mut events = runtime.subscribe();
+    let group = runtime
+        .create_group(a, "once", &[b.clone(), c.clone()], None)
+        .await
+        .unwrap()
+        .operation
+        .unwrap();
+    let mut invitations = std::collections::HashSet::from([b.clone(), c.clone()]);
+    while !invitations.is_empty() {
+        let event = wait_for_event(&mut events, |event| matches!(event, MarmotAppEvent::GroupJoined { account_id_hex, group_id, .. } if invitations.contains(account_id_hex) && group_id == &group)).await;
+        let MarmotAppEvent::GroupJoined { account_id_hex, .. } = event else {
+            panic!("expected group invitation")
+        };
+        invitations.remove(&account_id_hex);
+        accept_group_invite_retrying_busy(&runtime, &account_id_hex, &group)
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        runtime
+            .view_once_activation_refusal(a, &group)
+            .await
+            .unwrap(),
+        None
+    );
+    runtime.enable_view_once(a, &group).await.unwrap();
+    let mut encoded = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+        2,
+        2,
+        image::Rgba([13, 27, 41, 255]),
+    ))
+    .write_to(&mut encoded, image::ImageFormat::Png)
+    .unwrap();
+    let plaintext = encoded.into_inner();
+    let expires = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 3600;
+    let sent = runtime
+        .send_view_once_media(
+            a,
+            &group,
+            ViewOnceMediaRequest {
+                plaintext: plaintext.clone(),
+                media_type: "image/png".into(),
+                unopened_expires_at: expires,
+                blossom_server: Some(blossom.url.clone()),
+            },
+        )
+        .await
+        .unwrap();
+    let id = &sent.message_ids[0];
+    let mut deliveries = std::collections::HashSet::from([b.clone(), c.clone()]);
+    while !deliveries.is_empty() {
+        let event = wait_for_event(&mut events, |event| matches!(event, MarmotAppEvent::MessageReceived(m) if deliveries.contains(&m.account_id_hex) && &m.message.message_id_hex == id)).await;
+        let MarmotAppEvent::MessageReceived(message) = event else {
+            panic!("expected received message")
+        };
+        deliveries.remove(&message.account_id_hex);
+        assert!(message.message.plaintext.is_empty());
+        assert!(message.message.tags.iter().all(|tag| tag[0] == "view-once"));
+        assert_eq!(
+            runtime
+                .view_once_state(&message.account_id_hex, &group, id, 0)
+                .await
+                .unwrap(),
+            ViewOnceState::Unopened
+        );
+    }
+    assert_eq!(
+        runtime.view_once_state(a, &group, id, 0).await.unwrap(),
+        ViewOnceState::Sent
+    );
+    assert!(matches!(
+        runtime.consume_view_once(a, &group, id, 0).await.unwrap(),
+        ViewOnceConsumeOutcome::Unavailable
+    ));
+    let ViewOnceConsumeOutcome::Opened { viewer: bob_viewer } =
+        runtime.consume_view_once(b, &group, id, 0).await.unwrap()
+    else {
+        panic!("Bob must open once")
+    };
+    assert_eq!(
+        &**bob_viewer
+            .read(0, plaintext.len() as u32)
+            .await
+            .unwrap()
+            .as_ref()
+            .unwrap(),
+        &plaintext
+    );
+    assert_eq!(
+        &**bob_viewer.read(4, 8).await.unwrap().as_ref().unwrap(),
+        &plaintext[4..12]
+    );
+    assert!(matches!(
+        runtime.consume_view_once(b, &group, id, 0).await.unwrap(),
+        ViewOnceConsumeOutcome::Consumed
+    ));
+    bob_viewer.close();
+    assert!(bob_viewer.read(0, 8).await.unwrap().is_none());
+    let row = app
+        .timeline_message(&bob.label, &hex::encode(group.as_slice()), id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.view_once.unwrap().state, ViewOnceState::Consumed);
+    assert!(row.media.is_none());
+    assert!(row.plaintext.is_empty());
+
+    let canceled_id = Box::pin(canceled_once_send_update(
+        &runtime,
+        a,
+        &group,
+        id,
+        ViewOnceMediaRequest {
+            plaintext: plaintext.clone(),
+            media_type: "image/png".into(),
+            unopened_expires_at: expires,
+            blossom_server: Some(blossom.url.clone()),
+        },
+        &blossom,
+    ))
+    .await;
+    wait_for_event(&mut events, |event| matches!(event, MarmotAppEvent::MessageReceived(m) if &m.account_id_hex == b && m.message.message_id_hex == canceled_id)).await;
+    Box::pin(canceled_once_update(
+        &runtime,
+        b,
+        &group,
+        &canceled_id,
+        &blossom,
+    ))
+    .await;
+
+    // A normal copy in the same epoch stays usable: consumption never erases its exporter.
+    let ordinary = runtime
+        .upload_media(
+            a,
+            &group,
+            MediaUploadRequest {
+                attachments: vec![MediaUploadAttachmentRequest {
+                    file_name: "ordinary.png".into(),
+                    media_type: "image/png".into(),
+                    plaintext: plaintext.clone(),
+                    dim: None,
+                    thumbhash: None,
+                }],
+                caption: None,
+                send: true,
+                blossom_server: Some(blossom.url.clone()),
+                message_tags: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+    let ordinary_id = &ordinary.sent.as_ref().unwrap().message_ids[0];
+    wait_for_event(&mut events, |event| matches!(event, MarmotAppEvent::MessageReceived(m) if &m.account_id_hex == b && &m.message.message_id_hex == ordinary_id)).await;
+    assert_eq!(
+        runtime
+            .download_media(b, &group, ordinary.attachments[0].reference.clone())
+            .await
+            .unwrap()
+            .plaintext,
+        plaintext
+    );
+    let source_epoch = runtime.group_mls_state(a, &group).await.unwrap().epoch;
+    for step in 0..6 {
+        runtime
+            .update_group_profile(a, &group, Some(format!("once-advance-{step}")), None)
+            .await
+            .unwrap();
+        wait_component_epoch(&runtime, a, b, &group).await;
+        wait_component_epoch(&runtime, a, c, &group).await;
+    }
+    assert!(runtime.group_mls_state(c, &group).await.unwrap().epoch >= source_epoch + 6);
+    assert_eq!(
+        runtime.view_once_state(c, &group, id, 0).await.unwrap(),
+        ViewOnceState::Unopened
+    );
+    let ViewOnceConsumeOutcome::Opened {
+        viewer: carol_viewer,
+    } = runtime.consume_view_once(c, &group, id, 0).await.unwrap()
+    else {
+        panic!("Carol must open after source snapshots have been pruned")
+    };
+    assert_eq!(carol_viewer.size_bytes(), plaintext.len() as u64);
+    assert_eq!(carol_viewer.media_type(), "image/png");
+    runtime.delete_message(a, &group, id).await.unwrap();
+    wait_for_event(&mut events, |event| matches!(event, MarmotAppEvent::MessageReceived(m) if &m.account_id_hex == c && matches!(m.message.kind, 5 | 4891))).await;
+    assert!(carol_viewer.read(0, 8).await.unwrap().is_none());
+    assert!(matches!(
+        runtime.consume_view_once(c, &group, id, 0).await.unwrap(),
+        ViewOnceConsumeOutcome::Consumed
+    ));
+    runtime.shutdown_and_close().await.unwrap();
+    assert!(carol_viewer.read(0, 8).await.is_err());
+}
+
+async fn canceled_once_send_update(
+    runtime: &MarmotAppRuntime,
+    account: &str,
+    group: &GroupId,
+    anchor: &str,
+    request: marmot_app::ViewOnceMediaRequest,
+    blossom: &MockBlossom,
+) -> String {
+    use marmot_app::ViewOnceState;
+    let mut window = runtime
+        .open_conversation_window(
+            account,
+            group,
+            marmot_app::ConversationOpenQuery {
+                target: marmot_app::ConversationOpenTarget::Message(anchor.to_owned()),
+                limit: 20,
+            },
+        )
+        .await
+        .unwrap();
+    let group_hex = hex::encode(group.as_slice());
+    let mut chats = runtime.subscribe_chat_list(account, false).await.unwrap();
+    assert!(
+        chats
+            .snapshot
+            .iter()
+            .any(|row| row.group_id_hex == group_hex)
+    );
+    let mut events = runtime.subscribe();
+    let puts = blossom.ledger.puts.load(Ordering::SeqCst);
+    let held = blossom.blobs.lock().await;
+    let started = blossom.ledger.put_started.notified();
+    tokio::pin!(started);
+    started.as_mut().enable();
+    let mut sending = Box::pin(runtime.send_view_once_media(account, group, request));
+    timeout(Duration::from_secs(20), async {
+        tokio::select! {
+            _ = &mut started => {}
+            _ = &mut sending => panic!("send completed before the held ciphertext PUT"),
+        }
+    })
+    .await
+    .expect("send reaches its ciphertext PUT");
+    drop(sending);
+    drop(held);
+    let event = wait_for_event_within(&mut events, Duration::from_secs(20), |event| {
+        matches!(event, MarmotAppEvent::ProjectionUpdated(update)
+            if update.account_id_hex == account
+                && update.update.timeline_messages.iter().any(|row|
+                    row.message_id_hex != anchor && row.view_once.as_ref()
+                        .is_some_and(|once| once.state == ViewOnceState::Sent)))
+    })
+    .await;
+    let MarmotAppEvent::ProjectionUpdated(update) = event else {
+        panic!("expected sender projection");
+    };
+    assert_eq!(
+        update
+            .update
+            .chat_list_row
+            .as_ref()
+            .map(|row| row.group_id_hex.as_str()),
+        Some(group_hex.as_str())
+    );
+    let message = update
+        .update
+        .timeline_messages
+        .into_iter()
+        .find(|row| {
+            row.message_id_hex != anchor
+                && row
+                    .view_once
+                    .as_ref()
+                    .is_some_and(|once| once.state == ViewOnceState::Sent)
+        })
+        .unwrap()
+        .message_id_hex;
+    timeout(Duration::from_secs(20), async {
+        loop {
+            let snapshot = window.recv().await.unwrap().expect("live sender window");
+            if snapshot.page.page().messages.iter().any(|row| {
+                row.message_id_hex == message
+                    && row
+                        .view_once
+                        .as_ref()
+                        .is_some_and(|once| once.state == ViewOnceState::Sent)
+            }) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("detached send updates its sender window");
+    assert_chat_row_retained(&mut chats, &group_hex, &message).await;
+    assert_eq!(blossom.ledger.puts.load(Ordering::SeqCst), puts + 1);
+    message
+}
+
+async fn assert_chat_row_retained(
+    chats: &mut marmot_app::RuntimeChatListSubscription,
+    group_hex: &str,
+    message: &str,
+) {
+    use marmot_app::RuntimeChatListUpdate;
+    timeout(Duration::from_secs(20), async {
+        loop {
+            let row = match chats.recv().await.expect("live chat list") {
+                RuntimeChatListUpdate::Row { row, .. } if row.group_id_hex == group_hex => {
+                    Some(*row)
+                }
+                RuntimeChatListUpdate::RemoveRow { group_id_hex, .. } => {
+                    assert_ne!(
+                        group_id_hex, group_hex,
+                        "protected updates must not remove a retained chat"
+                    );
+                    None
+                }
+                RuntimeChatListUpdate::Snapshot { rows, .. } => Some(
+                    rows.into_iter()
+                        .find(|row| row.group_id_hex == group_hex)
+                        .expect("snapshot retains the protected chat"),
+                ),
+                _ => None,
+            };
+            if row
+                .and_then(|row| row.last_message)
+                .is_some_and(|last| last.message_id_hex == message)
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("chat list reaches the ordered message without removing the chat");
+}
+
+async fn canceled_once_update(
+    runtime: &MarmotAppRuntime,
+    account: &str,
+    group: &GroupId,
+    message: &str,
+    blossom: &MockBlossom,
+) {
+    use marmot_app::{ViewOnceConsumeOutcome, ViewOnceState};
+    let mut window = runtime
+        .open_conversation_window(
+            account,
+            group,
+            marmot_app::ConversationOpenQuery {
+                target: marmot_app::ConversationOpenTarget::Message(message.to_owned()),
+                limit: 20,
+            },
+        )
+        .await
+        .unwrap();
+    let state = |snapshot: &marmot_app::ConversationWindowSnapshot| {
+        snapshot
+            .page
+            .page()
+            .messages
+            .iter()
+            .find(|row| row.message_id_hex == message)
+            .unwrap()
+            .view_once
+            .as_ref()
+            .unwrap()
+            .state
+    };
+    assert_eq!(state(&window.snapshot), ViewOnceState::Unopened);
+    let group_hex = hex::encode(group.as_slice());
+    let mut chats = runtime.subscribe_chat_list(account, false).await.unwrap();
+    assert!(
+        chats
+            .snapshot
+            .iter()
+            .any(|row| row.group_id_hex == group_hex)
+    );
+    let mut events = runtime.subscribe();
+    let gets = blossom.ledger.gets.load(Ordering::SeqCst);
+    let held = blossom.blobs.lock().await;
+    let started = blossom.ledger.get_started.notified();
+    tokio::pin!(started);
+    started.as_mut().enable();
+    let mut opening = Box::pin(runtime.consume_view_once(account, group, message, 0));
+    timeout(Duration::from_secs(20), async {
+        tokio::select! {
+            _ = &mut started => {}
+            _ = &mut opening => panic!("opening completed before the held ciphertext GET"),
+        }
+    })
+    .await
+    .expect("consume reaches ciphertext GET after its durable claim");
+    assert_eq!(
+        runtime
+            .view_once_state(account, group, message, 0)
+            .await
+            .unwrap(),
+        ViewOnceState::Consumed,
+    );
+    drop(opening);
+    drop(held);
+    let event = wait_for_event(&mut events, |event| {
+        matches!(event, MarmotAppEvent::ProjectionUpdated(update)
+            if update.account_id_hex == account
+                && update.update.timeline_messages.iter().any(|row|
+                    row.message_id_hex == message && row.view_once.as_ref()
+                        .is_some_and(|once| once.state == ViewOnceState::Consumed)))
+    })
+    .await;
+    let MarmotAppEvent::ProjectionUpdated(update) = event else {
+        panic!("expected consumed projection");
+    };
+    assert_eq!(
+        update
+            .update
+            .chat_list_row
+            .as_ref()
+            .map(|row| row.group_id_hex.as_str()),
+        Some(group_hex.as_str())
+    );
+    timeout(Duration::from_secs(20), async {
+        loop {
+            let snapshot = window
+                .recv()
+                .await
+                .unwrap()
+                .expect("live conversation window");
+            if state(&snapshot) == ViewOnceState::Consumed {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("cancelled caller still updates its host window");
+    assert!(matches!(
+        runtime
+            .consume_view_once(account, group, message, 0)
+            .await
+            .unwrap(),
+        ViewOnceConsumeOutcome::Consumed,
+    ));
+    assert_eq!(blossom.ledger.gets.load(Ordering::SeqCst), gets + 1);
+    // A normal text send fences the chat-list stream after the consume update.
+    let barrier = runtime
+        .send_message(account, group, b"chat-list ordering barrier".to_vec())
+        .await
+        .unwrap();
+    assert_chat_row_retained(&mut chats, &group_hex, &barrier.message_ids[0]).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

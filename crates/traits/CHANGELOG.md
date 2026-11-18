@@ -4,6 +4,11 @@
 
 ### Breaking changes
 
+- `SendIntent` adds `EnableViewOnce`; exhaustive intent matches must handle it
+  (#1327).
+- `AppMessageRetentionDecision` gains optional authenticated `view_once` source
+  policy. Marker parsing alone does not establish source-epoch eligibility;
+  ordinary decisions and older serialized records use `None` (#1327).
 - `OutboundIntentStorage` gains `put_change_not_delivered`, `changes_not_delivered` and
   `delete_change_not_delivered` for `ChangeNotDelivered` records (mdk#2332); custom storage must implement them.
 
@@ -13,6 +18,9 @@
   for size, such as the Nostr relay plane's host-safety refusal (mdk#3305).
   `EventSizeClass::from_rejected_targets` leaves such targets out of its proof: the rest must all refuse the event for
   size, and at least one must remain.
+- Negotiated view-once component `0x8010`, strict authenticated marker policy,
+  and absolute expiry composition (#1327). Media grammar checks are separate
+  from generic application-payload decoding and sender authentication.
 - `OutboundFanout::record_stuck` keeps when the session first read a pending commit back past the read-back bound,
   and `stuck_at_ms` reads it (mdk#3460); the session audits the commit stuck once by it. A fanout stored before the
   field reads `None`.

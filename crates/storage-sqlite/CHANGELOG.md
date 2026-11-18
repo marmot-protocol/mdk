@@ -13,6 +13,10 @@
   `SqliteAppStorage::record_sign_in_removals` writes them and deletes those slots' unrejected sign-ins no later than
   that; `record_sign_in_check` adds no sign-in for such a publication. Account schema advances
   from 210 to 211; older binaries refuse the upgraded database. Downgrade is unsupported.
+- Account migration 0214 adds durable view-once claims and an expiry high-water
+  clock (#1327). Account schema advances from 213 to 214; downgrade is unsupported.
+  Historical view-once-like records become unavailable, not newly openable.
+  Timeline and reply records gain `view_once` presentation data.
 - Account migration 0210 adds `cgka_changes_not_delivered`: one row per group change given up after its call
   returned, kept until the user acknowledges it and deleted with its group (mdk#2332). Account schema advances from
   209 to 210; older binaries refuse the upgraded database. Downgrade is unsupported.
@@ -38,6 +42,11 @@
   reasons for derivative-cache eviction (mdk#3491). Pages hold up to 256 records; the journal holds 4,096.
   First use, store reset, and trimmed history require reconciliation from a captured high-water cursor.
   Local-byte reads remain the authorization boundary.
+- Atomic view-once claim, descriptor erasure, MIME admission, and earliest-expiry
+  checks (#1327). Consumed/expired decisions survive history clearing and replay;
+  ordinary acquisition, gallery, and portable-history paths cannot reopen them.
+  Unclaimed sources follow live visibility across branch rollback and cache/group
+  restoration without refreshing their cap. Already-opened viewers stay revoked.
 - File-backed composer-draft attachments (#3431, migration 0209): a
   `message_draft_attachments` row can own a staged media file
   (`message_draft_attachment_stage`, a `StageTarget`) instead of holding bytes,

@@ -1890,6 +1890,21 @@ impl<S: StorageProvider> Engine<S> {
             recovered_source_retention,
         } = context;
         let needs_authority = cgka_traits::reporting::requires_source_authority(app_event.kind);
+        // Media eligibility never changes authenticated application validity.
+        let view_once = app_event.view_once_policy().ok().flatten();
+        let once_source_policy = if view_once.is_some() {
+            crate::view_once::source_policy(
+                &self.storage,
+                &self.rewinds,
+                &self.crypto,
+                mls_group,
+                msg_epoch,
+            )?
+        } else {
+            None
+        };
+        let view_once =
+            view_once.filter(|_| once_source_policy.is_some_and(|(required, _)| required));
         let historical_source = if needs_authority && msg_epoch != current_epoch {
             if let Some(snapshot) =
                 crate::app_payload::retained_source_snapshot(&self.storage, group_id, msg_epoch)?
@@ -1917,7 +1932,9 @@ impl<S: StorageProvider> Engine<S> {
         } else {
             None
         };
-        let retention_seconds = if msg_epoch == current_epoch {
+        let retention_seconds = if let Some((_, seconds)) = once_source_policy {
+            Some(seconds)
+        } else if msg_epoch == current_epoch {
             Some(crate::app_components::message_retention_seconds_of_group(mls_group)?.unwrap_or(0))
         } else {
             // Successful authentication supplies both policies in one
@@ -1961,8 +1978,16 @@ impl<S: StorageProvider> Engine<S> {
             epoch: msg_epoch,
             payload,
             authority,
-            retention: retention_seconds
-                .map(|seconds| AppMessageRetentionDecision::new(app_event.created_at, seconds)),
+            retention: retention_seconds.or(view_once.map(|_| 0)).map(|seconds| {
+                AppMessageRetentionDecision {
+                    view_once,
+                    ..AppMessageRetentionDecision::with_absolute_expiry(
+                        app_event.created_at,
+                        seconds,
+                        view_once.map(|policy| policy.unopened_expires_at),
+                    )
+                }
+            }),
             encrypted_media_secret,
         };
         let previous = self

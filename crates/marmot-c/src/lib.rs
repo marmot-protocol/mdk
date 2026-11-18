@@ -38,6 +38,7 @@ pub mod secret_store;
 pub mod status;
 pub mod subscriptions;
 pub mod types;
+pub mod view_once;
 
 pub use status::MarmotStatus;
 

@@ -143,6 +143,8 @@ pub use conversions::{
     TimelineRemoveReasonFfi, TimelineSubscriptionUpdateFfi, TimelineUpdateTriggerFfi,
     TimelineUserReactionFfi, TransportFanoutStatusFfi, UsageDiagnosticsDecisionFfi,
     UsageDiagnosticsSettingsFfi, UsageDiagnosticsStatusFfi, UserEmojiListFfi,
+    ViewOnceActivationRefusalFfi, ViewOnceConsumeOutcomeFfi, ViewOnceMediaRequestFfi,
+    ViewOncePresentationFfi, ViewOnceStateFfi, ViewOnceViewerFfi,
 };
 
 /// Convenience: turn an FFI string list of relay URLs into the engine's

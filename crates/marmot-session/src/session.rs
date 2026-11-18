@@ -2288,6 +2288,21 @@ impl AccountDeviceSession {
         self.engine.account_devices_activation_refusal(group_id)
     }
 
+    pub fn view_once_activation_refusal(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<Option<cgka_traits::error::ViewOnceActivationRefusal>, EngineError> {
+        self.engine.view_once_activation_refusal(group_id)
+    }
+
+    pub fn view_once_required_at(
+        &self,
+        group_id: &GroupId,
+        epoch: cgka_traits::EpochId,
+    ) -> Result<bool, EngineError> {
+        self.engine.view_once_required_at(group_id, epoch)
+    }
+
     /// See [`cgka_engine::engine::Engine::sibling_add_refusal`].
     pub fn sibling_add_refusal(
         &self,
@@ -2692,6 +2707,7 @@ fn send_intent_kind(intent: &SendIntent) -> &'static str {
         SendIntent::UpdateGroupData { .. } => "update_group_data",
         SendIntent::EnableDisbanding { .. } => "enable_disbanding",
         SendIntent::EnableAccountDevices { .. } => "enable_account_devices",
+        SendIntent::EnableViewOnce { .. } => "enable_view_once",
         SendIntent::LinkDevice { .. } => "link_device",
         SendIntent::UnlinkDevice { .. } => "unlink_device",
         SendIntent::ImportDeviceGroupRejections { .. } => "import_device_group_rejections",

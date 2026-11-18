@@ -247,6 +247,8 @@ impl AccountWorkerCommand {
             | Self::EnableGroupDisbanding { .. }
             | Self::AccountDevicesActivation { .. }
             | Self::EnableAccountDevices { .. }
+            | Self::ViewOnceActivation { .. }
+            | Self::EnableViewOnce { .. }
             | Self::DisbandGroup { .. }
             | Self::AcknowledgeDisbandFailure { .. }
             | Self::RetryHydrateQuarantinedGroup { .. }
@@ -289,6 +291,8 @@ impl AccountWorkerCommand {
             | Self::BuildMediaImetaTag { .. }
             | Self::UploadMedia { .. }
             | Self::DownloadMedia { .. }
+            | Self::SendViewOnce { .. }
+            | Self::ConsumeViewOnce { .. }
             | Self::SecureDeleteExpiredPlaintext { .. }
             | Self::DiscardFailedSend { .. }
             | Self::StartAgentTextStream { .. }

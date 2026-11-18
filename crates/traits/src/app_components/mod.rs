@@ -85,6 +85,8 @@ pub use routing::{
 /// MLS ComponentID.
 pub type AppComponentId = u16;
 
+pub use crate::error::ViewOnceActivationRefusal;
+
 /// First application-component id in the private-use range.
 ///
 /// Kind-30443 KeyPackage events publish only private-use application
@@ -149,9 +151,17 @@ pub const DEVICE_ROSTER_COMPONENT_ID: AppComponentId = 0x800e;
 /// LeafNode is unknown data.
 pub const DEVICE_TAG_COMPONENT_ID: AppComponentId = 0x800f;
 
+/// Negotiated view-once media profile. Its id appears only in support and
+/// required lists; no location carries component data.
+pub const VIEW_ONCE_COMPONENT_ID: AppComponentId = 0x8010;
+pub const VIEW_ONCE_COMPONENT: &str = "marmot.group.view-once.v1";
+pub const VIEW_ONCE_MEDIA_FORMAT: &str = "encrypted-media-view-once-v1";
+pub const VIEW_ONCE_MARKER_VERSION: &str = "view-once-v1";
+pub const VIEW_ONCE_MAX_LIFETIME_SECONDS: u64 = 45 * 24 * 3600;
+
 /// First component id applications may allocate for themselves.
 ///
-/// The protocol registry allocates upward from `0x8001` and is at `0x800f`
+/// The protocol registry allocates upward from `0x8001` and is at `0x8010`
 /// today, so "any private-use id the registry has not taken yet" is not a
 /// safe rule for applications: an id chosen that way can be assigned by a
 /// later registry entry, stranding state already committed in live groups.
@@ -194,6 +204,7 @@ pub const PROTOCOL_OWNED_APP_COMPONENT_IDS: &[AppComponentId] = &[
     ACCOUNT_DEVICES_COMPONENT_ID,
     DEVICE_ROSTER_COMPONENT_ID,
     DEVICE_TAG_COMPONENT_ID,
+    VIEW_ONCE_COMPONENT_ID,
 ];
 
 /// Lookup key for the encrypted-media secret in the

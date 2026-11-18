@@ -106,6 +106,7 @@ pub use attachment_permission::{AttachmentAutomaticPermission, AutomaticAttachme
 mod attachment_access;
 mod attachment_history;
 mod attachment_storage;
+mod view_once;
 pub use attachment_access::{
     AttachmentAssetRef, AttachmentLocalTarget, MAX_ATTACHMENT_ASSET_LOOKUPS,
     MAX_ATTACHMENT_LOCAL_READ_BYTES, RetainedAttachmentAsset,

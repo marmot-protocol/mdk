@@ -26,7 +26,7 @@ use crate::device_tag::OwnDeviceTag;
 use crate::engine::Engine;
 use cgka_traits::app_components::{
     APP_COMPONENTS_COMPONENT_ID, AppComponentId, AppComponentSet, DEVICE_TAG_COMPONENT_ID,
-    encode_components_list,
+    VIEW_ONCE_COMPONENT_ID, encode_components_list,
 };
 use cgka_traits::error::EngineError;
 use cgka_traits::storage::StorageProvider;
@@ -36,13 +36,17 @@ use openmls::group::MlsGroup;
 use openmls::messages::proposals::Proposal;
 use openmls::prelude::{LeafNode, LeafNodeParameters};
 
-/// Replacement extensions for this device's own leaf when it advertises fewer
-/// component ids than the device supports or `device_tag` is a tag it needs,
-/// or `None` when neither holds.
+fn needs_once_leaf_cleanup(leaf: &LeafNode, supported: &AppComponentSet) -> bool {
+    supported.contains(VIEW_ONCE_COMPONENT_ID)
+        && crate::app_components::carries_view_once_data(leaf.extensions().app_data_dictionary())
+}
+
+/// Replacement extensions when the own leaf needs support refresh, a device
+/// tag, or removal of obsolete view-once bytes. Otherwise `None`.
 ///
-/// Every extension and every other dictionary entry, including the account
-/// identity proof, is copied unchanged; only the `app_components` support list
-/// grows, and the `0x800f` entry becomes `device_tag`. The list is the union
+/// Unknown entries and the account identity proof are copied unchanged. The
+/// `app_components` list grows, `0x800f` becomes `device_tag`, and a producer
+/// supporting view-once removes obsolete `0x8010` entry bytes. The list is the union
 /// of what the leaf already advertises and the supported set, plus `0x800f`
 /// for a tagged leaf, so a refresh never withdraws support the group may
 /// require.
@@ -52,7 +56,8 @@ pub(crate) fn own_leaf_refresh_extensions(
     device_tag: Option<Vec<u8>>,
 ) -> Result<Option<Extensions<LeafNode>>, EngineError> {
     let advertised = crate::app_components::app_components_of_leaf(leaf)?;
-    if supported.missing_from(&advertised).is_empty() && device_tag.is_none() {
+    let clean_once = needs_once_leaf_cleanup(leaf, supported);
+    if supported.missing_from(&advertised).is_empty() && device_tag.is_none() && !clean_once {
         return Ok(None);
     }
     let mut merged: BTreeSet<AppComponentId> = advertised.ids;
@@ -69,6 +74,9 @@ pub(crate) fn own_leaf_refresh_extensions(
             Extension::AppDataDictionary(existing) => {
                 saw_dictionary = true;
                 let mut dictionary = existing.dictionary().clone();
+                if clean_once {
+                    dictionary.remove(&VIEW_ONCE_COMPONENT_ID);
+                }
                 dictionary.insert(APP_COMPONENTS_COMPONENT_ID, encode_components_list(&merged));
                 if let Some(tag) = &device_tag {
                     dictionary.insert(DEVICE_TAG_COMPONENT_ID, tag.clone());
@@ -97,9 +105,10 @@ impl<S: StorageProvider> Engine<S> {
     }
 
     /// Component ids this device supports that its own leaf in `group_id` does
-    /// not advertise yet, plus `0x800f` while the leaf needs a device tag that
-    /// reads as its own. Non-empty exactly when a self-update would change the
-    /// leaf: a leaf [`own_leaf_refresh_extensions`] cannot refresh (no
+    /// not advertise yet, plus `0x800f` while a tag is due and `0x8010` while
+    /// obsolete view-once entry bytes need cleanup. The result is non-empty
+    /// exactly when a self-update changes the leaf. A leaf
+    /// [`own_leaf_refresh_extensions`] cannot refresh (no
     /// `app_data_dictionary`) reports nothing missing, so maintenance never
     /// schedules a refresh that would leave it stale again.
     pub fn own_leaf_missing_app_components(
@@ -126,6 +135,9 @@ impl<S: StorageProvider> Engine<S> {
         if tag_due {
             missing.insert(DEVICE_TAG_COMPONENT_ID);
         }
+        if needs_once_leaf_cleanup(leaf, &self.supported_app_components) {
+            missing.insert(VIEW_ONCE_COMPONENT_ID);
+        }
         Ok(missing)
     }
 
@@ -144,18 +156,22 @@ impl<S: StorageProvider> Engine<S> {
     /// "every LeafNode it creates for its own leaf" carries a tag
     /// (device-tag-v1.md, "Producing tags"). The parameters stay empty, so the
     /// UpdatePath keeps the leaf's extensions and its tag, unless the leaf
-    /// needs one. Then they replace the leaf as a self-update would, and force
-    /// an UpdatePath into a Commit that would otherwise omit it.
+    /// needs a tag or view-once data cleanup. Replacement forces an UpdatePath
+    /// into a Commit that would otherwise omit it.
     pub(crate) fn own_commit_leaf_parameters(
         &self,
         mls_group: &MlsGroup,
         proposals: &[Proposal],
     ) -> Result<LeafNodeParameters, EngineError> {
-        let Some(due) = self.device_tag_due(mls_group, proposals) else {
+        let due = self.device_tag_due(mls_group, proposals);
+        let clean_once = mls_group
+            .own_leaf_node()
+            .is_some_and(|leaf| needs_once_leaf_cleanup(leaf, &self.supported_app_components));
+        if due.is_none() && !clean_once {
             return Ok(LeafNodeParameters::default());
-        };
+        }
         Ok(self
-            .replace_own_leaf(mls_group, Some(due))?
+            .replace_own_leaf(mls_group, due)?
             .map(|extensions| {
                 LeafNodeParameters::builder()
                     .with_extensions(extensions)
@@ -219,11 +235,11 @@ mod tests {
             encode_components_list(&BTreeSet::from([APP_COMPONENTS_COMPONENT_ID, old])),
         );
         dictionary.insert(opaque_id, opaque.clone());
-        let make_leaf = |with_dictionary| {
+        let make_leaf = |entries: Option<AppDataDictionary>| {
             let mut extensions = vec![proof.clone(), other.clone()];
-            if with_dictionary {
+            if let Some(entries) = entries {
                 extensions.push(Extension::AppDataDictionary(
-                    AppDataDictionaryExtension::new(dictionary.clone()),
+                    AppDataDictionaryExtension::new(entries),
                 ));
             }
             KeyPackage::builder()
@@ -250,7 +266,7 @@ mod tests {
                 .leaf_node()
                 .clone()
         };
-        let leaf = make_leaf(true);
+        let leaf = make_leaf(Some(dictionary.clone()));
         crate::account_identity_proof::validate_leaf_account_identity_proof(
             &leaf,
             DEFAULT_CIPHERSUITE,
@@ -280,7 +296,45 @@ mod tests {
                 .as_slice()
             )
         );
-        let no_dictionary = make_leaf(false);
+        dictionary.insert(VIEW_ONCE_COMPONENT_ID, vec![1]);
+        dictionary.insert(
+            APP_COMPONENTS_COMPONENT_ID,
+            encode_components_list(&BTreeSet::from([
+                APP_COMPONENTS_COMPONENT_ID,
+                old,
+                VIEW_ONCE_COMPONENT_ID,
+            ])),
+        );
+        let dirty = make_leaf(Some(dictionary));
+        let clean = own_leaf_refresh_extensions(
+            &dirty,
+            &AppComponentSet::new([VIEW_ONCE_COMPONENT_ID]),
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            !clean
+                .app_data_dictionary()
+                .unwrap()
+                .dictionary()
+                .contains(&VIEW_ONCE_COMPONENT_ID)
+        );
+        assert_eq!(
+            clean
+                .app_data_dictionary()
+                .unwrap()
+                .dictionary()
+                .get(&opaque_id),
+            Some(opaque.as_slice())
+        );
+        assert_eq!(clean.unknown(0xf123), dirty.extensions().unknown(0xf123));
+        assert!(
+            crate::app_components::app_components_of_leaf_extensions(&clean)
+                .unwrap()
+                .contains(VIEW_ONCE_COMPONENT_ID)
+        );
+        let no_dictionary = make_leaf(None);
         crate::account_identity_proof::validate_leaf_account_identity_proof(
             &no_dictionary,
             DEFAULT_CIPHERSUITE,

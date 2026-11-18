@@ -74,6 +74,7 @@ mod audit_recovery;
 mod audit_v5_app_update;
 pub(crate) mod audit_v5_probe;
 mod chat_history;
+pub(crate) mod view_once;
 #[cfg(feature = "test-policy-overrides")]
 pub use chat_history::DevSealedHistoryBundle;
 #[cfg(all(test, feature = "test-policy-overrides"))]
@@ -4599,6 +4600,11 @@ impl AppClient {
                 )
                 .map_err(AppError::InvalidEncryptedMedia)?,
             )?,
+            EncryptedMediaVersion::ViewOnceV1 => {
+                return Err(AppError::InvalidEncryptedMedia(
+                    "view-once is not a group media policy".into(),
+                ));
+            }
         }
         .to_app_component_data()?;
         let audit_context = Self::local_human_action_context(
@@ -4964,6 +4970,7 @@ impl AppClient {
                                 || crate::messages::is_nip22_comment(target.kind, &target.tags))
                                 && target.sender == sender
                                 && !target.deleted
+                                && target.view_once.is_none()
                                 // A failed local publish is retried; recipients
                                 // resolve the edit once the original arrives.
                                 && target.invalidation_status.as_deref().is_none_or(|status| {
@@ -6103,6 +6110,11 @@ impl AppClient {
         reference: MediaAttachmentReference,
         max_bytes: u64,
     ) -> Result<Option<EncryptedMediaDownloadHttp>, AppError> {
+        if reference.version.starts_with("encrypted-media-view-once") {
+            return Err(AppError::InvalidEncryptedMedia(
+                "view-once requires consumption".into(),
+            ));
+        }
         self.ensure_group(group_id)?;
         let policy = self
             .state
@@ -6208,6 +6220,11 @@ impl AppClient {
         group_id: &GroupId,
         reference: MediaAttachmentReference,
     ) -> Result<EncryptedMediaDownloadHttp, AppError> {
+        if reference.version.starts_with("encrypted-media-view-once") {
+            return Err(AppError::InvalidEncryptedMedia(
+                "view-once requires consumption".into(),
+            ));
+        }
         self.ensure_group(group_id)?;
         let policy = self.encrypted_media_policy_for_group(group_id)?;
         // The current group policy governs fetch endpoints, but the retained

@@ -383,6 +383,9 @@ pub enum SendIntent {
     /// over the leaf limit. The checks run against the state the Commit is
     /// prepared on, so an intent queued behind other work sees that work.
     EnableAccountDevices { group_id: GroupId },
+    /// Explicitly require the irreversible view-once profile in one admin
+    /// Commit, only when every current leaf supports it and media-v2 is required.
+    EnableViewOnce { group_id: GroupId },
     /// Persist the irreversible local intent to terminate the group. Preparing
     /// and publishing the terminal Commit is driven asynchronously from this
     /// durable request.

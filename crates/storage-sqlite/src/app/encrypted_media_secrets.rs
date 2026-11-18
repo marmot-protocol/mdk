@@ -185,7 +185,7 @@ pub(crate) fn encrypted_media_component_ids(tags: &[Vec<String>]) -> BTreeSet<u1
             ENCRYPTED_MEDIA_FORMAT_V1 => {
                 component_ids.insert(GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID);
             }
-            ENCRYPTED_MEDIA_FORMAT_V2 => {
+            ENCRYPTED_MEDIA_FORMAT_V2 | cgka_traits::app_components::VIEW_ONCE_MEDIA_FORMAT => {
                 component_ids.insert(GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID);
             }
             _ => {}

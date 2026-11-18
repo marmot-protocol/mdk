@@ -112,6 +112,12 @@ pub enum EngineError {
         reason: AccountDevicesActivationRefusal,
     },
 
+    #[error("view-once activation refused: {reason}")]
+    ViewOnceActivationRefused {
+        group_id: GroupId,
+        reason: ViewOnceActivationRefusal,
+    },
+
     /// The configured MLS ciphersuite is not the Marmot mandatory-to-implement
     /// ciphersuite. Per `spec/foundation/mls-protocol.md`, Marmot requires
     /// `MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519` (id `0x0001`); building an
@@ -391,6 +397,7 @@ impl EngineError {
             EngineError::AccountDevicesActivationRefused { .. } => {
                 "account_devices_activation_refused"
             }
+            EngineError::ViewOnceActivationRefused { .. } => "view_once_activation_refused",
             EngineError::UnsupportedCiphersuite { .. } => "unsupported_ciphersuite",
             EngineError::InvalidAppMessagePayload(_) => "invalid_app_message_payload",
             EngineError::InvalidAccountIdentityProof(_) => "invalid_account_identity_proof",
@@ -441,6 +448,37 @@ impl EngineError {
     pub fn is_transient(&self) -> bool {
         matches!(self, EngineError::GroupRecoveryUnsettled { .. })
             || matches!(self, EngineError::Storage(e) if e.is_transient())
+    }
+}
+
+/// Aggregate, privacy-safe reasons a group cannot activate view-once now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ViewOnceActivationRefusal {
+    NotAdmin,
+    AlreadyRequired,
+    LegacyProfile,
+    UnsupportedLeaf,
+    CarriesData,
+    EncryptedMediaV2NotRequired,
+}
+
+impl ViewOnceActivationRefusal {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NotAdmin => "not_admin",
+            Self::AlreadyRequired => "already_required",
+            Self::LegacyProfile => "legacy_profile",
+            Self::UnsupportedLeaf => "unsupported_leaf",
+            Self::CarriesData => "carries_data",
+            Self::EncryptedMediaV2NotRequired => "encrypted_media_v2_not_required",
+        }
+    }
+}
+
+impl std::fmt::Display for ViewOnceActivationRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 

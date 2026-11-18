@@ -243,6 +243,9 @@ impl SqliteAppStorage {
             let mut imported = 0;
             let mut changed = BTreeSet::new();
             for event in events {
+                if crate::app::view_once::is_view_once(&event.tags) {
+                    continue;
+                }
                 let expired = event
                     .retention
                     .and_then(|retention| retention.expires_at)
@@ -393,6 +396,7 @@ impl SqliteAppStorage {
                         CASE WHEN event.kind IN (1985, 4891) AND event.authority_state = 2
                              THEN event.moderation_grant END,
                         event.invalidated != 0
+                        OR EXISTS(SELECT 1 FROM view_once_consumption v WHERE v.group_id_hex=event.group_id_hex AND v.message_id_hex=event.message_id_hex)
                         OR ifnull(event.retention_expires_at <= ?5, 0)
                         OR event.kind = 1210
                         OR (event.direction = 'sent' AND event.source_message_id_hex IS NULL)
@@ -630,7 +634,8 @@ impl SqliteAppStorage {
             .lock()?
             .query_row_cached(
                 "SELECT file_key FROM imported_media_file_keys
-                 WHERE group_id_hex = ?1 AND message_id_hex = ?2 AND ciphertext_sha256 = ?3",
+                 WHERE group_id_hex = ?1 AND message_id_hex = ?2 AND ciphertext_sha256 = ?3
+                   AND NOT EXISTS(SELECT 1 FROM view_once_consumption v WHERE v.group_id_hex=imported_media_file_keys.group_id_hex AND v.message_id_hex=imported_media_file_keys.message_id_hex)",
                 params![group_id_hex, message_id_hex, ciphertext_sha256],
                 |row| row.get::<_, Vec<u8>>(0).map(Zeroizing::new),
             )
@@ -653,6 +658,7 @@ impl SqliteAppStorage {
             .query_row_cached(
                 "SELECT file_key FROM imported_media_file_keys
                  WHERE group_id_hex = ?1 AND ciphertext_sha256 = ?2
+                   AND NOT EXISTS(SELECT 1 FROM view_once_consumption v WHERE v.group_id_hex=imported_media_file_keys.group_id_hex AND v.message_id_hex=imported_media_file_keys.message_id_hex)
                  LIMIT 1",
                 params![group_id_hex, ciphertext_sha256],
                 |row| row.get::<_, Vec<u8>>(0).map(Zeroizing::new),
@@ -674,6 +680,7 @@ impl SqliteAppStorage {
             .prepare_cached(
                 "SELECT ciphertext_sha256, file_key FROM imported_media_file_keys
                  WHERE group_id_hex = ?1 AND message_id_hex = ?2
+                   AND NOT EXISTS(SELECT 1 FROM view_once_consumption v WHERE v.group_id_hex=imported_media_file_keys.group_id_hex AND v.message_id_hex=imported_media_file_keys.message_id_hex)
                  ORDER BY ciphertext_sha256",
             )
             .storage()?;

@@ -644,7 +644,11 @@ async fn send_app_message_passes_retention_metadata_to_peeler() {
     let seen = seen_metadata.lock().unwrap();
     assert_eq!(
         seen.as_slice(),
-        &[GroupMessageMetadata::application(1_700_000_000, Some(60))]
+        &[GroupMessageMetadata::application(
+            1_700_000_000,
+            Some(60),
+            None
+        )]
     );
 }
 

@@ -4,6 +4,10 @@
 
 ### Breaking changes
 
+- C timeline and reply-preview record layouts gain view-once presentation
+  fields (#1327). Rebuild consumers with the matching header and library;
+  arrays use the new record stride. App message events no longer expose
+  source-epoch media exporter secrets; use the media APIs instead.
 - C hosts: `MarmotSelectedMessageDraftAttachment` and
   `MarmotAttachmentStorageUsage` gain fields for file-backed draft attachments
   (#3431), so their layouts changed: rebuild with the matching header and
@@ -22,6 +26,16 @@
 - MarmotKit and C bindings expose emoji-scoped reaction removal and a typed
   `ReactionNotFound` outcome for local no-match results. Target-wide removal
   remains available (#1963).
+- View-once image/video media with explicit group activation and one durable
+  opening attempt per receiving account-device (#1327). Claims precede
+  transfer; later failure or a crash stays consumed. The bounded viewer
+  replaces ordinary download, preview, gallery, and export access. Unopened
+  media uses the earliest retention deadline, with a 45-day cap from the
+  receiver's admission-time wall-clock reading, not a trusted-time guarantee.
+  Screenshot prevention and erasure are best effort; relay expiry hints can
+  reveal view-once use. Completed sends and durable claims update live
+  conversation and chat-list subscriptions even after the caller drops its
+  future.
 - The v5 audit records a pending commit going stuck, confirming without a
   relay's `OK`, or being given up (#3460). The new `pending_commit_changed` row
   says `stuck` once, at the commit's first read-back past the ten-minute bound;

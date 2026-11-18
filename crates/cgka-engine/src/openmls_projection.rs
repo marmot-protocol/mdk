@@ -1016,8 +1016,15 @@ fn replay_openmls_messages_prevalidated_output<S: StorageProvider>(
         RewindSite::Replay,
         &replay_snapshot_suffix(group_id, messages),
         |storage| {
-            replay_openmls_messages_window(storage, group_id, messages, own_commits, profile_policy)
-                .map_err(ReplayWindowError)
+            replay_openmls_messages_window(
+                storage,
+                rewinds,
+                group_id,
+                messages,
+                own_commits,
+                profile_policy,
+            )
+            .map_err(ReplayWindowError)
         },
     )
     .map_err(|ReplayWindowError(error)| error)?;
@@ -1040,6 +1047,7 @@ impl From<StorageError> for ReplayWindowError {
 // the savepoint. Production callers enter through the contained wrapper.
 fn replay_openmls_messages_window<S: StorageProvider>(
     storage: &S,
+    rewinds: &Rewinds,
     group_id: &GroupId,
     messages: &[TransportMessage],
     own_commits: &PrevalidatedOwnCommits,
@@ -1047,6 +1055,7 @@ fn replay_openmls_messages_window<S: StorageProvider>(
 ) -> Result<OpenMlsReplayOutput, OpenMlsProjectionError> {
     let result = process_openmls_messages_inner(
         storage,
+        rewinds,
         group_id,
         messages,
         own_commits,
@@ -1080,8 +1089,14 @@ fn replay_openmls_messages_probe<S: StorageProvider>(
         &replay_snapshot_suffix(group_id, messages),
     )
     .map_err(|e| OpenMlsProjectionError::Snapshot(format!("{e:?}")))?;
-    let result =
-        replay_openmls_messages_window(storage, group_id, messages, own_commits, profile_policy);
+    let result = replay_openmls_messages_window(
+        storage,
+        &Rewinds::default(),
+        group_id,
+        messages,
+        own_commits,
+        profile_policy,
+    );
     guard
         .commit()
         .map_err(|e| OpenMlsProjectionError::Snapshot(format!("{e:?}")))?;
@@ -1420,6 +1435,7 @@ pub(crate) fn canonicalize_stored_openmls_messages_with_profile_policy<S: Storag
 /// The caller owns the transaction spanning MLS ratchets, disposition and app outbox.
 pub(crate) fn process_current_openmls_application<S: StorageProvider>(
     storage: &S,
+    rewinds: &Rewinds,
     group_id: &GroupId,
     message: &TransportMessage,
     profile_policy: ReplayProfilePolicy,
@@ -1432,6 +1448,7 @@ pub(crate) fn process_current_openmls_application<S: StorageProvider>(
     }
     Ok(process_openmls_messages_inner(
         storage,
+        rewinds,
         group_id,
         std::slice::from_ref(message),
         &PrevalidatedOwnCommits::default(),
@@ -2443,6 +2460,7 @@ fn candidate_path_peel_context<S: StorageProvider>(
         |storage| {
             capture_candidate_tip_context(
                 storage,
+                rewinds,
                 group_id,
                 &replay_path.messages,
                 own_commits,
@@ -2472,6 +2490,7 @@ struct CandidateTipState {
 /// restores the live state before the returned context is used.
 fn capture_candidate_tip_context<S: StorageProvider>(
     storage: &S,
+    rewinds: &Rewinds,
     group_id: &GroupId,
     messages: &[TransportMessage],
     own_commits: &PrevalidatedOwnCommits,
@@ -2481,6 +2500,7 @@ fn capture_candidate_tip_context<S: StorageProvider>(
     // later replay says nothing about the path's validity and must propagate.
     if let Err(error) = process_openmls_messages_inner(
         storage,
+        rewinds,
         group_id,
         messages,
         own_commits,
@@ -2915,6 +2935,7 @@ pub(crate) fn apply_openmls_canonicalization_result_with_profile_policy<S: Stora
 
         let observations = apply_openmls_canonicalization_result_inner(
             storage,
+            rewinds,
             group_id,
             result,
             &replay_messages,
@@ -3331,8 +3352,10 @@ struct ReplayAcceptance<'a> {
 
 /// Atomically merge replay messages, refresh canonical group state and persist dispositions.
 /// Activity is returned only after successful apply, so candidate probes cannot publish it.
+#[allow(clippy::too_many_arguments)]
 fn apply_openmls_canonicalization_result_inner<S: StorageProvider>(
     storage: &S,
+    rewinds: &Rewinds,
     group_id: &GroupId,
     result: &CanonicalizationResult,
     replay_messages: &[TransportMessage],
@@ -3360,6 +3383,7 @@ fn apply_openmls_canonicalization_result_inner<S: StorageProvider>(
         // replay never echoes a sender's own message as `MessageReceived`.
         let output = process_openmls_messages_inner(
             storage,
+            rewinds,
             group_id,
             replay_messages,
             own_commits,
@@ -3969,6 +3993,7 @@ fn project_pending_canonicalization_messages(
 #[allow(clippy::disallowed_methods)]
 fn process_openmls_messages_inner<S: StorageProvider>(
     storage: &S,
+    rewinds: &Rewinds,
     group_id: &GroupId,
     messages: &[TransportMessage],
     own_commits: &PrevalidatedOwnCommits,
@@ -3999,6 +4024,7 @@ fn process_openmls_messages_inner<S: StorageProvider>(
     let mut group_changes = Vec::new();
     let mut roster_tag_keys = Vec::new();
     let mut disband_former_members = None;
+    let mut once_source_policies = BTreeMap::new();
     let mut epoch_authenticators = BTreeMap::from([(
         mls_group.epoch().as_u64(),
         own_commit_post_merge_epoch_authenticator(&mls_group),
@@ -4602,14 +4628,44 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                 });
                 if let Some((sender, app_event)) = validated {
                     let at_source_epoch = source_epoch == mls_group.epoch().as_u64();
-                    let retention_seconds =
+                    // Bad media metadata cannot invalidate an authenticated witness.
+                    let view_once = app_event.view_once_policy().ok().flatten();
+                    let once_source_policy = if view_once.is_some() {
+                        if let Some(policy) = once_source_policies.get(&source_epoch) {
+                            *policy
+                        } else {
+                            let policy = crate::view_once::source_policy(
+                                storage,
+                                rewinds,
+                                &crypto,
+                                &mls_group,
+                                EpochId(source_epoch),
+                            )
+                            .map_err(|error| match error {
+                                EngineError::Storage(error) => {
+                                    OpenMlsProjectionError::Storage(format!("{error:?}"))
+                                }
+                                error => OpenMlsProjectionError::Replay(error.to_string()),
+                            })?;
+                            once_source_policies.insert(source_epoch, policy);
+                            policy
+                        }
+                    } else {
+                        None
+                    };
+                    let view_once = view_once
+                        .filter(|_| once_source_policy.is_some_and(|(required, _)| required));
+                    let retention_seconds = if let Some((_, seconds)) = once_source_policy {
+                        seconds
+                    } else {
                         crate::app_components::message_retention_seconds_of_group(&mls_group)
                             .map_err(|error| {
                                 OpenMlsProjectionError::Replay(format!(
                                     "decode source-epoch message retention: {error}"
                                 ))
                             })?
-                            .unwrap_or(0);
+                            .unwrap_or(0)
+                    };
                     observations.push(OpenMlsReplayObservation::ApplicationProcessed {
                         message_id,
                         source_epoch,
@@ -4638,10 +4694,14 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                         } else {
                             None
                         },
-                        retention: AppMessageRetentionDecision::new(
-                            app_event.created_at,
-                            retention_seconds,
-                        ),
+                        retention: AppMessageRetentionDecision {
+                            view_once,
+                            ..AppMessageRetentionDecision::with_absolute_expiry(
+                                app_event.created_at,
+                                retention_seconds,
+                                view_once.map(|policy| policy.unopened_expires_at),
+                            )
+                        },
                         decrypted_payload_ref: crate::app_payload::decrypted_payload_ref(
                             payload.as_slice(),
                         ),
@@ -4888,7 +4948,7 @@ fn read_retained_anchor_group<S: StorageProvider, T>(
     // Loads the retained anchor this contained window rewound to, on purpose (see clippy.toml).
     #[allow(clippy::disallowed_methods)]
     let historical_group = MlsGroup::load(provider.storage(), &mls_gid)
-        .map_err(|error| EngineError::Backend(format!("load retained anchor: {error:?}")))?
+        .map_err(|error| StorageError::Backend(format!("load retained anchor: {error:?}")))?
         .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;
     // An anchor taken before an own commit merged still holds that staged
     // commit; the group itself is at the anchor epoch.

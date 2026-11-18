@@ -64,11 +64,18 @@ impl OutgoingDescriptor {
         let file_name = match version {
             EncryptedMediaVersion::V1 => file_name.trim().to_owned(),
             EncryptedMediaVersion::V2 => file_name,
+            EncryptedMediaVersion::ViewOnceV1 => {
+                return Err(AppError::InvalidEncryptedMedia(
+                    "view-once cannot be retained as ordinary media".into(),
+                ));
+            }
         };
         super::validate_outbound_file_name(&file_name, version)?;
         let media_type = match version {
             EncryptedMediaVersion::V1 => super::crypto::canonical_media_type_v1(media_type)?,
-            EncryptedMediaVersion::V2 => super::crypto::canonical_media_type_v2(media_type)?,
+            EncryptedMediaVersion::V2 | EncryptedMediaVersion::ViewOnceV1 => {
+                super::crypto::canonical_media_type_v2(media_type)?
+            }
         };
         Ok(Self {
             file_name,

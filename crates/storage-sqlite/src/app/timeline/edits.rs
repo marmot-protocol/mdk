@@ -141,6 +141,7 @@ impl SqliteAppStorage {
                 .query_row_cached(
                     "SELECT EXISTS(SELECT 1 FROM visible_message_timeline
                  WHERE group_id_hex=?1 AND message_id_hex=?2
+                 AND NOT EXISTS(SELECT 1 FROM view_once_consumption v WHERE v.group_id_hex=?1 AND v.message_id_hex=?2)
                  AND deleted=0 AND invalidation_status IS NULL)",
                     params![group, target],
                     |r| r.get(0),

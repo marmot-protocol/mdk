@@ -300,7 +300,10 @@ pub(crate) fn parse_admin_keys_hex(value: &str) -> Vec<[u8; 32]> {
         .collect()
 }
 
-pub(crate) fn app_message_record_from_stored(record: StoredAppMessageRecord) -> AppMessageRecord {
+pub(crate) fn app_message_record_from_stored(
+    mut record: StoredAppMessageRecord,
+) -> AppMessageRecord {
+    crate::view_once::redact_fields(&mut record.plaintext, &mut record.tags);
     AppMessageRecord {
         authority: record.authority,
         message_id_hex: record.message_id_hex,

@@ -22,24 +22,44 @@ use crate::types::{GroupId, MemberId};
 /// application message is accepted.
 ///
 /// `retention_seconds == 0` means retention was disabled at the message's
-/// authenticated source epoch. A non-zero duration whose timestamp addition
-/// overflows is still a known decision, but has no finite `expires_at` and must
-/// never be pruned by a timestamp sweep.
+/// authenticated source epoch. Its finite expiry, if any, is capped by the
+/// authenticated view-once deadline. An overflowing group duration contributes
+/// no finite expiry but never discards the per-message cap.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppMessageRetentionDecision {
     pub retention_seconds: u64,
     pub expires_at: Option<u64>,
+    /// Set by authenticated source-epoch admission, never by marker parsing alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub view_once: Option<ViewOncePolicy>,
 }
 
 impl AppMessageRetentionDecision {
     pub fn new(recorded_at: u64, retention_seconds: u64) -> Self {
+        Self::with_absolute_expiry(recorded_at, retention_seconds, None)
+    }
+
+    /// Pin the earliest finite source-epoch timer or authenticated deadline.
+    pub fn with_absolute_expiry(
+        recorded_at: u64,
+        retention_seconds: u64,
+        absolute_expires_at: Option<u64>,
+    ) -> Self {
+        let group_expiry = (retention_seconds != 0)
+            .then(|| recorded_at.checked_add(retention_seconds))
+            .flatten();
         Self {
             retention_seconds,
-            expires_at: (retention_seconds != 0)
-                .then(|| recorded_at.checked_add(retention_seconds))
-                .flatten(),
+            expires_at: group_expiry.into_iter().chain(absolute_expires_at).min(),
+            view_once: None,
         }
     }
+}
+
+/// Authenticated unopened-media deadline; consumption is device-local state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ViewOncePolicy {
+    pub unopened_expires_at: u64,
 }
 
 /// Nostr `kind` values used as Marmot inner app events.
@@ -171,6 +191,8 @@ pub enum MarmotAppEventError {
     PubkeyMismatch { expected: String, found: String },
     #[error("group-system event requires an authenticated actor")]
     MissingAuthenticatedActor,
+    #[error("invalid view-once event: {0}")]
+    InvalidViewOnce(&'static str),
 }
 
 impl MarmotAppEvent {
@@ -240,6 +262,128 @@ impl MarmotAppEvent {
             });
         }
         Ok(())
+    }
+
+    /// Validate the message-wide view-once envelope, never interpreting a
+    /// malformed or stripped marker as ordinary reusable media. Attachment
+    /// locator, MIME and cryptographic fields also require the media parser.
+    pub fn view_once_policy(&self) -> Result<Option<ViewOncePolicy>, MarmotAppEventError> {
+        use crate::app_components::{
+            VIEW_ONCE_MARKER_VERSION, VIEW_ONCE_MAX_LIFETIME_SECONDS, VIEW_ONCE_MEDIA_FORMAT,
+        };
+        let invalid = MarmotAppEventError::InvalidViewOnce;
+        let mut markers = self
+            .tags
+            .iter()
+            .filter(|tag| tag.first().is_some_and(|name| name == "view-once"));
+        let marker = markers.next();
+        let Some(marker) = marker else {
+            let has_once_reference = self.tags.iter().any(|tag| {
+                tag.first().is_some_and(|name| name == "imeta")
+                    && tag.iter().skip(1).any(|field| {
+                        field.split_once(' ').is_some_and(|(name, value)| {
+                            name == "v" && value.starts_with("encrypted-media-view-once")
+                        })
+                    })
+            });
+            return if has_once_reference {
+                Err(invalid("media profile requires its marker"))
+            } else {
+                Ok(None)
+            };
+        };
+        if markers.next().is_some() || marker.len() != 3 || marker[1] != VIEW_ONCE_MARKER_VERSION {
+            return Err(invalid(
+                "marker must occur exactly once with the known version",
+            ));
+        }
+        let deadline = marker[2]
+            .parse::<u64>()
+            .ok()
+            .filter(|_| {
+                !marker[2].is_empty()
+                    && marker[2].bytes().all(|byte| byte.is_ascii_digit())
+                    && (marker[2].len() == 1 || !marker[2].starts_with('0'))
+            })
+            .ok_or_else(|| invalid("deadline must be canonical decimal Unix seconds"))?;
+        if deadline <= self.created_at
+            || deadline - self.created_at > VIEW_ONCE_MAX_LIFETIME_SECONDS
+        {
+            return Err(invalid(
+                "deadline must be after creation and within 45 days",
+            ));
+        }
+        if self.kind != MARMOT_APP_EVENT_KIND_CHAT || !self.content.is_empty() {
+            return Err(invalid("only caption-free kind-9 media is allowed"));
+        }
+        // No reply/quote previews, alternate attachments, reactions, edits or
+        // message-level render hints can accompany the protected attachment.
+        if self
+            .tags
+            .iter()
+            .any(|tag| !matches!(tag.first().map(String::as_str), Some("view-once" | "imeta")))
+        {
+            return Err(invalid("unexpected message tag"));
+        }
+        let mut attachments = self
+            .tags
+            .iter()
+            .filter(|tag| tag.first().is_some_and(|v| v == "imeta"));
+        let attachment = attachments
+            .next()
+            .ok_or_else(|| invalid("exactly one attachment is required"))?;
+        if attachments.next().is_some() {
+            return Err(invalid("exactly one attachment is required"));
+        }
+        let mut version = None;
+        let mut fields = 0u8;
+        for field in attachment.iter().skip(1) {
+            let (name, value) = field
+                .split_once(' ')
+                .ok_or_else(|| invalid("malformed attachment field"))?;
+            let bit = match name {
+                "v" => 1,
+                "locator" => 2,
+                "ciphertext_sha256" => 4,
+                "plaintext_sha256" => 8,
+                "nonce" => 16,
+                "m" => 32,
+                "filename" => 64,
+                _ => return Err(invalid("unexpected attachment field")),
+            };
+            if value.is_empty() || (name != "locator" && fields & bit != 0) {
+                return Err(invalid("empty or duplicate attachment field"));
+            }
+            fields |= bit;
+            if name == "m" && !(value.starts_with("image/") || value.starts_with("video/")) {
+                return Err(invalid("only image and video media are allowed"));
+            }
+            if name == "v" {
+                version = Some(value);
+            }
+        }
+        if fields != 127 {
+            return Err(invalid("required attachment field is missing"));
+        }
+        if version != Some(VIEW_ONCE_MEDIA_FORMAT) {
+            return Err(invalid("marker requires the view-once media profile"));
+        }
+        Ok(Some(ViewOncePolicy {
+            unopened_expires_at: deadline,
+        }))
+    }
+
+    /// Pin source-epoch retention without ever restarting the absolute cap.
+    pub fn retention_decision(
+        &self,
+        retention_seconds: u64,
+    ) -> Result<AppMessageRetentionDecision, MarmotAppEventError> {
+        Ok(AppMessageRetentionDecision::with_absolute_expiry(
+            self.created_at,
+            retention_seconds,
+            self.view_once_policy()?
+                .map(|policy| policy.unopened_expires_at),
+        ))
     }
 
     /// First value of the named tag (`tag[0] == name` → `tag[1]`).
@@ -538,6 +682,208 @@ pub fn group_system_canonical_id(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn view_once_event(created_at: u64, deadline: u64) -> MarmotAppEvent {
+        use crate::app_components::{VIEW_ONCE_MARKER_VERSION, VIEW_ONCE_MEDIA_FORMAT};
+        MarmotAppEvent::new(
+            "aa".repeat(32),
+            created_at,
+            MARMOT_APP_EVENT_KIND_CHAT,
+            vec![
+                vec![
+                    "view-once".into(),
+                    VIEW_ONCE_MARKER_VERSION.into(),
+                    deadline.to_string(),
+                ],
+                vec![
+                    "imeta".into(),
+                    format!("v {VIEW_ONCE_MEDIA_FORMAT}"),
+                    "locator blossom-v1 https://example.com/blob".into(),
+                    format!("ciphertext_sha256 {}", "ab".repeat(32)),
+                    format!("plaintext_sha256 {}", "cd".repeat(32)),
+                    format!("nonce {}", "ef".repeat(12)),
+                    "m image/png".into(),
+                    "filename photo.png".into(),
+                ],
+            ],
+            "",
+        )
+    }
+
+    #[test]
+    fn view_once_profile_is_strict() {
+        let valid = view_once_event(100, 160);
+        assert_eq!(
+            valid.view_once_policy().unwrap(),
+            Some(ViewOncePolicy {
+                unopened_expires_at: 160
+            })
+        );
+        let ordinary = MarmotAppEvent::new("aa".repeat(32), 100, 9, vec![], "hello");
+        assert_eq!(ordinary.view_once_policy().unwrap(), None);
+
+        let mut without_marker = valid.clone();
+        without_marker.tags.remove(0);
+        assert_eq!(
+            without_marker.view_once_policy(),
+            Err(MarmotAppEventError::InvalidViewOnce(
+                "media profile requires its marker"
+            ))
+        );
+        let mut ordinary_profile = valid.clone();
+        ordinary_profile.tags[1][1] = "v encrypted-media-v2".into();
+        assert_eq!(
+            ordinary_profile.view_once_policy(),
+            Err(MarmotAppEventError::InvalidViewOnce(
+                "marker requires the view-once media profile"
+            ))
+        );
+        for deadline in ["0101", "+101", "101.0", "18446744073709551616", ""] {
+            let mut invalid = valid.clone();
+            invalid.tags[0][2] = deadline.into();
+            assert_eq!(
+                invalid.view_once_policy(),
+                Err(MarmotAppEventError::InvalidViewOnce(
+                    "deadline must be canonical decimal Unix seconds"
+                )),
+                "{deadline}"
+            );
+        }
+        for deadline in [
+            100,
+            99,
+            100 + crate::app_components::VIEW_ONCE_MAX_LIFETIME_SECONDS + 1,
+        ] {
+            assert_eq!(
+                view_once_event(100, deadline).view_once_policy(),
+                Err(MarmotAppEventError::InvalidViewOnce(
+                    "deadline must be after creation and within 45 days"
+                ))
+            );
+        }
+        let mut duplicate = valid.clone();
+        duplicate.tags.push(duplicate.tags[0].clone());
+        assert_eq!(
+            duplicate.view_once_policy(),
+            Err(MarmotAppEventError::InvalidViewOnce(
+                "marker must occur exactly once with the known version"
+            ))
+        );
+        let mut unknown = valid.clone();
+        unknown.tags[0][1] = "view-once-v2".into();
+        unknown.id = canonical_event_id(
+            &unknown.pubkey,
+            unknown.created_at,
+            unknown.kind,
+            &unknown.tags,
+            &unknown.content,
+        );
+        assert_eq!(
+            MarmotAppEvent::decode(&unknown.encode().unwrap()).unwrap(),
+            unknown
+        );
+        assert_eq!(
+            unknown.view_once_policy(),
+            Err(MarmotAppEventError::InvalidViewOnce(
+                "marker must occur exactly once with the known version"
+            ))
+        );
+    }
+
+    #[test]
+    fn view_once_forbids_content() {
+        let valid = view_once_event(100, 160);
+        for kind in [7, 1009, 1111] {
+            let mut event = valid.clone();
+            event.kind = kind;
+            assert_eq!(
+                event.view_once_policy(),
+                Err(MarmotAppEventError::InvalidViewOnce(
+                    "only caption-free kind-9 media is allowed"
+                ))
+            );
+        }
+        let mut caption = valid.clone();
+        caption.content = "caption".into();
+        assert_eq!(
+            caption.view_once_policy(),
+            Err(MarmotAppEventError::InvalidViewOnce(
+                "only caption-free kind-9 media is allowed"
+            ))
+        );
+        for field in [
+            "dim 10x10",
+            "thumbhash hash",
+            "thumb https://example.com/thumb",
+            "url https://example.com/alternate",
+        ] {
+            let mut event = valid.clone();
+            event.tags[1].push(field.into());
+            assert_eq!(
+                event.view_once_policy(),
+                Err(MarmotAppEventError::InvalidViewOnce(
+                    "unexpected attachment field"
+                )),
+                "{field}"
+            );
+        }
+        let mut reply = valid.clone();
+        reply.tags.push(vec!["e".into(), "ab".repeat(32)]);
+        assert_eq!(
+            reply.view_once_policy(),
+            Err(MarmotAppEventError::InvalidViewOnce(
+                "unexpected message tag"
+            ))
+        );
+        let mut alternate = valid.clone();
+        alternate.tags.push(alternate.tags[1].clone());
+        assert_eq!(
+            alternate.view_once_policy(),
+            Err(MarmotAppEventError::InvalidViewOnce(
+                "exactly one attachment is required"
+            ))
+        );
+        let mut duplicate = valid;
+        duplicate.tags[1].push("filename other.png".into());
+        assert_eq!(
+            duplicate.view_once_policy(),
+            Err(MarmotAppEventError::InvalidViewOnce(
+                "empty or duplicate attachment field"
+            ))
+        );
+    }
+
+    #[test]
+    fn view_once_earliest_expiry() {
+        let event = view_once_event(100, 160);
+        for (seconds, expected) in [(0, 160), (30, 130), (600, 160), (u64::MAX, 160)] {
+            let replayed = MarmotAppEvent::decode(&event.encode().unwrap()).unwrap();
+            assert_eq!(
+                replayed.retention_decision(seconds).unwrap(),
+                AppMessageRetentionDecision {
+                    retention_seconds: seconds,
+                    expires_at: Some(expected),
+                    view_once: None,
+                }
+            );
+        }
+        let near_overflow = view_once_event(u64::MAX - 60, u64::MAX);
+        assert_eq!(
+            near_overflow.retention_decision(120).unwrap().expires_at,
+            Some(u64::MAX)
+        );
+        assert_eq!(
+            view_once_event(
+                100,
+                100 + crate::app_components::VIEW_ONCE_MAX_LIFETIME_SECONDS
+            )
+            .view_once_policy()
+            .unwrap(),
+            Some(ViewOncePolicy {
+                unopened_expires_at: 3_888_100
+            })
+        );
+    }
 
     #[test]
     fn group_system_event_round_trips() {

@@ -850,6 +850,21 @@ where
         Ok(self.session.account_devices_activation_refusal(group_id)?)
     }
 
+    pub fn view_once_activation_refusal(
+        &self,
+        group_id: &GroupId,
+    ) -> AccountResult<Option<cgka_traits::error::ViewOnceActivationRefusal>> {
+        Ok(self.session.view_once_activation_refusal(group_id)?)
+    }
+
+    pub fn view_once_required_at(
+        &self,
+        group_id: &GroupId,
+        epoch: cgka_traits::EpochId,
+    ) -> AccountResult<bool> {
+        Ok(self.session.view_once_required_at(group_id, epoch)?)
+    }
+
     /// Why a same-account Add of `sibling` to `group_id` would be refused
     /// now, or `None`, without spending its KeyPackage. The send repeats the
     /// checks. See [`cgka_engine::engine::Engine::sibling_add_refusal`].
@@ -8432,6 +8447,7 @@ fn supports_deferred_commit_publish(intent: &SendIntent) -> bool {
             | SendIntent::UpdateGroupData { .. }
             | SendIntent::EnableDisbanding { .. }
             | SendIntent::EnableAccountDevices { .. }
+            | SendIntent::EnableViewOnce { .. }
             | SendIntent::LinkDevice { .. }
             | SendIntent::UnlinkDevice { .. }
             | SendIntent::RecordRemovedSlot { .. }

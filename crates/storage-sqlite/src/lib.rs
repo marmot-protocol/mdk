@@ -23,6 +23,7 @@ pub use app::group_system::{
     GroupSystemEventProjection, GroupSystemEventProvenance, group_system_event_from_message,
 };
 pub use app::handle::SqliteAppStorage;
+pub use app::view_once::{StoredViewOncePresentation, ViewOnceClaim, ViewOnceState};
 
 pub use app::account_recovery::{
     MAX_LOSS_ROUTES, ParkedRecoveryObligation, RecoveryCause, RecoveryConversionInput,

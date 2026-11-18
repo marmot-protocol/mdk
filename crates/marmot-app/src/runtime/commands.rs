@@ -94,6 +94,26 @@ enum GroupReadVersionError {
 }
 
 impl AccountManager {
+    pub(super) async fn enable_view_once(
+        &self,
+        account_ref: &str,
+        group: &GroupId,
+    ) -> Result<SendSummary, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::EnableViewOnce {
+                group_id: group.clone(),
+                respond,
+            })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        let summary = account_worker_response(response).await?;
+        self.catch_up_committed(command, "enable_view_once").await;
+        self.schedule_audit_log_tracker_update("enable_view_once");
+        Ok(summary)
+    }
+
     /// One account read answered from the worker's published read state, A
     /// (mdk#3273). Admission is the worker lane's, as for a read the worker
     /// answers; the answer then comes from one version on the caller's task,
