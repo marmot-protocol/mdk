@@ -209,17 +209,29 @@ async fn serve_information(mut stream: tokio::net::TcpStream, header: usize, pag
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn late_commit_700_recovers() {
-    late_commit_recovery(false).await;
+    late_commit_recovery(LateCommit::BeforeSweep).await;
 }
 
 /// Real SDK filters omit a commit published late below their live floor.
 /// Existing coverage must not strand a still-unresolved epoch gap.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn late_commit_published_after_gap_coverage_recovers() {
-    late_commit_recovery(true).await;
+    late_commit_recovery(LateCommit::AfterSweep).await;
 }
 
-async fn late_commit_recovery(publish_after_cover: bool) {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn late_commit_partial_recovers() {
+    late_commit_recovery(LateCommit::AfterAdvance).await;
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LateCommit {
+    BeforeSweep,
+    AfterSweep,
+    AfterAdvance,
+}
+
+async fn late_commit_recovery(timing: LateCommit) {
     use cgka_traits::storage::GroupStorage;
     use marmot_account::AccountHome;
     use nostr_relay_builder::prelude::{EventId as RelayEventId, Filter as RelayFilter};
@@ -341,6 +353,18 @@ async fn late_commit_recovery(publish_after_cover: bool) {
         .update_group_profile(&bob.label, &group, Some("late commit".into()), None)
         .await
         .unwrap();
+    let first_epoch = runtime
+        .group_mls_state(&bob.label, &group)
+        .await
+        .unwrap()
+        .epoch;
+    let second_start = proxy.counts.group_events.lock().unwrap().len() - start;
+    if timing == LateCommit::AfterAdvance {
+        runtime
+            .update_group_profile(&bob.label, &group, Some("second late commit".into()), None)
+            .await
+            .unwrap();
+    }
     let expected = "new message after paged recovery";
     runtime
         .send_message(&bob.label, &group, expected.as_bytes().to_vec())
@@ -351,6 +375,13 @@ async fn late_commit_recovery(publish_after_cover: bool) {
         .await
         .unwrap()
         .epoch;
+    if timing == LateCommit::AfterAdvance {
+        assert_eq!(
+            epoch,
+            first_epoch + 1,
+            "the fixture needs two successive commits"
+        );
+    }
     let published = proxy.counts.group_events.lock().unwrap().split_off(start);
 
     // Retained outer copies carry an already-durable MLS payload. Their raw
@@ -402,7 +433,7 @@ async fn late_commit_recovery(publish_after_cover: bool) {
         .custom_created_at(Timestamp::from_secs(base))
         .finalize(&outer)
         .unwrap();
-    if !publish_after_cover {
+    if timing == LateCommit::BeforeSweep {
         database
             .save_event(&serde_json::from_str(late.as_json().as_str()).unwrap())
             .await
@@ -412,6 +443,21 @@ async fn late_commit_recovery(publish_after_cover: bool) {
         .delete(RelayFilter::new().id(RelayEventId::from_byte_array(commit.id.to_bytes())))
         .await
         .unwrap();
+    let mut second_late = if timing == LateCommit::AfterAdvance {
+        let second = &published[second_start];
+        let late = EventBuilder::new(second.kind, second.content.clone())
+            .tags(second.tags.iter().cloned())
+            .custom_created_at(Timestamp::from_secs(base + 1))
+            .finalize(&outer)
+            .unwrap();
+        database
+            .delete(RelayFilter::new().id(RelayEventId::from_byte_array(second.id.to_bytes())))
+            .await
+            .unwrap();
+        Some(late)
+    } else {
+        None
+    };
     let future = published.last().unwrap();
     for index in 0..700 {
         let event = EventBuilder::new(future.kind, future.content.clone())
@@ -430,11 +476,15 @@ async fn late_commit_recovery(publish_after_cover: bool) {
         .sign_in_account(&alice.label)
         .await
         .unwrap();
-    runtime.reconcile_accounts().await.unwrap();
-    if publish_after_cover {
+    if timing != LateCommit::AfterAdvance {
+        runtime.reconcile_accounts().await.unwrap();
+    }
+    if timing != LateCommit::BeforeSweep {
         tokio::time::timeout(Duration::from_secs(120), async {
             loop {
-                runtime.catch_up_accounts().await.unwrap();
+                if timing != LateCommit::AfterAdvance {
+                    runtime.catch_up_accounts().await.unwrap();
+                }
                 let gap = storage
                     .pending_recovery_demands()
                     .unwrap()
@@ -456,14 +506,7 @@ async fn late_commit_recovery(publish_after_cover: bool) {
                             && proof.proof == storage_sqlite::RecoveryCoverageProof::SweepSlice
                     });
                 if gap && storage.recovery_coverage_mark().unwrap() > mark_before_gap && covered {
-                    assert!(
-                        runtime
-                            .group_mls_state(&alice.label, &group)
-                            .await
-                            .unwrap()
-                            .epoch
-                            < epoch
-                    );
+                    assert!(protocol_store.get_group(&group).unwrap().epoch.0 < epoch);
                     database
                         .save_event(&serde_json::from_str(late.as_json().as_str()).unwrap())
                         .await
@@ -476,21 +519,55 @@ async fn late_commit_recovery(publish_after_cover: bool) {
         .await
         .expect("fresh gap followed by real sweep coverage before late publication");
     }
+    let recovery_timeout = match timing {
+        LateCommit::AfterAdvance => Duration::from_secs(300),
+        LateCommit::BeforeSweep | LateCommit::AfterSweep => Duration::from_secs(180),
+    };
     // Held-only cuts retain production backoff between scan attempts.
-    let recovered = tokio::time::timeout(Duration::from_secs(180), async {
+    let recovered = tokio::time::timeout(recovery_timeout, async {
         loop {
-            runtime.catch_up_accounts().await.unwrap();
+            if timing != LateCommit::AfterAdvance {
+                runtime.catch_up_accounts().await.unwrap();
+            }
+            if let Some(late) = &second_late {
+                let partial = app.group(&alice.label, &hex::encode(&group)).unwrap();
+                let old_gap = storage
+                    .pending_recovery_demands()
+                    .unwrap()
+                    .into_iter()
+                    .find(|demand| {
+                        demand.cause == storage_sqlite::RecoveryCause::EpochGap
+                            && demand.group_id.as_deref() == Some(group.as_ref())
+                            && demand
+                                .stalled_epoch
+                                .is_some_and(|stalled| stalled < epoch - 1)
+                    });
+                let visit_settled = old_gap.is_none_or(|gap| {
+                    storage
+                        .recovery_epoch_gap_retry(gap.ticket)
+                        .unwrap()
+                        .is_some_and(|retry| !retry.in_progress)
+                });
+                if partial.is_some_and(|group| group.profile.name == "late commit") && visit_settled
+                {
+                    database
+                        .save_event(&serde_json::from_str(late.as_json().as_str()).unwrap())
+                        .await
+                        .unwrap();
+                    second_late = None;
+                }
+            }
             if app
                 .messages(&alice.label)
                 .unwrap()
                 .iter()
                 .any(|message| message.plaintext == expected)
-                && runtime
-                    .group_mls_state(&alice.label, &group)
-                    .await
-                    .unwrap()
-                    .epoch
-                    >= epoch
+                && (timing != LateCommit::AfterAdvance
+                    || app
+                        .group(&alice.label, &hex::encode(&group))
+                        .unwrap()
+                        .is_some_and(|group| group.profile.name == "second late commit"))
+                && protocol_store.get_group(&group).unwrap().epoch.0 >= epoch
             {
                 break;
             }
@@ -512,11 +589,7 @@ async fn late_commit_recovery(publish_after_cover: bool) {
     if recovered.is_err() || retained_admitted != retained_ids.len() || !full_goal {
         // Preserve a private, closed capsule when a runner-only history proof
         // fails; generated test keys must never be posted with its log.
-        let local_epoch = runtime
-            .group_mls_state(&alice.label, &group)
-            .await
-            .unwrap()
-            .epoch;
+        let local_epoch = protocol_store.get_group(&group).unwrap().epoch.0;
         let capsule = dir.keep();
         runtime.shutdown_and_close().await.unwrap();
         panic!(
@@ -524,16 +597,6 @@ async fn late_commit_recovery(publish_after_cover: bool) {
             capsule.display()
         );
     }
-    assert!(
-        recovered.is_ok(),
-        "late commit recovery failed: local_epoch={}, target_epoch={epoch}, history_requests={}",
-        runtime
-            .group_mls_state(&alice.label, &group)
-            .await
-            .unwrap()
-            .epoch,
-        proxy.counts.group_history_requests.lock().unwrap().len()
-    );
     assert!(
         retained_admitted == retained_ids.len() && full_goal,
         "recovery must durably admit all 1,024 retained wrappers before the missing commit"

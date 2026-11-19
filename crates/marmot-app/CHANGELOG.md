@@ -151,6 +151,10 @@
 - With device groups on, an idle maintenance tick takes no writer transaction again (mdk#3479), whether the account
   holds no device group or a settled one: the history-delivery expiry, small-state pass, private KeyPackage upkeep
   and device-inactivity coverage read first and write only when they have work.
+- Reassess retained current-epoch ciphertext after local replay settles before retiring an advanced epoch gap.
+  When enough failures remain, persist the successor request before deleting the old request. Failed writes keep
+  recovery demand, and secondary outbound retries do not block the handoff. Successive missing commits can recover
+  without reopening the account or receiving fresh traffic.
 - Emoji discovery applies its 60-set limit after deduplicating coordinates, so overlapping revisions from additional
   relays no longer hide older sets below that limit (#3492).
 - The compaction and housekeeping batch looks again 15 s after the account's storage fails to open, instead of resting

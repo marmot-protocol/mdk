@@ -4236,10 +4236,12 @@ impl<S: StorageProvider> Engine<S> {
                 if metadata.epoch != epoch {
                     continue;
                 }
-                // Best-effort evidence: a row that cannot be read now is
-                // skipped, as one retired between the listing and this read is.
-                let Ok(record) = self.storage.get_message(&metadata.id) else {
-                    continue;
+                // A retired row may disappear between listing and reading.
+                // Other read failures cannot certify a below-threshold sample.
+                let record = match self.storage.get_message(&metadata.id) {
+                    Ok(record) => record,
+                    Err(StorageError::NotFound) => continue,
+                    Err(error) => return Err(error.into()),
                 };
                 let Ok(cgka_traits::message::StoredMessagePayload::RawTransport(message)) =
                     cgka_traits::message::StoredMessagePayload::decode(&record.payload)

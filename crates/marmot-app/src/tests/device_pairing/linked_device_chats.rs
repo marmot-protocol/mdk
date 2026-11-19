@@ -2302,6 +2302,21 @@ async fn a_lower_sibling_claim_holds_only_its_chat() {
     // A claimant that starts leaving no longer holds this chat back. Give
     // it usable stock first so its own no-claim assertion is not vacuous.
     hold_key_packages(&relay, &mut low, &mut target).await;
+    // The hand-off can arrive while the claimant still has device-group work.
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while !low
+            .client
+            .runtime
+            .device_group_takes_commit(&group, &[])
+            .unwrap()
+        {
+            boxed(|| converge_device_group(&mut low.client, &relay, &mut low.cursor, &group, 1))
+                .await;
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the claimant can commit after the private KeyPackage hand-off");
     let low_slot: [u8; 32] = hex::decode(low.slot_hex()).unwrap().try_into().unwrap();
     let marmot_session::DeviceRosterEdit::Committed(effects) = low
         .client

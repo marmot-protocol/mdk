@@ -54,6 +54,9 @@
 
 ### Fixed
 
+- `Engine::deferred_stall_evidence` propagates storage read failures instead of omitting unread rows from its sample.
+  Only `StorageError::NotFound` is skipped when a row disappears after listing, so an incomplete read cannot retire
+  recovery demand as though too few failures remained.
 - A deferred row released while it may predate this copy's Welcome is journaled as no stall evidence
   (`release_message_for_replay_without_stall_evidence`), so a host consuming its release journal no longer arms the
   epoch gap the suppressed `TransportObjectResourceRefused` withheld (mdk#3536, mdk#3535).
