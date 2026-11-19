@@ -1618,8 +1618,9 @@ from the current roster on the account worker, so changing one toggle does not r
 A patch that still matches after earlier-edit recovery sends no new edit. Enabling **Add to all my chats** permits
 eligible direct post-link Adds while that flow is still adding, and gap filling under its conditions; turning it off
 does not leave joined chats. The approving device's direct post-link pass sends no gap-fill claim (kind 458), so
-other devices leave a newly linked device to it while it is active: for up to a week after the link, until two hours
-pass without a heartbeat from the approver. The approver passes over a chat another device holds a live claim for. A
+other devices leave a newly linked device to it, in the chats it is in, while it is active: for up to a week after
+the link, until two hours pass without a heartbeat from the approver. The approver does not add the device to a chat
+another device holds a live claim for. A
 device running a version before this rule gap-fills at once and can still race the approver; selected-parent
 presence checks and ordinary branch selection still apply. **Bring chat history** applies to future sibling Adds and transfers still owed; enabling
 it does not backfill chats already joined or recreate a transfer discarded while it was off. **Keep while inactive**

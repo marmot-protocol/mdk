@@ -13,9 +13,11 @@
 //! [`LINK_CHAT_ADD_SECS`] after the roster's `linked_at`, until this
 //! device's last heartbeat, or that `linked_at`, is
 //! [`APPROVER_ACTIVE_SECS`](super::device_heartbeats::APPROVER_ACTIVE_SECS)
-//! old. This pass publishes no gap-fill claim; it passes over a chat while
-//! another linked device holds a live claim to add the new device there,
-//! as after this device came back to find its siblings had taken over.
+//! old, in the chats this device holds a leaf in. This pass publishes no
+//! gap-fill claim; it, and this device's own gap filling, pass over a chat
+//! while another linked device holds a live claim to add the new device
+//! there, whatever its slot, as after this device came back to find its
+//! siblings had taken over.
 //! A sibling from before that rule still fills at once.
 //!
 //! - Each maintenance pass reads the chats anew: every chat this device is in
@@ -203,7 +205,10 @@ impl AppClient {
                 }
                 // A sibling took this chat over by gap filling while this
                 // device was away: leave it the Add (mdk#3537).
-                if self.gap_claimed_by_sibling(&exchange, &chat, &device.slot, unix_now_seconds()) {
+                if self
+                    .approver_claim_wait(&exchange, &chat, &device.slot, unix_now_seconds())
+                    .is_some()
+                {
                     continue;
                 }
                 match self.group_quiet(&chat) {

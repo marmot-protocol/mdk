@@ -1453,7 +1453,11 @@ async fn a_declined_generation_holds_automatic_adds_until_a_later_accept() {
     remember_test_member_inbox(&bob_app, &alice, "wss://relay.example");
     let mut bob = boxed(|| bob_app.client("bob")).await.unwrap();
     let mut invitations = Vec::new();
-    for name in ["direct declined invitation", "gap declined invitation"] {
+    for name in [
+        "direct declined invitation",
+        "gap declined invitation",
+        "claimed declined invitation",
+    ] {
         let chat = boxed(|| bob.create_group(name, &[]))
             .await
             .unwrap()
@@ -1499,14 +1503,14 @@ async fn a_declined_generation_holds_automatic_adds_until_a_later_accept() {
         assert!(phone.client.group_quiet(&chat).unwrap());
         invitations.push(chat);
     }
-    let [direct, gap] = <[_; 2]>::try_from(invitations).unwrap();
+    let [direct, gap, claimed] = <[_; 3]>::try_from(invitations).unwrap();
     // Tablet has not learned the decline yet. Its real authenticated lower
     // claim is advisory and must survive Phone's later semantic hold.
     let claim = format!(
         "{{\"v\":1,\"from\":\"{}\",\"to\":\"{}\",\"chat\":\"{}\"}}",
         tablet.slot_hex(),
         laptop.slot_hex(),
-        hex::encode(direct.as_slice())
+        hex::encode(claimed.as_slice())
     );
     assert!(
         boxed(|| tablet.client.send_device_group_message(&group, 458, claim))
@@ -1516,7 +1520,7 @@ async fn a_declined_generation_holds_automatic_adds_until_a_later_accept() {
     boxed(|| converge_device_group(&mut tablet.client, &relay, &mut tablet.cursor, &group, 1))
         .await;
     boxed(|| converge_device_group(&mut phone.client, &relay, &mut phone.cursor, &group, 1)).await;
-    for chat in [&direct, &gap] {
+    for chat in [&direct, &gap, &claimed] {
         let generation = store
             .invitation_admission(chat)
             .unwrap()
@@ -1690,21 +1694,25 @@ async fn a_declined_generation_holds_automatic_adds_until_a_later_accept() {
         phone.client.group_quiet(&group).unwrap(),
         "the device group is ready for an automatic Add"
     );
-    let before = relay.published_event_ids().len();
-    let mut selection = Default::default();
-    boxed(|| phone.client.fill_sibling_chat_gaps(&[], 10, &mut selection)).await;
-    assert_eq!(
-        taken_from(&phone, &laptop),
-        0,
-        "the original live lower claim still holds this gap after decline and accept"
-    );
-    assert_eq!(
-        relay.published_event_ids().len(),
-        before,
-        "no renewed claim before its original expiry"
-    );
-    // The approver's direct flow publishes no claim, and leaves the chat to
-    // the tablet's live claim (mdk#3537).
+    tablet.client.accept_group_invite(&claimed).unwrap();
+    let generation = store
+        .invitation_admission(&claimed)
+        .unwrap()
+        .unwrap()
+        .generation;
+    exchange_decision(
+        &relay,
+        &mut tablet,
+        &mut phone,
+        &group,
+        &claimed,
+        (generation, 2, false),
+    )
+    .await;
+    phone.client.drive_invitation_decisions().await;
+    // The approver's direct flow adds the laptop to the accepted chat
+    // despite the unrelated Decline. It leaves the claimed chat to the
+    // tablet's live claim (mdk#3537).
     let mut selection = Default::default();
     boxed(|| {
         phone
@@ -1712,9 +1720,23 @@ async fn a_declined_generation_holds_automatic_adds_until_a_later_accept() {
             .add_linked_devices_to_chats(&[], &mut selection)
     })
     .await;
-    assert_eq!(taken_from(&phone, &laptop), 0);
-    assert_eq!(leaves_of(&phone, &laptop, &direct, &group), 0);
+    assert_eq!(taken_from(&phone, &laptop), 1);
+    assert_eq!(leaves_of(&phone, &laptop, &direct, &group), 1);
+    assert_eq!(leaves_of(&phone, &laptop, &claimed, &group), 0);
     assert_eq!(leaves_of(&phone, &laptop, &gap, &group), 0);
+    let before = relay.published_event_ids().len();
+    let mut selection = Default::default();
+    boxed(|| phone.client.fill_sibling_chat_gaps(&[], 10, &mut selection)).await;
+    assert_eq!(
+        taken_from(&phone, &laptop),
+        1,
+        "the original live lower claim still holds its gap after decline and accept"
+    );
+    assert_eq!(
+        relay.published_event_ids().len(),
+        before,
+        "no renewed claim before its original expiry"
+    );
     boxed(|| phone.client.sibling_key_package_upkeep(&[])).await;
     let mut selection = Default::default();
     boxed(|| phone.client.fill_sibling_chat_gaps(&[], 10, &mut selection)).await;
@@ -1747,11 +1769,11 @@ async fn a_declined_generation_holds_automatic_adds_until_a_later_accept() {
     boxed(|| phone.client.fill_sibling_chat_gaps(&[], 10, &mut selection)).await;
     assert_eq!(
         taken_from(&phone, &laptop),
-        1,
+        2,
         "a higher Accept wakes the already permitted gap"
     );
     assert_eq!(leaves_of(&phone, &laptop, &gap, &group), 1);
-    assert_eq!(leaves_of(&phone, &laptop, &direct, &group), 0);
+    assert_eq!(leaves_of(&phone, &laptop, &direct, &group), 1);
     assert_eq!(taken_from(&phone, &tablet), tablet_taken);
     assert!(
         stock
@@ -1842,6 +1864,87 @@ async fn a_sibling_fills_missing_chats_while_the_approver_is_offline() {
         assert_eq!(leaves_of(&phone, &tablet, chat, &group), 1);
     }
     assert_eq!(taken_from(&phone, &tablet), 0);
+}
+
+/// mdk#3537: an approver in the lowest slot that comes back to find a
+/// higher sibling's live claim on a chat for its new device, before that
+/// sibling's Add, leaves the chat to it. One maintenance turn adds the device
+/// to the unclaimed chat, and neither the direct pass nor the approver's own
+/// gap filling spends stock for or adds it in the claimed one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_returning_approver_leaves_a_claimed_chat_to_a_higher_sibling() {
+    let (relay, [first, second, mut tablet]) = alice_devices::<3>().await;
+    let (mut phone, mut laptop) = if first.slot_hex() < second.slot_hex() {
+        (first, second)
+    } else {
+        (second, first)
+    };
+    let chats = chats(&mut phone, 2).await;
+    let group = link(&relay, &mut phone, &mut laptop, "Laptop").await;
+    passes(&relay, &mut [&mut phone, &mut laptop], 4).await;
+    assert!(chats.iter().all(|chat| joined(&laptop, chat)));
+    link(&relay, &mut phone, &mut tablet, "Tablet").await;
+    hold_key_packages(&relay, &mut phone, &mut tablet).await;
+    converge_device_group(&mut laptop.client, &relay, &mut laptop.cursor, &group, 4).await;
+    let claim = format!(
+        "{{\"v\":1,\"from\":\"{}\",\"to\":\"{}\",\"chat\":\"{}\"}}",
+        laptop.slot_hex(),
+        tablet.slot_hex(),
+        hex::encode(chats[0].as_slice())
+    );
+    assert!(
+        laptop
+            .client
+            .send_device_group_message(&group, 458, claim)
+            .await
+            .unwrap()
+    );
+    deliver_new(&mut phone.client, &relay, &mut phone.cursor).await;
+    phone.client.run_due_maintenance().await.unwrap();
+    assert_eq!(leaves_of(&phone, &tablet, &chats[0], &group), 0);
+    assert_eq!(leaves_of(&phone, &tablet, &chats[1], &group), 1);
+    assert_eq!(taken_from(&phone, &tablet), 1);
+}
+
+/// mdk#3537: the hold covers only chats the approver is in, where its
+/// direct pass could add the new device. A sibling adds the new device to
+/// a chat the approver never joined while the approver is active.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_sibling_fills_a_chat_its_active_approver_is_not_in() {
+    let (relay, [mut phone, mut laptop, mut tablet]) = alice_devices::<3>().await;
+    // Made before the laptop is linked, so no sibling founds it.
+    let chat = chats(&mut laptop, 1).await.remove(0);
+    let group = link(&relay, &mut phone, &mut laptop, "Laptop").await;
+    // Keep the phone out of the laptop's chat.
+    phone
+        .client
+        .update_linked_device_settings(&phone.slot_hex(), Some(false), None, None)
+        .await
+        .unwrap();
+    link(&relay, &mut phone, &mut tablet, "Tablet").await;
+    hold_key_packages(&relay, &mut laptop, &mut tablet).await;
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while !joined(&tablet, &chat) {
+            passes(&relay, &mut [&mut laptop, &mut tablet], 1).await;
+            for client in [&mut laptop.client, &mut tablet.client] {
+                for group in client.take_pending_convergence_groups() {
+                    client
+                        .advance_convergence_with_projection_progress_and_yield(
+                            &group,
+                            None,
+                            std::future::pending(),
+                        )
+                        .await
+                        .unwrap();
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the laptop adds the tablet to a chat the phone is not in");
+    assert_eq!(leaves_of(&laptop, &phone, &chat, &group), 0);
+    assert_eq!(taken_from(&laptop, &tablet), 1);
 }
 
 /// A live claim from a lower slot holds just that chat's Add. Another chat
