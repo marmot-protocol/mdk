@@ -1243,6 +1243,13 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                     .or_default()
                     .push(record);
             }
+            for index in &indices {
+                let account_id = &targets[*index].account_id_hex;
+                if let Some(records) = records_by_author.get(account_id) {
+                    self.journal_key_package_records(account_id, records)
+                        .await?;
+                }
+            }
             for index in indices {
                 let account_id = &targets[index].account_id_hex;
                 let account_records = records_by_author.remove(account_id).unwrap_or_default();
@@ -1338,6 +1345,9 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                             // valid package observed in this call's batch.
                             // Never load a previously cached package here.
                             records.extend(observed_records);
+                            directory
+                                .journal_key_package_records(&target.account_id_hex, &records)
+                                .await?;
                             let records = directory
                                 .recover_key_package_records(
                                     super::key_package_recovery::KeyPackageRecoveryRequest {
@@ -1350,6 +1360,12 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                                         cached_target: None,
                                         wanted: MAX_KEY_PACKAGES_PER_ACCOUNT,
                                     },
+                                )
+                                .await?;
+                            directory
+                                .journal_key_package_records(
+                                    &target.account_id_hex,
+                                    &records.records,
                                 )
                                 .await?;
                             select_key_packages_from_records(

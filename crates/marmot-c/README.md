@@ -25,6 +25,7 @@ per feature.
   [emoji set installs](#emoji-set-installs),
   [file-backed media upload](#file-backed-media-upload),
   [account attachment history](#account-attachment-history),
+  [direct-follow availability](#direct-follow-availability),
   [public event verification](#public-event-verification), [host performance stages](#host-performance-stages),
   [Markdown rendering](#markdown-rendering), [identity references and pseudonyms](#identity-references-and-pseudonyms),
   [KeyPackage inventory](#keypackage-inventory), [invitation lookup outcomes](#invitation-lookup-outcomes), [selected chat-list presentation](#selected-chat-list-presentation),
@@ -60,6 +61,17 @@ terminal NULL on failure. Blocking `next` returns the same error status directly
 freeing the handle; release it with `marmot_relay_liveness_subscription_free` before
 freeing its client. Callback cancellation and context lifetime follow the generic
 subscription rules below.
+
+
+## Direct-follow availability
+
+The shared [direct-follow availability contract](../marmot-uniffi/README.md#direct-follow-availability) applies to C.
+`marmot_follow_availability_page` returns an owned `MarmotFollowAvailabilityPage`;
+`marmot_refresh_follow_availability` and `marmot_follow_availability_status` return an owned
+`MarmotFollowAvailabilityRefreshStatus`. Release them with `marmot_follow_availability_page_free` and
+`marmot_follow_availability_refresh_status_free`. Page freeing releases every embedded row and optional string.
+`marmot_cancel_follow_availability` writes a C boolean through its out-pointer. All four calls block the
+calling thread; keep page and status reads off the UI thread.
 
 ## What you get
 

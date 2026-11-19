@@ -1,7 +1,11 @@
 use super::invite_recovery::package_expiring_at;
 use super::*;
 use crate::key_package_records::select_key_packages_from_records;
-use nostr_directory::{KEY_PACKAGE_FRESHNESS, KeyPackageSelection, MAX_KEY_PACKAGES_PER_ACCOUNT};
+use nostr_directory::{
+    FollowAvailabilityState, KEY_PACKAGE_FRESHNESS, KeyPackageSelection,
+    MAX_KEY_PACKAGES_PER_ACCOUNT,
+};
+use std::collections::BTreeMap;
 
 fn candidate(
     account: &AccountSummary,
@@ -59,6 +63,23 @@ fn selected(
 
 fn ids(events: &[&NostrTransportEvent]) -> Vec<String> {
     events.iter().map(|event| event.id.clone()).collect()
+}
+
+fn selection_availability_states(
+    app: &MarmotApp,
+    owner: &AccountSummary,
+) -> BTreeMap<String, FollowAvailabilityState> {
+    app.directory()
+        .follow_availability_page(
+            &crate::directory_resources::directory_account(owner),
+            None,
+            100,
+        )
+        .unwrap()
+        .rows
+        .into_iter()
+        .map(|row| (row.account_id_hex, row.state))
+        .collect()
 }
 
 fn signed_deletion(
@@ -1369,4 +1390,622 @@ async fn legacy_slots_never_select_or_mask_current_slots() {
             ..
         })
     ));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn availability_expired() {
+    let (_root, app, accounts, fetcher) = member_resolution_fixture(1, false).await;
+    let owner = app
+        .account_home()
+        .create_account("availability-owner")
+        .unwrap();
+    app.directory()
+        .remember_directory_follow_list_for_test(
+            &owner.account_id_hex,
+            &nostr_directory::FetchedFollowList {
+                follows: vec![accounts[0].account_id_hex.clone()],
+                source_relays: Vec::new(),
+            },
+        )
+        .unwrap();
+    let expired = package_expiring_at(&app, &accounts[0], unix_now_seconds() - 1, false);
+    let mut publication = member_resolution_key_package_event(
+        &accounts[0],
+        fresh_key_package_for_account(&app, &accounts[0], false).await,
+    );
+    publication.content = BASE64_STANDARD.encode(expired.bytes());
+    publication.id = "ee".repeat(32);
+    fetcher
+        .events
+        .lock()
+        .unwrap()
+        .retain(|event| event.kind != KIND_MARMOT_KEY_PACKAGE);
+    fetcher.events.lock().unwrap().push(publication);
+
+    let status = app
+        .directory()
+        .refresh_follow_availability(&crate::directory_resources::directory_account(&owner))
+        .await
+        .unwrap();
+    assert_eq!(status.ready, 0);
+    assert_eq!(status.unknown, 1);
+    let page = app
+        .directory()
+        .follow_availability_page(
+            &crate::directory_resources::directory_account(&owner),
+            None,
+            100,
+        )
+        .unwrap();
+    assert_eq!(
+        page.rows[0].state,
+        nostr_directory::FollowAvailabilityState::Unknown
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn availability_obsolete_only() {
+    let (_root, mut app, account, fetcher) = legacy_only_fixture().await;
+    let now = unix_now_seconds();
+    let clock = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(now));
+    app.directory_test_clock = Some(clock.clone());
+    let owner = app
+        .account_home()
+        .create_account("availability-owner")
+        .unwrap();
+    app.directory()
+        .remember_directory_follow_list_for_test(
+            &owner.account_id_hex,
+            &nostr_directory::FetchedFollowList {
+                follows: vec![account.account_id_hex.clone()],
+                source_relays: Vec::new(),
+            },
+        )
+        .unwrap();
+
+    let (entered, release) = fetcher.hold_fetches();
+    let task_app = app.clone();
+    let task_owner = owner.clone();
+    let refresh = tokio::spawn(async move {
+        task_app
+            .directory()
+            .refresh_follow_availability(&crate::directory_resources::directory_account(
+                &task_owner,
+            ))
+            .await
+    });
+    entered.notified().await;
+    clock.store(now + 5, std::sync::atomic::Ordering::SeqCst);
+    release.notify_one();
+    let status = refresh.await.unwrap().unwrap();
+    assert_eq!(status.not_found, 1, "{status:?}");
+    assert_eq!(
+        selection_availability_states(&app, &owner)[&account.account_id_hex],
+        nostr_directory::FollowAvailabilityState::NotFound
+    );
+    let checked_at = app
+        .directory()
+        .follow_availability_page(
+            &crate::directory_resources::directory_account(&owner),
+            None,
+            100,
+        )
+        .unwrap()
+        .rows[0]
+        .checked_at
+        .unwrap();
+    app.shared_storage()
+        .unwrap()
+        .put_public_key_package_replacement(&storage_sqlite::PublicKeyPackageReplacementRecord {
+            account_id_hex: account.account_id_hex.clone(),
+            key_package_id: "later-evidence".into(),
+            event_id_hex: "ff".repeat(32),
+            event_created_at: now + 6,
+            observed_at: checked_at,
+        })
+        .unwrap();
+    assert_eq!(
+        selection_availability_states(&app, &owner)[&account.account_id_hex],
+        nostr_directory::FollowAvailabilityState::Unknown,
+        "evidence written at the completion second invalidates the negative"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn availability_multi_slot() {
+    let (_root, app, accounts, fetcher) = member_resolution_fixture(1, false).await;
+    let owner = app
+        .account_home()
+        .create_account("availability-owner")
+        .unwrap();
+    app.directory()
+        .remember_directory_follow_list_for_test(
+            &owner.account_id_hex,
+            &nostr_directory::FetchedFollowList {
+                follows: vec![accounts[0].account_id_hex.clone()],
+                source_relays: Vec::new(),
+            },
+        )
+        .unwrap();
+    let last_resort = package_expiring_at(&app, &accounts[0], unix_now_seconds() + 3_000, true);
+    let mut publication = member_resolution_key_package_event(&accounts[0], last_resort);
+    publication.id = "bb".repeat(32);
+    let created_at = publication.created_at;
+    let publication_id = publication.id.clone();
+    fetcher.events.lock().unwrap().push(publication);
+    for event in fetcher.events.lock().unwrap().iter_mut() {
+        if event.kind == KIND_MARMOT_KEY_PACKAGE
+            && event.pubkey == accounts[0].account_id_hex
+            && event.id != publication_id
+        {
+            event.created_at = created_at.saturating_sub(1);
+        }
+    }
+
+    let selected = {
+        let events = fetcher.events.lock().unwrap();
+        let publications = events.iter().collect::<Vec<_>>();
+        select(&app, &accounts[0], &publications).unwrap()
+    };
+    assert_eq!(selected.value.len(), 1);
+
+    let status = app
+        .directory()
+        .refresh_follow_availability(&crate::directory_resources::directory_account(&owner))
+        .await
+        .unwrap();
+    assert_eq!(status.ready, 1, "{status:?}");
+    let page = app
+        .directory()
+        .follow_availability_page(
+            &crate::directory_resources::directory_account(&owner),
+            None,
+            100,
+        )
+        .unwrap();
+    assert_eq!(
+        page.rows[0].state,
+        nostr_directory::FollowAvailabilityState::Ready,
+        "a newer last-resort publication must not hide the preferred slot"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn availability_fenced_first_slot_uses_alternative() {
+    let (_root, app, accounts, fetcher) = member_resolution_fixture(1, false).await;
+    let owner = app
+        .account_home()
+        .create_account("availability-owner")
+        .unwrap();
+    app.directory()
+        .remember_directory_follow_list_for_test(
+            &owner.account_id_hex,
+            &nostr_directory::FetchedFollowList {
+                follows: vec![accounts[0].account_id_hex.clone()],
+                source_relays: Vec::new(),
+            },
+        )
+        .unwrap();
+    let first = fetcher
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|event| event.kind == KIND_MARMOT_KEY_PACKAGE)
+        .unwrap()
+        .clone();
+    let mut second = member_resolution_key_package_event(
+        &accounts[0],
+        device_package(&app, &accounts[0], false),
+    );
+    second.tags.iter_mut().find(|tag| tag[0] == "d").unwrap()[1] = "second-slot".into();
+    let second = EventBuilder::new(
+        Kind::Custom(KIND_MARMOT_KEY_PACKAGE as u16),
+        second.content.clone(),
+    )
+    .tags(second.tags.into_iter().map(|tag| Tag::parse(tag).unwrap()))
+    .custom_created_at(NostrTimestamp::from_secs(
+        first.created_at.saturating_sub(1),
+    ))
+    .finalize(
+        &app.account_home()
+            .load_signing_keys(&accounts[0].label)
+            .unwrap(),
+    )
+    .unwrap();
+    let second = NostrTransportEvent::from_nostr_event(&second).unwrap();
+    let second_id = second.id.clone();
+    fetcher.events.lock().unwrap().push(second);
+    let now = unix_now_seconds();
+    app.shared_storage()
+        .unwrap()
+        .put_public_key_package_replacement(&storage_sqlite::PublicKeyPackageReplacementRecord {
+            account_id_hex: accounts[0].account_id_hex.clone(),
+            key_package_id: first.tag_value("d").unwrap().to_owned(),
+            event_id_hex: "ff".repeat(32),
+            event_created_at: now + 100,
+            observed_at: now,
+        })
+        .unwrap();
+
+    let status = app
+        .directory()
+        .refresh_follow_availability(&crate::directory_resources::directory_account(&owner))
+        .await
+        .unwrap();
+    assert_eq!(status.ready, 1, "{status:?}");
+    let page = app
+        .directory()
+        .follow_availability_page(
+            &crate::directory_resources::directory_account(&owner),
+            None,
+            100,
+        )
+        .unwrap();
+    assert_eq!(
+        page.rows[0].state,
+        nostr_directory::FollowAvailabilityState::Ready
+    );
+    assert_eq!(
+        page.rows[0].key_package_event_id.as_deref(),
+        Some(second_id.as_str())
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn availability_recovery_stays_bounded() {
+    let (_root, app, accounts, fetcher) = member_resolution_fixture(1, false).await;
+    let owner = app
+        .account_home()
+        .create_account("availability-owner")
+        .unwrap();
+    app.directory()
+        .remember_directory_follow_list_for_test(
+            &owner.account_id_hex,
+            &nostr_directory::FetchedFollowList {
+                follows: vec![accounts[0].account_id_hex.clone()],
+                source_relays: Vec::new(),
+            },
+        )
+        .unwrap();
+
+    let omitted = fetcher
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|event| event.kind == KIND_MARMOT_KEY_PACKAGE)
+        .unwrap()
+        .clone();
+    for event in fetcher.events.lock().unwrap().iter_mut() {
+        if event.kind == transport_nostr_adapter::KIND_NIP65_RELAY_LIST
+            && event.pubkey == accounts[0].account_id_hex
+        {
+            event.tags = (0..20)
+                .map(|index| vec!["r".into(), format!("wss://outbox-{index}.example")])
+                .collect();
+        }
+    }
+    let relay_list = fetcher
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|event| event.kind == transport_nostr_adapter::KIND_NIP65_RELAY_LIST)
+        .unwrap()
+        .clone();
+    fetcher.events.lock().unwrap().retain(|event| {
+        event.kind != KIND_MARMOT_KEY_PACKAGE
+            && event.kind != transport_nostr_adapter::KIND_NIP65_RELAY_LIST
+    });
+    {
+        let mut by_endpoint = fetcher.events_by_endpoint.lock().unwrap();
+        by_endpoint.insert("wss://directory.example".into(), vec![relay_list]);
+        for index in 0..4 {
+            by_endpoint.insert(format!("wss://outbox-{index}.example"), Vec::new());
+        }
+        by_endpoint.insert("wss://outbox-4.example".into(), vec![omitted]);
+    }
+
+    let status = app
+        .directory()
+        .refresh_follow_availability(&crate::directory_resources::directory_account(&owner))
+        .await
+        .unwrap();
+    assert_eq!(status.unknown, 1, "{status:?}");
+    assert_eq!(status.not_found, 0, "{status:?}");
+    let requests = fetcher.requests.lock().unwrap();
+    assert!(requests.len() <= 2, "{}", requests.len());
+    assert!(
+        requests.iter().all(|request| request.endpoints.len()
+            <= nostr_directory::MAX_FOLLOW_AVAILABILITY_RELAYS_PER_TARGET),
+        "recovery must not widen the per-target relay set"
+    );
+    drop(requests);
+
+    let page = app
+        .directory()
+        .follow_availability_page(
+            &crate::directory_resources::directory_account(&owner),
+            None,
+            100,
+        )
+        .unwrap();
+    assert_eq!(
+        page.rows[0].state,
+        nostr_directory::FollowAvailabilityState::Unknown,
+        "a package on an omitted relay cannot support a clean negative"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn availability_discovery_is_bounded() {
+    let (_root, app, accounts, fetcher) = member_resolution_fixture_with_relays(
+        1,
+        false,
+        (0..5)
+            .map(|index| format!("wss://directory-{index}.example"))
+            .collect(),
+    )
+    .await;
+    let owner = app
+        .account_home()
+        .create_account("availability-owner")
+        .unwrap();
+    app.directory()
+        .remember_directory_follow_list_for_test(
+            &owner.account_id_hex,
+            &nostr_directory::FetchedFollowList {
+                follows: vec![accounts[0].account_id_hex.clone()],
+                source_relays: Vec::new(),
+            },
+        )
+        .unwrap();
+    let status = app
+        .directory()
+        .refresh_follow_availability(&crate::directory_resources::directory_account(&owner))
+        .await
+        .unwrap();
+    assert_eq!(status.ready, 1, "{status:?}");
+    let requests = fetcher.requests.lock().unwrap();
+    assert!(requests.iter().any(|request| {
+        request
+            .queries
+            .iter()
+            .any(|query| query.kind == transport_nostr_adapter::KIND_NIP65_RELAY_LIST)
+    }));
+    assert!(
+        requests.iter().all(|request| request.endpoints.len()
+            <= nostr_directory::MAX_FOLLOW_AVAILABILITY_RELAYS_PER_TARGET),
+        "discovery must be bounded before its first fetch"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn availability_unusable_cached_route_rediscovers() {
+    let (_root, app, accounts, fetcher) = member_resolution_fixture(1, false).await;
+    let owner = app
+        .account_home()
+        .create_account("availability-owner")
+        .unwrap();
+    let account = &accounts[0];
+    let mut relay_list = fetcher
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|event| event.kind == transport_nostr_adapter::KIND_NIP65_RELAY_LIST)
+        .unwrap()
+        .clone();
+    relay_list.tags = vec![vec!["r".into(), "ws://127.0.0.1:9999".into()]];
+    let package = fetcher
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|event| event.kind == KIND_MARMOT_KEY_PACKAGE)
+        .unwrap()
+        .clone();
+    *fetcher.events.lock().unwrap() = vec![relay_list.clone()];
+    app.directory()
+        .fetch_account_relay_list_status_for_account_id(&account.account_id_hex, Vec::new())
+        .await
+        .unwrap();
+
+    relay_list.created_at += 1;
+    relay_list.tags = vec![vec!["r".into(), "wss://usable.example".into()]];
+    {
+        let mut by_endpoint = fetcher.events_by_endpoint.lock().unwrap();
+        by_endpoint.insert("wss://directory.example".into(), vec![relay_list]);
+        by_endpoint.insert("wss://usable.example".into(), vec![package]);
+    }
+    app.directory()
+        .remember_directory_follow_list_for_test(
+            &owner.account_id_hex,
+            &nostr_directory::FetchedFollowList {
+                follows: vec![account.account_id_hex.clone()],
+                source_relays: Vec::new(),
+            },
+        )
+        .unwrap();
+    let status = app
+        .directory()
+        .refresh_follow_availability(&crate::directory_resources::directory_account(&owner))
+        .await
+        .unwrap();
+    assert_eq!(status.ready, 1, "{status:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn availability_live_deletions_are_fenced() {
+    let (_root, app, accounts, _fetcher) = member_resolution_fixture(2, false).await;
+    let owner = app
+        .account_home()
+        .create_account("availability-live-delete-owner")
+        .unwrap();
+    app.directory()
+        .remember_directory_follow_list_for_test(
+            &owner.account_id_hex,
+            &nostr_directory::FetchedFollowList {
+                follows: accounts
+                    .iter()
+                    .map(|account| account.account_id_hex.clone())
+                    .collect(),
+                source_relays: Vec::new(),
+            },
+        )
+        .unwrap();
+    app.directory()
+        .refresh_follow_availability(&crate::directory_resources::directory_account(&owner))
+        .await
+        .unwrap();
+    let rows = app
+        .directory()
+        .follow_availability_page(
+            &crate::directory_resources::directory_account(&owner),
+            None,
+            100,
+        )
+        .unwrap()
+        .rows;
+    let selected = |index: usize| {
+        rows.iter()
+            .find(|row| row.account_id_hex == accounts[index].account_id_hex)
+            .unwrap()
+            .key_package_event_id
+            .clone()
+            .unwrap()
+    };
+    let event_deletion = signed_deletion(
+        &app,
+        &accounts[0],
+        vec![vec!["e".into(), selected(0).to_ascii_uppercase()]],
+        unix_now_seconds() + 10,
+    );
+    let address_deletion = signed_deletion(
+        &app,
+        &accounts[1],
+        vec![vec![
+            "a".into(),
+            format!(
+                "30443:{}:{}-slot",
+                accounts[1].account_id_hex.to_ascii_uppercase(),
+                accounts[1].label
+            ),
+        ]],
+        unix_now_seconds() + 11,
+    );
+    for deletion in [event_deletion, address_deletion] {
+        app.directory()
+            .ingest_directory_relay_event(transport_nostr::DirectoryRelayEventRecord {
+                endpoints: Vec::new(),
+                event: deletion,
+            })
+            .unwrap();
+    }
+    let states = selection_availability_states(&app, &owner);
+    for account in accounts {
+        assert_eq!(
+            states[&account.account_id_hex],
+            nostr_directory::FollowAvailabilityState::Unknown
+        );
+    }
+}
+
+#[tokio::test]
+async fn availability_deleted_stays_not_found() {
+    let (_root, app, accounts, fetcher) = member_resolution_fixture(1, false).await;
+    let owner = app
+        .account_home()
+        .create_account("availability-owner")
+        .unwrap();
+    app.directory()
+        .remember_directory_follow_list_for_test(
+            &owner.account_id_hex,
+            &nostr_directory::FetchedFollowList {
+                follows: vec![accounts[0].account_id_hex.clone()],
+                source_relays: Vec::new(),
+            },
+        )
+        .unwrap();
+    app.directory()
+        .refresh_follow_availability(&crate::directory_resources::directory_account(&owner))
+        .await
+        .unwrap();
+
+    let selected = app
+        .directory()
+        .follow_availability_page(
+            &crate::directory_resources::directory_account(&owner),
+            None,
+            100,
+        )
+        .unwrap()
+        .rows[0]
+        .key_package_event_id
+        .clone()
+        .unwrap();
+    let deletion = signed_deletion(
+        &app,
+        &accounts[0],
+        vec![
+            vec!["e".into(), selected.clone()],
+            vec!["k".into(), KIND_MARMOT_KEY_PACKAGE.to_string()],
+        ],
+        unix_now_seconds() + 10,
+    );
+    fetcher.events.lock().unwrap().push(deletion.clone());
+    app.directory()
+        .reset_availability_for_test(&owner.account_id_hex);
+    app.directory()
+        .refresh_follow_availability(&crate::directory_resources::directory_account(&owner))
+        .await
+        .unwrap();
+    let shared_revision = app
+        .shared_storage()
+        .unwrap()
+        .key_package_evidence_revision(&accounts[0].account_id_hex)
+        .unwrap();
+    let stored_revision = app
+        .directory()
+        .availability_evidence_revision_for_test(
+            &crate::directory_resources::directory_account(&owner),
+            &accounts[0].account_id_hex,
+        )
+        .unwrap();
+    assert_eq!(stored_revision, shared_revision);
+    assert_eq!(
+        selection_availability_states(&app, &owner)[&accounts[0].account_id_hex],
+        nostr_directory::FollowAvailabilityState::NotFound
+    );
+
+    app.directory()
+        .ingest_directory_relay_event(transport_nostr::DirectoryRelayEventRecord {
+            endpoints: Vec::new(),
+            event: deletion.clone(),
+        })
+        .unwrap();
+    assert_eq!(
+        selection_availability_states(&app, &owner)[&accounts[0].account_id_hex],
+        nostr_directory::FollowAvailabilityState::NotFound,
+        "replaying the same deletion must not invalidate the negative"
+    );
+
+    fetcher
+        .events
+        .lock()
+        .unwrap()
+        .retain(|event| event.id != deletion.id);
+    app.drop_account_caches(&owner.label);
+    app.directory()
+        .reset_availability_for_test(&owner.account_id_hex);
+    app.directory()
+        .refresh_follow_availability(&crate::directory_resources::directory_account(&owner))
+        .await
+        .unwrap();
+    assert_eq!(
+        selection_availability_states(&app, &owner)[&accounts[0].account_id_hex],
+        nostr_directory::FollowAvailabilityState::Unknown,
+        "a stale relay cannot resurrect a deleted package"
+    );
 }

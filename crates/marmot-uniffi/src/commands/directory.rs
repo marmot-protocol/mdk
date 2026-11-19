@@ -116,6 +116,60 @@ impl Marmot {
             .collect())
     }
 
+    /// Network-free availability of the selected account's direct follows.
+    /// Results are keyset-paged by canonical account id, at most 100 rows.
+    /// `Ready` means a current compatible KeyPackage was selected; it never
+    /// proves installation of any particular client.
+    pub fn follow_availability_page(
+        &self,
+        account_ref: String,
+        after: Option<String>,
+        limit: u32,
+    ) -> Result<conversions::FollowAvailabilityPageFfi, MarmotKitError> {
+        Ok(self
+            .runtime
+            .follow_availability_page(&account_ref, after.as_deref(), limit as usize)?
+            .into())
+    }
+
+    /// Refresh at most 100 direct follows with bounded target lookups. Partial
+    /// results persist as each target finishes and remain readable while this
+    /// call runs. Repeated calls share an active refresh and completed refreshes
+    /// have a 60-second cadence. Clean negatives expire after 15 minutes.
+    pub async fn refresh_follow_availability(
+        &self,
+        account_ref: String,
+    ) -> Result<conversions::FollowAvailabilityRefreshStatusFfi, MarmotKitError> {
+        Ok(self
+            .runtime
+            .refresh_follow_availability(&account_ref)
+            .await?
+            .into())
+    }
+
+    /// Current or last direct-follow refresh progress for this account.
+    pub fn follow_availability_status(
+        &self,
+        account_ref: String,
+    ) -> Result<conversions::FollowAvailabilityRefreshStatusFfi, MarmotKitError> {
+        Ok(self
+            .runtime
+            .follow_availability_status(&account_ref)?
+            .into())
+    }
+
+    /// Cancel only the operation returned by the refresh status API. Returns
+    /// false when that operation already finished or a newer one replaced it.
+    pub fn cancel_follow_availability(
+        &self,
+        account_ref: String,
+        operation_id: u64,
+    ) -> Result<bool, MarmotKitError> {
+        Ok(self
+            .runtime
+            .cancel_follow_availability(&account_ref, operation_id)?)
+    }
+
     /// Cached Nostr kind:0 `website` metadata for an account id, when it is a
     /// string. The generic profile record intentionally exposes the fields the
     /// host can publish; this read-only accessor preserves arbitrary kind:0
@@ -678,5 +732,62 @@ mod tests {
             SearchUpdateTriggerFfi::SearchCompleted
         ));
         assert!(subscription.next_update().await.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn availability_ffi() {
+        let root = tempfile::tempdir().unwrap();
+        let app = MarmotApp::with_relay(root.path(), "wss://relay.example");
+        let runtime = app.runtime();
+        let kit = Marmot { app, runtime };
+        let account = kit
+            .runtime
+            .create_identity_local_ready(AccountSetupRequest {
+                default_relays: vec![TransportEndpoint("wss://relay.example".into())],
+                ..AccountSetupRequest::default()
+            })
+            .await
+            .unwrap()
+            .account;
+
+        let idle = kit
+            .follow_availability_status(account.account_id_hex.clone())
+            .unwrap();
+        assert_eq!(idle.operation_id, None);
+        assert!(matches!(
+            idle.phase,
+            conversions::FollowAvailabilityRefreshPhaseFfi::Idle
+        ));
+        assert!(
+            kit.follow_availability_page(account.account_id_hex.clone(), None, 100)
+                .unwrap()
+                .rows
+                .is_empty()
+        );
+
+        let complete = kit
+            .refresh_follow_availability(account.account_id_hex.clone())
+            .await
+            .unwrap();
+        assert!(matches!(
+            complete.phase,
+            conversions::FollowAvailabilityRefreshPhaseFfi::Complete
+        ));
+        assert_eq!(complete.total, 0);
+        let throttled = kit
+            .refresh_follow_availability(account.account_id_hex.clone())
+            .await
+            .unwrap();
+        assert!(matches!(
+            throttled.phase,
+            conversions::FollowAvailabilityRefreshPhaseFfi::Throttled
+        ));
+        assert!(
+            !kit.cancel_follow_availability(
+                account.account_id_hex,
+                complete.operation_id.unwrap(),
+            )
+            .unwrap()
+        );
     }
 }

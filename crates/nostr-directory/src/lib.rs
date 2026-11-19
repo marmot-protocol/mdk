@@ -1,3 +1,4 @@
+mod availability;
 mod cache;
 mod cached_search;
 pub mod config;
@@ -20,6 +21,15 @@ mod sync;
 #[cfg(any(test, feature = "test-support"))]
 mod test_support;
 
+pub use availability::{
+    FOLLOW_AVAILABILITY_CONCURRENCY, FOLLOW_AVAILABILITY_NEGATIVE_TTL,
+    FOLLOW_AVAILABILITY_REFRESH_CADENCE, FOLLOW_AVAILABILITY_REFRESH_TIMEOUT,
+    FOLLOW_AVAILABILITY_TARGET_TIMEOUT, FollowAvailability, FollowAvailabilityPage,
+    FollowAvailabilityRefreshPhase, FollowAvailabilityRefreshStatus, FollowAvailabilitySource,
+    FollowAvailabilityState, MAX_FOLLOW_AVAILABILITY_PAGE_SIZE,
+    MAX_FOLLOW_AVAILABILITY_RELAY_FETCHES, MAX_FOLLOW_AVAILABILITY_RELAYS_PER_TARGET,
+    MAX_FOLLOW_AVAILABILITY_TARGETS,
+};
 pub use cache::DirectoryCache;
 pub use config::DirectoryConfig;
 pub use ids::{

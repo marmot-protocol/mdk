@@ -18,6 +18,7 @@ pub mod directory;
 pub mod draft;
 pub mod emoji_set;
 pub mod event;
+pub mod follow_availability;
 pub mod group;
 pub mod history_import;
 pub mod history_notice;

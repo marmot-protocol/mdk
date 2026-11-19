@@ -1606,6 +1606,54 @@ Bounded local cached-identity page for many account IDs.
 
 [Source](src/commands/directory.rs#L101)
 
+### `Marmot::follow_availability_page`
+
+**Current.**
+
+```rust
+pub fn follow_availability_page( &self, account_ref: String, after: Option<String>, limit: u32, ) -> Result<conversions::FollowAvailabilityPageFfi, MarmotKitError>
+```
+
+Read the selected account's direct follows from its encrypted cache without networking. Results use canonical account ids in keyset order. Pass `next_cursor` as `after` for the next page; `limit` clamps to 1 through 100. Keep this synchronous SQLCipher read off the UI thread. `ready` means a current compatible KeyPackage has not expired, not that a particular client is installed. `unknown` covers missing, stale, incomplete, malformed, replaced, and expired results. A completed clean, deleted, or obsolete miss is `not_found` for 15 minutes.
+
+[Source](src/commands/directory.rs#L123)
+
+### `Marmot::refresh_follow_availability`
+
+**Current.**
+
+```rust
+pub async fn refresh_follow_availability( &self, account_ref: String, ) -> Result<conversions::FollowAvailabilityRefreshStatusFfi, MarmotKitError>
+```
+
+Refresh at most 100 direct follows with four concurrent target lookups, a 10-second target deadline, a five-minute overall deadline, and at most two relay fetches per target. Results persist per target and can be paged while the call runs. Concurrent calls share one refresh and completed refreshes have a 60-second cadence. The returned aggregate distinguishes complete, partial, cancelled, throttled, and failed outcomes without exposing followed identities in telemetry.
+
+[Source](src/commands/directory.rs#L139)
+
+### `Marmot::follow_availability_status`
+
+**Current.**
+
+```rust
+pub fn follow_availability_status( &self, account_ref: String, ) -> Result<conversions::FollowAvailabilityRefreshStatusFfi, MarmotKitError>
+```
+
+Return the current or last direct-follow refresh status for this account, including its operation id, phase, aggregate result counts, and truncation flag. Poll this method while a refresh runs; page the projection for per-account states. An account with no refresh returns `Idle` without an operation id.
+
+[Source](src/commands/directory.rs#L151)
+
+### `Marmot::cancel_follow_availability`
+
+**Current.**
+
+```rust
+pub fn cancel_follow_availability( &self, account_ref: String, operation_id: u64, ) -> Result<bool, MarmotKitError>
+```
+
+Cancel the running refresh identified by `operation_id`. Returns `false` when that operation already finished or a newer operation replaced it, so a stale status cannot cancel newer work. Committed results remain readable. Use the operation id from `follow_availability_status` or the refresh result.
+
+[Source](src/commands/directory.rs#L163)
+
 ### `Marmot::user_profile_website`
 
 **Current.**
@@ -1616,7 +1664,7 @@ pub fn user_profile_website( &self, account_id_hex: String, ) -> Result<Option<S
 
 Cached Nostr kind:0 `website` metadata for an account id, when it is a string. The generic profile record intentionally exposes the fields the host can publish; this read-only accessor preserves arbitrary kind:0 metadata while still making the standard website field available to profile presentation surfaces.
 
-[Source](src/commands/directory.rs#L124)
+[Source](src/commands/directory.rs#L178)
 
 ### `Marmot::refresh_profile`
 
@@ -1628,7 +1676,7 @@ pub async fn refresh_profile( &self, account_id_hex: String, relays: Vec<String>
 
 Fetch and cache an account's own Nostr kind:0 profile from `relays`. After this resolves, `user_profile` / `display_name` return the freshly-fetched metadata (name, picture, etc.) for that account.
 
-[Source](src/commands/directory.rs#L144)
+[Source](src/commands/directory.rs#L198)
 
 ### `Marmot::user_relay_lists`
 
@@ -1640,7 +1688,7 @@ pub fn user_relay_lists( &self, account_id_hex: String, ) -> Result<conversions:
 
 Cached NIP-65 and inbox relay lists for any account id — no network. An account with nothing cached yet returns an empty status with both kinds in `missing` rather than erroring; call `refresh_user_relay_lists` to fetch.
 
-[Source](src/commands/directory.rs#L160)
+[Source](src/commands/directory.rs#L214)
 
 ### `Marmot::refresh_user_relay_lists`
 
@@ -1652,7 +1700,7 @@ pub async fn refresh_user_relay_lists( &self, account_id_hex: String, relays: Ve
 
 Fetch an account's published NIP-65 and inbox relay lists from `relays`, updating the cache. An account with nothing published reports both kinds in `missing` rather than erroring.
 
-[Source](src/commands/directory.rs#L174)
+[Source](src/commands/directory.rs#L228)
 
 ### `Marmot::search_cached_users`
 
@@ -1664,7 +1712,7 @@ pub fn search_cached_users( &self, account_id_hex: String, query: String, limit:
 
 Search public identities cached through any connected account, without network or group-membership work. Follow flags refer only to the selected searcher. Call off the UI thread; zero limit returns no rows.
 
-[Source](src/commands/directory.rs#L190)
+[Source](src/commands/directory.rs#L244)
 
 ### `Marmot::search_users`
 
@@ -1676,7 +1724,7 @@ pub async fn search_users( &self, account_id_hex: String, query: String, radius_
 
 Stream cached public identities across accounts, then independent provider and graph results. The radius window bounds known social distances; cached/provider identities without a known distance remain discoverable. Those identities can recur when paging radii: deduplicate by account id across pages as well as within each subscription.
 
-[Source](src/commands/directory.rs#L217)
+[Source](src/commands/directory.rs#L271)
 
 </details>
 
@@ -4702,7 +4750,7 @@ pub fn new_with_configuration( root_path: String, relay_urls: Vec<String>, optio
 
 Open with any combination of runtime options, including the required deployment. The other constructors are wrappers around this entry point and take the deployment as their last argument.
 
-[Source](src/lib.rs#L328)
+[Source](src/lib.rs#L330)
 
 ### `Marmot::new_with_experimental_device_groups`
 
@@ -4712,7 +4760,7 @@ pub fn new_with_experimental_device_groups( root_path: String, relay_urls: Vec<S
 
 The same open as `new_with_configuration`: every constructor opens with [device groups](README.md#device-groups) on. Kept so existing hosts keep compiling.
 
-[Source](src/lib.rs#L341)
+[Source](src/lib.rs#L343)
 
 ### `Marmot::new_with_options`
 
@@ -4724,7 +4772,7 @@ pub fn new_with_options( root_path: String, relay_urls: Vec<String>, relay_polic
 
 Open with an explicit relay policy and optional host-owned key storage. Existing constructors retain their public-only relay policy.
 
-[Source](src/lib.rs#L352)
+[Source](src/lib.rs#L354)
 
 ### `Marmot::new`
 
@@ -4736,7 +4784,7 @@ pub fn new( root_path: String, relay_urls: Vec<String>, deployment: MarmotDeploy
 
 Open the Marmot app at `root_path`, configured with the given default relay URLs and `deployment`. Account secrets (Nostr private keys) are stored in the platform keyring (Keychain on Apple platforms, Android's native keyring on Android) under the deployment's `keychain_service` — not in a plaintext file. Fallible because initializing the platform secret store can fail or another process may own the same root (`MarmotKitError::RuntimeBusy`). Root ownership is nonblocking and remains held until the final `Marmot`/runtime handle is dropped, even after `Marmot::shutdown`. Call `Marmot::start` before subscribing to events.
 
-[Source](src/lib.rs#L381)
+[Source](src/lib.rs#L383)
 
 ### `Marmot::new_with_secret_store`
 
@@ -4748,7 +4796,7 @@ pub fn new_with_secret_store( root_path: String, relay_urls: Vec<String>, secret
 
 Open the Marmot app with host-supplied account-secret storage instead of the platform keychain. Identical to `Marmot::new` except that every read, write, and removal of an account signing key goes through `secret_store`.
 
-[Source](src/lib.rs#L407)
+[Source](src/lib.rs#L409)
 
 ### `Marmot::new_with_cursor_persistence`
 
@@ -4760,7 +4808,7 @@ pub fn new_with_cursor_persistence( root_path: String, relay_urls: Vec<String>, 
 
 Construct with explicit advancing/frozen relay cursor behavior; new_with_configuration composes this with other options.
 
-[Source](src/lib.rs#L438)
+[Source](src/lib.rs#L440)
 
 ### `Marmot::new_with_client_name`
 
@@ -4772,7 +4820,7 @@ pub fn new_with_client_name( root_path: String, relay_urls: Vec<String>, client_
 
 Open with an optional public client label for new KeyPackage publications. Existing constructors remain untagged. Whitespace-only labels, and labels longer than 64 bytes once trimmed, are omitted rather than truncated. Hosts must supply this on every foreground/background runtime construction.
 
-[Source](src/lib.rs#L459)
+[Source](src/lib.rs#L461)
 
 ### `Marmot::start`
 
@@ -4784,7 +4832,7 @@ pub async fn start(&self) -> Result<(), MarmotKitError>
 
 Bring the runtime to local readiness.
 
-[Source](src/lib.rs#L497)
+[Source](src/lib.rs#L499)
 
 ### `Marmot::shutdown`
 
@@ -4796,7 +4844,7 @@ pub async fn shutdown(&self)
 
 Tear the runtime down. Drops all subscriptions; long-lived `EventsSubscription` / `ChatsSubscription` / etc. instances on the host side will see their `next()` return `None` shortly after.
 
-[Source](src/lib.rs#L509)
+[Source](src/lib.rs#L511)
 
 ### `Marmot::shutdown_and_close`
 
@@ -4808,7 +4856,7 @@ pub async fn shutdown_and_close(&self) -> Result<(), MarmotKitError>
 
 Terminally stop work, close storage and release root ownership; reconstruct before further reads/work.
 
-[Source](src/lib.rs#L545)
+[Source](src/lib.rs#L547)
 
 ### `Marmot::storage_is_closed`
 
@@ -4820,7 +4868,7 @@ pub fn storage_is_closed(&self) -> bool
 
 True once `Marmot::shutdown_and_close` has closed the store. A host can check this to confirm it is safe to be suspended, or to notice it is holding a spent handle and needs a fresh one.
 
-[Source](src/lib.rs#L553)
+[Source](src/lib.rs#L555)
 
 ### `Marmot::is_stopping`
 
@@ -4832,7 +4880,7 @@ pub fn is_stopping(&self) -> bool
 
 True once shutdown has started. Host apps can use this to avoid launching more subscriptions or account work while they are moving to the background.
 
-[Source](src/lib.rs#L560)
+[Source](src/lib.rs#L562)
 
 </details>
 
@@ -5672,6 +5720,7 @@ Network-free read of cached public Nostr events referenced from message content,
 pub async fn resolve_public_event_preview( &self, account_ref: String, reference: String, ) -> Result<PublicEventPreviewFfi, MarmotKitError>
 ```
 
+Keep this synchronous SQLCipher read off the UI thread. `ready` means a current compatible KeyPackage has not expired, not that a particular client is installed. `unknown` covers missing, stale, incomplete, malformed, replaced, and expired results. A completed clean, deleted, or obsolete miss is `not_found` for 15 minutes.
 Fetch one referenced event from at most two safe relay hints plus the configured directory relays when it is missing or stale, store it if it verifies and matches, and return the resulting local state. An event-ID preview never refetches once every relay answered the fetch that cached it; otherwise, and for `naddr` previews, it refetches after 30 minutes. `naddr` keeps the newest version. Author-signed NIP-09 deletions apply in either tag form: an `e` tag removes that event (an `naddr` falls back to the previous version), an `a` tag removes every version up to its timestamp. Calls within 30 seconds of a finished fetch for the same reference return local state without network I/O, as does any call while the row is fresh, so call it for every reference a screen shows. A failed or empty fetch keeps prior content and stores no miss.
 
 [Source](src/commands/public_event_preview.rs#L83)

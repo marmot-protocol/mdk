@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 use nostr_directory::MEMBER_PREWARM_CACHE_TTL;
 use nostr_directory::MemberResolutionPurpose;
 use nostr_directory::{MemberResolutionOutcome, MemberResolutionPolicy, MemberResolutionStatus};
+use nostr_sdk::prelude::FinalizeEvent;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn partial_members_stay_fresh() {
@@ -233,6 +234,99 @@ async fn discovery_recovery_refreshes_routes_for_fresh_commit_resolution() {
             .iter()
             .any(|q| q.kind == transport_nostr_adapter::KIND_NIP65_RELAY_LIST)
     }));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn member_recovery_journals_malformed_replacement() {
+    let (_directory, app, accounts, fetcher) =
+        crate::tests::member_resolution_fixture(1, false).await;
+    let owner = app
+        .account_home()
+        .create_account("availability-owner")
+        .unwrap();
+    app.directory()
+        .remember_directory_follow_list_for_test(
+            &owner.account_id_hex,
+            &nostr_directory::FetchedFollowList {
+                follows: vec![accounts[0].account_id_hex.clone()],
+                source_relays: Vec::new(),
+            },
+        )
+        .unwrap();
+    app.directory()
+        .prewarm_group_member_key_packages(&[accounts[0].account_id_hex.as_str()])
+        .await
+        .unwrap();
+
+    let replacement = {
+        let mut replacement = fetcher
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|event| {
+                event.kind == transport_nostr_adapter::KIND_MARMOT_KEY_PACKAGE
+                    && event.pubkey == accounts[0].account_id_hex
+            })
+            .unwrap()
+            .clone();
+        replacement.id = "ff".repeat(32);
+        replacement.created_at = replacement.created_at.saturating_add(1);
+        replacement.content = "not-base64".into();
+        let signed = nostr_sdk::prelude::EventBuilder::new(
+            nostr_sdk::prelude::Kind::from(replacement.kind as u16),
+            replacement.content.clone(),
+        )
+        .tags(
+            replacement
+                .tags
+                .iter()
+                .map(|tag| nostr_sdk::prelude::Tag::parse(tag.clone()).unwrap()),
+        )
+        .custom_created_at(nostr_sdk::prelude::Timestamp::from_secs(
+            replacement.created_at,
+        ))
+        .finalize(
+            &app.account_home()
+                .load_signing_keys(&accounts[0].label)
+                .unwrap(),
+        )
+        .unwrap();
+        transport_nostr_peeler::NostrTransportEvent::from_nostr_event(&signed).unwrap()
+    };
+    fetcher.events.lock().unwrap().push(replacement.clone());
+    let _ = app
+        .directory()
+        .resolve_member_key_packages_for_purpose_for_test(
+            vec![accounts[0].account_id_hex.clone()],
+            MemberResolutionPurpose::CommitFresh,
+            None,
+        )
+        .await;
+    fetcher
+        .events
+        .lock()
+        .unwrap()
+        .retain(|event| event.id != replacement.id);
+    app.drop_account_caches(&owner.label);
+
+    app.directory()
+        .prewarm_group_member_key_packages(&[accounts[0].account_id_hex.as_str()])
+        .await
+        .unwrap();
+    let page = app
+        .directory()
+        .follow_availability_page(
+            &crate::directory_resources::directory_account(&owner),
+            None,
+            100,
+        )
+        .unwrap();
+    assert_eq!(
+        page.rows[0].state,
+        nostr_directory::FollowAvailabilityState::Unknown,
+        "supplementary recovery must retain malformed replacement evidence"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

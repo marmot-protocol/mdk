@@ -357,7 +357,10 @@ pub use nostr_directory::{
     AccountRelayListState, AccountRelayListStatus, FetchedKeyPackage, MissingRelayListKind,
 };
 pub use nostr_directory::{
-    CachedIdentityProjection, DirectoryKeyPackage, MAX_CACHED_IDENTITY_PAGE_SIZE, MatchQuality,
+    CachedIdentityProjection, DirectoryKeyPackage, FollowAvailability, FollowAvailabilityPage,
+    FollowAvailabilityRefreshPhase, FollowAvailabilityRefreshStatus, FollowAvailabilitySource,
+    FollowAvailabilityState, MAX_CACHED_IDENTITY_PAGE_SIZE, MAX_FOLLOW_AVAILABILITY_PAGE_SIZE,
+    MAX_FOLLOW_AVAILABILITY_RELAY_FETCHES, MAX_FOLLOW_AVAILABILITY_TARGETS, MatchQuality,
     MatchedField, MemberKeyPackagePrewarmSummary, MemberResolutionOutcome, MemberResolutionPolicy,
     MemberResolutionStatus, OFF_GRAPH_SEARCH_RADIUS, SearchUpdateTrigger,
     UserDirectoryLocalAccount, UserDirectoryRecord, UserDirectoryRefresh, UserDirectorySearch,

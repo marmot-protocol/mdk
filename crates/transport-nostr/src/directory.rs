@@ -97,6 +97,7 @@ pub struct DirectorySyncBatch {
     pub subscription_id: String,
     pub authors: Vec<String>,
     pub kinds: Vec<u64>,
+    pub reference: Option<(char, String)>,
     pub since: Option<u64>,
 }
 
@@ -113,6 +114,7 @@ pub struct DirectorySyncBatch {
 pub struct DirectorySubscriptionFilter {
     authors: HashSet<String>,
     kinds: HashSet<u64>,
+    pub(crate) reference: Option<(char, String)>,
 }
 
 impl DirectorySubscriptionFilter {
@@ -120,11 +122,24 @@ impl DirectorySubscriptionFilter {
         Self {
             authors: authors.into_iter().collect(),
             kinds: kinds.into_iter().collect(),
+            reference: None,
         }
     }
 
+    #[cfg(test)]
     fn accepts(&self, author: &str, kind: u64) -> bool {
-        self.authors.contains(author) && self.kinds.contains(&kind)
+        self.accepts_event(author, kind, &[])
+    }
+
+    fn accepts_event(&self, author: &str, kind: u64, tags: &[Vec<String>]) -> bool {
+        self.authors.contains(author)
+            && self.kinds.contains(&kind)
+            && self.reference.as_ref().is_none_or(|(name, value)| {
+                tags.iter().any(|tag| {
+                    tag.first().and_then(|tag| tag.parse::<char>().ok()) == Some(*name)
+                        && tag.get(1) == Some(value)
+                })
+            })
     }
 }
 
@@ -738,6 +753,7 @@ impl DirectoryRelayPlane {
         endpoint: &str,
         author: &str,
         kind: u64,
+        tags: &[Vec<String>],
     ) -> bool {
         let state = self.state.lock().await;
         // Pending rebuild means coverage is unknown and a retry is still owed.
@@ -750,7 +766,7 @@ impl DirectoryRelayPlane {
             && state
                 .active_subscriptions
                 .get(subscription_id)
-                .is_some_and(|filter| filter.accepts(author, kind))
+                .is_some_and(|filter| filter.accepts_event(author, kind, tags))
     }
 }
 

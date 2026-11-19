@@ -187,6 +187,7 @@ fn plan_directory_sync_with_batch_size(
         "local",
         &local_account_ids,
         DIRECTORY_SYNC_LOCAL_ACCOUNT_KINDS,
+        None,
         since,
         batch_size,
     );
@@ -195,9 +196,27 @@ fn plan_directory_sync_with_batch_size(
         "users",
         &remote_user_ids,
         DIRECTORY_SYNC_KINDS,
+        None,
         since,
         batch_size,
     );
+
+    // Regular kind-5 events are unbounded per author. Keep them out of the
+    // replaceable-kind batches and require the KeyPackage kind hint.
+    for (group, account_ids) in [
+        ("local-deletions", &local_account_ids),
+        ("users-deletions", &remote_user_ids),
+    ] {
+        extend_directory_sync_batches(
+            &mut batches,
+            group,
+            account_ids,
+            &[5],
+            Some(('k', KIND_MARMOT_KEY_PACKAGE.to_string())),
+            since,
+            batch_size,
+        );
+    }
 
     DirectorySyncPlan {
         endpoints,
@@ -211,6 +230,7 @@ fn extend_directory_sync_batches(
     group: &str,
     account_ids: &[String],
     kinds: &[u64],
+    reference: Option<(char, String)>,
     since: Option<u64>,
     batch_size: usize,
 ) {
@@ -220,6 +240,7 @@ fn extend_directory_sync_batches(
             subscription_id: directory_subscription_id(group, index, &authors),
             authors,
             kinds: kinds.to_vec(),
+            reference: reference.clone(),
             since,
         });
     }
@@ -506,11 +527,19 @@ mod tests {
             vec![TransportEndpoint("wss://relay.example".to_owned())]
         );
         assert_eq!(plan.watched_user_count, 3);
-        assert_eq!(plan.batches.len(), 2);
+        assert_eq!(plan.batches.len(), 4);
         assert_eq!(plan.batches[0].authors, vec![account_id(1), account_id(2)]);
         assert_eq!(plan.batches[1].authors, vec![account_id(3)]);
         assert_eq!(plan.batches[0].kinds, DIRECTORY_SYNC_KINDS);
         assert_eq!(plan.batches[0].since, Some(100));
+        for batch in &plan.batches[2..] {
+            assert_eq!(batch.kinds, [5]);
+            assert_eq!(
+                batch.reference,
+                Some(('k', KIND_MARMOT_KEY_PACKAGE.to_string()))
+            );
+            assert_eq!(batch.since, Some(100));
+        }
         assert!(!plan.batches[0].subscription_id.contains(&account_id(1)));
         assert_ne!(
             plan.batches[0].subscription_id,
@@ -550,13 +579,14 @@ mod tests {
         assert!(remote_batch.kinds.contains(&KIND_NOSTR_METADATA));
         assert!(remote_batch.kinds.contains(&KIND_MARMOT_KEY_PACKAGE));
         // The local account must not also appear in a remote (contact-list-free)
-        // batch, which would defeat its contact-list subscription.
+        // One regular local batch and one deletion batch; no remote batch may
+        // repeat the local author.
         assert_eq!(
             plan.batches
                 .iter()
                 .filter(|batch| batch.authors.contains(&local))
                 .count(),
-            1
+            2
         );
     }
 

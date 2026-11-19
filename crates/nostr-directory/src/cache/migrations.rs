@@ -21,10 +21,16 @@ const MIGRATIONS: &[Migration] = &[
         name: "0002_public_event_previews",
         apply: version_2,
     },
+    Migration {
+        version: 3,
+        name: "0003_follow_availability",
+        apply: version_3,
+    },
 ];
 
 const VERSION_1_SQL: &str = include_str!("v1.sql");
 const VERSION_2_SQL: &str = include_str!("v2.sql");
+const VERSION_3_SQL: &str = include_str!("v3.sql");
 
 /// Open the cache's independent migration domain without exposing stored values.
 pub(super) fn run_all(conn: &mut Connection) -> Result<(), DirectoryError> {
@@ -136,6 +142,11 @@ fn version_1(tx: &Transaction<'_>) -> Result<(), DirectoryError> {
 
 fn version_2(tx: &Transaction<'_>) -> Result<(), DirectoryError> {
     tx.execute_batch(VERSION_2_SQL)?;
+    Ok(())
+}
+
+fn version_3(tx: &Transaction<'_>) -> Result<(), DirectoryError> {
+    tx.execute_batch(VERSION_3_SQL)?;
     Ok(())
 }
 
@@ -337,7 +348,12 @@ mod tests {
             },
             Migration {
                 version: 3,
-                name: "0003_test",
+                name: MIGRATIONS[2].name,
+                apply: version_3,
+            },
+            Migration {
+                version: 4,
+                name: "0004_test",
                 apply: |tx| {
                     tx.execute_batch(
                         "CREATE TABLE rollback_probe (value INTEGER);
@@ -348,7 +364,8 @@ mod tests {
                 },
             },
         ];
-        assert!(run(&mut conn, &migrations).is_err());
+        let error = run(&mut conn, &migrations).unwrap_err();
+        assert!(error.to_string().contains("injected failure"));
         assert!(!DirectoryCache::table_exists_locked(&conn, "rollback_probe").unwrap());
         let count: i64 = conn
             .query_row(
@@ -365,7 +382,7 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(count, 2);
+        assert_eq!(count, 3);
     }
 }
 

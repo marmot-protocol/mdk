@@ -13,7 +13,7 @@ use transport_nostr_adapter::{
     KIND_MARMOT_INBOX_RELAY_LIST, KIND_MARMOT_KEY_PACKAGE, KIND_NIP65_RELAY_LIST,
 };
 
-use super::error::DirectoryError;
+use super::error::{DirectoryError, blocking_directory_task};
 use super::ids::{
     normalize_account_ids, npub_for_account_id, npub_for_account_id_lossy, parse_account_id_hex,
 };
@@ -30,7 +30,166 @@ use super::records::{
 use super::resources::DirectoryResources;
 use super::{Directory, DirectoryCache};
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DeletionEvidenceScope {
+    KeyPackageQuery,
+    ScopedTarget,
+}
+
+fn deletion_barriers(
+    record: &RelayEventRecord,
+    evidence_scope: DeletionEvidenceScope,
+) -> Vec<storage_sqlite::PublicKeyPackageBarrierRecord> {
+    let account_id_hex = record.event.pubkey.clone();
+    let targets_key_packages = record.event.tags.iter().any(|tag| {
+        tag.first().is_some_and(|name| name == "k")
+            && tag.get(1).and_then(|value| value.parse::<u64>().ok())
+                == Some(KIND_MARMOT_KEY_PACKAGE)
+    });
+    let has_kind_hint = record
+        .event
+        .tags
+        .iter()
+        .any(|tag| tag.first().is_some_and(|name| name == "k"));
+    let has_event_target = record
+        .event
+        .tags
+        .iter()
+        .any(|tag| tag.first().is_some_and(|name| name == "e"));
+    let has_address_target = record
+        .event
+        .tags
+        .iter()
+        .any(|tag| tag.first().is_some_and(|name| name == "a"));
+    if evidence_scope == DeletionEvidenceScope::KeyPackageQuery
+        && !targets_key_packages
+        && (has_kind_hint || !(has_event_target || has_address_target))
+    {
+        return Vec::new();
+    }
+    record
+        .event
+        .tags
+        .iter()
+        .filter(|tag| tag.first().is_some_and(|name| name == "a"))
+        .filter_map(|tag| {
+            let mut parts = tag.get(1)?.splitn(3, ':');
+            let kind = parts.next()?.parse::<u64>().ok()?;
+            let author = parts.next()?;
+            let slot = parts.next()?;
+            (kind == KIND_MARMOT_KEY_PACKAGE && author.eq_ignore_ascii_case(&account_id_hex))
+                .then_some(storage_sqlite::PublicKeyPackageBarrierRecord {
+                    account_id_hex: account_id_hex.clone(),
+                    key_package_id: slot.to_owned(),
+                    kind: storage_sqlite::PublicKeyPackageBarrierKind::Deletion,
+                    event_id_hex: record.event.id.clone(),
+                    deleted_event_id: None,
+                    event_created_at: record.event.created_at,
+                    observed_at: 0,
+                })
+        })
+        .chain(
+            record
+                .event
+                .tags
+                .iter()
+                .filter(|tag| tag.first().is_some_and(|name| name == "e"))
+                .filter_map(|tag| {
+                    Some(storage_sqlite::PublicKeyPackageBarrierRecord {
+                        account_id_hex: account_id_hex.clone(),
+                        key_package_id: String::new(),
+                        kind: storage_sqlite::PublicKeyPackageBarrierKind::Deletion,
+                        event_id_hex: record.event.id.clone(),
+                        deleted_event_id: Some(tag.get(1)?.to_ascii_lowercase()),
+                        event_created_at: record.event.created_at,
+                        observed_at: 0,
+                    })
+                }),
+        )
+        .collect()
+}
+
 impl<R: DirectoryResources> Directory<R> {
+    pub(super) async fn journal_key_package_records(
+        &self,
+        account_id_hex: &str,
+        records: &[RelayEventRecord],
+    ) -> Result<(), DirectoryError> {
+        self.journal_key_package_records_with_scope(
+            account_id_hex,
+            records,
+            DeletionEvidenceScope::KeyPackageQuery,
+        )
+        .await
+    }
+
+    pub(super) async fn journal_scoped_deletion_records(
+        &self,
+        account_id_hex: &str,
+        records: &[RelayEventRecord],
+    ) -> Result<(), DirectoryError> {
+        self.journal_key_package_records_with_scope(
+            account_id_hex,
+            records,
+            DeletionEvidenceScope::ScopedTarget,
+        )
+        .await
+    }
+
+    async fn journal_key_package_records_with_scope(
+        &self,
+        account_id_hex: &str,
+        records: &[RelayEventRecord],
+        evidence_scope: DeletionEvidenceScope,
+    ) -> Result<(), DirectoryError> {
+        let freshness = self.directory_freshness();
+        let replacements = records
+            .iter()
+            .filter(|record| {
+                record.event.kind == KIND_MARMOT_KEY_PACKAGE
+                    && record.event.pubkey == account_id_hex
+                    && freshness.accepts(record)
+                    && record.event.to_verified_nostr_event().is_ok()
+            })
+            .map(|record| storage_sqlite::PublicKeyPackageReplacementRecord {
+                account_id_hex: account_id_hex.to_owned(),
+                key_package_id: record.event.tag_value("d").unwrap_or_default().to_owned(),
+                event_id_hex: record.event.id.clone(),
+                event_created_at: record.event.created_at,
+                observed_at: freshness.now,
+            })
+            .collect::<Vec<_>>();
+        let barriers = records
+            .iter()
+            .filter(|record| {
+                record.event.kind == 5
+                    && record.event.pubkey == account_id_hex
+                    && freshness.accepts(record)
+                    && record.event.to_verified_nostr_event().is_ok()
+            })
+            .flat_map(|record| deletion_barriers(record, evidence_scope))
+            .map(|mut barrier| {
+                barrier.observed_at = freshness.now;
+                barrier
+            })
+            .collect::<Vec<_>>();
+        if replacements.is_empty() && barriers.is_empty() {
+            return Ok(());
+        }
+        let directory = self.clone();
+        blocking_directory_task(move || {
+            let shared = directory.resources.shared_storage()?;
+            for replacement in replacements {
+                shared.put_public_key_package_replacement(&replacement)?;
+            }
+            for barrier in barriers {
+                shared.put_public_key_package_barrier(&barrier)?;
+            }
+            Ok(())
+        })
+        .await
+    }
+
     pub fn local_accounts_by_id(
         &self,
     ) -> Result<HashMap<String, LocalAccountNames>, DirectoryError> {
@@ -122,6 +281,17 @@ impl<R: DirectoryResources> Directory<R> {
         &self,
         fetched: &FetchedKeyPackage,
     ) -> Result<(), DirectoryError> {
+        self.resources
+            .shared_storage()?
+            .put_public_key_package_replacement(
+                &storage_sqlite::PublicKeyPackageReplacementRecord {
+                    account_id_hex: fetched.account_id_hex.clone(),
+                    key_package_id: fetched.key_package_id.clone(),
+                    event_id_hex: fetched.key_package_event_id.clone(),
+                    event_created_at: fetched.created_at,
+                    observed_at: self.directory_freshness().now,
+                },
+            )?;
         self.update_directory_entry(&fetched.account_id_hex, |entry| {
             entry.relay_lists =
                 merge_relay_list_status(entry.relay_lists.clone(), fetched.relay_lists.clone());
@@ -277,7 +447,9 @@ impl<R: DirectoryResources> Directory<R> {
     }
 
     /// Ingest authenticated directory data. Invalid or future-dated events
-    /// are ignored before either directory store is changed.
+    /// are ignored before either directory store is changed. KeyPackage content
+    /// validation follows the shared journal write so malformed replacements
+    /// still fence stale availability.
     pub fn ingest_directory_relay_event(
         &self,
         record: RelayEventRecord,
@@ -305,11 +477,34 @@ impl<R: DirectoryResources> Directory<R> {
                 self.remember_directory_relay_list_event(&account_id_hex, &record)?;
             }
             KIND_MARMOT_KEY_PACKAGE => {
+                let key_package_id = record.event.tag_value("d").unwrap_or_default();
+                self.resources
+                    .shared_storage()?
+                    .put_public_key_package_replacement(
+                        &storage_sqlite::PublicKeyPackageReplacementRecord {
+                            account_id_hex: account_id_hex.clone(),
+                            key_package_id: key_package_id.to_owned(),
+                            event_id_hex: record.event.id.clone(),
+                            event_created_at: record.event.created_at,
+                            observed_at: self.directory_freshness().now,
+                        },
+                    )?;
                 let mut fetched = key_package_from_record(record)?;
                 fetched.relay_lists = self
                     .cached_relay_list_status(&account_id_hex)
                     .unwrap_or_else(|_| AccountRelayListStatus::empty());
                 self.remember_directory_key_package(&fetched)?;
+            }
+            5 => {
+                let observed_at = self.directory_freshness().now;
+                for mut barrier in
+                    deletion_barriers(&record, DeletionEvidenceScope::KeyPackageQuery)
+                {
+                    barrier.observed_at = observed_at;
+                    self.resources
+                        .shared_storage()?
+                        .put_public_key_package_barrier(&barrier)?;
+                }
             }
             _ => {}
         }
@@ -520,3 +715,24 @@ pub fn hydrate_directory_record(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod deletion_barrier_tests {
+    use super::*;
+    use transport_nostr_peeler::NostrTransportEvent;
+
+    #[test]
+    fn deletion_barriers_ignore_empty_and_incomplete_tags() {
+        let record = RelayEventRecord {
+            endpoints: Vec::new(),
+            event: NostrTransportEvent::new_unsigned(
+                "11".repeat(32),
+                5,
+                vec![vec![], vec!["e".into()], vec!["a".into()]],
+                String::new(),
+            ),
+        };
+
+        assert!(deletion_barriers(&record, DeletionEvidenceScope::KeyPackageQuery).is_empty());
+    }
+}

@@ -58,6 +58,9 @@ use crate::types::emoji_set::{
     MarmotEmojiSetSyncResult, MarmotInstalledCustomEmojiAsset, MarmotInstalledCustomEmojiList,
     MarmotUserEmojiList,
 };
+use crate::types::follow_availability::{
+    MarmotFollowAvailabilityPage, MarmotFollowAvailabilityRefreshStatus,
+};
 use crate::types::group::{
     MarmotAccountDevicesActivation, MarmotAppBlobEndpoint, MarmotAppGroupMemberIdsList,
     MarmotAppGroupMemberRecordList, MarmotAppGroupMlsState, MarmotAppGroupRecord,
@@ -1442,6 +1445,23 @@ c_cmd! {
     /// row per request in order. Free with
     /// `marmot_cached_identity_projection_list_free`.
     sync fn marmot_cached_identity_projections(account_id_hexes/account_id_hexes_len: str_arr) -> rec(MarmotCachedIdentityProjectionList) = cached_identity_projections;
+
+    /// Network-free availability of the selected account's direct follows.
+    /// Results are keyset-paged by canonical account id, at most 100 rows.
+    /// Free with `marmot_follow_availability_page_free`.
+    sync fn marmot_follow_availability_page(account_ref: str, after: opt_str, limit: val u32) -> rec(MarmotFollowAvailabilityPage) = follow_availability_page;
+
+    /// Refresh at most 100 direct follows with bounded target lookups.
+    /// Free with `marmot_follow_availability_refresh_status_free`.
+    async fn marmot_refresh_follow_availability(account_ref: str) -> rec(MarmotFollowAvailabilityRefreshStatus) = refresh_follow_availability;
+
+    /// Current or last direct-follow refresh progress for this account.
+    /// Free with `marmot_follow_availability_refresh_status_free`.
+    sync fn marmot_follow_availability_status(account_ref: str) -> rec(MarmotFollowAvailabilityRefreshStatus) = follow_availability_status;
+
+    /// Cancel only the operation returned by the refresh status API. Returns
+    /// false when that operation already finished or a newer one replaced it.
+    sync fn marmot_cancel_follow_availability(account_ref: str, operation_id: val u64) -> scalar(bool) = cancel_follow_availability;
 
     /// Network-free cached previews of public events referenced from message
     /// content, one row per reference (at most 16) in order. Free with

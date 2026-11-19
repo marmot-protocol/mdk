@@ -14,7 +14,7 @@ use crate::published_records::{
     KeyPackageRecoveryEvidence, KeyPackageRecoveryTarget, key_package_queries,
     key_package_read_page_full, select_key_packages_from_records, without_revoked_slot_winners,
 };
-use transport_nostr::{DirectoryEventQuery, DirectoryRelayEventRecord};
+use transport_nostr::{DirectoryEventQuery, DirectoryFetchOutcome, DirectoryRelayEventRecord};
 
 const RECOVERY_ENDPOINT_LIMIT: usize = 8;
 /// How many revoked candidates recovery replaces before it reports the lookup
@@ -109,6 +109,7 @@ impl<R: DirectoryResources> Directory<R> {
                 .await
                 .map_err(DirectoryError::RelayDirectory)?;
             observed.extend(outcome.records);
+            self.journal_key_package_records(account, &observed).await?;
             package_coverage &= outcome.complete;
         }
         let routes = distinct_recovery_routes(searched.iter().chain(&supplementary));
@@ -212,8 +213,9 @@ impl<R: DirectoryResources> Directory<R> {
                     .fetch_directory_events_with_completion(endpoints.to_vec(), queries.clone())
                     .await
                     .map_err(DirectoryError::RelayDirectory)?;
-                deletion_coverage &= outcome.complete;
-                deletions.extend(outcome.records);
+                deletion_coverage &= self
+                    .record_recovery_deletion_outcome(account, outcome, &mut deletions)
+                    .await?;
                 let (_, gathered) =
                     without_revoked_slot_winners(account, observed.clone(), &deletions, freshness);
                 // A verified positive is sufficient to reject a candidate,
@@ -233,6 +235,21 @@ impl<R: DirectoryResources> Directory<R> {
             }
             proven.insert(target.event_id);
         }
+    }
+
+    async fn record_recovery_deletion_outcome(
+        &self,
+        account: &str,
+        outcome: DirectoryFetchOutcome,
+        deletions: &mut Vec<DirectoryRelayEventRecord>,
+    ) -> Result<bool, DirectoryError> {
+        // Scoped discoveries are not included in the returned package records.
+        // Persist even incomplete reads before selection or a later error can
+        // discard their positive deletion evidence.
+        self.journal_scoped_deletion_records(account, &outcome.records)
+            .await?;
+        deletions.extend(outcome.records);
+        Ok(outcome.complete)
     }
 }
 
@@ -277,6 +294,109 @@ fn recovery_incomplete(account: &str) -> DirectoryError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{DirectoryAccount, DirectoryCache, DirectoryConfig, DirectoryState};
+    use nostr::prelude::{EventBuilder, FinalizeEvent, Keys, Kind, Tag};
+    use std::time::Duration;
+    use storage_sqlite::SqliteSharedStorage;
+    use transport_nostr::MarmotRelayPlane;
+    use transport_nostr_peeler::NostrTransportEvent;
+
+    #[derive(Clone)]
+    struct JournalResources(SqliteSharedStorage);
+
+    impl DirectoryResources for JournalResources {
+        fn local_accounts(&self) -> Result<Vec<DirectoryAccount>, DirectoryError> {
+            Ok(Vec::new())
+        }
+
+        fn account_id_for_label(&self, _: &str) -> Result<String, DirectoryError> {
+            unreachable!("deletion journaling does not resolve account labels")
+        }
+
+        fn current_caches(&self) -> Result<Vec<DirectoryCache>, DirectoryError> {
+            Ok(Vec::new())
+        }
+
+        fn cache_for_account(
+            &self,
+            _: &DirectoryAccount,
+        ) -> Result<DirectoryCache, DirectoryError> {
+            unreachable!("deletion journaling does not open account caches")
+        }
+
+        fn shared_storage(&self) -> Result<SqliteSharedStorage, DirectoryError> {
+            Ok(self.0.clone())
+        }
+
+        fn directory_entry_changed(&self, _: &str) {}
+
+        fn account_key_package_published(&self, _: &str) {}
+    }
+
+    #[tokio::test]
+    async fn scoped_deletion_outcome_is_journaled_even_when_incomplete() {
+        let shared = SqliteSharedStorage::in_memory().unwrap();
+        let plane = MarmotRelayPlane::full_history();
+        let directory = Directory::new(
+            JournalResources(shared.clone()),
+            DirectoryConfig {
+                directory_relays: Vec::new(),
+                default_relays: Vec::new(),
+                max_future_skew: Duration::from_secs(60),
+                open_ranking: None,
+                fallback_seeds: Vec::new(),
+                http_builder: Ok,
+                test_clock: None,
+            },
+            plane.clone(),
+            DirectoryState::default(),
+        );
+        let keys = Keys::generate();
+        let account = keys.public_key().to_hex();
+        let deleted_event_id = "ab".repeat(32);
+        let signed = EventBuilder::new(Kind::from(5), "")
+            .tags([Tag::custom("e", [deleted_event_id.clone()])])
+            .finalize(&keys)
+            .unwrap();
+        let record = DirectoryRelayEventRecord {
+            endpoints: vec![TransportEndpoint("wss://outbox.example".into())],
+            event: NostrTransportEvent::from_nostr_event(&signed).unwrap(),
+        };
+        let mut deletions = Vec::new();
+
+        let complete = directory
+            .record_recovery_deletion_outcome(
+                &account,
+                DirectoryFetchOutcome {
+                    records: vec![record.clone()],
+                    complete: false,
+                    complete_endpoints: Vec::new(),
+                },
+                &mut deletions,
+            )
+            .await
+            .unwrap();
+
+        assert!(!complete);
+        assert_eq!(deletions, vec![record.clone()]);
+        let recovered = proven_records(
+            &account,
+            Vec::new(),
+            &deletions,
+            directory.directory_freshness(),
+            &BTreeSet::new(),
+        );
+        assert!(recovered.records.is_empty());
+        let barriers = shared.public_key_package_barriers(&account).unwrap();
+        assert_eq!(barriers.len(), 1);
+        assert_eq!(barriers[0].event_id_hex, record.event.id);
+        assert_eq!(
+            barriers[0].deleted_event_id.as_deref(),
+            Some(deleted_event_id.as_str())
+        );
+        shared.close().unwrap();
+        plane.shutdown().await;
+    }
 
     #[test]
     fn invite_recovery_deletion_routes_deduplicate_optional_root_slashes() {

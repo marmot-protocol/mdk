@@ -227,30 +227,59 @@ async fn live_directory_forgery_cannot_change_persisted_metadata() {
     };
     let initial = records(stamp, false);
     let newer = records(stamp + 1, true);
+    let deleted_event_id = "aa".repeat(32);
+    let deletion = EventBuilder::new(Kind::from(5), "")
+        .tags([
+            Tag::parse(["e", &deleted_event_id]).unwrap(),
+            Tag::parse(["k", "30443"]).unwrap(),
+        ])
+        .custom_created_at(Timestamp::from_secs(stamp + 4))
+        .finalize(&keys)
+        .unwrap();
     let (send_frames, mut frames) = mpsc::channel::<Vec<Event>>(4);
     let (ready, registered) = oneshot::channel();
     let server = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
         let mut socket = accept_async(stream).await.unwrap();
-        let subscription = loop {
+        let mut regular_subscription = None;
+        let mut deletion_subscription = None;
+        while regular_subscription.is_none() || deletion_subscription.is_none() {
             let message = socket.next().await.unwrap().unwrap();
             let Message::Text(text) = message else {
                 continue;
             };
             let request: serde_json::Value = serde_json::from_str(&text).unwrap();
             if request[0] == "REQ" {
-                break request[1].as_str().unwrap().to_owned();
+                let subscription = request[1].as_str().unwrap().to_owned();
+                let is_deletion = request[2]["kinds"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|kind| kind.as_u64() == Some(5));
+                if is_deletion {
+                    assert_eq!(request[2]["#k"], serde_json::json!(["30443"]));
+                    deletion_subscription = Some(subscription.clone());
+                } else {
+                    regular_subscription = Some(subscription.clone());
+                }
+                socket
+                    .send(Message::Text(
+                        serde_json::json!(["EOSE", subscription]).to_string().into(),
+                    ))
+                    .await
+                    .unwrap();
             }
-        };
-        socket
-            .send(Message::Text(
-                serde_json::json!(["EOSE", subscription]).to_string().into(),
-            ))
-            .await
-            .unwrap();
+        }
+        let regular_subscription = regular_subscription.unwrap();
+        let deletion_subscription = deletion_subscription.unwrap();
         ready.send(()).unwrap();
         while let Some(batch) = frames.recv().await {
             for event in batch {
+                let subscription = if event.kind == Kind::from(5) {
+                    &deletion_subscription
+                } else {
+                    &regular_subscription
+                };
                 socket
                     .send(Message::Text(
                         serde_json::json!(["EVENT", subscription, event])
@@ -275,12 +304,22 @@ async fn live_directory_forgery_cannot_change_persisted_metadata() {
             DirectorySyncPlan {
                 endpoints: vec![endpoint],
                 watched_user_count: 2,
-                batches: vec![DirectorySyncBatch {
-                    subscription_id: "directory_identity_regression".into(),
-                    authors: vec![author.clone(), fence_author.clone()],
-                    kinds: vec![0, 3, 10002, 10050],
-                    since: None,
-                }],
+                batches: vec![
+                    DirectorySyncBatch {
+                        subscription_id: "directory_identity_regression".into(),
+                        authors: vec![author.clone(), fence_author.clone()],
+                        kinds: vec![0, 3, 10002, 10050],
+                        reference: None,
+                        since: None,
+                    },
+                    DirectorySyncBatch {
+                        subscription_id: "directory_identity_deletions".into(),
+                        authors: vec![author.clone(), fence_author.clone()],
+                        kinds: vec![5],
+                        reference: Some(('k', 30443.to_string())),
+                        since: None,
+                    },
+                ],
             },
             false,
         )
@@ -394,6 +433,74 @@ async fn live_directory_forgery_cannot_change_persisted_metadata() {
             );
         }
     }
+    send_frames.send(vec![deletion]).await.unwrap();
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let barriers = app
+                .shared_storage()
+                .unwrap()
+                .public_key_package_barriers(&author)
+                .unwrap();
+            if barriers.iter().any(|barrier| {
+                barrier.deleted_event_id.as_deref() == Some(deleted_event_id.as_str())
+            }) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("a live deletion must reach the shared availability barriers");
+
+    let revision_before = app
+        .shared_storage()
+        .unwrap()
+        .key_package_evidence_revision(&author)
+        .unwrap();
+    let barrier_count = app
+        .shared_storage()
+        .unwrap()
+        .public_key_package_barriers(&author)
+        .unwrap()
+        .len();
+    let unrelated = EventBuilder::new(Kind::from(5), "")
+        .tags([Tag::parse(["e", "bb".repeat(32).as_str()]).unwrap()])
+        .custom_created_at(Timestamp::from_secs(stamp + 5))
+        .finalize(&keys)
+        .unwrap();
+    let fence = EventBuilder::new(Kind::Metadata, r#"{"name":"after-unrelated"}"#)
+        .custom_created_at(Timestamp::from_secs(stamp + 6))
+        .finalize(&fence_keys)
+        .unwrap();
+    send_frames.send(vec![unrelated, fence]).await.unwrap();
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if app
+                .directory()
+                .directory_entry_for_account_id(&fence_author)
+                .unwrap()
+                .and_then(|entry| entry.profile)
+                .and_then(|profile| profile.name)
+                .as_deref()
+                == Some("after-unrelated")
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the unrelated deletion must drain");
+    let shared = app.shared_storage().unwrap();
+    assert_eq!(
+        shared.key_package_evidence_revision(&author).unwrap(),
+        revision_before
+    );
+    assert_eq!(
+        shared.public_key_package_barriers(&author).unwrap().len(),
+        barrier_count
+    );
+
     let expected = app
         .directory()
         .directory_entry_for_account_id(&author)

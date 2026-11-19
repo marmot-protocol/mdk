@@ -37,6 +37,14 @@ const MIGRATIONS: &[Migration] = &[
                 .map_err(sqlite_error)
         },
     },
+    Migration {
+        version: 5,
+        name: "0005_key_package_replacements",
+        apply: |tx| {
+            tx.execute_batch(include_str!("v5.sql"))
+                .map_err(sqlite_error)
+        },
+    },
 ];
 
 fn version_2(tx: &Transaction<'_>) -> StorageResult<()> {

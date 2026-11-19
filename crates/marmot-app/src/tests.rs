@@ -803,6 +803,11 @@ impl MemberResolutionDirectoryFetcher {
         self.fail_all
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
+
+    pub(crate) fn incomplete_key_packages(&self) {
+        *self.incomplete_endpoint.lock().unwrap() = Some("wss://shared.example".into());
+        *self.incomplete_query_kind.lock().unwrap() = Some(KIND_MARMOT_KEY_PACKAGE);
+    }
 }
 
 /// The KeyPackage query of a KeyPackage read, checking that the read also
@@ -8154,6 +8159,24 @@ pub(crate) async fn member_resolution_fixture(
     Vec<AccountSummary>,
     Arc<MemberResolutionDirectoryFetcher>,
 ) {
+    member_resolution_fixture_with_relays(
+        count,
+        split_relays,
+        vec!["wss://directory.example".into()],
+    )
+    .await
+}
+
+pub(crate) async fn member_resolution_fixture_with_relays(
+    count: usize,
+    split_relays: bool,
+    directory_relays: Vec<String>,
+) -> (
+    tempfile::TempDir,
+    MarmotApp,
+    Vec<AccountSummary>,
+    Arc<MemberResolutionDirectoryFetcher>,
+) {
     let directory = tempfile::tempdir().unwrap();
     let home = AccountHome::open(directory.path());
     let accounts = (0..count)
@@ -8161,7 +8184,7 @@ pub(crate) async fn member_resolution_fixture(
         .collect::<Vec<_>>();
     let fetcher = Arc::new(MemberResolutionDirectoryFetcher::default());
     let relay = Arc::new(ScriptedPushRelayClient::default());
-    let mut app = MarmotApp::with_relay(directory.path(), "wss://directory.example")
+    let mut app = MarmotApp::with_relays(directory.path(), directory_relays)
         .with_test_relay_client(relay.clone());
     for (index, account) in accounts.iter().enumerate() {
         let key_package = fresh_key_package_for_account(&app, account, false).await;
@@ -12193,13 +12216,14 @@ fn directory_sync_plan_does_not_subscribe_kind3_for_non_local_known_user() {
     assert!(remote_kinds.contains(&KIND_NOSTR_METADATA));
     assert!(remote_kinds.contains(&KIND_MARMOT_KEY_PACKAGE));
     // The local account's own batch keeps the full kind set; it must not be
-    // double-listed in a contact-list-free remote batch.
+    // The local account has one regular and one deletion batch; no remote
+    // batch may repeat its author.
     assert_eq!(
         plan.batches
             .iter()
             .filter(|batch| batch.authors.contains(&account.account_id_hex))
             .count(),
-        1
+        2
     );
 }
 

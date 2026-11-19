@@ -62,6 +62,10 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   reconciliation before saving their captured cursor; journal states never
   authorize byte reads. Use matching generated headers and libraries.
 
+- `marmot_follow_availability_page`, `marmot_refresh_follow_availability`,
+  `marmot_follow_availability_status`, and `marmot_cancel_follow_availability` expose bounded
+  direct-follow availability (mdk#1996). The new page/status records, state/source/phase enums, and deep-free
+  functions use the shared contract; rebuild clients with the matching header and library.
 - `marmot_group_pending_commit` returns a `MarmotGroupPendingCommit` (free with
   `marmot_group_pending_commit_free`) for the group's own commit that has not
   confirmed yet, with `MarmotGroupPendingCommitState` (mdk#2332). Group changes

@@ -122,10 +122,23 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
         account_id_hex: &str,
         bootstrap_relays: Vec<TransportEndpoint>,
     ) -> Result<AccountRelayListStatus, DirectoryError> {
+        self.fetch_relay_list_status_with_cap(account_id_hex, bootstrap_relays, None)
+            .await
+    }
+
+    pub(crate) async fn fetch_relay_list_status_with_cap(
+        &self,
+        account_id_hex: &str,
+        bootstrap_relays: Vec<TransportEndpoint>,
+        cap: Option<usize>,
+    ) -> Result<AccountRelayListStatus, DirectoryError> {
         let public_key =
             PublicKey::parse(account_id_hex).map_err(|_| DirectoryError::InvalidPublicKey)?;
         let account_id_hex = public_key.to_hex();
-        let bootstrap_relays = self.directory_source_relays(&bootstrap_relays);
+        let mut bootstrap_relays = self.directory_source_relays(&bootstrap_relays);
+        if let Some(cap) = cap {
+            bootstrap_relays.truncate(cap);
+        }
         let freshness = self.directory_freshness();
         let records = self
             .relay_plane
@@ -494,7 +507,6 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
         }
         result.map(|(fetched, _)| fetched)
     }
-
     async fn fetch_latest_key_package_for_account_id_unobserved(
         &self,
         account_id_hex: &str,
@@ -581,6 +593,8 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
             .map_err(|error| {
                 DirectoryError::RelayDirectory(format!("fetch key packages: {error}"))
             })?;
+        self.journal_key_package_records(account_id_hex, &outcome.records)
+            .await?;
         let cached_entry = {
             let directory = self.clone();
             let account_id = account_id_hex.to_owned();
@@ -613,6 +627,8 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                 cached_target,
                 wanted: 1,
             })
+            .await?;
+        self.journal_key_package_records(account_id_hex, &records.records)
             .await?;
         let cached_entry = cached_entry.filter(|entry| {
             records.cache_evidence.as_ref().is_none_or(|evidence| {
@@ -836,18 +852,22 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
     ) -> Result<Vec<RelayEventRecord>, DirectoryError> {
         let public_key =
             PublicKey::parse(account_id_hex).map_err(|_| DirectoryError::InvalidPublicKey)?;
+        let account = public_key.to_hex();
         let source_relays = self.directory_source_relays(source_relays);
-        self.relay_plane
+        let records = self
+            .relay_plane
             .fetch_directory_events(
                 source_relays,
                 vec![DirectoryEventQuery::new(
                     KIND_MARMOT_KEY_PACKAGE,
-                    vec![public_key.to_hex()],
+                    vec![account.clone()],
                     limit,
                 )],
             )
             .await
-            .map_err(|e| DirectoryError::RelayDirectory(format!("fetch key packages: {e}")))
+            .map_err(|e| DirectoryError::RelayDirectory(format!("fetch key packages: {e}")))?;
+        self.journal_key_package_records(&account, &records).await?;
+        Ok(records)
     }
 
     /// Read every KeyPackage slot of `account_id_hex` from `source_relays`
@@ -882,6 +902,8 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
             )
             .await
             .map_err(|e| DirectoryError::RelayDirectory(format!("fetch key packages: {e}")))?;
+        self.journal_key_package_records(&account, &outcome.records)
+            .await?;
         Ok(account_key_package_slots_from_records(
             &account,
             &outcome.records,
