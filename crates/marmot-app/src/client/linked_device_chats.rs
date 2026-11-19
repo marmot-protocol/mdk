@@ -219,6 +219,14 @@ impl AppClient {
                         continue;
                     }
                 }
+                match self.send_unrecorded_acceptance(&chat).await {
+                    Ok(false) => {}
+                    Ok(true) => continue,
+                    Err(error) => {
+                        first_error.get_or_insert(error);
+                        continue;
+                    }
+                }
                 let candidate =
                     match self.next_private_key_package_for_chat(&chat, &device.slot, selection) {
                         Ok(Some(candidate)) => candidate,

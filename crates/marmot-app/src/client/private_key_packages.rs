@@ -1000,14 +1000,6 @@ impl AppClient {
             return Ok(());
         }
         let forwarded = self.forwarded_invitation(chat);
-        // A newly recorded acceptance goes out now, ahead of any Welcome, so
-        // the sibling installs its copy settled. Sending can take in
-        // device-group traffic, such as a decline or another device's claim,
-        // so this Add stops here and a later pass makes it from fresh checks.
-        if forwarded.confirmed && self.record_unrecorded_acceptance(chat)? {
-            self.send_owed_small_state().await?;
-            return Ok(());
-        }
         if !self.take_private_key_package_exact(sibling, &candidate)? {
             return Err(AppError::DeviceGroupRefused("no_private_key_package"));
         }

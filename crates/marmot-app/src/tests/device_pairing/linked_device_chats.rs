@@ -1929,7 +1929,9 @@ async fn a_declined_generation_holds_automatic_adds_until_a_later_accept() {
 /// one in a lower slot, leaves the new device to it while it is active
 /// (mdk#3537), and fills the missing chats through the advisory claim flow
 /// once the approver has gone quiet; the returning approver adds no
-/// duplicate.
+/// duplicate. A chat the laptop holds confirmed but with no decision, as
+/// when accepted with device groups off, first gets its acceptance sent,
+/// with no claim to hold up the Add that follows (mdk#3546).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_sibling_fills_missing_chats_while_the_approver_is_offline() {
     let (relay, [first, second, mut tablet]) = alice_devices::<3>().await;
@@ -1966,6 +1968,13 @@ async fn a_sibling_fills_missing_chats_while_the_approver_is_offline() {
     assert_eq!(relay.published_event_ids().len(), before);
     assert_eq!(taken_from(&laptop, &tablet), 0);
 
+    account_database(&laptop.app)
+        .execute(
+            "DELETE FROM invitation_decisions WHERE group_id_hex = ?1",
+            [hex::encode(chats[0].as_slice())],
+        )
+        .unwrap();
+
     // Two hours on, the phone has not been heard from.
     laptop.client.sibling_chat_gaps.test_approver_clock_ahead =
         crate::client::device_heartbeats::APPROVER_ACTIVE_SECS;
@@ -1989,6 +1998,15 @@ async fn a_sibling_fills_missing_chats_while_the_approver_is_offline() {
     })
     .await
     .expect("the online sibling fills both missing chats");
+    // The acceptance the laptop sent first settles that chat. The other's
+    // decision reaches the tablet only by a later broadcast (mdk#3556).
+    assert!(
+        !tablet
+            .client
+            .state_group_record(&chats[0])
+            .unwrap()
+            .pending_confirmation
+    );
     assert_eq!(
         tablet.op(DeviceLinkOp::Read).await.chat_progress,
         vec![crate::LinkChatProgress {

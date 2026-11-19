@@ -253,17 +253,26 @@ impl AppClient {
         Ok(())
     }
 
-    /// A confirmed copy holding no decision for its generation, such as one
-    /// accepted while device groups were off, records the acceptance a founder
-    /// records before a sibling Add carries that generation (mdk#3546). Only
-    /// a copy founded here, or whose presented invitation is that admission's
-    /// own Welcome, counts as accepted: a row rebuilt after a local deletion is
-    /// unconfirmed by default and carries no Welcome. Returns whether it
-    /// recorded one.
-    pub(super) fn record_unrecorded_acceptance(
-        &self,
+    /// Before a sibling Add of `chat`, which makes no claim or KeyPackage
+    /// spend first: a confirmed copy holding no decision for its generation,
+    /// such as one accepted while device groups were off, records the
+    /// acceptance a founder records and sends it, so the sibling installs its
+    /// copy settled (mdk#3546). Returns whether it did; the caller then leaves
+    /// the Add to a later pass, since sending can take in device-group traffic
+    /// (a decline, another device's claim) its checks have not seen. Only a
+    /// copy founded here, or whose presented invitation is that admission's
+    /// own Welcome, counts as accepted: a row rebuilt after a local deletion
+    /// is unconfirmed by default and carries no Welcome.
+    pub(super) async fn send_unrecorded_acceptance(
+        &mut self,
         group_id: &GroupId,
     ) -> Result<bool, AppError> {
+        let Some(group) = self.state_group_record(group_id) else {
+            return Ok(false);
+        };
+        if group.pending_confirmation {
+            return Ok(false);
+        }
         let account = self.app.account_storage(&self.state.label)?;
         let Some(admission) = account.invitation_admission(group_id)? else {
             return Ok(false);
@@ -276,17 +285,25 @@ impl AppClient {
         {
             return Ok(false);
         }
-        let presented_welcome = self
-            .state_group_record(group_id)
-            .and_then(|group| group.via_welcome_message_id_hex);
         let accepted_here = match &admission.via_welcome {
             None => admission.created_locally,
-            Some(welcome) => presented_welcome == Some(hex::encode(welcome.as_slice())),
+            Some(welcome) => {
+                group.via_welcome_message_id_hex == Some(hex::encode(welcome.as_slice()))
+            }
         };
-        if accepted_here {
-            storage.ensure_founding_invitation_decision(&chat, admission.generation)?;
+        if !accepted_here {
+            return Ok(false);
         }
-        Ok(accepted_here)
+        storage.ensure_founding_invitation_decision(&chat, admission.generation)?;
+        // A value the decision format cannot hold is not recorded.
+        if storage
+            .invitation_decision(&chat, &admission.generation)?
+            .is_none()
+        {
+            return Ok(false);
+        }
+        self.send_owed_small_state().await?;
+        Ok(true)
     }
 
     /// Native founding can be recovered by the ordinary projection reconcile

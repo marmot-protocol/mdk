@@ -964,6 +964,10 @@ impl AppClient {
                 self.sibling_chat_gaps.schedule(chat.clone(), expiry);
                 continue;
             }
+            if retire.is_empty() && self.send_unrecorded_acceptance(chat).await? {
+                self.sibling_chat_gaps.schedule(chat.clone(), 0);
+                continue;
+            }
             // Retiring unused leaves spends no KeyPackage, and the engine
             // refuses an Add while they hold the sibling's place.
             if retire.is_empty() {
