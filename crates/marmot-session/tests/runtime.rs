@@ -96,13 +96,12 @@ impl AccountIdentityProofSigner for NostrAccountIdentityProofSigner {
     }
 }
 
+/// A 32-byte id, the length of the Nostr event ids a real transport gives
+/// its messages, which the v5 Welcome audit rows reference.
 fn hash_id(bytes: &[u8]) -> MessageId {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
+    use sha2::{Digest, Sha256};
 
-    let mut h = DefaultHasher::new();
-    bytes.hash(&mut h);
-    MessageId::new(h.finish().to_be_bytes().to_vec())
+    MessageId::new(Sha256::digest(bytes).to_vec())
 }
 
 struct MockPeeler;

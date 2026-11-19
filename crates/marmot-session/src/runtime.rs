@@ -254,6 +254,14 @@ enum LegacyPublishCompletion {
     ),
 }
 
+/// An invite's selected KeyPackages, kept for its `welcome_prepared` rows
+/// ([`AccountDeviceRuntime::v5_invite_selection`]).
+struct V5InviteSelection {
+    group_id: GroupId,
+    /// Each recipient's KeyPackage event ids, in intent order.
+    selected: HashMap<Vec<u8>, VecDeque<[u8; 32]>>,
+}
+
 struct PreparedLegacyPublishAttempt {
     message_id: cgka_traits::MessageId,
     msg_id_hex: String,
@@ -3896,6 +3904,7 @@ where
         // Only an invite: other commits that carry Welcomes (recovery, own
         // devices) keep their own handling of a Welcome that cannot be sent.
         let invite = matches!(intent, SendIntent::Invite { .. });
+        let v5_invite = self.v5_invite_selection(&intent);
         let session_effects = self.send_session_intent(intent, context, origin).await?;
         let prepared = classify_prepared_session_send(session_effects)?;
         let PreparedSessionSend::Commit(commit) = prepared else {
@@ -3908,8 +3917,103 @@ where
                 .insert(0, refused_before_publishing(message_id, oversized));
             return Ok(PreparedSessionSend::Refused(Box::new(output)));
         }
+        if let Some(selection) = v5_invite {
+            self.record_v5_invite_welcomes_prepared(selection, &commit);
+        }
         self.watch_welcomes(commit.welcomes().iter().map(|welcome| welcome.id.clone()));
         Ok(PreparedSessionSend::Commit(commit))
+    }
+
+    /// What an invite's `welcome_prepared` rows need from its intent, read
+    /// before the intent is consumed: the group, and each selected
+    /// KeyPackage's member identity and Nostr event id, in intent order.
+    /// `None` without a v5 recorder, for any other intent, or when a
+    /// KeyPackage lacks either, since a constructed row must name both.
+    fn v5_invite_selection(&self, intent: &SendIntent) -> Option<V5InviteSelection> {
+        if !self.audit.records_v5() {
+            return None;
+        }
+        let SendIntent::Invite {
+            group_id,
+            key_packages,
+            ..
+        } = intent
+        else {
+            return None;
+        };
+        let mut selected = HashMap::<Vec<u8>, VecDeque<[u8; 32]>>::new();
+        for key_package in key_packages {
+            let event_id =
+                <[u8; 32]>::try_from(key_package.source.as_ref()?.event_id.as_slice()).ok()?;
+            let identity = self.session.key_package_metadata(key_package).ok()?;
+            let recipient = hex::decode(identity.credential_identity_hex).ok()?;
+            selected.entry(recipient).or_default().push_back(event_id);
+        }
+        Some(V5InviteSelection {
+            group_id: group_id.clone(),
+            selected,
+        })
+    }
+
+    /// Record `welcome_prepared` for each Welcome of an accepted invite: the
+    /// engine has retained it, staged with its Add commit, so a publish may
+    /// follow. Each Welcome takes the next selected KeyPackage of its
+    /// recipient, in the order the engine wraps them; one that matches none
+    /// is not recorded.
+    fn record_v5_invite_welcomes_prepared(
+        &self,
+        mut selection: V5InviteSelection,
+        commit: &PreparedSessionCommit,
+    ) {
+        let Ok(group_ref) = audit_v5::GroupRef::from_group_id(selection.group_id.as_slice()) else {
+            return;
+        };
+        let Some(commit_ref) = commit.effects.publish.iter().find_map(|work| match work {
+            PublishWork::GroupEvolution { msg, pending, .. } if *pending == commit.pending => {
+                audit_v5::EngineMessageRef::from_message_id(msg.id.as_slice()).ok()
+            }
+            _ => None,
+        }) else {
+            return;
+        };
+        for welcome in commit.welcomes() {
+            let TransportEnvelope::Welcome { recipient } = &welcome.envelope else {
+                continue;
+            };
+            let Some(key_package_event_id) = selection
+                .selected
+                .get_mut(recipient.as_slice())
+                .and_then(VecDeque::pop_front)
+            else {
+                continue;
+            };
+            let (Ok(recipient_ref), Some(outer)) = (
+                audit_v5::MemberRef::from_member_identity(recipient.as_slice()),
+                v5_outbound_welcome_ref(welcome),
+            ) else {
+                continue;
+            };
+            self.audit.record_v5_event(
+                Some(group_ref.clone()),
+                audit_v5::Event::WelcomePrepared(audit_v5::WelcomePrepared {
+                    op_id: v5_welcome_operation_id(&welcome.id),
+                    recipient_ref,
+                    mode: audit_v5::Mode::Invite,
+                    basis: audit_v5::Basis::Commit {
+                        commit_ref: commit_ref.clone(),
+                    },
+                    key_package_event_ref: Some(audit_v5::NostrEventRef::from_validated_event_id(
+                        &key_package_event_id,
+                    )),
+                    outer_event_ref: Some(outer),
+                    construction: audit_v5::Construction::Constructed,
+                    retention: audit_v5::Retention::Committed,
+                    failure_stage: None,
+                    reason: None,
+                    elapsed_us: None,
+                }),
+            );
+        }
     }
 
     /// The commit's id and the oversized artifact when an invite must be
@@ -6059,6 +6163,21 @@ where
                 operation_id: Some(format!("publish-{msg_id_hex}")),
                 ..AuditEventContext::default()
             };
+            let v5_welcome = self.record_v5_welcome_publish_started(
+                self.v5_welcome_identity(&fanout.exact_message, &publish_context),
+                &fanout,
+                &remaining,
+                required_acks,
+                accepted_before,
+            );
+            // The pass's per-endpoint reports, joined for its finished row;
+            // an adapter error leaves that row's results incomplete.
+            let mut pass_report = TransportPublishReport {
+                message_id: message_id.clone(),
+                accepted: Vec::new(),
+                failed: Vec::new(),
+                required_acks,
+            };
             self.record_audit_event(
                 fanout.group_id.as_ref(),
                 Some(publish_context.clone()),
@@ -6128,6 +6247,10 @@ where
                                 reason: "fanout endpoint did not acknowledge".into(),
                             });
                         }
+                        if v5_welcome.is_some() {
+                            pass_report.accepted.extend(report.accepted.iter().cloned());
+                            pass_report.failed.extend(report.failed.iter().cloned());
+                        }
                         output.reports.push(report);
                     }
                     Err(error) => {
@@ -6161,6 +6284,13 @@ where
             }
             self.session.put_transport_fanout(&fanout)?;
             let accepted_total = accepted_fanout_targets(&fanout);
+            self.record_v5_welcome_publish_finished(
+                &v5_welcome,
+                Some(&pass_report),
+                &remaining,
+                accepted_total,
+                required_acks,
+            );
             self.record_audit_event(
                 fanout.group_id.as_ref(),
                 Some(publish_context),
@@ -7136,29 +7266,7 @@ where
         };
         let mut publish_context = context.unwrap_or_default();
         publish_context.operation_id = Some(format!("publish-{msg_id_hex}"));
-        let v5_welcome_identity = if self.audit.records_v5() {
-            match &message.envelope {
-                TransportEnvelope::Welcome { recipient } => publish_context
-                    .v5_welcome_refs
-                    .iter()
-                    .find(|(id, _, _, _)| id == &msg_id_hex)
-                    .and_then(|(_, outer, op_id, group_ref)| {
-                        audit_v5::MemberRef::from_member_identity(recipient.as_slice())
-                            .ok()
-                            .map(|recipient_ref| {
-                                (
-                                    op_id.clone(),
-                                    outer.clone(),
-                                    recipient_ref,
-                                    group_ref.clone(),
-                                )
-                            })
-                    }),
-                _ => None,
-            }
-        } else {
-            None
-        };
+        let v5_welcome_identity = self.v5_welcome_identity(&message, &publish_context);
         let existing_fanout = self.session.transport_fanout(&message_id)?;
         if existing_fanout
             .as_ref()
@@ -7330,50 +7438,13 @@ where
             .max(1)
             .min(retry_endpoints.len());
 
-        let v5_welcome = v5_welcome_identity.map(|(op_id, outer, recipient_ref, group_ref)| {
-            let ordinal = fanout
-                .targets
-                .iter()
-                .map(|t| t.attempt_count)
-                .max()
-                .unwrap_or(0)
-                .saturating_add(1);
-            let attempt_id =
-                v5_local_id(b"welcome-publish-attempt", message_id.as_slice(), ordinal);
-            (op_id, outer, attempt_id, recipient_ref, group_ref)
-        });
-        if let Some((op_id, outer, attempt_id, recipient_ref, group_ref)) = &v5_welcome
-            && let (Ok(target_count), Ok(required_acks), Ok(accepted_before_count)) = (
-                u32::try_from(retry_endpoints.len()),
-                u32::try_from(required_acks),
-                u32::try_from(accepted_before),
-            )
-        {
-            let mut targets = retry_endpoints
-                .iter()
-                .filter_map(v5_endpoint_ref)
-                .collect::<Vec<_>>();
-            targets.sort();
-            targets.dedup();
-            let targets_complete =
-                targets.len() == retry_endpoints.len() && targets.len() <= audit_v5::MAX_ENDPOINTS;
-            targets.truncate(audit_v5::MAX_ENDPOINTS);
-            self.audit.record_v5_event(
-                Some(group_ref.clone()),
-                audit_v5::Event::WelcomePublishStarted(audit_v5::WelcomePublishStarted {
-                    op_id: op_id.clone(),
-                    attempt_id: attempt_id.clone(),
-                    outer_event_ref: outer.clone(),
-                    recipient_ref: recipient_ref.clone(),
-                    route_source: audit_v5::RouteSource::Unknown,
-                    targets,
-                    target_count: Some(target_count),
-                    targets_complete,
-                    required_acks,
-                    accepted_before_count,
-                }),
-            );
-        }
+        let v5_welcome = self.record_v5_welcome_publish_started(
+            v5_welcome_identity,
+            &fanout,
+            &retry_endpoints,
+            required_acks,
+            accepted_before,
+        );
 
         Ok(PreparedLegacyPublish::Network(Box::new(
             PreparedLegacyPublishAttempt {
@@ -7657,6 +7728,119 @@ where
             withdrawn: false,
             awaits_commit: false,
         })
+    }
+
+    /// The v5 identity of a retained Welcome about to be published: the
+    /// founding probe's when the caller passed one in `context`, otherwise
+    /// derived from the Welcome's own stored row, so an invite's Welcome and
+    /// every retry of any Welcome are audited too. The operation id is then
+    /// [`v5_welcome_operation_id`], the one its `welcome_prepared` row uses.
+    fn v5_welcome_identity(
+        &self,
+        message: &TransportMessage,
+        context: &AuditEventContext,
+    ) -> Option<(
+        audit_v5::LocalId,
+        audit_v5::NostrEventRef,
+        audit_v5::MemberRef,
+        audit_v5::GroupRef,
+    )> {
+        if !self.audit.records_v5() {
+            return None;
+        }
+        let TransportEnvelope::Welcome { recipient } = &message.envelope else {
+            return None;
+        };
+        let recipient_ref = audit_v5::MemberRef::from_member_identity(recipient.as_slice()).ok()?;
+        let msg_id_hex = hex::encode(message.id.as_slice());
+        if let Some((_, outer, op_id, group_ref)) = context
+            .v5_welcome_refs
+            .iter()
+            .find(|(id, _, _, _)| id == &msg_id_hex)
+        {
+            return Some((
+                op_id.clone(),
+                outer.clone(),
+                recipient_ref,
+                group_ref.clone(),
+            ));
+        }
+        let outer = v5_outbound_welcome_ref(message)?;
+        let (group_id, _) = self.session.stored_sent_welcome(&message.id).ok()?;
+        let group_ref = audit_v5::GroupRef::from_group_id(group_id.as_slice()).ok()?;
+        Some((
+            v5_welcome_operation_id(&message.id),
+            outer,
+            recipient_ref,
+            group_ref,
+        ))
+    }
+
+    /// Record `welcome_publish_started` for one pass over `endpoints` of a
+    /// Welcome's fanout, and return the identity its finished row needs.
+    fn record_v5_welcome_publish_started(
+        &self,
+        identity: Option<(
+            audit_v5::LocalId,
+            audit_v5::NostrEventRef,
+            audit_v5::MemberRef,
+            audit_v5::GroupRef,
+        )>,
+        fanout: &DurableTransportFanout,
+        endpoints: &[TransportEndpoint],
+        required_acks: usize,
+        accepted_before: usize,
+    ) -> Option<(
+        audit_v5::LocalId,
+        audit_v5::NostrEventRef,
+        audit_v5::LocalId,
+        audit_v5::MemberRef,
+        audit_v5::GroupRef,
+    )> {
+        let (op_id, outer, recipient_ref, group_ref) = identity?;
+        let ordinal = fanout
+            .targets
+            .iter()
+            .map(|t| t.attempt_count)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+        let attempt_id = v5_local_id(
+            b"welcome-publish-attempt",
+            fanout.exact_message.id.as_slice(),
+            ordinal,
+        );
+        if let (Ok(target_count), Ok(required_acks), Ok(accepted_before_count)) = (
+            u32::try_from(endpoints.len()),
+            u32::try_from(required_acks),
+            u32::try_from(accepted_before),
+        ) {
+            let mut targets = endpoints
+                .iter()
+                .filter_map(v5_endpoint_ref)
+                .collect::<Vec<_>>();
+            targets.sort();
+            targets.dedup();
+            let targets_complete =
+                targets.len() == endpoints.len() && targets.len() <= audit_v5::MAX_ENDPOINTS;
+            targets.truncate(audit_v5::MAX_ENDPOINTS);
+            self.audit.record_v5_event(
+                Some(group_ref.clone()),
+                audit_v5::Event::WelcomePublishStarted(audit_v5::WelcomePublishStarted {
+                    op_id: op_id.clone(),
+                    attempt_id: attempt_id.clone(),
+                    outer_event_ref: outer.clone(),
+                    recipient_ref: recipient_ref.clone(),
+                    route_source: audit_v5::RouteSource::Unknown,
+                    targets,
+                    target_count: Some(target_count),
+                    targets_complete,
+                    required_acks,
+                    accepted_before_count,
+                }),
+            );
+        }
+        Some((op_id, outer, attempt_id, recipient_ref, group_ref))
     }
 
     fn record_v5_welcome_publish_finished(
@@ -8968,6 +9152,21 @@ fn v5_endpoint_ref(endpoint: &TransportEndpoint) -> Option<audit_v5::EndpointRef
     // TransportEndpoint is supplied by the routing owner after canonical relay
     // URL normalization; preserve its path/query in the hash input.
     audit_v5::EndpointRef::from_normalized_url(&endpoint.0).ok()
+}
+
+/// The v5 operation id of one retained Welcome: its `welcome_prepared` row
+/// and every publish attempt of it share this id, whichever path sends it.
+fn v5_welcome_operation_id(message_id: &cgka_traits::MessageId) -> audit_v5::LocalId {
+    v5_local_id(b"welcome-operation", message_id.as_slice(), 0)
+}
+
+/// The outer event reference of a retained outbound Welcome. Its id is the
+/// one this account's own peeler gave the wrap it built, the event's NIP-01
+/// hash, which is the id the recipient observes; the session parses no
+/// transport event to check it again.
+fn v5_outbound_welcome_ref(message: &TransportMessage) -> Option<audit_v5::NostrEventRef> {
+    let id = <[u8; 32]>::try_from(message.id.as_slice()).ok()?;
+    Some(audit_v5::NostrEventRef::from_validated_event_id(&id))
 }
 
 fn v5_local_id(domain: &[u8], message_id: &[u8], ordinal: u32) -> audit_v5::LocalId {

@@ -34,6 +34,57 @@ async fn maintenance_retry_that_lands_settles_the_welcome() {
     );
 }
 
+/// Maintenance's retry of a Welcome is audited as its first pass is: a
+/// `welcome_publish_started` and a `welcome_publish_finished` for the
+/// Welcome's outer event, in its group. Without them a Welcome that reaches
+/// its relays only on a retry leaves no sender evidence of that delivery.
+#[tokio::test]
+async fn maintenance_retry_of_a_welcome_records_its_publish_rows() {
+    let dir = relaxed_storage_dir().unwrap();
+    let OwedInviteWelcome {
+        mut runtime,
+        adapter,
+        wall,
+        group_id,
+        welcome,
+    } = owed_invite_welcome(dir.path()).await;
+    let audit_path = dir.path().join("audit-v5.jsonl");
+    runtime
+        .audit_recorder()
+        .swap(v5_audit_recorder(&audit_path));
+    adapter.accept_only_endpoints(vec![
+        TransportEndpoint("wss://group.example".into()),
+        TransportEndpoint("wss://carol-inbox.example".into()),
+    ]);
+
+    wall.set(300_100);
+    runtime.run_due_maintenance().await.unwrap();
+
+    let outer = marmot_forensics::v5::NostrEventRef::from_validated_event_id(
+        &<[u8; 32]>::try_from(welcome.id.as_slice()).unwrap(),
+    );
+    let group_ref = marmot_forensics::v5::GroupRef::from_group_id(group_id.as_slice()).unwrap();
+    let rows = v5_audit_rows(&audit_path)
+        .into_iter()
+        .filter(|row| row["event"]["outer_event_ref"] == outer.as_str())
+        .collect::<Vec<_>>();
+    let kinds = rows
+        .iter()
+        .map(|row| row["event"]["type"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        kinds,
+        ["welcome_publish_started", "welcome_publish_finished"],
+        "{rows:?}"
+    );
+    assert!(rows.iter().all(|row| row["group_ref"] == group_ref.as_str()));
+    assert_eq!(
+        rows[0]["event"]["attempt_id"], rows[1]["event"]["attempt_id"],
+        "one attempt"
+    );
+    assert_eq!(rows[1]["event"]["policy"], "met");
+}
+
 /// A Welcome whose inbox relay the transport refused before sending, as the
 /// relay plane refuses a relay its host-safety rule rejects, reached no relay.
 /// Neither its first attempt nor maintenance's retry of its stored fanout is a

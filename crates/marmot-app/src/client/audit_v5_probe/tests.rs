@@ -1077,6 +1077,87 @@ async fn normal_opt_in_records_real_welcome_and_operational_v5_rows() {
     .expect("bounded live v5 scenario");
 }
 
+/// An invite into an existing group leaves the sender the same linked chain
+/// a founding create does: `welcome_prepared` in invite mode on the Add
+/// commit, then publish started and finished, all on the outer event the
+/// invitee observes. Without it, a missing invite has no sender evidence.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn invite_into_existing_group_records_prepared_and_publish_rows() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let relay = MockRelay::run().await.unwrap();
+        let relay_url = relay.url().await.to_string();
+        let alice_dir = tempfile::tempdir().unwrap();
+        let carol_dir = tempfile::tempdir().unwrap();
+        AccountHome::open(alice_dir.path())
+            .create_account("alice")
+            .unwrap();
+        let carol_id = AccountHome::open(carol_dir.path())
+            .create_account("carol")
+            .unwrap()
+            .account_id_hex;
+        let alice_app = app(alice_dir.path(), &relay_url);
+        let carol_app = app(carol_dir.path(), &relay_url);
+        let mut alice = alice_app.client("alice").await.unwrap();
+        let mut carol = carol_app.client("carol").await.unwrap();
+        let group = alice
+            .create_group("synthetic private group title", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("a group with only its founder");
+        carol.publish_key_package().await.unwrap();
+        alice.invite_members(&group, &[&carol_id]).await.unwrap();
+        assert!(carol.sync().await.unwrap().joined_groups.contains(&group));
+
+        let observed = actual_v5_rows(&carol_app, "carol")
+            .iter()
+            .find_map(|row| match &row.fields().event {
+                Event::WelcomeObserved(event) => Some(event.outer_event_ref.clone()),
+                _ => None,
+            })
+            .expect("the invitee observed the Welcome");
+        let sender = actual_v5_rows(&alice_app, "alice");
+        let group_ref = GroupRef::from_group_id(group.as_slice()).unwrap();
+        let prepared = sender
+            .iter()
+            .find_map(|row| match &row.fields().event {
+                Event::WelcomePrepared(event) if event.mode == Mode::Invite => {
+                    assert_eq!(row.fields().group_ref.as_ref(), Some(&group_ref));
+                    Some(event)
+                }
+                _ => None,
+            })
+            .expect("an invite-mode welcome_prepared row");
+        assert!(matches!(prepared.basis, Basis::Commit { .. }));
+        assert_eq!(prepared.construction, Construction::Constructed);
+        assert!(prepared.key_package_event_ref.is_some());
+        assert_eq!(prepared.outer_event_ref.as_ref(), Some(&observed));
+        let started = sender
+            .iter()
+            .find_map(|row| match &row.fields().event {
+                Event::WelcomePublishStarted(event) if event.outer_event_ref == observed => {
+                    Some(event)
+                }
+                _ => None,
+            })
+            .expect("a welcome_publish_started row for the invite");
+        assert_eq!(started.op_id, prepared.op_id);
+        let finished = sender
+            .iter()
+            .find_map(|row| match &row.fields().event {
+                Event::WelcomePublishFinished(event) if event.outer_event_ref == observed => {
+                    Some(event)
+                }
+                _ => None,
+            })
+            .expect("a welcome_publish_finished row for the invite");
+        assert_eq!(finished.attempt_id, started.attempt_id);
+        assert_eq!(finished.policy, Policy::Met);
+    })
+    .await
+    .expect("bounded live v5 scenario");
+}
+
 struct Scenario {
     _relay: MockRelay,
     _alice_dir: tempfile::TempDir,
