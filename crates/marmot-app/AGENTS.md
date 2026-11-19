@@ -398,7 +398,10 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   approved its link, once that link is decided made, for `LINK_CHAT_ADD_SECS`, and only while the roster lists the
   device as active, linked by this device, with "add to all my chats" on, and this device has recorded no removal of its
   slot (`device_removals`) nor applied a roster state that held the slot as `removed` (`held_as_removed`, while it keeps
-  that record's key). Other devices add it only through gap filling (3.5e). Read the chats anew on each maintenance
+  that record's key). Other devices add it only through gap filling (3.5e), which holds off while this device is
+  active (mdk#3537, next bullet). This pass sends no gap-fill claim (kind 458); it passes over a chat while another
+  linked device holds a live claim for the new device there (`gap_claimed_by_sibling`, ignoring this device's own
+  claims), as when siblings took over while this device was away. Read the chats anew on each maintenance
   pass, in chat-list order; a chat holds the device when a leaf of this account carries its tag or its tag signature
   key. Pass over a chat while this device's commit there is queued, in flight or settling (`group_quiet`), so no Add is
   doubled. Check the Add with the engine's read-only `sibling_add_refusal` against the KeyPackage
@@ -439,6 +442,16 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   behalf.
   Share `LINK_CHAT_ADDS_PER_PASS` with the direct post-link burst. The engine rechecks sibling presence at actual
   direct/queued preparation.
+  Leave a newly linked target to its approver while that approver is active (mdk#3537, `approver_hold_until`): the
+  approver's direct pass claims nothing, so a sibling's Add would fork the chat. On a device other than the target's
+  roster `linked_by`, skip the target, with no claim, stock spend, stock request or tree read, while that approver is
+  Active or Inactive in the roster, the target's roster `linked_at` is less than `LINK_CHAT_ADD_SECS` old, and the
+  approver's last activity, the newer of its counted heartbeat (`sibling_last_active`) and that `linked_at`, is less
+  than `APPROVER_ACTIVE_SECS` (two heartbeat intervals) old. Record each skipped chat under its target
+  (`approver_holds`) instead of scheduling it; when the hold's end passes, recompute it once: a newer heartbeat
+  pushes it back, otherwise wake only that target's chats. A roster change rescans every chat. Devices from before
+  this rule gap-fill at once. Stated limit: an approver that keeps sending heartbeats while its pass makes no
+  progress holds its siblings back for up to `LINK_CHAT_ADD_SECS`.
   A chat holding a sibling only by unused Add leaves whose KeyPackages expired (engine `own_device_leaves`) is a
   copy the sibling cannot open (mdk#3042). Retire those leaves only after a heartbeat from the sibling dated past
   that expiry and another dated at least `UNUSED_ADD_ACTIVITY_SECS` later have counted, from the claimant under its

@@ -129,6 +129,13 @@
 
 ### Fixed
 
+- A device linked to an account that already has two or more devices no longer forks chats when its approver and
+  another sibling both add it (mdk#3537). While the approver is active (heard from, or approving the link, within the
+  last two hours) and the link is under a week old, other devices leave the new device to the approver and gap-fill
+  it only once the approver goes quiet. The approver publishes no gap-fill claim, and passes over a chat
+  another device holds a live claim for. No wire change. A sibling running an older version still gap-fills at once,
+  and an approver that keeps sending heartbeats while it cannot add the device holds the others back for up to a week.
+
 - A device the user linked and then removed no longer comes back as a new sign-in once its `removed` roster record
   expires. Every device that trusts the device group records the removal when its roster shows the record, drops the
   slot's sign-in, and keeps any publication from before the removal (allowing the directory's future skew) from

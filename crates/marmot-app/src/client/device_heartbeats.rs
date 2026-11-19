@@ -44,6 +44,12 @@ const HEARTBEAT_CONTENT: &str = r#"{"v":1}"#;
 /// A device sends a heartbeat once its last one is this old.
 pub(crate) const HEARTBEAT_INTERVAL_SECS: u64 = 60 * 60;
 
+/// How long after its last activity the device that approved a link still
+/// counts as active, so its siblings leave adding the new device to chats to
+/// it (mdk#3537). Heartbeats go out every [`HEARTBEAT_INTERVAL_SECS`], so two
+/// intervals tolerate one missed or late heartbeat.
+pub(crate) const APPROVER_ACTIVE_SECS: u64 = 2 * HEARTBEAT_INTERVAL_SECS;
+
 /// A sibling is inactive this long after the later of its last activity and
 /// when this device first found it in the roster.
 pub(crate) const INACTIVE_AFTER_SECS: u64 = 30 * 24 * 60 * 60;

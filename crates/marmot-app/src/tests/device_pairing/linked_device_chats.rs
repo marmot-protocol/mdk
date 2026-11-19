@@ -1703,7 +1703,8 @@ async fn a_declined_generation_holds_automatic_adds_until_a_later_accept() {
         before,
         "no renewed claim before its original expiry"
     );
-    // The approver's independent direct flow does not use advisory gap claims.
+    // The approver's direct flow publishes no claim, and leaves the chat to
+    // the tablet's live claim (mdk#3537).
     let mut selection = Default::default();
     boxed(|| {
         phone
@@ -1711,8 +1712,8 @@ async fn a_declined_generation_holds_automatic_adds_until_a_later_accept() {
             .add_linked_devices_to_chats(&[], &mut selection)
     })
     .await;
-    assert_eq!(taken_from(&phone, &laptop), 1);
-    assert_eq!(leaves_of(&phone, &laptop, &direct, &group), 1);
+    assert_eq!(taken_from(&phone, &laptop), 0);
+    assert_eq!(leaves_of(&phone, &laptop, &direct, &group), 0);
     assert_eq!(leaves_of(&phone, &laptop, &gap, &group), 0);
     boxed(|| phone.client.sibling_key_package_upkeep(&[])).await;
     let mut selection = Default::default();
@@ -1746,11 +1747,11 @@ async fn a_declined_generation_holds_automatic_adds_until_a_later_accept() {
     boxed(|| phone.client.fill_sibling_chat_gaps(&[], 10, &mut selection)).await;
     assert_eq!(
         taken_from(&phone, &laptop),
-        2,
+        1,
         "a higher Accept wakes the already permitted gap"
     );
     assert_eq!(leaves_of(&phone, &laptop, &gap, &group), 1);
-    assert_eq!(leaves_of(&phone, &laptop, &direct, &group), 1);
+    assert_eq!(leaves_of(&phone, &laptop, &direct, &group), 0);
     assert_eq!(taken_from(&phone, &tablet), tablet_taken);
     assert!(
         stock
@@ -1760,12 +1761,19 @@ async fn a_declined_generation_holds_automatic_adds_until_a_later_accept() {
     );
 }
 
-/// The direct post-link burst belongs to the approver. A different sibling
-/// can still fill the missing chats through the advisory claim flow while
-/// that approver is offline; the returning approver adds no duplicate.
+/// The direct post-link burst belongs to the approver. Another sibling, even
+/// one in a lower slot, leaves the new device to it while it is active
+/// (mdk#3537), and fills the missing chats through the advisory claim flow
+/// once the approver has gone quiet; the returning approver adds no
+/// duplicate.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_sibling_fills_missing_chats_while_the_approver_is_offline() {
-    let (relay, [mut phone, mut laptop, mut tablet]) = alice_devices::<3>().await;
+    let (relay, [first, second, mut tablet]) = alice_devices::<3>().await;
+    let (mut laptop, mut phone) = if first.slot_hex() < second.slot_hex() {
+        (first, second)
+    } else {
+        (second, first)
+    };
     let chats = chats(&mut phone, 2).await;
     let group = link(&relay, &mut phone, &mut laptop, "Laptop").await;
     passes(&relay, &mut [&mut phone, &mut laptop], 4).await;
@@ -1784,6 +1792,19 @@ async fn a_sibling_fills_missing_chats_while_the_approver_is_offline() {
     assert_eq!(taken_from(&laptop, &tablet), 0);
     assert!(!chats.iter().any(|chat| joined(&tablet, chat)));
 
+    // The phone approved the link just now, so it is active: the laptop
+    // neither claims nor spends stock for the tablet.
+    let before = relay.published_event_ids().len();
+    laptop
+        .client
+        .fill_sibling_chat_gaps(&[], LINK_CHAT_ADDS_PER_PASS, &mut Default::default())
+        .await;
+    assert_eq!(relay.published_event_ids().len(), before);
+    assert_eq!(taken_from(&laptop, &tablet), 0);
+
+    // Two hours on, the phone has not been heard from.
+    laptop.client.sibling_chat_gaps.test_approver_clock_ahead =
+        crate::client::device_heartbeats::APPROVER_ACTIVE_SECS;
     tokio::time::timeout(Duration::from_secs(30), async {
         while !chats.iter().all(|chat| joined(&tablet, chat)) {
             passes(&relay, &mut [&mut laptop, &mut tablet], 1).await;
@@ -1840,6 +1861,11 @@ async fn a_lower_sibling_claim_holds_only_its_chat() {
     assert!(chats.iter().all(|chat| joined(&high, chat)));
     link(&relay, &mut low, &mut target, "New device").await;
     let target_slot: [u8; 32] = hex::decode(target.slot_hex()).unwrap().try_into().unwrap();
+    // This test is about claims between gap fillers, so the holder finds
+    // the target's approver quiet rather than leaving it the device
+    // (mdk#3537).
+    high.client.sibling_chat_gaps.test_approver_clock_ahead =
+        crate::client::device_heartbeats::APPROVER_ACTIVE_SECS;
     // Observe the completed link without running this holder's maintenance:
     // it has no private stock yet. Gap filling must request it, then a
     // hand-off must wake the waiting chat even with no membership change.

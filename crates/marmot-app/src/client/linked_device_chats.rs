@@ -8,7 +8,15 @@
 //! "Approving"). Each Add uses one of the private KeyPackages the new device
 //! handed this device, never a published one, and its sibling Welcome goes
 //! out as a 461 (3.5b-2); the chat's history follows from the confirmed Add
-//! (4.2b). Other devices add it only through gap filling (3.5e).
+//! (4.2b). Other devices add it only through gap filling (3.5e), and leave
+//! it to this device while this device is active (mdk#3537): for
+//! [`LINK_CHAT_ADD_SECS`] after the roster's `linked_at`, until this
+//! device's last heartbeat, or that `linked_at`, is
+//! [`APPROVER_ACTIVE_SECS`](super::device_heartbeats::APPROVER_ACTIVE_SECS)
+//! old. This pass publishes no gap-fill claim; it passes over a chat while
+//! another linked device holds a live claim to add the new device there,
+//! as after this device came back to find its siblings had taken over.
+//! A sibling from before that rule still fills at once.
 //!
 //! - Each maintenance pass reads the chats anew: every chat this device is in
 //!   and can commit in, in chat-list order, so the chats the user sees first
@@ -192,6 +200,11 @@ impl AppClient {
             for chat in owed {
                 if *budget == 0 {
                     break;
+                }
+                // A sibling took this chat over by gap filling while this
+                // device was away: leave it the Add (mdk#3537).
+                if self.gap_claimed_by_sibling(&exchange, &chat, &device.slot, unix_now_seconds()) {
+                    continue;
                 }
                 match self.group_quiet(&chat) {
                     Ok(true) => {}
