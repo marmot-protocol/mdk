@@ -1,26 +1,43 @@
 //! Restart scheduling must separate required publication from secondary replication.
 use super::*;
 use crate::MarmotApp;
-use crate::tests::{ScriptedPushRelayClient, client_on_app_relay_plane};
+use crate::tests::{ScriptedPushRelayClient, client_on_app_relay_plane, epoch_gap_probe};
 use cgka_traits::{
-    MarmotAppEvent, MessageId, OutboundFanout, Timestamp, TransportEndpoint,
-    TransportEndpointFailure, TransportEndpointFailureKind, TransportEnvelope, TransportMessage,
-    TransportPublishRequest, TransportPublishTarget, TransportSource,
+    MarmotAppEvent, MessageId, OutboundFanout, Timestamp, TransportDelivery,
+    TransportDeliveryPlane, TransportDeliverySource, TransportEndpoint, TransportEndpointFailure,
+    TransportEndpointFailureKind, TransportEnvelope, TransportMessage, TransportPublishRequest,
+    TransportPublishTarget, TransportSource,
 };
 use marmot_account::AccountHome;
 use std::sync::Arc;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn restarted_safe_queued_send_does_not_inherit_secondary_retry_cutoff() {
-    assert_restart_schedule(1).await;
+    assert_restart_schedule(1, InboundReplay::Absent).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn restarted_below_quorum_send_keeps_required_retry_cutoff() {
-    assert_restart_schedule(2).await;
+    assert_restart_schedule(2, InboundReplay::Absent).await;
 }
 
-async fn assert_restart_schedule(required_acks: usize) {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn due_replay_secondary_ready() {
+    assert_restart_schedule(1, InboundReplay::Due).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn due_replay_required_blocked() {
+    assert_restart_schedule(2, InboundReplay::Due).await;
+}
+
+enum InboundReplay {
+    Absent,
+    Due,
+}
+
+async fn assert_restart_schedule(required_acks: usize, replay: InboundReplay) {
+    let due_replay = matches!(replay, InboundReplay::Due);
     let dir = tempfile::tempdir().unwrap();
     AccountHome::open(dir.path())
         .create_account("alice")
@@ -35,6 +52,9 @@ async fn assert_restart_schedule(required_acks: usize) {
         .operation
         .expect("eligible fixture members");
     let account = client.runtime.session().self_id();
+    if due_replay {
+        seed_due_handoff(&app, &mut client, &group).await;
+    }
     let payload = MarmotAppEvent::new(
         hex::encode(account.as_slice()),
         1_700_000_000,
@@ -122,6 +142,42 @@ async fn assert_restart_schedule(required_acks: usize) {
             .unwrap()
             > 20_000
     );
+    if due_replay {
+        assert!(reopened.has_epoch_gap_handoff(&group));
+        assert_eq!(
+            reopened
+                .runtime
+                .deferred_peel_cutoff_delay_ms(&group)
+                .unwrap(),
+            Some(0)
+        );
+        assert!(
+            reopened
+                .runtime
+                .has_queued_outbound_intents(&group)
+                .unwrap()
+        );
+        let schedule = reopened.convergence_schedule_state(&group).unwrap();
+        if required_acks == 1 {
+            assert_eq!(schedule, ConvergenceScheduleState::Ready);
+        } else {
+            assert!(matches!(
+                schedule,
+                ConvergenceScheduleState::PendingOutbound { retry_after_ms: Some(ms) } if ms > 20_000
+            ));
+        }
+        assert!(reopened.has_epoch_gap_handoff(&group));
+        assert_eq!(
+            app.account_storage("alice")
+                .unwrap()
+                .app_storage()
+                .pending_epoch_backfill_intents()
+                .unwrap()
+                .len(),
+            1
+        );
+        return;
+    }
     let schedule = reopened.convergence_schedule_state(&group).unwrap();
     if required_acks == 1 {
         assert_eq!(
@@ -162,6 +218,65 @@ async fn assert_restart_schedule(required_acks: usize) {
                 .unwrap()
         );
     }
+}
+
+async fn seed_due_handoff(
+    app: &MarmotApp,
+    client: &mut crate::AppClient,
+    group: &cgka_traits::GroupId,
+) {
+    let stalled_epoch = client.runtime.group_record(group).unwrap().epoch.0;
+    client
+        .update_group_profile(group, Some("advanced handoff"), None)
+        .await
+        .unwrap();
+    assert!(client.runtime.group_record(group).unwrap().epoch.0 > stalled_epoch);
+    let group_id_hex = hex::encode(group.as_slice());
+    let route = app
+        .group("alice", &group_id_hex)
+        .unwrap()
+        .unwrap()
+        .nostr_routing;
+    let now = crate::unix_now_seconds();
+    let account_id = client.runtime.session().self_id();
+    let ingested = client
+        .runtime
+        .session_mut()
+        .ingest_delivery(&TransportDelivery {
+            account_id,
+            group_id_hint: Some(group.clone()),
+            message: epoch_gap_probe(&route.nostr_group_id_hex, now, "scheduler-deferred-peel")
+                .to_transport_message()
+                .unwrap(),
+            received_at: Timestamp(now),
+            source: TransportDeliverySource {
+                transport: TransportSource("nostr".into()),
+                plane: TransportDeliveryPlane::Group,
+                endpoint: None,
+                subscription_id: None,
+                wire: None,
+            },
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        ingested.outcome,
+        IngestOutcome::TransportDeferred { .. }
+    ));
+    app.account_storage("alice")
+        .unwrap()
+        .app_storage()
+        .arm_epoch_backfill_intents(&[storage_sqlite::StoredEpochBackfillIntent {
+            group_id_hex,
+            stalled_epoch,
+        }])
+        .unwrap();
+    client.queue_epoch_gap_handoffs();
+    assert!(client.has_epoch_gap_handoff(group));
+    assert_eq!(
+        client.runtime.deferred_peel_cutoff_delay_ms(group).unwrap(),
+        Some(0)
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -226,6 +341,11 @@ async fn publication_barrier_keeps_pending_mls_after_quorum() {
         .unwrap()
         .operation
         .expect("eligible fixture members");
+    seed_due_handoff(&app, &mut client, &group).await;
+    assert_eq!(
+        client.convergence_schedule_state(&group).unwrap(),
+        ConvergenceScheduleState::Ready
+    );
     let effects = client
         .runtime
         .session_mut()
@@ -273,4 +393,11 @@ async fn publication_barrier_keeps_pending_mls_after_quorum() {
             .unwrap(),
         "relay acknowledgement alone does not confirm the MLS transition"
     );
+    assert_eq!(
+        client.convergence_schedule_state(&group).unwrap(),
+        ConvergenceScheduleState::PendingOutbound {
+            retry_after_ms: None
+        }
+    );
+    assert!(client.has_epoch_gap_handoff(&group));
 }

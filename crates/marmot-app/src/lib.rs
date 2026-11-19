@@ -2486,6 +2486,8 @@ impl MarmotApp {
                     epoch_stall: crate::client::history_recovery::epoch_stall::EpochStallDetector::default()
                         .with_wedge_rearm_interval_ms(wedge_rearm_interval_ms),
                     pending_recovery_arm_writes: HashMap::new(),
+                    pending_epoch_handoffs: HashMap::new(),
+                    direct_handoffs_checked: std::collections::HashSet::new(),
                     released_backfill_reload_pending: true,
                     runner_post_join: HashMap::new(),
                 },

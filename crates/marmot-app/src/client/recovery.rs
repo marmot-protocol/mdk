@@ -400,9 +400,7 @@ impl AppClient {
         self.synchronize_recovery_loss(&storage.app_storage())?;
         // Failed detector persistence is retried here. These observations
         // carry demand only; SQL remains the retry authority.
-        let arms = self.history_recovery.buffered_epoch_gap_arms();
-        self.arm_epoch_gap_recovery(&arms)?;
-        self.history_recovery.clear_buffered_epoch_gap_arms();
+        self.flush_epoch_gap_arms()?;
         drop(self.transport_receipts()?);
         Ok(())
     }

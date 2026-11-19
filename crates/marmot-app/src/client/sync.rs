@@ -600,31 +600,55 @@ impl AppClient {
                 // A removed or disbanded copy never converges again, so a rival
                 // its removal left unresolved stays pending for good; waking
                 // the copy for it would do nothing.
-                if self.runtime.has_pending_convergence_inputs(group_id)?
+                let pending_inputs = self.runtime.has_pending_convergence_inputs(group_id)?;
+                let checking_handoff = !pending_inputs
+                    && matches!(
+                        self.runtime.epoch_state(group_id),
+                        Some(cgka_traits::EpochState::Stable { .. })
+                    )
+                    && self.has_epoch_gap_handoff(group_id);
+                let deferred_delay = if checking_handoff {
+                    self.runtime.deferred_peel_cutoff_delay_ms(group_id)?
+                } else {
+                    None
+                };
+                let replay_due = checking_handoff && deferred_delay == Some(0);
+                // Secondary replication cannot withhold inbound replay or its handoff.
+                if checking_handoff && deferred_delay != Some(0) {
+                    self.finish_epoch_gap_handoff(group_id)?;
+                }
+                if pending_inputs
                     && !self
                         .runtime
                         .group_record(group_id)
                         .is_ok_and(|group| group.is_terminal())
                 {
-                    Ok(ConvergenceScheduleState::PendingUnopenable)
-                } else if self.runtime.has_queued_outbound_intents(group_id)?
-                    && !self
+                    return Ok(ConvergenceScheduleState::PendingUnopenable);
+                }
+                let queued_outbound = self.runtime.has_queued_outbound_intents(group_id)?;
+                let fanouts_block_work = (replay_due || queued_outbound)
+                    && self
                         .runtime
-                        .queued_outbound_intents_blocked_by_fanouts(group_id)?
-                {
+                        .queued_outbound_intents_blocked_by_fanouts(group_id)?;
+                if replay_due && !fanouts_block_work {
+                    return Ok(ConvergenceScheduleState::Ready);
+                }
+                if queued_outbound && !fanouts_block_work {
                     // Restarted queued sends must get their ordinary wake even
                     // when secondary replication retains a longer retry cutoff.
                     // The drain uses the same durable publication safety gate.
                     Ok(ConvergenceScheduleState::PendingOutbound {
                         retry_after_ms: None,
                     })
-                } else if self.runtime.has_pending_outbound_fanouts(group_id)? {
+                } else if fanouts_block_work
+                    || self.runtime.has_pending_outbound_fanouts(group_id)?
+                {
                     // Required publication and pending MLS still gate queued
                     // sends. Other local mutations retain fanout precedence.
                     Ok(ConvergenceScheduleState::PendingOutbound {
                         retry_after_ms: self.runtime.outbound_fanout_retry_delay_ms(group_id)?,
                     })
-                } else if self.runtime.has_queued_outbound_intents(group_id)?
+                } else if queued_outbound
                     || (matches!(
                         self.runtime.epoch_state(group_id),
                         Some(cgka_traits::EpochState::Stable { .. })
@@ -653,7 +677,11 @@ impl AppClient {
                     let lifecycle_delay = self
                         .runtime
                         .scheduled_self_remove_auto_commit_delay_ms(group_id)?;
-                    let deferred_delay = self.runtime.deferred_peel_cutoff_delay_ms(group_id)?;
+                    let deferred_delay = if checking_handoff {
+                        deferred_delay
+                    } else {
+                        self.runtime.deferred_peel_cutoff_delay_ms(group_id)?
+                    };
                     match lifecycle_delay.into_iter().chain(deferred_delay).min() {
                         Some(0) => Ok(ConvergenceScheduleState::Ready),
                         Some(remaining_ms) => {
@@ -1462,6 +1490,16 @@ impl AppClient {
             }
         };
         summary.merge(drained);
+        if self.has_in_place_recovery_runner() {
+            self.queue_epoch_gap_handoffs();
+        }
+        if let Err(error) = self.check_direct_epoch_handoffs() {
+            return Err(ClassifiedSyncFailure::at_stage(
+                summary,
+                error,
+                SyncFailureStage::Unknown,
+            ));
+        }
         self.drain_epoch_stall_escalations(&mut summary);
         Ok(summary)
     }
@@ -4033,7 +4071,11 @@ impl AppClient {
         self.prune_plaintext_retention_for_group(group_id)?;
         self.save_state_with_pending_local_group_deletion_frontier_clears()?;
         self.publish_checkpointed_resumed_message_notifications()
-            .await
+            .await?;
+        if self.has_in_place_recovery_runner() {
+            self.convergence_schedule_state(group_id)?;
+        }
+        Ok(())
     }
 
     /// Dispatch only after source finalization and the account checkpoint. A
@@ -6801,6 +6843,9 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    #[cfg(feature = "test-policy-overrides")]
+    mod epoch_gap_retirement_tests;
+
     /// #2151: the projection must preserve the source key carried by an
     /// authenticated reaction after retention retired the previous cached key.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -7931,7 +7976,7 @@ mod tests {
                 None
             };
             make_group_terminal(&client, &group, disbanded);
-            client.drop_settled_epoch_backfill_intents();
+            client.queue_epoch_gap_handoffs();
             assert!(
                 client
                     .history_recovery

@@ -129,6 +129,10 @@
 
 ### Fixed
 
+- Reassess retained current-epoch ciphertext after local replay settles before retiring an advanced epoch gap.
+  When enough failures remain, persist the successor request before deleting the old request. Failed writes keep
+  recovery demand, and secondary outbound retries do not block the handoff. Successive missing commits can recover
+  without reopening the account or receiving fresh traffic.
 - A device the user linked and then removed no longer comes back as a new sign-in once its `removed` roster record
   expires. Every device that trusts the device group records the removal when its roster shows the record, drops the
   slot's sign-in, and keeps any publication from before the removal (allowing the directory's future skew) from

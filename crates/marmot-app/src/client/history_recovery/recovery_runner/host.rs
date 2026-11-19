@@ -184,8 +184,16 @@ impl RunnerHost for AccountRunnerHost {
             Box::pin(async move {
                 let app = runner_storage(client)?;
                 let now = unix_now();
-                // The actual local epoch, never a successful sweep, ends a gap.
-                client.drop_settled_epoch_backfill_intents();
+                // An advance queues local reassessment; a sweep alone ends no gap.
+                client.queue_epoch_gap_handoffs();
+                if let Err(error) = client.check_direct_epoch_handoffs() {
+                    return Some(Err(match error {
+                        crate::AppError::Storage(error) => error,
+                        error => {
+                            cgka_traits::StorageError::Backend(error.privacy_safe_kind().into())
+                        }
+                    }));
+                }
                 if let Err(error) = client.settle_recovery_route_changes(&app, now) {
                     return Some(Err(error));
                 }
@@ -544,6 +552,7 @@ impl AppClient {
     /// one, a worker account's, would still pay for it.
     pub(crate) fn run_recovery_runner_pass(&mut self) -> ClientFuture<'_, Option<PassReport>> {
         Box::pin(async move {
+            self.history_recovery.state.direct_handoffs_checked.clear();
             let mut seat = self.take_in_place_runner().await?;
             #[cfg(test)]
             {
@@ -604,6 +613,7 @@ impl AppClient {
                     .end
             }
             None => {
+                self.history_recovery.state.direct_handoffs_checked.clear();
                 let Some(mut seat) = self.take_in_place_runner().await else {
                     return RepairEnd::Stopped;
                 };

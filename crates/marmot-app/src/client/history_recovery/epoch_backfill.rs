@@ -14,6 +14,12 @@ use crate::client::sync::{EpochBackfillRunOutcome, epoch_stall_now_ms};
 use crate::config::CursorPersistence;
 use crate::{AppError, SyncSummary};
 
+#[derive(PartialEq, Eq)]
+enum StallAssessment {
+    Complete,
+    Deferred,
+}
+
 impl AppClient {
     /// Feed one effects batch's epoch-gap recovery evidence to the stall
     /// detector: a resource refusal arms a replay, and an epoch passage or a
@@ -85,6 +91,20 @@ impl AppClient {
                         .state
                         .epoch_stall
                         .observe_epoch_passage(group_id, *from, *to);
+                    if to > from {
+                        self.history_recovery
+                            .state
+                            .direct_handoffs_checked
+                            .remove(group_id);
+                        if self
+                            .history_recovery
+                            .state
+                            .pending_epoch_handoffs
+                            .contains_key(group_id)
+                        {
+                            self.pending_convergence_groups.insert(group_id.clone());
+                        }
+                    }
                 }
                 cgka_traits::engine::GroupEvent::TransportObjectResourceRefused {
                     group_id,
@@ -294,7 +314,6 @@ impl AppClient {
         if self.app.cursor_persistence() != CursorPersistence::Advance {
             return;
         }
-        let limit = self.history_recovery.state.epoch_stall.threshold();
         let groups = self
             .state
             .groups
@@ -303,35 +322,71 @@ impl AppClient {
             .map(GroupId::new)
             .collect::<Vec<_>>();
         for group_id in groups {
-            let Ok(evidence) = self.runtime.deferred_stall_evidence(&group_id, limit) else {
-                continue;
-            };
-            // Retained rows supply only the first arm. Once this group has
-            // signalled at the evidence epoch, here or in the durable state
-            // restored before hydration, rows replayed on every later open are
-            // not fresh traffic and must not pace re-arms or end the run.
-            if evidence.rows.is_empty()
-                || self
-                    .history_recovery
-                    .state
-                    .epoch_stall
-                    .has_signalled_at(&group_id, evidence.epoch)
-            {
-                continue;
-            }
-            let outcome = IngestOutcome::TransportDeferred {
-                group_id: group_id.clone(),
-                lineage: evidence.lineage,
-            };
-            for row in evidence.rows {
-                self.detect_epoch_stall(
-                    Some(group_id.clone()),
-                    &hex::encode(row.message_id.as_slice()),
-                    &outcome,
-                    row.transport_timestamp,
-                );
-            }
+            let _ = self.seed_group_stall_from_rows(&group_id);
         }
+    }
+
+    fn seed_group_stall_from_rows(
+        &mut self,
+        group_id: &GroupId,
+    ) -> Result<StallAssessment, AppError> {
+        if self.app.cursor_persistence() != CursorPersistence::Advance {
+            return Ok(StallAssessment::Complete);
+        }
+        if self.runtime.group_record(group_id)?.is_terminal() {
+            return Ok(StallAssessment::Complete);
+        }
+        let limit = self.history_recovery.state.epoch_stall.threshold();
+        let evidence = self.runtime.deferred_stall_evidence(group_id, limit)?;
+        // Retained rows supply the first arm at an epoch, never paced re-arms.
+        if evidence.rows.is_empty() {
+            return Ok(StallAssessment::Complete);
+        }
+        if self
+            .history_recovery
+            .state
+            .epoch_stall
+            .has_signalled_at(group_id, evidence.epoch)
+        {
+            // Older versions could persist this latch after the arm write failed.
+            return Ok(if evidence.rows.len() >= limit {
+                StallAssessment::Deferred
+            } else {
+                StallAssessment::Complete
+            });
+        }
+        let outcome = IngestOutcome::TransportDeferred {
+            group_id: group_id.clone(),
+            lineage: evidence.lineage,
+        };
+        let trigger = super::epoch_stall::backfill_trigger_for(&outcome);
+        if trigger == EpochStallBackfillTrigger::ContestedForkDeferral {
+            self.history_recovery
+                .state
+                .epoch_stall
+                .observe_group_epoch(group_id, evidence.epoch);
+            self.pending_convergence_groups.insert(group_id.clone());
+            return Ok(if evidence.rows.len() >= limit {
+                StallAssessment::Deferred
+            } else {
+                StallAssessment::Complete
+            });
+        }
+        let now = epoch_stall_now_ms();
+        for row in evidence.rows {
+            let decision = self
+                .history_recovery
+                .state
+                .epoch_stall
+                .observe_undecryptable(
+                    group_id.clone(),
+                    hex::encode(row.message_id.as_slice()),
+                    evidence.epoch,
+                    now,
+                );
+            self.apply_backfill_decision(group_id, evidence.epoch.0, decision, trigger);
+        }
+        Ok(StallAssessment::Complete)
     }
 
     /// Apply an epoch-stall backfill decision: arm the replay, and record an
@@ -502,7 +557,40 @@ impl AppClient {
     ) {
         // Demand is already authoritative in SQL. Hydration does not rebuild
         // an independent execution queue or reset retry cost.
-        self.drop_settled_epoch_backfill_intents();
+        self.queue_epoch_gap_handoffs();
+    }
+
+    pub(in crate::client) fn flush_epoch_gap_arms(&mut self) -> Result<(), AppError> {
+        let arms = self.history_recovery.buffered_epoch_gap_arms();
+        self.arm_epoch_gap_recovery(&arms)?;
+        self.history_recovery.clear_buffered_epoch_gap_arms();
+        for arm in arms {
+            let Ok(bytes) = hex::decode(arm.group_id_hex) else {
+                continue;
+            };
+            let group = GroupId::new(bytes);
+            if self
+                .history_recovery
+                .state
+                .epoch_stall
+                .has_signalled_at(&group, cgka_traits::EpochId(arm.stalled_epoch))
+            {
+                self.persist_epoch_stall_evidence(std::iter::once(&group));
+            }
+            if self
+                .history_recovery
+                .state
+                .pending_epoch_handoffs
+                .contains_key(&group)
+            {
+                self.history_recovery
+                    .state
+                    .direct_handoffs_checked
+                    .remove(&group);
+                self.pending_convergence_groups.insert(group);
+            }
+        }
+        Ok(())
     }
 
     /// Write the detector's frozen-epoch evidence for `groups` to durable
@@ -519,11 +607,27 @@ impl AppClient {
         let evidence = groups
             .into_iter()
             .filter_map(|group_id| {
+                if self
+                    .history_recovery
+                    .state
+                    .pending_recovery_arm_writes
+                    .contains_key(group_id)
+                {
+                    return None;
+                }
                 let evidence = self
                     .history_recovery
                     .state
                     .epoch_stall
                     .wedge_evidence(group_id)?;
+                if !self
+                    .history_recovery
+                    .state
+                    .epoch_stall
+                    .has_signalled_at(group_id, cgka_traits::EpochId(evidence.stalled_epoch))
+                {
+                    return None;
+                }
                 Some(storage_sqlite::StoredEpochStallEvidence {
                     group_id_hex: hex::encode(group_id.as_slice()),
                     stalled_epoch: evidence.stalled_epoch,
@@ -618,7 +722,7 @@ impl AppClient {
     /// warn is in here so both callers share it — but a caller holding
     /// something that would strand the evidence row on failure has to be able
     /// to see it, which is what
-    /// [`Self::drop_settled_epoch_backfill_intents`] does with the intent row.
+    /// [`Self::queue_epoch_gap_handoffs`] does with the intent row.
     fn retire_terminal_group_recovery(&mut self, group_id: &cgka_traits::GroupId) -> bool {
         #[cfg(test)]
         if std::mem::take(&mut self.fail_next_terminal_recovery_retire) {
@@ -639,10 +743,7 @@ impl AppClient {
                     .retire_terminal_group_recovery(group_id)?)
             }) {
             Ok(changed) => {
-                self.history_recovery
-                    .state
-                    .epoch_stall
-                    .clear_recovered_group(group_id);
+                self.history_recovery.forget_epoch_gap(group_id);
                 if changed {
                     self.mark_recovery_status_changed(group_id);
                 }
@@ -683,10 +784,9 @@ impl AppClient {
     /// completion instead uses the owner's exact obligation revision and scope
     /// tokens, so stale attempts cannot retire newer demand.
     ///
-    /// An epoch gap also completes on its own evidence: once the group's local
-    /// epoch moves past the stalled one, that exact gap no longer applies. A
-    /// later stall arms a new gap at its own epoch.
-    pub(in crate::client) fn drop_settled_epoch_backfill_intents(&mut self) {
+    /// Queue advanced gaps for the existing local scheduler. Runner debt turns
+    /// must not scan deferred payloads or commit history.
+    pub(in crate::client) fn queue_epoch_gap_handoffs(&mut self) {
         let intents = match self
             .app
             .account_storage(&self.state.label)
@@ -694,33 +794,28 @@ impl AppClient {
         {
             Ok(intents) => intents,
             Err(error) => {
-                tracing::warn!(target: "marmot_app::epoch_stall", method = "drop_settled_epoch_backfill_intents",
-                    error_kind=error.privacy_safe_kind(), "could not inspect settled recovery demand");
+                tracing::warn!(target: "marmot_app::epoch_stall", method = "queue_epoch_gap_handoffs",
+                    error_kind=error.privacy_safe_kind(), "could not inspect advanced recovery demand");
                 return;
             }
         };
-        let resolved = intents
-            .iter()
-            .filter(|intent| {
-                hex::decode(&intent.group_id_hex)
-                    .ok()
-                    .and_then(|group| self.local_epoch_for_group(&cgka_traits::GroupId::new(group)))
-                    .is_some_and(|epoch| epoch > intent.stalled_epoch)
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        if !resolved.is_empty()
-            && let Err(error) = self
-                .app
-                .account_storage(&self.state.label)
-                .and_then(|storage| {
-                    Ok(storage
-                        .app_storage()
-                        .clear_epoch_backfill_intents(&resolved)?)
-                })
-        {
-            tracing::warn!(target: "marmot_app::epoch_stall", method = "drop_settled_epoch_backfill_intents",
-                error_kind=error.privacy_safe_kind(), "could not retire resolved epoch-gap demand");
+        for intent in &intents {
+            let Ok(bytes) = hex::decode(&intent.group_id_hex) else {
+                continue;
+            };
+            let group = GroupId::new(bytes);
+            if self
+                .local_epoch_for_group(&group)
+                .is_some_and(|epoch| epoch > intent.stalled_epoch)
+                && self
+                    .history_recovery
+                    .state
+                    .pending_epoch_handoffs
+                    .insert(group.clone(), intent.stalled_epoch)
+                    .is_none()
+            {
+                self.pending_convergence_groups.insert(group);
+            }
         }
         let mut terminal = self
             .history_recovery
@@ -736,13 +831,98 @@ impl AppClient {
         }));
         terminal.retain(|group| crate::client::group_is_terminal(&self.runtime, group));
         for group in terminal {
-            if self.retire_terminal_group_recovery(&group) {
-                self.history_recovery
-                    .state
-                    .pending_recovery_arm_writes
-                    .remove(&group);
-            }
+            self.retire_terminal_group_recovery(&group);
         }
+    }
+
+    pub(in crate::client) fn has_epoch_gap_handoff(&self, group: &GroupId) -> bool {
+        self.history_recovery
+            .state
+            .pending_epoch_handoffs
+            .contains_key(group)
+    }
+
+    pub(in crate::client) fn check_direct_epoch_handoffs(&mut self) -> Result<(), AppError> {
+        if !self.has_in_place_recovery_runner() {
+            return Ok(());
+        }
+        let groups = self
+            .history_recovery
+            .state
+            .pending_epoch_handoffs
+            .keys()
+            .filter(|group| {
+                !self
+                    .history_recovery
+                    .state
+                    .direct_handoffs_checked
+                    .contains(*group)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        for group in groups {
+            // Direct owners drive Ready convergence explicitly. This check
+            // stays local and only hands off after that work has settled.
+            self.convergence_schedule_state(&group)?;
+            self.history_recovery
+                .state
+                .direct_handoffs_checked
+                .insert(group);
+        }
+        Ok(())
+    }
+
+    pub(in crate::client) fn finish_epoch_gap_handoff(
+        &mut self,
+        group: &GroupId,
+    ) -> Result<(), AppError> {
+        if self.app.cursor_persistence() != CursorPersistence::Advance {
+            return Ok(());
+        }
+        let Some(stalled_epoch) = self
+            .history_recovery
+            .state
+            .pending_epoch_handoffs
+            .get(group)
+            .copied()
+        else {
+            return Ok(());
+        };
+        let record = self.runtime.group_record(group)?;
+        if record.is_terminal() {
+            self.retire_terminal_group_recovery(group);
+            return Ok(());
+        }
+        if record.epoch.0 <= stalled_epoch {
+            self.history_recovery
+                .state
+                .pending_epoch_handoffs
+                .remove(group);
+            return Ok(());
+        }
+        if self.seed_group_stall_from_rows(group)? == StallAssessment::Deferred {
+            return Ok(());
+        }
+        if self
+            .history_recovery
+            .state
+            .pending_recovery_arm_writes
+            .contains_key(group)
+        {
+            return Ok(());
+        }
+        self.app
+            .account_storage(&self.state.label)?
+            .app_storage()
+            .clear_epoch_backfill_intents(&[storage_sqlite::StoredEpochBackfillIntent {
+                group_id_hex: hex::encode(group.as_slice()),
+                stalled_epoch,
+            }])?;
+        self.history_recovery
+            .state
+            .pending_epoch_handoffs
+            .remove(group);
+        Ok(())
     }
 
     /// Move every recorded escalation onto the summary a seam is about to
@@ -828,7 +1008,7 @@ impl AppClient {
     ) -> Result<EpochBackfillRunOutcome, AppError> {
         // Owed until it finishes: a seam that fails retries.
         self.recovery_seam_owed = Some(true);
-        self.drop_settled_epoch_backfill_intents();
+        self.queue_epoch_gap_handoffs();
         self.refresh_account_recovery().await?;
         let demands = !self
             .app
