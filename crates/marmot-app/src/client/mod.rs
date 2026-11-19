@@ -809,9 +809,13 @@ pub struct AppClient {
     /// promotion. It shares the engine's close state.
     pub(crate) engine_storage: storage_sqlite::SqliteAccountStorage,
     pub(crate) maintenance_observation_generation: Option<crate::DiagnosticsPermit>,
-    /// Changes only after a hand-off commits genuinely new received stock.
-    /// Pass-local selectors observe native projection retries through it.
+    /// Changes only after a hand-off commits genuinely new received stock, or
+    /// a refused sibling Add hands its KeyPackage back. Pass-local selectors
+    /// observe native projection retries through it.
     pub(crate) received_private_key_package_generation: u64,
+    /// A sibling-Add scan recorded an acceptance it has not sent yet
+    /// ([`Self::send_recorded_acceptances`]).
+    pub(crate) acceptances_recorded: bool,
     // Struct fields drop in declaration order. Keep the engine-owning runtime
     // and the engine connection before this guard so ownership is released
     // only after engine teardown.

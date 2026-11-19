@@ -2101,13 +2101,18 @@ async fn a_queued_sibling_add_the_drain_refuses_spends_its_key_package() {
             .welcomer_account_id_hex = welcomer;
     };
     welcomer(&mut devices, Some(bob_id.clone()));
+    // Selected as a pass selects it, so the hand-back must reach the pass's
+    // own selection too, not only storage.
+    let mut selection = Default::default();
+    let first = devices
+        .laptop
+        .next_private_key_package_for_chat(&chat, &phone_slot, &mut selection)
+        .unwrap()
+        .unwrap();
+    selection.record_attempt(&phone_slot, &first.key_package_ref_hex);
     let error = devices
         .laptop
-        .add_sibling_to_chat(
-            &chat,
-            &phone_slot,
-            private_candidate(&devices.laptop, &phone_slot),
-        )
+        .add_sibling_to_chat(&chat, &phone_slot, first.clone())
         .await
         .unwrap_err();
     assert!(
@@ -2125,6 +2130,12 @@ async fn a_queued_sibling_add_the_drain_refuses_spends_its_key_package() {
             .unwrap()
     );
     assert_eq!(received_from(&devices.laptop, &phone_slot).len(), stock);
+    let again = devices
+        .laptop
+        .next_private_key_package_for_chat(&chat, &phone_slot, &mut selection)
+        .unwrap()
+        .unwrap();
+    assert_eq!(again.key_package_ref_hex, first.key_package_ref_hex);
     welcomer(&mut devices, None);
     devices
         .laptop

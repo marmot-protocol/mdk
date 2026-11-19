@@ -2497,6 +2497,7 @@ impl MarmotApp {
             app: self.clone(),
             maintenance_observation_generation: self.product_analytics.permit(),
             received_private_key_package_generation: 0,
+            acceptances_recorded: false,
             runtime: open.runtime,
             engine_storage: open.engine_storage,
             _session_guard: open.session_guard,

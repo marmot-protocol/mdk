@@ -1030,11 +1030,17 @@ impl AppClient {
                 error.as_engine_error(),
                 Some(EngineError::SiblingAddUnsettled { .. })
             )
-        {
-            self.app
+            && self
+                .app
                 .account_storage(&self.state.label)?
                 .app_storage()
-                .return_received_private_key_package(&candidate, unix_now_seconds())?;
+                .return_received_private_key_package(&candidate, unix_now_seconds())?
+        {
+            // Back in stock as a hand-off would put it: this pass's selection
+            // sees it again, and a chat waiting for this sibling's stock wakes.
+            self.received_private_key_package_generation =
+                self.received_private_key_package_generation.wrapping_add(1);
+            self.sibling_gap_stock_arrived(sibling);
         }
         let effects = sent?;
         self.observe_recovery_evidence_then_fail_if_publish_failed(&effects)

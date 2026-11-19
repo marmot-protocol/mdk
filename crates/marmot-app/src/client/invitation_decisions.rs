@@ -265,7 +265,7 @@ impl AppClient {
     /// rebuilt after a local deletion is unconfirmed by default and carries no
     /// Welcome.
     pub(super) fn record_unrecorded_acceptance(
-        &self,
+        &mut self,
         group_id: &GroupId,
     ) -> Result<bool, AppError> {
         let Some(group) = self.state_group_record(group_id) else {
@@ -303,22 +303,18 @@ impl AppClient {
         {
             return Ok(false);
         }
+        self.acceptances_recorded = true;
         Ok(true)
     }
 
     /// Send, once a sibling-Add scan has ended, the acceptances it recorded,
-    /// with any other owed small state.
+    /// with any other owed small state. Other owed state alone waits for
+    /// ordinary maintenance.
     pub(super) async fn send_recorded_acceptances(&mut self) {
-        let owed = self
-            .app
-            .account_storage(&self.state.label)
-            .and_then(|account| Ok(account.app_storage().unsent_invitation_decisions()?));
-        let result = match owed {
-            Ok(owed) if owed.is_empty() => return,
-            Ok(_) => self.send_owed_small_state().await,
-            Err(error) => Err(error),
-        };
-        if let Err(error) = result {
+        if !std::mem::take(&mut self.acceptances_recorded) {
+            return;
+        }
+        if let Err(error) = self.send_owed_small_state().await {
             tracing::warn!(target: "marmot_app::client::invitation_decisions", method = "send_recorded_acceptances", error_kind = error.privacy_safe_kind(), "recorded acceptances wait for ordinary small-state sending");
         }
     }
