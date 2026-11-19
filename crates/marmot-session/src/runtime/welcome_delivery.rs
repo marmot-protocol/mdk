@@ -633,7 +633,9 @@ where
                 });
             match status {
                 Ok((OutboundWelcomeStatus::Settled(settlement), _)) => {
-                    self.record_v5_welcome_settled(&id, settlement);
+                    if !self.record_v5_welcome_settled(&id, settlement) {
+                        watching.push(id);
+                    }
                 }
                 Ok((OutboundWelcomeStatus::Waiting, _) | (_, true)) => watching.push(id),
                 Ok((OutboundWelcomeStatus::Owed { group_id, message }, false)) => {

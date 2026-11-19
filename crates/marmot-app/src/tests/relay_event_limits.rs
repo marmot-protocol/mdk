@@ -769,6 +769,8 @@ async fn a_queued_invite_whose_welcome_fits_no_inbox_relay_is_retired_unsent() {
         &[("wss://small-inbox.example", 200)],
         QUIESCENCE_MS,
     );
+    app.set_audit_log_settings(crate::AuditLogSettings { enabled: true })
+        .unwrap();
     let carol = super::push_token_reshare::Device::create(&home, &app, "carol").await;
     remember_member_inbox_at(&app, &carol.account_id_hex, "wss://small-inbox.example", 2);
     let (mut alice, _bob, group) = chat_with_an_open_settlement_window(&home, &app, &relay).await;
@@ -835,6 +837,35 @@ async fn a_queued_invite_whose_welcome_fits_no_inbox_relay_is_retired_unsent() {
         sent_before,
         "neither the commit nor the Welcome was sent"
     );
+    // The drained invite's Welcome is audited as a direct invite's is:
+    // prepared on its commit, then withdrawn as too large, never started.
+    let group_ref = marmot_forensics::v5::GroupRef::from_group_id(group.as_slice()).unwrap();
+    let welcome_rows = v5_audit_rows(&app, "alice")
+        .into_iter()
+        .filter(|row| {
+            row["group_ref"] == group_ref.as_str()
+                && row["event"]["type"]
+                    .as_str()
+                    .is_some_and(|kind| kind.starts_with("welcome_"))
+        })
+        .collect::<Vec<_>>();
+    let prepared = welcome_rows
+        .iter()
+        .find(|row| row["event"]["type"] == "welcome_prepared" && row["event"]["mode"] == "invite")
+        .expect("the drained invite's Welcome was prepared");
+    assert_eq!(prepared["event"]["basis"]["kind"], "commit");
+    let outer = &prepared["event"]["outer_event_ref"];
+    let withdrawn = welcome_rows
+        .iter()
+        .find(|row| {
+            row["event"]["type"] == "welcome_withdrawn" && row["event"]["outer_event_ref"] == *outer
+        })
+        .expect("the refused Welcome was withdrawn");
+    assert_eq!(withdrawn["event"]["reason"], "welcome_too_large");
+    assert!(!welcome_rows.iter().any(|row| {
+        row["event"]["type"] == "welcome_publish_started"
+            && row["event"]["outer_event_ref"] == *outer
+    }));
 }
 
 /// How every relay refuses an account publish for size in the tests below

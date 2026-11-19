@@ -1076,3 +1076,82 @@ async fn an_expired_link_welcome_is_audited_once_across_restarts() {
     second.run_due_maintenance().await.unwrap();
     assert!(withdrawn(&second_audit).is_empty(), "already settled at start");
 }
+
+/// A pass that starts before a device link's Welcome deadline and fails after
+/// it does not report the Welcome pending: it has expired, so its retention
+/// is unknown.
+#[tokio::test]
+async fn a_pass_that_fails_after_the_link_deadline_does_not_report_the_welcome_pending() {
+    let dir = relaxed_storage_dir().unwrap();
+    let key = SqlCipherKey::new("marmot link deadline pass key").unwrap();
+    let mut alice =
+        current_nostr_welcome_session(dir.path().join("alice.sqlite"), &key, b"alice-pass");
+    let mut bob = current_nostr_welcome_session(dir.path().join("bob.sqlite"), &key, b"bob-pass");
+    let bob_id = bob.self_id();
+    let chosen = GroupId::new(vec![0x44; 16]);
+    let created = alice
+        .create_group_with_chosen_id_and_audit_context(
+            CreateGroupRequest {
+                name: String::new(),
+                description: String::new(),
+                members: vec![bob.fresh_key_package().await.unwrap()],
+                required_features: Vec::new(),
+                app_components: Vec::new(),
+                initial_admins: Vec::new(),
+            },
+            chosen.clone(),
+            None,
+            Timestamp(300_100),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+    let welcome = match &created.effects.publish[0] {
+        PublishWork::FoundingGroupCreated { welcomes } => welcomes[0].clone(),
+        other => panic!("expected FoundingGroupCreated publish work, got {other:?}"),
+    };
+    let adapter = RecordingAdapter::default();
+    adapter.accept_only_endpoints(Vec::new());
+    let policy =
+        StaticTransportRouting::new(vec![TransportEndpoint("wss://alice-inbox.example".into())])
+            .with_group_route(
+                chosen.clone(),
+                chosen.as_slice().to_vec(),
+                vec![TransportEndpoint("wss://group.example".into())],
+            )
+            .with_inbox_route(
+                bob_id,
+                vec![TransportEndpoint("wss://bob-inbox.example".into())],
+            );
+    let wall = Arc::new(TestWallClock::new(300_000));
+    let mut runtime = AccountDeviceRuntime::new(
+        alice,
+        adapter.clone(),
+        policy,
+        RecordingKeyPackages::default(),
+    )
+    .with_maintenance_sources(
+        wall.clone(),
+        Arc::new(TestMonotonicClock::default()),
+        Arc::new(TestRandom::new(0)),
+    );
+    let audit_path = dir.path().join("link-pass-audit-v5.jsonl");
+    runtime
+        .audit_recorder()
+        .swap(v5_audit_recorder(&audit_path));
+
+    let task = runtime
+        .prepare_welcome_retry_task_with_audit_context(vec![welcome.clone()], Default::default())
+        .unwrap();
+    wall.set(300_050);
+    let completed = task.run().await;
+    wall.set(300_200);
+    runtime.finish_welcome_publish_task(completed).await.unwrap();
+
+    let finished = v5_audit_rows(&audit_path)
+        .into_iter()
+        .find(|row| row["event"]["type"] == "welcome_publish_finished")
+        .expect("the pass started before the deadline");
+    assert_eq!(finished["event"]["policy"], "unmet", "{finished}");
+    assert_eq!(finished["event"]["retained_state"], "unknown", "{finished}");
+}

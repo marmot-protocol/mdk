@@ -8,7 +8,7 @@
 //! ([`welcome_audit_operation_id`]).
 
 use super::*;
-use crate::session::WelcomeSettlement;
+use crate::session::{OutboundWelcomeStatus, WelcomeSettlement};
 
 /// The most Welcome ids remembered as already prepared in this process. A
 /// prepared row is written once per Welcome; past this many the memory is
@@ -221,34 +221,37 @@ where
         );
     }
 
-    /// The ids among `welcome_ids` still retained and not withdrawn: those a
-    /// rollback that follows may retire ([`Self::retired_welcomes`]).
+    /// What the audit knows of each of `welcome_ids` still retained and not
+    /// withdrawn, read just before a size refusal's rollback: those it may
+    /// retire ([`Self::retired_welcomes`]). Empty without a v5 recorder.
     pub(super) fn unretired_welcomes(
         &self,
         welcome_ids: impl IntoIterator<Item = cgka_traits::MessageId>,
-    ) -> Vec<cgka_traits::MessageId> {
+    ) -> Vec<V5Welcome> {
+        if !self.audit.records_v5() {
+            return Vec::new();
+        }
         welcome_ids
             .into_iter()
-            .filter(|id| {
-                matches!(
-                    self.session.stored_message_state(id),
-                    Ok(Some(MessageState::Sent))
-                )
+            .filter_map(|id| {
+                self.session
+                    .outbound_welcome_audit_facts(&id)
+                    .ok()
+                    .flatten()
             })
+            .filter(|facts| facts.state == MessageState::Sent)
+            .filter_map(|facts| self.v5_welcome_of(facts))
             .collect()
     }
 
-    /// The ids among `unretired`, read just before a rollback, that the
-    /// rollback retired: their rows went from `Sent` to `Failed`.
-    pub(super) fn retired_welcomes(
-        &self,
-        unretired: Vec<cgka_traits::MessageId>,
-    ) -> Vec<cgka_traits::MessageId> {
+    /// Those of `unretired`, read just before a rollback, that the rollback
+    /// retired: their rows went from `Sent` to `Failed`.
+    pub(super) fn retired_welcomes(&self, unretired: Vec<V5Welcome>) -> Vec<V5Welcome> {
         unretired
             .into_iter()
-            .filter(|id| {
+            .filter(|v5| {
                 matches!(
-                    self.session.stored_message_state(id),
+                    self.session.stored_message_state(&v5.facts.id),
                     Ok(Some(MessageState::Failed))
                 )
             })
@@ -256,18 +259,17 @@ where
     }
 
     /// Record `welcome_withdrawn` for each Welcome a size refusal's rollback
-    /// retired, and stop watching it: the reason is known here, not to the
+    /// retired, then stop watching it: the reason is known here, not to the
     /// watcher. A refused commit stopped them all, with the commit's size; a
     /// refused invite names each Welcome the size check refused, with its own
     /// size, and any other the rollback retired is withdrawn with it.
     pub(super) fn record_v5_welcomes_refused(
         &mut self,
-        retired: &[cgka_traits::MessageId],
+        retired: &[V5Welcome],
         refusal: &InviteRefusal,
     ) {
-        for welcome_id in retired {
-            self.watched_welcomes
-                .retain(|watched| watched != welcome_id);
+        for v5 in retired {
+            let welcome_id = &v5.facts.id;
             let (reason, size_class) = match refusal.oversized.artifact {
                 OversizedArtifact::Commit => (
                     audit_v5::WithdrawalReason::CommitTooLarge,
@@ -281,27 +283,35 @@ where
                     None => (audit_v5::WithdrawalReason::Withdrawn, None),
                 },
             };
-            if let Some(v5) = self.v5_welcome_from_store(welcome_id) {
-                self.record_v5_welcome_withdrawn(&v5, reason, size_class.map(v5_size_class));
-            }
+            self.record_v5_welcome_withdrawn(v5, reason, size_class.map(v5_size_class));
+            self.watched_welcomes
+                .retain(|watched| watched != welcome_id);
         }
     }
 
-    fn v5_welcome_from_store(&self, welcome_id: &cgka_traits::MessageId) -> Option<V5Welcome> {
+    /// `welcome_id` as its v5 rows name it, from its stored row. `Ok(None)`
+    /// when there is nothing to record (no v5 recorder, no such Welcome, or
+    /// another transport's); `Err` when the row could not be read now.
+    fn v5_welcome_from_store(
+        &self,
+        welcome_id: &cgka_traits::MessageId,
+    ) -> Result<Option<V5Welcome>, ()> {
         if !self.audit.records_v5() {
-            return None;
+            return Ok(None);
         }
         let facts = self
             .session
             .outbound_welcome_audit_facts(welcome_id)
-            .ok()??;
-        self.v5_welcome_of(facts)
+            .map_err(|_| ())?;
+        Ok(facts.and_then(|facts| self.v5_welcome_of(facts)))
     }
 
     /// Record `welcome_withdrawn` for a Welcome its sender just withdrew,
     /// watched or not; the watcher then leaves that settlement alone.
     pub(super) fn record_v5_welcome_withdrawal(&self, welcome_id: &cgka_traits::MessageId) {
-        let Some(v5) = self.v5_welcome_from_store(welcome_id) else {
+        // A row that cannot be read now is left to the watcher, if it holds
+        // the Welcome.
+        let Ok(Some(v5)) = self.v5_welcome_from_store(welcome_id) else {
             return;
         };
         self.record_v5_welcome_withdrawn(&v5, audit_v5::WithdrawalReason::Withdrawn, None);
@@ -335,13 +345,32 @@ where
         }
     }
 
+    /// Whether `fanout` is a Welcome's whose stored acceptances meet its
+    /// policy while the Welcome is still owed: its delivered mark has not
+    /// landed, so the acceptance must not be dropped.
+    pub(super) fn welcome_still_owes_met_policy(
+        &self,
+        fanout: &DurableTransportFanout,
+        accepted: usize,
+    ) -> bool {
+        matches!(
+            fanout.exact_message.envelope,
+            TransportEnvelope::Welcome { .. }
+        ) && accepted >= fanout.required_acks.max(1)
+            && matches!(
+                self.session.stored_message_state(&fanout.exact_message.id),
+                Ok(Some(MessageState::Sent))
+            )
+    }
+
     /// Record `welcome_withdrawn` for a watched Welcome that settled without
-    /// being delivered.
+    /// being delivered. False when its row could not be read now, so the
+    /// watcher keeps it for a later pass.
     pub(super) fn record_v5_welcome_settled(
         &self,
         welcome_id: &cgka_traits::MessageId,
         settlement: WelcomeSettlement,
-    ) {
+    ) -> bool {
         let reason = match settlement {
             WelcomeSettlement::Withdrawn => {
                 let recorded = self
@@ -350,16 +379,21 @@ where
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .remove(welcome_id);
                 if recorded {
-                    return;
+                    return true;
                 }
                 audit_v5::WithdrawalReason::Withdrawn
             }
             WelcomeSettlement::CommitSuperseded => audit_v5::WithdrawalReason::CommitSuperseded,
             WelcomeSettlement::Expired => audit_v5::WithdrawalReason::Expired,
-            WelcomeSettlement::Delivered | WelcomeSettlement::Untracked => return,
+            WelcomeSettlement::Delivered | WelcomeSettlement::Untracked => return true,
         };
-        if let Some(v5) = self.v5_welcome_from_store(welcome_id) {
-            self.record_v5_welcome_withdrawn(&v5, reason, None);
+        match self.v5_welcome_from_store(welcome_id) {
+            Ok(Some(v5)) => {
+                self.record_v5_welcome_withdrawn(&v5, reason, None);
+                true
+            }
+            Ok(None) => true,
+            Err(()) => false,
         }
     }
 
@@ -448,14 +482,15 @@ where
     /// Record the finished row of a pass that started, after the pass's
     /// delivered mark, if any. The cumulative acceptance count comes from the
     /// Welcome's stored fanout, so it holds even when this pass's own
-    /// endpoint results are incomplete; retention is the Welcome's stored row
-    /// as the pass left it.
+    /// endpoint results are incomplete, and is `None` when the pass's
+    /// bookkeeping could not be saved; retention is the Welcome's delivery
+    /// status as the pass left it.
     pub(super) fn record_v5_welcome_publish_finished(
         &self,
         pass: &Option<V5WelcomePass>,
         report: Option<&TransportPublishReport>,
         attempted: &[TransportEndpoint],
-        accepted_total: usize,
+        accepted_total: Option<usize>,
         required_acks: usize,
     ) {
         let Some(pass) = pass.as_ref().filter(|pass| pass.recorded) else {
@@ -500,7 +535,9 @@ where
         let accepted_this_attempt_count = results_complete
             .then(|| report.and_then(|report| u32::try_from(report.accepted.len()).ok()))
             .flatten();
-        let accepted_total_count = u32::try_from(accepted_total).ok();
+        // `None` when the pass's bookkeeping could not be saved: the relays'
+        // answers above are observed, the stored total is not.
+        let accepted_total_count = accepted_total.and_then(|total| u32::try_from(total).ok());
         // Met by the stored total whatever this pass's detail; unmet only
         // when every endpoint of the pass answered.
         let policy = match accepted_total_count {
@@ -508,18 +545,25 @@ where
             Some(_) if results_complete => audit_v5::Policy::Unmet,
             _ => audit_v5::Policy::Unknown,
         };
-        let state = self
-            .session
-            .stored_message_state(&pass.welcome_id)
-            .ok()
+        // The Welcome's delivery status as the pass left it: delivered,
+        // still owed, or settled undelivered (expired, its commit lost).
+        let status = accepted_total_count
+            .is_some()
+            .then(|| {
+                self.session
+                    .outbound_welcome_status(&pass.welcome_id, self.wall_clock.now())
+                    .ok()
+            })
             .flatten();
-        let retained_state = match (state, policy) {
-            (Some(MessageState::Processed), audit_v5::Policy::Met) => {
-                audit_v5::RetainedState::Completed
-            }
-            (Some(MessageState::Sent), audit_v5::Policy::Unmet | audit_v5::Policy::Unknown) => {
-                audit_v5::RetainedState::Pending
-            }
+        let retained_state = match (status, policy) {
+            (
+                Some(OutboundWelcomeStatus::Settled(WelcomeSettlement::Delivered)),
+                audit_v5::Policy::Met,
+            ) => audit_v5::RetainedState::Completed,
+            (
+                Some(OutboundWelcomeStatus::Owed { .. } | OutboundWelcomeStatus::Waiting),
+                audit_v5::Policy::Unmet | audit_v5::Policy::Unknown,
+            ) => audit_v5::RetainedState::Pending,
             _ => audit_v5::RetainedState::Unknown,
         };
         self.audit.record_v5_event(

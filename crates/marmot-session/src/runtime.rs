@@ -6040,6 +6040,13 @@ where
                 .bounded_until
                 .is_some_and(|bounded_until| bounded_until <= now)
             {
+                // A saved acceptance that meets a Welcome's policy is
+                // reconciled first; one that still cannot be keeps its record.
+                let accepted = accepted_fanout_targets(&fanout);
+                self.settle_met_welcome(&fanout.exact_message, accepted, fanout.required_acks);
+                if self.welcome_still_owes_met_policy(&fanout, accepted) {
+                    continue;
+                }
                 self.session.delete_transport_fanout(&fanout.id)?;
                 continue;
             }
@@ -6256,7 +6263,7 @@ where
                     }
                 }
             }
-            self.session.put_transport_fanout(&fanout)?;
+            self.put_pass_fanout(&fanout, &v5_welcome, Some(&pass_report), &remaining)?;
             let accepted_total = accepted_fanout_targets(&fanout);
             self.record_audit_event(
                 audit_group_id.as_ref(),
@@ -6286,7 +6293,7 @@ where
                 &v5_welcome,
                 Some(&pass_report),
                 &remaining,
-                accepted_total,
+                Some(accepted_total),
                 required_acks,
             );
         }
@@ -7458,6 +7465,37 @@ where
         )))
     }
 
+    /// Save a publish pass's fanout bookkeeping. When that fails after the
+    /// relays answered, the pass's finished row still records their answers,
+    /// with no stored total, before the error returns.
+    fn put_pass_fanout(
+        &self,
+        fanout: &DurableTransportFanout,
+        v5_welcome: &Option<V5WelcomePass>,
+        report: Option<&TransportPublishReport>,
+        attempted: &[TransportEndpoint],
+    ) -> AccountResult<()> {
+        // Test-only fault injection (`arm_finish_stage_failure`): the write
+        // fails with transient contention.
+        let written = if self.finish_stage_failure.as_ref() == Some(&fanout.exact_message.id) {
+            Err(SessionError::from(StorageError::Busy(
+                "injected finish-stage failure".into(),
+            )))
+        } else {
+            self.session.put_transport_fanout(fanout)
+        };
+        if written.is_err() {
+            self.record_v5_welcome_publish_finished(
+                v5_welcome,
+                report,
+                attempted,
+                None,
+                fanout.required_acks,
+            );
+        }
+        Ok(written?)
+    }
+
     async fn finish_prepared_legacy_publish(
         &self,
         attempt: PreparedLegacyPublishAttempt,
@@ -7482,13 +7520,6 @@ where
             deliver_until: _,
             request: _,
         } = attempt;
-        // Test-only fault injection (`arm_finish_stage_failure`): behaves like
-        // the durable fanout persist below failing with transient contention.
-        if self.finish_stage_failure.as_ref() == Some(&message_id) {
-            return Err(AccountError::Session(SessionError::from(
-                StorageError::Busy("injected finish-stage failure".into()),
-            )));
-        }
         // Diagnostic only: no exposure, retry or rollback decision below reads
         // it. Legacy publication's coarse durable prior-attempt records cannot
         // reconstruct a definitive earlier refusal. A crash before finish
@@ -7546,7 +7577,12 @@ where
                         }
                     }
                 }
-                self.session.put_transport_fanout(&fanout)?;
+                self.put_pass_fanout(
+                    &fanout,
+                    &v5_welcome,
+                    endpoint_report.as_ref(),
+                    &retry_endpoints,
+                )?;
                 // An earlier acceptance may already meet the policy, stored
                 // before a stop interrupted its mark.
                 self.settle_met_welcome(&fanout.exact_message, accepted_before, required_acks);
@@ -7554,7 +7590,7 @@ where
                     &v5_welcome,
                     endpoint_report.as_ref(),
                     &retry_endpoints,
-                    accepted_before,
+                    Some(accepted_before),
                     required_acks,
                 );
                 if let Some(report) = &endpoint_report {
@@ -7634,7 +7670,7 @@ where
             &report,
             self.wall_clock.now(),
         );
-        self.session.put_transport_fanout(&fanout)?;
+        self.put_pass_fanout(&fanout, &v5_welcome, Some(&report), &retry_endpoints)?;
         let accepted_total = fanout
             .targets
             .iter()
@@ -7648,7 +7684,7 @@ where
             &v5_welcome,
             Some(&report),
             &retry_endpoints,
-            accepted_total,
+            Some(accepted_total),
             required_acks,
         );
         let accepted_by_any_endpoint = accepted_total > 0;

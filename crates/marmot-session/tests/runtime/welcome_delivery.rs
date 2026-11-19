@@ -464,34 +464,80 @@ async fn a_too_large_welcome_is_named_and_its_sibling_invitee_is_withdrawn() {
 
 /// A Welcome whose stored fanout already meets its policy, from an
 /// acceptance saved before a stop interrupted its delivered mark, is marked
-/// delivered by the next maintenance pass, though no relay is due.
+/// delivered by the next maintenance pass, though no relay is due, and even
+/// when that pass comes after the retry record's retention: the acceptance is
+/// reconciled before the record is dropped, and nothing is sent again.
 #[tokio::test]
 async fn a_saved_acceptance_whose_mark_was_interrupted_settles_the_welcome() {
+    for at in [300_100, 300_000 + 24 * 60 * 60 + 600] {
+        let dir = relaxed_storage_dir().unwrap();
+        let OwedInviteWelcome {
+            mut runtime,
+            adapter,
+            wall,
+            welcome,
+            ..
+        } = owed_invite_welcome(dir.path()).await;
+        // The relay's acceptance reached storage; the mark after it did not.
+        let mut fanout = runtime
+            .session()
+            .transport_fanout(&welcome.id)
+            .unwrap()
+            .unwrap();
+        for target in &mut fanout.targets {
+            target.state = cgka_traits::TransportFanoutAttemptState::Accepted;
+        }
+        runtime.session().put_transport_fanout(&fanout).unwrap();
+        assert_eq!(runtime.outstanding_welcome_deliveries().unwrap().len(), 1);
+        let sent = welcome_publishes(&adapter).len();
+
+        wall.set(at);
+        runtime.run_due_maintenance().await.unwrap();
+
+        assert!(
+            runtime.outstanding_welcome_deliveries().unwrap().is_empty(),
+            "at {at}"
+        );
+        assert_eq!(
+            runtime.withdraw_welcome(&welcome.id).unwrap(),
+            WelcomeWithdrawal::AlreadyDelivered
+        );
+        assert_eq!(welcome_publishes(&adapter).len(), sent, "at {at}");
+    }
+}
+
+/// A pass whose relays answered but whose bookkeeping could not be saved
+/// still records what the relays said, with no stored total, before the
+/// error returns: an investigator sees the relay answered.
+#[tokio::test]
+async fn a_pass_whose_bookkeeping_fails_records_the_relays_answers() {
     let dir = relaxed_storage_dir().unwrap();
     let OwedInviteWelcome {
         mut runtime,
+        adapter,
         wall,
+        group_id,
         welcome,
-        ..
     } = owed_invite_welcome(dir.path()).await;
-    // The relay's acceptance reached storage; the mark after it did not.
-    let mut fanout = runtime
-        .session()
-        .transport_fanout(&welcome.id)
-        .unwrap()
-        .unwrap();
-    for target in &mut fanout.targets {
-        target.state = cgka_traits::TransportFanoutAttemptState::Accepted;
-    }
-    runtime.session().put_transport_fanout(&fanout).unwrap();
-    assert_eq!(runtime.outstanding_welcome_deliveries().unwrap().len(), 1);
+    let recorded = welcome_rows(dir.path(), &welcome, &group_id).len();
+    adapter.accept_only_endpoints(vec![
+        TransportEndpoint("wss://group.example".into()),
+        TransportEndpoint("wss://carol-inbox.example".into()),
+    ]);
+    runtime.arm_finish_stage_failure(welcome.id.clone());
 
     wall.set(300_100);
-    runtime.run_due_maintenance().await.unwrap();
+    let _ = runtime.run_due_maintenance().await;
 
-    assert!(runtime.outstanding_welcome_deliveries().unwrap().is_empty());
+    let rows = welcome_rows(dir.path(), &welcome, &group_id);
+    let retry = &rows[recorded..];
     assert_eq!(
-        runtime.withdraw_welcome(&welcome.id).unwrap(),
-        WelcomeWithdrawal::AlreadyDelivered
+        kinds(retry),
+        ["welcome_publish_started", "welcome_publish_finished"]
     );
+    let finished = &retry[1]["event"];
+    assert_eq!(finished["results"][0]["status"], "acknowledged", "{finished}");
+    assert_eq!(finished["accepted_total_count"], serde_json::Value::Null);
+    assert_eq!(finished["policy"], "unknown");
+    assert_eq!(finished["retained_state"], "unknown");
 }
