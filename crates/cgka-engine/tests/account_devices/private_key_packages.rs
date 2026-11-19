@@ -1040,6 +1040,52 @@ async fn a_sibling_welcome_carried_before_a_forget_joins_from_a_later_carrier() 
     );
 }
 
+/// What a sibling Welcome forwards is the sending sibling's word about a copy
+/// of its own account's, so a join counts it only from a Welcome its own
+/// account authored; one relaying another account's Commit forwards nothing
+/// (mdk#3546).
+#[tokio::test]
+async fn a_sibling_welcome_another_account_authored_forwards_nothing() {
+    let mut bob = device(b"bob", true);
+    let mut laptop = device(b"alice", true);
+    laptop
+        .engine
+        .issue_private_key_packages(&SLOT, 1, None, NOW)
+        .unwrap();
+    let issued = laptop.engine.issued_private_key_packages().unwrap();
+    let (gid, welcomes) = create(
+        &mut bob,
+        vec![current(issued[0].key_package.clone())],
+        vec![],
+    )
+    .await
+    .unwrap();
+    let sibling = SiblingWelcome {
+        forwarded: ForwardedInvitation {
+            inviter: None,
+            confirmed: true,
+        },
+        ..sibling_welcome(&welcomes[0], SLOT, &issued[0].key_package_ref)
+    };
+    assert_eq!(
+        join_sibling(&mut laptop, b"relayed", &sibling).await,
+        Settled(IngestOutcome::Processed)
+    );
+    assert!(
+        laptop
+            .engine
+            .drain_events()
+            .into_iter()
+            .any(|event| matches!(
+                event,
+                GroupEvent::GroupJoined { group_id, welcomer, forwarded, .. }
+                    if group_id == gid
+                        && welcomer == Some(bob.engine.self_id())
+                        && forwarded.is_empty()
+            ))
+    );
+}
+
 /// A sibling Welcome decodes only from its exact encoding.
 #[tokio::test]
 async fn a_sibling_welcome_decodes_only_its_exact_encoding() {

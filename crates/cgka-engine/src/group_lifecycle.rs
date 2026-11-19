@@ -167,6 +167,21 @@ pub(crate) enum WelcomeRoute {
     },
 }
 
+/// What a sibling Welcome forwards counts only when its authenticated author
+/// is this account: a sibling asserts facts about a copy of its own, not
+/// about another account's Commit it relayed (mdk#3546).
+fn forwarded_from(
+    forwarded: &cgka_traits::engine::ForwardedInvitation,
+    welcome_author: &MemberId,
+    own_account: &MemberId,
+) -> cgka_traits::engine::ForwardedInvitation {
+    if welcome_author == own_account {
+        forwarded.clone()
+    } else {
+        Default::default()
+    }
+}
+
 /// Whether a delivery of a Welcome this device already joined names a
 /// KeyPackage publication this device never held. One Welcome reaches every
 /// device it adds, each in its own delivery of the same content, so once this
@@ -1485,6 +1500,7 @@ impl<S: StorageProvider> Engine<S> {
             },
             WelcomeRoute::Delivery => Default::default(),
         };
+        let own_account = self.identity.self_id().clone();
         let (welcome_bytes, welcome_created_at, key_package_claim) = match peeled.content {
             cgka_traits::ingest::PeeledContent::Welcome {
                 bytes,
@@ -2068,7 +2084,7 @@ impl<S: StorageProvider> Engine<S> {
                     via_welcome: welcome_id.clone(),
                     explicitly_confirmed: consent.is_some(),
                     welcomer: Some(welcome_sender_id.clone()),
-                    forwarded: forwarded.clone(),
+                    forwarded: forwarded_from(&forwarded, &welcome_sender_id, &own_account),
                 },
             )?;
 
@@ -2251,9 +2267,9 @@ impl<S: StorageProvider> Engine<S> {
             .push_back(cgka_traits::engine::GroupEvent::GroupJoined {
                 group_id: group_id.clone(),
                 via_welcome: welcome_id.clone(),
+                forwarded: forwarded_from(&forwarded, &welcome_sender_id, &own_account),
                 explicitly_confirmed: consent.is_some(),
                 welcomer: Some(welcome_sender_id.clone()),
-                forwarded,
             });
         if let Some(new_seconds) =
             crate::app_components::message_retention_seconds_of_group(&mls_group)?
