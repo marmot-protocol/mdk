@@ -258,8 +258,8 @@ enum LegacyPublishCompletion {
 /// ([`AccountDeviceRuntime::v5_invite_selection`]).
 struct V5InviteSelection {
     group_id: GroupId,
-    /// Each recipient's KeyPackage event ids, in intent order.
-    selected: HashMap<Vec<u8>, VecDeque<[u8; 32]>>,
+    /// Each KeyPackage's `KeyPackageRef` and Nostr event id.
+    selected: Vec<(Vec<u8>, [u8; 32])>,
 }
 
 struct PreparedLegacyPublishAttempt {
@@ -3926,9 +3926,8 @@ where
 
     /// What an invite's `welcome_prepared` rows need from its intent, read
     /// before the intent is consumed: the group, and each selected
-    /// KeyPackage's member identity and Nostr event id, in intent order.
-    /// `None` without a v5 recorder, for any other intent, or when a
-    /// KeyPackage lacks either, since a constructed row must name both.
+    /// KeyPackage's `KeyPackageRef` and Nostr event id. `None` without a v5
+    /// recorder or for any other intent.
     fn v5_invite_selection(&self, intent: &SendIntent) -> Option<V5InviteSelection> {
         if !self.audit.records_v5() {
             return None;
@@ -3941,14 +3940,17 @@ where
         else {
             return None;
         };
-        let mut selected = HashMap::<Vec<u8>, VecDeque<[u8; 32]>>::new();
-        for key_package in key_packages {
-            let event_id =
-                <[u8; 32]>::try_from(key_package.source.as_ref()?.event_id.as_slice()).ok()?;
-            let identity = self.session.key_package_metadata(key_package).ok()?;
-            let recipient = hex::decode(identity.credential_identity_hex).ok()?;
-            selected.entry(recipient).or_default().push_back(event_id);
-        }
+        // A KeyPackage that cannot be named is left out; the Welcomes of the
+        // rest are still recorded.
+        let selected = key_packages
+            .iter()
+            .filter_map(|key_package| {
+                let event_id =
+                    <[u8; 32]>::try_from(key_package.source.as_ref()?.event_id.as_slice()).ok()?;
+                let metadata = self.session.key_package_metadata(key_package).ok()?;
+                Some((hex::decode(metadata.key_package_ref_hex).ok()?, event_id))
+            })
+            .collect();
         Some(V5InviteSelection {
             group_id: group_id.clone(),
             selected,
@@ -3957,12 +3959,13 @@ where
 
     /// Record `welcome_prepared` for each Welcome of an accepted invite: the
     /// engine has retained it, staged with its Add commit, so a publish may
-    /// follow. Each Welcome takes the next selected KeyPackage of its
-    /// recipient, in the order the engine wraps them; one that matches none
-    /// is not recorded.
+    /// follow. Each Welcome is matched to its KeyPackage through the
+    /// `KeyPackageRef` the engine stored with it, since the engine skips a
+    /// selected KeyPackage whose device is already in the group; one that
+    /// matches none is not recorded.
     fn record_v5_invite_welcomes_prepared(
         &self,
-        mut selection: V5InviteSelection,
+        selection: V5InviteSelection,
         commit: &PreparedSessionCommit,
     ) {
         let Ok(group_ref) = audit_v5::GroupRef::from_group_id(selection.group_id.as_slice()) else {
@@ -3976,15 +3979,23 @@ where
         }) else {
             return;
         };
+        let mut key_package_events = HashMap::new();
+        for (key_package_ref, event_id) in &selection.selected {
+            let Ok(welcome_ids) = self
+                .session
+                .sent_welcomes_for_key_package(&selection.group_id, key_package_ref)
+            else {
+                return;
+            };
+            for welcome_id in welcome_ids {
+                key_package_events.insert(welcome_id, *event_id);
+            }
+        }
         for welcome in commit.welcomes() {
             let TransportEnvelope::Welcome { recipient } = &welcome.envelope else {
                 continue;
             };
-            let Some(key_package_event_id) = selection
-                .selected
-                .get_mut(recipient.as_slice())
-                .and_then(VecDeque::pop_front)
-            else {
+            let Some(key_package_event_id) = key_package_events.get(&welcome.id) else {
                 continue;
             };
             let (Ok(recipient_ref), Some(outer)) = (
@@ -3996,14 +4007,14 @@ where
             self.audit.record_v5_event(
                 Some(group_ref.clone()),
                 audit_v5::Event::WelcomePrepared(audit_v5::WelcomePrepared {
-                    op_id: v5_welcome_operation_id(&welcome.id),
+                    op_id: welcome_audit_operation_id(&welcome.id),
                     recipient_ref,
                     mode: audit_v5::Mode::Invite,
                     basis: audit_v5::Basis::Commit {
                         commit_ref: commit_ref.clone(),
                     },
                     key_package_event_ref: Some(audit_v5::NostrEventRef::from_validated_event_id(
-                        &key_package_event_id,
+                        key_package_event_id,
                     )),
                     outer_event_ref: Some(outer),
                     construction: audit_v5::Construction::Constructed,
@@ -6170,8 +6181,9 @@ where
                 required_acks,
                 accepted_before,
             );
-            // The pass's per-endpoint reports, joined for its finished row;
-            // an adapter error leaves that row's results incomplete.
+            // The pass's per-endpoint results, joined for its finished row:
+            // each report, and the endpoint failures an adapter error names.
+            // One that names none leaves the row's results incomplete.
             let mut pass_report = TransportPublishReport {
                 message_id: message_id.clone(),
                 accepted: Vec::new(),
@@ -6254,6 +6266,11 @@ where
                         output.reports.push(report);
                     }
                     Err(error) => {
+                        if v5_welcome.is_some() {
+                            pass_report
+                                .failed
+                                .extend(error.publish_endpoint_failures().iter().cloned());
+                        }
                         pass_failed.push(PublishRelayFailure {
                             relay_url: endpoint.0.clone(),
                             reason: error.to_string(),
@@ -7733,8 +7750,9 @@ where
     /// The v5 identity of a retained Welcome about to be published: the
     /// founding probe's when the caller passed one in `context`, otherwise
     /// derived from the Welcome's own stored row, so an invite's Welcome and
-    /// every retry of any Welcome are audited too. The operation id is then
-    /// [`v5_welcome_operation_id`], the one its `welcome_prepared` row uses.
+    /// every retry of any Welcome are audited too, delivered or still owed.
+    /// The operation id is [`welcome_audit_operation_id`], as every
+    /// `welcome_prepared` row's is.
     fn v5_welcome_identity(
         &self,
         message: &TransportMessage,
@@ -7766,10 +7784,10 @@ where
             ));
         }
         let outer = v5_outbound_welcome_ref(message)?;
-        let (group_id, _) = self.session.stored_sent_welcome(&message.id).ok()?;
+        let group_id = self.session.stored_message_group(&message.id).ok()??;
         let group_ref = audit_v5::GroupRef::from_group_id(group_id.as_slice()).ok()?;
         Some((
-            v5_welcome_operation_id(&message.id),
+            welcome_audit_operation_id(&message.id),
             outer,
             recipient_ref,
             group_ref,
@@ -9154,17 +9172,22 @@ fn v5_endpoint_ref(endpoint: &TransportEndpoint) -> Option<audit_v5::EndpointRef
     audit_v5::EndpointRef::from_normalized_url(&endpoint.0).ok()
 }
 
-/// The v5 operation id of one retained Welcome: its `welcome_prepared` row
-/// and every publish attempt of it share this id, whichever path sends it.
-fn v5_welcome_operation_id(message_id: &cgka_traits::MessageId) -> audit_v5::LocalId {
-    v5_local_id(b"welcome-operation", message_id.as_slice(), 0)
+/// The v5 operation id of one outbound Welcome, named by its id: its
+/// `welcome_prepared` row and every publish attempt of it share this id,
+/// whichever path prepares or sends it.
+pub fn welcome_audit_operation_id(welcome_id: &cgka_traits::MessageId) -> audit_v5::LocalId {
+    v5_local_id(b"welcome-operation", welcome_id.as_slice(), 0)
 }
 
-/// The outer event reference of a retained outbound Welcome. Its id is the
-/// one this account's own peeler gave the wrap it built, the event's NIP-01
-/// hash, which is the id the recipient observes; the session parses no
-/// transport event to check it again.
+/// The outer event reference of a retained outbound Welcome the Nostr
+/// transport wrapped. Its id is the one this account's own peeler gave the
+/// wrap it built, the event's NIP-01 hash, which is the id the recipient
+/// observes; the session parses no transport event to check it again.
+/// `None` for another transport's Welcome.
 fn v5_outbound_welcome_ref(message: &TransportMessage) -> Option<audit_v5::NostrEventRef> {
+    if message.source.0 != "nostr" {
+        return None;
+    }
     let id = <[u8; 32]>::try_from(message.id.as_slice()).ok()?;
     Some(audit_v5::NostrEventRef::from_validated_event_id(&id))
 }

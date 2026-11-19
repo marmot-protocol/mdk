@@ -752,6 +752,11 @@ impl AccountDeviceSession {
         Ok(self.engine.stored_message_state(id)?)
     }
 
+    /// The group one stored message belongs to, in any state.
+    pub fn stored_message_group(&self, id: &MessageId) -> SessionResult<Option<GroupId>> {
+        Ok(self.engine.stored_message_group(id)?)
+    }
+
     pub fn group_evolutions(&self) -> SessionResult<Vec<DurableGroupEvolution>> {
         Ok(self.storage.list_group_evolutions()?)
     }

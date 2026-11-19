@@ -897,6 +897,61 @@ fn publication_id(key_package: &cgka_traits::engine::KeyPackage) -> MessageId {
     key_package.source.clone().unwrap().event_id
 }
 
+/// An invite's `welcome_prepared` row names the KeyPackage its Welcome was
+/// built for. Here the inviter is handed a fresh KeyPackage of the phone,
+/// already in the group, before the laptop's; the engine skips the phone's,
+/// so the one Welcome, the laptop's, must name the laptop's publication, not
+/// the first one of the account.
+#[tokio::test]
+async fn an_invite_prepared_row_names_the_key_package_its_welcome_answers() {
+    let Account {
+        _dir: dir,
+        mut phone,
+        laptop,
+        ..
+    } = alice_with_two_devices("invite prepared row").await;
+    let key = SqlCipherKey::new("invite prepared row").unwrap();
+    let mut bob = Device::open(dir.path().join("bob-runtime.sqlite"), &key, b"bob").await;
+    let (group_id, _) = create_group(
+        bob.runtime.session_mut(),
+        &[&phone.key_package],
+        "phone first",
+    )
+    .await;
+    phone.publish().await;
+    let audit_path = dir.path().join("bob-audit-v5.jsonl");
+    bob.runtime
+        .audit_recorder()
+        .swap(v5_audit_recorder(&audit_path));
+
+    let prepared = bob
+        .runtime
+        .confirm_host_change_without_publish_with_audit_context(
+            SendIntent::Invite {
+                group_id,
+                key_packages: vec![phone.key_package.clone(), laptop.key_package.clone()],
+                initial_admins: Vec::new(),
+            },
+            marmot_forensics::AuditEventContext::default(),
+        )
+        .await
+        .unwrap();
+    let marmot_session::PreparedSessionSend::Commit(commit) = prepared else {
+        panic!("expected a staged invite commit");
+    };
+    assert_eq!(commit.welcomes().len(), 1, "the phone is already a member");
+
+    let laptop_ref = marmot_forensics::v5::NostrEventRef::from_validated_event_id(
+        &<[u8; 32]>::try_from(publication_id(&laptop.key_package).as_slice()).unwrap(),
+    );
+    let named = v5_audit_rows(&audit_path)
+        .into_iter()
+        .filter(|row| row["event"]["type"] == "welcome_prepared")
+        .map(|row| row["event"]["key_package_event_ref"].clone())
+        .collect::<Vec<_>>();
+    assert_eq!(named, [laptop_ref.as_str()]);
+}
+
 /// A Welcome from a device of the joiner's own account, in a group that
 /// requires `marmot.group.account-devices.v1`
 /// (`app-components/account-devices-v1.md`, "Welcome acceptance").

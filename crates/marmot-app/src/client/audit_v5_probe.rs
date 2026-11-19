@@ -41,7 +41,7 @@ pub(crate) struct FoundingSelection {
 pub(crate) struct PendingFounding {
     /// Each recipient's selected KeyPackages, in the order the engine wraps
     /// their Welcomes.
-    selected: BTreeMap<Vec<u8>, VecDeque<(LocalId, [u8; 32])>>,
+    selected: BTreeMap<Vec<u8>, VecDeque<[u8; 32]>>,
 }
 
 /// One selected AppClient delivery episode. The app arms it before engine
@@ -399,8 +399,9 @@ impl WelcomeProbe {
         self.rows.push(row);
     }
 
-    /// Allocate operation IDs before the authoritative preparation call. A
-    /// failed call drops this bounded token and emits no fictitious terminal.
+    /// Capture the selected KeyPackages before the authoritative preparation
+    /// call. A failed call drops this bounded token and emits no fictitious
+    /// terminal.
     pub(crate) fn begin_founding(
         &mut self,
         selections: Vec<FoundingSelection>,
@@ -409,7 +410,7 @@ impl WelcomeProbe {
             self.dropped += selections.len();
             return None;
         }
-        let mut selected = BTreeMap::<Vec<u8>, VecDeque<(LocalId, [u8; 32])>>::new();
+        let mut selected = BTreeMap::<Vec<u8>, VecDeque<[u8; 32]>>::new();
         for selection in selections {
             let Ok(recipient) = hex::decode(selection.recipient_hex) else {
                 self.invalid += 1;
@@ -428,11 +429,11 @@ impl WelcomeProbe {
                 return None;
             };
             let packages = selected.entry(recipient).or_default();
-            if packages.iter().any(|(_, selected)| *selected == event_id) {
+            if packages.contains(&event_id) {
                 self.invalid += 1;
                 return None;
             }
-            packages.push_back((self.local_id(), event_id));
+            packages.push_back(event_id);
         }
         Some(PendingFounding { selected })
     }
@@ -469,7 +470,7 @@ impl WelcomeProbe {
                     self.invalid += 1;
                     return;
                 };
-                let Some((op_id, key_package_event_id)) = pending
+                let Some(key_package_event_id) = pending
                     .selected
                     .get_mut(recipient.as_slice())
                     .and_then(VecDeque::pop_front)
@@ -496,6 +497,8 @@ impl WelcomeProbe {
                     self.invalid += 1;
                     return;
                 };
+                // The id every publish of this Welcome carries too.
+                let op_id = marmot_session::welcome_audit_operation_id(&welcome.id);
                 rows.push((op_id, recipient_ref, key_package_event_id, outer_event_id));
             }
         }

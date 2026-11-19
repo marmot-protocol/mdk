@@ -9,6 +9,78 @@ struct OwedInviteWelcome {
     welcome: TransportMessage,
 }
 
+/// [`MockPeeler`] whose Welcomes carry what the Nostr transport gives its
+/// own: a 32-byte event id and the `nostr` source, which the runtime's v5
+/// Welcome audit rows reference.
+struct NostrWelcomePeeler(MockPeeler);
+
+#[async_trait]
+impl TransportPeeler for NostrWelcomePeeler {
+    async fn wrap_group_recovery(
+        &self,
+        message: &cgka_traits::GroupRecoveryMessage,
+        recipient: &MemberId,
+    ) -> Result<TransportMessage, PeelerError> {
+        self.0.wrap_group_recovery(message, recipient).await
+    }
+
+    async fn peel_group_message(
+        &self,
+        msg: &cgka_traits::peeler::PreparedGroupMessage<'_>,
+        ctx: &GroupContextSnapshot,
+    ) -> Result<PeeledMessage, PeelerError> {
+        self.0.peel_group_message(msg, ctx).await
+    }
+
+    async fn peel_welcome(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
+        self.0.peel_welcome(msg).await
+    }
+
+    async fn wrap_group_message(
+        &self,
+        payload: &EncryptedPayload,
+        ctx: &GroupContextSnapshot,
+    ) -> Result<TransportMessage, PeelerError> {
+        self.0.wrap_group_message(payload, ctx).await
+    }
+
+    async fn wrap_welcome(
+        &self,
+        payload: &EncryptedPayload,
+        recipient: &MemberId,
+    ) -> Result<TransportMessage, PeelerError> {
+        use sha2::{Digest, Sha256};
+
+        let mut welcome = self.0.wrap_welcome(payload, recipient).await?;
+        welcome.id = MessageId::new(Sha256::digest(welcome.id.as_slice()).to_vec());
+        welcome.source = TransportSource("nostr".into());
+        Ok(welcome)
+    }
+}
+
+/// [`session`] wrapping its Welcomes as [`NostrWelcomePeeler`] does.
+fn nostr_welcome_session(
+    path: impl Into<std::path::PathBuf>,
+    key: &SqlCipherKey,
+    identity: &[u8],
+) -> AccountDeviceSession {
+    AccountDeviceSession::open(
+        SessionConfig::new(
+            path,
+            SqlCipherKey::new(key.as_secret_str()).unwrap(),
+            pad32(identity),
+            Box::new(NostrWelcomePeeler(MockPeeler)),
+        )
+        .legacy_compatibility_profile()
+        .account_identity_proof_signer(Arc::new(NostrAccountIdentityProofSigner {
+            keys: deterministic_nostr_keys(identity),
+        }))
+        .feature_registry(FeatureRegistry::new())
+        .supported_app_components(default_group_components()),
+    )
+    .unwrap()
+}
+
 /// Alice invites carol into a confirmed group. The relay accepts the commit
 /// but not carol's Welcome, so the Welcome stays owed with a retry record.
 async fn owed_invite_welcome(dir: &std::path::Path) -> OwedInviteWelcome {
@@ -22,9 +94,9 @@ async fn owed_invite_welcome_through(
     adapter: RecordingAdapter,
 ) -> OwedInviteWelcome {
     let key = SqlCipherKey::new("marmot welcome withdrawal key").unwrap();
-    let mut alice = session(dir.join("alice.sqlite"), &key, b"alice-withdrawal");
-    let mut bob = session(dir.join("bob.sqlite"), &key, b"bob-withdrawal");
-    let mut carol = session(dir.join("carol.sqlite"), &key, b"carol-withdrawal");
+    let mut alice = nostr_welcome_session(dir.join("alice.sqlite"), &key, b"alice-withdrawal");
+    let mut bob = nostr_welcome_session(dir.join("bob.sqlite"), &key, b"bob-withdrawal");
+    let mut carol = nostr_welcome_session(dir.join("carol.sqlite"), &key, b"carol-withdrawal");
     let carol_id = carol.self_id();
     let created = alice
         .create_group(CreateGroupRequest {

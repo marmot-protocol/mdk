@@ -1094,6 +1094,17 @@ impl<S: StorageProvider> Engine<S> {
         }
     }
 
+    /// The group one stored message belongs to, in any state: an outbound
+    /// Welcome's group stays known after it is delivered, for audit rows of
+    /// later retries. Ungated, as [`Self::stored_message_state`] is.
+    pub fn stored_message_group(&self, id: &MessageId) -> Result<Option<GroupId>, EngineError> {
+        match self.storage.get_message(id) {
+            Ok(record) => Ok(Some(record.group_id)),
+            Err(cgka_traits::storage::StorageError::NotFound) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     /// Read the durable state of one synthetic scenario input under either its
     /// transport or content-derived id.
     ///
