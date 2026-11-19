@@ -3227,6 +3227,9 @@ mod tests {
     #[derive(Default)]
     struct RecordingBackend {
         invocations: Mutex<Vec<Invocation>>,
+        /// Signalled after each recorded invocation; `notify_one` keeps a
+        /// permit, so a waiter that arrives late still wakes.
+        invoked: tokio::sync::Notify,
     }
 
     #[derive(Debug)]
@@ -3340,6 +3343,7 @@ mod tests {
             _tx: mpsc::Sender<RunnerEvent>,
         ) -> std::result::Result<Outcome, RunFailure> {
             self.invocations.lock().await.push(invocation);
+            self.invoked.notify_one();
             Ok(Outcome {
                 observed_session: None,
                 exit_code: Some(0),
@@ -4432,7 +4436,7 @@ mod tests {
             ));
             tokio::time::timeout(Duration::from_secs(5), async {
                 while backend.invocations.lock().await.len() <= index {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    backend.invoked.notified().await;
                 }
             })
             .await
