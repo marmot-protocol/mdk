@@ -196,41 +196,50 @@ impl Group {
         self.removed || self.disbanded.is_some()
     }
 
-    /// Does `timestamp` sit far enough before this copy's Welcome that traffic
-    /// carrying it is more likely the group's history than this copy's?
+    /// Could traffic carrying `timestamp` be the group's history from before
+    /// this copy's Welcome, rather than traffic of this copy's own epochs?
     ///
     /// This copy's epochs begin at the commit that minted its Welcome, so a
-    /// message genuinely published before then can never be opened here. But
-    /// the converse does not hold — an application message carries its
-    /// sender's compose time, which the offline outbox can leave hours behind
-    /// the moment the message actually went out — so a `true` here is a guess,
-    /// not a verdict.
+    /// message genuinely published before then can never be opened here. A
+    /// sender whose clock runs ahead of the inviter's stamps such history after
+    /// the Welcome time, and siblings still finishing the link go on sending
+    /// under the epoch before this copy's for a moment after it, so anything
+    /// earlier than the Welcome plus [`PRE_WELCOME_CLOCK_SKEW_SECS`] counts
+    /// (mdk#3536). The converse does not hold either — an application message
+    /// carries its sender's compose time, which the offline outbox can leave
+    /// hours behind the moment the message actually went out — so a `true`
+    /// here is a guess, not a verdict.
     ///
-    /// Every caller must therefore be one for which a wrong guess costs
-    /// nothing in either direction. Today that is two: dropping one piece of
-    /// stall evidence, and suppressing a refusal notification for a release
-    /// that happens either way. Never gate persistence, decryption, retry, or
+    /// Callers may therefore let it decide only what counts as recovery
+    /// evidence: dropping a piece of stall evidence, and suppressing the
+    /// refusal notification and epoch-gap arm for a release that happens
+    /// either way. A wrong guess there can delay a stall's detection but loses
+    /// no message. Never gate persistence, decryption, retry, redelivery, or
     /// any terminal classification on it.
     pub fn transport_message_predates_local_copy(
         &self,
         timestamp: crate::transport::Timestamp,
     ) -> bool {
         self.local_copy_welcome_created_at.is_some_and(|welcome| {
-            timestamp.0.saturating_add(PRE_WELCOME_CLOCK_SKEW_SECS) < welcome.0
+            timestamp.0 < welcome.0.saturating_add(PRE_WELCOME_CLOCK_SKEW_SECS)
         })
     }
 }
 
 /// Clock-skew tolerance for [`Group::transport_message_predates_local_copy`].
 ///
-/// Both decisions this margin gates are reversible, which sets its size from a
-/// direction opposite to the usual one. A margin that is too *wide* leaves more
-/// false stall arms and more refusal notifications for expected traffic —
-/// exactly what the signal exists to reduce. A margin that is too *narrow*
-/// costs one piece of stall evidence from a sender whose clock trails the
-/// inviter's, or from a message composed offline; every other message that
-/// device receives still arms, so the detector still fires on a real stall.
-/// The cheap direction is therefore the tight one.
+/// The margin lies *after* the Welcome. Both decisions it gates are
+/// reversible, and their costs are lopsided. Counting pre-Welcome history as
+/// evidence arms a false epoch gap at the epoch this copy sits at: a freshly
+/// linked device's first sweep hands it a busy group's recent history, which
+/// is enough to report it as unable to catch up and to hold its device-group
+/// work, the private KeyPackages that adding it to chats waits on included
+/// (mdk#3536, mdk#3535). Dropping evidence from the first minutes of this
+/// copy's own epochs is the cheaper error, but not free: messages stamped in
+/// that window never count, then or after a restart, so a commit missed just
+/// after joining is detected only from undecryptable traffic stamped after the
+/// margin. A group that falls quiet right after such a miss raises no stall
+/// until it speaks again.
 ///
 /// Five minutes is the sender-clock tolerance this project already assumes
 /// elsewhere — `marmot-app`'s transport cursor allows the same drift. That
@@ -317,22 +326,22 @@ mod tests {
     }
 
     #[test]
-    fn the_tolerance_band_ends_one_second_before_the_margin() {
+    fn history_stamped_up_to_the_margin_after_the_welcome_may_predate_it() {
         let joined = copy_installed_at(Some(WELCOME));
         let margin = PRE_WELCOME_CLOCK_SKEW_SECS;
 
-        // Inside the band, including its exact edge: not old enough to say.
-        assert!(!joined.transport_message_predates_local_copy(Timestamp(WELCOME)));
-        assert!(!joined.transport_message_predates_local_copy(Timestamp(WELCOME - margin)));
-        // One second beyond it.
-        assert!(joined.transport_message_predates_local_copy(Timestamp(WELCOME - margin - 1)));
+        assert!(joined.transport_message_predates_local_copy(Timestamp(0)));
+        assert!(joined.transport_message_predates_local_copy(Timestamp(WELCOME)));
+        // A sender running ahead of the inviter, to the margin's last second.
+        assert!(joined.transport_message_predates_local_copy(Timestamp(WELCOME + margin - 1)));
     }
 
     #[test]
-    fn a_message_newer_than_the_welcome_never_predates_it() {
+    fn a_message_from_the_margin_on_never_predates_the_welcome() {
         let joined = copy_installed_at(Some(WELCOME));
+        let margin = PRE_WELCOME_CLOCK_SKEW_SECS;
 
-        assert!(!joined.transport_message_predates_local_copy(Timestamp(WELCOME + 1)));
+        assert!(!joined.transport_message_predates_local_copy(Timestamp(WELCOME + margin)));
         assert!(!joined.transport_message_predates_local_copy(Timestamp(u64::MAX)));
     }
 }

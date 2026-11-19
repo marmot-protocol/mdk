@@ -27311,7 +27311,8 @@ mod conversation_cold_open;
 #[path = "../tests/support/limited_relay.rs"]
 pub(crate) mod limited_relay;
 
-/// Undecryptable traffic older than this copy's Welcome is not stall evidence.
+/// Undecryptable traffic older than this copy's Welcome, or within the clock-skew
+/// margin after it, is not stall evidence.
 ///
 /// The detector's undecryptable signal means "this device is behind the group".
 /// After a join — and especially after a re-add, where the relay serves the
@@ -27323,8 +27324,8 @@ pub(crate) mod limited_relay;
 ///
 /// The signal is deliberately soft: an application message carries its sender's
 /// compose time, so a message drained from the offline outbox can look old
-/// while being perfectly live. Dropping one piece of stall evidence is free —
-/// every other undecryptable message that device receives still arms.
+/// while being perfectly live. Wrongly dropping such evidence loses no message;
+/// it delays a stall's detection until traffic stamped past the margin arrives.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn undecryptable_traffic_older_than_this_copys_welcome_does_not_arm_a_backfill() {
     use cgka_traits::storage::GroupStorage;
@@ -27341,12 +27342,17 @@ async fn undecryptable_traffic_older_than_this_copys_welcome_does_not_arm_a_back
     record.local_copy_welcome_created_at = Some(cgka_traits::transport::Timestamp(welcome_at));
     storage.put_group(&record).unwrap();
 
-    let before_the_welcome = welcome_at - 4 * 60 * 60;
+    // A busy group's last minutes before the Welcome, and siblings still
+    // sending under the epoch before this copy's just after it (mdk#3536): a
+    // freshly linked device must not report itself stalled at the epoch it
+    // joined at.
+    let around_the_welcome = welcome_at - 60;
     for probe in 0..crate::client::history_recovery::epoch_stall::EPOCH_STALL_BACKFILL_THRESHOLD {
         client
-            .ingest_received_delivery(
-                route.probe(before_the_welcome + probe as u64, &format!("gap-{probe}")),
-            )
+            .ingest_received_delivery(route.probe(
+                around_the_welcome + 30 * probe as u64,
+                &format!("linking-{probe}"),
+            ))
             .await
             .expect("a retained undecryptable object completes its ingest pass");
     }
@@ -27359,9 +27365,10 @@ async fn undecryptable_traffic_older_than_this_copys_welcome_does_not_arm_a_back
     // the envelope time differs — still arms.
     for probe in 0..crate::client::history_recovery::epoch_stall::EPOCH_STALL_BACKFILL_THRESHOLD {
         client
-            .ingest_received_delivery(
-                route.probe(welcome_at + probe as u64, &format!("live-{probe}")),
-            )
+            .ingest_received_delivery(route.probe(
+                welcome_at + cgka_traits::group::PRE_WELCOME_CLOCK_SKEW_SECS + probe as u64,
+                &format!("live-{probe}"),
+            ))
             .await
             .expect("a retained undecryptable object completes its ingest pass");
     }

@@ -23,7 +23,7 @@ use cgka_traits::ingest::IngestOutcome;
 use cgka_traits::message::{MessageState, StoredMessagePayload};
 use cgka_traits::storage::{GroupStorage, MessageStorage};
 use cgka_traits::transport::{Timestamp, TransportEnvelope, TransportMessage};
-use cgka_traits::types::{EpochId, GroupId, MemberId};
+use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
 use std::collections::HashMap;
 use storage_sqlite::SqliteAccountStorage;
 
@@ -552,6 +552,10 @@ async fn a_reopened_row_this_copy_can_no_longer_peel_lands_in_the_deferred_peel_
 
 /// Wall-clock second the re-add Welcome in the tests below is minted at.
 const WELCOME_CREATED_AT: u64 = 1_700_000_000;
+/// The first envelope time that is not possibly this copy's pre-Welcome
+/// history (`Group::transport_message_predates_local_copy`).
+const PAST_THE_WELCOME_MARGIN: u64 =
+    WELCOME_CREATED_AT + cgka_traits::group::PRE_WELCOME_CLOCK_SKEW_SECS;
 
 /// Route a group message and stamp the envelope time the transport carries.
 fn route_at(msg: TransportMessage, group_id: &GroupId, at: u64) -> TransportMessage {
@@ -798,7 +802,7 @@ async fn unopenable_traffic_from_an_epoch_this_copy_has_not_reached_still_defers
 /// recovery evidence and arms a history backfill from. For traffic older than
 /// this copy's Welcome that backfill can only re-fetch history this copy can
 /// never open, so the release happens either way and only the announcement is
-/// suppressed — a decision that costs nothing when the guess is wrong.
+/// suppressed — a wrong guess delays recovery evidence but loses no message.
 #[tokio::test]
 async fn a_released_row_older_than_this_copys_welcome_raises_no_refusal() {
     let (mut alice, mut bob, bob_storage, group_id) = alice_and_a_removed_bob(b"release").await;
@@ -824,7 +828,7 @@ async fn a_released_row_older_than_this_copys_welcome_raises_no_refusal() {
     let live = route_at(
         chat(&mut alice, &group_id, "from after this copy").await,
         &group_id,
-        WELCOME_CREATED_AT + 60,
+        PAST_THE_WELCOME_MARGIN + 60,
     );
     // Their residence budget is spent the moment they are retained.
     bob.set_deferred_peel_residence_ms(0);
@@ -869,6 +873,94 @@ async fn a_released_row_older_than_this_copys_welcome_raises_no_refusal() {
         "only the row that could plausibly be this copy's history announces its release"
     );
 }
+
+/// The application's release journal honours the same decision (mdk#3536).
+///
+/// Consuming the journal on the next receipt sync or account open arms an
+/// epoch gap from each release it holds, the durable twin of the refusal
+/// event. A row that may predate this copy's Welcome must not arm one there
+/// either, or the newly linked device reports it cannot catch up and holds the
+/// device-group work its KeyPackage handoff waits on (mdk#3535). The release
+/// is otherwise unchanged: the id still comes back for redelivery.
+#[tokio::test]
+async fn a_released_row_older_than_this_copys_welcome_arms_no_epoch_gap() {
+    let (mut alice, mut bob, bob_storage, group_id) = alice_and_a_removed_bob(b"journal").await;
+
+    let welcome = readd(&mut alice, &mut bob, &group_id, WELCOME_CREATED_AT).await;
+    bob.join_welcome(welcome).await.unwrap();
+    bob.drain_events();
+    // From here on an application owns this database's released messages.
+    bob_storage
+        .app_storage()
+        .ensure_account_projection("bob")
+        .unwrap();
+    assert!(
+        bob_storage
+            .consume_released_transport_receipts()
+            .unwrap()
+            .is_empty()
+    );
+
+    let _withheld = evolve(
+        &mut alice,
+        SendIntent::SelfUpdate {
+            group_id: group_id.clone(),
+        },
+    )
+    .await;
+    let predating = TransportMessage {
+        // A transport event id, as the app's recovery inventory keys it.
+        id: MessageId::new(vec![0x5a; 32]),
+        ..route_at(
+            chat(&mut alice, &group_id, "from before this copy").await,
+            &group_id,
+            WELCOME_CREATED_AT,
+        )
+    };
+    bob.set_deferred_peel_residence_ms(0);
+    assert!(matches!(
+        bob.ingest(predating.clone()).await.unwrap(),
+        IngestOutcome::TransportDeferred { .. }
+    ));
+    // The app places a retained delivery in its recovery inventory. Once the
+    // row is released, that inventory row re-owes the message; an epoch gap
+    // re-owes only a release that has none.
+    bob_storage
+        .app_storage()
+        .record_reconciliation_items(std::iter::once((
+            &storage_sqlite::TransportReconciliationRoute::Group([7; 32]),
+            &storage_sqlite::TransportReconciliationItem {
+                event_id: predating.id.as_slice().try_into().unwrap(),
+                created_at: unix_seconds_now(),
+            },
+        )))
+        .unwrap();
+    for _ in 0..8 {
+        bob.retry_deferred_peels(&group_id).await.unwrap();
+        if deferred_rows(&bob_storage, &group_id) == 0 {
+            break;
+        }
+    }
+    assert_eq!(
+        deferred_rows(&bob_storage, &group_id),
+        0,
+        "the row is released"
+    );
+
+    assert_eq!(
+        bob_storage.consume_released_transport_receipts().unwrap(),
+        vec![predating.id],
+        "and its id comes back for redelivery"
+    );
+    assert!(
+        bob_storage
+            .app_storage()
+            .pending_epoch_backfill_intents()
+            .unwrap()
+            .is_empty(),
+        "but it arms no epoch gap"
+    );
+}
 fn unix_seconds_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -905,8 +997,10 @@ async fn a_welcome_dated_in_the_future_is_clamped_to_this_devices_clock() {
         !bob_storage
             .get_group(&group_id)
             .unwrap()
-            .transport_message_predates_local_copy(cgka_traits::transport::Timestamp(recorded.0)),
-        "and nothing arriving now may look like this copy's history"
+            .transport_message_predates_local_copy(cgka_traits::transport::Timestamp(
+                recorded.0 + cgka_traits::group::PRE_WELCOME_CLOCK_SKEW_SECS
+            )),
+        "and nothing arriving once the skew margin has passed may look like this copy's history"
     );
 }
 
@@ -940,12 +1034,12 @@ async fn deferred_stall_evidence_lists_current_epoch_rows_newer_than_the_welcome
     let first = route_at(
         chat(&mut alice, &group_id, "first after this copy").await,
         &group_id,
-        WELCOME_CREATED_AT + 60,
+        PAST_THE_WELCOME_MARGIN + 60,
     );
     let second = route_at(
         chat(&mut alice, &group_id, "second after this copy").await,
         &group_id,
-        WELCOME_CREATED_AT + 90,
+        PAST_THE_WELCOME_MARGIN + 90,
     );
     for msg in [&predating, &first, &second] {
         assert!(matches!(
@@ -977,7 +1071,7 @@ async fn deferred_stall_evidence_lists_current_epoch_rows_newer_than_the_welcome
         evidence
             .rows
             .iter()
-            .all(|row| row.transport_timestamp.0 > WELCOME_CREATED_AT),
+            .all(|row| row.transport_timestamp.0 > PAST_THE_WELCOME_MARGIN),
         "each row carries its transport timestamp"
     );
 

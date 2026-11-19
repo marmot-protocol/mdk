@@ -127,6 +127,14 @@ fn open_store_with_config(
     )
 }
 
+/// Envelope time for probes that must count as stall evidence: bob joined
+/// moments ago, and traffic stamped within the clock-skew margin after his
+/// Welcome may be the group's pre-Welcome history, which is not evidence
+/// (`Group::transport_message_predates_local_copy`, mdk#3536).
+fn stall_probe_created_at() -> u64 {
+    test_unix_now_seconds() + cgka_traits::group::PRE_WELCOME_CLOCK_SKEW_SECS
+}
+
 fn test_unix_now_seconds() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -336,7 +344,7 @@ impl StalledGroup {
     /// assert the arm rows themselves, so a run that failed to arm cannot leave
     /// an absence assertion holding vacuously.
     async fn stall_bob_for_one_run(&mut self, run: usize) -> Vec<marmot_app::EpochStallEscalation> {
-        let created_at = test_unix_now_seconds();
+        let created_at = stall_probe_created_at();
         for probe in 0..BACKFILL_THRESHOLD {
             publish_garbage_group_message_at(
                 &self.relay_url,
@@ -505,7 +513,7 @@ async fn arming_a_backfill_records_one_epoch_stall_backfill_armed_row() {
     // messages at bob's live epoch. Present-dated so they clear any since floor
     // and reach bob's live subscription; distinct markers make distinct event
     // ids, hence distinct undecryptables at the one stalled epoch.
-    let created_at = test_unix_now_seconds();
+    let created_at = stall_probe_created_at();
     for arm in 0..BACKFILL_THRESHOLD {
         publish_garbage_group_message_at(
             &live.relay_url,
@@ -590,7 +598,7 @@ async fn undecryptable_traffic_ingested_only_while_frozen_arms_on_the_next_advan
         MarmotAppConfig::white_noise().with_cursor_persistence(CursorPersistence::Frozen),
     );
     let mut frozen = app_frozen.client("bob").await.unwrap();
-    let created_at = test_unix_now_seconds();
+    let created_at = stall_probe_created_at();
     for arm in 0..BACKFILL_THRESHOLD {
         publish_garbage_group_message_at(
             &relay_url,
@@ -673,7 +681,7 @@ async fn below_threshold_undecryptable_traffic_records_no_backfill_armed_row() {
     let _setup_rows = audit_rows.new_rows(&live.app_bob, "bob");
 
     // One below the threshold: enough to accumulate a stall run but never arm.
-    let created_at = test_unix_now_seconds();
+    let created_at = stall_probe_created_at();
     for probe in 0..(BACKFILL_THRESHOLD - 1) {
         publish_garbage_group_message_at(
             &live.relay_url,
@@ -720,7 +728,7 @@ async fn a_second_stall_burst_at_the_same_epoch_records_no_further_row() {
     let mut audit_rows = AuditRowTracker::default();
 
     // First burst arms the backfill (row 1).
-    let created_at = test_unix_now_seconds();
+    let created_at = stall_probe_created_at();
     for arm in 0..BACKFILL_THRESHOLD {
         publish_garbage_group_message_at(
             &live.relay_url,
@@ -963,7 +971,7 @@ async fn escalation_from_completed_delivery_survives_later_sync_failure() {
     }
 
     let stalled_epoch = live.bobs_epoch();
-    let created_at = test_unix_now_seconds();
+    let created_at = stall_probe_created_at();
     for probe in 0..=BACKFILL_THRESHOLD {
         publish_garbage_group_message_at(
             &live.relay_url,
@@ -1008,7 +1016,7 @@ async fn compatibility_sync_retains_escalation_after_failure() {
     }
 
     let stalled_epoch = live.bobs_epoch();
-    let created_at = test_unix_now_seconds();
+    let created_at = stall_probe_created_at();
     for probe in 0..=BACKFILL_THRESHOLD {
         publish_garbage_group_message_at(
             &live.relay_url,
@@ -1070,7 +1078,7 @@ async fn escalation_survives_failed_projection_checkpoint() {
     }
 
     let stalled_epoch = live.bobs_epoch();
-    let created_at = test_unix_now_seconds();
+    let created_at = stall_probe_created_at();
     for probe in 0..=BACKFILL_THRESHOLD {
         publish_garbage_group_message_at(
             &live.relay_url,

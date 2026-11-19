@@ -49,6 +49,9 @@
 
 ### Fixed
 
+- A deferred row released while it may predate this copy's Welcome is journaled as no stall evidence
+  (`release_message_for_replay_without_stall_evidence`), so a host consuming its release journal no longer arms the
+  epoch gap the suppressed `TransportObjectResourceRefused` withheld (mdk#3536, mdk#3535).
 - `uncount_outdated_private_key_packages` opens no writer transaction when nothing is outdated (mdk#3479).
 - Hydration restores a pending commit's link to the queued intent it was drained from, from the frozen fanout that
   names it, so confirming the commit, refusing it for size or `publish_not_delivered` after a restart retires that

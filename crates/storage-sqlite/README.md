@@ -351,7 +351,9 @@ runner supplies validated facts and owns execution policy. Design:
   adapters; 0093 added the route-policy snapshot, a unique explicit-history row, and a receipt-journal invalidation
   flag, preserving populated obligations, loss evidence, retry state, receipts, maintenance, inventory, and cursors.
   Unexpected duplicate explicit rows make migration fail atomically; no demand is silently discarded. Later
-  migrations add stall observations, recovery comparison, the loss `created_at` bound, and history notices.
+  migrations add stall observations, recovery comparison, the loss `created_at` bound, and history notices; 0215
+  marks whether each journaled release is stall evidence, and only those arm an epoch gap when consumed. A release
+  no inventory row placed counts as evidence, since that gap is all that re-owes it.
 - **Coverage ledger (`recovery_coverage.rs`, migration 0123, mdk#2660).** Per route (the inbox or a group's transport
   route) and relay, the inclusive `created_at` ranges proved complete, each with its proof (live boundary, comparison
   certificate, sweep slice, re-check), plus each route's goal floor. `record_recovery_coverage` is the one write entry

@@ -13,12 +13,11 @@
 //!
 //! This drives `AppClient::next_event` directly (the worker's exact call, at
 //! `account_worker.rs`) rather than through the full runtime. The observable is
-//! precisely "did `next_event` return", which a runtime-level harness cannot
-//! see: it exercises the cold-boot catch-up seam (the recovery seam after the
-//! initial `sync()`), not the live
-//! `next_event` seam this test pins. Before the guard learned about
-//! `epoch_backfill_pending` this call hangs, and the timeout below is the RED
-//! signal.
+//! "did `next_event` return with an empty summary". That is weaker than the
+//! guard it was written for: the convergence a retained undecryptable row
+//! schedules also makes `next_event` return, so this test does not isolate the
+//! `epoch_backfill_pending` branch, and it does not prove the burst armed the
+//! backfill.
 
 // Test fixtures dial local relays directly; the proxy policy is crate-private.
 #![allow(clippy::disallowed_methods)]
@@ -44,10 +43,8 @@ use transport_nostr_peeler::{NOSTR_GROUP_CONTENT_MIN_LEN, NostrTransportEvent};
 /// arms a full-history epoch-gap backfill.
 const BACKFILL_THRESHOLD: usize = 8;
 
-/// How long the arming `next_event` call is allowed to run before the test
-/// gives up. With the fix it returns as soon as the threshold-crossing delivery
-/// arms the backfill; without it the call blocks forever on the next
-/// `receive()`, and this bound is the RED failure.
+/// How long the `next_event` call is allowed to run before the test gives up;
+/// a call that blocks on the next `receive()` fails here.
 const NEXT_EVENT_DEADLINE: Duration = Duration::from_secs(10);
 
 /// Deadline for bob's welcome to arrive and the group to become live.
@@ -108,11 +105,11 @@ async fn publish_garbage_group_message_at(
         .expect("publish garbage kind-445 test event");
 }
 
-/// A live delivery that arms the epoch-gap backfill but yields no visible
-/// summary content must still make `next_event` return, so the worker reaches
-/// its recovery seam (`refresh_recovery_at_seam`).
+/// A burst of undecryptable live traffic that yields no visible summary
+/// content still makes `next_event` return, so the worker reaches its recovery
+/// seam (`refresh_recovery_at_seam`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn next_event_returns_when_a_live_delivery_arms_the_epoch_backfill() {
+async fn next_event_returns_after_an_undecryptable_live_burst() {
     storage_sqlite::relax_storage_for_test_process();
     let (_relay, url) = mock_relay().await;
 
@@ -169,9 +166,12 @@ async fn next_event_returns_when_a_live_delivery_arms_the_epoch_backfill() {
     // messages at bob's live epoch. Present-dated so they clear any since floor
     // and reach bob's live subscription; distinct markers make distinct event
     // ids, hence distinct undecryptables at the one stalled epoch. None produces
-    // a visible `MarmotAppEvent`, so the summary stays empty across all of them
-    // and only the armed backfill can force the return.
-    let created_at = test_unix_now_seconds();
+    // a visible `MarmotAppEvent`, so the summary stays empty across all of
+    // them. The convergence a retained row schedules can also force the
+    // return, so this pins the empty summary, not the arm itself. Stamped past the
+    // clock-skew margin after bob's Welcome: traffic within it may be the
+    // group's pre-Welcome history, which is not stall evidence.
+    let created_at = test_unix_now_seconds() + cgka_traits::group::PRE_WELCOME_CLOCK_SKEW_SECS;
     for arm in 0..BACKFILL_THRESHOLD {
         publish_garbage_group_message_at(
             &url,
@@ -182,22 +182,23 @@ async fn next_event_returns_when_a_live_delivery_arms_the_epoch_backfill() {
         .await;
     }
 
-    // The threshold-crossing delivery arms the backfill with an empty summary.
-    // With the guard fix `next_event` returns here; without it the call blocks
-    // on the next `receive()` and this timeout is the RED failure.
+    // The threshold-crossing delivery arms the backfill with an empty summary,
+    // and the convergence a retained row schedules can force the same return,
+    // so this observes only that `next_event` returns rather than blocking on
+    // the next `receive()`.
     let summary = timeout(NEXT_EVENT_DEADLINE, bob.next_event())
         .await
-        .expect("next_event must return once a live delivery arms the epoch backfill")
+        .expect("next_event must return after the undecryptable burst")
         .expect("next_event should not error");
 
-    // The return is driven purely by the armed backfill: the undecryptable
-    // probes carry no visible content, so an empty summary is the expected and
-    // harmless payload the worker forwards to `publish_app_runtime_summary`.
+    // The undecryptable probes carry no visible content, so an empty summary is
+    // the expected and harmless payload the worker forwards to
+    // `publish_app_runtime_summary`.
     assert!(
         summary.joined_groups.is_empty()
             && summary.messages.is_empty()
             && summary.events.is_empty(),
         "the arming deliveries are undecryptable and must not surface visible \
-         summary content; the return is forced by the armed backfill alone",
+         summary content",
     );
 }

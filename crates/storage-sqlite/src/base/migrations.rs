@@ -407,6 +407,8 @@ mod migration_0212_attachment_body_removals;
 mod migration_0213_epoch_gap_visit_window;
 #[path = "migrations/0214_link_chat_progress.rs"]
 mod migration_0214_link_chat_progress;
+#[path = "migrations/0215_released_receipt_stall_evidence.rs"]
+mod migration_0215_released_receipt_stall_evidence;
 
 const MIGRATIONS: &[Migration] = &[
     Migration {
@@ -1545,6 +1547,12 @@ const MIGRATIONS: &[Migration] = &[
         name: "0214_link_chat_progress",
         suspend_foreign_keys: &[],
         apply: migration_0214_link_chat_progress::apply,
+    },
+    Migration {
+        version: 215,
+        name: "0215_released_receipt_stall_evidence",
+        suspend_foreign_keys: &[],
+        apply: migration_0215_released_receipt_stall_evidence::apply,
     },
 ];
 

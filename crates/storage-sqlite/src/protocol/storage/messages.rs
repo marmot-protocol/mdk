@@ -69,8 +69,12 @@ pub struct StorageFormatBenchSizes {
 
 impl SqliteAccountStorage {
     /// Retire stale host receipts and durably arm backfill before acknowledging
-    /// release evidence. The caller must remove returned ids from its in-memory
-    /// seen ring synchronously, before its next checkpoint or duplicate check.
+    /// release evidence. Every journaled id is retired and returned; only the
+    /// releases that were stall evidence arm their group's epoch gap
+    /// (`MessageStorage::release_message_for_replay_without_stall_evidence`
+    /// journals one that is not). The caller must remove returned ids from its
+    /// in-memory seen ring synchronously, before its next checkpoint or
+    /// duplicate check.
     /// A process death after commit is safe: both disk receipt stores are already
     /// clean and backfill intent survives. An interrupted engine effects batch
     /// needs no special handling because the release journal is authoritative.
@@ -105,10 +109,22 @@ impl SqliteAccountStorage {
                 )?;
                 unknown_bounds |= removed == 0 && !invalidated;
             }
-            let groups = conn.prepare_cached(
-                "SELECT group_id, MAX(epoch) FROM cgka_released_transport_receipts GROUP BY group_id",
-            ).storage()?.query_map([], |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?)))
-                .storage()?.collect::<Result<Vec<_>, _>>().storage()?;
+            // Every release above is retired, but only one that was stall
+            // evidence arms its group's epoch gap: the engine judged the rest
+            // (traffic that may predate this copy's Welcome, mdk#3536) unable
+            // to show history this copy could open.
+            let groups = conn
+                .prepare_cached(
+                    "SELECT group_id, MAX(epoch) FROM cgka_released_transport_receipts
+                 WHERE stall_evidence = 1 GROUP BY group_id",
+                )
+                .storage()?
+                .query_map([], |row| {
+                    Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?))
+                })
+                .storage()?
+                .collect::<Result<Vec<_>, _>>()
+                .storage()?;
             for (group_id, epoch) in groups {
                 crate::cross::release::arm_released_epoch(
                     &conn,
@@ -266,6 +282,87 @@ fn promotion_crash_pause(promoted: usize) {
     }
 }
 
+impl SqliteAccountStorage {
+    /// Release retained transport bytes for replay, journaling the release for
+    /// an app owner. `stall_evidence` says whether consuming the journal arms
+    /// the group's epoch gap from it; every other effect is the same.
+    fn release_for_replay(
+        &self,
+        record: &MessageRecord,
+        stall_evidence: bool,
+    ) -> StorageResult<()> {
+        let release = || {
+            let conn = self.lock()?;
+            // App ownership is durable before engine hydration. It must not
+            // depend on individual receipts: the app's active seen ring may
+            // not have checkpointed yet, and inventory writes are best-effort.
+            // A standalone engine has no app consumer and needs only deletion.
+            if !crate::cross::release::app_owns_released_messages(&conn)? {
+                return delete_message_on_connection(&conn, &record.id);
+            }
+            // Bound journal metadata even if a host never consumes it. At the
+            // bound, fail before deleting bytes; never evict replay evidence.
+            // An id released again before the journal is consumed is stall
+            // evidence if any of its releases was, at that release's epoch: a
+            // later release that is not evidence must not withdraw the epoch
+            // gap an earlier one owes.
+            let recorded = conn
+                .execute_cached(
+                    "INSERT INTO cgka_released_transport_receipts(id, group_id, epoch, stall_evidence)
+                 SELECT ?1, ?2, ?3, ?5 WHERE
+                    (SELECT count(*) FROM cgka_released_transport_receipts) < ?4
+                    OR EXISTS(SELECT 1 FROM cgka_released_transport_receipts WHERE id = ?1)
+                 ON CONFLICT(id) DO UPDATE SET
+                    epoch = CASE WHEN excluded.stall_evidence >= stall_evidence
+                        THEN excluded.epoch ELSE epoch END,
+                    stall_evidence = MAX(stall_evidence, excluded.stall_evidence)",
+                    params![
+                        record.id.as_slice(),
+                        record.group_id.as_slice(),
+                        epoch_to_i64(record.epoch)?,
+                        RELEASED_TRANSPORT_RECEIPT_CAPACITY,
+                        stall_evidence
+                    ],
+                )
+                .storage()?;
+            if recorded == 0 {
+                return Err(StorageError::Backend(
+                    "released transport receipt journal is full".into(),
+                ));
+            }
+            let invalidated: bool = conn.query_row_cached(
+                "SELECT inventory_invalidated FROM cgka_released_transport_receipts WHERE id=?1",
+                [record.id.as_slice()], |row| row.get(0),
+            ).storage()?;
+            if crate::cross::release::retire_transport_receipts(&conn, &record.id)? == 0
+                && !invalidated
+            {
+                crate::cross::release::invalidate_recovery_inventory(&conn)?;
+                // No inventory row placed this message on a route and second,
+                // so no coverage was reopened for it: only the epoch gap the
+                // journal arms still owes its redelivery, whatever the engine
+                // judged about it as stall evidence.
+                conn.execute_cached(
+                    "UPDATE cgka_released_transport_receipts SET stall_evidence = 1 WHERE id = ?1",
+                    [record.id.as_slice()],
+                )
+                .storage()?;
+            }
+            conn.execute_cached(
+                "UPDATE cgka_released_transport_receipts SET inventory_invalidated=1 WHERE id=?1",
+                [record.id.as_slice()],
+            )
+            .storage()?;
+            delete_message_on_connection(&conn, &record.id)
+        };
+        if self.connection.is_current_thread_transaction_owner() {
+            release()
+        } else {
+            retry_on_busy(|| self.connection.with_transaction(release))
+        }
+    }
+}
+
 impl MessageStorage for SqliteAccountStorage {
     fn put_message(&self, record: &MessageRecord) -> StorageResult<()> {
         let write = || {
@@ -313,58 +410,14 @@ impl MessageStorage for SqliteAccountStorage {
     }
 
     fn release_message_for_replay(&self, record: &MessageRecord) -> StorageResult<()> {
-        let release = || {
-            let conn = self.lock()?;
-            // App ownership is durable before engine hydration. It must not
-            // depend on individual receipts: the app's active seen ring may
-            // not have checkpointed yet, and inventory writes are best-effort.
-            // A standalone engine has no app consumer and needs only deletion.
-            if !crate::cross::release::app_owns_released_messages(&conn)? {
-                return delete_message_on_connection(&conn, &record.id);
-            }
-            // Bound journal metadata even if a host never consumes it. At the
-            // bound, fail before deleting bytes; never evict replay evidence.
-            let recorded = conn
-                .execute_cached(
-                    "INSERT INTO cgka_released_transport_receipts(id, group_id, epoch)
-                 SELECT ?1, ?2, ?3 WHERE
-                    (SELECT count(*) FROM cgka_released_transport_receipts) < ?4
-                    OR EXISTS(SELECT 1 FROM cgka_released_transport_receipts WHERE id = ?1)
-                 ON CONFLICT(id) DO UPDATE SET epoch = excluded.epoch",
-                    params![
-                        record.id.as_slice(),
-                        record.group_id.as_slice(),
-                        epoch_to_i64(record.epoch)?,
-                        RELEASED_TRANSPORT_RECEIPT_CAPACITY
-                    ],
-                )
-                .storage()?;
-            if recorded == 0 {
-                return Err(StorageError::Backend(
-                    "released transport receipt journal is full".into(),
-                ));
-            }
-            let invalidated: bool = conn.query_row_cached(
-                "SELECT inventory_invalidated FROM cgka_released_transport_receipts WHERE id=?1",
-                [record.id.as_slice()], |row| row.get(0),
-            ).storage()?;
-            if crate::cross::release::retire_transport_receipts(&conn, &record.id)? == 0
-                && !invalidated
-            {
-                crate::cross::release::invalidate_recovery_inventory(&conn)?;
-            }
-            conn.execute_cached(
-                "UPDATE cgka_released_transport_receipts SET inventory_invalidated=1 WHERE id=?1",
-                [record.id.as_slice()],
-            )
-            .storage()?;
-            delete_message_on_connection(&conn, &record.id)
-        };
-        if self.connection.is_current_thread_transaction_owner() {
-            release()
-        } else {
-            retry_on_busy(|| self.connection.with_transaction(release))
-        }
+        self.release_for_replay(record, true)
+    }
+
+    fn release_message_for_replay_without_stall_evidence(
+        &self,
+        record: &MessageRecord,
+    ) -> StorageResult<()> {
+        self.release_for_replay(record, false)
     }
 
     fn update_message_state(&self, id: &MessageId, new_state: MessageState) -> StorageResult<()> {
@@ -1595,6 +1648,162 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    /// A release the engine judged not to be stall evidence (traffic that may
+    /// predate this copy's Welcome, mdk#3536) is still a release: consuming it
+    /// retires both receipt stores again and hands the id back for redelivery.
+    /// It arms no epoch gap, though, including when a later open of the
+    /// database consumes it: the inventory row that placed it re-owes its
+    /// second instead.
+    #[test]
+    fn a_release_that_is_not_stall_evidence_retires_receipts_but_arms_no_epoch_gap() {
+        use crate::protocol::storage::write_contention::SharedDatabase;
+
+        let db = SharedDatabase::new();
+        let releaser = db.open();
+        releaser.put_group(&sample_group(gid(1), 3, 0)).unwrap();
+        releaser
+            .app_storage()
+            .ensure_account_projection("app-owner")
+            .unwrap();
+        let mut record = sample_message(MessageId::new(vec![42; 32]), gid(1), 3);
+        record.state = MessageState::PeelDeferred;
+        releaser.put_message(&record).unwrap();
+        inventory(&releaser, &record.id);
+        releaser
+            .release_message_for_replay_without_stall_evidence(&record)
+            .unwrap();
+        assert!(matches!(
+            releaser.get_message(&record.id),
+            Err(StorageError::NotFound)
+        ));
+        // Model an old app checkpoint written before the journal is consumed.
+        let seen = |store: &SqliteAccountStorage| {
+            store
+                .lock()
+                .unwrap()
+                .query_row("SELECT count(*) FROM seen_events", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap()
+        };
+        releaser
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO seen_events(event_id, seen_at) VALUES (?1, 1)",
+                params![hex::encode(record.id.as_slice())],
+            )
+            .unwrap();
+        drop(releaser);
+
+        let reopened = db.open();
+        assert_eq!(
+            reopened.consume_released_transport_receipts().unwrap(),
+            vec![record.id.clone()],
+            "the id is still eligible for redelivery"
+        );
+        assert_eq!(seen(&reopened), 0, "its stale receipt is retired");
+        let obligations: i64 = reopened
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM account_recovery_obligations",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(obligations, 0, "no epoch gap is armed");
+    }
+
+    /// An id released twice before the journal is consumed is stall evidence
+    /// when either release was, at the epoch of the release that was.
+    #[test]
+    fn a_released_id_is_stall_evidence_when_any_of_its_releases_was() {
+        for evidence_first in [true, false] {
+            let store = SqliteAccountStorage::in_memory().unwrap();
+            store
+                .app_storage()
+                .ensure_account_projection("app-owner")
+                .unwrap();
+            store.put_group(&sample_group(gid(1), 5, 0)).unwrap();
+            let id = MessageId::new(vec![1; 32]);
+            for evidence in [evidence_first, !evidence_first] {
+                let epoch = if evidence { 2 } else { 5 };
+                let mut record = sample_message(id.clone(), gid(1), epoch);
+                record.state = MessageState::PeelDeferred;
+                store.put_message(&record).unwrap();
+                inventory(&store, &id);
+                if evidence {
+                    store.release_message_for_replay(&record).unwrap();
+                } else {
+                    store
+                        .release_message_for_replay_without_stall_evidence(&record)
+                        .unwrap();
+                }
+            }
+            assert_eq!(
+                store.consume_released_transport_receipts().unwrap(),
+                vec![id]
+            );
+            let armed: Vec<_> = store
+                .app_storage()
+                .pending_epoch_backfill_intents()
+                .unwrap()
+                .into_iter()
+                .map(|intent| intent.stalled_epoch)
+                .collect();
+            assert_eq!(armed, vec![2], "evidence first: {evidence_first}");
+        }
+    }
+
+    /// Places a retained message on a route and second in the recovery
+    /// inventory, as the app does when it admits the delivery.
+    fn inventory(store: &SqliteAccountStorage, id: &MessageId) {
+        store
+            .app_storage()
+            .record_reconciliation_items(std::iter::once((
+                &crate::TransportReconciliationRoute::Group([7; 32]),
+                &crate::TransportReconciliationItem {
+                    event_id: id.as_slice().try_into().unwrap(),
+                    created_at: crate::unix_now_seconds(),
+                },
+            )))
+            .unwrap();
+    }
+
+    /// A release reopens its message's route and second only through the
+    /// inventory rows that placed it there, and that inventory write is
+    /// best-effort. Without one, the epoch gap the journal arms is the only
+    /// thing left that owes the message's redelivery, so it arms even for a
+    /// release the engine judged not to be stall evidence.
+    #[test]
+    fn a_release_no_inventory_placed_still_arms_its_epoch_gap() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        store
+            .app_storage()
+            .ensure_account_projection("app-owner")
+            .unwrap();
+        store.put_group(&sample_group(gid(1), 3, 0)).unwrap();
+        let mut record = sample_message(MessageId::new(vec![1; 32]), gid(1), 3);
+        record.state = MessageState::PeelDeferred;
+        store.put_message(&record).unwrap();
+        store
+            .release_message_for_replay_without_stall_evidence(&record)
+            .unwrap();
+        assert_eq!(
+            store.consume_released_transport_receipts().unwrap(),
+            vec![record.id]
+        );
+        let armed: Vec<_> = store
+            .app_storage()
+            .pending_epoch_backfill_intents()
+            .unwrap()
+            .into_iter()
+            .map(|intent| intent.stalled_epoch)
+            .collect();
+        assert_eq!(armed, vec![3]);
     }
 
     #[test]

@@ -1050,11 +1050,15 @@ impl<S: StorageProvider> Engine<S> {
         // is the one shape where that is knowably wasted work: the copy's own
         // epochs begin at the commit that minted its Welcome, so a re-fetch can
         // only bring back more of what it already cannot open. The release
-        // itself is unchanged — only the announcement is dropped, which is why
+        // itself is unchanged — only the announcement and its durable twin, the
+        // release journal's backfill arm, are dropped, which is why
         // a timestamp is allowed to decide it at all. It is a compose-time
         // value for application messages and this seam cannot tell those from
-        // commits, so being wrong here must stay free, and here it is: the row
-        // is released either way, and the id stays eligible for redelivery.
+        // commits, so being wrong here must lose nothing, and it does not: the
+        // row is released either way, the id stays eligible for redelivery,
+        // and the host still re-owes it (through the recovery inventory, or
+        // the journal's arm where none placed it). A wrong guess can only
+        // delay a stall's detection until traffic past the margin arrives.
         let predates_this_copy = self.released_row_predates_local_copy(record);
         let released_as = if predates_this_copy {
             crate::message_disposition::MessageDisposition::PredatesLocalCopy
@@ -1081,7 +1085,15 @@ impl<S: StorageProvider> Engine<S> {
                 .max(self.convergence_now().wall_ms)
                 .saturating_sub(lifecycle.first_observed_wall_ms)
         });
-        self.storage.release_message_for_replay(record)?;
+        // The host's durable release journal arms the same backfill when it is
+        // consumed, so it is told the same decision; without it a receipt sync
+        // or reopen would re-raise what the suppressed event withheld.
+        if predates_this_copy {
+            self.storage
+                .release_message_for_replay_without_stall_evidence(record)?;
+        } else {
+            self.storage.release_message_for_replay(record)?;
+        }
         let release_reason = released_as.tag();
         tracing::info!(
             target: "cgka_engine::message_processor",

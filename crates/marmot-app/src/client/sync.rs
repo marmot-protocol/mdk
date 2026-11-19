@@ -7089,6 +7089,52 @@ mod tests {
         );
     }
 
+    /// A refusal arms its epoch gap even when it is stamped near this copy's
+    /// Welcome, where a retained deferral would not count (mdk#3536). The
+    /// engine kept nothing, and a refused recovery fetch leaves its second
+    /// covered, so the gap is what fetches the event again once the backlog
+    /// drains.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refusal_near_this_copys_welcome_still_arms_an_epoch_gap() {
+        use cgka_traits::ingest::{InboundResourceLimit, IngestOutcome};
+        use cgka_traits::storage::GroupStorage;
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let app = MarmotApp::with_relay_and_config(
+            dir.path(),
+            "wss://relay.example",
+            crate::MarmotAppConfig::white_noise(),
+        )
+        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+        let mut client = client_on_app_relay_plane(&app, "alice").await;
+        let group = client
+            .create_group("refused", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
+        // Model a Welcome-installed copy; one this device created has no
+        // Welcome time to compare against.
+        let storage = app.account_storage("alice").unwrap();
+        let welcome_at = crate::unix_now_seconds();
+        let mut record = storage.get_group(&group).unwrap();
+        record.local_copy_welcome_created_at = Some(cgka_traits::transport::Timestamp(welcome_at));
+        storage.put_group(&record).unwrap();
+
+        client.detect_epoch_stall(
+            Some(group.clone()),
+            "near-the-welcome",
+            &IngestOutcome::ResourceRefused {
+                group_id: group.clone(),
+                resource: InboundResourceLimit::TransportDeferredCapacity,
+            },
+            cgka_traits::transport::Timestamp(welcome_at - 60),
+        );
+        assert!(client.has_pending_epoch_backfill());
+    }
+
     /// A commit or retry can release several retained messages in one effects batch.
     /// Each row needs its own source identity, including when no relay envelope
     /// triggered the batch. Replay must remain idempotent across observation seams.

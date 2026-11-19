@@ -5179,10 +5179,13 @@ async fn app_runtime_uploads_armed_backfill_row_without_visible_activity() {
     // messages at his live epoch. Present-dated so they clear any since floor;
     // none yields visible summary content, so the summary-gated schedule stays
     // silent and only the armed-backfill schedule can deliver these rows.
+    // Stamped past the clock-skew margin after bob's Welcome: traffic within
+    // it may be the group's pre-Welcome history, which is not stall evidence.
     let created_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
-        .as_secs();
+        .as_secs()
+        + cgka_traits::group::PRE_WELCOME_CLOCK_SKEW_SECS;
     for arm in 0..BACKFILL_THRESHOLD {
         publish_garbage_group_message(&url, &nostr_group_id_hex, created_at, &format!("arm-{arm}"))
             .await;

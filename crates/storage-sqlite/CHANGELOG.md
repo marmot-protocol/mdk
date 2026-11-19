@@ -4,6 +4,11 @@
 
 ### Breaking changes
 
+- Account migration 0215 adds `stall_evidence` to `cgka_released_transport_receipts` (mdk#3536). Consuming the
+  journal retires every release but arms an epoch gap only from releases that were stall evidence; a row released
+  through `release_message_for_replay_without_stall_evidence` arms none unless no recovery inventory row placed it,
+  since the gap is then all that re-owes its redelivery. Journaled rows from before the upgrade count. Older binaries
+  refuse an upgraded database; downgrade is unsupported.
 - Account migration 0214 persists link chat progress across restarts. Older binaries refuse schema 214 (#3532).
 - Account migration 0213 persists the end of each epoch-gap visit (#3538). Older binaries refuse an upgraded
   database. Callers constructing `RecoveryEpochGapRetry` must supply `visit_until_seconds`.
