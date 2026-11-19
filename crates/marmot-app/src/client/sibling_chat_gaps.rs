@@ -740,6 +740,7 @@ impl AppClient {
         {
             tracing::warn!(target: TARGET, method = "fill_sibling_chat_gaps", error_kind = error.privacy_safe_kind(), "could not fill sibling chat gaps");
         }
+        self.send_recorded_acceptances().await;
     }
 
     async fn try_fill_sibling_chat_gaps(
@@ -964,7 +965,7 @@ impl AppClient {
                 self.sibling_chat_gaps.schedule(chat.clone(), expiry);
                 continue;
             }
-            if retire.is_empty() && self.send_unrecorded_acceptance(chat).await? {
+            if retire.is_empty() && self.record_unrecorded_acceptance(chat)? {
                 self.sibling_chat_gaps.schedule(chat.clone(), 0);
                 continue;
             }

@@ -125,6 +125,7 @@ impl AppClient {
                 "could not add linked devices to chats"
             );
         }
+        self.send_recorded_acceptances().await;
         LINK_CHAT_ADDS_PER_PASS - budget
     }
 
@@ -219,7 +220,7 @@ impl AppClient {
                         continue;
                     }
                 }
-                match self.send_unrecorded_acceptance(&chat).await {
+                match self.record_unrecorded_acceptance(&chat) {
                     Ok(false) => {}
                     Ok(true) => continue,
                     Err(error) => {

@@ -683,7 +683,15 @@ async fn a_sibling_welcome_joins_with_the_private_key_package_issued_to_its_send
         2
     );
 
-    let sibling = sibling_welcome(welcome, SLOT, &reference);
+    // It forwards a confirmation and an inviter that is no valid account key,
+    // which the join reports without (mdk#3546).
+    let sibling = SiblingWelcome {
+        forwarded: ForwardedInvitation {
+            inviter: Some([0xff; 32]),
+            confirmed: true,
+        },
+        ..sibling_welcome(welcome, SLOT, &reference)
+    };
     let sibling = SiblingWelcome::decode(&sibling.encode().unwrap()).unwrap();
     assert_eq!(
         join_sibling(&mut laptop, b"461", &sibling).await,
@@ -700,12 +708,25 @@ async fn a_sibling_welcome_joins_with_the_private_key_package_issued_to_its_send
         .into_iter()
         .filter_map(|event| match event {
             GroupEvent::GroupJoined {
-                group_id, welcomer, ..
-            } => Some((group_id, welcomer)),
+                group_id,
+                welcomer,
+                forwarded,
+                ..
+            } => Some((group_id, welcomer, forwarded)),
             _ => None,
         })
         .collect();
-    assert_eq!(joined, vec![(gid.clone(), Some(phone.engine.self_id()))]);
+    assert_eq!(
+        joined,
+        vec![(
+            gid.clone(),
+            Some(phone.engine.self_id()),
+            ForwardedInvitation {
+                inviter: None,
+                confirmed: true,
+            }
+        )]
+    );
     let left = laptop.engine.issued_private_key_packages().unwrap();
     assert_eq!(left.len(), 1);
     assert_eq!(left[0].key_package_ref, issued[1].key_package_ref);

@@ -1474,7 +1474,15 @@ impl<S: StorageProvider> Engine<S> {
     ) -> Result<GroupId, EngineError> {
         let welcome_id = welcome_msg.id.clone();
         let forwarded = match &route {
-            WelcomeRoute::Sibling { forwarded, .. } => forwarded.clone(),
+            // An inviter that is no valid account key, or is this account, is
+            // no other account to show; the confirmation still stands.
+            WelcomeRoute::Sibling { forwarded, .. } => cgka_traits::engine::ForwardedInvitation {
+                inviter: forwarded.inviter.filter(|inviter| {
+                    crate::identity::validate_credential_identity(inviter).is_ok()
+                        && inviter.as_slice() != self.identity.self_id().as_slice()
+                }),
+                confirmed: forwarded.confirmed,
+            },
             WelcomeRoute::Delivery => Default::default(),
         };
         let (welcome_bytes, welcome_created_at, key_package_claim) = match peeled.content {

@@ -256,15 +256,16 @@ impl AppClient {
     /// Before a sibling Add of `chat`, which makes no claim or KeyPackage
     /// spend first: a confirmed copy holding no decision for its generation,
     /// such as one accepted while device groups were off, records the
-    /// acceptance a founder records and sends it, so the sibling installs its
-    /// copy settled (mdk#3546). Returns whether it did; the caller then leaves
-    /// the Add to a later pass, since sending can take in device-group traffic
-    /// (a decline, another device's claim) its checks have not seen. Only a
-    /// copy founded here, or whose presented invitation is that admission's
-    /// own Welcome, counts as accepted: a row rebuilt after a local deletion
-    /// is unconfirmed by default and carries no Welcome.
-    pub(super) async fn send_unrecorded_acceptance(
-        &mut self,
+    /// acceptance a founder records (mdk#3546). Returns whether it did; the
+    /// caller then leaves the Add to a later pass, and sends what it recorded
+    /// once its scan ends ([`Self::send_recorded_acceptances`]), so the
+    /// sibling installs its copy settled and no send takes in device-group
+    /// traffic mid-scan. Only a copy founded here, or whose presented
+    /// invitation is that admission's own Welcome, counts as accepted: a row
+    /// rebuilt after a local deletion is unconfirmed by default and carries no
+    /// Welcome.
+    pub(super) fn record_unrecorded_acceptance(
+        &self,
         group_id: &GroupId,
     ) -> Result<bool, AppError> {
         let Some(group) = self.state_group_record(group_id) else {
@@ -302,8 +303,24 @@ impl AppClient {
         {
             return Ok(false);
         }
-        self.send_owed_small_state().await?;
         Ok(true)
+    }
+
+    /// Send, once a sibling-Add scan has ended, the acceptances it recorded,
+    /// with any other owed small state.
+    pub(super) async fn send_recorded_acceptances(&mut self) {
+        let owed = self
+            .app
+            .account_storage(&self.state.label)
+            .and_then(|account| Ok(account.app_storage().unsent_invitation_decisions()?));
+        let result = match owed {
+            Ok(owed) if owed.is_empty() => return,
+            Ok(_) => self.send_owed_small_state().await,
+            Err(error) => Err(error),
+        };
+        if let Err(error) = result {
+            tracing::warn!(target: "marmot_app::client::invitation_decisions", method = "send_recorded_acceptances", error_kind = error.privacy_safe_kind(), "recorded acceptances wait for ordinary small-state sending");
+        }
     }
 
     /// Native founding can be recovered by the ordinary projection reconcile
