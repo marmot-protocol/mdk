@@ -71,7 +71,7 @@
 
 use base64::Engine as _;
 use cgka_traits::app_components::{DeviceSlotId, valid_sibling_welcome_relays};
-use cgka_traits::engine::{EpochPin, SendIntent, SiblingKeyPackage};
+use cgka_traits::engine::{EpochPin, ForwardedInvitation, SendIntent, SiblingKeyPackage};
 use cgka_traits::error::{EngineError, SiblingAddRefusal};
 use cgka_traits::storage::{IssuedPrivateKeyPackage, MessageStorage as _};
 use cgka_traits::welcome::SiblingWelcomeJoin;
@@ -955,6 +955,25 @@ impl AppClient {
             .take_received_private_key_package_exact(candidate, unix_now_seconds())?)
     }
 
+    /// What this device's copy of `chat` says about the invitation it came
+    /// in by, for the sibling it adds to show the chat as it stands here
+    /// (mdk#3546).
+    fn forwarded_invitation(&self, chat: &GroupId) -> ForwardedInvitation {
+        let Some(group) = self.state_group_record(chat) else {
+            return ForwardedInvitation::default();
+        };
+        let own = self.runtime.self_id();
+        ForwardedInvitation {
+            // A copy joined from an earlier sibling Welcome names this
+            // account, which is no inviter to forward.
+            inviter: group
+                .welcomer_account_id_hex
+                .and_then(|welcomer| <[u8; 32] as hex::FromHex>::from_hex(welcomer).ok())
+                .filter(|welcomer| welcomer.as_slice() != own.as_slice()),
+            confirmed: !group.pending_confirmation,
+        }
+    }
+
     /// Add the sibling in `sibling` to `chat` with the exact received
     /// `candidate` the caller admitted, then send the sibling Welcome owed once
     /// its Commit is published. The engine refuses the Add, writing nothing,
@@ -964,8 +983,10 @@ impl AppClient {
     /// candidate must still be held and unexpired when claimed. Once claimed,
     /// the KeyPackage is spent either way and never handed back: an error after
     /// the engine took the Add reads the same as a refusal, and a KeyPackage
-    /// returned then could reach two Welcomes. Upkeep asks the sibling for
-    /// more.
+    /// returned then could reach two Welcomes. The one exception is
+    /// `SiblingAddUnsettled`, which the engine answers before staging or
+    /// queueing anything, so a gap fill that retries it spends no stock.
+    /// Upkeep asks the sibling for more.
     pub(crate) async fn add_sibling_to_chat(
         &mut self,
         chat: &GroupId,
@@ -978,6 +999,7 @@ impl AppClient {
         if !self.invitation_allows_sibling_add(chat)? {
             return Ok(());
         }
+        let forwarded = self.forwarded_invitation(chat);
         if !self.take_private_key_package_exact(sibling, &candidate)? {
             return Err(AppError::DeviceGroupRefused("no_private_key_package"));
         }
@@ -988,7 +1010,7 @@ impl AppClient {
             Vec::new(),
             Some(1),
         );
-        let effects = self
+        let sent = self
             .runtime
             .send_with_audit_context(
                 SendIntent::AddOwnAccountDevices {
@@ -997,10 +1019,30 @@ impl AppClient {
                         slot: *sibling,
                         key_package,
                     }],
+                    forwarded,
                 },
                 audit_context,
             )
-            .await?;
+            .await
+            .map_err(AppError::from);
+        if let Err(error) = &sent
+            && matches!(
+                error.as_engine_error(),
+                Some(EngineError::SiblingAddUnsettled { .. })
+            )
+            && self
+                .app
+                .account_storage(&self.state.label)?
+                .app_storage()
+                .return_received_private_key_package(&candidate, unix_now_seconds())?
+        {
+            // Back in stock as a hand-off would put it: this pass's selection
+            // sees it again, and a chat waiting for this sibling's stock wakes.
+            self.received_private_key_package_generation =
+                self.received_private_key_package_generation.wrapping_add(1);
+            self.sibling_gap_stock_arrived(sibling);
+        }
+        let effects = sent?;
         self.observe_recovery_evidence_then_fail_if_publish_failed(&effects)
             .await?;
         // The shared sender reads its device group's hold itself, and

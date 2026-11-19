@@ -18,6 +18,7 @@ use cgka_engine::private_key_packages::{
     validate_received_private_key_package,
 };
 use cgka_traits::app_components::{DeviceEntryV1, DeviceRosterV1};
+use cgka_traits::engine::ForwardedInvitation;
 use cgka_traits::storage::{GroupStorage as _, KeyPackageBundleStorage as _};
 use cgka_traits::welcome::SiblingWelcomeJoin::{self, Settled};
 use tls_codec::VLBytes;
@@ -615,6 +616,7 @@ fn sibling_welcome(
         key_package_ref: key_package_ref.to_vec(),
         welcome: welcome.payload.clone(),
         relays: vec![],
+        forwarded: Default::default(),
     }
 }
 
@@ -681,7 +683,15 @@ async fn a_sibling_welcome_joins_with_the_private_key_package_issued_to_its_send
         2
     );
 
-    let sibling = sibling_welcome(welcome, SLOT, &reference);
+    // It forwards a confirmation and an inviter that is no valid account key,
+    // which the join reports without (mdk#3546).
+    let sibling = SiblingWelcome {
+        forwarded: ForwardedInvitation {
+            inviter: Some([0xff; 32]),
+            confirmed: true,
+        },
+        ..sibling_welcome(welcome, SLOT, &reference)
+    };
     let sibling = SiblingWelcome::decode(&sibling.encode().unwrap()).unwrap();
     assert_eq!(
         join_sibling(&mut laptop, b"461", &sibling).await,
@@ -698,12 +708,25 @@ async fn a_sibling_welcome_joins_with_the_private_key_package_issued_to_its_send
         .into_iter()
         .filter_map(|event| match event {
             GroupEvent::GroupJoined {
-                group_id, welcomer, ..
-            } => Some((group_id, welcomer)),
+                group_id,
+                welcomer,
+                forwarded,
+                ..
+            } => Some((group_id, welcomer, forwarded)),
             _ => None,
         })
         .collect();
-    assert_eq!(joined, vec![(gid.clone(), Some(phone.engine.self_id()))]);
+    assert_eq!(
+        joined,
+        vec![(
+            gid.clone(),
+            Some(phone.engine.self_id()),
+            ForwardedInvitation {
+                inviter: None,
+                confirmed: true,
+            }
+        )]
+    );
     let left = laptop.engine.issued_private_key_packages().unwrap();
     assert_eq!(left.len(), 1);
     assert_eq!(left[0].key_package_ref, issued[1].key_package_ref);
@@ -1017,6 +1040,52 @@ async fn a_sibling_welcome_carried_before_a_forget_joins_from_a_later_carrier() 
     );
 }
 
+/// What a sibling Welcome forwards is the sending sibling's word about a copy
+/// of its own account's, so a join counts it only from a Welcome its own
+/// account authored; one relaying another account's Commit forwards nothing
+/// (mdk#3546).
+#[tokio::test]
+async fn a_sibling_welcome_another_account_authored_forwards_nothing() {
+    let mut bob = device(b"bob", true);
+    let mut laptop = device(b"alice", true);
+    laptop
+        .engine
+        .issue_private_key_packages(&SLOT, 1, None, NOW)
+        .unwrap();
+    let issued = laptop.engine.issued_private_key_packages().unwrap();
+    let (gid, welcomes) = create(
+        &mut bob,
+        vec![current(issued[0].key_package.clone())],
+        vec![],
+    )
+    .await
+    .unwrap();
+    let sibling = SiblingWelcome {
+        forwarded: ForwardedInvitation {
+            inviter: None,
+            confirmed: true,
+        },
+        ..sibling_welcome(&welcomes[0], SLOT, &issued[0].key_package_ref)
+    };
+    assert_eq!(
+        join_sibling(&mut laptop, b"relayed", &sibling).await,
+        Settled(IngestOutcome::Processed)
+    );
+    assert!(
+        laptop
+            .engine
+            .drain_events()
+            .into_iter()
+            .any(|event| matches!(
+                event,
+                GroupEvent::GroupJoined { group_id, welcomer, forwarded, .. }
+                    if group_id == gid
+                        && welcomer == Some(bob.engine.self_id())
+                        && forwarded.is_empty()
+            ))
+    );
+}
+
 /// A sibling Welcome decodes only from its exact encoding.
 #[tokio::test]
 async fn a_sibling_welcome_decodes_only_its_exact_encoding() {
@@ -1051,10 +1120,72 @@ async fn a_sibling_welcome_decodes_only_its_exact_encoding() {
         matches!(SiblingWelcome::decode(&inherited_bytes[..96]), Err(EngineError::Serialize(reason)) if reason == "invalid sibling Welcome")
     );
 
+    // Version 3 carries what the sender's copy says about its invitation
+    // (mdk#3546): an inviter beside an inherited generation, or, for a copy
+    // with no generation, its confirmation.
+    let invited = SiblingWelcome {
+        forwarded: ForwardedInvitation {
+            inviter: Some([0xb6; 32]),
+            confirmed: false,
+        },
+        ..inherited.clone()
+    };
+    let invited_bytes = invited.encode().unwrap();
+    assert_eq!(invited_bytes[0], 3);
+    assert_eq!(&invited_bytes[1..65], &inherited_bytes[1..65]);
+    assert_eq!(invited_bytes[65], 1);
+    assert_eq!(&invited_bytes[66..98], &[0xa5; 32]);
+    assert_eq!(invited_bytes[98], 1);
+    assert_eq!(&invited_bytes[99..131], &[0xb6; 32]);
+    assert_eq!(invited_bytes[131], 0);
+    assert_eq!(&invited_bytes[132..], &bytes[65..]);
+    assert_eq!(SiblingWelcome::decode(&invited_bytes).unwrap(), invited);
+    let confirmed = ForwardedInvitation {
+        inviter: None,
+        confirmed: true,
+    };
+    let local_only = SiblingWelcome {
+        forwarded: confirmed.clone(),
+        ..sibling.clone()
+    };
+    let local_only_bytes = local_only.encode().unwrap();
+    assert_eq!(local_only_bytes[0], 3);
+    assert_eq!(&local_only_bytes[65..68], &[0, 0, 1]);
+    assert_eq!(&local_only_bytes[68..], &bytes[65..]);
+    assert_eq!(
+        SiblingWelcome::decode(&local_only_bytes).unwrap(),
+        local_only
+    );
+    let mut beside_generation = invited_bytes.clone();
+    beside_generation[131] = 1;
+    let mut nothing_forwarded = local_only_bytes.clone();
+    nothing_forwarded[67] = 0;
+    let mut presence = local_only_bytes.clone();
+    presence[65] = 2;
+    let mut flag = local_only_bytes.clone();
+    flag[67] = 2;
+    for refused in [
+        &beside_generation,
+        &nothing_forwarded,
+        &presence,
+        &flag,
+        &local_only_bytes[..67],
+    ] {
+        assert_serialize_error(SiblingWelcome::decode(refused), "invalid sibling Welcome");
+    }
+    assert_serialize_error(
+        SiblingWelcome {
+            forwarded: confirmed,
+            ..inherited.clone()
+        }
+        .encode(),
+        "sibling Welcome: an identified invitation forwards no confirmation",
+    );
+
     let mut trailing = bytes.clone();
     trailing.push(0);
     let mut version = bytes.clone();
-    version[0] = 3;
+    version[0] = 4;
     for refused in [&bytes[..bytes.len() - 1], &trailing, &version, &bytes[..65]] {
         assert_serialize_error(SiblingWelcome::decode(refused), "invalid sibling Welcome");
     }

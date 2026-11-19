@@ -22,7 +22,7 @@ use crate::key_package::{
     KeyPackageMetadata, key_package_device_tag_claim, key_package_metadata, key_package_ref,
 };
 use cgka_traits::app_components::{DeviceRosterV1, DeviceSlotId, DeviceTagClaim};
-use cgka_traits::engine::KeyPackage;
+use cgka_traits::engine::{ForwardedInvitation, KeyPackage};
 use cgka_traits::error::EngineError;
 use cgka_traits::group::ProtocolProfile;
 use cgka_traits::ingest::{PeeledContent, PeeledMessage};
@@ -61,6 +61,10 @@ pub const MAX_RETAINED_PRIVATE_KEY_PACKAGES: usize = 3 * MAX_PRIVATE_KEY_PACKAGE
 const HAND_OFF_VERSION: u8 = 1;
 const REQUEST_VERSION: u64 = 1;
 const SIBLING_WELCOME_VERSION: u8 = 1;
+/// Adds an inherited invitation generation to version 1.
+const SIBLING_WELCOME_INHERITED_VERSION: u8 = 2;
+/// Adds the adding device's [`ForwardedInvitation`].
+const SIBLING_WELCOME_FORWARDED_VERSION: u8 = 3;
 /// The longest `KeyPackageRefV1` the roster's encoding allows.
 const MAX_KEY_PACKAGE_REF_LEN: usize = 64;
 /// The longest relay URL a sibling Welcome carries.
@@ -206,6 +210,9 @@ pub struct SiblingWelcome {
     /// Original account invitation inherited by this automatic sibling Add.
     /// None retains the exact version-1, local-only invitation contract.
     pub invitation_generation: Option<[u8; 32]>,
+    /// What the sender's copy says about the invitation it came in by. Empty
+    /// keeps the version-1 or version-2 encoding.
+    pub forwarded: ForwardedInvitation,
     /// The consumed private KeyPackage's `KeyPackageRef`, 1 to 64 bytes.
     pub key_package_ref: Vec<u8>,
     /// One `mls_welcome` MLSMessage, as MLS encodes it.
@@ -219,8 +226,11 @@ impl SiblingWelcome {
     /// KeyPackageRefV1 key_package_ref; MLSMessage welcome;
     /// SiblingWelcomeRelayV1 relays<V> }`, each relay an `opaque url<1..512>`.
     /// With an original invitation generation, V2 inserts its fixed 32 bytes
-    /// after `to`; otherwise this remains byte-identical V1. The message
-    /// content is its standard base64.
+    /// after `to`; otherwise this remains byte-identical V1. With anything
+    /// forwarded, V3 instead inserts `optional<opaque generation[32]>`,
+    /// `optional<opaque inviter[32]>` and `uint8 confirmed` after `to`, and
+    /// `confirmed` is 1 only without a generation. The message content is its
+    /// standard base64.
     pub fn encode(&self) -> Result<Vec<u8>, EngineError> {
         let invalid = |reason: &str| EngineError::Serialize(format!("sibling Welcome: {reason}"));
         if !(1..=MAX_KEY_PACKAGE_REF_LEN).contains(&self.key_package_ref.len()) {
@@ -238,15 +248,28 @@ impl SiblingWelcome {
                 .tls_serialize(&mut relays)
                 .map_err(|error| invalid(&format!("{error:?}")))?;
         }
-        let mut bytes = vec![if self.invitation_generation.is_some() {
-            2
+        let mut bytes = Vec::new();
+        if self.forwarded.is_empty() {
+            bytes.push(if self.invitation_generation.is_some() {
+                SIBLING_WELCOME_INHERITED_VERSION
+            } else {
+                SIBLING_WELCOME_VERSION
+            });
+            bytes.extend_from_slice(&self.from);
+            bytes.extend_from_slice(&self.to);
+            bytes.extend(self.invitation_generation.iter().flatten());
         } else {
-            SIBLING_WELCOME_VERSION
-        }];
-        bytes.extend_from_slice(&self.from);
-        bytes.extend_from_slice(&self.to);
-        if let Some(generation) = self.invitation_generation {
-            bytes.extend_from_slice(&generation);
+            if self.forwarded.confirmed && self.invitation_generation.is_some() {
+                return Err(invalid("an identified invitation forwards no confirmation"));
+            }
+            bytes.push(SIBLING_WELCOME_FORWARDED_VERSION);
+            bytes.extend_from_slice(&self.from);
+            bytes.extend_from_slice(&self.to);
+            for optional in [self.invitation_generation, self.forwarded.inviter] {
+                bytes.push(u8::from(optional.is_some()));
+                bytes.extend(optional.iter().flatten());
+            }
+            bytes.push(u8::from(self.forwarded.confirmed));
         }
         VLBytes::new(self.key_package_ref.clone())
             .tls_serialize(&mut bytes)
@@ -259,27 +282,44 @@ impl SiblingWelcome {
     }
 
     /// Decode a sibling Welcome, accepting only the exact encoding: version
-    /// 1 or 2 (with its fixed inherited generation), a ref of 1 to 64 bytes,
+    /// 1, 2 (with its fixed inherited generation) or 3 (with something
+    /// forwarded, a presence byte of 0 or 1 before each optional field, and
+    /// no confirmation beside a generation), a ref of 1 to 64 bytes,
     /// one `mls_welcome` MLSMessage, relay URLs of
     /// 1 to 512 bytes of UTF-8, and nothing left over. The Welcome itself is
     /// not processed here.
     pub fn decode(bytes: &[u8]) -> Result<Self, EngineError> {
         let invalid = || EngineError::Serialize("invalid sibling Welcome".into());
-        let (&version, rest) = bytes.split_first().ok_or_else(invalid)?;
-        if ![SIBLING_WELCOME_VERSION, 2].contains(&version) || rest.len() < 64 {
-            return Err(invalid());
-        }
-        let (from, rest) = rest.split_at(32);
-        let (to, mut rest) = rest.split_at(32);
-        let invitation_generation = if version == 2 {
-            if rest.len() < 32 {
-                return Err(invalid());
+        let (&version, mut rest) = bytes.split_first().ok_or_else(invalid)?;
+        let from = take_array(&mut rest).ok_or_else(invalid)?;
+        let to = take_array(&mut rest).ok_or_else(invalid)?;
+        let (invitation_generation, forwarded) = match version {
+            SIBLING_WELCOME_VERSION => (None, ForwardedInvitation::default()),
+            SIBLING_WELCOME_INHERITED_VERSION => (
+                Some(take_array(&mut rest).ok_or_else(invalid)?),
+                ForwardedInvitation::default(),
+            ),
+            SIBLING_WELCOME_FORWARDED_VERSION => {
+                let mut optional = || match take_array(&mut rest) {
+                    Some([0]) => Ok(None),
+                    Some([1]) => take_array::<32>(&mut rest).map(Some).ok_or_else(invalid),
+                    _ => Err(invalid()),
+                };
+                let generation = optional()?;
+                let inviter = optional()?;
+                let confirmed = match take_array(&mut rest) {
+                    Some([0]) => false,
+                    Some([1]) if generation.is_none() => true,
+                    _ => return Err(invalid()),
+                };
+                let forwarded = ForwardedInvitation { inviter, confirmed };
+                // An empty one is exactly version 1 or 2.
+                if forwarded.is_empty() {
+                    return Err(invalid());
+                }
+                (generation, forwarded)
             }
-            let (generation, remaining) = rest.split_at(32);
-            rest = remaining;
-            Some(generation.try_into().map_err(|_| invalid())?)
-        } else {
-            None
+            _ => return Err(invalid()),
         };
         let key_package_ref = VLBytes::tls_deserialize(&mut rest).map_err(|_| invalid())?;
         if !(1..=MAX_KEY_PACKAGE_REF_LEN).contains(&key_package_ref.as_slice().len()) {
@@ -305,14 +345,22 @@ impl SiblingWelcome {
             relays.push(String::from_utf8(relay.as_slice().to_vec()).map_err(|_| invalid())?);
         }
         Ok(Self {
-            from: from.try_into().map_err(|_| invalid())?,
-            to: to.try_into().map_err(|_| invalid())?,
+            from,
+            to,
             invitation_generation,
+            forwarded,
             key_package_ref: key_package_ref.as_slice().to_vec(),
             welcome,
             relays,
         })
     }
+}
+
+/// The first `N` bytes of `rest`, leaving `rest` after them.
+fn take_array<const N: usize>(rest: &mut &[u8]) -> Option<[u8; N]> {
+    let (taken, remaining) = rest.split_first_chunk::<N>()?;
+    *rest = remaining;
+    Some(*taken)
 }
 
 /// The id a sibling Welcome's join is recorded under, derived from the id of
@@ -573,6 +621,7 @@ impl<S: StorageProvider> Engine<S> {
                     from: welcome.from,
                     key_package_ref: welcome.key_package_ref.clone(),
                     invitation_generation: welcome.invitation_generation,
+                    forwarded: welcome.forwarded.clone(),
                 },
             )
             .await;

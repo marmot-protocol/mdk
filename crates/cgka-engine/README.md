@@ -282,3 +282,5 @@ with device groups disabled: it serializes/hashes the validated admission contex
 It adds no per-message observation work. Custom `GroupStorage` providers must implement the transactional
 `invitation_admission` and `put_invitation_admission` methods; an older unidentified copy is never seeded from its
 current epoch. Experimental sibling-Welcome V2 inheritance requires updated receivers; retained V1 bodies stay V1.
+V3 adds the Add's `ForwardedInvitation` (the original inviter, and confirmation for an unidentified copy), reported
+on `GroupJoined.forwarded`; it is sent only when something is forwarded and also requires updated receivers.

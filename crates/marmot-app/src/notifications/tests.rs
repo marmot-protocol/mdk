@@ -2093,6 +2093,10 @@ fn notification_dm_projection() {
                 assert_eq!(update, None, "messages from unknown groups are suppressed");
                 continue;
             }
+            if name.is_some() && !pending && matches!(event, MarmotAppEvent::GroupJoined { .. }) {
+                assert_eq!(update, None, "a confirmed join is no invitation");
+                continue;
+            }
             let update = update.expect("eligible notification");
             assert_eq!(
                 update.is_dm, expected,

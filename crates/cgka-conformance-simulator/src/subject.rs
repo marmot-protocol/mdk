@@ -2568,6 +2568,7 @@ pub(crate) fn classify_engine_error(error: &EngineError) -> (SubjectFailureCateg
         | EngineError::AppMessageEpochMismatch { .. }
         | EngineError::AppMessageEpochUnsettled { .. }
         | EngineError::LinkDeviceUnsettled { .. }
+        | EngineError::SiblingAddUnsettled { .. }
         | EngineError::DeviceEntryChanged { .. }
         | EngineError::AccountEntryChanged { .. }
         | EngineError::AccountEntryUnsettled { .. }
@@ -2649,6 +2650,7 @@ fn observe_engine_error(error: &EngineError) -> String {
         EngineError::AppMessageEpochMismatch { .. } => "app_message_epoch_mismatch",
         EngineError::AppMessageEpochUnsettled { .. } => "app_message_epoch_unsettled",
         EngineError::LinkDeviceUnsettled { .. } => "link_device_unsettled",
+        EngineError::SiblingAddUnsettled { .. } => "sibling_add_unsettled",
         EngineError::DeviceEntryChanged { .. } => "device_entry_changed",
         EngineError::AccountEntryChanged { .. } => "account_entry_changed",
         EngineError::AccountEntryUnsettled { .. } => "account_entry_unsettled",

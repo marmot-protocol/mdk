@@ -301,6 +301,213 @@ async fn the_approving_device_adds_a_new_device_to_its_chats() {
     assert_eq!(phone.client.chats_closed_to_linked_devices().unwrap(), 0);
 }
 
+/// A chat reaches a newly linked laptop as it stands on the phone that adds
+/// it (mdk#3546): one the phone founded or accepted arrives confirmed, and
+/// an invitation still unanswered there arrives pending, from the account
+/// that sent it rather than from Alice herself. Chats from before invitation
+/// generations (no admission, which stay local-only) take that state from
+/// the sibling Welcome. An identified invitation settles through its
+/// generation's shared decision, which the phone records first if it
+/// accepted without one, as with device groups off.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_linked_device_gets_each_chat_as_the_adding_device_holds_it() {
+    forwarded_invitation_case(false).await;
+}
+
+/// The laptop's own block of the inviter still governs how an accepted chat
+/// it gets from the phone is shown, as it governs a shared acceptance: each
+/// stays a pending invitation, which the block hides.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_linked_devices_block_holds_a_forwarded_acceptance() {
+    forwarded_invitation_case(true).await;
+}
+
+async fn forwarded_invitation_case(laptop_blocks_bob: bool) {
+    let (relay, [mut phone]) = alice_devices::<1>().await;
+    let alice = phone
+        .app
+        .account_home()
+        .account("alice")
+        .unwrap()
+        .account_id_hex;
+    let bob_dir = tempfile::tempdir().unwrap();
+    let bob_id = AccountHome::open(bob_dir.path())
+        .create_account("bob")
+        .unwrap()
+        .account_id_hex;
+    let bob_app = crate::tests::canonical_membership::app_at(&bob_dir, relay.clone());
+    remember_test_member_inbox(&bob_app, &alice, "wss://relay.example");
+    let mut bob = bob_app.client("bob").await.unwrap();
+    let mut invite = async |name: &str| {
+        bob.create_group(name, &[&alice])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members")
+    };
+    let accepted_legacy = invite("accepted, legacy").await;
+    let unanswered_legacy = invite("unanswered, legacy").await;
+    let accepted_unrecorded = invite("accepted, no decision").await;
+    let rebuilt = invite("unanswered, rebuilt").await;
+    let unanswered = invite("unanswered").await;
+    deliver_new(&mut phone.client, &relay, &mut phone.cursor).await;
+    phone.client.sync().await.unwrap();
+    for chat in [&accepted_legacy, &accepted_unrecorded] {
+        phone.client.accept_group_invite(chat).unwrap();
+    }
+    let founded_legacy = chats(&mut phone, 1).await.remove(0);
+    // Copies installed before invitation generations have no admission and
+    // so no decision; migration 0170 seeded none. A copy accepted while
+    // device groups were off has its admission but no decision.
+    let db = account_database(&phone.app);
+    for chat in [&founded_legacy, &accepted_legacy, &unanswered_legacy] {
+        db.execute(
+            "DELETE FROM cgka_invitation_admissions WHERE group_id = ?1",
+            [chat.as_slice()],
+        )
+        .unwrap();
+    }
+    for chat in [&founded_legacy, &accepted_legacy, &accepted_unrecorded] {
+        db.execute(
+            "DELETE FROM invitation_decisions WHERE group_id_hex = ?1",
+            [hex::encode(chat.as_slice())],
+        )
+        .unwrap();
+    }
+    // A row rebuilt after a local deletion is unconfirmed by default and
+    // carries no Welcome; that is no acceptance to share.
+    db.execute(
+        "UPDATE account_groups SET pending_confirmation = 0, welcomer_account_id_hex = NULL,
+             via_welcome_message_id_hex = NULL WHERE group_id_hex = ?1",
+        [hex::encode(rebuilt.as_slice())],
+    )
+    .unwrap();
+    drop(db);
+    let mut phone = reopen(phone).await;
+
+    // The laptop signs in only now, so none of Bob's invitations reached it.
+    let mut laptop = another_alice_device(&relay, &phone).await;
+    if laptop_blocks_bob {
+        laptop
+            .app
+            .set_user_blocked("alice", &bob_id, true)
+            .await
+            .unwrap();
+    }
+    link(&relay, &mut phone, &mut laptop, "Laptop").await;
+    // The decision the phone records for `accepted_unrecorded` reaches the
+    // laptop ahead of its Welcome, so the copy is never an invitation there.
+    let mut seen = false;
+    for _ in 0..6 {
+        passes(&relay, &mut [&mut phone, &mut laptop], 1).await;
+        if !seen && let Some(group) = laptop.client.state_group_record(&accepted_unrecorded) {
+            seen = true;
+            assert_eq!(group.pending_confirmation, laptop_blocks_bob);
+        }
+    }
+    assert!(seen);
+
+    let invitation = |chat: &GroupId| {
+        let group = laptop
+            .client
+            .state_group_record(chat)
+            .expect("the laptop joined from the phone's sibling Welcome");
+        (group.pending_confirmation, group.welcomer_account_id_hex)
+    };
+    assert!(!invitation(&founded_legacy).0);
+    let from_bob = |pending| (pending, Some(bob_id.clone()));
+    assert_eq!(invitation(&accepted_legacy), from_bob(laptop_blocks_bob));
+    assert_eq!(
+        invitation(&accepted_unrecorded),
+        from_bob(laptop_blocks_bob)
+    );
+    assert_eq!(invitation(&unanswered_legacy), from_bob(true));
+    assert!(invitation(&rebuilt).0);
+    let phone_store = phone.app.account_storage("alice").unwrap();
+    let generation = {
+        use cgka_traits::storage::GroupStorage as _;
+        phone_store
+            .invitation_admission(&rebuilt)
+            .unwrap()
+            .unwrap()
+            .generation
+    };
+    assert_eq!(
+        phone_store
+            .app_storage()
+            .invitation_decision(&hex::encode(rebuilt.as_slice()), &generation)
+            .unwrap(),
+        None,
+        "a rebuilt row records no acceptance"
+    );
+    assert_eq!(invitation(&unanswered), from_bob(true));
+}
+
+/// A chat the phone accepted with device groups off holds no decision. The
+/// scan that records its acceptance adds no device to that chat, not even a
+/// second new device that would otherwise find the decision stored and get
+/// its Welcome before the decision is sent (mdk#3546); a later pass adds
+/// both, and both see the chat confirmed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_recorded_acceptance_holds_every_new_device_until_it_is_sent() {
+    let (relay, [mut phone]) = alice_devices::<1>().await;
+    let alice = phone
+        .app
+        .account_home()
+        .account("alice")
+        .unwrap()
+        .account_id_hex;
+    let bob_dir = tempfile::tempdir().unwrap();
+    AccountHome::open(bob_dir.path())
+        .create_account("bob")
+        .unwrap();
+    let bob_app = crate::tests::canonical_membership::app_at(&bob_dir, relay.clone());
+    remember_test_member_inbox(&bob_app, &alice, "wss://relay.example");
+    let mut bob = bob_app.client("bob").await.unwrap();
+    let chat = bob
+        .create_group("accepted, no decision", &[&alice])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
+    deliver_new(&mut phone.client, &relay, &mut phone.cursor).await;
+    phone.client.sync().await.unwrap();
+    phone.client.accept_group_invite(&chat).unwrap();
+    account_database(&phone.app)
+        .execute(
+            "DELETE FROM invitation_decisions WHERE group_id_hex = ?1",
+            [hex::encode(chat.as_slice())],
+        )
+        .unwrap();
+    // The laptop and tablet sign in only now, so Bob's invitation reached
+    // neither.
+    let mut laptop = another_alice_device(&relay, &phone).await;
+    let mut tablet = another_alice_device(&relay, &phone).await;
+    link(&relay, &mut phone, &mut laptop, "Laptop").await;
+    link(&relay, &mut phone, &mut tablet, "Tablet").await;
+    hold_key_packages(&relay, &mut phone, &mut laptop).await;
+    hold_key_packages(&relay, &mut phone, &mut tablet).await;
+    phone
+        .client
+        .add_linked_devices_to_chats(&[], &mut Default::default())
+        .await;
+    assert_eq!(
+        (taken_from(&phone, &laptop), taken_from(&phone, &tablet)),
+        (0, 0)
+    );
+
+    passes(&relay, &mut [&mut phone, &mut laptop, &mut tablet], 4).await;
+    for device in [&laptop, &tablet] {
+        assert!(
+            !device
+                .client
+                .state_group_record(&chat)
+                .expect("added once the acceptance was sent")
+                .pending_confirmation
+        );
+    }
+}
+
 /// A real linked sender rebroadcasts a retained winning choice. It need not
 /// have this ordinary chat installed to authenticate its account's choice.
 async fn receive_account_choice(
@@ -1787,7 +1994,9 @@ async fn a_declined_generation_holds_automatic_adds_until_a_later_accept() {
 /// one in a lower slot, leaves the new device to it while it is active
 /// (mdk#3537), and fills the missing chats through the advisory claim flow
 /// once the approver has gone quiet; the returning approver adds no
-/// duplicate.
+/// duplicate. A chat the laptop holds confirmed but with no decision, as
+/// when accepted with device groups off, first gets its acceptance sent,
+/// with no claim to hold up the Add that follows (mdk#3546).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_sibling_fills_missing_chats_while_the_approver_is_offline() {
     let (relay, [first, second, mut tablet]) = alice_devices::<3>().await;
@@ -1824,6 +2033,13 @@ async fn a_sibling_fills_missing_chats_while_the_approver_is_offline() {
     assert_eq!(relay.published_event_ids().len(), before);
     assert_eq!(taken_from(&laptop, &tablet), 0);
 
+    account_database(&laptop.app)
+        .execute(
+            "DELETE FROM invitation_decisions WHERE group_id_hex = ?1",
+            [hex::encode(chats[0].as_slice())],
+        )
+        .unwrap();
+
     // Two hours on, the phone has not been heard from.
     laptop.client.sibling_chat_gaps.test_approver_clock_ahead =
         crate::client::device_heartbeats::APPROVER_ACTIVE_SECS;
@@ -1847,6 +2063,15 @@ async fn a_sibling_fills_missing_chats_while_the_approver_is_offline() {
     })
     .await
     .expect("the online sibling fills both missing chats");
+    // The acceptance the laptop sent first settles that chat. The other's
+    // decision reaches the tablet only by a later broadcast (mdk#3556).
+    assert!(
+        !tablet
+            .client
+            .state_group_record(&chats[0])
+            .unwrap()
+            .pending_confirmation
+    );
     assert_eq!(
         tablet.op(DeviceLinkOp::Read).await.chat_progress,
         vec![crate::LinkChatProgress {

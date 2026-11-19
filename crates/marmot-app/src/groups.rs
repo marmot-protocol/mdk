@@ -2339,13 +2339,20 @@ pub(crate) fn observe_event(
                             via_welcome,
                             welcomer,
                             explicitly_confirmed,
+                            forwarded,
                             ..
                         } => GroupConfirmationProjection::Welcome {
                             explicitly_confirmed: *explicitly_confirmed,
                             via_welcome_message_id_hex: hex::encode(via_welcome.as_slice()),
-                            welcomer_account_id_hex: welcomer
-                                .as_ref()
-                                .map(|member_id| hex::encode(member_id.as_slice())),
+                            // A sibling Welcome's author is this account; the
+                            // invitation came from whoever its sender names.
+                            welcomer_account_id_hex: forwarded.inviter.map(hex::encode).or_else(
+                                || {
+                                    welcomer
+                                        .as_ref()
+                                        .map(|member_id| hex::encode(member_id.as_slice()))
+                                },
+                            ),
                         },
                         _ => GroupConfirmationProjection::Preserve,
                     },

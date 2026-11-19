@@ -61,7 +61,7 @@ impl AppClient {
     /// out, and only if they still hold the value it carried; an update that
     /// reached no relay stops the pass, and its items stay owed. Sending one
     /// twice does no harm: every device merges it to the same winner.
-    async fn send_owed_small_state(&mut self) -> Result<(), AppError> {
+    pub(super) async fn send_owed_small_state(&mut self) -> Result<(), AppError> {
         if !self.app.device_groups_enabled() {
             return Ok(());
         }

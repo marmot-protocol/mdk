@@ -44,6 +44,9 @@
 
 ### Added
 
+- `SqliteAppStorage::return_received_private_key_package` hands back exactly a claimed private KeyPackage when what
+  claimed it was refused before any Commit could carry it (mdk#3546).
+
 - `SqliteAppStorage::attachment_removals(cursor, limit)` returns durable, ordered removal identities and
   reasons for derivative-cache eviction (mdk#3491). Pages hold up to 256 records; the journal holds 4,096.
   First use, store reset, and trimmed history require reconciliation from a captured high-water cursor.

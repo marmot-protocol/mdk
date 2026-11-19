@@ -570,6 +570,7 @@ async fn add_the_phone_unpublished(devices: &mut Devices, chat: &GroupId) {
                 slot: phone_slot,
                 key_package,
             }],
+            forwarded: Default::default(),
         },
     )
     .await;
@@ -2045,7 +2046,9 @@ async fn a_refused_sibling_add_spends_its_key_package() {
 /// An Add queued behind the chat's convergence spends its KeyPackage
 /// whatever the drain makes of it: with the laptop no longer tagged by the
 /// time bob's Commit settles, the drain refuses the Add, and the KeyPackage
-/// is not handed back.
+/// is not handed back. One that forwards its copy's invitation is refused
+/// rather than queued, since the copy could change before the drain
+/// (mdk#3546); nothing could carry its KeyPackage, which comes back.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_queued_sibling_add_the_drain_refuses_spends_its_key_package() {
     let (mut devices, _, [chat]) = tagging_devices_with_chats::<1>().await;
@@ -2086,6 +2089,54 @@ async fn a_queued_sibling_add_the_drain_refuses_spends_its_key_package() {
     deliver_new(&mut devices.laptop, &devices.relay, &mut cursor).await;
     let phone_slot = slot(&devices.phone);
     let stock = received_from(&devices.laptop, &phone_slot).len();
+    let welcomer = |devices: &mut Devices, welcomer: Option<String>| {
+        let chat_hex = hex::encode(chat.as_slice());
+        devices
+            .laptop
+            .state
+            .groups
+            .iter_mut()
+            .find(|group| group.group_id_hex == chat_hex)
+            .unwrap()
+            .welcomer_account_id_hex = welcomer;
+    };
+    welcomer(&mut devices, Some(bob_id.clone()));
+    // Selected as a pass selects it, so the hand-back must reach the pass's
+    // own selection too, not only storage.
+    let mut selection = Default::default();
+    let first = devices
+        .laptop
+        .next_private_key_package_for_chat(&chat, &phone_slot, &mut selection)
+        .unwrap()
+        .unwrap();
+    selection.record_attempt(&phone_slot, &first.key_package_ref_hex);
+    let error = devices
+        .laptop
+        .add_sibling_to_chat(&chat, &phone_slot, first.clone())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            error.as_engine_error(),
+            Some(cgka_traits::EngineError::SiblingAddUnsettled { .. })
+        ),
+        "{error}"
+    );
+    assert!(
+        !devices
+            .laptop
+            .runtime
+            .has_queued_outbound_intents(&chat)
+            .unwrap()
+    );
+    assert_eq!(received_from(&devices.laptop, &phone_slot).len(), stock);
+    let again = devices
+        .laptop
+        .next_private_key_package_for_chat(&chat, &phone_slot, &mut selection)
+        .unwrap()
+        .unwrap();
+    assert_eq!(again.key_package_ref_hex, first.key_package_ref_hex);
+    welcomer(&mut devices, None);
     devices
         .laptop
         .add_sibling_to_chat(
@@ -2095,13 +2146,20 @@ async fn a_queued_sibling_add_the_drain_refuses_spends_its_key_package() {
         )
         .await
         .unwrap();
-    assert!(
-        devices
-            .laptop
-            .runtime
-            .has_queued_outbound_intents(&chat)
+    // The founded copy's confirmation is not forwarded beside its generation,
+    // so the Add queues forwarding nothing, and a repair before the drain
+    // cannot revive it.
+    let [queued] = <[_; 1]>::try_from({
+        use cgka_traits::storage::OutboundIntentStorage as _;
+        group_storage(&devices.laptop)
+            .list_queued_outbound_intents(&chat)
             .unwrap()
-    );
+    })
+    .unwrap();
+    assert!(matches!(
+        queued.intent,
+        SendIntent::AddOwnAccountDevices { forwarded, .. } if forwarded.is_empty()
+    ));
     assert_eq!(received_from(&devices.laptop, &phone_slot).len(), stock - 1);
 
     let session = devices.laptop.runtime.session_mut();

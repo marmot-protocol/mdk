@@ -802,6 +802,7 @@ async fn authoritative_worker_acceptance_preserves_archive_and_rejoin_restores_o
                 via_welcome: cgka_traits::MessageId::new(vec![2; 32]),
                 welcomer: None,
                 explicitly_confirmed: false,
+                forwarded: Default::default(),
             },
             &mut summary,
         )
@@ -822,6 +823,7 @@ async fn authoritative_worker_acceptance_preserves_archive_and_rejoin_restores_o
                 via_welcome: cgka_traits::MessageId::new(vec![2; 32]),
                 welcomer: None,
                 explicitly_confirmed: false,
+                forwarded: Default::default(),
             },
             &mut summary,
         )

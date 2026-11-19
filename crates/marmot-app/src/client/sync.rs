@@ -1630,10 +1630,11 @@ impl AppClient {
                     cgka_traits::engine::GroupEvent::GroupJoined {
                         group_id,
                         via_welcome,
+                        forwarded,
                         ..
-                    } => self.note_invitation_admission(group_id, Some(via_welcome))?,
+                    } => self.note_invitation_admission(group_id, Some(via_welcome), forwarded)?,
                     cgka_traits::engine::GroupEvent::GroupCreated { group_id } => {
-                        self.note_invitation_admission(group_id, None)?
+                        self.note_invitation_admission(group_id, None, &Default::default())?
                     }
                     _ => {}
                 }
@@ -5174,10 +5175,11 @@ impl AppClient {
                     cgka_traits::engine::GroupEvent::GroupJoined {
                         group_id,
                         via_welcome,
+                        forwarded,
                         ..
-                    } => self.note_invitation_admission(group_id, Some(via_welcome))?,
+                    } => self.note_invitation_admission(group_id, Some(via_welcome), forwarded)?,
                     cgka_traits::engine::GroupEvent::GroupCreated { group_id } => {
-                        self.note_invitation_admission(group_id, None)?
+                        self.note_invitation_admission(group_id, None, &Default::default())?
                     }
                     _ => {}
                 }
@@ -5938,6 +5940,7 @@ mod runtime_group_subscription_refresh_tests {
                 via_welcome: cgka_traits::MessageId::new(vec![0x75; 32]),
                 welcomer: None,
                 explicitly_confirmed: true,
+                forwarded: Default::default(),
             }],
             ..Default::default()
         };
@@ -6245,6 +6248,7 @@ mod runtime_group_subscription_refresh_tests {
                 via_welcome: cgka_traits::MessageId::new(vec![0x77; 32]),
                 welcomer: None,
                 explicitly_confirmed: true,
+                forwarded: Default::default(),
             }],
             ..Default::default()
         };

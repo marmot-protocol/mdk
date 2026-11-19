@@ -393,7 +393,9 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   row's prepared-carrier high-water; a backward clock holds new preparation, while an unexposed exact retry remains
   safe. Settlement runs before accepted-fanout projection ACK, so storage failure stays replayable. The Add spends
   its handed KeyPackage whatever happens to it: a refused or failed Add, or a queued one the drain refuses, never hands
-  it back.
+  it back. The one exception is `SiblingAddUnsettled`, an Add that forwards its copy's invitation refused instead of
+  queued (mdk#3546): the engine answers it before staging or queueing anything, so the exact claimed KeyPackage goes
+  back (`return_received_private_key_package`).
 - Add a newly linked device to chats (mdk#2628 3.5c, D70, `src/client/linked_device_chats.rs`) only from the device that
   approved its link, once that link is decided made, for `LINK_CHAT_ADD_SECS`, and only while the roster lists the
   device as active, linked by this device, with "add to all my chats" on, and this device has recorded no removal of its

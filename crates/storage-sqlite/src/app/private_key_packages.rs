@@ -101,6 +101,35 @@ impl SqliteAppStorage {
         received_from(&conn, issuer_slot_hex, now)
     }
 
+    /// Hand back exactly a record `take_received_private_key_package_exact`
+    /// claimed, when what claimed it was refused before any Commit could carry
+    /// it. Only that claimed, still unexpired row comes back.
+    pub fn return_received_private_key_package(
+        &self,
+        candidate: &ReceivedPrivateKeyPackage,
+        now: u64,
+    ) -> StorageResult<bool> {
+        let returned = self
+            .lock()?
+            .execute_cached(
+                "UPDATE private_key_packages_received SET taken_at = NULL, key_package = ?5
+             WHERE key_package_ref_hex = ?1 AND issuer_slot_hex = ?2
+               AND not_before = ?3 AND not_after = ?4 AND key_package = X''
+               AND received_at = ?6 AND taken_at IS NOT NULL AND not_after > ?7",
+                params![
+                    candidate.key_package_ref_hex,
+                    candidate.issuer_slot_hex,
+                    u64_to_i64(candidate.not_before)?,
+                    u64_to_i64(candidate.not_after)?,
+                    candidate.key_package,
+                    u64_to_i64(candidate.received_at)?,
+                    u64_to_i64(now)?,
+                ],
+            )
+            .storage()?;
+        Ok(returned == 1)
+    }
+
     /// Claim exactly the received record the caller validated, if it is still
     /// held, unchanged and unexpired at `now`. Never substitute another row
     /// when ranking changes or the selected record is no longer eligible.

@@ -1522,7 +1522,9 @@ artifacts.
 
 Experimental updated clients also share invitation decisions through MDK for one authenticated admission generation
 and its inherited sibling Adds. Older unidentified invitations remain local-only; a separate external Add batch or
-fork can prompt again. Accept never joins/rejoins or resets explicit archive intent. Decline requests each matching
+fork can prompt again. A chat a newly linked device gets from a sibling arrives as that sibling holds it where it can:
+pending with the original inviter as `welcomerAccountIdHex` if unanswered there, and otherwise confirmed, unless this
+device blocks that inviter or the shared decision has not arrived yet. Keep rendering the returned state. Accept never joins/rejoins or resets explicit archive intent. Decline requests each matching
 local leaf's existing Leave; later acceptance cannot cancel already-requested Leave. A decline does not reach a copy
 this device already deleted locally. Private KeyPackage requests follow the ordinary stock rules. A zero-publication
 `CompletionUnknown` is pending work, not proof every device departed. Keep rendering the returned invitation and
@@ -1530,7 +1532,7 @@ membership state. Explicit user Leave, including declining an invitation, record
 before departure publication when this device trusts a device group; archive, local deletion, sign-out and removal do
 not create that choice. Unknown admissions or absent trust keep departure leaf-only. A held maximum version skips the new choice, allowing ordinary
 Leave without replacing the retained winner. Invitation decisions use the existing host APIs. Custom experimental peers must update together before using
-V2 sibling Welcomes; there is no capability negotiation or mixed-old-receiver guarantee.
+V2 or V3 sibling Welcomes; there is no capability negotiation or mixed-old-receiver guarantee.
 
 An admin account's Leave, and its Decline of an invitation that made it an admin, return `AdminCannotSelfRemove` before
 anything is written or sent: when `requires_self_demote_before_leave` is true, call `self_demote_admin` first and then

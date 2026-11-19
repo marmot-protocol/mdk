@@ -1101,6 +1101,7 @@ mod same_account_welcome {
             .send(SendIntent::AddOwnAccountDevices {
                 group_id: chat.clone(),
                 siblings: vec![sibling.clone()],
+                forwarded: Default::default(),
             })
             .await
             .unwrap();

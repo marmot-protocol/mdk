@@ -1973,6 +1973,7 @@ fn add_own_devices(gid: &GroupId, siblings: Vec<SiblingKeyPackage>) -> SendInten
     SendIntent::AddOwnAccountDevices {
         group_id: gid.clone(),
         siblings,
+        forwarded: Default::default(),
     }
 }
 

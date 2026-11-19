@@ -163,7 +163,23 @@ pub(crate) enum WelcomeRoute {
         from: DeviceSlotId,
         key_package_ref: Vec<u8>,
         invitation_generation: Option<[u8; 32]>,
+        forwarded: cgka_traits::engine::ForwardedInvitation,
     },
+}
+
+/// What a sibling Welcome forwards counts only when its authenticated author
+/// is this account: a sibling asserts facts about a copy of its own, not
+/// about another account's Commit it relayed (mdk#3546).
+fn forwarded_from(
+    forwarded: &cgka_traits::engine::ForwardedInvitation,
+    welcome_author: &MemberId,
+    own_account: &MemberId,
+) -> cgka_traits::engine::ForwardedInvitation {
+    if welcome_author == own_account {
+        forwarded.clone()
+    } else {
+        Default::default()
+    }
 }
 
 /// Whether a delivery of a Welcome this device already joined names a
@@ -1472,6 +1488,19 @@ impl<S: StorageProvider> Engine<S> {
         route: WelcomeRoute,
     ) -> Result<GroupId, EngineError> {
         let welcome_id = welcome_msg.id.clone();
+        let forwarded = match &route {
+            // An inviter that is no valid account key, or is this account, is
+            // no other account to show; the confirmation still stands.
+            WelcomeRoute::Sibling { forwarded, .. } => cgka_traits::engine::ForwardedInvitation {
+                inviter: forwarded.inviter.filter(|inviter| {
+                    crate::identity::validate_credential_identity(inviter).is_ok()
+                        && inviter.as_slice() != self.identity.self_id().as_slice()
+                }),
+                confirmed: forwarded.confirmed,
+            },
+            WelcomeRoute::Delivery => Default::default(),
+        };
+        let own_account = self.identity.self_id().clone();
         let (welcome_bytes, welcome_created_at, key_package_claim) = match peeled.content {
             cgka_traits::ingest::PeeledContent::Welcome {
                 bytes,
@@ -2055,6 +2084,7 @@ impl<S: StorageProvider> Engine<S> {
                     via_welcome: welcome_id.clone(),
                     explicitly_confirmed: consent.is_some(),
                     welcomer: Some(welcome_sender_id.clone()),
+                    forwarded: forwarded_from(&forwarded, &welcome_sender_id, &own_account),
                 },
             )?;
 
@@ -2237,6 +2267,7 @@ impl<S: StorageProvider> Engine<S> {
             .push_back(cgka_traits::engine::GroupEvent::GroupJoined {
                 group_id: group_id.clone(),
                 via_welcome: welcome_id.clone(),
+                forwarded: forwarded_from(&forwarded, &welcome_sender_id, &own_account),
                 explicitly_confirmed: consent.is_some(),
                 welcomer: Some(welcome_sender_id.clone()),
             });

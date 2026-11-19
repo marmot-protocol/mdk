@@ -54,6 +54,7 @@
 use cgka_traits::GroupId;
 use cgka_traits::app_components::{DeviceRosterV1, DeviceSlotId, DeviceStatusV1, DeviceTagClaim};
 use cgka_traits::engine::SiblingKeyPackage;
+use std::collections::HashSet;
 use storage_sqlite::{ChatListQuery, DeviceLinkOutcome, ReceivedPrivateKeyPackage};
 
 use super::AppClient;
@@ -125,6 +126,7 @@ impl AppClient {
                 "could not add linked devices to chats"
             );
         }
+        self.send_recorded_acceptances().await;
         LINK_CHAT_ADDS_PER_PASS - budget
     }
 
@@ -148,6 +150,9 @@ impl AppClient {
         }
         let (chats, scan_complete) = self.sibling_commit_chats_in_list_order()?;
         let mut first_error: Option<AppError> = None;
+        // Chats whose acceptance this scan recorded: no device is added to
+        // them before that acceptance is sent, after the scan.
+        let mut awaiting_acceptance = HashSet::new();
         for device in new_devices {
             match self.device_setting_ready(&exchange, &device.slot, |settings| {
                 settings.add_to_all_chats
@@ -214,6 +219,20 @@ impl AppClient {
                 match self.group_quiet(&chat) {
                     Ok(true) => {}
                     Ok(false) => continue,
+                    Err(error) => {
+                        first_error.get_or_insert(error);
+                        continue;
+                    }
+                }
+                if awaiting_acceptance.contains(&chat) {
+                    continue;
+                }
+                match self.record_unrecorded_acceptance(&chat) {
+                    Ok(false) => {}
+                    Ok(true) => {
+                        awaiting_acceptance.insert(chat.clone());
+                        continue;
+                    }
                     Err(error) => {
                         first_error.get_or_insert(error);
                         continue;

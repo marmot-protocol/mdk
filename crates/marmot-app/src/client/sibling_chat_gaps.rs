@@ -740,6 +740,7 @@ impl AppClient {
         {
             tracing::warn!(target: TARGET, method = "fill_sibling_chat_gaps", error_kind = error.privacy_safe_kind(), "could not fill sibling chat gaps");
         }
+        self.send_recorded_acceptances().await;
     }
 
     async fn try_fill_sibling_chat_gaps(
@@ -963,6 +964,11 @@ impl AppClient {
             {
                 self.sibling_chat_gaps.schedule(chat.clone(), expiry);
                 continue;
+            }
+            // Every target of this chat waits for the acceptance's send.
+            if retire.is_empty() && self.record_unrecorded_acceptance(chat)? {
+                self.sibling_chat_gaps.schedule(chat.clone(), 0);
+                break;
             }
             // Retiring unused leaves spends no KeyPackage, and the engine
             // refuses an Add while they hold the sibling's place.

@@ -82,6 +82,32 @@ pub struct SiblingKeyPackage {
     pub key_package: KeyPackage,
 }
 
+/// What the adding device's own copy of a chat says about the invitation it
+/// came in by, forwarded in the sibling Welcomes of a same-account Add
+/// (device-group.md, "Sibling Welcomes"). The adding device is the account's
+/// own, so the receiving sibling trusts it as it trusts the Welcome itself.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForwardedInvitation {
+    /// The raw 32-byte account id of the other account whose invitation
+    /// admitted the copy. None for a chat the account founded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inviter: Option<[u8; 32]>,
+    /// The copy is confirmed: founded, or its invitation accepted. Only a
+    /// chat with no invitation generation carries it; an identified one is
+    /// settled by its generation's shared decision (account-sync.md,
+    /// "Invitation decisions").
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub confirmed: bool,
+}
+
+impl ForwardedInvitation {
+    /// Nothing forwarded: an ordinary Welcome, or a sibling Welcome of an
+    /// earlier version.
+    pub fn is_empty(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
 impl KeyPackage {
     pub fn new(bytes: Vec<u8>) -> Self {
         Self {
@@ -211,6 +237,10 @@ pub enum SendIntent {
     AddOwnAccountDevices {
         group_id: GroupId,
         siblings: Vec<SiblingKeyPackage>,
+        /// What this device's copy says about the invitation it came in by,
+        /// forwarded in each sibling Welcome.
+        #[serde(default, skip_serializing_if = "ForwardedInvitation::is_empty")]
+        forwarded: ForwardedInvitation,
     },
     /// Remove other devices of this device's own account, without admin
     /// authority, in a group that requires
@@ -875,6 +905,11 @@ pub enum GroupEvent {
         /// Local recipient explicitly authorized replacement of an active branch.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         explicitly_confirmed: bool,
+        /// For a join by a sibling Welcome, what the adding sibling's copy
+        /// said about the invitation it came in by. `welcomer` stays the
+        /// Welcome's MLS author, which for a sibling is this account.
+        #[serde(default, skip_serializing_if = "ForwardedInvitation::is_empty")]
+        forwarded: ForwardedInvitation,
     },
     /// A raw transport object was released solely because a local durable
     /// resource budget expired. This is not a protocol validity verdict and
