@@ -998,8 +998,9 @@ impl AppClient {
             return Ok(());
         }
         let forwarded = self.forwarded_invitation(chat);
-        if forwarded.confirmed {
-            self.record_unrecorded_acceptance(chat)?;
+        // Ahead of the Welcome, so the sibling installs its copy settled.
+        if forwarded.confirmed && self.record_unrecorded_acceptance(chat)? {
+            self.send_owed_small_state().await?;
         }
         if !self.take_private_key_package_exact(sibling, &candidate)? {
             return Err(AppError::DeviceGroupRefused("no_private_key_package"));

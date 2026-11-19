@@ -255,18 +255,38 @@ impl AppClient {
 
     /// A confirmed copy holding no decision for its generation, such as one
     /// accepted while device groups were off, records the acceptance a founder
-    /// records before a sibling Add carries that generation (mdk#3546).
-    pub(super) fn record_unrecorded_acceptance(&self, group_id: &GroupId) -> Result<(), AppError> {
+    /// records before a sibling Add carries that generation (mdk#3546). Only
+    /// a copy founded here, or whose presented invitation is that admission's
+    /// own Welcome, counts as accepted: a row rebuilt after a local deletion is
+    /// unconfirmed by default and carries no Welcome. Returns whether it
+    /// recorded one.
+    pub(super) fn record_unrecorded_acceptance(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<bool, AppError> {
         let account = self.app.account_storage(&self.state.label)?;
-        if let Some(admission) = account.invitation_admission(group_id)? {
-            account
-                .app_storage()
-                .ensure_implicit_invitation_acceptance(
-                    &hex::encode(group_id.as_slice()),
-                    admission.generation,
-                )?;
+        let Some(admission) = account.invitation_admission(group_id)? else {
+            return Ok(false);
+        };
+        let chat = hex::encode(group_id.as_slice());
+        let storage = account.app_storage();
+        if storage
+            .invitation_decision(&chat, &admission.generation)?
+            .is_some()
+        {
+            return Ok(false);
         }
-        Ok(())
+        let presented_welcome = self
+            .state_group_record(group_id)
+            .and_then(|group| group.via_welcome_message_id_hex);
+        let accepted_here = match &admission.via_welcome {
+            None => admission.created_locally,
+            Some(welcome) => presented_welcome == Some(hex::encode(welcome.as_slice())),
+        };
+        if accepted_here {
+            storage.ensure_implicit_invitation_acceptance(&chat, admission.generation)?;
+        }
+        Ok(accepted_here)
     }
 
     /// Native founding can be recovered by the ordinary projection reconcile

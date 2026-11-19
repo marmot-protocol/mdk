@@ -348,6 +348,7 @@ async fn forwarded_invitation_case(laptop_blocks_bob: bool) {
     let accepted_legacy = invite("accepted, legacy").await;
     let unanswered_legacy = invite("unanswered, legacy").await;
     let accepted_unrecorded = invite("accepted, no decision").await;
+    let rebuilt = invite("unanswered, rebuilt").await;
     let unanswered = invite("unanswered").await;
     deliver_new(&mut phone.client, &relay, &mut phone.cursor).await;
     phone.client.sync().await.unwrap();
@@ -373,6 +374,14 @@ async fn forwarded_invitation_case(laptop_blocks_bob: bool) {
         )
         .unwrap();
     }
+    // A row rebuilt after a local deletion is unconfirmed by default and
+    // carries no Welcome; that is no acceptance to share.
+    db.execute(
+        "UPDATE account_groups SET pending_confirmation = 0, welcomer_account_id_hex = NULL,
+             via_welcome_message_id_hex = NULL WHERE group_id_hex = ?1",
+        [hex::encode(rebuilt.as_slice())],
+    )
+    .unwrap();
     drop(db);
     let mut phone = reopen(phone).await;
 
@@ -386,9 +395,17 @@ async fn forwarded_invitation_case(laptop_blocks_bob: bool) {
             .unwrap();
     }
     link(&relay, &mut phone, &mut laptop, "Laptop").await;
-    passes(&relay, &mut [&mut phone, &mut laptop], 2).await;
-    passes(&relay, &mut [&mut phone], 1).await;
-    passes(&relay, &mut [&mut laptop, &mut phone], 3).await;
+    // The decision the phone records for `accepted_unrecorded` reaches the
+    // laptop ahead of its Welcome, so the copy is never an invitation there.
+    let mut seen = false;
+    for _ in 0..6 {
+        passes(&relay, &mut [&mut phone, &mut laptop], 1).await;
+        if !seen && let Some(group) = laptop.client.state_group_record(&accepted_unrecorded) {
+            seen = true;
+            assert_eq!(group.pending_confirmation, laptop_blocks_bob);
+        }
+    }
+    assert!(seen);
 
     let invitation = |chat: &GroupId| {
         let group = laptop
@@ -405,6 +422,24 @@ async fn forwarded_invitation_case(laptop_blocks_bob: bool) {
         from_bob(laptop_blocks_bob)
     );
     assert_eq!(invitation(&unanswered_legacy), from_bob(true));
+    assert!(invitation(&rebuilt).0);
+    let phone_store = phone.app.account_storage("alice").unwrap();
+    let generation = {
+        use cgka_traits::storage::GroupStorage as _;
+        phone_store
+            .invitation_admission(&rebuilt)
+            .unwrap()
+            .unwrap()
+            .generation
+    };
+    assert_eq!(
+        phone_store
+            .app_storage()
+            .invitation_decision(&hex::encode(rebuilt.as_slice()), &generation)
+            .unwrap(),
+        None,
+        "a rebuilt row records no acceptance"
+    );
     assert_eq!(invitation(&unanswered), from_bob(true));
 }
 
