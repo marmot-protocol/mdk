@@ -1522,8 +1522,9 @@ artifacts.
 
 Experimental updated clients also share invitation decisions through MDK for one authenticated admission generation
 and its inherited sibling Adds. Older unidentified invitations remain local-only; a separate external Add batch or
-fork can prompt again. A chat a newly linked device gets from a sibling arrives as that sibling holds it: confirmed if
-confirmed there, otherwise pending with the original inviter as `welcomerAccountIdHex`. Accept never joins/rejoins or resets explicit archive intent. Decline requests each matching
+fork can prompt again. A chat a newly linked device gets from a sibling arrives as that sibling holds it where it can:
+pending with the original inviter as `welcomerAccountIdHex` if unanswered there, and otherwise confirmed, unless this
+device blocks that inviter or the shared decision has not arrived yet. Keep rendering the returned state. Accept never joins/rejoins or resets explicit archive intent. Decline requests each matching
 local leaf's existing Leave; later acceptance cannot cancel already-requested Leave. A decline does not reach a copy
 this device already deleted locally. Private KeyPackage requests follow the ordinary stock rules. A zero-publication
 `CompletionUnknown` is pending work, not proof every device departed. Keep rendering the returned invitation and

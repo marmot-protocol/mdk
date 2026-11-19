@@ -231,7 +231,7 @@ impl AppClient {
                 let storage = account.app_storage();
                 let chat = hex::encode(group_id.as_slice());
                 if admission.created_locally {
-                    storage.ensure_implicit_invitation_acceptance(&chat, admission.generation)?;
+                    storage.ensure_founding_invitation_decision(&chat, admission.generation)?;
                 }
                 storage.owe_installed_invitation_decision(&chat, &admission.generation)?;
                 self.accepted_invitation_projection(group_id)?.is_some()
@@ -284,7 +284,7 @@ impl AppClient {
             Some(welcome) => presented_welcome == Some(hex::encode(welcome.as_slice())),
         };
         if accepted_here {
-            storage.ensure_implicit_invitation_acceptance(&chat, admission.generation)?;
+            storage.ensure_founding_invitation_decision(&chat, admission.generation)?;
         }
         Ok(accepted_here)
     }
@@ -299,12 +299,10 @@ impl AppClient {
         if let Some(admission) = account.invitation_admission(group_id)?
             && admission.created_locally
         {
-            account
-                .app_storage()
-                .ensure_implicit_invitation_acceptance(
-                    &hex::encode(group_id.as_slice()),
-                    admission.generation,
-                )?;
+            account.app_storage().ensure_founding_invitation_decision(
+                &hex::encode(group_id.as_slice()),
+                admission.generation,
+            )?;
         }
         Ok(())
     }
