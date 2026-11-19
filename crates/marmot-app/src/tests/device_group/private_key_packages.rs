@@ -2048,7 +2048,7 @@ async fn a_refused_sibling_add_spends_its_key_package() {
 /// time bob's Commit settles, the drain refuses the Add, and the KeyPackage
 /// is not handed back. One that forwards its copy's invitation is refused
 /// rather than queued, since the copy could change before the drain
-/// (mdk#3546), and it spends its KeyPackage too.
+/// (mdk#3546); nothing could carry its KeyPackage, which comes back.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_queued_sibling_add_the_drain_refuses_spends_its_key_package() {
     let (mut devices, _, [chat]) = tagging_devices_with_chats::<1>().await;
@@ -2124,9 +2124,8 @@ async fn a_queued_sibling_add_the_drain_refuses_spends_its_key_package() {
             .has_queued_outbound_intents(&chat)
             .unwrap()
     );
-    assert_eq!(received_from(&devices.laptop, &phone_slot).len(), stock - 1);
+    assert_eq!(received_from(&devices.laptop, &phone_slot).len(), stock);
     welcomer(&mut devices, None);
-    let stock = stock - 1;
     devices
         .laptop
         .add_sibling_to_chat(
@@ -2136,13 +2135,20 @@ async fn a_queued_sibling_add_the_drain_refuses_spends_its_key_package() {
         )
         .await
         .unwrap();
-    assert!(
-        devices
-            .laptop
-            .runtime
-            .has_queued_outbound_intents(&chat)
+    // The founded copy's confirmation is not forwarded beside its generation,
+    // so the Add queues forwarding nothing, and a repair before the drain
+    // cannot revive it.
+    let [queued] = <[_; 1]>::try_from({
+        use cgka_traits::storage::OutboundIntentStorage as _;
+        group_storage(&devices.laptop)
+            .list_queued_outbound_intents(&chat)
             .unwrap()
-    );
+    })
+    .unwrap();
+    assert!(matches!(
+        queued.intent,
+        SendIntent::AddOwnAccountDevices { forwarded, .. } if forwarded.is_empty()
+    ));
     assert_eq!(received_from(&devices.laptop, &phone_slot).len(), stock - 1);
 
     let session = devices.laptop.runtime.session_mut();

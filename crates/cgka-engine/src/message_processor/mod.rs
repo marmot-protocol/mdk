@@ -1076,18 +1076,32 @@ impl<S: StorageProvider> Engine<S> {
             }
             // Nor does a same-account Add that forwards its copy's invitation:
             // the copy could change before the drain (mdk#3546). Gap filling
-            // retries with the copy as it then stands.
-            if let SendIntent::AddOwnAccountDevices { forwarded, .. } = &intent
-                && !crate::own_account_devices::sent_forwarded(
+            // retries with the copy as it then stands. One that forwards
+            // nothing for this copy queues as exactly that, so a repair before
+            // the drain cannot revive a confirmation its generation dropped.
+            let intent = match intent {
+                SendIntent::AddOwnAccountDevices {
+                    group_id: chat,
+                    siblings,
                     forwarded,
-                    self.storage
-                        .invitation_admission(&group_id)?
-                        .map(|admission| admission.generation),
-                )
-                .is_empty()
-            {
-                return Err(EngineError::SiblingAddUnsettled { group_id });
-            }
+                } => {
+                    let generation = self
+                        .storage
+                        .invitation_admission(&chat)?
+                        .map(|admission| admission.generation);
+                    if !crate::own_account_devices::sent_forwarded(&forwarded, generation)
+                        .is_empty()
+                    {
+                        return Err(EngineError::SiblingAddUnsettled { group_id });
+                    }
+                    SendIntent::AddOwnAccountDevices {
+                        group_id: chat,
+                        siblings,
+                        forwarded: Default::default(),
+                    }
+                }
+                intent => intent,
+            };
             // An activation the current state already refuses is answered now,
             // not accepted and then refused at drain.
             if matches!(&intent, SendIntent::EnableAccountDevices { .. }) {
