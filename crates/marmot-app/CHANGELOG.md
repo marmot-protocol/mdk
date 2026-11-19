@@ -129,6 +129,10 @@
 
 ### Fixed
 
+- A sibling Add forwards how this device holds the chat, and the new device's copy shows it the same way (mdk#3546):
+  confirmed if confirmed here, including a copy with no invitation generation, otherwise pending with the original
+  inviter as `welcomer_account_id_hex` instead of the account itself.
+
 - When a device is linked to an account that already has two or more devices, its approver and the other devices
   no longer both add it to the same chat in the usual case, which forked chats (mdk#3537). While the approver is active
   (heard from, or approving the link, within the last two hours) and the link is under a week old, other devices leave

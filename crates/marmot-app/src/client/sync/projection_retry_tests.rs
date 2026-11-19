@@ -1173,6 +1173,7 @@ async fn never_projected_terminal_group_does_not_stall_live_effects() {
                 via_welcome: cgka_traits::MessageId::new(vec![0x75; 32]),
                 welcomer: None,
                 explicitly_confirmed: true,
+                forwarded: Default::default(),
             },
             GroupEvent::GroupStateChanged {
                 group_id: terminal,
@@ -1974,6 +1975,7 @@ fn deferral_skips_only_unprojected_events_of_deferred_groups() {
         via_welcome: cgka_traits::MessageId::new(vec![0x53; 32]),
         welcomer: None,
         explicitly_confirmed: false,
+        forwarded: Default::default(),
     };
     let quarantined = GroupEvent::GroupHydrationQuarantined {
         group_id: deferred.clone(),

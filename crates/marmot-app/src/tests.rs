@@ -16744,6 +16744,7 @@ async fn a_drained_self_departure_and_rejoin_move_stored_self_membership() {
             via_welcome: MessageId::new(vec![0x7a; 32]),
             explicitly_confirmed: false,
             welcomer: None,
+            forwarded: Default::default(),
         }],
         ..Default::default()
     };
@@ -19712,6 +19713,7 @@ async fn invite_recovery_failure_preserves_committed_effects_and_results() {
                 via_welcome: cgka_traits::MessageId::new(vec![0xcd; 32]),
                 welcomer: None,
                 explicitly_confirmed: true,
+                forwarded: Default::default(),
             });
         let path = app.account_storage_path("alice");
         let keys = app.account_home().load_signing_keys("alice").unwrap();

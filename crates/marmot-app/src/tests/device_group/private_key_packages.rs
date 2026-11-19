@@ -570,6 +570,7 @@ async fn add_the_phone_unpublished(devices: &mut Devices, chat: &GroupId) {
                 slot: phone_slot,
                 key_package,
             }],
+            forwarded: Default::default(),
         },
     )
     .await;

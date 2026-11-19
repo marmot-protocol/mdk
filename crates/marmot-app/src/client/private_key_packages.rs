@@ -71,7 +71,7 @@
 
 use base64::Engine as _;
 use cgka_traits::app_components::{DeviceSlotId, valid_sibling_welcome_relays};
-use cgka_traits::engine::{EpochPin, SendIntent, SiblingKeyPackage};
+use cgka_traits::engine::{EpochPin, ForwardedInvitation, SendIntent, SiblingKeyPackage};
 use cgka_traits::error::{EngineError, SiblingAddRefusal};
 use cgka_traits::storage::{IssuedPrivateKeyPackage, MessageStorage as _};
 use cgka_traits::welcome::SiblingWelcomeJoin;
@@ -966,6 +966,26 @@ impl AppClient {
     /// the engine took the Add reads the same as a refusal, and a KeyPackage
     /// returned then could reach two Welcomes. Upkeep asks the sibling for
     /// more.
+    /// What this device's copy of `chat` says about the invitation it came
+    /// in by, for the sibling it adds to show the chat as it stands here
+    /// (mdk#3546).
+    fn forwarded_invitation(&self, chat: &GroupId) -> ForwardedInvitation {
+        let Some(group) = self.state_group_record(chat) else {
+            return ForwardedInvitation::default();
+        };
+        let own = self.runtime.self_id();
+        ForwardedInvitation {
+            // A copy joined from an earlier sibling Welcome names this
+            // account, which is no inviter to forward.
+            inviter: group
+                .welcomer_account_id_hex
+                .and_then(|welcomer| hex::decode(welcomer).ok())
+                .map(MemberId::new)
+                .filter(|welcomer| welcomer != &own),
+            confirmed: !group.pending_confirmation,
+        }
+    }
+
     pub(crate) async fn add_sibling_to_chat(
         &mut self,
         chat: &GroupId,
@@ -997,6 +1017,7 @@ impl AppClient {
                         slot: *sibling,
                         key_package,
                     }],
+                    forwarded: self.forwarded_invitation(chat),
                 },
                 audit_context,
             )

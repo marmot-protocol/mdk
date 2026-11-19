@@ -10570,6 +10570,7 @@ mod tests {
                 via_welcome: cgka_traits::MessageId::new(vec![1; 32]),
                 welcomer: None,
                 explicitly_confirmed: true,
+                forwarded: Default::default(),
             }],
             ..Default::default()
         };

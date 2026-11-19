@@ -677,6 +677,7 @@ fn snapshot_send_intents() {
                 slot: [0x5A; 32],
                 key_package: KeyPackage::new(vec![0xEF; 4]),
             }],
+            forwarded: Default::default(),
         }
     );
     insta::assert_json_snapshot!(
@@ -819,6 +820,7 @@ fn snapshot_group_events() {
             via_welcome: mid(),
             explicitly_confirmed: false,
             welcomer: Some(mem_id()),
+            forwarded: Default::default(),
         }
     );
     insta::assert_json_snapshot!(

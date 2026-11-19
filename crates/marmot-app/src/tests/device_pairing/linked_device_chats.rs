@@ -301,6 +301,83 @@ async fn the_approving_device_adds_a_new_device_to_its_chats() {
     assert_eq!(phone.client.chats_closed_to_linked_devices().unwrap(), 0);
 }
 
+/// A chat reaches a newly linked laptop as it stands on the phone that adds
+/// it (mdk#3546): one the phone founded or accepted arrives confirmed, and
+/// an invitation still unanswered there arrives pending, from the account
+/// that sent it rather than from Alice herself. Chats from before invitation
+/// generations (no admission, which stay local-only) take that state from
+/// the sibling Welcome; an identified invitation still settles through its
+/// generation's shared decision, so only its inviter travels.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_linked_device_gets_each_chat_as_the_adding_device_holds_it() {
+    let (relay, [mut phone]) = alice_devices::<1>().await;
+    let alice = phone
+        .app
+        .account_home()
+        .account("alice")
+        .unwrap()
+        .account_id_hex;
+    let bob_dir = tempfile::tempdir().unwrap();
+    let bob_id = AccountHome::open(bob_dir.path())
+        .create_account("bob")
+        .unwrap()
+        .account_id_hex;
+    let bob_app = crate::tests::canonical_membership::app_at(&bob_dir, relay.clone());
+    remember_test_member_inbox(&bob_app, &alice, "wss://relay.example");
+    let mut bob = bob_app.client("bob").await.unwrap();
+    let mut invite = async |name: &str| {
+        bob.create_group(name, &[&alice])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members")
+    };
+    let accepted_legacy = invite("accepted, legacy").await;
+    let unanswered_legacy = invite("unanswered, legacy").await;
+    let unanswered = invite("unanswered").await;
+    deliver_new(&mut phone.client, &relay, &mut phone.cursor).await;
+    phone.client.sync().await.unwrap();
+    phone.client.accept_group_invite(&accepted_legacy).unwrap();
+    let founded_legacy = chats(&mut phone, 1).await.remove(0);
+    // Copies installed before invitation generations have no admission and
+    // so no decision; migration 0170 seeded none.
+    let legacy = [&founded_legacy, &accepted_legacy, &unanswered_legacy];
+    let db = account_database(&phone.app);
+    for chat in legacy {
+        db.execute(
+            "DELETE FROM cgka_invitation_admissions WHERE group_id = ?1",
+            [chat.as_slice()],
+        )
+        .unwrap();
+        db.execute(
+            "DELETE FROM invitation_decisions WHERE group_id_hex = ?1",
+            [hex::encode(chat.as_slice())],
+        )
+        .unwrap();
+    }
+    drop(db);
+    let mut phone = reopen(phone).await;
+
+    // The laptop signs in only now, so none of Bob's invitations reached it.
+    let mut laptop = another_alice_device(&relay, &phone).await;
+    link(&relay, &mut phone, &mut laptop, "Laptop").await;
+    passes(&relay, &mut [&mut phone, &mut laptop], 2).await;
+    passes(&relay, &mut [&mut phone], 1).await;
+    passes(&relay, &mut [&mut laptop, &mut phone], 3).await;
+
+    let invitation = |chat: &GroupId| {
+        let group = laptop
+            .client
+            .state_group_record(chat)
+            .expect("the laptop joined from the phone's sibling Welcome");
+        (group.pending_confirmation, group.welcomer_account_id_hex)
+    };
+    assert!(!invitation(&founded_legacy).0);
+    assert_eq!(invitation(&accepted_legacy), (false, Some(bob_id.clone())));
+    assert_eq!(invitation(&unanswered_legacy), (true, Some(bob_id.clone())));
+    assert_eq!(invitation(&unanswered), (true, Some(bob_id)));
+}
+
 /// A real linked sender rebroadcasts a retained winning choice. It need not
 /// have this ordinary chat installed to authenticate its account's choice.
 async fn receive_account_choice(

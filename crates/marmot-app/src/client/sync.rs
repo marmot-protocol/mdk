@@ -5938,6 +5938,7 @@ mod runtime_group_subscription_refresh_tests {
                 via_welcome: cgka_traits::MessageId::new(vec![0x75; 32]),
                 welcomer: None,
                 explicitly_confirmed: true,
+                forwarded: Default::default(),
             }],
             ..Default::default()
         };
@@ -6245,6 +6246,7 @@ mod runtime_group_subscription_refresh_tests {
                 via_welcome: cgka_traits::MessageId::new(vec![0x77; 32]),
                 welcomer: None,
                 explicitly_confirmed: true,
+                forwarded: Default::default(),
             }],
             ..Default::default()
         };

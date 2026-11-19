@@ -97,6 +97,13 @@
 
 ### Fixed
 
+- A newly linked device gets each chat as the device that adds it holds it
+  (#3546). A chat confirmed there, including one from before invitation
+  generations, arrives confirmed instead of as an invitation from the account
+  itself, and an unanswered invitation arrives pending from its real inviter.
+  The sibling Welcome that carries this is a new version 3, which linked
+  devices must both run to read.
+
 - A relay the host-safety rule refuses no longer reads as one a send may have
   reached, or hides that a send is too large (#3305). A Welcome whose inbox
   relays it refuses, on the first attempt or a later retry, no longer counts

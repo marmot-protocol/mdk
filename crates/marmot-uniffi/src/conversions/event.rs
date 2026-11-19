@@ -1224,6 +1224,7 @@ mod tests {
             group_id: group(), via_welcome: MessageId::new(vec![0x42; 32]),
             explicitly_confirmed: true,
             welcomer: Some(MemberId::new(hex::decode(CHOICE_SENDER).unwrap())),
+            forwarded: Default::default(),
         }), F::GroupJoined { via_welcome_hex, welcomer_id_hex }
             if via_welcome_hex == "42".repeat(32) && welcomer_id_hex.as_deref() == Some(CHOICE_SENDER)));
         let inner =

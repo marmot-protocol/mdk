@@ -549,6 +549,7 @@ async fn session_ingest_surfaces_join_and_app_message_events() {
             via_welcome: welcome_id,
             explicitly_confirmed: false,
             welcomer: Some(alice.self_id()),
+            forwarded: Default::default(),
         }]
     );
 

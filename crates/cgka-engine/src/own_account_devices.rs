@@ -36,7 +36,9 @@ use crate::provider::EngineOpenMlsProvider;
 use cgka_traits::app_components::{
     DeviceRosterV1, DeviceSlotId, MAX_LEAVES_PER_ACCOUNT, valid_sibling_welcome_relays,
 };
-use cgka_traits::engine::{KeyPackage, SendIntent, SendResult, SiblingKeyPackage};
+use cgka_traits::engine::{
+    ForwardedInvitation, KeyPackage, SendIntent, SendResult, SiblingKeyPackage,
+};
 use cgka_traits::engine_state::{EpochState, InvalidTransition, StagedCommitHandle};
 use cgka_traits::error::{EngineError, SiblingAddRefusal};
 use cgka_traits::message::{
@@ -61,6 +63,7 @@ pub(crate) struct SiblingWelcomePlan {
     from: DeviceSlotId,
     relays: Vec<String>,
     pub(crate) invitation_generation: Option<[u8; 32]>,
+    pub(crate) forwarded: ForwardedInvitation,
 }
 
 /// A sibling Welcome plan, or why the Add is refused and the reason it gives.
@@ -138,13 +141,14 @@ impl<S: StorageProvider> Engine<S> {
         &mut self,
         group_id: GroupId,
         siblings: Vec<SiblingKeyPackage>,
+        forwarded: ForwardedInvitation,
     ) -> Result<SendResult, EngineError> {
         if siblings.is_empty() {
             return Err(EngineError::Other(
                 "adding own account devices requires at least one KeyPackage".into(),
             ));
         }
-        self.do_send_own_account_devices(group_id, siblings, Vec::new(), ADD)
+        self.do_send_own_account_devices(group_id, siblings, forwarded, Vec::new(), ADD)
             .await
     }
 
@@ -153,7 +157,10 @@ impl<S: StorageProvider> Engine<S> {
     /// once with nothing written; the drain checks a queued one again when
     /// it prepares it, and refuses it there as `QueuedIntentRefused`.
     pub(crate) fn check_queued_sibling_add(&self, intent: &SendIntent) -> Result<(), EngineError> {
-        let SendIntent::AddOwnAccountDevices { group_id, siblings } = intent else {
+        let SendIntent::AddOwnAccountDevices {
+            group_id, siblings, ..
+        } = intent
+        else {
             return Ok(());
         };
         if siblings.is_empty() {
@@ -240,14 +247,21 @@ impl<S: StorageProvider> Engine<S> {
                 "removing own account devices requires at least one device".into(),
             ));
         }
-        self.do_send_own_account_devices(group_id, Vec::new(), leaf_signature_keys, REMOVE)
-            .await
+        self.do_send_own_account_devices(
+            group_id,
+            Vec::new(),
+            ForwardedInvitation::default(),
+            leaf_signature_keys,
+            REMOVE,
+        )
+        .await
     }
 
     async fn do_send_own_account_devices(
         &mut self,
         group_id: GroupId,
         siblings: Vec<SiblingKeyPackage>,
+        forwarded: ForwardedInvitation,
         leaf_signature_keys: Vec<Vec<u8>>,
         intent: &'static str,
     ) -> Result<SendResult, EngineError> {
@@ -293,7 +307,10 @@ impl<S: StorageProvider> Engine<S> {
         let sibling_plan = if siblings.is_empty() {
             None
         } else {
-            Some(self.sibling_welcome_plan(&mls_group, &siblings)?)
+            Some(SiblingWelcomePlan {
+                forwarded,
+                ..self.sibling_welcome_plan(&mls_group, &siblings)?
+            })
         };
 
         let pre_commit_epoch = EpochId(mls_group.epoch().as_u64());
@@ -575,6 +592,7 @@ impl<S: StorageProvider> Engine<S> {
                 .storage
                 .invitation_admission(&GroupId::new(mls_group.group_id().as_slice().to_vec()))?
                 .map(|admission| admission.generation),
+            forwarded: ForwardedInvitation::default(),
         }))
     }
 
@@ -1148,6 +1166,12 @@ pub(crate) fn build_sibling_welcomes(
                 from: plan.from,
                 to: sibling.slot,
                 invitation_generation: plan.invitation_generation,
+                forwarded: ForwardedInvitation {
+                    inviter: plan.forwarded.inviter.clone(),
+                    // A generation's shared decision settles its copies
+                    // (account-sync.md, "Invitation decisions").
+                    confirmed: plan.forwarded.confirmed && plan.invitation_generation.is_none(),
+                },
                 key_package_ref: key_package_ref.clone(),
                 welcome: welcome.to_vec(),
                 relays: plan.relays.clone(),

@@ -18,6 +18,7 @@ use cgka_engine::private_key_packages::{
     validate_received_private_key_package,
 };
 use cgka_traits::app_components::{DeviceEntryV1, DeviceRosterV1};
+use cgka_traits::engine::ForwardedInvitation;
 use cgka_traits::storage::{GroupStorage as _, KeyPackageBundleStorage as _};
 use cgka_traits::welcome::SiblingWelcomeJoin::{self, Settled};
 use tls_codec::VLBytes;
@@ -615,6 +616,7 @@ fn sibling_welcome(
         key_package_ref: key_package_ref.to_vec(),
         welcome: welcome.payload.clone(),
         relays: vec![],
+        forwarded: Default::default(),
     }
 }
 
@@ -1051,10 +1053,83 @@ async fn a_sibling_welcome_decodes_only_its_exact_encoding() {
         matches!(SiblingWelcome::decode(&inherited_bytes[..96]), Err(EngineError::Serialize(reason)) if reason == "invalid sibling Welcome")
     );
 
+    // Version 3 carries what the sender's copy says about its invitation
+    // (mdk#3546): an inviter beside an inherited generation, or, for a copy
+    // with no generation, its confirmation.
+    let invited = SiblingWelcome {
+        forwarded: ForwardedInvitation {
+            inviter: Some(MemberId::new(vec![0xb6; 32])),
+            confirmed: false,
+        },
+        ..inherited.clone()
+    };
+    let invited_bytes = invited.encode().unwrap();
+    assert_eq!(invited_bytes[0], 3);
+    assert_eq!(&invited_bytes[1..65], &inherited_bytes[1..65]);
+    assert_eq!(invited_bytes[65], 1);
+    assert_eq!(&invited_bytes[66..98], &[0xa5; 32]);
+    assert_eq!(invited_bytes[98], 1);
+    assert_eq!(&invited_bytes[99..131], &[0xb6; 32]);
+    assert_eq!(invited_bytes[131], 0);
+    assert_eq!(&invited_bytes[132..], &bytes[65..]);
+    assert_eq!(SiblingWelcome::decode(&invited_bytes).unwrap(), invited);
+    let confirmed = ForwardedInvitation {
+        inviter: None,
+        confirmed: true,
+    };
+    let local_only = SiblingWelcome {
+        forwarded: confirmed.clone(),
+        ..sibling.clone()
+    };
+    let local_only_bytes = local_only.encode().unwrap();
+    assert_eq!(local_only_bytes[0], 3);
+    assert_eq!(&local_only_bytes[65..68], &[0, 0, 1]);
+    assert_eq!(&local_only_bytes[68..], &bytes[65..]);
+    assert_eq!(
+        SiblingWelcome::decode(&local_only_bytes).unwrap(),
+        local_only
+    );
+    let mut beside_generation = invited_bytes.clone();
+    beside_generation[131] = 1;
+    let mut nothing_forwarded = local_only_bytes.clone();
+    nothing_forwarded[67] = 0;
+    let mut presence = local_only_bytes.clone();
+    presence[65] = 2;
+    let mut flag = local_only_bytes.clone();
+    flag[67] = 2;
+    for refused in [
+        &beside_generation,
+        &nothing_forwarded,
+        &presence,
+        &flag,
+        &local_only_bytes[..67],
+    ] {
+        assert_serialize_error(SiblingWelcome::decode(refused), "invalid sibling Welcome");
+    }
+    assert_serialize_error(
+        SiblingWelcome {
+            forwarded: confirmed,
+            ..inherited.clone()
+        }
+        .encode(),
+        "sibling Welcome: an identified invitation forwards no confirmation",
+    );
+    assert_serialize_error(
+        SiblingWelcome {
+            forwarded: ForwardedInvitation {
+                inviter: Some(MemberId::new(vec![0xb6; 31])),
+                confirmed: false,
+            },
+            ..sibling.clone()
+        }
+        .encode(),
+        "sibling Welcome: an inviter is a 32-byte account id",
+    );
+
     let mut trailing = bytes.clone();
     trailing.push(0);
     let mut version = bytes.clone();
-    version[0] = 3;
+    version[0] = 4;
     for refused in [&bytes[..bytes.len() - 1], &trailing, &version, &bytes[..65]] {
         assert_serialize_error(SiblingWelcome::decode(refused), "invalid sibling Welcome");
     }

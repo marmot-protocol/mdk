@@ -106,6 +106,7 @@ async fn invite_lifecycle_chaos_handles_wrong_routes_replays_and_welcome_before_
             via_welcome: welcome_report.message_id,
             explicitly_confirmed: false,
             welcomer: Some(alice.account_id.clone()),
+            forwarded: Default::default(),
         }]
     );
     assert_eq!(carol.session.epoch(&group_id).unwrap(), EpochId(2));
@@ -244,6 +245,7 @@ async fn invite_lifecycle_chaos_handles_commit_before_welcome_and_shared_replay(
             via_welcome: welcome_report.message_id,
             explicitly_confirmed: false,
             welcomer: Some(alice.account_id.clone()),
+            forwarded: Default::default(),
         }]
     );
     assert_eq!(carol.session.epoch(&group_id).unwrap(), EpochId(2));
@@ -750,6 +752,7 @@ async fn publish_confirm_and_deliver_welcome(
             via_welcome: welcome_report.message_id,
             explicitly_confirmed: false,
             welcomer: Some(alice.account_id.clone()),
+            forwarded: Default::default(),
         }]
     );
 }

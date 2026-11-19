@@ -163,6 +163,7 @@ pub(crate) enum WelcomeRoute {
         from: DeviceSlotId,
         key_package_ref: Vec<u8>,
         invitation_generation: Option<[u8; 32]>,
+        forwarded: cgka_traits::engine::ForwardedInvitation,
     },
 }
 
@@ -1472,6 +1473,10 @@ impl<S: StorageProvider> Engine<S> {
         route: WelcomeRoute,
     ) -> Result<GroupId, EngineError> {
         let welcome_id = welcome_msg.id.clone();
+        let forwarded = match &route {
+            WelcomeRoute::Sibling { forwarded, .. } => forwarded.clone(),
+            WelcomeRoute::Delivery => Default::default(),
+        };
         let (welcome_bytes, welcome_created_at, key_package_claim) = match peeled.content {
             cgka_traits::ingest::PeeledContent::Welcome {
                 bytes,
@@ -2055,6 +2060,7 @@ impl<S: StorageProvider> Engine<S> {
                     via_welcome: welcome_id.clone(),
                     explicitly_confirmed: consent.is_some(),
                     welcomer: Some(welcome_sender_id.clone()),
+                    forwarded: forwarded.clone(),
                 },
             )?;
 
@@ -2239,6 +2245,7 @@ impl<S: StorageProvider> Engine<S> {
                 via_welcome: welcome_id.clone(),
                 explicitly_confirmed: consent.is_some(),
                 welcomer: Some(welcome_sender_id.clone()),
+                forwarded,
             });
         if let Some(new_seconds) =
             crate::app_components::message_retention_seconds_of_group(&mls_group)?

@@ -1073,6 +1073,7 @@ impl AppGroupRecord {
             }
             GroupConfirmationProjection::Welcome {
                 explicitly_confirmed,
+                sibling_confirmed,
                 via_welcome_message_id_hex,
                 welcomer_account_id_hex,
             } => {
@@ -1089,7 +1090,7 @@ impl AppGroupRecord {
                 {
                     return;
                 }
-                self.pending_confirmation = !explicitly_confirmed;
+                self.pending_confirmation = !(explicitly_confirmed || sibling_confirmed);
                 // Only the engine's successful consented rejoin clears archive.
                 // Offers and ordinary invitation acceptance preserve explicit archive intent;
                 // the replay guard above prevents an old join from undoing a later archive.
@@ -2093,6 +2094,9 @@ pub(crate) enum GroupConfirmationProjection {
     Accepted,
     Welcome {
         explicitly_confirmed: bool,
+        /// The sibling that added this copy holds the chat confirmed and it
+        /// has no invitation generation to share a decision through.
+        sibling_confirmed: bool,
         via_welcome_message_id_hex: String,
         welcomer_account_id_hex: Option<String>,
     },
@@ -2339,12 +2343,18 @@ pub(crate) fn observe_event(
                             via_welcome,
                             welcomer,
                             explicitly_confirmed,
+                            forwarded,
                             ..
                         } => GroupConfirmationProjection::Welcome {
                             explicitly_confirmed: *explicitly_confirmed,
+                            sibling_confirmed: forwarded.confirmed,
                             via_welcome_message_id_hex: hex::encode(via_welcome.as_slice()),
-                            welcomer_account_id_hex: welcomer
+                            // A sibling Welcome's author is this account; the
+                            // invitation came from whoever its sender names.
+                            welcomer_account_id_hex: forwarded
+                                .inviter
                                 .as_ref()
+                                .or(welcomer.as_ref())
                                 .map(|member_id| hex::encode(member_id.as_slice())),
                         },
                         _ => GroupConfirmationProjection::Preserve,
@@ -2782,6 +2792,7 @@ mod confirmation_state_tests {
     fn pending(via_welcome: &str, welcomer: Option<&str>) -> GroupConfirmationProjection {
         GroupConfirmationProjection::Welcome {
             explicitly_confirmed: false,
+            sibling_confirmed: false,
             via_welcome_message_id_hex: via_welcome.to_owned(),
             welcomer_account_id_hex: welcomer.map(str::to_owned),
         }
@@ -2853,6 +2864,7 @@ mod confirmation_state_tests {
         assert!(!record.pending_confirmation);
         let rejoin = GroupConfirmationProjection::Welcome {
             explicitly_confirmed: true,
+            sibling_confirmed: false,
             via_welcome_message_id_hex: "new".into(),
             welcomer_account_id_hex: None,
         };
