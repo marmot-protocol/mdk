@@ -2046,7 +2046,9 @@ async fn a_refused_sibling_add_spends_its_key_package() {
 /// An Add queued behind the chat's convergence spends its KeyPackage
 /// whatever the drain makes of it: with the laptop no longer tagged by the
 /// time bob's Commit settles, the drain refuses the Add, and the KeyPackage
-/// is not handed back.
+/// is not handed back. One that forwards its copy's invitation is refused
+/// rather than queued, since the copy could change before the drain
+/// (mdk#3546), and it spends its KeyPackage too.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_queued_sibling_add_the_drain_refuses_spends_its_key_package() {
     let (mut devices, _, [chat]) = tagging_devices_with_chats::<1>().await;
@@ -2087,6 +2089,44 @@ async fn a_queued_sibling_add_the_drain_refuses_spends_its_key_package() {
     deliver_new(&mut devices.laptop, &devices.relay, &mut cursor).await;
     let phone_slot = slot(&devices.phone);
     let stock = received_from(&devices.laptop, &phone_slot).len();
+    let welcomer = |devices: &mut Devices, welcomer: Option<String>| {
+        let chat_hex = hex::encode(chat.as_slice());
+        devices
+            .laptop
+            .state
+            .groups
+            .iter_mut()
+            .find(|group| group.group_id_hex == chat_hex)
+            .unwrap()
+            .welcomer_account_id_hex = welcomer;
+    };
+    welcomer(&mut devices, Some(bob_id.clone()));
+    let error = devices
+        .laptop
+        .add_sibling_to_chat(
+            &chat,
+            &phone_slot,
+            private_candidate(&devices.laptop, &phone_slot),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            error.as_engine_error(),
+            Some(cgka_traits::EngineError::SiblingAddUnsettled { .. })
+        ),
+        "{error}"
+    );
+    assert!(
+        !devices
+            .laptop
+            .runtime
+            .has_queued_outbound_intents(&chat)
+            .unwrap()
+    );
+    assert_eq!(received_from(&devices.laptop, &phone_slot).len(), stock - 1);
+    welcomer(&mut devices, None);
+    let stock = stock - 1;
     devices
         .laptop
         .add_sibling_to_chat(

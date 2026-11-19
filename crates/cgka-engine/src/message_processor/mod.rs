@@ -1074,6 +1074,20 @@ impl<S: StorageProvider> Engine<S> {
             if matches!(&intent, SendIntent::ReplaceAccountEntry { .. }) {
                 return Err(EngineError::AccountEntryUnsettled { group_id });
             }
+            // Nor does a same-account Add that forwards its copy's invitation:
+            // the copy could change before the drain (mdk#3546). Gap filling
+            // retries with the copy as it then stands.
+            if let SendIntent::AddOwnAccountDevices { forwarded, .. } = &intent
+                && !crate::own_account_devices::sent_forwarded(
+                    forwarded,
+                    self.storage
+                        .invitation_admission(&group_id)?
+                        .map(|admission| admission.generation),
+                )
+                .is_empty()
+            {
+                return Err(EngineError::SiblingAddUnsettled { group_id });
+            }
             // An activation the current state already refuses is answered now,
             // not accepted and then refused at drain.
             if matches!(&intent, SendIntent::EnableAccountDevices { .. }) {

@@ -7,6 +7,8 @@
 - `SendIntent::AddOwnAccountDevices` and `GroupEvent::GroupJoined` gain `forwarded: ForwardedInvitation`, what the
   adding device's copy says about its invitation (mdk#3546). Both default when deserialized; struct literals need
   the field.
+- `EngineError::SiblingAddUnsettled` refuses a same-account Add that forwards its copy's invitation instead of
+  queueing it while the chat is unsettled (mdk#3546); exhaustive matches need the variant.
 
 - `OutboundIntentStorage` gains `put_change_not_delivered`, `changes_not_delivered` and
   `delete_change_not_delivered` for `ChangeNotDelivered` records (mdk#2332); custom storage must implement them.

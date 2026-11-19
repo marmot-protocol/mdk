@@ -1144,6 +1144,19 @@ fn sibling_welcome_relays(mls_group: &MlsGroup) -> Result<Option<Vec<String>>, E
     Ok(valid_sibling_welcome_relays(&relays).then_some(relays))
 }
 
+/// What a sibling Welcome forwards for a copy with `generation`. A
+/// generation's shared decision settles its copies (account-sync.md,
+/// "Invitation decisions"), so only a copy without one forwards confirmation.
+pub(crate) fn sent_forwarded(
+    forwarded: &ForwardedInvitation,
+    generation: Option<[u8; 32]>,
+) -> ForwardedInvitation {
+    ForwardedInvitation {
+        inviter: forwarded.inviter,
+        confirmed: forwarded.confirmed && generation.is_none(),
+    }
+}
+
 /// One sibling Welcome per added KeyPackage, each naming its own KeyPackage
 /// and carrying the staged Commit's Welcome (device-group.md, "Sending a
 /// sibling Welcome"). It is deliverable until the KeyPackage's lifetime ends,
@@ -1166,12 +1179,7 @@ pub(crate) fn build_sibling_welcomes(
                 from: plan.from,
                 to: sibling.slot,
                 invitation_generation: plan.invitation_generation,
-                forwarded: ForwardedInvitation {
-                    inviter: plan.forwarded.inviter,
-                    // A generation's shared decision settles its copies
-                    // (account-sync.md, "Invitation decisions").
-                    confirmed: plan.forwarded.confirmed && plan.invitation_generation.is_none(),
-                },
+                forwarded: sent_forwarded(&plan.forwarded, plan.invitation_generation),
                 key_package_ref: key_package_ref.clone(),
                 welcome: welcome.to_vec(),
                 relays: plan.relays.clone(),

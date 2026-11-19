@@ -194,6 +194,13 @@ pub enum EngineError {
     #[error("linking a device refused while the device group is unsettled")]
     LinkDeviceUnsettled { group_id: GroupId },
 
+    /// A same-account Add that forwards its copy's invitation never waits in
+    /// the outbound queue: the copy could change before the drain and leave
+    /// it forwarding facts that no longer hold (mdk#3546). Retry once the
+    /// chat settles, reading the copy again.
+    #[error("adding a sibling with its invitation refused while the chat is unsettled")]
+    SiblingAddUnsettled { group_id: GroupId },
+
     /// A [`SendIntent::ReplaceDeviceEntry`](crate::engine::SendIntent::ReplaceDeviceEntry)
     /// refused because the slot no longer holds the entry the replacement
     /// was computed from: a commit applied since changed or removed it.
@@ -400,6 +407,7 @@ impl EngineError {
             EngineError::AppMessageEpochMismatch { .. } => "app_message_epoch_mismatch",
             EngineError::AppMessageEpochUnsettled { .. } => "app_message_epoch_unsettled",
             EngineError::LinkDeviceUnsettled { .. } => "link_device_unsettled",
+            EngineError::SiblingAddUnsettled { .. } => "sibling_add_unsettled",
             EngineError::DeviceEntryChanged { .. } => "device_entry_changed",
             EngineError::AccountEntryChanged { .. } => "account_entry_changed",
             EngineError::AccountEntryUnsettled { .. } => "account_entry_unsettled",

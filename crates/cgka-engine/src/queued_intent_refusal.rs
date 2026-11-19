@@ -118,6 +118,7 @@ fn reports_the_device(error: &EngineError) -> bool {
         | EngineError::AppMessageEpochMismatch { .. }
         | EngineError::AppMessageEpochUnsettled { .. }
         | EngineError::LinkDeviceUnsettled { .. }
+        | EngineError::SiblingAddUnsettled { .. }
         | EngineError::DeviceEntryChanged { .. }
         | EngineError::AccountEntryChanged { .. }
         | EngineError::AccountEntryUnsettled { .. }

@@ -6,7 +6,8 @@
 
 - `SiblingWelcome` gains `forwarded`, encoded as version 3 when anything is forwarded: the original inviter, and for
   a copy with no invitation generation whether it is confirmed (mdk#3546). A sibling join reports it on
-  `GroupJoined.forwarded`. Receivers older than this refuse a version-3 Welcome.
+  `GroupJoined.forwarded`. Receivers older than this refuse a version-3 Welcome. An Add that forwards anything
+  is refused with `SiblingAddUnsettled` rather than queued, so it never forwards facts read before a drain.
 
 - `Engine::publish_failed_fanout`, `publish_not_delivered` and `publish_refused_as_too_large` take a `RollbackPass`
   (mdk#2332). On `RollbackPass::Later`, a host change the fanout names is recorded as not delivered and announced
