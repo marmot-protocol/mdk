@@ -766,12 +766,9 @@ impl AccountDeviceSession {
     /// `origin_commit_id`, which its rollback retires.
     pub(crate) fn staged_invite_welcome_ids(
         &self,
-        group_id: &GroupId,
         origin_commit_id: &MessageId,
     ) -> SessionResult<Vec<MessageId>> {
-        Ok(self
-            .engine
-            .staged_invite_welcome_ids(group_id, origin_commit_id)?)
+        Ok(self.engine.staged_invite_welcome_ids(origin_commit_id)?)
     }
 
     pub fn group_evolutions(&self) -> SessionResult<Vec<DurableGroupEvolution>> {

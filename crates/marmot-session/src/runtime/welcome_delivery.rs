@@ -399,26 +399,62 @@ where
     /// dropped with it. A relay attempt already started cannot be recalled;
     /// a detached wave skips every attempt it has not started.
     ///
+    /// A Welcome whose stored relay acceptances already meet its policy,
+    /// its delivered mark interrupted, is marked delivered instead and
+    /// reported `AlreadyDelivered`.
+    ///
     /// This touches only the Welcome, never group state, so it works before
     /// hydration reaches the Welcome's group.
     pub fn withdraw_welcome(
         &self,
         message_id: &cgka_traits::MessageId,
     ) -> AccountResult<WelcomeWithdrawal> {
-        // Only a withdrawal of a live Welcome is its terminal reason: one
-        // already settled (expired, its commit lost) was or is recorded so.
-        let live = self.audit.records_v5()
-            && matches!(
-                self.session
-                    .outbound_welcome_status(message_id, self.wall_clock.now()),
-                Ok(OutboundWelcomeStatus::Owed { .. } | OutboundWelcomeStatus::Waiting)
+        // Relays that already took it make it delivered, not withdrawn: a
+        // saved acceptance that meets its policy, whose mark a stop
+        // interrupted, is reconciled first.
+        if let Some(fanout) = self.session.transport_fanout(message_id)? {
+            self.settle_met_welcome(
+                &fanout.exact_message,
+                accepted_fanout_targets(&fanout),
+                fanout.required_acks,
             );
+        }
+        // The Welcome's terminal reason, read before the withdrawal hides
+        // it: `withdrawn` for a live one; for one already settled (expired,
+        // its commit lost) that the watcher has not recorded yet, the reason
+        // it settled for. One no watcher holds was recorded when it settled,
+        // or settled before this process watched it.
+        let reason = if self.audit.records_v5() {
+            match self
+                .session
+                .outbound_welcome_status(message_id, self.wall_clock.now())
+            {
+                Ok(OutboundWelcomeStatus::Owed { .. } | OutboundWelcomeStatus::Waiting) => {
+                    Some(audit_v5::WithdrawalReason::Withdrawn)
+                }
+                Ok(OutboundWelcomeStatus::Settled(WelcomeSettlement::Expired))
+                    if self.watched_welcomes.contains(message_id) =>
+                {
+                    Some(audit_v5::WithdrawalReason::Expired)
+                }
+                Ok(OutboundWelcomeStatus::Settled(WelcomeSettlement::CommitSuperseded))
+                    if self.watched_welcomes.contains(message_id) =>
+                {
+                    Some(audit_v5::WithdrawalReason::CommitSuperseded)
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
         let withdrawal = self.session.withdraw_sent_welcome(message_id)?;
         if withdrawal == WelcomeWithdrawal::AlreadyDelivered {
             return Ok(withdrawal);
         }
-        if withdrawal == WelcomeWithdrawal::Withdrawn && live {
-            self.record_v5_welcome_withdrawal(message_id);
+        if withdrawal == WelcomeWithdrawal::Withdrawn
+            && let Some(reason) = reason
+        {
+            self.record_v5_welcome_withdrawal(message_id, reason);
         }
         // A reserved wave owns its fanout until finish; maintenance prunes
         // the withdrawn retry after that reservation is released.

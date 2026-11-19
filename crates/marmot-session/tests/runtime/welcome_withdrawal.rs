@@ -1266,3 +1266,56 @@ async fn a_saved_acceptance_outlives_the_link_deadline() {
         "{rows:?}"
     );
 }
+
+/// A device link's cleanup that withdraws its Welcome after the deadline,
+/// before the watcher has recorded the expiry, records it once, as
+/// `expired`: the deadline is why it was never delivered. One whose relays
+/// already accepted it, the mark interrupted, is delivered instead: the
+/// withdrawal finds nothing to stop and nothing is recorded withdrawn.
+#[tokio::test]
+async fn a_link_welcome_withdrawn_after_its_deadline_is_audited_as_expired() {
+    for accepted in [false, true] {
+        let dir = relaxed_storage_dir().unwrap();
+        let LinkWelcome {
+            mut runtime,
+            wall,
+            welcome,
+            audit_path,
+        } = link_welcome(dir.path(), false).await;
+        // Watched; its first pass fails.
+        runtime.run_due_maintenance().await.unwrap();
+        if accepted {
+            let mut fanout = runtime
+                .session()
+                .transport_fanout(&welcome.id)
+                .unwrap()
+                .unwrap();
+            for target in &mut fanout.targets {
+                target.state = cgka_traits::TransportFanoutAttemptState::Accepted;
+            }
+            runtime.session().put_transport_fanout(&fanout).unwrap();
+        }
+
+        wall.set(300_200);
+        assert_eq!(
+            runtime.withdraw_welcome(&welcome.id).unwrap(),
+            if accepted {
+                WelcomeWithdrawal::AlreadyDelivered
+            } else {
+                WelcomeWithdrawal::Withdrawn
+            }
+        );
+        runtime.run_due_maintenance().await.unwrap();
+
+        let rows = v5_audit_rows(&audit_path)
+            .into_iter()
+            .filter(|row| row["event"]["type"] == "welcome_withdrawn")
+            .collect::<Vec<_>>();
+        if accepted {
+            assert!(rows.is_empty(), "{rows:?}");
+        } else {
+            assert_eq!(rows.len(), 1, "{rows:?}");
+            assert_eq!(rows[0]["event"]["reason"], "expired");
+        }
+    }
+}

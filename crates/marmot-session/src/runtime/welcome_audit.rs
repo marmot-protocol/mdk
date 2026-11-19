@@ -258,11 +258,7 @@ where
             .iter()
             .map(|welcome| welcome.id.clone())
             .collect::<Vec<_>>();
-        if let Some(group_id) = fanout.group_id()
-            && let Ok(staged) = self
-                .session
-                .staged_invite_welcome_ids(group_id, fanout.message_id())
-        {
+        if let Ok(staged) = self.session.staged_invite_welcome_ids(fanout.message_id()) {
             for id in staged {
                 if !ids.contains(&id) {
                     ids.push(id);
@@ -334,16 +330,20 @@ where
         Ok(facts.and_then(|facts| self.v5_welcome_of(facts)))
     }
 
-    /// Record `welcome_withdrawn` for a live Welcome its sender just
-    /// withdrew, watched or not; the watcher then leaves that settlement
-    /// alone.
-    pub(super) fn record_v5_welcome_withdrawal(&self, welcome_id: &cgka_traits::MessageId) {
+    /// Record `welcome_withdrawn`, with `reason`, for a Welcome its sender
+    /// just withdrew, watched or not; the watcher then leaves that
+    /// settlement alone.
+    pub(super) fn record_v5_welcome_withdrawal(
+        &self,
+        welcome_id: &cgka_traits::MessageId,
+        reason: audit_v5::WithdrawalReason,
+    ) {
         // A row that cannot be read now is left to the watcher, if it holds
         // the Welcome.
         let Ok(Some(v5)) = self.v5_welcome_from_store(welcome_id) else {
             return;
         };
-        self.record_v5_welcome_withdrawn(&v5, audit_v5::WithdrawalReason::Withdrawn, None);
+        self.record_v5_welcome_withdrawn(&v5, reason, None);
         let mut recorded = self
             .v5_withdrawn_welcomes
             .lock()

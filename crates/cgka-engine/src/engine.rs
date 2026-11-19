@@ -4766,27 +4766,19 @@ impl<S: StorageProvider> Engine<S> {
     }
 
     /// The invite Welcomes still staged with the unconfirmed commit
-    /// `origin_commit_id` of `group_id`: those its rollback retires. A
-    /// caller that took the Welcomes off the commit's publish work finds
-    /// them here.
+    /// `origin_commit_id`, at that commit's source epoch: those its rollback
+    /// retires. A caller that took the Welcomes off the commit's publish work
+    /// finds them here.
     pub fn staged_invite_welcome_ids(
         &self,
-        group_id: &GroupId,
         origin_commit_id: &MessageId,
     ) -> Result<Vec<MessageId>, EngineError> {
-        let mut ids = Vec::new();
-        self.visit_group_welcome_records(group_id, &[MessageState::Sent], |id, _, payload| {
-            if let StoredMessagePayload::StagedInviteWelcome {
-                origin_commit_id: staged_origin,
-                ..
-            } = payload
-                && staged_origin == *origin_commit_id
-            {
-                ids.push(id);
-            }
-            Ok(())
-        })?;
-        Ok(ids)
+        let commit = self.storage.get_message(origin_commit_id)?;
+        Ok(self
+            .staged_welcomes_for_evolution(&commit.group_id, commit.epoch, origin_commit_id)?
+            .into_iter()
+            .map(|welcome| welcome.id)
+            .collect())
     }
 
     /// When the retained outbound Welcome `id`, staged or owed, stops being
