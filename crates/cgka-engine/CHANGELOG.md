@@ -9,7 +9,8 @@
   `GroupJoined.forwarded`. Receivers older than this refuse a version-3 Welcome. An Add that forwards anything
   is refused with `SiblingAddUnsettled` rather than queued, so it never forwards facts read before a drain.
 - `OutboundWelcomeStatus::Settled` carries a `WelcomeSettlement`: delivered, withdrawn (or retired with its rolled-back
-  commit), commit superseded, expired, or untracked.
+  commit), commit superseded (also once convergence has retired the Welcome with its lost commit, and ahead of a
+  deadline), expired, or untracked.
 - `Engine::publish_failed_fanout`, `publish_not_delivered` and `publish_refused_as_too_large` take a `RollbackPass`
   (mdk#2332). On `RollbackPass::Later`, a host change the fanout names is recorded as not delivered and announced
   with `GroupChangeNotDelivered`; a retired queued intent is recorded on any pass.

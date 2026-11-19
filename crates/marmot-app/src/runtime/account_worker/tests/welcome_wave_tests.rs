@@ -188,11 +188,25 @@ async fn pending_of(
 
 /// W5: a wave whose chat the host deletes while it runs changes nothing of
 /// the group when it settles. Its Welcome fails, which would leave a pending
-/// delivery and its event for a chat the host no longer shows.
+/// delivery and its event for a chat the host no longer shows. The pass
+/// that reached the relays is still audited to its end: its finished row
+/// records what the relays answered, with no stored outcome.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_wave_settling_after_its_chat_is_deleted_leaves_it_alone() {
     let dir = tempfile::tempdir().unwrap();
-    let (Alice { relay, runtime, .. }, group) = held_founding_wave(&dir).await;
+    let (alice, bob) = alice_and_bob(&dir).await;
+    alice
+        .runtime
+        .set_audit_log_settings(crate::AuditLogSettings { enabled: true })
+        .await
+        .unwrap();
+    let group = hold_founding_wave(&alice, &bob).await;
+    let Alice {
+        app,
+        relay,
+        runtime,
+        ..
+    } = alice;
     relay.fail_publishes_of_kind(transport_nostr_peeler::KIND_NIP59_GIFT_WRAP);
     assert!(runtime.delete_group_local("alice", &group).await.unwrap());
     let mut events = runtime.subscribe();
@@ -213,6 +227,29 @@ async fn a_wave_settling_after_its_chat_is_deleted_leaves_it_alone() {
     // read then would have listed it the same way.
     assert_eq!(pending_of(&runtime, &group).await.len(), 1);
     close(&runtime).await;
+    let passes = crate::tests::v5_audit_rows(&app, "alice")
+        .into_iter()
+        .filter(|row| {
+            row["event"]["type"]
+                .as_str()
+                .unwrap()
+                .starts_with("welcome_publish_")
+        })
+        .collect::<Vec<_>>();
+    let kinds = passes
+        .iter()
+        .map(|row| row["event"]["type"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        kinds,
+        ["welcome_publish_started", "welcome_publish_finished"],
+        "{passes:?}"
+    );
+    let finished = &passes[1]["event"];
+    assert_eq!(finished["attempt_id"], passes[0]["event"]["attempt_id"]);
+    assert_eq!(finished["accepted_total_count"], serde_json::Value::Null);
+    assert_eq!(finished["policy"], "unknown");
+    assert_eq!(finished["retained_state"], "unknown");
 }
 
 /// W5 for a wave with no group of its own: the startup retry's wave carries

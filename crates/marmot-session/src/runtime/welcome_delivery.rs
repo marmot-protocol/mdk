@@ -9,7 +9,7 @@
 //! `DurableTransportFanout`, which maintenance retries.
 
 use super::*;
-use crate::session::OutboundWelcomeStatus;
+use crate::session::{OutboundWelcomeStatus, WelcomeSettlement};
 
 impl<A, R, K> AccountDeviceRuntime<A, R, K>
 where
@@ -256,6 +256,7 @@ where
             group_id,
             metadata,
             completions,
+            audit: _,
         } = completed;
         // Every network attempt above has already been exposed to relays, so a
         // finish-stage failure for one recipient must not skip completion
@@ -561,14 +562,17 @@ where
     /// Watch Welcomes read from the store, except one already settled: it
     /// settled before this process watched it, and a later start reads it
     /// again, so its settlement is not this process's to audit.
+    /// Without a v5 recorder no settlement is audited, so none is read.
     fn adopt_stored_welcomes(&mut self, ids: impl IntoIterator<Item = cgka_traits::MessageId>) {
         let now = self.wall_clock.now();
+        let audited = self.audit.records_v5();
         for id in ids {
             if self.watched_welcomes.contains(&id)
-                || matches!(
-                    self.session.outbound_welcome_status(&id, now),
-                    Ok(OutboundWelcomeStatus::Settled(_))
-                )
+                || (audited
+                    && matches!(
+                        self.session.outbound_welcome_status(&id, now),
+                        Ok(OutboundWelcomeStatus::Settled(_))
+                    ))
             {
                 continue;
             }
@@ -632,6 +636,12 @@ where
                     Ok((status, held))
                 });
             match status {
+                Ok((OutboundWelcomeStatus::Settled(WelcomeSettlement::Expired), _))
+                    if self.expired_welcome_may_still_close(&id) =>
+                {
+                    // Recorded once a mark or the pass settles it.
+                    watching.push(id);
+                }
                 Ok((OutboundWelcomeStatus::Settled(settlement), _)) => {
                     if !self.record_v5_welcome_settled(&id, settlement) {
                         watching.push(id);

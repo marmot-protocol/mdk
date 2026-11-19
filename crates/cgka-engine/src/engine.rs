@@ -108,9 +108,11 @@ pub enum WelcomeSettlement {
     /// It was withdrawn, or retired with its staged commit when that commit
     /// was rolled back.
     Withdrawn,
-    /// Its commit lost to another branch.
+    /// Its commit lost to another branch, whether or not convergence has
+    /// retired its row yet.
     CommitSuperseded,
-    /// Its delivery deadline passed.
+    /// Its delivery deadline passed while its commit was canonical or still
+    /// pending.
     Expired,
     /// No retained delivery-aware Welcome has this id.
     Untracked,
@@ -4508,7 +4510,9 @@ impl<S: StorageProvider> Engine<S> {
     /// Where the retained outbound Welcome `id` stands for delivery at `now`.
     /// A missing row is settled: there is nothing this engine owes under it.
     /// So is one whose delivery deadline is not after `now`: it is never
-    /// published again (mdk#2628 D40).
+    /// published again (mdk#2628 D40). A Welcome whose commit lost reads as
+    /// superseded, before and after convergence retires its row, and ahead
+    /// of its deadline.
     pub fn outbound_welcome_status(
         &self,
         id: &MessageId,
@@ -4527,7 +4531,20 @@ impl<S: StorageProvider> Engine<S> {
                 return Ok(OutboundWelcomeStatus::Settled(WelcomeSettlement::Delivered));
             }
             MessageState::Failed => {
-                return Ok(OutboundWelcomeStatus::Settled(WelcomeSettlement::Withdrawn));
+                // Convergence retires an undelivered Welcome with its commit
+                // when that commit loses; any other retirement is a withdrawal.
+                let superseded =
+                    StoredMessagePayload::decode(&record.payload).is_ok_and(|payload| {
+                        matches!(
+                            self.welcome_origin_state(&record.group_id, &payload),
+                            Ok(MessageState::EpochInvalidated)
+                        )
+                    });
+                return Ok(OutboundWelcomeStatus::Settled(if superseded {
+                    WelcomeSettlement::CommitSuperseded
+                } else {
+                    WelcomeSettlement::Withdrawn
+                }));
             }
             _ => return Ok(OutboundWelcomeStatus::Settled(WelcomeSettlement::Untracked)),
         }
@@ -4539,14 +4556,10 @@ impl<S: StorageProvider> Engine<S> {
         let Ok(payload) = StoredMessagePayload::decode(&record.payload) else {
             return Ok(OutboundWelcomeStatus::Waiting);
         };
-        if payload
-            .welcome_deliver_until()
-            .is_some_and(|deliver_until| now >= deliver_until)
-        {
-            return Ok(OutboundWelcomeStatus::Settled(WelcomeSettlement::Expired));
-        }
-        match self.welcome_origin_state(&record.group_id, &payload)? {
-            MessageState::Processed => {}
+        // A commit that lost settles its Welcome whatever the deadline, so an
+        // expired Welcome's commit is canonical or still pending.
+        let origin = self.welcome_origin_state(&record.group_id, &payload)?;
+        match origin {
             MessageState::EpochInvalidated => {
                 return Ok(OutboundWelcomeStatus::Settled(
                     WelcomeSettlement::CommitSuperseded,
@@ -4555,7 +4568,16 @@ impl<S: StorageProvider> Engine<S> {
             MessageState::Failed => {
                 return Ok(OutboundWelcomeStatus::Settled(WelcomeSettlement::Withdrawn));
             }
-            _ => return Ok(OutboundWelcomeStatus::Waiting),
+            _ => {}
+        }
+        if payload
+            .welcome_deliver_until()
+            .is_some_and(|deliver_until| now >= deliver_until)
+        {
+            return Ok(OutboundWelcomeStatus::Settled(WelcomeSettlement::Expired));
+        }
+        if origin != MessageState::Processed {
+            return Ok(OutboundWelcomeStatus::Waiting);
         }
         Ok(match payload {
             StoredMessagePayload::StagedInviteWelcome { .. } => OutboundWelcomeStatus::Waiting,

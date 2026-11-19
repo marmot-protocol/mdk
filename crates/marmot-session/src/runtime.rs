@@ -299,6 +299,8 @@ struct CompletedWelcomePublish {
     group_id: Option<GroupId>,
     metadata: Vec<WelcomePublishMetadata>,
     completions: Vec<Option<LegacyPublishCompletion>>,
+    /// Records the finished row of a pass whose results are dropped.
+    audit: SharedRecorder,
 }
 
 /// Relay-only half of a prepared Welcome retry.
@@ -330,14 +332,32 @@ impl CompletedWelcomePublishTask {
     /// finishing this task changes nothing of a group the host left or
     /// deleted while the task ran. Their records stay as preparation left
     /// them, as an abandoned task leaves them; finishing still releases every
-    /// reservation. Returns how many results were dropped.
+    /// reservation. A dropped pass that reached relays still records its
+    /// finished audit row from the answers it got. Returns how many results
+    /// were dropped.
     pub fn drop_gone_groups(&mut self, gone: impl Fn(&GroupId) -> bool) -> usize {
         let completed = &mut self.completed;
         let before = completed.metadata.len();
+        let audit = &completed.audit;
         let (metadata, completions) = std::mem::take(&mut completed.metadata)
             .into_iter()
             .zip(std::mem::take(&mut completed.completions))
-            .filter(|(metadata, _)| !metadata.group_id.as_ref().is_some_and(&gone))
+            .filter(|(metadata, completion)| {
+                if !metadata.group_id.as_ref().is_some_and(&gone) {
+                    return true;
+                }
+                if let Some(LegacyPublishCompletion::Network(attempt, result)) = completion
+                    && let Some(pass) = &attempt.v5_welcome
+                {
+                    pass.record_dropped(
+                        audit,
+                        result,
+                        &attempt.retry_endpoints,
+                        attempt.required_acks,
+                    );
+                }
+                false
+            })
             .unzip();
         completed.metadata = metadata;
         completed.completions = completions;
@@ -456,6 +476,7 @@ impl PreparedWelcomePublish {
             group_id: self.group_id,
             metadata: self.metadata,
             completions: self.completions,
+            audit: self.audit.clone(),
         }
     }
 }
@@ -6091,9 +6112,16 @@ where
             return Ok(());
         };
         match self.welcome_hold(message_id, &fanout.exact_message.envelope)? {
-            // A withdrawn or expired Welcome's remaining retries go with it.
+            // A withdrawn or expired Welcome's remaining retries go with it,
+            // once a saved acceptance that meets its policy is reconciled: an
+            // expired Welcome the relays took is delivered, not expired. One
+            // whose mark cannot land now keeps that acceptance, unpublished.
             Some(WelcomeHold::Withdrawn | WelcomeHold::Expired) => {
-                self.session.delete_transport_fanout(message_id)?;
+                let accepted = accepted_fanout_targets(&fanout);
+                self.settle_met_welcome(&fanout.exact_message, accepted, fanout.required_acks);
+                if !self.welcome_still_owes_met_policy(&fanout, accepted) {
+                    self.session.delete_transport_fanout(message_id)?;
+                }
                 return Ok(());
             }
             // A staged one keeps them for when its commit confirms.

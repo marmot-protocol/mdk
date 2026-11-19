@@ -125,21 +125,20 @@ where
     /// on (none for a founding Welcome) and the KeyPackage it answers.
     /// Called where each first reaches the runtime: a create, a host's
     /// accepted commit, and a drained or automatic commit when published.
-    /// Each is watched from here, so it is seen to settle. A Welcome is
-    /// remembered once its row is read, so a failed read is tried again.
+    /// Each is watched from here, so it is seen to settle. With a v5
+    /// recorder, a Welcome is remembered once its row is read, so a failed
+    /// read is tried again.
     pub(super) fn note_retained_welcomes(&mut self, welcomes: &[TransportMessage]) {
         self.watch_welcomes(welcomes.iter().map(|welcome| welcome.id.clone()));
+        if !self.audit.records_v5() {
+            return;
+        }
         for welcome in welcomes {
             if self.v5_prepared_welcomes.contains(&welcome.id) {
                 continue;
             }
-            let facts = if self.audit.is_enabled() {
-                match self.session.outbound_welcome_audit_facts(&welcome.id) {
-                    Ok(facts) => facts,
-                    Err(_) => continue,
-                }
-            } else {
-                None
+            let Ok(facts) = self.session.outbound_welcome_audit_facts(&welcome.id) else {
+                continue;
             };
             if self.v5_prepared_welcomes.len() >= MAX_PREPARED_WELCOMES_REMEMBERED {
                 self.v5_prepared_welcomes.clear();
@@ -346,8 +345,11 @@ where
     }
 
     /// Whether `fanout` is a Welcome's whose stored acceptances meet its
-    /// policy while the Welcome is still owed: its delivered mark has not
-    /// landed, so the acceptance must not be dropped.
+    /// policy while a later delivered mark can still close it: the Welcome is
+    /// owed, waiting on its group or commit, or past its deadline with its
+    /// commit not lost. The acceptance must not be dropped then; an expired
+    /// Welcome is never published again to replace it. A Welcome settled any
+    /// other way (withdrawn, its commit lost, delivered) owes nothing.
     pub(super) fn welcome_still_owes_met_policy(
         &self,
         fanout: &DurableTransportFanout,
@@ -357,10 +359,44 @@ where
             fanout.exact_message.envelope,
             TransportEnvelope::Welcome { .. }
         ) && accepted >= fanout.required_acks.max(1)
-            && matches!(
-                self.session.stored_message_state(&fanout.exact_message.id),
-                Ok(Some(MessageState::Sent))
-            )
+            && match self
+                .session
+                .outbound_welcome_status(&fanout.exact_message.id, self.wall_clock.now())
+            {
+                Ok(
+                    OutboundWelcomeStatus::Owed { .. }
+                    | OutboundWelcomeStatus::Waiting
+                    | OutboundWelcomeStatus::Settled(WelcomeSettlement::Expired),
+                ) => true,
+                Ok(OutboundWelcomeStatus::Settled(_)) => false,
+                // Unreadable now: keep it for a later pass.
+                Err(_) => true,
+            }
+    }
+
+    /// Whether a Welcome past its deadline may still close as delivered, so
+    /// the watcher records no expiry yet: a detached pass started before the
+    /// deadline holds it and may yet be acknowledged, or its stored
+    /// acceptances meet its policy (marked here, if the mark can land now).
+    /// A fanout that cannot be read now is asked again on a later pass.
+    pub(super) fn expired_welcome_may_still_close(
+        &self,
+        welcome_id: &cgka_traits::MessageId,
+    ) -> bool {
+        if self.session.detached_welcome_publishes.contains(welcome_id) {
+            return true;
+        }
+        let fanout = match self.session.transport_fanout(welcome_id) {
+            Ok(Some(fanout)) => fanout,
+            Ok(None) => return false,
+            Err(_) => return true,
+        };
+        let accepted = accepted_fanout_targets(&fanout);
+        if accepted < fanout.required_acks.max(1) {
+            return false;
+        }
+        self.settle_met_welcome(&fanout.exact_message, accepted, fanout.required_acks);
+        true
     }
 
     /// Record `welcome_withdrawn` for a watched Welcome that settled without
@@ -371,18 +407,18 @@ where
         welcome_id: &cgka_traits::MessageId,
         settlement: WelcomeSettlement,
     ) -> bool {
+        // Its sender's withdrawal was recorded when it happened, whatever
+        // the Welcome reads as since (its commit may have lost after).
+        let recorded = self
+            .v5_withdrawn_welcomes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(welcome_id);
+        if recorded {
+            return true;
+        }
         let reason = match settlement {
-            WelcomeSettlement::Withdrawn => {
-                let recorded = self
-                    .v5_withdrawn_welcomes
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .remove(welcome_id);
-                if recorded {
-                    return true;
-                }
-                audit_v5::WithdrawalReason::Withdrawn
-            }
+            WelcomeSettlement::Withdrawn => audit_v5::WithdrawalReason::Withdrawn,
             WelcomeSettlement::CommitSuperseded => audit_v5::WithdrawalReason::CommitSuperseded,
             WelcomeSettlement::Expired => audit_v5::WithdrawalReason::Expired,
             WelcomeSettlement::Delivered | WelcomeSettlement::Untracked => return true,
@@ -496,6 +532,70 @@ where
         let Some(pass) = pass.as_ref().filter(|pass| pass.recorded) else {
             return;
         };
+        // The Welcome's delivery status as the pass left it: delivered,
+        // still owed, or settled undelivered (expired, its commit lost).
+        let status = accepted_total
+            .is_some()
+            .then(|| {
+                self.session
+                    .outbound_welcome_status(&pass.welcome_id, self.wall_clock.now())
+                    .ok()
+            })
+            .flatten();
+        pass.record_finished(
+            &self.audit,
+            report,
+            attempted,
+            accepted_total,
+            required_acks,
+            status,
+        );
+    }
+}
+
+impl V5WelcomePass {
+    /// Record this pass's finished row, if it started, from the relays'
+    /// answers it observed, without its stored total, policy or retention:
+    /// for a pass whose results are dropped unreconciled, as when its
+    /// group's chat was deleted while it ran.
+    pub(super) fn record_dropped(
+        &self,
+        audit: &SharedRecorder,
+        result: &Result<TransportPublishReport, TransportAdapterError>,
+        attempted: &[TransportEndpoint],
+        required_acks: usize,
+    ) {
+        let endpoint_report;
+        let report = match result {
+            Ok(report) => Some(report),
+            Err(error) if !error.publish_endpoint_failures().is_empty() => {
+                endpoint_report = TransportPublishReport {
+                    message_id: self.welcome_id.clone(),
+                    accepted: Vec::new(),
+                    failed: error.publish_endpoint_failures().to_vec(),
+                    required_acks,
+                };
+                Some(&endpoint_report)
+            }
+            Err(_) => None,
+        };
+        self.record_finished(audit, report, attempted, None, required_acks, None);
+    }
+
+    /// The finished row; `status` is the Welcome's delivery status after
+    /// the pass, read only when `accepted_total` was stored.
+    fn record_finished(
+        &self,
+        audit: &SharedRecorder,
+        report: Option<&TransportPublishReport>,
+        attempted: &[TransportEndpoint],
+        accepted_total: Option<usize>,
+        required_acks: usize,
+        status: Option<OutboundWelcomeStatus>,
+    ) {
+        if !self.recorded {
+            return;
+        }
         let Ok(required_acks) = u32::try_from(required_acks) else {
             return;
         };
@@ -545,16 +645,6 @@ where
             Some(_) if results_complete => audit_v5::Policy::Unmet,
             _ => audit_v5::Policy::Unknown,
         };
-        // The Welcome's delivery status as the pass left it: delivered,
-        // still owed, or settled undelivered (expired, its commit lost).
-        let status = accepted_total_count
-            .is_some()
-            .then(|| {
-                self.session
-                    .outbound_welcome_status(&pass.welcome_id, self.wall_clock.now())
-                    .ok()
-            })
-            .flatten();
         let retained_state = match (status, policy) {
             (
                 Some(OutboundWelcomeStatus::Settled(WelcomeSettlement::Delivered)),
@@ -566,11 +656,11 @@ where
             ) => audit_v5::RetainedState::Pending,
             _ => audit_v5::RetainedState::Unknown,
         };
-        self.audit.record_v5_event(
-            Some(pass.group_ref.clone()),
+        audit.record_v5_event(
+            Some(self.group_ref.clone()),
             audit_v5::Event::WelcomePublishFinished(audit_v5::WelcomePublishFinished {
-                attempt_id: pass.started.attempt_id.clone(),
-                outer_event_ref: pass.started.outer_event_ref.clone(),
+                attempt_id: self.started.attempt_id.clone(),
+                outer_event_ref: self.started.outer_event_ref.clone(),
                 results,
                 results_complete,
                 accepted_this_attempt_count,

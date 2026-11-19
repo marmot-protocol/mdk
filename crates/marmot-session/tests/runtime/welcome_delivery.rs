@@ -506,6 +506,65 @@ async fn a_saved_acceptance_whose_mark_was_interrupted_settles_the_welcome() {
     }
 }
 
+/// A Welcome whose commit lost after its relays accepted it, with the
+/// delivered mark interrupted, is audited as superseded, not withdrawn, and
+/// its retry record goes once its retention passes: no later mark can close
+/// it, so nothing keeps retrying one.
+#[tokio::test]
+async fn a_superseded_welcomes_saved_acceptance_goes_with_its_retention() {
+    let dir = relaxed_storage_dir().unwrap();
+    let OwedInviteWelcome {
+        mut runtime,
+        adapter,
+        wall,
+        group_id,
+        welcome,
+    } = owed_invite_welcome(dir.path()).await;
+    let recorded = welcome_rows(dir.path(), &welcome, &group_id).len();
+    let mut fanout = runtime
+        .session()
+        .transport_fanout(&welcome.id)
+        .unwrap()
+        .unwrap();
+    for target in &mut fanout.targets {
+        target.state = cgka_traits::TransportFanoutAttemptState::Accepted;
+    }
+    runtime.session().put_transport_fanout(&fanout).unwrap();
+    // What convergence writes when the commit loses terminally, before it
+    // retires the Welcome's row.
+    use cgka_traits::storage::MessageStorage as _;
+    let origin = runtime
+        .session()
+        .outbound_welcome_audit_facts(&welcome.id)
+        .unwrap()
+        .unwrap()
+        .origin_commit_id
+        .unwrap();
+    SqliteAccountStorage::open_encrypted(
+        &dir.path().join("alice.sqlite"),
+        &SqlCipherKey::new("marmot welcome withdrawal key").unwrap(),
+    )
+    .unwrap()
+    .update_message_state(&origin, cgka_traits::MessageState::EpochInvalidated)
+    .unwrap();
+    let sent = welcome_publishes(&adapter).len();
+
+    wall.set(300_000 + 24 * 60 * 60 + 600);
+    runtime.run_due_maintenance().await.unwrap();
+
+    assert!(
+        runtime
+            .session()
+            .transport_fanout(&welcome.id)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(welcome_publishes(&adapter).len(), sent);
+    let rows = welcome_rows(dir.path(), &welcome, &group_id);
+    assert_eq!(kinds(&rows[recorded..]), ["welcome_withdrawn"]);
+    assert_eq!(rows[recorded]["event"]["reason"], "commit_superseded");
+}
+
 /// A pass whose relays answered but whose bookkeeping could not be saved
 /// still records what the relays said, with no stored total, before the
 /// error returns: an investigator sees the relay answered.

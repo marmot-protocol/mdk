@@ -279,22 +279,6 @@ async fn an_invite_whose_welcome_fits_no_inbox_relay_is_refused_unsent() {
     );
 }
 
-/// The account's v5 audit rows, each checked against the v5 contract.
-fn v5_audit_rows(app: &MarmotApp, account: &str) -> Vec<serde_json::Value> {
-    let mut rows = Vec::new();
-    for entry in std::fs::read_dir(app.account_dir(account)).unwrap() {
-        let path = entry.unwrap().path();
-        if !path.to_string_lossy().ends_with("-v5.jsonl") {
-            continue;
-        }
-        for line in std::fs::read_to_string(&path).unwrap().lines() {
-            marmot_forensics::v5::Record::from_json(line.as_bytes()).expect("strict v5 row");
-            rows.push(serde_json::from_str(line).unwrap());
-        }
-    }
-    rows
-}
-
 /// Account publishes, a profile here, go through the same refusal: no relay is
 /// sent an event over its known limit, and an event over every relay's limit
 /// fails as too large, sent nowhere.

@@ -1077,17 +1077,24 @@ async fn an_expired_link_welcome_is_audited_once_across_restarts() {
     assert!(withdrawn(&second_audit).is_empty(), "already settled at start");
 }
 
-/// A pass that starts before a device link's Welcome deadline and fails after
-/// it does not report the Welcome pending: it has expired, so its retention
-/// is unknown.
-#[tokio::test]
-async fn a_pass_that_fails_after_the_link_deadline_does_not_report_the_welcome_pending() {
-    let dir = relaxed_storage_dir().unwrap();
+/// A device link's Welcome, owed to bob until its deadline at 300_100, and
+/// the runtime at 300_000 that owes it, recording its v5 audit.
+struct LinkWelcome {
+    runtime: WithdrawalRuntime,
+    wall: Arc<TestWallClock>,
+    welcome: TransportMessage,
+    audit_path: std::path::PathBuf,
+}
+
+/// Alice creates a group with bob whose founding Welcome carries a device
+/// link's delivery deadline, 300_100. Bob's inbox relay accepts it only when
+/// `bob_accepts`.
+async fn link_welcome(dir: &std::path::Path, bob_accepts: bool) -> LinkWelcome {
     let key = SqlCipherKey::new("marmot link deadline pass key").unwrap();
-    let mut alice =
-        current_nostr_welcome_session(dir.path().join("alice.sqlite"), &key, b"alice-pass");
-    let mut bob = current_nostr_welcome_session(dir.path().join("bob.sqlite"), &key, b"bob-pass");
+    let mut alice = current_nostr_welcome_session(dir.join("alice.sqlite"), &key, b"alice-pass");
+    let mut bob = current_nostr_welcome_session(dir.join("bob.sqlite"), &key, b"bob-pass");
     let bob_id = bob.self_id();
+    let bob_inbox = TransportEndpoint("wss://bob-inbox.example".into());
     let chosen = GroupId::new(vec![0x44; 16]);
     let created = alice
         .create_group_with_chosen_id_and_audit_context(
@@ -1111,7 +1118,11 @@ async fn a_pass_that_fails_after_the_link_deadline_does_not_report_the_welcome_p
         other => panic!("expected FoundingGroupCreated publish work, got {other:?}"),
     };
     let adapter = RecordingAdapter::default();
-    adapter.accept_only_endpoints(Vec::new());
+    adapter.accept_only_endpoints(if bob_accepts {
+        vec![bob_inbox.clone()]
+    } else {
+        Vec::new()
+    });
     let policy =
         StaticTransportRouting::new(vec![TransportEndpoint("wss://alice-inbox.example".into())])
             .with_group_route(
@@ -1119,26 +1130,38 @@ async fn a_pass_that_fails_after_the_link_deadline_does_not_report_the_welcome_p
                 chosen.as_slice().to_vec(),
                 vec![TransportEndpoint("wss://group.example".into())],
             )
-            .with_inbox_route(
-                bob_id,
-                vec![TransportEndpoint("wss://bob-inbox.example".into())],
-            );
+            .with_inbox_route(bob_id, vec![bob_inbox]);
     let wall = Arc::new(TestWallClock::new(300_000));
-    let mut runtime = AccountDeviceRuntime::new(
-        alice,
-        adapter.clone(),
-        policy,
-        RecordingKeyPackages::default(),
-    )
-    .with_maintenance_sources(
-        wall.clone(),
-        Arc::new(TestMonotonicClock::default()),
-        Arc::new(TestRandom::new(0)),
-    );
-    let audit_path = dir.path().join("link-pass-audit-v5.jsonl");
+    let runtime = AccountDeviceRuntime::new(alice, adapter, policy, RecordingKeyPackages::default())
+        .with_maintenance_sources(
+            wall.clone(),
+            Arc::new(TestMonotonicClock::default()),
+            Arc::new(TestRandom::new(0)),
+        );
+    let audit_path = dir.join("link-pass-audit-v5.jsonl");
     runtime
         .audit_recorder()
         .swap(v5_audit_recorder(&audit_path));
+    LinkWelcome {
+        runtime,
+        wall,
+        welcome,
+        audit_path,
+    }
+}
+
+/// A pass that starts before a device link's Welcome deadline and fails after
+/// it does not report the Welcome pending: it has expired, so its retention
+/// is unknown.
+#[tokio::test]
+async fn a_pass_that_fails_after_the_link_deadline_does_not_report_the_welcome_pending() {
+    let dir = relaxed_storage_dir().unwrap();
+    let LinkWelcome {
+        mut runtime,
+        wall,
+        welcome,
+        audit_path,
+    } = link_welcome(dir.path(), false).await;
 
     let task = runtime
         .prepare_welcome_retry_task_with_audit_context(vec![welcome.clone()], Default::default())
@@ -1154,4 +1177,89 @@ async fn a_pass_that_fails_after_the_link_deadline_does_not_report_the_welcome_p
         .expect("the pass started before the deadline");
     assert_eq!(finished["event"]["policy"], "unmet", "{finished}");
     assert_eq!(finished["event"]["retained_state"], "unknown", "{finished}");
+}
+
+/// A pass that starts before a device link's Welcome deadline and is
+/// acknowledged after it delivers the Welcome. Maintenance that runs past the
+/// deadline while the pass is out records no expiry, and the pass reports
+/// the Welcome completed.
+#[tokio::test]
+async fn a_pass_acknowledged_after_the_link_deadline_delivers_the_welcome() {
+    let dir = relaxed_storage_dir().unwrap();
+    let LinkWelcome {
+        mut runtime,
+        wall,
+        welcome,
+        audit_path,
+    } = link_welcome(dir.path(), true).await;
+    let task = runtime
+        .prepare_welcome_retry_task_with_audit_context(vec![welcome.clone()], Default::default())
+        .unwrap();
+    // Watched from before the deadline; the pass holds it.
+    runtime.run_due_maintenance().await.unwrap();
+    wall.set(300_050);
+    let completed = task.run().await;
+
+    wall.set(300_200);
+    runtime.run_due_maintenance().await.unwrap();
+    runtime.finish_welcome_publish_task(completed).await.unwrap();
+    wall.set(300_300);
+    runtime.run_due_maintenance().await.unwrap();
+
+    let rows = v5_audit_rows(&audit_path);
+    assert!(
+        rows.iter()
+            .all(|row| row["event"]["type"] != "welcome_withdrawn"),
+        "{rows:?}"
+    );
+    let finished = rows
+        .iter()
+        .find(|row| row["event"]["type"] == "welcome_publish_finished")
+        .expect("the pass started before the deadline");
+    assert_eq!(finished["event"]["policy"], "met", "{finished}");
+    assert_eq!(finished["event"]["retained_state"], "completed", "{finished}");
+    assert_eq!(
+        runtime.withdraw_welcome(&welcome.id).unwrap(),
+        WelcomeWithdrawal::AlreadyDelivered
+    );
+}
+
+/// A device link's Welcome whose relays accepted it before its deadline,
+/// saved before a stop interrupted its delivered mark, is delivered by the
+/// first maintenance pass after the deadline: the acceptance is reconciled
+/// before the expired Welcome's retry record goes, and no expiry is recorded.
+#[tokio::test]
+async fn a_saved_acceptance_outlives_the_link_deadline() {
+    let dir = relaxed_storage_dir().unwrap();
+    let LinkWelcome {
+        mut runtime,
+        wall,
+        welcome,
+        audit_path,
+    } = link_welcome(dir.path(), false).await;
+    // The first pass fails, leaving a retry record.
+    runtime.run_due_maintenance().await.unwrap();
+    let mut fanout = runtime
+        .session()
+        .transport_fanout(&welcome.id)
+        .unwrap()
+        .expect("the failed pass keeps a retry record");
+    for target in &mut fanout.targets {
+        target.state = cgka_traits::TransportFanoutAttemptState::Accepted;
+    }
+    runtime.session().put_transport_fanout(&fanout).unwrap();
+
+    wall.set(300_200);
+    runtime.run_due_maintenance().await.unwrap();
+
+    assert_eq!(
+        runtime.withdraw_welcome(&welcome.id).unwrap(),
+        WelcomeWithdrawal::AlreadyDelivered
+    );
+    let rows = v5_audit_rows(&audit_path);
+    assert!(
+        rows.iter()
+            .all(|row| row["event"]["type"] != "welcome_withdrawn"),
+        "{rows:?}"
+    );
 }
