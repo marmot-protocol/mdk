@@ -952,6 +952,28 @@ platforms:
         superseded: "➡️"
 ```
 
+For a minimal "seen → done" indicator (the same 👀 → ✅ behavior as Hermes'
+Signal adapter), map the in-progress states to the accepted emoji:
+
+```yaml
+platforms:
+  marmot:
+    extra:
+      presence_reactions: true
+      presence_emojis:
+        accepted: "👀"
+        thinking: "👀"
+        construction: ["👀"]
+        completed: "✅"
+        failed: "❌"
+```
+
+A transition to the emoji already shown on the same message is a no-op, so the
+👀 stays in place with no extra remove/add churn, and is replaced by ✅ or ❌
+when the turn ends. If a new authorized message arrives in the group during the
+turn, the indicator moves: 👀 is removed from the old message and added to the
+new one.
+
 Eyes appear when processing begins. Hermes' live-status callback maps tool
 start to the construction cycle and tool completion to the between-tools
 hourglass. Leave Hermes' `display.live_status` enabled (its default is `full`)
