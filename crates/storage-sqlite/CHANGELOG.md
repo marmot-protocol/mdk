@@ -4,6 +4,8 @@
 
 ### Breaking changes
 
+- Account migration 0216 gates stored Welcome payload tags 14 and 15, which name the transport event of the
+  KeyPackage a Welcome answers. It changes no table; older binaries refuse schema 216, and downgrade is unsupported.
 - Account migration 0215 adds `stall_evidence` to `cgka_released_transport_receipts` (mdk#3536). Consuming the
   journal retires every release but arms an epoch gap only from releases that were stall evidence; a row released
   through `release_message_for_replay_without_stall_evidence` arms none unless no recovery inventory row placed it,

@@ -2462,23 +2462,16 @@ impl AppClient {
                     || selected_accounts.contains(hex::encode(admin.as_slice()).as_str())
             });
         }
-        let mut founding_selections = Vec::with_capacity(members.len());
+        let mut recipients = Vec::with_capacity(members.len());
         for member in &members {
             let metadata = marmot_session::key_package_metadata(member)
                 .map_err(|error| AppError::InvalidKeyPackageEvent(error.to_string()))?;
             if metadata.credential_identity_hex == creator.account_id_hex {
                 return Err(AppError::GroupCreateIncludesCreator);
             }
-            founding_selections.push(audit_v5_probe::FoundingSelection {
-                recipient_hex: metadata.credential_identity_hex,
-                key_package_event_id: member.source.as_ref().map(|source| source.event_id.clone()),
-            });
+            recipients.push(metadata.credential_identity_hex);
         }
-        self.refresh_member_inbox_routes(
-            founding_selections
-                .iter()
-                .map(|selection| selection.recipient_hex.as_str()),
-        )?;
+        self.refresh_member_inbox_routes(recipients.iter().map(String::as_str))?;
         let constructable = self.runtime.constructable_capabilities(&members)?;
         require_initial_group_component_support(&constructable, &request.app_components)?;
         let uploads_inline_image =
@@ -2592,7 +2585,7 @@ impl AppClient {
             changed_fields.push("image");
         }
         // The people added, not their devices' KeyPackages.
-        let mut audit_context = Self::local_human_action_context(
+        let audit_context = Self::local_human_action_context(
             "create_group",
             changed_fields,
             touched_components,
@@ -2621,17 +2614,6 @@ impl AppClient {
             &nostr_routing.relays,
         );
         let has_founding_siblings = !siblings.is_empty();
-        let founding_probe = (self.audit_v5_enabled() || cfg!(test))
-            .then_some(())
-            .and_then(|()| {
-                (self.runtime.new_protocol_profile() == ProtocolProfile::Current)
-                    .then(|| {
-                        self.audit_v5_probe
-                            .as_mut()
-                            .and_then(|probe| probe.begin_founding(founding_selections))
-                    })
-                    .flatten()
-            });
         let mls_started_at = Instant::now();
         let prepared = self
             .runtime
@@ -2677,13 +2659,14 @@ impl AppClient {
                 "confirmed group creation outpaced prepared-image consumption; retry will reconcile the engine component"
             );
         }
-        if let (Some(probe), Some(pending)) = (&mut self.audit_v5_probe, founding_probe) {
-            probe.founding_prepared(pending, &group_id, &prepared.effects);
-            audit_context.v5_welcome_refs = probe.take_validated_refs();
-            if self.audit.records_v5()
-                && let Ok(group) = self.runtime.group_record(&group_id)
-            {
-                let admins = self.runtime.admin_pubkeys(&group_id).ok();
+        // The runtime recorded the founding Welcomes' rows from their stored
+        // rows; the probe records the new group's baseline.
+        if self.runtime.new_protocol_profile() == ProtocolProfile::Current
+            && self.audit.records_v5()
+            && let Ok(group) = self.runtime.group_record(&group_id)
+        {
+            let admins = self.runtime.admin_pubkeys(&group_id).ok();
+            if let Some(probe) = &mut self.audit_v5_probe {
                 probe.baseline(
                     &group,
                     admins.as_deref(),

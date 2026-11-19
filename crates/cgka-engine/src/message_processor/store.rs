@@ -144,6 +144,7 @@ pub(crate) fn transition_staged_invite_welcomes<S: StorageProvider>(
             payload.welcome_key_package_ref().map(<[u8]>::to_vec),
             payload.welcome_deliver_until(),
         )
+        .with_key_package_event_id(payload.welcome_key_package_event_id().cloned())
         .encode()
         .map_err(|error| EngineError::Serialize(format!("{error:?}")))?;
         record.state = state;
@@ -327,24 +328,24 @@ impl<S: StorageProvider> Engine<S> {
 
     pub(super) fn persist_staged_invite_welcome(
         &self,
-        msg: &TransportMessage,
+        welcome: super::send::WrappedWelcome,
         origin_commit_id: &MessageId,
-        key_package_ref: Vec<u8>,
         deliver_until: Option<Timestamp>,
         group_id: &GroupId,
         epoch: EpochId,
     ) -> Result<(), EngineError> {
         self.persist_stored_message_payload(
-            msg.id.clone(),
+            welcome.message.id.clone(),
             group_id,
             RowEpochs::at(epoch),
             MessageState::Sent,
             StoredMessagePayload::staged_invite_welcome(
-                msg.clone(),
+                welcome.message,
                 origin_commit_id.clone(),
-                Some(key_package_ref),
+                Some(welcome.key_package_ref),
                 deliver_until,
-            ),
+            )
+            .with_key_package_event_id(welcome.key_package_event_id),
             None,
         )
     }

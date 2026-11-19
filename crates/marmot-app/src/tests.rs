@@ -7978,6 +7978,22 @@ pub(crate) fn key_package_cache_exists(app: &MarmotApp, label: &str) -> bool {
     app.key_package_record_path(label).exists()
 }
 
+/// The account's v5 audit rows, each checked against the v5 contract.
+pub(crate) fn v5_audit_rows(app: &MarmotApp, account: &str) -> Vec<serde_json::Value> {
+    let mut rows = Vec::new();
+    for entry in std::fs::read_dir(app.account_dir(account)).unwrap() {
+        let path = entry.unwrap().path();
+        if !path.to_string_lossy().ends_with("-v5.jsonl") {
+            continue;
+        }
+        for line in std::fs::read_to_string(&path).unwrap().lines() {
+            marmot_forensics::v5::Record::from_json(line.as_bytes()).expect("strict v5 row");
+            rows.push(serde_json::from_str(line).unwrap());
+        }
+    }
+    rows
+}
+
 /// Seed the explicit kind-10050 state normally established by account setup.
 pub(crate) fn remember_test_member_inbox(app: &MarmotApp, account_id_hex: &str, relay: &str) {
     let mut relay_lists = AccountRelayListStatus::empty();

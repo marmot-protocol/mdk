@@ -19,7 +19,9 @@ pub use cgka_engine::account_identity_proof::{
 };
 pub use cgka_engine::application_message_len;
 pub use cgka_engine::canonicalization::{CanonicalizationPolicy, V1_SETTLEMENT_QUIESCENCE_MS};
-pub(crate) use cgka_engine::engine::{OutboundWelcomeStatus, OutboundWelcomeWork};
+pub(crate) use cgka_engine::engine::{
+    OutboundWelcomeStatus, OutboundWelcomeWork, WelcomeSettlement,
+};
 pub use cgka_engine::engine::{
     OwedSiblingWelcome, SiblingWelcomeResendOutcome, WelcomeDeliveryIndex, WelcomeWithdrawal,
 };
@@ -750,6 +752,23 @@ impl AccountDeviceSession {
         id: &MessageId,
     ) -> SessionResult<Option<cgka_traits::MessageState>> {
         Ok(self.engine.stored_message_state(id)?)
+    }
+
+    /// What the sender's audit reads of one retained outbound Welcome.
+    pub fn outbound_welcome_audit_facts(
+        &self,
+        id: &MessageId,
+    ) -> SessionResult<Option<cgka_engine::engine::OutboundWelcomeAuditFacts>> {
+        Ok(self.engine.outbound_welcome_audit_facts(id)?)
+    }
+
+    /// The invite Welcomes staged with the unconfirmed commit
+    /// `origin_commit_id`, which its rollback retires.
+    pub(crate) fn staged_invite_welcome_ids(
+        &self,
+        origin_commit_id: &MessageId,
+    ) -> SessionResult<Vec<MessageId>> {
+        Ok(self.engine.staged_invite_welcome_ids(origin_commit_id)?)
     }
 
     pub fn group_evolutions(&self) -> SessionResult<Vec<DurableGroupEvolution>> {

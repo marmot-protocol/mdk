@@ -96,9 +96,43 @@ pub enum OutboundWelcomeStatus {
         group_id: GroupId,
         message: TransportMessage,
     },
-    /// Nothing is left to send: delivered, withdrawn, retired with its
-    /// commit, past its delivery deadline, or not a delivery-aware Welcome.
-    Settled,
+    /// Nothing is left to send, for the reason given.
+    Settled(WelcomeSettlement),
+}
+
+/// Why an outbound Welcome has nothing left to send.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WelcomeSettlement {
+    /// It met its delivery policy.
+    Delivered,
+    /// It was withdrawn, or retired with its staged commit when that commit
+    /// was rolled back.
+    Withdrawn,
+    /// Its commit lost to another branch, whether or not convergence has
+    /// retired its row yet.
+    CommitSuperseded,
+    /// Its delivery deadline passed while its commit was canonical or still
+    /// pending.
+    Expired,
+    /// No retained delivery-aware Welcome has this id.
+    Untracked,
+}
+
+/// What the sender's audit reads of one retained outbound Welcome, staged or
+/// not, in any state. It holds no Welcome bytes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OutboundWelcomeAuditFacts {
+    pub group_id: GroupId,
+    /// The Welcome's transport message id.
+    pub id: MessageId,
+    /// The transport that wrapped it.
+    pub source: cgka_traits::transport::TransportSource,
+    pub recipient: MemberId,
+    /// The commit it was staged with; a founding Welcome has none.
+    pub origin_commit_id: Option<MessageId>,
+    /// The transport event of the KeyPackage it answers, when recorded.
+    pub key_package_event_id: Option<MessageId>,
+    pub state: MessageState,
 }
 
 /// What [`Engine::withdraw_sent_welcome`] found.
@@ -1094,6 +1128,49 @@ impl<S: StorageProvider> Engine<S> {
         }
     }
 
+    /// What the sender's audit reads of the retained outbound Welcome `id`,
+    /// staged or not, in any state: an audit row of a retry after delivery
+    /// still names its group. `None` for a missing row or any other payload.
+    /// Ungated, as [`Self::stored_message_state`] is: one row's facts are not
+    /// a question about its group.
+    pub fn outbound_welcome_audit_facts(
+        &self,
+        id: &MessageId,
+    ) -> Result<Option<OutboundWelcomeAuditFacts>, EngineError> {
+        let record = match self.storage.get_message(id) {
+            Ok(record) => record,
+            Err(StorageError::NotFound) => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let payload = StoredMessagePayload::decode(&record.payload)
+            .map_err(|error| EngineError::Serialize(format!("{error:?}")))?;
+        let (message, origin_commit_id) = match &payload {
+            StoredMessagePayload::OutboundWelcome {
+                message,
+                origin_commit_id,
+                ..
+            } => (message, origin_commit_id.clone()),
+            StoredMessagePayload::StagedInviteWelcome {
+                message,
+                origin_commit_id,
+                ..
+            } => (message, Some(origin_commit_id.clone())),
+            _ => return Ok(None),
+        };
+        let TransportEnvelope::Welcome { recipient } = &message.envelope else {
+            return Ok(None);
+        };
+        Ok(Some(OutboundWelcomeAuditFacts {
+            group_id: record.group_id,
+            id: message.id.clone(),
+            source: message.source.clone(),
+            recipient: recipient.clone(),
+            origin_commit_id,
+            key_package_event_id: payload.welcome_key_package_event_id().cloned(),
+            state: record.state,
+        }))
+    }
+
     /// Read the durable state of one synthetic scenario input under either its
     /// transport or content-derived id.
     ///
@@ -1480,7 +1557,6 @@ impl<S: StorageProvider> Engine<S> {
             group: None,
             convergence: None,
             source: None,
-            v5_welcome_refs: Vec::new(),
         };
         // A relay replay of a message this engine already holds or sent ends
         // `Ignored { Duplicate | OwnEcho }` before any work, and replay storms
@@ -4434,7 +4510,9 @@ impl<S: StorageProvider> Engine<S> {
     /// Where the retained outbound Welcome `id` stands for delivery at `now`.
     /// A missing row is settled: there is nothing this engine owes under it.
     /// So is one whose delivery deadline is not after `now`: it is never
-    /// published again (mdk#2628 D40).
+    /// published again (mdk#2628 D40). A Welcome whose commit lost reads as
+    /// superseded, before and after convergence retires its row, and ahead
+    /// of its deadline.
     pub fn outbound_welcome_status(
         &self,
         id: &MessageId,
@@ -4442,11 +4520,34 @@ impl<S: StorageProvider> Engine<S> {
     ) -> Result<OutboundWelcomeStatus, EngineError> {
         let record = match self.storage.get_message(id) {
             Ok(record) => record,
-            Err(StorageError::NotFound) => return Ok(OutboundWelcomeStatus::Settled),
+            Err(StorageError::NotFound) => {
+                return Ok(OutboundWelcomeStatus::Settled(WelcomeSettlement::Untracked));
+            }
             Err(error) => return Err(EngineError::Storage(error)),
         };
-        if record.state != MessageState::Sent {
-            return Ok(OutboundWelcomeStatus::Settled);
+        match record.state {
+            MessageState::Sent => {}
+            MessageState::Processed => {
+                return Ok(OutboundWelcomeStatus::Settled(WelcomeSettlement::Delivered));
+            }
+            MessageState::Failed => {
+                // Convergence retires an undelivered Welcome with its commit
+                // when that commit loses; any other retirement is a withdrawal.
+                // An origin that cannot be read now is not guessed at.
+                let superseded = match StoredMessagePayload::decode(&record.payload) {
+                    Ok(payload) => {
+                        self.welcome_origin_state(&record.group_id, &payload)?
+                            == MessageState::EpochInvalidated
+                    }
+                    Err(_) => false,
+                };
+                return Ok(OutboundWelcomeStatus::Settled(if superseded {
+                    WelcomeSettlement::CommitSuperseded
+                } else {
+                    WelcomeSettlement::Withdrawn
+                }));
+            }
+            _ => return Ok(OutboundWelcomeStatus::Settled(WelcomeSettlement::Untracked)),
         }
         // A quarantined group may recover, and an unhydrated one hydrates.
         if self.ensure_group_live(&record.group_id).is_err() {
@@ -4456,18 +4557,28 @@ impl<S: StorageProvider> Engine<S> {
         let Ok(payload) = StoredMessagePayload::decode(&record.payload) else {
             return Ok(OutboundWelcomeStatus::Waiting);
         };
+        // A commit that lost settles its Welcome whatever the deadline, so an
+        // expired Welcome's commit is canonical or still pending.
+        let origin = self.welcome_origin_state(&record.group_id, &payload)?;
+        match origin {
+            MessageState::EpochInvalidated => {
+                return Ok(OutboundWelcomeStatus::Settled(
+                    WelcomeSettlement::CommitSuperseded,
+                ));
+            }
+            MessageState::Failed => {
+                return Ok(OutboundWelcomeStatus::Settled(WelcomeSettlement::Withdrawn));
+            }
+            _ => {}
+        }
         if payload
             .welcome_deliver_until()
             .is_some_and(|deliver_until| now >= deliver_until)
         {
-            return Ok(OutboundWelcomeStatus::Settled);
+            return Ok(OutboundWelcomeStatus::Settled(WelcomeSettlement::Expired));
         }
-        match self.welcome_origin_state(&record.group_id, &payload)? {
-            MessageState::Processed => {}
-            MessageState::EpochInvalidated | MessageState::Failed => {
-                return Ok(OutboundWelcomeStatus::Settled);
-            }
-            _ => return Ok(OutboundWelcomeStatus::Waiting),
+        if origin != MessageState::Processed {
+            return Ok(OutboundWelcomeStatus::Waiting);
         }
         Ok(match payload {
             StoredMessagePayload::StagedInviteWelcome { .. } => OutboundWelcomeStatus::Waiting,
@@ -4479,7 +4590,7 @@ impl<S: StorageProvider> Engine<S> {
                     message,
                 }
             }
-            _ => OutboundWelcomeStatus::Settled,
+            _ => OutboundWelcomeStatus::Settled(WelcomeSettlement::Untracked),
         })
     }
 
@@ -4652,6 +4763,22 @@ impl<S: StorageProvider> Engine<S> {
             }
         }
         Ok(ids)
+    }
+
+    /// The invite Welcomes still staged with the unconfirmed commit
+    /// `origin_commit_id`, at that commit's source epoch: those its rollback
+    /// retires. A caller that took the Welcomes off the commit's publish work
+    /// finds them here.
+    pub fn staged_invite_welcome_ids(
+        &self,
+        origin_commit_id: &MessageId,
+    ) -> Result<Vec<MessageId>, EngineError> {
+        let commit = self.storage.get_message(origin_commit_id)?;
+        Ok(self
+            .staged_welcomes_for_evolution(&commit.group_id, commit.epoch, origin_commit_id)?
+            .into_iter()
+            .map(|welcome| welcome.id)
+            .collect())
     }
 
     /// When the retained outbound Welcome `id`, staged or owed, stops being

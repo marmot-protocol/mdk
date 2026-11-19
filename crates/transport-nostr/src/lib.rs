@@ -4717,6 +4717,16 @@ impl TransportAdapter for MarmotRelayPlaneAccountAdapter {
         }
     }
 
+    fn event_size_class(
+        &self,
+        message: &cgka_traits::TransportMessage,
+    ) -> Option<cgka_traits::EventSizeClass> {
+        let event = NostrTransportEvent::from_transport_message(message).ok()?;
+        Some(cgka_traits::EventSizeClass::of_bytes(event_json_bytes(
+            &event,
+        )))
+    }
+
     async fn size_class_over_known_limits(
         &self,
         message: &cgka_traits::TransportMessage,

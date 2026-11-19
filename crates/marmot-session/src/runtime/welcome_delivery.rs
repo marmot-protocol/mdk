@@ -9,7 +9,7 @@
 //! `DurableTransportFanout`, which maintenance retries.
 
 use super::*;
-use crate::session::OutboundWelcomeStatus;
+use crate::session::{OutboundWelcomeStatus, WelcomeSettlement};
 
 impl<A, R, K> AccountDeviceRuntime<A, R, K>
 where
@@ -243,6 +243,7 @@ where
             metadata,
             completions,
             pending,
+            audit: self.audit.clone(),
         })
     }
 
@@ -255,6 +256,7 @@ where
             group_id,
             metadata,
             completions,
+            audit: _,
         } = completed;
         // Every network attempt above has already been exposed to relays, so a
         // finish-stage failure for one recipient must not skip completion
@@ -287,21 +289,20 @@ where
                     None
                 }
             };
+            // The attempt that met the policy marked the Welcome delivered.
             if let Some(status) = status
                 && !status.withdrawn
                 && !status.awaits_commit
+                && !status.met_required_acks
+                && let Some(recipient) = recipient
             {
-                if status.met_required_acks {
-                    self.mark_welcome_delivered_best_effort(&welcome_id);
-                } else if let Some(recipient) = recipient {
-                    effects.welcome_failures.push(self.welcome_delivery_failure(
-                        welcome_id,
-                        recipient,
-                        group_id.clone(),
-                        &effects,
-                        0,
-                    ));
-                }
+                effects.welcome_failures.push(self.welcome_delivery_failure(
+                    welcome_id,
+                    recipient,
+                    group_id.clone(),
+                    &effects,
+                    0,
+                ));
             }
             output.extend(effects);
         }
@@ -373,9 +374,9 @@ where
         let status = self
             .publish_one_with_retry_policy(message, &mut output, None, true)
             .await?;
-        if status.met_required_acks {
-            self.mark_welcome_delivered_best_effort(message_id);
-        } else if !status.withdrawn
+        // The attempt that met the policy marked the Welcome delivered.
+        if !status.met_required_acks
+            && !status.withdrawn
             && let Some(recipient) = recipient
         {
             let failure = self.welcome_delivery_failure(
@@ -398,15 +399,63 @@ where
     /// dropped with it. A relay attempt already started cannot be recalled;
     /// a detached wave skips every attempt it has not started.
     ///
+    /// A Welcome whose stored relay acceptances already meet its policy,
+    /// its delivered mark interrupted, is marked delivered instead and
+    /// reported `AlreadyDelivered`.
+    ///
     /// This touches only the Welcome, never group state, so it works before
     /// hydration reaches the Welcome's group.
     pub fn withdraw_welcome(
         &self,
         message_id: &cgka_traits::MessageId,
     ) -> AccountResult<WelcomeWithdrawal> {
+        // Relays that already took it make it delivered, not withdrawn: a
+        // saved acceptance that meets its policy, whose mark a stop
+        // interrupted, is reconciled first. A record that cannot be read now
+        // does not stop the withdrawal.
+        if let Ok(Some(fanout)) = self.session.transport_fanout(message_id) {
+            self.settle_met_welcome(
+                &fanout.exact_message,
+                accepted_fanout_targets(&fanout),
+                fanout.required_acks,
+            );
+        }
+        // The Welcome's terminal reason, read before the withdrawal hides
+        // it: `withdrawn` for a live one; for one already settled (expired,
+        // its commit lost) that the watcher has not recorded yet, the reason
+        // it settled for. One no watcher holds was recorded when it settled,
+        // or settled before this process watched it.
+        let reason = if self.audit.records_v5() {
+            match self
+                .session
+                .outbound_welcome_status(message_id, self.wall_clock.now())
+            {
+                Ok(OutboundWelcomeStatus::Owed { .. } | OutboundWelcomeStatus::Waiting) => {
+                    Some(audit_v5::WithdrawalReason::Withdrawn)
+                }
+                Ok(OutboundWelcomeStatus::Settled(WelcomeSettlement::Expired))
+                    if self.watched_welcomes.contains(message_id) =>
+                {
+                    Some(audit_v5::WithdrawalReason::Expired)
+                }
+                Ok(OutboundWelcomeStatus::Settled(WelcomeSettlement::CommitSuperseded))
+                    if self.watched_welcomes.contains(message_id) =>
+                {
+                    Some(audit_v5::WithdrawalReason::CommitSuperseded)
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
         let withdrawal = self.session.withdraw_sent_welcome(message_id)?;
         if withdrawal == WelcomeWithdrawal::AlreadyDelivered {
             return Ok(withdrawal);
+        }
+        if withdrawal == WelcomeWithdrawal::Withdrawn
+            && let Some(reason) = reason
+        {
+            self.record_v5_welcome_withdrawal(message_id, reason);
         }
         // A reserved wave owns its fanout until finish; maintenance prunes
         // the withdrawn retry after that reservation is released.
@@ -526,8 +575,8 @@ where
         let work = self.session.outbound_welcome_work()?;
         self.welcome_store_read = true;
         self.unread_welcome_groups = work.unread_groups;
-        self.watch_welcomes(work.staged);
-        self.watch_welcomes(work.owed.iter().map(|(_, welcome)| welcome.id.clone()));
+        self.adopt_stored_welcomes(work.staged);
+        self.adopt_stored_welcomes(work.owed.iter().map(|(_, welcome)| welcome.id.clone()));
         if work.owed.is_empty() {
             return Ok(None);
         }
@@ -555,6 +604,27 @@ where
         }
     }
 
+    /// Watch Welcomes read from the store, except one already settled: it
+    /// settled before this process watched it, and a later start reads it
+    /// again, so its settlement is not this process's to audit.
+    /// Without a v5 recorder no settlement is audited, so none is read.
+    fn adopt_stored_welcomes(&mut self, ids: impl IntoIterator<Item = cgka_traits::MessageId>) {
+        let now = self.wall_clock.now();
+        let audited = self.audit.records_v5();
+        for id in ids {
+            if self.watched_welcomes.contains(&id)
+                || (audited
+                    && matches!(
+                        self.session.outbound_welcome_status(&id, now),
+                        Ok(OutboundWelcomeStatus::Settled(_))
+                    ))
+            {
+                continue;
+            }
+            self.watched_welcomes.push(id);
+        }
+    }
+
     /// Read the store for Welcomes to watch: all of it the first time, unless
     /// the startup pass did, then each group a read skipped, once it is live.
     fn read_welcome_store(&mut self) -> AccountResult<()> {
@@ -562,14 +632,16 @@ where
             let work = self.session.outbound_welcome_work()?;
             self.welcome_store_read = true;
             self.unread_welcome_groups = work.unread_groups;
-            self.watch_welcomes(work.staged);
-            self.watch_welcomes(work.owed.into_iter().map(|(_, welcome)| welcome.id));
+            self.adopt_stored_welcomes(work.staged);
+            self.adopt_stored_welcomes(work.owed.into_iter().map(|(_, welcome)| welcome.id));
         }
         for group_id in std::mem::take(&mut self.unread_welcome_groups) {
             match self.session.outbound_welcome_work_in(&group_id) {
                 Ok(Some(work)) => {
-                    self.watch_welcomes(work.staged);
-                    self.watch_welcomes(work.owed.into_iter().map(|(_, welcome)| welcome.id));
+                    self.adopt_stored_welcomes(work.staged);
+                    self.adopt_stored_welcomes(
+                        work.owed.into_iter().map(|(_, welcome)| welcome.id),
+                    );
                 }
                 Ok(None) => self.unread_welcome_groups.push(group_id),
                 Err(error) => {
@@ -609,7 +681,17 @@ where
                     Ok((status, held))
                 });
             match status {
-                Ok((OutboundWelcomeStatus::Settled, _)) => {}
+                Ok((OutboundWelcomeStatus::Settled(WelcomeSettlement::Expired), _))
+                    if self.expired_welcome_may_still_close(&id) =>
+                {
+                    // Recorded once a mark or the pass settles it.
+                    watching.push(id);
+                }
+                Ok((OutboundWelcomeStatus::Settled(settlement), _)) => {
+                    if !self.record_v5_welcome_settled(&id, settlement) {
+                        watching.push(id);
+                    }
+                }
                 Ok((OutboundWelcomeStatus::Waiting, _) | (_, true)) => watching.push(id),
                 Ok((OutboundWelcomeStatus::Owed { group_id, message }, false)) => {
                     watching.push(id);

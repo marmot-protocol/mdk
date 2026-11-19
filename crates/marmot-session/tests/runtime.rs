@@ -420,6 +420,8 @@ struct RecordingAdapterInner {
     /// Endpoints that refuse every commit for its size, unsent: over a known
     /// limit, or over the commit size floor (mdk#2332).
     commit_too_large: Mutex<Vec<TransportEndpoint>>,
+    /// Inbox relays whose known limit every Welcome is over.
+    welcome_too_large: Mutex<Vec<TransportEndpoint>>,
     /// Each commit size check's target endpoints, in order.
     commit_size_checks: Mutex<Vec<Vec<TransportEndpoint>>>,
     commit_size_check_gate: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
@@ -547,6 +549,12 @@ impl RecordingAdapter {
     /// check and in the commit entry point alike.
     fn refuse_commits_as_too_large(&self, endpoints: Vec<TransportEndpoint>) {
         *self.inner.commit_too_large.lock().unwrap() = endpoints;
+    }
+
+    /// Report every Welcome over the known limit of `endpoints`, so a
+    /// Welcome whose inbox relays are all among them fits none.
+    fn refuse_welcomes_as_too_large(&self, endpoints: Vec<TransportEndpoint>) {
+        *self.inner.welcome_too_large.lock().unwrap() = endpoints;
     }
 
     /// Hold every commit size check until the returned gate gets a permit.
@@ -849,6 +857,21 @@ impl TransportAdapter for RecordingAdapter {
 
     async fn receive(&self) -> Result<Option<TransportDelivery>, TransportAdapterError> {
         Ok(None)
+    }
+
+    async fn size_class_over_known_limits(
+        &self,
+        message: &TransportMessage,
+        target: &TransportPublishTarget,
+    ) -> Option<cgka_traits::EventSizeClass> {
+        let refused = self.inner.welcome_too_large.lock().unwrap();
+        (matches!(message.envelope, TransportEnvelope::Welcome { .. })
+            && !target.endpoints().is_empty()
+            && target
+                .endpoints()
+                .iter()
+                .all(|endpoint| refused.contains(endpoint)))
+        .then(|| cgka_traits::EventSizeClass::of_bytes(70_000))
     }
 
     async fn read_back(

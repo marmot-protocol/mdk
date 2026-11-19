@@ -1,5 +1,6 @@
 use super::*;
 use crate::{AppClient, AuditLogSettings, MarmotApp, MarmotAppConfig};
+use cgka_traits::{GroupId, MessageId};
 use cgka_traits::{group::ProtocolProfile, storage::GroupStorage};
 use marmot_account::AccountHome;
 use nostr_relay_builder::MockRelay;
@@ -1039,7 +1040,8 @@ async fn normal_opt_in_records_real_welcome_and_operational_v5_rows() {
         assert_eq!(published.outer_event_ref, outer);
         assert_eq!(observed.outer_event_ref, outer);
         assert_eq!(published.policy, Policy::Met);
-        assert_eq!(published.retained_state, RetainedState::Unknown);
+        // The pass that met the policy completed the Welcome.
+        assert_eq!(published.retained_state, RetainedState::Completed);
         assert_eq!(
             prepared.op_id,
             sender
@@ -1071,6 +1073,112 @@ async fn normal_opt_in_records_real_welcome_and_operational_v5_rows() {
                     &row.fields().event,
                     Event::GroupBaseline(baseline) if baseline.reason == BaselineReason::Opened
                 ))
+        );
+    })
+    .await
+    .expect("bounded live v5 scenario");
+}
+
+/// An invite into an existing group leaves the sender the same linked chain
+/// a founding create does: `welcome_prepared` in invite mode on the Add
+/// commit, the Welcome's size, then publish started and finished, all on the
+/// outer event the invitee observes, and its generic publish rows name the
+/// group. Without it, a missing invite has no sender evidence.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn invite_into_existing_group_records_prepared_and_publish_rows() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let relay = MockRelay::run().await.unwrap();
+        let relay_url = relay.url().await.to_string();
+        let alice_dir = tempfile::tempdir().unwrap();
+        let carol_dir = tempfile::tempdir().unwrap();
+        AccountHome::open(alice_dir.path())
+            .create_account("alice")
+            .unwrap();
+        let carol_id = AccountHome::open(carol_dir.path())
+            .create_account("carol")
+            .unwrap()
+            .account_id_hex;
+        let alice_app = app(alice_dir.path(), &relay_url);
+        let carol_app = app(carol_dir.path(), &relay_url);
+        let mut alice = alice_app.client("alice").await.unwrap();
+        let mut carol = carol_app.client("carol").await.unwrap();
+        let group = alice
+            .create_group("synthetic private group title", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("a group with only its founder");
+        carol.publish_key_package().await.unwrap();
+        alice.invite_members(&group, &[&carol_id]).await.unwrap();
+        assert!(carol.sync().await.unwrap().joined_groups.contains(&group));
+
+        let observed = actual_v5_rows(&carol_app, "carol")
+            .iter()
+            .find_map(|row| match &row.fields().event {
+                Event::WelcomeObserved(event) => Some(event.outer_event_ref.clone()),
+                _ => None,
+            })
+            .expect("the invitee observed the Welcome");
+        let sender = actual_v5_rows(&alice_app, "alice");
+        let group_ref = GroupRef::from_group_id(group.as_slice()).unwrap();
+        let prepared = sender
+            .iter()
+            .find_map(|row| match &row.fields().event {
+                Event::WelcomePrepared(event) if event.mode == Mode::Invite => {
+                    assert_eq!(row.fields().group_ref.as_ref(), Some(&group_ref));
+                    Some(event)
+                }
+                _ => None,
+            })
+            .expect("an invite-mode welcome_prepared row");
+        assert!(matches!(prepared.basis, Basis::Commit { .. }));
+        assert_eq!(prepared.construction, Construction::Constructed);
+        assert!(prepared.key_package_event_ref.is_some());
+        assert_eq!(prepared.outer_event_ref.as_ref(), Some(&observed));
+        let started = sender
+            .iter()
+            .find_map(|row| match &row.fields().event {
+                Event::WelcomePublishStarted(event) if event.outer_event_ref == observed => {
+                    Some(event)
+                }
+                _ => None,
+            })
+            .expect("a welcome_publish_started row for the invite");
+        assert_eq!(started.op_id, prepared.op_id);
+        let finished = sender
+            .iter()
+            .find_map(|row| match &row.fields().event {
+                Event::WelcomePublishFinished(event) if event.outer_event_ref == observed => {
+                    Some(event)
+                }
+                _ => None,
+            })
+            .expect("a welcome_publish_finished row for the invite");
+        assert_eq!(finished.attempt_id, started.attempt_id);
+        assert_eq!(finished.policy, Policy::Met);
+        // Its first pass resolved carol's inbox.
+        assert_eq!(started.route_source, RouteSource::ResolvedInbox);
+        // The Welcome's size, as the transport sends it.
+        assert!(sender.iter().any(|row| matches!(
+            &row.fields().event,
+            Event::WelcomeEventSize(event)
+                if event.outer_event_ref == observed
+                    && event.op_id == prepared.op_id
+                    && event.event_size_class == EventSizeClass::Under64Kib
+        )));
+        // The generic publish rows of the Welcome are found with its group.
+        let welcome_publishes = sender
+            .iter()
+            .filter(|row| {
+                let event = serde_json::to_value(&row.fields().event).unwrap();
+                event["type"] == "publish_attempt" && event["artifact_kind"] == "welcome"
+            })
+            .collect::<Vec<_>>();
+        assert!(!welcome_publishes.is_empty());
+        assert!(
+            welcome_publishes
+                .iter()
+                .all(|row| row.fields().group_ref.as_ref() == Some(&group_ref))
         );
     })
     .await
@@ -1164,8 +1272,7 @@ impl Scenario {
             .unwrap();
         assert_eq!(stored, retained[0]);
         assert_eq!(
-            self.sender_capture()
-                .rows
+            actual_v5_rows(&self.alice.app, "alice")
                 .iter()
                 .filter(|row| matches!(row.fields().event, Event::WelcomePrepared(_)))
                 .count(),
@@ -1652,9 +1759,8 @@ async fn real_welcome_pending_then_accepted_checkpoint_and_volume() {
             Some(committed_group.local_copy_install_epoch.0.into())
         );
         assert_eq!(join.elapsed_us, None);
-        let prepared = scenario
-            .sender_capture()
-            .rows
+        let sender = actual_v5_rows(&scenario.alice.app, "alice");
+        let prepared = sender
             .iter()
             .find_map(|row| match &row.fields().event {
                 Event::WelcomePrepared(event) => Some((row, event)),
@@ -1811,12 +1917,9 @@ async fn real_welcome_pending_then_accepted_checkpoint_and_volume() {
                 (kind, body.len())
             })
             .collect::<Vec<_>>();
+        // The runtime records the founding Welcome's rows (checked above);
+        // the probe records the new group's baseline.
         assert!(sender_body < 3000);
-        assert!(
-            sender_by_kind
-                .iter()
-                .any(|(kind, _)| kind == "welcome_prepared")
-        );
         assert!(
             sender_by_kind
                 .iter()
@@ -1899,10 +2002,13 @@ async fn founding_preparation_matches_two_recipients_without_order_inference() {
                 (retained_group.clone(), welcome.clone())
             );
         }
-        let sender = scenario.sender_capture();
+        // The runtime records each founding Welcome from its stored row.
+        let sender = actual_v5_rows(&scenario.alice.app, "alice")
+            .into_iter()
+            .filter(|row| matches!(row.fields().event, Event::WelcomePrepared(_)))
+            .collect::<Vec<_>>();
         assert_eq!(
             sender
-                .rows
                 .iter()
                 .filter(|row| matches!(row.fields().event, Event::WelcomePrepared(_)))
                 .count(),
@@ -1916,7 +2022,6 @@ async fn founding_preparation_matches_two_recipients_without_order_inference() {
             let recipient_bytes = hex::decode(recipient_hex).unwrap();
             let recipient_ref = MemberRef::from_member_identity(&recipient_bytes).unwrap();
             let row = sender
-                .rows
                 .iter()
                 .find(|row| match &row.fields().event {
                     Event::WelcomePrepared(prepared) => prepared.recipient_ref == recipient_ref,
@@ -1951,78 +2056,20 @@ async fn founding_preparation_matches_two_recipients_without_order_inference() {
             assert_eq!(prepared.retention, Retention::Committed);
         }
         assert_ne!(
-            match &sender.rows[0].fields().event {
+            match &sender[0].fields().event {
                 Event::WelcomePrepared(e) => &e.outer_event_ref,
                 _ => unreachable!(),
             },
-            match &sender.rows[1].fields().event {
+            match &sender[1].fields().event {
                 Event::WelcomePrepared(e) => &e.outer_event_ref,
                 _ => unreachable!(),
             }
         );
         scenario.assert_clean();
 
-        // Reorder the same engine-retained artifacts when presenting them to
-        // a separate bounded probe. Recipient identity, not vec index, binds K.
-        let effects = SessionEffects {
-            events: Vec::new(),
-            publish: vec![PublishWork::FoundingGroupCreated {
-                welcomes: retained
-                    .iter()
-                    .rev()
-                    .map(|(_, welcome)| welcome.clone())
-                    .collect(),
-            }],
-            queued: Vec::new(),
-            pending_convergence: Vec::new(),
-        };
-        let selections = vec![
-            FoundingSelection {
-                recipient_hex: scenario.bob_id.clone(),
-                key_package_event_id: Some(MessageId::new(scenario.key_package_event_id.to_vec())),
-            },
-            FoundingSelection {
-                recipient_hex: carol_id.clone(),
-                key_package_event_id: Some(MessageId::new(carol_key_package_event_id.to_vec())),
-            },
-        ];
-        let mut reordered = probe_with_ids(0x55, 0x66);
-        let pending = reordered.begin_founding(selections).unwrap();
-        reordered.founding_prepared(pending, &group, &effects);
-        assert_eq!(reordered.rows.len(), 2);
-        assert_eq!(reordered.invalid, 0);
-        for row in &reordered.rows {
-            let Event::WelcomePrepared(prepared) = &row.fields().event else {
-                unreachable!()
-            };
-            let (_, expected_id) = expected
-                .iter()
-                .find(|(recipient, _)| {
-                    prepared.recipient_ref
-                        == MemberRef::from_member_identity(&hex::decode(recipient).unwrap())
-                            .unwrap()
-                })
-                .unwrap();
-            assert_eq!(
-                prepared.key_package_event_ref,
-                Some(NostrEventRef::from_validated_event_id(expected_id))
-            );
-        }
-
-        let mut mismatched = probe_with_ids(0x77, 0x88);
-        let pending = mismatched
-            .begin_founding(vec![FoundingSelection {
-                recipient_hex: scenario.bob_id.clone(),
-                key_package_event_id: Some(MessageId::new(scenario.key_package_event_id.to_vec())),
-            }])
-            .unwrap();
-        mismatched.founding_prepared(pending, &group, &effects);
-        assert!(mismatched.rows.is_empty());
-        assert_eq!(mismatched.invalid, 1);
-
         let mut total = 0;
         let mut largest = 0;
-        for row in &sender.rows {
+        for row in &sender {
             let body = row.to_json().unwrap();
             total += body.len();
             largest = largest.max(body.len());
@@ -2106,9 +2153,8 @@ async fn founding_preparation_records_every_device_of_one_account() {
         );
         let bob_ref =
             MemberRef::from_member_identity(&hex::decode(&scenario.bob_id).unwrap()).unwrap();
-        let prepared = scenario
-            .sender_capture()
-            .rows
+        let sender = actual_v5_rows(&scenario.alice.app, "alice");
+        let prepared = sender
             .iter()
             .filter_map(|row| match &row.fields().event {
                 Event::WelcomePrepared(prepared) => Some(prepared),
@@ -2168,19 +2214,6 @@ async fn founding_preparation_records_every_device_of_one_account() {
             create["event"]["record_context"]["human_action"]["target_count"],
             1
         );
-
-        // One account's KeyPackage repeated is not two devices.
-        let mut repeated = probe_with_ids(0x55, 0x66);
-        let selection = || FoundingSelection {
-            recipient_hex: scenario.bob_id.clone(),
-            key_package_event_id: Some(MessageId::new(scenario.key_package_event_id.to_vec())),
-        };
-        assert!(
-            repeated
-                .begin_founding(vec![selection(), selection()])
-                .is_none()
-        );
-        assert_eq!(repeated.invalid, 1);
     })
     .await
     .expect("bounded two-device preparation");

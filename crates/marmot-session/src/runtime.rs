@@ -87,7 +87,9 @@ mod removed_device_slot;
 mod removed_slot_expiry;
 mod sign_in_rejection;
 mod slot_announcement;
+mod welcome_audit;
 mod welcome_delivery;
+use welcome_audit::{InviteRefusal, V5WelcomePass};
 
 const TRACE_TARGET: &str = "marmot_session::runtime";
 const WELCOME_PUBLISH_CONCURRENCY: usize = 8;
@@ -257,13 +259,7 @@ enum LegacyPublishCompletion {
 struct PreparedLegacyPublishAttempt {
     message_id: cgka_traits::MessageId,
     msg_id_hex: String,
-    v5_welcome: Option<(
-        audit_v5::LocalId,
-        audit_v5::NostrEventRef,
-        audit_v5::LocalId,
-        audit_v5::MemberRef,
-        audit_v5::GroupRef,
-    )>,
+    v5_welcome: Option<V5WelcomePass>,
     wire: AuditTransportWire,
     artifact_kind: Option<MessageArtifactKind>,
     publish_context: AuditEventContext,
@@ -273,7 +269,8 @@ struct PreparedLegacyPublishAttempt {
     required_acks: usize,
     target_kind: String,
     relay_urls: Vec<String>,
-    target_group_id: Option<GroupId>,
+    /// The group its audit rows name: the target's, or a Welcome's own.
+    audit_group_id: Option<GroupId>,
     defers_remaining_fanout_until_confirmation: bool,
     /// A device link's Welcome's delivery deadline: a batch does not start
     /// the attempt from then on.
@@ -294,12 +291,16 @@ struct PreparedWelcomePublish {
     metadata: Vec<WelcomePublishMetadata>,
     completions: Vec<Option<LegacyPublishCompletion>>,
     pending: VecDeque<(usize, Box<PreparedLegacyPublishAttempt>)>,
+    /// Records each attempt's start, when its relay I/O begins.
+    audit: SharedRecorder,
 }
 
 struct CompletedWelcomePublish {
     group_id: Option<GroupId>,
     metadata: Vec<WelcomePublishMetadata>,
     completions: Vec<Option<LegacyPublishCompletion>>,
+    /// Records the finished row of a pass whose results are dropped.
+    audit: SharedRecorder,
 }
 
 /// Relay-only half of a prepared Welcome retry.
@@ -331,18 +332,54 @@ impl CompletedWelcomePublishTask {
     /// finishing this task changes nothing of a group the host left or
     /// deleted while the task ran. Their records stay as preparation left
     /// them, as an abandoned task leaves them; finishing still releases every
-    /// reservation. Returns how many results were dropped.
+    /// reservation. A dropped pass that reached relays still records its
+    /// finished audit row from the answers it got. Returns how many results
+    /// were dropped.
     pub fn drop_gone_groups(&mut self, gone: impl Fn(&GroupId) -> bool) -> usize {
         let completed = &mut self.completed;
         let before = completed.metadata.len();
+        let audit = &completed.audit;
         let (metadata, completions) = std::mem::take(&mut completed.metadata)
             .into_iter()
             .zip(std::mem::take(&mut completed.completions))
-            .filter(|(metadata, _)| !metadata.group_id.as_ref().is_some_and(&gone))
+            .filter(|(metadata, completion)| {
+                if !metadata.group_id.as_ref().is_some_and(&gone) {
+                    return true;
+                }
+                if let Some(completion) = completion {
+                    record_dropped_completion(audit, completion);
+                }
+                false
+            })
             .unzip();
         completed.metadata = metadata;
         completed.completions = completions;
         before - completed.metadata.len()
+    }
+
+    /// Record the finished audit row of each pass of this task that reached
+    /// relays, from the answers it got, with no stored outcome: for a task
+    /// dropped unsettled as its worker stops. Its records stay as preparation
+    /// left them, and its Welcomes stay owed.
+    pub fn record_unsettled_passes(&self) {
+        for completion in self.completed.completions.iter().flatten() {
+            record_dropped_completion(&self.completed.audit, completion);
+        }
+    }
+}
+
+/// The finished row of a pass that reached relays and whose results are
+/// dropped unreconciled.
+fn record_dropped_completion(audit: &SharedRecorder, completion: &LegacyPublishCompletion) {
+    if let LegacyPublishCompletion::Network(attempt, result) = completion
+        && let Some(pass) = &attempt.v5_welcome
+    {
+        pass.record_dropped(
+            audit,
+            result,
+            &attempt.retry_endpoints,
+            attempt.required_acks,
+        );
     }
 }
 
@@ -387,7 +424,8 @@ impl PreparedWelcomePublish {
         holds: Option<&DetachedWelcomeHolds>,
         selection: Option<&Arc<futures::lock::Mutex<()>>>,
     ) -> CompletedWelcomePublish {
-        let publish = |index, attempt: Box<PreparedLegacyPublishAttempt>| async move {
+        let audit = &self.audit;
+        let publish = |index, mut attempt: Box<PreparedLegacyPublishAttempt>| async move {
             let mut selection = match selection {
                 Some(selection) => Some(selection.lock().await),
                 None => None,
@@ -413,6 +451,9 @@ impl PreparedWelcomePublish {
                 };
                 if let Some(hold) = hold {
                     return std::task::Poll::Ready(Err(hold));
+                }
+                if let Some(pass) = attempt.v5_welcome.as_mut() {
+                    pass.start(audit);
                 }
                 let mut future = adapter.publish(attempt.request.clone());
                 let result = future.poll_unpin(cx).map(Ok);
@@ -453,6 +494,7 @@ impl PreparedWelcomePublish {
             group_id: self.group_id,
             metadata: self.metadata,
             completions: self.completions,
+            audit: self.audit.clone(),
         }
     }
 }
@@ -622,6 +664,12 @@ pub struct AccountDeviceRuntime<A, R = StaticTransportRouting, K = NoopKeyPackag
     /// in the order this runtime met them. Maintenance publishes each once it
     /// is owed (see `welcome_delivery`).
     watched_welcomes: Vec<cgka_traits::MessageId>,
+    /// Retained Welcomes this process noted, each read once
+    /// ([`Self::note_retained_welcomes`]).
+    v5_prepared_welcomes: HashSet<cgka_traits::MessageId>,
+    /// Welcomes whose withdrawal `withdraw_welcome` recorded, so the
+    /// watcher does not record it again.
+    v5_withdrawn_welcomes: std::sync::Mutex<HashSet<cgka_traits::MessageId>>,
     /// Whether the store has been read for `watched_welcomes`: the startup
     /// pass reads it, or else the first maintenance pass.
     welcome_store_read: bool,
@@ -698,6 +746,8 @@ where
             detached_welcome_adapter: None,
             prepared_welcome_tasks: Vec::new(),
             watched_welcomes: Vec::new(),
+            v5_prepared_welcomes: HashSet::new(),
+            v5_withdrawn_welcomes: std::sync::Mutex::new(HashSet::new()),
             welcome_store_read: false,
             unread_welcome_groups: Vec::new(),
             finish_stage_failure: None,
@@ -3641,6 +3691,7 @@ where
         request: CreateGroupRequest,
     ) -> AccountResult<(GroupId, AccountDeviceEffects)> {
         let CreateGroupEffects { group_id, effects } = self.session.create_group(request).await?;
+        self.note_founding_welcomes(&effects);
         let effects = self.publish_session_effects(effects).await?;
         Ok((group_id, effects))
     }
@@ -3698,7 +3749,7 @@ where
             adapter: &self.adapter,
             routing: &self.routing,
         };
-        Ok(self
+        let created = self
             .session
             .create_group_with_optional_app_components_and_audit_context(
                 request,
@@ -3706,7 +3757,9 @@ where
                 Some(&welcome_sizes),
                 context,
             )
-            .await?)
+            .await?;
+        self.note_founding_welcomes(&created.effects);
+        Ok(created)
     }
 
     /// Prepare a chat whose founding Add includes authenticated private sibling KeyPackages.
@@ -3723,7 +3776,7 @@ where
             adapter: &self.adapter,
             routing: &self.routing,
         };
-        Ok(self
+        let created = self
             .session
             .prepare_create_group_with_siblings_and_audit_context(
                 request,
@@ -3732,7 +3785,9 @@ where
                 Some(&welcome_sizes),
                 context,
             )
-            .await?)
+            .await?;
+        self.note_founding_welcomes(&created.effects);
+        Ok(created)
     }
 
     /// Prepare creation of a group under a group id chosen before it exists,
@@ -3747,7 +3802,7 @@ where
         welcome_deliver_until: Timestamp,
         context: AuditEventContext,
     ) -> AccountResult<CreateGroupEffects> {
-        Ok(self
+        let created = self
             .session
             .create_group_with_chosen_id_and_audit_context(
                 request,
@@ -3756,7 +3811,9 @@ where
                 welcome_deliver_until,
                 context,
             )
-            .await?)
+            .await?;
+        self.note_founding_welcomes(&created.effects);
+        Ok(created)
     }
 
     /// Publish effects returned by
@@ -3901,14 +3958,17 @@ where
         let PreparedSessionSend::Commit(commit) = prepared else {
             return Ok(prepared);
         };
-        if invite && let Some((message_id, oversized)) = self.oversized_invite(&commit).await {
-            let mut output = self.rollback_prepared_session_commit(commit).await?;
+        self.note_retained_welcomes(commit.welcomes());
+        if invite && let Some((message_id, refusal)) = self.oversized_invite(&commit).await {
+            let oversized = refusal.oversized;
+            let mut output = self
+                .rollback_prepared_session_commit_refused(commit, Some(refusal))
+                .await?;
             output
                 .failures
                 .insert(0, refused_before_publishing(message_id, oversized));
             return Ok(PreparedSessionSend::Refused(Box::new(output)));
         }
-        self.watch_welcomes(commit.welcomes().iter().map(|welcome| welcome.id.clone()));
         Ok(PreparedSessionSend::Commit(commit))
     }
 
@@ -3918,7 +3978,7 @@ where
     async fn oversized_invite(
         &self,
         prepared: &PreparedSessionCommit,
-    ) -> Option<(cgka_traits::MessageId, OversizedEvent)> {
+    ) -> Option<(cgka_traits::MessageId, InviteRefusal)> {
         let commit = prepared
             .effects
             .publish
@@ -3931,10 +3991,10 @@ where
                 }
                 _ => None,
             })?;
-        let oversized = self
+        let refusal = self
             .oversized_invite_events(commit, &prepared.welcomes)
             .await?;
-        Some((commit.id.clone(), oversized))
+        Some((commit.id.clone(), refusal))
     }
 
     /// The oversized artifact when an invite's commit fits none of its group
@@ -3950,26 +4010,30 @@ where
         &self,
         commit: &TransportMessage,
         welcomes: &[TransportMessage],
-    ) -> Pin<Box<impl Future<Output = Option<OversizedEvent>>>> {
+    ) -> Pin<Box<impl Future<Output = Option<InviteRefusal>>>> {
         Box::pin(async move {
             // A commit or Welcome without a route fails when it is published.
             let target = self.routing.publish_target(commit).ok()?;
             let adapter = &self.adapter;
             if let Some(size_class) = adapter.size_class_over_known_limits(commit, &target).await {
-                return Some(OversizedEvent {
+                return Some(InviteRefusal::from(OversizedEvent {
                     artifact: OversizedArtifact::Commit,
                     size_class,
-                });
+                }));
             }
             // The same check a founding create runs on its Welcomes.
             let welcome_sizes = WelcomeSizes {
                 adapter,
                 routing: &self.routing,
             };
-            let size_class = welcome_sizes.oversized_welcome(welcomes).await?;
-            Some(OversizedEvent {
-                artifact: OversizedArtifact::Welcome,
-                size_class,
+            let oversized_welcomes = welcome_sizes.oversized_welcomes(welcomes).await;
+            let (_, size_class) = oversized_welcomes.first()?.clone();
+            Some(InviteRefusal {
+                oversized: OversizedEvent {
+                    artifact: OversizedArtifact::Welcome,
+                    size_class,
+                },
+                oversized_welcomes: oversized_welcomes.into_iter().collect(),
             })
         })
     }
@@ -3981,7 +4045,22 @@ where
         &mut self,
         prepared: PreparedSessionCommit,
     ) -> AccountResult<AccountDeviceEffects> {
-        let (mut prepared_effects, _welcomes, pending) = prepared.into_parts();
+        self.rollback_prepared_session_commit_refused(prepared, None)
+            .await
+    }
+
+    /// [`Self::rollback_prepared_session_commit`], recording why a size
+    /// `refusal` retired each Welcome right after the rollback, before any
+    /// later work.
+    async fn rollback_prepared_session_commit_refused(
+        &mut self,
+        prepared: PreparedSessionCommit,
+        refusal: Option<InviteRefusal>,
+    ) -> AccountResult<AccountDeviceEffects> {
+        let (mut prepared_effects, welcomes, pending) = prepared.into_parts();
+        let unretired = refusal
+            .as_ref()
+            .map(|_| self.unretired_welcomes(welcomes.iter().map(|welcome| welcome.id.clone())));
         prepared_effects.publish.retain(|work| {
             !matches!(work, PublishWork::GroupEvolution { pending: own, .. } | PublishWork::GroupCreated { pending: own, .. } if *own == pending)
         });
@@ -3990,7 +4069,14 @@ where
         let mut queue = VecDeque::new();
         output.absorb_session_effects(prepared_effects, &mut queue);
 
-        let rollback_effects = self.session.publish_failed(pending).await?;
+        let rollback = self.session.publish_failed(pending).await;
+        // A rollback can commit, retiring Welcomes, and fail after: record
+        // what it retired either way.
+        if let (Some(refusal), Some(unretired)) = (refusal, unretired) {
+            let retired = self.retired_welcomes(unretired);
+            self.record_v5_welcomes_refused(&retired, &refusal);
+        }
+        let rollback_effects = rollback?;
         output
             .pending
             .push(PendingResolution::RolledBack { pending });
@@ -5908,20 +5994,29 @@ where
             return Ok(());
         }
 
+        // Welcomes of a drained or automatic commit first reach the runtime
+        // here; a host's reached it when its commit was accepted.
+        self.note_retained_welcomes(&welcomes);
         // A queued invite the drain prepared is judged as a direct invite
         // is, before its commit is published: one whose commit or Welcome
         // fits none of its relays is retired unsent (mdk#2334).
         if self.session.pending_is_queued_invite(pending)?
-            && let Some(oversized) = self.oversized_invite_events(&commit, &welcomes).await
+            && let Some(refusal) = self.oversized_invite_events(&commit, &welcomes).await
         {
+            let unretired =
+                self.unretired_welcomes(welcomes.iter().map(|welcome| welcome.id.clone()));
             let effects = refuse_too_large(
                 &mut self.session,
                 pending,
                 None,
-                oversized,
+                refusal.oversized,
                 RollbackPass::Staging,
             )
-            .await?;
+            .await;
+            // Recorded even when the rollback fails after it committed.
+            let retired = self.retired_welcomes(unretired);
+            self.record_v5_welcomes_refused(&retired, &refusal);
+            let effects = effects?;
             output
                 .pending
                 .push(PendingResolution::RolledBack { pending });
@@ -5984,6 +6079,13 @@ where
                 .bounded_until
                 .is_some_and(|bounded_until| bounded_until <= now)
             {
+                // A saved acceptance that meets a Welcome's policy is
+                // reconciled first; one that still cannot be keeps its record.
+                let accepted = accepted_fanout_targets(&fanout);
+                self.settle_met_welcome(&fanout.exact_message, accepted, fanout.required_acks);
+                if self.welcome_still_owes_met_policy(&fanout, accepted) {
+                    continue;
+                }
                 self.session.delete_transport_fanout(&fanout.id)?;
                 continue;
             }
@@ -6028,9 +6130,16 @@ where
             return Ok(());
         };
         match self.welcome_hold(message_id, &fanout.exact_message.envelope)? {
-            // A withdrawn or expired Welcome's remaining retries go with it.
+            // A withdrawn or expired Welcome's remaining retries go with it,
+            // once a saved acceptance that meets its policy is reconciled: an
+            // expired Welcome the relays took is delivered, not expired. One
+            // whose mark cannot land now keeps that acceptance, unpublished.
             Some(WelcomeHold::Withdrawn | WelcomeHold::Expired) => {
-                self.session.delete_transport_fanout(message_id)?;
+                let accepted = accepted_fanout_targets(&fanout);
+                self.settle_met_welcome(&fanout.exact_message, accepted, fanout.required_acks);
+                if !self.welcome_still_owes_met_policy(&fanout, accepted) {
+                    self.session.delete_transport_fanout(message_id)?;
+                }
                 return Ok(());
             }
             // A staged one keeps them for when its commit confirms.
@@ -6043,7 +6152,15 @@ where
             .filter(|target| transport_fanout_target_retry_due(target, self.wall_clock.now()))
             .map(|target| target.endpoint.clone())
             .collect::<Vec<_>>();
-        if !remaining.is_empty() {
+        if remaining.is_empty() {
+            // Its stored acceptances may meet the policy, though a stop
+            // interrupted the mark.
+            self.settle_met_welcome(
+                &fanout.exact_message,
+                accepted_fanout_targets(&fanout),
+                fanout.required_acks,
+            );
+        } else {
             let required_acks = fanout.required_acks.max(1);
             let accepted_before = accepted_fanout_targets(&fanout);
             // Secondary retries are audited like the first pass, so a relay
@@ -6059,8 +6176,29 @@ where
                 operation_id: Some(format!("publish-{msg_id_hex}")),
                 ..AuditEventContext::default()
             };
+            let welcome_facts = self.welcome_audit_facts(&fanout.exact_message);
+            let audit_group_id = fanout
+                .group_id
+                .clone()
+                .or_else(|| welcome_facts.as_ref().map(|facts| facts.group_id.clone()));
+            let mut v5_welcome = self.v5_welcome_pass(
+                welcome_facts,
+                &remaining,
+                required_acks,
+                accepted_before,
+                audit_v5::RouteSource::RetainedTarget,
+            );
+            // The pass's per-endpoint results, joined for its finished row:
+            // each report, and the endpoint failures an adapter error names.
+            // One that names none leaves the row's results incomplete.
+            let mut pass_report = TransportPublishReport {
+                message_id: message_id.clone(),
+                accepted: Vec::new(),
+                failed: Vec::new(),
+                required_acks,
+            };
             self.record_audit_event(
-                fanout.group_id.as_ref(),
+                audit_group_id.as_ref(),
                 Some(publish_context.clone()),
                 AuditEventKind::PublishAttempt {
                     msg_id: msg_id_hex.clone(),
@@ -6092,6 +6230,9 @@ where
                 };
                 async move { (endpoint.clone(), adapter.publish(request).await) }
             });
+            if let Some(pass) = v5_welcome.as_mut() {
+                pass.start(&self.audit);
+            }
             for (endpoint, result) in futures::future::join_all(attempts).await {
                 match result {
                     Ok(report) => {
@@ -6128,9 +6269,18 @@ where
                                 reason: "fanout endpoint did not acknowledge".into(),
                             });
                         }
+                        if v5_welcome.is_some() {
+                            pass_report.accepted.extend(report.accepted.iter().cloned());
+                            pass_report.failed.extend(report.failed.iter().cloned());
+                        }
                         output.reports.push(report);
                     }
                     Err(error) => {
+                        if v5_welcome.is_some() {
+                            pass_report
+                                .failed
+                                .extend(error.publish_endpoint_failures().iter().cloned());
+                        }
                         pass_failed.push(PublishRelayFailure {
                             relay_url: endpoint.0.clone(),
                             reason: error.to_string(),
@@ -6159,10 +6309,10 @@ where
                     }
                 }
             }
-            self.session.put_transport_fanout(&fanout)?;
+            self.put_pass_fanout(&fanout, &v5_welcome, Some(&pass_report), &remaining)?;
             let accepted_total = accepted_fanout_targets(&fanout);
             self.record_audit_event(
-                fanout.group_id.as_ref(),
+                audit_group_id.as_ref(),
                 Some(publish_context),
                 AuditEventKind::PublishOutcome {
                     msg_id: msg_id_hex,
@@ -6183,12 +6333,15 @@ where
             // A Welcome is delivered by whichever attempt meets its policy,
             // this retry included, so it stops being owed now rather than at
             // the next open.
-            if matches!(artifact_kind, Some(MessageArtifactKind::Welcome))
-                && accepted_before < required_acks
-                && accepted_total >= required_acks
-            {
-                self.mark_welcome_delivered_best_effort(message_id);
-            }
+            self.settle_met_welcome(&fanout.exact_message, accepted_total, required_acks);
+            // After the mark, so retention is what this pass left stored.
+            self.record_v5_welcome_publish_finished(
+                &v5_welcome,
+                Some(&pass_report),
+                &remaining,
+                Some(accepted_total),
+                required_acks,
+            );
         }
         Ok(())
     }
@@ -7033,7 +7186,18 @@ where
             && !fanout.possible_exposure()
             && let Some(pending) = fanout.pending_ref()
         {
-            let effects = roll_back_failed_fanout(&mut self.session, pending, fanout, pass).await?;
+            let oversized = OversizedEvent::of_fanout(fanout);
+            // The commit's staged Welcomes, which a host's invite does not
+            // carry on the fanout.
+            let unretired =
+                oversized.map(|_| self.unretired_welcomes(self.staged_welcomes_of_fanout(fanout)));
+            let effects = roll_back_failed_fanout(&mut self.session, pending, fanout, pass).await;
+            // Recorded even when the rollback fails after it committed.
+            if let (Some(oversized), Some(unretired)) = (oversized, unretired) {
+                let retired = self.retired_welcomes(unretired);
+                self.record_v5_welcomes_refused(&retired, &InviteRefusal::from(oversized));
+            }
+            let effects = effects?;
             output
                 .pending
                 .push(PendingResolution::RolledBack { pending });
@@ -7072,7 +7236,10 @@ where
     ) -> AccountResult<PublishStatus> {
         match self.prepare_legacy_publish(message, output, context, retry_immediately)? {
             PreparedLegacyPublish::Complete(status) => Ok(status),
-            PreparedLegacyPublish::Network(attempt) => {
+            PreparedLegacyPublish::Network(mut attempt) => {
+                if let Some(pass) = attempt.v5_welcome.as_mut() {
+                    pass.start(&self.audit);
+                }
                 let result = self.adapter.publish(attempt.request.clone()).await;
                 self.finish_prepared_legacy_publish(*attempt, result, output)
                     .await
@@ -7136,30 +7303,13 @@ where
         };
         let mut publish_context = context.unwrap_or_default();
         publish_context.operation_id = Some(format!("publish-{msg_id_hex}"));
-        let v5_welcome_identity = if self.audit.records_v5() {
-            match &message.envelope {
-                TransportEnvelope::Welcome { recipient } => publish_context
-                    .v5_welcome_refs
-                    .iter()
-                    .find(|(id, _, _, _)| id == &msg_id_hex)
-                    .and_then(|(_, outer, op_id, group_ref)| {
-                        audit_v5::MemberRef::from_member_identity(recipient.as_slice())
-                            .ok()
-                            .map(|recipient_ref| {
-                                (
-                                    op_id.clone(),
-                                    outer.clone(),
-                                    recipient_ref,
-                                    group_ref.clone(),
-                                )
-                            })
-                    }),
-                _ => None,
-            }
-        } else {
-            None
-        };
+        let welcome_facts = self.welcome_audit_facts(&message);
         let existing_fanout = self.session.transport_fanout(&message_id)?;
+        let route_source = if existing_fanout.is_some() {
+            audit_v5::RouteSource::RetainedTarget
+        } else {
+            audit_v5::RouteSource::ResolvedInbox
+        };
         if existing_fanout
             .as_ref()
             .is_some_and(|fanout| fanout.exact_message != message)
@@ -7174,24 +7324,12 @@ where
             match self.routing.publish_target(&message) {
                 Ok(target) => target,
                 Err(e) => {
-                    if let Some((op_id, outer_event_ref, recipient_ref, group_ref)) =
-                        &v5_welcome_identity
-                    {
-                        self.audit.record_v5_event(
-                            Some(group_ref.clone()),
-                            audit_v5::Event::WelcomePublishNotStarted(
-                                audit_v5::WelcomePublishNotStarted {
-                                    op_id: op_id.clone(),
-                                    outer_event_ref: outer_event_ref.clone(),
-                                    recipient_ref: recipient_ref.clone(),
-                                    reason: audit_v5::NotStartedReason::RouteResolutionFailed,
-                                    elapsed_us: None,
-                                },
-                            ),
-                        );
-                    }
+                    self.record_v5_welcome_not_started(
+                        welcome_facts.clone(),
+                        audit_v5::NotStartedReason::RouteResolutionFailed,
+                    );
                     self.record_audit_event(
-                        None,
+                        welcome_facts.as_ref().map(|facts| &facts.group_id),
                         Some(publish_context),
                         AuditEventKind::PublishFailure {
                             msg_id: msg_id_hex,
@@ -7223,8 +7361,11 @@ where
         let target_kind = publish_target_kind(&target).to_string();
         let relay_urls = publish_target_relay_urls(&target);
         let target_group_id = publish_target_group_id(&target);
+        let audit_group_id = target_group_id
+            .clone()
+            .or_else(|| welcome_facts.as_ref().map(|facts| facts.group_id.clone()));
         self.record_audit_event(
-            target_group_id.as_ref(),
+            audit_group_id.as_ref(),
             Some(publish_context.clone()),
             AuditEventKind::PublishAttempt {
                 msg_id: msg_id_hex.clone(),
@@ -7313,6 +7454,7 @@ where
                             | TransportFanoutAttemptState::AttemptedFailed
                     )
                 });
+            self.settle_met_welcome(&message, accepted_before, required_acks);
             return Ok(PreparedLegacyPublish::Complete(PublishStatus {
                 met_required_acks: accepted_before >= required_acks.max(1),
                 accepted_by_any_endpoint: accepted_before > 0,
@@ -7330,50 +7472,13 @@ where
             .max(1)
             .min(retry_endpoints.len());
 
-        let v5_welcome = v5_welcome_identity.map(|(op_id, outer, recipient_ref, group_ref)| {
-            let ordinal = fanout
-                .targets
-                .iter()
-                .map(|t| t.attempt_count)
-                .max()
-                .unwrap_or(0)
-                .saturating_add(1);
-            let attempt_id =
-                v5_local_id(b"welcome-publish-attempt", message_id.as_slice(), ordinal);
-            (op_id, outer, attempt_id, recipient_ref, group_ref)
-        });
-        if let Some((op_id, outer, attempt_id, recipient_ref, group_ref)) = &v5_welcome
-            && let (Ok(target_count), Ok(required_acks), Ok(accepted_before_count)) = (
-                u32::try_from(retry_endpoints.len()),
-                u32::try_from(required_acks),
-                u32::try_from(accepted_before),
-            )
-        {
-            let mut targets = retry_endpoints
-                .iter()
-                .filter_map(v5_endpoint_ref)
-                .collect::<Vec<_>>();
-            targets.sort();
-            targets.dedup();
-            let targets_complete =
-                targets.len() == retry_endpoints.len() && targets.len() <= audit_v5::MAX_ENDPOINTS;
-            targets.truncate(audit_v5::MAX_ENDPOINTS);
-            self.audit.record_v5_event(
-                Some(group_ref.clone()),
-                audit_v5::Event::WelcomePublishStarted(audit_v5::WelcomePublishStarted {
-                    op_id: op_id.clone(),
-                    attempt_id: attempt_id.clone(),
-                    outer_event_ref: outer.clone(),
-                    recipient_ref: recipient_ref.clone(),
-                    route_source: audit_v5::RouteSource::Unknown,
-                    targets,
-                    target_count: Some(target_count),
-                    targets_complete,
-                    required_acks,
-                    accepted_before_count,
-                }),
-            );
-        }
+        let v5_welcome = self.v5_welcome_pass(
+            welcome_facts,
+            &retry_endpoints,
+            required_acks,
+            accepted_before,
+            route_source,
+        );
 
         Ok(PreparedLegacyPublish::Network(Box::new(
             PreparedLegacyPublishAttempt {
@@ -7389,7 +7494,7 @@ where
                 required_acks,
                 target_kind,
                 relay_urls,
-                target_group_id,
+                audit_group_id,
                 defers_remaining_fanout_until_confirmation,
                 deliver_until,
                 request: TransportPublishRequest {
@@ -7400,6 +7505,37 @@ where
                 },
             },
         )))
+    }
+
+    /// Save a publish pass's fanout bookkeeping. When that fails after the
+    /// relays answered, the pass's finished row still records their answers,
+    /// with no stored total, before the error returns.
+    fn put_pass_fanout(
+        &self,
+        fanout: &DurableTransportFanout,
+        v5_welcome: &Option<V5WelcomePass>,
+        report: Option<&TransportPublishReport>,
+        attempted: &[TransportEndpoint],
+    ) -> AccountResult<()> {
+        // Test-only fault injection (`arm_finish_stage_failure`): the write
+        // fails with transient contention.
+        let written = if self.finish_stage_failure.as_ref() == Some(&fanout.exact_message.id) {
+            Err(SessionError::from(StorageError::Busy(
+                "injected finish-stage failure".into(),
+            )))
+        } else {
+            self.session.put_transport_fanout(fanout)
+        };
+        if written.is_err() {
+            self.record_v5_welcome_publish_finished(
+                v5_welcome,
+                report,
+                attempted,
+                None,
+                fanout.required_acks,
+            );
+        }
+        Ok(written?)
     }
 
     async fn finish_prepared_legacy_publish(
@@ -7421,18 +7557,11 @@ where
             required_acks,
             target_kind,
             relay_urls,
-            target_group_id,
+            audit_group_id,
             defers_remaining_fanout_until_confirmation,
             deliver_until: _,
             request: _,
         } = attempt;
-        // Test-only fault injection (`arm_finish_stage_failure`): behaves like
-        // the durable fanout persist below failing with transient contention.
-        if self.finish_stage_failure.as_ref() == Some(&message_id) {
-            return Err(AccountError::Session(SessionError::from(
-                StorageError::Busy("injected finish-stage failure".into()),
-            )));
-        }
         // Diagnostic only: no exposure, retry or rollback decision below reads
         // it. Legacy publication's coarse durable prior-attempt records cannot
         // reconstruct a definitive earlier refusal. A crash before finish
@@ -7490,17 +7619,25 @@ where
                         }
                     }
                 }
-                self.session.put_transport_fanout(&fanout)?;
+                self.put_pass_fanout(
+                    &fanout,
+                    &v5_welcome,
+                    endpoint_report.as_ref(),
+                    &retry_endpoints,
+                )?;
+                // An earlier acceptance may already meet the policy, stored
+                // before a stop interrupted its mark.
+                self.settle_met_welcome(&fanout.exact_message, accepted_before, required_acks);
                 self.record_v5_welcome_publish_finished(
                     &v5_welcome,
                     endpoint_report.as_ref(),
                     &retry_endpoints,
-                    accepted_before,
+                    Some(accepted_before),
                     required_acks,
                 );
                 if let Some(report) = &endpoint_report {
                     self.record_audit_event(
-                        target_group_id.as_ref(),
+                        audit_group_id.as_ref(),
                         Some(publish_context.clone()),
                         AuditEventKind::PublishOutcome {
                             msg_id: msg_id_hex.clone(),
@@ -7527,7 +7664,7 @@ where
                     );
                 }
                 self.record_audit_event(
-                    target_group_id.as_ref(),
+                    audit_group_id.as_ref(),
                     Some(publish_context),
                     AuditEventKind::PublishFailure {
                         msg_id: msg_id_hex,
@@ -7575,23 +7712,26 @@ where
             &report,
             self.wall_clock.now(),
         );
-        self.session.put_transport_fanout(&fanout)?;
+        self.put_pass_fanout(&fanout, &v5_welcome, Some(&report), &retry_endpoints)?;
         let accepted_total = fanout
             .targets
             .iter()
             .filter(|target| target.state == TransportFanoutAttemptState::Accepted)
             .count();
+        let published = accepted_total >= required_acks.max(1);
+        // Whichever attempt meets a Welcome's policy marks it delivered; the
+        // finished row then reports what the mark left stored.
+        self.settle_met_welcome(&fanout.exact_message, accepted_total, required_acks);
         self.record_v5_welcome_publish_finished(
             &v5_welcome,
             Some(&report),
             &retry_endpoints,
-            accepted_total,
+            Some(accepted_total),
             required_acks,
         );
-        let published = accepted_total >= required_acks.max(1);
         let accepted_by_any_endpoint = accepted_total > 0;
         self.record_audit_event(
-            target_group_id.as_ref(),
+            audit_group_id.as_ref(),
             Some(publish_context.clone()),
             AuditEventKind::PublishOutcome {
                 msg_id: hex::encode(report.message_id.as_slice()),
@@ -7622,7 +7762,7 @@ where
         );
         if !published {
             self.record_audit_event(
-                target_group_id.as_ref(),
+                audit_group_id.as_ref(),
                 Some(publish_context),
                 AuditEventKind::PublishFailure {
                     msg_id: hex::encode(report.message_id.as_slice()),
@@ -7657,97 +7797,6 @@ where
             withdrawn: false,
             awaits_commit: false,
         })
-    }
-
-    fn record_v5_welcome_publish_finished(
-        &self,
-        identity: &Option<(
-            audit_v5::LocalId,
-            audit_v5::NostrEventRef,
-            audit_v5::LocalId,
-            audit_v5::MemberRef,
-            audit_v5::GroupRef,
-        )>,
-        report: Option<&TransportPublishReport>,
-        attempted: &[TransportEndpoint],
-        accepted_total: usize,
-        required_acks: usize,
-    ) {
-        let Some((_, outer, attempt_id, _, group_ref)) = identity else {
-            return;
-        };
-        let Ok(required_acks) = u32::try_from(required_acks) else {
-            return;
-        };
-        let mut results = Vec::new();
-        let mut source_count = 0usize;
-        if let Some(report) = report {
-            source_count = report.accepted.len() + report.failed.len();
-            for receipt in &report.accepted {
-                if let Some(endpoint_ref) = v5_endpoint_ref(&receipt.endpoint) {
-                    results.push(audit_v5::EndpointResult {
-                        endpoint_ref,
-                        status: audit_v5::EndpointStatus::Acknowledged,
-                        failure_kind: None,
-                        rejection_category: (receipt.ack_kind
-                            == Some(TransportEndpointAckKind::Duplicate))
-                        .then_some(audit_v5::RejectionCategory::Duplicate),
-                    });
-                }
-            }
-            for failure in &report.failed {
-                if let Some(result) = v5_failed_endpoint_result(failure) {
-                    results.push(result);
-                }
-            }
-        }
-        results.sort_by(|a, b| a.endpoint_ref.cmp(&b.endpoint_ref));
-        let unique = results
-            .windows(2)
-            .all(|pair| pair[0].endpoint_ref < pair[1].endpoint_ref);
-        results.dedup_by(|a, b| a.endpoint_ref == b.endpoint_ref);
-        let results_complete = report.is_some()
-            && unique
-            && results.len() == attempted.len()
-            && source_count == attempted.len()
-            && results.len() <= audit_v5::MAX_ENDPOINTS;
-        results.truncate(audit_v5::MAX_ENDPOINTS);
-        let accepted_this_attempt_count = results_complete
-            .then(|| report.and_then(|report| u32::try_from(report.accepted.len()).ok()))
-            .flatten();
-        let accepted_total_count = results_complete
-            .then(|| u32::try_from(accepted_total).ok())
-            .flatten();
-        let policy = if !results_complete {
-            audit_v5::Policy::Unknown
-        } else if accepted_total_count.is_some_and(|count| count >= required_acks) {
-            audit_v5::Policy::Met
-        } else {
-            audit_v5::Policy::Unmet
-        };
-        // This is the durable receipt boundary, before remaining fanout is
-        // finished. A met quorum does not establish that the retained
-        // obligation is terminal; later work may still be owed.
-        let retained_state = if policy == audit_v5::Policy::Met {
-            audit_v5::RetainedState::Unknown
-        } else {
-            audit_v5::RetainedState::Pending
-        };
-        self.audit.record_v5_event(
-            Some(group_ref.clone()),
-            audit_v5::Event::WelcomePublishFinished(audit_v5::WelcomePublishFinished {
-                attempt_id: attempt_id.clone(),
-                outer_event_ref: outer.clone(),
-                results,
-                results_complete,
-                accepted_this_attempt_count,
-                accepted_total_count,
-                required_acks,
-                policy,
-                retained_state,
-                elapsed_us: None,
-            }),
-        );
     }
 }
 
@@ -8358,6 +8407,25 @@ where
         &self,
         welcomes: &[TransportMessage],
     ) -> Option<cgka_traits::EventSizeClass> {
+        self.oversized_welcomes(welcomes)
+            .await
+            .into_iter()
+            .next()
+            .map(|(_, size_class)| size_class)
+    }
+}
+
+impl<A, R> WelcomeSizes<'_, A, R>
+where
+    A: TransportAdapter,
+    R: TransportRoutingPolicy,
+{
+    /// Each of `welcomes` that fits none of its inbox relays' known limits,
+    /// with its size class, in order.
+    async fn oversized_welcomes(
+        &self,
+        welcomes: &[TransportMessage],
+    ) -> Vec<(cgka_traits::MessageId, cgka_traits::EventSizeClass)> {
         // A Welcome without a route fails when it is published.
         let checks = welcomes.iter().filter_map(|welcome| {
             let target = self.routing.publish_target(welcome).ok()?;
@@ -8365,13 +8433,14 @@ where
                 self.adapter
                     .size_class_over_known_limits(welcome, &target)
                     .await
+                    .map(|size_class| (welcome.id.clone(), size_class))
             })
         });
         futures::future::join_all(checks)
             .await
             .into_iter()
             .flatten()
-            .next()
+            .collect()
     }
 }
 

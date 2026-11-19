@@ -9,6 +9,123 @@ struct OwedInviteWelcome {
     welcome: TransportMessage,
 }
 
+/// [`MockPeeler`] whose Welcomes carry what the Nostr transport gives its
+/// own: a 32-byte event id and the `nostr` source, which the runtime's v5
+/// Welcome audit rows reference.
+struct NostrWelcomePeeler(MockPeeler);
+
+#[async_trait]
+impl TransportPeeler for NostrWelcomePeeler {
+    async fn wrap_group_recovery(
+        &self,
+        message: &cgka_traits::GroupRecoveryMessage,
+        recipient: &MemberId,
+    ) -> Result<TransportMessage, PeelerError> {
+        self.0.wrap_group_recovery(message, recipient).await
+    }
+
+    async fn peel_group_message(
+        &self,
+        msg: &cgka_traits::peeler::PreparedGroupMessage<'_>,
+        ctx: &GroupContextSnapshot,
+    ) -> Result<PeeledMessage, PeelerError> {
+        self.0.peel_group_message(msg, ctx).await
+    }
+
+    async fn peel_welcome(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
+        self.0.peel_welcome(msg).await
+    }
+
+    async fn wrap_group_message(
+        &self,
+        payload: &EncryptedPayload,
+        ctx: &GroupContextSnapshot,
+    ) -> Result<TransportMessage, PeelerError> {
+        self.0.wrap_group_message(payload, ctx).await
+    }
+
+    async fn wrap_welcome(
+        &self,
+        payload: &EncryptedPayload,
+        recipient: &MemberId,
+    ) -> Result<TransportMessage, PeelerError> {
+        use sha2::{Digest, Sha256};
+
+        let mut welcome = self.0.wrap_welcome(payload, recipient).await?;
+        welcome.id = MessageId::new(Sha256::digest(welcome.id.as_slice()).to_vec());
+        welcome.source = TransportSource("nostr".into());
+        Ok(welcome)
+    }
+}
+
+/// [`session`] wrapping its Welcomes as [`NostrWelcomePeeler`] does.
+fn nostr_welcome_session(
+    path: impl Into<std::path::PathBuf>,
+    key: &SqlCipherKey,
+    identity: &[u8],
+) -> AccountDeviceSession {
+    AccountDeviceSession::open(
+        SessionConfig::new(
+            path,
+            SqlCipherKey::new(key.as_secret_str()).unwrap(),
+            pad32(identity),
+            Box::new(NostrWelcomePeeler(MockPeeler)),
+        )
+        .legacy_compatibility_profile()
+        .account_identity_proof_signer(Arc::new(NostrAccountIdentityProofSigner {
+            keys: deterministic_nostr_keys(identity),
+        }))
+        .feature_registry(FeatureRegistry::new())
+        .supported_app_components(default_group_components()),
+    )
+    .unwrap()
+}
+
+/// [`current_session`] wrapping its Welcomes as [`NostrWelcomePeeler`] does.
+fn current_nostr_welcome_session(
+    path: impl Into<std::path::PathBuf>,
+    key: &SqlCipherKey,
+    identity: &[u8],
+) -> AccountDeviceSession {
+    AccountDeviceSession::open(current_nostr_welcome_config(path, key, identity)).unwrap()
+}
+
+/// [`deferred_current_session`] wrapping its Welcomes as
+/// [`NostrWelcomePeeler`] does.
+fn deferred_current_nostr_welcome_session(
+    path: impl Into<std::path::PathBuf>,
+    key: &SqlCipherKey,
+    identity: &[u8],
+) -> AccountDeviceSession {
+    AccountDeviceSession::open(
+        current_nostr_welcome_config(path, key, identity).defer_group_hydration(),
+    )
+    .unwrap()
+}
+
+fn current_nostr_welcome_config(
+    path: impl Into<std::path::PathBuf>,
+    key: &SqlCipherKey,
+    identity: &[u8],
+) -> SessionConfig {
+    SessionConfig::new(
+        path,
+        SqlCipherKey::new(key.as_secret_str()).unwrap(),
+        pad32(identity),
+        Box::new(NostrWelcomePeeler(MockPeeler)),
+    )
+    .account_identity_proof_signer(Arc::new(NostrAccountIdentityProofSigner {
+        keys: deterministic_nostr_keys(identity),
+    }))
+    .protocol_profile(ProtocolProfile::Current)
+}
+
+/// Where the owed-invite fixture's runtime records its v5 audit, from before
+/// the invite.
+fn owed_invite_audit_path(dir: &std::path::Path) -> std::path::PathBuf {
+    dir.join("owed-invite-audit-v5.jsonl")
+}
+
 /// Alice invites carol into a confirmed group. The relay accepts the commit
 /// but not carol's Welcome, so the Welcome stays owed with a retry record.
 async fn owed_invite_welcome(dir: &std::path::Path) -> OwedInviteWelcome {
@@ -21,10 +138,40 @@ async fn owed_invite_welcome_through(
     dir: &std::path::Path,
     adapter: RecordingAdapter,
 ) -> OwedInviteWelcome {
+    adapter.accept_next(1);
+    adapter.accept_next(0);
+    let (invited, effects) = invite_carol_through(
+        dir,
+        adapter,
+        vec![TransportEndpoint("wss://carol-inbox.example".into())],
+    )
+    .await;
+    assert_eq!(effects.welcome_failures.len(), 1);
+    assert_eq!(invited.welcome.id, effects.welcome_failures[0].message_id);
+    assert!(
+        invited
+            .runtime
+            .session()
+            .transport_fanout(&invited.welcome.id)
+            .unwrap()
+            .is_some(),
+        "the failed Welcome keeps a retry record"
+    );
+    invited
+}
+
+/// Alice invites carol, whose inbox relays are `carol_inboxes`, into a
+/// confirmed group, through `adapter` as scripted; the runtime records its v5
+/// audit at [`owed_invite_audit_path`] from before the invite.
+async fn invite_carol_through(
+    dir: &std::path::Path,
+    adapter: RecordingAdapter,
+    carol_inboxes: Vec<TransportEndpoint>,
+) -> (OwedInviteWelcome, AccountDeviceEffects) {
     let key = SqlCipherKey::new("marmot welcome withdrawal key").unwrap();
-    let mut alice = session(dir.join("alice.sqlite"), &key, b"alice-withdrawal");
-    let mut bob = session(dir.join("bob.sqlite"), &key, b"bob-withdrawal");
-    let mut carol = session(dir.join("carol.sqlite"), &key, b"carol-withdrawal");
+    let mut alice = nostr_welcome_session(dir.join("alice.sqlite"), &key, b"alice-withdrawal");
+    let mut bob = nostr_welcome_session(dir.join("bob.sqlite"), &key, b"bob-withdrawal");
+    let mut carol = nostr_welcome_session(dir.join("carol.sqlite"), &key, b"carol-withdrawal");
     let carol_id = carol.self_id();
     let created = alice
         .create_group(CreateGroupRequest {
@@ -44,8 +191,6 @@ async fn owed_invite_welcome_through(
     alice.confirm_published(create_pending).await.unwrap();
     let group_id = created.group_id;
 
-    adapter.accept_next(1);
-    adapter.accept_next(0);
     let policy =
         StaticTransportRouting::new(vec![TransportEndpoint("wss://alice-inbox.example".into())])
             .with_group_route(
@@ -53,10 +198,7 @@ async fn owed_invite_welcome_through(
                 group_id.as_slice().to_vec(),
                 vec![TransportEndpoint("wss://group.example".into())],
             )
-            .with_inbox_route(
-                carol_id,
-                vec![TransportEndpoint("wss://carol-inbox.example".into())],
-            );
+            .with_inbox_route(carol_id, carol_inboxes);
     let wall = Arc::new(TestWallClock::new(300_000));
     let mut runtime = AccountDeviceRuntime::new(
         alice,
@@ -69,11 +211,20 @@ async fn owed_invite_welcome_through(
         Arc::new(TestMonotonicClock::default()),
         Arc::new(TestRandom::new(0)),
     );
+    runtime
+        .audit_recorder()
+        .swap(v5_audit_recorder(&owed_invite_audit_path(dir)));
 
     let effects = runtime
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
-            key_packages: vec![carol.fresh_key_package().await.unwrap()],
+            // As fetched from a relay, so its Welcome names the publication.
+            key_packages: vec![cgka_traits::engine::KeyPackage {
+                source: Some(cgka_traits::engine::KeyPackageSource {
+                    event_id: MessageId::new(vec![0x77; 32]),
+                }),
+                ..carol.fresh_key_package().await.unwrap()
+            }],
             initial_admins: Vec::new(),
         })
         .await
@@ -82,26 +233,19 @@ async fn owed_invite_welcome_through(
         effects.pending.as_slice(),
         [PendingResolution::Confirmed { .. }]
     ));
-    assert_eq!(effects.welcome_failures.len(), 1);
     let welcome = welcome_publishes(&adapter)
         .pop()
         .expect("the first pass tried carol's Welcome");
-    assert_eq!(welcome.id, effects.welcome_failures[0].message_id);
-    assert!(
-        runtime
-            .session()
-            .transport_fanout(&welcome.id)
-            .unwrap()
-            .is_some(),
-        "the failed Welcome keeps a retry record"
-    );
-    OwedInviteWelcome {
-        runtime,
-        adapter,
-        wall,
-        group_id,
-        welcome,
-    }
+    (
+        OwedInviteWelcome {
+            runtime,
+            adapter,
+            wall,
+            group_id,
+            welcome,
+        },
+        effects,
+    )
 }
 
 fn welcome_publishes(adapter: &RecordingAdapter) -> Vec<TransportMessage> {
@@ -400,7 +544,8 @@ async fn withdrawal_reports_a_delivered_welcome_and_refuses_other_messages() {
 }
 
 /// A Welcome withdrawn after a detached startup retry was prepared, but
-/// before the task runs, never reaches the relay.
+/// before the task runs, never reaches the relay. Its audit records no start
+/// for that attempt, since no relay was called, and records the withdrawal.
 #[tokio::test]
 async fn detached_startup_retry_skips_a_welcome_withdrawn_before_it_runs() {
     let dir = relaxed_storage_dir().unwrap();
@@ -408,8 +553,8 @@ async fn detached_startup_retry_skips_a_welcome_withdrawn_before_it_runs() {
         mut runtime,
         adapter,
         wall,
+        group_id,
         welcome,
-        ..
     } = owed_invite_welcome(dir.path()).await;
     adapter.accept_only_endpoints(vec![
         TransportEndpoint("wss://group.example".into()),
@@ -444,6 +589,20 @@ async fn detached_startup_retry_skips_a_welcome_withdrawn_before_it_runs() {
             .is_none()
     );
     assert_eq!(welcome_publishes(&adapter).len(), tried);
+    // The audit shows the first pass, no start for the attempt the
+    // withdrawal stopped before any relay was called, and the withdrawal.
+    let rows = welcome_rows(dir.path(), &welcome, &group_id);
+    assert_eq!(
+        kinds(&rows),
+        [
+            "welcome_prepared",
+            "welcome_publish_started",
+            "welcome_publish_finished",
+            "welcome_withdrawn",
+        ]
+    );
+    assert_eq!(rows[3]["event"]["reason"], "withdrawn");
+    assert_eq!(rows[3]["event"]["oversized_size_class"], serde_json::Value::Null);
 }
 
 /// A Welcome withdrawn while a detached startup retry runs is skipped if it
@@ -619,7 +778,11 @@ async fn welcome_is_withdrawn_before_its_group_is_hydrated() {
             Arc::new(TestRandom::new(0)),
         )
     };
-    let mut runtime = open(current_session(&database, &key, b"alice-unhydrated"));
+    let mut runtime = open(current_nostr_welcome_session(
+        &database,
+        &key,
+        b"alice-unhydrated",
+    ));
     let (group_id, created) = runtime
         .create_group(CreateGroupRequest {
             name: "unhydrated withdrawal".into(),
@@ -638,11 +801,15 @@ async fn welcome_is_withdrawn_before_its_group_is_hydrated() {
     drop(runtime);
 
     adapter.accept_only_endpoints(vec![bob_inbox]);
-    let mut runtime = open(deferred_current_session(
+    let mut runtime = open(deferred_current_nostr_welcome_session(
         &database,
         &key,
         b"alice-unhydrated",
     ));
+    let withdrawn_audit = dir.path().join("withdrawn-audit-v5.jsonl");
+    runtime
+        .audit_recorder()
+        .swap(v5_audit_recorder(&withdrawn_audit));
     assert_eq!(
         runtime.session().unhydrated_group_ids(),
         vec![group_id.clone()]
@@ -681,10 +848,27 @@ async fn welcome_is_withdrawn_before_its_group_is_hydrated() {
     assert_eq!(runtime.session().unhydrated_group_ids(), vec![group_id]);
     drop(runtime);
 
-    let mut runtime = open(current_session(&database, &key, b"alice-unhydrated"));
+    let mut runtime = open(current_nostr_welcome_session(
+        &database,
+        &key,
+        b"alice-unhydrated",
+    ));
+    let reopened_audit = dir.path().join("reopened-audit-v5.jsonl");
+    runtime
+        .audit_recorder()
+        .swap(v5_audit_recorder(&reopened_audit));
     assert!(runtime.outstanding_welcome_deliveries().unwrap().is_empty());
     runtime.run_due_maintenance().await.unwrap();
     assert_eq!(welcome_publishes(&adapter).len(), 1);
+    // The withdrawal is audited once, where it happened, though no watch
+    // held the Welcome then.
+    let withdrawals = [&withdrawn_audit, &reopened_audit]
+        .into_iter()
+        .flat_map(|path| v5_audit_rows(path))
+        .filter(|row| row["event"]["type"] == "welcome_withdrawn")
+        .collect::<Vec<_>>();
+    assert_eq!(withdrawals.len(), 1, "{withdrawals:?}");
+    assert_eq!(withdrawals[0]["event"]["reason"], "withdrawn");
 }
 
 /// mdk#2628 D40: a device link's Welcome is never published from its delivery
@@ -791,4 +975,347 @@ async fn a_link_welcome_is_never_published_from_its_deadline_on() {
             .is_none(),
         "maintenance drops the expired Welcome's retry record"
     );
+}
+
+/// A device link's Welcome that expires while this process watches it is
+/// audited once, as `expired`. A later start that reads it from the store,
+/// already expired, adds no row: it settled before that process watched it.
+/// Nor does the link's cleanup withdrawing it after its expiry was recorded.
+#[tokio::test]
+async fn an_expired_link_welcome_is_audited_once_across_restarts() {
+    let dir = relaxed_storage_dir().unwrap();
+    let key = SqlCipherKey::new("marmot expired link audit key").unwrap();
+    let alice_path = dir.path().join("alice.sqlite");
+    let mut alice = current_nostr_welcome_session(&alice_path, &key, b"alice-expired-link");
+    let mut bob =
+        current_nostr_welcome_session(dir.path().join("bob.sqlite"), &key, b"bob-expired-link");
+    let bob_id = bob.self_id();
+    let chosen = GroupId::new(vec![0x43; 16]);
+    let created = alice
+        .create_group_with_chosen_id_and_audit_context(
+            CreateGroupRequest {
+                name: String::new(),
+                description: String::new(),
+                members: vec![bob.fresh_key_package().await.unwrap()],
+                required_features: Vec::new(),
+                app_components: Vec::new(),
+                initial_admins: Vec::new(),
+            },
+            chosen.clone(),
+            None,
+            Timestamp(300_100),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+    let welcome = match &created.effects.publish[0] {
+        PublishWork::FoundingGroupCreated { welcomes } => welcomes[0].clone(),
+        other => panic!("expected FoundingGroupCreated publish work, got {other:?}"),
+    };
+    drop(alice);
+    let policy =
+        StaticTransportRouting::new(vec![TransportEndpoint("wss://alice-inbox.example".into())])
+            .with_group_route(
+                chosen.clone(),
+                chosen.as_slice().to_vec(),
+                vec![TransportEndpoint("wss://group.example".into())],
+            )
+            .with_inbox_route(
+                bob_id,
+                vec![TransportEndpoint("wss://bob-inbox.example".into())],
+            );
+    let withdrawn = |path: &std::path::Path| {
+        v5_audit_rows(path)
+            .into_iter()
+            .filter(|row| row["event"]["type"] == "welcome_withdrawn")
+            .collect::<Vec<_>>()
+    };
+
+    // Owed and watched, unreachable until its deadline passes.
+    let start = |at: u64, audit: &std::path::Path| {
+        let adapter = RecordingAdapter::default();
+        adapter.accept_only_endpoints(Vec::new());
+        let runtime = AccountDeviceRuntime::new(
+            current_nostr_welcome_session(&alice_path, &key, b"alice-expired-link"),
+            adapter,
+            policy.clone(),
+            RecordingKeyPackages::default(),
+        )
+        .with_maintenance_sources(
+            Arc::new(TestWallClock::new(at)),
+            Arc::new(TestMonotonicClock::default()),
+            Arc::new(TestRandom::new(0)),
+        );
+        runtime.audit_recorder().swap(v5_audit_recorder(audit));
+        runtime
+    };
+    let first_audit = dir.path().join("first-audit-v5.jsonl");
+    let mut first = start(300_000, &first_audit);
+    first.run_due_maintenance().await.unwrap();
+    assert!(withdrawn(&first_audit).is_empty(), "still owed");
+    let wall = Arc::new(TestWallClock::new(300_200));
+    first = first.with_maintenance_sources(
+        wall,
+        Arc::new(TestMonotonicClock::default()),
+        Arc::new(TestRandom::new(0)),
+    );
+    first.run_due_maintenance().await.unwrap();
+    let rows = withdrawn(&first_audit);
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0]["event"]["reason"], "expired");
+    first.withdraw_welcome(&welcome.id).unwrap();
+    assert_eq!(withdrawn(&first_audit).len(), 1, "expired, then withdrawn");
+    assert_eq!(
+        rows[0]["event"]["outer_event_ref"],
+        marmot_forensics::v5::NostrEventRef::from_validated_event_id(
+            &<[u8; 32]>::try_from(welcome.id.as_slice()).unwrap()
+        )
+        .as_str()
+    );
+    drop(first);
+
+    let second_audit = dir.path().join("second-audit-v5.jsonl");
+    let mut second = start(300_300, &second_audit);
+    second.run_due_maintenance().await.unwrap();
+    assert!(withdrawn(&second_audit).is_empty(), "already settled at start");
+}
+
+/// A device link's Welcome, owed to bob until its deadline at 300_100, and
+/// the runtime at 300_000 that owes it, recording its v5 audit.
+struct LinkWelcome {
+    runtime: WithdrawalRuntime,
+    wall: Arc<TestWallClock>,
+    welcome: TransportMessage,
+    audit_path: std::path::PathBuf,
+}
+
+/// Alice creates a group with bob whose founding Welcome carries a device
+/// link's delivery deadline, 300_100. Bob's inbox relay accepts it only when
+/// `bob_accepts`.
+async fn link_welcome(dir: &std::path::Path, bob_accepts: bool) -> LinkWelcome {
+    let key = SqlCipherKey::new("marmot link deadline pass key").unwrap();
+    let mut alice = current_nostr_welcome_session(dir.join("alice.sqlite"), &key, b"alice-pass");
+    let mut bob = current_nostr_welcome_session(dir.join("bob.sqlite"), &key, b"bob-pass");
+    let bob_id = bob.self_id();
+    let bob_inbox = TransportEndpoint("wss://bob-inbox.example".into());
+    let chosen = GroupId::new(vec![0x44; 16]);
+    let created = alice
+        .create_group_with_chosen_id_and_audit_context(
+            CreateGroupRequest {
+                name: String::new(),
+                description: String::new(),
+                members: vec![bob.fresh_key_package().await.unwrap()],
+                required_features: Vec::new(),
+                app_components: Vec::new(),
+                initial_admins: Vec::new(),
+            },
+            chosen.clone(),
+            None,
+            Timestamp(300_100),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+    let welcome = match &created.effects.publish[0] {
+        PublishWork::FoundingGroupCreated { welcomes } => welcomes[0].clone(),
+        other => panic!("expected FoundingGroupCreated publish work, got {other:?}"),
+    };
+    let adapter = RecordingAdapter::default();
+    adapter.accept_only_endpoints(if bob_accepts {
+        vec![bob_inbox.clone()]
+    } else {
+        Vec::new()
+    });
+    let policy =
+        StaticTransportRouting::new(vec![TransportEndpoint("wss://alice-inbox.example".into())])
+            .with_group_route(
+                chosen.clone(),
+                chosen.as_slice().to_vec(),
+                vec![TransportEndpoint("wss://group.example".into())],
+            )
+            .with_inbox_route(bob_id, vec![bob_inbox]);
+    let wall = Arc::new(TestWallClock::new(300_000));
+    let runtime = AccountDeviceRuntime::new(alice, adapter, policy, RecordingKeyPackages::default())
+        .with_maintenance_sources(
+            wall.clone(),
+            Arc::new(TestMonotonicClock::default()),
+            Arc::new(TestRandom::new(0)),
+        );
+    let audit_path = dir.join("link-pass-audit-v5.jsonl");
+    runtime
+        .audit_recorder()
+        .swap(v5_audit_recorder(&audit_path));
+    LinkWelcome {
+        runtime,
+        wall,
+        welcome,
+        audit_path,
+    }
+}
+
+/// A pass that starts before a device link's Welcome deadline and fails after
+/// it does not report the Welcome pending: it has expired, so its retention
+/// is unknown.
+#[tokio::test]
+async fn a_pass_that_fails_after_the_link_deadline_does_not_report_the_welcome_pending() {
+    let dir = relaxed_storage_dir().unwrap();
+    let LinkWelcome {
+        mut runtime,
+        wall,
+        welcome,
+        audit_path,
+    } = link_welcome(dir.path(), false).await;
+
+    let task = runtime
+        .prepare_welcome_retry_task_with_audit_context(vec![welcome.clone()], Default::default())
+        .unwrap();
+    wall.set(300_050);
+    let completed = task.run().await;
+    wall.set(300_200);
+    runtime.finish_welcome_publish_task(completed).await.unwrap();
+
+    let finished = v5_audit_rows(&audit_path)
+        .into_iter()
+        .find(|row| row["event"]["type"] == "welcome_publish_finished")
+        .expect("the pass started before the deadline");
+    assert_eq!(finished["event"]["policy"], "unmet", "{finished}");
+    assert_eq!(finished["event"]["retained_state"], "unknown", "{finished}");
+}
+
+/// A pass that starts before a device link's Welcome deadline and is
+/// acknowledged after it delivers the Welcome. Maintenance that runs past the
+/// deadline while the pass is out records no expiry, and the pass reports
+/// the Welcome completed.
+#[tokio::test]
+async fn a_pass_acknowledged_after_the_link_deadline_delivers_the_welcome() {
+    let dir = relaxed_storage_dir().unwrap();
+    let LinkWelcome {
+        mut runtime,
+        wall,
+        welcome,
+        audit_path,
+    } = link_welcome(dir.path(), true).await;
+    let task = runtime
+        .prepare_welcome_retry_task_with_audit_context(vec![welcome.clone()], Default::default())
+        .unwrap();
+    // Watched from before the deadline; the pass holds it.
+    runtime.run_due_maintenance().await.unwrap();
+    wall.set(300_050);
+    let completed = task.run().await;
+
+    wall.set(300_200);
+    runtime.run_due_maintenance().await.unwrap();
+    runtime.finish_welcome_publish_task(completed).await.unwrap();
+    wall.set(300_300);
+    runtime.run_due_maintenance().await.unwrap();
+
+    let rows = v5_audit_rows(&audit_path);
+    assert!(
+        rows.iter()
+            .all(|row| row["event"]["type"] != "welcome_withdrawn"),
+        "{rows:?}"
+    );
+    let finished = rows
+        .iter()
+        .find(|row| row["event"]["type"] == "welcome_publish_finished")
+        .expect("the pass started before the deadline");
+    assert_eq!(finished["event"]["policy"], "met", "{finished}");
+    assert_eq!(finished["event"]["retained_state"], "completed", "{finished}");
+    assert_eq!(
+        runtime.withdraw_welcome(&welcome.id).unwrap(),
+        WelcomeWithdrawal::AlreadyDelivered
+    );
+}
+
+/// A device link's Welcome whose relays accepted it before its deadline,
+/// saved before a stop interrupted its delivered mark, is delivered by the
+/// first maintenance pass after the deadline: the acceptance is reconciled
+/// before the expired Welcome's retry record goes, and no expiry is recorded.
+#[tokio::test]
+async fn a_saved_acceptance_outlives_the_link_deadline() {
+    let dir = relaxed_storage_dir().unwrap();
+    let LinkWelcome {
+        mut runtime,
+        wall,
+        welcome,
+        audit_path,
+    } = link_welcome(dir.path(), false).await;
+    // The first pass fails, leaving a retry record.
+    runtime.run_due_maintenance().await.unwrap();
+    let mut fanout = runtime
+        .session()
+        .transport_fanout(&welcome.id)
+        .unwrap()
+        .expect("the failed pass keeps a retry record");
+    for target in &mut fanout.targets {
+        target.state = cgka_traits::TransportFanoutAttemptState::Accepted;
+    }
+    runtime.session().put_transport_fanout(&fanout).unwrap();
+
+    wall.set(300_200);
+    runtime.run_due_maintenance().await.unwrap();
+
+    assert_eq!(
+        runtime.withdraw_welcome(&welcome.id).unwrap(),
+        WelcomeWithdrawal::AlreadyDelivered
+    );
+    let rows = v5_audit_rows(&audit_path);
+    assert!(
+        rows.iter()
+            .all(|row| row["event"]["type"] != "welcome_withdrawn"),
+        "{rows:?}"
+    );
+}
+
+/// A device link's cleanup that withdraws its Welcome after the deadline,
+/// before the watcher has recorded the expiry, records it once, as
+/// `expired`: the deadline is why it was never delivered. One whose relays
+/// already accepted it, the mark interrupted, is delivered instead: the
+/// withdrawal finds nothing to stop and nothing is recorded withdrawn.
+#[tokio::test]
+async fn a_link_welcome_withdrawn_after_its_deadline_is_audited_as_expired() {
+    for accepted in [false, true] {
+        let dir = relaxed_storage_dir().unwrap();
+        let LinkWelcome {
+            mut runtime,
+            wall,
+            welcome,
+            audit_path,
+        } = link_welcome(dir.path(), false).await;
+        // Watched; its first pass fails.
+        runtime.run_due_maintenance().await.unwrap();
+        if accepted {
+            let mut fanout = runtime
+                .session()
+                .transport_fanout(&welcome.id)
+                .unwrap()
+                .unwrap();
+            for target in &mut fanout.targets {
+                target.state = cgka_traits::TransportFanoutAttemptState::Accepted;
+            }
+            runtime.session().put_transport_fanout(&fanout).unwrap();
+        }
+
+        wall.set(300_200);
+        assert_eq!(
+            runtime.withdraw_welcome(&welcome.id).unwrap(),
+            if accepted {
+                WelcomeWithdrawal::AlreadyDelivered
+            } else {
+                WelcomeWithdrawal::Withdrawn
+            }
+        );
+        runtime.run_due_maintenance().await.unwrap();
+
+        let rows = v5_audit_rows(&audit_path)
+            .into_iter()
+            .filter(|row| row["event"]["type"] == "welcome_withdrawn")
+            .collect::<Vec<_>>();
+        if accepted {
+            assert!(rows.is_empty(), "{rows:?}");
+        } else {
+            assert_eq!(rows.len(), 1, "{rows:?}");
+            assert_eq!(rows[0]["event"]["reason"], "expired");
+        }
+    }
 }

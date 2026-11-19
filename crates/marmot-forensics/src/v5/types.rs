@@ -147,6 +147,49 @@ pub enum RetainedState {
     Unknown,
 }
 
+/// Why a retained Welcome will never be published.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WithdrawalReason {
+    /// Withdrawn by its sender, or retired with its staged commit when that
+    /// commit was rolled back.
+    Withdrawn,
+    /// Its commit lost to another branch, so the group never reached the
+    /// epoch the Welcome joins.
+    CommitSuperseded,
+    /// Its delivery deadline passed before a relay took it.
+    Expired,
+    /// Refused unsent: the Welcome fits none of its inbox relays' known
+    /// size limits.
+    WelcomeTooLarge,
+    /// Refused unsent: its commit fits none of its group relays' known
+    /// size limits.
+    CommitTooLarge,
+}
+
+/// An event's serialized size, in the buckets relay limits fall on: the
+/// bucket's lower bound is inclusive, its upper bound exclusive.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EventSizeClass {
+    #[serde(rename = "under_64_kib")]
+    Under64Kib,
+    #[serde(rename = "from_64_to_128_kib")]
+    From64To128Kib,
+    #[serde(rename = "from_128_to_256_kib")]
+    From128To256Kib,
+    #[serde(rename = "from_256_to_512_kib")]
+    From256To512Kib,
+    #[serde(rename = "from_512_kib_to_1_mib")]
+    From512KibTo1Mib,
+    #[serde(rename = "from_1_to_2_mib")]
+    From1To2Mib,
+    #[serde(rename = "from_2_to_4_mib")]
+    From2To4Mib,
+    #[serde(rename = "over_4_mib")]
+    Over4Mib,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NotStartedReason {
@@ -474,6 +517,28 @@ pub struct WelcomePublishNotStarted {
     pub elapsed_us: Option<U64String>,
 }
 
+/// A retained Welcome that will never be published, and why.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WelcomeWithdrawn {
+    pub op_id: LocalId,
+    pub outer_event_ref: NostrEventRef,
+    pub recipient_ref: MemberRef,
+    pub reason: WithdrawalReason,
+    /// The oversized artifact's size, for a too-large reason only.
+    #[serde(deserialize_with = "nullable")]
+    pub oversized_size_class: Option<EventSizeClass>,
+}
+
+/// The size of a retained Welcome's outer event as its transport sends it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WelcomeEventSize {
+    pub op_id: LocalId,
+    pub outer_event_ref: NostrEventRef,
+    pub event_size_class: EventSizeClass,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WelcomeObserved {
@@ -654,6 +719,8 @@ pub enum Event {
     WelcomePublishStarted(WelcomePublishStarted),
     WelcomePublishFinished(WelcomePublishFinished),
     WelcomePublishNotStarted(WelcomePublishNotStarted),
+    WelcomeWithdrawn(WelcomeWithdrawn),
+    WelcomeEventSize(WelcomeEventSize),
     WelcomeObserved(WelcomeObserved),
     WelcomeUnwrapped(WelcomeUnwrapped),
     WelcomeJoinFinished(WelcomeJoinFinished),
@@ -675,6 +742,8 @@ enum WelcomeEvent {
     WelcomePublishStarted(WelcomePublishStarted),
     WelcomePublishFinished(WelcomePublishFinished),
     WelcomePublishNotStarted(WelcomePublishNotStarted),
+    WelcomeWithdrawn(WelcomeWithdrawn),
+    WelcomeEventSize(WelcomeEventSize),
     WelcomeObserved(WelcomeObserved),
     WelcomeUnwrapped(WelcomeUnwrapped),
     WelcomeJoinFinished(WelcomeJoinFinished),
@@ -700,6 +769,8 @@ impl Serialize for Event {
             Event::WelcomePublishStarted(e) => WelcomeEvent::WelcomePublishStarted(e.clone()),
             Event::WelcomePublishFinished(e) => WelcomeEvent::WelcomePublishFinished(e.clone()),
             Event::WelcomePublishNotStarted(e) => WelcomeEvent::WelcomePublishNotStarted(e.clone()),
+            Event::WelcomeWithdrawn(e) => WelcomeEvent::WelcomeWithdrawn(e.clone()),
+            Event::WelcomeEventSize(e) => WelcomeEvent::WelcomeEventSize(e.clone()),
             Event::WelcomeObserved(e) => WelcomeEvent::WelcomeObserved(e.clone()),
             Event::WelcomeUnwrapped(e) => WelcomeEvent::WelcomeUnwrapped(e.clone()),
             Event::WelcomeJoinFinished(e) => WelcomeEvent::WelcomeJoinFinished(e.clone()),
@@ -733,6 +804,8 @@ impl<'de> Deserialize<'de> for Event {
                 | "welcome_publish_started"
                 | "welcome_publish_finished"
                 | "welcome_publish_not_started"
+                | "welcome_withdrawn"
+                | "welcome_event_size"
                 | "welcome_observed"
                 | "welcome_unwrapped"
                 | "welcome_join_finished"
@@ -752,6 +825,8 @@ impl<'de> Deserialize<'de> for Event {
                 WelcomeEvent::WelcomePublishStarted(e) => Event::WelcomePublishStarted(e),
                 WelcomeEvent::WelcomePublishFinished(e) => Event::WelcomePublishFinished(e),
                 WelcomeEvent::WelcomePublishNotStarted(e) => Event::WelcomePublishNotStarted(e),
+                WelcomeEvent::WelcomeWithdrawn(e) => Event::WelcomeWithdrawn(e),
+                WelcomeEvent::WelcomeEventSize(e) => Event::WelcomeEventSize(e),
                 WelcomeEvent::WelcomeObserved(e) => Event::WelcomeObserved(e),
                 WelcomeEvent::WelcomeUnwrapped(e) => Event::WelcomeUnwrapped(e),
                 WelcomeEvent::WelcomeJoinFinished(e) => Event::WelcomeJoinFinished(e),

@@ -4406,3 +4406,76 @@ async fn inbound_commit_at_the_live_epoch_takes_the_convergence_door() {
         commit_source_epoch
     );
 }
+
+/// A Welcome whose commit lost terminally reads as superseded, before and
+/// after convergence retires its row; one its sender withdrew still reads as
+/// withdrawn. The sender's audit names the reason
+/// from this status.
+#[tokio::test]
+async fn a_welcome_retired_with_its_lost_commit_reads_as_superseded() {
+    use cgka_engine::engine::{OutboundWelcomeStatus, WelcomeSettlement};
+
+    let (mut x, x_storage) = build_client_with_storage(b"sup-x");
+    let mut y = build_client(b"sup-y");
+    let mut david = build_client(b"sup-david");
+    let mut erin = build_client(b"sup-erin");
+    let (group_id, create) = x
+        .create_group(CreateGroupRequest {
+            name: "superseded-welcome".into(),
+            description: String::new(),
+            members: vec![y.fresh_key_package().await.unwrap()],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let SendResult::GroupCreated { pending, .. } = create else {
+        unreachable!()
+    };
+    x.confirm_published(pending).await.unwrap();
+    let mut invite = async |key_package| match x
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![key_package],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::GroupEvolution {
+            msg,
+            pending,
+            mut welcomes,
+        } => {
+            x.confirm_published(pending).await.unwrap();
+            (msg, welcomes.remove(0))
+        }
+        _ => unreachable!(),
+    };
+    let (lost_commit, lost) = invite(david.fresh_key_package().await.unwrap()).await;
+    let (_, withdrawn) = invite(erin.fresh_key_package().await.unwrap()).await;
+    let status = |id: &MessageId, now| x.outbound_welcome_status(id, Timestamp(now)).unwrap();
+    assert!(matches!(
+        status(&lost.id, 0),
+        OutboundWelcomeStatus::Owed { .. }
+    ));
+
+    // What the convergence transaction writes when it terminally invalidates
+    // an own commit: the commit first, then its undelivered Welcome.
+    x_storage
+        .update_message_state(&lost_commit.id, MessageState::EpochInvalidated)
+        .unwrap();
+    let superseded = OutboundWelcomeStatus::Settled(WelcomeSettlement::CommitSuperseded);
+    assert_eq!(status(&lost.id, 0), superseded);
+    x_storage
+        .update_message_state(&lost.id, MessageState::Failed)
+        .unwrap();
+    assert_eq!(status(&lost.id, 0), superseded);
+
+    x.withdraw_sent_welcome(&withdrawn.id).unwrap();
+    assert_eq!(
+        status(&withdrawn.id, 0),
+        OutboundWelcomeStatus::Settled(WelcomeSettlement::Withdrawn)
+    );
+}

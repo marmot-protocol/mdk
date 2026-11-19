@@ -28,8 +28,11 @@ use tls_codec::Serialize as _;
 /// A staged Commit's Welcome wrapped for one added KeyPackage, not yet
 /// recorded ([`Engine::wrap_staged_welcomes`]).
 pub(crate) struct WrappedWelcome {
-    message: TransportMessage,
-    key_package_ref: Vec<u8>,
+    pub(super) message: TransportMessage,
+    pub(super) key_package_ref: Vec<u8>,
+    /// The transport event of the KeyPackage it answers, when it came from
+    /// one.
+    pub(super) key_package_event_id: Option<MessageId>,
 }
 const MAX_RECOVERY_MEMBERS: usize = 32;
 
@@ -768,6 +771,10 @@ impl<S: StorageProvider> Engine<S> {
                 key_package_ref: crate::key_package::key_package_ref(parsed_kp)?
                     .as_slice()
                     .to_vec(),
+                key_package_event_id: source_kp
+                    .source
+                    .as_ref()
+                    .map(|source| source.event_id.clone()),
             });
         }
         Ok(welcomes)
@@ -788,15 +795,15 @@ impl<S: StorageProvider> Engine<S> {
         welcomes
             .into_iter()
             .map(|welcome| {
+                let message = welcome.message.clone();
                 self.persist_staged_invite_welcome(
-                    &welcome.message,
+                    welcome,
                     commit_id,
-                    welcome.key_package_ref,
                     deliver_until,
                     group_id,
                     source_epoch,
                 )?;
-                Ok(welcome.message)
+                Ok(message)
             })
             .collect()
     }

@@ -76,12 +76,26 @@ It must not own MLS internals, transport event parsing, SQLCipher key derivation
     record a deciding device makes after a failed link's undo (mdk#2761) goes only through `record_removed_slot`, as
     `SendIntent::RecordRemovedSlot`, which the engine never queues or re-issues. A slot the merged roster already
     holds, as a device or a rejected slot, is left out: a rejection never replaces an entry.
+  - `runtime/welcome_audit.rs` — the sender's v5 Welcome rows for every retained Nostr Welcome, each built from the
+    Welcome's stored row (`Engine::outbound_welcome_audit_facts`), never from a caller's context. `welcome_prepared`
+    and `welcome_event_size` come from `note_retained_welcomes`, where a retained Welcome first reaches the runtime
+    (every create path, a host's accepted commit, `publish_group_evolution` for a drained or automatic one), which
+    also starts its watch. `welcome_withdrawn` comes from the size refusal that retired the Welcome (direct, queued
+    or fanout refusal: only the ids whose rows that rollback moved `Sent` → `Failed`, each with its own verdict; it
+    stops the watch), or from the watcher when a watched Welcome settles undelivered; one read from the store already
+    settled is not watched. One started/finished pair per relay pass. The attempt that meets a Welcome's policy marks
+    it delivered (`finish_prepared_legacy_publish`, maintenance's retry, or the preparation that finds it already met)
+    before its finished row; never mark it elsewhere. Start a pass
+    (`V5WelcomePass::start`) only where the transport is called, after the last hold check, so a stopped attempt
+    records nothing. Every row of a Welcome carries `welcome_audit_operation_id`.
   - `runtime/welcome_delivery.rs` — outbound Welcome delivery (mdk#2628 3.5a). The engine's Welcome row is the
     obligation, and every publish reads it first (`welcome_hold`): a withdrawn Welcome never goes out again, a staged
     one waits for its commit, and a device link's Welcome never goes out from its `deliver_until` on, by this
     runtime's wall clock (mdk#2628 D40). A batch checks that deadline again before it starts each relay attempt, so a
-    detached wave prepared earlier does not send it late. An expired Welcome is settled for its watch, and
-    maintenance drops its retry record. The runtime watches the Welcomes it stages, and those the startup pass (or else the first
+    detached wave prepared earlier does not send it late. An expired Welcome is never sent again, but it may still close
+    as delivered: a detached pass started before the deadline may be acknowledged, and a saved relay acceptance that
+    meets its policy is marked (`expired_welcome_may_still_close`, `welcome_still_owes_met_policy`). Its watch records
+    the expiry, and maintenance drops its retry record, only once neither can. The runtime watches the Welcomes it stages, and those the startup pass (or else the first
     maintenance pass) finds staged or owed; a group skipped because it was not live is read again on each pass until it
     is. A Welcome stays watched until its row is settled. Maintenance publishes each watched Welcome that is owed and
     that no attempt record (stored fanout or detached wave) holds, so one whose publish stored nothing (no
