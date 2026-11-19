@@ -1630,10 +1630,11 @@ impl AppClient {
                     cgka_traits::engine::GroupEvent::GroupJoined {
                         group_id,
                         via_welcome,
+                        forwarded,
                         ..
-                    } => self.note_invitation_admission(group_id, Some(via_welcome))?,
+                    } => self.note_invitation_admission(group_id, Some(via_welcome), forwarded)?,
                     cgka_traits::engine::GroupEvent::GroupCreated { group_id } => {
-                        self.note_invitation_admission(group_id, None)?
+                        self.note_invitation_admission(group_id, None, &Default::default())?
                     }
                     _ => {}
                 }
@@ -5174,10 +5175,11 @@ impl AppClient {
                     cgka_traits::engine::GroupEvent::GroupJoined {
                         group_id,
                         via_welcome,
+                        forwarded,
                         ..
-                    } => self.note_invitation_admission(group_id, Some(via_welcome))?,
+                    } => self.note_invitation_admission(group_id, Some(via_welcome), forwarded)?,
                     cgka_traits::engine::GroupEvent::GroupCreated { group_id } => {
-                        self.note_invitation_admission(group_id, None)?
+                        self.note_invitation_admission(group_id, None, &Default::default())?
                     }
                     _ => {}
                 }

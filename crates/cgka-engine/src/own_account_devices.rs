@@ -1167,7 +1167,7 @@ pub(crate) fn build_sibling_welcomes(
                 to: sibling.slot,
                 invitation_generation: plan.invitation_generation,
                 forwarded: ForwardedInvitation {
-                    inviter: plan.forwarded.inviter.clone(),
+                    inviter: plan.forwarded.inviter,
                     // A generation's shared decision settles its copies
                     // (account-sync.md, "Invitation decisions").
                     confirmed: plan.forwarded.confirmed && plan.invitation_generation.is_none(),

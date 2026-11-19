@@ -2,6 +2,7 @@
 
 use super::AppClient;
 use crate::{AppError, AppGroupRecord, SelfMembership};
+use cgka_traits::engine::ForwardedInvitation;
 use cgka_traits::storage::{GroupStorage, LeaveRequestStorage};
 use cgka_traits::{EngineError, GroupId};
 use storage_sqlite::InvitationDecision;
@@ -213,25 +214,31 @@ impl AppClient {
         &mut self,
         group_id: &GroupId,
         via_welcome: Option<&cgka_traits::MessageId>,
+        forwarded: &ForwardedInvitation,
     ) -> Result<(), AppError> {
         if !self.app.device_groups_enabled() || self.is_device_group(group_id)? {
             return Ok(());
         }
         let account = self.app.account_storage(&self.state.label)?;
-        let Some(admission) = account.invitation_admission(group_id)? else {
-            return Ok(());
+        let accepted = match account.invitation_admission(group_id)? {
+            // An unidentified copy stays local-only. Only the sibling that
+            // added it can say it is confirmed there (mdk#3546).
+            None => forwarded.confirmed && self.acceptable_pending_invitation(group_id)?.is_some(),
+            Some(admission) => {
+                if admission.via_welcome.as_ref() != via_welcome {
+                    return Ok(());
+                }
+                let storage = account.app_storage();
+                let chat = hex::encode(group_id.as_slice());
+                if admission.created_locally {
+                    storage.ensure_implicit_invitation_acceptance(&chat, admission.generation)?;
+                }
+                storage.owe_installed_invitation_decision(&chat, &admission.generation)?;
+                self.accepted_invitation_projection(group_id)?.is_some()
+            }
         };
-        if admission.via_welcome.as_ref() != via_welcome {
-            return Ok(());
-        }
-        let storage = account.app_storage();
-        let chat = hex::encode(group_id.as_slice());
-        if admission.created_locally {
-            storage.ensure_founding_invitation_decision(&chat, admission.generation)?;
-        }
-        storage.owe_installed_invitation_decision(&chat, &admission.generation)?;
         // The enclosing projection batch persists any presentation change.
-        if self.accepted_invitation_projection(group_id)?.is_some() {
+        if accepted {
             let chat = hex::encode(group_id.as_slice());
             if let Some(group) = self
                 .state
@@ -246,6 +253,22 @@ impl AppClient {
         Ok(())
     }
 
+    /// A confirmed copy holding no decision for its generation, such as one
+    /// accepted while device groups were off, records the acceptance a founder
+    /// records before a sibling Add carries that generation (mdk#3546).
+    pub(super) fn record_unrecorded_acceptance(&self, group_id: &GroupId) -> Result<(), AppError> {
+        let account = self.app.account_storage(&self.state.label)?;
+        if let Some(admission) = account.invitation_admission(group_id)? {
+            account
+                .app_storage()
+                .ensure_implicit_invitation_acceptance(
+                    &hex::encode(group_id.as_slice()),
+                    admission.generation,
+                )?;
+        }
+        Ok(())
+    }
+
     /// Native founding can be recovered by the ordinary projection reconcile
     /// even if a crash preceded delivery of its non-Welcome creation event.
     pub(super) fn remember_founding_invitation(&self, group_id: &GroupId) -> Result<(), AppError> {
@@ -256,10 +279,12 @@ impl AppClient {
         if let Some(admission) = account.invitation_admission(group_id)?
             && admission.created_locally
         {
-            account.app_storage().ensure_founding_invitation_decision(
-                &hex::encode(group_id.as_slice()),
-                admission.generation,
-            )?;
+            account
+                .app_storage()
+                .ensure_implicit_invitation_acceptance(
+                    &hex::encode(group_id.as_slice()),
+                    admission.generation,
+                )?;
         }
         Ok(())
     }
@@ -278,7 +303,21 @@ impl AppClient {
         else {
             return Ok(None);
         };
-        if decision.declined || account.leave_request(group_id)?.is_some() {
+        if decision.declined {
+            return Ok(None);
+        }
+        self.acceptable_pending_invitation(group_id)
+    }
+
+    /// A pending invitation on an active local copy that an acceptance may
+    /// resolve: no Leave requested, still a member, and its inviter not
+    /// blocked here.
+    fn acceptable_pending_invitation(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<Option<AppGroupRecord>, AppError> {
+        let account = self.app.account_storage(&self.state.label)?;
+        if account.leave_request(group_id)?.is_some() {
             return Ok(None);
         }
         let native = self.runtime.group_record(group_id)?;

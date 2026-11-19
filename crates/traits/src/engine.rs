@@ -88,10 +88,10 @@ pub struct SiblingKeyPackage {
 /// own, so the receiving sibling trusts it as it trusts the Welcome itself.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ForwardedInvitation {
-    /// The other account whose invitation admitted the copy. None for a chat
-    /// the account founded.
+    /// The raw 32-byte account id of the other account whose invitation
+    /// admitted the copy. None for a chat the account founded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub inviter: Option<MemberId>,
+    pub inviter: Option<[u8; 32]>,
     /// The copy is confirmed: founded, or its invitation accepted. Only a
     /// chat with no invitation generation carries it; an identified one is
     /// settled by its generation's shared decision (account-sync.md,

@@ -979,9 +979,8 @@ impl AppClient {
             // account, which is no inviter to forward.
             inviter: group
                 .welcomer_account_id_hex
-                .and_then(|welcomer| hex::decode(welcomer).ok())
-                .map(MemberId::new)
-                .filter(|welcomer| welcomer != &own),
+                .and_then(|welcomer| <[u8; 32] as hex::FromHex>::from_hex(welcomer).ok())
+                .filter(|welcomer| welcomer.as_slice() != own.as_slice()),
             confirmed: !group.pending_confirmation,
         }
     }
@@ -997,6 +996,10 @@ impl AppClient {
         // Already admitted/signed work has its own settlement owner.
         if !self.invitation_allows_sibling_add(chat)? {
             return Ok(());
+        }
+        let forwarded = self.forwarded_invitation(chat);
+        if forwarded.confirmed {
+            self.record_unrecorded_acceptance(chat)?;
         }
         if !self.take_private_key_package_exact(sibling, &candidate)? {
             return Err(AppError::DeviceGroupRefused("no_private_key_package"));
@@ -1017,7 +1020,7 @@ impl AppClient {
                         slot: *sibling,
                         key_package,
                     }],
-                    forwarded: self.forwarded_invitation(chat),
+                    forwarded,
                 },
                 audit_context,
             )

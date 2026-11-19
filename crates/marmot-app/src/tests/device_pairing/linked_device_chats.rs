@@ -306,10 +306,23 @@ async fn the_approving_device_adds_a_new_device_to_its_chats() {
 /// an invitation still unanswered there arrives pending, from the account
 /// that sent it rather than from Alice herself. Chats from before invitation
 /// generations (no admission, which stay local-only) take that state from
-/// the sibling Welcome; an identified invitation still settles through its
-/// generation's shared decision, so only its inviter travels.
+/// the sibling Welcome. An identified invitation settles through its
+/// generation's shared decision, which the phone records first if it
+/// accepted without one, as with device groups off.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_linked_device_gets_each_chat_as_the_adding_device_holds_it() {
+    forwarded_invitation_case(false).await;
+}
+
+/// The laptop's own block of the inviter still governs how an accepted chat
+/// it gets from the phone is shown, as it governs a shared acceptance: each
+/// stays a pending invitation, which the block hides.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_linked_devices_block_holds_a_forwarded_acceptance() {
+    forwarded_invitation_case(true).await;
+}
+
+async fn forwarded_invitation_case(laptop_blocks_bob: bool) {
     let (relay, [mut phone]) = alice_devices::<1>().await;
     let alice = phone
         .app
@@ -334,21 +347,26 @@ async fn a_linked_device_gets_each_chat_as_the_adding_device_holds_it() {
     };
     let accepted_legacy = invite("accepted, legacy").await;
     let unanswered_legacy = invite("unanswered, legacy").await;
+    let accepted_unrecorded = invite("accepted, no decision").await;
     let unanswered = invite("unanswered").await;
     deliver_new(&mut phone.client, &relay, &mut phone.cursor).await;
     phone.client.sync().await.unwrap();
-    phone.client.accept_group_invite(&accepted_legacy).unwrap();
+    for chat in [&accepted_legacy, &accepted_unrecorded] {
+        phone.client.accept_group_invite(chat).unwrap();
+    }
     let founded_legacy = chats(&mut phone, 1).await.remove(0);
     // Copies installed before invitation generations have no admission and
-    // so no decision; migration 0170 seeded none.
-    let legacy = [&founded_legacy, &accepted_legacy, &unanswered_legacy];
+    // so no decision; migration 0170 seeded none. A copy accepted while
+    // device groups were off has its admission but no decision.
     let db = account_database(&phone.app);
-    for chat in legacy {
+    for chat in [&founded_legacy, &accepted_legacy, &unanswered_legacy] {
         db.execute(
             "DELETE FROM cgka_invitation_admissions WHERE group_id = ?1",
             [chat.as_slice()],
         )
         .unwrap();
+    }
+    for chat in [&founded_legacy, &accepted_legacy, &accepted_unrecorded] {
         db.execute(
             "DELETE FROM invitation_decisions WHERE group_id_hex = ?1",
             [hex::encode(chat.as_slice())],
@@ -360,6 +378,13 @@ async fn a_linked_device_gets_each_chat_as_the_adding_device_holds_it() {
 
     // The laptop signs in only now, so none of Bob's invitations reached it.
     let mut laptop = another_alice_device(&relay, &phone).await;
+    if laptop_blocks_bob {
+        laptop
+            .app
+            .set_user_blocked("alice", &bob_id, true)
+            .await
+            .unwrap();
+    }
     link(&relay, &mut phone, &mut laptop, "Laptop").await;
     passes(&relay, &mut [&mut phone, &mut laptop], 2).await;
     passes(&relay, &mut [&mut phone], 1).await;
@@ -373,9 +398,14 @@ async fn a_linked_device_gets_each_chat_as_the_adding_device_holds_it() {
         (group.pending_confirmation, group.welcomer_account_id_hex)
     };
     assert!(!invitation(&founded_legacy).0);
-    assert_eq!(invitation(&accepted_legacy), (false, Some(bob_id.clone())));
-    assert_eq!(invitation(&unanswered_legacy), (true, Some(bob_id.clone())));
-    assert_eq!(invitation(&unanswered), (true, Some(bob_id)));
+    let from_bob = |pending| (pending, Some(bob_id.clone()));
+    assert_eq!(invitation(&accepted_legacy), from_bob(laptop_blocks_bob));
+    assert_eq!(
+        invitation(&accepted_unrecorded),
+        from_bob(laptop_blocks_bob)
+    );
+    assert_eq!(invitation(&unanswered_legacy), from_bob(true));
+    assert_eq!(invitation(&unanswered), from_bob(true));
 }
 
 /// A real linked sender rebroadcasts a retained winning choice. It need not

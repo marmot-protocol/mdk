@@ -1531,7 +1531,7 @@ membership state. Explicit user Leave, including declining an invitation, record
 before departure publication when this device trusts a device group; archive, local deletion, sign-out and removal do
 not create that choice. Unknown admissions or absent trust keep departure leaf-only. A held maximum version skips the new choice, allowing ordinary
 Leave without replacing the retained winner. Invitation decisions use the existing host APIs. Custom experimental peers must update together before using
-V2 sibling Welcomes; there is no capability negotiation or mixed-old-receiver guarantee.
+V2 or V3 sibling Welcomes; there is no capability negotiation or mixed-old-receiver guarantee.
 
 An admin account's Leave, and its Decline of an invitation that made it an admin, return `AdminCannotSelfRemove` before
 anything is written or sent: when `requires_self_demote_before_leave` is true, call `self_demote_admin` first and then

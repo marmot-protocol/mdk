@@ -85,8 +85,9 @@ impl SqliteAppStorage {
         })
     }
 
-    /// Creation is implicitly accepted once, never a fresh action on replay/restart.
-    pub fn ensure_founding_invitation_decision(
+    /// A founded copy, or a confirmed one holding no decision, is implicitly
+    /// accepted once at version 1, never a fresh action on replay/restart.
+    pub fn ensure_implicit_invitation_acceptance(
         &self,
         chat: &str,
         generation: [u8; 32],

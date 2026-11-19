@@ -2228,6 +2228,14 @@ fn notification_update_from_group_join(
     }
     let group_id_hex = hex::encode(group_id.as_slice());
     let group = resolver.group(app, account_label, &group_id_hex)?;
+    // A join already confirmed, such as a chat this account holds reaching a
+    // newly linked device, is no invitation (mdk#3546).
+    if group
+        .as_ref()
+        .is_some_and(|group| !group.pending_confirmation)
+    {
+        return Ok(None);
+    }
     let receiver = resolver.user(app, account_id_hex)?;
     let sender_id = group
         .as_ref()

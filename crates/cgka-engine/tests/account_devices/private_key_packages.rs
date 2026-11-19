@@ -1058,7 +1058,7 @@ async fn a_sibling_welcome_decodes_only_its_exact_encoding() {
     // with no generation, its confirmation.
     let invited = SiblingWelcome {
         forwarded: ForwardedInvitation {
-            inviter: Some(MemberId::new(vec![0xb6; 32])),
+            inviter: Some([0xb6; 32]),
             confirmed: false,
         },
         ..inherited.clone()
@@ -1113,17 +1113,6 @@ async fn a_sibling_welcome_decodes_only_its_exact_encoding() {
         }
         .encode(),
         "sibling Welcome: an identified invitation forwards no confirmation",
-    );
-    assert_serialize_error(
-        SiblingWelcome {
-            forwarded: ForwardedInvitation {
-                inviter: Some(MemberId::new(vec![0xb6; 31])),
-                confirmed: false,
-            },
-            ..sibling.clone()
-        }
-        .encode(),
-        "sibling Welcome: an inviter is a 32-byte account id",
     );
 
     let mut trailing = bytes.clone();

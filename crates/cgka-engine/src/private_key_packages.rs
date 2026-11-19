@@ -262,17 +262,10 @@ impl SiblingWelcome {
             if self.forwarded.confirmed && self.invitation_generation.is_some() {
                 return Err(invalid("an identified invitation forwards no confirmation"));
             }
-            let inviter = match &self.forwarded.inviter {
-                Some(inviter) => Some(
-                    <[u8; 32]>::try_from(inviter.as_slice())
-                        .map_err(|_| invalid("an inviter is a 32-byte account id"))?,
-                ),
-                None => None,
-            };
             bytes.push(SIBLING_WELCOME_FORWARDED_VERSION);
             bytes.extend_from_slice(&self.from);
             bytes.extend_from_slice(&self.to);
-            for optional in [self.invitation_generation, inviter] {
+            for optional in [self.invitation_generation, self.forwarded.inviter] {
                 bytes.push(u8::from(optional.is_some()));
                 bytes.extend(optional.iter().flatten());
             }
@@ -319,10 +312,7 @@ impl SiblingWelcome {
                     Some([1]) if generation.is_none() => true,
                     _ => return Err(invalid()),
                 };
-                let forwarded = ForwardedInvitation {
-                    inviter: inviter.map(|inviter| MemberId::new(inviter.to_vec())),
-                    confirmed,
-                };
+                let forwarded = ForwardedInvitation { inviter, confirmed };
                 // An empty one is exactly version 1 or 2.
                 if forwarded.is_empty() {
                     return Err(invalid());
