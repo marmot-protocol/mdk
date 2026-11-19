@@ -579,13 +579,14 @@ mod tests {
         assert!(remote_batch.kinds.contains(&KIND_NOSTR_METADATA));
         assert!(remote_batch.kinds.contains(&KIND_MARMOT_KEY_PACKAGE));
         // The local account must not also appear in a remote (contact-list-free)
-        // batch, which would defeat its contact-list subscription.
+        // One regular local batch and one deletion batch; no remote batch may
+        // repeat the local author.
         assert_eq!(
             plan.batches
                 .iter()
                 .filter(|batch| batch.authors.contains(&local))
                 .count(),
-            1
+            2
         );
     }
 

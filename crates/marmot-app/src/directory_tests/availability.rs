@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use marmot_account::AccountSummary;
 use nostr_directory::{
@@ -342,20 +342,7 @@ async fn availability_replacement_fence() {
         "a refresh cannot overwrite a replacement received during its fetch"
     );
 
-    let stale = fetcher
-        .events
-        .lock()
-        .unwrap()
-        .iter()
-        .find(|event| {
-            event.kind == KIND_MARMOT_KEY_PACKAGE && event.pubkey == accounts[0].account_id_hex
-        })
-        .unwrap()
-        .clone();
-    fetcher.events.lock().unwrap().extend(std::iter::repeat_n(
-        stale,
-        transport_nostr_adapter::RELAY_REPLAY_PAGE_LIMIT,
-    ));
+    fetcher.incomplete_key_packages();
     for _ in 0..2 {
         app.directory()
             .reset_availability_for_test(&owner.account_id_hex);
@@ -481,13 +468,9 @@ async fn availability_cancel_fence() {
         app.directory()
             .cancel_follow_availability(&owner.account_id_hex, operation_id)
     );
-    release.notify_one();
-    let cancelled = tokio::time::timeout(Duration::from_secs(1), refresh)
-        .await
-        .expect("cancellation must not wait for the target timeout")
-        .unwrap()
-        .unwrap();
+    let cancelled = refresh.await.unwrap().unwrap();
     assert_eq!(cancelled.phase, FollowAvailabilityRefreshPhase::Cancelled);
+    release.notify_one();
     assert!(cancelled.completed <= 1);
     assert!(
         !app.directory()
@@ -542,6 +525,7 @@ async fn availability_detached_wait() {
     });
     admitted.notified().await;
     leader.abort();
+    assert!(leader.await.unwrap_err().is_cancelled());
     release.notify_one();
     let status = follower.await.unwrap().unwrap();
     assert_eq!(
@@ -583,13 +567,9 @@ async fn availability_cancel_early() {
         app.directory()
             .cancel_follow_availability(&owner.account_id_hex, operation_id)
     );
-    release.notify_one();
-    let cancelled = tokio::time::timeout(Duration::from_secs(1), refresh)
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
+    let cancelled = refresh.await.unwrap().unwrap();
     assert_eq!(cancelled.phase, FollowAvailabilityRefreshPhase::Cancelled);
+    release.notify_one();
     assert!(!fetcher.requests.lock().unwrap().is_empty());
 
     let retried = app

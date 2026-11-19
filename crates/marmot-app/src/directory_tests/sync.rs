@@ -257,6 +257,7 @@ async fn live_directory_forgery_cannot_change_persisted_metadata() {
                     .iter()
                     .any(|kind| kind.as_u64() == Some(5));
                 if is_deletion {
+                    assert_eq!(request[2]["#k"], serde_json::json!(["30443"]));
                     deletion_subscription = Some(subscription.clone());
                 } else {
                     regular_subscription = Some(subscription.clone());

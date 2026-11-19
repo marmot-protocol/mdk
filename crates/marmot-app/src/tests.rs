@@ -803,6 +803,11 @@ impl MemberResolutionDirectoryFetcher {
         self.fail_all
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
+
+    pub(crate) fn incomplete_key_packages(&self) {
+        *self.incomplete_endpoint.lock().unwrap() = Some("wss://shared.example".into());
+        *self.incomplete_query_kind.lock().unwrap() = Some(KIND_MARMOT_KEY_PACKAGE);
+    }
 }
 
 /// The KeyPackage query of a KeyPackage read, checking that the read also
@@ -12211,13 +12216,14 @@ fn directory_sync_plan_does_not_subscribe_kind3_for_non_local_known_user() {
     assert!(remote_kinds.contains(&KIND_NOSTR_METADATA));
     assert!(remote_kinds.contains(&KIND_MARMOT_KEY_PACKAGE));
     // The local account's own batch keeps the full kind set; it must not be
-    // double-listed in a contact-list-free remote batch.
+    // The local account has one regular and one deletion batch; no remote
+    // batch may repeat its author.
     assert_eq!(
         plan.batches
             .iter()
             .filter(|batch| batch.authors.contains(&account.account_id_hex))
             .count(),
-        1
+        2
     );
 }
 

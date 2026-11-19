@@ -262,12 +262,13 @@ keep warming the cache.
 
 **Direct-follow availability.** `follow_availability_page(account_ref, after, limit)` reads a keyset-paged projection
 of the selected account's direct cached follows without networking. `ready` records a selected current compatible
-KeyPackage and its MLS expiry, not proof that a particular client is installed. `unknown` covers missing, stale,
+KeyPackage and its `fresh_until` deadline (the earlier of MLS expiry and publication freshness), not proof that a
+particular client is installed. `unknown` covers missing, stale,
 incomplete, malformed, replaced, and expired results. A completed clean, deleted, or obsolete miss is `not_found` for 15
 minutes, with check and expiry timestamps plus network provenance.
 
 `refresh_follow_availability` processes at most 100 follows with four concurrent target lookups, a 10-second target
-deadline, and a five-minute overall deadline. Results persist per target and remain readable while the refresh runs.
+deadline, and a five-minute target-processing budget. Results persist per target and remain readable while the refresh runs.
 Poll `follow_availability_status` for aggregate progress and call `cancel_follow_availability` with
 the observed operation id to stop it without cancelling a newer operation. Completed refreshes have a 60-second
 cadence. Pages contain at most 100 rows and always join the current follow list, so account switches and unfollows do
