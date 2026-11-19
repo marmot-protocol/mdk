@@ -63,17 +63,33 @@ where
     R: TransportRoutingPolicy,
     K: KeyPackagePublisher,
 {
-    /// `welcome_id` as its v5 rows name it, from its stored row in any
-    /// state; `None` without a v5 recorder, for any other row, or for a
-    /// Welcome another transport wrapped.
-    pub(super) fn v5_welcome(&self, welcome_id: &cgka_traits::MessageId) -> Option<V5Welcome> {
+    /// What the audit reads of the retained Welcome `message`, when audit is
+    /// on; `None` for anything else, or a row that cannot be read now. One
+    /// read serves every row of a publish pass.
+    pub(super) fn welcome_audit_facts(
+        &self,
+        message: &TransportMessage,
+    ) -> Option<cgka_engine::engine::OutboundWelcomeAuditFacts> {
+        if !self.audit.is_enabled()
+            || !matches!(message.envelope, TransportEnvelope::Welcome { .. })
+        {
+            return None;
+        }
+        self.session
+            .outbound_welcome_audit_facts(&message.id)
+            .ok()
+            .flatten()
+    }
+
+    /// The Welcome `facts` describe as its v5 rows name it; `None` without a
+    /// v5 recorder or for a Welcome another transport wrapped.
+    fn v5_welcome_of(
+        &self,
+        facts: cgka_engine::engine::OutboundWelcomeAuditFacts,
+    ) -> Option<V5Welcome> {
         if !self.audit.records_v5() {
             return None;
         }
-        let facts = self
-            .session
-            .outbound_welcome_audit_facts(welcome_id)
-            .ok()??;
         let outer = v5_outbound_welcome_ref(&facts.message)?;
         let TransportEnvelope::Welcome { recipient } = &facts.message.envelope else {
             return None;
@@ -81,7 +97,7 @@ where
         let recipient_ref = audit_v5::MemberRef::from_member_identity(recipient.as_slice()).ok()?;
         let group_ref = audit_v5::GroupRef::from_group_id(facts.group_id.as_slice()).ok()?;
         Some(V5Welcome {
-            op_id: welcome_audit_operation_id(welcome_id),
+            op_id: welcome_audit_operation_id(&facts.message.id),
             outer,
             recipient_ref,
             group_ref,
@@ -89,94 +105,91 @@ where
         })
     }
 
-    /// The group a publish of `message` is audited under: its target's
-    /// group, or for a Welcome the group its stored row names, so generic
-    /// publish rows of Welcomes are found with their group.
-    pub(super) fn audit_group_of(
-        &self,
-        message: &TransportMessage,
-        target_group: Option<GroupId>,
-    ) -> Option<GroupId> {
-        if target_group.is_some() || !matches!(message.envelope, TransportEnvelope::Welcome { .. })
-        {
-            return target_group;
-        }
-        self.session
-            .outbound_welcome_audit_facts(&message.id)
-            .ok()
-            .flatten()
-            .map(|facts| facts.group_id)
-    }
-
-    /// Record `welcome_prepared` and `welcome_event_size` for each Welcome a
-    /// commit just staged, exactly as the engine stored it: the commit it
-    /// waits on and the KeyPackage it answers. Called where every such
-    /// Welcome first reaches the runtime: a host's commit when accepted, and
-    /// a drained or automatic commit when it is published.
-    pub(super) fn record_v5_welcomes_prepared(&mut self, welcomes: &[TransportMessage]) {
-        if !self.audit.records_v5() {
-            return;
-        }
+    /// Record `welcome_prepared` and `welcome_event_size` for each Welcome
+    /// just retained, exactly as the engine stored it: the commit it waits
+    /// on (none for a founding Welcome) and the KeyPackage it answers.
+    /// Called where each first reaches the runtime: a create, a host's
+    /// accepted commit, and a drained or automatic commit when published.
+    /// Each is watched from here, so it is seen to settle. A Welcome is
+    /// remembered once its row is read, so a failed read is tried again.
+    pub(super) fn note_retained_welcomes(&mut self, welcomes: &[TransportMessage]) {
+        self.watch_welcomes(welcomes.iter().map(|welcome| welcome.id.clone()));
         for welcome in welcomes {
+            if self.v5_prepared_welcomes.contains(&welcome.id) {
+                continue;
+            }
+            let facts = if self.audit.is_enabled() {
+                match self.session.outbound_welcome_audit_facts(&welcome.id) {
+                    Ok(facts) => facts,
+                    Err(_) => continue,
+                }
+            } else {
+                None
+            };
             if self.v5_prepared_welcomes.len() >= MAX_PREPARED_WELCOMES_REMEMBERED {
                 self.v5_prepared_welcomes.clear();
             }
-            if !self.v5_prepared_welcomes.insert(welcome.id.clone()) {
-                continue;
+            self.v5_prepared_welcomes.insert(welcome.id.clone());
+            if let Some(v5) = facts.and_then(|facts| self.v5_welcome_of(facts)) {
+                self.record_v5_welcome_prepared(&v5);
+                self.record_v5_welcome_size(&v5, welcome);
             }
-            let Some(v5) = self.v5_welcome(&welcome.id) else {
-                continue;
-            };
-            let commit_ref = v5
-                .facts
-                .origin_commit_id
-                .as_ref()
-                .and_then(|id| audit_v5::EngineMessageRef::from_message_id(id.as_slice()).ok());
-            let key_package_ref = v5
-                .facts
-                .key_package_event_id
-                .as_ref()
-                .and_then(|id| <[u8; 32]>::try_from(id.as_slice()).ok())
-                .map(|id| audit_v5::NostrEventRef::from_validated_event_id(&id));
-            // A constructed invite row names the commit and the KeyPackage.
-            if let (Some(commit_ref), Some(key_package_ref)) = (commit_ref, key_package_ref) {
-                self.audit.record_v5_event(
-                    Some(v5.group_ref.clone()),
-                    audit_v5::Event::WelcomePrepared(audit_v5::WelcomePrepared {
-                        op_id: v5.op_id.clone(),
-                        recipient_ref: v5.recipient_ref.clone(),
-                        mode: audit_v5::Mode::Invite,
-                        basis: audit_v5::Basis::Commit { commit_ref },
-                        key_package_event_ref: Some(key_package_ref),
-                        outer_event_ref: Some(v5.outer.clone()),
-                        construction: audit_v5::Construction::Constructed,
-                        // Retained, staged with its commit.
-                        retention: audit_v5::Retention::Committed,
-                        failure_stage: None,
-                        reason: None,
-                        elapsed_us: None,
-                    }),
-                );
-            }
-            self.record_v5_welcome_size(&v5, welcome);
         }
     }
 
-    /// Record `welcome_event_size` for each founding Welcome a create just
-    /// retained; the app's probe records their `welcome_prepared` rows.
-    pub(super) fn record_v5_founding_welcome_sizes(&self, effects: &SessionEffects) {
+    /// Note each Welcome a create retained ([`Self::note_retained_welcomes`]).
+    pub(super) fn note_founding_welcomes(&mut self, effects: &SessionEffects) {
         for work in &effects.publish {
-            let (PublishWork::FoundingGroupCreated { welcomes }
-            | PublishWork::GroupCreated { welcomes, .. }) = work
-            else {
-                continue;
-            };
-            for welcome in welcomes {
-                if let Some(v5) = self.v5_welcome(&welcome.id) {
-                    self.record_v5_welcome_size(&v5, welcome);
-                }
+            if let PublishWork::FoundingGroupCreated { welcomes }
+            | PublishWork::GroupCreated { welcomes, .. } = work
+            {
+                self.note_retained_welcomes(welcomes);
             }
         }
+    }
+
+    fn record_v5_welcome_prepared(&self, v5: &V5Welcome) {
+        // A constructed row names the KeyPackage it answers.
+        let Some(key_package_ref) = v5
+            .facts
+            .key_package_event_id
+            .as_ref()
+            .and_then(|id| <[u8; 32]>::try_from(id.as_slice()).ok())
+            .map(|id| audit_v5::NostrEventRef::from_validated_event_id(&id))
+        else {
+            return;
+        };
+        let (mode, basis) = match &v5.facts.origin_commit_id {
+            None => (audit_v5::Mode::Founding, audit_v5::Basis::Founding {}),
+            Some(origin) => {
+                let Ok(commit_ref) = audit_v5::EngineMessageRef::from_message_id(origin.as_slice())
+                else {
+                    return;
+                };
+                (
+                    audit_v5::Mode::Invite,
+                    audit_v5::Basis::Commit { commit_ref },
+                )
+            }
+        };
+        self.audit.record_v5_event(
+            Some(v5.group_ref.clone()),
+            audit_v5::Event::WelcomePrepared(audit_v5::WelcomePrepared {
+                op_id: v5.op_id.clone(),
+                recipient_ref: v5.recipient_ref.clone(),
+                mode,
+                basis,
+                key_package_event_ref: Some(key_package_ref),
+                outer_event_ref: Some(v5.outer.clone()),
+                construction: audit_v5::Construction::Constructed,
+                // Retained: canonical for a founding Welcome, staged with its
+                // commit for an invite's.
+                retention: audit_v5::Retention::Committed,
+                failure_stage: None,
+                reason: None,
+                elapsed_us: None,
+            }),
+        );
     }
 
     fn record_v5_welcome_size(&self, v5: &V5Welcome, welcome: &TransportMessage) {
@@ -193,11 +206,12 @@ where
         );
     }
 
-    /// Record `welcome_withdrawn` for each Welcome of an invite refused as
-    /// too large, before its commit is rolled back.
+    /// Record `welcome_withdrawn` for each Welcome of a commit refused as too
+    /// large, once its rollback has retired the Welcome, and stop watching
+    /// it: the reason is known here, not to the watcher.
     pub(super) fn record_v5_welcomes_refused(
-        &self,
-        welcomes: &[TransportMessage],
+        &mut self,
+        welcome_ids: &[cgka_traits::MessageId],
         oversized: OversizedEvent,
     ) {
         let reason = match oversized.artifact {
@@ -206,8 +220,16 @@ where
             // An invite is refused for its commit or a Welcome only.
             OversizedArtifact::ApplicationMessage | OversizedArtifact::Other => return,
         };
-        for welcome in welcomes {
-            if let Some(v5) = self.v5_welcome(&welcome.id) {
+        for welcome_id in welcome_ids {
+            let Ok(Some(facts)) = self.session.outbound_welcome_audit_facts(welcome_id) else {
+                continue;
+            };
+            if facts.state != MessageState::Failed {
+                continue;
+            }
+            self.watched_welcomes
+                .retain(|watched| watched != welcome_id);
+            if let Some(v5) = self.v5_welcome_of(facts) {
                 self.record_v5_welcome_withdrawn(
                     &v5,
                     reason,
@@ -230,7 +252,12 @@ where
             WelcomeSettlement::Expired => audit_v5::WithdrawalReason::Expired,
             WelcomeSettlement::Delivered | WelcomeSettlement::Untracked => return,
         };
-        if let Some(v5) = self.v5_welcome(welcome_id) {
+        if !self.audit.records_v5() {
+            return;
+        }
+        if let Ok(Some(facts)) = self.session.outbound_welcome_audit_facts(welcome_id)
+            && let Some(v5) = self.v5_welcome_of(facts)
+        {
             self.record_v5_welcome_withdrawn(&v5, reason, None);
         }
     }
@@ -257,10 +284,10 @@ where
     /// no route.
     pub(super) fn record_v5_welcome_not_started(
         &self,
-        welcome_id: &cgka_traits::MessageId,
+        facts: Option<cgka_engine::engine::OutboundWelcomeAuditFacts>,
         reason: audit_v5::NotStartedReason,
     ) {
-        if let Some(v5) = self.v5_welcome(welcome_id) {
+        if let Some(v5) = facts.and_then(|facts| self.v5_welcome_of(facts)) {
             self.audit.record_v5_event(
                 Some(v5.group_ref.clone()),
                 audit_v5::Event::WelcomePublishNotStarted(audit_v5::WelcomePublishNotStarted {
@@ -274,21 +301,17 @@ where
         }
     }
 
-    /// The v5 rows of one publish pass of `message` over `endpoints`, ready
-    /// for [`V5WelcomePass::start`]; `None` for anything but a Welcome
-    /// [`Self::v5_welcome`] names.
+    /// The v5 rows of one publish pass over `endpoints` of the Welcome
+    /// `facts` describe, ready for [`V5WelcomePass::start`].
     pub(super) fn v5_welcome_pass(
         &self,
-        message: &TransportMessage,
+        facts: Option<cgka_engine::engine::OutboundWelcomeAuditFacts>,
         endpoints: &[TransportEndpoint],
         required_acks: usize,
         accepted_before: usize,
         route_source: audit_v5::RouteSource,
     ) -> Option<V5WelcomePass> {
-        if !matches!(message.envelope, TransportEnvelope::Welcome { .. }) {
-            return None;
-        }
-        let v5 = self.v5_welcome(&message.id)?;
+        let v5 = self.v5_welcome_of(facts?)?;
         let target_count = u32::try_from(endpoints.len()).ok()?;
         let required_acks = u32::try_from(required_acks).ok()?;
         let accepted_before_count = u32::try_from(accepted_before).ok()?;
@@ -302,7 +325,7 @@ where
             targets.len() == endpoints.len() && targets.len() <= audit_v5::MAX_ENDPOINTS;
         targets.truncate(audit_v5::MAX_ENDPOINTS);
         Some(V5WelcomePass {
-            welcome_id: message.id.clone(),
+            welcome_id: v5.facts.message.id.clone(),
             group_ref: v5.group_ref,
             started: audit_v5::WelcomePublishStarted {
                 op_id: v5.op_id,
@@ -389,8 +412,10 @@ where
             .ok()
             .flatten()
             .map(|facts| facts.state);
+        // A met policy completes an owed Welcome: the runtime marks it
+        // delivered right after this row. A withdrawn one stays withdrawn.
         let retained_state = match (state, policy) {
-            (Some(MessageState::Processed), audit_v5::Policy::Met) => {
+            (Some(MessageState::Processed | MessageState::Sent), audit_v5::Policy::Met) => {
                 audit_v5::RetainedState::Completed
             }
             (Some(MessageState::Sent), audit_v5::Policy::Unmet | audit_v5::Policy::Unknown) => {

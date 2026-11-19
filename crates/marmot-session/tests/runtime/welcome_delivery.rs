@@ -115,10 +115,8 @@ async fn every_pass_over_a_welcome_records_its_publish_rows() {
         assert_ne!(retry[0]["event"]["attempt_id"], first[1]["event"]["attempt_id"]);
         assert_eq!(retry[0]["event"]["op_id"], first[0]["event"]["op_id"]);
         assert_eq!(retry[1]["event"]["policy"], "met");
-        assert_eq!(
-            retry[1]["event"]["retained_state"],
-            if delivered { "completed" } else { "unknown" }
-        );
+        // The pass that meets the policy completes the Welcome.
+        assert_eq!(retry[1]["event"]["retained_state"], "completed");
     }
 }
 
@@ -221,4 +219,95 @@ async fn welcome_refused_before_sending_is_not_a_possible_exposure() {
             .ambiguous_exposure,
         1
     );
+}
+
+/// An invite whose commit every group relay refuses for its size rolls back,
+/// and its Welcome's audit says why: `welcome_withdrawn` with
+/// `commit_too_large` and the size class, once, after the rollback retired
+/// it. The watcher, seeing the Welcome settle later, adds no generic row.
+#[tokio::test]
+async fn an_invite_whose_commit_every_relay_refuses_for_size_records_why_its_welcome_was_withdrawn()
+{
+    let dir = relaxed_storage_dir().unwrap();
+    let key = SqlCipherKey::new("marmot refused invite key").unwrap();
+    let mut alice = nostr_welcome_session(dir.path().join("alice.sqlite"), &key, b"alice-refused");
+    let mut bob = nostr_welcome_session(dir.path().join("bob.sqlite"), &key, b"bob-refused");
+    let mut carol = nostr_welcome_session(dir.path().join("carol.sqlite"), &key, b"carol-refused");
+    let created = alice
+        .create_group(CreateGroupRequest {
+            name: "refused invite".into(),
+            description: String::new(),
+            members: vec![bob.fresh_key_package().await.unwrap()],
+            required_features: Vec::new(),
+            app_components: Vec::new(),
+            initial_admins: Vec::new(),
+        })
+        .await
+        .unwrap();
+    let PublishWork::GroupCreated { pending, .. } = &created.effects.publish[0] else {
+        panic!("expected GroupCreated publish work");
+    };
+    alice.confirm_published(*pending).await.unwrap();
+    let group_id = created.group_id;
+    let group_relay = TransportEndpoint("wss://group.example".into());
+    let policy =
+        StaticTransportRouting::new(vec![TransportEndpoint("wss://alice-inbox.example".into())])
+            .with_group_route(
+                group_id.clone(),
+                group_id.as_slice().to_vec(),
+                vec![group_relay.clone()],
+            )
+            .with_inbox_route(
+                carol.self_id(),
+                vec![TransportEndpoint("wss://carol-inbox.example".into())],
+            );
+    let adapter = RecordingAdapter::default();
+    adapter.refuse_commits_as_too_large(vec![group_relay]);
+    let wall = Arc::new(TestWallClock::new(300_000));
+    let mut runtime =
+        AccountDeviceRuntime::new(alice, adapter.clone(), policy, RecordingKeyPackages::default())
+            .with_maintenance_sources(
+                wall.clone(),
+                Arc::new(TestMonotonicClock::default()),
+                Arc::new(TestRandom::new(0)),
+            );
+    let audit_path = dir.path().join("refused-audit-v5.jsonl");
+    runtime
+        .audit_recorder()
+        .swap(v5_audit_recorder(&audit_path));
+
+    let effects = runtime
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![cgka_traits::engine::KeyPackage {
+                source: Some(cgka_traits::engine::KeyPackageSource {
+                    event_id: MessageId::new(vec![0x78; 32]),
+                }),
+                ..carol.fresh_key_package().await.unwrap()
+            }],
+            initial_admins: Vec::new(),
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        effects.pending.as_slice(),
+        [PendingResolution::RolledBack { .. }]
+    ));
+    wall.set(300_100);
+    runtime.run_due_maintenance().await.unwrap();
+
+    let group_ref = marmot_forensics::v5::GroupRef::from_group_id(group_id.as_slice()).unwrap();
+    let rows = v5_audit_rows(&audit_path)
+        .into_iter()
+        .filter(|row| {
+            row["event"]["type"]
+                .as_str()
+                .is_some_and(|kind| kind.starts_with("welcome_"))
+        })
+        .inspect(|row| assert_eq!(row["group_ref"], group_ref.as_str(), "{row}"))
+        .collect::<Vec<_>>();
+    assert_eq!(kinds(&rows), ["welcome_prepared", "welcome_withdrawn"], "{rows:?}");
+    assert_eq!(rows[1]["event"]["reason"], "commit_too_large");
+    assert_eq!(rows[1]["event"]["oversized_size_class"], "from_64_to_128_kib");
+    assert_eq!(rows[0]["event"]["op_id"], rows[1]["event"]["op_id"]);
 }

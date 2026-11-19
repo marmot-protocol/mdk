@@ -527,8 +527,8 @@ where
         let work = self.session.outbound_welcome_work()?;
         self.welcome_store_read = true;
         self.unread_welcome_groups = work.unread_groups;
-        self.watch_welcomes(work.staged);
-        self.watch_welcomes(work.owed.iter().map(|(_, welcome)| welcome.id.clone()));
+        self.adopt_stored_welcomes(work.staged);
+        self.adopt_stored_welcomes(work.owed.iter().map(|(_, welcome)| welcome.id.clone()));
         if work.owed.is_empty() {
             return Ok(None);
         }
@@ -556,6 +556,18 @@ where
         }
     }
 
+    /// Watch Welcomes read from the store. One already settled when first
+    /// checked settled before this process watched it, so its settlement is
+    /// not audited: every later start reads it again.
+    fn adopt_stored_welcomes(&mut self, ids: impl IntoIterator<Item = cgka_traits::MessageId>) {
+        for id in ids {
+            if !self.watched_welcomes.contains(&id) {
+                self.adopted_welcomes.insert(id.clone());
+                self.watched_welcomes.push(id);
+            }
+        }
+    }
+
     /// Read the store for Welcomes to watch: all of it the first time, unless
     /// the startup pass did, then each group a read skipped, once it is live.
     fn read_welcome_store(&mut self) -> AccountResult<()> {
@@ -563,14 +575,16 @@ where
             let work = self.session.outbound_welcome_work()?;
             self.welcome_store_read = true;
             self.unread_welcome_groups = work.unread_groups;
-            self.watch_welcomes(work.staged);
-            self.watch_welcomes(work.owed.into_iter().map(|(_, welcome)| welcome.id));
+            self.adopt_stored_welcomes(work.staged);
+            self.adopt_stored_welcomes(work.owed.into_iter().map(|(_, welcome)| welcome.id));
         }
         for group_id in std::mem::take(&mut self.unread_welcome_groups) {
             match self.session.outbound_welcome_work_in(&group_id) {
                 Ok(Some(work)) => {
-                    self.watch_welcomes(work.staged);
-                    self.watch_welcomes(work.owed.into_iter().map(|(_, welcome)| welcome.id));
+                    self.adopt_stored_welcomes(work.staged);
+                    self.adopt_stored_welcomes(
+                        work.owed.into_iter().map(|(_, welcome)| welcome.id),
+                    );
                 }
                 Ok(None) => self.unread_welcome_groups.push(group_id),
                 Err(error) => {
@@ -611,10 +625,16 @@ where
                 });
             match status {
                 Ok((OutboundWelcomeStatus::Settled(settlement), _)) => {
-                    self.record_v5_welcome_settled(&id, settlement);
+                    if !self.adopted_welcomes.remove(&id) {
+                        self.record_v5_welcome_settled(&id, settlement);
+                    }
                 }
-                Ok((OutboundWelcomeStatus::Waiting, _) | (_, true)) => watching.push(id),
+                Ok((OutboundWelcomeStatus::Waiting, _) | (_, true)) => {
+                    self.adopted_welcomes.remove(&id);
+                    watching.push(id);
+                }
                 Ok((OutboundWelcomeStatus::Owed { group_id, message }, false)) => {
+                    self.adopted_welcomes.remove(&id);
                     watching.push(id);
                     match due.iter_mut().find(|(group, _)| *group == group_id) {
                         Some((_, welcomes)) => welcomes.push(message),

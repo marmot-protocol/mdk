@@ -81,6 +81,27 @@ fn nostr_welcome_session(
     .unwrap()
 }
 
+/// [`current_session`] wrapping its Welcomes as [`NostrWelcomePeeler`] does.
+fn current_nostr_welcome_session(
+    path: impl Into<std::path::PathBuf>,
+    key: &SqlCipherKey,
+    identity: &[u8],
+) -> AccountDeviceSession {
+    AccountDeviceSession::open(
+        SessionConfig::new(
+            path,
+            SqlCipherKey::new(key.as_secret_str()).unwrap(),
+            pad32(identity),
+            Box::new(NostrWelcomePeeler(MockPeeler)),
+        )
+        .account_identity_proof_signer(Arc::new(NostrAccountIdentityProofSigner {
+            keys: deterministic_nostr_keys(identity),
+        }))
+        .protocol_profile(ProtocolProfile::Current),
+    )
+    .unwrap()
+}
+
 /// Where the owed-invite fixture's runtime records its v5 audit, from before
 /// the invite.
 fn owed_invite_audit_path(dir: &std::path::Path) -> std::path::PathBuf {
@@ -893,4 +914,104 @@ async fn a_link_welcome_is_never_published_from_its_deadline_on() {
             .is_none(),
         "maintenance drops the expired Welcome's retry record"
     );
+}
+
+/// A device link's Welcome that expires while this process watches it is
+/// audited once, as `expired`. A later start that reads it from the store,
+/// already expired, adds no row: it settled before that process watched it.
+#[tokio::test]
+async fn an_expired_link_welcome_is_audited_once_across_restarts() {
+    let dir = relaxed_storage_dir().unwrap();
+    let key = SqlCipherKey::new("marmot expired link audit key").unwrap();
+    let alice_path = dir.path().join("alice.sqlite");
+    let mut alice = current_nostr_welcome_session(&alice_path, &key, b"alice-expired-link");
+    let mut bob =
+        current_nostr_welcome_session(dir.path().join("bob.sqlite"), &key, b"bob-expired-link");
+    let bob_id = bob.self_id();
+    let chosen = GroupId::new(vec![0x43; 16]);
+    let created = alice
+        .create_group_with_chosen_id_and_audit_context(
+            CreateGroupRequest {
+                name: String::new(),
+                description: String::new(),
+                members: vec![bob.fresh_key_package().await.unwrap()],
+                required_features: Vec::new(),
+                app_components: Vec::new(),
+                initial_admins: Vec::new(),
+            },
+            chosen.clone(),
+            None,
+            Timestamp(300_100),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+    let welcome = match &created.effects.publish[0] {
+        PublishWork::FoundingGroupCreated { welcomes } => welcomes[0].clone(),
+        other => panic!("expected FoundingGroupCreated publish work, got {other:?}"),
+    };
+    drop(alice);
+    let policy =
+        StaticTransportRouting::new(vec![TransportEndpoint("wss://alice-inbox.example".into())])
+            .with_group_route(
+                chosen.clone(),
+                chosen.as_slice().to_vec(),
+                vec![TransportEndpoint("wss://group.example".into())],
+            )
+            .with_inbox_route(
+                bob_id,
+                vec![TransportEndpoint("wss://bob-inbox.example".into())],
+            );
+    let withdrawn = |path: &std::path::Path| {
+        v5_audit_rows(path)
+            .into_iter()
+            .filter(|row| row["event"]["type"] == "welcome_withdrawn")
+            .collect::<Vec<_>>()
+    };
+
+    // Owed and watched, unreachable until its deadline passes.
+    let start = |at: u64, audit: &std::path::Path| {
+        let adapter = RecordingAdapter::default();
+        adapter.accept_only_endpoints(Vec::new());
+        let runtime = AccountDeviceRuntime::new(
+            current_nostr_welcome_session(&alice_path, &key, b"alice-expired-link"),
+            adapter,
+            policy.clone(),
+            RecordingKeyPackages::default(),
+        )
+        .with_maintenance_sources(
+            Arc::new(TestWallClock::new(at)),
+            Arc::new(TestMonotonicClock::default()),
+            Arc::new(TestRandom::new(0)),
+        );
+        runtime.audit_recorder().swap(v5_audit_recorder(audit));
+        runtime
+    };
+    let first_audit = dir.path().join("first-audit-v5.jsonl");
+    let mut first = start(300_000, &first_audit);
+    first.run_due_maintenance().await.unwrap();
+    assert!(withdrawn(&first_audit).is_empty(), "still owed");
+    let wall = Arc::new(TestWallClock::new(300_200));
+    first = first.with_maintenance_sources(
+        wall,
+        Arc::new(TestMonotonicClock::default()),
+        Arc::new(TestRandom::new(0)),
+    );
+    first.run_due_maintenance().await.unwrap();
+    let rows = withdrawn(&first_audit);
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0]["event"]["reason"], "expired");
+    assert_eq!(
+        rows[0]["event"]["outer_event_ref"],
+        marmot_forensics::v5::NostrEventRef::from_validated_event_id(
+            &<[u8; 32]>::try_from(welcome.id.as_slice()).unwrap()
+        )
+        .as_str()
+    );
+    drop(first);
+
+    let second_audit = dir.path().join("second-audit-v5.jsonl");
+    let mut second = start(300_300, &second_audit);
+    second.run_due_maintenance().await.unwrap();
+    assert!(withdrawn(&second_audit).is_empty(), "already settled at start");
 }

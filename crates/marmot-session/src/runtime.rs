@@ -626,9 +626,11 @@ pub struct AccountDeviceRuntime<A, R = StaticTransportRouting, K = NoopKeyPackag
     /// in the order this runtime met them. Maintenance publishes each once it
     /// is owed (see `welcome_delivery`).
     watched_welcomes: Vec<cgka_traits::MessageId>,
-    /// Welcomes whose `welcome_prepared` row this process wrote
-    /// ([`Self::record_v5_welcomes_prepared`]).
+    /// Retained Welcomes this process noted, each read once
+    /// ([`Self::note_retained_welcomes`]).
     v5_prepared_welcomes: HashSet<cgka_traits::MessageId>,
+    /// Watched Welcomes read from the store and not yet seen unsettled.
+    adopted_welcomes: HashSet<cgka_traits::MessageId>,
     /// Whether the store has been read for `watched_welcomes`: the startup
     /// pass reads it, or else the first maintenance pass.
     welcome_store_read: bool,
@@ -706,6 +708,7 @@ where
             prepared_welcome_tasks: Vec::new(),
             watched_welcomes: Vec::new(),
             v5_prepared_welcomes: HashSet::new(),
+            adopted_welcomes: HashSet::new(),
             welcome_store_read: false,
             unread_welcome_groups: Vec::new(),
             finish_stage_failure: None,
@@ -3649,6 +3652,7 @@ where
         request: CreateGroupRequest,
     ) -> AccountResult<(GroupId, AccountDeviceEffects)> {
         let CreateGroupEffects { group_id, effects } = self.session.create_group(request).await?;
+        self.note_founding_welcomes(&effects);
         let effects = self.publish_session_effects(effects).await?;
         Ok((group_id, effects))
     }
@@ -3706,7 +3710,7 @@ where
             adapter: &self.adapter,
             routing: &self.routing,
         };
-        Ok(self
+        let created = self
             .session
             .create_group_with_optional_app_components_and_audit_context(
                 request,
@@ -3714,7 +3718,9 @@ where
                 Some(&welcome_sizes),
                 context,
             )
-            .await?)
+            .await?;
+        self.note_founding_welcomes(&created.effects);
+        Ok(created)
     }
 
     /// Prepare a chat whose founding Add includes authenticated private sibling KeyPackages.
@@ -3741,7 +3747,7 @@ where
                 context,
             )
             .await?;
-        self.record_v5_founding_welcome_sizes(&created.effects);
+        self.note_founding_welcomes(&created.effects);
         Ok(created)
     }
 
@@ -3757,7 +3763,7 @@ where
         welcome_deliver_until: Timestamp,
         context: AuditEventContext,
     ) -> AccountResult<CreateGroupEffects> {
-        Ok(self
+        let created = self
             .session
             .create_group_with_chosen_id_and_audit_context(
                 request,
@@ -3766,7 +3772,9 @@ where
                 welcome_deliver_until,
                 context,
             )
-            .await?)
+            .await?;
+        self.note_founding_welcomes(&created.effects);
+        Ok(created)
     }
 
     /// Publish effects returned by
@@ -3911,16 +3919,20 @@ where
         let PreparedSessionSend::Commit(commit) = prepared else {
             return Ok(prepared);
         };
-        self.record_v5_welcomes_prepared(commit.welcomes());
+        self.note_retained_welcomes(commit.welcomes());
         if invite && let Some((message_id, oversized)) = self.oversized_invite(&commit).await {
-            self.record_v5_welcomes_refused(commit.welcomes(), oversized);
+            let welcome_ids = commit
+                .welcomes()
+                .iter()
+                .map(|welcome| welcome.id.clone())
+                .collect::<Vec<_>>();
             let mut output = self.rollback_prepared_session_commit(commit).await?;
+            self.record_v5_welcomes_refused(&welcome_ids, oversized);
             output
                 .failures
                 .insert(0, refused_before_publishing(message_id, oversized));
             return Ok(PreparedSessionSend::Refused(Box::new(output)));
         }
-        self.watch_welcomes(commit.welcomes().iter().map(|welcome| welcome.id.clone()));
         Ok(PreparedSessionSend::Commit(commit))
     }
 
@@ -5922,14 +5934,13 @@ where
 
         // Welcomes of a drained or automatic commit first reach the runtime
         // here; a host's reached it when its commit was accepted.
-        self.record_v5_welcomes_prepared(&welcomes);
+        self.note_retained_welcomes(&welcomes);
         // A queued invite the drain prepared is judged as a direct invite
         // is, before its commit is published: one whose commit or Welcome
         // fits none of its relays is retired unsent (mdk#2334).
         if self.session.pending_is_queued_invite(pending)?
             && let Some(oversized) = self.oversized_invite_events(&commit, &welcomes).await
         {
-            self.record_v5_welcomes_refused(&welcomes, oversized);
             let effects = refuse_too_large(
                 &mut self.session,
                 pending,
@@ -5938,15 +5949,17 @@ where
                 RollbackPass::Staging,
             )
             .await?;
+            let welcome_ids = welcomes
+                .iter()
+                .map(|welcome| welcome.id.clone())
+                .collect::<Vec<_>>();
+            self.record_v5_welcomes_refused(&welcome_ids, oversized);
             output
                 .pending
                 .push(PendingResolution::RolledBack { pending });
             output.absorb_session_effects(effects, queue);
             return Ok(());
         }
-        // Watched from here, as a host's are once accepted, so a Welcome
-        // withdrawn or retired with its commit is seen to settle.
-        self.watch_welcomes(welcomes.iter().map(|welcome| welcome.id.clone()));
 
         Box::pin(self.publish_one_with_post_confirmation_welcomes(
             commit,
@@ -6078,10 +6091,13 @@ where
                 operation_id: Some(format!("publish-{msg_id_hex}")),
                 ..AuditEventContext::default()
             };
-            let audit_group_id =
-                self.audit_group_of(&fanout.exact_message, fanout.group_id.clone());
+            let welcome_facts = self.welcome_audit_facts(&fanout.exact_message);
+            let audit_group_id = fanout
+                .group_id
+                .clone()
+                .or_else(|| welcome_facts.as_ref().map(|facts| facts.group_id.clone()));
             let mut v5_welcome = self.v5_welcome_pass(
-                &fanout.exact_message,
+                welcome_facts,
                 &remaining,
                 required_acks,
                 accepted_before,
@@ -7089,7 +7105,16 @@ where
             && !fanout.possible_exposure()
             && let Some(pending) = fanout.pending_ref()
         {
+            let oversized = OversizedEvent::of_fanout(fanout);
+            let welcome_ids = fanout
+                .pending_post_confirmation_welcomes()
+                .iter()
+                .map(|welcome| welcome.id.clone())
+                .collect::<Vec<_>>();
             let effects = roll_back_failed_fanout(&mut self.session, pending, fanout, pass).await?;
+            if let Some(oversized) = oversized {
+                self.record_v5_welcomes_refused(&welcome_ids, oversized);
+            }
             output
                 .pending
                 .push(PendingResolution::RolledBack { pending });
@@ -7195,6 +7220,7 @@ where
         };
         let mut publish_context = context.unwrap_or_default();
         publish_context.operation_id = Some(format!("publish-{msg_id_hex}"));
+        let welcome_facts = self.welcome_audit_facts(&message);
         let existing_fanout = self.session.transport_fanout(&message_id)?;
         let route_source = if existing_fanout.is_some() {
             audit_v5::RouteSource::RetainedTarget
@@ -7216,11 +7242,11 @@ where
                 Ok(target) => target,
                 Err(e) => {
                     self.record_v5_welcome_not_started(
-                        &message_id,
+                        welcome_facts.clone(),
                         audit_v5::NotStartedReason::RouteResolutionFailed,
                     );
                     self.record_audit_event(
-                        self.audit_group_of(&message, None).as_ref(),
+                        welcome_facts.as_ref().map(|facts| &facts.group_id),
                         Some(publish_context),
                         AuditEventKind::PublishFailure {
                             msg_id: msg_id_hex,
@@ -7252,7 +7278,9 @@ where
         let target_kind = publish_target_kind(&target).to_string();
         let relay_urls = publish_target_relay_urls(&target);
         let target_group_id = publish_target_group_id(&target);
-        let audit_group_id = self.audit_group_of(&message, target_group_id.clone());
+        let audit_group_id = target_group_id
+            .clone()
+            .or_else(|| welcome_facts.as_ref().map(|facts| facts.group_id.clone()));
         self.record_audit_event(
             audit_group_id.as_ref(),
             Some(publish_context.clone()),
@@ -7361,7 +7389,7 @@ where
             .min(retry_endpoints.len());
 
         let v5_welcome = self.v5_welcome_pass(
-            &message,
+            welcome_facts,
             &retry_endpoints,
             required_acks,
             accepted_before,

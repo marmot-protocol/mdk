@@ -6,7 +6,7 @@
 //! checkpoint are distinct evidence boundaries. A sender founding preparation
 //! also records the returned retained artifact and recipient engine join.
 //! Publication receipts are captured at the account owner boundary.
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -19,9 +19,8 @@ use cgka_traits::ingest::PeeledMessage;
 use cgka_traits::peeler::{GroupMessageMetadata, TransportPeeler};
 use cgka_traits::transport::EncryptedPayload;
 use cgka_traits::types::MemberId;
-use cgka_traits::{GroupEvent, GroupId, MessageId, TransportMessage};
+use cgka_traits::{GroupEvent, TransportMessage};
 use marmot_forensics::v5::*;
-use marmot_session::{PublishWork, SessionEffects};
 use transport_nostr_peeler::AccountGiftWrap;
 use transport_nostr_peeler::{NostrMlsPeeler, NostrTransportEvent, WelcomePeelProvenance};
 
@@ -30,19 +29,6 @@ use crate::AppGroupRecord;
 const MAX_ROWS: usize = 128;
 const MAX_BYTES: usize = 256 * 1024;
 const MAX_PENDING: usize = 64;
-
-/// Public selection captured from the already validated KeyPackage metadata
-/// on the real app create path. No KeyPackage bytes or secrets enter the probe.
-pub(crate) struct FoundingSelection {
-    pub recipient_hex: String,
-    pub key_package_event_id: Option<MessageId>,
-}
-
-pub(crate) struct PendingFounding {
-    /// Each recipient's selected KeyPackages, in the order the engine wraps
-    /// their Welcomes.
-    selected: BTreeMap<Vec<u8>, VecDeque<[u8; 32]>>,
-}
 
 /// One selected AppClient delivery episode. The app arms it before engine
 /// ingress and drains it immediately after. No source/session lives here.
@@ -389,141 +375,6 @@ impl WelcomeProbe {
         }
         self.bytes += size;
         self.rows.push(row);
-    }
-
-    /// Capture the selected KeyPackages before the authoritative preparation
-    /// call. A failed call drops this bounded token and emits no fictitious
-    /// terminal.
-    pub(crate) fn begin_founding(
-        &mut self,
-        selections: Vec<FoundingSelection>,
-    ) -> Option<PendingFounding> {
-        if selections.len() > MAX_PENDING {
-            self.dropped += selections.len();
-            return None;
-        }
-        let mut selected = BTreeMap::<Vec<u8>, VecDeque<[u8; 32]>>::new();
-        for selection in selections {
-            let Ok(recipient) = hex::decode(selection.recipient_hex) else {
-                self.invalid += 1;
-                return None;
-            };
-            if recipient.len() != 32 {
-                self.invalid += 1;
-                return None;
-            }
-            let Some(event_id) = selection.key_package_event_id else {
-                self.invalid += 1;
-                return None;
-            };
-            let Ok(event_id) = <[u8; 32]>::try_from(event_id.as_slice()) else {
-                self.invalid += 1;
-                return None;
-            };
-            let packages = selected.entry(recipient).or_default();
-            if packages.contains(&event_id) {
-                self.invalid += 1;
-                return None;
-            }
-            packages.push_back(event_id);
-        }
-        Some(PendingFounding { selected })
-    }
-
-    /// The returned FoundingGroupCreated artifact comes after the engine's
-    /// canonical transaction retained these exact Welcome messages as Sent.
-    /// Match by validated recipient identity. One account's several
-    /// KeyPackages match in the order the engine wrapped their Welcomes.
-    pub(crate) fn founding_prepared(
-        &mut self,
-        mut pending: PendingFounding,
-        group_id: &GroupId,
-        effects: &SessionEffects,
-    ) {
-        let Ok(group_ref) = GroupRef::from_group_id(group_id.as_slice()) else {
-            self.invalid += 1;
-            return;
-        };
-        let mut rows = Vec::new();
-        let mut found_work = false;
-        for work in &effects.publish {
-            let PublishWork::FoundingGroupCreated { welcomes } = work else {
-                continue;
-            };
-            if found_work {
-                self.invalid += 1;
-                return;
-            }
-            found_work = true;
-            for welcome in welcomes {
-                let cgka_traits::transport::TransportEnvelope::Welcome { recipient } =
-                    &welcome.envelope
-                else {
-                    self.invalid += 1;
-                    return;
-                };
-                let Some(key_package_event_id) = pending
-                    .selected
-                    .get_mut(recipient.as_slice())
-                    .and_then(VecDeque::pop_front)
-                else {
-                    self.invalid += 1;
-                    return;
-                };
-                let Ok(outer) = NostrTransportEvent::from_transport_message(welcome)
-                    .and_then(|event| event.to_transport_message())
-                else {
-                    self.invalid += 1;
-                    return;
-                };
-                if outer.id != welcome.id || outer.envelope != welcome.envelope {
-                    self.invalid += 1;
-                    return;
-                }
-                let Ok(outer_event_id) = <[u8; 32]>::try_from(outer.id.as_slice()) else {
-                    self.invalid += 1;
-                    return;
-                };
-                let Ok(recipient_ref) = MemberRef::from_member_identity(recipient.as_slice())
-                else {
-                    self.invalid += 1;
-                    return;
-                };
-                // The id every publish of this Welcome carries too.
-                let op_id = marmot_session::welcome_audit_operation_id(&welcome.id);
-                rows.push((op_id, recipient_ref, key_package_event_id, outer_event_id));
-            }
-        }
-        if !found_work
-            || pending
-                .selected
-                .values()
-                .any(|packages| !packages.is_empty())
-        {
-            self.invalid += 1;
-            return;
-        }
-        for (op_id, recipient_ref, key_package_event_id, outer_event_id) in rows {
-            self.record(
-                Some(group_ref.clone()),
-                Event::WelcomePrepared(WelcomePrepared {
-                    op_id,
-                    recipient_ref,
-                    mode: Mode::Founding,
-                    basis: Basis::Founding {},
-                    key_package_event_ref: Some(NostrEventRef::from_validated_event_id(
-                        &key_package_event_id,
-                    )),
-                    outer_event_ref: Some(NostrEventRef::from_validated_event_id(&outer_event_id)),
-                    construction: Construction::Constructed,
-                    retention: Retention::Committed,
-                    failure_stage: None,
-                    reason: None,
-                    // A batch duration would misstate per-recipient construction.
-                    elapsed_us: None,
-                }),
-            );
-        }
     }
 
     pub(super) fn observe(
