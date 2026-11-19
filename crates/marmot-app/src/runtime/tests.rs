@@ -4347,7 +4347,7 @@ async fn session_maintenance_rereads_its_due_time_after_changes_only() {
 
 /// Another account's activity runs none of this account's passes; its own
 /// does (mdk#2923).
-#[tokio::test(flavor = "current_thread")]
+#[tokio::test(start_paused = true)]
 async fn another_accounts_wake_runs_no_pass_here() {
     let dir = tempfile::tempdir().expect("tempdir");
     let app = MarmotApp::with_relays(dir.path(), vec![]);
@@ -4356,53 +4356,36 @@ async fn another_accounts_wake_runs_no_pass_here() {
         .expect("create alice");
     let runtime = MarmotAppRuntime::new(app.clone());
     runtime.accounts().reconcile().await.expect("alice starts");
-    let runtime = &runtime;
-    let count = |operation| startup_stage_snapshot(runtime, operation).completed;
-    let settled = || {
-        count(RuntimeOp::WorkerMaintenance) > 0
-            && count(RuntimeOp::WorkerAttachmentPass) > 0
-            && count(RuntimeOp::WorkerPresentationPass) > 0
-            && [
-                RuntimeOp::WorkerAttachmentPass,
-                RuntimeOp::WorkerPresentationPass,
-                RuntimeOp::WorkerAvatarPass,
-            ]
-            .into_iter()
-            .all(|operation| startup_stage_snapshot(runtime, operation).in_flight == 0)
-    };
-    timeout(ACCOUNT_OPEN_TEST_DEADLINE, async {
-        while !settled() {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("the first tick's passes run");
-    // Let anything the startup passes left due run out.
-    for _ in 0..200 {
-        tokio::task::yield_now().await;
-    }
+    crate::worker_fences::worker_startup_finished(&runtime, "alice")
+        .await
+        .expect("alice finishes startup");
+
+    let count = |operation| startup_stage_snapshot(&runtime, operation).completed;
     let passes = || {
         (
             count(RuntimeOp::WorkerAttachmentPass),
             count(RuntimeOp::WorkerPresentationPass),
         )
     };
+    // A paused timer advances only once runnable work and spawn_blocking jobs
+    // have drained. Get past the first maintenance tick and its 1 s due-time
+    // re-read, then measure both wakes before the next 15 s tick or retry.
+    tokio::time::sleep(Duration::from_secs(2)).await;
     let before = passes();
+    assert!(count(RuntimeOp::WorkerMaintenance) > 0 && count(RuntimeOp::WorkerMaintenanceDue) > 0);
+    assert!(before.0 > 0 && before.1 > 0, "both startup passes ran");
 
     app.presentation_signals.wake_account("bob");
-    for _ in 0..200 {
-        tokio::task::yield_now().await;
-    }
+    tokio::time::sleep(Duration::from_millis(1)).await;
     assert_eq!(passes(), before, "bob's wake runs no pass for alice");
 
     app.presentation_signals.wake_account("alice");
-    timeout(ACCOUNT_OPEN_TEST_DEADLINE, async {
-        while passes().0 == before.0 || passes().1 == before.1 {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("alice's own wake runs her passes");
+    tokio::time::sleep(Duration::from_millis(1)).await;
+    let after = passes();
+    assert!(
+        after.0 > before.0 && after.1 > before.1,
+        "alice's own wake runs both passes"
+    );
     runtime.shutdown().await;
 }
 
