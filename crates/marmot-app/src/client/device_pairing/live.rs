@@ -110,6 +110,15 @@ impl PairingInbox {
         }
     }
 
+    /// Whether a pairing message waits to be read (mdk#3265).
+    fn holds_messages(&self) -> bool {
+        !self
+            .queue
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_empty()
+    }
+
     fn take(&self) -> Vec<InboundPairingMessage> {
         self.queue
             .lock()
@@ -153,12 +162,19 @@ pub(crate) struct DevicePairing {
     /// link before its first commit there landed: its user is told linking
     /// failed until it starts another link.
     removed_after_join: bool,
+    /// The trusted device group's roster may have changed since the last
+    /// drive: a failed link this device approved may still be listed there,
+    /// to be taken out (mdk#3265).
+    pub(crate) roster_changed: bool,
 }
 
 impl DevicePairing {
     pub(crate) fn new(inbox: Option<PairingInbox>) -> Self {
         Self {
             inbox,
+            // A failed link this device approved may still be listed: the
+            // first drive after open reads the roster (mdk#3265).
+            roster_changed: true,
             ..Self::default()
         }
     }
@@ -171,6 +187,11 @@ impl DevicePairing {
             || !self.prompts.is_empty()
             || !self.outbox.is_empty()
             || !self.quiet_since.is_empty()
+            || self
+                .inbox
+                .as_ref()
+                .is_some_and(PairingInbox::holds_messages)
+            || self.roster_changed
     }
 
     fn send(&mut self, message: PairingMessage, now: u64) {
@@ -446,6 +467,8 @@ impl AppClient {
         if self.device_unlinked {
             return;
         }
+        // This drive reads the roster as it now stands (mdk#3265).
+        self.device_pairing.roster_changed = false;
         let messages = self
             .device_pairing
             .inbox
@@ -1742,18 +1765,25 @@ impl AppClient {
                     Some(EngineError::LinkDeviceUnsettled { .. })
                 ) =>
             {
+                // What settles it need not change the roster: read it again
+                // on the next drive, 15 s on.
+                self.device_pairing.roster_changed = true;
                 tracing::debug!(
                     target: TARGET,
                     method = "unlink_failed_device",
                     "the device group is unsettled; the removal waits"
                 );
             }
-            Err(error) => tracing::warn!(
-                target: TARGET,
-                method = "unlink_failed_device",
-                error_kind = error.privacy_safe_kind(),
-                "could not remove a device whose link failed; retrying"
-            ),
+            Err(error) => {
+                // The next drive reads the roster again, 15 s on.
+                self.device_pairing.roster_changed = true;
+                tracing::warn!(
+                    target: TARGET,
+                    method = "unlink_failed_device",
+                    error_kind = error.privacy_safe_kind(),
+                    "could not remove a device whose link failed; retrying"
+                );
+            }
         }
     }
 

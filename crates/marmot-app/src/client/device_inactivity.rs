@@ -122,6 +122,7 @@ impl AppClient {
             return;
         }
         if let Err(error) = self.try_device_inactivity_upkeep(held, now).await {
+            self.device_group_work_changed = true;
             tracing::warn!(
                 target: TRACE_TARGET,
                 method = "device_inactivity_upkeep",

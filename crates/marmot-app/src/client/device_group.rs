@@ -1108,6 +1108,9 @@ impl AppClient {
     /// device reads may differ, and with it the linked devices and how each
     /// unrecognized sign-in is listed.
     pub(crate) fn note_device_roster_changed(&mut self) {
+        // The device-group passes may owe work the change brings (mdk#3265).
+        self.device_group_work_changed = true;
+        self.device_pairing.roster_changed = true;
         self.linked_devices_changed = true;
         self.unrecognized_sign_ins_changed = true;
         self.note_compromise_warning_due();

@@ -4830,3 +4830,143 @@ async fn compatible_private_stock_keeps_usable_order_and_longest_fallback() {
         "duplicate reception preserves the selected allocation"
     );
 }
+
+/// An invitation answered on one linked device shows as answered on the
+/// other within seconds, with device groups on and nothing else happening.
+/// Each worker used to wait for its next maintenance pass, 15 s apart, the
+/// phone to send the answer and the laptop to apply it, so a user waited
+/// about a minute, and the receiving device's chat list changed only with
+/// the chat's next event (mdk#3566). Each device's runtime here starts on
+/// the account the fixtures linked, and the test stands in for the relay
+/// between them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_linked_device_shows_an_answered_invitation_within_seconds() {
+    let (relay, [mut phone, mut laptop]) = alice_devices::<2>().await;
+    link(&relay, &mut phone, &mut laptop, "Laptop").await;
+    let (_bob_dir, _bob, chat) =
+        invite_account_pending(&relay, &mut phone, &mut laptop, false, None).await;
+    let chat_hex = hex::encode(chat.as_slice());
+    passes(&relay, &mut [&mut phone, &mut laptop], 2).await;
+    let pending = |app: &MarmotApp| {
+        app.group("alice", &chat_hex)
+            .unwrap()
+            .expect("the invited chat")
+            .pending_confirmation
+    };
+    assert!(pending(&phone.app) && pending(&laptop.app));
+    let Device {
+        _dir: _phone_dir,
+        app: phone_app,
+        client: phone_client,
+        ..
+    } = phone;
+    let Device {
+        _dir: _laptop_dir,
+        app: laptop_app,
+        client: laptop_client,
+        ..
+    } = laptop;
+    drop((phone_client, laptop_client));
+
+    // What the runtimes publish from their start on is relayed below.
+    let relayed_from = relay.published_events.lock().unwrap().len();
+    let phone_runtime = MarmotAppRuntime::new(phone_app.clone());
+    let laptop_runtime = MarmotAppRuntime::new(laptop_app.clone());
+    let maintenance_runs = |runtime: &MarmotAppRuntime| {
+        runtime
+            .app_performance_snapshot()
+            .runtime_operations
+            .into_iter()
+            .find(|snapshot| {
+                snapshot.operation == crate::RuntimePerformanceOperation::WorkerMaintenanceDue
+            })
+            .expect("every runtime operation is exported")
+            .completed
+    };
+    for runtime in [&phone_runtime, &laptop_runtime] {
+        runtime.reconcile_accounts().await.unwrap();
+    }
+    // Each worker's first maintenance pass runs at start. Answer after both
+    // have run it, so the next pass by the clock is a full interval away.
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while maintenance_runs(&phone_runtime) == 0 || maintenance_runs(&laptop_runtime) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("both workers run their startup maintenance");
+
+    // The relay between the devices: what either publishes from here on
+    // reaches both, as it would live.
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let forwarder = tokio::spawn({
+        let relay = relay.clone();
+        let apps = [phone_app.clone(), laptop_app.clone()];
+        let stop = stop.clone();
+        async move {
+            let mut cursor = relayed_from;
+            while !stop.load(std::sync::atomic::Ordering::Acquire) {
+                let events = relay.published_events.lock().unwrap()[cursor..].to_vec();
+                cursor += events.len();
+                for event in events {
+                    for app in &apps {
+                        let _ = app
+                            .relay_plane
+                            .handle_relay_event_for_test(NostrRelayEvent {
+                                endpoint: TransportEndpoint("wss://relay.example".to_owned()),
+                                subscription_id: Some("linked-devices".to_owned()),
+                                event: event.clone(),
+                            })
+                            .await;
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        }
+    });
+
+    // What the laptop's user sees: its chat list.
+    let mut laptop_chats = laptop_runtime
+        .subscribe_chat_list("alice", true)
+        .await
+        .unwrap();
+    assert!(
+        laptop_chats
+            .snapshot
+            .iter()
+            .any(|row| row.group_id_hex == chat_hex && row.pending_confirmation)
+    );
+    phone_runtime
+        .accept_group_invite("alice", &chat)
+        .await
+        .unwrap();
+    let answered = std::time::Instant::now();
+    // Well under a maintenance pass apart, with room for a loaded runner:
+    // unloaded, it shows within a second.
+    let shown = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let rows = match laptop_chats.recv().await.expect("the chat list stays open") {
+                crate::RuntimeChatListUpdate::Row { row, .. } => vec![*row],
+                crate::RuntimeChatListUpdate::Snapshot { rows, .. } => rows,
+                crate::RuntimeChatListUpdate::RemoveRow { .. } => continue,
+            };
+            if rows
+                .iter()
+                .any(|row| row.group_id_hex == chat_hex && !row.pending_confirmation)
+            {
+                break;
+            }
+        }
+    })
+    .await;
+    assert!(!pending(&laptop_app) || shown.is_err());
+    stop.store(true, std::sync::atomic::Ordering::Release);
+    forwarder.await.unwrap();
+    phone_runtime.shutdown().await;
+    laptop_runtime.shutdown().await;
+    assert!(
+        shown.is_ok(),
+        "the laptop shows the answer within seconds, not after {:?}",
+        answered.elapsed()
+    );
+}

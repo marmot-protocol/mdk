@@ -50,6 +50,14 @@ pub(crate) struct LinkChatProgressState {
     prune_at: u64,
 }
 
+impl LinkChatProgressState {
+    /// The earliest second an inventory page of a recently linked device is
+    /// due to go out again (mdk#3265).
+    pub(super) fn next_due(&self) -> Option<u64> {
+        self.links.values().map(|publication| publication.due).min()
+    }
+}
+
 struct ReceivedInventory {
     group: String,
     link: String,

@@ -327,6 +327,7 @@ impl AppClient {
     /// maintenance pass.
     pub(crate) async fn device_rename_upkeep(&mut self) {
         if let Err(error) = self.try_device_rename_upkeep().await {
+            self.device_group_work_changed = true;
             tracing::warn!(
                 target: TRACE_TARGET,
                 method = "device_rename_upkeep",

@@ -257,6 +257,10 @@ pub(crate) struct SiblingChatGaps {
     /// Targets left to their approver in some chat (mdk#3537), and when to
     /// look again. Every chat is examined again once a hold ends.
     approver_holds: HashMap<DeviceSlotId, u64>,
+    /// The last pass found this device unable to send gap work until an
+    /// event or its device group's hold ending: its due chats then wait for
+    /// that, not for their times (mdk#3265).
+    sender_waiting: bool,
     /// Moves the clock approver holds are judged by this far ahead, so a
     /// journey test can find an approver quiet without waiting for it.
     #[cfg(test)]
@@ -291,6 +295,20 @@ impl SiblingChatGaps {
     fn hold_for_approver(&mut self, chat: &GroupId, target: DeviceSlotId, until: u64) {
         self.approver_holds.insert(target, until);
         self.waiting_for_stock.remove(&(chat.clone(), target));
+    }
+
+    /// The earliest second gap filling looks at a chat again by time: a
+    /// chat due, an approver hold ending or a claim expiring (mdk#3265).
+    pub(super) fn next_due(&self) -> Option<u64> {
+        if self.sender_waiting {
+            return None;
+        }
+        self.due
+            .values()
+            .chain(self.approver_holds.values())
+            .chain(self.claims.values().flat_map(BTreeMap::values))
+            .min()
+            .copied()
     }
 
     /// When the first live claim on `gap` from a linked device other than
@@ -468,6 +486,16 @@ impl SiblingChatGaps {
 }
 
 impl AppClient {
+    /// Look at `chat` again once it can be quiet: at once for what passes on
+    /// its own, when an epoch-gap hold ends, or on its next event
+    /// ([`Self::quiet_retry_at`], mdk#3265).
+    fn schedule_gap_when_quiet(&mut self, chat: &GroupId) -> Result<(), AppError> {
+        if let Some(at) = self.quiet_retry_at(chat)? {
+            self.sibling_chat_gaps.schedule(chat.clone(), at);
+        }
+        Ok(())
+    }
+
     pub(super) fn invitation_decision_changes_sibling_gaps(&mut self, chat: &GroupId) {
         self.sibling_chat_gaps.schedule(chat.clone(), 0);
     }
@@ -738,6 +766,7 @@ impl AppClient {
             .try_fill_sibling_chat_gaps(held, budget, selection)
             .await
         {
+            self.device_group_work_changed = true;
             tracing::warn!(target: TARGET, method = "fill_sibling_chat_gaps", error_kind = error.privacy_safe_kind(), "could not fill sibling chat gaps");
         }
         self.send_recorded_acceptances().await;
@@ -757,11 +786,19 @@ impl AppClient {
             ready,
             mut first_error,
         } = self.gap_siblings(&exchange)?;
-        let sender_ready = !ready.is_empty()
-            && !held.contains(&exchange.group_id)
-            && claimant_is_eligible(&exchange, &exchange.own_slot)
-            && exchange.tagged
-            && self.group_quiet(&exchange.group_id)?;
+        // What only an event or the device group's hold ending changes: its
+        // due chats wait for that, not for a 15 s retry (mdk#3265).
+        let sender_blocked = ready.is_empty()
+            || held.contains(&exchange.group_id)
+            || !claimant_is_eligible(&exchange, &exchange.own_slot)
+            || !exchange.tagged;
+        if held.contains(&exchange.group_id) {
+            // Look again when the device group's hold ends.
+            self.retry_when_quiet(&exchange.group_id)?;
+        }
+        let sender_ready = !sender_blocked && self.group_quiet(&exchange.group_id)?;
+        self.sibling_chat_gaps.sender_waiting = sender_blocked
+            || (!sender_ready && self.quiet_retry_at(&exchange.group_id)? != Some(0));
         let eligibility = GapEligibility {
             group: exchange.group_id.clone(),
             own_slot: exchange.own_slot,
@@ -784,6 +821,7 @@ impl AppClient {
                 .collect(),
         };
         if eligible.is_empty() {
+            self.sibling_chat_gaps.sender_waiting = false;
             self.sibling_chat_gaps.eligibility = None;
             self.sibling_chat_gaps.due.clear();
             self.sibling_chat_gaps
@@ -924,7 +962,7 @@ impl AppClient {
             return Ok(());
         }
         if !self.group_quiet(chat)? {
-            self.sibling_chat_gaps.schedule(chat.clone(), 0);
+            self.schedule_gap_when_quiet(chat)?;
             return Ok(());
         }
         let mut first_error = None;
@@ -953,7 +991,7 @@ impl AppClient {
             // its send returned successfully. Do not publish another claim
             // for work this chat already cannot advance.
             if !self.group_quiet(chat)? {
-                self.sibling_chat_gaps.schedule(chat.clone(), 0);
+                self.schedule_gap_when_quiet(chat)?;
                 break;
             }
             let now = unix_now_seconds();

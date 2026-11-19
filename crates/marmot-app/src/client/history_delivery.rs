@@ -294,6 +294,7 @@ impl AppClient {
             Err(error) => Err(error),
         };
         if let Err(error) = result {
+            self.device_group_work_changed = true;
             tracing::warn!(
                 target: TRACE_TARGET,
                 method = "drive_history_deliveries",

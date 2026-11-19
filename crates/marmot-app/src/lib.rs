@@ -718,6 +718,10 @@ pub struct MarmotApp {
     /// Live KeyPackages of this app's accounts that their clients have not
     /// checked for new sign-ins yet (mdk#2628 3.2).
     pub(crate) sign_in_nudges: Arc<client::sign_ins::SignInNudges>,
+    /// Changes the account workers do not otherwise see that can make
+    /// device-group maintenance owed: a sign-in nudge or a small-state edit
+    /// (mdk#3265).
+    pub(crate) device_group_wakes: Arc<client::worker_due::DeviceGroupWakes>,
     /// Each account's publish stop, by account id: set once its device group
     /// unlinked this device, and shared by every publisher
     /// [`Self::relay_client_for_account_id`] hands out for it (mdk#2628 D67).
@@ -2070,6 +2074,7 @@ impl MarmotApp {
             shared_storage: Arc::new(Mutex::new(None)),
             presentation_signals: Arc::new(Default::default()),
             sign_in_nudges: Arc::new(Default::default()),
+            device_group_wakes: Arc::new(Default::default()),
             unlinked_publish_stops: Arc::default(),
             signing_out_accounts: Arc::default(),
             account_state_ready: Arc::new(Mutex::new(HashSet::new())),
@@ -2198,6 +2203,7 @@ impl MarmotApp {
             shared_storage: Arc::new(Mutex::new(None)),
             presentation_signals: Arc::new(Default::default()),
             sign_in_nudges: Arc::new(Default::default()),
+            device_group_wakes: Arc::new(Default::default()),
             unlinked_publish_stops: Arc::default(),
             signing_out_accounts: Arc::default(),
             account_state_ready: Arc::new(Mutex::new(HashSet::new())),
@@ -2500,6 +2506,12 @@ impl MarmotApp {
             maintenance_observation_generation: self.product_analytics.permit(),
             received_private_key_package_generation: 0,
             acceptances_recorded: false,
+            invitation_decisions_changed: false,
+            invitation_work_held: false,
+            invitations_settled: Vec::new(),
+            device_group_work_changed: true,
+            small_state_edited: false,
+            device_group_retry_at: None,
             runtime: open.runtime,
             engine_storage: open.engine_storage,
             _session_guard: open.session_guard,
@@ -3988,10 +4000,13 @@ impl MarmotApp {
         pinned: bool,
     ) -> Result<ChatPinState, AppError> {
         self.ensure_account_state(label)?;
-        self.account_storage(label)?
+        let state = self
+            .account_storage(label)?
             .app_storage()
             .set_chat_pinned(group_id_hex, pinned)
-            .map_err(chat_pin_error_from_storage)
+            .map_err(chat_pin_error_from_storage)?;
+        self.device_group_wakes.small_state_edited(label);
+        Ok(state)
     }
 
     /// Atomically replace the order of the current pinned set.
@@ -4003,10 +4018,13 @@ impl MarmotApp {
         ordered_group_ids: &[String],
     ) -> Result<ChatPinState, AppError> {
         self.ensure_account_state(label)?;
-        self.account_storage(label)?
+        let state = self
+            .account_storage(label)?
             .app_storage()
             .set_pinned_chat_order(ordered_group_ids)
-            .map_err(chat_pin_error_from_storage)
+            .map_err(chat_pin_error_from_storage)?;
+        self.device_group_wakes.small_state_edited(label);
+        Ok(state)
     }
 
     /// Per-account unread aggregate for the account-switcher and application
@@ -4135,6 +4153,7 @@ impl MarmotApp {
                 message_id_hex,
                 &classifier,
             )?;
+        self.device_group_wakes.small_state_edited(&account.label);
         self.hydrate_chat_list_row(row.as_mut());
         Ok(row)
     }
@@ -4159,6 +4178,7 @@ impl MarmotApp {
                 manually_unread,
                 &classifier,
             )?;
+        self.device_group_wakes.small_state_edited(&account.label);
         self.hydrate_chat_list_row(row.as_mut());
         Ok(row)
     }
@@ -4210,6 +4230,7 @@ impl MarmotApp {
             .account_storage(&account.label)?
             .app_storage()
             .set_chat_muted(group_id_hex, muted_until_ms)?;
+        self.device_group_wakes.small_state_edited(&account.label);
         Ok(chat_notification_settings_from_account(
             account.label,
             account.account_id_hex,
@@ -4230,6 +4251,7 @@ impl MarmotApp {
             .account_storage(&account.label)?
             .app_storage()
             .clear_chat_muted(group_id_hex)?;
+        self.device_group_wakes.small_state_edited(&account.label);
         Ok(chat_notification_settings_from_account(
             account.label,
             account.account_id_hex,

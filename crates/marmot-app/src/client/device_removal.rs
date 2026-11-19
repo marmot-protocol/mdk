@@ -153,6 +153,7 @@ impl AppClient {
             return;
         }
         if let Err(error) = self.decide_leaving_siblings() {
+            self.device_group_work_changed = true;
             tracing::warn!(
                 target: TARGET,
                 method = "decide_leaving_siblings",
@@ -161,6 +162,7 @@ impl AppClient {
             );
         }
         if let Err(error) = self.drive_recorded_removals().await {
+            self.device_group_work_changed = true;
             tracing::warn!(
                 target: TARGET,
                 method = "drive_device_removals",
@@ -169,6 +171,7 @@ impl AppClient {
             );
         }
         if let Err(error) = self.remove_moved_siblings().await {
+            self.device_group_work_changed = true;
             tracing::warn!(
                 target: TARGET,
                 method = "remove_moved_siblings",
@@ -177,6 +180,7 @@ impl AppClient {
             );
         }
         if let Err(error) = self.clean_up_removed_devices().await {
+            self.device_group_work_changed = true;
             tracing::warn!(
                 target: TARGET,
                 method = "clean_up_removed_devices",
@@ -193,7 +197,7 @@ impl AppClient {
             return Ok(());
         };
         if !self.group_quiet(&group_id)? {
-            return Ok(());
+            return self.retry_when_quiet(&group_id);
         }
         let own = self.own_slot()?;
         let removals = self
@@ -345,9 +349,11 @@ impl AppClient {
             .saturating_add(REMOVED_RECORD_LIFETIME_SECS)
             <= now
             || !self.device_group_settled(group_id)
-            || !self.group_quiet(group_id)?
         {
             return Ok(());
+        }
+        if !self.group_quiet(group_id)? {
+            return self.retry_when_quiet(group_id);
         }
         let remembered = self.remembered_tag_keys(group_id)?;
         if remembered
@@ -417,7 +423,7 @@ impl AppClient {
         audit_context: marmot_forensics::AuditEventContext,
     ) -> Result<(), AppError> {
         if !self.group_quiet(group_id)? {
-            return Ok(());
+            return self.retry_when_quiet(group_id);
         }
         let Some(entry) = roster.devices.get(slot) else {
             return Ok(());
@@ -511,7 +517,12 @@ impl AppClient {
             };
             match removal {
                 Ok(OwnLeafRemoval::Sent) => self.linked_devices_changed = true,
-                Ok(OwnLeafRemoval::Busy | OwnLeafRemoval::Unsupported) => {}
+                Ok(OwnLeafRemoval::Busy) => {
+                    if let Err(error) = self.retry_when_quiet(&chat_id) {
+                        first_error.get_or_insert(error);
+                    }
+                }
+                Ok(OwnLeafRemoval::Unsupported) => {}
                 Err(error) => {
                     first_error.get_or_insert(error);
                 }
@@ -802,6 +813,45 @@ impl AppClient {
     /// a chat: it is stable and readable, this device is not leaving or
     /// disbanding it, and nothing of this device's is queued or unconfirmed
     /// there. A later pass retries.
+    /// When a device-group pass that found `group_id` not quiet should look
+    /// again (mdk#3265): `None` while it waits for an event (quarantined, or
+    /// a Leave or disband under way), the second an epoch-gap hold ends, or
+    /// `Some(0)` for what passes on its own (a commit, send or convergence
+    /// in flight), retried 15 s after the last maintenance run.
+    pub(crate) fn quiet_retry_at(&self, group_id: &GroupId) -> Result<Option<u64>, AppError> {
+        if self.skips_quarantined_group_reads(group_id)
+            || self
+                .runtime
+                .leave_in_progress(group_id)
+                .map_err(marmot_session::SessionError::from)?
+            || self.runtime.disbanding_in_progress(group_id)?
+        {
+            return Ok(None);
+        }
+        let epoch = self.runtime.group_record(group_id)?.epoch;
+        let now_ms = super::recovery::wall_now_ms()?;
+        Ok(Some(match self.epoch_gap_open_since(group_id, epoch)? {
+            Some(since) if super::self_update_waits_for_epoch_gap(since, now_ms) => since
+                .saturating_add(super::EPOCH_GAP_SELF_UPDATE_HOLD_MS)
+                .div_ceil(1_000),
+            _ => 0,
+        }))
+    }
+
+    /// Have maintenance look again at work a device-group pass left because
+    /// `group_id` was not quiet, at [`Self::quiet_retry_at`].
+    pub(crate) fn retry_when_quiet(&mut self, group_id: &GroupId) -> Result<(), AppError> {
+        match self.quiet_retry_at(group_id)? {
+            None => {}
+            Some(0) => self.device_group_work_changed = true,
+            Some(at) => {
+                self.device_group_retry_at =
+                    Some(self.device_group_retry_at.map_or(at, |next| next.min(at)));
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn group_quiet(&self, group_id: &GroupId) -> Result<bool, AppError> {
         if !matches!(
             self.runtime.epoch_state(group_id),

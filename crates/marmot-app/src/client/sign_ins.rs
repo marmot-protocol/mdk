@@ -217,6 +217,27 @@ pub(crate) struct SignInSchedule {
     reading: bool,
 }
 
+impl SignInSchedule {
+    /// When the next check comes due, in unix seconds as of `now_unix` and
+    /// `now`, brought forward a minute after the last when `nudged`
+    /// (mdk#3265). `Some(0)` before the first check. `None` while the
+    /// worker's read is requested or in flight: its settling re-reads what
+    /// maintenance owes.
+    pub(crate) fn next_due_unix(&self, nudged: bool, now: Instant, now_unix: u64) -> Option<u64> {
+        if self.requested || self.reading {
+            return None;
+        }
+        let Some(mut due) = self.due else {
+            return Some(0);
+        };
+        if nudged {
+            due = due.min(self.last.map_or(now, |last| last + SIGN_IN_NUDGE_INTERVAL));
+        }
+        let ahead = due.saturating_duration_since(now);
+        Some(now_unix.saturating_add(ahead.as_secs() + u64::from(ahead.subsec_nanos() > 0)))
+    }
+}
+
 #[cfg(all(test, feature = "test-policy-overrides"))]
 impl SignInSchedule {
     /// Move the schedule back by `by`, as if that much time passed.
@@ -242,6 +263,14 @@ impl SignInNudges {
         {
             *nudged = true;
         }
+    }
+
+    /// Whether a KeyPackage of `account_id_hex` arrived since the last
+    /// [`Self::take`], without taking it.
+    pub(crate) fn peek(&self, account_id_hex: &str) -> bool {
+        self.0
+            .lock()
+            .is_ok_and(|accounts| accounts.get(account_id_hex).copied().unwrap_or(false))
     }
 
     /// Whether a KeyPackage of `account_id_hex` arrived since the last call.
@@ -635,6 +664,7 @@ impl AppClient {
     /// Commit any rejection the roster still lacks, as each check does.
     pub(crate) async fn commit_sign_in_rejections_best_effort(&mut self) {
         if let Err(error) = self.commit_sign_in_rejections().await {
+            self.device_group_work_changed = true;
             tracing::warn!(
                 target: "marmot_app::client::sign_ins",
                 method = "commit_sign_in_rejections",

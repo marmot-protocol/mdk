@@ -127,7 +127,19 @@
   maintenance found due before its deadline (`watchdog_missed_wake_session_maintenance`) and a relay-config retry with
   no deadline (`watchdog_missed_wake_relay_config`).
 
+- With device groups on, an idle account no longer runs session maintenance every 15 s (mdk#3265, after mdk#3361).
+  Device-group passes run at their own times: the sign-in check, and once linked the hourly heartbeat, the small-state
+  broadcast, private KeyPackage request pacing, a leaving sibling's decision, gap filling and inventory pages. They
+  retry 15 s after the last run only while they owe work with no time: something left unsent, held invitation work, a
+  device-group event, a small-state edit or a pass that failed. Device pairing runs only while linking is under way,
+  not for every settled device group.
+
 ### Fixed
+
+- An invitation answered on one linked device shows as answered on the other within seconds (mdk#3566). The answer is
+  sent on the worker's next turn, a sibling's winning answer is applied when it arrives, and the chat then reports its
+  new state as a host accept does. Before, each device waited for a maintenance pass, and the receiving device's chat
+  list changed only with the chat's next event.
 
 - A sibling Add forwards how this device holds the chat, and the new device's copy shows it the same way (mdk#3546).
   A copy with no invitation generation that is confirmed here arrives confirmed; one with a generation settles through

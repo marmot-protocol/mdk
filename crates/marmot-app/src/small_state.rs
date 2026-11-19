@@ -391,6 +391,22 @@ pub(crate) fn broadcast_due(
         || (schedule.answer_owed && elapsed >= ANSWER_INTERVAL_SECS)
 }
 
+/// The second [`broadcast_due`] next owes a broadcast by time alone: at
+/// once before the first, a day after the last, or an hour after it while a
+/// sibling's request waits. The tip moving past the window is a device-group
+/// commit, which wakes maintenance itself (mdk#3265).
+pub(crate) fn broadcast_next_at(schedule: &SmallStateSchedule) -> u64 {
+    let Some(last) = schedule.last_broadcast else {
+        return 0;
+    };
+    let period = if schedule.answer_owed {
+        ANSWER_INTERVAL_SECS
+    } else {
+        BROADCAST_PERIOD_SECS
+    };
+    last.at.saturating_add(period)
+}
+
 /// The content's object, when it is one with exactly `members`, no object in
 /// it repeating a member name, no longer than the limit, at version 1.
 fn small_state_object(content: &str, members: &[&str]) -> Result<Map<String, Value>, AppError> {
