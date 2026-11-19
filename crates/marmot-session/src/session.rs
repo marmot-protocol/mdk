@@ -19,7 +19,9 @@ pub use cgka_engine::account_identity_proof::{
 };
 pub use cgka_engine::application_message_len;
 pub use cgka_engine::canonicalization::{CanonicalizationPolicy, V1_SETTLEMENT_QUIESCENCE_MS};
-pub(crate) use cgka_engine::engine::{OutboundWelcomeStatus, OutboundWelcomeWork};
+pub(crate) use cgka_engine::engine::{
+    OutboundWelcomeStatus, OutboundWelcomeWork, WelcomeSettlement,
+};
 pub use cgka_engine::engine::{
     OwedSiblingWelcome, SiblingWelcomeResendOutcome, WelcomeDeliveryIndex, WelcomeWithdrawal,
 };
@@ -752,9 +754,12 @@ impl AccountDeviceSession {
         Ok(self.engine.stored_message_state(id)?)
     }
 
-    /// The group one stored message belongs to, in any state.
-    pub fn stored_message_group(&self, id: &MessageId) -> SessionResult<Option<GroupId>> {
-        Ok(self.engine.stored_message_group(id)?)
+    /// What the sender's audit reads of one retained outbound Welcome.
+    pub fn outbound_welcome_audit_facts(
+        &self,
+        id: &MessageId,
+    ) -> SessionResult<Option<cgka_engine::engine::OutboundWelcomeAuditFacts>> {
+        Ok(self.engine.outbound_welcome_audit_facts(id)?)
     }
 
     pub fn group_evolutions(&self) -> SessionResult<Vec<DurableGroupEvolution>> {

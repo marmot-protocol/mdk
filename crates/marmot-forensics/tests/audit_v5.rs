@@ -171,7 +171,7 @@ fn all_contract_fixtures_round_trip_through_rust_and_schema() {
         })
         .collect::<std::collections::BTreeSet<_>>();
     assert_eq!(kinds, catalog);
-    assert_eq!(kinds.len(), 15);
+    assert_eq!(kinds.len(), 17);
 }
 
 #[test]
@@ -852,5 +852,33 @@ fn lifecycle_and_app_outcome_shapes_reject_false_scope_and_counts() {
         {
             assert!(!schema.is_valid(&body), "schema accepted invalid {body}");
         }
+    }
+}
+
+/// A withdrawn Welcome carries an oversized size class exactly when it was
+/// refused as too large, and both new Welcome rows name their group, in Rust
+/// and in the schema alike, as a receiver porting the rules needs.
+#[test]
+fn withdrawn_and_size_rows_are_group_scoped_and_pair_size_with_reason() {
+    let schema = validator();
+    let mut cases = Vec::new();
+    let mut too_large_without_size = fixture("welcome_withdrawn_too_large");
+    too_large_without_size["event"]["oversized_size_class"] = Value::Null;
+    cases.push(("too large without size", too_large_without_size));
+    let mut superseded_with_size = fixture("welcome_withdrawn_superseded");
+    superseded_with_size["event"]["oversized_size_class"] = json!("under_64_kib");
+    cases.push(("superseded with size", superseded_with_size));
+    for name in [
+        "welcome_withdrawn_superseded",
+        "welcome_withdrawn_too_large",
+        "welcome_event_size",
+    ] {
+        let mut account_scoped = fixture(name);
+        account_scoped["group_ref"] = Value::Null;
+        cases.push((name, account_scoped));
+    }
+    for (name, body) in cases {
+        assert!(decode(&body).is_err(), "Rust accepted {name}");
+        assert!(!schema.is_valid(&body), "schema accepted {name}");
     }
 }

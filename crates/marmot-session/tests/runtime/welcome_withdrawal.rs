@@ -81,6 +81,12 @@ fn nostr_welcome_session(
     .unwrap()
 }
 
+/// Where the owed-invite fixture's runtime records its v5 audit, from before
+/// the invite.
+fn owed_invite_audit_path(dir: &std::path::Path) -> std::path::PathBuf {
+    dir.join("owed-invite-audit-v5.jsonl")
+}
+
 /// Alice invites carol into a confirmed group. The relay accepts the commit
 /// but not carol's Welcome, so the Welcome stays owed with a retry record.
 async fn owed_invite_welcome(dir: &std::path::Path) -> OwedInviteWelcome {
@@ -141,11 +147,20 @@ async fn owed_invite_welcome_through(
         Arc::new(TestMonotonicClock::default()),
         Arc::new(TestRandom::new(0)),
     );
+    runtime
+        .audit_recorder()
+        .swap(v5_audit_recorder(&owed_invite_audit_path(dir)));
 
     let effects = runtime
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
-            key_packages: vec![carol.fresh_key_package().await.unwrap()],
+            // As fetched from a relay, so its Welcome names the publication.
+            key_packages: vec![cgka_traits::engine::KeyPackage {
+                source: Some(cgka_traits::engine::KeyPackageSource {
+                    event_id: MessageId::new(vec![0x77; 32]),
+                }),
+                ..carol.fresh_key_package().await.unwrap()
+            }],
             initial_admins: Vec::new(),
         })
         .await
@@ -472,7 +487,8 @@ async fn withdrawal_reports_a_delivered_welcome_and_refuses_other_messages() {
 }
 
 /// A Welcome withdrawn after a detached startup retry was prepared, but
-/// before the task runs, never reaches the relay.
+/// before the task runs, never reaches the relay. Its audit records no start
+/// for that attempt, since no relay was called, and records the withdrawal.
 #[tokio::test]
 async fn detached_startup_retry_skips_a_welcome_withdrawn_before_it_runs() {
     let dir = relaxed_storage_dir().unwrap();
@@ -480,8 +496,8 @@ async fn detached_startup_retry_skips_a_welcome_withdrawn_before_it_runs() {
         mut runtime,
         adapter,
         wall,
+        group_id,
         welcome,
-        ..
     } = owed_invite_welcome(dir.path()).await;
     adapter.accept_only_endpoints(vec![
         TransportEndpoint("wss://group.example".into()),
@@ -516,6 +532,20 @@ async fn detached_startup_retry_skips_a_welcome_withdrawn_before_it_runs() {
             .is_none()
     );
     assert_eq!(welcome_publishes(&adapter).len(), tried);
+    // The audit shows the first pass, no start for the attempt the
+    // withdrawal stopped before any relay was called, and the withdrawal.
+    let rows = welcome_rows(dir.path(), &welcome, &group_id);
+    assert_eq!(
+        kinds(&rows),
+        [
+            "welcome_prepared",
+            "welcome_publish_started",
+            "welcome_publish_finished",
+            "welcome_withdrawn",
+        ]
+    );
+    assert_eq!(rows[3]["event"]["reason"], "withdrawn");
+    assert_eq!(rows[3]["event"]["oversized_size_class"], serde_json::Value::Null);
 }
 
 /// A Welcome withdrawn while a detached startup retry runs is skipped if it

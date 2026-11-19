@@ -76,6 +76,13 @@ It must not own MLS internals, transport event parsing, SQLCipher key derivation
     record a deciding device makes after a failed link's undo (mdk#2761) goes only through `record_removed_slot`, as
     `SendIntent::RecordRemovedSlot`, which the engine never queues or re-issues. A slot the merged roster already
     holds, as a device or a rejected slot, is left out: a rejection never replaces an entry.
+  - `runtime/welcome_audit.rs` — the sender's v5 Welcome rows for every retained Nostr Welcome, each built from the
+    Welcome's stored row (`Engine::outbound_welcome_audit_facts`), never from a caller's context: `welcome_prepared`
+    where a staged Welcome first reaches the runtime (a host's accepted commit, or `publish_group_evolution` for a
+    drained or automatic one), `welcome_event_size`, `welcome_withdrawn` for an invite refused as too large or a
+    watched Welcome that settles undelivered, and one started/finished pair per relay pass. Start a pass
+    (`V5WelcomePass::start`) only where the transport is called, after the last hold check, so a stopped attempt
+    records nothing. Every row of a Welcome carries `welcome_audit_operation_id`.
   - `runtime/welcome_delivery.rs` — outbound Welcome delivery (mdk#2628 3.5a). The engine's Welcome row is the
     obligation, and every publish reads it first (`welcome_hold`): a withdrawn Welcome never goes out again, a staged
     one waits for its commit, and a device link's Welcome never goes out from its `deliver_until` on, by this

@@ -1018,7 +1018,9 @@ impl<S: StorageProvider> Engine<S> {
                             enrolled_at,
                         )?;
 
-                        for (welcome, parsed_kp) in welcomes.iter().zip(&parsed_kps) {
+                        for ((welcome, parsed_kp), source_kp) in
+                            welcomes.iter().zip(&parsed_kps).zip(&req.members)
+                        {
                             let payload = StoredMessagePayload::outbound_welcome(
                                 welcome.clone(),
                                 None,
@@ -1028,6 +1030,12 @@ impl<S: StorageProvider> Engine<S> {
                                         .to_vec(),
                                 ),
                                 chosen.as_ref().map(|chosen| chosen.welcome_deliver_until),
+                            )
+                            .with_key_package_event_id(
+                                source_kp
+                                    .source
+                                    .as_ref()
+                                    .map(|source| source.event_id.clone()),
                             )
                             .encode()
                             .map_err(|error| {

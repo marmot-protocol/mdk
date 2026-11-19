@@ -1244,5 +1244,81 @@
         "no_subscribers": "0"
       }
     }
+  },
+  {
+    "name": "welcome_withdrawn_superseded",
+    "record": {
+      "schema_version": "marmot-forensics-audit/v5",
+      "source_ref": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "session_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "seq": "41",
+      "wall_time_ms": "0",
+      "mono_us": "0",
+      "producer": {
+        "mdk_revision": "0e2c48241da467abfb83830d5e6f72921a1af248",
+        "build_profile": "debug",
+        "platform": "macos",
+        "host_build": null
+      },
+      "group_ref": "1e50a718a6a13c6bac32359e1bdadfacb0a3e41845081b0dfdeb197bfb648b10",
+      "event": {
+        "type": "welcome_withdrawn",
+        "op_id": "11111111111111111111111111111111",
+        "outer_event_ref": "5b0dd1b869983ab60d53f45d83d87bddb199a970c61be9590809d0de0bd2d14e",
+        "recipient_ref": "8dc149328f6915c0e83420b2d1cceab7dfa483679259b58b979af7fff1ebc5f7",
+        "reason": "commit_superseded",
+        "oversized_size_class": null
+      }
+    }
+  },
+  {
+    "name": "welcome_withdrawn_too_large",
+    "record": {
+      "schema_version": "marmot-forensics-audit/v5",
+      "source_ref": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "session_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "seq": "42",
+      "wall_time_ms": "0",
+      "mono_us": "0",
+      "producer": {
+        "mdk_revision": "0e2c48241da467abfb83830d5e6f72921a1af248",
+        "build_profile": "debug",
+        "platform": "macos",
+        "host_build": null
+      },
+      "group_ref": "1e50a718a6a13c6bac32359e1bdadfacb0a3e41845081b0dfdeb197bfb648b10",
+      "event": {
+        "type": "welcome_withdrawn",
+        "op_id": "11111111111111111111111111111111",
+        "outer_event_ref": "5b0dd1b869983ab60d53f45d83d87bddb199a970c61be9590809d0de0bd2d14e",
+        "recipient_ref": "8dc149328f6915c0e83420b2d1cceab7dfa483679259b58b979af7fff1ebc5f7",
+        "reason": "welcome_too_large",
+        "oversized_size_class": "from_256_to_512_kib"
+      }
+    }
+  },
+  {
+    "name": "welcome_event_size",
+    "record": {
+      "schema_version": "marmot-forensics-audit/v5",
+      "source_ref": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "session_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "seq": "43",
+      "wall_time_ms": "0",
+      "mono_us": "0",
+      "producer": {
+        "mdk_revision": "0e2c48241da467abfb83830d5e6f72921a1af248",
+        "build_profile": "debug",
+        "platform": "macos",
+        "host_build": null
+      },
+      "group_ref": "1e50a718a6a13c6bac32359e1bdadfacb0a3e41845081b0dfdeb197bfb648b10",
+      "event": {
+        "type": "welcome_event_size",
+        "op_id": "11111111111111111111111111111111",
+        "outer_event_ref": "5b0dd1b869983ab60d53f45d83d87bddb199a970c61be9590809d0de0bd2d14e",
+        "event_size_class": "from_128_to_256_kib"
+      }
+    }
   }
 ]

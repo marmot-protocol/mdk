@@ -13,6 +13,17 @@
 
 ### Added
 
+- The v5 audit records every invite on the sender, not only a new group's
+  founding Welcomes. An invite into an existing group records
+  `welcome_prepared` naming the exact KeyPackage its Welcome answers, every
+  pass over the Welcome's relays records `welcome_publish_started` and
+  `welcome_publish_finished` (first sends, startup retries, redeliveries and
+  background retries, each with its own attempt id), and the generic publish
+  rows of Welcomes name their group. Two new group-scoped kinds say how big a
+  Welcome is (`welcome_event_size`) and why one will never be sent
+  (`welcome_withdrawn`: withdrawn, its commit superseded, expired, or refused
+  as too large with the oversized size class). A receiver must accept the new
+  kinds before it gets these rows; one that rejects them loses only them.
 - A group send none of whose relays MDK may send to, such as relays at
   private-network addresses, fails as a typed no-usable-relay error, not a
   generic publish failure: `AppError::NoUsableRelay`,

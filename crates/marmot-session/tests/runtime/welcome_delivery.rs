@@ -34,10 +34,10 @@ async fn maintenance_retry_that_lands_settles_the_welcome() {
     );
 }
 
-/// The v5 Welcome rows in the audit at `path` for `welcome`, after checking
-/// that each names `group_id`.
+/// The v5 Welcome rows the owed-invite fixture's runtime recorded in `dir`
+/// for `welcome`, after checking that each names `group_id`.
 fn welcome_rows(
-    path: &std::path::Path,
+    dir: &std::path::Path,
     welcome: &TransportMessage,
     group_id: &GroupId,
 ) -> Vec<serde_json::Value> {
@@ -45,20 +45,27 @@ fn welcome_rows(
         &<[u8; 32]>::try_from(welcome.id.as_slice()).unwrap(),
     );
     let group_ref = marmot_forensics::v5::GroupRef::from_group_id(group_id.as_slice()).unwrap();
-    v5_audit_rows(path)
+    v5_audit_rows(&owed_invite_audit_path(dir))
         .into_iter()
         .filter(|row| row["event"]["outer_event_ref"] == outer.as_str())
         .inspect(|row| assert_eq!(row["group_ref"], group_ref.as_str(), "{row}"))
         .collect()
 }
 
-/// Maintenance's retry of a Welcome is audited as its first pass is, owed
-/// or already delivered: one `welcome_publish_started` and one
-/// `welcome_publish_finished` for the Welcome's outer event, in its group.
-/// Without them a Welcome that reaches a relay only on a retry leaves no
-/// sender evidence of that delivery.
+fn kinds(rows: &[serde_json::Value]) -> Vec<&str> {
+    rows.iter()
+        .map(|row| row["event"]["type"].as_str().unwrap())
+        .collect()
+}
+
+/// An invite's Welcome is audited from its preparation on: a
+/// `welcome_prepared` row naming the KeyPackage it answers, then one started
+/// and one finished row per pass over its relays, each with its own attempt
+/// id. Maintenance's retry is audited as the first pass is, owed or already
+/// delivered; without that a Welcome that reaches a relay only on a retry
+/// leaves no sender evidence of the delivery.
 #[tokio::test]
-async fn maintenance_retry_of_a_welcome_records_its_publish_rows() {
+async fn every_pass_over_a_welcome_records_its_publish_rows() {
     for delivered in [false, true] {
         let dir = relaxed_storage_dir().unwrap();
         let OwedInviteWelcome {
@@ -68,6 +75,19 @@ async fn maintenance_retry_of_a_welcome_records_its_publish_rows() {
             group_id,
             welcome,
         } = owed_invite_welcome(dir.path()).await;
+        let first = welcome_rows(dir.path(), &welcome, &group_id);
+        assert_eq!(
+            kinds(&first),
+            [
+                "welcome_prepared",
+                "welcome_publish_started",
+                "welcome_publish_finished"
+            ]
+        );
+        assert_eq!(
+            first[0]["event"]["key_package_event_ref"],
+            marmot_forensics::v5::NostrEventRef::from_validated_event_id(&[0x77; 32]).as_str()
+        );
         if delivered {
             // As if another inbox relay had met the policy: the retry of
             // this one still runs.
@@ -76,10 +96,6 @@ async fn maintenance_retry_of_a_welcome_records_its_publish_rows() {
                 .mark_sent_welcome_delivered(&welcome.id)
                 .unwrap();
         }
-        let audit_path = dir.path().join("audit-v5.jsonl");
-        runtime
-            .audit_recorder()
-            .swap(v5_audit_recorder(&audit_path));
         adapter.accept_only_endpoints(vec![
             TransportEndpoint("wss://group.example".into()),
             TransportEndpoint("wss://carol-inbox.example".into()),
@@ -88,19 +104,53 @@ async fn maintenance_retry_of_a_welcome_records_its_publish_rows() {
         wall.set(300_100);
         runtime.run_due_maintenance().await.unwrap();
 
-        let rows = welcome_rows(&audit_path, &welcome, &group_id);
-        let kinds = rows
-            .iter()
-            .map(|row| row["event"]["type"].as_str().unwrap())
-            .collect::<Vec<_>>();
+        let rows = welcome_rows(dir.path(), &welcome, &group_id);
+        let retry = &rows[first.len()..];
         assert_eq!(
-            kinds,
+            kinds(retry),
             ["welcome_publish_started", "welcome_publish_finished"],
             "delivered: {delivered}"
         );
-        assert_eq!(rows[0]["event"]["attempt_id"], rows[1]["event"]["attempt_id"]);
-        assert_eq!(rows[1]["event"]["policy"], "met");
+        assert_eq!(retry[0]["event"]["attempt_id"], retry[1]["event"]["attempt_id"]);
+        assert_ne!(retry[0]["event"]["attempt_id"], first[1]["event"]["attempt_id"]);
+        assert_eq!(retry[0]["event"]["op_id"], first[0]["event"]["op_id"]);
+        assert_eq!(retry[1]["event"]["policy"], "met");
+        assert_eq!(
+            retry[1]["event"]["retained_state"],
+            if delivered { "completed" } else { "unknown" }
+        );
     }
+}
+
+/// A Welcome sent again after its retry record expired gets a new attempt
+/// id: two passes never share one, though both start the first attempt of
+/// a fresh record.
+#[tokio::test]
+async fn a_welcome_sent_again_after_its_retry_record_expired_gets_a_new_attempt_id() {
+    let dir = relaxed_storage_dir().unwrap();
+    let OwedInviteWelcome {
+        mut runtime,
+        wall,
+        group_id,
+        welcome,
+        ..
+    } = owed_invite_welcome(dir.path()).await;
+
+    // Past the retry record's retention it is dropped, and the owed Welcome
+    // is published again under a new one.
+    for step in 1..=3 {
+        wall.set(300_000 + 24 * 60 * 60 + step * 600);
+        runtime.run_due_maintenance().await.unwrap();
+    }
+
+    let attempts = welcome_rows(dir.path(), &welcome, &group_id)
+        .into_iter()
+        .filter(|row| row["event"]["type"] == "welcome_publish_started")
+        .map(|row| row["event"]["attempt_id"].as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    assert!(attempts.len() >= 2, "{attempts:?}");
+    let distinct = attempts.iter().collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(distinct.len(), attempts.len(), "{attempts:?}");
 }
 
 /// A Welcome whose inbox relay the transport refused before sending, as the
@@ -135,17 +185,15 @@ async fn welcome_refused_before_sending_is_not_a_possible_exposure() {
     assert!(!exposed(&runtime), "the first attempt reached no relay");
 
     let tried = welcome_publishes(&adapter).len();
-    let audit_path = dir.path().join("audit-v5.jsonl");
-    runtime
-        .audit_recorder()
-        .swap(v5_audit_recorder(&audit_path));
+    let recorded = welcome_rows(dir.path(), &welcome, &group_id).len();
     wall.set(300_100);
     let effects = runtime.run_due_maintenance().await.unwrap();
     assert_eq!(welcome_publishes(&adapter).len(), tried + 1, "the retry ran");
     assert!(!exposed(&runtime), "the retry reached no relay either");
     // The retry's audit row names the refusal, not an unknown result.
-    let finished = welcome_rows(&audit_path, &welcome, &group_id)
+    let finished = welcome_rows(dir.path(), &welcome, &group_id)
         .into_iter()
+        .skip(recorded)
         .find(|row| row["event"]["type"] == "welcome_publish_finished")
         .expect("the retry's finished row");
     assert_eq!(finished["event"]["results_complete"], true, "{finished}");

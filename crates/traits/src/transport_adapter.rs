@@ -2181,6 +2181,13 @@ pub trait TransportAdapter: Send + Sync {
     /// the adapter has shut down and will not produce more deliveries.
     async fn receive(&self) -> Result<Option<TransportDelivery>, TransportAdapterError>;
 
+    /// The size class of `message` as this transport sends it, for the
+    /// sender's audit. Sends nothing. An adapter that does not measure its
+    /// events returns `None`.
+    fn event_size_class(&self, _message: &TransportMessage) -> Option<EventSizeClass> {
+        None
+    }
+
     /// The size class of `message` when [`Self::publish`] would refuse it,
     /// unsent, on every endpoint of `target` it would send to, because it is
     /// over each one's known size limit. Sends nothing.

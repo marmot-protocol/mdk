@@ -266,7 +266,6 @@ pub(crate) struct WelcomeProbe {
     pub(super) rows: Vec<Record>,
     live: bool,
     pending_live: Vec<(Option<GroupRef>, Event)>,
-    validated_refs: Vec<(String, NostrEventRef, LocalId, GroupRef)>,
     // Only origins observed at an actual projection path are eligible. Absence
     // of a receive row never implies local replay or successful computation.
     projections: BTreeMap<String, UpdateCause>,
@@ -317,7 +316,6 @@ impl WelcomeProbe {
             rows: Vec::new(),
             live: false,
             pending_live: Vec::new(),
-            validated_refs: Vec::new(),
             projections: BTreeMap::new(),
             dropped: 0,
             invalid: 0,
@@ -343,12 +341,6 @@ impl WelcomeProbe {
 
     pub(super) fn take_live_events(&mut self) -> Vec<(Option<GroupRef>, Event)> {
         std::mem::take(&mut self.pending_live)
-    }
-
-    pub(super) fn take_validated_refs(
-        &mut self,
-    ) -> Vec<(String, NostrEventRef, LocalId, GroupRef)> {
-        std::mem::take(&mut self.validated_refs)
     }
 
     fn local_id(&mut self) -> LocalId {
@@ -512,12 +504,6 @@ impl WelcomeProbe {
             return;
         }
         for (op_id, recipient_ref, key_package_event_id, outer_event_id) in rows {
-            self.validated_refs.push((
-                hex::encode(outer_event_id),
-                NostrEventRef::from_validated_event_id(&outer_event_id),
-                op_id.clone(),
-                group_ref.clone(),
-            ));
             self.record(
                 Some(group_ref.clone()),
                 Event::WelcomePrepared(WelcomePrepared {

@@ -243,6 +243,7 @@ where
             metadata,
             completions,
             pending,
+            audit: self.audit.clone(),
         })
     }
 
@@ -609,7 +610,9 @@ where
                     Ok((status, held))
                 });
             match status {
-                Ok((OutboundWelcomeStatus::Settled, _)) => {}
+                Ok((OutboundWelcomeStatus::Settled(settlement), _)) => {
+                    self.record_v5_welcome_settled(&id, settlement);
+                }
                 Ok((OutboundWelcomeStatus::Waiting, _) | (_, true)) => watching.push(id),
                 Ok((OutboundWelcomeStatus::Owed { group_id, message }, false)) => {
                     watching.push(id);

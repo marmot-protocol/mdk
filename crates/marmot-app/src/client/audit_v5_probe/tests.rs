@@ -1079,8 +1079,9 @@ async fn normal_opt_in_records_real_welcome_and_operational_v5_rows() {
 
 /// An invite into an existing group leaves the sender the same linked chain
 /// a founding create does: `welcome_prepared` in invite mode on the Add
-/// commit, then publish started and finished, all on the outer event the
-/// invitee observes. Without it, a missing invite has no sender evidence.
+/// commit, the Welcome's size, then publish started and finished, all on the
+/// outer event the invitee observes, and its generic publish rows name the
+/// group. Without it, a missing invite has no sender evidence.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn invite_into_existing_group_records_prepared_and_publish_rows() {
     tokio::time::timeout(Duration::from_secs(60), async {
@@ -1153,6 +1154,30 @@ async fn invite_into_existing_group_records_prepared_and_publish_rows() {
             .expect("a welcome_publish_finished row for the invite");
         assert_eq!(finished.attempt_id, started.attempt_id);
         assert_eq!(finished.policy, Policy::Met);
+        // Its first pass resolved carol's inbox.
+        assert_eq!(started.route_source, RouteSource::ResolvedInbox);
+        // The Welcome's size, as the transport sends it.
+        assert!(sender.iter().any(|row| matches!(
+            &row.fields().event,
+            Event::WelcomeEventSize(event)
+                if event.outer_event_ref == observed
+                    && event.op_id == prepared.op_id
+                    && event.event_size_class == EventSizeClass::Under64Kib
+        )));
+        // The generic publish rows of the Welcome are found with its group.
+        let welcome_publishes = sender
+            .iter()
+            .filter(|row| {
+                let event = serde_json::to_value(&row.fields().event).unwrap();
+                event["type"] == "publish_attempt" && event["artifact_kind"] == "welcome"
+            })
+            .collect::<Vec<_>>();
+        assert!(!welcome_publishes.is_empty());
+        assert!(
+            welcome_publishes
+                .iter()
+                .all(|row| row.fields().group_ref.as_ref() == Some(&group_ref))
+        );
     })
     .await
     .expect("bounded live v5 scenario");

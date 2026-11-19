@@ -345,7 +345,6 @@ fn audit_event_round_trips_through_serde() {
             group: None,
             convergence: None,
             source: None,
-            v5_welcome_refs: Vec::new(),
         }),
         kind: AuditEventKind::ForkResolution {
             source_epoch: 4,
@@ -1506,7 +1505,6 @@ fn sample_events_serialize_within_schema_property_names() {
                 local_member_ref: Some("b".repeat(32)),
                 ..Default::default()
             }),
-            v5_welcome_refs: Vec::new(),
         }),
         kind: AuditEventKind::SendEntry {
             intent_kind: "app_message".into(),

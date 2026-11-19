@@ -262,6 +262,20 @@ pub(super) fn validate(record: &RecordFields) -> Result<(), ContractError> {
             )?;
         }
         Event::WelcomePublishNotStarted(_) => {}
+        Event::WelcomeWithdrawn(e) => {
+            require(has_group, "a withdrawn Welcome names its group")?;
+            require(
+                e.oversized_size_class.is_some()
+                    == matches!(
+                        e.reason,
+                        WithdrawalReason::WelcomeTooLarge | WithdrawalReason::CommitTooLarge
+                    ),
+                "an oversized size class goes with a too-large reason only",
+            )?;
+        }
+        Event::WelcomeEventSize(_) => {
+            require(has_group, "a Welcome's size row names its group")?;
+        }
         Event::WelcomeObserved(e) => {
             require(
                 e.acquisition != Acquisition::LocalReplay

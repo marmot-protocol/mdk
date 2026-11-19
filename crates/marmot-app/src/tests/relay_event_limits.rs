@@ -190,7 +190,8 @@ async fn a_create_whose_welcome_fits_one_inbox_relay_sends_it_only_there() {
 
 /// An invite whose Welcome fits none of the invitee's inbox relays is refused
 /// before its commit is sent: the commit rolls back, no Welcome stays owed,
-/// and nothing reaches a relay.
+/// and nothing reaches a relay. The sender's audit shows the Welcome
+/// prepared, its size, and its withdrawal as too large, in its group.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_invite_whose_welcome_fits_no_inbox_relay_is_refused_unsent() {
     let dir = tempfile::tempdir().unwrap();
@@ -199,6 +200,8 @@ async fn an_invite_whose_welcome_fits_no_inbox_relay_is_refused_unsent() {
     let bob = home.create_account("bob").unwrap();
     let relay = Arc::new(ScriptedPushRelayClient::default());
     let app = app_with_event_limits(&dir, relay.clone(), &[("wss://inbox.example", 200)]);
+    app.set_audit_log_settings(crate::AuditLogSettings { enabled: true })
+        .unwrap();
     remember_test_member_inbox(&app, &bob.account_id_hex, "wss://inbox.example");
     app.client("bob")
         .await
@@ -243,6 +246,53 @@ async fn an_invite_whose_welcome_fits_no_inbox_relay_is_refused_unsent() {
         attempted,
         "neither the commit nor the Welcome reached a relay"
     );
+    let group_ref = marmot_forensics::v5::GroupRef::from_group_id(group.as_slice()).unwrap();
+    let welcome_rows = v5_audit_rows(&app, "alice")
+        .into_iter()
+        .filter(|row| {
+            row["event"]["type"]
+                .as_str()
+                .unwrap()
+                .starts_with("welcome_")
+        })
+        .inspect(|row| assert_eq!(row["group_ref"], group_ref.as_str(), "{row}"))
+        .collect::<Vec<_>>();
+    let kinds = welcome_rows
+        .iter()
+        .map(|row| row["event"]["type"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        kinds,
+        [
+            "welcome_prepared",
+            "welcome_event_size",
+            "welcome_withdrawn"
+        ]
+    );
+    let withdrawn = &welcome_rows[2]["event"];
+    assert_eq!(withdrawn["reason"], "welcome_too_large");
+    assert_eq!(withdrawn["oversized_size_class"], "under_64_kib");
+    assert!(
+        welcome_rows
+            .iter()
+            .all(|row| row["event"]["outer_event_ref"] == withdrawn["outer_event_ref"])
+    );
+}
+
+/// The account's v5 audit rows, each checked against the v5 contract.
+fn v5_audit_rows(app: &MarmotApp, account: &str) -> Vec<serde_json::Value> {
+    let mut rows = Vec::new();
+    for entry in std::fs::read_dir(app.account_dir(account)).unwrap() {
+        let path = entry.unwrap().path();
+        if !path.to_string_lossy().ends_with("-v5.jsonl") {
+            continue;
+        }
+        for line in std::fs::read_to_string(&path).unwrap().lines() {
+            marmot_forensics::v5::Record::from_json(line.as_bytes()).expect("strict v5 row");
+            rows.push(serde_json::from_str(line).unwrap());
+        }
+    }
+    rows
 }
 
 /// Account publishes, a profile here, go through the same refusal: no relay is

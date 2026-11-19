@@ -15,6 +15,12 @@
 
 ### Added
 
+- `StoredMessagePayload::OutboundWelcome` and `StagedInviteWelcome` keep the transport event id of the KeyPackage
+  the Welcome answers (`key_package_event_id`, `with_key_package_event_id`, `welcome_key_package_event_id`). A Welcome
+  that names one is stored as the new variant 14 (outbound) or 15 (staged); one that does not keeps its old variant,
+  byte for byte. An older build cannot decode the new variants.
+- `TransportAdapter::event_size_class` measures an event as the transport sends it, for the sender's audit. It
+  defaults to `None`.
 - `MessageStorage::release_message_for_replay_without_stall_evidence` releases a row the engine judged not to be
   evidence of missing history, such as traffic that may predate this copy's Welcome (mdk#3536). It defaults to
   `release_message_for_replay`; a backend that turns releases into an epoch-gap backfill must not raise one from it as

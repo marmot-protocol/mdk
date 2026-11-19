@@ -2592,7 +2592,7 @@ impl AppClient {
             changed_fields.push("image");
         }
         // The people added, not their devices' KeyPackages.
-        let mut audit_context = Self::local_human_action_context(
+        let audit_context = Self::local_human_action_context(
             "create_group",
             changed_fields,
             touched_components,
@@ -2679,7 +2679,6 @@ impl AppClient {
         }
         if let (Some(probe), Some(pending)) = (&mut self.audit_v5_probe, founding_probe) {
             probe.founding_prepared(pending, &group_id, &prepared.effects);
-            audit_context.v5_welcome_refs = probe.take_validated_refs();
             if self.audit.records_v5()
                 && let Ok(group) = self.runtime.group_record(&group_id)
             {
