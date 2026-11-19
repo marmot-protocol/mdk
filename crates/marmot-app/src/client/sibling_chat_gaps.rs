@@ -142,6 +142,18 @@ fn claimant_is_eligible(exchange: &Exchange, slot: &DeviceSlotId) -> bool {
     linked_device(&exchange.roster, slot)
 }
 
+/// Whether a claim to add `slot` is kept: the roster lists it as linked
+/// and tagged. A local admission hold, such as this device's own link of it
+/// still pending, does not drop a sibling's claim; it holds only this
+/// device's own Adds and claims.
+fn claim_target_is_valid(roster: &DeviceRosterV1, slot: &DeviceSlotId) -> bool {
+    linked_device(roster, slot)
+        && roster
+            .devices
+            .get(slot)
+            .is_some_and(|entry| entry.tag_signature_key.is_some())
+}
+
 /// Whether the roster lists `slot` as active or inactive: linked, neither
 /// leaving nor moved.
 fn linked_device(roster: &DeviceRosterV1, slot: &DeviceSlotId) -> bool {
@@ -192,7 +204,9 @@ fn approver_hold_until(
 struct GapEligibility {
     group: GroupId,
     own_slot: DeviceSlotId,
-    targets: BTreeMap<DeviceSlotId, Vec<u8>>,
+    /// Each ready target's tag signature key, approver and link time: a
+    /// changed approver or link recomputes approver holds (mdk#3537).
+    targets: BTreeMap<DeviceSlotId, (Vec<u8>, Option<DeviceSlotId>, u64)>,
     claimants: BTreeSet<DeviceSlotId>,
 }
 
@@ -700,7 +714,7 @@ impl AppClient {
         };
         if claim.from == exchange.own_slot
             || !claimant_is_eligible(&exchange, &claim.from)
-            || !self.gap_siblings(&exchange)?.eligible.contains(&claim.to)
+            || !claim_target_is_valid(&exchange.roster, &claim.to)
             || !self.sibling_commit_chats().contains(&claim.chat)
         {
             return Ok(());
@@ -753,10 +767,11 @@ impl AppClient {
             targets: ready
                 .iter()
                 .filter_map(|slot| {
-                    exchange.roster.devices[slot]
+                    let entry = &exchange.roster.devices[slot];
+                    entry
                         .tag_signature_key
                         .clone()
-                        .map(|key| (*slot, key))
+                        .map(|key| (*slot, (key, entry.linked_by, entry.linked_at)))
                 })
                 .collect(),
             claimants: exchange
@@ -770,7 +785,9 @@ impl AppClient {
         if eligible.is_empty() {
             self.sibling_chat_gaps.eligibility = None;
             self.sibling_chat_gaps.due.clear();
-            self.sibling_chat_gaps.claims.clear();
+            self.sibling_chat_gaps
+                .claims
+                .retain(|(_, target), _| claim_target_is_valid(&exchange.roster, target));
             self.sibling_chat_gaps.waiting_for_stock.clear();
             self.sibling_chat_gaps.unused_adds.clear();
             self.sibling_chat_gaps.approver_holds.clear();
@@ -828,7 +845,9 @@ impl AppClient {
             .claims
             .retain(|(chat, target), claims| {
                 claims.retain(|slot, _| claimant_is_eligible(&exchange, slot));
-                known.contains(chat) && eligible.contains(target) && !claims.is_empty()
+                known.contains(chat)
+                    && claim_target_is_valid(&exchange.roster, target)
+                    && !claims.is_empty()
             });
         self.sibling_chat_gaps
             .waiting_for_stock
@@ -1079,12 +1098,13 @@ mod tests {
     /// interval must still schedule the first ready pass.
     #[test]
     fn blocked_gap_passes_preserve_the_last_scheduled_eligibility() {
-        let eligibility = |key| GapEligibility {
+        let linked = |key, linked_by| GapEligibility {
             group: GroupId::new(vec![1, 2, 3]),
             own_slot: [1; 32],
-            targets: BTreeMap::from([([2; 32], vec![key; 32])]),
-            claimants: BTreeSet::from([[1; 32], [2; 32]]),
+            targets: BTreeMap::from([([2; 32], (vec![key; 32], linked_by, 100))]),
+            claimants: BTreeSet::from([[1; 32], [2; 32], [3; 32]]),
         };
+        let eligibility = |key| linked(key, Some([1; 32]));
         let mut state = SiblingChatGaps::default();
         assert!(!state.schedule_eligibility(eligibility(3), false));
         assert!(
@@ -1102,6 +1122,12 @@ mod tests {
             "blocked key change is not consumed"
         );
         assert!(!state.schedule_eligibility(eligibility(4), true));
+        // mdk#3537: a branch that names another approver for the same
+        // target rescans, so holds are found afresh.
+        assert!(
+            state.schedule_eligibility(linked(4, Some([3; 32])), true),
+            "a changed approver rescans"
+        );
     }
 
     #[test]

@@ -424,10 +424,11 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   device neither claims nor suppresses another claimant. Claims are transient, expire from their original event time
   after ten minutes, and never authorize an Add; replay cannot extend one. A live own claim delays another local
   attempt after a terminal Add failure until that same expiry; restart can forget it. Only changed/due chats load their
-  MLS trees: compare effective target keys/exclusions, pending-setting readiness and claimant eligibility with the
-  last actually scheduled inputs. A blocked sender does not consume changes; routine busy/ready cycles and device-group commits do not
+  MLS trees: compare effective target keys/exclusions, each target's `linked_by` and `linked_at`, pending-setting
+  readiness and claimant eligibility with the last actually scheduled inputs. A blocked sender does not consume changes; routine busy/ready cycles and device-group commits do not
   invalidate all chats. Preserve live claims and stock waiters for roster-eligible targets during a local settings
-  hold; use only ready targets for scheduling fingerprints, new Adds and stock requests. Isolate settings-readiness
+  hold. Receive and keep a sibling's authenticated claim for any linked, tagged roster target (`claim_target_is_valid`)
+  even while a local admission hold, such as this device's own link still pending, excludes the target here; use only ready targets for scheduling fingerprints, new Adds and stock requests. Isolate settings-readiness
   and stock read errors per target, report the error and retry the chat while healthy siblings progress.
   Check chat quiet again before each target claim; keep original-expiry claims when readiness
   changes during publication. With no eligible target, clear pending work without enumerating chats. Hydration
@@ -443,7 +444,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   Share `LINK_CHAT_ADDS_PER_PASS` with the direct post-link burst. The engine rechecks sibling presence at actual
   direct/queued preparation.
   Leave a newly linked target to its approver while that approver is active (mdk#3537, `approver_hold_until`): the
-  approver's direct pass claims nothing, so a sibling's Add would fork the chat. On a device other than the target's
+  approver's direct pass claims nothing, so a sibling's Add could fork the chat. This narrows, not closes, the race:
+  claim delivery timing at the hand-off edges and devices from before this rule can still race. On a device other than the target's
   roster `linked_by`, skip the target in a chat holding a leaf of that approver (`approver_in_chat`, the tag-or-tag-key
   check), with no claim or stock spend, while that approver is Active or Inactive in the roster, the target's roster
   `linked_at` is less than `LINK_CHAT_ADD_SECS` old, and the approver's last activity, the newer of its counted

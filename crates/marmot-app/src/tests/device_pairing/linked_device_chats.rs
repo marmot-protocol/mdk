@@ -1868,9 +1868,11 @@ async fn a_sibling_fills_missing_chats_while_the_approver_is_offline() {
 
 /// mdk#3537: an approver in the lowest slot that comes back to find a
 /// higher sibling's live claim on a chat for its new device, before that
-/// sibling's Add, leaves the chat to it. One maintenance turn adds the device
-/// to the unclaimed chat, and neither the direct pass nor the approver's own
-/// gap filling spends stock for or adds it in the claimed one.
+/// sibling's Add, leaves the chat to it. The claim arrives with the new
+/// device's first commit, before the approver has settled its own link. One
+/// maintenance turn adds the device to the unclaimed chat, and neither the
+/// direct pass nor the approver's own gap filling spends stock for or adds it
+/// in the claimed one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_returning_approver_leaves_a_claimed_chat_to_a_higher_sibling() {
     let (relay, [first, second, mut tablet]) = alice_devices::<3>().await;
@@ -1883,8 +1885,14 @@ async fn a_returning_approver_leaves_a_claimed_chat_to_a_higher_sibling() {
     let group = link(&relay, &mut phone, &mut laptop, "Laptop").await;
     passes(&relay, &mut [&mut phone, &mut laptop], 4).await;
     assert!(chats.iter().all(|chat| joined(&laptop, chat)));
-    link(&relay, &mut phone, &mut tablet, "Tablet").await;
-    hold_key_packages(&relay, &mut phone, &mut tablet).await;
+    // The phone links the tablet, then is away while the tablet joins and
+    // makes its first commit, and the laptop claims the first chat.
+    let slot = choose_link(&relay, &mut phone, &mut tablet).await;
+    tablet.op(DeviceLinkOp::ConfirmMatch).await;
+    tablet.step(&relay).await; // the phone's confirm in, the tablet's out
+    phone.step(&relay).await; // the tablet's confirm in: the commit
+    let joined_tablet = tablet.step(&relay).await; // the Welcome, and its first commit
+    assert_eq!(joined_tablet.new_device, Some(NewDeviceLinkState::Linked));
     converge_device_group(&mut laptop.client, &relay, &mut laptop.cursor, &group, 4).await;
     let claim = format!(
         "{{\"v\":1,\"from\":\"{}\",\"to\":\"{}\",\"chat\":\"{}\"}}",
@@ -1900,6 +1908,17 @@ async fn a_returning_approver_leaves_a_claimed_chat_to_a_higher_sibling() {
             .unwrap()
     );
     deliver_new(&mut phone.client, &relay, &mut phone.cursor).await;
+    assert_eq!(
+        link_record(&phone, &group, &slot).outcome,
+        DeviceLinkOutcome::Pending,
+        "the claim arrived before the phone settled its link"
+    );
+    let settled = phone.step(&relay).await;
+    assert_eq!(
+        settled.prompt_for_slot(&slot).unwrap().state,
+        DeviceLinkPromptState::Linked
+    );
+    hold_key_packages(&relay, &mut phone, &mut tablet).await;
     phone.client.run_due_maintenance().await.unwrap();
     assert_eq!(leaves_of(&phone, &tablet, &chats[0], &group), 0);
     assert_eq!(leaves_of(&phone, &tablet, &chats[1], &group), 1);

@@ -1620,9 +1620,10 @@ eligible direct post-link Adds while that flow is still adding, and gap filling 
 does not leave joined chats. The approving device's direct post-link pass sends no gap-fill claim (kind 458), so
 other devices leave a newly linked device to it, in the chats it is in, while it is active: for up to a week after
 the link, until two hours pass without a heartbeat from the approver. The approver does not add the device to a chat
-another device holds a live claim for. A
-device running a version before this rule gap-fills at once and can still race the approver; selected-parent
-presence checks and ordinary branch selection still apply. **Bring chat history** applies to future sibling Adds and transfers still owed; enabling
+another device holds a live claim for. This prevents competing Adds in the usual case only: a claim that arrives late
+at the hand-off, or a device running a version before this rule, which gap-fills at once, can still race the
+approver; selected-parent presence checks and ordinary branch selection still apply.
+**Bring chat history** applies to future sibling Adds and transfers still owed; enabling
 it does not backfill chats already joined or recreate a transfer discarded while it was off. **Keep while inactive**
 stops automatic removal of an `Inactive` device; it does not stop the mark, explicit removal or sign-out.
 
