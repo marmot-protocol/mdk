@@ -411,8 +411,9 @@ where
     ) -> AccountResult<WelcomeWithdrawal> {
         // Relays that already took it make it delivered, not withdrawn: a
         // saved acceptance that meets its policy, whose mark a stop
-        // interrupted, is reconciled first.
-        if let Some(fanout) = self.session.transport_fanout(message_id)? {
+        // interrupted, is reconciled first. A record that cannot be read now
+        // does not stop the withdrawal.
+        if let Ok(Some(fanout)) = self.session.transport_fanout(message_id) {
             self.settle_met_welcome(
                 &fanout.exact_message,
                 accepted_fanout_targets(&fanout),

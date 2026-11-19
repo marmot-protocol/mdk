@@ -23,7 +23,12 @@
   Welcome is (`welcome_event_size`) and why one will never be sent
   (`welcome_withdrawn`: withdrawn, its commit superseded, expired, or refused
   as too large with the oversized size class). A receiver must accept the new
-  kinds before it gets these rows; one that rejects them loses only them.
+  kinds before it gets these rows; one that rejects them loses only them, so
+  repin and deploy the White Noise audit receiver before shipping. The rows
+  are best-effort evidence, and a missing row proves nothing: a Welcome whose
+  KeyPackage had no transport source has no `welcome_prepared`, a pass cut
+  off by a worker stop may have no finished row, and a Welcome that settles
+  while no process watches it has no `welcome_withdrawn`.
 - A group send none of whose relays MDK may send to, such as relays at
   private-network addresses, fails as a typed no-usable-relay error, not a
   generic publish failure: `AppError::NoUsableRelay`,
