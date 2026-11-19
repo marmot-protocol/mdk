@@ -97,9 +97,6 @@
 
 ### Fixed
 
-- Continue group history recovery across partial MLS epoch advances. Retained
-  unreadable messages can arm the next recovery request after local replay
-  settles, without reopening the account or waiting for fresh traffic.
 - A relay the host-safety rule refuses no longer reads as one a send may have
   reached, or hides that a send is too large (#3305). A Welcome whose inbox
   relays it refuses, on the first attempt or a later retry, no longer counts
@@ -110,6 +107,9 @@
   native origin loses (#3493). Parked recovery keeps its exact retry for
   canonical re-adoption; terminal loss retires it. Already-started relay I/O
   still completes.
+- Continue group history recovery across partial MLS epoch advances. Retained
+  unreadable messages can arm the next recovery request after local replay
+  settles, without reopening the account or waiting for fresh traffic.
 - Stop a retried emoji-set install from deleting emoji the user already has
   (#3464). Reinstalling the installed version keeps each image whose download
   fails, and the result's `skipped` list names only entries left without an
