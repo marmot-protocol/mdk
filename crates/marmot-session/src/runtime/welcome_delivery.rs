@@ -408,6 +408,9 @@ where
         if withdrawal == WelcomeWithdrawal::AlreadyDelivered {
             return Ok(withdrawal);
         }
+        if withdrawal == WelcomeWithdrawal::Withdrawn {
+            self.record_v5_welcome_withdrawal(message_id);
+        }
         // A reserved wave owns its fanout until finish; maintenance prunes
         // the withdrawn retry after that reservation is released.
         if !self.session.detached_welcome_publishes.contains(message_id) {

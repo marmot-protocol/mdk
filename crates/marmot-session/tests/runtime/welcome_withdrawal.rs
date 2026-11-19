@@ -87,19 +87,37 @@ fn current_nostr_welcome_session(
     key: &SqlCipherKey,
     identity: &[u8],
 ) -> AccountDeviceSession {
+    AccountDeviceSession::open(current_nostr_welcome_config(path, key, identity)).unwrap()
+}
+
+/// [`deferred_current_session`] wrapping its Welcomes as
+/// [`NostrWelcomePeeler`] does.
+fn deferred_current_nostr_welcome_session(
+    path: impl Into<std::path::PathBuf>,
+    key: &SqlCipherKey,
+    identity: &[u8],
+) -> AccountDeviceSession {
     AccountDeviceSession::open(
-        SessionConfig::new(
-            path,
-            SqlCipherKey::new(key.as_secret_str()).unwrap(),
-            pad32(identity),
-            Box::new(NostrWelcomePeeler(MockPeeler)),
-        )
-        .account_identity_proof_signer(Arc::new(NostrAccountIdentityProofSigner {
-            keys: deterministic_nostr_keys(identity),
-        }))
-        .protocol_profile(ProtocolProfile::Current),
+        current_nostr_welcome_config(path, key, identity).defer_group_hydration(),
     )
     .unwrap()
+}
+
+fn current_nostr_welcome_config(
+    path: impl Into<std::path::PathBuf>,
+    key: &SqlCipherKey,
+    identity: &[u8],
+) -> SessionConfig {
+    SessionConfig::new(
+        path,
+        SqlCipherKey::new(key.as_secret_str()).unwrap(),
+        pad32(identity),
+        Box::new(NostrWelcomePeeler(MockPeeler)),
+    )
+    .account_identity_proof_signer(Arc::new(NostrAccountIdentityProofSigner {
+        keys: deterministic_nostr_keys(identity),
+    }))
+    .protocol_profile(ProtocolProfile::Current)
 }
 
 /// Where the owed-invite fixture's runtime records its v5 audit, from before
@@ -760,7 +778,11 @@ async fn welcome_is_withdrawn_before_its_group_is_hydrated() {
             Arc::new(TestRandom::new(0)),
         )
     };
-    let mut runtime = open(current_session(&database, &key, b"alice-unhydrated"));
+    let mut runtime = open(current_nostr_welcome_session(
+        &database,
+        &key,
+        b"alice-unhydrated",
+    ));
     let (group_id, created) = runtime
         .create_group(CreateGroupRequest {
             name: "unhydrated withdrawal".into(),
@@ -779,11 +801,15 @@ async fn welcome_is_withdrawn_before_its_group_is_hydrated() {
     drop(runtime);
 
     adapter.accept_only_endpoints(vec![bob_inbox]);
-    let mut runtime = open(deferred_current_session(
+    let mut runtime = open(deferred_current_nostr_welcome_session(
         &database,
         &key,
         b"alice-unhydrated",
     ));
+    let withdrawn_audit = dir.path().join("withdrawn-audit-v5.jsonl");
+    runtime
+        .audit_recorder()
+        .swap(v5_audit_recorder(&withdrawn_audit));
     assert_eq!(
         runtime.session().unhydrated_group_ids(),
         vec![group_id.clone()]
@@ -822,10 +848,27 @@ async fn welcome_is_withdrawn_before_its_group_is_hydrated() {
     assert_eq!(runtime.session().unhydrated_group_ids(), vec![group_id]);
     drop(runtime);
 
-    let mut runtime = open(current_session(&database, &key, b"alice-unhydrated"));
+    let mut runtime = open(current_nostr_welcome_session(
+        &database,
+        &key,
+        b"alice-unhydrated",
+    ));
+    let reopened_audit = dir.path().join("reopened-audit-v5.jsonl");
+    runtime
+        .audit_recorder()
+        .swap(v5_audit_recorder(&reopened_audit));
     assert!(runtime.outstanding_welcome_deliveries().unwrap().is_empty());
     runtime.run_due_maintenance().await.unwrap();
     assert_eq!(welcome_publishes(&adapter).len(), 1);
+    // The withdrawal is audited once, where it happened, though no watch
+    // held the Welcome then.
+    let withdrawals = [&withdrawn_audit, &reopened_audit]
+        .into_iter()
+        .flat_map(|path| v5_audit_rows(path))
+        .filter(|row| row["event"]["type"] == "welcome_withdrawn")
+        .collect::<Vec<_>>();
+    assert_eq!(withdrawals.len(), 1, "{withdrawals:?}");
+    assert_eq!(withdrawals[0]["event"]["reason"], "withdrawn");
 }
 
 /// mdk#2628 D40: a device link's Welcome is never published from its delivery

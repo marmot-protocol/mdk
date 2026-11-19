@@ -409,6 +409,8 @@ mod migration_0213_epoch_gap_visit_window;
 mod migration_0214_link_chat_progress;
 #[path = "migrations/0215_released_receipt_stall_evidence.rs"]
 mod migration_0215_released_receipt_stall_evidence;
+#[path = "migrations/0216_welcome_key_package_event_id.rs"]
+mod migration_0216_welcome_key_package_event_id;
 
 const MIGRATIONS: &[Migration] = &[
     Migration {
@@ -1553,6 +1555,12 @@ const MIGRATIONS: &[Migration] = &[
         name: "0215_released_receipt_stall_evidence",
         suspend_foreign_keys: &[],
         apply: migration_0215_released_receipt_stall_evidence::apply,
+    },
+    Migration {
+        version: 216,
+        name: "0216_welcome_key_package_event_id",
+        suspend_foreign_keys: &[],
+        apply: migration_0216_welcome_key_package_event_id::apply,
     },
 ];
 

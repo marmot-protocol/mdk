@@ -628,6 +628,9 @@ pub struct AccountDeviceRuntime<A, R = StaticTransportRouting, K = NoopKeyPackag
     /// Retained Welcomes this process noted, each read once
     /// ([`Self::note_retained_welcomes`]).
     v5_prepared_welcomes: HashSet<cgka_traits::MessageId>,
+    /// Welcomes whose withdrawal `withdraw_welcome` recorded, so the
+    /// watcher does not record it again.
+    v5_withdrawn_welcomes: std::sync::Mutex<HashSet<cgka_traits::MessageId>>,
     /// Whether the store has been read for `watched_welcomes`: the startup
     /// pass reads it, or else the first maintenance pass.
     welcome_store_read: bool,
@@ -705,6 +708,7 @@ where
             prepared_welcome_tasks: Vec::new(),
             watched_welcomes: Vec::new(),
             v5_prepared_welcomes: HashSet::new(),
+            v5_withdrawn_welcomes: std::sync::Mutex::new(HashSet::new()),
             welcome_store_read: false,
             unread_welcome_groups: Vec::new(),
             finish_stage_failure: None,
@@ -4015,7 +4019,9 @@ where
         refusal: Option<InviteRefusal>,
     ) -> AccountResult<AccountDeviceEffects> {
         let (mut prepared_effects, welcomes, pending) = prepared.into_parts();
-        let unretired = self.unretired_welcomes(welcomes.iter().map(|welcome| welcome.id.clone()));
+        let unretired = refusal
+            .as_ref()
+            .map(|_| self.unretired_welcomes(welcomes.iter().map(|welcome| welcome.id.clone())));
         prepared_effects.publish.retain(|work| {
             !matches!(work, PublishWork::GroupEvolution { pending: own, .. } | PublishWork::GroupCreated { pending: own, .. } if *own == pending)
         });
@@ -4024,11 +4030,14 @@ where
         let mut queue = VecDeque::new();
         output.absorb_session_effects(prepared_effects, &mut queue);
 
-        let rollback_effects = self.session.publish_failed(pending).await?;
-        if let Some(refusal) = refusal {
+        let rollback = self.session.publish_failed(pending).await;
+        // A rollback can commit, retiring Welcomes, and fail after: record
+        // what it retired either way.
+        if let (Some(refusal), Some(unretired)) = (refusal, unretired) {
             let retired = self.retired_welcomes(unretired);
             self.record_v5_welcomes_refused(&retired, &refusal);
         }
+        let rollback_effects = rollback?;
         output
             .pending
             .push(PendingResolution::RolledBack { pending });
@@ -5964,9 +5973,11 @@ where
                 refusal.oversized,
                 RollbackPass::Staging,
             )
-            .await?;
+            .await;
+            // Recorded even when the rollback fails after it committed.
             let retired = self.retired_welcomes(unretired);
             self.record_v5_welcomes_refused(&retired, &refusal);
+            let effects = effects?;
             output
                 .pending
                 .push(PendingResolution::RolledBack { pending });
@@ -6088,7 +6099,15 @@ where
             .filter(|target| transport_fanout_target_retry_due(target, self.wall_clock.now()))
             .map(|target| target.endpoint.clone())
             .collect::<Vec<_>>();
-        if !remaining.is_empty() {
+        if remaining.is_empty() {
+            // Its stored acceptances may meet the policy, though a stop
+            // interrupted the mark.
+            self.settle_met_welcome(
+                &fanout.exact_message,
+                accepted_fanout_targets(&fanout),
+                fanout.required_acks,
+            );
+        } else {
             let required_acks = fanout.required_acks.max(1);
             let accepted_before = accepted_fanout_targets(&fanout);
             // Secondary retries are audited like the first pass, so a relay
@@ -6261,12 +6280,7 @@ where
             // A Welcome is delivered by whichever attempt meets its policy,
             // this retry included, so it stops being owed now rather than at
             // the next open.
-            if matches!(artifact_kind, Some(MessageArtifactKind::Welcome))
-                && accepted_before < required_acks
-                && accepted_total >= required_acks
-            {
-                self.mark_welcome_delivered_best_effort(message_id);
-            }
+            self.settle_met_welcome(&fanout.exact_message, accepted_total, required_acks);
             // After the mark, so retention is what this pass left stored.
             self.record_v5_welcome_publish_finished(
                 &v5_welcome,
@@ -7120,17 +7134,21 @@ where
             && let Some(pending) = fanout.pending_ref()
         {
             let oversized = OversizedEvent::of_fanout(fanout);
-            let unretired = self.unretired_welcomes(
-                fanout
-                    .pending_post_confirmation_welcomes()
-                    .iter()
-                    .map(|welcome| welcome.id.clone()),
-            );
-            let effects = roll_back_failed_fanout(&mut self.session, pending, fanout, pass).await?;
-            if let Some(oversized) = oversized {
+            let unretired = oversized.map(|_| {
+                self.unretired_welcomes(
+                    fanout
+                        .pending_post_confirmation_welcomes()
+                        .iter()
+                        .map(|welcome| welcome.id.clone()),
+                )
+            });
+            let effects = roll_back_failed_fanout(&mut self.session, pending, fanout, pass).await;
+            // Recorded even when the rollback fails after it committed.
+            if let (Some(oversized), Some(unretired)) = (oversized, unretired) {
                 let retired = self.retired_welcomes(unretired);
                 self.record_v5_welcomes_refused(&retired, &InviteRefusal::from(oversized));
             }
+            let effects = effects?;
             output
                 .pending
                 .push(PendingResolution::RolledBack { pending });
@@ -7387,17 +7405,7 @@ where
                             | TransportFanoutAttemptState::AttemptedFailed
                     )
                 });
-            // A Welcome an earlier attempt already delivered to its policy,
-            // as one interrupted before its mark, is marked now.
-            if accepted_before >= required_acks.max(1)
-                && matches!(artifact_kind, Some(MessageArtifactKind::Welcome))
-                && matches!(
-                    self.session.stored_message_state(&message_id),
-                    Ok(Some(MessageState::Sent))
-                )
-            {
-                self.mark_welcome_delivered_best_effort(&message_id);
-            }
+            self.settle_met_welcome(&message, accepted_before, required_acks);
             return Ok(PreparedLegacyPublish::Complete(PublishStatus {
                 met_required_acks: accepted_before >= required_acks.max(1),
                 accepted_by_any_endpoint: accepted_before > 0,
@@ -7539,6 +7547,9 @@ where
                     }
                 }
                 self.session.put_transport_fanout(&fanout)?;
+                // An earlier acceptance may already meet the policy, stored
+                // before a stop interrupted its mark.
+                self.settle_met_welcome(&fanout.exact_message, accepted_before, required_acks);
                 self.record_v5_welcome_publish_finished(
                     &v5_welcome,
                     endpoint_report.as_ref(),
@@ -7632,9 +7643,7 @@ where
         let published = accepted_total >= required_acks.max(1);
         // Whichever attempt meets a Welcome's policy marks it delivered; the
         // finished row then reports what the mark left stored.
-        if published && matches!(artifact_kind, Some(MessageArtifactKind::Welcome)) {
-            self.mark_welcome_delivered_best_effort(&message_id);
-        }
+        self.settle_met_welcome(&fanout.exact_message, accepted_total, required_acks);
         self.record_v5_welcome_publish_finished(
             &v5_welcome,
             Some(&report),

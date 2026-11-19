@@ -298,6 +298,43 @@ where
         self.v5_welcome_of(facts)
     }
 
+    /// Record `welcome_withdrawn` for a Welcome its sender just withdrew,
+    /// watched or not; the watcher then leaves that settlement alone.
+    pub(super) fn record_v5_welcome_withdrawal(&self, welcome_id: &cgka_traits::MessageId) {
+        let Some(v5) = self.v5_welcome_from_store(welcome_id) else {
+            return;
+        };
+        self.record_v5_welcome_withdrawn(&v5, audit_v5::WithdrawalReason::Withdrawn, None);
+        let mut recorded = self
+            .v5_withdrawn_welcomes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if recorded.len() >= MAX_PREPARED_WELCOMES_REMEMBERED {
+            recorded.clear();
+        }
+        recorded.insert(welcome_id.clone());
+    }
+
+    /// Mark a still-owed Welcome delivered when its stored acceptances meet
+    /// its policy: from the attempt that met it, or after a stop interrupted
+    /// that attempt's mark.
+    pub(super) fn settle_met_welcome(
+        &self,
+        message: &TransportMessage,
+        accepted: usize,
+        required_acks: usize,
+    ) {
+        if matches!(message.envelope, TransportEnvelope::Welcome { .. })
+            && accepted >= required_acks.max(1)
+            && matches!(
+                self.session.stored_message_state(&message.id),
+                Ok(Some(MessageState::Sent))
+            )
+        {
+            self.mark_welcome_delivered_best_effort(&message.id);
+        }
+    }
+
     /// Record `welcome_withdrawn` for a watched Welcome that settled without
     /// being delivered.
     pub(super) fn record_v5_welcome_settled(
@@ -306,7 +343,17 @@ where
         settlement: WelcomeSettlement,
     ) {
         let reason = match settlement {
-            WelcomeSettlement::Withdrawn => audit_v5::WithdrawalReason::Withdrawn,
+            WelcomeSettlement::Withdrawn => {
+                let recorded = self
+                    .v5_withdrawn_welcomes
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .remove(welcome_id);
+                if recorded {
+                    return;
+                }
+                audit_v5::WithdrawalReason::Withdrawn
+            }
             WelcomeSettlement::CommitSuperseded => audit_v5::WithdrawalReason::CommitSuperseded,
             WelcomeSettlement::Expired => audit_v5::WithdrawalReason::Expired,
             WelcomeSettlement::Delivered | WelcomeSettlement::Untracked => return,

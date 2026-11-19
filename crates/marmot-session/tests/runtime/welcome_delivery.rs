@@ -461,3 +461,37 @@ async fn a_too_large_welcome_is_named_and_its_sibling_invitee_is_withdrawn() {
         .collect()
     );
 }
+
+/// A Welcome whose stored fanout already meets its policy, from an
+/// acceptance saved before a stop interrupted its delivered mark, is marked
+/// delivered by the next maintenance pass, though no relay is due.
+#[tokio::test]
+async fn a_saved_acceptance_whose_mark_was_interrupted_settles_the_welcome() {
+    let dir = relaxed_storage_dir().unwrap();
+    let OwedInviteWelcome {
+        mut runtime,
+        wall,
+        welcome,
+        ..
+    } = owed_invite_welcome(dir.path()).await;
+    // The relay's acceptance reached storage; the mark after it did not.
+    let mut fanout = runtime
+        .session()
+        .transport_fanout(&welcome.id)
+        .unwrap()
+        .unwrap();
+    for target in &mut fanout.targets {
+        target.state = cgka_traits::TransportFanoutAttemptState::Accepted;
+    }
+    runtime.session().put_transport_fanout(&fanout).unwrap();
+    assert_eq!(runtime.outstanding_welcome_deliveries().unwrap().len(), 1);
+
+    wall.set(300_100);
+    runtime.run_due_maintenance().await.unwrap();
+
+    assert!(runtime.outstanding_welcome_deliveries().unwrap().is_empty());
+    assert_eq!(
+        runtime.withdraw_welcome(&welcome.id).unwrap(),
+        WelcomeWithdrawal::AlreadyDelivered
+    );
+}
