@@ -39,7 +39,6 @@ pub use runtime::{
     PendingResolution, PreparedSessionCommit, PreparedSessionSend, PreparedWelcomePublishTask,
     PublishFailure, PublishedApplicationMessage, UndeliveredCommit, UnresolvedApplicationMessage,
     UnresolvedPublish, UnresolvedPublishReason, WallClockWindow, WelcomeDeliveryFailure,
-    welcome_audit_operation_id,
 };
 pub use session::{
     CreateGroupEffects, GroupAuthorityView, HydrationProgress, PublishWork, QueuedIntentRef,

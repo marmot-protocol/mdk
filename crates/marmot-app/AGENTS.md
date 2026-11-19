@@ -819,8 +819,9 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   `AuditLogSource` metadata, salted-hash identity derivation, and the `MarmotApp` methods for audit settings,
   recorder open/build, file enumeration, and path validation/resolution/removal. Audit-log unit tests live in its own
   `#[cfg(test)] mod tests`. Recorded rows leave the device only through v5 OTLP delivery; there is no file upload.
-- Keep the bounded live v5 Welcome capture in `src/client/audit_v5_probe.rs`. It records actual retained founding
-  preparation, receipt/peel, app join/checkpoint, and bounded stored-group snapshots through the installed recorder;
+- Keep the bounded live v5 Welcome capture in `src/client/audit_v5_probe.rs`. It records receipt/peel, app
+  join/checkpoint, and bounded stored-group snapshots through the installed recorder; the sender's Welcome rows,
+  founding and invite alike, are the account runtime's (`marmot-session` `runtime/welcome_audit.rs`), never the probe's;
   tests retain an in-memory probe for focused product-boundary assertions. Do not infer ACKs, recipient joins, or
   durable writes from another boundary. See `tests/audit-v5-welcome-probe.md` for historical subset measurements.
 - Keep the v5-only recovery-owner and transport-cursor audit rows in `src/client/audit_recovery.rs`

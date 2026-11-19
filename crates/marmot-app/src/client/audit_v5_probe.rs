@@ -3,9 +3,9 @@
 //! tests can inspect a private in-memory probe without changing product flow.
 //!
 //! A received envelope, its actual transport peel, and a committed app
-//! checkpoint are distinct evidence boundaries. A sender founding preparation
-//! also records the returned retained artifact and recipient engine join.
-//! Publication receipts are captured at the account owner boundary.
+//! checkpoint are distinct evidence boundaries. The sender's Welcome rows,
+//! preparation and publication alike, are the account runtime's; the probe
+//! records a created group's baseline.
 use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};

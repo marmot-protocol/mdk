@@ -120,6 +120,36 @@ async fn owed_invite_welcome_through(
     dir: &std::path::Path,
     adapter: RecordingAdapter,
 ) -> OwedInviteWelcome {
+    adapter.accept_next(1);
+    adapter.accept_next(0);
+    let (invited, effects) = invite_carol_through(
+        dir,
+        adapter,
+        vec![TransportEndpoint("wss://carol-inbox.example".into())],
+    )
+    .await;
+    assert_eq!(effects.welcome_failures.len(), 1);
+    assert_eq!(invited.welcome.id, effects.welcome_failures[0].message_id);
+    assert!(
+        invited
+            .runtime
+            .session()
+            .transport_fanout(&invited.welcome.id)
+            .unwrap()
+            .is_some(),
+        "the failed Welcome keeps a retry record"
+    );
+    invited
+}
+
+/// Alice invites carol, whose inbox relays are `carol_inboxes`, into a
+/// confirmed group, through `adapter` as scripted; the runtime records its v5
+/// audit at [`owed_invite_audit_path`] from before the invite.
+async fn invite_carol_through(
+    dir: &std::path::Path,
+    adapter: RecordingAdapter,
+    carol_inboxes: Vec<TransportEndpoint>,
+) -> (OwedInviteWelcome, AccountDeviceEffects) {
     let key = SqlCipherKey::new("marmot welcome withdrawal key").unwrap();
     let mut alice = nostr_welcome_session(dir.join("alice.sqlite"), &key, b"alice-withdrawal");
     let mut bob = nostr_welcome_session(dir.join("bob.sqlite"), &key, b"bob-withdrawal");
@@ -143,8 +173,6 @@ async fn owed_invite_welcome_through(
     alice.confirm_published(create_pending).await.unwrap();
     let group_id = created.group_id;
 
-    adapter.accept_next(1);
-    adapter.accept_next(0);
     let policy =
         StaticTransportRouting::new(vec![TransportEndpoint("wss://alice-inbox.example".into())])
             .with_group_route(
@@ -152,10 +180,7 @@ async fn owed_invite_welcome_through(
                 group_id.as_slice().to_vec(),
                 vec![TransportEndpoint("wss://group.example".into())],
             )
-            .with_inbox_route(
-                carol_id,
-                vec![TransportEndpoint("wss://carol-inbox.example".into())],
-            );
+            .with_inbox_route(carol_id, carol_inboxes);
     let wall = Arc::new(TestWallClock::new(300_000));
     let mut runtime = AccountDeviceRuntime::new(
         alice,
@@ -190,26 +215,19 @@ async fn owed_invite_welcome_through(
         effects.pending.as_slice(),
         [PendingResolution::Confirmed { .. }]
     ));
-    assert_eq!(effects.welcome_failures.len(), 1);
     let welcome = welcome_publishes(&adapter)
         .pop()
         .expect("the first pass tried carol's Welcome");
-    assert_eq!(welcome.id, effects.welcome_failures[0].message_id);
-    assert!(
-        runtime
-            .session()
-            .transport_fanout(&welcome.id)
-            .unwrap()
-            .is_some(),
-        "the failed Welcome keeps a retry record"
-    );
-    OwedInviteWelcome {
-        runtime,
-        adapter,
-        wall,
-        group_id,
-        welcome,
-    }
+    (
+        OwedInviteWelcome {
+            runtime,
+            adapter,
+            wall,
+            group_id,
+            welcome,
+        },
+        effects,
+    )
 }
 
 fn welcome_publishes(adapter: &RecordingAdapter) -> Vec<TransportMessage> {

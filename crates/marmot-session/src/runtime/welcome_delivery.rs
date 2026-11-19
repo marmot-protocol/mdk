@@ -288,21 +288,20 @@ where
                     None
                 }
             };
+            // The attempt that met the policy marked the Welcome delivered.
             if let Some(status) = status
                 && !status.withdrawn
                 && !status.awaits_commit
+                && !status.met_required_acks
+                && let Some(recipient) = recipient
             {
-                if status.met_required_acks {
-                    self.mark_welcome_delivered_best_effort(&welcome_id);
-                } else if let Some(recipient) = recipient {
-                    effects.welcome_failures.push(self.welcome_delivery_failure(
-                        welcome_id,
-                        recipient,
-                        group_id.clone(),
-                        &effects,
-                        0,
-                    ));
-                }
+                effects.welcome_failures.push(self.welcome_delivery_failure(
+                    welcome_id,
+                    recipient,
+                    group_id.clone(),
+                    &effects,
+                    0,
+                ));
             }
             output.extend(effects);
         }
@@ -374,9 +373,9 @@ where
         let status = self
             .publish_one_with_retry_policy(message, &mut output, None, true)
             .await?;
-        if status.met_required_acks {
-            self.mark_welcome_delivered_best_effort(message_id);
-        } else if !status.withdrawn
+        // The attempt that met the policy marked the Welcome delivered.
+        if !status.met_required_acks
+            && !status.withdrawn
             && let Some(recipient) = recipient
         {
             let failure = self.welcome_delivery_failure(
@@ -556,15 +555,21 @@ where
         }
     }
 
-    /// Watch Welcomes read from the store. One already settled when first
-    /// checked settled before this process watched it, so its settlement is
-    /// not audited: every later start reads it again.
+    /// Watch Welcomes read from the store, except one already settled: it
+    /// settled before this process watched it, and a later start reads it
+    /// again, so its settlement is not this process's to audit.
     fn adopt_stored_welcomes(&mut self, ids: impl IntoIterator<Item = cgka_traits::MessageId>) {
+        let now = self.wall_clock.now();
         for id in ids {
-            if !self.watched_welcomes.contains(&id) {
-                self.adopted_welcomes.insert(id.clone());
-                self.watched_welcomes.push(id);
+            if self.watched_welcomes.contains(&id)
+                || matches!(
+                    self.session.outbound_welcome_status(&id, now),
+                    Ok(OutboundWelcomeStatus::Settled(_))
+                )
+            {
+                continue;
             }
+            self.watched_welcomes.push(id);
         }
     }
 
@@ -625,16 +630,10 @@ where
                 });
             match status {
                 Ok((OutboundWelcomeStatus::Settled(settlement), _)) => {
-                    if !self.adopted_welcomes.remove(&id) {
-                        self.record_v5_welcome_settled(&id, settlement);
-                    }
+                    self.record_v5_welcome_settled(&id, settlement);
                 }
-                Ok((OutboundWelcomeStatus::Waiting, _) | (_, true)) => {
-                    self.adopted_welcomes.remove(&id);
-                    watching.push(id);
-                }
+                Ok((OutboundWelcomeStatus::Waiting, _) | (_, true)) => watching.push(id),
                 Ok((OutboundWelcomeStatus::Owed { group_id, message }, false)) => {
-                    self.adopted_welcomes.remove(&id);
                     watching.push(id);
                     match due.iter_mut().find(|(group, _)| *group == group_id) {
                         Some((_, welcomes)) => welcomes.push(message),

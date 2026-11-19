@@ -89,8 +89,7 @@ mod sign_in_rejection;
 mod slot_announcement;
 mod welcome_audit;
 mod welcome_delivery;
-use welcome_audit::V5WelcomePass;
-pub use welcome_audit::welcome_audit_operation_id;
+use welcome_audit::{InviteRefusal, V5WelcomePass};
 
 const TRACE_TARGET: &str = "marmot_session::runtime";
 const WELCOME_PUBLISH_CONCURRENCY: usize = 8;
@@ -629,8 +628,6 @@ pub struct AccountDeviceRuntime<A, R = StaticTransportRouting, K = NoopKeyPackag
     /// Retained Welcomes this process noted, each read once
     /// ([`Self::note_retained_welcomes`]).
     v5_prepared_welcomes: HashSet<cgka_traits::MessageId>,
-    /// Watched Welcomes read from the store and not yet seen unsettled.
-    adopted_welcomes: HashSet<cgka_traits::MessageId>,
     /// Whether the store has been read for `watched_welcomes`: the startup
     /// pass reads it, or else the first maintenance pass.
     welcome_store_read: bool,
@@ -708,7 +705,6 @@ where
             prepared_welcome_tasks: Vec::new(),
             watched_welcomes: Vec::new(),
             v5_prepared_welcomes: HashSet::new(),
-            adopted_welcomes: HashSet::new(),
             welcome_store_read: false,
             unread_welcome_groups: Vec::new(),
             finish_stage_failure: None,
@@ -3920,14 +3916,11 @@ where
             return Ok(prepared);
         };
         self.note_retained_welcomes(commit.welcomes());
-        if invite && let Some((message_id, oversized)) = self.oversized_invite(&commit).await {
-            let welcome_ids = commit
-                .welcomes()
-                .iter()
-                .map(|welcome| welcome.id.clone())
-                .collect::<Vec<_>>();
-            let mut output = self.rollback_prepared_session_commit(commit).await?;
-            self.record_v5_welcomes_refused(&welcome_ids, oversized);
+        if invite && let Some((message_id, refusal)) = self.oversized_invite(&commit).await {
+            let oversized = refusal.oversized;
+            let mut output = self
+                .rollback_prepared_session_commit_refused(commit, Some(refusal))
+                .await?;
             output
                 .failures
                 .insert(0, refused_before_publishing(message_id, oversized));
@@ -3942,7 +3935,7 @@ where
     async fn oversized_invite(
         &self,
         prepared: &PreparedSessionCommit,
-    ) -> Option<(cgka_traits::MessageId, OversizedEvent)> {
+    ) -> Option<(cgka_traits::MessageId, InviteRefusal)> {
         let commit = prepared
             .effects
             .publish
@@ -3955,10 +3948,10 @@ where
                 }
                 _ => None,
             })?;
-        let oversized = self
+        let refusal = self
             .oversized_invite_events(commit, &prepared.welcomes)
             .await?;
-        Some((commit.id.clone(), oversized))
+        Some((commit.id.clone(), refusal))
     }
 
     /// The oversized artifact when an invite's commit fits none of its group
@@ -3974,26 +3967,30 @@ where
         &self,
         commit: &TransportMessage,
         welcomes: &[TransportMessage],
-    ) -> Pin<Box<impl Future<Output = Option<OversizedEvent>>>> {
+    ) -> Pin<Box<impl Future<Output = Option<InviteRefusal>>>> {
         Box::pin(async move {
             // A commit or Welcome without a route fails when it is published.
             let target = self.routing.publish_target(commit).ok()?;
             let adapter = &self.adapter;
             if let Some(size_class) = adapter.size_class_over_known_limits(commit, &target).await {
-                return Some(OversizedEvent {
+                return Some(InviteRefusal::from(OversizedEvent {
                     artifact: OversizedArtifact::Commit,
                     size_class,
-                });
+                }));
             }
             // The same check a founding create runs on its Welcomes.
             let welcome_sizes = WelcomeSizes {
                 adapter,
                 routing: &self.routing,
             };
-            let size_class = welcome_sizes.oversized_welcome(welcomes).await?;
-            Some(OversizedEvent {
-                artifact: OversizedArtifact::Welcome,
-                size_class,
+            let oversized_welcomes = welcome_sizes.oversized_welcomes(welcomes).await;
+            let (_, size_class) = oversized_welcomes.first()?.clone();
+            Some(InviteRefusal {
+                oversized: OversizedEvent {
+                    artifact: OversizedArtifact::Welcome,
+                    size_class,
+                },
+                oversized_welcomes: oversized_welcomes.into_iter().collect(),
             })
         })
     }
@@ -4005,7 +4002,20 @@ where
         &mut self,
         prepared: PreparedSessionCommit,
     ) -> AccountResult<AccountDeviceEffects> {
-        let (mut prepared_effects, _welcomes, pending) = prepared.into_parts();
+        self.rollback_prepared_session_commit_refused(prepared, None)
+            .await
+    }
+
+    /// [`Self::rollback_prepared_session_commit`], recording why a size
+    /// `refusal` retired each Welcome right after the rollback, before any
+    /// later work.
+    async fn rollback_prepared_session_commit_refused(
+        &mut self,
+        prepared: PreparedSessionCommit,
+        refusal: Option<InviteRefusal>,
+    ) -> AccountResult<AccountDeviceEffects> {
+        let (mut prepared_effects, welcomes, pending) = prepared.into_parts();
+        let unretired = self.unretired_welcomes(welcomes.iter().map(|welcome| welcome.id.clone()));
         prepared_effects.publish.retain(|work| {
             !matches!(work, PublishWork::GroupEvolution { pending: own, .. } | PublishWork::GroupCreated { pending: own, .. } if *own == pending)
         });
@@ -4015,6 +4025,10 @@ where
         output.absorb_session_effects(prepared_effects, &mut queue);
 
         let rollback_effects = self.session.publish_failed(pending).await?;
+        if let Some(refusal) = refusal {
+            let retired = self.retired_welcomes(unretired);
+            self.record_v5_welcomes_refused(&retired, &refusal);
+        }
         output
             .pending
             .push(PendingResolution::RolledBack { pending });
@@ -5939,21 +5953,20 @@ where
         // is, before its commit is published: one whose commit or Welcome
         // fits none of its relays is retired unsent (mdk#2334).
         if self.session.pending_is_queued_invite(pending)?
-            && let Some(oversized) = self.oversized_invite_events(&commit, &welcomes).await
+            && let Some(refusal) = self.oversized_invite_events(&commit, &welcomes).await
         {
+            let unretired =
+                self.unretired_welcomes(welcomes.iter().map(|welcome| welcome.id.clone()));
             let effects = refuse_too_large(
                 &mut self.session,
                 pending,
                 None,
-                oversized,
+                refusal.oversized,
                 RollbackPass::Staging,
             )
             .await?;
-            let welcome_ids = welcomes
-                .iter()
-                .map(|welcome| welcome.id.clone())
-                .collect::<Vec<_>>();
-            self.record_v5_welcomes_refused(&welcome_ids, oversized);
+            let retired = self.retired_welcomes(unretired);
+            self.record_v5_welcomes_refused(&retired, &refusal);
             output
                 .pending
                 .push(PendingResolution::RolledBack { pending });
@@ -6226,13 +6239,6 @@ where
             }
             self.session.put_transport_fanout(&fanout)?;
             let accepted_total = accepted_fanout_targets(&fanout);
-            self.record_v5_welcome_publish_finished(
-                &v5_welcome,
-                Some(&pass_report),
-                &remaining,
-                accepted_total,
-                required_acks,
-            );
             self.record_audit_event(
                 audit_group_id.as_ref(),
                 Some(publish_context),
@@ -6261,6 +6267,14 @@ where
             {
                 self.mark_welcome_delivered_best_effort(message_id);
             }
+            // After the mark, so retention is what this pass left stored.
+            self.record_v5_welcome_publish_finished(
+                &v5_welcome,
+                Some(&pass_report),
+                &remaining,
+                accepted_total,
+                required_acks,
+            );
         }
         Ok(())
     }
@@ -7106,14 +7120,16 @@ where
             && let Some(pending) = fanout.pending_ref()
         {
             let oversized = OversizedEvent::of_fanout(fanout);
-            let welcome_ids = fanout
-                .pending_post_confirmation_welcomes()
-                .iter()
-                .map(|welcome| welcome.id.clone())
-                .collect::<Vec<_>>();
+            let unretired = self.unretired_welcomes(
+                fanout
+                    .pending_post_confirmation_welcomes()
+                    .iter()
+                    .map(|welcome| welcome.id.clone()),
+            );
             let effects = roll_back_failed_fanout(&mut self.session, pending, fanout, pass).await?;
             if let Some(oversized) = oversized {
-                self.record_v5_welcomes_refused(&welcome_ids, oversized);
+                let retired = self.retired_welcomes(unretired);
+                self.record_v5_welcomes_refused(&retired, &InviteRefusal::from(oversized));
             }
             output
                 .pending
@@ -7371,6 +7387,17 @@ where
                             | TransportFanoutAttemptState::AttemptedFailed
                     )
                 });
+            // A Welcome an earlier attempt already delivered to its policy,
+            // as one interrupted before its mark, is marked now.
+            if accepted_before >= required_acks.max(1)
+                && matches!(artifact_kind, Some(MessageArtifactKind::Welcome))
+                && matches!(
+                    self.session.stored_message_state(&message_id),
+                    Ok(Some(MessageState::Sent))
+                )
+            {
+                self.mark_welcome_delivered_best_effort(&message_id);
+            }
             return Ok(PreparedLegacyPublish::Complete(PublishStatus {
                 met_required_acks: accepted_before >= required_acks.max(1),
                 accepted_by_any_endpoint: accepted_before > 0,
@@ -7602,6 +7629,12 @@ where
             .iter()
             .filter(|target| target.state == TransportFanoutAttemptState::Accepted)
             .count();
+        let published = accepted_total >= required_acks.max(1);
+        // Whichever attempt meets a Welcome's policy marks it delivered; the
+        // finished row then reports what the mark left stored.
+        if published && matches!(artifact_kind, Some(MessageArtifactKind::Welcome)) {
+            self.mark_welcome_delivered_best_effort(&message_id);
+        }
         self.record_v5_welcome_publish_finished(
             &v5_welcome,
             Some(&report),
@@ -7609,7 +7642,6 @@ where
             accepted_total,
             required_acks,
         );
-        let published = accepted_total >= required_acks.max(1);
         let accepted_by_any_endpoint = accepted_total > 0;
         self.record_audit_event(
             audit_group_id.as_ref(),
@@ -8288,6 +8320,25 @@ where
         &self,
         welcomes: &[TransportMessage],
     ) -> Option<cgka_traits::EventSizeClass> {
+        self.oversized_welcomes(welcomes)
+            .await
+            .into_iter()
+            .next()
+            .map(|(_, size_class)| size_class)
+    }
+}
+
+impl<A, R> WelcomeSizes<'_, A, R>
+where
+    A: TransportAdapter,
+    R: TransportRoutingPolicy,
+{
+    /// Each of `welcomes` that fits none of its inbox relays' known limits,
+    /// with its size class, in order.
+    async fn oversized_welcomes(
+        &self,
+        welcomes: &[TransportMessage],
+    ) -> Vec<(cgka_traits::MessageId, cgka_traits::EventSizeClass)> {
         // A Welcome without a route fails when it is published.
         let checks = welcomes.iter().filter_map(|welcome| {
             let target = self.routing.publish_target(welcome).ok()?;
@@ -8295,13 +8346,14 @@ where
                 self.adapter
                     .size_class_over_known_limits(welcome, &target)
                     .await
+                    .map(|size_class| (welcome.id.clone(), size_class))
             })
         });
         futures::future::join_all(checks)
             .await
             .into_iter()
             .flatten()
-            .next()
+            .collect()
     }
 }
 

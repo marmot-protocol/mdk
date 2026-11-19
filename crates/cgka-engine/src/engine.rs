@@ -117,11 +117,15 @@ pub enum WelcomeSettlement {
 }
 
 /// What the sender's audit reads of one retained outbound Welcome, staged or
-/// not, in any state.
+/// not, in any state. It holds no Welcome bytes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OutboundWelcomeAuditFacts {
     pub group_id: GroupId,
-    pub message: TransportMessage,
+    /// The Welcome's transport message id.
+    pub id: MessageId,
+    /// The transport that wrapped it.
+    pub source: cgka_traits::transport::TransportSource,
+    pub recipient: MemberId,
     /// The commit it was staged with; a founding Welcome has none.
     pub origin_commit_id: Option<MessageId>,
     /// The transport event of the KeyPackage it answers, when recorded.
@@ -1151,12 +1155,14 @@ impl<S: StorageProvider> Engine<S> {
             } => (message, Some(origin_commit_id.clone())),
             _ => return Ok(None),
         };
-        if !matches!(message.envelope, TransportEnvelope::Welcome { .. }) {
+        let TransportEnvelope::Welcome { recipient } = &message.envelope else {
             return Ok(None);
-        }
+        };
         Ok(Some(OutboundWelcomeAuditFacts {
             group_id: record.group_id,
-            message: message.clone(),
+            id: message.id.clone(),
+            source: message.source.clone(),
+            recipient: recipient.clone(),
             origin_commit_id,
             key_package_event_id: payload.welcome_key_package_event_id().cloned(),
             state: record.state,

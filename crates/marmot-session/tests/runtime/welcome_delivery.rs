@@ -61,63 +61,98 @@ fn kinds(rows: &[serde_json::Value]) -> Vec<&str> {
 /// An invite's Welcome is audited from its preparation on: a
 /// `welcome_prepared` row naming the KeyPackage it answers, then one started
 /// and one finished row per pass over its relays, each with its own attempt
-/// id. Maintenance's retry is audited as the first pass is, owed or already
-/// delivered; without that a Welcome that reaches a relay only on a retry
-/// leaves no sender evidence of the delivery.
+/// id. Maintenance's retry is audited as the first pass is, and the pass that
+/// meets the policy reports the Welcome completed: it was marked delivered
+/// before its row.
 #[tokio::test]
 async fn every_pass_over_a_welcome_records_its_publish_rows() {
-    for delivered in [false, true] {
-        let dir = relaxed_storage_dir().unwrap();
-        let OwedInviteWelcome {
+    let dir = relaxed_storage_dir().unwrap();
+    let OwedInviteWelcome {
+        mut runtime,
+        adapter,
+        wall,
+        group_id,
+        welcome,
+    } = owed_invite_welcome(dir.path()).await;
+    let first = welcome_rows(dir.path(), &welcome, &group_id);
+    assert_eq!(
+        kinds(&first),
+        [
+            "welcome_prepared",
+            "welcome_publish_started",
+            "welcome_publish_finished"
+        ]
+    );
+    assert_eq!(
+        first[0]["event"]["key_package_event_ref"],
+        marmot_forensics::v5::NostrEventRef::from_validated_event_id(&[0x77; 32]).as_str()
+    );
+    assert_eq!(first[2]["event"]["retained_state"], "pending");
+    adapter.accept_only_endpoints(vec![
+        TransportEndpoint("wss://group.example".into()),
+        TransportEndpoint("wss://carol-inbox.example".into()),
+    ]);
+
+    wall.set(300_100);
+    runtime.run_due_maintenance().await.unwrap();
+
+    let rows = welcome_rows(dir.path(), &welcome, &group_id);
+    let retry = &rows[first.len()..];
+    assert_eq!(
+        kinds(retry),
+        ["welcome_publish_started", "welcome_publish_finished"]
+    );
+    assert_eq!(retry[0]["event"]["attempt_id"], retry[1]["event"]["attempt_id"]);
+    assert_ne!(retry[0]["event"]["attempt_id"], first[1]["event"]["attempt_id"]);
+    assert_eq!(retry[0]["event"]["op_id"], first[0]["event"]["op_id"]);
+    assert_eq!(retry[1]["event"]["policy"], "met");
+    assert_eq!(retry[1]["event"]["retained_state"], "completed");
+}
+
+/// A retry after one inbox relay already met the policy keeps that
+/// cumulative evidence: when the other relay's retry fails with an error that
+/// names no relay, its finished row is incomplete for this pass, yet reports
+/// the stored acceptance, the met policy, and the delivered Welcome.
+#[tokio::test]
+async fn a_retry_after_the_policy_was_met_keeps_the_stored_acceptance() {
+    let dir = relaxed_storage_dir().unwrap();
+    let (first, second) = (
+        TransportEndpoint("wss://carol-first.example".into()),
+        TransportEndpoint("wss://carol-second.example".into()),
+    );
+    let adapter = RecordingAdapter::default();
+    adapter.accept_only_endpoints(vec![
+        TransportEndpoint("wss://group.example".into()),
+        first.clone(),
+    ]);
+    let (
+        OwedInviteWelcome {
             mut runtime,
             adapter,
             wall,
             group_id,
             welcome,
-        } = owed_invite_welcome(dir.path()).await;
-        let first = welcome_rows(dir.path(), &welcome, &group_id);
-        assert_eq!(
-            kinds(&first),
-            [
-                "welcome_prepared",
-                "welcome_publish_started",
-                "welcome_publish_finished"
-            ]
-        );
-        assert_eq!(
-            first[0]["event"]["key_package_event_ref"],
-            marmot_forensics::v5::NostrEventRef::from_validated_event_id(&[0x77; 32]).as_str()
-        );
-        if delivered {
-            // As if another inbox relay had met the policy: the retry of
-            // this one still runs.
-            runtime
-                .session()
-                .mark_sent_welcome_delivered(&welcome.id)
-                .unwrap();
-        }
-        adapter.accept_only_endpoints(vec![
-            TransportEndpoint("wss://group.example".into()),
-            TransportEndpoint("wss://carol-inbox.example".into()),
-        ]);
+        },
+        effects,
+    ) = invite_carol_through(dir.path(), adapter, vec![first, second.clone()]).await;
+    assert!(effects.welcome_failures.is_empty(), "one relay met the policy");
+    let recorded = welcome_rows(dir.path(), &welcome, &group_id).len();
+    adapter.error_for_endpoints(vec![second]);
 
-        wall.set(300_100);
-        runtime.run_due_maintenance().await.unwrap();
+    wall.set(300_100);
+    runtime.run_due_maintenance().await.unwrap();
 
-        let rows = welcome_rows(dir.path(), &welcome, &group_id);
-        let retry = &rows[first.len()..];
-        assert_eq!(
-            kinds(retry),
-            ["welcome_publish_started", "welcome_publish_finished"],
-            "delivered: {delivered}"
-        );
-        assert_eq!(retry[0]["event"]["attempt_id"], retry[1]["event"]["attempt_id"]);
-        assert_ne!(retry[0]["event"]["attempt_id"], first[1]["event"]["attempt_id"]);
-        assert_eq!(retry[0]["event"]["op_id"], first[0]["event"]["op_id"]);
-        assert_eq!(retry[1]["event"]["policy"], "met");
-        // The pass that meets the policy completes the Welcome.
-        assert_eq!(retry[1]["event"]["retained_state"], "completed");
-    }
+    let rows = welcome_rows(dir.path(), &welcome, &group_id);
+    let retry = &rows[recorded..];
+    assert_eq!(
+        kinds(retry),
+        ["welcome_publish_started", "welcome_publish_finished"]
+    );
+    let finished = &retry[1]["event"];
+    assert_eq!(finished["results_complete"], false, "{finished}");
+    assert_eq!(finished["accepted_total_count"], 1);
+    assert_eq!(finished["policy"], "met");
+    assert_eq!(finished["retained_state"], "completed");
 }
 
 /// A Welcome sent again after its retry record expired gets a new attempt
@@ -310,4 +345,119 @@ async fn an_invite_whose_commit_every_relay_refuses_for_size_records_why_its_wel
     assert_eq!(rows[1]["event"]["reason"], "commit_too_large");
     assert_eq!(rows[1]["event"]["oversized_size_class"], "from_64_to_128_kib");
     assert_eq!(rows[0]["event"]["op_id"], rows[1]["event"]["op_id"]);
+}
+
+/// An invite refused because one invitee's Welcome is too large names that
+/// Welcome, with its own size, and withdraws the other invitee's Welcome with
+/// it, with no size: that one would have fit.
+#[tokio::test]
+async fn a_too_large_welcome_is_named_and_its_sibling_invitee_is_withdrawn() {
+    let dir = relaxed_storage_dir().unwrap();
+    let key = SqlCipherKey::new("marmot two welcome refusal key").unwrap();
+    let mut alice = nostr_welcome_session(dir.path().join("alice.sqlite"), &key, b"alice-two");
+    let mut bob = nostr_welcome_session(dir.path().join("bob.sqlite"), &key, b"bob-two");
+    let mut carol = nostr_welcome_session(dir.path().join("carol.sqlite"), &key, b"carol-two");
+    let mut dave = nostr_welcome_session(dir.path().join("dave.sqlite"), &key, b"dave-two");
+    let created = alice
+        .create_group(CreateGroupRequest {
+            name: "two welcome refusal".into(),
+            description: String::new(),
+            members: vec![bob.fresh_key_package().await.unwrap()],
+            required_features: Vec::new(),
+            app_components: Vec::new(),
+            initial_admins: Vec::new(),
+        })
+        .await
+        .unwrap();
+    let PublishWork::GroupCreated { pending, .. } = &created.effects.publish[0] else {
+        panic!("expected GroupCreated publish work");
+    };
+    alice.confirm_published(*pending).await.unwrap();
+    let group_id = created.group_id;
+    let small_inbox = TransportEndpoint("wss://dave-small-inbox.example".into());
+    let policy =
+        StaticTransportRouting::new(vec![TransportEndpoint("wss://alice-inbox.example".into())])
+            .with_group_route(
+                group_id.clone(),
+                group_id.as_slice().to_vec(),
+                vec![TransportEndpoint("wss://group.example".into())],
+            )
+            .with_inbox_route(
+                carol.self_id(),
+                vec![TransportEndpoint("wss://carol-inbox.example".into())],
+            )
+            .with_inbox_route(dave.self_id(), vec![small_inbox.clone()]);
+    let adapter = RecordingAdapter::default();
+    adapter.refuse_welcomes_as_too_large(vec![small_inbox]);
+    let mut runtime =
+        AccountDeviceRuntime::new(alice, adapter.clone(), policy, RecordingKeyPackages::default())
+            .with_maintenance_sources(
+                Arc::new(TestWallClock::new(300_000)),
+                Arc::new(TestMonotonicClock::default()),
+                Arc::new(TestRandom::new(0)),
+            );
+    let audit_path = dir.path().join("two-welcome-audit-v5.jsonl");
+    runtime
+        .audit_recorder()
+        .swap(v5_audit_recorder(&audit_path));
+    let sourced = |key_package: cgka_traits::engine::KeyPackage, marker: u8| {
+        cgka_traits::engine::KeyPackage {
+            source: Some(cgka_traits::engine::KeyPackageSource {
+                event_id: MessageId::new(vec![marker; 32]),
+            }),
+            ..key_package
+        }
+    };
+
+    let refused = runtime
+        .confirm_host_change_without_publish_with_audit_context(
+            SendIntent::Invite {
+                group_id: group_id.clone(),
+                key_packages: vec![
+                    sourced(carol.fresh_key_package().await.unwrap(), 0x7a),
+                    sourced(dave.fresh_key_package().await.unwrap(), 0x7b),
+                ],
+                initial_admins: Vec::new(),
+            },
+            Default::default(),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        refused,
+        marmot_session::PreparedSessionSend::Refused(_)
+    ));
+
+    let member_ref = |session: &AccountDeviceSession| {
+        marmot_forensics::v5::MemberRef::from_member_identity(session.self_id().as_slice())
+            .unwrap()
+            .as_str()
+            .to_owned()
+    };
+    let withdrawn = v5_audit_rows(&audit_path)
+        .into_iter()
+        .filter(|row| row["event"]["type"] == "welcome_withdrawn")
+        .map(|row| {
+            (
+                row["event"]["recipient_ref"].as_str().unwrap().to_owned(),
+                row["event"]["reason"].as_str().unwrap().to_owned(),
+                row["event"]["oversized_size_class"]
+                    .as_str()
+                    .map(str::to_owned),
+            )
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        withdrawn,
+        [
+            (member_ref(&carol), "withdrawn".to_owned(), None),
+            (
+                member_ref(&dave),
+                "welcome_too_large".to_owned(),
+                Some("from_64_to_128_kib".to_owned())
+            ),
+        ]
+        .into_iter()
+        .collect()
+    );
 }

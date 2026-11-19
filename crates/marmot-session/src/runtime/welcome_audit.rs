@@ -18,7 +18,7 @@ const MAX_PREPARED_WELCOMES_REMEMBERED: usize = 4096;
 /// The v5 operation id of one outbound Welcome, named by its id: its
 /// `welcome_prepared` row and every other row of it share this id, whichever
 /// path prepares or sends it.
-pub fn welcome_audit_operation_id(welcome_id: &cgka_traits::MessageId) -> audit_v5::LocalId {
+pub(super) fn welcome_audit_operation_id(welcome_id: &cgka_traits::MessageId) -> audit_v5::LocalId {
     v5_local_id(b"welcome-operation", welcome_id.as_slice(), 0)
 }
 
@@ -29,6 +29,23 @@ pub(super) struct V5Welcome {
     pub(super) recipient_ref: audit_v5::MemberRef,
     pub(super) group_ref: audit_v5::GroupRef,
     pub(super) facts: cgka_engine::engine::OutboundWelcomeAuditFacts,
+}
+
+/// Why an invite is refused as too large: the event the host is told of,
+/// and each Welcome the size check itself refused, with its own size.
+#[derive(Clone, Debug)]
+pub(super) struct InviteRefusal {
+    pub(super) oversized: OversizedEvent,
+    pub(super) oversized_welcomes: HashMap<cgka_traits::MessageId, cgka_traits::EventSizeClass>,
+}
+
+impl From<OversizedEvent> for InviteRefusal {
+    fn from(oversized: OversizedEvent) -> Self {
+        Self {
+            oversized,
+            oversized_welcomes: HashMap::new(),
+        }
+    }
 }
 
 /// One publish pass over a Welcome's relays: its started row, recorded with a
@@ -90,14 +107,12 @@ where
         if !self.audit.records_v5() {
             return None;
         }
-        let outer = v5_outbound_welcome_ref(&facts.message)?;
-        let TransportEnvelope::Welcome { recipient } = &facts.message.envelope else {
-            return None;
-        };
-        let recipient_ref = audit_v5::MemberRef::from_member_identity(recipient.as_slice()).ok()?;
+        let outer = v5_outbound_welcome_ref(&facts.id, &facts.source)?;
+        let recipient_ref =
+            audit_v5::MemberRef::from_member_identity(facts.recipient.as_slice()).ok()?;
         let group_ref = audit_v5::GroupRef::from_group_id(facts.group_id.as_slice()).ok()?;
         Some(V5Welcome {
-            op_id: welcome_audit_operation_id(&facts.message.id),
+            op_id: welcome_audit_operation_id(&facts.id),
             outer,
             recipient_ref,
             group_ref,
@@ -206,37 +221,81 @@ where
         );
     }
 
-    /// Record `welcome_withdrawn` for each Welcome of a commit refused as too
-    /// large, once its rollback has retired the Welcome, and stop watching
-    /// it: the reason is known here, not to the watcher.
+    /// The ids among `welcome_ids` still retained and not withdrawn: those a
+    /// rollback that follows may retire ([`Self::retired_welcomes`]).
+    pub(super) fn unretired_welcomes(
+        &self,
+        welcome_ids: impl IntoIterator<Item = cgka_traits::MessageId>,
+    ) -> Vec<cgka_traits::MessageId> {
+        welcome_ids
+            .into_iter()
+            .filter(|id| {
+                matches!(
+                    self.session.stored_message_state(id),
+                    Ok(Some(MessageState::Sent))
+                )
+            })
+            .collect()
+    }
+
+    /// The ids among `unretired`, read just before a rollback, that the
+    /// rollback retired: their rows went from `Sent` to `Failed`.
+    pub(super) fn retired_welcomes(
+        &self,
+        unretired: Vec<cgka_traits::MessageId>,
+    ) -> Vec<cgka_traits::MessageId> {
+        unretired
+            .into_iter()
+            .filter(|id| {
+                matches!(
+                    self.session.stored_message_state(id),
+                    Ok(Some(MessageState::Failed))
+                )
+            })
+            .collect()
+    }
+
+    /// Record `welcome_withdrawn` for each Welcome a size refusal's rollback
+    /// retired, and stop watching it: the reason is known here, not to the
+    /// watcher. A refused commit stopped them all, with the commit's size; a
+    /// refused invite names each Welcome the size check refused, with its own
+    /// size, and any other the rollback retired is withdrawn with it.
     pub(super) fn record_v5_welcomes_refused(
         &mut self,
-        welcome_ids: &[cgka_traits::MessageId],
-        oversized: OversizedEvent,
+        retired: &[cgka_traits::MessageId],
+        refusal: &InviteRefusal,
     ) {
-        let reason = match oversized.artifact {
-            OversizedArtifact::Welcome => audit_v5::WithdrawalReason::WelcomeTooLarge,
-            OversizedArtifact::Commit => audit_v5::WithdrawalReason::CommitTooLarge,
-            // An invite is refused for its commit or a Welcome only.
-            OversizedArtifact::ApplicationMessage | OversizedArtifact::Other => return,
-        };
-        for welcome_id in welcome_ids {
-            let Ok(Some(facts)) = self.session.outbound_welcome_audit_facts(welcome_id) else {
-                continue;
-            };
-            if facts.state != MessageState::Failed {
-                continue;
-            }
+        for welcome_id in retired {
             self.watched_welcomes
                 .retain(|watched| watched != welcome_id);
-            if let Some(v5) = self.v5_welcome_of(facts) {
-                self.record_v5_welcome_withdrawn(
-                    &v5,
-                    reason,
-                    Some(v5_size_class(oversized.size_class)),
-                );
+            let (reason, size_class) = match refusal.oversized.artifact {
+                OversizedArtifact::Commit => (
+                    audit_v5::WithdrawalReason::CommitTooLarge,
+                    Some(refusal.oversized.size_class),
+                ),
+                _ => match refusal.oversized_welcomes.get(welcome_id) {
+                    Some(size_class) => (
+                        audit_v5::WithdrawalReason::WelcomeTooLarge,
+                        Some(*size_class),
+                    ),
+                    None => (audit_v5::WithdrawalReason::Withdrawn, None),
+                },
+            };
+            if let Some(v5) = self.v5_welcome_from_store(welcome_id) {
+                self.record_v5_welcome_withdrawn(&v5, reason, size_class.map(v5_size_class));
             }
         }
+    }
+
+    fn v5_welcome_from_store(&self, welcome_id: &cgka_traits::MessageId) -> Option<V5Welcome> {
+        if !self.audit.records_v5() {
+            return None;
+        }
+        let facts = self
+            .session
+            .outbound_welcome_audit_facts(welcome_id)
+            .ok()??;
+        self.v5_welcome_of(facts)
     }
 
     /// Record `welcome_withdrawn` for a watched Welcome that settled without
@@ -252,12 +311,7 @@ where
             WelcomeSettlement::Expired => audit_v5::WithdrawalReason::Expired,
             WelcomeSettlement::Delivered | WelcomeSettlement::Untracked => return,
         };
-        if !self.audit.records_v5() {
-            return;
-        }
-        if let Ok(Some(facts)) = self.session.outbound_welcome_audit_facts(welcome_id)
-            && let Some(v5) = self.v5_welcome_of(facts)
-        {
+        if let Some(v5) = self.v5_welcome_from_store(welcome_id) {
             self.record_v5_welcome_withdrawn(&v5, reason, None);
         }
     }
@@ -325,7 +379,7 @@ where
             targets.len() == endpoints.len() && targets.len() <= audit_v5::MAX_ENDPOINTS;
         targets.truncate(audit_v5::MAX_ENDPOINTS);
         Some(V5WelcomePass {
-            welcome_id: v5.facts.message.id.clone(),
+            welcome_id: v5.facts.id.clone(),
             group_ref: v5.group_ref,
             started: audit_v5::WelcomePublishStarted {
                 op_id: v5.op_id,
@@ -344,10 +398,11 @@ where
         })
     }
 
-    /// Record the finished row of a pass that started. The cumulative
-    /// acceptance count comes from the Welcome's stored fanout, so it holds
-    /// even when this pass's own endpoint results are incomplete; retention
-    /// comes from the Welcome's stored row.
+    /// Record the finished row of a pass that started, after the pass's
+    /// delivered mark, if any. The cumulative acceptance count comes from the
+    /// Welcome's stored fanout, so it holds even when this pass's own
+    /// endpoint results are incomplete; retention is the Welcome's stored row
+    /// as the pass left it.
     pub(super) fn record_v5_welcome_publish_finished(
         &self,
         pass: &Option<V5WelcomePass>,
@@ -408,14 +463,11 @@ where
         };
         let state = self
             .session
-            .outbound_welcome_audit_facts(&pass.welcome_id)
+            .stored_message_state(&pass.welcome_id)
             .ok()
-            .flatten()
-            .map(|facts| facts.state);
-        // A met policy completes an owed Welcome: the runtime marks it
-        // delivered right after this row. A withdrawn one stays withdrawn.
+            .flatten();
         let retained_state = match (state, policy) {
-            (Some(MessageState::Processed | MessageState::Sent), audit_v5::Policy::Met) => {
+            (Some(MessageState::Processed), audit_v5::Policy::Met) => {
                 audit_v5::RetainedState::Completed
             }
             (Some(MessageState::Sent), audit_v5::Policy::Unmet | audit_v5::Policy::Unknown) => {
@@ -446,11 +498,14 @@ where
 /// wrap it built, the event's NIP-01 hash, which is the id the recipient
 /// observes; the session parses no transport event to check it again.
 /// `None` for another transport's Welcome.
-fn v5_outbound_welcome_ref(message: &TransportMessage) -> Option<audit_v5::NostrEventRef> {
-    if message.source.0 != "nostr" {
+fn v5_outbound_welcome_ref(
+    id: &cgka_traits::MessageId,
+    source: &cgka_traits::transport::TransportSource,
+) -> Option<audit_v5::NostrEventRef> {
+    if source.0 != "nostr" {
         return None;
     }
-    let id = <[u8; 32]>::try_from(message.id.as_slice()).ok()?;
+    let id = <[u8; 32]>::try_from(id.as_slice()).ok()?;
     Some(audit_v5::NostrEventRef::from_validated_event_id(&id))
 }
 

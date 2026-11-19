@@ -80,9 +80,12 @@ It must not own MLS internals, transport event parsing, SQLCipher key derivation
     Welcome's stored row (`Engine::outbound_welcome_audit_facts`), never from a caller's context. `welcome_prepared`
     and `welcome_event_size` come from `note_retained_welcomes`, where a retained Welcome first reaches the runtime
     (every create path, a host's accepted commit, `publish_group_evolution` for a drained or automatic one), which
-    also starts its watch. `welcome_withdrawn` comes after a too-large rollback has retired the Welcome (direct,
-    queued or fanout refusal; it stops the watch), or from the watcher when a Welcome it saw unsettled settles
-    undelivered; one read from the store already settled is never audited. One started/finished pair per relay pass. Start a pass
+    also starts its watch. `welcome_withdrawn` comes from the size refusal that retired the Welcome (direct, queued
+    or fanout refusal: only the ids whose rows that rollback moved `Sent` → `Failed`, each with its own verdict; it
+    stops the watch), or from the watcher when a watched Welcome settles undelivered; one read from the store already
+    settled is not watched. One started/finished pair per relay pass. The attempt that meets a Welcome's policy marks
+    it delivered (`finish_prepared_legacy_publish`, maintenance's retry, or the preparation that finds it already met)
+    before its finished row; never mark it elsewhere. Start a pass
     (`V5WelcomePass::start`) only where the transport is called, after the last hold check, so a stopped attempt
     records nothing. Every row of a Welcome carries `welcome_audit_operation_id`.
   - `runtime/welcome_delivery.rs` — outbound Welcome delivery (mdk#2628 3.5a). The engine's Welcome row is the
