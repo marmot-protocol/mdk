@@ -260,9 +260,17 @@ async fn welcome_refused_before_sending_is_not_a_possible_exposure() {
 /// and its Welcome's audit says why: `welcome_withdrawn` with
 /// `commit_too_large` and the size class, once, after the rollback retired
 /// it. The watcher, seeing the Welcome settle later, adds no generic row.
+/// So for a host's invite, accepted first and its Welcomes taken off the
+/// commit before it is published, as the app does.
 #[tokio::test]
 async fn an_invite_whose_commit_every_relay_refuses_for_size_records_why_its_welcome_was_withdrawn()
 {
+    for host_accepts_first in [false, true] {
+        invite_refused_for_commit_size(host_accepts_first).await;
+    }
+}
+
+async fn invite_refused_for_commit_size(host_accepts_first: bool) {
     let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new("marmot refused invite key").unwrap();
     let mut alice = nostr_welcome_session(dir.path().join("alice.sqlite"), &key, b"alice-refused");
@@ -311,19 +319,33 @@ async fn an_invite_whose_commit_every_relay_refuses_for_size_records_why_its_wel
         .audit_recorder()
         .swap(v5_audit_recorder(&audit_path));
 
-    let effects = runtime
-        .send(SendIntent::Invite {
-            group_id: group_id.clone(),
-            key_packages: vec![cgka_traits::engine::KeyPackage {
-                source: Some(cgka_traits::engine::KeyPackageSource {
-                    event_id: MessageId::new(vec![0x78; 32]),
-                }),
-                ..carol.fresh_key_package().await.unwrap()
-            }],
-            initial_admins: Vec::new(),
-        })
-        .await
-        .unwrap();
+    let invite = SendIntent::Invite {
+        group_id: group_id.clone(),
+        key_packages: vec![cgka_traits::engine::KeyPackage {
+            source: Some(cgka_traits::engine::KeyPackageSource {
+                event_id: MessageId::new(vec![0x78; 32]),
+            }),
+            ..carol.fresh_key_package().await.unwrap()
+        }],
+        initial_admins: Vec::new(),
+    };
+    let effects = if host_accepts_first {
+        let marmot_session::PreparedSessionSend::Commit(prepared) = runtime
+            .confirm_host_change_without_publish_with_audit_context(invite, Default::default())
+            .await
+            .unwrap()
+        else {
+            panic!("expected a staged commit");
+        };
+        let (effects, welcomes) = prepared.into_effects_and_welcomes();
+        assert_eq!(welcomes.len(), 1);
+        runtime
+            .publish_prepared_session_effects_with_audit_context(effects, Default::default())
+            .await
+            .unwrap()
+    } else {
+        runtime.send(invite).await.unwrap()
+    };
     assert!(matches!(
         effects.pending.as_slice(),
         [PendingResolution::RolledBack { .. }]
@@ -341,7 +363,11 @@ async fn an_invite_whose_commit_every_relay_refuses_for_size_records_why_its_wel
         })
         .inspect(|row| assert_eq!(row["group_ref"], group_ref.as_str(), "{row}"))
         .collect::<Vec<_>>();
-    assert_eq!(kinds(&rows), ["welcome_prepared", "welcome_withdrawn"], "{rows:?}");
+    assert_eq!(
+        kinds(&rows),
+        ["welcome_prepared", "welcome_withdrawn"],
+        "host accepts first: {host_accepts_first}, {rows:?}"
+    );
     assert_eq!(rows[1]["event"]["reason"], "commit_too_large");
     assert_eq!(rows[1]["event"]["oversized_size_class"], "from_64_to_128_kib");
     assert_eq!(rows[0]["event"]["op_id"], rows[1]["event"]["op_id"]);
@@ -541,7 +567,7 @@ async fn a_superseded_welcomes_saved_acceptance_goes_with_its_retention() {
         .origin_commit_id
         .unwrap();
     SqliteAccountStorage::open_encrypted(
-        &dir.path().join("alice.sqlite"),
+        dir.path().join("alice.sqlite"),
         &SqlCipherKey::new("marmot welcome withdrawal key").unwrap(),
     )
     .unwrap()

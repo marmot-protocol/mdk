@@ -23,6 +23,8 @@
 - `Engine::outbound_welcome_audit_facts` reads one retained outbound Welcome's group, id, transport source,
   recipient, origin commit, KeyPackage event id and state, in any state and without its bytes, for the sender's audit. Invite and founding Welcomes record the
   transport event id of the KeyPackage they answer.
+- `Engine::staged_invite_welcome_ids` lists the invite Welcomes still staged with one unconfirmed commit, which its
+  rollback retires.
 - `EngineBuilder::monotonic_clock` installs the `MonotonicClock` that times the engine's in-process budgets,
   deadlines and duration metrics, so a test moves time forward without sleeping (mdk#3496). An engine built without
   it runs on the new `SystemMonotonicClock`. `SystemWallClock` and `OsMaintenanceRandom`, the other defaults, are

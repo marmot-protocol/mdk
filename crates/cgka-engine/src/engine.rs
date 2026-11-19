@@ -4533,13 +4533,14 @@ impl<S: StorageProvider> Engine<S> {
             MessageState::Failed => {
                 // Convergence retires an undelivered Welcome with its commit
                 // when that commit loses; any other retirement is a withdrawal.
-                let superseded =
-                    StoredMessagePayload::decode(&record.payload).is_ok_and(|payload| {
-                        matches!(
-                            self.welcome_origin_state(&record.group_id, &payload),
-                            Ok(MessageState::EpochInvalidated)
-                        )
-                    });
+                // An origin that cannot be read now is not guessed at.
+                let superseded = match StoredMessagePayload::decode(&record.payload) {
+                    Ok(payload) => {
+                        self.welcome_origin_state(&record.group_id, &payload)?
+                            == MessageState::EpochInvalidated
+                    }
+                    Err(_) => false,
+                };
                 return Ok(OutboundWelcomeStatus::Settled(if superseded {
                     WelcomeSettlement::CommitSuperseded
                 } else {
@@ -4761,6 +4762,30 @@ impl<S: StorageProvider> Engine<S> {
                 ids.push(record.id);
             }
         }
+        Ok(ids)
+    }
+
+    /// The invite Welcomes still staged with the unconfirmed commit
+    /// `origin_commit_id` of `group_id`: those its rollback retires. A
+    /// caller that took the Welcomes off the commit's publish work finds
+    /// them here.
+    pub fn staged_invite_welcome_ids(
+        &self,
+        group_id: &GroupId,
+        origin_commit_id: &MessageId,
+    ) -> Result<Vec<MessageId>, EngineError> {
+        let mut ids = Vec::new();
+        self.visit_group_welcome_records(group_id, &[MessageState::Sent], |id, _, payload| {
+            if let StoredMessagePayload::StagedInviteWelcome {
+                origin_commit_id: staged_origin,
+                ..
+            } = payload
+                && staged_origin == *origin_commit_id
+            {
+                ids.push(id);
+            }
+            Ok(())
+        })?;
         Ok(ids)
     }
 

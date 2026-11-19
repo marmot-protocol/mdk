@@ -10,7 +10,9 @@
 //! Every wave belongs to one client generation. Before the worker replaces
 //! its client it cancels that client's waves and settles each on it
 //! ([`WelcomeRuns::settle_all`]). Before the worker returns it cancels every
-//! wave and waits for its task to end ([`WelcomeRuns::end`]). On runtime
+//! wave and waits for its task to end ([`WelcomeRuns::end`]); a stop first
+//! audits the passes of the waves already returned
+//! ([`WelcomeRuns::record_returned`]). On runtime
 //! shutdown it first settles each wave whose task ends within the shutdown
 //! bound ([`WelcomeRuns::settle_until`], L3).
 //!
@@ -25,9 +27,9 @@
 //! parked when the worker returns gets the error a queued command gets
 //! ([`WelcomeRuns::end`]).
 
-use futures::StreamExt;
 use futures::future::BoxFuture;
 use futures::stream::FuturesUnordered;
+use futures::{FutureExt, StreamExt};
 use tokio::sync::oneshot;
 use tokio::task::{AbortHandle, JoinError};
 use tokio::time::{Instant as TokioInstant, timeout_at};
@@ -213,6 +215,20 @@ impl WelcomeRuns {
         while let Ok(Some(ended)) = timeout_at(deadline, self.running.next()).await {
             self.settle(client, ended).await;
             self.answer_waiting(client, shared);
+        }
+    }
+
+    /// When the worker stops, before its audit recording closes: each wave
+    /// whose task already returned is not settled, but each of its passes
+    /// that reached relays records its finished row from their answers.
+    pub(super) fn record_returned(&mut self, client: &mut AppClient) {
+        self.adopt(client);
+        while let Some(Some(ended)) = self.running.next().now_or_never() {
+            if let Ok(tasks) = &ended.run {
+                for task in tasks {
+                    task.record_unsettled_passes();
+                }
+            }
         }
     }
 

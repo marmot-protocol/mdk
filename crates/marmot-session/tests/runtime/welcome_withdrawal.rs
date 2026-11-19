@@ -980,6 +980,7 @@ async fn a_link_welcome_is_never_published_from_its_deadline_on() {
 /// A device link's Welcome that expires while this process watches it is
 /// audited once, as `expired`. A later start that reads it from the store,
 /// already expired, adds no row: it settled before that process watched it.
+/// Nor does the link's cleanup withdrawing it after its expiry was recorded.
 #[tokio::test]
 async fn an_expired_link_welcome_is_audited_once_across_restarts() {
     let dir = relaxed_storage_dir().unwrap();
@@ -1062,6 +1063,8 @@ async fn an_expired_link_welcome_is_audited_once_across_restarts() {
     let rows = withdrawn(&first_audit);
     assert_eq!(rows.len(), 1, "{rows:?}");
     assert_eq!(rows[0]["event"]["reason"], "expired");
+    first.withdraw_welcome(&welcome.id).unwrap();
+    assert_eq!(withdrawn(&first_audit).len(), 1, "expired, then withdrawn");
     assert_eq!(
         rows[0]["event"]["outer_event_ref"],
         marmot_forensics::v5::NostrEventRef::from_validated_event_id(

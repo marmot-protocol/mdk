@@ -346,15 +346,8 @@ impl CompletedWelcomePublishTask {
                 if !metadata.group_id.as_ref().is_some_and(&gone) {
                     return true;
                 }
-                if let Some(LegacyPublishCompletion::Network(attempt, result)) = completion
-                    && let Some(pass) = &attempt.v5_welcome
-                {
-                    pass.record_dropped(
-                        audit,
-                        result,
-                        &attempt.retry_endpoints,
-                        attempt.required_acks,
-                    );
+                if let Some(completion) = completion {
+                    record_dropped_completion(audit, completion);
                 }
                 false
             })
@@ -362,6 +355,31 @@ impl CompletedWelcomePublishTask {
         completed.metadata = metadata;
         completed.completions = completions;
         before - completed.metadata.len()
+    }
+
+    /// Record the finished audit row of each pass of this task that reached
+    /// relays, from the answers it got, with no stored outcome: for a task
+    /// dropped unsettled as its worker stops. Its records stay as preparation
+    /// left them, and its Welcomes stay owed.
+    pub fn record_unsettled_passes(&self) {
+        for completion in self.completed.completions.iter().flatten() {
+            record_dropped_completion(&self.completed.audit, completion);
+        }
+    }
+}
+
+/// The finished row of a pass that reached relays and whose results are
+/// dropped unreconciled.
+fn record_dropped_completion(audit: &SharedRecorder, completion: &LegacyPublishCompletion) {
+    if let LegacyPublishCompletion::Network(attempt, result) = completion
+        && let Some(pass) = &attempt.v5_welcome
+    {
+        pass.record_dropped(
+            audit,
+            result,
+            &attempt.retry_endpoints,
+            attempt.required_acks,
+        );
     }
 }
 
@@ -7169,14 +7187,10 @@ where
             && let Some(pending) = fanout.pending_ref()
         {
             let oversized = OversizedEvent::of_fanout(fanout);
-            let unretired = oversized.map(|_| {
-                self.unretired_welcomes(
-                    fanout
-                        .pending_post_confirmation_welcomes()
-                        .iter()
-                        .map(|welcome| welcome.id.clone()),
-                )
-            });
+            // The commit's staged Welcomes, which a host's invite does not
+            // carry on the fanout.
+            let unretired =
+                oversized.map(|_| self.unretired_welcomes(self.staged_welcomes_of_fanout(fanout)));
             let effects = roll_back_failed_fanout(&mut self.session, pending, fanout, pass).await;
             // Recorded even when the rollback fails after it committed.
             if let (Some(oversized), Some(unretired)) = (oversized, unretired) {

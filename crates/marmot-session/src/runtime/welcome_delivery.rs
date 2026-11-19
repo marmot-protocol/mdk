@@ -405,11 +405,19 @@ where
         &self,
         message_id: &cgka_traits::MessageId,
     ) -> AccountResult<WelcomeWithdrawal> {
+        // Only a withdrawal of a live Welcome is its terminal reason: one
+        // already settled (expired, its commit lost) was or is recorded so.
+        let live = self.audit.records_v5()
+            && matches!(
+                self.session
+                    .outbound_welcome_status(message_id, self.wall_clock.now()),
+                Ok(OutboundWelcomeStatus::Owed { .. } | OutboundWelcomeStatus::Waiting)
+            );
         let withdrawal = self.session.withdraw_sent_welcome(message_id)?;
         if withdrawal == WelcomeWithdrawal::AlreadyDelivered {
             return Ok(withdrawal);
         }
-        if withdrawal == WelcomeWithdrawal::Withdrawn {
+        if withdrawal == WelcomeWithdrawal::Withdrawn && live {
             self.record_v5_welcome_withdrawal(message_id);
         }
         // A reserved wave owns its fanout until finish; maintenance prunes

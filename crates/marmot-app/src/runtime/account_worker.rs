@@ -2093,6 +2093,7 @@ async fn run_app_runtime_account_worker(
             }
             stop = &mut shutdown => {
                 if stop.is_ok() {
+                    welcome_runs.record_returned(&mut client);
                     client.finish_audit_recording();
                 }
                 stop_recovery_runner(&mut recovery_runner, &mut client).await;

@@ -92,8 +92,10 @@ It must not own MLS internals, transport event parsing, SQLCipher key derivation
     obligation, and every publish reads it first (`welcome_hold`): a withdrawn Welcome never goes out again, a staged
     one waits for its commit, and a device link's Welcome never goes out from its `deliver_until` on, by this
     runtime's wall clock (mdk#2628 D40). A batch checks that deadline again before it starts each relay attempt, so a
-    detached wave prepared earlier does not send it late. An expired Welcome is settled for its watch, and
-    maintenance drops its retry record. The runtime watches the Welcomes it stages, and those the startup pass (or else the first
+    detached wave prepared earlier does not send it late. An expired Welcome is never sent again, but it may still close
+    as delivered: a detached pass started before the deadline may be acknowledged, and a saved relay acceptance that
+    meets its policy is marked (`expired_welcome_may_still_close`, `welcome_still_owes_met_policy`). Its watch records
+    the expiry, and maintenance drops its retry record, only once neither can. The runtime watches the Welcomes it stages, and those the startup pass (or else the first
     maintenance pass) finds staged or owed; a group skipped because it was not live is read again on each pass until it
     is. A Welcome stays watched until its row is settled. Maintenance publishes each watched Welcome that is owed and
     that no attempt record (stored fanout or detached wave) holds, so one whose publish stored nothing (no

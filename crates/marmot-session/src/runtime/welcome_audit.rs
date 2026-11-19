@@ -243,6 +243,35 @@ where
             .collect()
     }
 
+    /// The Welcomes a rollback of `fanout`'s commit may retire: those it
+    /// carries and those still staged with its commit. Empty without a v5
+    /// recorder.
+    pub(super) fn staged_welcomes_of_fanout(
+        &self,
+        fanout: &OutboundFanout,
+    ) -> Vec<cgka_traits::MessageId> {
+        if !self.audit.records_v5() {
+            return Vec::new();
+        }
+        let mut ids = fanout
+            .pending_post_confirmation_welcomes()
+            .iter()
+            .map(|welcome| welcome.id.clone())
+            .collect::<Vec<_>>();
+        if let Some(group_id) = fanout.group_id()
+            && let Ok(staged) = self
+                .session
+                .staged_invite_welcome_ids(group_id, fanout.message_id())
+        {
+            for id in staged {
+                if !ids.contains(&id) {
+                    ids.push(id);
+                }
+            }
+        }
+        ids
+    }
+
     /// Those of `unretired`, read just before a rollback, that the rollback
     /// retired: their rows went from `Sent` to `Failed`.
     pub(super) fn retired_welcomes(&self, unretired: Vec<V5Welcome>) -> Vec<V5Welcome> {
@@ -305,8 +334,9 @@ where
         Ok(facts.and_then(|facts| self.v5_welcome_of(facts)))
     }
 
-    /// Record `welcome_withdrawn` for a Welcome its sender just withdrew,
-    /// watched or not; the watcher then leaves that settlement alone.
+    /// Record `welcome_withdrawn` for a live Welcome its sender just
+    /// withdrew, watched or not; the watcher then leaves that settlement
+    /// alone.
     pub(super) fn record_v5_welcome_withdrawal(&self, welcome_id: &cgka_traits::MessageId) {
         // A row that cannot be read now is left to the watcher, if it holds
         // the Welcome.
