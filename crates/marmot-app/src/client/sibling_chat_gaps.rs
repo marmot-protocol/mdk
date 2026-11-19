@@ -9,10 +9,28 @@
 //! Once the sibling has been active for an hour after that expiry, the
 //! claimant retires those leaves with a same-account Remove, and the chat is
 //! then missing the sibling like any other. The wait is memory-only.
+//!
+//! A newly linked device is left to the device that approved its link while
+//! that approver is active (mdk#3537): its post-link pass
+//! (`linked_device_chats.rs`) adds the device to chats without claims, so a
+//! gap-filling sibling adding it too would fork the chat. For
+//! [`LINK_CHAT_ADD_SECS`] after the roster's `linked_at`, while the roster
+//! lists the approver (`linked_by`) as another active or inactive device and
+//! its last activity, the newer of its last counted heartbeat and that
+//! `linked_at`, is less than [`APPROVER_ACTIVE_SECS`] old, gap filling on
+//! other devices neither claims nor spends stock for that device in a chat
+//! the approver holds a leaf in. It looks again when the approver's window
+//! lapses; a heartbeat counted meanwhile pushes that time back. Devices from
+//! before this rule fill at once. An approver that keeps sending heartbeats
+//! while its pass makes no progress holds its siblings back for up to
+//! [`LINK_CHAT_ADD_SECS`]. In turn the approver, by its direct pass or its
+//! own gap filling, leaves a chat to another linked device's live claim for
+//! its new device, whatever that claimant's slot
+//! ([`AppClient::approver_claim_wait`]).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-use cgka_traits::app_components::{DeviceSlotId, DeviceStatusV1, OwnDeviceLeaf};
+use cgka_traits::app_components::{DeviceRosterV1, DeviceSlotId, DeviceStatusV1, OwnDeviceLeaf};
 use cgka_traits::engine::GroupEvent;
 use cgka_traits::error::SiblingAddRefusal;
 use cgka_traits::{EpochId, GroupId};
@@ -20,7 +38,9 @@ use serde::{Deserialize, Serialize};
 
 use super::AppClient;
 use super::device_group::Exchange;
+use super::device_heartbeats::APPROVER_ACTIVE_SECS;
 use super::device_removal::OwnLeafRemoval;
+use super::linked_device_chats::LINK_CHAT_ADD_SECS;
 use super::private_key_packages::PrivateKeyPackageSelection;
 use crate::{AppError, unix_now_seconds};
 
@@ -119,12 +139,62 @@ fn lower_hex(value: &str) -> bool {
 /// A leaving device cannot advance gap filling; its earlier claims no
 /// longer hold another worker back. Active and inactive entries remain linked.
 fn claimant_is_eligible(exchange: &Exchange, slot: &DeviceSlotId) -> bool {
-    exchange.roster.devices.get(slot).is_some_and(|entry| {
+    linked_device(&exchange.roster, slot)
+}
+
+/// Whether a claim to add `slot` is kept: the roster lists it as linked
+/// and tagged. A local admission hold, such as this device's own link of it
+/// still pending, does not drop a sibling's claim; it holds only this
+/// device's own Adds and claims.
+fn claim_target_is_valid(roster: &DeviceRosterV1, slot: &DeviceSlotId) -> bool {
+    linked_device(roster, slot)
+        && roster
+            .devices
+            .get(slot)
+            .is_some_and(|entry| entry.tag_signature_key.is_some())
+}
+
+/// Whether the roster lists `slot` as active or inactive: linked, neither
+/// leaving nor moved.
+fn linked_device(roster: &DeviceRosterV1, slot: &DeviceSlotId) -> bool {
+    roster.devices.get(slot).is_some_and(|entry| {
         matches!(
             entry.status,
             DeviceStatusV1::Active | DeviceStatusV1::Inactive
         )
     })
+}
+
+/// Until when gap filling on `own` leaves `target` to the device that
+/// approved its link (mdk#3537), or `None` when it fills `target` itself.
+/// It holds while the roster names another linked device as `target`'s
+/// approver, `target` was linked less than [`LINK_CHAT_ADD_SECS`] ago, and
+/// the approver's last activity is less than [`APPROVER_ACTIVE_SECS`] old.
+/// That activity is the newer of the approver's last counted heartbeat,
+/// which `heartbeat` reads for its slot and `linked_at`, and `target`'s
+/// `linked_at`: approving the link shows the approver active then.
+fn approver_hold_until(
+    roster: &DeviceRosterV1,
+    own: &DeviceSlotId,
+    target: &DeviceSlotId,
+    heartbeat: impl FnOnce(&DeviceSlotId, u64) -> Result<Option<u64>, AppError>,
+    now: u64,
+) -> Result<Option<u64>, AppError> {
+    let Some(entry) = roster.devices.get(target) else {
+        return Ok(None);
+    };
+    let Some(approver) = entry.linked_by.filter(|approver| approver != own) else {
+        return Ok(None);
+    };
+    let window_ends = entry.linked_at.saturating_add(LINK_CHAT_ADD_SECS);
+    if now >= window_ends || !linked_device(roster, &approver) {
+        return Ok(None);
+    }
+    let approver_linked_at = roster.devices[&approver].linked_at;
+    let last_active = heartbeat(&approver, approver_linked_at)?
+        .map_or(entry.linked_at, |at| at.max(entry.linked_at));
+    let active_ends = last_active.saturating_add(APPROVER_ACTIVE_SECS);
+    Ok((now < active_ends).then_some(active_ends.min(window_ends)))
 }
 
 /// Effective admission inputs, independent of routine device-group commits.
@@ -134,7 +204,9 @@ fn claimant_is_eligible(exchange: &Exchange, slot: &DeviceSlotId) -> bool {
 struct GapEligibility {
     group: GroupId,
     own_slot: DeviceSlotId,
-    targets: BTreeMap<DeviceSlotId, Vec<u8>>,
+    /// Each ready target's tag signature key, approver and link time: a
+    /// changed approver or link recomputes approver holds (mdk#3537).
+    targets: BTreeMap<DeviceSlotId, (Vec<u8>, Option<DeviceSlotId>, u64)>,
     claimants: BTreeSet<DeviceSlotId>,
 }
 
@@ -182,6 +254,13 @@ pub(crate) struct SiblingChatGaps {
     claims: HashMap<Gap, BTreeMap<DeviceSlotId, u64>>,
     waiting_for_stock: HashSet<Gap>,
     unused_adds: HashMap<Gap, UnusedAdd>,
+    /// Targets left to their approver in some chat (mdk#3537), and when to
+    /// look again. Every chat is examined again once a hold ends.
+    approver_holds: HashMap<DeviceSlotId, u64>,
+    /// Moves the clock approver holds are judged by this far ahead, so a
+    /// journey test can find an approver quiet without waiting for it.
+    #[cfg(test)]
+    pub(crate) test_approver_clock_ahead: u64,
 }
 
 impl SiblingChatGaps {
@@ -201,8 +280,34 @@ impl SiblingChatGaps {
             self.waiting_for_stock.clear();
             self.unused_adds.clear();
         }
+        // Every chat is examined again, and holds are found afresh.
+        self.approver_holds.clear();
         self.eligibility = Some(eligibility);
         true
+    }
+
+    /// Pass over `chat` for `target` until `until`, when its approver's
+    /// window lapses (mdk#3537).
+    fn hold_for_approver(&mut self, chat: &GroupId, target: DeviceSlotId, until: u64) {
+        self.approver_holds.insert(target, until);
+        self.waiting_for_stock.remove(&(chat.clone(), target));
+    }
+
+    /// When the first live claim on `gap` from a linked device other than
+    /// `own` expires, if there is one.
+    fn other_claim_until(
+        &self,
+        gap: &Gap,
+        own: &DeviceSlotId,
+        now: u64,
+        eligible: impl Fn(&DeviceSlotId) -> bool,
+    ) -> Option<u64> {
+        self.claims
+            .get(gap)?
+            .iter()
+            .filter(|(from, expiry)| *from != own && **expiry > now && eligible(from))
+            .map(|(_, expiry)| *expiry)
+            .min()
     }
 
     fn schedule(&mut self, chat: GroupId, at: u64) {
@@ -503,6 +608,76 @@ impl AppClient {
             .repair(gap, refusal, leaves, last_active, unix_now_seconds()))
     }
 
+    /// When this device, as `target`'s approver, may add it to `chat`
+    /// again, if another linked device holds a live gap-fill claim there
+    /// (mdk#3537): that claim's expiry, whatever the claimant's slot. Both
+    /// the direct post-link pass and this device's own gap filling defer
+    /// to it, so a sibling that took over while this device was away is
+    /// never raced. `None` when this device is not `target`'s approver.
+    pub(super) fn approver_claim_wait(
+        &self,
+        exchange: &Exchange,
+        chat: &GroupId,
+        target: &DeviceSlotId,
+        now: u64,
+    ) -> Option<u64> {
+        let entry = exchange.roster.devices.get(target)?;
+        if entry.linked_by != Some(exchange.own_slot) {
+            return None;
+        }
+        self.sibling_chat_gaps.other_claim_until(
+            &(chat.clone(), *target),
+            &exchange.own_slot,
+            now,
+            |slot| claimant_is_eligible(exchange, slot),
+        )
+    }
+
+    /// Whether `target`'s approver holds a leaf in `chat`: one of this
+    /// account's leaves there carries its tag or its tag signature key. Only
+    /// then can its post-link pass add `target` there (mdk#3537).
+    fn approver_in_chat(
+        &self,
+        exchange: &Exchange,
+        chat: &GroupId,
+        target: &DeviceSlotId,
+    ) -> Result<bool, AppError> {
+        let Some(approver) = exchange
+            .roster
+            .devices
+            .get(target)
+            .and_then(|entry| entry.linked_by)
+        else {
+            return Ok(false);
+        };
+        let key = exchange
+            .roster
+            .devices
+            .get(&approver)
+            .and_then(|entry| entry.tag_signature_key.as_deref());
+        Ok(!self
+            .runtime
+            .own_device_leaves(chat, &exchange.roster, &approver, key)?
+            .is_empty())
+    }
+
+    /// [`approver_hold_until`] for `target`, reading the approver's last
+    /// counted heartbeat.
+    fn approver_hold(
+        &self,
+        exchange: &Exchange,
+        target: &DeviceSlotId,
+        now: u64,
+    ) -> Result<Option<u64>, AppError> {
+        approver_hold_until(
+            &exchange.roster,
+            &exchange.own_slot,
+            target,
+            |approver, linked_at| self.sibling_last_active(approver, linked_at),
+            now,
+        )
+    }
+
     /// The newest date a heartbeat from the roster entry `slot` linked at
     /// `linked_at` counted for.
     fn sibling_last_active(
@@ -539,7 +714,7 @@ impl AppClient {
         };
         if claim.from == exchange.own_slot
             || !claimant_is_eligible(&exchange, &claim.from)
-            || !self.gap_siblings(&exchange)?.eligible.contains(&claim.to)
+            || !claim_target_is_valid(&exchange.roster, &claim.to)
             || !self.sibling_commit_chats().contains(&claim.chat)
         {
             return Ok(());
@@ -592,10 +767,11 @@ impl AppClient {
             targets: ready
                 .iter()
                 .filter_map(|slot| {
-                    exchange.roster.devices[slot]
+                    let entry = &exchange.roster.devices[slot];
+                    entry
                         .tag_signature_key
                         .clone()
-                        .map(|key| (*slot, key))
+                        .map(|key| (*slot, (key, entry.linked_by, entry.linked_at)))
                 })
                 .collect(),
             claimants: exchange
@@ -609,9 +785,12 @@ impl AppClient {
         if eligible.is_empty() {
             self.sibling_chat_gaps.eligibility = None;
             self.sibling_chat_gaps.due.clear();
-            self.sibling_chat_gaps.claims.clear();
+            self.sibling_chat_gaps
+                .claims
+                .retain(|(_, target), _| claim_target_is_valid(&exchange.roster, target));
             self.sibling_chat_gaps.waiting_for_stock.clear();
             self.sibling_chat_gaps.unused_adds.clear();
+            self.sibling_chat_gaps.approver_holds.clear();
             return Ok(());
         }
         let changed = self
@@ -627,6 +806,37 @@ impl AppClient {
                 self.sibling_chat_gaps.schedule(chat, 0);
             }
         }
+        #[cfg(test)]
+        let hold_now = now.saturating_add(self.sibling_chat_gaps.test_approver_clock_ahead);
+        #[cfg(not(test))]
+        let hold_now = now;
+        // A hold whose approver window lapsed runs on when the approver was
+        // heard from since; otherwise it ends and every chat is examined
+        // again, as after a roster change.
+        let lapsed: Vec<_> = (self.sibling_chat_gaps.approver_holds.iter())
+            .filter(|(_, until)| **until <= hold_now)
+            .map(|(target, _)| *target)
+            .collect();
+        let mut ended = false;
+        for target in lapsed {
+            match self.approver_hold(&exchange, &target, hold_now) {
+                Ok(Some(until)) => {
+                    self.sibling_chat_gaps.approver_holds.insert(target, until);
+                }
+                Ok(None) => {
+                    self.sibling_chat_gaps.approver_holds.remove(&target);
+                    ended = true;
+                }
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+        if ended {
+            for chat in self.sibling_commit_chats() {
+                self.sibling_chat_gaps.schedule(chat, 0);
+            }
+        }
         if self.sibling_chat_gaps.due.values().all(|at| *at > now) {
             return first_error.map_or(Ok(()), Err);
         }
@@ -635,7 +845,9 @@ impl AppClient {
             .claims
             .retain(|(chat, target), claims| {
                 claims.retain(|slot, _| claimant_is_eligible(&exchange, slot));
-                known.contains(chat) && eligible.contains(target) && !claims.is_empty()
+                known.contains(chat)
+                    && claim_target_is_valid(&exchange.roster, target)
+                    && !claims.is_empty()
             });
         self.sibling_chat_gaps
             .waiting_for_stock
@@ -654,10 +866,26 @@ impl AppClient {
             .map(|(chat, _)| chat.clone())
             .collect();
         due.sort_by(|a, b| a.as_slice().cmp(b.as_slice()));
+        // Targets left to their approver, with when to look again. One whose
+        // approver's activity cannot be read is held and looked at again on
+        // the next pass.
+        let mut holds = HashMap::new();
+        for target in &ready {
+            match self.approver_hold(&exchange, target, hold_now) {
+                Ok(Some(until)) => {
+                    holds.insert(*target, until);
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    holds.insert(*target, hold_now);
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
         for chat in due {
             self.sibling_chat_gaps.due.remove(&chat);
             let result = self
-                .fill_one_chat_gap(&exchange, &chat, &ready, &mut budget, selection)
+                .fill_one_chat_gap(&exchange, &chat, &ready, &holds, &mut budget, selection)
                 .await;
             if let Err(error) = result {
                 self.sibling_chat_gaps.schedule(chat, 0);
@@ -685,6 +913,7 @@ impl AppClient {
         exchange: &Exchange,
         chat: &GroupId,
         siblings: &[DeviceSlotId],
+        holds: &HashMap<DeviceSlotId, u64>,
         budget: &mut usize,
         selection: &mut PrivateKeyPackageSelection,
     ) -> Result<(), AppError> {
@@ -700,6 +929,15 @@ impl AppClient {
         let mut first_error = None;
         for slot in siblings {
             let gap = (chat.clone(), *slot);
+            // Left to its approver where the approver can add it: no claim,
+            // no stock.
+            if let Some(until) = holds.get(slot)
+                && self.approver_in_chat(exchange, chat, slot)?
+            {
+                self.sibling_chat_gaps
+                    .hold_for_approver(chat, *slot, *until);
+                continue;
+            }
             let repair = self.gap_repair(exchange, &gap)?;
             let retire = match &repair {
                 GapRepair::Present | GapRepair::Waiting => continue,
@@ -717,11 +955,12 @@ impl AppClient {
                 self.sibling_chat_gaps.schedule(chat.clone(), 0);
                 break;
             }
-            if let Some(expiry) = self.sibling_chat_gaps.claim_wait_until(
-                &gap,
-                &exchange.own_slot,
-                unix_now_seconds(),
-            ) {
+            let now = unix_now_seconds();
+            if let Some(expiry) = self
+                .sibling_chat_gaps
+                .claim_wait_until(&gap, &exchange.own_slot, now)
+                .or_else(|| self.approver_claim_wait(exchange, chat, slot, now))
+            {
                 self.sibling_chat_gaps.schedule(chat.clone(), expiry);
                 continue;
             }
@@ -859,12 +1098,13 @@ mod tests {
     /// interval must still schedule the first ready pass.
     #[test]
     fn blocked_gap_passes_preserve_the_last_scheduled_eligibility() {
-        let eligibility = |key| GapEligibility {
+        let linked = |key, linked_by| GapEligibility {
             group: GroupId::new(vec![1, 2, 3]),
             own_slot: [1; 32],
-            targets: BTreeMap::from([([2; 32], vec![key; 32])]),
-            claimants: BTreeSet::from([[1; 32], [2; 32]]),
+            targets: BTreeMap::from([([2; 32], (vec![key; 32], linked_by, 100))]),
+            claimants: BTreeSet::from([[1; 32], [2; 32], [3; 32]]),
         };
+        let eligibility = |key| linked(key, Some([1; 32]));
         let mut state = SiblingChatGaps::default();
         assert!(!state.schedule_eligibility(eligibility(3), false));
         assert!(
@@ -882,6 +1122,12 @@ mod tests {
             "blocked key change is not consumed"
         );
         assert!(!state.schedule_eligibility(eligibility(4), true));
+        // mdk#3537: a branch that names another approver for the same
+        // target rescans, so holds are found afresh.
+        assert!(
+            state.schedule_eligibility(linked(4, Some([3; 32])), true),
+            "a changed approver rescans"
+        );
     }
 
     #[test]
@@ -951,6 +1197,165 @@ mod tests {
         assert!(Claim::decode(CLAIM, 100, 700).unwrap().is_none());
         assert!(Claim::decode(CLAIM, 201, 200).unwrap().is_none());
         assert!(Claim::decode(CLAIM, u64::MAX, u64::MAX).unwrap().is_none());
+    }
+
+    const OWN: DeviceSlotId = [0x01; 32];
+    const APPROVER: DeviceSlotId = [0x0a; 32];
+    const TARGET: DeviceSlotId = [0x22; 32];
+    const LINKED_AT: u64 = 1_000_000;
+
+    /// `TARGET`, linked by `APPROVER` at `LINKED_AT`, in a roster where
+    /// this device has the lowest slot.
+    fn linked_roster(approver_status: DeviceStatusV1) -> DeviceRosterV1 {
+        let entry = |linked_at, linked_by, status| cgka_traits::app_components::DeviceEntryV1 {
+            linked_at,
+            linked_by,
+            status,
+            ..Default::default()
+        };
+        DeviceRosterV1 {
+            devices: BTreeMap::from([
+                (OWN, entry(10, Some(APPROVER), DeviceStatusV1::Active)),
+                (APPROVER, entry(5, None, approver_status)),
+                (
+                    TARGET,
+                    entry(LINKED_AT, Some(APPROVER), DeviceStatusV1::Active),
+                ),
+            ]),
+            ..Default::default()
+        }
+    }
+
+    fn hold(
+        roster: &DeviceRosterV1,
+        own: DeviceSlotId,
+        heartbeat: Option<u64>,
+        now: u64,
+    ) -> Option<u64> {
+        approver_hold_until(
+            roster,
+            &own,
+            &TARGET,
+            |approver, linked_at| {
+                assert_eq!((approver, linked_at), (&APPROVER, 5));
+                Ok(heartbeat)
+            },
+            now,
+        )
+        .unwrap()
+    }
+
+    /// mdk#3537: while a new device's approver is active, its other
+    /// siblings leave adding it to chats to that approver, whatever their
+    /// slot order: the approver claims nothing, so a sibling's Add of the
+    /// same device would fork the chat. Approving the link shows the
+    /// approver active at `linked_at`; a later heartbeat extends that.
+    #[test]
+    fn siblings_leave_a_new_device_to_its_active_approver() {
+        assert!(OWN < APPROVER, "this device outranks the approver");
+        let roster = linked_roster(DeviceStatusV1::Active);
+        let quiet_at = LINKED_AT + APPROVER_ACTIVE_SECS;
+        assert_eq!(hold(&roster, OWN, None, LINKED_AT), Some(quiet_at));
+        assert_eq!(hold(&roster, OWN, None, quiet_at - 1), Some(quiet_at));
+        assert_eq!(
+            hold(&roster, OWN, Some(LINKED_AT - 600), quiet_at - 1),
+            Some(quiet_at),
+            "a heartbeat older than the link does not shorten the hold"
+        );
+        let heard = LINKED_AT + 3 * 24 * 60 * 60;
+        assert_eq!(
+            hold(&roster, OWN, Some(heard), heard + 60),
+            Some(heard + APPROVER_ACTIVE_SECS),
+            "a newer heartbeat pushes the hold back"
+        );
+        let inactive = linked_roster(DeviceStatusV1::Inactive);
+        assert_eq!(
+            hold(&inactive, OWN, None, LINKED_AT),
+            Some(quiet_at),
+            "a roster-inactive approver that is heard from still holds"
+        );
+        let window_ends = LINKED_AT + LINK_CHAT_ADD_SECS;
+        assert_eq!(
+            hold(&roster, OWN, Some(window_ends - 60), window_ends - 1),
+            Some(window_ends),
+            "the hold never outlasts the approver's post-link window"
+        );
+    }
+
+    /// mdk#3537: gap filling takes the new device over once its approver
+    /// has been quiet for `APPROVER_ACTIVE_SECS`, once the post-link window
+    /// ended, or when the approver is no longer a linked sibling. The
+    /// approver's own gap filling is never held.
+    #[test]
+    fn siblings_fill_a_new_device_once_its_approver_goes_quiet() {
+        let roster = linked_roster(DeviceStatusV1::Active);
+        let quiet_at = LINKED_AT + APPROVER_ACTIVE_SECS;
+        assert_eq!(hold(&roster, OWN, None, quiet_at), None, "link time lapsed");
+        let heard = LINKED_AT + 600;
+        assert_eq!(
+            hold(&roster, OWN, Some(heard), heard + APPROVER_ACTIVE_SECS),
+            None,
+            "last heartbeat lapsed"
+        );
+        let window_ends = LINKED_AT + LINK_CHAT_ADD_SECS;
+        assert_eq!(hold(&roster, OWN, Some(window_ends), window_ends), None);
+        for status in [DeviceStatusV1::Leaving, DeviceStatusV1::Moved] {
+            assert_eq!(hold(&linked_roster(status), OWN, None, LINKED_AT), None);
+        }
+        let mut gone = linked_roster(DeviceStatusV1::Active);
+        gone.devices.remove(&APPROVER);
+        assert_eq!(hold(&gone, OWN, None, LINKED_AT), None);
+        assert_eq!(
+            approver_hold_until(
+                &roster,
+                &APPROVER,
+                &TARGET,
+                |_, _| unreachable!("the approver reads no activity of its own"),
+                LINKED_AT
+            )
+            .unwrap(),
+            None
+        );
+        let mut founder = linked_roster(DeviceStatusV1::Active);
+        founder.devices.get_mut(&TARGET).unwrap().linked_by = None;
+        assert_eq!(hold(&founder, OWN, None, LINKED_AT), None);
+    }
+
+    /// mdk#3537: an approver defers to another linked device's live claim
+    /// to add its new device to a chat until that claim expires, whatever
+    /// the claimant's slot, and ignores its own, expired or leaving
+    /// claimants' claims.
+    #[test]
+    fn the_approver_leaves_a_claimed_chat_to_its_claimant() {
+        let mut state = SiblingChatGaps::default();
+        let gap = (GroupId::new(vec![1, 2, 3]), [0x22; 32]);
+        let other_chat = (GroupId::new(vec![4]), [0x22; 32]);
+        state.retain_claim(Claim::decode(CLAIM, 100, 200).unwrap().unwrap());
+        let eligible = |_: &DeviceSlotId| true;
+        assert_eq!(
+            state.other_claim_until(&gap, &[0x01; 32], 200, eligible),
+            Some(700)
+        );
+        assert_eq!(
+            state.other_claim_until(&gap, &[0x33; 32], 200, eligible),
+            Some(700)
+        );
+        assert_eq!(
+            state.other_claim_until(&other_chat, &[0x01; 32], 200, eligible),
+            None
+        );
+        assert_eq!(
+            state.other_claim_until(&gap, &[0x11; 32], 200, eligible),
+            None
+        );
+        assert_eq!(
+            state.other_claim_until(&gap, &[0x01; 32], 700, eligible),
+            None
+        );
+        assert_eq!(
+            state.other_claim_until(&gap, &[0x01; 32], 200, |_| false),
+            None
+        );
     }
 
     /// mdk#3042: a sibling held only by unused Add leaves whose KeyPackages
