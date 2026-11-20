@@ -24,8 +24,9 @@
 
 ### Added
 
-- `Engine::stored_rejoin_welcomes` and `Engine::rejoin_offers` read the stored rejoin offers whose group's MLS state
-  loads, for the host's published read state (#3428).
+- `Engine::stored_rejoin_welcomes` lists every stored rejoin candidate without loading its group, and
+  `Engine::rejoin_offers` keeps the candidates whose group's MLS state loads, for the host's published read state
+  (#3428).
 - `Engine::outbound_welcome_audit_facts` reads one retained outbound Welcome's group, id, transport source,
   recipient, origin commit, KeyPackage event id and state, in any state and without its bytes, for the sender's audit. Invite and founding Welcomes record the
   transport event id of the KeyPackage they answer.

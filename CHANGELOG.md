@@ -148,8 +148,10 @@
 - WN Agent accounts run with device groups on, through the runtime's new
   default; the connector has no switch for them.
 - Runtime shutdown gives Welcome waves still publishing up to 2 s before it
-  cancels them, so a Welcome a create or invite just started is not left owed
-  until the next start (#3488).
+  cancels them, so a Welcome a create or invite just started is usually sent
+  before exit (#3488). `shutdown_and_close` still closes storage first: a wave
+  that settles after the close leaves its Welcome owed, and the next start
+  sends it again.
 - Destructive sign-out reports queued member leaves in its leave failures
   instead of counting them as left (#3539).
 - A group change made while the group's own commit is pending fails with the
