@@ -19,6 +19,7 @@ trap 'rm -rf "$smoke_dir"' EXIT
 "$smoke_target/uniffi-bindgen" generate --library "$smoke_library" --language swift --out-dir "$smoke_dir"
 cat "$smoke_dir/marmot_uniffi.swift" \
   crates/marmot-uniffi/swift-support/CancellableSubscriptions.swift \
+  crates/marmot-uniffi/tests/memory_secret_store.swift \
   crates/marmot-uniffi/tests/subscription_cancellation_smoke.swift > "$smoke_dir/CombinedSmoke.swift"
 swiftc -parse-as-library -I "$smoke_dir" -Xcc "-fmodule-map-file=$smoke_dir/marmot_uniffiFFI.modulemap" \
   -L "$smoke_target" -lmarmot_uniffi "$smoke_dir/CombinedSmoke.swift" -o "$smoke_dir/smoke"

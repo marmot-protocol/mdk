@@ -291,7 +291,7 @@ async fn run_cli_with_import_nsec(mut cli: Cli, mut import_nsec: Option<ImportNs
         }
     }
 
-    run_cli_local(cli, import_nsec).await
+    run_cli_local(cli, import_nsec, None).await
 }
 
 fn validate_secret_input_flags(cli: &Cli) -> Result<(), WnError> {
@@ -493,8 +493,12 @@ fn is_notifications_subscribe(cli: &Cli) -> bool {
     )
 }
 
-pub(crate) async fn run_cli_local(cli: Cli, import_nsec: Option<ImportNsec>) -> CliOutput {
-    match execute(cli, import_nsec).await {
+pub(crate) async fn run_cli_local(
+    cli: Cli,
+    import_nsec: Option<ImportNsec>,
+    root_context: Option<(&marmot_app::MarmotRootRuntimeLease, AccountHome)>,
+) -> CliOutput {
+    match execute(cli, import_nsec, root_context).await {
         Ok((json_output, output)) => command_output_result(json_output, Ok(output)),
         Err((json_output, err)) => command_output_result(json_output, Err(err)),
     }
@@ -546,9 +550,10 @@ pub(crate) fn command_output_result(
 async fn execute(
     cli: Cli,
     import_nsec: Option<ImportNsec>,
+    root_context: Option<(&marmot_app::MarmotRootRuntimeLease, AccountHome)>,
 ) -> Result<(bool, CommandOutput), (bool, WnError)> {
     let json_output = cli.json;
-    execute_inner(cli, import_nsec)
+    execute_inner(cli, import_nsec, root_context)
         .await
         .map(|output| (json_output, output))
         .map_err(|err| (json_output, err))
@@ -557,6 +562,7 @@ async fn execute(
 async fn execute_inner(
     cli: Cli,
     mut import_nsec: Option<ImportNsec>,
+    root_context: Option<(&marmot_app::MarmotRootRuntimeLease, AccountHome)>,
 ) -> Result<CommandOutput, WnError> {
     let home = resolve_home(cli.home.clone());
     let account_flag = cli.account.clone();
@@ -582,34 +588,52 @@ async fn execute_inner(
         secret_store,
         keychain_service: keychain_service.clone(),
     };
-    let account_home = open_account_home(&home, secret_store, &keychain_service)?;
+    let (root_owner, account_home) = match root_context {
+        Some((root_owner, account_home)) => (Some(root_owner), account_home),
+        None => (
+            None,
+            open_account_home(&home, secret_store, &keychain_service)?,
+        ),
+    };
     let command_relay = match &command {
         Command::Login { relay, .. } => relay.clone().or_else(|| cli.relay.clone()),
         _ => cli.relay.clone(),
     };
     let relay = resolve_relay(command_relay)?;
-    let app = app_for(
-        home.clone(),
-        relay
-            .clone()
-            .or_else(|| cli.daemon_discovery_relays.first().cloned())
-            .or_else(|| cli.daemon_default_account_relays.first().cloned()),
-        cli.daemon_discovery_relays.clone(),
-        account_home.clone(),
-    )?;
+    let access = if matches!(
+        &command,
+        Command::Stream { command } if client_hosted_stream_command(command).is_some()
+    ) {
+        CliAppAccess::ClientHosted
+    } else {
+        CliAppAccess::RequireOwner
+    };
+    let app = || {
+        app_for(
+            home.clone(),
+            relay
+                .clone()
+                .or_else(|| cli.daemon_discovery_relays.first().cloned())
+                .or_else(|| cli.daemon_default_account_relays.first().cloned()),
+            cli.daemon_discovery_relays.clone(),
+            account_home.clone(),
+            root_owner,
+            access,
+        )
+    };
     match command {
         Command::UsageDiagnostics { command } => {
-            let runtime = app.runtime();
+            let runtime = app()?.runtime();
             marmot_app::configure_product_analytics_from_environment(&runtime, "daemon");
             usage_diagnostics_command(&runtime, command)
         }
         Command::Devices { .. } => Err(WnError::DevicesRequireDaemon),
         Command::Debug { command } => {
-            commands::debug::debug_command(&account_home, &app, command, account_flag)
+            commands::debug::debug_command(&account_home, &app()?, command, account_flag)
         }
         Command::CreateIdentity => {
             commands::account::identity_create_command(
-                &app,
+                &app()?,
                 runtime_info,
                 relay,
                 cli.daemon_default_account_relays,
@@ -623,7 +647,7 @@ async fn execute_inner(
             relay: _,
         } => {
             commands::account::identity_login_command(
-                &app,
+                &app()?,
                 runtime_info,
                 identity,
                 import_nsec.take(),
@@ -635,14 +659,14 @@ async fn execute_inner(
             .await
         }
         Command::Whoami => {
-            commands::account::whoami_command(&account_home, &app, runtime_info, account_flag)
+            commands::account::whoami_command(&account_home, &app()?, runtime_info, account_flag)
         }
         Command::Logout { pubkey } => commands::account::logout_command(&account_home, pubkey),
         Command::ExportNsec { pubkey } => commands::account::export_nsec_command(pubkey),
         Command::Account { command } => {
             commands::account::account_command(
                 &account_home,
-                &app,
+                &app()?,
                 command,
                 runtime_info,
                 account_flag,
@@ -654,7 +678,7 @@ async fn execute_inner(
         Command::Accounts { command } => {
             commands::account::account_command(
                 &account_home,
-                &app,
+                &app()?,
                 command,
                 runtime_info,
                 account_flag,
@@ -664,14 +688,19 @@ async fn execute_inner(
             .await
         }
         Command::Keys { command } => {
-            commands::key_package::key_package_command(&account_home, &app, command, account_flag)
-                .await
+            commands::key_package::key_package_command(
+                &account_home,
+                &app()?,
+                command,
+                account_flag,
+            )
+            .await
         }
         Command::Chats { command } => {
-            commands::chats::chats_command(&account_home, &app, command, account_flag).await
+            commands::chats::chats_command(&account_home, &app()?, command, account_flag).await
         }
         Command::Media { command } => {
-            commands::media::media_command(&account_home, &app, command, account_flag).await
+            commands::media::media_command(&account_home, &app()?, command, account_flag).await
         }
         Command::Group {
             command,
@@ -680,7 +709,7 @@ async fn execute_inner(
         } => {
             commands::groups::group_command(
                 &account_home,
-                &app,
+                &app()?,
                 command,
                 account_flag,
                 crate::commands::groups::AcceptedGroupChangeRisks {
@@ -697,7 +726,7 @@ async fn execute_inner(
         } => {
             commands::groups::groups_command(
                 &account_home,
-                &app,
+                &app()?,
                 command,
                 account_flag,
                 crate::commands::groups::AcceptedGroupChangeRisks {
@@ -708,32 +737,33 @@ async fn execute_inner(
             .await
         }
         Command::Message { command } => {
-            commands::messages::message_command(&account_home, &app, command, account_flag).await
+            commands::messages::message_command(&account_home, &app()?, command, account_flag).await
         }
         Command::Messages { command } => {
-            commands::messages::message_command(&account_home, &app, command, account_flag).await
+            commands::messages::message_command(&account_home, &app()?, command, account_flag).await
         }
         Command::Follows { command } => {
-            commands::follows::follows_command(&account_home, &app, command, account_flag, relay)
+            commands::follows::follows_command(&account_home, &app()?, command, account_flag, relay)
                 .await
         }
         Command::Profile { command } => {
-            commands::profile::profile_command(&account_home, &app, command, account_flag, relay)
+            commands::profile::profile_command(&account_home, &app()?, command, account_flag, relay)
                 .await
         }
         Command::Relays { command } => {
-            commands::relays::relays_command(&account_home, &app, command, account_flag, relay)
+            commands::relays::relays_command(&account_home, &app()?, command, account_flag, relay)
                 .await
         }
         Command::Settings { command } => commands::settings::settings_command(&home, command),
         Command::Users { command } => {
-            commands::users::users_command(&account_home, &app, command, account_flag).await
+            commands::users::users_command(&account_home, &app()?, command, account_flag).await
         }
         Command::Notifications { command } => {
             commands::notifications::notifications_command(command)
         }
         Command::Stream { command } => {
-            commands::stream::stream_command_app(&account_home, &app, command, account_flag).await
+            commands::stream::stream_command_app(&account_home, &app()?, command, account_flag)
+                .await
         }
         Command::Daemon { .. } => Ok(CommandOutput {
             plain: "daemon command is handled by wn".to_owned(),
@@ -746,9 +776,9 @@ async fn execute_inner(
         Command::Sync => {
             let account = resolve_account(&account_home, account_flag)?;
             ensure_local_signing(&account)?;
-            commands::sync::sync_command(&app, account).await
+            commands::sync::sync_command(&app()?, account).await
         }
-        Command::RelayStats => commands::relay_stats::relay_stats_command(&app).await,
+        Command::RelayStats => commands::relay_stats::relay_stats_command(&app()?).await,
         Command::Reset { confirm } => reset_command(&home, confirm),
     }
 }
@@ -1286,13 +1316,29 @@ pub(crate) fn relay_lists_json(status: AccountRelayListStatus) -> Value {
     })
 }
 
+#[derive(Clone, Copy)]
+enum CliAppAccess {
+    RequireOwner,
+    ClientHosted,
+}
+
 fn app_for(
     home: PathBuf,
     relay: Option<String>,
     directory_relays: Vec<String>,
     account_home: AccountHome,
+    root_owner: Option<&marmot_app::MarmotRootRuntimeLease>,
+    access: CliAppAccess,
 ) -> Result<MarmotApp, WnError> {
-    app_for_role(home, relay, directory_relays, account_home, true)
+    app_for_role(
+        home,
+        relay,
+        directory_relays,
+        account_home,
+        true,
+        root_owner,
+        access,
+    )
 }
 
 fn app_for_role(
@@ -1301,6 +1347,8 @@ fn app_for_role(
     directory_relays: Vec<String>,
     account_home: AccountHome,
     silent: bool,
+    root_owner: Option<&marmot_app::MarmotRootRuntimeLease>,
+    access: CliAppAccess,
 ) -> Result<MarmotApp, WnError> {
     // Loopback-HTTP blob endpoints are only acted on when explicitly enabled for
     // dev/test (see MarmotAppConfig::allow_loopback_blob_endpoints). Opt in via
@@ -1316,6 +1364,31 @@ fn app_for_role(
     // pinned convergence settlement window (e.g. `0` for integration tests).
     if let Some(ms) = wn_dev_settlement_quiescence_ms()? {
         config = config.with_dev_settlement_quiescence_ms(ms);
+    }
+    if root_owner.is_none() && matches!(access, CliAppAccess::RequireOwner) {
+        return Ok(MarmotApp::try_with_relays_and_account_home_and_config(
+            home,
+            relay.into_iter().collect(),
+            account_home,
+            config,
+        )?);
+    }
+    if root_owner.is_none() {
+        // Client-hosted watches keep their local path; a busy root defers replay only.
+        let cleanup_owner = match marmot_app::MarmotRootRuntimeLease::try_acquire(&home) {
+            Ok(owner) => Some(owner),
+            Err(marmot_app::AppError::RuntimeBusy) => None,
+            Err(error) => return Err(error.into()),
+        };
+        if cleanup_owner.is_some()
+            && let (Ok(root), Ok(account_root)) = (
+                std::fs::canonicalize(&home),
+                std::fs::canonicalize(account_home.root()),
+            )
+            && root == account_root
+        {
+            account_home.resume_wipe_cleanup()?;
+        }
     }
     Ok(MarmotApp::with_relays_and_account_home_and_config(
         home,
@@ -1383,7 +1456,11 @@ fn open_account_home(
 ) -> Result<AccountHome, WnError> {
     match secret_store {
         SecretStoreKind::File => Ok(AccountHome::open(home)),
-        SecretStoreKind::Keychain => Ok(AccountHome::open_with_keychain(home, keychain_service)?),
+        SecretStoreKind::Keychain => Ok(AccountHome::open_with_keychain(
+            home,
+            keychain_service,
+            marmot_account::IosOptions::default(),
+        )?),
     }
 }
 
@@ -1570,6 +1647,68 @@ mod tests {
                 "{off:?} turns them off"
             );
         }
+    }
+
+    #[test]
+    fn cli_wipe_needs_root_lease() {
+        let home = tempfile::tempdir().unwrap();
+        let pending = home.path().join(".wipe-tombstones").join("pending");
+        crate::create_private_dir_all(&pending).unwrap();
+        crate::write_private_file(
+            &pending.join(".wipe-cleanup.json"),
+            b"unreadable wipe intent",
+        )
+        .unwrap();
+        crate::write_private_file(&pending.join("payload"), b"removed account payload").unwrap();
+
+        let owner = marmot_app::MarmotRootRuntimeLease::try_acquire(home.path()).unwrap();
+        let account_home = crate::open_account_home(
+            home.path(),
+            crate::SecretStoreKind::File,
+            "wn-test-keychain",
+        )
+        .unwrap();
+        assert!(pending.join("payload").exists());
+        assert!(matches!(
+            crate::app_for(
+                home.path().to_path_buf(),
+                None,
+                Vec::new(),
+                account_home.clone(),
+                None,
+                crate::CliAppAccess::RequireOwner
+            ),
+            Err(WnError::App(marmot_app::AppError::RuntimeBusy))
+        ));
+        assert!(pending.join(".wipe-cleanup.json").exists());
+        assert!(pending.join("payload").exists());
+
+        let local = crate::app_for(
+            home.path().to_path_buf(),
+            None,
+            Vec::new(),
+            account_home.clone(),
+            None,
+            crate::CliAppAccess::ClientHosted,
+        )
+        .unwrap();
+        assert!(pending.join(".wipe-cleanup.json").exists());
+        assert!(pending.join("payload").exists());
+        drop(local);
+
+        drop(owner);
+        let app = crate::app_for(
+            home.path().to_path_buf(),
+            None,
+            Vec::new(),
+            account_home,
+            None,
+            crate::CliAppAccess::RequireOwner,
+        )
+        .unwrap();
+        assert!(!pending.join("payload").exists());
+        assert!(pending.join(".wipe-cleanup.json").exists());
+        drop(app);
     }
 
     #[test]

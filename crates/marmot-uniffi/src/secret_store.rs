@@ -1,60 +1,143 @@
-//! Host-supplied account-secret storage.
-//!
-//! By default account signing keys live in the platform keychain
-//! ([`crate::Marmot::new`]). A host that already owns an encrypted store —
-//! a desktop client with a password-sealed vault, an iOS host that wants
-//! its own Keychain access-control flags, an Android host layering its own
-//! Keystore policy — implements [`SecretStore`] and constructs through
-//! [`crate::Marmot::new_with_secret_store`] instead.
-//!
-//! The boundary is strings only: the signing key crosses as secret-key hex
-//! and an account is identified by its `label` plus `account_id_hex`, which
-//! is everything a store needs from `AccountSummary`.
-
-use std::sync::Arc;
-
-use marmot_account::{AccountSecretStore, AccountSummary};
-use zeroize::Zeroizing;
+//! Host-supplied storage for owned account credentials.
 
 use crate::MarmotKitError;
+use marmot_account::AccountSecretStore;
+use std::sync::Arc;
+use zeroize::Zeroizing;
 
-/// Foreign-implemented storage for account signing keys.
-///
-/// Implementations must be thread-safe: the runtime calls these methods
-/// from worker threads and may call them concurrently.
-///
-/// This is a storage boundary, not a security boundary. The plaintext
-/// secret-key hex crosses it in both directions; whatever protection the
-/// key gets (encryption, an OS keystore, a password-derived seal) is the
-/// implementation's responsibility.
-#[uniffi::export(with_foreign)]
-pub trait SecretStore: Send + Sync {
-    /// Whether a credential is stored under `label`.
-    fn has_secret_for_label(&self, label: String) -> Result<bool, MarmotKitError>;
-
-    /// Whether a credential is stored under `account_id_hex`. Stores that
-    /// key one credential per label report `false`.
-    fn has_secret_for_account_id(&self, account_id_hex: String) -> Result<bool, MarmotKitError>;
-
-    /// Persist `secret_key_hex` for this account, replacing any existing
-    /// credential.
-    fn write_secret(
-        &self,
-        label: String,
-        account_id_hex: String,
-        secret_key_hex: String,
-    ) -> Result<(), MarmotKitError>;
-
-    /// Return the stored secret-key hex, or [`MarmotKitError::SecretNotFound`]
-    /// when this account has no credential.
-    fn load_secret(&self, label: String, account_id_hex: String) -> Result<String, MarmotKitError>;
-
-    /// Remove this account's credential. Removing a missing credential
-    /// succeeds.
-    fn remove_secret(&self, label: String, account_id_hex: String) -> Result<(), MarmotKitError>;
+#[derive(Clone, Copy, Debug, Eq, PartialEq, uniffi::Enum)]
+pub enum SecretCredentialKind {
+    Signing,
+    ExternalDatabase,
+    Nip46Session,
 }
 
-/// Adapts a foreign [`SecretStore`] to the engine's [`AccountSecretStore`].
+#[derive(Clone, Debug, Eq, PartialEq, uniffi::Record)]
+pub struct SecretCredential {
+    pub label: String,
+    pub account_id_hex: String,
+    pub home_id: String,
+    pub owner_id: String,
+    pub kind: SecretCredentialKind,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, uniffi::Enum)]
+pub enum SecretClaimMode {
+    CreateOnly,
+    AdoptOnly,
+    CreateOrAdopt,
+    MigrateLegacy,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, uniffi::Enum)]
+pub enum SecretOrigin {
+    Created,
+    Existing,
+}
+
+#[derive(Clone, uniffi::Record)]
+pub struct AcquiredSecret {
+    pub secret_key_hex: String,
+    pub origin: SecretOrigin,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, uniffi::Enum)]
+pub enum SecretReleaseMode {
+    DeleteIfUnowned,
+    Preserve,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, uniffi::Enum)]
+pub enum SecretReleaseOutcome {
+    Released,
+    /// Managed retirement and deletion completed; only raw legacy cleanup remains unresolved.
+    PendingLegacy,
+}
+
+impl From<marmot_account::SecretCredential<'_>> for SecretCredential {
+    fn from(record: marmot_account::SecretCredential<'_>) -> Self {
+        Self {
+            label: record.label.to_owned(),
+            account_id_hex: record.account_id_hex.to_owned(),
+            home_id: record.home_id.to_owned(),
+            owner_id: record.owner_id.to_owned(),
+            kind: match record.kind {
+                marmot_account::SecretCredentialKind::Signing => SecretCredentialKind::Signing,
+                marmot_account::SecretCredentialKind::ExternalDatabase => {
+                    SecretCredentialKind::ExternalDatabase
+                }
+                marmot_account::SecretCredentialKind::Nip46Session => {
+                    SecretCredentialKind::Nip46Session
+                }
+            },
+        }
+    }
+}
+
+/// Host storage for immutable per-owner credential copies.
+///
+/// Calls may run synchronously on a constructor's calling thread or concurrently
+/// on runtime threads. Implementations must be thread-safe and must not wait for
+/// the UI thread. The runtime retains the callback object while it uses it.
+/// Do not re-enter account-home mutations on the same root, including through
+/// another independently opened client.
+///
+/// Plaintext secret-key hex crosses this boundary in both directions. Hosts
+/// provide encryption and credential protection, and clear temporary secret copies.
+#[uniffi::export(with_foreign)]
+pub trait SecretStore: Send + Sync {
+    /// Stable, nonsecret identity of the physical vault and credential namespace,
+    /// including service or tenant. Keep it stable across restarts and lock/unlock.
+    /// Different vaults require different identities. Keep the target fixed for
+    /// this object's lifetime; switching vaults requires a new callback object.
+    fn cleanup_namespace(&self) -> Result<String, MarmotKitError>;
+
+    /// Whether discoverable signing material is stored under this label.
+    fn has_secret_for_label(&self, label: String) -> Result<bool, MarmotKitError>;
+
+    /// Whether discoverable signing material exists for this account ID.
+    fn has_secret_for_account_id(&self, account_id_hex: String) -> Result<bool, MarmotKitError>;
+
+    /// Acquire an immutable copy before returning. Same-owner retries preserve
+    /// the original material and origin; retired owner IDs must never be reused.
+    /// Signing discovery is shared across homes, auxiliary discovery home-scoped.
+    /// CreateOnly requires a proposal and rejects existing material. AdoptOnly
+    /// requires existing material. CreateOrAdopt creates only with a proposal.
+    /// Any proposal must match adopted material. Signing keys must derive the
+    /// requested account ID; auxiliary IDs are storage identifiers.
+    /// Only MigrateLegacy may inspect independent legacy material. Retain a
+    /// legacy pointer for pending cleanup; ordinary claims use managed sources.
+    /// Return SecretNotFound only if there is no usable source and no committed
+    /// or pending receipt for this owner. If a lookup or write is uncertain,
+    /// return a different failure so the runtime keeps the owner for recovery.
+    fn acquire_secret(
+        &self,
+        record: SecretCredential,
+        mode: SecretClaimMode,
+        proposed_hex: Option<String>,
+    ) -> Result<AcquiredSecret, MarmotKitError>;
+
+    /// Return this owner's secret hex, or SecretNotFound when no active copy exists.
+    fn load_secret(&self, record: SecretCredential) -> Result<String, MarmotKitError>;
+
+    /// Retire before deleting this owner's copy; never delete another owner's key.
+    /// Preserve retains discoverable material until a new owner owns a copy.
+    /// Old release retries cannot resurrect consumed holds. Retain ambiguous
+    /// independent legacy material and return PendingLegacy instead of claiming
+    /// physical erasure. Retirement metadata must outlive the account record.
+    /// PendingLegacy confirms managed retirement and deletion completed. An
+    /// uncertain or failed managed deletion returns an error, not PendingLegacy.
+    fn release_secret(
+        &self,
+        record: SecretCredential,
+        mode: SecretReleaseMode,
+    ) -> Result<SecretReleaseOutcome, MarmotKitError>;
+
+    /// Replay retired-owner cleanup even when no account wipe remains pending.
+    /// Retain retirement metadata; never infer exclusive ownership of legacy keys.
+    fn reconcile_cleanup(&self) -> Result<(), MarmotKitError>;
+}
+
 pub(crate) struct ForeignSecretStore {
     store: Arc<dyn SecretStore>,
 }
@@ -66,6 +149,13 @@ impl ForeignSecretStore {
 }
 
 impl AccountSecretStore for ForeignSecretStore {
+    fn cleanup_namespace(&self) -> marmot_account::AccountHomeResult<String> {
+        self.store
+            .cleanup_namespace()
+            .map(|namespace| format!("foreign:{namespace}"))
+            .map_err(account_home_error)
+    }
+
     fn has_secret_for_label(&self, label: &str) -> marmot_account::AccountHomeResult<bool> {
         self.store
             .has_secret_for_label(label.to_owned())
@@ -81,39 +171,100 @@ impl AccountSecretStore for ForeignSecretStore {
             .map_err(account_home_error)
     }
 
-    fn write_secret(
+    fn acquire_secret(
         &self,
-        account: &AccountSummary,
-        keys: &nostr::prelude::Keys,
-    ) -> marmot_account::AccountHomeResult<()> {
-        let secret_key_hex = Zeroizing::new(keys.secret_key().to_secret_hex());
-        self.store
-            .write_secret(
-                account.label.clone(),
-                account.account_id_hex.clone(),
-                secret_key_hex.to_string(),
+        record: marmot_account::SecretCredential<'_>,
+        mode: marmot_account::SecretClaimMode,
+        proposed: Option<&nostr::prelude::Keys>,
+    ) -> marmot_account::AccountHomeResult<marmot_account::AcquiredSecret> {
+        let proposed_hex = proposed.map(|keys| Zeroizing::new(keys.secret_key().to_secret_hex()));
+        let acquired = self
+            .store
+            .acquire_secret(
+                record.into(),
+                match mode {
+                    marmot_account::SecretClaimMode::CreateOnly => SecretClaimMode::CreateOnly,
+                    marmot_account::SecretClaimMode::AdoptOnly => SecretClaimMode::AdoptOnly,
+                    marmot_account::SecretClaimMode::CreateOrAdopt => {
+                        SecretClaimMode::CreateOrAdopt
+                    }
+                    marmot_account::SecretClaimMode::MigrateLegacy => {
+                        SecretClaimMode::MigrateLegacy
+                    }
+                },
+                proposed_hex.as_ref().map(|hex| hex.to_string()),
             )
-            .map_err(account_home_error)
+            .map_err(account_home_error)?;
+        let secret = Zeroizing::new(acquired.secret_key_hex);
+        let keys = parse_secret(&secret, record)?;
+        if proposed.is_some_and(|proposed| proposed.secret_key() != keys.secret_key()) {
+            return Err(marmot_account::AccountHomeError::InvalidSecretKey);
+        }
+        Ok(marmot_account::AcquiredSecret {
+            keys,
+            origin: match acquired.origin {
+                SecretOrigin::Created => marmot_account::SecretOrigin::Created,
+                SecretOrigin::Existing => marmot_account::SecretOrigin::Existing,
+            },
+        })
     }
 
     fn load_secret(
         &self,
-        account: &AccountSummary,
+        record: marmot_account::SecretCredential<'_>,
     ) -> marmot_account::AccountHomeResult<nostr::prelude::Keys> {
-        let secret_key_hex = Zeroizing::new(
+        let secret = Zeroizing::new(
             self.store
-                .load_secret(account.label.clone(), account.account_id_hex.clone())
+                .load_secret(record.into())
                 .map_err(account_home_error)?,
         );
-        nostr::prelude::Keys::parse(secret_key_hex.as_str())
-            .map_err(|_| marmot_account::AccountHomeError::InvalidSecretKey)
+        parse_secret(&secret, record)
     }
 
-    fn remove_secret(&self, account: &AccountSummary) -> marmot_account::AccountHomeResult<()> {
+    fn release_secret(
+        &self,
+        record: marmot_account::SecretCredential<'_>,
+        mode: marmot_account::SecretReleaseMode,
+    ) -> marmot_account::AccountHomeResult<marmot_account::SecretReleaseOutcome> {
         self.store
-            .remove_secret(account.label.clone(), account.account_id_hex.clone())
+            .release_secret(
+                record.into(),
+                match mode {
+                    marmot_account::SecretReleaseMode::DeleteIfUnowned => {
+                        SecretReleaseMode::DeleteIfUnowned
+                    }
+                    marmot_account::SecretReleaseMode::Preserve => SecretReleaseMode::Preserve,
+                },
+            )
+            .map(|outcome| match outcome {
+                SecretReleaseOutcome::Released => marmot_account::SecretReleaseOutcome::Released,
+                SecretReleaseOutcome::PendingLegacy => {
+                    marmot_account::SecretReleaseOutcome::PendingLegacy
+                }
+            })
             .map_err(account_home_error)
     }
+
+    fn reconcile_cleanup(&self) -> marmot_account::AccountHomeResult<()> {
+        self.store.reconcile_cleanup().map_err(account_home_error)
+    }
+}
+
+fn parse_secret(
+    secret: &str,
+    record: marmot_account::SecretCredential<'_>,
+) -> marmot_account::AccountHomeResult<nostr::prelude::Keys> {
+    if secret.len() != 64 || !secret.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(marmot_account::AccountHomeError::InvalidSecretKey);
+    }
+    let keys = nostr::prelude::Keys::parse(secret)
+        .map_err(|_| marmot_account::AccountHomeError::InvalidSecretKey)?;
+    if record.kind == marmot_account::SecretCredentialKind::Signing
+        && keys.public_key().to_hex() != record.account_id_hex
+    {
+        return Err(marmot_account::AccountHomeError::InvalidSecretKey);
+    }
+    Ok(keys)
 }
 
 /// Map a host-reported failure onto the account layer's existing secret-store
@@ -133,197 +284,294 @@ fn account_home_error(error: MarmotKitError) -> marmot_account::AccountHomeError
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use super::*;
+    use nostr::prelude::ToBech32;
     use std::sync::Mutex;
 
-    use super::*;
-
-    struct MapStore {
-        entries: Mutex<BTreeMap<(String, String), String>>,
+    // Protocol probe for the adapter, not a vault supplied to an account home.
+    struct CallbackProbe {
+        record: SecretCredential,
+        claim: SecretClaimMode,
+        proposal: Option<String>,
+        secret: Mutex<String>,
+        origin: SecretOrigin,
+        release: SecretReleaseMode,
+        outcome: SecretReleaseOutcome,
     }
 
-    impl SecretStore for MapStore {
+    impl SecretStore for CallbackProbe {
+        fn cleanup_namespace(&self) -> Result<String, MarmotKitError> {
+            Ok("local-file:host-vault".into())
+        }
+
         fn has_secret_for_label(&self, label: String) -> Result<bool, MarmotKitError> {
-            Ok(self
-                .entries
-                .lock()
-                .unwrap()
-                .keys()
-                .any(|(key, _)| *key == label))
+            Ok(self.record.kind == SecretCredentialKind::Signing && self.record.label == label)
         }
 
         fn has_secret_for_account_id(
             &self,
             account_id_hex: String,
         ) -> Result<bool, MarmotKitError> {
-            Ok(self
-                .entries
-                .lock()
-                .unwrap()
-                .keys()
-                .any(|(_, id)| *id == account_id_hex))
+            Ok(self.record.kind == SecretCredentialKind::Signing
+                && self.record.account_id_hex == account_id_hex)
         }
 
-        fn write_secret(
+        fn acquire_secret(
             &self,
-            label: String,
-            account_id_hex: String,
-            secret_key_hex: String,
-        ) -> Result<(), MarmotKitError> {
-            self.entries
-                .lock()
-                .unwrap()
-                .insert((label, account_id_hex), secret_key_hex);
-            Ok(())
+            record: SecretCredential,
+            mode: SecretClaimMode,
+            proposed_hex: Option<String>,
+        ) -> Result<AcquiredSecret, MarmotKitError> {
+            let proposed = proposed_hex.map(Zeroizing::new);
+            assert_eq!(record, self.record);
+            assert_eq!(mode, self.claim);
+            assert!(proposed.as_ref().map(|value| value.as_str()) == self.proposal.as_deref());
+            Ok(AcquiredSecret {
+                secret_key_hex: self.secret.lock().unwrap().clone(),
+                origin: self.origin,
+            })
         }
 
-        fn load_secret(
+        fn load_secret(&self, record: SecretCredential) -> Result<String, MarmotKitError> {
+            assert_eq!(record, self.record);
+            Ok(self.secret.lock().unwrap().clone())
+        }
+
+        fn release_secret(
             &self,
-            label: String,
-            account_id_hex: String,
-        ) -> Result<String, MarmotKitError> {
-            self.entries
-                .lock()
-                .unwrap()
-                .get(&(label, account_id_hex.clone()))
-                .cloned()
-                .ok_or(MarmotKitError::SecretNotFound {
-                    details: account_id_hex,
-                })
+            record: SecretCredential,
+            mode: SecretReleaseMode,
+        ) -> Result<SecretReleaseOutcome, MarmotKitError> {
+            assert_eq!(record, self.record);
+            assert_eq!(mode, self.release);
+            Ok(self.outcome)
         }
 
-        fn remove_secret(
-            &self,
-            label: String,
-            account_id_hex: String,
-        ) -> Result<(), MarmotKitError> {
-            self.entries
-                .lock()
-                .unwrap()
-                .remove(&(label, account_id_hex));
-            Ok(())
-        }
-    }
-
-    fn summary(keys: &nostr::prelude::Keys) -> AccountSummary {
-        AccountSummary {
-            label: "vault-account".to_owned(),
-            account_id_hex: keys.public_key().to_hex(),
-            local_signing: true,
-            external_signing: false,
-            signed_out: false,
-            unlinked: false,
+        fn reconcile_cleanup(&self) -> Result<(), MarmotKitError> {
+            Err(MarmotKitError::KeystoreUnavailable {
+                details: "cleanup locked".into(),
+            })
         }
     }
 
     #[test]
-    fn foreign_store_roundtrips_the_signing_key() {
-        let host = Arc::new(MapStore {
-            entries: Mutex::new(BTreeMap::new()),
-        });
-        let store = ForeignSecretStore::new(host.clone());
+    fn foreign_owned_roundtrip() {
+        use marmot_account::{
+            SecretClaimMode as Claim, SecretCredentialKind as Kind, SecretOrigin as Origin,
+            SecretReleaseMode as Release, SecretReleaseOutcome as Outcome,
+        };
         let keys = nostr::prelude::Keys::generate();
-        let account = summary(&keys);
+        let account_id = keys.public_key().to_hex();
+        let home_id = "11".repeat(32);
+        let owner_id = "22".repeat(32);
+        for (
+            kind,
+            foreign_kind,
+            claim,
+            foreign_claim,
+            origin,
+            foreign_origin,
+            release,
+            foreign_release,
+            outcome,
+            foreign_outcome,
+        ) in [
+            (
+                Kind::Signing,
+                SecretCredentialKind::Signing,
+                Claim::CreateOnly,
+                SecretClaimMode::CreateOnly,
+                Origin::Created,
+                SecretOrigin::Created,
+                Release::DeleteIfUnowned,
+                SecretReleaseMode::DeleteIfUnowned,
+                Outcome::Released,
+                SecretReleaseOutcome::Released,
+            ),
+            (
+                Kind::ExternalDatabase,
+                SecretCredentialKind::ExternalDatabase,
+                Claim::AdoptOnly,
+                SecretClaimMode::AdoptOnly,
+                Origin::Existing,
+                SecretOrigin::Existing,
+                Release::Preserve,
+                SecretReleaseMode::Preserve,
+                Outcome::PendingLegacy,
+                SecretReleaseOutcome::PendingLegacy,
+            ),
+            (
+                Kind::Nip46Session,
+                SecretCredentialKind::Nip46Session,
+                Claim::CreateOrAdopt,
+                SecretClaimMode::CreateOrAdopt,
+                Origin::Existing,
+                SecretOrigin::Existing,
+                Release::DeleteIfUnowned,
+                SecretReleaseMode::DeleteIfUnowned,
+                Outcome::Released,
+                SecretReleaseOutcome::Released,
+            ),
+            (
+                Kind::Signing,
+                SecretCredentialKind::Signing,
+                Claim::MigrateLegacy,
+                SecretClaimMode::MigrateLegacy,
+                Origin::Existing,
+                SecretOrigin::Existing,
+                Release::Preserve,
+                SecretReleaseMode::Preserve,
+                Outcome::PendingLegacy,
+                SecretReleaseOutcome::PendingLegacy,
+            ),
+        ] {
+            let record = marmot_account::SecretCredential {
+                label: "vault-account",
+                account_id_hex: &account_id,
+                home_id: &home_id,
+                owner_id: &owner_id,
+                kind,
+            };
+            let proposal = if claim == Claim::CreateOnly {
+                Some(&keys)
+            } else {
+                None
+            };
+            let host = Arc::new(CallbackProbe {
+                record: SecretCredential {
+                    label: "vault-account".into(),
+                    account_id_hex: account_id.clone(),
+                    home_id: home_id.clone(),
+                    owner_id: owner_id.clone(),
+                    kind: foreign_kind,
+                },
+                claim: foreign_claim,
+                proposal: proposal.map(|keys| keys.secret_key().to_secret_hex()),
+                secret: Mutex::new(keys.secret_key().to_secret_hex()),
+                origin: foreign_origin,
+                release: foreign_release,
+                outcome: foreign_outcome,
+            });
+            let store = ForeignSecretStore::new(host.clone());
+            assert_eq!(
+                store.cleanup_namespace().unwrap(),
+                "foreign:local-file:host-vault"
+            );
+            assert_eq!(
+                store.has_secret_for_label(record.label).unwrap(),
+                kind == Kind::Signing
+            );
+            assert_eq!(
+                store.has_secret_for_account_id(&account_id).unwrap(),
+                kind == Kind::Signing
+            );
+            let acquired = store.acquire_secret(record, claim, proposal).unwrap();
+            assert_eq!(acquired.keys.secret_key(), keys.secret_key());
+            assert_eq!(acquired.origin, origin);
+            assert_eq!(
+                store.load_secret(record).unwrap().secret_key(),
+                keys.secret_key()
+            );
+            assert_eq!(store.release_secret(record, release).unwrap(), outcome);
+            assert!(matches!(store.reconcile_cleanup(),
+                Err(marmot_account::AccountHomeError::SecretStoreUnavailable(details)) if details == "cleanup locked"));
+            *host.secret.lock().unwrap() = "not-a-secret-key".into();
+            assert!(matches!(
+                store.load_secret(record),
+                Err(marmot_account::AccountHomeError::InvalidSecretKey)
+            ));
+            assert!(matches!(
+                store.acquire_secret(record, claim, proposal),
+                Err(marmot_account::AccountHomeError::InvalidSecretKey)
+            ));
+        }
+    }
 
-        assert!(!store.has_secret_for_label(&account.label).unwrap());
-        store.write_secret(&account, &keys).unwrap();
-        assert!(store.has_secret_for_label(&account.label).unwrap());
-        assert!(
-            store
-                .has_secret_for_account_id(&account.account_id_hex)
-                .unwrap()
-        );
-        let other_keys = nostr::prelude::Keys::generate();
-        let other_account = summary(&other_keys);
-        assert_eq!(
-            other_account.label, account.label,
-            "different roots may reuse a host label"
-        );
-        assert!(
-            !store
-                .has_secret_for_account_id(&other_account.account_id_hex)
-                .unwrap()
-        );
-        store.write_secret(&other_account, &other_keys).unwrap();
-        assert!(
-            host.entries
-                .lock()
-                .unwrap()
-                .get(&(account.label.clone(), account.account_id_hex.clone()))
-                .is_some_and(|secret| secret == &keys.secret_key().to_secret_hex()),
-            "host received the wrong first identity slot"
-        );
-        assert!(
-            host.entries
-                .lock()
-                .unwrap()
-                .get(&(
-                    other_account.label.clone(),
-                    other_account.account_id_hex.clone()
-                ))
-                .is_some_and(|secret| secret == &other_keys.secret_key().to_secret_hex()),
-            "host received the wrong second identity slot"
-        );
-        assert_eq!(
-            store.load_secret(&other_account).unwrap().secret_key(),
-            other_keys.secret_key()
-        );
-        assert_eq!(
-            store.load_secret(&account).unwrap().secret_key(),
-            keys.secret_key()
-        );
-
-        store.remove_secret(&account).unwrap();
-        assert!(
-            !store
-                .has_secret_for_account_id(&account.account_id_hex)
-                .unwrap()
-        );
-        assert!(
-            store
-                .has_secret_for_account_id(&other_account.account_id_hex)
-                .unwrap()
-        );
-        assert!(store.has_secret_for_label(&account.label).unwrap());
-        assert_eq!(
-            store.load_secret(&other_account).unwrap().secret_key(),
-            other_keys.secret_key()
-        );
-        store.remove_secret(&other_account).unwrap();
-        assert!(!store.has_secret_for_label(&account.label).unwrap());
+    #[test]
+    fn foreign_key_validation() {
+        let keys = nostr::prelude::Keys::generate();
+        let other = nostr::prelude::Keys::generate();
+        let account_id = keys.public_key().to_hex();
+        let mut record = marmot_account::SecretCredential {
+            label: "vault-account",
+            account_id_hex: &account_id,
+            home_id: "home",
+            owner_id: "owner",
+            kind: marmot_account::SecretCredentialKind::Signing,
+        };
+        let host = Arc::new(CallbackProbe {
+            record: record.into(),
+            claim: SecretClaimMode::CreateOnly,
+            proposal: Some(keys.secret_key().to_secret_hex()),
+            secret: Mutex::new(other.secret_key().to_secret_hex()),
+            origin: SecretOrigin::Created,
+            release: SecretReleaseMode::DeleteIfUnowned,
+            outcome: SecretReleaseOutcome::Released,
+        });
+        let store = ForeignSecretStore::new(host);
         assert!(matches!(
-            store.load_secret(&account),
-            Err(marmot_account::AccountHomeError::SecretNotFound(_))
-        ));
-        host.entries.lock().unwrap().insert(
-            (account.label.clone(), account.account_id_hex.clone()),
-            "not-a-secret-key".into(),
-        );
-        assert!(matches!(
-            store.load_secret(&account),
+            store.load_secret(record),
             Err(marmot_account::AccountHomeError::InvalidSecretKey)
         ));
+        assert!(matches!(
+            store.acquire_secret(
+                record,
+                marmot_account::SecretClaimMode::CreateOnly,
+                Some(&keys)
+            ),
+            Err(marmot_account::AccountHomeError::InvalidSecretKey)
+        ));
+        record.kind = marmot_account::SecretCredentialKind::ExternalDatabase;
+        record.account_id_hex = "synthetic-storage-id";
+        assert_eq!(
+            parse_secret(&other.secret_key().to_secret_hex(), record)
+                .unwrap()
+                .secret_key(),
+            other.secret_key()
+        );
+        let host = Arc::new(CallbackProbe {
+            record: record.into(),
+            claim: SecretClaimMode::CreateOnly,
+            proposal: Some(keys.secret_key().to_secret_hex()),
+            secret: Mutex::new(other.secret_key().to_secret_hex()),
+            origin: SecretOrigin::Created,
+            release: SecretReleaseMode::DeleteIfUnowned,
+            outcome: SecretReleaseOutcome::Released,
+        });
+        let store = ForeignSecretStore::new(host);
+        assert!(matches!(
+            store.acquire_secret(
+                record,
+                marmot_account::SecretClaimMode::CreateOnly,
+                Some(&keys)
+            ),
+            Err(marmot_account::AccountHomeError::InvalidSecretKey)
+        ));
+        for secret in [
+            "not-hex".to_owned(),
+            "0".repeat(64),
+            keys.secret_key().to_bech32().unwrap(),
+        ] {
+            assert!(matches!(
+                parse_secret(&secret, record),
+                Err(marmot_account::AccountHomeError::InvalidSecretKey)
+            ));
+        }
     }
 
     #[test]
-    fn host_errors_map_onto_existing_secret_store_variants() {
-        assert!(matches!(
-            account_home_error(MarmotKitError::SecretNotFound {
-                details: "gone".into()
-            }),
-            marmot_account::AccountHomeError::SecretNotFound(_)
-        ));
-        assert!(matches!(
-            account_home_error(MarmotKitError::KeystoreUnavailable {
-                details: "locked".into()
-            }),
-            marmot_account::AccountHomeError::SecretStoreUnavailable(_)
-        ));
-        assert!(matches!(
-            account_home_error(MarmotKitError::Runtime {
-                details: "boom".into()
-            }),
-            marmot_account::AccountHomeError::SecretStore(_)
-        ));
+    fn host_error_mapping() {
+        assert!(
+            matches!(account_home_error(MarmotKitError::SecretNotFound { details: "gone".into() }),
+            marmot_account::AccountHomeError::SecretNotFound(details) if details == "gone")
+        );
+        assert!(
+            matches!(account_home_error(MarmotKitError::KeystoreUnavailable { details: "locked".into() }),
+            marmot_account::AccountHomeError::SecretStoreUnavailable(details) if details == "locked")
+        );
+        assert!(
+            matches!(account_home_error(MarmotKitError::Runtime { details: "boom".into() }),
+            marmot_account::AccountHomeError::SecretStore(details) if details.contains("boom"))
+        );
     }
 }

@@ -796,6 +796,19 @@ other devices removed it. No new storage migration or background scheduler is in
 relay subscriptions for local signing accounts using the daemon's discovery and account-relay defaults, and updates them
 automatically after identity, group, message, and stream mutations forwarded through it.
 
+`wnd` owns the same exclusive root lease as app runtimes. Startup retries pending account-wipe cleanup before binding
+the socket, and shutdown releases the lease after its workers stop. Standalone commands that open an account runtime
+acquire that lease too; when another process owns the home, forward through its daemon socket instead of opening it locally.
+Local logout does not open an application runtime. Foreground stream watches remain client-hosted and defer pending
+wipe cleanup while another process owns the root.
+
+Runtime, subscriptions, stream workers and forwarded commands clone the daemon's one `AccountHome`.
+The credential store is fixed at startup. A forwarded command selecting another backend, or another keychain service
+when using keychain storage, fails before credential access. Restart the daemon with the intended configuration to
+change stores.
+Omitted forwarded flags inherit daemon settings; client environment values are not forwarded. Environment-based store
+selection applies when starting the daemon or running standalone commands.
+
 ```sh
 export WN_HOME="$PWD/dev/data/daemon-demo"
 export WN_SECRET_STORE=file

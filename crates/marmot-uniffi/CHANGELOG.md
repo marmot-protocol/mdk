@@ -4,6 +4,13 @@
 
 ### Breaking changes
 
+- Host `SecretStore` implementations replace raw secret mutation with
+  `acquireSecret`, `loadSecret`, `releaseSecret`, and `reconcileCleanup`, plus a
+  stable `cleanupNamespace()` (#819). Persist owner provenance and retirement
+  independently of account records. Regenerate Swift/Kotlin bindings and
+  migrate host implementations; see [the ownership contract](README.md#host-secret-store-identity).
+- `MarmotOptions` gains optional `iosOptions` for iOS App Group identifiers and the native Keychain access group
+  for managed receipts (#819).
 - `DeviceLinkSnapshotFfi.chatProgress` reports per-link remaining chats. Regenerate Swift or Kotlin bindings with the matching native library (#3532).
 
 - `AppMessageRecordFfi` gains `invalidated: Bool`, true when a raw row is retained only as an invalidated tombstone

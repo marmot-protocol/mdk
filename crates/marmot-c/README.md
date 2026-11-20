@@ -258,10 +258,14 @@ records retain ordinary strings and do not use this C-only encoding.
 ## Runtime construction
 
 `marmot_client_new_with_configuration` takes a `MarmotClientOptions` struct combining relay policy, cursor
-persistence, client label, secret store, attachment acquisition mode and device platform; NULL options or zero initialization selects
-the same defaults as the Swift/Kotlin `MarmotOptions` (see the
+persistence, client label, secret store, attachment acquisition mode, device platform, and iOS host options.
+NULL options or zero initialization selects the same defaults as the Swift/Kotlin `MarmotOptions` (see the
 [shared contract](../marmot-uniffi/README.md#runtime-options-and-client-label)). Use the matching header and library
 for that struct's layout. `marmot_client_new_with_client_name` is the older label-only constructor.
+
+To configure iOS, point `MarmotClientOptions.ios_options` at a `MarmotIosOptions` record. Keep the record, its
+App Group string array, and all its strings readable through the constructor call. The library copies the strings.
+A NULL array is valid with a zero count. A NULL access group uses the captured Keychain provider's default.
 
 Every `marmot_client_new*` constructor takes a required `MarmotDeployment` just before `out_client`: the
 deployment's recovery relays, discovery indexers, media and image servers, Open Ranking, moderation label namespace,
@@ -277,6 +281,26 @@ an explicit loopback relay policy and an optional host secret-store vtable.
 Existing constructors keep their public-only policy. Loopback broker access
 requires a separate publisher trust opt-in; neither permits private or
 link-local endpoints. Local insecure trust is intended only for tests.
+
+### Host secret-store identity
+
+`MarmotSecretStore.cleanup_namespace` is required. It returns an allocated, NUL-terminated nonsecret identity for the
+physical vault and credential namespace; MDK returns the buffer through `free_secret`, including error paths that
+returned a buffer. The identity must distinguish services or tenants and remain stable across restarts and vault locks.
+See the [shared identity contract](../marmot-uniffi/README.md#host-secret-store-identity).
+
+Pending account wipes retry credentials only through their originating namespace. This callback changes the vtable
+layout: rebuild hosts with the regenerated matching header and native library; do not reuse an older binary layout.
+
+The required `acquire_secret`, `load_secret`, `release_secret`, and `reconcile_cleanup` callbacks use
+`MarmotSecretCredential` owner receipts instead of unowned writes and deletions. Persist an independent copy and
+its original acquisition result before returning success. Retire a receipt before deleting its material, retain
+retirement metadata, and preserve ambiguous legacy sources with `PendingLegacy`. The
+[shared ownership contract](../marmot-uniffi/README.md#host-secret-store-identity) defines adoption and rollback.
+
+The credential record and its strings are borrowed only for the callback. Copy identifiers needed for persistence;
+do not retain their pointers. Return allocated secret buffers through `free_secret`, even on a failure status.
+The header defines the integer tags for claim mode, origin, release mode, and release outcome.
 
 <a id="experimental-device-group-test-builds"></a>
 

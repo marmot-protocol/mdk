@@ -9,8 +9,17 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+### Fixed
+
+- `wn` and `wnd` retry pending account-wipe cleanup only while exclusively owning the data root. Daemon helpers
+  clone its account home and share its lease instead of opening competing handles or replaying cleanup.
+- Local logout does not open an application runtime. Foreground stream watches remain client-hosted and defer
+  pending wipe cleanup when the daemon owns the root (#819).
+
 ### Changed
 
+- Forwarded commands cannot change the daemon's credential backend or keychain service. Conflicting selections
+  fail before credential access; restart the daemon with the intended configuration to change stores (#819).
 - Device-link status shows remaining chats on each device and includes per-link counts in the JSON `chat_progress` field (#3532).
 
 - Every `wn`/`wnd` build includes multi-device (mdk#2628), on by default; `--features dev-device-groups` is gone.

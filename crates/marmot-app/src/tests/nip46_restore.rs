@@ -3,9 +3,93 @@ use ::nostr::prelude::{Event, Filter, PublicKey, nip44};
 use ::nostr_sdk::prelude::{Client, ClientNotification};
 use futures::StreamExt;
 use marmot_account::Nip46SessionRecord;
-use marmot_account::{AccountHomeResult, AccountSecretStore, LocalFileSecretStore};
+use marmot_account::{AccountHomeResult, AccountSecretStore, IosOptions, LocalFileSecretStore};
 
 const KEY_PACKAGE_KIND: u64 = 30443;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn legacy_nip46_signout() {
+    #[derive(Clone, Copy)]
+    enum RawKey {
+        Valid,
+        Malformed,
+    }
+
+    for raw_key in [RawKey::Valid, RawKey::Malformed] {
+        let dir = tempfile::tempdir().unwrap();
+        let home = AccountHome::open(dir.path());
+        let user = Keys::parse(&"01".repeat(32)).unwrap();
+        let client = Keys::parse(&"02".repeat(32)).unwrap();
+        let id = user.public_key().to_hex();
+        let directory = home.account_dir(&id);
+        fs_private::create_dir_all_private(&directory).unwrap();
+        fs_private::write_private(
+            &directory.join("account.json"),
+            &serde_json::to_vec(&serde_json::json!({
+                "label": id, "account_id_hex": id, "local_signing": false, "external_signing": true,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let permissions = Nip46Session::permissions();
+        fs_private::write_private(
+            &directory.join(".nip46-session.json"),
+            &serde_json::to_vec(&Nip46SessionRecord {
+                version: 1,
+                user_public_key: id.clone(),
+                remote_signer_public_key: Keys::generate().public_key().to_hex(),
+                client_public_key: client.public_key().to_hex(),
+                relays: vec!["wss://signer.example".into()],
+                name: "Legacy signer".into(),
+                permission_version: permissions.version,
+                permissions: permissions.grants,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let raw_directory = dir.path().join("accounts/.nip46-client").join(&id);
+        fs_private::create_dir_all_private(&raw_directory).unwrap();
+        let raw = raw_directory.join("secret.json");
+        let raw_bytes = match raw_key {
+            RawKey::Valid => serde_json::to_vec(&serde_json::json!({
+                "secret_key_hex": client.secret_key().to_secret_hex(),
+            }))
+            .unwrap(),
+            RawKey::Malformed => b"{".to_vec(),
+        };
+        fs_private::write_private(&raw, &raw_bytes).unwrap();
+        let app = MarmotApp::with_relays_and_account_home_and_config(
+            dir.path(),
+            vec!["wss://account-relay.example".into()],
+            home.clone(),
+            MarmotAppConfig::white_noise(),
+        )
+        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+        app.register_external_signer(&id, TestExternalAccountSigner { keys: user })
+            .await
+            .unwrap();
+
+        let runtime = app.runtime();
+        let outcome = runtime
+            .sign_out(
+                &id,
+                crate::runtime::SignOutOptions {
+                    delete_key_packages: false,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            outcome.local_cleanup.completed,
+            "{:?}",
+            outcome.local_cleanup.reason
+        );
+        assert!(home.account(&id).unwrap().signed_out);
+        assert!(home.load_nip46_session(&id).unwrap().is_none());
+        assert_eq!(std::fs::read(raw).unwrap(), raw_bytes);
+        runtime.shutdown().await;
+    }
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn nip46_restore_and_signout() {
@@ -445,17 +529,18 @@ async fn run_nip46_drop(settlement: DropSettlement) {
     let peer = LoginPeer::new().await;
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(RemovalFailureStore {
-        inner: LocalFileSecretStore::new(dir.path()),
+        inner: LocalFileSecretStore::new(dir.path(), IosOptions::default()),
         refuse: std::sync::atomic::AtomicBool::new(false),
         native_removed: tokio::sync::Notify::new(),
     });
-    let home = AccountHome::open_with_secret_store(dir.path(), store.clone());
+    let home =
+        AccountHome::open_with_secret_store(dir.path(), store.clone(), IosOptions::default());
     let relay = Arc::new(ScriptedPushRelayClient::default());
     let open_app = || {
         MarmotApp::with_relays_and_account_home_and_config(
             dir.path(),
             vec!["wss://account-relay.example".into()],
-            AccountHome::open_with_secret_store(dir.path(), store.clone()),
+            AccountHome::open_with_secret_store(dir.path(), store.clone(), IosOptions::default()),
             MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
         )
         .with_test_relay_client(relay.clone())
@@ -741,8 +826,9 @@ async fn run_nip46_drop(settlement: DropSettlement) {
 async fn nip46_remove_after_rollback() {
     let peer = LoginPeer::new().await;
     let dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(LocalFileSecretStore::new(dir.path()));
-    let home = AccountHome::open_with_secret_store(dir.path(), store.clone());
+    let store = Arc::new(LocalFileSecretStore::new(dir.path(), IosOptions::default()));
+    let home =
+        AccountHome::open_with_secret_store(dir.path(), store.clone(), IosOptions::default());
     let relay = Arc::new(ScriptedPushRelayClient::default());
     let fetcher = Arc::new(MemberResolutionDirectoryFetcher::default());
     let (entered, release) = fetcher.hold_fetches_for_kind(KIND_NIP65_RELAY_LIST);
@@ -832,8 +918,8 @@ async fn nip46_login_needs_pairing() {
     ];
     for (case, refused, unpaired, absent) in &mut observations {
         let dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(LocalFileSecretStore::new(dir.path()));
-        let home = AccountHome::open_with_secret_store(dir.path(), store);
+        let store = Arc::new(LocalFileSecretStore::new(dir.path(), IosOptions::default()));
+        let home = AccountHome::open_with_secret_store(dir.path(), store, IosOptions::default());
         let app = MarmotApp::with_relays_and_account_home_and_config(
             dir.path(),
             vec!["wss://account-relay.example".into()],
@@ -1016,8 +1102,9 @@ async fn nip46_login_restores_host() {
     let peer = LoginPeer::new().await;
     for previous_grants in [None, Some(vec!["nip44_encrypt".to_owned()])] {
         let dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(LocalFileSecretStore::new(dir.path()));
-        let home = AccountHome::open_with_secret_store(dir.path(), store.clone());
+        let store = Arc::new(LocalFileSecretStore::new(dir.path(), IosOptions::default()));
+        let home =
+            AccountHome::open_with_secret_store(dir.path(), store.clone(), IosOptions::default());
         let account = home
             .add_external_signer_account(&peer.user.public_key().to_hex())
             .unwrap();
@@ -1152,8 +1239,9 @@ async fn nip46_login_restores_host() {
 async fn nip46_cold_rebind_failure() {
     let peer = LoginPeer::new().await;
     let dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(LocalFileSecretStore::new(dir.path()));
-    let home = AccountHome::open_with_secret_store(dir.path(), store.clone());
+    let store = Arc::new(LocalFileSecretStore::new(dir.path(), IosOptions::default()));
+    let home =
+        AccountHome::open_with_secret_store(dir.path(), store.clone(), IosOptions::default());
     let relay = Arc::new(ScriptedPushRelayClient::default());
     let open_app = || {
         MarmotApp::with_relays_and_account_home_and_config(
@@ -1359,12 +1447,21 @@ async fn nip46_post_commit_failure() {
     .unwrap();
     assert_eq!(
         runtime
-            .nip46_login(session, endpoints(), endpoints(), Vec::new())
+            .nip46_login(session.clone(), endpoints(), endpoints(), Vec::new())
             .await
             .unwrap()
             .account_id_hex,
         id
     );
+    let rejected_cleanup = home.account_dir(&account.label).join(".wipe-cleanup.json");
+    fs_private::create_dir_all_private(&rejected_cleanup).unwrap();
+    let outcome = crate::client::boxed(|| runtime.sign_out_and_wipe(&id))
+        .await
+        .unwrap();
+    assert!(!outcome.local_cleanup.completed);
+    assert!(home.account(&id).unwrap().external_signing);
+    session.ping_async().await.unwrap();
+    std::fs::remove_dir(rejected_cleanup).unwrap();
     runtime.shutdown_and_close().await.unwrap();
     peer.close().await;
 }
@@ -1376,116 +1473,211 @@ struct RemovalFailureStore {
 }
 
 impl AccountSecretStore for RemovalFailureStore {
+    fn cleanup_namespace(&self) -> AccountHomeResult<String> {
+        self.inner.cleanup_namespace()
+    }
     fn has_secret_for_label(&self, label: &str) -> AccountHomeResult<bool> {
         self.inner.has_secret_for_label(label)
     }
-    fn write_secret(
+    fn acquire_secret(
         &self,
-        account: &marmot_account::AccountSummary,
-        keys: &Keys,
-    ) -> AccountHomeResult<()> {
-        self.inner.write_secret(account, keys)
+        credential: marmot_account::SecretCredential<'_>,
+        mode: marmot_account::SecretClaimMode,
+        proposed: Option<&Keys>,
+    ) -> AccountHomeResult<marmot_account::AcquiredSecret> {
+        self.inner.acquire_secret(credential, mode, proposed)
     }
-    fn load_secret(&self, account: &marmot_account::AccountSummary) -> AccountHomeResult<Keys> {
-        self.inner.load_secret(account)
+    fn load_secret(
+        &self,
+        credential: marmot_account::SecretCredential<'_>,
+    ) -> AccountHomeResult<Keys> {
+        self.inner.load_secret(credential)
     }
-    fn remove_secret(&self, account: &marmot_account::AccountSummary) -> AccountHomeResult<()> {
-        if account.label.starts_with(".nip46-client/")
-            && self.refuse.load(std::sync::atomic::Ordering::SeqCst)
-        {
+    fn release_secret(
+        &self,
+        credential: marmot_account::SecretCredential<'_>,
+        mode: marmot_account::SecretReleaseMode,
+    ) -> AccountHomeResult<marmot_account::SecretReleaseOutcome> {
+        let nip46 = credential.kind == marmot_account::SecretCredentialKind::Nip46Session;
+        if nip46 && self.refuse.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(AccountHomeError::SecretStoreUnavailable(
                 "locked fixture vault".into(),
             ));
         }
-        let native_existed = account.label.starts_with(".nip46-client/")
-            && self.inner.has_secret_for_label(&account.label)?;
-        self.inner.remove_secret(account)?;
-        if native_existed {
+        let existed = if nip46 {
+            match self.inner.load_secret(credential) {
+                Ok(_) => true,
+                Err(AccountHomeError::SecretNotFound(_)) => false,
+                Err(AccountHomeError::Io(error))
+                    if error.kind() == std::io::ErrorKind::NotFound =>
+                {
+                    false
+                }
+                Err(error) => return Err(error),
+            }
+        } else {
+            false
+        };
+        let outcome = self.inner.release_secret(credential, mode)?;
+        if existed && outcome == marmot_account::SecretReleaseOutcome::Released {
             self.native_removed.notify_one();
         }
-        Ok(())
+        Ok(outcome)
+    }
+    fn reconcile_cleanup(&self) -> AccountHomeResult<()> {
+        self.inner.reconcile_cleanup()
     }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn nip46_erase_retry() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(RemovalFailureStore {
-        inner: LocalFileSecretStore::new(dir.path()),
-        refuse: std::sync::atomic::AtomicBool::new(false),
-        native_removed: tokio::sync::Notify::new(),
-    });
-    let home = AccountHome::open_with_secret_store(dir.path(), store.clone());
-    let user = Keys::generate();
-    let client = Keys::generate();
-    let account = home
-        .add_external_signer_account(&user.public_key().to_hex())
+    #[derive(Clone, Copy)]
+    enum Removal {
+        Session,
+        Account,
+    }
+
+    for removal in [Removal::Session, Removal::Account] {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(RemovalFailureStore {
+            inner: LocalFileSecretStore::new(dir.path(), IosOptions::default()),
+            refuse: std::sync::atomic::AtomicBool::new(false),
+            native_removed: tokio::sync::Notify::new(),
+        });
+        let home =
+            AccountHome::open_with_secret_store(dir.path(), store.clone(), IosOptions::default());
+        let user = Keys::generate();
+        let client = Keys::generate();
+        let account = home
+            .add_external_signer_account(&user.public_key().to_hex())
+            .unwrap();
+        let permissions = Nip46Session::permissions();
+        home.store_nip46_session(
+            &account.label,
+            &client,
+            &Nip46SessionRecord {
+                version: 1,
+                user_public_key: account.account_id_hex.clone(),
+                remote_signer_public_key: Keys::generate().public_key().to_hex(),
+                client_public_key: client.public_key().to_hex(),
+                relays: vec!["wss://signer-relay.example".into()],
+                name: "Deletion retry".into(),
+                permission_version: permissions.version,
+                permissions: permissions.grants,
+            },
+        )
         .unwrap();
-    let permissions = Nip46Session::permissions();
-    home.store_nip46_session(
-        &account.label,
-        &client,
-        &Nip46SessionRecord {
-            version: 1,
-            user_public_key: account.account_id_hex.clone(),
-            remote_signer_public_key: Keys::generate().public_key().to_hex(),
-            client_public_key: client.public_key().to_hex(),
-            relays: vec!["wss://signer-relay.example".into()],
-            name: "Deletion retry".into(),
-            permission_version: permissions.version,
-            permissions: permissions.grants,
-        },
-    )
-    .unwrap();
-    let app = MarmotApp::with_relays_and_account_home_and_config(
-        dir.path(),
-        vec!["wss://account-relay.example".into()],
-        home.clone(),
-        MarmotAppConfig::white_noise(),
-    );
-    let runtime = app.runtime();
-    let session = runtime.nip46_resume(&account.label).await.unwrap();
-    store
-        .refuse
-        .store(true, std::sync::atomic::Ordering::SeqCst);
-    assert_eq!(session.erase_local(), Err(Nip46Error::Storage));
-    assert_eq!(session.public_key(), Err(Nip46Error::LoggedOut));
-    assert!(!app.has_external_signer(&account.account_id_hex));
-    assert!(matches!(
-        home.load_nip46_session(&account.label),
-        Err(AccountHomeError::Io(_))
-    ));
-    store
-        .refuse
-        .store(false, std::sync::atomic::Ordering::SeqCst);
-    session.erase_local().unwrap();
-    assert!(home.load_nip46_session(&account.label).unwrap().is_none());
-    assert!(matches!(
-        runtime.nip46_resume(&account.label).await,
-        Err(AppError::Nip46(Nip46Error::Unavailable))
-    ));
-    runtime.shutdown_and_close().await.unwrap();
+        let managed_copy = std::fs::read_dir(dir.path().join(".owned-secrets-v1/receipts"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let app = MarmotApp::with_relays_and_account_home_and_config(
+            dir.path(),
+            vec!["wss://account-relay.example".into()],
+            home.clone(),
+            MarmotAppConfig::white_noise(),
+        )
+        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+        let runtime = app.runtime();
+        let session = runtime.nip46_resume(&account.label).await.unwrap();
+        if matches!(removal, Removal::Account) {
+            app.register_external_signer(
+                &account.account_id_hex,
+                TestExternalAccountSigner { keys: user },
+            )
+            .await
+            .unwrap();
+        }
+        store
+            .refuse
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        match removal {
+            Removal::Session => {
+                assert_eq!(session.erase_local(), Err(Nip46Error::Storage));
+                assert!(matches!(
+                    home.load_nip46_session(&account.label),
+                    Err(AccountHomeError::Io(_))
+                ));
+            }
+            Removal::Account => {
+                let outcome = crate::client::boxed(|| runtime.sign_out_and_wipe(&account.label))
+                    .await
+                    .unwrap();
+                assert!(
+                    outcome.local_cleanup.completed,
+                    "{:?}",
+                    outcome.local_cleanup.reason
+                );
+                assert!(home.accounts_strict().unwrap().is_empty());
+                assert!(!app.has_external_signer(&account.account_id_hex));
+                assert!(!home.account_dir(&account.label).exists());
+                let tombstone = std::fs::read_dir(dir.path().join(".wipe-tombstones"))
+                    .unwrap()
+                    .next()
+                    .unwrap()
+                    .unwrap()
+                    .path();
+                assert!(tombstone.join(".wipe-cleanup.json").is_file());
+            }
+        }
+        assert_eq!(session.public_key(), Err(Nip46Error::LoggedOut));
+        if matches!(removal, Removal::Session) {
+            assert!(!app.has_external_signer(&account.account_id_hex));
+        }
+        assert!(managed_copy.is_file());
+        store
+            .refuse
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        match removal {
+            Removal::Session => {
+                session.erase_local().unwrap();
+                assert!(home.load_nip46_session(&account.label).unwrap().is_none());
+                assert!(matches!(
+                    runtime.nip46_resume(&account.label).await,
+                    Err(AppError::Nip46(Nip46Error::Unavailable))
+                ));
+            }
+            Removal::Account => {
+                home.resume_wipe_cleanup().unwrap();
+                assert!(
+                    std::fs::read_dir(dir.path().join(".wipe-tombstones"))
+                        .unwrap()
+                        .next()
+                        .is_none()
+                );
+            }
+        }
+        assert!(!managed_copy.exists());
+        runtime.shutdown_and_close().await.unwrap();
+    }
 }
 
 struct BindingHoldStore {
     inner: LocalFileSecretStore,
     hold_once: std::sync::atomic::AtomicBool,
+    refuse_release: std::sync::atomic::AtomicBool,
     entered: tokio::sync::Notify,
     released: std::sync::Mutex<bool>,
     changed: std::sync::Condvar,
 }
 
 impl AccountSecretStore for BindingHoldStore {
+    fn cleanup_namespace(&self) -> AccountHomeResult<String> {
+        self.inner.cleanup_namespace()
+    }
     fn has_secret_for_label(&self, label: &str) -> AccountHomeResult<bool> {
         self.inner.has_secret_for_label(label)
     }
-    fn write_secret(
+    fn acquire_secret(
         &self,
-        account: &marmot_account::AccountSummary,
-        keys: &Keys,
-    ) -> AccountHomeResult<()> {
-        self.inner.write_secret(account, keys)?;
-        if account.label.starts_with(".nip46-client/")
+        credential: marmot_account::SecretCredential<'_>,
+        mode: marmot_account::SecretClaimMode,
+        proposed: Option<&Keys>,
+    ) -> AccountHomeResult<marmot_account::AcquiredSecret> {
+        let acquired = self.inner.acquire_secret(credential, mode, proposed)?;
+        if credential.kind == marmot_account::SecretCredentialKind::Nip46Session
             && self
                 .hold_once
                 .swap(false, std::sync::atomic::Ordering::SeqCst)
@@ -1499,15 +1691,32 @@ impl AccountSecretStore for BindingHoldStore {
                     |released| !*released,
                 )
                 .unwrap();
-            assert!(*released, "release the held protected-store write");
+            assert!(*released, "release the held protected-store acquisition");
         }
-        Ok(())
+        Ok(acquired)
     }
-    fn load_secret(&self, account: &marmot_account::AccountSummary) -> AccountHomeResult<Keys> {
-        self.inner.load_secret(account)
+    fn load_secret(
+        &self,
+        credential: marmot_account::SecretCredential<'_>,
+    ) -> AccountHomeResult<Keys> {
+        self.inner.load_secret(credential)
     }
-    fn remove_secret(&self, account: &marmot_account::AccountSummary) -> AccountHomeResult<()> {
-        self.inner.remove_secret(account)
+    fn release_secret(
+        &self,
+        credential: marmot_account::SecretCredential<'_>,
+        mode: marmot_account::SecretReleaseMode,
+    ) -> AccountHomeResult<marmot_account::SecretReleaseOutcome> {
+        if credential.kind == marmot_account::SecretCredentialKind::Nip46Session
+            && self
+                .refuse_release
+                .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(std::io::Error::other("injected session retirement failure").into());
+        }
+        self.inner.release_secret(credential, mode)
+    }
+    fn reconcile_cleanup(&self) -> AccountHomeResult<()> {
+        self.inner.reconcile_cleanup()
     }
 }
 
@@ -1535,13 +1744,15 @@ async fn nip46_disconnect_during_bind() {
     for (mode, retired, absent, transport) in &mut observations {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(BindingHoldStore {
-            inner: LocalFileSecretStore::new(dir.path()),
+            inner: LocalFileSecretStore::new(dir.path(), IosOptions::default()),
             hold_once: std::sync::atomic::AtomicBool::new(true),
+            refuse_release: std::sync::atomic::AtomicBool::new(false),
             entered: tokio::sync::Notify::new(),
             released: std::sync::Mutex::new(false),
             changed: std::sync::Condvar::new(),
         });
-        let home = AccountHome::open_with_secret_store(dir.path(), store.clone());
+        let home =
+            AccountHome::open_with_secret_store(dir.path(), store.clone(), IosOptions::default());
         let fetcher = Arc::new(MemberResolutionDirectoryFetcher::default());
         let (fetch_entered, fetch_release) = fetcher.hold_fetches_for_kind(KIND_NIP65_RELAY_LIST);
         let relay = Arc::new(ScriptedPushRelayClient::default());
@@ -1680,4 +1891,235 @@ async fn nip46_disconnect_during_bind() {
             .all(|(_, retired, absent, transport)| *retired && *absent && *transport),
         "disconnect retires the old adoption without blocking a new explicit connection: {observations:?}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nip46_bind_failure_stays_gated() {
+    #[derive(Clone, Copy)]
+    enum Origin {
+        Created,
+        Promoted,
+    }
+    #[derive(Clone, Copy)]
+    enum Fault {
+        Release,
+        MutationLease,
+        CleanupJournal,
+    }
+
+    let peer = LoginPeer::new().await;
+    let id = peer.user.public_key().to_hex();
+    for (origin, fault) in [
+        (Origin::Created, Fault::Release),
+        (Origin::Promoted, Fault::Release),
+        (Origin::Created, Fault::MutationLease),
+        (Origin::Created, Fault::CleanupJournal),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(BindingHoldStore {
+            inner: LocalFileSecretStore::new(dir.path(), IosOptions::default()),
+            hold_once: std::sync::atomic::AtomicBool::new(true),
+            refuse_release: std::sync::atomic::AtomicBool::new(false),
+            entered: tokio::sync::Notify::new(),
+            released: std::sync::Mutex::new(false),
+            changed: std::sync::Condvar::new(),
+        });
+        let home =
+            AccountHome::open_with_secret_store(dir.path(), store.clone(), IosOptions::default());
+        let payload = home.account_dir(&id).join("retained-public-data");
+        if matches!(origin, Origin::Promoted) {
+            home.add_public_account(&id).unwrap();
+            fs_private::write_private(&payload, b"existing public payload").unwrap();
+        }
+        let fetcher = Arc::new(MemberResolutionDirectoryFetcher::default());
+        let (fetch_entered, fetch_release) = fetcher.hold_fetches_for_kind(KIND_NIP65_RELAY_LIST);
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let mut app = MarmotApp::with_relays_and_account_home_and_config(
+            dir.path(),
+            vec!["wss://account-relay.example".into()],
+            home.clone(),
+            MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
+        )
+        .with_test_relay_client(relay.clone());
+        app.relay_plane = MarmotRelayPlane::new_with_directory_fetcher_for_test(
+            Some(Duration::from_secs(120)),
+            relay,
+            fetcher,
+            false,
+        );
+        let runtime = app.runtime();
+        let session = peer.session(&app);
+        session.connect_async().await.unwrap();
+        let login = {
+            let runtime = runtime.clone();
+            let session = session.clone();
+            tokio::spawn(async move {
+                let endpoints = || vec![TransportEndpoint("wss://account-relay.example".into())];
+                runtime
+                    .nip46_login(session, endpoints(), endpoints(), Vec::new())
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(10), store.entered.notified())
+            .await
+            .unwrap();
+        if matches!(fault, Fault::Release) {
+            app.register_external_signer(
+                &id,
+                TestExternalAccountSigner {
+                    keys: peer.user.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        }
+        let binding_readiness = runtime.account_setup_readiness(&id).unwrap();
+        let binding_contention = fs_private::try_acquire_private_exclusive_file_lease(
+            &dir.path().join(".account-mutation.lock"),
+        );
+        *store.released.lock().unwrap() = true;
+        store.changed.notify_one();
+        tokio::time::timeout(Duration::from_secs(10), fetch_entered.notified())
+            .await
+            .unwrap();
+
+        let lease = match fault {
+            Fault::MutationLease => Some(
+                fs_private::try_acquire_private_exclusive_file_lease(
+                    &dir.path().join(".account-mutation.lock"),
+                )
+                .unwrap(),
+            ),
+            Fault::CleanupJournal => {
+                fs_private::create_dir_all_private(
+                    &home.account_dir(&id).join(".wipe-cleanup.json"),
+                )
+                .unwrap();
+                None
+            }
+            Fault::Release => {
+                store
+                    .refuse_release
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                None
+            }
+        };
+        session.disconnect();
+        fetch_release.notify_one();
+        let result = tokio::time::timeout(Duration::from_secs(10), login)
+            .await
+            .unwrap()
+            .unwrap();
+        drop(lease);
+        assert_eq!(binding_readiness, AccountSetupReadiness::Initializing);
+        assert!(
+            matches!(binding_contention, Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+        );
+
+        if matches!(fault, Fault::Release) {
+            match origin {
+                Origin::Created => {
+                    assert!(matches!(
+                        home.account(&id),
+                        Err(AccountHomeError::UnknownAccount(_))
+                    ));
+                    assert!(!app.has_external_signer(&id));
+                    assert!(!home.account_dir(&id).exists());
+                    let tombstone = std::fs::read_dir(dir.path().join(".wipe-tombstones"))
+                        .unwrap()
+                        .next()
+                        .unwrap()
+                        .unwrap()
+                        .path();
+                    assert!(tombstone.join(".wipe-cleanup.json").is_file());
+                }
+                Origin::Promoted => {
+                    let retained = home.account(&id).unwrap();
+                    assert!(!retained.external_signing);
+                    assert!(!retained.local_signing);
+                    assert_eq!(std::fs::read(&payload).unwrap(), b"existing public payload");
+                    assert!(app.has_external_signer(&id));
+                    assert!(
+                        home.account_dir(&id)
+                            .join(".nip46-session-removing.json")
+                            .is_file()
+                    );
+                }
+            }
+            assert!(matches!(
+                result,
+                Err(AppError::Nip46(Nip46Error::Disconnected))
+            ));
+        } else {
+            let retained = home.account(&id).unwrap();
+            assert!(matches!(result, Err(AppError::RelayDirectory(error))
+                    if error.contains("rollback error:")
+                        && error.contains(&Nip46Error::Disconnected.to_string())));
+            assert!(retained.external_signing);
+            assert_eq!(
+                runtime.account_setup_readiness(&id).unwrap(),
+                AccountSetupReadiness::Initializing
+            );
+            let state = home.account_setup_state(&id).unwrap().unwrap();
+            assert_eq!(state.kind, marmot_account::AccountSetupKind::ExternalSigner);
+            assert_eq!(
+                state.phase,
+                marmot_account::AccountSetupPhase::LocalStateCreated
+            );
+        }
+        runtime.shutdown_and_close().await.unwrap();
+        drop(session);
+        drop(runtime);
+        drop(app);
+
+        store
+            .refuse_release
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let reopened =
+            AccountHome::open_with_secret_store(dir.path(), store, IosOptions::default());
+        if matches!((origin, fault), (Origin::Created, Fault::Release)) {
+            reopened.resume_wipe_cleanup().unwrap();
+        }
+        let app = MarmotApp::with_relays_and_account_home_and_config(
+            dir.path(),
+            vec!["wss://account-relay.example".into()],
+            reopened.clone(),
+            MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
+        )
+        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+        let runtime = app.runtime();
+        if matches!(fault, Fault::Release) {
+            let replacement = peer.session(&app);
+            let replacement_key = replacement.client_public_key().unwrap();
+            replacement.connect_async().await.unwrap();
+            let endpoints = || vec![TransportEndpoint("wss://account-relay.example".into())];
+            assert_eq!(
+                runtime
+                    .nip46_login(replacement, endpoints(), endpoints(), Vec::new())
+                    .await
+                    .unwrap()
+                    .account_id_hex,
+                id
+            );
+            assert_eq!(
+                reopened
+                    .load_nip46_session(&id)
+                    .unwrap()
+                    .unwrap()
+                    .0
+                    .public_key(),
+                replacement_key
+            );
+            if matches!(origin, Origin::Promoted) {
+                assert_eq!(std::fs::read(&payload).unwrap(), b"existing public payload");
+            }
+        } else {
+            assert_eq!(
+                runtime.account_setup_readiness(&id).unwrap(),
+                AccountSetupReadiness::Initializing
+            );
+        }
+        runtime.shutdown_and_close().await.unwrap();
+    }
+    peer.close().await;
 }

@@ -41,7 +41,8 @@ mkdir -p "$smoke_dir/generated" "$smoke_dir/Sources/MarmotKit" \
 cp "$smoke_dir/generated/marmot_uniffi.swift" "$smoke_dir/Sources/MarmotKit/"
 cp "$smoke_dir/generated/marmot_uniffiFFI.h" "$smoke_dir/Sources/marmot_uniffiFFI/"
 cp "$smoke_dir/generated/marmot_uniffiFFI.modulemap" "$smoke_dir/Sources/marmot_uniffiFFI/module.modulemap"
-cp crates/marmot-uniffi/tests/native_host_smoke.swift "$smoke_dir/Tests/MarmotKitTests/"
+cp crates/marmot-uniffi/tests/native_host_smoke.swift \
+  crates/marmot-uniffi/tests/memory_secret_store.swift "$smoke_dir/Tests/MarmotKitTests/"
 cat > "$smoke_dir/Package.swift" <<'EOF'
 // swift-tools-version: 5.9
 import PackageDescription

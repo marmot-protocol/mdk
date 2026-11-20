@@ -26,12 +26,14 @@ smoke_dir="$(mktemp -d)"
 trap 'rm -rf "$smoke_dir"' EXIT
 "$smoke_target/uniffi-bindgen" generate --library "$smoke_library" --language "$smoke_language" --out-dir "$smoke_dir"
 if [[ "$smoke_language" == swift ]]; then
-  cat "$smoke_dir/marmot_uniffi.swift" crates/marmot-uniffi/tests/options_smoke.swift > "$smoke_dir/CombinedSmoke.swift"
+  cat "$smoke_dir/marmot_uniffi.swift" crates/marmot-uniffi/tests/memory_secret_store.swift \
+    crates/marmot-uniffi/tests/options_smoke.swift > "$smoke_dir/CombinedSmoke.swift"
   swiftc -parse-as-library -I "$smoke_dir" -Xcc "-fmodule-map-file=$smoke_dir/marmot_uniffiFFI.modulemap" \
     -L "$smoke_target" -lmarmot_uniffi "$smoke_dir/CombinedSmoke.swift" -o "$smoke_dir/smoke"
   DYLD_LIBRARY_PATH="$smoke_target" LD_LIBRARY_PATH="$smoke_target" "$smoke_dir/smoke"
 else
-  kotlinc "$smoke_dir/dev/ipf/marmotkit/marmot_uniffi.kt" crates/marmot-uniffi/tests/options_smoke.kt \
+  kotlinc "$smoke_dir/dev/ipf/marmotkit/marmot_uniffi.kt" crates/marmot-uniffi/tests/memory_secret_store.kt \
+    crates/marmot-uniffi/tests/options_smoke.kt \
     -cp "$MDK_KOTLIN_CLASSPATH" -include-runtime -d "$smoke_dir/smoke.jar"
   java -Djna.library.path="$smoke_target" -cp "$smoke_dir/smoke.jar:$MDK_KOTLIN_CLASSPATH" \
     dev.ipf.marmotkit.Options_smokeKt ${smoke_args[@]+"${smoke_args[@]}"}

@@ -167,15 +167,17 @@ impl MarmotAppRuntime {
                 .retry_and_reconcile_for_account(&account.account_id_hex),
         )
         .await;
-        if result.is_err()
-            && let Some(binding) = binding
+        let Err(error) = result else {
+            return Ok(());
+        };
+        if let Some(binding) = binding
             && binding.previous_signer.is_some()
         {
             let cleanup = blocking_app_task(move || {
                 binding
                     .session
                     .unbind_account(
-                        &binding.previous,
+                        Some(&binding.previous),
                         binding.previous_signer,
                         binding.generation,
                     )
@@ -186,10 +188,12 @@ impl MarmotAppRuntime {
                 .accounts
                 .reconcile_nip46_cleanup(&account.account_id_hex)
                 .await;
-            cleanup?;
-            reconciliation?;
+            return Err(account_setup_rollback_error(
+                error,
+                [cleanup, reconciliation],
+            ));
         }
-        result
+        Err(error)
     }
 
     /// Rehydrate locally; the first signer operation reconnects with a bounded deadline.

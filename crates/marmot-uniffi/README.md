@@ -234,6 +234,32 @@ fails, and MDK retries neither. Retrying fails the same way while the group's re
 a plain retry. A send that relays refused themselves still fails as `Publish`, and a send waiting for a relay to
 come back is not an error: MDK keeps sending it.
 
+### Host secret-store identity
+
+Host `SecretStore` implementations must implement `cleanupNamespace()`. Return a stable, nonsecret identity for the
+physical vault and credential namespace, including the service or tenant when either changes where keys are stored.
+Keep it stable across restarts and vault lock/unlock; do not return an account id, a constant shared by different vaults,
+or a fresh per-process id. Report an error if the identity cannot be established.
+One store object must keep the same credential target for its lifetime; switching vaults or tenants requires a new object.
+
+Pending account wipes retain this identity and retry credential deletion only through the same vault. Opening the root
+with another store leaves the original intent pending.
+
+Implement `acquireSecret(record, mode, proposedHex)`, `loadSecret(record)`, `releaseSecret(record, mode)`, and
+`reconcileCleanup()`; there are no unowned write or remove callbacks. `SecretCredential` carries the label, account ID,
+home ID, owner ID, and `SecretCredentialKind`. Store an immutable copy per owner before returning
+`AcquiredSecret(secretKeyHex, origin)`. Retries must preserve the original key and `SecretOrigin`. Signing discovery is
+shared by account ID across homes; auxiliary discovery is home-scoped. Ordinary claims use managed sources only;
+`SecretClaimMode::MigrateLegacy` explicitly permits independent legacy lookup and retains its pending cleanup pointer.
+
+`SecretReleaseMode::Preserve` keeps a discoverable hold until a new owner has its own copy. Retire owners before deletion,
+keep retirement metadata, and never let old releases resurrect consumed holds or delete other owners' copies.
+Return `SecretReleaseOutcome::PendingLegacy` for retained ambiguous legacy material; it does not claim physical erasure.
+Replay cleanup at `reconcileCleanup()`, including when no account wipe remains. Keep the read-only signing presence probes.
+Callbacks may run synchronously during construction, so do not wait for the UI thread or re-enter mutations on the same root.
+The host owns callback-side secret protection and temporary-copy clearing. The [native host fixtures](NATIVE-HOST-TESTS.md)
+provide synchronized, explicitly in-memory examples, not persistent vault implementations.
+
 ### Screen snapshots, paging and ownership
 
 Prepared list/conversation updates are complete replacements for their bounded window.
@@ -369,7 +395,7 @@ The reference's names, signatures and source-line links are checked against sour
 
 ## Runtime options and client label
 
-`MarmotOptions` combines `relayPolicy`, `cursorPersistence`, `clientName`, `devicePlatform`, `secretStore` and
+`MarmotOptions` combines `relayPolicy`, `cursorPersistence`, `clientName`, `devicePlatform`, `secretStore`, `iosOptions` and
 `attachmentAcquisitionMode` with the required [`deployment`](#deployment) in `Marmot.newWithConfiguration`.
 Every other field is optional in generated Swift/Kotlin: omitted policies mean public-only endpoints and an advancing cursor;
 an omitted label stays untagged, omitted storage uses the platform keychain, and an omitted
@@ -378,6 +404,15 @@ acquisition mode keeps native automatic acquisition (see
 Existing constructors take the deployment as their last argument and delegate to this
 same configuration path. Use the options constructor when combining a label with a
 custom relay policy.
+
+On iOS, set `iosOptions.appGroupIdentifiers` when the account root is in a shared App Group container.
+Pass the entitled identifiers on each open, including when you supply a `secretStore` callback.
+With the native Keychain store, `iosOptions.keychainAccessGroup` selects the access group for managed receipts.
+An explicit group must be authorized by iOS and must not conflict with the captured Keychain provider's group.
+Omitting it uses the captured provider's default. The option does not change how the provider looks up legacy entries.
+Hosts with extensions or changing entitlements should always set the group explicitly; if the OS default changes,
+select the previous group to reopen existing credentials.
+
 C hosts use `marmot_client_new_with_configuration` and a `MarmotClientOptions`
 struct; zero initialization selects the same defaults. Use the matching header
 and library for that struct's layout.
@@ -508,7 +543,7 @@ MarmotKit runs MDK on a Tokio runtime it owns, not on the threads that call it.
   Each account's worker still handles its own commands one at a time, in order, so a slow
   operation delays that account's later worker-routed calls but not other accounts.
 - **Host callbacks** (`SecretStore`, `ExternalAccountSignerFfi`) can be invoked from runtime
-  threads or the calling thread, possibly concurrently. Implementations must be thread-safe and
+  threads or synchronously on the calling thread, including during construction, possibly concurrently. Implementations must be thread-safe and
   must not wait for the main thread.
 
 The C bindings block the calling thread on a runtime owned by each client; see
@@ -2248,8 +2283,9 @@ report does not by itself prove an app's Play Console result.
 
 ### Android initialization (required before the first `Marmot(...)`)
 
-`Marmot(...)` constructs the Android-native keyring store, which talks to the Android Keystore over JNI and needs the
-`ndk-context` initialized with the application `Context` first. The build copies two hand-written helpers
+Android account ownership uses the application identity and storage container, including with file or host-provided
+secret stores. Initialize `ndk-context` with the application `Context` first. The native store also uses Android
+Keystore over JNI. The build copies two hand-written helpers
 (`kotlin-support/`) next to the generated binding:
 
 - `dev.ipf.marmotkit.MarmotAndroid` — the call consumers use.
@@ -2257,7 +2293,7 @@ report does not by itself prove an app's Play Console result.
   `libmarmot_uniffi.so`, so its symbol is exported from that library).
 
 Android consumers MUST call `MarmotAndroid.initialize(this)` from `Application.onCreate` before constructing `Marmot`,
-otherwise the first constructor crashes with `android context was not initialized`:
+otherwise construction or credential access fails:
 
 ```kotlin
 class MarmotApplication : Application() {
