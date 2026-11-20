@@ -271,7 +271,27 @@ impl Backend {
                 {
                     Some(backend.legacy_target())
                 }
-                #[cfg(not(any(target_os = "ios", target_os = "windows")))]
+                #[cfg(any(
+                    target_os = "linux",
+                    target_os = "freebsd",
+                    target_os = "openbsd",
+                    target_os = "netbsd",
+                    target_os = "dragonfly"
+                ))]
+                {
+                    // The raw search spans collections beyond the managed target.
+                    let _ = backend;
+                    None
+                }
+                #[cfg(not(any(
+                    target_os = "ios",
+                    target_os = "windows",
+                    target_os = "linux",
+                    target_os = "freebsd",
+                    target_os = "openbsd",
+                    target_os = "netbsd",
+                    target_os = "dragonfly"
+                )))]
                 {
                     Some(backend.target())
                 }
@@ -454,12 +474,15 @@ mod platform {
     };
     use std::sync::Mutex;
     use zbus::blocking::{Connection, Proxy};
+    use zbus::fdo::{ReleaseNameReply, RequestNameFlags, RequestNameReply};
     use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
 
     const SERVICE: &str = "org.freedesktop.secrets";
     const ROOT: &str = "/org/freedesktop/secrets";
     const ITEM: &str = "org.freedesktop.Secret.Item";
     const COLLECTION: &str = "org.freedesktop.Secret.Collection";
+    const MARKER_SERVICE: &str = "mdk-owned-collection-v1";
+    const MARKER_ID: &str = "mdk-collection-id";
     const DH_PRIME: Odd<U1024> = Odd::<U1024>::from_be_hex(concat!(
         "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E088A67CC74020B",
         "BEA63B139B22514A08798E3404DDEF9519B3CD3A431B302B0A6DF25F14374FE1356D",
@@ -515,7 +538,13 @@ mod platform {
 
     pub(super) struct Backend {
         state: Mutex<State>,
+        marker: Marker,
         target: String,
+    }
+
+    struct Marker {
+        path: OwnedObjectPath,
+        id: String,
     }
 
     struct State {
@@ -535,31 +564,132 @@ mod platform {
             let proxy = self.proxy(self.collection.as_str(), COLLECTION)?;
             if proxy.get_property::<bool>("Locked").map_err(native_error)? {
                 return Err(AccountHomeError::SecretStoreUnavailable(
-                    "pinned Secret Service collection is locked".into(),
+                    "pinned Secret Service collection is locked; unlock it in your system keyring and retry"
+                        .into(),
                 ));
             }
             Ok(proxy)
         }
 
-        fn paths(
-            &self,
-            service: &str,
-            name: Option<&str>,
-        ) -> AccountHomeResult<Vec<OwnedObjectPath>> {
-            let mut attrs = HashMap::from([("service", service)]);
-            if let Some(name) = name {
-                attrs.insert("username", name);
+        fn managed(&self, marker: &Marker) -> AccountHomeResult<Proxy<'_>> {
+            let collection = self.collection()?;
+            if !self
+                .read_marker(&collection)?
+                .is_some_and(|current| current.path == marker.path && current.id == marker.id)
+            {
+                return Err(marker_error("changed"));
             }
-            self.collection()?
-                .call("SearchItems", &(attrs,))
-                .map_err(native_error)
+            Ok(collection)
+        }
+
+        fn marker_id(&self, path: &OwnedObjectPath) -> AccountHomeResult<String> {
+            let mut attrs: HashMap<String, String> = self
+                .proxy(path.as_str(), ITEM)?
+                .get_property("Attributes")
+                .map_err(|_| marker_error("unreadable"))?;
+            // Providers can add attributes (such as a schema) when reloading items.
+            if attrs.get("service").map(String::as_str) != Some(MARKER_SERVICE) {
+                return Err(marker_error("invalid"));
+            }
+            attrs
+                .remove(MARKER_ID)
+                .filter(|id| {
+                    id.len() == 64
+                        && id
+                            .bytes()
+                            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                })
+                .ok_or_else(|| marker_error("invalid"))
+        }
+
+        fn read_marker(&self, collection: &Proxy<'_>) -> AccountHomeResult<Option<Marker>> {
+            let mut paths = find_items(collection, MARKER_SERVICE, None)?;
+            if paths.len() > 1 {
+                return Err(marker_error("duplicated"));
+            }
+            paths
+                .pop()
+                .map(|path| {
+                    let id = self.marker_id(&path)?;
+                    Ok(Marker { path, id })
+                })
+                .transpose()
+        }
+
+        fn init_marker(&self, bus: &Proxy<'_>) -> AccountHomeResult<Marker> {
+            let collection = self.collection()?;
+            if let Some(marker) = self.read_marker(&collection)? {
+                return Ok(marker);
+            }
+
+            let mut hash = Sha256::new();
+            hash.update(self.owner.as_bytes());
+            hash.update([0]);
+            hash.update(self.collection.as_str().as_bytes());
+            let lease = format!(
+                "org.marmot_protocol.Mdk.CollectionInit.h{}",
+                hex::encode(hash.finalize())
+            );
+            let acquired: RequestNameReply = bus
+                .call("RequestName", &(lease.as_str(), RequestNameFlags::DoNotQueue as u32))
+                .map_err(|error| AccountHomeError::SecretStoreUnavailable(format!(
+                    "cannot initialize MDK Secret Service collection identity: allow temporary org.marmot_protocol.Mdk.CollectionInit names on the session bus and reopen the account home ({error})"
+                )))?;
+            if acquired != RequestNameReply::PrimaryOwner {
+                return Err(AccountHomeError::SecretStoreUnavailable(
+                    "Secret Service collection identity initialization is busy; reopen the account home and retry".into(),
+                ));
+            }
+            // Failed construction drops this connection and its name ownership.
+            let marker = match self.read_marker(&collection)? {
+                Some(marker) => marker,
+                None => self.create_marker(&collection)?,
+            };
+            let released: ReleaseNameReply = bus
+                .call("ReleaseName", &(lease.as_str(),))
+                .map_err(native_error)?;
+            if released != ReleaseNameReply::Released {
+                return Err(vault_error(
+                    "Secret Service collection initialization lease was lost",
+                ));
+            }
+            Ok(marker)
+        }
+
+        fn create_marker(&self, collection: &Proxy<'_>) -> AccountHomeResult<Marker> {
+            let items: Vec<OwnedObjectPath> =
+                collection.get_property("Items").map_err(native_error)?;
+            for path in items {
+                let attrs: HashMap<String, String> = self
+                    .proxy(path.as_str(), ITEM)?
+                    .get_property("Attributes")
+                    .map_err(native_error)?;
+                if attrs
+                    .get("service")
+                    .is_some_and(|service| service.starts_with("mdk-owned-"))
+                {
+                    return Err(marker_error(
+                        "missing from a collection with managed records",
+                    ));
+                }
+            }
+
+            let mut random = [0u8; 32];
+            getrandom::fill(&mut random).map_err(native_error)?;
+            let id = hex::encode(random);
+            self.write_items(collection, MARKER_SERVICE, &id, "", &[])?;
+            match self.read_marker(collection)? {
+                Some(marker) if marker.id == id => Ok(marker),
+                _ => Err(marker_error("not published as requested")),
+            }
         }
 
         fn read_item(&self, path: &OwnedObjectPath) -> AccountHomeResult<Zeroizing<String>> {
             let proxy = self.proxy(path.as_str(), ITEM)?;
             if proxy.get_property::<bool>("Locked").map_err(native_error)? {
                 return Err(AccountHomeError::SecretStoreUnavailable(
-                    "native receipt is locked".into(),
+                    "Secret Service credential is locked. Unlock the credential or its collection in your system keyring, then retry"
+                        .into(),
                 ));
             }
             let (session, parameters, bytes, content_type): Secret = proxy
@@ -585,6 +715,26 @@ mod platform {
         }
     }
 
+    fn marker_error(problem: &str) -> AccountHomeError {
+        AccountHomeError::SecretStoreUnavailable(format!(
+            "MDK Secret Service collection identity is {problem}; restore the original collection and its identity item, then reopen the account home"
+        ))
+    }
+
+    fn find_items(
+        collection: &Proxy<'_>,
+        service: &str,
+        name: Option<&str>,
+    ) -> AccountHomeResult<Vec<OwnedObjectPath>> {
+        let mut attrs = HashMap::from([("service", service)]);
+        if let Some(name) = name {
+            attrs.insert("username", name);
+        }
+        collection
+            .call("SearchItems", &(attrs,))
+            .map_err(native_error)
+    }
+
     impl Backend {
         pub(super) fn new(
             store: Arc<keyring_core::api::CredentialStore>,
@@ -604,13 +754,22 @@ mod platform {
                 "org.freedesktop.DBus",
             )
             .map_err(native_error)?;
-            // Activation and owner resolution happen once; every vault call uses the unique owner.
-            let _: u32 = bus
-                .call("StartServiceByName", &(SERVICE, 0u32))
-                .map_err(native_error)?;
-            let owner: String = bus
+            // A running provider need not have a D-Bus activation descriptor.
+            // Resolve it once; every vault call uses that captured unique owner.
+            let owner: String = match bus
                 .call("GetNameOwner", &(SERVICE,))
-                .map_err(native_error)?;
+                .map_err(zbus::fdo::Error::from)
+            {
+                Ok(owner) => owner,
+                Err(zbus::fdo::Error::NameHasNoOwner(_)) => {
+                    let _: u32 = bus
+                        .call("StartServiceByName", &(SERVICE, 0u32))
+                        .map_err(native_error)?;
+                    bus.call("GetNameOwner", &(SERVICE,))
+                        .map_err(native_error)?
+                }
+                Err(error) => return Err(native_error(error)),
+            };
             let uid: u32 = bus
                 .call("GetConnectionUnixUser", &(owner.as_str(),))
                 .map_err(native_error)?;
@@ -633,30 +792,27 @@ mod platform {
                 .call("ReadAlias", &("default",))
                 .map_err(native_error)?;
             if collection.as_str() == "/" {
-                return Err(vault_error(
-                    "Secret Service has no default collection to pin",
+                return Err(AccountHomeError::SecretStoreUnavailable(
+                    "Secret Service has no default collection. Restore the original MDK collection as default, or set the intended collection as default before first use. Then reopen the account home"
+                        .into(),
                 ));
             }
-            let collection_proxy =
-                Proxy::new(&connection, owner.as_str(), collection.as_str(), COLLECTION)
-                    .map_err(native_error)?;
-            let created: u64 = collection_proxy
-                .get_property("Created")
-                .map_err(native_error)?;
             let (session, key) = open_session(&root)?;
-            let target = format!("secret-service:{machine}:{uid}:{SERVICE}:{collection}:{created}");
-            drop(collection_proxy);
             drop(root);
             drop(peer);
+            let state = State {
+                connection: connection.clone(),
+                owner,
+                collection,
+                session,
+                key,
+            };
+            let marker = state.init_marker(&bus)?;
             drop(bus);
+            let target = format!("secret-service:{machine}:{uid}:{SERVICE}:{}", marker.id);
             Ok(Self {
-                state: Mutex::new(State {
-                    connection,
-                    owner,
-                    collection,
-                    session,
-                    key,
-                }),
+                state: Mutex::new(state),
+                marker,
                 target,
             })
         }
@@ -675,7 +831,7 @@ mod platform {
                 .lock()
                 .map_err(|_| vault_error("native vault lock poisoned"))?;
             let mut result = None;
-            for path in state.paths(service, Some(name))? {
+            for path in find_items(&state.managed(&self.marker)?, service, Some(name))? {
                 merge_secret(&mut result, Some(state.read_item(&path)?))?;
             }
             Ok(result)
@@ -699,7 +855,8 @@ mod platform {
                 .map_err(native_error)?;
             if !locked.is_empty() {
                 return Err(AccountHomeError::SecretStoreUnavailable(
-                    "legacy Secret Service credential is locked".into(),
+                    "legacy Secret Service credential is locked. Unlock the credential or its collection in your system keyring, then retry"
+                        .into(),
                 ));
             }
             let mut result = None;
@@ -719,56 +876,9 @@ mod platform {
                 .state
                 .lock()
                 .map_err(|_| vault_error("native vault lock poisoned"))?;
-            let paths = state.paths(service, Some(name))?;
-            let mut iv = [0u8; 16];
-            getrandom::fill(&mut iv).map_err(native_error)?;
-            let mut encrypted = Zeroizing::new(vec![0u8; value.len() + 16]);
-            encrypted[..value.len()].copy_from_slice(value.as_bytes());
-            let encrypted = cbc::Encryptor::<aes::Aes128>::new_from_slices(state.key.as_ref(), &iv)
-                .map_err(|_| vault_error("invalid Secret Service encryption parameters"))?
-                .encrypt_padded_mut::<Pkcs7>(&mut encrypted, value.len())
-                .map_err(|_| vault_error("Secret Service encryption failed"))?;
-            let secret = (
-                &state.session,
-                iv.as_slice(),
-                encrypted,
-                "text/plain; charset=utf-8",
-            );
-            if paths.is_empty() {
-                let attributes = HashMap::from([("service", service), ("username", name)]);
-                let properties = HashMap::from([
-                    (
-                        "org.freedesktop.Secret.Item.Label",
-                        Value::from("MDK owned vault record"),
-                    ),
-                    (
-                        "org.freedesktop.Secret.Item.Attributes",
-                        Value::from(attributes),
-                    ),
-                ]);
-                let (item, prompt): (OwnedObjectPath, OwnedObjectPath) = state
-                    .collection()?
-                    .call("CreateItem", &(properties, secret, false))
-                    .map_err(native_error)?;
-                if prompt.as_str() != "/" {
-                    return Err(AccountHomeError::SecretStoreUnavailable(
-                        "native vault write requires an interactive prompt".into(),
-                    ));
-                }
-                if item.as_str() == "/" {
-                    return Err(vault_error(
-                        "Secret Service did not create the requested item",
-                    ));
-                }
-            } else {
-                for path in paths {
-                    let _: () = state
-                        .proxy(path.as_str(), ITEM)?
-                        .call("SetSecret", &(&secret,))
-                        .map_err(native_error)?;
-                }
-            }
-            Ok(())
+            let collection = state.managed(&self.marker)?;
+            let paths = find_items(&collection, service, Some(name))?;
+            state.write_items(&collection, service, name, value, &paths)
         }
 
         pub(super) fn remove(&self, service: &str, name: &str) -> AccountHomeResult<()> {
@@ -776,7 +886,7 @@ mod platform {
                 .state
                 .lock()
                 .map_err(|_| vault_error("native vault lock poisoned"))?;
-            for path in state.paths(service, Some(name))? {
+            for path in find_items(&state.managed(&self.marker)?, service, Some(name))? {
                 let prompt: OwnedObjectPath = state
                     .proxy(path.as_str(), ITEM)?
                     .call("Delete", &())
@@ -796,8 +906,8 @@ mod platform {
                 .lock()
                 .map_err(|_| vault_error("native vault lock poisoned"))?;
             let mut names = Vec::new();
-            for path in state.paths(service, None)? {
-                let attrs: HashMap<String, String> = state
+            for path in find_items(&state.managed(&self.marker)?, service, None)? {
+                let mut attrs: HashMap<String, String> = state
                     .proxy(path.as_str(), ITEM)?
                     .get_property("Attributes")
                     .map_err(native_error)?;
@@ -806,12 +916,73 @@ mod platform {
                 }
                 names.push(
                     attrs
-                        .get("username")
-                        .cloned()
+                        .remove("username")
                         .ok_or_else(|| vault_error("native receipt has no username attribute"))?,
                 );
             }
             Ok(names)
+        }
+    }
+
+    impl State {
+        fn write_items(
+            &self,
+            collection: &Proxy<'_>,
+            service: &str,
+            name: &str,
+            value: &str,
+            paths: &[OwnedObjectPath],
+        ) -> AccountHomeResult<()> {
+            let mut iv = [0u8; 16];
+            getrandom::fill(&mut iv).map_err(native_error)?;
+            let mut encrypted = Zeroizing::new(vec![0u8; value.len() + 16]);
+            encrypted[..value.len()].copy_from_slice(value.as_bytes());
+            let encrypted = cbc::Encryptor::<aes::Aes128>::new_from_slices(self.key.as_ref(), &iv)
+                .map_err(|_| vault_error("invalid Secret Service encryption parameters"))?
+                .encrypt_padded_mut::<Pkcs7>(&mut encrypted, value.len())
+                .map_err(|_| vault_error("Secret Service encryption failed"))?;
+            let secret = (
+                &self.session,
+                iv.as_slice(),
+                encrypted,
+                "text/plain; charset=utf-8",
+            );
+            if paths.is_empty() {
+                let (label, field) = if service == MARKER_SERVICE {
+                    ("MDK collection identity", MARKER_ID)
+                } else {
+                    ("MDK owned vault record", "username")
+                };
+                let attributes = HashMap::from([("service", service), (field, name)]);
+                let properties = HashMap::from([
+                    ("org.freedesktop.Secret.Item.Label", Value::from(label)),
+                    (
+                        "org.freedesktop.Secret.Item.Attributes",
+                        Value::from(attributes),
+                    ),
+                ]);
+                let (item, prompt): (OwnedObjectPath, OwnedObjectPath) = collection
+                    .call("CreateItem", &(properties, secret, false))
+                    .map_err(native_error)?;
+                if prompt.as_str() != "/" {
+                    return Err(AccountHomeError::SecretStoreUnavailable(
+                        "native vault write requires an interactive prompt".into(),
+                    ));
+                }
+                if item.as_str() == "/" {
+                    return Err(vault_error(
+                        "Secret Service did not create the requested item",
+                    ));
+                }
+            } else {
+                for path in paths {
+                    let _: () = self
+                        .proxy(path.as_str(), ITEM)?
+                        .call("SetSecret", &(&secret,))
+                        .map_err(native_error)?;
+                }
+            }
+            Ok(())
         }
     }
 }

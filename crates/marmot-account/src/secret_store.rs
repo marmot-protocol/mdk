@@ -12,8 +12,8 @@ use crate::IosOptions;
 use crate::error::{AccountHomeError, AccountHomeResult};
 use crate::home::{ACCOUNT_SECRET_FILE, LOCAL_FILE_SECRET_BACKEND};
 use crate::io::{
-    read_secret_json, read_secret_text, remove_file_then_scrub, write_private_bytes,
-    write_secret_bytes,
+    read_secret_json, read_secret_text, remove_file_then_scrub, sync_directory,
+    write_private_bytes, write_secret_bytes,
 };
 use crate::native_vault::NativeVault;
 use crate::owned_vault::{self, Addressing, RecordKind, StoredSecretKeyHex, VaultStorage};
@@ -67,9 +67,89 @@ pub trait AccountSecretStore: Send + Sync {
 #[derive(Clone, Debug)]
 pub struct LocalFileSecretStore {
     root: PathBuf,
-    canonical_root: Arc<OnceLock<PathBuf>>,
+    directory: Arc<OnceLock<FileVaultDirectory>>,
     #[cfg(any(target_os = "ios", target_os = "android"))]
     ios_options: IosOptions,
+}
+
+#[derive(Debug)]
+struct FileVaultDirectory {
+    path: PathBuf,
+    handle: std::fs::File,
+}
+
+impl FileVaultDirectory {
+    fn verify(&self) -> AccountHomeResult<&Path> {
+        if !is_vault_directory(&self.handle, &self.path)? {
+            return Err(AccountHomeError::SecretStore(
+                "cached file vault directory changed; reopen its original target".into(),
+            ));
+        }
+        Ok(&self.path)
+    }
+}
+
+#[cfg(unix)]
+fn is_vault_directory(handle: &std::fs::File, path: &Path) -> std::io::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+
+    let held = handle.metadata()?;
+    let current = std::fs::symlink_metadata(path)?;
+    Ok(current.is_dir() && (held.dev(), held.ino()) == (current.dev(), current.ino()))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn is_vault_directory(_handle: &std::fs::File, _path: &Path) -> std::io::Result<bool> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "file vault requires stable directory identity",
+    ))
+}
+
+#[cfg(not(windows))]
+fn open_vault_directory(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::File::open(path)
+}
+
+#[cfg(windows)]
+fn open_vault_directory(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES,
+    };
+
+    std::fs::OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
+}
+
+#[cfg(windows)]
+fn is_vault_directory(handle: &std::fs::File, path: &Path) -> std::io::Result<bool> {
+    fn file_id(file: &std::fs::File) -> std::io::Result<(u64, [u8; 16])> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_ID_INFO, FileIdInfo, GetFileInformationByHandleEx,
+        };
+
+        let mut info = FILE_ID_INFO::default();
+        // The output buffer and borrowed handle remain valid for the call.
+        if unsafe {
+            GetFileInformationByHandleEx(
+                file.as_raw_handle(),
+                FileIdInfo,
+                (&raw mut info).cast(),
+                size_of::<FILE_ID_INFO>() as u32,
+            )
+        } == 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok((info.VolumeSerialNumber, info.FileId.Identifier))
+    }
+
+    let current = open_vault_directory(path)?;
+    Ok(file_id(handle)? == file_id(&current)?)
 }
 
 struct FileVaultGuard {
@@ -81,15 +161,15 @@ impl LocalFileSecretStore {
     pub fn new(root: impl AsRef<Path>, _ios_options: IosOptions) -> Self {
         Self {
             root: root.as_ref().to_path_buf(),
-            canonical_root: Arc::new(OnceLock::new()),
+            directory: Arc::new(OnceLock::new()),
             #[cfg(any(target_os = "ios", target_os = "android"))]
             ios_options: _ios_options,
         }
     }
 
     fn storage_root(&self) -> AccountHomeResult<&Path> {
-        if let Some(root) = self.canonical_root.get() {
-            return Ok(root);
+        if let Some(directory) = self.directory.get() {
+            return directory.verify();
         }
         let root = match self.root.canonicalize() {
             Ok(root) => root,
@@ -99,11 +179,21 @@ impl LocalFileSecretStore {
             }
             Err(error) => return Err(error.into()),
         };
-        let _ = self.canonical_root.set(root);
-        Ok(self
-            .canonical_root
+        let handle = open_vault_directory(&root)?;
+        if !handle.metadata()?.is_dir() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotADirectory,
+                "file vault root must be a directory",
+            )
+            .into());
+        }
+        let _ = self
+            .directory
+            .set(FileVaultDirectory { path: root, handle });
+        self.directory
             .get()
-            .expect("file vault target initialized"))
+            .expect("file vault target initialized")
+            .verify()
     }
 
     fn secret_path(&self, label: &str) -> AccountHomeResult<PathBuf> {
@@ -142,11 +232,13 @@ impl LocalFileSecretStore {
         let root = self.storage_root()?;
         #[cfg(any(unix, windows))]
         {
-            Ok(FileVaultGuard {
+            let guard = FileVaultGuard {
                 _lease: fs_private::try_acquire_private_exclusive_file_lease(
                     &root.join(".credential-store.lock"),
                 )?,
-            })
+            };
+            self.storage_root()?;
+            Ok(guard)
         }
         #[cfg(not(any(unix, windows)))]
         {
@@ -193,7 +285,7 @@ impl VaultStorage for LocalFileSecretStore {
         if matches!(kind, RecordKind::Receipt) {
             if let Some(existing) = self.read(kind, name)? {
                 if existing.as_str() == value {
-                    return Ok(());
+                    return self.sync(kind);
                 }
                 return Err(AccountHomeError::SecretStore(
                     "owned credential receipts are immutable".into(),
@@ -202,6 +294,10 @@ impl VaultStorage for LocalFileSecretStore {
             return write_secret_bytes(&path, value.as_bytes());
         }
         write_private_bytes(&path, value.as_bytes())
+    }
+
+    fn sync(&self, kind: RecordKind) -> AccountHomeResult<()> {
+        Ok(sync_directory(&self.owned_dir(kind)?)?)
     }
 
     fn remove(&self, kind: RecordKind, name: &str) -> AccountHomeResult<()> {
@@ -548,6 +644,53 @@ mod tests {
                 .cleanup_namespace()
                 .unwrap(),
             namespace
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn file_vault_rejects_retarget() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("vault");
+        let moved = directory.path().join("original-vault");
+        let store = LocalFileSecretStore::new(&root, IosOptions::default());
+        let keys = nostr::prelude::Keys::parse(&"01".repeat(32)).unwrap();
+        let account_id = keys.public_key().to_hex();
+        let home = "11".repeat(32);
+        let owner = "22".repeat(32);
+        let credential = SecretCredential {
+            label: "pinned",
+            account_id_hex: &account_id,
+            home_id: &home,
+            owner_id: &owner,
+            kind: SecretCredentialKind::Signing,
+        };
+        store
+            .acquire_secret(credential, SecretClaimMode::CreateOnly, Some(&keys))
+            .unwrap();
+        let clone = store.clone();
+        fs::rename(&root, &moved).unwrap();
+        fs::create_dir(&root).unwrap();
+
+        assert!(
+            matches!(store.cleanup_namespace(), Err(AccountHomeError::SecretStore(error))
+            if error == "cached file vault directory changed; reopen its original target")
+        );
+        assert!(
+            matches!(clone.load_secret(credential), Err(AccountHomeError::SecretStore(error))
+            if error == "cached file vault directory changed; reopen its original target")
+        );
+        assert!(
+            matches!(clone.release_secret(credential, SecretReleaseMode::DeleteIfUnowned),
+            Err(AccountHomeError::SecretStore(error)) if error == "cached file vault directory changed; reopen its original target")
+        );
+        assert!(fs::read_dir(&root).unwrap().next().is_none());
+
+        fs::remove_dir(&root).unwrap();
+        fs::rename(&moved, &root).unwrap();
+        assert_eq!(
+            store.load_secret(credential).unwrap().secret_key(),
+            keys.secret_key()
         );
     }
 

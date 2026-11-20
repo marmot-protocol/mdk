@@ -1,4 +1,4 @@
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -59,13 +59,8 @@ impl NativeVault {
             }
             None => android_native_keyring_store::by_store::store::StoreConfig::default(),
         };
-        if config.filename.is_empty()
-            || config.filename.len() > MAX_NAME
-            || !config
-                .filename
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
-            || matches!(config.filename.as_str(), "." | "..")
+        if matches!(config.filename.as_str(), "" | "." | "..")
+            || config.filename.contains(['/', '\0'])
             || config.divider.is_empty()
             || service.contains(&config.divider)
         {
@@ -179,8 +174,42 @@ impl NativeVault {
         })
     }
 
-    fn alias(&self, name: &str) -> String {
-        format!("{}{name}", self.alias_prefix)
+    fn alias(&self, name: &str) -> AccountHomeResult<String> {
+        let alias = format!("{}{name}", self.alias_prefix);
+        if alias == self.legacy_file {
+            return Err(failure(
+                "Android managed receipt alias collides with the legacy key",
+            ));
+        }
+        Ok(alias)
+    }
+
+    fn lease(&self) -> AccountHomeResult<fs_private::PrivateExclusiveFileLease> {
+        Ok(fs_private::try_acquire_private_exclusive_file_lease(
+            &self.root.join(".credential-store.lock"),
+        )?)
+    }
+
+    /// The vault lease excludes publication and deletion while recovering a stage.
+    fn read_receipt_under_lease(
+        &self,
+        directory: &Path,
+        path: &Path,
+        name: &str,
+    ) -> AccountHomeResult<Option<Zeroizing<String>>> {
+        if let Some(bytes) = read_record(path, MAX_CIPHER)? {
+            return self.decrypt(name, &bytes).map(Some);
+        }
+        let pending = directory.join(format!("{PENDING}{name}"));
+        let Some(file) = open_file(&pending)? else {
+            return Ok(None);
+        };
+        let bytes = read_open_file(&file, MAX_CIPHER, check_file)?;
+        let value = self.decrypt(name, &bytes)?;
+        file.sync_all()?;
+        fs::rename(&pending, path)?;
+        sync_directory(directory)?;
+        Ok(Some(value))
     }
 
     fn aad(&self, name: &str) -> Vec<u8> {
@@ -194,7 +223,7 @@ impl NativeVault {
     fn encrypt(&self, name: &str, value: &str) -> AccountHomeResult<Zeroizing<Vec<u8>>> {
         with_vm(&self.vm, |env| {
             let store = open_keystore(env)?;
-            let alias = self.alias(name);
+            let alias = self.alias(name)?;
             let mut key = find_key(env, &store, &alias)?;
             if key.is_null() {
                 key = generate_key(env, &alias)?;
@@ -236,7 +265,7 @@ impl NativeVault {
         }
         with_vm(&self.vm, |env| {
             let store = open_keystore(env)?;
-            let key = find_key(env, &store, &self.alias(name))?;
+            let key = find_key(env, &store, &self.alias(name)?)?;
             if key.is_null() {
                 return Err(failure("Android receipt decryption key is unavailable"));
             }
@@ -256,7 +285,7 @@ impl NativeVault {
     fn delete_key(&self, name: &str) -> AccountHomeResult<()> {
         with_vm(&self.vm, |env| {
             let store = open_keystore(env)?;
-            let alias = checked(env.new_string(self.alias(name)))?;
+            let alias = checked(env.new_string(self.alias(name)?))?;
             checked(env.call_method(
                 &store,
                 "deleteEntry",
@@ -282,26 +311,24 @@ impl NativeVault {
 impl VaultStorage for NativeVault {
     fn read(&self, kind: RecordKind, name: &str) -> AccountHomeResult<Option<Zeroizing<String>>> {
         validate_name(name)?;
-        let path = self.directory(kind).join(name);
-        let limit = match kind {
-            RecordKind::Receipt => MAX_CIPHER,
-            RecordKind::Retirement => MAX_VALUE,
-        };
-        let Some(bytes) = read_record(&path, limit)? else {
-            return Ok(None);
-        };
+        let directory = self.directory(kind);
+        let path = directory.join(name);
         match kind {
-            RecordKind::Receipt => self.decrypt(name, &bytes).map(Some),
-            RecordKind::Retirement => secret_string(&bytes).map(Some),
+            RecordKind::Receipt => {
+                if let Some(bytes) = read_record(&path, MAX_CIPHER)? {
+                    return self.decrypt(name, &bytes).map(Some);
+                }
+                let _lease = self.lease()?;
+                self.read_receipt_under_lease(&directory, &path, name)
+            }
+            RecordKind::Retirement => read_record(&path, MAX_VALUE)?
+                .map(|bytes| secret_string(&bytes))
+                .transpose(),
         }
     }
 
     fn write(&self, kind: RecordKind, name: &str, value: &str) -> AccountHomeResult<()> {
-        // Keep this stable inode outside record enumeration. The lease covers
-        // verification and Keystore key generation as well as publication.
-        let _lease = fs_private::try_acquire_private_exclusive_file_lease(
-            &self.root.join(".credential-store.lock"),
-        )?;
+        let _lease = self.lease()?;
         sync_directory(&self.root)?;
         validate_name(name)?;
         if value.is_empty() || value.len() > MAX_VALUE {
@@ -311,7 +338,9 @@ impl VaultStorage for NativeVault {
         match kind {
             RecordKind::Retirement => publish_record(&directory, name, value.as_bytes()),
             RecordKind::Receipt => {
-                if let Some(existing) = self.read(kind, name)? {
+                if let Some(existing) =
+                    self.read_receipt_under_lease(&directory, &directory.join(name), name)?
+                {
                     if existing.as_str() != value {
                         return Err(failure("Android receipt is immutable"));
                     }
@@ -325,6 +354,7 @@ impl VaultStorage for NativeVault {
 
     fn remove(&self, kind: RecordKind, name: &str) -> AccountHomeResult<()> {
         validate_name(name)?;
+        let _lease = self.lease()?;
         let directory = self.directory(kind);
         let mut result = remove_record(&directory.join(name));
         let pending = remove_record(&directory.join(format!("{PENDING}{name}")));
@@ -337,6 +367,7 @@ impl VaultStorage for NativeVault {
     }
 
     fn names(&self, kind: RecordKind) -> AccountHomeResult<Vec<String>> {
+        let _lease = self.lease()?;
         let mut names = Vec::new();
         for entry in fs::read_dir(self.directory(kind))? {
             let entry = entry?;
@@ -348,15 +379,24 @@ impl VaultStorage for NativeVault {
                 return Err(failure("Android vault record is not a regular file"));
             }
             check_file(&entry.metadata()?)?;
-            if let Some(pending) = name.strip_prefix(PENDING) {
-                validate_name(pending)?;
-                continue;
-            }
+            let name = match name.strip_prefix(PENDING) {
+                Some(pending) if matches!(kind, RecordKind::Retirement) => {
+                    validate_name(pending)?;
+                    continue;
+                }
+                Some(pending) => pending,
+                None => name,
+            };
             validate_name(name)?;
             names.push(name.to_owned());
         }
         names.sort_unstable();
+        names.dedup();
         Ok(names)
+    }
+
+    fn sync(&self, kind: RecordKind) -> AccountHomeResult<()> {
+        sync_directory(&self.directory(kind))
     }
 }
 
@@ -762,19 +802,28 @@ fn read_file(
     limit: usize,
     validate: impl FnOnce(&fs::Metadata) -> AccountHomeResult<()>,
 ) -> AccountHomeResult<Option<Zeroizing<Vec<u8>>>> {
-    let file = match OpenOptions::new()
+    open_file(path)?
+        .map(|file| read_open_file(&file, limit, validate))
+        .transpose()
+}
+
+fn open_file(path: &Path) -> AccountHomeResult<Option<File>> {
+    match OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)
     {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(None);
-        }
-        Err(error) => {
-            return Err(error.into());
-        }
-    };
+        Ok(file) => Ok(Some(file)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn read_open_file(
+    file: &File,
+    limit: usize,
+    validate: impl FnOnce(&fs::Metadata) -> AccountHomeResult<()>,
+) -> AccountHomeResult<Zeroizing<Vec<u8>>> {
     let metadata = file.metadata()?;
     validate(&metadata)?;
     if metadata.len() > limit as u64 {
@@ -785,7 +834,7 @@ fn read_file(
     if bytes.len() > limit {
         return Err(failure("Android vault record exceeds size limit"));
     }
-    Ok(Some(bytes))
+    Ok(bytes)
 }
 
 fn publish_record(directory: &Path, name: &str, bytes: &[u8]) -> AccountHomeResult<()> {

@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Barrier, Mutex, Once};
+use std::sync::{Arc, Mutex, Once, mpsc};
+use std::time::Duration;
 
 use marmot_account::{
     AccountHome, AccountHomeError, AccountHomeResult, AccountSecretStore, AccountSetupKind,
@@ -196,12 +197,10 @@ fn managed_reads_are_concurrent() {
             drop(home);
             std::fs::remove_file(directory.path().join(".account-mutation.lock")).unwrap();
 
-            let entered = Arc::new(Barrier::new(2));
-            let release = Arc::new(Barrier::new(2));
+            let (checkpoint, pause) = VaultCheckpoint::new();
             let paused = Arc::new(PausedReadStore {
                 inner: store.clone(),
-                entered: entered.clone(),
-                release: release.clone(),
+                pause,
             });
             let first = AccountHome::open_with_secret_store(
                 directory.path(),
@@ -229,9 +228,13 @@ fn managed_reads_are_concurrent() {
             });
             let label = account.label.clone();
             let reading = std::thread::spawn(move || read_managed_material(&first, &label, kind));
-            entered.wait();
-            let concurrent = read_managed_material(&second, &account.label, kind);
-            release.wait();
+            checkpoint.wait_for_entry();
+            let label = account.label.clone();
+            let concurrent = checkpoint.before_release({
+                let second = second.clone();
+                move || read_managed_material(&second, &label, kind)
+            });
+            checkpoint.release();
             let initial = reading.join().unwrap();
 
             assert_eq!(concurrent.unwrap(), expected, "{file_backed:?} {kind:?}");
@@ -431,9 +434,9 @@ fn generated_setup_admission() {
             AccountHome::open_with_secret_store(dir.path(), store.clone(), IosOptions::default());
         let other =
             AccountHome::open_with_secret_store(dir.path(), store.clone(), IosOptions::default());
-        let (entered, release) = store.pause_once("write");
+        let checkpoint = store.pause_once("write");
         let create = std::thread::spawn(move || home.create_nostr_account_for_setup());
-        entered.wait();
+        checkpoint.wait_for_entry();
         let directories = std::fs::read_dir(dir.path().join("accounts"))
             .map(|entries| {
                 entries
@@ -445,9 +448,12 @@ fn generated_setup_admission() {
             .first()
             .and_then(|path| std::fs::read(path.join(".account-setup.json")).ok())
             .and_then(|bytes| serde_json::from_slice::<AccountSetupState>(&bytes).ok());
-        let visible = other.accounts();
-        let credentials = store.keys.lock().unwrap().len();
-        release.wait();
+        let (visible, credentials) = checkpoint.before_release({
+            let other = other.clone();
+            let store = store.clone();
+            move || (other.accounts(), store.keys.lock().unwrap().len())
+        });
+        checkpoint.release();
         let result = create.join().unwrap();
 
         assert_eq!(directories.len(), 1);
@@ -457,6 +463,16 @@ fn generated_setup_admission() {
             assert!(matches!(result, Err(AccountHomeError::SecretStore(error))
                 if error == "injected write failure"));
             assert!(other.accounts().unwrap().is_empty());
+            store.fail_lookup.store(true, Ordering::SeqCst);
+            let ownership_path = directories[0].join(".credential-ownership.json");
+            let ownership = std::fs::read(&ownership_path).unwrap();
+            *store.load_error.lock().unwrap() = Some(AccountHomeError::SecretStore(
+                "exact receipt temporarily unavailable".into(),
+            ));
+            assert!(matches!(other.resumable_generated_account_setup(),
+                Err(AccountHomeError::SecretStore(error)) if error == "exact receipt temporarily unavailable"));
+            assert_eq!(std::fs::read(ownership_path).unwrap(), ownership);
+            assert!(directories[0].join(".account-setup.json").is_file());
             other.resumable_generated_account_setup().unwrap().unwrap()
         } else {
             result.unwrap()
@@ -1146,6 +1162,46 @@ fn nonlocal_setup_admission() {
             assert!(matches!(admit(&home, &public_key),
                 Err(AccountHomeError::AccountExists(label)) if label == public_key));
         }
+    }
+}
+
+#[test]
+fn signing_rejects_nonlocal() {
+    for external in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let home = AccountHome::open(dir.path());
+        let keys = nostr::prelude::Keys::generate();
+        let label = keys.public_key().to_hex();
+        let secret = keys.secret_key().to_secret_hex();
+        let admit = if external {
+            AccountHome::add_external_signer_account
+        } else {
+            AccountHome::add_public_account
+        };
+        let previous = admit(&home, &label).unwrap();
+        let directory = home.account_dir(&label);
+        std::fs::remove_file(directory.join("account.json")).unwrap();
+        let ownership_path = directory.join(".credential-ownership.json");
+        let ownership = std::fs::read(&ownership_path).unwrap();
+        drop(home);
+
+        let reopened = AccountHome::open(dir.path());
+        for attempt in [
+            reopened.import_account(&label, &secret),
+            reopened.import_account_idempotent(&label, &secret),
+            reopened
+                .import_nostr_account_idempotent(&secret)
+                .map(|import| import.account().clone()),
+        ] {
+            assert!(
+                matches!(attempt, Err(AccountHomeError::AccountExists(account)) if account == label)
+            );
+        }
+        assert!(file_receipts(dir.path()).is_empty());
+        assert!(!directory.join("account.json").exists());
+        assert!(!directory.join(".account-setup.json").exists());
+        assert_eq!(std::fs::read(ownership_path).unwrap(), ownership);
+        assert_eq!(admit(&reopened, &label).unwrap(), previous);
     }
 }
 
@@ -1984,11 +2040,30 @@ fn wipe_without_nip46_vault() {
         let reopened =
             AccountHome::open_with_secret_store(dir.path(), store.clone(), IosOptions::default());
         store.fail_lookup.store(true, Ordering::SeqCst);
+        store.fail_namespace.store(signing == 0, Ordering::SeqCst);
         reopened.remove_account(&account.label).unwrap();
         assert!(reopened.accounts_strict().unwrap().is_empty());
         assert!(!reopened.account_dir(&account.label).exists());
         assert!(store.keys.lock().unwrap().is_empty());
     }
+}
+
+#[test]
+fn public_wipe_skips_empty_vault() {
+    let dir = tempfile::tempdir().unwrap();
+    let vault = dir.path().join("separate-vault");
+    let home = AccountHome::open_with_secret_store(
+        dir.path().join("home"),
+        Arc::new(LocalFileSecretStore::new(&vault, IosOptions::default())),
+        IosOptions::default(),
+    );
+    let label = nostr::prelude::Keys::generate().public_key().to_hex();
+    let account = home.add_public_account_for_setup(&label).unwrap();
+    assert!(!account.can_sign());
+    home.remove_account(&label).unwrap();
+    assert!(home.accounts_strict().unwrap().is_empty());
+    assert!(!home.account_dir(&label).exists());
+    assert!(!vault.exists());
 }
 
 fn write_legacy_external(home: &AccountHome, label: &str) {
@@ -3025,53 +3100,63 @@ fn wipe_holds_root_mutation() {
     let account = imported.account().clone();
     let other =
         AccountHome::open_with_secret_store(dir.path(), store.clone(), IosOptions::default());
-    let (entered, release) = store.pause_once("remove");
+    let checkpoint = store.pause_once("remove");
     let label = account.label.clone();
     let wipe = std::thread::spawn(move || home.remove_account(&label));
-    entered.wait();
-    let attempts = [
-        other.create_account("new").map(|_| ()),
-        other.create_nostr_account().map(|_| ()),
-        other.create_nostr_account_for_setup().map(|_| ()),
-        other.import_account("new", &secret).map(|_| ()),
-        other
-            .import_account_idempotent(&account.label, &secret)
-            .map(|_| ()),
-        other.import_nostr_account(&secret).map(|_| ()),
-        other.import_nostr_account_idempotent(&secret).map(|_| ()),
-        other
-            .import_nostr_account_for_onboarding(&secret)
-            .map(|_| ()),
-        other
-            .add_public_account(&account.account_id_hex)
-            .map(|_| ()),
-        other
-            .add_external_signer_account(&account.account_id_hex)
-            .map(|_| ()),
-        other
-            .add_public_account_for_setup(&account.account_id_hex)
-            .map(|_| ()),
-        other
-            .add_external_signer_for_setup(&account.account_id_hex)
-            .map(|_| ()),
-        other.revert_external_signer_upgrade(&account.label),
-        other.reset_incomplete_setup_preserving_credential(&account.label),
-        other.rollback_nostr_account_import(&imported),
-        other
-            .set_account_signed_out(&account.label, true)
-            .map(|_| ()),
-        other.mark_account_unlinked(&account.label).map(|_| ()),
-        other.remove_account(&account.label),
-        other.remove_nip46_session(&account.label, Nip46Removal::IncludingOrphaned),
-        other
-            .external_database_secret(&account.label, ExternalSecretMode::Create)
-            .map(|_| ()),
-        other.load_signing_keys(&account.label).map(|_| ()),
-    ];
-    let recovery = other.resume_wipe_cleanup();
-    let credentials_during = store.keys.lock().unwrap().len();
-    let absent_during = other.account(&account.label).is_err();
-    release.wait();
+    checkpoint.wait_for_entry();
+    let (attempts, recovery, credentials_during, absent_during) = checkpoint.before_release({
+        let other = other.clone();
+        let account = account.clone();
+        let secret = secret.clone();
+        let store = store.clone();
+        move || {
+            let attempts = [
+                other.create_account("new").map(|_| ()),
+                other.create_nostr_account().map(|_| ()),
+                other.create_nostr_account_for_setup().map(|_| ()),
+                other.import_account("new", &secret).map(|_| ()),
+                other
+                    .import_account_idempotent(&account.label, &secret)
+                    .map(|_| ()),
+                other.import_nostr_account(&secret).map(|_| ()),
+                other.import_nostr_account_idempotent(&secret).map(|_| ()),
+                other
+                    .import_nostr_account_for_onboarding(&secret)
+                    .map(|_| ()),
+                other
+                    .add_public_account(&account.account_id_hex)
+                    .map(|_| ()),
+                other
+                    .add_external_signer_account(&account.account_id_hex)
+                    .map(|_| ()),
+                other
+                    .add_public_account_for_setup(&account.account_id_hex)
+                    .map(|_| ()),
+                other
+                    .add_external_signer_for_setup(&account.account_id_hex)
+                    .map(|_| ()),
+                other.revert_external_signer_upgrade(&account.label),
+                other.reset_incomplete_setup_preserving_credential(&account.label),
+                other.rollback_nostr_account_import(&imported),
+                other
+                    .set_account_signed_out(&account.label, true)
+                    .map(|_| ()),
+                other.mark_account_unlinked(&account.label).map(|_| ()),
+                other.remove_account(&account.label),
+                other.remove_nip46_session(&account.label, Nip46Removal::IncludingOrphaned),
+                other
+                    .external_database_secret(&account.label, ExternalSecretMode::Create)
+                    .map(|_| ()),
+                other.load_signing_keys(&account.label).map(|_| ()),
+            ];
+            let recovery = other.resume_wipe_cleanup();
+            let credentials_during = store.keys.lock().unwrap().len();
+            let absent_during = matches!(other.account(&account.label),
+                Err(AccountHomeError::UnknownAccount(label)) if label == account.label);
+            (attempts, recovery, credentials_during, absent_during)
+        }
+    });
+    checkpoint.release();
     wipe.join().unwrap().unwrap();
     assert!(
         matches!(recovery, Err(AccountHomeError::Io(error)) if error.kind() == std::io::ErrorKind::WouldBlock)
@@ -3117,11 +3202,14 @@ fn import_holds_root_mutation() {
         AccountHome::open_with_secret_store(dir.path(), store.clone(), IosOptions::default());
     let keys = nostr::prelude::Keys::generate();
     let secret = keys.secret_key().to_secret_hex();
-    let (entered, release) = store.pause_once("write");
+    let checkpoint = store.pause_once("write");
     let import = std::thread::spawn(move || home.import_account("imported", &secret));
-    entered.wait();
-    let wipe = other.remove_account("imported");
-    release.wait();
+    checkpoint.wait_for_entry();
+    let wipe = checkpoint.before_release({
+        let other = other.clone();
+        move || other.remove_account("imported")
+    });
+    checkpoint.release();
     let account = import.join().unwrap().unwrap();
 
     assert!(
@@ -3153,6 +3241,9 @@ fn twin_wipes_hold_root_mutation() {
         serde_json::to_vec(&twin).unwrap(),
     )
     .unwrap();
+    for directory in [home.account_dir(&first.label), twin_dir] {
+        std::fs::write(directory.join("session.sqlite"), b"local account state").unwrap();
+    }
     let other =
         AccountHome::open_with_secret_store(dir.path(), store.clone(), IosOptions::default());
     assert_eq!(
@@ -3162,11 +3253,14 @@ fn twin_wipes_hold_root_mutation() {
             .to_hex(),
         first.account_id_hex
     );
-    let (entered, release) = store.pause_once("remove");
+    let checkpoint = store.pause_once("remove");
     let wipe = std::thread::spawn(move || home.remove_account("first"));
-    entered.wait();
-    let concurrent = other.remove_account("twin");
-    release.wait();
+    checkpoint.wait_for_entry();
+    let concurrent = checkpoint.before_release({
+        let other = other.clone();
+        move || other.remove_account("twin")
+    });
+    checkpoint.release();
     wipe.join().unwrap().unwrap();
 
     assert!(
@@ -3183,11 +3277,34 @@ fn twin_wipes_hold_root_mutation() {
     other.remove_account("twin").unwrap();
     assert!(other.accounts_strict().unwrap().is_empty());
     assert!(store.keys.lock().unwrap().is_empty());
-    assert_eq!(
-        std::fs::read_dir(dir.path().join(".wipe-tombstones"))
+    other.resume_wipe_cleanup().unwrap();
+    let mut twin_intent = None;
+    for entry in std::fs::read_dir(dir.path().join(".wipe-tombstones")).unwrap() {
+        let directory = entry.unwrap().path();
+        assert!(!directory.join("session.sqlite").try_exists().unwrap());
+        let intent: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(directory.join(".wipe-cleanup.json")).unwrap())
+                .unwrap();
+        if intent["account"]["label"] == twin.label {
+            twin_intent = Some(intent);
+        }
+    }
+    // The manifestless twin has unknown raw history, separate from its
+    // successfully released managed credential and removed local payload.
+    let intent = twin_intent.expect("unknown raw history must remain recoverable");
+    assert!(
+        intent["credentials"]
+            .as_array()
             .unwrap()
-            .count(),
-        0
+            .iter()
+            .all(serde_json::Value::is_null)
+    );
+    assert!(
+        intent["legacy"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|legacy| legacy["account"]["label"] == twin.label)
     );
 }
 
@@ -3442,6 +3559,53 @@ fn file_vault_keeps_other_root() {
             .secret_key()
             .to_secret_hex(),
         secret
+    );
+
+    // Old records can coexist with a raw credential even when migration
+    // selects the managed copy already available in the shared vault.
+    let legacy_dir = first.account_dir(&original.label);
+    fs_private::create_dir_all_private(&legacy_dir).unwrap();
+    fs_private::write_private(
+        &legacy_dir.join("account.json"),
+        &serde_json::to_vec(&original).unwrap(),
+    )
+    .unwrap();
+    let raw = vault.path().join("accounts/shared/secret.json");
+    fs_private::create_dir_all_private(raw.parent().unwrap()).unwrap();
+    let raw_bytes = serde_json::to_vec(&serde_json::json!({ "secret_key_hex": secret })).unwrap();
+    fs_private::write_private(&raw, &raw_bytes).unwrap();
+    assert_eq!(
+        first
+            .load_signing_keys(&original.label)
+            .unwrap()
+            .public_key()
+            .to_hex(),
+        original.account_id_hex
+    );
+    first.remove_account(&original.label).unwrap();
+    first.resume_wipe_cleanup().unwrap();
+    assert_eq!(std::fs::read(raw).unwrap(), raw_bytes);
+    let mut tombstones = std::fs::read_dir(first_dir.path().join(".wipe-tombstones")).unwrap();
+    let intent = tombstones
+        .next()
+        .unwrap()
+        .unwrap()
+        .path()
+        .join(".wipe-cleanup.json");
+    assert!(tombstones.next().is_none());
+    let intent: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(intent).unwrap()).unwrap();
+    assert_eq!(intent["legacy"][0]["account"]["label"], original.label);
+    assert!(intent["credentials"][0].is_null());
+    assert!(first.accounts_strict().unwrap().is_empty());
+    assert_eq!(file_receipts(vault.path()).len(), 1);
+    assert_eq!(
+        reopened
+            .load_signing_keys(&adopted.label)
+            .unwrap()
+            .public_key()
+            .to_hex(),
+        adopted.account_id_hex
     );
 }
 
@@ -3841,6 +4005,37 @@ fn wipe_retry_ignores_symlinks() {
 }
 
 #[test]
+fn copied_manifest_keeps_owner() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let account = home.import_account("alice", &"01".repeat(32)).unwrap();
+    let live_dir = home.account_dir(&account.label);
+    let copy_dir = home.account_dir("recovery-copy");
+    std::fs::create_dir(&copy_dir).unwrap();
+    std::fs::copy(
+        live_dir.join(".credential-ownership.json"),
+        copy_dir.join(".credential-ownership.json"),
+    )
+    .unwrap();
+    drop(home);
+
+    let reopened = AccountHome::open(dir.path());
+    reopened.resume_wipe_cleanup().unwrap();
+    assert_eq!(reopened.account(&account.label).unwrap(), account);
+    assert_eq!(
+        reopened
+            .load_signing_keys(&account.label)
+            .unwrap()
+            .public_key()
+            .to_hex(),
+        account.account_id_hex
+    );
+    assert!(copy_dir.join(".credential-ownership.json").is_file());
+    assert!(!copy_dir.join(".wipe-cleanup.json").exists());
+    assert!(!live_dir.join(".wipe-cleanup.json").exists());
+}
+
+#[test]
 fn wipe_unknown_keeps_ownership() {
     for intent_kind in ["legacy", "corrupt", "unreadable", "old-intent"] {
         let dir = tempfile::tempdir().unwrap();
@@ -3926,6 +4121,8 @@ fn wipe_unknown_keeps_ownership() {
 #[cfg(unix)]
 #[test]
 fn account_home_scrubs_tombstoned_local_secret_before_failed_recursive_delete() {
+    use std::io::Read;
+
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(MemorySecretStore::default());
     let home =
@@ -3940,6 +4137,9 @@ fn account_home_scrubs_tombstoned_local_secret_before_failed_recursive_delete() 
     )
     .unwrap();
     std::fs::write(account_dir.join("session.sqlite"), b"encrypted state").unwrap();
+    let mut signing_file = std::fs::File::open(&secret_path).unwrap();
+    let mut database_file =
+        std::fs::File::open(account_dir.join(".external-sqlcipher-secret")).unwrap();
 
     // Force tombstone deletion to fail after `remove_account` has renamed the
     // live account out of `accounts/`, letting the test inspect the tombstone.
@@ -3949,19 +4149,46 @@ fn account_home_scrubs_tombstoned_local_secret_before_failed_recursive_delete() 
     permissions.set_mode(0o000);
     std::fs::set_permissions(&stubborn_dir, permissions).unwrap();
 
-    home.remove_account(&account.label).unwrap();
+    let remove = || {
+        let denied = match std::fs::read_dir(&stubborn_dir) {
+            Ok(_) => false,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => true,
+            Err(error) => panic!("opening deletion failure fixture: {error}"),
+        };
+        #[cfg(target_os = "linux")]
+        assert!(denied, "the test must exercise a real filesystem failure");
+        home.remove_account(&account.label).unwrap();
+        denied
+    };
+    #[cfg(target_os = "linux")]
+    let denied = without_dac_override(remove);
+    #[cfg(not(target_os = "linux"))]
+    let denied = remove();
 
     let tombstone_root = dir.path().join(".wipe-tombstones");
     let tombstones: Vec<_> = std::fs::read_dir(&tombstone_root)
         .unwrap()
         .map(|entry| entry.unwrap().path())
         .collect();
-    assert_eq!(tombstones.len(), 1);
+    assert_eq!(tombstones.len(), usize::from(denied));
     assert!(!dir.path().join("accounts").join(&account.label).exists());
+    for (file, len) in [
+        (&mut signing_file, b"local signing key".len()),
+        (&mut database_file, b"database key".len()),
+    ] {
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, vec![0; len]);
+    }
+    assert!(store.keys.lock().unwrap().is_empty());
+    if !denied {
+        // Other Unix superusers may have traversed the directory despite its mode.
+        return;
+    }
+    assert!(tombstones[0].join("stubborn").is_dir());
     assert!(!tombstones[0].join("secret.json").exists());
     assert!(!tombstones[0].join(".external-sqlcipher-secret").exists());
     assert!(!tombstones[0].join("session.sqlite").exists());
-    assert!(store.keys.lock().unwrap().is_empty());
     drop(home);
 
     // A later filesystem retry must not repeat completed vault deletion.
@@ -3979,6 +4206,114 @@ fn account_home_scrubs_tombstoned_local_secret_before_failed_recursive_delete() 
     );
     recovered.resume_wipe_cleanup().unwrap();
     assert!(!tombstones[0].exists());
+}
+
+#[cfg(target_os = "linux")]
+fn without_dac_override<T: Send>(operation: impl FnOnce() -> T + Send) -> T {
+    #[repr(C)]
+    struct CapabilityHeader {
+        version: u32,
+        pid: libc::c_int,
+    }
+    #[derive(Clone, Copy, Default)]
+    #[repr(C)]
+    struct CapabilityData {
+        effective: u32,
+        permitted: u32,
+        inheritable: u32,
+    }
+
+    // Raw capability syscalls affect only this worker thread. The rest of the
+    // test process, including tempfile cleanup, keeps its original credentials.
+    std::thread::scope(|scope| {
+        scope
+            .spawn(move || {
+                const VERSION_3: u32 = 0x2008_0522;
+                const DAC_CAPS: u32 = (1 << 1) | (1 << 2); // DAC_OVERRIDE, DAC_READ_SEARCH
+                let mut header = CapabilityHeader {
+                    version: VERSION_3,
+                    pid: 0,
+                };
+                let mut data = [CapabilityData::default(); 2];
+                // These are the Linux v3 capability ABI structures. A zero pid
+                // selects the calling thread, and both buffers live through the call.
+                let get =
+                    unsafe { libc::syscall(libc::SYS_capget, &raw mut header, data.as_mut_ptr()) };
+                assert_eq!(get, 0, "capget: {}", std::io::Error::last_os_error());
+                if data[0].effective & DAC_CAPS != 0 {
+                    data[0].effective &= !DAC_CAPS;
+                    let set = unsafe {
+                        libc::syscall(libc::SYS_capset, &raw const header, data.as_ptr())
+                    };
+                    assert_eq!(set, 0, "capset: {}", std::io::Error::last_os_error());
+                }
+                operation()
+            })
+            .join()
+            .unwrap()
+    })
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn receipt_retry_requires_sync() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = LocalFileSecretStore::new(dir.path(), IosOptions::default());
+    let keys = nostr::prelude::Keys::parse(&"01".repeat(32)).unwrap();
+    let account_id = keys.public_key().to_hex();
+    let home = "11".repeat(32);
+    let owner = "22".repeat(32);
+    let credential = SecretCredential {
+        label: "retry",
+        account_id_hex: &account_id,
+        home_id: &home,
+        owner_id: &owner,
+        kind: SecretCredentialKind::Signing,
+    };
+    store
+        .acquire_secret(credential, SecretClaimMode::CreateOnly, Some(&keys))
+        .unwrap();
+    let receipt = file_receipts(dir.path()).pop().unwrap();
+    let before = std::fs::read(&receipt).unwrap();
+    let parent = receipt.parent().unwrap();
+    std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o100)).unwrap();
+    let retry = without_dac_override(|| {
+        let loaded = store.load_secret(credential).unwrap();
+        assert_eq!(loaded.secret_key(), keys.secret_key());
+        store.acquire_secret(credential, SecretClaimMode::CreateOnly, None)
+    });
+    std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(
+        matches!(retry, Err(AccountHomeError::Io(error)) if error.kind() == std::io::ErrorKind::PermissionDenied)
+    );
+    let retried = store
+        .acquire_secret(credential, SecretClaimMode::CreateOnly, None)
+        .unwrap();
+    assert_eq!(retried.origin, SecretOrigin::Created);
+    assert_eq!(retried.keys.secret_key(), keys.secret_key());
+    assert_eq!(std::fs::read(receipt).unwrap(), before);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn wipe_waits_for_rename_sync() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let accounts = dir.path().join("accounts");
+    let tombstone = dir.path().join(".wipe-tombstones/interrupted.0.0");
+    let secret = tombstone.join("secret.json");
+    fs_private::create_dir_all_private(&accounts).unwrap();
+    fs_private::create_dir_all_private(&tombstone).unwrap();
+    fs_private::write_private(&secret, b"tombstoned secret").unwrap();
+    std::fs::set_permissions(&accounts, std::fs::Permissions::from_mode(0o100)).unwrap();
+
+    without_dac_override(|| home.resume_wipe_cleanup()).unwrap();
+    std::fs::set_permissions(&accounts, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(std::fs::read(&secret).unwrap(), b"tombstoned secret");
+
+    home.resume_wipe_cleanup().unwrap();
+    assert!(!secret.exists());
+    assert!(!tombstone.exists());
 }
 
 #[test]
@@ -4203,10 +4538,75 @@ impl AccountSecretStore for FaultAcquireStore {
     }
 }
 
+const CHECKPOINT_TIMEOUT: Duration = Duration::from_secs(10);
+
+struct VaultCheckpoint {
+    entered: mpsc::Receiver<()>,
+    release: mpsc::Sender<()>,
+}
+
+struct VaultPause {
+    entered: mpsc::Sender<()>,
+    release: Mutex<mpsc::Receiver<()>>,
+}
+
+impl VaultCheckpoint {
+    fn new() -> (Self, VaultPause) {
+        let (signal_entry, entered) = mpsc::channel();
+        let (release, await_release) = mpsc::channel();
+        (
+            Self { entered, release },
+            VaultPause {
+                entered: signal_entry,
+                release: Mutex::new(await_release),
+            },
+        )
+    }
+
+    fn wait_for_entry(&self) {
+        self.entered
+            .recv_timeout(CHECKPOINT_TIMEOUT)
+            .expect("worker did not reach the vault checkpoint");
+    }
+
+    fn before_release<T: Send + 'static>(
+        &self,
+        operation: impl FnOnce() -> T + Send + 'static,
+    ) -> T {
+        let (finished, result) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = finished.send(operation());
+        });
+        result
+            .recv_timeout(CHECKPOINT_TIMEOUT)
+            .expect("competing operation did not finish while the vault was paused")
+    }
+
+    fn release(self) {
+        self.release.send(()).expect("paused worker exited");
+    }
+}
+
+impl VaultPause {
+    fn wait(&self) {
+        if self.entered.send(()).is_ok() {
+            // Dropping the checkpoint on failure disconnects the waiting worker.
+            match self
+                .release
+                .lock()
+                .unwrap()
+                .recv_timeout(CHECKPOINT_TIMEOUT)
+            {
+                Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => {}
+                Err(mpsc::RecvTimeoutError::Timeout) => panic!("vault checkpoint was not released"),
+            }
+        }
+    }
+}
+
 struct PausedReadStore {
     inner: Arc<dyn AccountSecretStore>,
-    entered: Arc<Barrier>,
-    release: Arc<Barrier>,
+    pause: VaultPause,
 }
 
 impl AccountSecretStore for PausedReadStore {
@@ -4235,8 +4635,7 @@ impl AccountSecretStore for PausedReadStore {
         &self,
         credential: SecretCredential<'_>,
     ) -> AccountHomeResult<nostr::prelude::Keys> {
-        self.entered.wait();
-        self.release.wait();
+        self.pause.wait();
         self.inner.load_secret(credential)
     }
 
@@ -4287,8 +4686,7 @@ struct MemoryOwner {
 
 struct StorePause {
     operation: &'static str,
-    entered: Arc<Barrier>,
-    release: Arc<Barrier>,
+    pause: VaultPause,
 }
 
 impl Default for MemorySecretStore {
@@ -4350,15 +4748,10 @@ impl MemorySecretStore {
         Ok(())
     }
 
-    fn pause_once(&self, operation: &'static str) -> (Arc<Barrier>, Arc<Barrier>) {
-        let entered = Arc::new(Barrier::new(2));
-        let release = Arc::new(Barrier::new(2));
-        *self.pause.lock().unwrap() = Some(StorePause {
-            operation,
-            entered: entered.clone(),
-            release: release.clone(),
-        });
-        (entered, release)
+    fn pause_once(&self, operation: &'static str) -> VaultCheckpoint {
+        let (checkpoint, pause) = VaultCheckpoint::new();
+        *self.pause.lock().unwrap() = Some(StorePause { operation, pause });
+        checkpoint
     }
 
     fn pause_operation(&self, operation: &str) {
@@ -4374,8 +4767,7 @@ impl MemorySecretStore {
             }
         };
         if let Some(pause) = pause {
-            pause.entered.wait();
-            pause.release.wait();
+            pause.pause.wait();
         }
     }
 

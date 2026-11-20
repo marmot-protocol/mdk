@@ -818,10 +818,6 @@ impl AccountHome {
                     credential: credential.clone(),
                     mode,
                 });
-                if credential.claim_mode == SecretClaimMode::MigrateLegacy {
-                    // This receipt already retains its original raw lookup scope.
-                    continue;
-                }
             }
             if !manifest.legacy {
                 continue;
@@ -845,7 +841,16 @@ impl AccountHome {
         Ok(cleanup)
     }
 
-    fn abort_prepared_account(&self, manifest: &CredentialManifest) -> AccountHomeResult<()> {
+    fn abort_prepared_account(
+        &self,
+        label: &str,
+        directory: &Path,
+        manifest: &CredentialManifest,
+    ) -> AccountHomeResult<()> {
+        validate_account_label(label)?;
+        if manifest.account.label != label {
+            return Err(AccountHomeError::AccountIdMismatch);
+        }
         let signing = match &manifest.credentials[credential_index(SecretCredentialKind::Signing)] {
             Some(credential) if credential.claim_mode != SecretClaimMode::CreateOnly => {
                 SigningKeyRemoval::Preserve
@@ -854,9 +859,8 @@ impl AccountHome {
         };
         let account = &manifest.account;
         let cleanup = self.build_wipe_cleanup(account, manifest, signing)?;
-        let directory = self.account_dir(&account.label);
         write_private_json(directory.join(WIPE_CLEANUP_FILE), &cleanup)?;
-        if let Some(tombstone) = self.move_account_dir_to_tombstone(&account.label, &directory)? {
+        if let Some(tombstone) = self.move_account_dir_to_tombstone(label, directory)? {
             self.finish_wipe_cleanup(&tombstone, Some(cleanup));
         }
         Ok(())
@@ -878,16 +882,14 @@ impl AccountHome {
                 let Some(label) = entry.file_name().to_str().map(str::to_owned) else {
                     return Ok(());
                 };
-                if self.account_record_path(&label).try_exists()?
-                    || self
-                        .account_dir(&label)
-                        .join(ACCOUNT_SETUP_STATE_FILE)
-                        .try_exists()?
+                let directory = entry.path();
+                if directory.join(ACCOUNT_RECORD_FILE).try_exists()?
+                    || directory.join(ACCOUNT_SETUP_STATE_FILE).try_exists()?
                 {
                     return Ok(());
                 }
                 if let Some(manifest) = self.credential_manifest(&label)? {
-                    self.abort_prepared_account(&manifest)?;
+                    self.abort_prepared_account(&label, &directory, &manifest)?;
                 }
                 Ok(())
             })();
@@ -1063,6 +1065,9 @@ impl AccountHome {
         let mut entries = fs::read_dir(&dir)?.collect::<Result<Vec<_>, _>>()?;
         entries.sort_by_key(|entry| entry.file_name());
         for entry in entries {
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
             let Some(label) = entry.file_name().to_str().map(str::to_owned) else {
                 continue;
             };
@@ -1083,33 +1088,45 @@ impl AccountHome {
             if account.label != account.account_id_hex {
                 return Err(AccountHomeError::AccountIdMismatch);
             }
-            let recorded = self.account_record_path(&label).try_exists()?;
-            if recorded {
+            let signing = SecretCredentialKind::Signing;
+            if self.account_record_path(&label).try_exists()? {
                 let recorded = self.account(&label)?;
                 if recorded.signed_out || recorded.unlinked {
                     continue;
                 }
-            } else {
-                let has_secret = self.secret_store.has_secret_for_label(&label)?
-                    || self
-                        .secret_store
-                        .has_secret_for_account_id(&account.account_id_hex)?;
-                if !has_secret {
-                    if let Some(manifest) = self.credential_manifest(&label)? {
-                        self.abort_prepared_account(&manifest)?;
-                    } else {
-                        fs::remove_dir_all(self.account_dir(&label))?;
-                    }
-                    continue;
+                if recorded != account {
+                    return Err(AccountHomeError::AccountIdMismatch);
                 }
+                self.load_credential(&account, signing)?;
+                return Ok(Some(account));
             }
-            let keys = self.load_credential(&account, SecretCredentialKind::Signing)?;
-            if keys.public_key().to_hex() != account.account_id_hex {
-                return Err(AccountHomeError::AccountIdMismatch);
+            let manifest = self.pending_signing_admission(&label, &account.account_id_hex)?;
+            if let Some(manifest) = &manifest
+                && let Some(claim) = &manifest.credentials[credential_index(signing)]
+            {
+                match self.load_credential(&account, signing) {
+                    Ok(_) => {}
+                    Err(AccountHomeError::SecretNotFound(_)) if claim.origin.is_none() => {
+                        self.abort_prepared_account(&label, &entry.path(), manifest)?;
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                }
+            } else if self.secret_store.has_secret_for_label(&label)?
+                || self
+                    .secret_store
+                    .has_secret_for_account_id(&account.account_id_hex)?
+            {
+                self.load_credential(&account, signing)?;
+            } else {
+                if let Some(manifest) = &manifest {
+                    self.abort_prepared_account(&label, &entry.path(), manifest)?;
+                } else {
+                    fs::remove_dir_all(entry.path())?;
+                }
+                continue;
             }
-            if !recorded {
-                self.write_account_record(&account)?;
-            }
+            self.write_account_record(&account)?;
             return Ok(Some(account));
         }
         Ok(None)
@@ -1155,6 +1172,7 @@ impl AccountHome {
         {
             return self.reuse_or_repair_signing_account(account, &keys);
         }
+        let _ = self.pending_signing_admission(label, &account_id_hex)?;
         let account = AccountSummary {
             label: label.to_owned(),
             account_id_hex,
@@ -1249,6 +1267,7 @@ impl AccountHome {
             signed_out: false,
             unlinked: false,
         };
+        let _ = self.pending_signing_admission(&account.label, &account.account_id_hex)?;
         if let Some(mut setup) = self.raw_account_setup_state(&account.label)? {
             if setup.account_id_hex != account.account_id_hex || setup.kind != kind {
                 return Err(AccountHomeError::AccountExists(account.label));
@@ -2329,10 +2348,18 @@ impl AccountHome {
     }
 
     fn finish_wipe_cleanup(&self, tombstone: &Path, mut cleanup: Option<WipeCleanup>) {
-        let durable = crate::io::sync_directory(&self.root)
-            .and_then(|()| crate::io::sync_directory(&self.accounts_dir()))
+        if crate::io::sync_directory(&self.root)
+            .and_then(|()| match crate::io::sync_directory(&self.accounts_dir()) {
+                // The root sync covers the absence of the former parent.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                result => result,
+            })
             .and_then(|()| crate::io::sync_directory(&self.root.join(WIPE_TOMBSTONE_DIR)))
-            .is_ok();
+            .is_err()
+        {
+            tracing::warn!(target: TRACE_TARGET, method = "finish_wipe_cleanup", "wipe rename durability is uncertain; cleanup remains pending");
+            return;
+        }
         let mut progress_saved = true;
         if let Some(cleanup) = &mut cleanup {
             for index in 0..cleanup.credentials.len() {
@@ -2340,11 +2367,10 @@ impl AccountHome {
                 else {
                     continue;
                 };
-                if !durable
-                    || cleanup
-                        .account
-                        .as_ref()
-                        .is_none_or(|account| self.check_credential(account, credential).is_err())
+                if cleanup
+                    .account
+                    .as_ref()
+                    .is_none_or(|account| self.check_credential(account, credential).is_err())
                 {
                     continue;
                 }
@@ -2561,10 +2587,7 @@ impl AccountHome {
             return Err(AccountHomeError::AccountExists(label.to_owned()));
         }
         let account_id_hex = keys.public_key().to_hex();
-        if let Some(manifest) = self.credential_manifest(label)? {
-            if manifest.account.account_id_hex != account_id_hex {
-                return Err(AccountHomeError::AccountExists(label.to_owned()));
-            }
+        if let Some(manifest) = self.pending_signing_admission(label, &account_id_hex)? {
             let account = manifest.account;
             self.acquire_credential(
                 &account,
@@ -2593,6 +2616,23 @@ impl AccountHome {
             unlinked: false,
         };
         self.write_new_signing_account(&account, keys)
+    }
+
+    fn pending_signing_admission(
+        &self,
+        label: &str,
+        account_id_hex: &str,
+    ) -> AccountHomeResult<Option<CredentialManifest>> {
+        let manifest = self.credential_manifest(label)?;
+        if manifest.as_ref().is_some_and(|manifest| {
+            manifest.account.account_id_hex != account_id_hex
+                || manifest.account.label != label
+                || !manifest.account.local_signing
+                || manifest.account.external_signing
+        }) {
+            return Err(AccountHomeError::AccountExists(label.to_owned()));
+        }
+        Ok(manifest)
     }
 
     fn reuse_or_repair_signing_account(

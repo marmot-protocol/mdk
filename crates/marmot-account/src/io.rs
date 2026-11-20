@@ -81,7 +81,7 @@ fn read_private_file_bounded(
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW);
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
     let file = options.open(path)?;
     after_open();
@@ -160,10 +160,16 @@ fn read_linked_secret(path: &Path, mut after_open: impl FnMut()) -> io::Result<Z
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
-            options.custom_flags(libc::O_NOFOLLOW);
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
         }
         let mut file = options.open(path)?;
         after_open();
+        if !file.metadata()?.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "credential record must be a regular file",
+            ));
+        }
         let mut bytes = Zeroizing::new(Vec::new());
         (&mut file)
             .take(MAX_SECRET_FILE_BYTES + 1)
@@ -255,9 +261,8 @@ pub(crate) fn write_secret_json<T: Serialize>(
     write_file_atomically(path.as_ref(), bytes.as_slice(), FileMode::Secret)
 }
 
-/// Every mode publishes by renaming a synced owner-only temp file over the
-/// target, so on Unix a reader sees the complete previous file or the complete
-/// new one.
+/// Private records publish by replacing the live name with a synced owner-only
+/// temp file. Secret replacement also detaches the previous file for scrubbing.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FileMode {
     /// Owner-only. The replaced inode is left intact for readers that still
@@ -300,8 +305,16 @@ fn write_file_atomically(path: &Path, bytes: &[u8], mode: FileMode) -> AccountHo
         } else {
             None
         };
-        replace_file(&temp_path, path)?;
-        // The handle still refers to the replaced inode after the atomic rename,
+        match mode {
+            #[cfg(windows)]
+            FileMode::Private => {
+                use windows_sys::Win32::Storage::FileSystem::MOVEFILE_REPLACE_EXISTING;
+
+                windows_move_for_commit(&temp_path, path, MOVEFILE_REPLACE_EXISTING)?;
+            }
+            _ => replace_file(&temp_path, path)?,
+        }
+        // The handle still refers to the replaced file after publication,
         // so scrub it without creating a window where the live secret path is
         // zeroed if replacement fails. Best-effort, matching secret deletion.
         if let Some(file) = &mut replaced_secret_file {
@@ -430,8 +443,8 @@ fn create_temp_file(parent: &Path, path: &Path) -> AccountHomeResult<(File, Path
     .into())
 }
 
-/// Windows: the caller may still hold the old file open (the secret scrub
-/// handle). Deleting it and renaming onto its name then only works with
+/// Replace a Windows secret file while retaining its open scrub handle.
+/// Deleting it and renaming onto its name only works with
 /// POSIX delete semantics (NTFS on Windows 10 1903 and later); elsewhere the
 /// name stays delete-pending and the rename is denied. Moving the old file
 /// aside keeps open handles attached to the old file. A failed install attempts
@@ -472,11 +485,16 @@ fn replace_file(temp_path: &Path, path: &Path) -> io::Result<()> {
 
 #[cfg(windows)]
 pub(crate) fn rename_for_commit(from: &Path, to: &Path) -> io::Result<()> {
+    windows_move_for_commit(from, to, 0)
+}
+
+#[cfg(windows)]
+fn windows_move_for_commit(from: &Path, to: &Path, flags: u32) -> io::Result<()> {
     use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_WRITE_THROUGH, MoveFileExW};
 
     let from = windows_move_path(from)?;
     let to = windows_move_path(to)?;
-    if unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), MOVEFILE_WRITE_THROUGH) } == 0 {
+    if unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), flags | MOVEFILE_WRITE_THROUGH) } == 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(())
@@ -540,6 +558,58 @@ pub(crate) fn validate_account_label(label: &str) -> AccountHomeResult<()> {
 mod tests {
     use super::*;
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    #[test]
+    fn fifo_reads_do_not_block() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::process::Command;
+        use std::time::{Duration, Instant};
+
+        const FIFO_PROBE: &str = "MDK_ACCOUNT_FIFO_PROBE";
+        if let Some(path) = std::env::var_os(FIFO_PROBE) {
+            let path = Path::new(&path);
+            for result in [
+                read_private_json_bounded::<serde_json::Value>(path, 128).map(|_| ()),
+                read_secret_text(path).map(|_| ()),
+            ] {
+                assert!(matches!(result,
+                    Err(AccountHomeError::Io(error)) if error.kind() == io::ErrorKind::InvalidInput));
+            }
+            return;
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let fifo = root.path().join("record");
+        let name = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // No writer opens this FIFO. A blocking reader must be killed rather
+        // than leaving the entire test suite waiting for one.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "io::tests::fifo_reads_do_not_block",
+                "--nocapture",
+            ])
+            .env(FIFO_PROBE, &fifo)
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let observed = child.try_wait();
+            if let Ok(Some(status)) = &observed {
+                assert!(status.success(), "FIFO reader child failed: {status}");
+                return;
+            }
+            if observed.is_err() || Instant::now() >= deadline {
+                let killed = child.kill();
+                let reaped = child.wait();
+                panic!(
+                    "FIFO reader did not finish: {observed:?}; kill: {killed:?}; wait: {reaped:?}"
+                );
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
 
     #[test]
     fn secret_write_creates_account_directory_owner_only() {

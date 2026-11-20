@@ -82,6 +82,19 @@ Android Keystore keys on API 23 or later. SharedPreferences is read only for leg
 Windows managed copies use local-machine persistence and bind to the user SID and MachineGuid, not the computer
 name; they do not roam. macOS binds to the selected keychain domain and path, not the replaceable file inode.
 The development file store keeps plaintext receipts under `.owned-secrets-v1` with private permissions.
+It pins the directory on first use and rejects operations if the canonical path later names another directory.
+
+On Linux and BSD, select the intended Secret Service collection as the default before first use or legacy migration.
+MDK binds managed receipts to a nonsecret identity item in that collection. This identity survives keyring updates
+and service restarts. First use needs permission to create the item and take a temporary name on the session bus.
+Reopening a collection with an existing identity does not need those permissions.
+
+If you change the default collection, restore the original as the default and reopen the account home. Keep the
+identity item with its collection when restoring a backup. MDK does not recreate a missing identity over existing
+managed records. If a collection or item is locked, unlock it in the OS keyring and retry. Unattended cleanup does
+not prompt for an unlock. Legacy lookup still searches all collections, so a managed identity cannot prove that
+a raw legacy item is absent.
+
 Managed namespaces identify protected storage separately from raw legacy lookup options. On iOS, the OS resolves
 the default managed access group. Sharing across applications requires `IosOptions.keychain_access_group` set to
 an authorized common group, or a shared host store. Group selection does not narrow the captured provider's
@@ -102,7 +115,9 @@ A successful local wipe means the account is absent, not that every vault or sto
 > On iOS and Android, ownership binds to the OS container identity and the root's relative path, so an app-container
 > relocation preserves existing credentials. Roots must be inside an authorized app or app-group container.
 > Elsewhere, ownership binds to the canonical root path. A copy or move to a different logical root is rejected.
-> Create a fresh home and reimport its signing identity instead; an open object never follows a changed target.
+> Once credential access establishes an `AccountHome`'s root identity, credential operations and guarded mutations
+> reject a path that resolves to a different root. Catalog reads such as `account()` do not check that identity.
+> To change logical roots, create a fresh home and reimport the signing identity.
 > Copied databases retain their original device-local key; a fresh home does not rebind them.
 
 ## What it does not do

@@ -16,6 +16,10 @@ pub(crate) enum RecordKind {
 pub(crate) trait VaultStorage: Send + Sync {
     fn read(&self, kind: RecordKind, name: &str) -> AccountHomeResult<Option<Zeroizing<String>>>;
     fn write(&self, kind: RecordKind, name: &str, value: &str) -> AccountHomeResult<()>;
+    // Providers that publish durably in a single operation need no extra sync.
+    fn sync(&self, _kind: RecordKind) -> AccountHomeResult<()> {
+        Ok(())
+    }
     fn remove(&self, kind: RecordKind, name: &str) -> AccountHomeResult<()>;
     fn names(&self, kind: RecordKind) -> AccountHomeResult<Vec<String>>;
 }
@@ -39,6 +43,13 @@ pub(crate) struct LegacySecret {
 enum Lifecycle {
     Preserved,
     Retired,
+    Adopted,
+}
+
+impl Lifecycle {
+    fn has_preserve_hold(self) -> bool {
+        matches!(self, Self::Preserved)
+    }
 }
 
 #[derive(Deserialize, Serialize)]
@@ -185,11 +196,34 @@ fn validate_material(
 fn finish_adoption(storage: &impl VaultStorage, source: &str) -> AccountHomeResult<()> {
     let mut retirement = read_retirement(storage, source)?
         .ok_or_else(|| invalid_state("preserved credential source lost its lifecycle record"))?;
-    if matches!(retirement.state, Lifecycle::Preserved) {
-        retirement.state = Lifecycle::Retired;
+    if retirement.state.has_preserve_hold() {
+        retirement.state = Lifecycle::Adopted;
         write_retirement(storage, source, &retirement)?;
+    } else {
+        storage.sync(RecordKind::Retirement)?;
     }
     storage.remove(RecordKind::Receipt, source)
+}
+
+fn slot_receipts(storage: &impl VaultStorage, slot: &str) -> AccountHomeResult<Vec<String>> {
+    let mut names = storage.names(RecordKind::Receipt)?;
+    names.retain(|name| name.starts_with(slot) && name.as_bytes().get(slot.len()) == Some(&b'-'));
+    Ok(names)
+}
+
+fn check_receipt_listing(
+    storage: &impl VaultStorage,
+    slot: &str,
+    listed: &[String],
+) -> AccountHomeResult<()> {
+    let mut current = slot_receipts(storage, slot)?;
+    current.sort_unstable();
+    if current.as_slice() != listed {
+        return Err(invalid_state(
+            "credential receipt listing changed; retry acquisition",
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn acquire(
@@ -208,6 +242,7 @@ pub(crate) fn acquire(
     }
     if let Some(receipt) = read_receipt(storage, &name)? {
         let keys = receipt_keys(credential, &receipt, proposed)?;
+        storage.sync(RecordKind::Receipt)?;
         if let Some(source) = &receipt.adopted_from {
             finish_adoption(storage, source)?;
         }
@@ -218,25 +253,25 @@ pub(crate) fn acquire(
     }
 
     let slot = slot_name(credential, addressing);
-    let mut names = storage.names(RecordKind::Receipt)?;
+    let mut names = slot_receipts(storage, &slot)?;
     names.sort_unstable();
     let mut selected = None;
-    for candidate in names {
-        if !candidate.starts_with(&slot) || candidate.as_bytes().get(slot.len()) != Some(&b'-') {
-            continue;
-        }
-        let state = read_retirement(storage, &candidate)?;
+    let mut skipped = false;
+    for candidate in &names {
+        let state = read_retirement(storage, candidate)?;
         if state
             .as_ref()
-            .is_some_and(|state| matches!(state.state, Lifecycle::Retired))
+            .is_some_and(|state| !state.state.has_preserve_hold())
         {
+            skipped = true;
             continue;
         }
         let preserved = state.is_some();
         if selected.is_some() && !preserved {
             continue;
         }
-        let Some(receipt) = read_receipt(storage, &candidate)? else {
+        let Some(receipt) = read_receipt(storage, candidate)? else {
+            skipped = true;
             continue;
         };
         if mode == SecretClaimMode::CreateOnly {
@@ -247,6 +282,10 @@ pub(crate) fn acquire(
         if preserved {
             break;
         }
+    }
+    if selected.is_none() && skipped {
+        // Adoption publishes its replacement before retiring the listed source.
+        check_receipt_listing(storage, &slot, &names)?;
     }
 
     let (keys, origin, legacy, adopted_from) = if let Some((keys, legacy, source)) = selected {
@@ -286,7 +325,7 @@ pub(crate) fn acquire(
         secret_key_hex: StoredSecretKeyHex::new(keys.secret_key().to_secret_hex()),
         origin,
         legacy,
-        adopted_from,
+        adopted_from: adopted_from.cloned(),
     };
     let value = Zeroizing::new(serde_json::to_string(&receipt)?);
     storage.write(RecordKind::Receipt, &name, value.as_str())?;
@@ -355,7 +394,8 @@ pub(crate) fn release<N: AsRef<str>>(
 ) -> AccountHomeResult<SecretReleaseOutcome> {
     let name = receipt_name(credential, addressing)?;
     if let Some(retirement) = read_retirement(storage, &name)? {
-        if matches!(retirement.state, Lifecycle::Preserved) {
+        storage.sync(RecordKind::Retirement)?;
+        if retirement.state.has_preserve_hold() {
             if mode != SecretReleaseMode::Preserve {
                 return Err(invalid_state(
                     "preserved credential release mode cannot change",
@@ -364,14 +404,19 @@ pub(crate) fn release<N: AsRef<str>>(
             return Ok(SecretReleaseOutcome::Released);
         }
         storage.remove(RecordKind::Receipt, &name)?;
+        if matches!(retirement.state, Lifecycle::Adopted) && mode == SecretReleaseMode::Preserve {
+            return Ok(SecretReleaseOutcome::Released);
+        }
         return legacy_outcome(retirement.legacy.as_ref(), current_scope, legacy_lookup);
     }
     let receipt = read_receipt(storage, &name)?;
-    if let Some(source) = receipt
-        .as_ref()
-        .and_then(|receipt| receipt.adopted_from.as_deref())
-    {
-        finish_adoption(storage, source)?;
+    if let Some(receipt) = &receipt {
+        if mode == SecretReleaseMode::Preserve || receipt.adopted_from.is_some() {
+            storage.sync(RecordKind::Receipt)?;
+        }
+        if let Some(source) = &receipt.adopted_from {
+            finish_adoption(storage, source)?;
+        }
     }
     if mode == SecretReleaseMode::Preserve && receipt.is_some() {
         let retirement = Retirement {
@@ -406,18 +451,18 @@ pub(crate) fn has_managed(
     addressing: Addressing,
 ) -> AccountHomeResult<bool> {
     let slot = slot_name(credential, addressing);
-    for name in storage.names(RecordKind::Receipt)? {
-        if !name.starts_with(&slot) || name.as_bytes().get(slot.len()) != Some(&b'-') {
+    let mut names = slot_receipts(storage, &slot)?;
+    for name in &names {
+        if read_retirement(storage, name)?.is_some_and(|state| !state.state.has_preserve_hold()) {
             continue;
         }
-        if read_retirement(storage, &name)?
-            .is_some_and(|state| matches!(state.state, Lifecycle::Retired))
-        {
-            continue;
-        }
-        if storage.read(RecordKind::Receipt, &name)?.is_some() {
+        if storage.read(RecordKind::Receipt, name)?.is_some() {
             return Ok(true);
         }
+    }
+    if !names.is_empty() {
+        names.sort_unstable();
+        check_receipt_listing(storage, &slot, &names)?;
     }
     Ok(false)
 }
@@ -427,8 +472,9 @@ pub(crate) fn reconcile(storage: &impl VaultStorage) -> AccountHomeResult<()> {
     for name in storage.names(RecordKind::Retirement)? {
         let result = (|| {
             if read_retirement(storage, &name)?
-                .is_some_and(|record| matches!(record.state, Lifecycle::Retired))
+                .is_some_and(|record| !record.state.has_preserve_hold())
             {
+                storage.sync(RecordKind::Retirement)?;
                 storage.remove(RecordKind::Receipt, &name)?;
             }
             Ok(())
@@ -446,25 +492,64 @@ pub(crate) fn reconcile(storage: &impl VaultStorage) -> AccountHomeResult<()> {
 mod tests {
     use super::*;
     use crate::{AccountSecretStore, LocalFileSecretStore};
-    use std::sync::{Arc, Barrier};
+    use std::sync::{Mutex, mpsc};
+    use std::time::Duration;
 
-    struct PausedReceiptRead {
-        storage: LocalFileSecretStore,
-        entered: Arc<Barrier>,
-        resume: Arc<Barrier>,
+    const CHECKPOINT_TIMEOUT: Duration = Duration::from_secs(10);
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum PauseAfter {
+        Read,
+        Listing,
     }
 
-    impl VaultStorage for PausedReceiptRead {
+    struct PausedReceiptStorage {
+        storage: LocalFileSecretStore,
+        pause_after: PauseAfter,
+        entered: mpsc::Sender<()>,
+        resume: Mutex<Option<mpsc::Receiver<()>>>,
+    }
+
+    impl PausedReceiptStorage {
+        fn new(
+            storage: LocalFileSecretStore,
+            pause_after: PauseAfter,
+        ) -> (Self, mpsc::Receiver<()>, mpsc::Sender<()>) {
+            let (entered, wait_for_entry) = mpsc::channel();
+            let (release, resume) = mpsc::channel();
+            (
+                Self {
+                    storage,
+                    pause_after,
+                    entered,
+                    resume: Mutex::new(Some(resume)),
+                },
+                wait_for_entry,
+                release,
+            )
+        }
+
+        fn pause(&self, kind: RecordKind, point: PauseAfter) {
+            if matches!(kind, RecordKind::Receipt)
+                && self.pause_after == point
+                && let Some(resume) = self.resume.lock().unwrap().take()
+                && self.entered.send(()).is_ok()
+                && let Err(mpsc::RecvTimeoutError::Timeout) =
+                    resume.recv_timeout(CHECKPOINT_TIMEOUT)
+            {
+                panic!("receipt checkpoint was not released");
+            }
+        }
+    }
+
+    impl VaultStorage for PausedReceiptStorage {
         fn read(
             &self,
             kind: RecordKind,
             name: &str,
         ) -> AccountHomeResult<Option<Zeroizing<String>>> {
             let value = self.storage.read(kind, name)?;
-            if matches!(kind, RecordKind::Receipt) {
-                self.entered.wait();
-                self.resume.wait();
-            }
+            self.pause(kind, PauseAfter::Read);
             Ok(value)
         }
 
@@ -472,12 +557,18 @@ mod tests {
             self.storage.write(kind, name, value)
         }
 
+        fn sync(&self, kind: RecordKind) -> AccountHomeResult<()> {
+            self.storage.sync(kind)
+        }
+
         fn remove(&self, kind: RecordKind, name: &str) -> AccountHomeResult<()> {
             self.storage.remove(kind, name)
         }
 
         fn names(&self, kind: RecordKind) -> AccountHomeResult<Vec<String>> {
-            self.storage.names(kind)
+            let names = self.storage.names(kind)?;
+            self.pause(kind, PauseAfter::Listing);
+            Ok(names)
         }
     }
 
@@ -499,18 +590,15 @@ mod tests {
         storage
             .acquire_secret(credential, SecretClaimMode::CreateOnly, Some(&keys))
             .unwrap();
-        let entered = Arc::new(Barrier::new(2));
-        let resume = Arc::new(Barrier::new(2));
-        let reader = PausedReceiptRead {
-            storage: LocalFileSecretStore::new(directory.path(), crate::IosOptions::default()),
-            entered: entered.clone(),
-            resume: resume.clone(),
-        };
         std::thread::scope(|scope| {
-            let reading = scope.spawn(|| load(&reader, credential, Addressing::Label));
-            entered.wait();
+            let (reader, entered, resume) =
+                PausedReceiptStorage::new(storage.clone(), PauseAfter::Read);
+            let reading = scope.spawn(move || load(&reader, credential, Addressing::Label));
+            entered
+                .recv_timeout(CHECKPOINT_TIMEOUT)
+                .expect("reader did not read the receipt");
             let retired = storage.release_secret(credential, SecretReleaseMode::DeleteIfUnowned);
-            resume.wait();
+            resume.send(()).expect("paused reader exited");
             let loaded = reading.join().unwrap();
             assert_eq!(retired.unwrap(), SecretReleaseOutcome::Released);
             assert!(
@@ -519,6 +607,82 @@ mod tests {
         });
         assert!(matches!(storage.load_secret(credential),
             Err(AccountHomeError::SecretNotFound(label)) if label == "retiring"));
+    }
+
+    #[test]
+    fn adopt_rejects_stale_absence() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = LocalFileSecretStore::new(directory.path(), crate::IosOptions::default());
+        let keys = nostr::prelude::Keys::parse(&"01".repeat(32)).unwrap();
+        let account = keys.public_key().to_hex();
+        let home = "11".repeat(32);
+        let original_id = "22".repeat(32);
+        let adopter_id = "33".repeat(32);
+        let waiting_id = "44".repeat(32);
+        let original = SecretCredential {
+            label: "shared",
+            account_id_hex: &account,
+            home_id: &home,
+            owner_id: &original_id,
+            kind: SecretCredentialKind::Signing,
+        };
+        storage
+            .acquire_secret(original, SecretClaimMode::CreateOnly, Some(&keys))
+            .unwrap();
+        assert_eq!(
+            storage
+                .release_secret(original, SecretReleaseMode::Preserve)
+                .unwrap(),
+            SecretReleaseOutcome::Released
+        );
+        let adopter = SecretCredential {
+            owner_id: &adopter_id,
+            ..original
+        };
+        let waiting = SecretCredential {
+            owner_id: &waiting_id,
+            ..original
+        };
+
+        std::thread::scope(|scope| {
+            let (reader, entered, resume) =
+                PausedReceiptStorage::new(storage.clone(), PauseAfter::Listing);
+            let acquiring = scope.spawn(move || {
+                acquire(
+                    &reader,
+                    waiting,
+                    Addressing::Label,
+                    SecretClaimMode::AdoptOnly,
+                    None,
+                    || Ok(None),
+                )
+            });
+            entered
+                .recv_timeout(CHECKPOINT_TIMEOUT)
+                .expect("reader did not list receipts");
+            let adopted = storage
+                .acquire_secret(adopter, SecretClaimMode::AdoptOnly, None)
+                .unwrap();
+            assert_eq!(adopted.keys.secret_key(), keys.secret_key());
+            let source = receipt_name(original, Addressing::Label).unwrap();
+            assert!(
+                !storage
+                    .names(RecordKind::Receipt)
+                    .unwrap()
+                    .contains(&source)
+            );
+            resume.send(()).expect("paused reader exited");
+            assert!(
+                matches!(acquiring.join().unwrap(), Err(AccountHomeError::SecretStore(error))
+                if error == "credential receipt listing changed; retry acquisition")
+            );
+        });
+
+        let retried = storage
+            .acquire_secret(waiting, SecretClaimMode::AdoptOnly, None)
+            .unwrap();
+        assert_eq!(retried.keys.secret_key(), keys.secret_key());
+        assert_eq!(retried.origin, SecretOrigin::Existing);
     }
 
     #[test]
@@ -656,6 +820,32 @@ mod tests {
         .unwrap();
         assert_eq!(adopted.keys.public_key().to_hex(), account);
         assert_eq!(adopted.origin, SecretOrigin::Existing);
+        let original_owner =
+            LocalFileSecretStore::new(directory.path(), crate::IosOptions::default());
+        assert_eq!(
+            release(
+                &original_owner,
+                first,
+                Addressing::AccountId,
+                SecretReleaseMode::Preserve,
+                || Ok(Some("scope-a")),
+                |_| Ok(original.try_exists()?)
+            )
+            .unwrap(),
+            SecretReleaseOutcome::Released
+        );
+        assert_eq!(
+            release(
+                &original_owner,
+                first,
+                Addressing::AccountId,
+                SecretReleaseMode::DeleteIfUnowned,
+                || Ok(Some("scope-a")),
+                |_| Ok(original.try_exists()?)
+            )
+            .unwrap(),
+            SecretReleaseOutcome::PendingLegacy
+        );
         assert_eq!(
             release(
                 &storage,
