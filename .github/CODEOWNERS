@@ -20,10 +20,15 @@
 /.dockerignore               @erskingardner @Datawav @dannym-arx @mubarakcoded
 /release.md                  @erskingardner @Datawav @dannym-arx @mubarakcoded
 
-# Crate-local scripts and release settings that build, package and validate
-# published bindings.
-/crates/marmot-c/*.sh        @erskingardner @Datawav @dannym-arx @mubarakcoded
-/crates/marmot-c/*.pc.in     @erskingardner @Datawav @dannym-arx @mubarakcoded
-/crates/marmot-uniffi/*.sh   @erskingardner @Datawav @dannym-arx @mubarakcoded
-/crates/marmot-uniffi/*.py   @erskingardner @Datawav @dannym-arx @mubarakcoded
-/crates/marmot-uniffi/*.env  @erskingardner @Datawav @dannym-arx @mubarakcoded
+# Binding packaging: the scripts and settings that build, package and
+# validate published bindings, not the code they ship. Rust, Kotlin and Swift
+# source, like the rest of the workspace, needs no owner review.
+/crates/marmot-c/*.sh                 @erskingardner @Datawav @dannym-arx @mubarakcoded
+/crates/marmot-c/*.pc.in              @erskingardner @Datawav @dannym-arx @mubarakcoded
+/crates/marmot-c/cbindgen.toml        @erskingardner @Datawav @dannym-arx @mubarakcoded
+/crates/marmot-uniffi/*.sh            @erskingardner @Datawav @dannym-arx @mubarakcoded
+/crates/marmot-uniffi/*.py            @erskingardner @Datawav @dannym-arx @mubarakcoded
+/crates/marmot-uniffi/*.env           @erskingardner @Datawav @dannym-arx @mubarakcoded
+/crates/marmot-uniffi/*.json          @erskingardner @Datawav @dannym-arx @mubarakcoded
+/crates/marmot-uniffi/uniffi.toml     @erskingardner @Datawav @dannym-arx @mubarakcoded
+/crates/marmot-uniffi/apple-privacy/  @erskingardner @Datawav @dannym-arx @mubarakcoded
