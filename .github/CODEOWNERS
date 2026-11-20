@@ -23,6 +23,7 @@
 # Crate-local scripts and release settings that build, package and validate
 # published bindings.
 /crates/marmot-c/*.sh        @erskingardner @Datawav @dannym-arx @mubarakcoded
+/crates/marmot-c/*.pc.in     @erskingardner @Datawav @dannym-arx @mubarakcoded
 /crates/marmot-uniffi/*.sh   @erskingardner @Datawav @dannym-arx @mubarakcoded
 /crates/marmot-uniffi/*.py   @erskingardner @Datawav @dannym-arx @mubarakcoded
 /crates/marmot-uniffi/*.env  @erskingardner @Datawav @dannym-arx @mubarakcoded
