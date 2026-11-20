@@ -9,8 +9,8 @@
 - Multi-device ships. Every build includes device groups and every MarmotKit,
   Marmot C and WN Agent runtime opens with them on: device linking, the
   linked-device list, sign-in review, history transfer, backups and admin
-  step-down on Leave work without a special build or constructor, and every
-  build advertises the device-roster component. The `dev-device-groups` and
+  step-down on Leave work without a special build or constructor, and a
+  runtime with them on advertises the device-roster component. The `dev-device-groups` and
   `unreleased-device-pairing` Cargo features and the `--dev-device-groups`
   build flags are gone. `MarmotAppConfig::dev_device_groups` is renamed
   `device_groups` and defaults to true; `wn` and `wnd` honor

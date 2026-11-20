@@ -23,6 +23,8 @@
   runs backups and steps a nonlast admin down on Leave (`requiresSelfDemoteBeforeLeave` is false).
   `newWithExperimentalDeviceGroups` is now the same open, kept so existing hosts keep compiling. There is no binding
   switch to turn device groups off.
+- The Rust helper `require_experimental_device_groups` (not a UniFFI export) is removed; every build has device
+  groups.
 
 ### Changed
 
