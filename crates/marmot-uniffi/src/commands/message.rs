@@ -4,8 +4,9 @@ use marmot_app::AppMessageQuery;
 
 use crate::Marmot;
 use crate::conversions::{
-    AppMessageRecordFfi, DiscardFailedSendResultFfi, PollTypeFfi, RetentionSweepReportFfi,
-    SecureDeleteExpiredResultFfi, SendSummaryFfi, StickerRefFfi, group_id_from_hex,
+    AppMessageRecordFfi, DiscardFailedSendResultFfi, MediaAttachmentReferenceFfi, PollTypeFfi,
+    RetentionSweepReportFfi, SecureDeleteExpiredResultFfi, SendSummaryFfi, StickerRefFfi,
+    group_id_from_hex,
 };
 use crate::errors::MarmotKitError;
 use crate::optional_group_id_hex;
@@ -185,6 +186,37 @@ impl Marmot {
         let summary = self
             .runtime
             .reply_to_message(&account_ref, &group_id, &target_message_id, &text)
+            .await?;
+        Ok(summary.into())
+    }
+
+    /// Send a NIP-22 thread message (kind 1111) answering
+    /// `parent_message_id`: text, already-uploaded attachments (each with
+    /// its upload's `source_epoch_identity`), or both, plus application tags
+    /// such as NIP-30 `emoji`. MDK builds the thread's `E`/`K`/`P` and
+    /// `e`/`k` tags from the parent's row and refuses them in `tags`. A
+    /// client without a thread view answers with `reply_to_message`, also
+    /// when the target is a thread message.
+    pub async fn send_thread_message(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+        parent_message_id: String,
+        text: String,
+        attachments: Vec<MediaAttachmentReferenceFfi>,
+        tags: Vec<Vec<String>>,
+    ) -> Result<SendSummaryFfi, MarmotKitError> {
+        let group_id = group_id_from_hex(&group_id_hex)?;
+        let summary = self
+            .runtime
+            .send_thread_message(
+                &account_ref,
+                &group_id,
+                &parent_message_id,
+                text,
+                attachments.into_iter().map(Into::into).collect(),
+                tags,
+            )
             .await?;
         Ok(summary.into())
     }

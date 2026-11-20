@@ -3153,6 +3153,300 @@ async fn media_send_branch_pin_body(before_send: bool, upload_and_send: bool, re
 }
 
 #[test]
+fn thread_messages_send_nip22_tags_from_local_rows() {
+    run_composed_app_runtime_test("thread-message-send", thread_message_send_body);
+}
+
+async fn thread_message_send_body() {
+    // MDK builds every NIP-22 tag from the parent's row; the first lowercase
+    // `e` stays the parent, which is what White Noise Linux reads today.
+    let dir = tempfile::tempdir().unwrap();
+    let alice = AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap()
+        .account_id_hex;
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    let mut client = app.client("alice").await.unwrap();
+    let group_id = client
+        .create_group("threads", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
+    let group_hex = hex::encode(group_id.as_slice());
+    let thread_message =
+        |parent: &str, content: &str, tags: Vec<Vec<String>>| AppMessageIntent::ThreadMessage {
+            parent_message_id: parent.to_owned(),
+            content: content.to_owned(),
+            attachments: Vec::new(),
+            message_tags: tags,
+            placement: None,
+        };
+    let row = |id: &str| {
+        app.timeline_message("alice", &group_hex, id)
+            .unwrap()
+            .unwrap()
+    };
+    let tags = |rows: &[&[&str]]| -> Vec<Vec<String>> {
+        rows.iter()
+            .map(|row| row.iter().map(|value| (*value).to_owned()).collect())
+            .collect()
+    };
+
+    // Sending a thread message reads the chat up to it, as sending chat does.
+    let earlier = "ee".repeat(32);
+    let at = unix_now_seconds() - 60;
+    app.account_storage("alice")
+        .unwrap()
+        .app_storage()
+        .record_app_event(&storage_sqlite::StoredAppEvent {
+            group_id_hex: group_hex.clone(),
+            message_id_hex: earlier.clone(),
+            source_message_id_hex: Some("ef".repeat(32)),
+            source_epoch: Some(client.group_mls_state(&group_id).unwrap().epoch),
+            direction: "received".into(),
+            sender: "ee".repeat(32),
+            plaintext: "tuesday?".into(),
+            kind: cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT,
+            tags: Vec::new(),
+            recorded_at: at,
+            received_at: at,
+            origin_commit_id: None,
+            moderation_grant: false,
+        })
+        .unwrap();
+    let (_, seen) = client
+        .send_app_event(&group_id, thread_message(&earlier, "seen", Vec::new()))
+        .await
+        .unwrap();
+    assert_eq!(
+        app.refresh_chat_list_row("alice", &group_hex)
+            .unwrap()
+            .unwrap()
+            .last_read_message_id_hex,
+        Some(seen.message_ids[0].clone()),
+        "the sender has read up to its thread message"
+    );
+
+    let root = client.send(&group_id, b"lunch?").await.unwrap().message_ids[0].clone();
+    let (_, first) = client
+        .send_app_event(&group_id, thread_message(&root, "friday", Vec::new()))
+        .await
+        .unwrap();
+    let first = first.message_ids[0].clone();
+    let first_row = row(&first);
+    assert_eq!(first_row.kind, cgka_traits::NIP22_COMMENT_KIND);
+    assert_eq!(
+        first_row.tags,
+        tags(&[
+            &["E", &root, "", &alice],
+            &["K", "9"],
+            &["P", &alice],
+            &["e", &root, "", &alice],
+            &["k", "9"],
+        ])
+    );
+    assert_eq!(
+        first_row.reply_to_message_id_hex.as_deref(),
+        Some(root.as_str())
+    );
+    assert_eq!(
+        first_row.thread,
+        Some(storage_sqlite::TimelineThreadRef {
+            root_message_id_hex: root.clone(),
+            parent_message_id_hex: root.clone(),
+        })
+    );
+
+    let emoji = vec![
+        "emoji".to_owned(),
+        "wave".to_owned(),
+        "https://example.com/w.png".to_owned(),
+    ];
+    let (_, nested) = client
+        .send_app_event(
+            &group_id,
+            thread_message(&first, "noon", vec![emoji.clone()]),
+        )
+        .await
+        .unwrap();
+    let nested_row = row(&nested.message_ids[0]);
+    assert_eq!(
+        nested_row.tags,
+        tags(&[
+            &["E", &root, "", &alice],
+            &["K", "9"],
+            &["P", &alice],
+            &["e", &first, "", &alice],
+            &["k", "1111"],
+            &["emoji", "wave", "https://example.com/w.png"],
+        ])
+    );
+    assert_eq!(
+        crate::messages::tag_value(&nested_row.tags, "e"),
+        Some(first.as_str()),
+        "Linux reads the first lowercase e as the thread it belongs to"
+    );
+    assert_eq!(
+        nested_row.thread,
+        Some(storage_sqlite::TimelineThreadRef {
+            root_message_id_hex: root.clone(),
+            parent_message_id_hex: first.clone(),
+        })
+    );
+
+    // An inline reply to a thread message stays kind 9 with e + q.
+    let (_, inline) = client
+        .send_app_event(
+            &group_id,
+            AppMessageIntent::Reply {
+                target_message_id: first.clone(),
+                text: "inline".into(),
+            },
+        )
+        .await
+        .unwrap();
+    let inline_row = row(&inline.message_ids[0]);
+    assert_eq!(
+        inline_row.kind,
+        cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT
+    );
+    assert_eq!(inline_row.tags, tags(&[&["e", &first], &["q", &first]]));
+    assert_eq!(inline_row.thread, None);
+    assert_eq!(
+        inline_row.reply_preview.and_then(|preview| preview.thread),
+        first_row.thread
+    );
+
+    // A root this device no longer holds keeps the kind and author the
+    // nearest ancestor naming it carries in K/P, here a NIP-22 grandparent
+    // above a Linux-style parent without E.
+    let gone = "ab".repeat(32);
+    let custom = |tags: Vec<Vec<String>>| AppMessageIntent::Custom {
+        kind: cgka_traits::NIP22_COMMENT_KIND,
+        tags,
+        content: "custom".to_owned(),
+    };
+    let (_, named) = client
+        .send_app_event(
+            &group_id,
+            custom(tags(&[
+                &["E", &gone],
+                &["K", "1068"],
+                &["P", &alice],
+                &["e", &gone],
+                &["k", "1068"],
+            ])),
+        )
+        .await
+        .unwrap();
+    let named = named.message_ids[0].clone();
+    let (_, legacy) = client
+        .send_app_event(&group_id, custom(tags(&[&["e", &named], &["k", "1111"]])))
+        .await
+        .unwrap();
+    let legacy = legacy.message_ids[0].clone();
+    let (_, below) = client
+        .send_app_event(&group_id, thread_message(&legacy, "below", Vec::new()))
+        .await
+        .unwrap();
+    assert_eq!(
+        row(&below.message_ids[0]).tags,
+        tags(&[
+            &["E", &gone, "", &alice],
+            &["K", "1068"],
+            &["P", &alice],
+            &["e", &legacy, "", &alice],
+            &["k", "1111"],
+        ])
+    );
+
+    let published_before = relay.published_event_ids().len();
+    for (intent, case) in [
+        (
+            thread_message("c0c0", "lost", Vec::new()),
+            "an unknown parent",
+        ),
+        (
+            thread_message(&root, "  ", Vec::new()),
+            "no text and no attachment",
+        ),
+        (
+            thread_message(&root, "forged", tags(&[&["E", "elsewhere"]])),
+            "a caller-built root tag",
+        ),
+        (
+            thread_message(&root, "forged", tags(&[&["e", "elsewhere"]])),
+            "a caller-built parent tag",
+        ),
+    ] {
+        let error = client.send_app_event(&group_id, intent).await.unwrap_err();
+        assert!(
+            matches!(error, AppError::InvalidAppMessagePayload(_)),
+            "{case} must be refused, got {error:?}"
+        );
+    }
+    assert_eq!(
+        relay.published_event_ids().len(),
+        published_before,
+        "a refused thread message must reach the relay with nothing"
+    );
+
+    // Attachments pass the same outbound media check as kind-9 media.
+    let current_epoch = client.group_mls_state(&group_id).unwrap().epoch;
+    let attachment = MediaAttachmentReference {
+        locators: vec![MediaLocator {
+            kind: "blossom-v1".to_owned(),
+            value: format!("https://media.example/{}.bin", hex::encode([0x33_u8; 32])),
+        }],
+        ciphertext_sha256: hex::encode([0x33_u8; 32]),
+        plaintext_sha256: hex::encode([0x11_u8; 32]),
+        nonce_hex: hex::encode([0x22_u8; 12]),
+        file_name: "a.png".to_owned(),
+        media_type: "image/png".to_owned(),
+        version: "encrypted-media-v2".to_owned(),
+        source_epoch: current_epoch,
+        source_epoch_identity: Some(hex::encode(
+            client.runtime.epoch_pin(&group_id).unwrap().identity,
+        )),
+        dim: None,
+        thumbhash: None,
+    };
+    let with_media = |attachment: &MediaAttachmentReference| AppMessageIntent::ThreadMessage {
+        parent_message_id: root.clone(),
+        content: String::new(),
+        attachments: vec![attachment.clone()],
+        message_tags: Vec::new(),
+        placement: None,
+    };
+    let wrong_version = MediaAttachmentReference {
+        version: "encrypted-media-v1".to_owned(),
+        ..attachment.clone()
+    };
+    let published_before = relay.published_event_ids().len();
+    assert!(
+        client
+            .send_app_event(&group_id, with_media(&wrong_version))
+            .await
+            .is_err(),
+        "an attachment the group's media policy refuses must not be sent"
+    );
+    assert_eq!(relay.published_event_ids().len(), published_before);
+    let (_, media) = client
+        .send_app_event(&group_id, with_media(&attachment))
+        .await
+        .unwrap();
+    let media_row = row(&media.message_ids[0]);
+    assert_eq!(media_row.thread, first_row.thread);
+    assert!(
+        media_row.media.is_some(),
+        "the thread message carries its imeta"
+    );
+}
+
+#[test]
 fn edits_require_an_available_own_chat_target() {
     run_composed_app_runtime_test("edit-target-preflight", edit_target_preflight_body);
 }
@@ -18998,7 +19292,9 @@ async fn local_delete_restart_preserves_rotated_route_relay_pairs_for_resurrecti
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn local_delete_batch_suppresses_historical_chat_in_both_event_orders() {
-    for fresh_first in [false, true] {
+    // A fresh thread message brings a locally deleted chat back like kind 9.
+    for (fresh_first, fresh_thread) in [(false, false), (true, false), (false, true), (true, true)]
+    {
         let dir = tempfile::tempdir().unwrap();
         AccountHome::open(dir.path())
             .create_account("alice")
@@ -19040,15 +19336,19 @@ async fn local_delete_batch_suppresses_historical_chat_in_both_event_orders() {
         assert!(historical.failures.is_empty());
         assert!(client.delete_group_local(&group_id).await.unwrap());
 
+        let fresh_intent = if fresh_thread {
+            AppMessageIntent::Custom {
+                kind: cgka_traits::NIP22_COMMENT_KIND,
+                tags: vec![vec!["e".to_owned(), "aa".repeat(32)]],
+                content: "fresh".to_owned(),
+            }
+        } else {
+            AppMessageIntent::Chat {
+                content: "fresh".to_owned(),
+            }
+        };
         let fresh_payload = crate::messages::encode_inner_event(
-            &build_inner_event(
-                &AppMessageIntent::Chat {
-                    content: "fresh".to_owned(),
-                },
-                &sender_hex,
-                unix_now_seconds(),
-            )
-            .unwrap(),
+            &build_inner_event(&fresh_intent, &sender_hex, unix_now_seconds()).unwrap(),
         )
         .unwrap();
         let fresh = client
@@ -19098,7 +19398,11 @@ async fn local_delete_batch_suppresses_historical_chat_in_both_event_orders() {
             .await
             .unwrap();
 
-        assert_eq!(summary.messages.len(), 1, "fresh_first={fresh_first}");
+        assert_eq!(
+            summary.messages.len(),
+            1,
+            "fresh_first={fresh_first} fresh_thread={fresh_thread}"
+        );
         assert_eq!(summary.messages[0].plaintext, "fresh");
         assert!(app.group("alice", &group_id_hex).unwrap().is_some());
         assert_eq!(

@@ -1,0 +1,129 @@
+{
+  "contract": "docs/marmot-architecture/overview/thread-messages.md",
+  "about": "Inner app events of one group, recorded in this order. Each expect block is what every timeline row read returns once all of them are stored: reply_to is reply_to_message_id_hex (what a client without a thread view quotes), thread is the typed thread field (null outside threads), and reply_preview_thread is the thread field of the row's reply preview. Deleting any of them by its author keeps reply_to and thread.",
+  "events": [
+    {
+      "name": "a chat message that threads hang from",
+      "id": "root",
+      "kind": 9,
+      "tags": [],
+      "expect": { "reply_to": null, "thread": null }
+    },
+    {
+      "name": "Linux thread message, text",
+      "id": "linux-text",
+      "kind": 1111,
+      "tags": [["e", "root"], ["k", "9"]],
+      "expect": { "reply_to": "root", "thread": { "root": "root", "parent": "root" } }
+    },
+    {
+      "name": "Linux thread message, media",
+      "id": "linux-media",
+      "kind": 1111,
+      "tags": [["e", "root"], ["k", "9"], ["imeta", "url https://example.com/a.png", "m image/png"]],
+      "expect": { "reply_to": "root", "thread": { "root": "root", "parent": "root" } }
+    },
+    {
+      "name": "Linux thread message without k (sent before 2026-11-17)",
+      "id": "linux-no-k",
+      "kind": 1111,
+      "tags": [["e", "root"]],
+      "expect": { "reply_to": "root", "thread": { "root": "root", "parent": "root" } }
+    },
+    {
+      "name": "Linux nested thread: a thread started on a thread message",
+      "id": "linux-nested",
+      "kind": 1111,
+      "tags": [["e", "linux-text"], ["k", "1111"]],
+      "expect": { "reply_to": "linux-text", "thread": { "root": "root", "parent": "linux-text" } }
+    },
+    {
+      "name": "Linux nested thread message stored before its parent",
+      "id": "linux-early",
+      "kind": 1111,
+      "tags": [["e", "linux-late"], ["k", "1111"]],
+      "expect": { "reply_to": "linux-late", "thread": { "root": "root", "parent": "linux-late" } }
+    },
+    {
+      "name": "the late parent",
+      "id": "linux-late",
+      "kind": 1111,
+      "tags": [["e", "root"], ["k", "9"]],
+      "expect": { "reply_to": "root", "thread": { "root": "root", "parent": "root" } }
+    },
+    {
+      "name": "Linux poll in a thread: a plain e on a poll is an inline reply",
+      "id": "linux-poll",
+      "kind": 1068,
+      "tags": [["option", "0", "Tea"], ["option", "1", "Coffee"], ["polltype", "singlechoice"], ["e", "root"]],
+      "expect": { "reply_to": "root", "thread": null }
+    },
+    {
+      "name": "NIP-22 thread message answering the root",
+      "id": "nip22-top",
+      "kind": 1111,
+      "tags": [["E", "root", "", "alice"], ["K", "9"], ["P", "alice"], ["e", "root", "", "alice"], ["k", "9"]],
+      "expect": { "reply_to": "root", "thread": { "root": "root", "parent": "root" } }
+    },
+    {
+      "name": "NIP-22 thread message answering another thread message",
+      "id": "nip22-nested",
+      "kind": 1111,
+      "tags": [["E", "root", "", "alice"], ["K", "9"], ["P", "alice"], ["e", "linux-text", "", "alice"], ["k", "1111"]],
+      "expect": { "reply_to": "linux-text", "thread": { "root": "root", "parent": "linux-text" } }
+    },
+    {
+      "name": "poll joining a thread",
+      "id": "thread-poll",
+      "kind": 1068,
+      "tags": [["option", "0", "Tea"], ["option", "1", "Coffee"], ["polltype", "singlechoice"], ["E", "root"], ["K", "9"], ["P", "alice"]],
+      "expect": { "reply_to": null, "thread": { "root": "root", "parent": "root" } }
+    },
+    {
+      "name": "chat or sticker joining a thread as a reply to a thread message",
+      "id": "thread-chat-reply",
+      "kind": 9,
+      "tags": [["E", "root"], ["K", "9"], ["P", "alice"], ["e", "linux-text"], ["q", "linux-text"]],
+      "expect": { "reply_to": "linux-text", "thread": { "root": "root", "parent": "linux-text" } }
+    },
+    {
+      "name": "inline reply (kind 9) to a thread message",
+      "id": "inline-reply",
+      "kind": 9,
+      "tags": [["e", "linux-text"], ["q", "linux-text"]],
+      "expect": {
+        "reply_to": "linux-text",
+        "thread": null,
+        "reply_preview_thread": { "root": "root", "parent": "root" }
+      }
+    },
+    {
+      "name": "legacy thread message whose parent is not stored",
+      "id": "missing-parent",
+      "kind": 1111,
+      "tags": [["e", "not-stored"], ["k", "1111"]],
+      "expect": { "reply_to": "not-stored", "thread": { "root": "not-stored", "parent": "not-stored" } }
+    },
+    {
+      "name": "NIP-22 thread message whose parent is not stored",
+      "id": "nip22-missing-parent",
+      "kind": 1111,
+      "tags": [["E", "root"], ["K", "9"], ["P", "alice"], ["e", "not-stored-either"], ["k", "1111"]],
+      "expect": { "reply_to": "not-stored-either", "thread": { "root": "root", "parent": "not-stored-either" } }
+    },
+    {
+      "name": "kind 1111 with neither e nor a numeric k stays a custom event",
+      "id": "not-a-comment",
+      "kind": 1111,
+      "tags": [["E", "root"], ["q", "root"]],
+      "expect": { "reply_to": null, "thread": null }
+    },
+    {
+      "name": "unrelated custom kind keeps its own tags",
+      "id": "custom",
+      "kind": 30078,
+      "tags": [["E", "root"], ["e", "root"], ["k", "9"]],
+      "expect": { "reply_to": null, "thread": null }
+    }
+  ]
+}

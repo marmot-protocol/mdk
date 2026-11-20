@@ -76,6 +76,7 @@ fn fixture_rejection_kind(case: &serde_json::Value) -> MediaAttachmentRejectionK
 fn projected_outcome(tag: &[String], source_epoch: u64) -> MediaAttachmentOutcomeFfi {
     let preview: TimelineReplyPreviewFfi = TimelineReplyPreview {
         message_id_hex: "aa".repeat(32),
+        reply_to_message_id_hex: None,
         sender: "bb".repeat(32),
         plaintext: "caption".to_owned(),
         tags: Vec::new(),
@@ -86,6 +87,7 @@ fn projected_outcome(tag: &[String], source_epoch: u64) -> MediaAttachmentOutcom
         deleted: false,
         deletion_source: Default::default(),
         invalidation_status: None,
+        thread: None,
     }
     .into();
     let mut media = preview.media;

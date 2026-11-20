@@ -426,7 +426,7 @@ fn presented_timeline(row: &app::TimelineMessageRecord, trusted: bool) -> Timeli
     presented_timeline_with_tokens(
         row,
         trusted,
-        super::common::markdown_content_tokens(row.kind, &row.plaintext),
+        super::common::markdown_content_tokens(row.kind, &row.tags, &row.plaintext),
         conversation_sticker_ref(row).map(Into::into),
     )
 }
@@ -459,6 +459,7 @@ fn presented_timeline_with_tokens(
         received_at: row.received_at,
         reply_to_message_id_hex: row.reply_to_message_id_hex.clone(),
         reply_preview: row.reply_preview.clone().map(Into::into),
+        thread: row.thread.clone().map(Into::into),
         media_json: None,
         media: super::media::timeline_media_outcomes_ffi(&row.media, row.source_epoch),
         agent_text_stream_json: row.agent_text_stream.as_ref().map(ToString::to_string),
@@ -612,6 +613,7 @@ impl ConversationConversionCache {
             received_at: row.received_at,
             reply_to_message_id_hex: row.reply_to_message_id_hex.clone(),
             reply_preview: row.reply_preview.clone(),
+            thread: row.thread.clone(),
             media: row.media.clone(),
             agent_text_stream: row.agent_text_stream.clone(),
             group_system: if trusted {
@@ -640,7 +642,7 @@ impl ConversationConversionCache {
                 {
                     self.parses += 1;
                 }
-                super::common::markdown_content_tokens(row.kind, &row.plaintext)
+                super::common::markdown_content_tokens(row.kind, &row.tags, &row.plaintext)
             }
         };
         #[cfg(test)]
@@ -682,6 +684,7 @@ fn visible_row_key(row: &app::TimelineMessageRecord, trusted: bool) -> impl Part
         received_at,
         reply_to_message_id_hex,
         reply_preview,
+        thread,
         media,
         agent_text_stream,
         group_system,
@@ -732,6 +735,7 @@ fn visible_row_key(row: &app::TimelineMessageRecord, trusted: bool) -> impl Part
             recipient_confirmed,
             imported_from,
             history_import_provenance,
+            thread,
         ),
     )
 }
@@ -873,6 +877,7 @@ mod tests {
             received_at: 11,
             reply_to_message_id_hex: None,
             reply_preview: None,
+            thread: None,
             media: None,
             agent_text_stream: None,
             reactions: app::TimelineReactionSummary::default(),

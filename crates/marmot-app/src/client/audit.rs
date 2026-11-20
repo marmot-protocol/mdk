@@ -178,6 +178,10 @@ impl AppClient {
             AppMessageIntent::Media { attachments, .. } => {
                 ("send_media", Some(attachments.len() as u64))
             }
+            AppMessageIntent::ThreadMessage { attachments, .. } if !attachments.is_empty() => {
+                ("send_media", Some(attachments.len() as u64))
+            }
+            AppMessageIntent::ThreadMessage { .. } => ("reply_message", None),
             AppMessageIntent::Custom { .. } => ("send_custom_event", None),
             AppMessageIntent::Poll { options, .. } => ("create_poll", Some(options.len() as u64)),
             AppMessageIntent::PollResponse { option_ids, .. } => {

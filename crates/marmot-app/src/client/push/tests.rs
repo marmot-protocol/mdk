@@ -377,3 +377,32 @@ async fn push_batch_scaling() {
         }
     }
 }
+
+/// A thread message wakes members whether it is sent typed or, as White Noise
+/// Linux does, through the custom-event path; other custom kinds do not.
+#[test]
+fn thread_messages_wake_members_from_either_send_path() {
+    use crate::client::push::notification_trigger_for_intent;
+    use crate::messages::AppMessageIntent;
+    let custom = |tags: Vec<Vec<String>>| AppMessageIntent::Custom {
+        kind: cgka_traits::NIP22_COMMENT_KIND,
+        tags,
+        content: "in the thread".to_owned(),
+    };
+    let parent = vec![vec!["e".to_owned(), "aa".repeat(32)]];
+    assert!(notification_trigger_for_intent(&custom(parent)).is_some());
+    assert!(
+        notification_trigger_for_intent(&custom(vec![vec!["E".to_owned(), "aa".repeat(32)]]))
+            .is_none()
+    );
+    assert!(
+        notification_trigger_for_intent(&AppMessageIntent::ThreadMessage {
+            parent_message_id: "aa".repeat(32),
+            content: "typed".to_owned(),
+            attachments: Vec::new(),
+            message_tags: Vec::new(),
+            placement: None,
+        })
+        .is_some()
+    );
+}

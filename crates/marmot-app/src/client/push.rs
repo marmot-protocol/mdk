@@ -1241,8 +1241,15 @@ pub(crate) fn notification_trigger_for_intent(
         | AppMessageIntent::Sticker { .. }
         | AppMessageIntent::Reply { .. }
         | AppMessageIntent::Media { .. }
+        | AppMessageIntent::ThreadMessage { .. }
         | AppMessageIntent::Poll { .. }
         | AppMessageIntent::StreamFinal { .. } => {
+            Some(notifications::NotificationTrigger::NewMessage)
+        }
+        // A thread message sent through the custom-event path wakes members too.
+        AppMessageIntent::Custom { kind, tags, .. }
+            if cgka_traits::thread_message_parent(*kind, tags).is_some() =>
+        {
             Some(notifications::NotificationTrigger::NewMessage)
         }
         AppMessageIntent::Report { .. }

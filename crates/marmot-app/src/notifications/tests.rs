@@ -1736,6 +1736,7 @@ fn timeline_target(kind: u64, plaintext: &str) -> TimelineMessageTarget {
         kind,
         deleted: false,
         invalidated: false,
+        thread_message: false,
     }
 }
 
@@ -1997,6 +1998,79 @@ fn muted_chat_live_event_resolver_emits_only_direct_mentions() {
     );
 }
 
+/// A thread message notifies like kind 9, with its text as the preview, and
+/// is a mention when it mentions the account. A kind-1111 event without a
+/// parent stays a silent custom event.
+#[test]
+fn thread_messages_notify_and_mention_like_chat() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = marmot_account::AccountHome::open(dir.path());
+    let account = home.create_account("alice").unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    let receiver = account.account_id_hex;
+    let sender = "bb".repeat(32);
+    let group = "ee".repeat(32);
+    let mut resolver = NotificationResolver::default();
+    seed_group_state_resolver(&app, &mut resolver, "alice", &group, Some(&sender), false);
+    let thread_message = |tags: &[&[&str]]| ReceivedMessage {
+        kind: cgka_traits::NIP22_COMMENT_KIND,
+        ..received_chat(
+            "in the thread",
+            tags.iter()
+                .map(|tag| tag.iter().map(|value| (*value).to_owned()).collect())
+                .collect(),
+        )
+    };
+    let parent = "cc".repeat(32);
+    for (name, message, expected) in [
+        (
+            "Linux thread message",
+            thread_message(&[&["e", &parent], &["k", "9"]]),
+            Some(false),
+        ),
+        (
+            "mention in a thread",
+            thread_message(&[
+                &["E", &parent],
+                &["K", "9"],
+                &["e", &parent],
+                &["k", "9"],
+                &["p", &receiver],
+            ]),
+            Some(true),
+        ),
+        (
+            "kind 1111 without a parent",
+            thread_message(&[&["E", &parent], &["p", &receiver]]),
+            None,
+        ),
+    ] {
+        let event = MarmotAppEvent::MessageReceived(RuntimeMessageReceived {
+            account_id_hex: receiver.clone(),
+            account_label: "alice".to_owned(),
+            message,
+        });
+        assert_eq!(
+            notification_event_notifies(&event),
+            expected.is_some(),
+            "{name}"
+        );
+        let update = notification_update_from_event_cached(&app, &mut resolver, &event).unwrap();
+        assert_eq!(
+            update.as_ref().map(|update| update.is_mention),
+            expected,
+            "{name}"
+        );
+        if let Some(update) = update {
+            assert_eq!(
+                update.preview_text.as_deref(),
+                Some("in the thread"),
+                "{name}"
+            );
+        }
+    }
+}
+
 #[test]
 fn group_invite_notification_is_not_a_mention() {
     let dir = tempfile::tempdir().unwrap();
@@ -2243,8 +2317,8 @@ fn agent_activity_and_operation_kinds_are_notifiable() {
         MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY, MARMOT_APP_EVENT_KIND_AGENT_OPERATION,
     };
 
-    assert!(notification_traffic_for_kind(MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY).is_some());
-    assert!(notification_traffic_for_kind(MARMOT_APP_EVENT_KIND_AGENT_OPERATION).is_some());
+    assert!(notification_traffic(MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY, &[]).is_some());
+    assert!(notification_traffic(MARMOT_APP_EVENT_KIND_AGENT_OPERATION, &[]).is_some());
 }
 
 #[test]
@@ -2254,10 +2328,10 @@ fn state_change_kinds_remain_non_notifiable() {
         MARMOT_APP_EVENT_KIND_EDIT, MARMOT_APP_EVENT_KIND_GROUP_SYSTEM,
     };
 
-    assert!(notification_traffic_for_kind(MARMOT_APP_EVENT_KIND_DELETE).is_none());
-    assert!(notification_traffic_for_kind(MARMOT_APP_EVENT_KIND_EDIT).is_none());
-    assert!(notification_traffic_for_kind(MARMOT_APP_EVENT_KIND_GROUP_SYSTEM).is_none());
-    assert!(notification_traffic_for_kind(MARMOT_APP_EVENT_KIND_AGENT_STREAM_START).is_none());
+    assert!(notification_traffic(MARMOT_APP_EVENT_KIND_DELETE, &[]).is_none());
+    assert!(notification_traffic(MARMOT_APP_EVENT_KIND_EDIT, &[]).is_none());
+    assert!(notification_traffic(MARMOT_APP_EVENT_KIND_GROUP_SYSTEM, &[]).is_none());
+    assert!(notification_traffic(MARMOT_APP_EVENT_KIND_AGENT_STREAM_START, &[]).is_none());
 }
 
 #[test]
@@ -2269,32 +2343,32 @@ fn notification_traffic_class_is_deterministic_from_the_wire_kind() {
     };
 
     assert_eq!(
-        notification_traffic_for_kind(MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY),
+        notification_traffic(MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY, &[]),
         Some(NotificationTrafficClass::AgentActivity),
     );
     assert_eq!(
-        notification_traffic_for_kind(MARMOT_APP_EVENT_KIND_AGENT_OPERATION),
+        notification_traffic(MARMOT_APP_EVENT_KIND_AGENT_OPERATION, &[]),
         Some(NotificationTrafficClass::AgentActivity),
     );
     assert_eq!(
-        notification_traffic_for_kind(MARMOT_APP_EVENT_KIND_CHAT),
+        notification_traffic(MARMOT_APP_EVENT_KIND_CHAT, &[]),
         Some(NotificationTrafficClass::Standard),
     );
     assert_eq!(
-        notification_traffic_for_kind(MARMOT_APP_EVENT_KIND_REACTION),
+        notification_traffic(MARMOT_APP_EVENT_KIND_REACTION, &[]),
         Some(NotificationTrafficClass::Standard),
     );
     assert_eq!(
-        notification_traffic_for_kind(MARMOT_APP_EVENT_KIND_AGENT_STREAM_START),
+        notification_traffic(MARMOT_APP_EVENT_KIND_AGENT_STREAM_START, &[]),
         None,
     );
-    assert_eq!(notification_traffic_for_kind(u64::MAX), None);
+    assert_eq!(notification_traffic(u64::MAX, &[]), None);
 }
 
 #[test]
 fn poll_notification_alerts_without_exposing_question_or_options() {
     assert_eq!(
-        notification_traffic_for_kind(MARMOT_APP_EVENT_KIND_POLL),
+        notification_traffic(MARMOT_APP_EVENT_KIND_POLL, &[]),
         Some(NotificationTrafficClass::Standard)
     );
     assert_eq!(
@@ -2308,7 +2382,7 @@ fn poll_notification_alerts_without_exposing_question_or_options() {
 #[test]
 fn device_group_kinds_never_notify_or_preview() {
     for kind in [457, 458, 459, 460, 461, 473, 475, 476] {
-        assert_eq!(notification_traffic_for_kind(kind), None);
+        assert_eq!(notification_traffic(kind, &[]), None);
         assert_eq!(preview_text_for_kind(kind, "{\"v\":1}"), None);
     }
 }

@@ -21,6 +21,7 @@ use cgka_traits::app_event::{
     MARMOT_APP_EVENT_KIND_GROUP_SYSTEM, MARMOT_APP_EVENT_KIND_REACTION, STREAM_TAG,
     group_system_canonical_id,
 };
+use cgka_traits::is_chat_message;
 
 /// Nostr pubkey-mention tag name. A `["p", <account-pubkey-hex>]` tag means that
 /// account was mentioned/addressed in the message.
@@ -398,7 +399,7 @@ fn available_target_context(
     else {
         return Ok(None);
     };
-    if raw_target.kind != MARMOT_APP_EVENT_KIND_CHAT || raw_target.invalidated {
+    if !is_chat_message(raw_target.kind, &raw_target.tags) || raw_target.invalidated {
         return Ok(None);
     }
     let context = referenced_message(
@@ -461,7 +462,17 @@ fn project_durable_record(
     let group_id_hex = record.group_id_hex.clone();
 
     match record.kind {
-        MARMOT_APP_EVENT_KIND_CHAT => {
+        // Chat, including a thread message: its first `e` names the parent.
+        kind if is_chat_message(kind, &record.tags) => {
+            // Replay reads raw rows, which keep a deleted message's text and
+            // attachments. A message deleted before delivery must not reach the
+            // agent; its deletion still does.
+            if runtime
+                .message_target(account_ref, &group_id_hex, &record.message_id_hex)?
+                .is_some_and(|target| target.deleted)
+            {
+                return Ok(None);
+            }
             let mentions_self =
                 message_mentions_account(&record.tags, &record.plaintext, account_id_hex);
             let reply_to = match reply_target_from_tags(&record.tags) {
@@ -498,7 +509,7 @@ fn project_durable_record(
             else {
                 return Ok(None);
             };
-            if raw_target.kind != MARMOT_APP_EVENT_KIND_CHAT
+            if !is_chat_message(raw_target.kind, &raw_target.tags)
                 || raw_target.sender != record.sender
                 || raw_target.invalidated
             {
@@ -593,7 +604,7 @@ fn project_durable_record(
                 }));
             }
 
-            if deleted_event.kind != MARMOT_APP_EVENT_KIND_CHAT
+            if !is_chat_message(deleted_event.kind, &deleted_event.tags)
                 || deleted_event.invalidated
                 || (deleted_event.sender != record.sender && !record.moderation_grant)
             {
@@ -770,14 +781,15 @@ pub(crate) fn control_event_from_runtime_event_with_runtime(
 /// this subscription already emitted.
 pub(crate) fn runtime_replay_dedup_key(event: &MarmotAppEvent) -> Option<String> {
     match event {
-        MarmotAppEvent::MessageReceived(update) => matches!(
-            update.message.kind,
-            MARMOT_APP_EVENT_KIND_CHAT
-                | MARMOT_APP_EVENT_KIND_DELETE
-                | MARMOT_APP_EVENT_KIND_EDIT
-                | MARMOT_APP_EVENT_KIND_REACTION
-        )
-        .then(|| update.message.message_id_hex.clone()),
+        MarmotAppEvent::MessageReceived(update) => {
+            (matches!(
+                update.message.kind,
+                MARMOT_APP_EVENT_KIND_DELETE
+                    | MARMOT_APP_EVENT_KIND_EDIT
+                    | MARMOT_APP_EVENT_KIND_REACTION
+            ) || is_chat_message(update.message.kind, &update.message.tags))
+            .then(|| update.message.message_id_hex.clone())
+        }
         MarmotAppEvent::GroupEvent(group_event) => {
             if let GroupEvent::GroupStateChanged {
                 group_id,

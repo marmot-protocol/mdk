@@ -3034,6 +3034,60 @@ fn unread_mentions_follow_tags_inline_text_and_sender() {
     }
 }
 
+/// A thread message moves the chat like kind 9: preview, activity order,
+/// unread and mention counts. A kind-1111 event without a parent does not.
+#[test]
+fn thread_messages_are_chat_activity() {
+    let thread_event = |id: &str, at: u64, tags: &[&[&str]]| {
+        let tags = tags
+            .iter()
+            .map(|tag| tag.iter().map(|value| (*value).to_owned()).collect())
+            .collect();
+        StoredAppEvent {
+            kind: cgka_traits::NIP22_COMMENT_KIND,
+            ..chat_with_tags(id, REMOTE, at, id, tags)
+        }
+    };
+    let store = setup_store().app_storage();
+    store
+        .initialize_chat_read_state(LOCAL, GROUP, &no_mentions)
+        .unwrap();
+    // Activity sorts by the later of message time and conversation creation.
+    let at = crate::unix_now_seconds() + 1_000;
+    store
+        .record_app_event(&chat("root", REMOTE, at, "root"))
+        .unwrap();
+    store
+        .record_app_event(&thread_event(
+            "no-parent",
+            at + 1,
+            &[&["E", "root"], &["K", "9"]],
+        ))
+        .unwrap();
+    let summary = |store: &SqliteAppStorage| {
+        let row = store
+            .refresh_chat_list_row(LOCAL, GROUP, &mentions_local)
+            .unwrap()
+            .expect("chat row");
+        (
+            row.last_message.map(|message| message.message_id_hex),
+            row.activity_sort_at,
+            row.unread_count,
+            row.unread_mention_count,
+        )
+    };
+    assert_eq!(summary(&store), (Some("root".into()), at, 1, 0));
+
+    store
+        .record_app_event(&thread_event(
+            "thread",
+            at + 2,
+            &[&["e", "root"], &["k", "9"], &["p", LOCAL]],
+        ))
+        .unwrap();
+    assert_eq!(summary(&store), (Some("thread".into()), at + 2, 2, 1));
+}
+
 #[test]
 fn targeted_refresh_classifies_only_changed_unread_messages() {
     let store = setup_store().app_storage();
@@ -3177,6 +3231,23 @@ fn targeted_refresh_reports_a_content_change_only_for_the_preview_body() {
         .record_app_event(&chat("newer", REMOTE, 5, "newer"))
         .unwrap();
     assert!(!refresh(&["newer"]).1, "a new message replaces the preview");
+    let mut thread = chat("thread", REMOTE, 6, "in thread");
+    thread.kind = cgka_traits::NIP22_COMMENT_KIND;
+    thread.tags = vec![
+        vec!["e".into(), "newer".into()],
+        vec!["k".into(), "9".into()],
+    ];
+    store.record_app_event(&thread).unwrap();
+    assert!(
+        !refresh(&["thread"]).1,
+        "a thread message replaces the preview"
+    );
+    store
+        .record_app_event(&edit("edit-thread", "thread", 7))
+        .unwrap();
+    let (row, changed) = refresh(&["edit-thread", "thread"]);
+    assert!(changed, "a thread message preview's edit");
+    assert_eq!(row.unwrap().last_message.unwrap().plaintext, "edited");
 }
 
 #[test]

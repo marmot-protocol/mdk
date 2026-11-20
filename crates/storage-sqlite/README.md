@@ -152,6 +152,10 @@ Expiry notifications follow actual acquisition cleanup, not the exact wall-clock
 worker and reads only the bounded journal and singleton metadata. Older binaries reject schema 212; downgrade
 is unsupported.
 
+Migration 0217 applies 0208's repair to kind-1111 events that carry a lowercase `e` but no numeric `k`: White Noise
+Linux sent its thread messages in that form until 2026-11-17. Comments without `e`, and those 0208 already owned, stay
+unchanged. Account schema advances to 217; downgrade is unsupported.
+
 Migration 0208 repairs retained NIP-22 comments (kind 1111 with any lowercase `k` value that parses as a Rust `u64`).
 It restores their first lowercase `e` parent, media metadata and accepted author edits, admits their attachment sources
 and backfills missing attachment slots. Encrypted-media-v1 and v2 source-epoch references make cached secrets

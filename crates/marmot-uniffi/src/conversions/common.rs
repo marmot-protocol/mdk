@@ -1,6 +1,6 @@
 //! Shared FFI helpers used across the conversion sub-modules.
 
-use cgka_traits::{GroupId, app_event::MARMOT_APP_EVENT_KIND_CHAT};
+use cgka_traits::GroupId;
 use marmot_app::SelfMembership;
 
 use crate::markdown::{MarkdownDocumentFfi, parse_markdown_document};
@@ -49,8 +49,14 @@ pub(crate) fn message_tags_ffi(tags: Vec<Vec<String>>) -> Vec<MessageTagFfi> {
         .collect()
 }
 
-pub(crate) fn markdown_content_tokens(kind: u64, plaintext: &str) -> MarkdownDocumentFfi {
-    if kind == MARMOT_APP_EVENT_KIND_CHAT {
+/// Markdown tokens for chat text: kind 9 and thread messages. Other kinds
+/// render their own content and get none.
+pub(crate) fn markdown_content_tokens(
+    kind: u64,
+    tags: &[Vec<String>],
+    plaintext: &str,
+) -> MarkdownDocumentFfi {
+    if cgka_traits::is_chat_message(kind, tags) {
         parse_markdown_document(plaintext)
     } else {
         MarkdownDocumentFfi::default()
@@ -81,6 +87,7 @@ pub fn group_id_from_hex(group_id_hex: &str) -> Result<GroupId, crate::errors::M
 mod tests {
     use super::*;
     use crate::markdown::{MarkdownBlockFfi, MarkdownInlineFfi};
+    use cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT;
 
     #[test]
     fn membership_keeps_account_departure_distinct_from_device_removal() {
@@ -104,14 +111,29 @@ mod tests {
     fn chat_tokens_include_details_blocks() {
         let tokens = markdown_content_tokens(
             MARMOT_APP_EVENT_KIND_CHAT,
+            &[],
             "<details>\n<summary>More</summary>\nbody\n</details>",
         );
         assert!(matches!(tokens.blocks[0], MarkdownBlockFfi::Details { .. }));
-        let other =
-            markdown_content_tokens(1, "<details>\n<summary>More</summary>\nbody\n</details>");
+        let other = markdown_content_tokens(
+            1,
+            &[],
+            "<details>\n<summary>More</summary>\nbody\n</details>",
+        );
         assert!(other.blocks.is_empty());
+        let parent = vec![vec!["e".to_owned(), "parent".to_owned()]];
+        let thread = markdown_content_tokens(cgka_traits::NIP22_COMMENT_KIND, &parent, "**bold**");
+        assert!(!thread.blocks.is_empty(), "a thread message is chat text");
+        let no_parent = vec![vec!["E".to_owned(), "root".to_owned()]];
+        let custom =
+            markdown_content_tokens(cgka_traits::NIP22_COMMENT_KIND, &no_parent, "**bold**");
+        assert!(
+            custom.blocks.is_empty(),
+            "kind 1111 without a parent stays custom"
+        );
         let fallback = markdown_content_tokens(
             MARMOT_APP_EVENT_KIND_CHAT,
+            &[],
             "<details>\n<summary>KEEP_THIS_SUMMARY</summary>\nbody",
         );
         assert!(
@@ -129,6 +151,7 @@ mod tests {
         }));
         let later = markdown_content_tokens(
             MARMOT_APP_EVENT_KIND_CHAT,
+            &[],
             "<details>\n    code\n<summary>ordinary later text</summary>\nbody\n</details>",
         );
         let MarkdownBlockFfi::Details { summary, body, .. } = &later.blocks[0] else {
@@ -145,6 +168,7 @@ mod tests {
         }));
         let protected = markdown_content_tokens(
             MARMOT_APP_EVENT_KIND_CHAT,
+            &[],
             "<details>\n<summary>`one\n</summary>\n</details>\ntwo`\n</summary>\nbody\n</details>",
         );
         let MarkdownBlockFfi::Details { summary, .. } = &protected.blocks[0] else {
@@ -158,6 +182,7 @@ mod tests {
         assert_eq!(protected.blocks.len(), 1);
         let tokens = markdown_content_tokens(
             MARMOT_APP_EVENT_KIND_CHAT,
+            &[],
             "<details>\n<summary>`one\n</summary>\ntwo`</summary>\nbody\n</details>",
         );
         let MarkdownBlockFfi::Details { summary, .. } = &tokens.blocks[0] else {
@@ -170,6 +195,7 @@ mod tests {
         );
         let hard = markdown_content_tokens(
             MARMOT_APP_EVENT_KIND_CHAT,
+            &[],
             "<details>\n<summary>one  \ntwo</summary>\nbody\n</details>",
         );
         let MarkdownBlockFfi::Details { summary, .. } = &hard.blocks[0] else {

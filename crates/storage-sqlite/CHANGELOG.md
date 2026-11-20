@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+### Breaking changes
+
+- `TimelineMessageRecord` and `TimelineReplyPreview` gain `thread: Option<TimelineThreadRef>`, the row's NIP-22
+  thread root and parent; `TimelineReplyPreview` also gains the previewed message's own `reply_to_message_id_hex`,
+  and `TimelineMessageTarget` gains `thread_message`. It is computed on read; a legacy thread message without `E` finds its root by walking
+  stored parents. Struct literals need the field.
+- Account migration 0217 projects stored kind-1111 events that carry a lowercase `e` but no numeric `k` as comments
+  (parent, media, author edits, media-key references). Older binaries refuse schema 217; downgrade is unsupported.
+
+### Changed
+
+- Thread messages (kind 1111 with a parent) count as chat activity: chat-list preview, order, unread and mention
+  counts, and the message-text filter. The chat-list projection version moves to 5, so every row is rebuilt once.
+  A new thread message reaches live subscribers as `TimelineUpdateTrigger::NewMessage`, not `CustomEvent`, and an
+  edit of a thread message that is the chat-list preview reports a content change like a chat edit.
+- A deleted row keeps its `thread`: it is resolved from the row's stored tags, not the masked ones a read returns.
+
+### Added
+
+- `SqliteAppStorage::thread_root_hint` returns the kind and author of a thread root this device no longer stores, as
+  the nearest ancestor naming it with `E`/`K`/`P` records them.
+
 ## 0.18.0 - 2026-11-20
 
 ### Breaking changes

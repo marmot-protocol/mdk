@@ -3507,7 +3507,10 @@ impl MarmotAppRuntime {
     /// edit, delete, agent, group system, push token) are rejected so an app
     /// cannot forge protocol events. Custom events project into the timeline
     /// as standalone rows with the `custom_event` trigger but do not bump the
-    /// chat-list preview or raise push notifications.
+    /// chat-list preview or raise push notifications. A kind-1111 thread
+    /// message (a lowercase `e` naming its parent) is the exception: it is chat
+    /// activity like kind 9. New code sends those with
+    /// [`Self::send_thread_message`].
     pub async fn send_custom_event(
         &self,
         account_ref: &str,
@@ -4483,7 +4486,7 @@ impl MarmotAppRuntime {
     /// matches the target's author. As a fail-fast check against this device's
     /// current view, the send refuses with [`AppError::InvalidEditTarget`]
     /// unless the target is an available chat or NIP-22 comment this account sent
-    /// (kind 1111 with a numeric lowercase `k` tag);
+    /// (kind 1111 with a numeric lowercase `k` or a lowercase `e` tag);
     /// recipients remain authoritative. Competing edits resolve by `created_at`,
     /// then the larger event id. The chat-list preview is
     /// intentionally left untouched so an edit doesn't reorder the
@@ -4561,6 +4564,44 @@ impl MarmotAppRuntime {
                     message_tags,
                     attachments,
                     caption,
+                },
+            )
+            .await?;
+        let _ = self.publish_chat_list_projection_refresh(
+            account_ref,
+            &hex::encode(group_id.as_slice()),
+            ChatListUpdateTrigger::NewLastMessage,
+        );
+        Ok(summary)
+    }
+
+    /// Send a NIP-22 thread message (kind 1111) answering `parent_message_id`:
+    /// text, already-uploaded attachments, or both, plus application tags
+    /// such as NIP-30 `emoji`. MDK finds the parent's thread in this device's
+    /// timeline and builds the `E`/`K`/`P` root and `e`/`k` parent tags;
+    /// callers cannot pass those. An inline reply stays
+    /// [`Self::reply_to_message`] (kind 9), also when it answers a thread
+    /// message.
+    pub async fn send_thread_message(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+        parent_message_id: &str,
+        content: String,
+        attachments: Vec<MediaAttachmentReference>,
+        message_tags: Vec<Vec<String>>,
+    ) -> Result<SendSummary, AppError> {
+        let summary = self
+            .accounts
+            .send_app_event(
+                account_ref,
+                group_id,
+                AppMessageIntent::ThreadMessage {
+                    parent_message_id: parent_message_id.to_owned(),
+                    content,
+                    attachments,
+                    message_tags,
+                    placement: None,
                 },
             )
             .await?;

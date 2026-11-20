@@ -548,6 +548,7 @@ mod tests {
             reply_to_message_id_hex: Some("parent".to_owned()),
             reply_preview: Some(TimelineReplyPreview {
                 message_id_hex: "parent".to_owned(),
+                reply_to_message_id_hex: None,
                 sender: "bb".repeat(32),
                 plaintext: "parent text".to_owned(),
                 kind: 9,
@@ -558,7 +559,9 @@ mod tests {
                 deleted: false,
                 deletion_source: Default::default(),
                 invalidation_status: Some("LosingBranch".to_owned()),
+                thread: None,
             }),
+            thread: None,
             media: Some(serde_json::json!({
                 "imeta": [["imeta", "url https://blob.example/file"]]
             })),
@@ -686,6 +689,7 @@ mod tests {
             received_at: 11,
             reply_to_message_id_hex: None,
             reply_preview: None,
+            thread: None,
             media: None,
             agent_text_stream: None,
             reactions: TimelineReactionSummary::default(),
@@ -741,6 +745,7 @@ mod tests {
             received_at: 11,
             reply_to_message_id_hex: None,
             reply_preview: None,
+            thread: None,
             media: None,
             agent_text_stream: None,
             reactions: TimelineReactionSummary::default(),

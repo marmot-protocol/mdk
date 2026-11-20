@@ -192,6 +192,7 @@ fn prepared_conversion_reuses_rows_and_text_but_keeps_all_visible_changes() {
         |row| {
             row.reply_preview = Some(app::TimelineReplyPreview {
                 message_id_hex: "reply-source".into(),
+                reply_to_message_id_hex: None,
                 sender: "bob".into(),
                 plaintext: "visible reply **new**".into(),
                 kind: 9,
@@ -202,6 +203,7 @@ fn prepared_conversion_reuses_rows_and_text_but_keeps_all_visible_changes() {
                 deleted: false,
                 deletion_source: Default::default(),
                 invalidation_status: None,
+                thread: None,
             })
         },
         |row| {
@@ -461,6 +463,7 @@ fn bench_prepared_conversation_conversion() {
                                 row.plaintext.clone(),
                                 super::super::common::markdown_content_tokens(
                                     row.kind,
+                                    &row.tags,
                                     &row.plaintext,
                                 ),
                             ),
@@ -480,6 +483,7 @@ fn bench_prepared_conversation_conversion() {
                                 row.plaintext.clone(),
                                 super::super::common::markdown_content_tokens(
                                     row.kind,
+                                    &row.tags,
                                     &row.plaintext,
                                 ),
                             );

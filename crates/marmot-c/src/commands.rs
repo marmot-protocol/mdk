@@ -2139,6 +2139,59 @@ pub unsafe extern "C" fn marmot_send_tagged_media(
     })
 }
 
+/// Send a NIP-22 thread message (kind 1111) answering `parent_message_id`:
+/// `text`, previously uploaded `attachments`, or both, plus application
+/// `tags` (for example NIP-30 `emoji`), each row a `(char **, len)` pair.
+/// MDK builds the thread's `E`/`K`/`P` and `e`/`k` tags from the parent's
+/// row and rejects them, and imeta, in `tags`. A client without a thread
+/// view answers with `marmot_reply_to_message` instead, also when the
+/// target is a thread message. Free with `marmot_send_summary_free`.
+///
+/// # Safety
+/// `client` must be a live handle; strings valid; `attachments` must
+/// point to `attachments_len` valid caller-owned structs and `tags` to
+/// `tags_len` valid rows (each NULL with length 0 allowed); `out` valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_send_thread_message(
+    client: *const MarmotClient,
+    account_ref: *const c_char,
+    group_id_hex: *const c_char,
+    parent_message_id: *const c_char,
+    text: *const c_char,
+    attachments: *const MarmotMediaAttachmentReference,
+    attachments_len: usize,
+    tags: *const MarmotStringArray,
+    tags_len: usize,
+    out: *mut *mut MarmotSendSummary,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { crate::preflight_out_ptr(out) });
+        let client = try_arg!(unsafe { client_ref(client) });
+        let account_ref = try_arg!(unsafe { required_str(account_ref) });
+        let group_id_hex = try_arg!(unsafe { required_str(group_id_hex) });
+        let parent_message_id = try_arg!(unsafe { required_str(parent_message_id) });
+        let text = try_arg!(unsafe { required_str(text) });
+        let attachments =
+            try_arg!(unsafe { struct_array(attachments, attachments_len, |a| a.to_ffi()) });
+        let tags = try_arg!(unsafe {
+            struct_array(tags, tags_len, |row| str_array(row.values, row.values_len))
+        });
+        unsafe {
+            deliver(
+                client.block_on(client.marmot.send_thread_message(
+                    account_ref,
+                    group_id_hex,
+                    parent_message_id,
+                    text,
+                    attachments,
+                    tags,
+                )),
+                out,
+            )
+        }
+    })
+}
+
 /// React with a custom emoji image. `attachments` (already uploaded)
 /// become `imeta` tags on the kind-7 and `tags` name them, e.g. NIP-30
 /// `["emoji", shortcode, url]` for `emoji` == `:shortcode:`. imeta rows

@@ -48,6 +48,7 @@ what lives here is in [`README.md`](README.md#what-lives-in-here).
 | `src/convergence_pass.rs` | Durable state for one bounded convergence pass. |
 | `src/maintenance.rs` | Durable maintenance and publication-recovery value types. |
 | `src/polls.rs` | Bounded Marmot profile of NIP-88 polls carried in MLS app messages. |
+| `src/threads.rs` | Marmot profile of NIP-22 thread messages: which kind-1111 events are comments, and the tags naming a thread's parent and root. |
 | `src/reporting.rs` | Typed group reports, dismissal labels, and admin deletion. |
 | `tests/snapshots.rs` | JSON/debug shape checks for cross-boundary types. |
 | `tests/error_display.rs` | Asserts `EngineError`/`PeelerError` `Display` output leaks no group/member ids or pubkeys. |

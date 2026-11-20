@@ -396,13 +396,14 @@ fn reference(raw: &str, ids: &mut BTreeSet<String>) -> Option<String> {
     Some(id)
 }
 
+/// Mentions of a chat message (`is_chat`: kind 9 or a thread message).
 fn mentions(
-    kind: u64,
+    is_chat: bool,
     plaintext: &str,
     tags: &[Vec<String>],
     ids: &mut BTreeSet<String>,
 ) -> (Vec<String>, bool) {
-    if kind != cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT {
+    if !is_chat {
         return (Vec::new(), false);
     }
     let mut found = Vec::new();
@@ -445,12 +446,19 @@ fn message_references(
         .reply_preview
         .as_ref()
         .and_then(|p| reference(&p.sender, ids));
-    let (mentions, mentions_truncated) =
-        mentions(message.kind, &message.plaintext, &message.tags, ids);
+    let (mentions, mentions_truncated) = mentions(
+        cgka_traits::is_chat_message(message.kind, &message.tags),
+        &message.plaintext,
+        &message.tags,
+        ids,
+    );
     let (reply_mentions, reply_mentions_truncated) = message
         .reply_preview
         .as_ref()
-        .map(|p| self::mentions(p.kind, &p.plaintext, &[], ids))
+        .map(|p| {
+            let is_chat = cgka_traits::is_chat_message(p.kind, &p.tags);
+            self::mentions(is_chat, &p.plaintext, &[], ids)
+        })
         .unwrap_or_default();
     let system = trusted
         .and_then(|text| crate::group_system_event_from_message(message.kind, text))
@@ -641,13 +649,13 @@ mod budget_tests {
     fn conversation_mentions_report_bounded_parser_prefix() {
         let mut ids = BTreeSet::new();
         let text = "x".repeat(crate::messages::MAX_MARKDOWN_MENTION_SCAN_BYTES + 1);
-        let (references, truncated) = mentions(9, &text, &[], &mut ids);
+        let (references, truncated) = mentions(true, &text, &[], &mut ids);
         assert!(references.is_empty() && truncated);
-        let (references, _) = mentions(9, &"aa".repeat(32), &[], &mut ids);
+        let (references, _) = mentions(true, &"aa".repeat(32), &[], &mut ids);
         assert!(references.is_empty());
         let mut tags = vec![vec!["p".into(), "aa".repeat(32)]; MAX_CONVERSATION_TAG_SCAN];
         tags.push(vec!["p".into(), "bb".repeat(32)]);
-        let (references, truncated) = mentions(9, "", &tags, &mut ids);
+        let (references, truncated) = mentions(true, "", &tags, &mut ids);
         assert!(truncated);
         assert_eq!(references, vec!["aa".repeat(32)]);
     }

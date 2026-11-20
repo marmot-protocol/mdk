@@ -56,7 +56,7 @@ several files in the same crate); methods shared across those files are `pub(cra
   recording/inject helpers.
 - `src/stream.rs` — QUIC text-stream preview session lifecycle (begin/append/status/progress/finalize/cancel) and the
   idle-session sweeper.
-- `src/inbound.rs` — `SubscribeInbound` drain loop and storage-backed `replay_missed_inbound` recovery after broadcast
+- `src/inbound.rs` — `SubscribeInbound` drain loop and storage-backed `missed_inbound` recovery after broadcast
   lag.
 - `src/invite_policy.rs` — background reconciliation of pending group invites against the welcomer allowlist
   (worker spawn, reconcile, candidate enumeration, apply). Event- and retry-driven: `GroupJoined` events apply

@@ -38,7 +38,7 @@ pub struct AppMessageRecordFfi {
 
 impl From<AppMessageRecord> for AppMessageRecordFfi {
     fn from(value: AppMessageRecord) -> Self {
-        let content_tokens = markdown_content_tokens(value.kind, &value.plaintext);
+        let content_tokens = markdown_content_tokens(value.kind, &value.tags, &value.plaintext);
         let sticker = sticker_ref_from_tags(value.kind, &value.tags).map(Into::into);
         Self {
             message_id_hex: value.message_id_hex,
@@ -211,7 +211,7 @@ impl From<&ReceivedMessage> for ReceivedMessageFfi {
             sender: value.sender.clone(),
             sender_display_name: value.sender_display_name.clone(),
             plaintext: value.plaintext.clone(),
-            content_tokens: markdown_content_tokens(value.kind, &value.plaintext),
+            content_tokens: markdown_content_tokens(value.kind, &value.tags, &value.plaintext),
             kind: value.kind,
             tags: message_tags_ffi(value.tags.clone()),
             sticker,

@@ -17,6 +17,7 @@ use crate::{
 };
 pub use attention::AccountAttentionTotal;
 use cgka_traits::MARMOT_APP_EVENT_KIND_POLL;
+use cgka_traits::NIP22_COMMENT_KIND;
 use cgka_traits::app_components::{GROUP_AVATAR_URL_COMPONENT_ID, decode_group_avatar_url_v1};
 use cgka_traits::app_event::{
     GROUP_SYSTEM_TYPE_ADMIN_ADDED, GROUP_SYSTEM_TYPE_ADMIN_REMOVED, GROUP_SYSTEM_TYPE_MEMBER_ADDED,
@@ -781,16 +782,21 @@ impl SqliteAppStorage {
             let conn = self.lock()?;
             let before: Option<(String, String, i64, i64)> = conn.query_row_cached(
                 "SELECT last_message_id_hex,last_message_preview,last_message_timeline_at,activity_sort_at
-                 FROM chat_list_rows WHERE group_id_hex=?1 AND last_message_kind=9
+                 FROM chat_list_rows WHERE group_id_hex=?1 AND last_message_kind IN (?2,?3)
                  AND last_message_deleted=0 AND last_message_id_hex IS NOT NULL",
-                [group_id_hex], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)),
+                params![
+                    group_id_hex,
+                    u64_to_i64(MARMOT_APP_EVENT_KIND_CHAT)?,
+                    u64_to_i64(NIP22_COMMENT_KIND)?,
+                ],
+                |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)),
             ).optional().storage()?;
             let row = refresh_chat_list_row_for_messages_tx(
                 &conn, local_account_id_hex, group_id_hex, message_ids_hex, mention_classifier,
             )?;
             let changed = before.is_some_and(|(id, body, at, activity)| {
                 row.as_ref().is_some_and(|r| Some(r.activity_sort_at) == u64::try_from(activity).ok() &&
-                    r.last_message.as_ref().is_some_and(|m| m.kind == 9 && !m.deleted &&
+                    r.last_message.as_ref().is_some_and(|m| is_chat_text(m.kind) && !m.deleted &&
                         m.message_id_hex == id && Some(m.timeline_at) == u64::try_from(at).ok() && m.plaintext != body))
             });
             Ok((row, changed))
@@ -1164,9 +1170,10 @@ fn dirty_unread_messages_are_covered_tx(
 /// Version 1 covered unread-mention counts (#750). Version 2 additionally
 /// projects kind-1210 group-system rows into preview, activity, and unread state
 /// (#822). Version 3 materializes per-message unread membership so incremental
-/// refreshes do not rescan the unread window. The persisted column keeps its legacy `mention_counts_version` name
+/// refreshes do not rescan the unread window. Version 5 counts NIP-22 thread
+/// messages as chat activity. The persisted column keeps its legacy `mention_counts_version` name
 /// for schema compatibility, but now gates the complete derived-row contract.
-const CHAT_LIST_PROJECTION_VERSION: i64 = 4;
+const CHAT_LIST_PROJECTION_VERSION: i64 = 5;
 
 const CHAT_LIST_GROUP_ACTIVITY_TYPES: [&str; 5] = [
     GROUP_SYSTEM_TYPE_MEMBER_ADDED,
@@ -1179,6 +1186,8 @@ const CHAT_LIST_GROUP_ACTIVITY_TYPES: [&str; 5] = [
 /// SQL predicate for activity that should behave like a chat message in the
 /// chat list. Kind-1210 also carries metadata changes; #822 intentionally
 /// promotes only membership/admin rows, leaving unrelated system events alone.
+/// A kind-1111 row is a thread message exactly when the projection gave it a
+/// parent; other kind-1111 events stay custom events.
 pub(crate) fn chat_list_activity_filter_sql(column_prefix: &str) -> String {
     let group_activity_tags = CHAT_LIST_GROUP_ACTIVITY_TYPES
         .iter()
@@ -1187,6 +1196,8 @@ pub(crate) fn chat_list_activity_filter_sql(column_prefix: &str) -> String {
         .join(", ");
     format!(
         "({column_prefix}kind IN ({MARMOT_APP_EVENT_KIND_CHAT}, {MARMOT_APP_EVENT_KIND_POLL}) OR \
+         ({column_prefix}kind = {NIP22_COMMENT_KIND} AND \
+          {column_prefix}reply_to_message_id_hex IS NOT NULL) OR \
          ({column_prefix}kind = {MARMOT_APP_EVENT_KIND_GROUP_SYSTEM} AND \
           {column_prefix}tags_json IN ({group_activity_tags}) AND \
           EXISTS (SELECT 1 FROM account_groups AS activity_group \
@@ -1797,6 +1808,13 @@ fn write_chat_list_row_for_group_tx(
     Ok(())
 }
 
+/// Chat messages and thread messages: the preview kinds whose text carries
+/// mentions and can be edited. The activity filter has already kept only
+/// kind-1111 rows that are thread messages.
+fn is_chat_text(kind: u64) -> bool {
+    kind == MARMOT_APP_EVENT_KIND_CHAT || kind == NIP22_COMMENT_KIND
+}
+
 #[derive(Clone, Debug)]
 struct UnreadSummary {
     count: u64,
@@ -2017,8 +2035,7 @@ fn unread_membership_for_message_tx(
         let kind = row.get::<_, i64>(2)? as u64;
         let tags = crate::tags_from_json(tags_json).unwrap_or_default();
         Ok(UnreadMembership {
-            mentions_local: kind == MARMOT_APP_EVENT_KIND_CHAT
-                && mention_classifier(&plaintext, &tags),
+            mentions_local: is_chat_text(kind) && mention_classifier(&plaintext, &tags),
             order_class: row.get(3)?,
             order_primary: row.get(4)?,
             order_phase: row.get(5)?,
@@ -2101,8 +2118,7 @@ fn rebuild_unread_membership_tx(
         }
         count += 1;
         let tags = crate::tags_from_json(tags_json).unwrap_or_default();
-        let mentions_local =
-            kind == MARMOT_APP_EVENT_KIND_CHAT && mention_classifier(&plaintext, &tags);
+        let mentions_local = is_chat_text(kind) && mention_classifier(&plaintext, &tags);
         if mentions_local {
             mention_count += 1;
         }

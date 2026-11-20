@@ -907,6 +907,7 @@ fn oversized_timeline_id_sets_are_chunked() {
     let previews = load_reply_previews(
         &conn,
         ids.iter().map(|id| ("11".repeat(32), id.clone())).collect(),
+        &mut HashMap::new(),
     )
     .unwrap();
     assert_eq!(
@@ -2799,6 +2800,176 @@ fn nip22_comment_in_timeline() {
     );
 }
 
+/// The thread-message contract fixtures every White Noise client shares:
+/// each wire form projects one reply target and one thread placement, in
+/// live projection, after a rebuild and once deleted.
+#[test]
+fn thread_message_fixtures_project_reply_target_and_thread() {
+    #[derive(serde::Deserialize)]
+    struct Fixture {
+        events: Vec<FixtureEvent>,
+    }
+    #[derive(serde::Deserialize)]
+    struct FixtureEvent {
+        name: String,
+        id: String,
+        kind: u64,
+        tags: Vec<Vec<String>>,
+        expect: Expect,
+    }
+    #[derive(serde::Deserialize)]
+    struct Expect {
+        reply_to: Option<String>,
+        thread: Option<ExpectThread>,
+        reply_preview_thread: Option<ExpectThread>,
+    }
+    #[derive(serde::Deserialize)]
+    struct ExpectThread {
+        root: String,
+        parent: String,
+    }
+    fn thread(expect: Option<&ExpectThread>) -> Option<TimelineThreadRef> {
+        expect.map(|thread| TimelineThreadRef {
+            root_message_id_hex: thread.root.clone(),
+            parent_message_id_hex: thread.parent.clone(),
+        })
+    }
+
+    let fixture: Fixture =
+        serde_json::from_str(include_str!("../../../fixtures/thread-messages.json")).unwrap();
+    let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
+    for (at, event) in (1..).zip(&fixture.events) {
+        let mut stored = chat(&event.id, "alice", at, &event.name);
+        stored.kind = event.kind;
+        stored.tags = event.tags.clone();
+        let update = store.record_app_event(&stored).unwrap();
+        // A new thread message reaches live subscribers as new chat.
+        let own_trigger = update.changes.iter().find_map(|change| match change {
+            TimelineMessageChange::Upsert { trigger, message }
+                if message.message_id_hex == event.id =>
+            {
+                Some(trigger.clone())
+            }
+            _ => None,
+        });
+        if event.kind == NIP22_COMMENT_KIND {
+            let expected = if event.expect.reply_to.is_some() {
+                TimelineUpdateTrigger::NewMessage
+            } else {
+                TimelineUpdateTrigger::CustomEvent
+            };
+            assert_eq!(own_trigger, Some(expected), "{}", event.name);
+        }
+    }
+    let group = "11".repeat(32);
+    // A deleted row reads with its tags masked; its place in the thread stays.
+    for (pass, rebuild, deleted) in [(0, false, false), (1, true, false), (2, false, true)] {
+        if rebuild {
+            store.rebuild_message_timeline_for_group(&group).unwrap();
+        }
+        if deleted {
+            for (at, event) in (100..).zip(&fixture.events) {
+                let delete_id = format!("delete-{}", event.id);
+                store
+                    .record_app_event(&delete(&delete_id, "alice", &event.id, at))
+                    .unwrap();
+            }
+        }
+        for event in &fixture.events {
+            let row = store.timeline_message(&group, &event.id).unwrap().unwrap();
+            assert_eq!(row.deleted, deleted, "{}", event.name);
+            let context = format!("{} (pass {pass})", event.name);
+            assert_eq!(
+                row.reply_to_message_id_hex, event.expect.reply_to,
+                "{context}"
+            );
+            assert_eq!(
+                row.thread,
+                thread(event.expect.thread.as_ref()),
+                "{context}"
+            );
+            if let Some(expected) = &event.expect.reply_preview_thread {
+                assert_eq!(
+                    row.reply_preview
+                        .as_ref()
+                        .and_then(|preview| preview.thread.clone()),
+                    thread(Some(expected)),
+                    "{context}"
+                );
+            }
+            // A preview places its message exactly as that message's own row.
+            if let Some(preview) = &row.reply_preview {
+                let target = fixture
+                    .events
+                    .iter()
+                    .find(|target| target.id == preview.message_id_hex)
+                    .unwrap();
+                assert_eq!(
+                    preview.reply_to_message_id_hex, target.expect.reply_to,
+                    "{context}"
+                );
+                assert_eq!(
+                    preview.thread,
+                    thread(target.expect.thread.as_ref()),
+                    "{context}"
+                );
+            }
+            if event.id == "linux-media" {
+                assert_eq!(
+                    row.media.is_some(),
+                    !deleted,
+                    "a thread message keeps its media"
+                );
+            }
+        }
+    }
+}
+
+/// Reading a thread and sending into it agree on the root at the deepest
+/// legacy chain the read walk follows: the send-side walk starts one row
+/// lower, at the parent itself.
+#[test]
+fn root_hint_reaches_as_far_as_the_read_walk() {
+    let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
+    let group = "11".repeat(32);
+    let comment = |id: &str, at, tags: &[&[&str]]| {
+        let mut event = chat(id, "alice", at, id);
+        event.kind = NIP22_COMMENT_KIND;
+        event.tags = tags
+            .iter()
+            .map(|tag| tag.iter().map(|value| (*value).to_owned()).collect())
+            .collect();
+        event
+    };
+    store
+        .record_app_event(&comment(
+            "named",
+            1,
+            &[
+                &["E", "gone"],
+                &["K", "9"],
+                &["P", "bob"],
+                &["e", "gone"],
+                &["k", "9"],
+            ],
+        ))
+        .unwrap();
+    let mut parent = "named".to_owned();
+    for depth in 1..=64 {
+        let id = format!("legacy-{depth}");
+        store
+            .record_app_event(&comment(&id, depth + 1, &[&["e", &parent], &["k", "1111"]]))
+            .unwrap();
+        parent = id;
+    }
+    let row = store.timeline_message(&group, &parent).unwrap().unwrap();
+    assert_eq!(row.thread.unwrap().root_message_id_hex, "gone");
+    assert_eq!(
+        store.thread_root_hint(&group, &parent, "gone").unwrap(),
+        Some((9, "bob".to_owned()))
+    );
+}
+
 #[test]
 fn unmarked_comments_stay_custom() {
     for kind_tag in [None, Some("invalid")] {
@@ -2806,7 +2977,7 @@ fn unmarked_comments_stay_custom() {
         let mut comment = chat("custom", "alice", 1, "original");
         comment.kind = NIP22_COMMENT_KIND;
         comment.tags = vec![
-            vec!["e".into(), "parent".into()],
+            vec!["E".into(), "parent".into()],
             vec!["imeta".into(), "url https://example.com/image.png".into()],
         ];
         if let Some(kind) = kind_tag {

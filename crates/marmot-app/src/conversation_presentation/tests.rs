@@ -75,6 +75,7 @@ fn message(group: &str, sender: &str) -> TimelineMessageRecord {
         received_at: 1,
         reply_to_message_id_hex: None,
         reply_preview: None,
+        thread: None,
         media: None,
         agent_text_stream: None,
         reactions: TimelineReactionSummary::default(),
@@ -267,6 +268,7 @@ fn conversation_dictionary_includes_former_members_replies_mentions_and_peer() {
     row.plaintext = format!("hello @{}", npub_for_account_id(&mentioned).unwrap());
     row.reply_preview = Some(TimelineReplyPreview {
         message_id_hex: "03".repeat(32),
+        reply_to_message_id_hex: None,
         sender: reply.clone(),
         plaintext: "earlier".into(),
         tags: Vec::new(),
@@ -277,6 +279,7 @@ fn conversation_dictionary_includes_former_members_replies_mentions_and_peer() {
         deleted: false,
         deletion_source: Default::default(),
         invalidation_status: None,
+        thread: None,
     });
     let result = project(&app, &input, &page(vec![row]));
     assert_eq!(result.identities.len(), 4);
@@ -286,9 +289,52 @@ fn conversation_dictionary_includes_former_members_replies_mentions_and_peer() {
     }
     assert_eq!(result.messages[0].sender.as_ref(), Some(&former));
     assert_eq!(result.messages[0].reply_author.as_ref(), Some(&reply));
-    assert_eq!(result.messages[0].mentions, vec![mentioned]);
+    assert_eq!(result.messages[0].mentions, vec![mentioned.clone()]);
     assert!(!result.depends_on_profile(&"ff".repeat(32)));
     assert!(result.depends_on_profile(&former.to_uppercase()));
+
+    // A thread message, and a thread message quoted, carry mentions like
+    // kind 9; a kind-1111 custom event does not.
+    let thread_tags = vec![vec!["e".to_owned(), "03".repeat(32)]];
+    for (tags, mentions) in [(thread_tags, true), (Vec::new(), false)] {
+        let mut thread = message(&input.group_id_hex, &former);
+        thread.kind = cgka_traits::NIP22_COMMENT_KIND;
+        thread.tags = tags.clone();
+        thread.plaintext = format!("hello @{}", npub_for_account_id(&mentioned).unwrap());
+        let mut quoting = message(&input.group_id_hex, &former);
+        quoting.reply_preview = Some(TimelineReplyPreview {
+            kind: cgka_traits::NIP22_COMMENT_KIND,
+            tags,
+            plaintext: thread.plaintext.clone(),
+            ..row_reply_preview(&reply)
+        });
+        let result = project(&app, &input, &page(vec![thread, quoting]));
+        let expected = if mentions {
+            vec![mentioned.clone()]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(result.messages[0].mentions, expected);
+        assert_eq!(result.messages[1].reply_mentions, expected);
+    }
+}
+
+fn row_reply_preview(sender: &str) -> TimelineReplyPreview {
+    TimelineReplyPreview {
+        message_id_hex: "03".repeat(32),
+        reply_to_message_id_hex: None,
+        sender: sender.to_owned(),
+        plaintext: String::new(),
+        tags: Vec::new(),
+        kind: 9,
+        source_epoch: Some(0),
+        media: None,
+        agent_text_stream: None,
+        deleted: false,
+        deletion_source: Default::default(),
+        invalidation_status: None,
+        thread: None,
+    }
 }
 
 #[test]
@@ -629,6 +675,7 @@ fn conversation_reply_mentions_have_independent_limits_and_complete_identities()
     row.plaintext = format!("@{}", npub_for_account_id(&main).unwrap());
     row.reply_preview = Some(TimelineReplyPreview {
         message_id_hex: "03".repeat(32),
+        reply_to_message_id_hex: None,
         sender: reply_author.clone(),
         plaintext: reply_ids
             .iter()
@@ -643,6 +690,7 @@ fn conversation_reply_mentions_have_independent_limits_and_complete_identities()
         deleted: false,
         deletion_source: Default::default(),
         invalidation_status: None,
+        thread: None,
     });
     let result = project(&app, &input, &page(vec![row.clone()]));
     assert_eq!(result.messages[0].mentions, vec![main]);
