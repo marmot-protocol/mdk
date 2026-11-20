@@ -1516,9 +1516,6 @@ impl AppClient {
 
     pub fn resume_maintenance(&mut self) {
         self.runtime.resume_maintenance();
-        // Nothing device-group ran while paused: the next run finds what is
-        // owed (mdk#3265).
-        self.device_group_work_changed = true;
     }
 
     pub async fn run_due_maintenance(&mut self) -> Result<crate::MaintenanceRunSummary, AppError> {

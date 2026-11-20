@@ -436,8 +436,17 @@ impl AppClient {
     /// won here is applied, on the worker's turn after the change instead of
     /// at the next maintenance pass (mdk#3566). What is left owed retries
     /// with maintenance. Returns whether it ran.
+    ///
+    /// Not where `run_due_maintenance` runs no pass either: with maintenance
+    /// paused, in a wake-collection runtime (`CursorPersistence::Frozen`),
+    /// on an unlinked device, or while a removal holds a sign-out's
+    /// publishing. The flag stays set and the work stays stored, for the
+    /// next advancing runtime's maintenance.
     pub(crate) async fn drive_changed_invitation_decisions(&mut self) -> bool {
         if self.runtime.maintenance_is_paused()
+            || self.app.cursor_persistence() == crate::CursorPersistence::Frozen
+            || self.device_unlinked
+            || self.hold_removed_sign_out_publishing().unwrap_or(true)
             || !std::mem::take(&mut self.invitation_decisions_changed)
         {
             return false;
@@ -584,8 +593,10 @@ impl AppClient {
                     if last_admin || settling {
                         // Keep the exact work owed before push drain, sync or
                         // a queued refusal. The native send rechecks after
-                        // send sync. A last admin waits for the chat's admins
-                        // to change, an event, not a retry.
+                        // send sync. A last admin is not retried: nothing
+                        // re-arms this work when the chat's admins change, so
+                        // it waits for the next maintenance run, up to an
+                        // hour (the linked account's heartbeat).
                         return Ok(settling);
                     }
                 }

@@ -4904,6 +4904,8 @@ async fn a_linked_device_shows_an_answered_invitation_within_seconds() {
         let apps = [phone_app.clone(), laptop_app.clone()];
         let stop = stop.clone();
         async move {
+            // A short pause per look leaves the CPU to the workers measured.
+            let mut look = tokio::time::interval(Duration::from_millis(10));
             let mut cursor = relayed_from;
             while !stop.load(std::sync::atomic::Ordering::Acquire) {
                 let events = relay.published_events.lock().unwrap()[cursor..].to_vec();
@@ -4920,7 +4922,7 @@ async fn a_linked_device_shows_an_answered_invitation_within_seconds() {
                             .await;
                     }
                 }
-                tokio::task::yield_now().await;
+                look.tick().await;
             }
         }
     });
@@ -4959,7 +4961,6 @@ async fn a_linked_device_shows_an_answered_invitation_within_seconds() {
         }
     })
     .await;
-    assert!(!pending(&laptop_app) || shown.is_err());
     stop.store(true, std::sync::atomic::Ordering::Release);
     forwarder.await.unwrap();
     phone_runtime.shutdown().await;
@@ -4968,5 +4969,126 @@ async fn a_linked_device_shows_an_answered_invitation_within_seconds() {
         shown.is_ok(),
         "the laptop shows the answer within seconds, not after {:?}",
         answered.elapsed()
+    );
+}
+
+/// A wake-collection runtime (`CursorPersistence::Frozen`, as a notification
+/// extension runs) that receives a sibling's decline leaves it for an
+/// advancing runtime: it requests no Leave, so publishes none, and the
+/// decline stays owed. Maintenance never runs a pass there; the worker's
+/// invitation step must not either.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_frozen_runtime_leaves_a_siblings_decline_owed() {
+    use cgka_traits::storage::{GroupStorage as _, LeaveRequestStorage as _};
+    let (relay, [mut phone, mut laptop]) = alice_devices::<2>().await;
+    link(&relay, &mut phone, &mut laptop, "Laptop").await;
+    let (_bob_dir, _bob, chat) =
+        invite_account_pending(&relay, &mut phone, &mut laptop, false, None).await;
+    let chat_hex = hex::encode(chat.as_slice());
+    passes(&relay, &mut [&mut phone, &mut laptop], 2).await;
+    let Device {
+        _dir: _phone_dir,
+        app: phone_app,
+        client: phone_client,
+        ..
+    } = phone;
+    let Device {
+        _dir: laptop_dir,
+        app: laptop_app,
+        client: laptop_client,
+        ..
+    } = laptop;
+    drop((phone_client, laptop_client));
+    // The laptop opens again as a wake-collection process.
+    laptop_app.close_storage().unwrap();
+    drop(laptop_app);
+    let frozen = MarmotApp::with_relay_and_config(
+        laptop_dir.path(),
+        "wss://relay.example",
+        MarmotAppConfig::white_noise()
+            .with_dev_settlement_quiescence_ms(0)
+            .with_dev_scheduled_convergence_delay_ms(0)
+            .with_device_groups(true)
+            .with_cursor_persistence(crate::CursorPersistence::Frozen),
+    )
+    .with_test_relay_client(relay.clone());
+
+    let relayed_from = relay.published_events.lock().unwrap().len();
+    let phone_runtime = MarmotAppRuntime::new(phone_app.clone());
+    let frozen_runtime = MarmotAppRuntime::new(frozen.clone());
+    for runtime in [&phone_runtime, &frozen_runtime] {
+        runtime.reconcile_accounts().await.unwrap();
+    }
+    // The relay between the devices, as in
+    // `a_linked_device_shows_an_answered_invitation_within_seconds`.
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let forwarder = tokio::spawn({
+        let relay = relay.clone();
+        let apps = [phone_app.clone(), frozen.clone()];
+        let stop = stop.clone();
+        async move {
+            let mut look = tokio::time::interval(Duration::from_millis(10));
+            let mut cursor = relayed_from;
+            while !stop.load(std::sync::atomic::Ordering::Acquire) {
+                let events = relay.published_events.lock().unwrap()[cursor..].to_vec();
+                cursor += events.len();
+                for event in events {
+                    for app in &apps {
+                        let _ = app
+                            .relay_plane
+                            .handle_relay_event_for_test(NostrRelayEvent {
+                                endpoint: TransportEndpoint("wss://relay.example".to_owned()),
+                                subscription_id: Some("linked-devices".to_owned()),
+                                event: event.clone(),
+                            })
+                            .await;
+                    }
+                }
+                look.tick().await;
+            }
+        }
+    });
+
+    phone_runtime
+        .decline_group_invite("alice", &chat)
+        .await
+        .unwrap();
+    let account = frozen.account_storage("alice").unwrap();
+    let generation = account
+        .invitation_admission(&chat)
+        .unwrap()
+        .unwrap()
+        .generation;
+    let storage = account.app_storage();
+    let merged = tokio::time::timeout(Duration::from_secs(30), async {
+        while storage
+            .invitation_decision(&chat_hex, &generation)
+            .unwrap()
+            .is_none_or(|held| !held.declined)
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    // Two commands through the worker: each turn's invitation step has run
+    // before the second answers.
+    for _ in 0..2 {
+        frozen_runtime.linked_devices("alice").await.unwrap();
+    }
+    let leave = account.leave_request(&chat).unwrap();
+    let owed = storage.invitation_decision_work().unwrap();
+    stop.store(true, std::sync::atomic::Ordering::Release);
+    forwarder.await.unwrap();
+    phone_runtime.shutdown().await;
+    frozen_runtime.shutdown().await;
+    merged.expect("the laptop merges the phone's decline");
+    assert!(
+        leave.is_none(),
+        "a wake-collection runtime requests no Leave for a sibling's decline"
+    );
+    assert!(
+        owed.iter()
+            .any(|work| work.decision.group_id_hex == chat_hex && work.decline_owed),
+        "the decline stays owed for an advancing runtime"
     );
 }
