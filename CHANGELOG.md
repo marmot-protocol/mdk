@@ -127,6 +127,8 @@
 
 ### Fixed
 
+- Native Secret Service sessions use `crypto-bigint 0.7.11`, removing the
+  dependency affected by RUSTSEC-2026-0387 (#819).
 - A newly linked device gets each chat as the device that adds it holds it
   (#3546). A chat confirmed there from before invitation generations arrives
   confirmed instead of as an invitation from the account itself; one with an

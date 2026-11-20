@@ -449,8 +449,8 @@ mod platform {
     use super::*;
     use aes::cipher::{BlockDecryptMut, BlockEncryptMut, KeyIvInit, block_padding::Pkcs7};
     use crypto_bigint::{
-        Encoding, U1024,
-        modular::runtime_mod::{DynResidue, DynResidueParams},
+        Odd, U1024,
+        modular::{FixedMontyForm, FixedMontyParams},
     };
     use std::sync::Mutex;
     use zbus::blocking::{Connection, Proxy};
@@ -460,13 +460,13 @@ mod platform {
     const ROOT: &str = "/org/freedesktop/secrets";
     const ITEM: &str = "org.freedesktop.Secret.Item";
     const COLLECTION: &str = "org.freedesktop.Secret.Collection";
-    const DH_PRIME: U1024 = U1024::from_be_hex(concat!(
+    const DH_PRIME: Odd<U1024> = Odd::<U1024>::from_be_hex(concat!(
         "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E088A67CC74020B",
         "BEA63B139B22514A08798E3404DDEF9519B3CD3A431B302B0A6DF25F14374FE1356D",
         "6D51C245E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7EDEE386BFB5A89",
         "9FA5AE9F24117C4B1FE649286651ECE65381FFFFFFFFFFFFFFFF"
     ));
-    const DH_PARAMS: DynResidueParams<{ U1024::LIMBS }> = DynResidueParams::new(&DH_PRIME);
+    const DH_PARAMS: FixedMontyParams<{ U1024::LIMBS }> = FixedMontyParams::new(DH_PRIME);
     type Secret = (OwnedObjectPath, Vec<u8>, Vec<u8>, String);
 
     fn open_session(root: &Proxy<'_>) -> AccountHomeResult<(OwnedObjectPath, Zeroizing<[u8; 16]>)> {
@@ -476,7 +476,7 @@ mod platform {
         if *private <= U1024::ONE {
             return Err(vault_error("invalid Secret Service DH private exponent"));
         }
-        let public = DynResidue::new(&U1024::from_u8(2), DH_PARAMS)
+        let public = FixedMontyForm::new(&U1024::from_u8(2), &DH_PARAMS)
             .pow(&private)
             .retrieve()
             .to_be_bytes();
@@ -500,10 +500,10 @@ mod platform {
         let mut padded = [0u8; 128];
         padded[128 - public.len()..].copy_from_slice(public);
         let public = U1024::from_be_slice(&padded);
-        if public <= U1024::ONE || public >= DH_PRIME.wrapping_sub(&U1024::ONE) {
+        if public <= U1024::ONE || public >= DH_PRIME.as_ref().wrapping_sub(&U1024::ONE) {
             return Err(vault_error("invalid Secret Service DH public key"));
         }
-        let shared = Zeroizing::new(DynResidue::new(&public, DH_PARAMS).pow(&private));
+        let shared = Zeroizing::new(FixedMontyForm::new(&public, &DH_PARAMS).pow(&private));
         let shared_integer = Zeroizing::new(shared.retrieve());
         let shared_bytes = Zeroizing::new(shared_integer.to_be_bytes());
         let mut key = Zeroizing::new([0u8; 16]);

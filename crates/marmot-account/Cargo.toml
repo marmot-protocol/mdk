@@ -41,7 +41,7 @@ windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Secur
 [target.'cfg(any(target_os = "linux", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd", target_os = "dragonfly"))'.dependencies]
 zbus-secret-service-keyring-store = { version = "1", features = ["crypto-rust"] }
 zbus = { version = "5.14", features = ["blocking-api"] }
-crypto-bigint = { version = "0.5.5", default-features = false, features = ["zeroize"] }
+crypto-bigint = { version = "0.7.11", default-features = false, features = ["zeroize"] }
 aes = { version = "0.8", features = ["zeroize"] }
 cbc = { version = "0.1", features = ["block-padding", "zeroize"] }
 hkdf.workspace = true
