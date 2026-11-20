@@ -9,7 +9,7 @@
       "sleep": 1
     },
     "crates/agent-connector/src/tests.rs": {
-      "sleep": 29,
+      "sleep": 27,
       "short_timeout": 4
     },
     "crates/agent-connector/src/usage_diagnostics.rs": {
