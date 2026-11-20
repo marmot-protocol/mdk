@@ -4005,7 +4005,11 @@ impl MarmotApp {
             .app_storage()
             .set_chat_pinned(group_id_hex, pinned)
             .map_err(chat_pin_error_from_storage)?;
-        self.device_group_wakes.small_state_edited(label);
+        // The worker knows its account by label, whatever reference named it.
+        // The pin is saved: a failed lookup only skips the wake.
+        if let Ok(account) = self.account_home().account(label) {
+            self.device_group_wakes.small_state_edited(&account.label);
+        }
         Ok(state)
     }
 
@@ -4023,7 +4027,11 @@ impl MarmotApp {
             .app_storage()
             .set_pinned_chat_order(ordered_group_ids)
             .map_err(chat_pin_error_from_storage)?;
-        self.device_group_wakes.small_state_edited(label);
+        // The worker knows its account by label, whatever reference named it.
+        // The pin is saved: a failed lookup only skips the wake.
+        if let Ok(account) = self.account_home().account(label) {
+            self.device_group_wakes.small_state_edited(&account.label);
+        }
         Ok(state)
     }
 

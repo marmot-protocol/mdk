@@ -1578,11 +1578,14 @@ impl AppClient {
     /// it is gone.
     async fn decide_device_links(&mut self, now: u64) {
         let window = Duration::from_millis(self.app.settlement_quiescence_ms());
+        // A failed read leaves the links to the next drive, 15 s on.
         let Ok(storage) = self.app.account_storage(&self.state.label) else {
+            self.device_pairing.roster_changed = true;
             return;
         };
         let storage = storage.app_storage();
         let (Ok(links), Ok(own_slot)) = (storage.device_links(), self.own_slot()) else {
+            self.device_pairing.roster_changed = true;
             return;
         };
         let mut pending = Vec::new();

@@ -843,6 +843,8 @@ impl AppClient {
         if to == SignInAnswer::Rejected
             && let Err(error) = self.commit_sign_in_rejections().await
         {
+            // Maintenance commits it 15 s on (mdk#3265).
+            self.device_group_work_changed = true;
             tracing::warn!(
                 target: "marmot_app::client::sign_ins",
                 method = "answer_sign_in",
