@@ -1866,8 +1866,11 @@ async fn run_app_runtime_account_worker(
         }
         // An invitation answered here, or one a sibling's decision settled,
         // goes out and applies on this turn, not at the next maintenance
-        // pass (mdk#3566). What it leaves owed retries with maintenance.
+        // pass (mdk#3566). What it leaves owed retries with maintenance. Not
+        // once shutdown is requested, as no scheduled job runs then: the
+        // answer is saved, and the next start sends and applies it.
         if client.invitation_decisions_changed
+            && !lifecycle.is_stopping()
             && Box::pin(client.drive_changed_invitation_decisions()).await
         {
             publish_settled_invitations(&mut client, &events, &account_id_hex, &account_label);
