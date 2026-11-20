@@ -134,8 +134,9 @@
   `upload_message_draft_attachments`, whose references carry the staged
   bodies' descriptors and digests, before `send_message_draft`. No full-size
   buffer crosses the binding after staging. Storage usage reports the staged
-  bytes as `draft_bytes`. `message_draft_attachment_if_revision` and the
-  legacy whole-draft read refuse a draft with a file-backed attachment.
+  bytes as `draft_bytes`. `message_draft_attachment_if_revision` refuses a
+  file-backed attachment (it still reads inline ones), and the legacy
+  whole-draft read refuses a draft that holds one.
 
 ### Changed
 
@@ -160,7 +161,8 @@
   the engine's untyped refusal (#2332). It is checked before `GroupCatchingUp`
   and `GroupCommitUndelivered`, and no acknowledgement releases it: retry once
   the commit confirms. A member's leave and invite decline fail the same way.
-  Disbanding and an admin's leave are still accepted, and messages still send.
+  Disbanding and an admin's leave are still accepted, and messages are accepted
+  but wait in the queue until the commit resolves.
 - `send_message_draft` (Rust, UniFFI, C) and captured-media admission match
   prepared media to the draft's attachments after the normalization an upload
   applies (#3431): a V1 upload's trimmed file name and either version's
