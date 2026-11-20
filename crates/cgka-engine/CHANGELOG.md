@@ -7,7 +7,7 @@
 ### Breaking changes
 
 - The `dev-device-groups` feature is gone (mdk#2628): every build may advertise the device-roster component
-  (`marmot.account.device-roster.v1`), so other clients see it in this build's capabilities.
+  (`marmot.account.device-roster.v1`). `marmot-app` lists it only while device groups are on.
 - `SiblingWelcome` gains `forwarded`, encoded as version 3 when anything is forwarded: the original inviter, and for
   a copy with no invitation generation whether it is confirmed (mdk#3546). A sibling join reports it on
   `GroupJoined.forwarded`. Receivers older than this refuse a version-3 Welcome. An Add that forwards anything
