@@ -202,8 +202,13 @@ class SignaturePolicyTests(unittest.TestCase):
                     return bool(needs) and any(gated(parent, visited | {job}) for parent in
                         re.findall(r"[a-z0-9][a-z0-9-]*", needs[1]))
                 for job, body in jobs.items():
-                    if job not in {"required-ci", "candidate-validation", "merge-group-fail-fast",
-                                   "report-master-failure"}:
+                    if (path.name, job) == ("bindings-profile.yml", "report-master-failure"):
+                        # It must run after a failure, so it may use always(), but only on master.
+                        self.assertTrue(gated(job))
+                        self.assertIn("    if: always() && github.event_name != 'pull_request' && "
+                                      "github.ref == 'refs/heads/master' && "
+                                      "needs.candidate-validation.result == 'failure'\n", body)
+                    elif job not in {"required-ci", "candidate-validation", "merge-group-fail-fast"}:
                         self.assertTrue(gated(job), f"{path.name}:{job} can run before signatures")
                         self.assertNotRegex(body, r"(?m)^    if:.*(?:always|failure|cancelled)\(")
 

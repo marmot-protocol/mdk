@@ -2,7 +2,8 @@
 # builds trust need approval from one of these owners (the "Safe Master"
 # ruleset requires code-owner review). These files decide what CI runs, what
 # counts as passing, and what gets published, so a PR must not be able to
-# change them and judge itself.
+# change them and judge itself. Owner review gates merging only: a
+# same-repository PR's edited workflow still runs before anyone approves it.
 #
 # The root Cargo.toml is owned because it sets dependency sources and the
 # release profile. Ordinary source changes, including Cargo.lock, need no
