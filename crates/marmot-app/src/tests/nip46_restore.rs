@@ -528,11 +528,7 @@ async fn run_nip46_drop(settlement: DropSettlement) {
     let expected_signed_out = !sign_in_requested;
     let peer = LoginPeer::new().await;
     let dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(RemovalFailureStore {
-        inner: LocalFileSecretStore::new(dir.path(), IosOptions::default()),
-        refuse: std::sync::atomic::AtomicBool::new(false),
-        native_removed: tokio::sync::Notify::new(),
-    });
+    let store = Arc::new(RemovalFailureStore::new(dir.path()));
     let home =
         AccountHome::open_with_secret_store(dir.path(), store.clone(), IosOptions::default());
     let relay = Arc::new(ScriptedPushRelayClient::default());
@@ -609,6 +605,7 @@ async fn run_nip46_drop(settlement: DropSettlement) {
         && home
             .load_nip46_session(&id)
             .is_ok_and(|pairing| pairing.is_some());
+    let receipts = store.native_receipts();
     let pending = !login.is_finished();
     login.abort();
     let aborted = matches!(login.await, Err(error) if error.is_cancelled());
@@ -684,9 +681,7 @@ async fn run_nip46_drop(settlement: DropSettlement) {
     let pairing_removed = home
         .load_nip46_session(&id)
         .is_ok_and(|pairing| pairing.is_none());
-    let secret_removed = store
-        .has_secret_for_label(&format!(".nip46-client/{}", account.label))
-        .is_ok_and(|exists| !exists);
+    let secret_removed = receipts.iter().all(|path| !path.try_exists().unwrap());
     let journal_removed = home
         .account_setup_state(&id)
         .is_ok_and(|state| state.is_none());
@@ -826,7 +821,7 @@ async fn run_nip46_drop(settlement: DropSettlement) {
 async fn nip46_remove_after_rollback() {
     let peer = LoginPeer::new().await;
     let dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(LocalFileSecretStore::new(dir.path(), IosOptions::default()));
+    let store = Arc::new(RemovalFailureStore::new(dir.path()));
     let home =
         AccountHome::open_with_secret_store(dir.path(), store.clone(), IosOptions::default());
     let relay = Arc::new(ScriptedPushRelayClient::default());
@@ -864,14 +859,13 @@ async fn nip46_remove_after_rollback() {
     let id = peer.user.public_key().to_hex();
     let account = home.account(&id).unwrap();
     let phase = home
-        .account_setup_state(&id)
+        .account_setup_state(&account.label)
         .unwrap()
         .map(|setup| setup.phase);
+    let receipts = store.native_receipts();
     let removal = tokio::time::timeout(Duration::from_secs(5), runtime.nip46_remove(&id)).await;
     let account_gone = matches!(home.account(&id), Err(AccountHomeError::UnknownAccount(_)));
-    let secret_gone = !store
-        .has_secret_for_label(&format!(".nip46-client/{}", account.label))
-        .unwrap();
+    let secret_gone = receipts.iter().all(|path| !path.try_exists().unwrap());
     release.notify_one();
     if tokio::time::timeout(Duration::from_secs(5), &mut login)
         .await
@@ -1102,7 +1096,7 @@ async fn nip46_login_restores_host() {
     let peer = LoginPeer::new().await;
     for previous_grants in [None, Some(vec!["nip44_encrypt".to_owned()])] {
         let dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(LocalFileSecretStore::new(dir.path(), IosOptions::default()));
+        let store = Arc::new(RemovalFailureStore::new(dir.path()));
         let home =
             AccountHome::open_with_secret_store(dir.path(), store.clone(), IosOptions::default());
         let account = home
@@ -1168,6 +1162,7 @@ async fn nip46_login_restores_host() {
         } else {
             None
         };
+        let previous_receipts = previous.as_ref().map(|_| store.native_receipts());
         relay.fail_publishes_of_kind(KEY_PACKAGE_KIND);
         assert!(matches!(
             runtime
@@ -1210,12 +1205,17 @@ async fn nip46_login_restores_host() {
             }
             None => {
                 assert!(home.load_nip46_session(&account.label).unwrap().is_none());
-                assert!(
-                    !store
-                        .has_secret_for_label(&format!(".nip46-client/{}", account.label))
-                        .unwrap()
-                );
             }
+        }
+        for path in store.native_receipts() {
+            let retained = previous_receipts
+                .as_ref()
+                .is_some_and(|paths| paths.contains(&path));
+            assert_eq!(
+                path.try_exists().unwrap(),
+                retained,
+                "NIP46 receipt at {path:?}"
+            );
         }
         assert_eq!(session.status().state, Nip46State::Disconnected);
         runtime.shutdown_and_close().await.unwrap();
@@ -1239,7 +1239,7 @@ async fn nip46_login_restores_host() {
 async fn nip46_cold_rebind_failure() {
     let peer = LoginPeer::new().await;
     let dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(LocalFileSecretStore::new(dir.path(), IosOptions::default()));
+    let store = Arc::new(RemovalFailureStore::new(dir.path()));
     let home =
         AccountHome::open_with_secret_store(dir.path(), store.clone(), IosOptions::default());
     let relay = Arc::new(ScriptedPushRelayClient::default());
@@ -1299,12 +1299,14 @@ async fn nip46_cold_rebind_failure() {
         AccountSetupReadiness::NetworkReady
     );
     assert!(home.account_setup_state(&id).unwrap().is_none());
-    assert!(home.load_nip46_session(&id).unwrap().is_none());
     let account = home.account(&id).unwrap();
+    assert!(home.load_nip46_session(&account.label).unwrap().is_none());
     assert!(
-        !store
-            .has_secret_for_label(&format!(".nip46-client/{}", account.label))
-            .unwrap()
+        store
+            .native_receipts()
+            .iter()
+            .all(|path| !path.try_exists().unwrap()),
+        "failed rebind must unlink its NIP46 receipt"
     );
     assert!(!app.has_external_signer(&id));
     runtime.shutdown_and_close().await.unwrap();
@@ -1468,8 +1470,31 @@ async fn nip46_post_commit_failure() {
 
 struct RemovalFailureStore {
     inner: LocalFileSecretStore,
+    root: std::path::PathBuf,
+    receipts: std::sync::Mutex<Vec<std::path::PathBuf>>,
     refuse: std::sync::atomic::AtomicBool,
     native_removed: tokio::sync::Notify,
+}
+
+impl RemovalFailureStore {
+    fn new(root: &std::path::Path) -> Self {
+        Self {
+            inner: LocalFileSecretStore::new(root, IosOptions::default()),
+            root: root.to_owned(),
+            receipts: std::sync::Mutex::new(Vec::new()),
+            refuse: std::sync::atomic::AtomicBool::new(false),
+            native_removed: tokio::sync::Notify::new(),
+        }
+    }
+
+    fn native_receipts(&self) -> Vec<std::path::PathBuf> {
+        let receipts = self.receipts.lock().unwrap().clone();
+        assert!(
+            !receipts.is_empty(),
+            "the fixture must acquire a NIP46 receipt"
+        );
+        receipts
+    }
 }
 
 impl AccountSecretStore for RemovalFailureStore {
@@ -1485,7 +1510,15 @@ impl AccountSecretStore for RemovalFailureStore {
         mode: marmot_account::SecretClaimMode,
         proposed: Option<&Keys>,
     ) -> AccountHomeResult<marmot_account::AcquiredSecret> {
-        self.inner.acquire_secret(credential, mode, proposed)
+        let acquired = self.inner.acquire_secret(credential, mode, proposed)?;
+        if credential.kind == marmot_account::SecretCredentialKind::Nip46Session {
+            let path = receipt_path(&self.root, credential.owner_id);
+            let mut receipts = self.receipts.lock().unwrap();
+            if !receipts.contains(&path) {
+                receipts.push(path);
+            }
+        }
+        Ok(acquired)
     }
     fn load_secret(
         &self,
@@ -1539,11 +1572,7 @@ async fn nip46_erase_retry() {
 
     for removal in [Removal::Session, Removal::Account] {
         let dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(RemovalFailureStore {
-            inner: LocalFileSecretStore::new(dir.path(), IosOptions::default()),
-            refuse: std::sync::atomic::AtomicBool::new(false),
-            native_removed: tokio::sync::Notify::new(),
-        });
+        let store = Arc::new(RemovalFailureStore::new(dir.path()));
         let home =
             AccountHome::open_with_secret_store(dir.path(), store.clone(), IosOptions::default());
         let user = Keys::generate();
@@ -1567,12 +1596,7 @@ async fn nip46_erase_retry() {
             },
         )
         .unwrap();
-        let managed_copy = std::fs::read_dir(dir.path().join(".owned-secrets-v1/receipts"))
-            .unwrap()
-            .next()
-            .unwrap()
-            .unwrap()
-            .path();
+        let [managed_copy]: [std::path::PathBuf; 1] = store.native_receipts().try_into().unwrap();
         let app = MarmotApp::with_relays_and_account_home_and_config(
             dir.path(),
             vec!["wss://account-relay.example".into()],

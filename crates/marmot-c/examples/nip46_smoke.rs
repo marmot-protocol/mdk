@@ -1564,6 +1564,14 @@ fn main() -> Result<()> {
         "PASS one-session cancel and unacknowledged logout preserve local/other remote accounts"
     );
 
+    const PAIRING_PREFIX: &str = ".nip46-client/";
+    let b_label = format!("{PAIRING_PREFIX}{account_b}");
+    let b_pairing = vault
+        .snapshot()
+        .expect("read B's durable pairing")
+        .into_iter()
+        .find(|(label, _, _)| label == &b_label)
+        .expect("B must own a durable communication credential before A's retry");
     let retry = Session::new(client, &export_a);
     assert_eq!(retry.connect(), account_a);
     let mut refused = ptr::dangling_mut();
@@ -1586,15 +1594,24 @@ fn main() -> Result<()> {
     );
     assert!(refused.is_null());
     assert_eq!(retry.state()["state"], "disconnected");
-    assert_eq!(
-        vault
-            .snapshot()
-            .expect("read durable host receipts")
-            .iter()
-            .filter(|(label, _, _)| label.starts_with(".nip46-client/"))
-            .count(),
-        1,
-        "failed reactivation retained account A's communication credential"
+    let mut active_pairings = vault
+        .snapshot()
+        .expect("read durable host receipts")
+        .into_iter()
+        .filter(|(label, _, _)| label.starts_with(PAIRING_PREFIX));
+    assert!(
+        active_pairings.next().as_ref() == Some(&b_pairing),
+        "account B must keep its exact communication credential"
+    );
+    assert!(
+        active_pairings.next().is_none(),
+        "only account B may have an active communication credential"
+    );
+    assert!(
+        !vault
+            .has_preserved_pairing(&format!("{PAIRING_PREFIX}{account_a}"))
+            .expect("read durable preservation holds"),
+        "failed reactivation preserved account A's communication credential"
     );
     assert_accounts(client, &local_id, &account_a, &account_b, true);
     assert_ready(client, &account_a);

@@ -2460,13 +2460,21 @@ async fn app_runtime_private_key_setup_rollback_preserves_only_recovered_keychai
         Err(AppError::MissingDefaultRelays)
     ));
     assert!(new_home.accounts().unwrap().is_empty());
-    assert!(
-        !KeychainSecretStore::new(new_service, &IosOptions::default())
-            .unwrap()
-            .has_secret_for_account_id(&new_account_id)
-            .unwrap(),
-        "rollback must still delete a signing credential created by failed setup"
-    );
+    let service_hash = hex::encode(Sha256::digest(new_service.as_bytes()));
+    let receipt_service = format!("mdk-owned-receipt-v1-{service_hash}");
+    let keyring = keyring_core::get_default_store().unwrap();
+    for receipt in keyring
+        .search(&HashMap::from([("service", receipt_service.as_str())]))
+        .unwrap()
+    {
+        let (service, _) = receipt.get_specifiers().unwrap();
+        if service == receipt_service {
+            assert!(
+                matches!(receipt.get_password(), Err(keyring_core::Error::NoEntry)),
+                "rollback must delete the signing receipt from the Keychain"
+            );
+        }
+    }
 
     recovered_runtime.shutdown().await;
     new_runtime.shutdown().await;

@@ -284,22 +284,14 @@ link-local endpoints. Local insecure trust is intended only for tests.
 
 ### Host secret-store identity
 
-`MarmotSecretStore.cleanup_namespace` is required. It returns an allocated, NUL-terminated nonsecret identity for the
-physical vault and credential namespace; MDK returns the buffer through `free_secret`, including error paths that
-returned a buffer. The identity must distinguish services or tenants and remain stable across restarts and vault locks.
-See the [shared identity contract](../marmot-uniffi/README.md#host-secret-store-identity).
-
-Pending account wipes retry credentials only through their originating namespace. This callback changes the vtable
-layout: rebuild hosts with the regenerated matching header and native library; do not reuse an older binary layout.
-
-The required `acquire_secret`, `load_secret`, `release_secret`, and `reconcile_cleanup` callbacks use
-`MarmotSecretCredential` owner receipts instead of unowned writes and deletions. Persist an independent copy and
-its original acquisition result before returning success. Retire a receipt before deleting its material, retain
-retirement metadata, and preserve ambiguous legacy sources with `PendingLegacy`. The
-[shared ownership contract](../marmot-uniffi/README.md#host-secret-store-identity) defines adoption and rollback.
+`MarmotSecretStore` requires `cleanup_namespace`, `acquire_secret`, `load_secret`, and
+`reconcile_cleanup`. See the [shared secret-store contract](../marmot-uniffi/README.md#host-secret-store-identity)
+for namespace identity, receipt ownership, and cleanup policy. Older vtables with unowned write and delete
+callbacks do not match this layout.
 
 The credential record and its strings are borrowed only for the callback. Copy identifiers needed for persistence;
-do not retain their pointers. Return allocated secret buffers through `free_secret`, even on a failure status.
+do not retain their pointers. Return namespace and secret buffers as allocated, NUL-terminated strings. MDK passes
+each non-NULL buffer back to the host's `free_secret` callback, even on a failure status.
 The header defines the integer tags for claim mode, origin, release mode, and release outcome.
 
 <a id="experimental-device-group-test-builds"></a>

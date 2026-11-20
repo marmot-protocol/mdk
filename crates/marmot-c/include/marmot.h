@@ -20,9 +20,10 @@
  *    C enum or _Bool would be undefined behavior before any check runs.
  *  - Required out-pointers are validated and cleared before the call does
  *    any work, so a rejected call never leaves a side effect behind.
- *  - Callbacks run on runtime worker threads; secret-store callbacks may
- *    also run synchronously on constructor callers. Callback inputs are
- *    borrowed and valid only for the duration of the call.
+ *  - Subscription callbacks run on runtime worker threads. Their event
+ *    payloads, secret-store credential inputs, and secret-store output slots
+ *    are borrowed only for the callback. See MarmotSecretStore for callback
+ *    threading, user_data lifetime, and returned buffer ownership.
  */
 
 #pragma once
@@ -2218,13 +2219,17 @@ typedef void (*MarmotSecretStoreDestroyFn)(void *user_data);
  * retained or freed by the library. Every function pointer except
  * `destroy` is required.
  *
- * See the module documentation for the thread-safety, re-entry, and
- * ownership rules a host must honor.
+ * Callbacks can run on runtime workers or synchronously on a calling thread,
+ * including during pending wipe replay in a constructor. Callbacks may run
+ * concurrently. Synchronize access to `user_data` and do not call `marmot_*`
+ * functions on this client or mutate the same account root from a callback.
+ * The library returns every non-NULL namespace or secret buffer to
+ * `free_secret`, even if the callback reports failure.
  */
 typedef struct MarmotSecretStore {
   /**
-   * Opaque host context passed to every callback. Must outlive the
-   * client; released by `destroy`.
+   * Opaque host context passed to every callback. On successful open, keep
+   * it valid until the last runtime reference to the store is released.
    */
   void *user_data;
   MarmotSecretStoreCleanupNamespaceFn cleanup_namespace;
@@ -8191,10 +8196,10 @@ MarmotStatus marmot_client_new_with_cursor_persistence(const char *root_path,
  * call takes no ownership and never invokes `destroy`; reclaiming
  * `user_data` stays the caller's job.
  *
- * Callbacks run synchronously on this constructor's calling thread as well
- * as runtime workers, possibly concurrently. They must not call any
- * `marmot_*` function on this client or re-enter the same account root; see the
- * `MarmotSecretStore` documentation for the full contract.
+ * Opening a root can replay pending wipes before this call returns.
+ * Secret-store callbacks can run on the constructor's calling thread during
+ * replay and can also run on runtime workers. See `MarmotSecretStore` for
+ * synchronization and re-entry rules.
  *
  * # Safety
  * `root_path` must be a valid NUL-terminated UTF-8 string; `relay_urls`

@@ -10,9 +10,9 @@
 //!
 //! **Rules for the host, all of them load-bearing:**
 //!
-//! - **Thread safety.** Callbacks run synchronously on the constructor's
-//!   calling thread as well as runtime workers and may run concurrently.
-//!   `user_data` access must be synchronized.
+//! - **Thread safety.** Pending wipe replay can invoke callbacks on the
+//!   constructor's calling thread. Callbacks can also run on runtime workers
+//!   and may run concurrently. `user_data` access must be synchronized.
 //! - **No re-entry.** A callback must not call any `marmot_*` function on
 //!   the same client or mutate the same account root through another client.
 //!   Account-home mutation is coordinated across independently opened handles,
@@ -192,13 +192,17 @@ pub type MarmotSecretStoreDestroyFn = Option<unsafe extern "C" fn(user_data: *mu
 /// retained or freed by the library. Every function pointer except
 /// `destroy` is required.
 ///
-/// See the module documentation for the thread-safety, re-entry, and
-/// ownership rules a host must honor.
+/// Callbacks can run on runtime workers or synchronously on a calling thread,
+/// including during pending wipe replay in a constructor. Callbacks may run
+/// concurrently. Synchronize access to `user_data` and do not call `marmot_*`
+/// functions on this client or mutate the same account root from a callback.
+/// The library returns every non-NULL namespace or secret buffer to
+/// `free_secret`, even if the callback reports failure.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct MarmotSecretStore {
-    /// Opaque host context passed to every callback. Must outlive the
-    /// client; released by `destroy`.
+    /// Opaque host context passed to every callback. On successful open, keep
+    /// it valid until the last runtime reference to the store is released.
     pub user_data: *mut c_void,
     pub cleanup_namespace: MarmotSecretStoreCleanupNamespaceFn,
     pub has_secret_for_label: MarmotSecretStoreHasFn,
@@ -562,11 +566,17 @@ pub(crate) mod fixture;
 
 #[cfg(test)]
 pub(crate) fn fixture_store() -> std::sync::Arc<CSecretStore> {
-    let vault = Box::new(fixture::MemoryVault::default());
-    let mut table = vault.table();
+    let data = Box::into_raw(Box::new(fixture::MemoryVault::default()));
+    let mut table = unsafe { &*data }.table();
+    table.user_data = data.cast();
     table.destroy = Some(fixture::MemoryVault::destroy_box);
-    let store = unsafe { CSecretStore::from_c(&table) }.expect("complete fixture vtable");
-    let _ = Box::into_raw(vault);
+    let store = match unsafe { CSecretStore::from_c(&table) } {
+        Ok(store) => store,
+        Err(status) => {
+            unsafe { fixture::MemoryVault::destroy_box(data.cast()) };
+            panic!("complete fixture vtable rejected: {status:?}");
+        }
+    };
     store.arm();
     std::sync::Arc::new(store)
 }
@@ -789,20 +799,27 @@ mod tests {
         host.namespace_null.store(false, Ordering::SeqCst);
         *host.namespace_bytes.lock().unwrap() = Some(b"valid failure namespace".to_vec());
 
-        for (raw, expected) in [
+        for (raw, expected, expected_details) in [
             (
                 MarmotSecretStoreStatus::NotFound as u32,
                 MarmotStatus::SecretNotFound,
+                "host secret store has no credential (cleanup_namespace)",
             ),
             (
                 MarmotSecretStoreStatus::Unavailable as u32,
                 MarmotStatus::KeystoreUnavailable,
+                "host secret store unavailable (cleanup_namespace)",
             ),
             (
                 MarmotSecretStoreStatus::Failed as u32,
                 MarmotStatus::Runtime,
+                "host secret store failed (cleanup_namespace)",
             ),
-            (u32::MAX, MarmotStatus::Runtime),
+            (
+                u32::MAX,
+                MarmotStatus::Runtime,
+                "host secret store returned status 4294967295 out of range (cleanup_namespace)",
+            ),
         ] {
             *host.forced_status.lock().unwrap() = Some(raw);
             let freed = *host.freed.lock().unwrap();
@@ -810,6 +827,12 @@ mod tests {
                 .cleanup_namespace()
                 .expect_err("callback failure must propagate");
             assert_eq!(crate::status::status_from_error(&error), expected);
+            match error {
+                MarmotKitError::SecretNotFound { details }
+                | MarmotKitError::KeystoreUnavailable { details }
+                | MarmotKitError::Runtime { details } => assert_eq!(details, expected_details),
+                other => panic!("unexpected callback error: {other:?}"),
+            }
             assert_eq!(*host.freed.lock().unwrap(), freed + 1);
         }
     }

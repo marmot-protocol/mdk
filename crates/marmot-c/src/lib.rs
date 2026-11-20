@@ -338,10 +338,10 @@ pub unsafe extern "C" fn marmot_client_new_with_cursor_persistence(
 /// call takes no ownership and never invokes `destroy`; reclaiming
 /// `user_data` stays the caller's job.
 ///
-/// Callbacks run synchronously on this constructor's calling thread as well
-/// as runtime workers, possibly concurrently. They must not call any
-/// `marmot_*` function on this client or re-enter the same account root; see the
-/// `MarmotSecretStore` documentation for the full contract.
+/// Opening a root can replay pending wipes before this call returns.
+/// Secret-store callbacks can run on the constructor's calling thread during
+/// replay and can also run on runtime workers. See `MarmotSecretStore` for
+/// synchronization and re-entry rules.
 ///
 /// # Safety
 /// `root_path` must be a valid NUL-terminated UTF-8 string; `relay_urls`

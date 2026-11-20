@@ -1203,6 +1203,7 @@ async fn unlinked_wipe_failure_relinks() {
 
     struct FailSecretRemoval {
         files: LocalFileSecretStore,
+        root: std::path::PathBuf,
         fail_release: AtomicBool,
     }
     impl AccountSecretStore for FailSecretRemoval {
@@ -1235,6 +1236,13 @@ async fn unlinked_wipe_failure_relinks() {
             if self.fail_release.load(Ordering::SeqCst) {
                 return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied).into());
             }
+            assert!(
+                matches!(
+                    crate::MarmotRootRuntimeLease::try_acquire(&self.root),
+                    Err(AppError::RuntimeBusy)
+                ),
+                "replay must hold the root lease while deleting the old credential"
+            );
             self.files.release_secret(credential, mode)
         }
         fn reconcile_cleanup(&self) -> AccountHomeResult<()> {
@@ -1245,6 +1253,7 @@ async fn unlinked_wipe_failure_relinks() {
     let root = tempfile::tempdir().unwrap();
     let store = Arc::new(FailSecretRemoval {
         files: LocalFileSecretStore::new(root.path(), IosOptions::default()),
+        root: root.path().to_owned(),
         fail_release: AtomicBool::new(true),
     });
     let home =
@@ -1308,8 +1317,19 @@ async fn unlinked_wipe_failure_relinks() {
         intent.is_file(),
         "relinking must not discard the old release"
     );
+    runtime.shutdown_and_close().await.unwrap();
+    drop(runtime);
+    drop(app);
+
     store.fail_release.store(false, Ordering::SeqCst);
-    app.account_home().resume_wipe_cleanup().unwrap();
+    let app = MarmotApp::try_with_relays_and_account_home_and_config(
+        root.path(),
+        vec!["wss://unlink.example".to_owned()],
+        AccountHome::open_with_secret_store(root.path(), store, IosOptions::default()),
+        crate::MarmotAppConfig::white_noise().with_dev_settlement_quiescence_ms(0),
+    )
+    .unwrap()
+    .with_test_relay_client(relay);
     assert_eq!(std::fs::read_dir(tombstones).unwrap().count(), 0);
     assert_eq!(
         app.account_home()
@@ -1319,7 +1339,22 @@ async fn unlinked_wipe_failure_relinks() {
         keys.public_key(),
         "replaying the old release must not delete the relinked owner's credential",
     );
-    runtime.shutdown().await;
+    let runtime = app.runtime();
+    timeout(Duration::from_secs(10), async {
+        runtime.reconcile_accounts().await.unwrap();
+        assert!(
+            runtime
+                .diagnostic_key_package_maintenance_status(&relinked.account().label)
+                .await
+                .unwrap()
+                .is_some(),
+            "the reopened runtime must serve the relinked account on its worker"
+        );
+    })
+    .await
+    .expect("the relinked worker must reopen");
+    runtime.shutdown_and_close().await.unwrap();
+    drop(crate::MarmotRootRuntimeLease::try_acquire(root.path()).unwrap());
 }
 
 /// Signing out on a single device keeps its leaf in a chat its account is

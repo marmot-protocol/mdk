@@ -1,4 +1,6 @@
-use super::host_abi::{MarmotSecretCredential, MarmotSecretStore, MarmotSecretStoreStatus};
+use super::host_abi::{
+    MarmotSecretCredential, MarmotSecretCredentialKind, MarmotSecretStore, MarmotSecretStoreStatus,
+};
 use nostr::prelude::{Keys, SecretKey};
 use std::collections::BTreeMap;
 use std::ffi::{CStr, CString, c_char, c_void};
@@ -174,6 +176,12 @@ impl MemoryVault {
                 )
             })
             .collect())
+    }
+    pub(super) fn has_preserved_pairing(&self, label: &str) -> Result<bool, u32> {
+        Ok(self.lock_state()?.preserved.values().any(|receipt| {
+            receipt.credential.label == label
+                && receipt.credential.kind == MarmotSecretCredentialKind::Nip46Session as u32
+        }))
     }
     pub fn global() -> &'static Self {
         static VAULT: LazyLock<MemoryVault> = LazyLock::new(MemoryVault::default);

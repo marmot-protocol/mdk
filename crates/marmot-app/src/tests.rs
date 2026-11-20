@@ -21930,6 +21930,18 @@ fn a_refused_delivery_stays_fetchable_through_the_catch_up_drain() {
     });
 }
 
+fn receipt_path(root: &std::path::Path, owner_id: &str) -> std::path::PathBuf {
+    let suffix = format!("-{owner_id}");
+    let mut receipts = std::fs::read_dir(root.join(".owned-secrets-v1/receipts"))
+        .unwrap()
+        .map(|entry| entry.unwrap())
+        .filter(|entry| entry.file_name().to_str().unwrap().ends_with(&suffix));
+    let receipt = receipts.next().expect("the acquired owner has no receipt");
+    assert!(receipts.next().is_none(), "the owner has multiple receipts");
+    assert!(receipt.file_type().unwrap().is_file());
+    receipt.path()
+}
+
 #[test]
 fn wipe_replay_needs_root_lease() {
     use marmot_account::{
@@ -22001,6 +22013,7 @@ fn wipe_replay_needs_root_lease() {
     let account = home.create_account("removed").unwrap();
     let key = home.load_signing_keys(&account.label).unwrap().public_key();
     let (home_id, owner_id) = store.receipt.lock().unwrap().clone().unwrap();
+    let receipt = receipt_path(vault.path(), &owner_id);
     let credential = SecretCredential {
         label: &account.label,
         account_id_hex: &account.account_id_hex,
@@ -22068,6 +22081,10 @@ fn wipe_replay_needs_root_lease() {
     )
     .unwrap();
     assert!(!store.has_secret_for_label(&account.label).unwrap());
+    assert!(
+        !receipt.try_exists().unwrap(),
+        "replay must unlink the receipt"
+    );
     assert_eq!(std::fs::read_dir(tombstones).unwrap().count(), 0);
     recovered.close_storage().unwrap();
 }

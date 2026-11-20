@@ -49,6 +49,7 @@ impl ClientFixture {
         let path = CString::new(home.path().to_str().unwrap()).unwrap();
         let data = Box::into_raw(Box::new(Vault::default()));
         let mut store = unsafe { &*data }.table();
+        store.user_data = data.cast();
         store.destroy = Some(Vault::destroy_box);
         let relays = [relay_url.as_ptr()];
         let mut client = std::ptr::null_mut();
