@@ -1810,6 +1810,64 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(fake_client.tool_events[0][2], fake_client.tool_events[1][2])
         self.assertEqual(fake_client.tool_events[1][2]["reply_to_message_id_hex"], "33" * 32)
 
+    async def test_final_reply_resembling_tool_progress_is_sent_verbatim(self):
+        # Hermes delivers progress bubbles and final replies through the same
+        # send() with no distinguishing metadata. A final reply must never be
+        # diverted to tool events just because one of its lines happens to fit
+        # the legacy "<icon> <tool>..." / '<icon> <tool>: "<preview>"' shape.
+        replies = {
+            "blockquoted yaml": (
+                "Here is the reaction config:\n\n"
+                ">     reactions:\n"
+                '>         accepted: "👀"\n'
+                '>         done: "✅"\n'
+                '>         waiting: "⏸️"\n'
+                '>         failed: "❌"\n\n'
+                "Restart the gateway to apply it."
+            ),
+            "blockquote only": '>         accepted: "👀"',
+            "prose ellipsis": "Hmm, checking...\nThe build passed on the second run.",
+            "prose ellipsis only": "Hmm, checking...",
+        }
+        for label, reply in replies.items():
+            with self.subTest(label):
+                fake_client = _DeliveryRoutingFakeClient()
+                adapter = self.adapter_module.MarmotPlatformAdapter(
+                    self.config_cls(extra={"account_id_hex": "11" * 32}),
+                    client=fake_client,
+                )
+
+                result = await adapter.send(chat_id="22" * 32, content=reply, reply_to="33" * 32)
+
+                self.assertTrue(result.success)
+                self.assertEqual(fake_client.tool_events, [])
+                self.assertEqual(
+                    fake_client.final_sends,
+                    [("11" * 32, "22" * 32, reply, "33" * 32)],
+                )
+
+    async def test_multi_line_tool_progress_bubble_maps_every_line_to_events(self):
+        # Hermes joins queued progress lines into one bubble on the first send
+        # and on overflow rollover; every line of a genuine bubble is progress.
+        fake_client = _DeliveryRoutingFakeClient()
+        adapter = self.adapter_module.MarmotPlatformAdapter(
+            self.config_cls(extra={"account_id_hex": "11" * 32}),
+            client=fake_client,
+        )
+
+        result = await adapter.send(
+            chat_id="22" * 32,
+            content='⚙️ terminal...\n🔍 web_search: "glp-1"\nvideo xai_video_generate...',
+        )
+
+        self.assertTrue(result.success)
+        self.assertTrue(result.message_id.startswith("marmot-tool-progress:"))
+        self.assertEqual(fake_client.final_sends, [])
+        self.assertEqual(
+            [(kwargs["name"], kwargs.get("preview")) for _, _, kwargs in fake_client.tool_events],
+            [("terminal", None), ("web_search", "glp-1"), ("xai_video_generate", None)],
+        )
+
     async def test_disconnect_clears_tool_progress_dedupe_cache(self):
         adapter = self.adapter_module.MarmotPlatformAdapter(
             self.config_cls(extra={"account_id_hex": "11" * 32}),

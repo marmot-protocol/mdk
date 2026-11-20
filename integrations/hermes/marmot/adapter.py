@@ -247,8 +247,13 @@ PROFILE_NAME_AFFIRM_REPLIES = {
     "go ahead",
 }
 MARMOT_ACCOUNT_ID_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
+# Hermes renders text tool progress as `<icon> <tool>...` or
+# `<icon> <tool>: "<preview>"`. The icon is normally an emoji but skins and
+# tools may register ASCII icons (e.g. `video`), so it cannot be required to be
+# non-ASCII. It is never a Markdown blockquote marker or a word ending in prose
+# punctuation, which keeps `> key: "value"` and `Hmm, checking...` out.
 LEGACY_TOOL_PROGRESS_RE = re.compile(
-    r'^\S+\s+(?P<tool>[A-Za-z0-9_.-]+)(?:\([^)]*\))?(?:(?::\s+"(?P<preview>.*)")|(?:\.\.\.))$',
+    r'^(?!>)\S*[^\s,;:.!?]\s+(?P<tool>[A-Za-z0-9_.-]+)(?:\([^)]*\))?(?:(?::\s+"(?P<preview>.*)")|(?:\.\.\.))$',
     re.DOTALL,
 )
 
@@ -2150,7 +2155,10 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
                 reply_to = None
         visible_content, is_preview = self._split_stream_preview(content)
 
-        tool_events = _tool_events_from_progress_text(visible_content)
+        # Hermes sends progress bubbles and final replies through send() with
+        # no distinguishing metadata, so only a message made entirely of
+        # progress lines is progress. A reply quoting one such line stays text.
+        tool_events = _tool_events_from_progress_text(visible_content, require_all=True)
         if tool_events:
             return await self._send_tool_progress_events(
                 chat_id,
@@ -5370,7 +5378,14 @@ def _encoded_tool_event(event: Dict[str, Any]) -> str:
     return TOOL_EVENT_PREFIX + json.dumps(event, sort_keys=True, separators=(",", ":"))
 
 
-def _tool_events_from_progress_text(content: str) -> list[Dict[str, Any]]:
+def _tool_events_from_progress_text(content: str, *, require_all: bool = False) -> list[Dict[str, Any]]:
+    """Parse tool events from progress text.
+
+    With ``require_all`` any block that is not a tool event makes the whole
+    message ordinary text (returns ``[]``); use it where progress and final
+    replies share a path. Without it, unparsable blocks are skipped, which is
+    right only for messages already known to be tool progress.
+    """
     events: list[Dict[str, Any]] = []
     for block in _progress_blocks(content):
         if block.startswith(TOOL_EVENT_PREFIX):
@@ -5385,6 +5400,8 @@ def _tool_events_from_progress_text(content: str) -> list[Dict[str, Any]]:
         event = _legacy_tool_event_from_progress_block(block)
         if event is not None:
             events.append(event)
+        elif require_all:
+            return []
     return events
 
 
