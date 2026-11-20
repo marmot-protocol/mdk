@@ -246,7 +246,7 @@
   send by asking its relays for it (#2332). From then on, each retry of a
   relay that may hold the change first reads that exact change back from it,
   and a relay that returns it confirms the change. The read never signs in as
-  the account, sends one request per relay, at most eight per relay an hour, and feeds
+  the account, sends one request per relay, at most eight per account per relay an hour, and feeds
   nothing into message handling. Any other answer changes nothing: the relay
   is resent to as before, and nothing rolls back because a read found nothing.
 - Give up a group change that reached no relay (#2332). Ten minutes after its
