@@ -287,8 +287,11 @@ Judge only the latest queue event:
     --jq '.[] | select(.headBranch | startswith("gh-readonly-queue/master/pr-<pr>-"))'
   ```
 
-  Classify the failure with the step 5 table, fix it, bring the PR back to
-  ready, and enqueue again.
+  Classify the failure with the step 5 table, fetching master first, and do
+  what its row says. For a flake, enqueue the same head again instead of
+  rerunning the job: a rerun of a queue run does not put the PR back in the
+  queue. Once the PR is ready again, enqueue it. A second flake ejection, or
+  a failure you cannot classify, goes to the user.
 - No queue event since your enqueue: not recorded yet, check again.
 
 After the merge, confirm the squash commit on master (`gh pr view <pr> --json
