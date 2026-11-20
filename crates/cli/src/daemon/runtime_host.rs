@@ -871,16 +871,16 @@ pub(crate) async fn auto_watch_agent_stream_starts(
                 },
             },
         };
-        if let Ok((report, handle)) = spawn_stream_watch(
+        let _ = spawn_stream_watch(
             cli,
             account_home.clone(),
             app.clone(),
             runtime.clone(),
             stream_manager.clone(),
             defaults.root_owner.clone(),
-        ) {
-            stream_workers.replace(report.watch_id, handle).await;
-        }
+            &stream_workers,
+        )
+        .await;
     }
 }
 

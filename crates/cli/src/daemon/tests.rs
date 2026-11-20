@@ -1044,8 +1044,21 @@ async fn daemon_execute_local_command_runs_without_holding_worker_lock() {
     .expect("a relay-less Execute must not block on the held workers lock");
     result.expect("handle_execute_connection should succeed off the lock");
 
+    let mut response = String::new();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        BufReader::new(client).read_line(&mut response),
+    )
+    .await
+    .expect("Whoami response must arrive while workers are locked")
+    .expect("read Whoami response");
+    let output: CliOutput = serde_json::from_str(response.trim()).expect("CLI output frame");
+    assert_eq!(output.code, 0, "Whoami shares daemon root ownership");
+    assert!(output.stderr.is_empty());
+    let value: serde_json::Value = serde_json::from_str(&output.stdout).expect("Whoami JSON");
+    assert_eq!(value["ok"], true);
+    assert_eq!(value["result"]["accounts"], serde_json::json!([]));
     drop(busy);
-    drop(client);
 }
 
 #[tokio::test]
@@ -1287,27 +1300,34 @@ fn runtime_message_json_marks_account_id_sender_as_me() {
 
 #[tokio::test]
 async fn watch_replacement_drops_lease() {
+    use std::future::{Future, pending, poll_fn};
+    use std::task::Poll;
+
     let workers = StreamWatchWorkers::default();
     let mut finished = tokio::spawn(async {});
     (&mut finished).await.expect("finished task completes");
-    workers.replace("finished".to_owned(), finished).await;
 
     let home = tempfile::tempdir().unwrap();
     let owner = marmot_app::MarmotRootRuntimeLease::try_acquire(home.path()).unwrap();
-    let held = tokio::spawn(async move {
-        let _owner = owner;
-        std::future::pending::<()>().await;
-    });
-    workers.replace("running".to_owned(), held).await;
     workers
-        .replace("running".to_owned(), tokio::spawn(std::future::pending()))
+        .replace(|| {
+            let held = tokio::spawn(async move {
+                let _owner = owner;
+                pending::<()>().await;
+            });
+            ("running".to_owned(), held, ())
+        })
         .await;
-    let _reacquired = marmot_app::MarmotRootRuntimeLease::try_acquire(home.path()).unwrap();
 
-    let handles = workers.handles.lock().expect("worker lock");
-    assert!(!handles.contains_key("finished"));
-    assert!(handles.contains_key("running"));
-    handles["running"].abort();
+    // Cancel registration while it is waiting for the displaced task. The
+    // finished replacement gives shutdown no other live watch to wait for.
+    {
+        let mut replace = std::pin::pin!(workers.replace(|| ("running".to_owned(), finished, ())));
+        assert!(poll_fn(|cx| Poll::Ready(replace.as_mut().poll(cx).is_pending())).await);
+    }
+    workers.abort_all().await;
+    marmot_app::MarmotRootRuntimeLease::try_acquire(home.path())
+        .expect("shutdown joins the displaced watch and releases its root lease");
 }
 
 fn stub_compose_session(stream_id: &str) -> StreamComposeSession {
@@ -2466,7 +2486,6 @@ fn gated_daemon(home: &Path) -> (DaemonDefaults, Arc<StartGate>) {
 
 #[tokio::test]
 async fn rejects_forwarded_vaults() {
-    keyring_core::set_default_store(keyring_core::mock::Store::new().unwrap());
     for store in [SecretStoreKind::File, SecretStoreKind::Keychain] {
         let home = tempfile::tempdir().unwrap();
         let (mut defaults, _) = gated_daemon(home.path());
@@ -2477,12 +2496,6 @@ async fn rejects_forwarded_vaults() {
         if store == SecretStoreKind::Keychain {
             defaults.secret_store = Some(store);
             defaults.keychain_service = Some("daemon-keychain".to_owned());
-            defaults.account_home = marmot_account::AccountHome::open_with_keychain(
-                home.path(),
-                "daemon-keychain",
-                marmot_account::IosOptions::default(),
-            )
-            .unwrap();
         }
         let before = home_snapshot(home.path());
         let mut cli = daemon_test_cli(crate::Command::Logout {

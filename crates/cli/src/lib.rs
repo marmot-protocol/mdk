@@ -564,6 +564,7 @@ async fn execute_inner(
     mut import_nsec: Option<ImportNsec>,
     root_context: Option<(&marmot_app::MarmotRootRuntimeLease, AccountHome)>,
 ) -> Result<CommandOutput, WnError> {
+    let settlement_quiescence_ms = wn_dev_settlement_quiescence_ms()?;
     let home = resolve_home(cli.home.clone());
     let account_flag = cli.account.clone();
     let command = cli.command.clone();
@@ -609,16 +610,21 @@ async fn execute_inner(
         CliAppAccess::RequireOwner
     };
     let app = || {
-        app_for(
+        let mut config = cli_app_config(
+            cli.daemon_discovery_relays.clone(),
+            settlement_quiescence_ms,
+        );
+        config.usage_diagnostics_silent = true;
+        app_for_config(
             home.clone(),
             relay
                 .clone()
                 .or_else(|| cli.daemon_discovery_relays.first().cloned())
                 .or_else(|| cli.daemon_default_account_relays.first().cloned()),
-            cli.daemon_discovery_relays.clone(),
             account_home.clone(),
             root_owner,
             access,
+            config,
         )
     };
     match command {
@@ -968,13 +974,27 @@ fn reset_command(home: &Path, confirm: bool) -> Result<CommandOutput, WnError> {
             reason: "pass --confirm to delete all local White Noise data",
         });
     }
-    match std::fs::remove_dir_all(home) {
-        Ok(()) => {}
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => return Err(err.into()),
+    #[cfg(unix)]
+    let root_exists = fs_private::inspect_directory_path(home)?.is_some();
+    #[cfg(not(unix))]
+    let root_exists = home.try_exists()?;
+    if root_exists {
+        let _root_owner = marmot_app::MarmotRootRuntimeLease::try_acquire(home)?;
+        for entry in std::fs::read_dir(home)? {
+            let entry = entry?;
+            // Unlinking the lock file would let another runtime lock a new inode.
+            if entry.file_name() == marmot_app::MARMOT_ROOT_RUNTIME_LOCK_FILE {
+                continue;
+            }
+            if entry.file_type()?.is_dir() {
+                std::fs::remove_dir_all(entry.path())?;
+            } else {
+                std::fs::remove_file(entry.path())?;
+            }
+        }
     }
     Ok(CommandOutput {
-        plain: format!("deleted {}", home.display()),
+        plain: format!("deleted local data in {}", home.display()),
         json: json!({
             "deleted": true,
             "home": home,
@@ -1350,6 +1370,16 @@ fn app_for_role(
     root_owner: Option<&marmot_app::MarmotRootRuntimeLease>,
     access: CliAppAccess,
 ) -> Result<MarmotApp, WnError> {
+    let settlement_quiescence_ms = wn_dev_settlement_quiescence_ms()?;
+    let mut config = cli_app_config(directory_relays, settlement_quiescence_ms);
+    config.usage_diagnostics_silent = silent;
+    app_for_config(home, relay, account_home, root_owner, access, config)
+}
+
+fn cli_app_config(
+    directory_relays: Vec<String>,
+    settlement_quiescence_ms: Option<u64>,
+) -> MarmotAppConfig {
     // Loopback-HTTP blob endpoints are only acted on when explicitly enabled for
     // dev/test (see MarmotAppConfig::allow_loopback_blob_endpoints). Opt in via
     // WN_ALLOW_LOOPBACK_BLOB_ENDPOINTS=1 for local Blossom servers; production
@@ -1359,12 +1389,22 @@ fn app_for_role(
         .with_allow_loopback_relay_endpoints(wn_allow_loopback_relays())
         .with_directory_relay_urls(directory_relays)
         .with_device_groups(wn_device_groups());
-    config.usage_diagnostics_silent = silent;
     // Explicit test builds only: WN_DEV_SETTLEMENT_QUIESCENCE_MS overrides the
     // pinned convergence settlement window (e.g. `0` for integration tests).
-    if let Some(ms) = wn_dev_settlement_quiescence_ms()? {
+    if let Some(ms) = settlement_quiescence_ms {
         config = config.with_dev_settlement_quiescence_ms(ms);
     }
+    config
+}
+
+fn app_for_config(
+    home: PathBuf,
+    relay: Option<String>,
+    account_home: AccountHome,
+    root_owner: Option<&marmot_app::MarmotRootRuntimeLease>,
+    access: CliAppAccess,
+    config: MarmotAppConfig,
+) -> Result<MarmotApp, WnError> {
     if root_owner.is_none() && matches!(access, CliAppAccess::RequireOwner) {
         return Ok(MarmotApp::try_with_relays_and_account_home_and_config(
             home,

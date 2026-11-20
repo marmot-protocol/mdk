@@ -4,48 +4,60 @@ use super::*;
 
 #[derive(Clone, Default)]
 pub(crate) struct StreamWatchWorkers {
-    pub(crate) handles: Arc<Mutex<HashMap<String, JoinHandle<()>>>>,
+    tasks: Arc<AsyncMutex<StreamWatchTasks>>,
+}
+
+#[derive(Default)]
+struct StreamWatchTasks {
+    active: HashMap<String, JoinHandle<()>>,
+    replaced: Option<JoinHandle<()>>,
+}
+
+impl StreamWatchTasks {
+    async fn join_replaced(&mut self) {
+        if let Some(handle) = &mut self.replaced {
+            let _ = handle.await;
+            self.replaced = None;
+        }
+    }
 }
 
 impl StreamWatchWorkers {
-    pub(crate) async fn replace(&self, watch_id: String, handle: JoinHandle<()>) {
-        let previous = {
-            let mut handles = self
-                .handles
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            Self::reap_finished_locked(&mut handles);
-            handles.insert(watch_id, handle)
-        };
-        if let Some(previous) = previous {
+    pub(crate) async fn replace<T>(
+        &self,
+        spawn: impl FnOnce() -> (String, JoinHandle<()>, T),
+    ) -> T {
+        let mut tasks = self.tasks.lock().await;
+        tasks.join_replaced().await;
+        tasks.active.retain(|_, handle| !handle.is_finished());
+        let (watch_id, handle, output) = spawn();
+        if let Some(previous) = tasks.active.insert(watch_id, handle) {
             previous.abort();
-            let _ = previous.await;
+            // The registering request can be cancelled during this join.
+            tasks.replaced = Some(previous);
+            tasks.join_replaced().await;
         }
+        output
     }
 
     pub(crate) fn reap_finished(&self) {
-        if let Ok(mut handles) = self.handles.lock() {
-            Self::reap_finished_locked(&mut handles);
+        if let Ok(mut tasks) = self.tasks.try_lock() {
+            tasks.active.retain(|_, handle| !handle.is_finished());
         }
-    }
-
-    pub(crate) fn reap_finished_locked(handles: &mut HashMap<String, JoinHandle<()>>) {
-        handles.retain(|_, handle| !handle.is_finished());
     }
 
     pub(crate) async fn abort_all(&self) {
-        let handles = std::mem::take(
-            &mut *self
-                .handles
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()),
-        );
-        for handle in handles.values() {
+        let mut tasks = self.tasks.lock().await;
+        for handle in tasks.active.values() {
             handle.abort();
         }
-        for (_, handle) in handles {
-            let _ = handle.await;
+        tasks.join_replaced().await;
+        for handle in tasks.active.values_mut() {
+            if !handle.is_finished() {
+                let _ = handle.await;
+            }
         }
+        tasks.active.clear();
     }
 }
 
@@ -126,35 +138,35 @@ pub(crate) async fn start_stream_watch(
         Ok(app) => app,
         Err(err) => return crate::command_output_result(json, Err(err)),
     };
-    let (report, handle) = match spawn_stream_watch(
+    let report = match spawn_stream_watch(
         cli,
         account_home,
         app,
         runtime.clone(),
         stream_manager,
         defaults.root_owner.clone(),
-    ) {
-        Ok(spawned) => spawned,
+        workers,
+    )
+    .await
+    {
+        Ok(report) => report,
         Err(message) => return daemon_error(json, "stream_watch_failed", message),
     };
-    let watch_id = report.watch_id.clone();
-    workers.replace(watch_id, handle).await;
 
     stream_watch_output(json, &report)
 }
 
-pub(crate) fn spawn_stream_watch(
+pub(crate) async fn spawn_stream_watch(
     mut cli: Cli,
     account_home: marmot_account::AccountHome,
     app: marmot_app::MarmotApp,
     runtime: marmot_app::MarmotAppRuntime,
     stream_manager: marmot_app::AgentStreamWatchManager,
     root_owner: Option<Arc<marmot_app::MarmotRootRuntimeLease>>,
-) -> Result<(DaemonStreamWatchReport, JoinHandle<()>), String> {
-    let report = stream_manager.start_watch(new_stream_watch_start(&cli)?);
-    let watch_id = report.watch_id.clone();
+    workers: &StreamWatchWorkers,
+) -> Result<DaemonStreamWatchReport, String> {
+    let start = new_stream_watch_start(&cli)?;
 
-    cli.json = true;
     if let crate::Command::Stream {
         command: crate::StreamCommand::Watch { background, .. },
     } = &mut cli.command
@@ -162,34 +174,37 @@ pub(crate) fn spawn_stream_watch(
         *background = false;
     }
 
-    let worker_watch_id = watch_id;
-    let worker_stream_manager = stream_manager.clone();
-    let handle = tokio::spawn(async move {
-        let _root_owner = root_owner;
-        let json = cli.json;
-        let account_flag = cli.account.clone();
-        let command = match cli.command.clone() {
-            crate::Command::Stream { command } => command,
-            _ => return,
-        };
-        let output = crate::command_output_result(
-            json,
-            crate::commands::stream::stream_watch_command_app_with_runtime(
-                &account_home,
-                &app,
-                &runtime,
-                command,
-                account_flag,
-                move |delta| {
-                    worker_stream_manager.record_delta(delta.clone());
-                },
-            )
-            .await,
-        );
-        finish_stream_watch(stream_manager, worker_watch_id, output);
-    });
+    let report = workers
+        .replace(|| {
+            let report = stream_manager.start_watch(start);
+            let worker_watch_id = report.watch_id.clone();
+            let worker_stream_manager = stream_manager.clone();
+            let handle = tokio::spawn(async move {
+                let _root_owner = root_owner;
+                let crate::Command::Stream { command } = cli.command else {
+                    return;
+                };
+                let output = crate::command_output_result(
+                    true,
+                    crate::commands::stream::stream_watch_command_app_with_runtime(
+                        &account_home,
+                        &app,
+                        &runtime,
+                        command,
+                        cli.account,
+                        move |delta| {
+                            worker_stream_manager.record_delta(delta.clone());
+                        },
+                    )
+                    .await,
+                );
+                finish_stream_watch(stream_manager, worker_watch_id, output);
+            });
+            (report.watch_id.clone(), handle, report)
+        })
+        .await;
 
-    Ok((report, handle))
+    Ok(report)
 }
 
 pub(crate) fn new_stream_watch_start(

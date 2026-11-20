@@ -159,7 +159,8 @@ wn reset --confirm
 - `export-nsec` exists for command-shape compatibility but returns `private_key_export_disabled`; this CLI never prints
   private keys.
 - `accounts create` is kept as a compatibility/repair surface; new setup flows should use `create-identity` or `login`.
-- `reset --confirm` deletes all local White Noise CLI data.
+- Stop the daemon before running `wn reset --confirm`. Reset deletes local data but keeps the data directory and its
+  runtime lock file.
 
 ### KeyPackages
 

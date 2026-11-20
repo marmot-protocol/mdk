@@ -15,6 +15,9 @@ versioning through the workspace version in the root `Cargo.toml`.
   clone its account home and share its lease instead of opening competing handles or replaying cleanup.
 - Local logout does not open an application runtime. Foreground stream watches remain client-hosted and defer
   pending wipe cleanup when the daemon owns the root (#819).
+- `wn reset --confirm` refuses to clear a root in use, even when the daemon uses a custom socket. Reset keeps the
+  root and its runtime lock file.
+- Local commands, including logout, reject `WN_DEV_SETTLEMENT_QUIESCENCE_MS` without `test-policy-overrides`.
 
 ### Changed
 

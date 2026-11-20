@@ -7864,7 +7864,6 @@ dependencies = [
  "fs-private",
  "hex",
  "image",
- "keyring-core",
  "libc",
  "marmot-account",
  "marmot-app",
