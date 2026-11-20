@@ -2925,6 +2925,51 @@ fn thread_message_fixtures_project_reply_target_and_thread() {
     }
 }
 
+/// Reading a thread and sending into it agree on the root at the deepest
+/// legacy chain the read walk follows: the send-side walk starts one row
+/// lower, at the parent itself.
+#[test]
+fn root_hint_reaches_as_far_as_the_read_walk() {
+    let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
+    let group = "11".repeat(32);
+    let comment = |id: &str, at, tags: &[&[&str]]| {
+        let mut event = chat(id, "alice", at, id);
+        event.kind = NIP22_COMMENT_KIND;
+        event.tags = tags
+            .iter()
+            .map(|tag| tag.iter().map(|value| (*value).to_owned()).collect())
+            .collect();
+        event
+    };
+    store
+        .record_app_event(&comment(
+            "named",
+            1,
+            &[
+                &["E", "gone"],
+                &["K", "9"],
+                &["P", "bob"],
+                &["e", "gone"],
+                &["k", "9"],
+            ],
+        ))
+        .unwrap();
+    let mut parent = "named".to_owned();
+    for depth in 1..=64 {
+        let id = format!("legacy-{depth}");
+        store
+            .record_app_event(&comment(&id, depth + 1, &[&["e", &parent], &["k", "1111"]]))
+            .unwrap();
+        parent = id;
+    }
+    let row = store.timeline_message(&group, &parent).unwrap().unwrap();
+    assert_eq!(row.thread.unwrap().root_message_id_hex, "gone");
+    assert_eq!(
+        store.thread_root_hint(&group, &parent, "gone").unwrap(),
+        Some((9, "bob".to_owned()))
+    );
+}
+
 #[test]
 fn unmarked_comments_stay_custom() {
     for kind_tag in [None, Some("invalid")] {

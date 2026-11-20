@@ -3507,7 +3507,10 @@ impl MarmotAppRuntime {
     /// edit, delete, agent, group system, push token) are rejected so an app
     /// cannot forge protocol events. Custom events project into the timeline
     /// as standalone rows with the `custom_event` trigger but do not bump the
-    /// chat-list preview or raise push notifications.
+    /// chat-list preview or raise push notifications. A kind-1111 thread
+    /// message (a lowercase `e` naming its parent) is the exception: it is chat
+    /// activity like kind 9. New code sends those with
+    /// [`Self::send_thread_message`].
     pub async fn send_custom_event(
         &self,
         account_ref: &str,

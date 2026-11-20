@@ -137,7 +137,9 @@ pub(super) fn named_root_hint(
 ) -> StorageResult<Option<(u64, String)>> {
     let mut current = start.to_owned();
     let mut visited = HashSet::new();
-    while visited.insert(current.clone()) && visited.len() <= MAX_LEGACY_THREAD_DEPTH {
+    // `start` is the parent itself, one row below where the read walk that
+    // found `root` began, so this walk may visit one row more.
+    while visited.insert(current.clone()) && visited.len() <= MAX_LEGACY_THREAD_DEPTH + 1 {
         let Some((kind, tags, reply_to)) = stored_row(conn, group_id_hex, &current)? else {
             break;
         };

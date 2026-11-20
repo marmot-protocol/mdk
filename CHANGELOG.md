@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Changed
+
+- `wn-agent` passes NIP-22 thread messages (kind 1111 with a parent) to the agent like chat: as inbound messages whose
+  reply target is the parent, with their edits and deletes, live and on replay.
+
 ## 0.18.0 - 2026-11-20
 
 ### Breaking changes

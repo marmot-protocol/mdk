@@ -1223,7 +1223,8 @@ Custom events retain their numeric `kind` and verbatim `plaintext` content. Conv
 also carry their ordered `tags`, so clients can render app-defined event types without fetching
 raw events. Deleted rows expose no raw tags in timeline reads, moderation reads, or conversation windows.
 MDK-owned kinds continue to use prepared fields and references there. Custom-event tag changes invalidate
-the conversion cache. Custom events do not change chat-list activity or notification policy.
+the conversion cache. Custom events do not change chat-list activity or notification policy, except a kind-1111
+thread message, which is chat (see [Replies and thread messages](#replies-and-thread-messages)).
 `sendCustomEvent` refuses every kind MDK owns, the device-group kinds 457, 458, 459, 460, 461, 473, 475 and 476 included. Those
 are read only in the account's own device group, so a chat never shows one, as a row, a message or a notification.
 

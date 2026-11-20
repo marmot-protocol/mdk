@@ -5571,6 +5571,32 @@ async fn inbound_message_event_from_record_projects_group_system_row() {
 }
 
 #[test]
+fn runtime_replay_dedup_key_covers_thread_messages_like_chat() {
+    // Live delivery records a thread message's row id so a later replay does
+    // not hand the agent the same message twice; other kind-1111 events stay
+    // outside the feed.
+    let update = |tags: Vec<Vec<String>>| {
+        MarmotAppEvent::MessageReceived(RuntimeMessageReceived {
+            account_id_hex: "aa".repeat(32),
+            account_label: "agent".to_owned(),
+            message: received_message(cgka_traits::NIP22_COMMENT_KIND, "in thread", tags),
+        })
+    };
+    let parent = vec![
+        vec!["e".to_owned(), "cc".repeat(32)],
+        vec!["k".to_owned(), "9".to_owned()],
+    ];
+    assert_eq!(
+        runtime_replay_dedup_key(&update(parent)),
+        Some("33".repeat(32))
+    );
+    assert_eq!(
+        runtime_replay_dedup_key(&update(vec![vec!["k".to_owned(), "9".to_owned()]])),
+        None
+    );
+}
+
+#[test]
 fn runtime_replay_dedup_key_matches_group_system_storage_row_id() {
     // The live GroupStateChanged event and the synthesized storage row must share the same
     // replay cursor id, otherwise replay after later lag would duplicate already-delivered state.
@@ -6050,6 +6076,31 @@ async fn replay_missed_inbound_recovers_dropped_messages_and_dedups() {
         )
         .await
         .unwrap();
+    // A thread message answering the agent is chat, as is its author's edit.
+    let thread_message_id_hex = connector
+        .runtime
+        .send_thread_message(
+            &human.account.account_id_hex,
+            &group_id,
+            &target_message_id_hex,
+            "in a thread".to_owned(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .await
+        .unwrap()
+        .message_ids[0]
+        .clone();
+    connector
+        .runtime
+        .edit_message(
+            &human.account.account_id_hex,
+            &group_id,
+            &thread_message_id_hex,
+            "edited in a thread",
+        )
+        .await
+        .unwrap();
     let reaction = connector
         .runtime
         .react_to_message(
@@ -6113,6 +6164,29 @@ async fn replay_missed_inbound_recovers_dropped_messages_and_dedups() {
             } if target == &target_message_id_hex && replacement_text == "edited while lagging"
         )),
         "accepted edit must replay through the production projector: {mutation_replay:?}"
+    );
+    assert!(
+        mutation_replay.iter().any(|event| matches!(
+            event,
+            AgentControlEvent::InboundMessage {
+                message,
+                reply_to: Some(parent),
+                ..
+            } if message.message_id_hex == thread_message_id_hex
+                && parent.message_id_hex == target_message_id_hex
+        )),
+        "a thread message reaches the agent as a reply to its parent: {mutation_replay:?}"
+    );
+    assert!(
+        mutation_replay.iter().any(|event| matches!(
+            event,
+            AgentControlEvent::MessageEdited {
+                target_message_id_hex: target,
+                replacement_text,
+                ..
+            } if target == &thread_message_id_hex && replacement_text == "edited in a thread"
+        )),
+        "a thread message's edit reaches the agent: {mutation_replay:?}"
     );
     assert!(
         mutation_replay.iter().any(|event| matches!(
