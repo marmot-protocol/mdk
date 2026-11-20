@@ -144,8 +144,9 @@
   ownership check from independently opened handles. Public/external setup
   journals precede visible records, so contention cannot leave failed setup
   looking network-ready. Failed external setup commits account removal or
-  public-role restoration before retiring credentials. A rejected wipe keeps
-  its live NIP-46 binding. Retries preserve signing
+  public-role restoration before retiring credentials. Runtime deletion reaps
+  workers and drops cached storage handles before the tombstone rename. A
+  rejected wipe keeps its live NIP-46 binding. Retries preserve signing
   credentials adopted by a new signing account. Lower-level
   Rust owners invoke `AccountHome::resume_wipe_cleanup` explicitly while
   holding exclusive cross-process ownership; constructors do not run cleanup.

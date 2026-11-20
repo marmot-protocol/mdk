@@ -37,10 +37,12 @@ fn install_mock_keyring() {
 }
 
 fn file_receipts(root: &std::path::Path) -> Vec<std::path::PathBuf> {
-    std::fs::read_dir(root.join(".owned-secrets-v1/receipts"))
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .collect()
+    let entries = match std::fs::read_dir(root.join(".owned-secrets-v1/receipts")) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(error) => panic!("reading credential receipts: {error}"),
+    };
+    entries.map(|entry| entry.unwrap().path()).collect()
 }
 
 #[cfg(unix)]
@@ -2320,22 +2322,41 @@ fn nip46_interrupted_repair() {
 
 #[test]
 fn nip46_orphan_wipe_intent() {
+    #[derive(Clone, Copy)]
+    enum Undo {
+        None,
+        Paired,
+        Legacy,
+    }
+
     let user = nostr::prelude::Keys::parse(&"01".repeat(32)).unwrap();
     let old = nostr::prelude::Keys::parse(&"02".repeat(32)).unwrap();
     let fresh = nostr::prelude::Keys::parse(&"03".repeat(32)).unwrap();
     let label = user.public_key().to_hex();
-    for reverted in [false, true] {
+    for undo in [Undo::None, Undo::Paired, Undo::Legacy] {
         let dir = tempfile::tempdir().unwrap();
         let home = AccountHome::open(dir.path());
         let raw = write_legacy_nip46(&home, &user, &old);
         let raw_bytes = std::fs::read(&raw).unwrap();
         std::fs::remove_file(home.account_dir(&label).join(".nip46-session.json")).unwrap();
-        home.store_nip46_session(&label, &fresh, &nip46_record(&user, &fresh))
-            .unwrap();
-        let home = if reverted {
+        if !matches!(undo, Undo::Legacy) {
+            home.store_nip46_session(&label, &fresh, &nip46_record(&user, &fresh))
+                .unwrap();
+        }
+        drop(home);
+        let home = AccountHome::open(dir.path());
+        let home = if !matches!(undo, Undo::None) {
             home.revert_external_signer_upgrade(&label).unwrap();
             assert!(!home.account(&label).unwrap().can_sign());
             assert!(file_receipts(dir.path()).is_empty());
+            if matches!(undo, Undo::Legacy) {
+                let history: serde_json::Value = serde_json::from_slice(
+                    &std::fs::read(home.account_dir(&label).join(".credential-ownership.json"))
+                        .unwrap(),
+                )
+                .unwrap();
+                assert_eq!(history["account"]["external_signing"], true);
+            }
             drop(home);
             AccountHome::open(dir.path())
         } else {

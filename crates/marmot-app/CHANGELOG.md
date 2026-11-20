@@ -140,6 +140,8 @@
   initialization-gated through failed rollback.
   Whole-account wipe and setup rollback retire NIP-46 credentials after account removal or public-role restoration;
   pending retirement resumes before another pairing. A rejected precommit wipe retains its live NIP-46 binding.
+  Account setup compensation and removal reap workers before catalog deletion or public-role restoration.
+  Destructive rollback shares the fenced local-removal path and drops cached storage handles.
   Standalone session removal does not require decoding retained raw keys.
 - When a device is linked to an account that already has two or more devices, its approver and the other devices
   no longer both add it to the same chat in the usual case, which forked chats (mdk#3537). While the approver is active

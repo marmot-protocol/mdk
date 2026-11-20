@@ -106,10 +106,11 @@ the owned work ends. Adoption keeps the session generation captured at admission
 through gate waits, binding, and network work. A disconnect between phases still
 retires it; a later explicit reconnect cannot resume that older adoption.
 Binding-only rollback restores the prior credential record and callback without
-disturbing a newer transport generation. Account-owned rollback commits catalog
-removal or public-role restoration before retiring the session credential. Failed
-retirement keeps exact-owner intent; another promotion or pairing completes it
-before accepting new keys.
+disturbing a newer transport generation. Account-owned rollback fences worker
+replacement and waits for active or retiring workers to release their storage
+handles. It commits catalog removal or public-role restoration before retiring
+the session credential. Failed retirement keeps exact-owner intent; another
+promotion or pairing completes it before accepting new keys.
 Shutdown interrupts and settles owned adoption before it
 closes storage. Local removal, sign-out, and wipe interrupt earlier admitted
 adoption for that account. Explicit reactivation waits for adoption to settle,
