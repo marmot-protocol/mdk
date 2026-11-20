@@ -158,6 +158,13 @@ async fn run_server(args: DaemonArgs) -> Result<(), Box<dyn std::error::Error + 
         .or_else(|| discovery_relays.first().cloned())
         .or_else(|| default_account_relays.first().cloned())
         .ok_or(crate::WnError::MissingRelay)?;
+    let root_owner = Arc::new(marmot_app::MarmotRootRuntimeLease::try_acquire(&home)?);
+    let secret_store = crate::resolve_secret_store(args.secret_store)?;
+    let keychain_service = crate::resolve_keychain_service(args.keychain_service.clone())
+        .trim()
+        .to_owned();
+    let account_home = crate::open_account_home(&home, secret_store, &keychain_service)?;
+    account_home.resume_wipe_cleanup()?;
     let _socket_parent_guard = socket
         .parent()
         .map(|parent| prepare_socket_dir(parent, &home))
@@ -177,14 +184,16 @@ async fn run_server(args: DaemonArgs) -> Result<(), Box<dyn std::error::Error + 
     write_pid_file(&pid_path)?;
     let defaults = DaemonDefaults {
         home,
+        root_owner: Some(root_owner),
+        account_home,
         socket,
         pid_path,
         log_path,
         relay: Some(relay),
         discovery_relays,
         default_account_relays,
-        secret_store: args.secret_store,
-        keychain_service: args.keychain_service,
+        secret_store: Some(secret_store),
+        keychain_service: Some(keychain_service),
     };
     let state = Arc::new(Mutex::new(DaemonState {
         pid: std::process::id(),
@@ -417,7 +426,12 @@ async fn handle_daemon_connection(
             let _ = shutdown_tx.send(());
         }
         DaemonRequest::MessagesSubscribe { mut cli } => {
-            apply_defaults(&mut cli, &defaults);
+            if let Err(err) = apply_defaults(&mut cli, &defaults) {
+                let _ =
+                    write_stream_response(&mut stream, &DaemonStreamResponse::err(err.to_string()))
+                        .await;
+                return;
+            }
             let runtime = {
                 let mut workers_guard = workers.lock().await;
                 reconcile_app_runtime(
@@ -434,7 +448,12 @@ async fn handle_daemon_connection(
                     .await;
         }
         DaemonRequest::ChatsSubscribe { mut cli } => {
-            apply_defaults(&mut cli, &defaults);
+            if let Err(err) = apply_defaults(&mut cli, &defaults) {
+                let _ =
+                    write_stream_response(&mut stream, &DaemonStreamResponse::err(err.to_string()))
+                        .await;
+                return;
+            }
             let runtime = {
                 let mut workers_guard = workers.lock().await;
                 reconcile_app_runtime(
@@ -449,7 +468,12 @@ async fn handle_daemon_connection(
             let _ = handle_chats_subscription(&mut stream, &defaults, runtime, *cli).await;
         }
         DaemonRequest::GroupStateSubscribe { mut cli } => {
-            apply_defaults(&mut cli, &defaults);
+            if let Err(err) = apply_defaults(&mut cli, &defaults) {
+                let _ =
+                    write_stream_response(&mut stream, &DaemonStreamResponse::err(err.to_string()))
+                        .await;
+                return;
+            }
             let runtime = {
                 let mut workers_guard = workers.lock().await;
                 reconcile_app_runtime(
@@ -464,7 +488,12 @@ async fn handle_daemon_connection(
             let _ = handle_group_state_subscription(&mut stream, &defaults, runtime, *cli).await;
         }
         DaemonRequest::NotificationsSubscribe { mut cli } => {
-            apply_defaults(&mut cli, &defaults);
+            if let Err(err) = apply_defaults(&mut cli, &defaults) {
+                let _ =
+                    write_stream_response(&mut stream, &DaemonStreamResponse::err(err.to_string()))
+                        .await;
+                return;
+            }
             let runtime = {
                 let mut workers_guard = workers.lock().await;
                 reconcile_app_runtime(
@@ -577,7 +606,10 @@ async fn handle_stream_watch_connection(
     events: DaemonEventHub,
     workers: &SharedDaemonWorkers,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    apply_defaults(&mut cli, defaults);
+    if let Err(err) = apply_defaults(&mut cli, defaults) {
+        write_daemon_output(stream, &crate::command_output_result(cli.json, Err(err))).await;
+        return Ok(());
+    }
     // Hold the lock only for the host-mutating reconcile; clone the runtime handle and the
     // (interior-mutable) stream-watch registry, then spawn the watch + open the broker
     // connection off the lock (#633).
@@ -604,7 +636,10 @@ async fn handle_execute_connection(
     events: DaemonEventHub,
     workers: &SharedDaemonWorkers,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    apply_defaults(&mut cli, defaults);
+    if let Err(err) = apply_defaults(&mut cli, defaults) {
+        write_daemon_output(stream, &crate::command_output_result(cli.json, Err(err))).await;
+        return Ok(());
+    }
     if let Some(output) = blocked_daemon_execute_output(cli.as_ref()) {
         write_daemon_output(stream, &output).await;
         return Ok(());
@@ -662,9 +697,16 @@ async fn handle_execute_connection(
         write_daemon_output(stream, &output).await;
         return Ok(());
     }
-    // run_cli_local opens its own account/session and touches no shared daemon state, so it runs
-    // entirely off the workers lock — the core head-of-line fix (#633).
-    let output = crate::run_cli_local(*cli, import_nsec).await;
+    // Fallback helpers share the daemon's root ownership without taking the workers lock.
+    let output = crate::run_cli_local(
+        *cli,
+        import_nsec,
+        defaults
+            .root_owner
+            .as_deref()
+            .map(|owner| (owner, defaults.account_home.clone())),
+    )
+    .await;
     if output.code == 0 {
         refresh_app_runtime(defaults, state.clone(), events.clone(), workers, refresh).await;
     }

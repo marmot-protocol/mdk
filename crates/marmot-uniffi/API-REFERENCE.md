@@ -4750,7 +4750,7 @@ pub fn new_with_configuration( root_path: String, relay_urls: Vec<String>, optio
 
 Open with any combination of runtime options, including the required deployment. The other constructors are wrappers around this entry point and take the deployment as their last argument.
 
-[Source](src/lib.rs#L330)
+[Source](src/lib.rs#L355)
 
 ### `Marmot::new_with_experimental_device_groups`
 
@@ -4760,7 +4760,7 @@ pub fn new_with_experimental_device_groups( root_path: String, relay_urls: Vec<S
 
 The same open as `new_with_configuration`: every constructor opens with [device groups](README.md#device-groups) on. Kept so existing hosts keep compiling.
 
-[Source](src/lib.rs#L343)
+[Source](src/lib.rs#L368)
 
 ### `Marmot::new_with_options`
 
@@ -4772,7 +4772,7 @@ pub fn new_with_options( root_path: String, relay_urls: Vec<String>, relay_polic
 
 Open with an explicit relay policy and optional host-owned key storage. Existing constructors retain their public-only relay policy.
 
-[Source](src/lib.rs#L354)
+[Source](src/lib.rs#L379)
 
 ### `Marmot::new`
 
@@ -4784,7 +4784,7 @@ pub fn new( root_path: String, relay_urls: Vec<String>, deployment: MarmotDeploy
 
 Open the Marmot app at `root_path`, configured with the given default relay URLs and `deployment`. Account secrets (Nostr private keys) are stored in the platform keyring (Keychain on Apple platforms, Android's native keyring on Android) under the deployment's `keychain_service` — not in a plaintext file. Fallible because initializing the platform secret store can fail or another process may own the same root (`MarmotKitError::RuntimeBusy`). Root ownership is nonblocking and remains held until the final `Marmot`/runtime handle is dropped, even after `Marmot::shutdown`. Call `Marmot::start` before subscribing to events.
 
-[Source](src/lib.rs#L383)
+[Source](src/lib.rs#L408)
 
 ### `Marmot::new_with_secret_store`
 
@@ -4796,7 +4796,7 @@ pub fn new_with_secret_store( root_path: String, relay_urls: Vec<String>, secret
 
 Open the Marmot app with host-supplied account-secret storage instead of the platform keychain. Identical to `Marmot::new` except that every read, write, and removal of an account signing key goes through `secret_store`.
 
-[Source](src/lib.rs#L409)
+[Source](src/lib.rs#L434)
 
 ### `Marmot::new_with_cursor_persistence`
 
@@ -4808,7 +4808,7 @@ pub fn new_with_cursor_persistence( root_path: String, relay_urls: Vec<String>, 
 
 Construct with explicit advancing/frozen relay cursor behavior; new_with_configuration composes this with other options.
 
-[Source](src/lib.rs#L440)
+[Source](src/lib.rs#L465)
 
 ### `Marmot::new_with_client_name`
 
@@ -4820,7 +4820,7 @@ pub fn new_with_client_name( root_path: String, relay_urls: Vec<String>, client_
 
 Open with an optional public client label for new KeyPackage publications. Existing constructors remain untagged. Whitespace-only labels, and labels longer than 64 bytes once trimmed, are omitted rather than truncated. Hosts must supply this on every foreground/background runtime construction.
 
-[Source](src/lib.rs#L461)
+[Source](src/lib.rs#L486)
 
 ### `Marmot::start`
 
@@ -4832,7 +4832,7 @@ pub async fn start(&self) -> Result<(), MarmotKitError>
 
 Bring the runtime to local readiness.
 
-[Source](src/lib.rs#L499)
+[Source](src/lib.rs#L524)
 
 ### `Marmot::shutdown`
 
@@ -4844,7 +4844,7 @@ pub async fn shutdown(&self)
 
 Tear the runtime down. Drops all subscriptions; long-lived `EventsSubscription` / `ChatsSubscription` / etc. instances on the host side will see their `next()` return `None` shortly after.
 
-[Source](src/lib.rs#L511)
+[Source](src/lib.rs#L536)
 
 ### `Marmot::shutdown_and_close`
 
@@ -4856,7 +4856,7 @@ pub async fn shutdown_and_close(&self) -> Result<(), MarmotKitError>
 
 Terminally stop work, close storage and release root ownership; reconstruct before further reads/work.
 
-[Source](src/lib.rs#L547)
+[Source](src/lib.rs#L572)
 
 ### `Marmot::storage_is_closed`
 
@@ -4868,7 +4868,7 @@ pub fn storage_is_closed(&self) -> bool
 
 True once `Marmot::shutdown_and_close` has closed the store. A host can check this to confirm it is safe to be suspended, or to notice it is holding a spent handle and needs a fresh one.
 
-[Source](src/lib.rs#L555)
+[Source](src/lib.rs#L580)
 
 ### `Marmot::is_stopping`
 
@@ -4880,7 +4880,7 @@ pub fn is_stopping(&self) -> bool
 
 True once shutdown has started. Host apps can use this to avoid launching more subscriptions or account work while they are moving to the background.
 
-[Source](src/lib.rs#L562)
+[Source](src/lib.rs#L587)
 
 </details>
 
@@ -4952,6 +4952,18 @@ Stop the preview; an already-running finish wins. State is not restored after pr
 <details>
 <summary>secret_store.rs</summary>
 
+### `SecretStore::cleanup_namespace`
+
+**Host callback.**
+
+```rust
+fn cleanup_namespace(&self) -> Result<String, MarmotKitError>
+```
+
+Identify the physical vault and credential namespace for restart-safe wipe cleanup. Keep this nonsecret identity stable across restarts and vault locks, distinct for different stores or services, and fixed for this store object's lifetime. Return an error rather than guessing an unavailable identity; see [host secret-store identity](README.md#host-secret-store-identity).
+
+[Source](src/secret_store.rs#L93)
+
 ### `SecretStore::has_secret_for_label`
 
 **Host callback.**
@@ -4962,7 +4974,7 @@ fn has_secret_for_label(&self, label: String) -> Result<bool, MarmotKitError>
 
 Whether a credential is stored under `label`.
 
-[Source](src/secret_store.rs#L33)
+[Source](src/secret_store.rs#L96)
 
 ### `SecretStore::has_secret_for_account_id`
 
@@ -4974,43 +4986,55 @@ fn has_secret_for_account_id(&self, account_id_hex: String) -> Result<bool, Marm
 
 Whether a credential is stored under `account_id_hex`. Stores that key one credential per label report `false`.
 
-[Source](src/secret_store.rs#L37)
+[Source](src/secret_store.rs#L99)
 
-### `SecretStore::write_secret`
+### `SecretStore::acquire_secret`
 
 **Host callback.**
 
 ```rust
-fn write_secret( &self, label: String, account_id_hex: String, secret_key_hex: String, ) -> Result<(), MarmotKitError>
+fn acquire_secret( &self, record: SecretCredential, mode: SecretClaimMode, proposed_hex: Option<String>, ) -> Result<AcquiredSecret, MarmotKitError>
 ```
 
-Persist `secret_key_hex` for this account, replacing any existing credential.
+Persist this owner's immutable credential copy before returning its secret and original acquisition origin. Same-owner retries retain both values. Managed signing discovery is shared by account ID; auxiliary discovery is home-scoped. Only `MigrateLegacy` permits raw legacy lookup. See [host ownership](README.md#host-secret-store-identity).
 
-[Source](src/secret_store.rs#L41)
+[Source](src/secret_store.rs#L113)
 
 ### `SecretStore::load_secret`
 
 **Host callback.**
 
 ```rust
-fn load_secret(&self, label: String, account_id_hex: String) -> Result<String, MarmotKitError>
+fn load_secret(&self, record: SecretCredential) -> Result<String, MarmotKitError>
 ```
 
-Return the stored secret-key hex, or `MarmotKitError::SecretNotFound` when this account has no credential.
+Return this active owner's secret-key hex, or `MarmotKitError::SecretNotFound` for a missing or retired receipt. Do not substitute another owner's copy on load; adoption requires `acquire_secret`.
 
-[Source](src/secret_store.rs#L50)
+[Source](src/secret_store.rs#L121)
 
-### `SecretStore::remove_secret`
+### `SecretStore::release_secret`
 
 **Host callback.**
 
 ```rust
-fn remove_secret(&self, label: String, account_id_hex: String) -> Result<(), MarmotKitError>
+fn release_secret( &self, record: SecretCredential, mode: SecretReleaseMode, ) -> Result<SecretReleaseOutcome, MarmotKitError>
 ```
 
-Remove this account's credential. Removing a missing credential succeeds.
+Retire only this receipt before deleting its material. `Preserve` keeps a discoverable hold until another owner durably adopts a copy. Retain retirement metadata so an old operation cannot recreate a retired owner or consume another owner's key. Return `PendingLegacy` only after managed retirement and deletion complete, with raw legacy material retained or its absence unproven. Return an error for failed or uncertain managed deletion.
 
-[Source](src/secret_store.rs#L54)
+[Source](src/secret_store.rs#L130)
+
+### `SecretStore::reconcile_cleanup`
+
+**Host callback.**
+
+```rust
+fn reconcile_cleanup(&self) -> Result<(), MarmotKitError>
+```
+
+Retry durable retired-receipt cleanup, including when no account wipe remains. Attempt independent retirements despite individual failures. Keep preserved holds and ambiguous legacy credentials. Cleanup cannot infer ownership from the live account catalog.
+
+[Source](src/secret_store.rs#L138)
 
 </details>
 

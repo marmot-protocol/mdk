@@ -6,12 +6,12 @@ import io.crates.keyring.Keyring
 /**
  * Android initialization bridge for MarmotKit.
  *
- * The `Marmot(...)` constructor builds the Android-native keyring store, which
- * talks to the Android Keystore over JNI and requires the `ndk-context` to be
- * initialized with the application [Context] first. Android consumers MUST call
+ * Account ownership uses the application identity and storage container, including
+ * with file or host-provided secret stores. The native store also uses Android
+ * Keystore over JNI. Both require `ndk-context` with the application [Context].
+ * Android consumers MUST call
  * [initialize] from `Application.onCreate` (or otherwise before the first
- * `Marmot(...)` constructor), otherwise construction crashes with
- * `android context was not initialized`.
+ * `Marmot(...)` constructor), otherwise construction or credential access fails.
  *
  * Usage:
  * ```kotlin

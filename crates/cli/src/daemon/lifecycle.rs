@@ -55,9 +55,11 @@ pub(crate) struct DaemonArgs {
     pub(crate) keychain_service: Option<String>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(crate) struct DaemonDefaults {
     pub(crate) home: PathBuf,
+    pub(super) root_owner: Option<Arc<marmot_app::MarmotRootRuntimeLease>>,
+    pub(super) account_home: marmot_account::AccountHome,
     pub(crate) socket: PathBuf,
     pub(crate) pid_path: PathBuf,
     pub(crate) log_path: PathBuf,

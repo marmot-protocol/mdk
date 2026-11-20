@@ -1191,40 +1191,64 @@ async fn an_unlinked_device_stops_its_account_for_good() {
     runtime.shutdown().await;
 }
 
-/// The wipe of an unlinked account commits its removal, then fails to remove
-/// its secret. The account is gone all the same, so its publish stop goes
-/// with it: the same account linked again here publishes (mdk#2628 D67).
+/// An unlinked wipe reports its commit despite a secret-store cleanup failure.
+/// Its publish stop goes with the account: a new link publishes (mdk#2628 D67).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_unlinked_wipe_that_keeps_its_secret_still_lets_a_new_link_publish() {
+async fn unlinked_wipe_failure_relinks() {
     use marmot_account::{
-        AccountHomeResult, AccountSecretStore, AccountSummary, LocalFileSecretStore,
+        AccountHomeResult, AccountSecretStore, AcquiredSecret, IosOptions, LocalFileSecretStore,
+        SecretClaimMode, SecretCredential, SecretReleaseMode, SecretReleaseOutcome,
     };
+    use std::sync::atomic::{AtomicBool, Ordering};
 
-    struct FailSecretRemoval(LocalFileSecretStore);
+    struct FailSecretRemoval {
+        files: LocalFileSecretStore,
+        fail_release: AtomicBool,
+    }
     impl AccountSecretStore for FailSecretRemoval {
+        fn cleanup_namespace(&self) -> AccountHomeResult<String> {
+            self.files.cleanup_namespace()
+        }
+
         fn has_secret_for_label(&self, label: &str) -> AccountHomeResult<bool> {
-            self.0.has_secret_for_label(label)
+            self.files.has_secret_for_label(label)
         }
-        fn write_secret(
+        fn acquire_secret(
             &self,
-            account: &AccountSummary,
-            keys: &nostr::prelude::Keys,
-        ) -> AccountHomeResult<()> {
-            self.0.write_secret(account, keys)
+            credential: SecretCredential<'_>,
+            mode: SecretClaimMode,
+            proposed: Option<&nostr::prelude::Keys>,
+        ) -> AccountHomeResult<AcquiredSecret> {
+            self.files.acquire_secret(credential, mode, proposed)
         }
-        fn load_secret(&self, account: &AccountSummary) -> AccountHomeResult<nostr::prelude::Keys> {
-            self.0.load_secret(account)
+        fn load_secret(
+            &self,
+            credential: SecretCredential<'_>,
+        ) -> AccountHomeResult<nostr::prelude::Keys> {
+            self.files.load_secret(credential)
         }
-        fn remove_secret(&self, _account: &AccountSummary) -> AccountHomeResult<()> {
-            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied).into())
+        fn release_secret(
+            &self,
+            credential: SecretCredential<'_>,
+            mode: SecretReleaseMode,
+        ) -> AccountHomeResult<SecretReleaseOutcome> {
+            if self.fail_release.load(Ordering::SeqCst) {
+                return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied).into());
+            }
+            self.files.release_secret(credential, mode)
+        }
+        fn reconcile_cleanup(&self) -> AccountHomeResult<()> {
+            self.files.reconcile_cleanup()
         }
     }
 
     let root = tempfile::tempdir().unwrap();
-    let home = AccountHome::open_with_secret_store(
-        root.path(),
-        Arc::new(FailSecretRemoval(LocalFileSecretStore::new(root.path()))),
-    );
+    let store = Arc::new(FailSecretRemoval {
+        files: LocalFileSecretStore::new(root.path(), IosOptions::default()),
+        fail_release: AtomicBool::new(true),
+    });
+    let home =
+        AccountHome::open_with_secret_store(root.path(), store.clone(), IosOptions::default());
     home.create_account("alice").unwrap();
     let keys = home.load_signing_keys("alice").unwrap();
     let relay = Arc::new(ScriptedPushRelayClient::default());
@@ -1252,11 +1276,24 @@ async fn an_unlinked_wipe_that_keeps_its_secret_still_lets_a_new_link_publish() 
     .expect("the runtime deactivates the account");
 
     let outcome = runtime.sign_out_and_wipe("alice").await.unwrap();
-    assert!(!outcome.local_cleanup.completed, "the secret is kept");
+    assert!(outcome.local_cleanup.completed, "the local wipe committed");
     assert!(app.account_home().accounts().unwrap().is_empty());
+    let tombstones = root.path().join(".wipe-tombstones");
+    let tombstone = std::fs::read_dir(&tombstones)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let intent = tombstone.join(".wipe-cleanup.json");
+    assert!(
+        intent.is_file(),
+        "the failed release must remain replayable"
+    );
 
     let attempted = relay.attempted_events().len();
-    app.account_home()
+    let relinked = app
+        .account_home()
         .import_nostr_account_idempotent(&keys.secret_key().to_secret_hex())
         .unwrap();
     runtime.reconcile_accounts().await.unwrap();
@@ -1267,6 +1304,21 @@ async fn an_unlinked_wipe_that_keeps_its_secret_still_lets_a_new_link_publish() 
     })
     .await
     .expect("the account linked again publishes");
+    assert!(
+        intent.is_file(),
+        "relinking must not discard the old release"
+    );
+    store.fail_release.store(false, Ordering::SeqCst);
+    app.account_home().resume_wipe_cleanup().unwrap();
+    assert_eq!(std::fs::read_dir(tombstones).unwrap().count(), 0);
+    assert_eq!(
+        app.account_home()
+            .load_signing_keys(&relinked.account().label)
+            .unwrap()
+            .public_key(),
+        keys.public_key(),
+        "replaying the old release must not delete the relinked owner's credential",
+    );
     runtime.shutdown().await;
 }
 
@@ -3712,6 +3764,84 @@ async fn cancelled_startup_is_reaped() {
     assert!(!commands.same_channel(&old_commands));
     assert!(manager.workers.lock().await[&account.account_id_hex].ready);
     runtime.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn setup_rollback_reaps_worker() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = MarmotApp::with_relays(dir.path(), vec![]);
+    let keys = nostr::prelude::Keys::parse(&"01".repeat(32)).unwrap();
+    let imported = app
+        .account_home()
+        .import_nostr_account_idempotent(&keys.secret_key().to_secret_hex())
+        .unwrap();
+    let account = imported.account().clone();
+    let runtime = app.runtime();
+    let manager = runtime.accounts();
+    let (reached, proceed) = install_local_open_gate(&app, &account.label);
+    let starting = manager.clone();
+    let reconcile = tokio::spawn(async move { starting.reconcile().await });
+    wait_for_test_signal(reached, "imported account session open").await;
+    reconcile.abort();
+    assert!(reconcile.await.unwrap_err().is_cancelled());
+    let old_commands = manager.workers.lock().await[&account.account_id_hex]
+        .commands
+        .clone();
+
+    let mut rollback = Box::pin(manager.rollback_import_setup::<()>(
+        &account,
+        Some(&imported),
+        AppError::MissingDefaultRelays,
+    ));
+    let early = timeout(ACCOUNT_OPEN_TEST_DEADLINE, async {
+        loop {
+            if let std::task::Poll::Ready(result) = futures::poll!(rollback.as_mut()) {
+                break Some(result);
+            }
+            let reaping = manager
+                .worker_reapers
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|reaper| reaper.account_id == account.account_id_hex);
+            if reaping {
+                break None;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("rollback reaches its tracked worker reaper");
+    let reached_reaper = early.is_none();
+    let live_while_open = app.account_home().account(&account.label).is_ok();
+    let worker_held = !old_commands.is_closed();
+    proceed.send(()).unwrap();
+    let result = match early {
+        Some(result) => result,
+        None => rollback.await,
+    };
+    let worker_stopped = old_commands.is_closed();
+    let removed = matches!(
+        app.account_home().account(&account.label),
+        Err(AccountHomeError::UnknownAccount(_))
+    );
+    runtime.shutdown().await;
+
+    assert!(
+        reached_reaper,
+        "rollback completed before reaping its worker"
+    );
+    assert!(worker_held, "the session gate still holds the old worker");
+    assert!(
+        live_while_open,
+        "rollback must not tombstone an open session"
+    );
+    assert!(
+        worker_stopped,
+        "the old worker must stop before removal completes"
+    );
+    assert!(matches!(result, Err(AppError::MissingDefaultRelays)));
+    assert!(removed, "successful compensation removes the failed import");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

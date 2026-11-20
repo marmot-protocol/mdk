@@ -146,6 +146,15 @@
   its shared decision and can stay pending until that decision arrives (mdk#3556). An unanswered invitation arrives
   pending with the original inviter as `welcomer_account_id_hex` instead of the account itself.
 
+- Account wipes report committed removal despite later vault or file cleanup errors (#819). Pending cleanup retries
+  require matching exclusive root ownership and release only the original credential receipt. Startup rejects
+  mutation-lease contention before admitting account work. Generated, public and external account setup stay
+  initialization-gated through failed rollback.
+  Whole-account wipe and setup rollback retire NIP-46 credentials after account removal or public-role restoration;
+  pending retirement resumes before another pairing. A rejected precommit wipe retains its live NIP-46 binding.
+  Account setup compensation and removal reap workers before catalog deletion or public-role restoration.
+  Destructive rollback shares the fenced local-removal path and drops cached storage handles.
+  Standalone session removal does not require decoding retained raw keys.
 - When a device is linked to an account that already has two or more devices, its approver and the other devices
   no longer both add it to the same chat in the usual case, which forked chats (mdk#3537). While the approver is active
   (heard from, or approving the link, within the last two hours) and the link is under a week old, other devices leave

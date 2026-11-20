@@ -2073,7 +2073,7 @@ impl AccountSetup<'_> {
                 let snapshot = self.initialize_onboarding(&account, options)?;
                 self.app()
                     .account_home()
-                    .add_external_signer_account(&public_key)?;
+                    .add_external_signer_for_setup(&public_key)?;
                 snapshot
             }
             Err(AccountHomeError::UnknownAccount(_)) => {
@@ -2096,7 +2096,7 @@ impl AccountSetup<'_> {
                 let account = self
                     .app()
                     .account_home()
-                    .add_external_signer_account(&public_key)?;
+                    .add_external_signer_for_setup(&public_key)?;
                 self.initialize_onboarding(&account, options)?
             }
             Err(error) => return Err(error.into()),

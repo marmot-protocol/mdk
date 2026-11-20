@@ -305,6 +305,7 @@ mod tests {
     fn legacy_audit_cleanup_does_not_follow_links_at_any_scan_level() {
         for container in LEGACY_CONTAINERS {
             let root = tempfile::tempdir().unwrap();
+            let _owner = MarmotRootRuntimeLease::try_acquire(root.path()).unwrap();
             let external = tempfile::tempdir().unwrap();
             let name = format!("audit-{ENGINE}-v3.jsonl");
             let target = external.path().join(&name);
@@ -315,7 +316,7 @@ mod tests {
             fs::write(&nested_target, b"EXTERNAL_ACCOUNT_BYTES").unwrap();
             let accounts = root.path().join(container);
             symlink(external.path(), &accounts).unwrap();
-            drop(open_app(root.path()).unwrap());
+            cleanup_legacy_audit_logs(root.path());
             assert_eq!(fs::read(&target).unwrap(), b"EXTERNAL_BYTES");
             assert_eq!(fs::read(&nested_target).unwrap(), b"EXTERNAL_ACCOUNT_BYTES");
             fs::remove_file(&accounts).unwrap();
@@ -324,7 +325,7 @@ mod tests {
             let real_account = accounts.join("real-account");
             fs::create_dir(&real_account).unwrap();
             symlink(&target, real_account.join(&name)).unwrap();
-            drop(open_app(root.path()).unwrap());
+            cleanup_legacy_audit_logs(root.path());
             assert_eq!(fs::read(target).unwrap(), b"EXTERNAL_BYTES");
             assert!(
                 fs::symlink_metadata(real_account.join(name))
@@ -375,38 +376,8 @@ mod tests {
 
     #[test]
     fn legacy_audit_cleanup_removes_logs_left_by_a_failed_account_wipe() {
-        use marmot_account::{
-            AccountHomeResult, AccountSecretStore, AccountSummary, LocalFileSecretStore,
-        };
-
-        struct FailSecretRemoval(LocalFileSecretStore);
-        impl AccountSecretStore for FailSecretRemoval {
-            fn has_secret_for_label(&self, label: &str) -> AccountHomeResult<bool> {
-                self.0.has_secret_for_label(label)
-            }
-            fn write_secret(
-                &self,
-                account: &AccountSummary,
-                keys: &nostr::prelude::Keys,
-            ) -> AccountHomeResult<()> {
-                self.0.write_secret(account, keys)
-            }
-            fn load_secret(
-                &self,
-                account: &AccountSummary,
-            ) -> AccountHomeResult<nostr::prelude::Keys> {
-                self.0.load_secret(account)
-            }
-            fn remove_secret(&self, _account: &AccountSummary) -> AccountHomeResult<()> {
-                Err(io::Error::from(io::ErrorKind::PermissionDenied).into())
-            }
-        }
-
         let root = tempfile::tempdir().unwrap();
-        let home = AccountHome::open_with_secret_store(
-            root.path(),
-            std::sync::Arc::new(FailSecretRemoval(LocalFileSecretStore::new(root.path()))),
-        );
+        let home = AccountHome::open(root.path());
         home.create_account("alice").unwrap();
         let account = home.account_dir("alice");
         let old = format!("audit-{ENGINE}-v2.jsonl");
@@ -414,18 +385,16 @@ mod tests {
         for name in [&old, &v4, "audit-key-reveal.jsonl"] {
             fs::write(account.join(name), b"PRESERVED_UNTIL_CLEANUP").unwrap();
         }
-        // Exercise the real rename-to-tombstone path. A credential-store error
-        // after the rename leaves the removed account's files outside accounts/.
-        assert!(home.remove_account("alice").is_err());
-        let remnant = fs::read_dir(root.path().join(".wipe-tombstones"))
-            .unwrap()
-            .next()
-            .unwrap()
-            .unwrap()
-            .path();
+        // Recreate a historical interrupted wipe. Test the legacy audit filter
+        // independently of AccountHome's full tombstone cleanup on reopen.
+        let remnants = root.path().join(".wipe-tombstones");
+        fs::create_dir(&remnants).unwrap();
+        let remnant = remnants.join("alice.interrupted");
+        fs::rename(&account, &remnant).unwrap();
         assert!(!account.exists());
         assert!(remnant.join(&old).exists());
-        drop(open_app(root.path()).unwrap());
+        let _owner = MarmotRootRuntimeLease::try_acquire(root.path()).unwrap();
+        cleanup_legacy_audit_logs(root.path());
         assert!(!remnant.join(old).exists());
         for name in [&v4, "audit-key-reveal.jsonl"] {
             assert_eq!(

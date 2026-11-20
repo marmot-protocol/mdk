@@ -1,38 +1,6 @@
 import Foundation
 
-private final class CancellationSmokeStore: SecretStore, @unchecked Sendable {
-  private let lock = NSLock()
-  private var secrets: [String: String] = [:]
 
-  func hasSecretForLabel(label: String) throws -> Bool {
-    lock.lock()
-    defer { lock.unlock() }
-    return secrets[label] != nil
-  }
-
-  func hasSecretForAccountId(accountIdHex: String) throws -> Bool { false }
-
-  func writeSecret(label: String, accountIdHex: String, secretKeyHex: String) throws {
-    lock.lock()
-    defer { lock.unlock() }
-    secrets[label] = secretKeyHex
-  }
-
-  func loadSecret(label: String, accountIdHex: String) throws -> String {
-    lock.lock()
-    defer { lock.unlock() }
-    guard let secret = secrets[label] else {
-      throw MarmotKitError.SecretNotFound(details: "smoke credential missing")
-    }
-    return secret
-  }
-
-  func removeSecret(label: String, accountIdHex: String) throws {
-    lock.lock()
-    defer { lock.unlock() }
-    secrets.removeValue(forKey: label)
-  }
-}
 
 private final class NativePollProbe: @unchecked Sendable {
   private let lock = NSLock()
@@ -180,7 +148,7 @@ private struct SubscriptionCancellationSmoke {
       relayUrls: [relay],
       options: MarmotOptions(
         relayPolicy: .allowLoopbackRelaysAndBlobs,
-        secretStore: CancellationSmokeStore(),
+        secretStore: MemorySecretStore(),
         deployment: marmotDeploymentNeutral()
       )
     )

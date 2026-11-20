@@ -1,4 +1,5 @@
 use super::*;
+use crate::secret_store::fixture::MemoryVault as Store;
 use futures::StreamExt;
 use nostr::nips::{nip44, nip46::NostrConnectUri};
 use nostr::prelude::*;
@@ -24,112 +25,16 @@ fn response_to(author: &Keys, client: PublicKey, payload: Value) -> Event {
         .finalize(author)
         .unwrap()
 }
-#[derive(Default)]
-struct Store(Mutex<Vec<(String, String, String)>>);
-impl Store {
-    unsafe fn input(value: *const c_char) -> String {
-        unsafe { std::ffi::CStr::from_ptr(value) }
-            .to_string_lossy()
-            .into_owned()
-    }
-    unsafe extern "C" fn has(data: *mut std::ffi::c_void, key: *const c_char, out: *mut u8) -> u32 {
-        let store = unsafe { &*data.cast::<Store>() };
-        let key = unsafe { Self::input(key) };
-        let Ok(entries) = store.0.lock() else {
-            return crate::secret_store::MarmotSecretStoreStatus::Failed as u32;
-        };
-        unsafe {
-            out.write(u8::from(
-                entries
-                    .iter()
-                    .any(|(label, account, _)| label == &key || account == &key),
-            ))
-        };
-        crate::secret_store::MarmotSecretStoreStatus::Ok as u32
-    }
-    unsafe extern "C" fn write(
-        data: *mut std::ffi::c_void,
-        label: *const c_char,
-        account: *const c_char,
-        secret: *const c_char,
-    ) -> u32 {
-        let store = unsafe { &*data.cast::<Store>() };
-        let (label, account, secret) = unsafe {
-            (
-                Self::input(label),
-                Self::input(account),
-                Self::input(secret),
-            )
-        };
-        let Ok(mut entries) = store.0.lock() else {
-            return crate::secret_store::MarmotSecretStoreStatus::Failed as u32;
-        };
-        entries
-            .retain(|(old_label, old_account, _)| old_label != &label && old_account != &account);
-        entries.push((label, account, secret));
-        crate::secret_store::MarmotSecretStoreStatus::Ok as u32
-    }
-    unsafe extern "C" fn load(
-        data: *mut std::ffi::c_void,
-        label: *const c_char,
-        account: *const c_char,
-        out: *mut *mut c_char,
-    ) -> u32 {
-        let store = unsafe { &*data.cast::<Store>() };
-        let (label, account) = unsafe { (Self::input(label), Self::input(account)) };
-        let Ok(entries) = store.0.lock() else {
-            return crate::secret_store::MarmotSecretStoreStatus::Failed as u32;
-        };
-        let Some((_, _, secret)) = entries
-            .iter()
-            .find(|(l, a, _)| l == &label || a == &account)
-        else {
-            return crate::secret_store::MarmotSecretStoreStatus::NotFound as u32;
-        };
-        let Ok(secret) = std::ffi::CString::new(secret.as_str()) else {
-            return crate::secret_store::MarmotSecretStoreStatus::Failed as u32;
-        };
-        unsafe { out.write(secret.into_raw()) };
-        crate::secret_store::MarmotSecretStoreStatus::Ok as u32
-    }
-    unsafe extern "C" fn remove(
-        data: *mut std::ffi::c_void,
-        label: *const c_char,
-        account: *const c_char,
-    ) -> u32 {
-        let store = unsafe { &*data.cast::<Store>() };
-        let (label, account) = unsafe { (Self::input(label), Self::input(account)) };
-        let Ok(mut entries) = store.0.lock() else {
-            return crate::secret_store::MarmotSecretStoreStatus::Failed as u32;
-        };
-        entries.retain(|(l, a, _)| l != &label && a != &account);
-        crate::secret_store::MarmotSecretStoreStatus::Ok as u32
-    }
-    unsafe extern "C" fn free(_: *mut std::ffi::c_void, value: *mut c_char) {
-        drop(unsafe { std::ffi::CString::from_raw(value) });
-    }
-    unsafe extern "C" fn destroy(data: *mut std::ffi::c_void) {
-        drop(unsafe { Arc::from_raw(data.cast::<Store>()) });
-    }
-}
-
 struct OwnedClient(*mut MarmotClient);
 impl OwnedClient {
     fn open(root: &std::path::Path, relay: &str, store: Arc<Store>) -> Self {
         let root = std::ffi::CString::new(root.to_str().unwrap()).unwrap();
         let relay = std::ffi::CString::new(relay).unwrap();
         let relays = [relay.as_ptr()];
+        let mut callbacks = store.table();
         let data = Arc::into_raw(store).cast_mut().cast();
-        let store = crate::secret_store::MarmotSecretStore {
-            user_data: data,
-            has_secret_for_label: Some(Store::has),
-            has_secret_for_account_id: Some(Store::has),
-            write_secret: Some(Store::write),
-            load_secret: Some(Store::load),
-            remove_secret: Some(Store::remove),
-            free_secret: Some(Store::free),
-            destroy: Some(Store::destroy),
-        };
+        callbacks.user_data = data;
+        callbacks.destroy = Some(Store::destroy_arc);
         let mut deployment = std::ptr::null_mut();
         assert_eq!(
             unsafe { crate::deployment::marmot_deployment_neutral(&mut deployment) },
@@ -142,7 +47,7 @@ impl OwnedClient {
                 relays.as_ptr(),
                 1,
                 crate::MarmotRelayPolicy::AllowLoopback as u32,
-                &store,
+                &callbacks,
                 deployment,
                 &mut client,
             )
@@ -150,7 +55,7 @@ impl OwnedClient {
         unsafe { crate::deployment::marmot_deployment_free(deployment) };
         if status != MarmotStatus::Ok {
             // The public constructor takes no host-context ownership on failure.
-            unsafe { Store::destroy(data) };
+            unsafe { Store::destroy_arc(data) };
         }
         assert_eq!(status, MarmotStatus::Ok);
         assert!(!client.is_null());

@@ -215,7 +215,9 @@ int main(int argc, char **argv) {
     const char *relays[] = {"wss://relay.example.org"};
     st = marmot_client_new(home, relays, 1, NULL, &client);
     check(st == MARMOT_STATUS_NULL_POINTER && client == NULL, "NULL deployment rejected before opening");
-    st = marmot_client_new(home, relays, 1, deployment, &client);
+    const MarmotIosOptions ios_options = {0};
+    const MarmotClientOptions options = {.ios_options = &ios_options};
+    st = marmot_client_new_with_configuration(home, relays, 1, &options, deployment, &client);
     marmot_deployment_free(deployment);
     if (st == MARMOT_STATUS_KEYSTORE_UNAVAILABLE) {
         /* No platform keychain (headless): a documented limitation. */
@@ -235,8 +237,8 @@ int main(int argc, char **argv) {
     check(st == MARMOT_STATUS_OK, "runtime backup facts need no account worker");
     MarmotBackgroundBackupOutcome backup = MARMOT_BACKGROUND_BACKUP_OUTCOME_FINISHED_ATTEMPT;
     st = marmot_run_due_backup_pass(client, "no-account", &backup);
-    check(st == MARMOT_STATUS_OK && backup == MARMOT_BACKGROUND_BACKUP_OUTCOME_NOT_STARTED,
-          "disabled background backup returns its completion enum without a worker");
+    check(st == MARMOT_STATUS_UNKNOWN_ACCOUNT,
+          "background backup rejects an unknown account");
 
     st = marmot_record_host_performance(client,
         MARMOT_HOST_PERFORMANCE_OPERATION_CONVERSATION_COMPOSER_READY, 125,

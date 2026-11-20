@@ -8,8 +8,17 @@
 mod error;
 mod home;
 mod io;
+#[cfg(not(target_os = "android"))]
 mod keyring;
+mod location;
+#[cfg(not(target_os = "android"))]
+mod native_vault;
+#[cfg(target_os = "android")]
+#[path = "android_vault.rs"]
+mod native_vault;
 mod nip49_export;
+mod owned_vault;
+mod ownership;
 mod secret_store;
 
 pub use error::{AccountHomeError, AccountHomeResult};
@@ -17,5 +26,10 @@ pub use home::{
     AccountHome, AccountSetupKind, AccountSetupPhase, AccountSetupState, AccountSummary,
     EXTERNAL_SQLCIPHER_SECRET_FILE, ExternalSecretMode, Nip46Removal, Nip46SessionRecord,
     Nip46SessionWrite, NostrAccountImport,
+};
+pub use location::IosOptions;
+pub use ownership::{
+    AcquiredSecret, SecretClaimMode, SecretCredential, SecretCredentialKind, SecretOrigin,
+    SecretReleaseMode, SecretReleaseOutcome,
 };
 pub use secret_store::{AccountSecretStore, KeychainSecretStore, LocalFileSecretStore};
