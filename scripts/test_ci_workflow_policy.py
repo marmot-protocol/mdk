@@ -202,7 +202,13 @@ class SignaturePolicyTests(unittest.TestCase):
                     return bool(needs) and any(gated(parent, visited | {job}) for parent in
                         re.findall(r"[a-z0-9][a-z0-9-]*", needs[1]))
                 for job, body in jobs.items():
-                    if job not in {"required-ci", "candidate-validation", "merge-group-fail-fast"}:
+                    if (path.name, job) == ("bindings-profile.yml", "report-master-failure"):
+                        # It must run after a failure, so it may use always(), but only on master.
+                        self.assertTrue(gated(job))
+                        self.assertIn("    if: always() && github.event_name != 'pull_request' && "
+                                      "github.ref == 'refs/heads/master' && "
+                                      "needs.candidate-validation.result == 'failure'", body.splitlines())
+                    elif job not in {"required-ci", "candidate-validation", "merge-group-fail-fast"}:
                         self.assertTrue(gated(job), f"{path.name}:{job} can run before signatures")
                         self.assertNotRegex(body, r"(?m)^    if:.*(?:always|failure|cancelled)\(")
 
@@ -509,13 +515,16 @@ class CacheBudgetPolicyTests(unittest.TestCase):
                 # rust-cache saves unless save-if says otherwise.
                 save_if = save_if.group(1) if save_if else "true"
                 with self.subTest(workflow=workflow.name, step=step.splitlines()[0]):
+                    if workflow.name == "wn-agent-binaries.yml":
+                        # Release tags and nightlies publish these binaries, so
+                        # they never restore a cache (binding packages below).
+                        self.assertRegex(step, r"(?m)^        if: runner\.os == 'macOS' && "
+                                               r"!startsWith\(github\.ref, 'refs/tags/'\) && !inputs\.nightly_version$")
                     if save_if == "false":
                         continue
                     saving.add(workflow.name)
                     # Pull requests and merge groups only restore.
                     self.assertEqual(save_if, "${{ github.ref == 'refs/heads/master' }}")
-                    if workflow.name == "wn-agent-binaries.yml":
-                        self.assertRegex(step, r"(?m)^        if: runner\.os == 'macOS'$")
         self.assertEqual(saving, {"ci.yml", "wn-agent-binaries.yml"})
 
     def test_only_setup_odin_saves_an_actions_cache_and_only_from_master(self):

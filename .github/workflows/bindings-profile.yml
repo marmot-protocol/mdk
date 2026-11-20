@@ -574,7 +574,6 @@ jobs:
     timeout-minutes: 5
     permissions:
       contents: read
-      issues: write
     steps:
       - name: Require every candidate package
         env:
@@ -600,8 +599,18 @@ jobs:
           fi
           echo "Validated selected candidate packages for $SOURCE_SHA"
 
+  # A separate job so that pull-request runs never hold `issues: write`.
+  report-master-failure:
+    name: Report master failure
+    runs-on: ubuntu-latest
+    needs: [identity, candidate-validation]
+    if: always() && github.event_name != 'pull_request' && github.ref == 'refs/heads/master' && needs.candidate-validation.result == 'failure'
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write
+    steps:
       - name: Report master failure
-        if: failure() && github.event_name != 'pull_request' && github.ref == 'refs/heads/master'
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}

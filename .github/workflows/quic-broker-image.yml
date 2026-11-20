@@ -5,6 +5,7 @@ on:
     paths:
       - Dockerfile.quic-broker
       - Dockerfile.convergence-campaign
+      - .dockerignore
       - Cargo.lock
       - Cargo.toml
       - rust-toolchain.toml
@@ -23,7 +24,6 @@ on:
 
 permissions:
   contents: read
-  packages: write
 
 concurrency:
   # Serialize publishers for a ref so an older build cannot overwrite latest.
@@ -49,38 +49,69 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Set image name
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo "IMAGE_NAME=ghcr.io/${GITHUB_REPOSITORY,,}/marmot-quic-broker" >> "$GITHUB_ENV"
-
       - name: Verify release image toolchain contract
         run: |
           ./scripts/check_campaign_toolchain.sh
           ./scripts/tests/test_campaign_toolchain.sh
 
       - name: Build image
-        run: docker build -f Dockerfile.quic-broker -t "$IMAGE_NAME:ci" .
+        run: docker build -f Dockerfile.quic-broker -t marmot-quic-broker:ci .
 
       - name: Smoke test image
-        run: docker run --rm "$IMAGE_NAME:ci" --help
+        run: docker run --rm marmot-quic-broker:ci --help
+
+      - name: Save image
+        if: github.event_name != 'pull_request'
+        run: docker save -o "$RUNNER_TEMP/marmot-quic-broker.tar" marmot-quic-broker:ci
+
+      - name: Upload image
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: marmot-quic-broker-image
+          path: ${{ runner.temp }}/marmot-quic-broker.tar
+          if-no-files-found: error
+          overwrite: true
+          # Long enough to rerun a publish that failed over a weekend.
+          retention-days: 7
+
+  # Only this job holds `packages: write`, and it runs no repository code: the
+  # build above, which runs the checked-out scripts and Dockerfile, keeps a
+  # read-only token.
+  publish:
+    name: Publish broker image
+    needs: image
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Download image
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: marmot-quic-broker-image
+          path: ${{ runner.temp }}/image
+
+      - name: Load image
+        run: docker load -i "$RUNNER_TEMP/image/marmot-quic-broker.tar"
 
       - name: Log in to GHCR
-        if: github.event_name != 'pull_request'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: echo "$GITHUB_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
 
       - name: Push image
-        if: github.event_name != 'pull_request'
         shell: bash
         run: |
           set -euo pipefail
+          image="ghcr.io/${GITHUB_REPOSITORY,,}/marmot-quic-broker"
           sha_tag="sha-${GITHUB_SHA::12}"
-          docker tag "$IMAGE_NAME:ci" "$IMAGE_NAME:$sha_tag"
-          docker push "$IMAGE_NAME:$sha_tag"
+          docker tag marmot-quic-broker:ci "$image:$sha_tag"
+          docker push "$image:$sha_tag"
           if [[ "$GITHUB_REF" == "refs/heads/master" ]]; then
-            docker tag "$IMAGE_NAME:ci" "$IMAGE_NAME:latest"
-            docker push "$IMAGE_NAME:latest"
+            docker tag marmot-quic-broker:ci "$image:latest"
+            docker push "$image:latest"
           fi
