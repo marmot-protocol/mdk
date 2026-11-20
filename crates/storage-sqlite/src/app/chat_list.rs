@@ -782,16 +782,21 @@ impl SqliteAppStorage {
             let conn = self.lock()?;
             let before: Option<(String, String, i64, i64)> = conn.query_row_cached(
                 "SELECT last_message_id_hex,last_message_preview,last_message_timeline_at,activity_sort_at
-                 FROM chat_list_rows WHERE group_id_hex=?1 AND last_message_kind=9
+                 FROM chat_list_rows WHERE group_id_hex=?1 AND last_message_kind IN (?2,?3)
                  AND last_message_deleted=0 AND last_message_id_hex IS NOT NULL",
-                [group_id_hex], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)),
+                params![
+                    group_id_hex,
+                    u64_to_i64(MARMOT_APP_EVENT_KIND_CHAT)?,
+                    u64_to_i64(NIP22_COMMENT_KIND)?,
+                ],
+                |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)),
             ).optional().storage()?;
             let row = refresh_chat_list_row_for_messages_tx(
                 &conn, local_account_id_hex, group_id_hex, message_ids_hex, mention_classifier,
             )?;
             let changed = before.is_some_and(|(id, body, at, activity)| {
                 row.as_ref().is_some_and(|r| Some(r.activity_sort_at) == u64::try_from(activity).ok() &&
-                    r.last_message.as_ref().is_some_and(|m| m.kind == 9 && !m.deleted &&
+                    r.last_message.as_ref().is_some_and(|m| is_chat_text(m.kind) && !m.deleted &&
                         m.message_id_hex == id && Some(m.timeline_at) == u64::try_from(at).ok() && m.plaintext != body))
             });
             Ok((row, changed))
@@ -1803,9 +1808,10 @@ fn write_chat_list_row_for_group_tx(
     Ok(())
 }
 
-/// Chat messages and thread messages carry mentions; the activity filter has
-/// already kept only kind-1111 rows that are thread messages.
-fn can_mention(kind: u64) -> bool {
+/// Chat messages and thread messages: the preview kinds whose text carries
+/// mentions and can be edited. The activity filter has already kept only
+/// kind-1111 rows that are thread messages.
+fn is_chat_text(kind: u64) -> bool {
     kind == MARMOT_APP_EVENT_KIND_CHAT || kind == NIP22_COMMENT_KIND
 }
 
@@ -2029,7 +2035,7 @@ fn unread_membership_for_message_tx(
         let kind = row.get::<_, i64>(2)? as u64;
         let tags = crate::tags_from_json(tags_json).unwrap_or_default();
         Ok(UnreadMembership {
-            mentions_local: can_mention(kind) && mention_classifier(&plaintext, &tags),
+            mentions_local: is_chat_text(kind) && mention_classifier(&plaintext, &tags),
             order_class: row.get(3)?,
             order_primary: row.get(4)?,
             order_phase: row.get(5)?,
@@ -2112,7 +2118,7 @@ fn rebuild_unread_membership_tx(
         }
         count += 1;
         let tags = crate::tags_from_json(tags_json).unwrap_or_default();
-        let mentions_local = can_mention(kind) && mention_classifier(&plaintext, &tags);
+        let mentions_local = is_chat_text(kind) && mention_classifier(&plaintext, &tags);
         if mentions_local {
             mention_count += 1;
         }

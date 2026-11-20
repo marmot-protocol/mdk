@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Fixed
+
+- Encrypted-media keys are kept for a kind-1111 thread message recognized by a lowercase `e` alone, as storage
+  already reads its attachments, not only for one with a numeric `k`.
+
 ## 0.18.0 - 2026-11-20
 
 ### Breaking changes

@@ -29,7 +29,9 @@ pub fn is_nip22_comment(kind: u64, tags: &[Vec<String>]) -> bool {
 /// and `q` is a body quote that never names the parent. `None` when the event
 /// is not a thread message.
 pub fn thread_message_parent(kind: u64, tags: &[Vec<String>]) -> Option<&str> {
-    if !is_nip22_comment(kind, tags) {
+    // A lowercase `e` alone makes a kind-1111 event a comment, so finding it
+    // is the whole recognition check.
+    if kind != NIP22_COMMENT_KIND {
         return None;
     }
     first_tag(tags, "e")

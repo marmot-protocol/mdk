@@ -33,8 +33,9 @@ MDK builds every tag of a new thread message from the parent's row:
 | `["e", <parent id>, "", <parent author>]`, `["k", <parent kind>]` | the immediate parent |
 
 A parent outside any thread is the root. A parent that is itself in a thread passes its root on, so a thread started
-on a thread message nests under the same root. The first lowercase `e` is always the parent, which is what White
-Noise Linux already reads.
+on a thread message nests under the same root. When this device no longer stores the root, its kind and author come
+from the `K`/`P` of the nearest ancestor that names it; with none, the send is refused. The first lowercase `e` is
+always the parent, which is what White Noise Linux already reads.
 
 MDK leaves out NIP-22's optional parent-author `p`. On Marmot messages a `p` tag is a mention (NIP-27): it raises the
 @-badge and breaks through a muted chat, which an ordinary thread answer must not. Mentions in the text get their `p`
@@ -65,16 +66,20 @@ Every timeline record, conversation-window message and reply preview carries:
   poll that joined a thread with `E`. A joined row without its own reply target answers the root. `thread` is null
   everywhere else, including on an inline reply to a thread message (its reply preview carries the target's `thread`).
 
-Clients never parse these tags.
+A deleted row keeps both fields: deletion hides its content, not where it sits, so a thread view can show the
+placeholder in place. Clients never parse these tags.
 
 ## Chat activity
 
 A thread message counts wherever kind 9 does: chat-list preview, order, unread count, mentions and the @-badge,
-chat-list text search and timeline search, the `NewMessage` live update, Markdown content tokens and mention
-identities, local notifications, background-wake notifications, push to the other members (also when Linux sends it
-through `send_custom_event`, or the queue publishes it later), bringing back a locally deleted chat, author edits and
-deletes, history import, and retention of its media keys. Kind 1111 events without a
-parent stay custom events and do none of this.
+edits of the chat-list preview, the sender's own read position, chat-list text search and timeline search, the
+`NewMessage` live update, Markdown content tokens and mention identities, local notifications, background-wake
+notifications, push to the other members (also when Linux sends it through `send_custom_event`, or the queue publishes
+it later), bringing back a locally deleted chat, author edits and deletes, history import, and retention of its media
+keys in storage and in the engine. Kind 1111 events without a parent stay custom events and do none of this.
+
+Admin removal is the exception: a group admin removing another member's message applies to kind 9 only, on the sending
+and the receiving side. Extending it changes what receivers accept, so it needs its own change.
 
 ## Display rules
 

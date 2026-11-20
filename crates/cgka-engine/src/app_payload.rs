@@ -66,11 +66,7 @@ pub(crate) fn encrypted_media_source_secret(
 
 /// Whether a chat, reaction or recognized comment references attachments (`imeta`).
 pub(crate) fn references_encrypted_media(app_event: &MarmotAppEvent) -> bool {
-    let comment = app_event.kind == 1111
-        && app_event.tags.iter().any(|tag| {
-            tag.first().is_some_and(|name| name == "k")
-                && tag.get(1).is_some_and(|kind| kind.parse::<u64>().is_ok())
-        });
+    let comment = cgka_traits::is_nip22_comment(app_event.kind, &app_event.tags);
     (matches!(
         app_event.kind,
         cgka_traits::MARMOT_APP_EVENT_KIND_CHAT | cgka_traits::MARMOT_APP_EVENT_KIND_REACTION
@@ -382,6 +378,38 @@ mod tests {
         );
         assert_eq!(storage.get_group(&group_id).unwrap().name, "live");
         assert!(storage.list_group_snapshots(&group_id).unwrap().is_empty());
+    }
+
+    /// The engine keeps a media key for exactly the events storage reads
+    /// attachments from, including thread messages sent without `k`.
+    #[test]
+    fn media_references_follow_the_shared_comment_rule() {
+        let imeta = vec![
+            "imeta".to_owned(),
+            "url https://example.com/a.png".to_owned(),
+        ];
+        let event = |kind: u64, extra: &[&[&str]]| {
+            let mut tags = extra
+                .iter()
+                .map(|tag| tag.iter().map(|value| (*value).to_owned()).collect())
+                .collect::<Vec<Vec<String>>>();
+            tags.push(imeta.clone());
+            MarmotAppEvent::new("aa".repeat(32), 1, kind, tags, "")
+        };
+        for (kind, extra, expected) in [
+            (9, &[][..], true),
+            (7, &[][..], true),
+            (1111, &[&["k", "9"][..]][..], true),
+            (1111, &[&["e", "parent"][..]][..], true),
+            (1111, &[&["E", "root"][..]][..], false),
+            (1068, &[&["e", "parent"][..]][..], false),
+        ] {
+            assert_eq!(
+                super::references_encrypted_media(&event(kind, extra)),
+                expected,
+                "kind {kind} with {extra:?}"
+            );
+        }
     }
 
     #[test]

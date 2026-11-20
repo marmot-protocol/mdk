@@ -3231,6 +3231,23 @@ fn targeted_refresh_reports_a_content_change_only_for_the_preview_body() {
         .record_app_event(&chat("newer", REMOTE, 5, "newer"))
         .unwrap();
     assert!(!refresh(&["newer"]).1, "a new message replaces the preview");
+    let mut thread = chat("thread", REMOTE, 6, "in thread");
+    thread.kind = cgka_traits::NIP22_COMMENT_KIND;
+    thread.tags = vec![
+        vec!["e".into(), "newer".into()],
+        vec!["k".into(), "9".into()],
+    ];
+    store.record_app_event(&thread).unwrap();
+    assert!(
+        !refresh(&["thread"]).1,
+        "a thread message replaces the preview"
+    );
+    store
+        .record_app_event(&edit("edit-thread", "thread", 7))
+        .unwrap();
+    let (row, changed) = refresh(&["edit-thread", "thread"]);
+    assert!(changed, "a thread message preview's edit");
+    assert_eq!(row.unwrap().last_message.unwrap().plaintext, "edited");
 }
 
 #[test]

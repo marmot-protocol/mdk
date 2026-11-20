@@ -1754,6 +1754,25 @@ impl SqliteAppStorage {
         Ok(message)
     }
 
+    /// The kind and author of a thread root this device no longer stores, as
+    /// the nearest row from `from_message_id_hex` up through its parents
+    /// names them with `E`/`K`/`P`. Deleted rows count: deletion hides their
+    /// content, not their thread tags.
+    pub fn thread_root_hint(
+        &self,
+        group_id_hex: &str,
+        from_message_id_hex: &str,
+        root_message_id_hex: &str,
+    ) -> StorageResult<Option<(u64, String)>> {
+        let conn = self.lock()?;
+        threads::named_root_hint(
+            &conn,
+            group_id_hex,
+            from_message_id_hex,
+            root_message_id_hex,
+        )
+    }
+
     /// One page of each voter's effective selection for one visible poll,
     /// resolved by the same rules as the row's tally: the latest valid
     /// response per voter, so all pages together hold `participants` entries
@@ -5314,10 +5333,14 @@ fn hydrate_timeline_presentation(
     for message in messages.iter_mut() {
         message.thread = threads::thread_ref(
             conn,
-            &message.group_id_hex,
-            message.kind,
-            &message.tags,
-            message.reply_to_message_id_hex.as_deref(),
+            &threads::ReadRow {
+                group_id_hex: &message.group_id_hex,
+                message_id_hex: &message.message_id_hex,
+                kind: message.kind,
+                tags: &message.tags,
+                reply_to_message_id_hex: message.reply_to_message_id_hex.as_deref(),
+                deleted: message.deleted,
+            },
             &mut legacy_roots,
         )?;
     }
@@ -5422,10 +5445,14 @@ fn load_reply_previews(
             for mut preview in rows {
                 preview.thread = threads::thread_ref(
                     conn,
-                    &group_id_hex,
-                    preview.kind,
-                    &preview.tags,
-                    preview.reply_to_message_id_hex.as_deref(),
+                    &threads::ReadRow {
+                        group_id_hex: &group_id_hex,
+                        message_id_hex: &preview.message_id_hex,
+                        kind: preview.kind,
+                        tags: &preview.tags,
+                        reply_to_message_id_hex: preview.reply_to_message_id_hex.as_deref(),
+                        deleted: preview.deleted,
+                    },
                     legacy_roots,
                 )?;
                 group_previews.insert(preview.message_id_hex.clone(), preview);

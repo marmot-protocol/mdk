@@ -3195,6 +3195,41 @@ async fn thread_message_send_body() {
             .collect()
     };
 
+    // Sending a thread message reads the chat up to it, as sending chat does.
+    let earlier = "ee".repeat(32);
+    let at = unix_now_seconds() - 60;
+    app.account_storage("alice")
+        .unwrap()
+        .app_storage()
+        .record_app_event(&storage_sqlite::StoredAppEvent {
+            group_id_hex: group_hex.clone(),
+            message_id_hex: earlier.clone(),
+            source_message_id_hex: Some("ef".repeat(32)),
+            source_epoch: Some(client.group_mls_state(&group_id).unwrap().epoch),
+            direction: "received".into(),
+            sender: "ee".repeat(32),
+            plaintext: "tuesday?".into(),
+            kind: cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT,
+            tags: Vec::new(),
+            recorded_at: at,
+            received_at: at,
+            origin_commit_id: None,
+            moderation_grant: false,
+        })
+        .unwrap();
+    let (_, seen) = client
+        .send_app_event(&group_id, thread_message(&earlier, "seen", Vec::new()))
+        .await
+        .unwrap();
+    assert_eq!(
+        app.refresh_chat_list_row("alice", &group_hex)
+            .unwrap()
+            .unwrap()
+            .last_read_message_id_hex,
+        Some(seen.message_ids[0].clone()),
+        "the sender has read up to its thread message"
+    );
+
     let root = client.send(&group_id, b"lunch?").await.unwrap().message_ids[0].clone();
     let (_, first) = client
         .send_app_event(&group_id, thread_message(&root, "friday", Vec::new()))
@@ -3283,6 +3318,49 @@ async fn thread_message_send_body() {
     assert_eq!(
         inline_row.reply_preview.and_then(|preview| preview.thread),
         first_row.thread
+    );
+
+    // A root this device no longer holds keeps the kind and author the
+    // nearest ancestor naming it carries in K/P, here a NIP-22 grandparent
+    // above a Linux-style parent without E.
+    let gone = "ab".repeat(32);
+    let custom = |tags: Vec<Vec<String>>| AppMessageIntent::Custom {
+        kind: cgka_traits::NIP22_COMMENT_KIND,
+        tags,
+        content: "custom".to_owned(),
+    };
+    let (_, named) = client
+        .send_app_event(
+            &group_id,
+            custom(tags(&[
+                &["E", &gone],
+                &["K", "1068"],
+                &["P", &alice],
+                &["e", &gone],
+                &["k", "1068"],
+            ])),
+        )
+        .await
+        .unwrap();
+    let named = named.message_ids[0].clone();
+    let (_, legacy) = client
+        .send_app_event(&group_id, custom(tags(&[&["e", &named], &["k", "1111"]])))
+        .await
+        .unwrap();
+    let legacy = legacy.message_ids[0].clone();
+    let (_, below) = client
+        .send_app_event(&group_id, thread_message(&legacy, "below", Vec::new()))
+        .await
+        .unwrap();
+    assert_eq!(
+        row(&below.message_ids[0]).tags,
+        tags(&[
+            &["E", &gone, "", &alice],
+            &["K", "1068"],
+            &["P", &alice],
+            &["e", &legacy, "", &alice],
+            &["k", "1111"],
+        ])
     );
 
     let published_before = relay.published_event_ids().len();

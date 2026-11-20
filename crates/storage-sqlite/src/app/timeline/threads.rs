@@ -21,18 +21,37 @@ const MAX_LEGACY_THREAD_DEPTH: usize = 64;
 /// walked from: one read can span groups that share an inner event id.
 pub(super) type ThreadRootCache = HashMap<(String, String), String>;
 
+/// What a read row carries for placing it in its thread.
+pub(super) struct ReadRow<'a> {
+    pub(super) group_id_hex: &'a str,
+    pub(super) message_id_hex: &'a str,
+    pub(super) kind: u64,
+    pub(super) tags: &'a [Vec<String>],
+    pub(super) reply_to_message_id_hex: Option<&'a str>,
+    pub(super) deleted: bool,
+}
+
 /// A row's place in its thread, from its kind, tags and projected reply
 /// target. A thread message's projected reply target is its parent, set only
-/// when the projection recognized it as a comment.
+/// when the projection recognized it as a comment. A deleted row reads with
+/// its tags masked, so its root comes from the tags stored for it: deletion
+/// hides content, not where the row sits.
 pub(super) fn thread_ref(
     conn: &Connection,
-    group_id_hex: &str,
-    kind: u64,
-    tags: &[Vec<String>],
-    reply_to_message_id_hex: Option<&str>,
+    row: &ReadRow<'_>,
     legacy_roots: &mut ThreadRootCache,
 ) -> StorageResult<Option<TimelineThreadRef>> {
-    let Some(own) = own_thread(kind, tags, reply_to_message_id_hex) else {
+    let stored_tags;
+    let tags = if row.deleted {
+        stored_tags = stored_row(conn, row.group_id_hex, row.message_id_hex)?
+            .map(|(_, tags, _)| tags)
+            .unwrap_or_default();
+        &stored_tags
+    } else {
+        row.tags
+    };
+    let group_id_hex = row.group_id_hex;
+    let Some(own) = own_thread(row.kind, tags, row.reply_to_message_id_hex) else {
         return Ok(None);
     };
     let root_message_id_hex = match own.named_root {
@@ -104,6 +123,42 @@ fn legacy_root(
     }
     cache.insert(key, current.clone());
     Ok(current)
+}
+
+/// The kind and author of `root` as the nearest stored row, from `start` up
+/// through its parents, names them: a row that names `root` with `E` and
+/// carries a numeric `K` and a non-empty `P`. Places a new thread message
+/// when the root itself is no longer stored.
+pub(super) fn named_root_hint(
+    conn: &Connection,
+    group_id_hex: &str,
+    start: &str,
+    root: &str,
+) -> StorageResult<Option<(u64, String)>> {
+    let mut current = start.to_owned();
+    let mut visited = HashSet::new();
+    while visited.insert(current.clone()) && visited.len() <= MAX_LEGACY_THREAD_DEPTH {
+        let Some((kind, tags, reply_to)) = stored_row(conn, group_id_hex, &current)? else {
+            break;
+        };
+        if thread_root_tag(&tags) == Some(root) {
+            let value = |name: &str| {
+                tags.iter()
+                    .find(|tag| tag.first().is_some_and(|tag_name| tag_name == name))
+                    .and_then(|tag| tag.get(1))
+            };
+            let root_kind = value("K").and_then(|kind| kind.parse().ok());
+            let author = value("P").filter(|author| !author.is_empty());
+            if let (Some(root_kind), Some(author)) = (root_kind, author) {
+                return Ok(Some((root_kind, author.clone())));
+            }
+        }
+        let Some(own) = own_thread(kind, &tags, reply_to.as_deref()) else {
+            break;
+        };
+        current = own.parent.to_owned();
+    }
+    Ok(None)
 }
 
 type StoredRow = (u64, Vec<Vec<String>>, Option<String>);

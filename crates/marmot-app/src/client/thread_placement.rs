@@ -7,8 +7,8 @@ use storage_sqlite::SqliteAppStorage;
 /// The root and parent a thread message answering `parent_message_id` names.
 /// The parent must be stored here and not deleted. Its typed thread field
 /// gives the root; a parent outside any thread is the root itself. A root
-/// this device no longer holds keeps the kind and author the parent's own
-/// `K`/`P` tags carry.
+/// this device no longer holds keeps the kind and author that the nearest
+/// ancestor naming it carries in `K`/`P`.
 pub(super) fn thread_placement(
     storage: &SqliteAppStorage,
     group_id_hex: &str,
@@ -36,18 +36,9 @@ pub(super) fn thread_placement(
         .map(|root| (root.kind, root.sender));
     let (root_kind, root_author) = match stored_root {
         Some(root) => root,
-        None => {
-            let tag = |name| crate::messages::tag_value(&parent.tags, name);
-            let named_here = cgka_traits::thread_root_tag(&parent.tags) == Some(&root_message_id);
-            match (
-                named_here,
-                tag("K").and_then(|kind| kind.parse().ok()),
-                tag("P"),
-            ) {
-                (true, Some(kind), Some(author)) => (kind, author.to_owned()),
-                _ => return Err(unavailable("root")),
-            }
-        }
+        None => storage
+            .thread_root_hint(group_id_hex, &parent.message_id_hex, &root_message_id)?
+            .ok_or_else(|| unavailable("root"))?,
     };
     Ok(ThreadPlacement {
         root_message_id,

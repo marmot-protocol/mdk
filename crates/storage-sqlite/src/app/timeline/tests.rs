@@ -2802,7 +2802,7 @@ fn nip22_comment_in_timeline() {
 
 /// The thread-message contract fixtures every White Noise client shares:
 /// each wire form projects one reply target and one thread placement, in
-/// live projection and after a rebuild.
+/// live projection, after a rebuild and once deleted.
 #[test]
 fn thread_message_fixtures_project_reply_target_and_thread() {
     #[derive(serde::Deserialize)]
@@ -2862,13 +2862,23 @@ fn thread_message_fixtures_project_reply_target_and_thread() {
         }
     }
     let group = "11".repeat(32);
-    for rebuild in [false, true] {
+    // A deleted row reads with its tags masked; its place in the thread stays.
+    for (pass, rebuild, deleted) in [(0, false, false), (1, true, false), (2, false, true)] {
         if rebuild {
             store.rebuild_message_timeline_for_group(&group).unwrap();
         }
+        if deleted {
+            for (at, event) in (100..).zip(&fixture.events) {
+                let delete_id = format!("delete-{}", event.id);
+                store
+                    .record_app_event(&delete(&delete_id, "alice", &event.id, at))
+                    .unwrap();
+            }
+        }
         for event in &fixture.events {
             let row = store.timeline_message(&group, &event.id).unwrap().unwrap();
-            let context = format!("{} (rebuild: {rebuild})", event.name);
+            assert_eq!(row.deleted, deleted, "{}", event.name);
+            let context = format!("{} (pass {pass})", event.name);
             assert_eq!(
                 row.reply_to_message_id_hex, event.expect.reply_to,
                 "{context}"
@@ -2904,13 +2914,15 @@ fn thread_message_fixtures_project_reply_target_and_thread() {
                     "{context}"
                 );
             }
+            if event.id == "linux-media" {
+                assert_eq!(
+                    row.media.is_some(),
+                    !deleted,
+                    "a thread message keeps its media"
+                );
+            }
         }
     }
-    let media = store
-        .timeline_message(&group, "linux-media")
-        .unwrap()
-        .unwrap();
-    assert!(media.media.is_some(), "a thread message keeps its media");
 }
 
 #[test]

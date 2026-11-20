@@ -5,7 +5,7 @@ use cgka_traits::app_components::{
     GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID, GROUP_MESSAGE_RETENTION_COMPONENT_ID,
     GROUP_PROFILE_COMPONENT_ID, NOSTR_ROUTING_COMPONENT_ID,
 };
-use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MarmotAppEvent as MarmotInnerEvent};
+use cgka_traits::app_event::MarmotAppEvent as MarmotInnerEvent;
 use cgka_traits::group::ProtocolProfile;
 use cgka_traits::storage::{GroupStorage, MessageStorage, StorageProvider};
 use cgka_traits::{GroupId, TransportGroupSubscription};
@@ -129,10 +129,8 @@ impl AppClient {
                 .record_account_app_event(&self.state.label, &message_projection)?
         };
         if advance_read_marker
-            && matches!(
-                event.kind,
-                MARMOT_APP_EVENT_KIND_CHAT | MARMOT_APP_EVENT_KIND_POLL
-            )
+            && (event.kind == MARMOT_APP_EVENT_KIND_POLL
+                || cgka_traits::is_chat_message(event.kind, &event.tags))
         {
             let read_marker =
                 self.app

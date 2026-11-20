@@ -11,7 +11,8 @@
 
 - Thread messages notify like kind 9 (live, background wake and push to other members, also when sent through
   `send_custom_event` or published later from the queue), count as mentions when they mention the account, bring back
-  a locally deleted chat like kind 9, and carry mention identities in conversation presentation. See `docs/marmot-architecture/overview/thread-messages.md`.
+  a locally deleted chat like kind 9, advance the sender's read position like a chat send, and carry mention
+  identities in conversation presentation. See `docs/marmot-architecture/overview/thread-messages.md`.
 
 ## 0.18.0 - 2026-11-20
 
