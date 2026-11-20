@@ -2842,7 +2842,24 @@ fn thread_message_fixtures_project_reply_target_and_thread() {
         let mut stored = chat(&event.id, "alice", at, &event.name);
         stored.kind = event.kind;
         stored.tags = event.tags.clone();
-        store.record_app_event(&stored).unwrap();
+        let update = store.record_app_event(&stored).unwrap();
+        // A new thread message reaches live subscribers as new chat.
+        let own_trigger = update.changes.iter().find_map(|change| match change {
+            TimelineMessageChange::Upsert { trigger, message }
+                if message.message_id_hex == event.id =>
+            {
+                Some(trigger.clone())
+            }
+            _ => None,
+        });
+        if event.kind == NIP22_COMMENT_KIND {
+            let expected = if event.expect.reply_to.is_some() {
+                TimelineUpdateTrigger::NewMessage
+            } else {
+                TimelineUpdateTrigger::CustomEvent
+            };
+            assert_eq!(own_trigger, Some(expected), "{}", event.name);
+        }
     }
     let group = "11".repeat(32);
     for rebuild in [false, true] {
@@ -2863,8 +2880,27 @@ fn thread_message_fixtures_project_reply_target_and_thread() {
             );
             if let Some(expected) = &event.expect.reply_preview_thread {
                 assert_eq!(
-                    row.reply_preview.and_then(|preview| preview.thread),
+                    row.reply_preview
+                        .as_ref()
+                        .and_then(|preview| preview.thread.clone()),
                     thread(Some(expected)),
+                    "{context}"
+                );
+            }
+            // A preview places its message exactly as that message's own row.
+            if let Some(preview) = &row.reply_preview {
+                let target = fixture
+                    .events
+                    .iter()
+                    .find(|target| target.id == preview.message_id_hex)
+                    .unwrap();
+                assert_eq!(
+                    preview.reply_to_message_id_hex, target.expect.reply_to,
+                    "{context}"
+                );
+                assert_eq!(
+                    preview.thread,
+                    thread(target.expect.thread.as_ref()),
                     "{context}"
                 );
             }

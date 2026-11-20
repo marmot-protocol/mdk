@@ -10,7 +10,8 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 ### Breaking changes
 
 - `MarmotTimelineMessageRecord` and `MarmotTimelineReplyPreview` gain a trailing nullable
-  `thread: MarmotTimelineThreadRef *`. Rebuild clients with the matching header and library.
+  `thread: MarmotTimelineThreadRef *`; `MarmotTimelineReplyPreview` also gains a trailing nullable
+  `reply_to_message_id_hex`. Rebuild clients with the matching header and library.
 
 ### Added
 

@@ -121,7 +121,7 @@ impl From<ChatListMessageDeliveryState> for ChatListMessageDeliveryStateFfi {
 
 impl From<ChatListMessagePreview> for ChatListMessagePreviewFfi {
     fn from(value: ChatListMessagePreview) -> Self {
-        let content_tokens = markdown_content_tokens(value.kind, &value.plaintext);
+        let content_tokens = markdown_content_tokens(value.kind, &value.tags, &value.plaintext);
         let sticker = super::sticker::presented_sticker_ref(value.kind, &value.tags, value.deleted);
         Self {
             group_system: value.group_system.map(Into::into),

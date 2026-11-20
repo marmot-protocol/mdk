@@ -426,7 +426,7 @@ fn presented_timeline(row: &app::TimelineMessageRecord, trusted: bool) -> Timeli
     presented_timeline_with_tokens(
         row,
         trusted,
-        super::common::markdown_content_tokens(row.kind, &row.plaintext),
+        super::common::markdown_content_tokens(row.kind, &row.tags, &row.plaintext),
         conversation_sticker_ref(row).map(Into::into),
     )
 }
@@ -642,7 +642,7 @@ impl ConversationConversionCache {
                 {
                     self.parses += 1;
                 }
-                super::common::markdown_content_tokens(row.kind, &row.plaintext)
+                super::common::markdown_content_tokens(row.kind, &row.tags, &row.plaintext)
             }
         };
         #[cfg(test)]

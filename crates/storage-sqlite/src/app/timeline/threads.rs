@@ -17,8 +17,9 @@ use std::collections::{HashMap, HashSet};
 /// Ancestors a legacy root walk visits before it stops at the last one.
 const MAX_LEGACY_THREAD_DEPTH: usize = 64;
 
-/// Legacy roots already walked in one read, keyed by the message walked from.
-pub(super) type ThreadRootCache = HashMap<String, String>;
+/// Legacy roots already walked in one read, keyed by group and the message
+/// walked from: one read can span groups that share an inner event id.
+pub(super) type ThreadRootCache = HashMap<(String, String), String>;
 
 /// A row's place in its thread, from its kind, tags and projected reply
 /// target. A thread message's projected reply target is its parent, set only
@@ -83,7 +84,8 @@ fn legacy_root(
     start: &str,
     cache: &mut ThreadRootCache,
 ) -> StorageResult<String> {
-    if let Some(root) = cache.get(start) {
+    let key = (group_id_hex.to_owned(), start.to_owned());
+    if let Some(root) = cache.get(&key) {
         return Ok(root.clone());
     }
     let mut current = start.to_owned();
@@ -100,7 +102,7 @@ fn legacy_root(
             break;
         }
     }
-    cache.insert(start.to_owned(), current.clone());
+    cache.insert(key, current.clone());
     Ok(current)
 }
 

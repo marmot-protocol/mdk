@@ -548,6 +548,7 @@ mod tests {
             reply_to_message_id_hex: Some("parent".to_owned()),
             reply_preview: Some(TimelineReplyPreview {
                 message_id_hex: "parent".to_owned(),
+                reply_to_message_id_hex: None,
                 sender: "bb".repeat(32),
                 plaintext: "parent text".to_owned(),
                 kind: 9,

@@ -5751,6 +5751,10 @@ typedef struct MarmotTimelineReplyPreview {
    * Where the previewed message sits in a NIP-22 thread. Nullable.
    */
   struct MarmotTimelineThreadRef *thread;
+  /**
+   * The previewed message's own reply target. Nullable.
+   */
+  char *reply_to_message_id_hex;
 } MarmotTimelineReplyPreview;
 
 /**

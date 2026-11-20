@@ -123,7 +123,9 @@ pub use storage::{
     QueuedOutboundIntent, RosterRevision, StorageError, StorageProvider, StorageResult,
     WelcomeStorage,
 };
-pub use threads::{NIP22_COMMENT_KIND, is_nip22_comment, thread_message_parent, thread_root_tag};
+pub use threads::{
+    NIP22_COMMENT_KIND, is_chat_message, is_nip22_comment, thread_message_parent, thread_root_tag,
+};
 pub use transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
 };

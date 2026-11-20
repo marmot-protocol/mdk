@@ -37,6 +37,13 @@ pub fn thread_message_parent(kind: u64, tags: &[Vec<String>]) -> Option<&str> {
         .map(String::as_str)
 }
 
+/// A chat message in the Marmot sense: kind 9, or a thread message. Both
+/// carry Markdown text and mentions, and both are chat activity.
+pub fn is_chat_message(kind: u64, tags: &[Vec<String>]) -> bool {
+    kind == crate::app_event::MARMOT_APP_EVENT_KIND_CHAT
+        || thread_message_parent(kind, tags).is_some()
+}
+
 /// The thread root an event names with its first uppercase `E` tag.
 pub fn thread_root_tag(tags: &[Vec<String>]) -> Option<&str> {
     first_tag(tags, "E")
@@ -87,5 +94,13 @@ mod tests {
         let empty_first = tags(&[&["k", "9"], &["e"], &["e", "later"]]);
         assert_eq!(thread_message_parent(1111, &empty_first), None);
         assert_eq!(thread_message_parent(9, &full), None);
+    }
+
+    #[test]
+    fn chat_messages_are_kind_9_and_thread_messages() {
+        assert!(is_chat_message(9, &[]));
+        assert!(is_chat_message(1111, &tags(&[&["e", "parent"]])));
+        assert!(!is_chat_message(1111, &tags(&[&["k", "9"]])));
+        assert!(!is_chat_message(1068, &tags(&[&["e", "parent"]])));
     }
 }

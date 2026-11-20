@@ -5,7 +5,8 @@
 ### Breaking changes
 
 - `TimelineMessageRecordFfi` and `TimelineReplyPreviewFfi` gain `thread: TimelineThreadRefFfi?` (root and parent of
-  a NIP-22 thread). Regenerate Swift or Kotlin bindings with the matching native library.
+  a NIP-22 thread), and `TimelineReplyPreviewFfi` gains the previewed message's `replyToMessageIdHex`. Thread
+  messages get Markdown `contentTokens` like kind 9. Regenerate Swift or Kotlin bindings with the matching native library.
 
 ### Added
 

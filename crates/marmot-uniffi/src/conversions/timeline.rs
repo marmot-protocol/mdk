@@ -218,6 +218,8 @@ pub struct TimelineMessageQueryFfi {
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct TimelineReplyPreviewFfi {
     pub message_id_hex: String,
+    /// The previewed message's own reply target, as on its timeline row.
+    pub reply_to_message_id_hex: Option<String>,
     pub sender: String,
     pub plaintext: String,
     pub content_tokens: MarkdownDocumentFfi,
@@ -263,11 +265,12 @@ impl From<TimelineThreadRef> for TimelineThreadRefFfi {
 
 impl From<TimelineReplyPreview> for TimelineReplyPreviewFfi {
     fn from(value: TimelineReplyPreview) -> Self {
-        let content_tokens = markdown_content_tokens(value.kind, &value.plaintext);
+        let content_tokens = markdown_content_tokens(value.kind, &value.tags, &value.plaintext);
         let media = timeline_media_outcomes_ffi(&value.media, value.source_epoch);
         let sticker = super::sticker::presented_sticker_ref(value.kind, &value.tags, value.deleted);
         Self {
             message_id_hex: value.message_id_hex,
+            reply_to_message_id_hex: value.reply_to_message_id_hex,
             sender: value.sender,
             plaintext: value.plaintext,
             content_tokens,
@@ -447,7 +450,7 @@ impl std::fmt::Debug for TimelineMessageRecordFfi {
 
 impl From<TimelineMessageRecord> for TimelineMessageRecordFfi {
     fn from(value: TimelineMessageRecord) -> Self {
-        let content_tokens = markdown_content_tokens(value.kind, &value.plaintext);
+        let content_tokens = markdown_content_tokens(value.kind, &value.tags, &value.plaintext);
         let group_system = value.group_system;
         let media = timeline_media_outcomes_ffi(&value.media, value.source_epoch);
         let sticker = super::sticker::presented_sticker_ref(value.kind, &value.tags, value.deleted);
@@ -1186,6 +1189,7 @@ mod tests {
     fn timeline_reply_preview_ffi_resolves_media_with_its_own_source_epoch() {
         let preview = TimelineReplyPreview {
             message_id_hex: "parent".to_owned(),
+            reply_to_message_id_hex: None,
             sender: "bob".to_owned(),
             plaintext: "original".to_owned(),
             kind: 9,
@@ -1224,6 +1228,7 @@ mod tests {
     fn reply_preview(kind: u64, tags: Vec<Vec<String>>, deleted: bool) -> TimelineReplyPreview {
         TimelineReplyPreview {
             message_id_hex: "parent".to_owned(),
+            reply_to_message_id_hex: None,
             sender: "bob".to_owned(),
             plaintext: String::new(),
             kind,

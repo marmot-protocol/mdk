@@ -70,8 +70,10 @@ Clients never parse these tags.
 ## Chat activity
 
 A thread message counts wherever kind 9 does: chat-list preview, order, unread count, mentions and the @-badge,
-chat-list text search and timeline search, local notifications, background-wake notifications, push to the other
-members, author edits and deletes, history import, and retention of its media keys. Kind 1111 events without a
+chat-list text search and timeline search, the `NewMessage` live update, Markdown content tokens and mention
+identities, local notifications, background-wake notifications, push to the other members (also when Linux sends it
+through `send_custom_event`, or the queue publishes it later), bringing back a locally deleted chat, author edits and
+deletes, history import, and retention of its media keys. Kind 1111 events without a
 parent stay custom events and do none of this.
 
 ## Display rules

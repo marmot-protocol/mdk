@@ -191,6 +191,8 @@ c_mirror! {
         opt_str invalidation_status,
         /// Where the previewed message sits in a NIP-22 thread. Nullable.
         opt_rec thread: MarmotTimelineThreadRef,
+        /// The previewed message's own reply target. Nullable.
+        opt_str reply_to_message_id_hex,
     }
 }
 

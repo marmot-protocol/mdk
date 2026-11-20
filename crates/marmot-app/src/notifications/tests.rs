@@ -1736,6 +1736,7 @@ fn timeline_target(kind: u64, plaintext: &str) -> TimelineMessageTarget {
         kind,
         deleted: false,
         invalidated: false,
+        thread_message: false,
     }
 }
 

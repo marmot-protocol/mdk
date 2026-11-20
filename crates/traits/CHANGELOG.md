@@ -6,7 +6,7 @@
 
 - `threads` holds the NIP-22 thread-message profile: `NIP22_COMMENT_KIND`, `is_nip22_comment` (now also true for a
   kind 1111 with a lowercase `e` and no numeric `k`, the form White Noise Linux sent before 2026-11-17),
-  `thread_message_parent` and `thread_root_tag`.
+  `thread_message_parent`, `thread_root_tag` and `is_chat_message` (kind 9 or a thread message).
 
 ## 0.18.0 - 2026-11-20
 

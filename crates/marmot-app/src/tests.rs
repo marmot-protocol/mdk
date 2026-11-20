@@ -3315,6 +3315,57 @@ async fn thread_message_send_body() {
         published_before,
         "a refused thread message must reach the relay with nothing"
     );
+
+    // Attachments pass the same outbound media check as kind-9 media.
+    let current_epoch = client.group_mls_state(&group_id).unwrap().epoch;
+    let attachment = MediaAttachmentReference {
+        locators: vec![MediaLocator {
+            kind: "blossom-v1".to_owned(),
+            value: format!("https://media.example/{}.bin", hex::encode([0x33_u8; 32])),
+        }],
+        ciphertext_sha256: hex::encode([0x33_u8; 32]),
+        plaintext_sha256: hex::encode([0x11_u8; 32]),
+        nonce_hex: hex::encode([0x22_u8; 12]),
+        file_name: "a.png".to_owned(),
+        media_type: "image/png".to_owned(),
+        version: "encrypted-media-v2".to_owned(),
+        source_epoch: current_epoch,
+        source_epoch_identity: Some(hex::encode(
+            client.runtime.epoch_pin(&group_id).unwrap().identity,
+        )),
+        dim: None,
+        thumbhash: None,
+    };
+    let with_media = |attachment: &MediaAttachmentReference| AppMessageIntent::ThreadMessage {
+        parent_message_id: root.clone(),
+        content: String::new(),
+        attachments: vec![attachment.clone()],
+        message_tags: Vec::new(),
+        placement: None,
+    };
+    let wrong_version = MediaAttachmentReference {
+        version: "encrypted-media-v1".to_owned(),
+        ..attachment.clone()
+    };
+    let published_before = relay.published_event_ids().len();
+    assert!(
+        client
+            .send_app_event(&group_id, with_media(&wrong_version))
+            .await
+            .is_err(),
+        "an attachment the group's media policy refuses must not be sent"
+    );
+    assert_eq!(relay.published_event_ids().len(), published_before);
+    let (_, media) = client
+        .send_app_event(&group_id, with_media(&attachment))
+        .await
+        .unwrap();
+    let media_row = row(&media.message_ids[0]);
+    assert_eq!(media_row.thread, first_row.thread);
+    assert!(
+        media_row.media.is_some(),
+        "the thread message carries its imeta"
+    );
 }
 
 #[test]
@@ -19163,7 +19214,9 @@ async fn local_delete_restart_preserves_rotated_route_relay_pairs_for_resurrecti
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn local_delete_batch_suppresses_historical_chat_in_both_event_orders() {
-    for fresh_first in [false, true] {
+    // A fresh thread message brings a locally deleted chat back like kind 9.
+    for (fresh_first, fresh_thread) in [(false, false), (true, false), (false, true), (true, true)]
+    {
         let dir = tempfile::tempdir().unwrap();
         AccountHome::open(dir.path())
             .create_account("alice")
@@ -19205,15 +19258,19 @@ async fn local_delete_batch_suppresses_historical_chat_in_both_event_orders() {
         assert!(historical.failures.is_empty());
         assert!(client.delete_group_local(&group_id).await.unwrap());
 
+        let fresh_intent = if fresh_thread {
+            AppMessageIntent::Custom {
+                kind: cgka_traits::NIP22_COMMENT_KIND,
+                tags: vec![vec!["e".to_owned(), "aa".repeat(32)]],
+                content: "fresh".to_owned(),
+            }
+        } else {
+            AppMessageIntent::Chat {
+                content: "fresh".to_owned(),
+            }
+        };
         let fresh_payload = crate::messages::encode_inner_event(
-            &build_inner_event(
-                &AppMessageIntent::Chat {
-                    content: "fresh".to_owned(),
-                },
-                &sender_hex,
-                unix_now_seconds(),
-            )
-            .unwrap(),
+            &build_inner_event(&fresh_intent, &sender_hex, unix_now_seconds()).unwrap(),
         )
         .unwrap();
         let fresh = client
@@ -19263,7 +19320,11 @@ async fn local_delete_batch_suppresses_historical_chat_in_both_event_orders() {
             .await
             .unwrap();
 
-        assert_eq!(summary.messages.len(), 1, "fresh_first={fresh_first}");
+        assert_eq!(
+            summary.messages.len(),
+            1,
+            "fresh_first={fresh_first} fresh_thread={fresh_thread}"
+        );
         assert_eq!(summary.messages[0].plaintext, "fresh");
         assert!(app.group("alice", &group_id_hex).unwrap().is_some());
         assert_eq!(

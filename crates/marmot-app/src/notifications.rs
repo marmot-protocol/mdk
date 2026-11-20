@@ -2334,9 +2334,7 @@ pub(crate) fn message_text_mentions_account(
     tags: &[Vec<String>],
     account_id_hex: &str,
 ) -> bool {
-    let carries_mentions = kind == MARMOT_APP_EVENT_KIND_CHAT
-        || cgka_traits::thread_message_parent(kind, tags).is_some();
-    if !carries_mentions || account_id_hex.is_empty() {
+    if !cgka_traits::is_chat_message(kind, tags) || account_id_hex.is_empty() {
         return false;
     }
     if tags.iter().any(|tag| {

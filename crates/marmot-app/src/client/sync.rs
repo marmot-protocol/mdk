@@ -4097,10 +4097,11 @@ impl AppClient {
                 self.app
                     .reaction_target(&self.state.label, &hex::encode(group.as_slice()), &id)?;
             if message.is_some_and(|message| {
-                matches!(
+                (matches!(
                     message.kind,
                     MARMOT_APP_EVENT_KIND_CHAT | MARMOT_APP_EVENT_KIND_POLL
-                ) && !message.deleted
+                ) || message.thread_message)
+                    && !message.deleted
                     && !message.invalidated
             }) {
                 groups.insert(group.clone());
@@ -4254,7 +4255,7 @@ impl AppClient {
         ) else {
             return Ok(false);
         };
-        if message.kind != MARMOT_APP_EVENT_KIND_CHAT {
+        if !cgka_traits::is_chat_message(message.kind, &message.tags) {
             return Ok(false);
         }
         let group_id_hex = hex::encode(group_id.as_slice());

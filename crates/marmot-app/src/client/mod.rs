@@ -5010,6 +5010,11 @@ impl AppClient {
                     message_tags,
                     placement: None,
                 } => {
+                    if !attachments.is_empty() {
+                        self.sync_runtime_groups_for_send("send_thread_message")
+                            .await?;
+                        self.validate_draft_media_references(group_id, &attachments)?;
+                    }
                     let storage = self.app.account_storage(&self.state.label)?.app_storage();
                     let placement = thread_placement::thread_placement(
                         &storage,
